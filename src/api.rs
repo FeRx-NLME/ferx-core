@@ -1428,10 +1428,13 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
 
 /// Features the analytic transit models (`one_cpt_transit`, `two_cpt_transit`) do
 /// not support in their first version (#386): the exponential-tilting closed form
-/// is a constant-parameter bolus superposition, so steady-state doses, IOV,
-/// within-subject time-varying covariates, and infusion doses are rejected up
+/// is a constant-parameter depot-bolus superposition, so steady-state doses, IOV,
+/// infusion doses, system resets, and non-depot (`CMT≠1`) doses are rejected up
 /// front — otherwise they would silently mis-predict or hit an `unreachable!` in
-/// the superposition dispatch. `fit()` surfaces this as an `Err`;
+/// the superposition dispatch. (Time-varying covariates and a `TIME`-dependent
+/// parameter are instead transparently rerouted to the plain form's ODE `transit()`
+/// twin via [`CompiledModel::effective_for`]; only a form outside that twin's scope
+/// rejects them.) `fit()` surfaces this as an `Err`;
 /// `predict()`/`simulate()` panic via [`assert_transit_support`], mirroring
 /// [`assert_modeled_doses_supported`]. Returns the first offending feature's
 /// message, or `None` when compatible.
@@ -1493,6 +1496,26 @@ pub(crate) fn check_transit_support(
             ));
         }
         for dose in &subject.doses {
+            if dose.cmt != 1 {
+                // The closed form folds *every* dose through the absorption chain into
+                // central ignoring `dose.cmt` (the `sens/provider.rs` superposition loop),
+                // while the ODE twin honours the compartment — a `CMT≠1` dose there falls to
+                // the direct-bolus branch and lands in a disposition compartment. So the two
+                // paths would silently disagree on a non-depot dose, and `effective_for`
+                // routes only TV-cov/`TIME` subjects to the twin, so a mixed population would
+                // even disagree with itself. A transit closed form only supports dosing the
+                // depot (`CMT=1`); reject anything else up front.
+                return Some(format!(
+                    "{name} does not support dosing into a non-depot compartment (subject \
+                     {}, CMT={}): the transit closed form routes every dose through the \
+                     absorption chain into central regardless of compartment, so a CMT≠1 dose \
+                     would be silently mistreated — and its ODE twin would instead bolus it \
+                     into a disposition compartment, so the two paths would disagree. Dose the \
+                     depot (CMT=1), or use an ODE transit model for direct central/peripheral \
+                     dosing.",
+                    subject.id, dose.cmt
+                ));
+            }
             if dose.ss {
                 return Some(format!(
                     "{name} does not support steady-state (SS) doses yet (subject \

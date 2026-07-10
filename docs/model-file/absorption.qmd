@@ -158,9 +158,12 @@ absorption with `ka = 1/MTT`.
 optimiser is kept inside this region automatically.
 
 **Scope (first version).** This analytic model supports single and multiple
-**bolus** doses, bioavailability, lag time, and a `central` initial amount.
-**Steady-state doses, IOV, time-varying covariates, infusions, system resets
-(EVID=3/4), and a `depot` initial amount are rejected** with an actionable message
+**bolus** doses into the depot (`CMT=1`), bioavailability, lag time, and a `central`
+initial amount. A model whose disposition switches mid-profile — a **time-varying
+covariate** or a `TIME`-dependent structural parameter — is transparently rerouted at
+parse time to an exact ODE `transit()` twin, so it is **supported**, not rejected.
+**Steady-state doses, IOV, infusions, system resets (EVID=3/4), a non-depot (`CMT≠1`)
+dose, and a `depot` initial amount are rejected** with an actionable message
 — use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
 tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
 drop-in choice when you need a feature the closed form does not yet cover.
@@ -200,9 +203,10 @@ with `cα = (α−k21)/(α−β)`, `cβ = (k21−β)/(α−β)` (`cα + cβ = 1`
 **exact `Dual2` FOCE/FOCEI sensitivities** `∂C/∂{CL, V1, Q, V2, N, MTT, F, η}`, and
 with `N = 0` reduces exactly to 2-cpt first-order oral absorption with `ka = 1/MTT`.
 The **domain** (`α < KTR`, since `α ≥ β`) and **scope/limits** are identical to
-`one_cpt_transit` (bolus doses, bioavailability, lag time; SS / IOV / time-varying
-covariates / infusions / resets / `depot`-init rejected, and the same flip-flop
-`α ≥ KTR` warning — use an ODE transit model for those).
+`one_cpt_transit` (bolus doses into the depot, bioavailability, lag time; time-varying
+covariates and `TIME`-dependent parameters transparently rerouted to an exact 2-cpt ODE
+`transit()` twin; SS / IOV / infusions / resets / non-depot (`CMT≠1`) doses / `depot`-init
+rejected, with the same flip-flop `α ≥ KTR` warning — use an ODE transit model for those).
 
 [`examples/two_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_transit.ferx)
 is a complete self-contained example:
