@@ -3276,11 +3276,25 @@ pub fn fit(
 /// converting the remaining ~80 string push-sites to full at-source emission is
 /// a later increment.
 fn rebuild_warnings_structured(result: &mut FitResult) {
-    let mut entries: Vec<crate::types::WarningEntry> = result
-        .warnings
-        .iter()
-        .map(|w| crate::types::classify_warning(w))
-        .collect();
+    // Entries emitted typed at source (`native_warnings`, already carrying a
+    // `details` payload) are keyed by message and take precedence; every other
+    // message is string-classified and then field-enriched. Keying by message
+    // keeps this idempotent — a second rebuild re-captures the native entries.
+    // Key by the *original* warning string: `classify_warning` strips a
+    // `[METHOD]` chain prefix into `source_method`, so a native entry produced
+    // in a multi-stage chain must reconstruct that prefix to match the raw
+    // `warnings` entry (an unprefixed entry keys by its message unchanged).
+    let native: std::collections::HashMap<String, crate::types::WarningEntry> =
+        std::mem::take(&mut result.warnings_structured)
+            .into_iter()
+            .map(|e| {
+                let key = match &e.source_method {
+                    Some(m) => format!("[{m}] {}", e.message),
+                    None => e.message.clone(),
+                };
+                (key, e)
+            })
+            .collect();
     let stats = DiagStats {
         dw_statistic: result.dw_statistic,
         iwres_lag1_r: result.iwres_lag1_r,
@@ -3290,9 +3304,19 @@ fn rebuild_warnings_structured(result: &mut FitResult) {
         shrinkage_eta: &result.shrinkage_eta,
         eta_names: &result.eta_names,
     };
-    for e in &mut entries {
-        e.details = diagnostic_details(&e.category, &stats);
-    }
+    let entries: Vec<crate::types::WarningEntry> = result
+        .warnings
+        .iter()
+        .map(|w| {
+            if let Some(entry) = native.get(w) {
+                entry.clone()
+            } else {
+                let mut e = crate::types::classify_warning(w);
+                e.details = diagnostic_details(&e.category, &stats);
+                e
+            }
+        })
+        .collect();
     result.warnings_structured = entries;
 }
 
@@ -5060,6 +5084,10 @@ fn fit_inner(
 
     // Optional SIR step
     let mut warnings = result.warnings;
+    // Warnings emitted *typed at source* (with a `details` payload) rather than
+    // string-classified. Seeded into `FitResult.warnings_structured`;
+    // `rebuild_warnings_structured` prefers these over re-classifying the string.
+    let mut native_warnings: Vec<WarningEntry> = Vec::new();
 
     // Warn when [derived] expressions that reference compartments[i] will
     // silently evaluate to NaN due to unsupported model/subject configurations.
@@ -5268,6 +5296,12 @@ fn fit_inner(
     if let Some(w) = eta_shrinkage_warning(&shrinkage_eta, &result.params.omega.eta_names) {
         warnings.push(w);
     }
+    // Theta estimates pinned to an optimizer bound — emitted typed at source
+    // with a `details` payload (#781).
+    if let Some((msg, entry)) = boundary_estimate_warning(&result.params) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
@@ -5412,7 +5446,7 @@ fn fit_inner(
         n_iterations: result.n_iterations,
         interaction: options.interaction,
         warnings,
-        warnings_structured: vec![],
+        warnings_structured: native_warnings,
         // If the normal SIR ran, use that; otherwise use the fallback result.
         sir_ci_theta: sir_result
             .as_ref()
@@ -6186,6 +6220,105 @@ pub(crate) fn eta_shrinkage_warning(shrinkage: &[f64], eta_names: &[String]) -> 
         100.0 * ETA_SHRINKAGE_WARN_THRESHOLD,
         list
     ))
+}
+
+/// Relative tolerance (a fraction of the packed bound range) within which a
+/// theta estimate counts as sitting on its lower/upper optimizer bound.
+const BOUNDARY_REL_TOL: f64 = 1e-3;
+
+/// Which bound a theta estimate is pinned to and the **effective** natural-space
+/// bound value the optimizer actually constrains to, or `None` when the estimate
+/// is interior. Evaluated in the optimizer's *packed* space (log when the lower
+/// bound is `>= 0`, else identity) so the proximity test is scale-appropriate —
+/// a log-scaled parameter is "at" its bound within a constant factor, not a
+/// constant absolute gap.
+///
+/// The floors/caps mirror `compute_bounds` / `pack_params`: a log-packed theta
+/// floors its estimate and lower bound at `1e-10` and caps the upper at `1e9`,
+/// so the reported bound matches the constraint that was actually active (and
+/// agrees with the estimate). Degenerate/non-finite bounds yield `None`.
+fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<(&'static str, f64)> {
+    use crate::estimation::parameterization::theta_packs_log;
+    let (lo_eff, hi_eff, pe, pl, pu) = if theta_packs_log(lower) {
+        let lo = lower.max(1e-10);
+        let hi = upper.min(1e9);
+        (lo, hi, est.max(1e-10).ln(), lo.ln(), hi.ln())
+    } else {
+        (lower, upper, est, lower, upper)
+    };
+    let range = pu - pl;
+    if !range.is_finite() || range <= 0.0 || !pe.is_finite() {
+        return None;
+    }
+    let frac = (pe - pl) / range;
+    if frac <= BOUNDARY_REL_TOL {
+        Some(("lower", lo_eff))
+    } else if frac >= 1.0 - BOUNDARY_REL_TOL {
+        Some(("upper", hi_eff))
+    } else {
+        None
+    }
+}
+
+/// Free (non-fixed) theta estimates pinned to an optimizer bound, as
+/// `(name, estimate, effective_bound, side)` per hit.
+fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'static str)> {
+    let mut hits = Vec::new();
+    for i in 0..params.theta.len() {
+        if params.theta_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let est = params.theta[i];
+        if let Some((side, bound)) =
+            theta_boundary_side(est, params.theta_lower[i], params.theta_upper[i])
+        {
+            let name = params
+                .theta_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("THETA{}", i + 1));
+            hits.push((name, est, bound, side));
+        }
+    }
+    hits
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// theta estimates pinned to an optimizer bound, or `None` when none are.
+fn boundary_estimate_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
+    let hits = boundary_estimates(params);
+    if hits.is_empty() {
+        return None;
+    }
+    let list = hits
+        .iter()
+        .map(|(name, est, _bound, side)| format!("{name} ({est:.4} at {side} bound)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let msg = format!(
+        "Parameter estimate(s) pinned to an optimizer bound: {list}. This often \
+         indicates non-identifiability or a too-tight bound; inspect the affected \
+         parameter(s) and consider relaxing the bound or simplifying the model."
+    );
+    let params_json: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|(name, est, bound, side)| {
+            serde_json::json!({
+                "parameter": name,
+                "estimate": est,
+                "bound": bound,
+                "side": side,
+            })
+        })
+        .collect();
+    let entry = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::BoundaryEstimate,
+        message: msg.clone(),
+        source_method: None,
+        details: Some(serde_json::json!({ "parameters": params_json })),
+    };
+    Some((msg, entry))
 }
 
 #[cfg(test)]
@@ -9152,6 +9285,12 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
+    // Deliberately no `assert_transit_flip_flop_no_twin` guard here (unlike
+    // `predict`/`simulate`): a survival prediction cannot be corrupted by a degenerate
+    // twin-less-flip-flop transit PK. A hazard that reads the PK is ODE-accumulated (the
+    // model then carries `ode_spec` and never takes the closed-form transit path), and a
+    // closed-form-family hazard does not read the PK at all — so the closed form's
+    // clamped `0` can never reach `S(t)`. See #776.
     use crate::survival::{
         cif_curves, hazard_and_cum_hazard, mean_survival, median_survival, tte_cause_params,
     };
@@ -12481,6 +12620,107 @@ mod simulate_with_uncertainty_tests {
         assert!(cd(None, None).is_none());
         // Non-finite condition number is skipped.
         assert!(cd(Some(f64::INFINITY), None).is_none());
+    }
+
+    #[test]
+    fn theta_boundary_side_detects_bounds() {
+        let side = |e, l, u| super::theta_boundary_side(e, l, u).map(|(s, _)| s);
+        // Identity-packed (lower < 0): interior, at-lower, at-upper.
+        assert_eq!(side(0.0, -1.0, 1.0), None);
+        assert_eq!(side(-1.0, -1.0, 1.0), Some("lower"));
+        assert_eq!(side(1.0, -1.0, 1.0), Some("upper"));
+        // Log-packed (lower >= 0): "at bound" is within a constant factor.
+        assert_eq!(side(1.0, 0.001, 1000.0), None);
+        assert_eq!(side(0.001, 0.001, 1000.0), Some("lower"));
+        // Degenerate bounds → None.
+        assert_eq!(side(1.0, 5.0, 5.0), None);
+        // Effective bound: a user lower bound of 0 (log-packed) is reported as
+        // the optimizer's 1e-10 floor, agreeing with the pinned estimate.
+        let (s, bound) = super::theta_boundary_side(1e-10, 0.0, 100.0).unwrap();
+        assert_eq!(s, "lower");
+        assert_eq!(bound, 1e-10);
+    }
+
+    #[test]
+    fn rebuild_native_key_reconstructs_chain_prefix() {
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        // A native entry produced inside a `[FOCEI]` chain: message is the
+        // stripped body, source_method carries the tag; the raw warning is the
+        // full prefixed string.
+        fit.warnings = vec!["[FOCEI] pinned to an optimizer bound: X".to_string()];
+        fit.warnings_structured = vec![crate::types::WarningEntry {
+            severity: crate::types::WarningSeverity::Warning,
+            category: crate::types::WarningCode::BoundaryEstimate,
+            message: "pinned to an optimizer bound: X".to_string(),
+            source_method: Some("FOCEI".to_string()),
+            details: Some(serde_json::json!({ "k": 1 })),
+        }];
+        super::rebuild_warnings_structured(&mut fit);
+        // Native entry (with details) is preferred despite the prefix.
+        assert_eq!(
+            fit.warnings_structured[0].category,
+            crate::types::WarningCode::BoundaryEstimate
+        );
+        assert_eq!(fit.warnings_structured[0].details.as_ref().unwrap()["k"], 1);
+    }
+
+    #[test]
+    fn boundary_estimate_warning_emits_typed_entry_with_details() {
+        use crate::types::WarningCode;
+        let mut params = tiny_model().default_params;
+        // No hit initially (estimates interior) — or at least assert whatever
+        // tiny_model starts with, then force a hit on theta 0 at its lower bound.
+        params.theta_fixed = vec![false; params.theta.len()];
+        params.theta[0] = params.theta_lower[0];
+        let (msg, entry) =
+            super::boundary_estimate_warning(&params).expect("expected a boundary hit");
+        assert!(msg.contains("optimizer bound"));
+        assert_eq!(entry.category, WarningCode::BoundaryEstimate);
+        let d = entry.details.as_ref().expect("details");
+        assert_eq!(d["parameters"][0]["side"], "lower");
+        assert_eq!(
+            d["parameters"][0]["parameter"],
+            params.theta_names[0].as_str()
+        );
+
+        // A fixed theta at its bound is not reported.
+        params.theta_fixed[0] = true;
+        assert!(super::boundary_estimate_warning(&params).is_none());
+    }
+
+    #[test]
+    fn rebuild_prefers_native_entry_and_is_idempotent() {
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        let msg = "Parameter estimate(s) pinned to an optimizer bound: CL (0.0010 at lower bound)."
+            .to_string();
+        fit.warnings = vec![msg.clone()];
+        // Native entry (with details) seeded as the fit pipeline would.
+        fit.warnings_structured = vec![crate::types::WarningEntry {
+            severity: crate::types::WarningSeverity::Warning,
+            category: crate::types::WarningCode::BoundaryEstimate,
+            message: msg.clone(),
+            source_method: None,
+            details: Some(serde_json::json!({ "parameters": [{ "parameter": "CL" }] })),
+        }];
+        super::rebuild_warnings_structured(&mut fit);
+        // Native entry preferred over re-classifying the string (details kept).
+        assert_eq!(fit.warnings_structured.len(), 1);
+        assert_eq!(
+            fit.warnings_structured[0].category,
+            crate::types::WarningCode::BoundaryEstimate
+        );
+        assert_eq!(
+            fit.warnings_structured[0].details.as_ref().unwrap()["parameters"][0]["parameter"],
+            "CL"
+        );
+        // Idempotent: a second rebuild re-captures the native entry, details intact.
+        super::rebuild_warnings_structured(&mut fit);
+        assert_eq!(
+            fit.warnings_structured[0].details.as_ref().unwrap()["parameters"][0]["parameter"],
+            "CL"
+        );
     }
 
     #[test]

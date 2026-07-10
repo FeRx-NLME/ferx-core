@@ -28,6 +28,14 @@ section of the SDLC for the versioning policy).
   thin wrapper returning just the rows), and `ferx <model> --simulate` now echoes these
   warnings alongside the fit warnings — including in the structured `warnings_structured`
   / JSON output, under a new typed `simulation` [`WarningCode`](https://ferx-nlme.github.io/ferx-core/warnings.html).
+- **Boundary-estimate warning** (#781): a fit now emits a `boundary_estimate`
+  warning when a free THETA estimate is pinned to an optimizer bound (evaluated
+  in the optimizer's packed/log space) — a sign of non-identifiability or a
+  too-tight bound. The structured warning carries `details` listing each
+  `{parameter, estimate, bound, side}`, and is emitted **typed at its source**
+  (the first warning to use the native at-source path rather than string
+  classification). See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
 - **Finer covariance-step warning codes** (#781): the overloaded
   `covariance_step` warning code is split by severity into `covariance_failed`
   (Critical — no standard errors), `covariance_regularized` (Warning — SEs
