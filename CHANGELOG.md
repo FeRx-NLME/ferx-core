@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **High parameter-correlation warning** (#781): a fit now emits a
+  `high_correlation` warning when a THETA (fixed-effect) pair's estimate
+  correlation (from the covariance matrix) has |r| ≥ 0.95 — a sign of
+  over-parameterization / non-identifiability that names the specific culprits
+  (complementing the aggregate `condition_number`). Emitted typed at source with
+  `details` listing each `{parameter_a, parameter_b, correlation}`. See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
 - **Inflated-RSE warning** (#781): a fit now emits an `inflated_rse` warning
   when a free THETA's relative standard error (`100 · se / |estimate|`) exceeds
   ~50% — an imprecisely estimated parameter, often a sign of
