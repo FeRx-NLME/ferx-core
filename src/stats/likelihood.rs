@@ -502,7 +502,10 @@ pub fn individual_nll_into_with_schedule(
         // Iterate model.endpoints (typically 1–3 entries) rather than scanning
         // obs_records for unique CMTs — avoids the HashSet and one pass over records.
         for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard, recurrence } = endpoint {
+            if let EndpointLikelihood::Tte {
+                hazard, recurrence, ..
+            } = endpoint
+            {
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()
@@ -720,10 +723,14 @@ pub(crate) fn obs_nll_subject_from_preds(
     if !subject.obs_records.is_empty() {
         use crate::types::EndpointLikelihood;
         for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard, recurrence } = endpoint {
-                // ObsRecord::Event is the only variant (DiscreteState/Count deferred);
-                // the `..` pattern captures all EventType variants (Exact, RightCensored,
-                // IntervalCensored), so this filter correctly passes every TTE record type.
+            if let EndpointLikelihood::Tte {
+                hazard, recurrence, ..
+            } = endpoint
+            {
+                // Keep only `ObsRecord::Event` records at this CMT; any `DiscreteState` /
+                // `Count` records (Phase 4.0) are correctly excluded from the TTE data term.
+                // The `..` pattern captures all EventType variants (Exact, RightCensored,
+                // IntervalCensored), so this filter passes every TTE record type.
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()
@@ -912,7 +919,10 @@ pub fn foce_subject_nll(
         let mut tte_h = DMatrix::<f64>::zeros(n_eta, n_eta);
 
         for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard, recurrence } = endpoint {
+            if let EndpointLikelihood::Tte {
+                hazard, recurrence, ..
+            } = endpoint
+            {
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()
@@ -2404,7 +2414,10 @@ pub fn individual_nll_iov(
         use crate::survival::tte_data_term;
         use crate::types::EndpointLikelihood;
         for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard, recurrence } = endpoint {
+            if let EndpointLikelihood::Tte {
+                hazard, recurrence, ..
+            } = endpoint
+            {
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()

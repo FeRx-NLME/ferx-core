@@ -502,7 +502,10 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // planned study end (#522). `match_method = None` makes this identical to
     // `simulate_with_seed` for the Gaussian path (same seeded RNG, no matching),
     // and the `None`-matching branch cannot error.
-    let sim_results = simulate_with_options(
+    let SimulationOutput {
+        results: sim_results,
+        warnings: sim_warnings,
+    } = simulate_with_options_diag(
         &parsed.model,
         &template,
         &parsed.model.default_params,
@@ -619,6 +622,16 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     result.model_path = Some(model_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.model_text = std::fs::read_to_string(model_path).ok();
+    // Surface any per-subject simulation diagnostics (#762/#763) alongside the fit
+    // warnings so the CLI reports a degenerate simulated subject rather than dropping it.
+    // `fit()` already built `warnings_structured` from the fit warnings; rebuild it
+    // unconditionally so the appended sim warnings also reach the typed / JSON surface
+    // (#778/#779), where `classify_warning` tags them `WarningCode::Simulation`. The
+    // rebuild is idempotent — a pure function of `result.warnings` — so an empty
+    // `sim_warnings` (the common case, and every non-survival build) just reproduces the
+    // fit's structured list.
+    result.warnings.extend(sim_warnings);
+    rebuild_warnings_structured(&mut result);
     Ok((result, population))
 }
 
@@ -1721,6 +1734,104 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
         }
     }
     None
+}
+
+/// Reject a model / dataset where a **survival hazard references a time-varying
+/// covariate** — currently silently frozen at its baseline value (#741).
+///
+/// The analytic hazard [`crate::types::HazardParamFn`] takes no time argument and is
+/// evaluated with the subject's baseline covariate snapshot; the ODE-accumulated (joint
+/// PK-TTE) hazard is integrated with the PK-parameter vector frozen at `t=0`
+/// (`survival::ode_cumhaz_hazard`). In both cases a covariate that varies within a subject
+/// is read at one fixed value, so the fit / simulation would use the wrong hazard with no
+/// warning. Until time-varying covariates on hazards are supported, reject up front — as the
+/// PK-path TV-covariate paths already do (`check_transit_support`) — rather than silently
+/// mis-fit.
+///
+/// The scope is deliberately tight so a legitimate model is not rejected:
+///   * an **analytic** hazard rejects only when a covariate its *own* closed-form parameters
+///     reference (`hazard_covariates`) is time-varying — a covariate used solely by a shared
+///     PK model (a frailty-only joint fit) is fine, since the analytic hazard never reads it;
+///   * an **ODE-accumulated** hazard rejects on *any* time-varying covariate, because the
+///     survival ODE solve freezes the whole PK-parameter vector at `t=0`, so a covariate
+///     feeding the concentration (and hence the drug-driven hazard) is equally frozen.
+///
+/// Returns `None` when no TTE endpoint references a time-varying covariate. `fit()` surfaces
+/// the message as an `Err`; `predict()`/`simulate()` panic via [`assert_survival_tv_covariates`].
+#[cfg(feature = "survival")]
+pub(crate) fn check_survival_tv_covariates(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<String> {
+    use crate::types::{EndpointLikelihood, HazardSpec};
+    if !model.has_tte() {
+        return None;
+    }
+    for subject in &population.subjects {
+        let tv = subject.time_varying_covariate_names();
+        if tv.is_empty() {
+            continue;
+        }
+        let tv_set: std::collections::HashSet<&str> = tv.iter().map(String::as_str).collect();
+        for (cmt, endpoint) in &model.endpoints {
+            let EndpointLikelihood::Tte {
+                hazard,
+                hazard_covariates,
+                ..
+            } = endpoint
+            else {
+                continue;
+            };
+            match hazard {
+                HazardSpec::Analytic { .. } => {
+                    if let Some(name) = hazard_covariates
+                        .iter()
+                        .find(|c| tv_set.contains(c.as_str()))
+                    {
+                        return Some(format!(
+                            "[event_model] on CMT={cmt}: the survival hazard references covariate \
+                             `{name}`, which is time-varying for subject `{}`. Time-varying \
+                             covariates on a hazard are not yet supported — the analytic hazard is \
+                             evaluated at the baseline covariate value, so the fit would silently \
+                             use the wrong hazard (#741). Use a time-constant (baseline) covariate \
+                             on the hazard for now.",
+                            subject.id
+                        ));
+                    }
+                }
+                HazardSpec::OdeAccumulated { .. } => {
+                    // Any time-varying covariate is frozen by the survival ODE solve's t=0
+                    // PK-parameter snapshot; name the first one deterministically (`tv` is sorted).
+                    let name = &tv[0];
+                    return Some(format!(
+                        "[event_model] on CMT={cmt}: the ODE-accumulated (joint PK-TTE) hazard is \
+                         integrated with covariates frozen at their t=0 baseline, but covariate \
+                         `{name}` is time-varying for subject `{}`. Time-varying covariates on a \
+                         drug-driven hazard are not yet supported (#741). Hold the covariate \
+                         constant within each subject for now.",
+                        subject.id
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Panic wrapper over [`check_survival_tv_covariates`] for the non-`fit` entry points
+/// (`predict()`/`simulate()`), mirroring [`assert_absorption_closed_form_support`]: the same
+/// time-varying-covariate-on-hazard combination that `fit()` rejects as an `Err` cannot be
+/// honoured by prediction / simulation either (the hazard would be silently frozen), so fail
+/// loudly rather than return a subtly wrong result.
+#[cfg(feature = "survival")]
+pub(crate) fn assert_survival_tv_covariates(model: &CompiledModel, population: &Population) {
+    if let Some(msg) = check_survival_tv_covariates(model, population) {
+        panic!(
+            "predict()/simulate() received a survival model / data combination with a \
+             time-varying covariate on a hazard: {msg}\n(fit() reports this as an error rather \
+             than panicking.)"
+        );
+    }
 }
 
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
@@ -2867,6 +2978,13 @@ pub fn fit(
     if let Some(e) = check_rtte_records(model, population) {
         return Err(e);
     }
+    // A survival hazard that references a time-varying covariate would be silently
+    // evaluated at the baseline value (analytic hazard) or with PK params frozen at t=0
+    // (ODE-accumulated hazard) — reject rather than mis-fit (#741).
+    #[cfg(feature = "survival")]
+    if let Some(e) = check_survival_tv_covariates(model, population) {
+        return Err(e);
+    }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
     // enforces these for `.ferx` models, but a Rust caller could otherwise set
     // `log_transform = true` together with a proportional/combined error or a
@@ -3201,11 +3319,25 @@ pub fn fit(
 /// converting the remaining ~80 string push-sites to full at-source emission is
 /// a later increment.
 fn rebuild_warnings_structured(result: &mut FitResult) {
-    let mut entries: Vec<crate::types::WarningEntry> = result
-        .warnings
-        .iter()
-        .map(|w| crate::types::classify_warning(w))
-        .collect();
+    // Entries emitted typed at source (`native_warnings`, already carrying a
+    // `details` payload) are keyed by message and take precedence; every other
+    // message is string-classified and then field-enriched. Keying by message
+    // keeps this idempotent — a second rebuild re-captures the native entries.
+    // Key by the *original* warning string: `classify_warning` strips a
+    // `[METHOD]` chain prefix into `source_method`, so a native entry produced
+    // in a multi-stage chain must reconstruct that prefix to match the raw
+    // `warnings` entry (an unprefixed entry keys by its message unchanged).
+    let native: std::collections::HashMap<String, crate::types::WarningEntry> =
+        std::mem::take(&mut result.warnings_structured)
+            .into_iter()
+            .map(|e| {
+                let key = match &e.source_method {
+                    Some(m) => format!("[{m}] {}", e.message),
+                    None => e.message.clone(),
+                };
+                (key, e)
+            })
+            .collect();
     let stats = DiagStats {
         dw_statistic: result.dw_statistic,
         iwres_lag1_r: result.iwres_lag1_r,
@@ -3215,9 +3347,19 @@ fn rebuild_warnings_structured(result: &mut FitResult) {
         shrinkage_eta: &result.shrinkage_eta,
         eta_names: &result.eta_names,
     };
-    for e in &mut entries {
-        e.details = diagnostic_details(&e.category, &stats);
-    }
+    let entries: Vec<crate::types::WarningEntry> = result
+        .warnings
+        .iter()
+        .map(|w| {
+            if let Some(entry) = native.get(w) {
+                entry.clone()
+            } else {
+                let mut e = crate::types::classify_warning(w);
+                e.details = diagnostic_details(&e.category, &stats);
+                e
+            }
+        })
+        .collect();
     result.warnings_structured = entries;
 }
 
@@ -4985,6 +5127,10 @@ fn fit_inner(
 
     // Optional SIR step
     let mut warnings = result.warnings;
+    // Warnings emitted *typed at source* (with a `details` payload) rather than
+    // string-classified. Seeded into `FitResult.warnings_structured`;
+    // `rebuild_warnings_structured` prefers these over re-classifying the string.
+    let mut native_warnings: Vec<WarningEntry> = Vec::new();
 
     // Warn when [derived] expressions that reference compartments[i] will
     // silently evaluate to NaN due to unsupported model/subject configurations.
@@ -5193,6 +5339,18 @@ fn fit_inner(
     if let Some(w) = eta_shrinkage_warning(&shrinkage_eta, &result.params.omega.eta_names) {
         warnings.push(w);
     }
+    // Theta estimates pinned to an optimizer bound — emitted typed at source
+    // with a `details` payload (#781).
+    if let Some((msg, entry)) = boundary_estimate_warning(&result.params) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
+    // Imprecisely estimated thetas (high relative standard error) — likewise
+    // emitted typed at source with `details` (#781).
+    if let Some((msg, entry)) = inflated_rse_warning(&se_theta, &result.params) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
@@ -5305,7 +5463,7 @@ fn fit_inner(
         }
     };
 
-    let fit_result = FitResult {
+    let mut fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
         method_wall_times_secs,
@@ -5337,7 +5495,7 @@ fn fit_inner(
         n_iterations: result.n_iterations,
         interaction: options.interaction,
         warnings,
-        warnings_structured: vec![],
+        warnings_structured: native_warnings,
         // If the normal SIR ran, use that; otherwise use the fallback result.
         sir_ci_theta: sir_result
             .as_ref()
@@ -5488,6 +5646,15 @@ fn fit_inner(
             ms(jac_fd_n),
             avg_us(jac_fd_n, jac_fd_c)
         );
+    }
+
+    // Highly correlated parameter pairs — emitted typed at source with a
+    // `details` payload (#781). Appended post-construction because it needs the
+    // packed parameter names, which are derived from the assembled `FitResult`;
+    // `rebuild_warnings_structured` preserves this native entry by message.
+    if let Some((msg, entry)) = high_correlation_warning(&fit_result) {
+        fit_result.warnings.push(msg);
+        fit_result.warnings_structured.push(entry);
     }
 
     Ok(fit_result)
@@ -6111,6 +6278,268 @@ pub(crate) fn eta_shrinkage_warning(shrinkage: &[f64], eta_names: &[String]) -> 
         100.0 * ETA_SHRINKAGE_WARN_THRESHOLD,
         list
     ))
+}
+
+/// Relative tolerance (a fraction of the packed bound range) within which a
+/// theta estimate counts as sitting on its lower/upper optimizer bound.
+const BOUNDARY_REL_TOL: f64 = 1e-3;
+
+/// Which bound a theta estimate is pinned to and the **effective** natural-space
+/// bound value the optimizer actually constrains to, or `None` when the estimate
+/// is interior. Evaluated in the optimizer's *packed* space (log when the lower
+/// bound is `>= 0`, else identity) so the proximity test is scale-appropriate —
+/// a log-scaled parameter is "at" its bound within a constant factor, not a
+/// constant absolute gap.
+///
+/// The floors/caps mirror `compute_bounds` / `pack_params`: a log-packed theta
+/// floors its estimate and lower bound at `1e-10` and caps the upper at `1e9`,
+/// so the reported bound matches the constraint that was actually active (and
+/// agrees with the estimate). Degenerate/non-finite bounds yield `None`.
+fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<(&'static str, f64)> {
+    use crate::estimation::parameterization::theta_packs_log;
+    let (lo_eff, hi_eff, pe, pl, pu) = if theta_packs_log(lower) {
+        let lo = lower.max(1e-10);
+        let hi = upper.min(1e9);
+        (lo, hi, est.max(1e-10).ln(), lo.ln(), hi.ln())
+    } else {
+        (lower, upper, est, lower, upper)
+    };
+    let range = pu - pl;
+    if !range.is_finite() || range <= 0.0 || !pe.is_finite() {
+        return None;
+    }
+    let frac = (pe - pl) / range;
+    if frac <= BOUNDARY_REL_TOL {
+        Some(("lower", lo_eff))
+    } else if frac >= 1.0 - BOUNDARY_REL_TOL {
+        Some(("upper", hi_eff))
+    } else {
+        None
+    }
+}
+
+/// Free (non-fixed) theta estimates pinned to an optimizer bound, as
+/// `(name, estimate, effective_bound, side)` per hit.
+fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'static str)> {
+    let mut hits = Vec::new();
+    for i in 0..params.theta.len() {
+        if params.theta_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let est = params.theta[i];
+        if let Some((side, bound)) =
+            theta_boundary_side(est, params.theta_lower[i], params.theta_upper[i])
+        {
+            let name = params
+                .theta_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("THETA{}", i + 1));
+            hits.push((name, est, bound, side));
+        }
+    }
+    hits
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// theta estimates pinned to an optimizer bound, or `None` when none are.
+fn boundary_estimate_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
+    let hits = boundary_estimates(params);
+    if hits.is_empty() {
+        return None;
+    }
+    let list = hits
+        .iter()
+        .map(|(name, est, _bound, side)| format!("{name} ({est:.4} at {side} bound)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let msg = format!(
+        "Parameter estimate(s) pinned to an optimizer bound: {list}. This often \
+         indicates non-identifiability or a too-tight bound; inspect the affected \
+         parameter(s) and consider relaxing the bound or simplifying the model."
+    );
+    let params_json: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|(name, est, bound, side)| {
+            serde_json::json!({
+                "parameter": name,
+                "estimate": est,
+                "bound": bound,
+                "side": side,
+            })
+        })
+        .collect();
+    let entry = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::BoundaryEstimate,
+        message: msg.clone(),
+        source_method: None,
+        details: Some(serde_json::json!({ "parameters": params_json })),
+    };
+    Some((msg, entry))
+}
+
+/// Relative-standard-error threshold (percent) above which a free THETA is
+/// flagged as imprecisely estimated. 50% is a common rule of thumb for fixed
+/// effects (well-estimated parameters typically sit well below it).
+const RSE_WARN_THRESHOLD_PCT: f64 = 50.0;
+
+/// Free (non-fixed) THETA estimates with a relative standard error above the
+/// threshold, as `(name, estimate, se, rse_pct)`. Empty when the covariance
+/// step produced no SEs, or none are imprecise. `RSE = 100 * se / |estimate|`.
+fn inflated_rse_thetas(
+    se_theta: &Option<Vec<f64>>,
+    params: &ModelParameters,
+) -> Vec<(String, f64, f64, f64)> {
+    let Some(se) = se_theta else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for i in 0..params.theta.len() {
+        if params.theta_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let (est, se_i) = (params.theta[i], se.get(i).copied().unwrap_or(f64::NAN));
+        if est.abs() <= 1e-12 || !se_i.is_finite() {
+            continue;
+        }
+        let rse = 100.0 * se_i / est.abs();
+        if rse.is_finite() && rse > RSE_WARN_THRESHOLD_PCT {
+            let name = params
+                .theta_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("THETA{}", i + 1));
+            hits.push((name, est, se_i, rse));
+        }
+    }
+    hits
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// free THETAs whose relative standard error exceeds the threshold, or `None`.
+fn inflated_rse_warning(
+    se_theta: &Option<Vec<f64>>,
+    params: &ModelParameters,
+) -> Option<(String, WarningEntry)> {
+    let hits = inflated_rse_thetas(se_theta, params);
+    if hits.is_empty() {
+        return None;
+    }
+    let list = hits
+        .iter()
+        // One decimal so a borderline value (e.g. 50.4%) is not displayed as
+        // "50%" — which would read as below the threshold it just tripped.
+        .map(|(name, _est, _se, rse)| format!("{name} ({rse:.1}%)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let msg = format!(
+        "High relative standard error (RSE > {:.0}%): {list}. These parameter(s) \
+         are imprecisely estimated — often a sign of over-parameterization or \
+         data that do not inform them; consider simplifying the model.",
+        RSE_WARN_THRESHOLD_PCT
+    );
+    let params_json: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|(name, est, se, rse)| {
+            serde_json::json!({
+                "parameter": name,
+                "estimate": est,
+                "se": se,
+                "rse_pct": rse,
+            })
+        })
+        .collect();
+    let entry = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::InflatedRse,
+        message: msg.clone(),
+        source_method: None,
+        details: Some(serde_json::json!({
+            "threshold_pct": RSE_WARN_THRESHOLD_PCT,
+            "parameters": params_json,
+        })),
+    };
+    Some((msg, entry))
+}
+
+/// Absolute correlation above which a parameter pair is flagged as
+/// collinear/non-identified. `0.95` is a common rule of thumb.
+const CORRELATION_WARN_THRESHOLD: f64 = 0.95;
+
+/// THETA (fixed-effect) pairs whose estimate correlation exceeds the threshold,
+/// as `(name_a, name_b, correlation)`. Restricted to the THETA block — it
+/// occupies the first `theta_names.len()` packed entries with unambiguous names,
+/// and fixed-effect collinearity is the most actionable/interpretable case
+/// (omega/sigma live in Cholesky space, where both the correlation and the
+/// packed labels are murkier). Fixed / zero-variance thetas (diagonal `<= 0`)
+/// are skipped. Empty when there is no covariance matrix.
+fn high_correlation_pairs(
+    cov: Option<&DMatrix<f64>>,
+    theta_names: &[String],
+) -> Vec<(String, String, f64)> {
+    let Some(cov) = cov else {
+        return Vec::new();
+    };
+    let n_theta = theta_names.len().min(cov.nrows());
+    let mut pairs = Vec::new();
+    for a in 0..n_theta {
+        if cov[(a, a)] <= 0.0 {
+            continue;
+        }
+        for b in (a + 1)..n_theta {
+            if cov[(b, b)] <= 0.0 {
+                continue;
+            }
+            // sqrt(var_a) * sqrt(var_b) avoids the overflow/underflow that
+            // `(var_a * var_b).sqrt()` can hit for extreme variances.
+            let denom = cov[(a, a)].sqrt() * cov[(b, b)].sqrt();
+            if denom <= 0.0 || !denom.is_finite() {
+                continue;
+            }
+            let r = cov[(a, b)] / denom;
+            if r.is_finite() && r.abs() >= CORRELATION_WARN_THRESHOLD {
+                pairs.push((theta_names[a].clone(), theta_names[b].clone(), r));
+            }
+        }
+    }
+    pairs
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// highly correlated THETA pairs in the fit's covariance matrix, or `None`.
+fn high_correlation_warning(result: &FitResult) -> Option<(String, WarningEntry)> {
+    let pairs = high_correlation_pairs(result.covariance_matrix.as_ref(), &result.theta_names);
+    if pairs.is_empty() {
+        return None;
+    }
+    let list = pairs
+        .iter()
+        .map(|(a, b, r)| format!("{a} ~ {b} ({r:.2})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let msg = format!(
+        "Highly correlated parameter pair(s) (|r| >= {CORRELATION_WARN_THRESHOLD:.2}): \
+         {list}. Highly correlated estimates indicate over-parameterization or \
+         non-identifiability; consider fixing or removing one of each pair."
+    );
+    let pairs_json: Vec<serde_json::Value> = pairs
+        .iter()
+        .map(
+            |(a, b, r)| serde_json::json!({ "parameter_a": a, "parameter_b": b, "correlation": r }),
+        )
+        .collect();
+    let entry = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::HighCorrelation,
+        message: msg.clone(),
+        source_method: None,
+        details: Some(serde_json::json!({
+            "threshold": CORRELATION_WARN_THRESHOLD,
+            "pairs": pairs_json,
+        })),
+    };
+    Some((msg, entry))
 }
 
 #[cfg(test)]
@@ -7230,6 +7659,21 @@ fn validate_tte_simulatable(
     Ok(())
 }
 
+/// Simulate observations under `opts`, returning only the observation rows.
+///
+/// Thin wrapper over [`simulate_with_options_diag`] that discards the per-subject
+/// simulation diagnostics ([`SimulationOutput::warnings`]). Use the `_diag` form when a
+/// degenerate-subject warning (#762 / #763) must be surfaced (e.g. a population VPC).
+pub fn simulate_with_options(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+) -> Result<Vec<SimulationResult>, String> {
+    simulate_with_options_diag(model, population, params, n_sim, opts).map(|o| o.results)
+}
+
 /// Simulate observations, optionally with propensity-score matching.
 ///
 /// With `opts.match_method == None` this is identical to
@@ -7242,13 +7686,18 @@ fn validate_tte_simulatable(
 ///
 /// Returns `Err` if matching is requested but the population is empty or any
 /// subject has no observations.
-pub fn simulate_with_options(
+///
+/// This is the diagnostics-returning form: the [`SimulationOutput`] carries both the
+/// rows and any non-fatal per-subject warnings (a degenerate hazard draw, #763; a
+/// degenerate recurrent stream skipped, #762). [`simulate_with_options`] is the thin
+/// wrapper that returns only the rows.
+pub fn simulate_with_options_diag(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
     opts: &SimulateOptions,
-) -> Result<Vec<SimulationResult>, String> {
+) -> Result<SimulationOutput, String> {
     use rand::SeedableRng;
 
     // ODE-accumulated (joint PK-TTE) TTE simulation samples drug-driven event times
@@ -7318,12 +7767,17 @@ pub fn simulate_with_options(
     assert_modeled_doses_supported(model, population);
     assert_absorption_closed_form_support(model, population);
     assert_absorption_flip_flop_no_twin(model, population, &params.theta);
+    // A time-varying covariate on a survival hazard would be silently frozen — panic
+    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
+    #[cfg(feature = "survival")]
+    assert_survival_tv_covariates(model, population);
     assert_absorption_dosing_supported(model, population);
 
     let method = match opts.match_method {
         Some(m) => m,
         None => {
-            return Ok(simulate_inner_with_draw(
+            let mut warnings = Vec::new();
+            let results = simulate_inner_with_draw(
                 model,
                 population,
                 params,
@@ -7332,7 +7786,9 @@ pub fn simulate_with_options(
                 None,
                 opts.horizon,
                 &mut rng,
-            ));
+                &mut warnings,
+            );
+            return Ok(SimulationOutput { results, warnings });
         }
     };
 
@@ -7380,7 +7836,8 @@ pub fn simulate_with_options(
     }
 
     let omega_inv = &params.omega.inv;
-    Ok(simulate_inner_with_draw(
+    let mut warnings = Vec::new();
+    let results = simulate_inner_with_draw(
         model,
         population,
         params,
@@ -7389,7 +7846,9 @@ pub fn simulate_with_options(
         Some((&eta_hats, omega_inv, method)),
         opts.horizon,
         &mut rng,
-    ))
+        &mut warnings,
+    );
+    Ok(SimulationOutput { results, warnings })
 }
 
 fn simulate_inner<R: rand::Rng>(
@@ -7401,7 +7860,21 @@ fn simulate_inner<R: rand::Rng>(
 ) -> Vec<SimulationResult> {
     // `simulate` / `simulate_with_seed` carry no horizon; the per-record window
     // applies. An explicit `[simulation] horizon` enters via `simulate_with_options`.
-    simulate_inner_with_draw(model, population, params, n_sim, 1, None, None, rng)
+    // These entry points return only the rows; per-subject simulation diagnostics
+    // (#762 degenerate RTTE, #763 degenerate hazard draw) are collected but surfaced
+    // only on the `simulate_with_options` path (`SimulationOutput.warnings`).
+    let mut warnings = Vec::new();
+    simulate_inner_with_draw(
+        model,
+        population,
+        params,
+        n_sim,
+        1,
+        None,
+        None,
+        rng,
+        &mut warnings,
+    )
 }
 
 /// Emit all observation rows for one subject given a fully-formed `eta_slice`
@@ -7431,11 +7904,12 @@ fn emit_subject_rows<R: rand::Rng>(
     horizon: Option<f64>,
     rng: &mut R,
     results: &mut Vec<SimulationResult>,
+    warnings: &mut Vec<String>,
 ) {
-    // `horizon` is consumed only by the TTE path below; without the `survival`
-    // feature there are no TTE endpoints, so discard it to avoid an unused-arg warn.
+    // `horizon` and `warnings` are consumed only by the TTE path below; without the
+    // `survival` feature there are no TTE endpoints, so discard them to avoid unused-arg warns.
     #[cfg(not(feature = "survival"))]
-    let _ = horizon;
+    let _ = (horizon, &mut *warnings);
 
     // Predict IPRED. For IOV models (`n_kappa > 0`) route through the
     // occasion-aware `predict_iov`, drawing one independent κ ~ N(0, Ω_IOV) per
@@ -7553,6 +8027,7 @@ fn emit_subject_rows<R: rand::Rng>(
         horizon,
         rng,
         results,
+        warnings,
     );
 }
 
@@ -7667,6 +8142,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
     horizon: Option<f64>,
     rng: &mut R,
+    warnings: &mut Vec<String>,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
 
@@ -7677,6 +8153,10 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     assert_modeled_doses_supported(model, population);
     assert_absorption_closed_form_support(model, population);
     assert_absorption_flip_flop_no_twin(model, population, &params.theta);
+    // A time-varying covariate on a survival hazard would be silently frozen — panic
+    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
+    #[cfg(feature = "survival")]
+    assert_survival_tv_covariates(model, population);
     assert_absorption_dosing_supported(model, population);
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
@@ -7725,6 +8205,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         horizon,
                         rng,
                         &mut results,
+                        &mut *warnings,
                     );
                 }
             }
@@ -7747,6 +8228,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         horizon,
                         rng,
                         &mut results,
+                        &mut *warnings,
                     );
                 }
             }
@@ -8817,6 +9299,11 @@ pub fn simulate_with_uncertainty(
     let total_obs: usize = population.subjects.iter().map(|s| s.obs_times.len()).sum();
     let mut results =
         Vec::with_capacity(opts.n_uncertainty_draws * opts.n_sim_per_draw * total_obs);
+    // Per-subject simulation diagnostics (#762/#763) are collected but not surfaced on
+    // this uncertainty-aggregation path (its return is the flat row vec); the underlying
+    // per-subject handling — no whole-run panic, degenerate subjects censored — still
+    // applies. Use `simulate_with_options` when the warnings matter.
+    let mut sim_warnings: Vec<String> = Vec::new();
     for (k, params) in draws.iter().enumerate() {
         let mut rows = simulate_inner_with_draw(
             model,
@@ -8827,6 +9314,7 @@ pub fn simulate_with_uncertainty(
             None,
             None,
             &mut rng,
+            &mut sim_warnings,
         );
         results.append(&mut rows);
     }
@@ -8859,6 +9347,24 @@ pub struct SimulationResult {
     pub outcome: SimOutcome,
 }
 
+/// The result of [`simulate_with_options`]: the simulated rows plus any non-fatal
+/// per-subject diagnostics collected during the run.
+///
+/// `warnings` is the simulation analogue of [`FitResult::warnings`]: a subject whose
+/// draw degenerates — a non-positive / non-finite analytic hazard rate that produces
+/// no event (#763), or a hazard so extreme its recurrent stream is skipped rather than
+/// materialised (#762) — is handled *per subject* (censored / skipped, the run
+/// continues) and named here, instead of silently vanishing into the censored rows or
+/// aborting the whole run. Empty for a clean simulation. The simpler `simulate()` /
+/// `simulate_with_seed()` entry points apply the same per-subject handling but return
+/// only the rows (no diagnostics channel) — use `simulate_with_options` when the
+/// warnings matter (e.g. a population VPC).
+#[derive(Debug, Clone, Default)]
+pub struct SimulationOutput {
+    pub results: Vec<SimulationResult>,
+    pub warnings: Vec<String>,
+}
+
 /// Predict concentrations for a population using given parameters (no random effects).
 ///
 /// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
@@ -8875,6 +9381,10 @@ pub fn predict(
     assert_modeled_doses_supported(model, population);
     assert_absorption_closed_form_support(model, population);
     assert_absorption_flip_flop_no_twin(model, population, &params.theta);
+    // A time-varying covariate on a survival hazard would be silently frozen — panic
+    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
+    #[cfg(feature = "survival")]
+    assert_survival_tv_covariates(model, population);
     assert_analytic_readout_support(model, population);
     assert_absorption_dosing_supported(model, population);
 
@@ -9005,6 +9515,11 @@ pub fn predict_survival(
     use crate::survival::{
         cif_curves, hazard_and_cum_hazard, mean_survival, median_survival, tte_cause_params,
     };
+
+    // Like predict()/simulate(), the survival curves read the hazard at a frozen
+    // baseline covariate snapshot — a time-varying covariate on the hazard would be
+    // silently applied at its baseline, so fail loudly instead (#741).
+    assert_survival_tv_covariates(model, population);
 
     // The competing-risks CIF telescopes the all-cause survival drop, which
     // requires the grid in ascending time order; sort a local copy so the
@@ -10066,6 +10581,7 @@ mod iov_integration {
                     param_fn: Box::new(|_theta, _eta, _cov| vec![0.1]),
                 },
                 recurrence: crate::types::TteRecurrence::Single,
+                hazard_covariates: Vec::new(),
             },
         );
 
@@ -11786,6 +12302,150 @@ mod simulate_with_uncertainty_tests {
         );
     }
 
+    // ---- #741: time-varying covariate on a survival hazard is rejected ----
+
+    /// A standalone TTE model with a covariate (`CRCL`) on the hazard via the PH
+    /// `loghr` term, so the parser records `CRCL` in the endpoint's
+    /// `hazard_covariates`. Used by the `check_survival_tv_covariates` tests.
+    #[cfg(feature = "survival")]
+    fn parse_tte_hazard_cov_model() -> CompiledModel {
+        use crate::parser::model_parser::parse_model_string;
+        const M: &str = r#"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  theta TVBETA(0.1, -5.0, 5.0)
+  omega ETA_LAMBDA ~ 0.09
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+  loghr  = TVBETA * CRCL
+[fit_options]
+  method = focei
+"#;
+        parse_model_string(M).expect("TTE + covariate-on-hazard model parses")
+    }
+
+    /// One-subject population whose per-observation covariate snapshots are `snaps`
+    /// (a covariate that differs across them is time-varying). `obs_records` are left
+    /// empty — `check_survival_tv_covariates` inspects only covariate snapshots and
+    /// the model endpoints.
+    #[cfg(feature = "survival")]
+    fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Population {
+        let n = snaps.len();
+        let base = snaps.first().cloned().unwrap_or_default();
+        let subject = Subject {
+            id: id.to_string(),
+            doses: Vec::new(),
+            obs_times: vec![0.0; n],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![2; n],
+            covariates: base,
+            dose_covariates: Vec::new(),
+            obs_covariates: snaps,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: Vec::new(),
+        };
+        Population {
+            subjects: vec![subject],
+            covariate_names: vec!["CRCL".to_string(), "WT".to_string()],
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn analytic_hazard_time_varying_covariate_is_rejected() {
+        let model = parse_tte_hazard_cov_model();
+        let pop = tte_cov_snapshot_pop(
+            "S1",
+            vec![
+                HashMap::from([("CRCL".to_string(), 100.0)]),
+                HashMap::from([("CRCL".to_string(), 60.0)]),
+            ],
+        );
+        let msg = check_survival_tv_covariates(&model, &pop)
+            .expect("a time-varying CRCL on the hazard must be rejected up front");
+        assert!(msg.contains("CRCL"), "must name the covariate: {msg}");
+        assert!(msg.contains("S1"), "must name the subject: {msg}");
+        assert!(msg.contains("#741"), "must cite the issue: {msg}");
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn analytic_hazard_constant_covariate_is_accepted() {
+        let model = parse_tte_hazard_cov_model();
+        let pop = tte_cov_snapshot_pop(
+            "S1",
+            vec![
+                HashMap::from([("CRCL".to_string(), 100.0)]),
+                HashMap::from([("CRCL".to_string(), 100.0)]),
+            ],
+        );
+        assert!(
+            check_survival_tv_covariates(&model, &pop).is_none(),
+            "a constant hazard covariate must not be rejected"
+        );
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn analytic_hazard_ignores_tv_covariate_it_does_not_reference() {
+        // WT is time-varying but the hazard references only CRCL (held constant). A
+        // time-varying covariate used solely by an unrelated (e.g. PK) part of a joint
+        // model must not trigger a false rejection — the analytic hazard never reads it.
+        let model = parse_tte_hazard_cov_model();
+        let pop = tte_cov_snapshot_pop(
+            "S1",
+            vec![
+                HashMap::from([("CRCL".to_string(), 100.0), ("WT".to_string(), 70.0)]),
+                HashMap::from([("CRCL".to_string(), 100.0), ("WT".to_string(), 80.0)]),
+            ],
+        );
+        assert!(
+            check_survival_tv_covariates(&model, &pop).is_none(),
+            "a time-varying covariate the hazard does not reference must not be rejected"
+        );
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn ode_accumulated_hazard_rejects_any_time_varying_covariate() {
+        // The survival ODE solve freezes the whole PK-parameter vector at t=0, so ANY
+        // time-varying covariate corrupts the drug-driven hazard — even one not listed in
+        // `hazard_covariates` (empty for the ODE variant).
+        let mut model = parse_tte_hazard_cov_model();
+        model.endpoints.insert(
+            2,
+            crate::types::EndpointLikelihood::Tte {
+                hazard: crate::types::HazardSpec::OdeAccumulated { chz_state: 0 },
+                recurrence: crate::types::TteRecurrence::Single,
+                hazard_covariates: Vec::new(),
+            },
+        );
+        let pop = tte_cov_snapshot_pop(
+            "S9",
+            vec![
+                HashMap::from([("WT".to_string(), 70.0)]),
+                HashMap::from([("WT".to_string(), 90.0)]),
+            ],
+        );
+        let msg = check_survival_tv_covariates(&model, &pop)
+            .expect("ODE-accumulated hazard + any TV covariate must be rejected");
+        assert!(msg.contains("WT"), "must name the covariate: {msg}");
+        assert!(msg.contains("#741"), "must cite the issue: {msg}");
+    }
+
     fn tiny_population() -> Population {
         let obs_times = vec![1.0, 2.0, 3.0];
         let subjects: Vec<Subject> = (0..2)
@@ -12181,6 +12841,201 @@ mod simulate_with_uncertainty_tests {
         assert!(cd(None, None).is_none());
         // Non-finite condition number is skipped.
         assert!(cd(Some(f64::INFINITY), None).is_none());
+    }
+
+    #[test]
+    fn theta_boundary_side_detects_bounds() {
+        let side = |e, l, u| super::theta_boundary_side(e, l, u).map(|(s, _)| s);
+        // Identity-packed (lower < 0): interior, at-lower, at-upper.
+        assert_eq!(side(0.0, -1.0, 1.0), None);
+        assert_eq!(side(-1.0, -1.0, 1.0), Some("lower"));
+        assert_eq!(side(1.0, -1.0, 1.0), Some("upper"));
+        // Log-packed (lower >= 0): "at bound" is within a constant factor.
+        assert_eq!(side(1.0, 0.001, 1000.0), None);
+        assert_eq!(side(0.001, 0.001, 1000.0), Some("lower"));
+        // Degenerate bounds → None.
+        assert_eq!(side(1.0, 5.0, 5.0), None);
+        // Effective bound: a user lower bound of 0 (log-packed) is reported as
+        // the optimizer's 1e-10 floor, agreeing with the pinned estimate.
+        let (s, bound) = super::theta_boundary_side(1e-10, 0.0, 100.0).unwrap();
+        assert_eq!(s, "lower");
+        assert_eq!(bound, 1e-10);
+    }
+
+    #[test]
+    fn high_correlation_pairs_flags_collinear_estimates() {
+        let names = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        // 3x3 covariance: A~B correlation 0.99 (0.0099/0.01), A~C and B~C ~0.
+        let mut cov = DMatrix::identity(3, 3) * 0.01;
+        cov[(0, 1)] = 0.0099;
+        cov[(1, 0)] = 0.0099;
+        let pairs = super::high_correlation_pairs(Some(&cov), &names);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!((pairs[0].0.as_str(), pairs[0].1.as_str()), ("A", "B"));
+        assert!((pairs[0].2 - 0.99).abs() < 1e-9);
+        // A fixed / zero-variance parameter (diag == 0) is excluded.
+        let mut cov2 = DMatrix::identity(2, 2) * 0.01;
+        cov2[(1, 1)] = 0.0;
+        assert!(super::high_correlation_pairs(Some(&cov2), &names).is_empty());
+        // No covariance matrix → nothing.
+        assert!(super::high_correlation_pairs(None, &names).is_empty());
+        // Theta-only scope: a strong correlation involving a non-theta packed
+        // entry (index >= n_theta) is NOT flagged. With 2 theta names but a 3x3
+        // covariance, the (0,2) correlation lies outside the theta block.
+        let mut cov3 = DMatrix::identity(3, 3) * 0.01;
+        cov3[(0, 2)] = 0.0099;
+        cov3[(2, 0)] = 0.0099;
+        let theta2 = vec!["A".to_string(), "B".to_string()];
+        assert!(super::high_correlation_pairs(Some(&cov3), &theta2).is_empty());
+    }
+
+    #[test]
+    fn high_correlation_warning_emits_typed_entry_with_details() {
+        use crate::types::WarningCode;
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        // synthetic_fit's covariance is a scaled identity (no correlation) →
+        // no warning.
+        assert!(super::high_correlation_warning(&fit).is_none());
+        // Inject a strong theta0~theta1 correlation into the packed covariance.
+        let n = fit.covariance_matrix.as_ref().unwrap().nrows();
+        assert!(n >= 2);
+        let mut cov = DMatrix::identity(n, n) * 0.01;
+        cov[(0, 1)] = 0.0098; // r = 0.98
+        cov[(1, 0)] = 0.0098;
+        fit.covariance_matrix = Some(cov);
+        let (msg, entry) = super::high_correlation_warning(&fit).expect("expected a pair");
+        assert!(msg.contains("highly correlated") || msg.contains("Highly correlated"));
+        assert_eq!(entry.category, WarningCode::HighCorrelation);
+        let d = entry.details.as_ref().expect("details");
+        assert_eq!(d["threshold"], 0.95);
+        assert!((d["pairs"][0]["correlation"].as_f64().unwrap() - 0.98).abs() < 1e-9);
+        // The labels are the packed parameter names (first two thetas here).
+        assert_eq!(d["pairs"][0]["parameter_a"], fit.theta_names[0].as_str());
+    }
+
+    #[test]
+    fn rebuild_native_key_reconstructs_chain_prefix() {
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        // A native entry produced inside a `[FOCEI]` chain: message is the
+        // stripped body, source_method carries the tag; the raw warning is the
+        // full prefixed string.
+        fit.warnings = vec!["[FOCEI] pinned to an optimizer bound: X".to_string()];
+        fit.warnings_structured = vec![crate::types::WarningEntry {
+            severity: crate::types::WarningSeverity::Warning,
+            category: crate::types::WarningCode::BoundaryEstimate,
+            message: "pinned to an optimizer bound: X".to_string(),
+            source_method: Some("FOCEI".to_string()),
+            details: Some(serde_json::json!({ "k": 1 })),
+        }];
+        super::rebuild_warnings_structured(&mut fit);
+        // Native entry (with details) is preferred despite the prefix.
+        assert_eq!(
+            fit.warnings_structured[0].category,
+            crate::types::WarningCode::BoundaryEstimate
+        );
+        assert_eq!(fit.warnings_structured[0].details.as_ref().unwrap()["k"], 1);
+    }
+
+    #[test]
+    fn boundary_estimate_warning_emits_typed_entry_with_details() {
+        use crate::types::WarningCode;
+        let mut params = tiny_model().default_params;
+        // No hit initially (estimates interior) — or at least assert whatever
+        // tiny_model starts with, then force a hit on theta 0 at its lower bound.
+        params.theta_fixed = vec![false; params.theta.len()];
+        params.theta[0] = params.theta_lower[0];
+        let (msg, entry) =
+            super::boundary_estimate_warning(&params).expect("expected a boundary hit");
+        assert!(msg.contains("optimizer bound"));
+        assert_eq!(entry.category, WarningCode::BoundaryEstimate);
+        let d = entry.details.as_ref().expect("details");
+        assert_eq!(d["parameters"][0]["side"], "lower");
+        assert_eq!(
+            d["parameters"][0]["parameter"],
+            params.theta_names[0].as_str()
+        );
+
+        // A fixed theta at its bound is not reported.
+        params.theta_fixed[0] = true;
+        assert!(super::boundary_estimate_warning(&params).is_none());
+    }
+
+    #[test]
+    fn inflated_rse_warning_emits_typed_entry_with_details() {
+        use crate::types::WarningCode;
+        let mut params = tiny_model().default_params;
+        params.theta_fixed = vec![false; params.theta.len()];
+        // No SEs (covariance step didn't run) → no warning.
+        assert!(super::inflated_rse_warning(&None, &params).is_none());
+        // theta[0] with SE = |est| → RSE 100% (> 50%); theta[1] SE tiny → fine.
+        let mut se = vec![0.0; params.theta.len()];
+        se[0] = params.theta[0].abs();
+        let (msg, entry) =
+            super::inflated_rse_warning(&Some(se.clone()), &params).expect("expected an RSE hit");
+        assert!(msg.contains("relative standard error"));
+        assert_eq!(entry.category, WarningCode::InflatedRse);
+        let d = entry.details.as_ref().expect("details");
+        assert_eq!(d["threshold_pct"], 50.0);
+        assert_eq!(
+            d["parameters"][0]["parameter"],
+            params.theta_names[0].as_str()
+        );
+        assert!((d["parameters"][0]["rse_pct"].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        // A fixed theta with a huge SE is not reported.
+        params.theta_fixed[0] = true;
+        assert!(super::inflated_rse_warning(&Some(se), &params).is_none());
+        // A near-zero estimate is skipped (avoids divide-by-~0 blowups).
+        params.theta_fixed[0] = false;
+        params.theta[0] = 0.0;
+        assert!(
+            super::inflated_rse_warning(&Some(vec![1.0; params.theta.len()]), &params).is_none()
+        );
+
+        // Borderline value renders with a decimal (not rounded to the
+        // threshold): RSE = 50.4% must show "50.4%", not "50%".
+        let mut p2 = tiny_model().default_params;
+        p2.theta_fixed = vec![false; p2.theta.len()];
+        p2.theta[0] = 1.0;
+        let mut se2 = vec![0.0; p2.theta.len()];
+        se2[0] = 0.504; // RSE = 50.4%
+        let (msg2, _) = super::inflated_rse_warning(&Some(se2), &p2).expect("borderline hit");
+        assert!(msg2.contains("50.4%"), "got: {msg2}");
+    }
+
+    #[test]
+    fn rebuild_prefers_native_entry_and_is_idempotent() {
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        let msg = "Parameter estimate(s) pinned to an optimizer bound: CL (0.0010 at lower bound)."
+            .to_string();
+        fit.warnings = vec![msg.clone()];
+        // Native entry (with details) seeded as the fit pipeline would.
+        fit.warnings_structured = vec![crate::types::WarningEntry {
+            severity: crate::types::WarningSeverity::Warning,
+            category: crate::types::WarningCode::BoundaryEstimate,
+            message: msg.clone(),
+            source_method: None,
+            details: Some(serde_json::json!({ "parameters": [{ "parameter": "CL" }] })),
+        }];
+        super::rebuild_warnings_structured(&mut fit);
+        // Native entry preferred over re-classifying the string (details kept).
+        assert_eq!(fit.warnings_structured.len(), 1);
+        assert_eq!(
+            fit.warnings_structured[0].category,
+            crate::types::WarningCode::BoundaryEstimate
+        );
+        assert_eq!(
+            fit.warnings_structured[0].details.as_ref().unwrap()["parameters"][0]["parameter"],
+            "CL"
+        );
+        // Idempotent: a second rebuild re-captures the native entry, details intact.
+        super::rebuild_warnings_structured(&mut fit);
+        assert_eq!(
+            fit.warnings_structured[0].details.as_ref().unwrap()["parameters"][0]["parameter"],
+            "CL"
+        );
     }
 
     #[test]

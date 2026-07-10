@@ -3927,6 +3927,10 @@ fn parse_event_model_block(
             EndpointLikelihood::Tte {
                 hazard: HazardSpec::OdeAccumulated { chz_state },
                 recurrence,
+                // The ODE-accumulated hazard's covariate dependencies flow through the
+                // injected `d/dt(__chz)` derivative; the whole-subject time-varying check
+                // (the ODE solve freezes PK params at t=0) guards them, not this list.
+                hazard_covariates: Vec::new(),
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -3978,30 +3982,54 @@ fn parse_event_model_block(
 
     // Collect covariate/theta/eta references from all expressions BEFORE they are
     // moved into the param_fn closure.
-    let event_model_covariates: Vec<String>;
+    let mut event_model_covariates: Vec<String>;
     let event_model_thetas: std::collections::HashSet<usize>;
     let event_model_etas: std::collections::HashSet<usize>;
+    // The hazard's parameter expressions in optimizer-parameter order, bound once
+    // and reused by the three scans below — reference collection, the direct-kappa
+    // reject (#770), and the transitive needed-statement collection (#442) — so a
+    // future family parameter can't be added to one walk and silently forgotten in
+    // another.
+    let hazard_param_exprs = [
+        &scale_expr,
+        &shape_expr,
+        &alpha_expr,
+        &gamma_expr,
+        &loghr_expr,
+    ];
     {
         let mut cov_set = std::collections::HashSet::new();
         let mut theta_set = std::collections::HashSet::new();
         let mut eta_set = std::collections::HashSet::new();
-        for expr_opt in [
-            &scale_expr,
-            &shape_expr,
-            &alpha_expr,
-            &gamma_expr,
-            &loghr_expr,
-        ] {
-            if let Some(expr) = expr_opt {
-                collect_covariates(expr, &mut cov_set);
-                collect_theta_eta(expr, &mut theta_set, &mut eta_set);
-            }
+        for expr in hazard_param_exprs.into_iter().flatten() {
+            collect_covariates(expr, &mut cov_set);
+            collect_theta_eta(expr, &mut theta_set, &mut eta_set);
         }
         let mut v: Vec<String> = cov_set.into_iter().collect();
         v.sort();
         event_model_covariates = v;
         event_model_thetas = theta_set;
         event_model_etas = eta_set;
+    }
+
+    // A hazard expression that references an IOV kappa **by name directly**
+    // (e.g. `scale = TVLAMBDA * exp(KAPPA_CL)`) is as ill-defined as one that
+    // reaches a kappa through an [individual_parameters] value (rejected just
+    // below, #442): the hazard is evaluated once per subject, with no occasion
+    // context. The hazard parse scope is BSV-only, so a kappa name here parses as
+    // an unresolved identifier (Variable/Covariate) rather than `Eta(i)` and would
+    // otherwise fall back to a leniently-read 0.0 covariate (see the "read
+    // leniently" note above), silently dropping the IOV term. Reject it fail-loud
+    // instead (#770).
+    for expr in hazard_param_exprs.into_iter().flatten() {
+        if let Some(k) = expr_references_kappa(expr, kappa_names) {
+            return Err(format!(
+                "[event_model]: a hazard expression references the inter-occasion (IOV) \
+                 random effect `{k}` directly. The hazard is evaluated once per subject, with \
+                 no occasion context, so an IOV kappa has no well-defined value here — write \
+                 the hazard in terms of θ/η, or reference an IOV-free parameter."
+            ));
+        }
     }
 
     // Restrict the individual-parameter statements the hazard closures evaluate to
@@ -4016,16 +4044,7 @@ fn parse_event_model_block(
     // `visit_stmt_nodes`).
     let needed_indiv_stmts: Vec<Statement> = {
         let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for expr in [
-            &scale_expr,
-            &shape_expr,
-            &alpha_expr,
-            &gamma_expr,
-            &loghr_expr,
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for expr in hazard_param_exprs.into_iter().flatten() {
             collect_variable_names(expr, &mut needed);
         }
         let mut keep: Vec<Statement> = Vec::new();
@@ -4046,6 +4065,25 @@ fn parse_event_model_block(
         keep.reverse();
         keep
     };
+
+    // A hazard sub-expression may reference an [individual_parameters] value (PR #442)
+    // whose own definition reads covariates — e.g. `scale = LAMBDA` with
+    // `LAMBDA = TVLAMBDA * exp(TVBETA * CRCL + ETA)`. The `param_fn` evaluates those kept
+    // statements, so the hazard transitively reads `CRCL` at the baseline snapshot. Union
+    // the covariates of the kept statements into the event-model covariate set so (a) they
+    // appear in the covariate table and (b) `hazard_covariates` is complete — otherwise a
+    // *time-varying* covariate reached only through an individual parameter slips past the
+    // #741 guard and is silently frozen (the exact bug #741 exists to reject).
+    {
+        let mut cov_set = std::collections::HashSet::new();
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut cov_set);
+        for c in cov_set {
+            if !event_model_covariates.contains(&c) {
+                event_model_covariates.push(c);
+            }
+        }
+        event_model_covariates.sort();
+    }
 
     // The hazard `param_fn` evaluates the kept statements with the BSV-only η it is
     // handed (kappas are PK/occasion-level, not part of a per-subject hazard), so a
@@ -4165,6 +4203,7 @@ fn parse_event_model_block(
         EndpointLikelihood::Tte {
             hazard: HazardSpec::Analytic { family, param_fn },
             recurrence,
+            hazard_covariates: event_model_covariates.clone(),
         },
         event_model_covariates,
         event_model_thetas,

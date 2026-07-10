@@ -364,6 +364,161 @@ mod survival_smoke {
         pop
     }
 
+    /// A single-TTE exponential model whose hazard carries a PH covariate (`CRCL`
+    /// via `loghr`), paired with one subject whose `CRCL` is time-varying. This is
+    /// the #741 fixture: the hazard would otherwise be silently evaluated at the
+    /// baseline `CRCL`.
+    fn tv_cov_hazard_model_and_pop() -> (ferx_core::types::CompiledModel, Population) {
+        use std::collections::HashMap;
+        const M: &str = r"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  theta TVBETA(0.1, -5.0, 5.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+  loghr  = TVBETA * CRCL
+
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+        let model = parse_model_string(M).expect("TV-cov hazard model must parse");
+        let mut pop = common::tte_pop_from_pairs(&[(30.0, 0)]);
+        pop.covariate_names = vec!["CRCL".to_string()];
+        pop.subjects[0].covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+        pop.subjects[0].obs_covariates = vec![
+            HashMap::from([("CRCL".to_string(), 100.0)]),
+            HashMap::from([("CRCL".to_string(), 60.0)]),
+        ];
+        (model, pop)
+    }
+
+    /// `fit()` rejects a time-varying covariate on a survival hazard rather than
+    /// silently freezing it at baseline (#741). Regression for the analytic path.
+    #[test]
+    fn tv_cov_hazard_fit_is_rejected() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("a time-varying covariate on the hazard must be rejected by fit()");
+        assert!(err.contains("#741"), "error must cite the issue: {err}");
+        assert!(err.contains("CRCL"), "error must name the covariate: {err}");
+    }
+
+    /// `predict()` panics on the same combination — the non-`fit` entry points cannot
+    /// honour a silently-frozen hazard either (#741).
+    #[test]
+    #[should_panic(expected = "#741")]
+    fn tv_cov_hazard_predict_panics() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let _ = ferx_core::predict(&model, &pop, &model.default_params);
+    }
+
+    /// `simulate()` panics on the same combination for the same reason (#741).
+    #[test]
+    #[should_panic(expected = "#741")]
+    fn tv_cov_hazard_simulate_panics() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 0);
+    }
+
+    /// `predict_survival()` panics too — the survival curves read the hazard at the
+    /// frozen baseline covariate, so a time-varying covariate must fail loudly (#741).
+    #[test]
+    #[should_panic(expected = "#741")]
+    fn tv_cov_hazard_predict_survival_panics() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let _ = ferx_core::predict_survival(&model, &pop, &model.default_params, &[1.0, 5.0, 10.0]);
+    }
+
+    /// A zero-rate hazard (`λ = 0`): every draw hits the degenerate sentinel, so each
+    /// subject is censored with no event — surfaced as a per-subject warning on the
+    /// `_diag` path rather than silently vanishing into the censored rows (#763).
+    #[test]
+    fn degenerate_hazard_simulation_warns_not_silent() {
+        use ferx_core::{simulate_with_options_diag, SimOutcome, SimulateOptions};
+        const M: &str = "
+[parameters]
+  theta TVLAMBDA(1.0, 0.0, 10.0)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * 0
+
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(M).expect("zero-rate model parses");
+        let pop = common::tte_pop_from_pairs(&[(20.0, 0), (20.0, 0)]);
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(20.0),
+        };
+        let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &opts)
+            .expect("a degenerate hazard still simulates (censored); it does not error");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("W_TTE_DEGENERATE_HAZARD") && w.contains("#763")),
+            "a degenerate hazard draw must be surfaced as a warning: {:?}",
+            out.warnings
+        );
+        assert!(
+            out.results
+                .iter()
+                .all(|r| matches!(r.outcome, SimOutcome::Event { observed, .. } if !observed)),
+            "every subject is censored (no event)"
+        );
+    }
+
+    /// An RTTE hazard so extreme it would fire ≫ MAX_EVENTS times: the degenerate
+    /// subject's stream is skipped (censored) with a warning and the run completes for the
+    /// whole population — no whole-run panic, no ~1e6 materialised rows (#762).
+    #[test]
+    fn degenerate_rtte_simulation_warns_and_continues() {
+        use ferx_core::{simulate_with_options_diag, SimulateOptions};
+        const M: &str = "
+[parameters]
+  theta TVLAMBDA(1000000.0, 0.001, 100000000.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(M).expect("high-rate RTTE model parses");
+        let pop = common::tte_pop_from_pairs(&[(30.0, 0), (30.0, 0)]);
+        let opts = SimulateOptions {
+            seed: Some(2),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &opts)
+            .expect("a degenerate RTTE stream must not abort the whole run");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("W_RTTE_DEGENERATE") && w.contains("#762")),
+            "a degenerate RTTE stream must warn: {:?}",
+            out.warnings
+        );
+        assert_eq!(
+            out.results.len(),
+            pop.subjects.len(),
+            "one administrative censor row per subject; the degenerate stream is not materialised"
+        );
+    }
+
     /// A clock-forward RTTE model fits end-to-end (finite OFV) through the telescoping
     /// likelihood, and — under the Laplace-based default method — surfaces the ω²
     /// underestimation warning. Tier-2: capped at 3 outer iterations, no convergence.
@@ -470,6 +625,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let pop = rtte_pop();
@@ -603,6 +759,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let mut pop = rtte_pop();
@@ -661,6 +818,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let mut pop = rtte_pop();
@@ -714,6 +872,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let mut pop = rtte_pop();
@@ -2474,6 +2633,60 @@ mod survival_smoke {
         );
     }
 
+    /// #772 review (Finding 1): a hazard that references an `[individual_parameters]`
+    /// value (PR #442) which itself reads a covariate transitively reads that covariate
+    /// at the baseline snapshot when the analytic `param_fn` is evaluated. It MUST appear
+    /// in `hazard_covariates` so the #741 time-varying-covariate guard can reject a TV
+    /// covariate reached this way — otherwise it is silently frozen (the exact bug #741
+    /// exists to block). Here `CRCL` is read only through `SCALE_I → LAMBDA0`, never in a
+    /// direct hazard sub-expression.
+    #[test]
+    fn event_model_hazard_covariates_include_transitive_indiv_param_covariates() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVBASE(0.05, 0.001, 10.0)
+  theta TVEFF(2.0, 0.1, 10.0)
+  theta TVBETA(0.01, -1.0, 1.0)
+  omega ETA_BASE ~ 0.09
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  CL      = TVCL
+  V       = TVV
+  LAMBDA0 = TVBASE * exp(TVBETA * CRCL + ETA_BASE)
+  SCALE_I = LAMBDA0 * TVEFF
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = SCALE_I
+";
+        let model = parse_model_string(src).expect("model must parse");
+        let ep = model
+            .endpoints
+            .get(&2)
+            .expect("CMT=2 must be a TTE endpoint");
+        let EndpointLikelihood::Tte {
+            hazard_covariates, ..
+        } = ep
+        else {
+            panic!("expected Tte endpoint");
+        };
+        assert!(
+            hazard_covariates.iter().any(|c| c == "CRCL"),
+            "hazard_covariates must include the transitively-referenced covariate CRCL \
+             (reached via SCALE_I → LAMBDA0); got {hazard_covariates:?}"
+        );
+    }
+
     /// Issue #442 (review #1): a hazard that references an `[individual_parameters]`
     /// value whose definition uses an IOV **kappa** must be rejected at parse time,
     /// not crash the fit. The hazard `param_fn` is handed the BSV-only η, but a kappa
@@ -2508,6 +2721,48 @@ mod survival_smoke {
         let err = parse_model_string(src).expect_err(
             "a hazard referencing a kappa-bearing individual parameter must be rejected, \
              not OOB-panic",
+        );
+        assert!(
+            err.contains("inter-occasion") && err.contains("KAPPA_CL"),
+            "the error should name the offending IOV random effect; got: {err}"
+        );
+    }
+
+    /// Issue #770: a hazard that references an IOV **kappa by name directly**
+    /// (not through an [individual_parameters] value) must also be rejected at
+    /// parse. The hazard parse scope is BSV-only, so `KAPPA_CL` here would
+    /// otherwise fall back to a leniently-read 0.0 covariate — silently dropping
+    /// the IOV term instead of failing loud. Sibling to
+    /// `event_model_referencing_kappa_indiv_param_is_rejected`, which covers the
+    /// *indirect* case (`scale = CL` with `CL = TVCL * exp(ETA_CL + KAPPA_CL)`).
+    #[test]
+    fn event_model_referencing_kappa_by_name_is_rejected() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TVLAMBDA(0.05, 0.001, 5.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma SIGMA_ADD ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_ADD)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(KAPPA_CL)
+";
+        let err = parse_model_string(src).expect_err(
+            "a hazard referencing an IOV kappa by name must be rejected, not read as 0.0",
         );
         assert!(
             err.contains("inter-occasion") && err.contains("KAPPA_CL"),
