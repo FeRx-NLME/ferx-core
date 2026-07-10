@@ -3162,10 +3162,20 @@ fn rebuild_warnings_structured(result: &mut FitResult) {
     // `details` payload) are keyed by message and take precedence; every other
     // message is string-classified and then field-enriched. Keying by message
     // keeps this idempotent — a second rebuild re-captures the native entries.
+    // Key by the *original* warning string: `classify_warning` strips a
+    // `[METHOD]` chain prefix into `source_method`, so a native entry produced
+    // in a multi-stage chain must reconstruct that prefix to match the raw
+    // `warnings` entry (an unprefixed entry keys by its message unchanged).
     let native: std::collections::HashMap<String, crate::types::WarningEntry> =
         std::mem::take(&mut result.warnings_structured)
             .into_iter()
-            .map(|e| (e.message.clone(), e))
+            .map(|e| {
+                let key = match &e.source_method {
+                    Some(m) => format!("[{m}] {}", e.message),
+                    None => e.message.clone(),
+                };
+                (key, e)
+            })
             .collect();
     let stats = DiagStats {
         dw_statistic: result.dw_statistic,
@@ -6098,22 +6108,25 @@ pub(crate) fn eta_shrinkage_warning(shrinkage: &[f64], eta_names: &[String]) -> 
 /// theta estimate counts as sitting on its lower/upper optimizer bound.
 const BOUNDARY_REL_TOL: f64 = 1e-3;
 
-/// Which bound (`"lower"`/`"upper"`) a theta estimate is pinned to, or `None`
-/// when it is interior. Evaluated in the optimizer's *packed* space (log when
-/// the lower bound is `>= 0`, else identity) so the proximity test is
-/// scale-appropriate — a log-scaled parameter is "at" its bound within a
-/// constant factor, not a constant absolute gap. Degenerate/non-finite bounds
-/// yield `None`.
-fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<&'static str> {
+/// Which bound a theta estimate is pinned to and the **effective** natural-space
+/// bound value the optimizer actually constrains to, or `None` when the estimate
+/// is interior. Evaluated in the optimizer's *packed* space (log when the lower
+/// bound is `>= 0`, else identity) so the proximity test is scale-appropriate —
+/// a log-scaled parameter is "at" its bound within a constant factor, not a
+/// constant absolute gap.
+///
+/// The floors/caps mirror `compute_bounds` / `pack_params`: a log-packed theta
+/// floors its estimate and lower bound at `1e-10` and caps the upper at `1e9`,
+/// so the reported bound matches the constraint that was actually active (and
+/// agrees with the estimate). Degenerate/non-finite bounds yield `None`.
+fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<(&'static str, f64)> {
     use crate::estimation::parameterization::theta_packs_log;
-    let (pe, pl, pu) = if theta_packs_log(lower) {
-        (
-            est.max(1e-300).ln(),
-            lower.max(1e-10).ln(),
-            upper.min(1e9).ln(),
-        )
+    let (lo_eff, hi_eff, pe, pl, pu) = if theta_packs_log(lower) {
+        let lo = lower.max(1e-10);
+        let hi = upper.min(1e9);
+        (lo, hi, est.max(1e-10).ln(), lo.ln(), hi.ln())
     } else {
-        (est, lower, upper)
+        (lower, upper, est, lower, upper)
     };
     let range = pu - pl;
     if !range.is_finite() || range <= 0.0 || !pe.is_finite() {
@@ -6121,16 +6134,16 @@ fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<&'static str>
     }
     let frac = (pe - pl) / range;
     if frac <= BOUNDARY_REL_TOL {
-        Some("lower")
+        Some(("lower", lo_eff))
     } else if frac >= 1.0 - BOUNDARY_REL_TOL {
-        Some("upper")
+        Some(("upper", hi_eff))
     } else {
         None
     }
 }
 
 /// Free (non-fixed) theta estimates pinned to an optimizer bound, as
-/// `(name, estimate, bound_value, side)` per hit.
+/// `(name, estimate, effective_bound, side)` per hit.
 fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'static str)> {
     let mut hits = Vec::new();
     for i in 0..params.theta.len() {
@@ -6138,10 +6151,9 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
             continue;
         }
         let est = params.theta[i];
-        let lo = params.theta_lower[i];
-        let hi = params.theta_upper[i];
-        if let Some(side) = theta_boundary_side(est, lo, hi) {
-            let bound = if side == "lower" { lo } else { hi };
+        if let Some((side, bound)) =
+            theta_boundary_side(est, params.theta_lower[i], params.theta_upper[i])
+        {
             let name = params
                 .theta_names
                 .get(i)
@@ -12257,18 +12269,45 @@ mod simulate_with_uncertainty_tests {
 
     #[test]
     fn theta_boundary_side_detects_bounds() {
+        let side = |e, l, u| super::theta_boundary_side(e, l, u).map(|(s, _)| s);
         // Identity-packed (lower < 0): interior, at-lower, at-upper.
-        assert_eq!(super::theta_boundary_side(0.0, -1.0, 1.0), None);
-        assert_eq!(super::theta_boundary_side(-1.0, -1.0, 1.0), Some("lower"));
-        assert_eq!(super::theta_boundary_side(1.0, -1.0, 1.0), Some("upper"));
+        assert_eq!(side(0.0, -1.0, 1.0), None);
+        assert_eq!(side(-1.0, -1.0, 1.0), Some("lower"));
+        assert_eq!(side(1.0, -1.0, 1.0), Some("upper"));
         // Log-packed (lower >= 0): "at bound" is within a constant factor.
-        assert_eq!(super::theta_boundary_side(1.0, 0.001, 1000.0), None);
-        assert_eq!(
-            super::theta_boundary_side(0.001, 0.001, 1000.0),
-            Some("lower")
-        );
+        assert_eq!(side(1.0, 0.001, 1000.0), None);
+        assert_eq!(side(0.001, 0.001, 1000.0), Some("lower"));
         // Degenerate bounds → None.
-        assert_eq!(super::theta_boundary_side(1.0, 5.0, 5.0), None);
+        assert_eq!(side(1.0, 5.0, 5.0), None);
+        // Effective bound: a user lower bound of 0 (log-packed) is reported as
+        // the optimizer's 1e-10 floor, agreeing with the pinned estimate.
+        let (s, bound) = super::theta_boundary_side(1e-10, 0.0, 100.0).unwrap();
+        assert_eq!(s, "lower");
+        assert_eq!(bound, 1e-10);
+    }
+
+    #[test]
+    fn rebuild_native_key_reconstructs_chain_prefix() {
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        // A native entry produced inside a `[FOCEI]` chain: message is the
+        // stripped body, source_method carries the tag; the raw warning is the
+        // full prefixed string.
+        fit.warnings = vec!["[FOCEI] pinned to an optimizer bound: X".to_string()];
+        fit.warnings_structured = vec![crate::types::WarningEntry {
+            severity: crate::types::WarningSeverity::Warning,
+            category: crate::types::WarningCode::BoundaryEstimate,
+            message: "pinned to an optimizer bound: X".to_string(),
+            source_method: Some("FOCEI".to_string()),
+            details: Some(serde_json::json!({ "k": 1 })),
+        }];
+        super::rebuild_warnings_structured(&mut fit);
+        // Native entry (with details) is preferred despite the prefix.
+        assert_eq!(
+            fit.warnings_structured[0].category,
+            crate::types::WarningCode::BoundaryEstimate
+        );
+        assert_eq!(fit.warnings_structured[0].details.as_ref().unwrap()["k"], 1);
     }
 
     #[test]

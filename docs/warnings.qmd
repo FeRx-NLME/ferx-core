@@ -99,9 +99,11 @@ associated stored statistic, or when any contributing statistic is non-finite
 Most codes are assigned centrally by `classify_warning()`, which maps each
 engine message to its `WarningCode` and severity, after which `details` is
 attached from the fit's typed numeric fields for the codes above.
-`classify_warning()` is the single, type-checked source of the taxonomy — the
-`WarningCode` enum is exhaustive, so the vocabulary can no longer drift as a
-free string.
+`classify_warning()` is the single, type-checked source of the taxonomy: codes
+are `WarningCode` enum variants rather than free strings, so the vocabulary is
+centrally defined and cannot drift. The enum is `#[non_exhaustive]` — new codes
+may be added over time, so consumers should treat an unrecognised token as a
+generic warning rather than assuming a fixed, closed set.
 
 Some warnings are instead emitted **typed at their source**: the site
 constructs a `WarningEntry` (code, severity, message, and a `details` payload)
