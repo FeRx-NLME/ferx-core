@@ -3193,12 +3193,19 @@ struct DiagStats<'a> {
 }
 
 /// Machine-readable `details` payload for the numeric diagnostic warning codes,
-/// sourced from the typed `FitResult` fields rather than parsed from the
-/// message text. Returns `None` for a code with no associated stored statistic,
-/// or when **any** contributing statistic is non-finite (`NaN`/`±Inf`) — the
-/// `details` key is then omitted from the JSON entirely, rather than emitting a
-/// `null` value (`serde_json` maps non-finite floats to `null`). `cov_condition_number`
-/// in particular is documented as `+Inf` for a near-singular parameter space.
+/// sourced from the typed `FitResult` fields rather than parsed from the message
+/// text. A non-finite (`NaN`/`±Inf`) statistic is never emitted as a JSON `null`
+/// (`serde_json` maps non-finite floats to `null`) — instead:
+///
+/// - the single/paired-stat codes (`DwAutocorrelation`, `EpsShrinkage`,
+///   `ConditionNumber`) return `None` (whole `details` key omitted) when a
+///   required statistic is missing or non-finite;
+/// - the covariance codes (`CovarianceFailed`, `CovarianceRegularized`) build a
+///   partial object, **skipping** individual non-finite/absent fields and
+///   emitting whatever is available; they return `None` only when nothing is.
+///
+/// `cov_condition_number` in particular is documented as `+Inf` for a
+/// near-singular parameter space, so it is dropped from the payload there.
 fn diagnostic_details(
     code: &crate::types::WarningCode,
     s: &DiagStats,
