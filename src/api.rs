@@ -2345,7 +2345,20 @@ pub fn check_model_data_warnings(
         for subject in &population.subjects {
             let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &subject.covariates, 0.0);
             let (cl, v1, n, mtt) = (pk.cl(), pk.v(), pk.n_transit(), pk.mtt());
-            if !(mtt > 0.0 && n >= 0.0 && v1 > 0.0 && cl > 0.0) {
+            // Mirror the exact validity guard `pk::transit_flip_flop_at` applies
+            // (incl. `q`/`v2` for 2-cpt), so this heads-up never fires on a
+            // parameter region the reroute treats as invalid rather than flip-flop
+            // — otherwise a `v2 ≤ 0` subject would get the "ferx auto-evaluates the
+            // ODE twin" note while no reroute actually happens.
+            let params_valid = mtt > 0.0
+                && n >= 0.0
+                && v1 > 0.0
+                && cl > 0.0
+                && match model.pk_model {
+                    PkModel::TwoCptTransit => pk.q() >= 0.0 && pk.v2() > 0.0,
+                    _ => true,
+                };
+            if !params_valid {
                 continue; // invalid params are a separate (fatal) domain check
             }
             let ktr = (n + 1.0) / mtt;

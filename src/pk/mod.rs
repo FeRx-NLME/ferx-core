@@ -38,7 +38,9 @@ fn pk_params_at_time(
 /// [`crate::sens::two_cpt::transit_2cpt_domain_ok`] would clamp the prediction
 /// (and its sensitivities) to `0`.
 ///
-/// Mirrors those exact guards, including the NaN-safe `!(x < KTR)` form, so the
+/// Mirrors those exact guards — the 1-cpt arm inline, the 2-cpt arm by deferring
+/// to `transit_2cpt_domain_ok` itself (so both the flip-flop `!(α < KTR)` clamp
+/// *and* the confluent-eigenvalue `|α − β| < 1e-12` clamp are honoured) — so the
 /// prediction and every sensitivity path make the *same* routing decision.
 /// Returns `false` for a non-transit model, and for invalid parameters — there
 /// the closed form's `0` is a deliberate optimiser penalty, not a flip-flop to
@@ -54,17 +56,27 @@ fn transit_flip_flop_at(
     if !(mtt > 0.0 && n >= 0.0 && cl > 0.0 && v1 > 0.0) {
         return false;
     }
-    let ktr = (n + 1.0) / mtt;
     match model.pk_model {
-        PkModel::OneCptTransit => !(cl / v1 < ktr),
+        PkModel::OneCptTransit => {
+            // 1-cpt clamps inline (`one_cpt_transit_amt_g`) at `!(ke < KTR)`;
+            // mirror that single-exponential guard directly (there is no
+            // confluent-eigenvalue case for a single disposition rate).
+            let ktr = (n + 1.0) / mtt;
+            !(cl / v1 < ktr)
+        }
         PkModel::TwoCptTransit => {
             if !(pk.q() >= 0.0 && pk.v2() > 0.0) {
                 return false;
             }
-            // `α ≥ β`, so guarding the fast macro-rate `α` suffices — matching
-            // `transit_2cpt_domain_ok`.
-            let alpha = crate::sens::two_cpt::macro_rates_g::<f64>(cl, v1, pk.q(), pk.v2()).0;
-            !(alpha < ktr)
+            // Defer to the closed form's own domain guard rather than re-deriving
+            // it: `transit_2cpt_domain_ok` returns `None` (⇒ the closed form
+            // clamps to `0`) for *both* the flip-flop `!(α < KTR)` case and the
+            // confluent-eigenvalue `|α − β| < 1e-12` case. Rerouting exactly when
+            // it clamps keeps this predicate a faithful negation of the guard — no
+            // third copy of the rule to drift. Params are valid here, so a `None`
+            // always means "would clamp", never "invalid input".
+            crate::sens::two_cpt::transit_2cpt_domain_ok::<f64>(cl, v1, pk.q(), pk.v2(), n, mtt)
+                .is_none()
         }
         _ => false,
     }
@@ -92,19 +104,19 @@ pub(crate) fn effective_model_for_eval<'a>(
     eta: &[f64],
 ) -> &'a CompiledModel {
     let structural = model.effective_for(subject);
-    // Structural reroute already fired (now an ODE model), or there is no twin
-    // to route to: nothing parameter-dependent left to decide.
-    if structural.ode_spec.is_some() || model.transit_ode_equivalent.is_none() {
+    // No twin to route to (a non-transit model, or a lagtime / `f` / user-`[odes]`
+    // transit whose desugar declined): nothing parameter-dependent to decide.
+    let Some(twin) = &model.transit_ode_equivalent else {
+        return structural;
+    };
+    // Keep the structural (closed-form) model when it has already been rerouted to
+    // an ODE twin (TV-cov / `TIME`), or when this subject is not in the flip-flop
+    // regime. `||` short-circuits, so the predicate is evaluated only for
+    // closed-form transit subjects — the same work as before.
+    if structural.ode_spec.is_some() || !transit_flip_flop_at(model, subject, theta, eta) {
         return structural;
     }
-    if transit_flip_flop_at(model, subject, theta, eta) {
-        return model
-            .transit_ode_equivalent
-            .as_ref()
-            .expect("transit_ode_equivalent is Some (checked above)")
-            .get_or_build();
-    }
-    structural
+    twin.get_or_build()
 }
 
 /// Divide each prediction in-place by the scale derived from
