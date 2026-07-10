@@ -964,24 +964,40 @@ pub fn predict_iov(
     // no-op. (Form C ODE output `y = <expr>` is applied inside the ODE solver,
     // not here; see the note below for the κ=0 limitation there.)
     if !matches!(model.scaling, ScalingSpec::None) {
-        if occ_groups.is_empty() {
-            // Occasion-less subject (`simulate()` on data read without an
-            // `iov_column`): there are no per-occasion groups, so scale here with the
-            // BSV+κ=0 vector `[η_bsv, 0…0]` — the same combination the non-IOV
-            // `compute_predictions_with_tv` path scales with. Without this the
-            // predictions would be returned UNSCALED, off by the full scale factor
-            // (#723 review).
+        // Guard on `subject.occasions`, NOT `occ_groups`: `iov_occasion_groups`
+        // appends *dose-only* occasions (a dose in an occasion with no co-timed
+        // sample) as groups with an EMPTY obs-index list, so `occ_groups` can be
+        // non-empty while no observation is owned by any group. The base pass
+        // below is what scales those otherwise-unowned observations, so it must
+        // run whenever the observations carry no occasion labels — the real
+        // condition is `subject.occasions.is_empty()` (#769 review). Keying on
+        // `occ_groups.is_empty()` would take the per-occasion branch for a
+        // dose-only-occasion subject and leave every observation UNSCALED.
+        if subject.occasions.is_empty() {
+            // No observation carries an occasion label (`simulate()` on data read
+            // without an `iov_column`, or a subject whose only occasion labels are
+            // dose-side): scale here with the BSV+κ=0 vector `[η_bsv, 0…0]` — the
+            // same combination the non-IOV `compute_predictions_with_tv` path
+            // scales with. Without this the predictions would be returned UNSCALED,
+            // off by the full scale factor (#723 review).
             apply_scaling(model, subject, theta, &pk_only_combined, &mut preds);
         } else {
-            // Per-occasion scaling: every observation carries an occasion label and is
-            // owned by exactly one group (`subject.occasions` is parallel to the obs
-            // grid — either fully populated or empty), so the loop below determines
-            // *all* of `preds`. That makes a κ=0 base pass redundant here; skipping it
-            // avoids a full extra scaling evaluation on the estimation hot path
-            // (`predict_iov` runs in the IMP/SAEM/FOCEI inner loops) with a
-            // bit-identical result (#723 review / efficiency follow-up).
+            // Every observation carries an occasion label and is owned by exactly
+            // one group (`subject.occasions` is parallel to the obs grid — either
+            // fully populated or empty, never partial), so the loop below
+            // determines *all* of `preds`. That makes a κ=0 base pass redundant
+            // here; skipping it avoids a full extra scaling evaluation on the
+            // estimation hot path (`predict_iov` runs in the IMP/SAEM/FOCEI inner
+            // loops) with a bit-identical result (#723 review / efficiency
+            // follow-up, #769).
             let raw = preds.clone();
             for (occ_id, obs_indices) in &occ_groups {
+                // Dose-only occasions own no observations, so their scaling pass
+                // would write nothing — skip the redundant full `apply_scaling`
+                // (+ clone) rather than compute and discard it.
+                if obs_indices.is_empty() {
+                    continue;
+                }
                 let combined = combined_for(*occ_id);
                 let mut scaled = raw.clone();
                 apply_scaling(model, subject, theta, &combined, &mut scaled);
@@ -3035,6 +3051,80 @@ mod tests {
         apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
         for (got, exp) in preds.iter().zip([1.0, 2.0, 3.0].iter()) {
             assert_relative_eq!(got, exp, epsilon = 1e-12);
+        }
+    }
+
+    /// Regression (#769 review): `predict_iov` must apply `[scaling]` to a subject
+    /// that carries *dose* occasions but no *observation* occasions. In that state
+    /// `iov_occasion_groups` is non-empty — it appends the dose-only occasion as a
+    /// group with an EMPTY obs-index list — yet no observation is owned by any
+    /// group, so the per-occasion scaling loop writes nothing. The base pass is
+    /// what scales those observations; guarding it on `occ_groups.is_empty()`
+    /// (rather than `subject.occasions.is_empty()`) skips it here and returns the
+    /// predictions UNSCALED, off by the full scale factor — the #723 bug.
+    ///
+    /// The current data readers never build this state (they gate observation- and
+    /// dose-occasion labels on the same column), so it is constructed directly to
+    /// lock the guard against a future path that produces it.
+    #[test]
+    fn predict_iov_scales_subject_with_dose_only_occasions() {
+        let scale = 1000.0;
+        let mut model = cl_from_cr_model();
+        // A consistent IOV model — `dose_occasions` are only populated for IOV
+        // models. The κ block stays zero here, which is all this guard needs.
+        model.n_kappa = 1;
+        model.kappa_names = vec!["KAPPA_CL".to_string()];
+
+        // Observations present + a dose occasion, but NO observation occasions.
+        let mut dose_only = one_subject_for_scaling();
+        dose_only.dose_occasions = vec![1; dose_only.doses.len()];
+        assert!(
+            dose_only.occasions.is_empty() && !dose_only.dose_occasions.is_empty(),
+            "trigger state: dose occasions present, observation occasions absent"
+        );
+
+        // Unscaled reference (scaling off) — the predictions the scale divides.
+        model.scaling = ScalingSpec::None;
+        let raw = predict_iov(&model, &dose_only, &[1.0], &[], &[]);
+        assert!(
+            !raw.is_empty() && raw.iter().all(|v| v.is_finite() && *v > 0.0),
+            "sanity: positive concentrations to scale, got {raw:?}"
+        );
+
+        // Scaling on: every prediction must be divided by `scale`, not left as-is.
+        // Fails on the `occ_groups.is_empty()` guard (returns `raw`, `scale`× too big).
+        model.scaling = ScalingSpec::ScalarScale(scale);
+        let got = predict_iov(&model, &dose_only, &[1.0], &[], &[]);
+        assert_eq!(got.len(), raw.len());
+        for (g, r) in got.iter().zip(raw.iter()) {
+            assert_relative_eq!(*g, r / scale, epsilon = 1e-12);
+        }
+
+        // And identical to the fully occasion-less subject (the known-correct #723
+        // base-pass path, unchanged by #769): dose-only occasions must not move it.
+        let occasionless = one_subject_for_scaling(); // occasions=[] AND dose_occasions=[]
+        let reference = predict_iov(&model, &occasionless, &[1.0], &[], &[]);
+        assert_eq!(got.len(), reference.len());
+        for (g, r) in got.iter().zip(reference.iter()) {
+            assert_relative_eq!(*g, r, epsilon = 1e-12);
+        }
+
+        // Mixed subject — observations DO carry occasions, plus a second dose in an
+        // occasion with no co-timed sample. This takes the per-occasion (`else`)
+        // branch and exercises the dose-only-group `continue`: the empty group is
+        // skipped while every observation is still scaled per-occasion.
+        let mut mixed = one_subject_for_scaling();
+        mixed.doses.push(bolus_dose(0.0, 100.0));
+        mixed.occasions = vec![1, 1, 1]; // all observations in occasion 1
+        mixed.dose_occasions = vec![1, 2]; // second dose in occasion 2 (no observations)
+        model.scaling = ScalingSpec::None;
+        let raw_mixed = predict_iov(&model, &mixed, &[1.0], &[], &[]);
+        assert!(raw_mixed.iter().all(|v| v.is_finite() && *v > 0.0));
+        model.scaling = ScalingSpec::ScalarScale(scale);
+        let got_mixed = predict_iov(&model, &mixed, &[1.0], &[], &[]);
+        assert_eq!(got_mixed.len(), raw_mixed.len());
+        for (g, r) in got_mixed.iter().zip(raw_mixed.iter()) {
+            assert_relative_eq!(*g, r / scale, epsilon = 1e-12);
         }
     }
 
