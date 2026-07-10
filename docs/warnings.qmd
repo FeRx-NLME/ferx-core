@@ -68,4 +68,5 @@ source of the taxonomy — the `WarningCode` enum is exhaustive, so the vocabula
 can no longer drift as a free string. Native at-source emission (each site
 constructing its own typed `WarningEntry` with a populated `details` payload) is
 being migrated incrementally; until a site is converted, its entry is classified
-from the message and carries `details: null`.
+from the message and has no `details` payload (the `details` key is omitted from
+the JSON; the Rust field is `None`).

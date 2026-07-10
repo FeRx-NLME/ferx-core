@@ -3861,6 +3861,7 @@ pub enum WarningSeverity {
 /// warning classes appear; never repurpose an existing token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum WarningCode {
     /// Optimizer did not reach the convergence criterion.
     Convergence,
