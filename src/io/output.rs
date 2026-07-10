@@ -1569,6 +1569,9 @@ pub fn write_result_json(result: &FitResult, path: &str) -> Result<(), String> {
     std::fs::write(path, json).map_err(|e| format!("Failed to write {}: {}", path, e))
 }
 
+/// Write the curated, human-readable parameter estimates and uncertainty as
+/// YAML to `path` (`{model}-fit.yaml`). This is a selected subset for reading;
+/// for the complete machine-readable result use [`write_result_json`].
 pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String> {
     use std::io::Write;
 

@@ -2166,6 +2166,44 @@ mod tests {
     }
 
     #[test]
+    fn json_result_maps_non_finite_floats_to_null() {
+        // #777 review: guarantee that non-finite floats serialize to JSON
+        // `null` and never panic `to_json_value()` / `write_result_json()`.
+        // serde_json's `Value`/string serializers map non-finite f64 to null
+        // (no `arbitrary_precision` feature here), so this holds without a
+        // sanitizing pass — this test locks that contract in.
+        let mut fit = minimal_fit_result();
+        fit.ofv = f64::INFINITY;
+        fit.shrinkage_eps = f64::NAN;
+        fit.iwres_lag1_r = f64::NEG_INFINITY;
+        // A missing covariate value is stored as NaN in the covariate table.
+        fit.covariate_table = Some(crate::types::CovariateTable {
+            names: vec!["WT".into()],
+            kinds: vec![crate::types::CovariateKind::Continuous],
+            rows: vec![crate::types::CovariateRow {
+                id: "S1".into(),
+                time: 0.0,
+                evid: 0,
+                values: vec![f64::NAN],
+            }],
+        });
+
+        let v = fit.to_json_value(); // must not panic
+        assert!(v["ofv"].is_null());
+        assert!(v["shrinkage_eps"].is_null());
+        assert!(v["iwres_lag1_r"].is_null());
+        assert!(v["covariate_table"]["rows"][0]["values"][0].is_null());
+
+        // Full write path also succeeds (pretty-printer never panics on null).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nan-fit.json");
+        crate::io::output::write_result_json(&fit, path.to_str().unwrap()).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(parsed["ofv"].is_null());
+    }
+
+    #[test]
     fn write_result_json_writes_parseable_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run-fit.json");
