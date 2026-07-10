@@ -3213,7 +3213,7 @@ fn diagnostic_details(
                 .into_iter()
                 .map(|i| {
                     serde_json::json!({
-                        "eta": eta_names.get(i).cloned().unwrap_or_default(),
+                        "eta": eta_label(eta_names, i),
                         "shrinkage_pct": 100.0 * shrinkage_eta[i],
                     })
                 })
@@ -5982,6 +5982,16 @@ pub(crate) fn high_shrinkage_eta_indices(shrinkage: &[f64]) -> Vec<usize> {
         .collect()
 }
 
+/// Label for the `i`-th ETA, falling back to a non-empty `eta_{i}` placeholder
+/// when the name is missing — so both the message and the `details` payload
+/// stay unambiguous.
+fn eta_label(eta_names: &[String], i: usize) -> String {
+    eta_names
+        .get(i)
+        .cloned()
+        .unwrap_or_else(|| format!("eta_{i}"))
+}
+
 /// Build the user-facing warning for high ETA shrinkage, or `None` when no ETA
 /// exceeds the threshold. `shrinkage` is per-ETA shrinkage as a fraction;
 /// `eta_names` labels them in the same order.
@@ -5992,10 +6002,7 @@ pub(crate) fn eta_shrinkage_warning(shrinkage: &[f64], eta_names: &[String]) -> 
     }
     let list = high
         .iter()
-        .map(|&i| {
-            let name = eta_names.get(i).map(String::as_str).unwrap_or("?");
-            format!("{} ({:.0}%)", name, 100.0 * shrinkage[i])
-        })
+        .map(|&i| format!("{} ({:.0}%)", eta_label(eta_names, i), 100.0 * shrinkage[i]))
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!(
@@ -12032,6 +12039,19 @@ mod simulate_with_uncertainty_tests {
             &names,
         )
         .is_none());
+
+        // Missing name → non-empty `eta_{i}` placeholder, not "".
+        let d = super::diagnostic_details(
+            &WarningCode::EtaShrinkage,
+            f64::NAN,
+            0.0,
+            f64::NAN,
+            None,
+            &[0.42],
+            &[], // no names
+        )
+        .expect("details");
+        assert_eq!(d["high_shrinkage_etas"][0]["eta"], "eta_0");
     }
 
     #[test]

@@ -4049,7 +4049,8 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, WarningCode::ImportanceSampling)
     } else if lower.contains("eps shrinkage") {
         (WarningSeverity::Warning, WarningCode::EpsShrinkage)
-    } else if lower.contains("eta shrinkage") {
+    } else if lower.starts_with("eta shrinkage") || lower.contains(" eta shrinkage") {
+        // Word-boundary match so "beta shrinkage" (or similar) does not collide.
         (WarningSeverity::Warning, WarningCode::EtaShrinkage)
     } else if lower.starts_with("w_addl_missing_ii") || lower.contains("addl > 0 but ii") {
         (WarningSeverity::Warning, WarningCode::DataQuality)
@@ -6489,6 +6490,24 @@ mod tests {
         let w = classify_warning("some entirely novel message");
         assert_eq!(w.severity, WarningSeverity::Warning);
         assert_eq!(w.category.as_str(), "general");
+    }
+
+    #[test]
+    fn classify_warning_eta_shrinkage_is_word_bounded() {
+        // The real message classifies to eta_shrinkage.
+        assert_eq!(
+            classify_warning("High ETA shrinkage (>= 30%): eta_V (42%)")
+                .category
+                .as_str(),
+            "eta_shrinkage"
+        );
+        // A substring like "beta shrinkage" must NOT collide.
+        assert_ne!(
+            classify_warning("beta shrinkage looks odd")
+                .category
+                .as_str(),
+            "eta_shrinkage"
+        );
     }
 
     /// #778: the `WarningCode` serde token is a public API an agent / the R
