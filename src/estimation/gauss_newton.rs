@@ -2052,7 +2052,7 @@ mod tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         }
     }
 
@@ -3022,7 +3022,7 @@ mod tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         };
 
         let template = &model.default_params;
@@ -3310,7 +3310,7 @@ mod tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         }
     }
 

@@ -315,9 +315,11 @@ fn state_layout(pk_model: PkModel) -> (usize, usize) {
         PkModel::OneCptIv => (1, 0),
         PkModel::OneCptOral => (2, 1),    // [depot, central]
         PkModel::OneCptTransit => (2, 1), // [depot (lumped transit), central]
+        PkModel::OneCptIg => (2, 1),      // [depot (unabsorbed IG mass), central]
         PkModel::TwoCptIv => (2, 0),
         PkModel::TwoCptOral => (3, 1),    // [depot, central, periph]
         PkModel::TwoCptTransit => (3, 1), // [depot (lumped transit), central, periph]
+        PkModel::TwoCptIg => (3, 1),      // [depot (unabsorbed IG mass), central, periph]
         PkModel::ThreeCptIv => (3, 0),
         PkModel::ThreeCptOral => (4, 1), // [depot, central, periph1, periph2]
     }
@@ -912,6 +914,14 @@ fn propagate_with_bounds(
             PkModel::TwoCptTransit => unreachable!(
                 "two_cpt_transit uses closed-form superposition, not the event-driven walk"
             ),
+            // IG's inverse-Gaussian convolution memory is likewise not a finite state
+            // vector, so it never uses the event-driven walk (#790).
+            PkModel::OneCptIg => {
+                unreachable!("one_cpt_ig uses closed-form superposition, not the event-driven walk")
+            }
+            PkModel::TwoCptIg => {
+                unreachable!("two_cpt_ig uses closed-form superposition, not the event-driven walk")
+            }
             PkModel::OneCptIv => {
                 propagate_one_cpt(state, dt, pk, rate_central);
             }

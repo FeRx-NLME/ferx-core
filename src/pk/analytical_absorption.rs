@@ -1,8 +1,8 @@
 //! Analytical closed forms for absorption models that are **closed under
 //! exponential tilting** — the #386 / absorption-Phase-3 acceleration that moves
-//! `transit()` (and, later, `igd()`) off the numerical ODE forcing path onto the
-//! analytic `pk` path, where sensitivities come from `sens/`'s `Dual2` jets
-//! rather than finite differences.
+//! `transit()` (#386) and `igd()` (inverse-Gaussian, #790) off the numerical ODE
+//! forcing path onto the analytic `pk` path, where sensitivities come from
+//! `sens/`'s `Dual2` jets rather than finite differences.
 //!
 //! ## The tilting identity
 //!
@@ -48,7 +48,7 @@
 //! model on the numerical ODE forcing path instead.
 
 use crate::sens::num::PkNum;
-use crate::stats::special::regularized_gamma_p;
+use crate::stats::special::{log_normal_cdf_g, normal_cdf_g, regularized_gamma_p};
 
 /// An absorption-time distribution that is **closed under exponential tilting**:
 /// both its MGF `M(k) = E[e^{kX}]` and the CDF of the `e^{kt}`-tilted density have
@@ -114,6 +114,93 @@ impl<T: PkNum> TiltedAbsorption<T> for TransitAbsorption<T> {
         // the regularized lower incomplete gamma P(n+1, (KTR−k)·t).
         let ktr = self.ktr();
         regularized_gamma_p(self.n + T::from_f64(1.0), (ktr - k) * t)
+    }
+}
+
+/// Freijer & Post inverse-Gaussian (convection–dispersion) absorption: the dose's
+/// first-passage time into central is `InverseGaussian(μ = MAT, λ = MAT/CV²)`. The
+/// IG family is closed under exponential tilting, so both [`TiltedAbsorption`]
+/// pieces are elementary in the normal CDF `Φ` (#790).
+///
+/// This is the same `igd(mat, cv2)` density the ODE forcing path implements (see
+/// [`crate::pk::absorption::PreparedInputRate::InverseGaussian`]); the closed form
+/// replaces the ODE solve with exact tolerance-free `Dual2` gradients. Unlike transit
+/// (whose stiff-ish ODE makes the closed form much faster), IG's ODE is non-stiff and
+/// cheap, so this is a correctness/consistency path, **not** a speed win — the
+/// normal-CDF terms ride the incomplete-gamma continued fraction ([`normal_cdf_g`] /
+/// [`log_normal_cdf_g`]), which is ~2× slower per eval than integrating `igd()` (#790).
+/// `MAT` is the mean absorption time; `CV²` the squared coefficient of variation of the
+/// absorption-time distribution (so the shape is `λ = μ/CV²`, i.e. `lambda = mat / cv2`).
+/// The dispatcher constructs this from the user's `(mat, cv2)`.
+pub struct IgAbsorption<T: PkNum> {
+    /// Mean absorption time `μ = MAT > 0`.
+    pub mat: T,
+    /// Inverse-Gaussian shape `λ = MAT/CV² > 0`.
+    pub lambda: T,
+}
+
+impl<T: PkNum> IgAbsorption<T> {
+    /// `2μ²/λ` — the coefficient of `k` under the tilting square root. Equals
+    /// `2·MAT·CV²`, so the MGF's abscissa of convergence `k < λ/(2μ²)` is
+    /// `k < 1/(2·MAT·CV²)`.
+    #[inline]
+    fn two_mu2_over_lambda(&self) -> T {
+        T::from_f64(2.0) * self.mat * self.mat / self.lambda
+    }
+
+    /// `λ/μ` (`= 1/CV²`) — the MGF/tilt scale factor.
+    #[inline]
+    fn lambda_over_mu(&self) -> T {
+        self.lambda / self.mat
+    }
+
+    /// Tilt factor `r(k) = √(1 − 2μ²k/λ)`; the tilted mean is `μ* = μ/r`. Real for
+    /// `k < λ/(2μ²)`; [`PkNum::sqrt`]'s non-positive guard keeps a domain violation
+    /// finite (flat 0) rather than `NaN`, but the dispatch guards `k` upstream.
+    #[inline]
+    fn tilt_r(&self, k: T) -> T {
+        (T::from_f64(1.0) - self.two_mu2_over_lambda() * k).sqrt()
+    }
+}
+
+impl<T: PkNum> TiltedAbsorption<T> for IgAbsorption<T> {
+    fn mgf(&self, k: T) -> T {
+        // IG(μ,λ) MGF: M(k) = exp((λ/μ)(1 − √(1 − 2μ²k/λ))), converging for
+        // k < λ/(2μ²) = 1/(2·MAT·CV²). Above the abscissa the radicand goes
+        // negative; `sqrt` then clamps to a finite (wrong) value rather than NaN,
+        // so — unlike transit's `.pow` — this can't poison the likelihood, but the
+        // dispatch still guards `ke < 1/(2·MAT·CV²)` upstream (routing to the ODE
+        // `igd()` twin otherwise). The assert catches a guard regression in tests.
+        debug_assert!(
+            self.two_mu2_over_lambda().val() * k.val() < 1.0,
+            "IG MGF diverges for k ≥ λ/(2μ²) ({} ≥ {}); caller must guard ke < 1/(2·MAT·CV²)",
+            k.val(),
+            1.0 / self.two_mu2_over_lambda().val()
+        );
+        (self.lambda_over_mu() * (T::from_f64(1.0) - self.tilt_r(k))).exp()
+    }
+
+    fn tilted_cdf(&self, t: T, k: T) -> T {
+        // The e^{ku}-tilted IG(μ,λ) is IG(μ* = μ/r, λ) with r = √(1 − 2μ²k/λ). Its
+        // CDF is the standard inverse-Gaussian CDF
+        //   F_IG(t; μ*, λ) = Φ(z₁) + exp(2λ/μ*)·Φ(z₂),
+        //   z₁ = √(λ/t)(t/μ* − 1),   z₂ = −√(λ/t)(t/μ* + 1),
+        // written via `r` (t/μ* = t·r/μ, 2λ/μ* = 2λr/μ) so the diverging μ* = μ/r at
+        // the abscissa never forms. The second term multiplies an astronomically
+        // large `exp(2λ/μ*)` (for small CV²) by a vanishing `Φ(z₂)`; evaluating it as
+        // `exp(2λ/μ* + ln Φ(z₂))` via [`log_normal_cdf_g`] avoids the catastrophic
+        // cancellation of a direct product (which would underflow to a spurious 0).
+        // `z₂ < 0` for all `t > 0`, so the log form is always in its stable regime.
+        if t.val() <= 0.0 {
+            return T::from_f64(0.0);
+        }
+        let r = self.tilt_r(k);
+        let q_t = (self.lambda / t).sqrt(); // √(λ/t)
+        let tr_over_mu = t * r / self.mat; // t/μ* = t·r/μ
+        let z1 = q_t * (tr_over_mu - T::from_f64(1.0));
+        let z2 = -(q_t * (tr_over_mu + T::from_f64(1.0)));
+        let two_lambda_over_mu_star = T::from_f64(2.0) * self.lambda_over_mu() * r; // 2λ/μ*
+        normal_cdf_g(z1) + (two_lambda_over_mu_star + log_normal_cdf_g(z2)).exp()
     }
 }
 
@@ -619,6 +706,370 @@ mod tests {
                 let numeric = (amt / v2) * (k12 / (alpha - beta)) * acc * h;
                 let got = convolve_2cpt_peripheral(&abs, t, alpha, beta, k12, amt / v2);
                 assert_relative_eq!(got, numeric, max_relative = 1e-4, epsilon = 1e-9);
+            }
+        }
+    }
+
+    // ── IgAbsorption (inverse-Gaussian, #790) ────────────────────────────────
+
+    /// Standard inverse-Gaussian density `f(u; μ=mat, λ=lambda)` — the independent
+    /// reference the closed form's convolutions are checked against.
+    fn ig_density(mat: f64, lambda: f64, u: f64) -> f64 {
+        if u <= 0.0 {
+            return 0.0;
+        }
+        (lambda / (std::f64::consts::TAU * u * u * u)).sqrt()
+            * (-lambda * (u - mat) * (u - mat) / (2.0 * mat * mat * u)).exp()
+    }
+
+    /// The MGF abscissa of convergence `k < λ/(2μ²) = 1/(2·MAT·CV²)`.
+    fn ig_abscissa(mat: f64, lambda: f64) -> f64 {
+        lambda / (2.0 * mat * mat)
+    }
+
+    /// `f64` 1-cpt IG concentration for the value-level tests.
+    fn ig_conc(mat: f64, lambda: f64, t: f64, ke: f64, fdv: f64) -> f64 {
+        convolve_1cpt(&IgAbsorption { mat, lambda }, t, ke, fdv)
+    }
+
+    /// Same, with `mat`, `lambda`, `ke` seeded as `Dual2` vars (dims 0, 1, 2).
+    fn ig_dual_conc(mat: f64, lambda: f64, t: f64, ke: f64, fdv: f64) -> Dual2<3> {
+        let abs = IgAbsorption {
+            mat: Dual2::<3>::var(mat, 0),
+            lambda: Dual2::<3>::var(lambda, 1),
+        };
+        convolve_1cpt(
+            &abs,
+            Dual2::<3>::from_f64(t),
+            Dual2::<3>::var(ke, 2),
+            Dual2::<3>::from_f64(fdv),
+        )
+    }
+
+    /// MGF / tilted-CDF sanity: `M(0) = 1`, `G(0; k) = 0`, `G` rises to 1, the
+    /// concentration starts at 0 and is positive after, and `G` is a monotone CDF.
+    #[test]
+    fn ig_mgf_and_tilted_cdf_sanity() {
+        let abs = IgAbsorption {
+            mat: 2.0,
+            lambda: 6.0,
+        };
+        assert_relative_eq!(abs.mgf(0.0), 1.0, max_relative = 1e-12);
+        assert_relative_eq!(abs.tilted_cdf(0.0, 0.1), 0.0, epsilon = 1e-12);
+        assert_relative_eq!(abs.tilted_cdf(1e6, 0.1), 1.0, max_relative = 1e-9);
+        assert_relative_eq!(ig_conc(2.0, 6.0, 0.0, 0.1, 2.0), 0.0, epsilon = 1e-12);
+        assert!(ig_conc(2.0, 6.0, 2.0, 0.1, 2.0) > 0.0);
+        // Monotone CDF in t.
+        let mut prev = -1.0;
+        for k in 0..=40 {
+            let t = k as f64 * 0.5;
+            let g = abs.tilted_cdf(t, 0.1);
+            assert!((-1e-12..=1.0 + 1e-9).contains(&g), "G out of [0,1]: {g}");
+            assert!(g >= prev - 1e-12, "non-monotone at t={t}");
+            prev = g;
+        }
+    }
+
+    /// At `k = 0` the tilted CDF is the **untilted** IG CDF `F_IG(t; μ, λ)`; check it
+    /// against the defining `∫₀ᵗ f_IG(u) du` by fine quadrature — validates the
+    /// `Φ`-based CDF formula independently of the tilting and the convolution.
+    #[test]
+    fn ig_untilted_cdf_matches_integrated_density() {
+        for &(mat, lambda) in &[(2.0, 6.0), (1.0, 4.0), (4.0, 20.0), (3.0, 3.0)] {
+            let abs = IgAbsorption { mat, lambda };
+            for &t in &[0.5, 1.0, 2.0, 4.0, 8.0] {
+                let steps = 400_000usize;
+                let h = t / steps as f64;
+                let mut acc = 0.0;
+                for i in 0..=steps {
+                    let u = i as f64 * h;
+                    let w = if i == 0 || i == steps { 0.5 } else { 1.0 };
+                    acc += w * ig_density(mat, lambda, u);
+                }
+                let numeric = acc * h;
+                assert_relative_eq!(
+                    abs.tilted_cdf(t, 0.0),
+                    numeric,
+                    max_relative = 2e-4,
+                    epsilon = 1e-7
+                );
+            }
+        }
+    }
+
+    /// The 1-cpt closed form must equal the defining convolution
+    /// `(F·Dose/V) ∫₀ᵗ f_IG(u) e^{−ke(t−u)} du` — fine quadrature, including the
+    /// near-seam `ke = 0.9·abscissa` where the MGF factor is large (yet the closed
+    /// form, a *product* `M(ke)·G`, must still match).
+    #[test]
+    fn convolve_1cpt_ig_matches_numerical_convolution() {
+        let fdv = 2.0;
+        for &(mat, lambda) in &[(2.0, 6.0), (1.0, 4.0), (4.0, 20.0), (1.5, 3.0)] {
+            let abscissa = ig_abscissa(mat, lambda);
+            for &ke_frac in &[0.05_f64, 0.2, 0.5, 0.9] {
+                let ke = ke_frac * abscissa;
+                for &t in &[0.5, 1.0, 2.0, 4.0, 8.0] {
+                    let steps = 400_000usize;
+                    let h = t / steps as f64;
+                    let mut acc = 0.0;
+                    for i in 0..=steps {
+                        let u = i as f64 * h;
+                        let w = if i == 0 || i == steps { 0.5 } else { 1.0 };
+                        acc += w * ig_density(mat, lambda, u) * (-ke * (t - u)).exp();
+                    }
+                    let numeric = fdv * acc * h;
+                    assert_relative_eq!(
+                        ig_conc(mat, lambda, t, ke, fdv),
+                        numeric,
+                        max_relative = 2e-4,
+                        epsilon = 1e-8
+                    );
+                }
+            }
+        }
+    }
+
+    /// Exact `Dual2` `∂C/∂{mat,lambda,ke}` (the FOCE/FOCEI gradients) vs a central
+    /// difference of the `f64` value, plus the three diagonal 2nd derivatives vs a
+    /// central difference of the exact dual 1st-derivative (the two-rung ladder that
+    /// dodges the `1/h²` value-difference blow-up), and the cross terms.
+    #[test]
+    fn convolve_1cpt_ig_dual_gradients_match_fd() {
+        let fdv = 2.0;
+        // (mat, lambda, ke, t) with ke < abscissa = lambda/(2·mat²).
+        for &(mv, lv, kv, tv) in &[
+            (2.0, 6.0, 0.10, 1.5),
+            (1.0, 4.0, 0.30, 3.0),
+            (4.0, 20.0, 0.05, 6.0),
+            (1.5, 3.0, 0.20, 2.0),
+        ] {
+            let d = ig_dual_conc(mv, lv, tv, kv, fdv);
+            let h = 1e-6;
+            let dm =
+                (ig_conc(mv + h, lv, tv, kv, fdv) - ig_conc(mv - h, lv, tv, kv, fdv)) / (2.0 * h);
+            let dl =
+                (ig_conc(mv, lv + h, tv, kv, fdv) - ig_conc(mv, lv - h, tv, kv, fdv)) / (2.0 * h);
+            let dk =
+                (ig_conc(mv, lv, tv, kv + h, fdv) - ig_conc(mv, lv, tv, kv - h, fdv)) / (2.0 * h);
+            assert_relative_eq!(d.grad[0], dm, max_relative = 1e-4, epsilon = 1e-8);
+            assert_relative_eq!(d.grad[1], dl, max_relative = 1e-4, epsilon = 1e-8);
+            assert_relative_eq!(d.grad[2], dk, max_relative = 1e-4, epsilon = 1e-8);
+
+            let h2 = 1e-4;
+            let d2m = (ig_dual_conc(mv + h2, lv, tv, kv, fdv).grad[0]
+                - ig_dual_conc(mv - h2, lv, tv, kv, fdv).grad[0])
+                / (2.0 * h2);
+            let d2l = (ig_dual_conc(mv, lv + h2, tv, kv, fdv).grad[1]
+                - ig_dual_conc(mv, lv - h2, tv, kv, fdv).grad[1])
+                / (2.0 * h2);
+            let d2k = (ig_dual_conc(mv, lv, tv, kv + h2, fdv).grad[2]
+                - ig_dual_conc(mv, lv, tv, kv - h2, fdv).grad[2])
+                / (2.0 * h2);
+            // cross terms.
+            let dml = (ig_dual_conc(mv, lv + h2, tv, kv, fdv).grad[0]
+                - ig_dual_conc(mv, lv - h2, tv, kv, fdv).grad[0])
+                / (2.0 * h2);
+            let dmk = (ig_dual_conc(mv, lv, tv, kv + h2, fdv).grad[0]
+                - ig_dual_conc(mv, lv, tv, kv - h2, fdv).grad[0])
+                / (2.0 * h2);
+            assert_relative_eq!(d.hess[0][0], d2m, max_relative = 2e-4, epsilon = 1e-6);
+            assert_relative_eq!(d.hess[1][1], d2l, max_relative = 2e-4, epsilon = 1e-6);
+            assert_relative_eq!(d.hess[2][2], d2k, max_relative = 2e-4, epsilon = 1e-6);
+            assert_relative_eq!(d.hess[0][1], dml, max_relative = 2e-4, epsilon = 1e-6);
+            assert_relative_eq!(d.hess[0][2], dmk, max_relative = 2e-4, epsilon = 1e-6);
+        }
+    }
+
+    /// Sensitivities in the two arguments the gradient ladder holds constant:
+    /// `∂C/∂t` (+ `∂²C/∂t²`) via the same two-rung FD ladder, and exact linearity in
+    /// `F·Dose/V` (`∂C/∂fdv = C/fdv`, `∂²C/∂fdv² = 0`).
+    #[test]
+    fn convolve_1cpt_ig_t_and_dose_sensitivities() {
+        let h = 1e-6;
+        let h2 = 1e-4;
+        for &(mat, lambda, ke, t) in &[
+            (2.0, 6.0, 0.10, 1.5),
+            (1.0, 4.0, 0.30, 3.0),
+            (4.0, 20.0, 0.05, 6.0),
+        ] {
+            let abs = IgAbsorption {
+                mat: Dual2::<1>::from_f64(mat),
+                lambda: Dual2::<1>::from_f64(lambda),
+            };
+            let ke_c = Dual2::<1>::from_f64(ke);
+            let fdv_c = Dual2::<1>::from_f64(2.0);
+            let d = convolve_1cpt(&abs, Dual2::<1>::var(t, 0), ke_c, fdv_c);
+            let dt = (ig_conc(mat, lambda, t + h, ke, 2.0) - ig_conc(mat, lambda, t - h, ke, 2.0))
+                / (2.0 * h);
+            assert_relative_eq!(d.grad[0], dt, max_relative = 1e-4, epsilon = 1e-8);
+            let gp = convolve_1cpt(&abs, Dual2::<1>::var(t + h2, 0), ke_c, fdv_c).grad[0];
+            let gm = convolve_1cpt(&abs, Dual2::<1>::var(t - h2, 0), ke_c, fdv_c).grad[0];
+            assert_relative_eq!(
+                d.hess[0][0],
+                (gp - gm) / (2.0 * h2),
+                max_relative = 1e-4,
+                epsilon = 1e-7
+            );
+        }
+        // Exactly linear in F·Dose/V.
+        let fdv = 2.0;
+        let abs = IgAbsorption {
+            mat: Dual2::<1>::from_f64(2.0),
+            lambda: Dual2::<1>::from_f64(6.0),
+        };
+        let d = convolve_1cpt(
+            &abs,
+            Dual2::<1>::from_f64(1.5),
+            Dual2::<1>::from_f64(0.1),
+            Dual2::<1>::var(fdv, 0),
+        );
+        assert_relative_eq!(
+            d.grad[0],
+            ig_conc(2.0, 6.0, 1.5, 0.1, fdv) / fdv,
+            max_relative = 1e-12
+        );
+        assert_relative_eq!(d.hess[0][0], 0.0, epsilon = 1e-12);
+    }
+
+    /// `f64` 2-cpt central IG concentration, `F·Dose/V1` folded from `amt`/`f_bio`.
+    fn ig_tc(cl: f64, v1: f64, q: f64, v2: f64, mat: f64, lambda: f64, t: f64, amt: f64) -> f64 {
+        let (a, b, k21) = macro_rates_g(cl, v1, q, v2);
+        convolve_2cpt(&IgAbsorption { mat, lambda }, t, a, b, k21, amt / v1)
+    }
+
+    /// Same with all six PK params seeded as `Dual2<6>` (cl,v1,q,v2,mat,lambda).
+    #[allow(clippy::too_many_arguments)]
+    fn ig_tc_dual(
+        cl: f64,
+        v1: f64,
+        q: f64,
+        v2: f64,
+        mat: f64,
+        lambda: f64,
+        t: f64,
+        amt: f64,
+    ) -> Dual2<6> {
+        let (a, b, k21) = macro_rates_g(
+            Dual2::<6>::var(cl, 0),
+            Dual2::<6>::var(v1, 1),
+            Dual2::<6>::var(q, 2),
+            Dual2::<6>::var(v2, 3),
+        );
+        let abs = IgAbsorption {
+            mat: Dual2::<6>::var(mat, 4),
+            lambda: Dual2::<6>::var(lambda, 5),
+        };
+        convolve_2cpt(
+            &abs,
+            Dual2::<6>::from_f64(t),
+            a,
+            b,
+            k21,
+            Dual2::<6>::from_f64(amt) / Dual2::<6>::var(v1, 1),
+        )
+    }
+
+    /// The 2-cpt closed form must equal the defining convolution
+    /// `(F·Dose/V1) ∫₀ᵗ f_IG(u)(cα e^{−α(t−u)} + cβ e^{−β(t−u)}) du` — fine
+    /// quadrature. Params are chosen absorption-rate-limited (`α < abscissa`).
+    #[test]
+    fn convolve_2cpt_ig_matches_numerical_convolution() {
+        let amt = 100.0;
+        for &(cl, v1, q, v2, mat, lambda) in &[
+            (5.0, 20.0, 10.0, 40.0, 1.0, 3.333),
+            (3.0, 30.0, 6.0, 60.0, 1.5, 6.0),
+            (8.0, 50.0, 20.0, 30.0, 1.0, 5.0),
+        ] {
+            let (alpha, beta, k21) = macro_rates_g::<f64>(cl, v1, q, v2);
+            assert!(
+                alpha < ig_abscissa(mat, lambda),
+                "α must be inside the abscissa"
+            );
+            let diff = alpha - beta;
+            let c_alpha = (alpha - k21) / diff;
+            let c_beta = (k21 - beta) / diff;
+            for &t in &[0.5, 1.0, 2.0, 4.0, 8.0] {
+                let steps = 400_000usize;
+                let h = t / steps as f64;
+                let mut acc = 0.0;
+                for i in 0..=steps {
+                    let u = i as f64 * h;
+                    let kernel =
+                        c_alpha * (-alpha * (t - u)).exp() + c_beta * (-beta * (t - u)).exp();
+                    let w = if i == 0 || i == steps { 0.5 } else { 1.0 };
+                    acc += w * ig_density(mat, lambda, u) * kernel;
+                }
+                let numeric = (amt / v1) * acc * h;
+                assert_relative_eq!(
+                    ig_tc(cl, v1, q, v2, mat, lambda, t, amt),
+                    numeric,
+                    max_relative = 2e-4,
+                    epsilon = 1e-8
+                );
+            }
+        }
+    }
+
+    /// Exact `Dual2` `∂C/∂{cl,v1,q,v2,mat,lambda}` vs central FD of the value, plus
+    /// the six diagonal 2nd derivatives vs central FD of the exact dual grad.
+    #[test]
+    fn convolve_2cpt_ig_dual_gradients_match_fd() {
+        let amt = 100.0;
+        let p = [5.0, 20.0, 10.0, 40.0, 1.0, 3.333]; // cl,v1,q,v2,mat,lambda
+        for &t in &[1.0, 3.0, 6.0] {
+            let d = ig_tc_dual(p[0], p[1], p[2], p[3], p[4], p[5], t, amt);
+            let h = 1e-6;
+            for dim in 0..6 {
+                let mut pp = p;
+                let mut pm = p;
+                pp[dim] += h;
+                pm[dim] -= h;
+                let fd = (ig_tc(pp[0], pp[1], pp[2], pp[3], pp[4], pp[5], t, amt)
+                    - ig_tc(pm[0], pm[1], pm[2], pm[3], pm[4], pm[5], t, amt))
+                    / (2.0 * h);
+                assert_relative_eq!(d.grad[dim], fd, max_relative = 1e-4, epsilon = 1e-7);
+                let h2 = 1e-4;
+                let mut qp = p;
+                let mut qm = p;
+                qp[dim] += h2;
+                qm[dim] -= h2;
+                let gp = ig_tc_dual(qp[0], qp[1], qp[2], qp[3], qp[4], qp[5], t, amt).grad[dim];
+                let gm = ig_tc_dual(qm[0], qm[1], qm[2], qm[3], qm[4], qm[5], t, amt).grad[dim];
+                assert_relative_eq!(
+                    d.hess[dim][dim],
+                    (gp - gm) / (2.0 * h2),
+                    max_relative = 3e-4,
+                    epsilon = 1e-6
+                );
+            }
+        }
+    }
+
+    /// The peripheral concentration `C2 = A2/V2` must equal its defining convolution
+    /// `(F·Dose/V2)(k12/(α−β)) ∫₀ᵗ f_IG(u)(e^{−β(t−u)} − e^{−α(t−u)}) du`.
+    #[test]
+    fn convolve_2cpt_ig_peripheral_matches_numerical() {
+        let amt = 100.0;
+        for &(cl, v1, q, v2, mat, lambda) in &[
+            (5.0, 20.0, 10.0, 40.0, 1.0, 3.333),
+            (3.0, 30.0, 6.0, 60.0, 1.5, 6.0),
+        ] {
+            let (alpha, beta, _k21) = macro_rates_g::<f64>(cl, v1, q, v2);
+            let k12 = q / v1;
+            let abs = IgAbsorption { mat, lambda };
+            for &t in &[0.5, 1.0, 2.0, 4.0, 8.0] {
+                let steps = 400_000usize;
+                let h = t / steps as f64;
+                let mut acc = 0.0;
+                for i in 0..=steps {
+                    let u = i as f64 * h;
+                    let kernel = (-beta * (t - u)).exp() - (-alpha * (t - u)).exp();
+                    let w = if i == 0 || i == steps { 0.5 } else { 1.0 };
+                    acc += w * ig_density(mat, lambda, u) * kernel;
+                }
+                let numeric = (amt / v2) * (k12 / (alpha - beta)) * acc * h;
+                let got = convolve_2cpt_peripheral(&abs, t, alpha, beta, k12, amt / v2);
+                assert_relative_eq!(got, numeric, max_relative = 2e-4, epsilon = 1e-8);
             }
         }
     }

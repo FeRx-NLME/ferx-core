@@ -20,6 +20,27 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic inverse-Gaussian (IG) absorption closed form** (#790): the Freijer &
+  Post inverse-Gaussian absorption model is now available as the analytic
+  structural models `pk one_cpt_ig(cl, v, mat, cv2)` and
+  `pk two_cpt_ig(cl, v1, q, v2, mat, cv2)` — the exponential-tilting closed form of
+  the same `igd(mat, cv2)` density the ODE path uses, giving exact `Dual2`
+  FOCE/FOCEI gradients that are independent of ODE-solver tolerance, and a uniform
+  `pk`-line interface consistent with the analytic transit models. Supports
+  absorption `lagtime`, bioavailability `f`, IIV, and time-varying covariates
+  (auto-rerouted to the ODE `igd()` twin per subject); IOV / steady-state /
+  infusion / non-depot doses are rejected with a clear error, as for the transit
+  closed form. Outside the tilting convergence domain (`ke ≥ 1/(2·MAT·CV²)`) a plain
+  model transparently falls back to its ODE twin. **Note on performance:** unlike
+  the analytic *transit* models (whose stiff-ish ODE makes the closed form ~28–31×
+  faster), IG's `igd()` ODE is non-stiff and cheap, so the closed form is not a
+  speed win — it is ~2× slower per objective evaluation than the `igd()` forcing;
+  use the ODE `igd()` forcing if raw speed matters, and this closed form when you
+  want exact tolerance-free gradients or the uniform interface. Validated against
+  the numerical `igd()` ODE (`tests/ig_analytic_equivalence.rs`, 1-/2-cpt) and
+  directly against NONMEM `$DES` on an in-domain IG-truth dataset
+  (`tests/ig_analytic_nonmem_anchor.rs`: ferx −1303.528 vs NONMEM −1303.639). See
+  [examples/one_cpt_ig.ferx](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_ig.ferx).
 - **High parameter-correlation warning** (#781): a fit now emits a
   `high_correlation` warning when a THETA (fixed-effect) pair's estimate
   correlation (from the covariance matrix) has |r| ≥ 0.95 — a sign of

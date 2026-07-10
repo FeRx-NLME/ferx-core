@@ -187,7 +187,7 @@ fn transit_time_desugar_matches_hand_written_ode() {
     // The shorthand stays a closed-form transit model but carries the ODE equivalent that
     // predict()/the gradient route TIME/TV-cov subjects to.
     assert!(
-        sh.ode_spec.is_none() && sh.transit_ode_equivalent.is_some(),
+        sh.ode_spec.is_none() && sh.absorption_ode_equivalent.is_some(),
         "transit + TIME shorthand carries an ODE equivalent (primary stays closed-form)"
     );
 
@@ -301,7 +301,7 @@ fn transit_flip_flop_routes_to_ode_twin() {
     let hd = parse_full_model(&hand_ode).expect("hand ODE parses").model;
     // Primary stays closed-form; it carries the ODE twin the flip-flop reroute uses.
     assert!(
-        sh.ode_spec.is_none() && sh.transit_ode_equivalent.is_some(),
+        sh.ode_spec.is_none() && sh.absorption_ode_equivalent.is_some(),
         "flip-flop transit shorthand keeps a closed-form primary + an ODE twin"
     );
 
@@ -556,7 +556,7 @@ fn transit_tv_covariate_now_served_by_ode_equivalent() {
     let (an_src, _) = build_pair(false, false);
     let model = parse_full_model(&an_src).expect("parses").model;
     assert!(
-        model.transit_ode_equivalent.is_some(),
+        model.absorption_ode_equivalent.is_some(),
         "plain transit carries an ODE equivalent"
     );
     let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
@@ -973,7 +973,7 @@ fn two_cpt_transit_time_desugar_matches_hand_written_ode() {
         .expect("hand 2-cpt ODE parses")
         .model;
     assert!(
-        sh.ode_spec.is_none() && sh.transit_ode_equivalent.is_some(),
+        sh.ode_spec.is_none() && sh.absorption_ode_equivalent.is_some(),
         "2-cpt transit + TIME shorthand must carry an ODE equivalent (primary stays closed-form)"
     );
     let pop = population(
@@ -1155,7 +1155,7 @@ fn two_cpt_transit_flip_flop_routes_to_ode_twin() {
         m.default_params.theta[i] = 50.0;
     }
     assert!(
-        an.ode_spec.is_none() && an.transit_ode_equivalent.is_some(),
+        an.ode_spec.is_none() && an.absorption_ode_equivalent.is_some(),
         "2-cpt flip-flop shorthand keeps a closed-form primary + an ODE twin"
     );
 
@@ -1205,7 +1205,7 @@ fn transit_flip_flop_without_twin_is_rejected() {
     let src = TWIN_LESS_FLIP_FLOP_SRC;
     let model = parse_full_model(src).expect("lagtime transit parses").model;
     assert!(
-        model.transit_ode_equivalent.is_none(),
+        model.absorption_ode_equivalent.is_none(),
         "a lagtime= transit model has no ODE twin (the desugar declines it)"
     );
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
@@ -1354,7 +1354,7 @@ fn two_cpt_transit_tv_covariate_now_served_by_ode_equivalent() {
     let (an_src, _) = build_pair_2cpt(false, false);
     let model = parse_full_model(&an_src).expect("parses").model;
     assert!(
-        model.transit_ode_equivalent.is_some(),
+        model.absorption_ode_equivalent.is_some(),
         "plain 2-cpt transit carries an ODE equivalent"
     );
     let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);

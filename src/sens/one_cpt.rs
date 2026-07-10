@@ -7,7 +7,7 @@
 
 use super::dual2::Dual2;
 use super::num::PkNum;
-use crate::pk::analytical_absorption::{convolve_1cpt, TransitAbsorption};
+use crate::pk::analytical_absorption::{convolve_1cpt, IgAbsorption, TransitAbsorption};
 use crate::types::DoseEvent;
 
 // ── Generic closed-form single-dose solutions ────────────────────────────────
@@ -85,6 +85,43 @@ pub fn one_cpt_transit_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, n: T, mtt: T, 
         return T::from_f64(0.0);
     }
     let abs = TransitAbsorption { n, mtt };
+    convolve_1cpt(&abs, t, ke, (f_bio * amt) / v)
+}
+
+/// 1-cpt with Freijer & Post inverse-Gaussian absorption (`igd(mat, cv2)`) — the
+/// analytic closed form of #790. Like [`one_cpt_transit_g`] it routes through
+/// [`convolve_1cpt`], here over an [`IgAbsorption`] density (`μ = mat`,
+/// `λ = mat/cv2`), so `T = f64` gives the concentration and `T = Dual2<N>` gives
+/// exact `∂C/∂{cl,v,mat,cv2,f}` (+ 2nd order).
+pub fn one_cpt_ig_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, mat: T, cv2: T, f_bio: T) -> T {
+    one_cpt_ig_amt_g(T::from_f64(amt), t, cl, v, mat, cv2, f_bio)
+}
+
+/// As [`one_cpt_ig_g`] but with a generic amount `amt` (issue #524 init path).
+///
+/// Domain: the exponential-tilting closed form converges only for `ke = CL/V` below
+/// the IG MGF abscissa `1/(2·MAT·CV²)` (the absorption-rate-limited regime). Outside
+/// it — invalid params, or the flip-flop `ke ≥ 1/(2·MAT·CV²)` — this returns `0.0`,
+/// matching the sibling closed forms' invalid-parameter convention (penalising the
+/// optimiser back into the valid region rather than letting `convolve_1cpt` produce a
+/// wrong value; `mgf`'s own `debug_assert` then never fires on this guarded path).
+/// The `!(ke < abscissa)` form is NaN-safe (a transient `NaN` `ke`/`abscissa` also
+/// clamps to `0.0`), matching [`one_cpt_transit_amt_g`].
+pub fn one_cpt_ig_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, mat: T, cv2: T, f_bio: T) -> T {
+    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || mat.val() <= 0.0 || cv2.val() <= 0.0 {
+        return T::from_f64(0.0);
+    }
+    let ke = cl / v;
+    // MGF abscissa of convergence: ke < 1/(2·MAT·CV²). `!(ke < abscissa)` clamps a
+    // transient NaN too (see `one_cpt_transit_amt_g`).
+    let abscissa = T::from_f64(1.0) / (T::from_f64(2.0) * mat * cv2);
+    if !(ke.val() < abscissa.val()) {
+        return T::from_f64(0.0);
+    }
+    let abs = IgAbsorption {
+        mat,
+        lambda: mat / cv2,
+    };
     convolve_1cpt(&abs, t, ke, (f_bio * amt) / v)
 }
 
@@ -253,6 +290,22 @@ pub fn one_cpt_transit_conc_g<T: PkNum>(
     f_bio: T,
 ) -> T {
     one_cpt_transit_amt_g(T::from_f64(dose.amt), t, cl, v, n, mtt, f_bio)
+}
+
+/// Inverse-Gaussian counterpart to [`one_cpt_conc_g`] for the analytic `one_cpt_ig`
+/// model (#790), used by the sensitivity provider — a thin `DoseEvent` wrapper over
+/// [`one_cpt_ig_amt_g`] with `F` baked into the kernel. Generic over [`PkNum`] so
+/// prediction (`T = f64`) and the `Dual2` sensitivity share one definition.
+pub fn one_cpt_ig_conc_g<T: PkNum>(
+    dose: &DoseEvent,
+    t: T,
+    cl: T,
+    v: T,
+    mat: T,
+    cv2: T,
+    f_bio: T,
+) -> T {
+    one_cpt_ig_amt_g(T::from_f64(dose.amt), t, cl, v, mat, cv2, f_bio)
 }
 
 // ── Sensitivity extraction (seed the active PK params as Dual2 variables) ─────
