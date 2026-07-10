@@ -20,6 +20,22 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`simulate_with_options_diag` surfaces per-subject simulation diagnostics** (#762,
+  #763): a new entry point returning `SimulationOutput { results, warnings }` — the
+  simulation analogue of `FitResult.warnings`. It reports subjects handled specially
+  during a run (a degenerate hazard draw, an over-large recurrent stream) instead of
+  letting them look like ordinary censoring. `simulate_with_options` is unchanged (a
+  thin wrapper returning just the rows), and `ferx <model> --simulate` now echoes these
+  warnings alongside the fit warnings — including in the structured `warnings_structured`
+  / JSON output, under a new typed `simulation` [`WarningCode`](https://ferx-nlme.github.io/ferx-core/warnings.html).
+- **Boundary-estimate warning** (#781): a fit now emits a `boundary_estimate`
+  warning when a free THETA estimate is pinned to an optimizer bound (evaluated
+  in the optimizer's packed/log space) — a sign of non-identifiability or a
+  too-tight bound. The structured warning carries `details` listing each
+  `{parameter, estimate, bound, side}`, and is emitted **typed at its source**
+  (the first warning to use the native at-source path rather than string
+  classification). See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
 - **Finer covariance-step warning codes** (#781): the overloaded
   `covariance_step` warning code is split by severity into `covariance_failed`
   (Critical — no standard errors), `covariance_regularized` (Warning — SEs
@@ -245,6 +261,26 @@ section of the SDLC for the versioning policy).
   leniently-read `0.0` covariate, silently dropping the IOV term. It now fails
   loud, naming the offending random effect — write the hazard in terms of θ/η, or
   reference an IOV-free parameter.
+- **A degenerate hazard draw in simulation no longer vanishes silently, and a pathological
+  RTTE hazard no longer aborts the whole run** (#762, #763). When an analytic hazard's
+  effective rate degenerates (non-positive / non-finite), the affected subject is censored
+  with no event — previously indistinguishable from ordinary administrative censoring; the
+  `simulate_with_options_diag` path now names it in a `W_TTE_DEGENERATE_HAZARD` warning. An
+  RTTE hazard so extreme it would fire more than a million times over the window is now
+  skipped (censored) with a `W_RTTE_DEGENERATE` warning and the run continues for the rest
+  of the population, instead of panicking the entire `simulate()` call — and without first
+  materialising ~1e6 rows. The `simulate()` / `simulate_with_seed()` entry points apply the
+  same per-subject handling (no panic) but return only the rows.
+- **A time-varying covariate on a survival hazard is now a hard error instead of a
+  silently frozen baseline value** (#741). A `[event_model]` hazard that references a
+  covariate whose value changes within a subject was evaluated at the covariate's
+  baseline — the analytic hazard families take no time argument, and the joint PK-TTE
+  ODE hazard integrates with the PK parameters frozen at `t=0` — so the fit or
+  simulation silently used the wrong hazard across every TTE / RTTE / competing-risks /
+  joint-PK-TTE endpoint. `fit()` now rejects it (and `predict()` / `simulate()` panic),
+  naming the covariate and the subject. A time-varying covariate the hazard does *not*
+  reference — e.g. one used only by a shared PK model in a frailty-only joint fit — is
+  unaffected. Hold the covariate constant within each subject for now.
 - **An `[initial_conditions]` covariate that matches no data column now fails the
   fit loudly instead of silently dropping the baseline** (#765). A covariate named
   only inside an init expression (e.g. `init(central) = CONC0 * V`) was never

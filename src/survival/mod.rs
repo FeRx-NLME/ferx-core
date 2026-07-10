@@ -555,15 +555,18 @@ fn draw_tte_outcome<R: rand::Rng>(
     entry_time: f64,
     window: f64,
     rng: &mut R,
-) -> (f64, bool) {
+) -> (f64, bool, bool) {
     let t_event = draw_tte_latent(family, params, entry_time, rng);
-    // `t_event < f64::MAX` rejects the samplers' degenerate / improper sentinel;
-    // without it an unbounded window would mis-report that sentinel as an
-    // observed event at `f64::MAX`.
-    if t_event < window && t_event < f64::MAX {
-        (t_event, true)
+    // The samplers return the `f64::MAX` sentinel for a degenerate / improper draw
+    // (non-positive or non-finite effective rate, #763) — reported as the third
+    // element so the caller can surface a per-subject diagnostic. A degenerate draw is
+    // never an observed event; the `!degenerate` guard also stops an unbounded window
+    // (`+∞`) from mis-reporting the sentinel as an event at `f64::MAX`.
+    let degenerate = t_event >= f64::MAX;
+    if t_event < window && !degenerate {
+        (t_event, true, false)
     } else {
-        (window, false)
+        (window, false, degenerate)
     }
 }
 
@@ -760,6 +763,7 @@ fn rtte_cause(
         let Some(EndpointLikelihood::Tte {
             hazard,
             recurrence: TteRecurrence::Repeated { clock },
+            ..
         }) = model.endpoints.get(cmt)
         else {
             continue;
@@ -818,8 +822,9 @@ fn rtte_cause(
 /// samplers return `t > t_prev` or the degenerate `f64::MAX` sentinel, which is
 /// `≥ horizon` and stops the loop), and the horizon is finite, so the loop
 /// terminates. A pathological parameterization (vanishing inter-event gaps) is
-/// caught by a hard event cap that **panics** rather than hanging or silently
-/// truncating the stream (which would fabricate a censored subject).
+/// handled **per subject** (#762): the stream is skipped or truncated, the subject is
+/// censored at the horizon, and a diagnostic is pushed to `warnings` — the run is never
+/// aborted for one unlucky subject, and no ~`MAX_EVENTS` rows are materialised first.
 #[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
 fn simulate_rtte_stream<R: rand::Rng>(
@@ -833,6 +838,7 @@ fn simulate_rtte_stream<R: rand::Rng>(
     sim: usize,
     rng: &mut R,
     results: &mut Vec<crate::api::SimulationResult>,
+    warnings: &mut Vec<String>,
 ) {
     let push = |time: f64, observed: bool, results: &mut Vec<crate::api::SimulationResult>| {
         results.push(crate::api::SimulationResult {
@@ -846,9 +852,39 @@ fn simulate_rtte_stream<R: rand::Rng>(
         });
     };
 
-    // Backstop against a degenerate hazard whose inter-event gaps vanish: fail
-    // loud instead of hanging or silently capping the stream.
+    // Backstop against a degenerate hazard whose inter-event gaps vanish.
     const MAX_EVENTS: usize = 1_000_000;
+
+    // Pre-flight degeneracy guard (#762): estimate the expected number of events over the
+    // window and skip the stream up front — recording just the administrative censor plus a
+    // warning — rather than materialise ~1e6 rows only to abort, letting the rest of the
+    // population simulate. The estimate is clock-specific (#772 review):
+    //   * Forward clock — Poisson process with cumulative hazard, so `E[N] = H(horizon)`
+    //     exactly (`cum_hazard`).
+    //   * Reset clock — a renewal process with i.i.d. gaps, so `E[N] ≈ horizon / E[gap]`.
+    //     The forward-clock `H(horizon)` massively OVER-counts here for an increasing-hazard
+    //     family (e.g. an IFR Weibull, where `H(horizon)` can be ~1e6 while the true renewal
+    //     count is a few dozen), which would wrongly skip a perfectly legitimate subject. Use
+    //     the median gap — the family's inverse-survival at `u = 0.5`, the same inverse the
+    //     loop draws — as a cheap, family-agnostic proxy for the mean gap: a vanishing median
+    //     gap → `+∞` estimate → skip; a rate-0 (infinite) gap → `~0` estimate → not skipped
+    //     (correctly: no events, not a flood). It is a pure computation on the fixed `0.5`, so
+    //     it draws no RNG and leaves the sequence (and the SSE tests) untouched.
+    let expected = match clock {
+        RtteClock::Forward => cum_hazard(family, horizon, params),
+        RtteClock::Reset => horizon / sample_event_time(family, params, 0.5),
+    };
+    if !expected.is_finite() || expected > MAX_EVENTS as f64 {
+        warnings.push(format!(
+            "W_RTTE_DEGENERATE: subject '{id}' (CMT={cmt}) has a degenerate recurrent hazard \
+             (~{expected:.3e} events expected before horizon {horizon}); its event stream was \
+             skipped and the subject censored at the horizon (#762). Check the hazard \
+             parameters / covariate values."
+        ));
+        push(horizon, false, results);
+        return;
+    }
+
     let mut t_prev = 0.0_f64;
     let mut n_events = 0usize;
     loop {
@@ -875,15 +911,22 @@ fn simulate_rtte_stream<R: rand::Rng>(
         // all fail this test (`NaN < horizon` is false), ending the stream: the subject
         // is administratively right-censored at the horizon.
         if t_next < horizon {
+            // In-loop backstop for a realisation that overshoots the pre-flight estimate
+            // (an unlucky draw sequence): truncate this subject's stream, warn, and let the
+            // run continue — never panic the whole `simulate()` call for one subject (#762).
+            // Checked *before* the push, so hitting the cap does not first pile up ~1e6 rows
+            // (and the branch is reachable in a test without generating them).
+            if n_events >= MAX_EVENTS {
+                warnings.push(format!(
+                    "W_RTTE_DEGENERATE: subject '{id}' (CMT={cmt}) produced over {MAX_EVENTS} \
+                     events before horizon {horizon} (vanishing inter-event gaps); its stream was \
+                     truncated and the subject censored at the horizon (#762)."
+                ));
+                break;
+            }
             push(t_next, true, results);
             t_prev = t_next;
             n_events += 1;
-            assert!(
-                n_events < MAX_EVENTS,
-                "RTTE simulation for subject '{id}' (CMT={cmt}) produced over {MAX_EVENTS} \
-                 events before horizon {horizon} — the hazard parameters are degenerate \
-                 (vanishing inter-event gaps)"
-            );
         } else {
             break;
         }
@@ -934,6 +977,7 @@ pub fn simulate_tte<R: rand::Rng>(
     horizon: Option<f64>,
     rng: &mut R,
     results: &mut Vec<crate::api::SimulationResult>,
+    warnings: &mut Vec<String>,
 ) {
     // Repeated events (RTTE, Slice 3.3) are a *recurrent* process, not competing
     // single events: a subject's rows at the RTTE CMT are one stream to be
@@ -957,6 +1001,7 @@ pub fn simulate_tte<R: rand::Rng>(
             sim,
             rng,
             results,
+            warnings,
         );
         return;
     }
@@ -1030,7 +1075,14 @@ pub fn simulate_tte<R: rand::Rng>(
                     family,
                     params,
                     entry_time,
-                } => draw_tte_outcome(*family, params, *entry_time, *window, rng),
+                } => {
+                    let (t, observed, degenerate) =
+                        draw_tte_outcome(*family, params, *entry_time, *window, rng);
+                    if degenerate {
+                        warnings.push(degenerate_hazard_warning(&subject.id, *cmt));
+                    }
+                    (t, observed)
+                }
                 CauseKind::Ode { chz_state } => {
                     let latent = draw_ode_tte_latent(
                         model, subject, theta, eta, *chz_state, horizon, *cmt, rng,
@@ -1072,11 +1124,34 @@ pub fn simulate_tte<R: rand::Rng>(
                 .map(|(_, w, _)| *w)
                 .fold(f64::NEG_INFINITY, f64::max);
             let (win_idx, obs_time, event) = resolve_competing_risks(&latents, window);
+            // A censored competing-risks outcome is spurious when it is driven by a
+            // degenerate *analytic* draw (the `f64::MAX` sentinel) rather than a genuine
+            // late event — an ODE cause's `f64::MAX` is a legitimate horizon censor, so
+            // only analytic causes are flagged (#763).
+            if !event {
+                for (i, (cmt, _, kind)) in causes.iter().enumerate() {
+                    if matches!(kind, CauseKind::Analytic { .. }) && latents[i] >= f64::MAX {
+                        warnings.push(degenerate_hazard_warning(&subject.id, *cmt));
+                    }
+                }
+            }
             for (i, (cmt, ..)) in causes.iter().enumerate() {
                 push(*cmt, obs_time, event && i == win_idx, results);
             }
         }
     }
+}
+
+/// Shared diagnostic for a subject whose analytic hazard draw degenerated (a
+/// non-positive / non-finite effective rate, yielding the `f64::MAX` sentinel and so
+/// no event) — collected into [`crate::api::SimulationOutput::warnings`] (#763).
+#[cfg(feature = "survival")]
+fn degenerate_hazard_warning(id: &str, cmt: usize) -> String {
+    format!(
+        "W_TTE_DEGENERATE_HAZARD: subject '{id}' (CMT={cmt}) drew a non-positive / non-finite \
+         effective hazard rate; no event was generated and the subject is censored at the \
+         observation window (#763). Check the hazard parameters / covariate values."
+    )
 }
 
 /// Cause-specific cumulative incidence functions (CIF) from per-cause cumulative
@@ -1213,6 +1288,7 @@ mod tests {
                 param_fn,
             },
             recurrence: TteRecurrence::Single,
+            hazard_covariates: Vec::new(),
         };
         let (family, params) =
             tte_cause_params(&tte, &theta, &eta, &cov).expect("Tte endpoint must yield Some");
@@ -1232,6 +1308,7 @@ mod tests {
         let ode = EndpointLikelihood::Tte {
             hazard: HazardSpec::OdeAccumulated { chz_state: 2 },
             recurrence: TteRecurrence::Single,
+            hazard_covariates: Vec::new(),
         };
         assert!(tte_cause_params(&ode, &theta, &eta, &cov).is_none());
     }
@@ -2000,7 +2077,7 @@ mod tests {
         let n = 20_000;
         let mut censored = 0usize;
         for _ in 0..n {
-            let (t, observed) =
+            let (t, observed, _) =
                 draw_tte_outcome(HazardFamily::Exponential, &[lambda], 0.0, window, &mut rng);
             if observed {
                 assert!(
@@ -2025,7 +2102,7 @@ mod tests {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         for _ in 0..1000 {
-            let (t, observed) = draw_tte_outcome(
+            let (t, observed, _) = draw_tte_outcome(
                 HazardFamily::Exponential,
                 &[1.0],
                 0.0,
@@ -2048,7 +2125,7 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(99);
         let window = 12.5_f64;
         for _ in 0..100 {
-            let (t, observed) =
+            let (t, observed, _) =
                 draw_tte_outcome(HazardFamily::Exponential, &[0.0], 0.0, window, &mut rng);
             assert!(!observed, "zero hazard can never produce an event");
             assert_eq!(t, window);
@@ -2064,7 +2141,7 @@ mod tests {
         let (entry, window) = (5.0_f64, 8.0_f64);
         let (mut saw_event, mut saw_censor) = (false, false);
         for _ in 0..5000 {
-            let (t, observed) =
+            let (t, observed, _) =
                 draw_tte_outcome(HazardFamily::Exponential, &[0.2], entry, window, &mut rng);
             if observed {
                 assert!(
@@ -2093,7 +2170,7 @@ mod tests {
         // guard must classify it as censored (no event) instead.
         let mut rng = rand::rngs::StdRng::seed_from_u64(123);
         for _ in 0..100 {
-            let (t, observed) = draw_tte_outcome(
+            let (t, observed, _) = draw_tte_outcome(
                 HazardFamily::Exponential,
                 &[0.0],
                 0.0,
@@ -2123,6 +2200,7 @@ mod tests {
         rng: &mut R,
     ) -> Vec<f64> {
         let mut results = Vec::new();
+        let mut warnings = Vec::new();
         simulate_rtte_stream(
             family,
             params,
@@ -2134,6 +2212,7 @@ mod tests {
             1,
             rng,
             &mut results,
+            &mut warnings,
         );
         assert!(!results.is_empty(), "a stream always emits the censor row");
         let last = results.last().unwrap();
@@ -2167,6 +2246,151 @@ mod tests {
             "cmt / id / NaN-ipred echoed on every row"
         );
         events
+    }
+
+    #[test]
+    fn rtte_stream_degenerate_high_rate_warns_and_skips() {
+        use rand::SeedableRng;
+        // A hazard so extreme it would fire far more than MAX_EVENTS times over the
+        // window is degenerate: the pre-flight guard (#762) skips the stream — it does
+        // NOT materialise ~1e6 rows, does NOT panic — records only the administrative
+        // censor, and names the subject in a warning so the run can continue.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let horizon = 30.0_f64;
+        for clock in [RtteClock::Forward, RtteClock::Reset] {
+            let mut results = Vec::new();
+            let mut warnings = Vec::new();
+            simulate_rtte_stream(
+                HazardFamily::Exponential,
+                &[1.0e7], // λ·horizon = 3e8 ≫ MAX_EVENTS
+                clock,
+                horizon,
+                2,
+                "S1",
+                0,
+                1,
+                &mut rng,
+                &mut results,
+                &mut warnings,
+            );
+            assert_eq!(
+                results.len(),
+                1,
+                "{clock:?}: degenerate stream is skipped → only the censor row"
+            );
+            match results[0].outcome {
+                SimOutcome::Event { time, observed } => {
+                    assert!(
+                        !observed && time == horizon,
+                        "{clock:?}: censored at horizon"
+                    );
+                }
+                _ => panic!("expected an Event outcome"),
+            }
+            assert_eq!(
+                warnings.len(),
+                1,
+                "{clock:?}: exactly one degenerate-stream warning"
+            );
+            assert!(
+                warnings[0].contains("W_RTTE_DEGENERATE")
+                    && warnings[0].contains("S1")
+                    && warnings[0].contains("#762"),
+                "{clock:?}: warning must name the subject and issue: {}",
+                warnings[0]
+            );
+        }
+    }
+
+    #[test]
+    fn rtte_reset_ifr_weibull_not_skipped_despite_large_forward_cum_hazard() {
+        use rand::SeedableRng;
+        // #772 review (Finding 2): under the RESET clock an increasing-hazard (IFR) Weibull is
+        // a renewal of iid gaps, so its expected count is `horizon / mean_gap` — a few dozen,
+        // NOT degenerate. But the forward-clock cumulative hazard
+        // `H(100) = (100/5.49)^5 ≈ 2e6 ≫ MAX_EVENTS`, so using `H(horizon)` as the reset
+        // pre-flight threshold (the pre-fix bug) would wrongly skip this legitimate subject.
+        // The pre-flight is now clock-specific (reset uses the median gap), so the stream runs.
+        let params = [5.49_f64, 5.0]; // Weibull [scale, shape], strongly increasing hazard.
+        let horizon = 100.0_f64;
+
+        // Reset: a real multi-event renewal stream, and NO degenerate warning.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(20);
+        let mut results = Vec::new();
+        let mut warnings = Vec::new();
+        simulate_rtte_stream(
+            HazardFamily::Weibull,
+            &params,
+            RtteClock::Reset,
+            horizon,
+            2,
+            "S1",
+            0,
+            1,
+            &mut rng,
+            &mut results,
+            &mut warnings,
+        );
+        let observed = results
+            .iter()
+            .filter(|r| matches!(r.outcome, SimOutcome::Event { observed: true, .. }))
+            .count();
+        assert!(
+            observed >= 5,
+            "reset IFR Weibull renews ~horizon/mean_gap ≈ 20 events — not skipped (got {observed})"
+        );
+        assert!(
+            warnings.is_empty(),
+            "reset IFR Weibull is a legitimate subject, no degenerate warning: {warnings:?}"
+        );
+
+        // Contrast: the SAME params under the FORWARD clock are genuinely pathological
+        // (`E[N] = H(horizon) ≈ 2e6`), so that stream IS still skipped with a warning — the
+        // guard is clock-specific, not disabled.
+        let mut rng2 = rand::rngs::StdRng::seed_from_u64(20);
+        let mut fwd_results = Vec::new();
+        let mut fwd_warnings = Vec::new();
+        simulate_rtte_stream(
+            HazardFamily::Weibull,
+            &params,
+            RtteClock::Forward,
+            horizon,
+            2,
+            "S1",
+            0,
+            1,
+            &mut rng2,
+            &mut fwd_results,
+            &mut fwd_warnings,
+        );
+        assert_eq!(
+            fwd_results.len(),
+            1,
+            "forward H(horizon)≈2e6 is degenerate → skipped to the single censor row"
+        );
+        assert!(
+            fwd_warnings.len() == 1 && fwd_warnings[0].contains("W_RTTE_DEGENERATE"),
+            "forward clock still warns degenerate for the same params: {fwd_warnings:?}"
+        );
+    }
+
+    #[test]
+    fn draw_tte_outcome_flags_degenerate_rate() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(4);
+        // λ = 0 ⇒ the sampler returns the f64::MAX sentinel ⇒ censored *and* flagged
+        // degenerate (the third return element, #763).
+        let (t, observed, degenerate) =
+            draw_tte_outcome(HazardFamily::Exponential, &[0.0], 0.0, 10.0, &mut rng);
+        assert!(!observed && degenerate, "a λ=0 draw is a degenerate censor");
+        assert_eq!(t, 10.0, "censored at the window");
+        // A positive-rate draw is never flagged degenerate — whether it fires an event
+        // or is a genuine late censor.
+        for _ in 0..200 {
+            let (_, _observed, degenerate) =
+                draw_tte_outcome(HazardFamily::Exponential, &[0.1], 0.0, 10.0, &mut rng);
+            assert!(!degenerate, "a positive-rate draw is never degenerate");
+        }
     }
 
     #[test]
@@ -2362,6 +2586,7 @@ mod tests {
         let horizon = 15.0_f64;
         for clock in [RtteClock::Forward, RtteClock::Reset] {
             let mut results = Vec::new();
+            let mut warnings = Vec::new();
             simulate_rtte_stream(
                 HazardFamily::Exponential,
                 &[0.0],
@@ -2373,6 +2598,7 @@ mod tests {
                 1,
                 &mut rng,
                 &mut results,
+                &mut warnings,
             );
             assert_eq!(results.len(), 1, "{clock:?}: only the censor row");
             match results[0].outcome {

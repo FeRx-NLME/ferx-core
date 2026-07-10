@@ -178,6 +178,17 @@ When `loghr` is omitted it defaults to 0 (no effect).
   loghr  = BETA_WT * WT
 ```
 
+> **Covariates on a hazard must be constant within each subject.** Time-varying
+> covariates on a hazard are not yet supported. A covariate referenced by a hazard
+> — in `scale` / `shape` / `alpha` / `gamma` / `loghr`, or in a drug-driven
+> `hazard =` expression — would otherwise be read at its baseline value (the analytic
+> hazard families take no time argument, and the joint PK-TTE ODE hazard integrates
+> with the PK parameters frozen at `t = 0`), silently fitting the wrong hazard.
+> `fit()` therefore rejects such a model up front (and `predict()` / `simulate()`
+> error), naming the covariate and the subject (#741). A time-varying covariate used
+> only elsewhere — e.g. on the PK parameters of a joint model whose hazard does not
+> reference it — is unaffected.
+
 ## Estimation
 
 The FOCEI Laplace objective includes a TTE-specific FD Hessian contribution:
@@ -447,6 +458,26 @@ round-trips straight back through the data reader. A finite horizon is required 
 stream has no implicit end); left truncation, multiple RTTE causes, an RTTE cause mixed
 with a competing single-event cause, and EVID=3/4 resets are rejected with a clear error
 rather than silently mis-sampled.
+
+Unlike fitting, `simulate()` **regenerates** each subject's stream from `t = 0` out of the
+model and drawn frailty — it never reads the input event rows. The fit-boundary
+input-shape checks (out-of-order, interval-censored, or non-finite event times; see
+[Repeated events](../model-file/event-model.qmd#rtte)) therefore do **not** apply to
+simulation: such rows are simply not consulted, not rejected.
+
+::: {.callout-note}
+## Per-subject simulation diagnostics
+
+A degenerate draw is handled *per subject*, not by aborting the run: a non-positive /
+non-finite analytic hazard rate produces no event (the subject is censored), and an RTTE
+hazard so extreme it would fire more than a million times over the window has its stream
+skipped (also censored). Rather than let these look like ordinary censoring, the
+`simulate_with_options_diag` API returns a `SimulationOutput { results, warnings }` naming
+the affected subjects (`W_TTE_DEGENERATE_HAZARD` / `W_RTTE_DEGENERATE`); `ferx … --simulate`
+echoes them alongside the fit warnings. The plain `simulate()` / `simulate_with_seed()` /
+`simulate_with_options()` entry points apply the same per-subject handling but return only
+the rows.
+:::
 
 ```
 [simulation]
