@@ -112,7 +112,7 @@ pub enum MarkovError {
 
     /// Observation times decreased (`Δt < 0`) between consecutive records.
     #[error("observation times must be non-decreasing; {prev} → {next} at index {index}")]
-    TimeNotDecreasing { index: usize, prev: f64, next: f64 },
+    TimeDecreased { index: usize, prev: f64, next: f64 },
 
     /// Two records share a timestamp (`Δt = 0`) but report different states —
     /// physically impossible and would make the likelihood `−inf`.
@@ -281,7 +281,7 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
         let dt = b.time - a.time;
 
         if dt < 0.0 {
-            return Err(MarkovError::TimeNotDecreasing {
+            return Err(MarkovError::TimeDecreased {
                 index: i + 1,
                 prev: a.time,
                 next: b.time,
@@ -835,7 +835,7 @@ mod tests {
         let err = ctmm_data_term(&q, &obs).unwrap_err();
         assert_eq!(
             err,
-            MarkovError::TimeNotDecreasing {
+            MarkovError::TimeDecreased {
                 index: 1,
                 prev: 2.0,
                 next: 1.0
