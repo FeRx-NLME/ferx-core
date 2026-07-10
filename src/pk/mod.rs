@@ -45,7 +45,7 @@ fn pk_params_at_time(
 /// Returns `false` for a non-transit model, and for invalid parameters — there
 /// the closed form's `0` is a deliberate optimiser penalty, not a flip-flop to
 /// reroute to the ODE twin.
-fn transit_flip_flop_at(
+pub(crate) fn transit_flip_flop_at(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],

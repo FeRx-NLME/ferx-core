@@ -1199,9 +1199,63 @@ fn two_cpt_transit_flip_flop_routes_to_ode_twin() {
 /// "rewrite as an explicit ODE model" wording, not the informational auto-routed
 /// one — covering the twin-less branch of the diagnostic.
 #[test]
-fn transit_flip_flop_without_twin_warns_actionable() {
-    // ke = CL/V = 0.5 ≥ KTR = 4/20 = 0.2 (flip-flop); the lagtime declines the desugar.
-    let src = "\
+fn transit_flip_flop_without_twin_is_rejected() {
+    // ke = CL/V = 0.5 ≥ KTR = 4/20 = 0.2 (flip-flop); the lagtime declines the desugar,
+    // so there is no ODE twin to reroute to — now a hard error (#776), not a warning.
+    let src = TWIN_LESS_FLIP_FLOP_SRC;
+    let model = parse_full_model(src).expect("lagtime transit parses").model;
+    assert!(
+        model.transit_ode_equivalent.is_none(),
+        "a lagtime= transit model has no ODE twin (the desugar declines it)"
+    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
+
+    // fit() rejects it with a clear, actionable error (not a silent zero-degenerate fit).
+    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("twin-less flip-flop must be rejected");
+    assert!(
+        e.contains("flip-flop") && e.contains("no ODE twin"),
+        "expected an actionable twin-less flip-flop error, got: {e}"
+    );
+
+    // It is an error now — no longer surfaced as the informational W_TRANSIT_FLIP_FLOP
+    // warning (that warning is reserved for the twin-carrying, auto-rerouted case).
+    let diags = ferx_core::api::check_model_data_warnings(&model, &pop, &model.default_params);
+    assert!(
+        !diags.iter().any(|d| d.code == "W_TRANSIT_FLIP_FLOP"),
+        "twin-less flip-flop is a hard error, not a warning"
+    );
+}
+
+/// The twin-less flip-flop reject also fires on the `predict()` path — via a panic,
+/// mirroring the other transit-support rejects (`assert_transit_support`) (#776).
+#[test]
+#[should_panic(expected = "flip-flop regime")]
+fn transit_flip_flop_without_twin_panics_in_predict() {
+    let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
+        .expect("lagtime transit parses")
+        .model;
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
+    let _ = predict(&model, &pop, &model.default_params);
+}
+
+/// The reject also fires on the `simulate()` path — a panic through the
+/// `simulate_inner_with_draw` chokepoint, mirroring the other transit-support
+/// rejects (#776).
+#[test]
+#[should_panic(expected = "flip-flop regime")]
+fn transit_flip_flop_without_twin_panics_in_simulate() {
+    let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
+        .expect("lagtime transit parses")
+        .model;
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
+    let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
+}
+
+/// A twin-less `one_cpt_transit` whose typical parameters put `ke = CL/V` at or above the
+/// transit rate `KTR = (n+1)/mtt` — the flip-flop regime the closed form cannot serve, with
+/// a `lagtime=` mapping that declines the ODE-twin desugar (#776).
+const TWIN_LESS_FLIP_FLOP_SRC: &str = "\
 [parameters]
   theta TVCL(2.0, 0.001, 50.0)
   theta TVV(4.0, 0.1, 500.0)
@@ -1224,23 +1278,6 @@ fn transit_flip_flop_without_twin_warns_actionable() {
 [error_model]
   DV ~ proportional(PROP)
 ";
-    let model = parse_full_model(src).expect("lagtime transit parses").model;
-    assert!(
-        model.transit_ode_equivalent.is_none(),
-        "a lagtime= transit model has no ODE twin (the desugar declines it)"
-    );
-    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
-    let diags = ferx_core::api::check_model_data_warnings(&model, &pop, &model.default_params);
-    let w = diags
-        .iter()
-        .find(|d| d.code == "W_TRANSIT_FLIP_FLOP")
-        .expect("twin-less flip-flop warns");
-    assert!(
-        w.message.contains("no ODE twin"),
-        "twin-less flip-flop must keep the actionable message, got: {}",
-        w.message
-    );
-}
 
 /// The reset guard also covers the 2-cpt model, naming it (#634 review finding 1).
 #[test]

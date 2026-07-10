@@ -259,10 +259,14 @@ section of the SDLC for the versioning policy).
   proportional-error objective. `predict()`, `simulate()`, `fit()` and the
   diagnostics now route such a model — per evaluation — to its exact ODE `transit()`
   twin, which is valid in that regime (matched to a NONMEM ADVAN13 transit
-  simulation to ~1e-4). A flip-flop model that carries a `lagtime`, bioavailability
-  `f`, or user `[odes]` block has no twin to route to; it keeps the closed form's
-  zero, and the `W_TRANSIT_FLIP_FLOP` warning stays actionable rather than becoming
-  the informational auto-routed note.
+  simulation to ~1e-4); a twin-carrying flip-flop model gets an informational
+  `W_TRANSIT_FLIP_FLOP` heads-up. A flip-flop model that carries a `lagtime`,
+  bioavailability `f`, or user `[odes]` block has **no** ODE twin to route to, so
+  rather than silently returning a zero profile that degenerates the objective it is
+  now **rejected with a hard error** (`fit()` returns `Err`, `predict()`/`simulate()`
+  panic, `ferx check` reports `E_TRANSIT_FLIP_FLOP`) — consistent with the other
+  unsupported-transit rejects. Rewrite such a model as an explicit ODE `transit()`
+  model, or adjust the MTT / CL starting estimates.
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point
