@@ -5,7 +5,7 @@ The `ferx` command-line tool runs population PK estimation from model files and 
 ## Usage
 
 ```bash
-ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data] [--inits-from-nca[=METHOD]]
+ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data] [--inits-from-nca[=METHOD]] [--output-format yaml|json|both]
 ferx <model.ferx> --simulate          [--output <run.fitrx>]
 ferx check <model.ferx> [--data <data.csv>] [--json]
 ferx summary <run.fitrx> [<run2.fitrx> ...]
@@ -156,6 +156,26 @@ default).
 ```bash
 ferx model.ferx --data data.csv --output run1.fitrx --include-data
 ```
+
+## Estimates format (`--output-format`)
+
+The human-readable estimates file defaults to YAML (`{model}-fit.yaml`). Pass
+`--output-format` to control it:
+
+| Value | Writes |
+|-------|--------|
+| `yaml` (default) | `{model}-fit.yaml` — curated, human-readable |
+| `json` | `{model}-fit.json` — the complete `FitResult`, machine-readable |
+| `both` | both files |
+
+```bash
+ferx model.ferx --data data.csv --output-format json
+```
+
+The JSON is the full fit under a versioned schema — intended for scripts, the R
+wrapper, or an agentic model-development loop. It is unrelated to the `--output`
+`.fitrx` bundle above (which packages a whole run for archival/interchange). See
+[Output Files](output.qmd#fit-json-modelfitjson) for the schema.
 
 ## NCA-based starting values (`--inits-from-nca`)
 

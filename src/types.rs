@@ -832,7 +832,7 @@ impl Subject {
 }
 
 /// Summary of records excluded by `[data_selection]` `ignore`/`accept` rules.
-#[derive(Debug, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct ExclusionSummary {
     /// Subject IDs that had all records removed (zero doses and observations remaining).
     pub excluded_subject_ids: Vec<String>,
@@ -965,7 +965,7 @@ pub struct CovariateDecl {
 }
 
 /// A single row of the [`CovariateTable`], echoing one input dataset record.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct CovariateRow {
     pub id: String,
     pub time: f64,
@@ -981,7 +981,7 @@ pub struct CovariateRow {
 /// sdtab). Produced at data-read time when a `[covariates]` block is present,
 /// and attached to [`FitResult::covariate_table`]. Missing values are
 /// `f64::NAN`. Restricted to declared columns to bound memory.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct CovariateTable {
     /// Declared covariate names, in declaration order. Parallel to each row's
     /// `values` and to `kinds`.
@@ -1413,7 +1413,7 @@ impl PkModel {
 }
 
 /// Supported residual error models
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorModel {
     Additive,
     Proportional,
@@ -1421,7 +1421,7 @@ pub enum ErrorModel {
 }
 
 /// How a sigma parameter enters the residual error model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigmaType {
     Proportional,
     Additive,
@@ -2132,7 +2132,7 @@ pub struct EndpointError {
 }
 
 /// Transformation applied to a theta on the natural scale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThetaTransform {
     /// Theta is on the natural scale (no transformation).
     Identity,
@@ -2147,7 +2147,7 @@ pub enum ThetaTransform {
 }
 
 /// Distribution / parameterisation of an ETA random effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EtaParamType {
     /// `TVCL * exp(ETA)` or `exp(THETA + ETA)` — log-normal.
     LogNormal,
@@ -2162,7 +2162,7 @@ pub enum EtaParamType {
 }
 
 /// Per-ETA transformation metadata, carried in `FitResult`.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct EtaParamInfo {
     pub eta_name: String,
     pub param_type: EtaParamType,
@@ -3508,9 +3508,10 @@ impl std::fmt::Debug for CompiledModel {
 }
 
 /// Per-subject estimation results
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SubjectResult {
     pub id: String,
+    #[serde(with = "crate::serde_nalgebra::dvector")]
     pub eta: DVector<f64>,
     pub ipred: Vec<f64>,
     pub pred: Vec<f64>,
@@ -3555,7 +3556,7 @@ pub struct SubjectResult {
 /// This is the SAEM analogue of saemix `conddist.saemix` / Monolix's
 /// "Conditional Distribution" task — the distribution `p(η_i | y_i; θ̂)` rather
 /// than just its mode (the EBE on `SubjectResult.eta`).
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CondDist {
     /// Conditional mean of η per subject: `cond_mean[i]` has length `n_eta`.
     pub cond_mean: Vec<Vec<f64>>,
@@ -3677,7 +3678,7 @@ pub enum IntegralStep {
 /// *partial* marginal likelihood that ignores κ uncertainty. (Legacy; no longer
 /// used for IOV models.)
 /// `NotApplicable` — model has no kappa declarations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KappaTreatment {
     NotApplicable,
     FixedAtMode,
@@ -3688,7 +3689,7 @@ pub enum KappaTreatment {
 ///
 /// Produced by the `Imp` stage in a method chain (`methods = [..., imp]`).
 /// Surfaced on `FitResult.importance_sampling`.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ImportanceSamplingResult {
     /// `−2 · Σᵢ log p(yᵢ | θ)` estimated by importance sampling. Lower-bias
     /// alternative to the FOCE/Laplace OFV when subject posteriors are
@@ -3721,7 +3722,7 @@ pub struct ImportanceSamplingResult {
 /// Analogous to one line in NONMEM's `.ext` file for `METHOD=IMPMAP`.
 /// Positive `iteration` values are EM iterations; special negative values
 /// mark the final (averaged) estimate and standard errors.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ImpmapTraceRow {
     /// EM iteration number (1-based). Special values:
     /// `-1_000_000_000` = final averaged estimate,
@@ -3739,7 +3740,7 @@ pub struct ImpmapTraceRow {
 ///
 /// Surfaced on `FitResult.impmap_trace` when the final estimating stage is
 /// IMPMAP. Column names follow NONMEM convention (`THETA1`, `OMEGA(1,1)`, …).
-#[derive(Debug, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct ImpmapTrace {
     pub rows: Vec<ImpmapTraceRow>,
     pub theta_names: Vec<String>,
@@ -3750,7 +3751,7 @@ pub struct ImpmapTrace {
 
 /// Posterior summary for a single scalar parameter, computed across all
 /// post-warmup, post-thinning draws from every chain.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PosteriorSummary {
     /// Parameter name (e.g. `TVCL`, `OMEGA(1,1)`, `SIGMA(1)`).
     pub name: String,
@@ -3777,7 +3778,7 @@ pub struct PosteriorSummary {
 /// instead of a single point estimate; the optimizer-style fields on
 /// `FitResult` (theta/omega/sigma) are populated with the posterior means so
 /// downstream consumers that expect a point estimate still work.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct BayesResult {
     /// Per-parameter posterior summaries, ordered θ, then Ω entries, then Σ.
     pub summaries: Vec<PosteriorSummary>,
@@ -3799,7 +3800,7 @@ pub struct BayesResult {
 }
 
 /// Outcome of the post-estimation covariance step.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub enum CovarianceStatus {
     /// User set `covariance = false`; step was not attempted.
     NotRequested,
@@ -4008,7 +4009,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
 }
 
 /// Full fit result
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct FitResult {
     /// Final method in the chain (same as `method_chain.last()`).
     pub method: EstimationMethod,
@@ -4022,6 +4023,7 @@ pub struct FitResult {
     pub theta_names: Vec<String>,
     /// Names of the random effects (etas), parallel to the omega diagonal.
     pub eta_names: Vec<String>,
+    #[serde(with = "crate::serde_nalgebra::dmatrix")]
     pub omega: DMatrix<f64>,
     pub sigma: Vec<f64>,
     /// Names of the sigma parameters, parallel to `sigma`.
@@ -4034,6 +4036,7 @@ pub struct FitResult {
     /// per-sigma classification and should be preferred by consumers that need
     /// to distinguish endpoints.
     pub error_model: ErrorModel,
+    #[serde(with = "crate::serde_nalgebra::option_dmatrix")]
     pub covariance_matrix: Option<DMatrix<f64>>,
     pub se_theta: Option<Vec<f64>>,
     /// Standard errors for omega elements.
@@ -4093,6 +4096,7 @@ pub struct FitResult {
     /// carries posterior summaries + convergence diagnostics. See [`BayesResult`].
     pub bayes: Option<BayesResult>,
     // IOV results (present when kappa declarations exist in the model)
+    #[serde(with = "crate::serde_nalgebra::option_dmatrix")]
     pub omega_iov: Option<DMatrix<f64>>,
     pub kappa_names: Vec<String>,
     pub kappa_fixed: Vec<bool>,
@@ -4115,6 +4119,7 @@ pub struct FitResult {
     /// Per-subject, per-occasion kappa EBEs.
     /// `ebe_kappas[i][k]` is the kappa vector for subject i, occasion k.
     /// Outer vec is empty when `n_kappa == 0`.
+    #[serde(with = "crate::serde_nalgebra::vec_vec_dvector")]
     pub ebe_kappas: Vec<Vec<DVector<f64>>>,
     /// Estimated OFV evaluations saved by the SAEM mu-ref gradient step M-step.
     /// Non-None only when method=saem and mu_referencing=true.
@@ -4209,9 +4214,11 @@ pub struct FitResult {
     /// the lognormal formula `(exp(ω_ij)−1)/√((exp(ω_ii)−1)(exp(ω_jj)−1))`
     /// when both etas are lognormal, otherwise falls back to
     /// `ω_ij/√(ω_ii·ω_jj)`.  `None` when omega is diagonal (no off-diagonals).
+    #[serde(with = "crate::serde_nalgebra::option_dmatrix")]
     pub omega_param_corr: Option<DMatrix<f64>>,
     /// Parameter-level correlation matrix for IOV block kappa, analogous to
     /// `omega_param_corr`.  `None` when `omega_iov` is absent or diagonal.
+    #[serde(with = "crate::serde_nalgebra::option_dmatrix")]
     pub omega_iov_param_corr: Option<DMatrix<f64>>,
     /// Path to the `.ferx` model file used for this fit, as supplied by the
     /// caller. `Some` when the fit was launched via `fit_from_files` or
@@ -4238,6 +4245,7 @@ pub struct FitResult {
     /// and `theta_names`.
     pub theta_init: Vec<f64>,
     /// Initial omega matrix (variance scale), same layout as `omega`.
+    #[serde(with = "crate::serde_nalgebra::dmatrix")]
     pub omega_init: DMatrix<f64>,
     /// Initial sigma values, parallel to `sigma` and `sigma_names`.
     pub sigma_init: Vec<f64>,
@@ -4322,6 +4330,33 @@ pub struct FitResult {
     /// were active during the fit (or the caller supplied `ignore`/`accept`
     /// expressions).  `None` means no filtering was requested.
     pub exclusions: Option<ExclusionSummary>,
+}
+
+impl FitResult {
+    /// Schema version for the machine-readable JSON serialization (#777).
+    ///
+    /// Bump on any breaking change to the JSON shape (renamed/removed fields,
+    /// changed nesting). Additive fields do not require a bump. Agent/tool
+    /// consumers pin on this via the top-level `schema_version` key.
+    pub const JSON_SCHEMA_VERSION: u32 = 1;
+
+    /// Serialize this fit to a complete, agent-friendly `serde_json::Value`,
+    /// with a top-level `schema_version` key injected alongside every field.
+    ///
+    /// This is the in-process counterpart to writing `{model}-fit.json`:
+    /// Rust/R callers get the structured payload without a file round-trip.
+    /// Non-finite floats (`NaN`/`±Inf`) serialize to JSON `null`, matching the
+    /// empty-cell convention of the YAML/CSV writers.
+    pub fn to_json_value(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).expect("FitResult is serializable");
+        if let serde_json::Value::Object(map) = &mut v {
+            map.insert(
+                "schema_version".to_string(),
+                serde_json::json!(Self::JSON_SCHEMA_VERSION),
+            );
+        }
+        v
+    }
 }
 
 /// Look up the SE for omega element (i, j) from the `se_omega` vector.
@@ -5200,7 +5235,7 @@ impl Optimizer {
 }
 
 /// Estimation method
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EstimationMethod {
     Foce,
     FoceI,

@@ -1555,6 +1555,20 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
 }
 
 /// Write parameter estimates and uncertainty as YAML
+/// Write the complete fit result as machine-readable JSON to `path` (#777).
+///
+/// Unlike the curated human YAML, this is the *entire* [`FitResult`] — every
+/// estimate, standard error, diagnostic, per-subject record, and provenance
+/// field — under a stable, versioned schema (top-level `schema_version`). It is
+/// the channel an agentic / programmatic consumer reads. Pretty-printed for
+/// readability; the shape is defined by `FitResult`'s serde derives and the
+/// `crate::serde_nalgebra` matrix/vector shims.
+pub fn write_result_json(result: &FitResult, path: &str) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(&result.to_json_value())
+        .map_err(|e| format!("Failed to serialize fit to JSON: {}", e))?;
+    std::fs::write(path, json).map_err(|e| format!("Failed to write {}: {}", path, e))
+}
+
 pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String> {
     use std::io::Write;
 
