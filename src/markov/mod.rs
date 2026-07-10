@@ -369,6 +369,37 @@ mod tests {
         )
     }
 
+    /// Closed-form transition matrix for the acyclic 3-state chain `0 → 1 → 2`
+    /// (state 2 absorbing) with `Q = [[-a, a, 0], [0, -b, b], [0, 0, 0]]`. Derived
+    /// by solving the Kolmogorov forward ODE directly (occupancy of a two-stage
+    /// process), so it is **independent of `expm`'s own `Σ Aᵏ/k!` definition** —
+    /// unlike `series_exp`.
+    ///
+    /// Only valid for `a != b`: the `a/(b−a)` term is singular at `a == b`, where
+    /// the occupancy has a *different* (confluent) closed form `P01 = a·t·e^{-at}`
+    /// — see `expm_matches_closed_form_3state_confluent`. The helper asserts this
+    /// rather than silently returning `NaN`, matching the module's fail-loud stance.
+    fn exact_seq3(a: f64, b: f64, t: f64) -> DMatrix<f64> {
+        assert!(
+            (a - b).abs() > 1e-12,
+            "exact_seq3 requires a != b (singular a/(b−a) term); got a == b == {a}"
+        );
+        let (ea, eb) = ((-a * t).exp(), (-b * t).exp());
+        let p00 = ea;
+        let p01 = a / (b - a) * (ea - eb);
+        let p02 = 1.0 - p00 - p01;
+        let p12 = 1.0 - eb;
+        DMatrix::from_row_slice(
+            3,
+            3,
+            &[
+                p00, p01, p02, // row 0: from state 0
+                0.0, eb, p12, // row 1: from state 1
+                0.0, 0.0, 1.0, // row 2: absorbing
+            ],
+        )
+    }
+
     /// Build a valid 3-state generator from off-diagonal rates (diagonal filled
     /// to make each row sum to zero).
     fn generator_3() -> DMatrix<f64> {
@@ -400,6 +431,93 @@ mod tests {
     fn expm_matches_series_3state_dense() {
         let qdt = generator_3() * 1.5;
         assert!(max_abs_diff(&matrix_exp(&qdt), &series_exp(&qdt, 50)) < 1e-12);
+    }
+
+    #[test]
+    fn expm_matches_closed_form_3state_chain() {
+        // Independent analytic anchor for the 3-state case: the acyclic 0→1→2
+        // chain has a closed-form P(t) from the Kolmogorov ODE, NOT from expm's own
+        // Σ Aᵏ/k! definition. `expm_matches_series_3state_dense` only compares
+        // against that series; this pins the 3-state result to a separate source.
+        let (a, b, t) = (0.6, 0.9, 1.75);
+        let q = DMatrix::from_row_slice(3, 3, &[-a, a, 0.0, 0.0, -b, b, 0.0, 0.0, 0.0]);
+        let reference = exact_seq3(a, b, t);
+
+        // Validate the reference *on its own terms* first — properties checkable
+        // without touching expm — so the cross-check below is "two independently
+        // valid objects agree", not "trust the hand-derived algebra":
+        //   • each row is a probability distribution over next states (sums to 1);
+        //   • the acyclic 0→1→2 structure forbids every back-transition, so the
+        //     strict lower triangle is exactly zero and state 2 is absorbing.
+        for i in 0..3 {
+            assert!(
+                (reference.row(i).sum() - 1.0).abs() < 1e-14,
+                "reference row {i} must sum to 1"
+            );
+        }
+        assert_eq!(reference[(1, 0)], 0.0, "no 1→0 transition");
+        assert_eq!(reference[(2, 0)], 0.0, "no 2→0 transition");
+        assert_eq!(reference[(2, 1)], 0.0, "no 2→1 transition");
+        assert!(
+            (reference[(2, 2)] - 1.0).abs() < 1e-15,
+            "state 2 is absorbing"
+        );
+
+        // Now the anchor itself: expm agrees with the independent closed form.
+        let p = matrix_exp(&(&q * t));
+        assert!(max_abs_diff(&p, &reference) < 1e-12);
+        // A generator's exponential is stochastic: rows sum to 1.
+        for i in 0..3 {
+            assert!((p.row(i).sum() - 1.0).abs() < 1e-13, "row {i} sums to 1");
+        }
+    }
+
+    #[test]
+    fn expm_matches_closed_form_3state_confluent() {
+        // The a == b case is the *defective* generator: Q has one repeated
+        // eigenvalue (−a, algebraic multiplicity 2, a single 2×2 Jordan block).
+        // An eigendecomposition-based expm would divide by the zero eigenvalue gap
+        // and return NaN here; nalgebra's scaling-and-squaring Padé has no such
+        // failure mode. Pin it to the *confluent limit* of the occupancy solution
+        // (l'Hôpital of a/(b−a)·(e^{-at}−e^{-bt}) as b → a):
+        //   P00 = e^{-at},  P01 = a·t·e^{-at} (Erlang-2),  P02 = 1 − P00 − P01,
+        //   P11 = e^{-at},  P12 = 1 − e^{-at},             P22 = 1.
+        // This is exactly the regime `exact_seq3`'s a != b form cannot represent,
+        // so it is a genuinely separate anchor, not a happy-path repeat.
+        let (a, t) = (0.7, 1.3);
+        let q = DMatrix::from_row_slice(3, 3, &[-a, a, 0.0, 0.0, -a, a, 0.0, 0.0, 0.0]);
+        let p = matrix_exp(&(&q * t));
+        // Named like `exact_seq3` so the matrix literal stays row-grouped.
+        let ea = (-a * t).exp();
+        let p00 = ea;
+        let p01 = a * t * ea; // Erlang-2: lim_{b→a} a/(b−a)·(e^{-at} − e^{-bt})
+        let p02 = 1.0 - p00 - p01;
+        let p12 = 1.0 - ea;
+        let confluent = DMatrix::from_row_slice(
+            3,
+            3,
+            &[
+                p00, p01, p02, // row 0: from state 0
+                0.0, ea, p12, // row 1: from state 1
+                0.0, 0.0, 1.0, // row 2: absorbing
+            ],
+        );
+        assert!(
+            max_abs_diff(&p, &confluent) < 1e-12,
+            "defective (a == b) generator must match the confluent limit form"
+        );
+        for i in 0..3 {
+            assert!((p.row(i).sum() - 1.0).abs() < 1e-13, "row {i} sums to 1");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "a != b")]
+    fn exact_seq3_rejects_equal_rates() {
+        // The closed form is singular at a == b (division by b − a = 0). The helper
+        // must fail loud, never silently return NaN — the confluent regime has its
+        // own limit form, anchored in `expm_matches_closed_form_3state_confluent`.
+        let _ = exact_seq3(0.5, 0.5, 1.0);
     }
 
     #[test]
@@ -584,6 +702,34 @@ mod tests {
         let p1 = exact_2state(a, b, 1.0)[(0, 1)];
         let p2 = exact_2state(a, b, 2.0)[(1, 1)];
         let expected = -(p1.ln()) - (p2.ln());
+        let got = ctmm_data_term(&q, &obs).unwrap();
+        assert!((got - expected).abs() < 1e-12, "got {got}, want {expected}");
+    }
+
+    #[test]
+    fn data_term_matches_hand_computed_3state() {
+        // 3-state acyclic chain 0→1→2 with two *off-diagonal* transitions (0→1
+        // then 1→2) — richer than the 2-state case, and hand-computed against the
+        // independent closed form `exact_seq3` (not against `matrix_exp` itself).
+        let (a, b) = (0.6, 0.9);
+        let q = DMatrix::from_row_slice(3, 3, &[-a, a, 0.0, 0.0, -b, b, 0.0, 0.0, 0.0]);
+        let obs = [
+            StateObs {
+                time: 0.0,
+                state: 0,
+            },
+            StateObs {
+                time: 1.0,
+                state: 1,
+            },
+            StateObs {
+                time: 2.5,
+                state: 2,
+            },
+        ];
+        let p01 = exact_seq3(a, b, 1.0)[(0, 1)]; // 0 → 1 over Δt = 1.0
+        let p12 = exact_seq3(a, b, 1.5)[(1, 2)]; // 1 → 2 over Δt = 1.5
+        let expected = -(p01.ln()) - (p12.ln());
         let got = ctmm_data_term(&q, &obs).unwrap();
         assert!((got - expected).abs() < 1e-12, "got {got}, want {expected}");
     }
