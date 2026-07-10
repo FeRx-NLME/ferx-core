@@ -60,13 +60,39 @@ Each `WarningCode` token, what it flags, and a typical response.
 | `threads` | Info | Thread-count efficiency note. | Optionally tune `threads`. |
 | `general` | Warning | Unrecognised message (fallback bucket). | Read the message text. |
 
+## Details payloads {#details}
+
+Numeric diagnostics also carry a `details` object with the value behind the
+message, so a consumer reads the number directly instead of parsing prose. The
+numbers are sourced from the fit's typed fields, not from the message text.
+
+| Code | `details` keys |
+|------|----------------|
+| `dw_autocorrelation` | `durbin_watson`, `iwres_lag1_autocorr` |
+| `eps_shrinkage` | `eps_shrinkage` (fraction), `eps_shrinkage_pct` |
+| `condition_number` | `condition_number` |
+
+```json
+{
+  "severity": "Warning",
+  "category": "dw_autocorrelation",
+  "message": "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).",
+  "source_method": null,
+  "details": { "durbin_watson": 1.20, "iwres_lag1_autocorr": 0.40 }
+}
+```
+
+Codes without an associated stored statistic omit the `details` key entirely
+(the Rust field is `None`).
+
 ## How codes are assigned
 
-Codes today are assigned centrally by `classify_warning()`, which maps each
-engine message to its `WarningCode` and severity. It is the single, type-checked
-source of the taxonomy — the `WarningCode` enum is exhaustive, so the vocabulary
-can no longer drift as a free string. Native at-source emission (each site
-constructing its own typed `WarningEntry` with a populated `details` payload) is
-being migrated incrementally; until a site is converted, its entry is classified
-from the message and has no `details` payload (the `details` key is omitted from
-the JSON; the Rust field is `None`).
+Codes are assigned centrally by `classify_warning()`, which maps each engine
+message to its `WarningCode` and severity, then `details` is attached from the
+fit's typed numeric fields for the codes above. `classify_warning()` is the
+single, type-checked source of the taxonomy — the `WarningCode` enum is
+exhaustive, so the vocabulary can no longer drift as a free string. Full native
+at-source emission (each site constructing its own typed `WarningEntry` with a
+`details` payload, and the human `warnings` strings derived from the structured
+list) is being migrated incrementally; `details` for the numeric diagnostics is
+the first step.

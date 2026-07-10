@@ -3149,12 +3149,58 @@ pub fn fit(
 ///
 /// Called after all late-injected warnings (LTBS splice, multi-start metadata)
 /// have been appended so the structured field is always in sync with the flat list.
+///
+/// Each message is classified into a typed [`crate::types::WarningCode`] +
+/// severity and — for the numeric diagnostics whose values are already stored
+/// as typed fields on the `FitResult` — enriched with a machine-readable
+/// `details` payload sourced from those fields (issue #781, increment 1). The
+/// numbers thus come from typed state, not from re-parsing the message prose;
+/// converting the remaining ~80 string push-sites to full at-source emission is
+/// a later increment.
 fn rebuild_warnings_structured(result: &mut FitResult) {
-    result.warnings_structured = result
+    let mut entries: Vec<crate::types::WarningEntry> = result
         .warnings
         .iter()
         .map(|w| crate::types::classify_warning(w))
         .collect();
+    for e in &mut entries {
+        e.details = diagnostic_details(
+            &e.category,
+            result.dw_statistic,
+            result.iwres_lag1_r,
+            result.shrinkage_eps,
+            result.cov_condition_number,
+        );
+    }
+    result.warnings_structured = entries;
+}
+
+/// Machine-readable `details` payload for the numeric diagnostic warning codes,
+/// sourced from the typed `FitResult` fields rather than parsed from the
+/// message text. Returns `None` for codes with no associated stored statistic
+/// (their `details` key is then omitted from the JSON).
+fn diagnostic_details(
+    code: &crate::types::WarningCode,
+    dw_statistic: f64,
+    iwres_lag1_r: f64,
+    shrinkage_eps: f64,
+    cov_condition_number: Option<f64>,
+) -> Option<serde_json::Value> {
+    use crate::types::WarningCode;
+    match code {
+        WarningCode::DwAutocorrelation if dw_statistic.is_finite() => Some(serde_json::json!({
+            "durbin_watson": dw_statistic,
+            "iwres_lag1_autocorr": iwres_lag1_r,
+        })),
+        WarningCode::EpsShrinkage if shrinkage_eps.is_finite() => Some(serde_json::json!({
+            "eps_shrinkage": shrinkage_eps,
+            "eps_shrinkage_pct": 100.0 * shrinkage_eps,
+        })),
+        WarningCode::ConditionNumber => {
+            cov_condition_number.map(|c| serde_json::json!({ "condition_number": c }))
+        }
+        _ => None,
+    }
 }
 
 /// Probe whether NLopt CRS2-LM (used for global_search) is available.
@@ -11791,6 +11837,69 @@ mod simulate_with_uncertainty_tests {
             err.contains("LTBS") && err.contains("Additive"),
             "expected LTBS+proportional rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn diagnostic_details_covers_numeric_codes() {
+        use crate::types::WarningCode;
+        // Durbin–Watson: both stored stats surface.
+        let d =
+            super::diagnostic_details(&WarningCode::DwAutocorrelation, 1.2, 0.4, f64::NAN, None)
+                .expect("DW details");
+        assert_eq!(d["durbin_watson"], 1.2);
+        assert_eq!(d["iwres_lag1_autocorr"], 0.4);
+        // EPS shrinkage: fraction + percent.
+        let d = super::diagnostic_details(&WarningCode::EpsShrinkage, f64::NAN, 0.0, -0.083, None)
+            .expect("eps details");
+        assert_eq!(d["eps_shrinkage"], -0.083);
+        assert!((d["eps_shrinkage_pct"].as_f64().unwrap() + 8.3).abs() < 1e-9);
+        // Condition number: from the Option.
+        let d = super::diagnostic_details(
+            &WarningCode::ConditionNumber,
+            f64::NAN,
+            0.0,
+            f64::NAN,
+            Some(1.4e6),
+        )
+        .expect("cond details");
+        assert_eq!(d["condition_number"], 1.4e6);
+        // None cases: missing stat, non-finite stat, and non-numeric code.
+        assert!(
+            super::diagnostic_details(&WarningCode::ConditionNumber, 0.0, 0.0, 0.0, None).is_none()
+        );
+        assert!(super::diagnostic_details(
+            &WarningCode::DwAutocorrelation,
+            f64::INFINITY,
+            0.0,
+            0.0,
+            None
+        )
+        .is_none());
+        assert!(
+            super::diagnostic_details(&WarningCode::Convergence, 1.0, 0.0, 0.0, Some(1.0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rebuild_attaches_details_from_typed_fields() {
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        fit.warnings = vec![
+            "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).".to_string(),
+            "Outer optimization did not converge".to_string(),
+        ];
+        fit.dw_statistic = 1.20;
+        fit.iwres_lag1_r = 0.4;
+        super::rebuild_warnings_structured(&mut fit);
+
+        let dw = &fit.warnings_structured[0];
+        assert_eq!(dw.category, crate::types::WarningCode::DwAutocorrelation);
+        let details = dw.details.as_ref().expect("DW warning carries details");
+        assert_eq!(details["durbin_watson"], 1.20);
+        assert_eq!(details["iwres_lag1_autocorr"], 0.4);
+        // A non-numeric code keeps details omitted.
+        assert!(fit.warnings_structured[1].details.is_none());
     }
 
     #[test]
