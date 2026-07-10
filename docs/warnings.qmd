@@ -53,6 +53,7 @@ Each `WarningCode` token, what it flags, and a typical response.
 | `importance_sampling` | Warning | ESS = 0 / proposal collapse. | Increase samples or improve the proposal. |
 | `eps_shrinkage` | Warning | Residual (EPS) shrinkage high / negative. | Sparse data for the error model — simplify it. |
 | `eta_shrinkage` | Warning | One or more ETA shrinkages exceed ~30%. | Data poorly inform that IIV — consider removing it on the affected parameter(s). |
+| `boundary_estimate` | Warning | One or more THETA estimates are pinned to an optimizer bound. | Non-identifiability or a too-tight bound — inspect; relax the bound or simplify. |
 | `data_quality` | Warning | Dataset issue (missing DV, ADDL/II, non-positive DV, …). | Fix the dataset before trusting the fit. |
 | `omega_structure` | Warning | Mixed lognormal / additive block in omega. | Make the block's parameterization consistent. |
 | `gradient_fallback` | Info | A gradient / sampler fallback was taken. | None; note the slower path. |
@@ -75,6 +76,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `dw_autocorrelation` | `durbin_watson`, `iwres_lag1_autocorr` |
 | `eps_shrinkage` | `eps_shrinkage` (fraction), `eps_shrinkage_pct` |
 | `eta_shrinkage` | `threshold_pct`, `high_shrinkage_etas` (array of `{eta, shrinkage_pct}`) |
+| `boundary_estimate` | `parameters` (array of `{parameter, estimate, bound, side}`) |
 | `covariance_failed`, `covariance_regularized` | `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys) |
 | `condition_number` | `condition_number` |
 
@@ -94,12 +96,15 @@ associated stored statistic, or when any contributing statistic is non-finite
 
 ## How codes are assigned
 
-Codes are assigned centrally by `classify_warning()`, which maps each engine
-message to its `WarningCode` and severity, then `details` is attached from the
-fit's typed numeric fields for the codes above. `classify_warning()` is the
-single, type-checked source of the taxonomy — the `WarningCode` enum is
-exhaustive, so the vocabulary can no longer drift as a free string. Full native
-at-source emission (each site constructing its own typed `WarningEntry` with a
-`details` payload, and the human `warnings` strings derived from the structured
-list) is being migrated incrementally; `details` for the numeric diagnostics is
-the first step.
+Most codes are assigned centrally by `classify_warning()`, which maps each
+engine message to its `WarningCode` and severity, after which `details` is
+attached from the fit's typed numeric fields for the codes above.
+`classify_warning()` is the single, type-checked source of the taxonomy — the
+`WarningCode` enum is exhaustive, so the vocabulary can no longer drift as a
+free string.
+
+Some warnings are instead emitted **typed at their source**: the site
+constructs a `WarningEntry` (code, severity, message, and a `details` payload)
+directly — `boundary_estimate` is the first — and that entry takes precedence
+over re-classifying the message string. Migrating the remaining string
+push-sites to this at-source form is ongoing.
