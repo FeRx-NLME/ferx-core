@@ -119,7 +119,15 @@ pub fn save_atomic(path: &str, cp: &Checkpoint) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(cp).map_err(std::io::Error::other)?;
     let tmp = format!("{path}.new");
     std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, path)?;
+    // Modern `std::fs::rename` replaces an existing destination on both POSIX
+    // and Windows, so the first branch is the normal (atomic) path. The fallback
+    // — remove-then-rename — guards against any platform/version where renaming
+    // onto an existing file errors, so periodic updates never silently stop
+    // after the first write. It gives up atomicity only on that fallback.
+    if let Err(_e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&tmp, path)?;
+    }
     Ok(())
 }
 
@@ -327,6 +335,19 @@ mod tests {
         save_atomic(&path, &cp).unwrap();
         let back = load(&path).unwrap();
         assert!(back.ofv.is_nan(), "non-finite OFV should round-trip to NaN");
+        remove(&path);
+    }
+
+    #[test]
+    fn save_atomic_overwrites_existing() {
+        // Periodic updates rewrite the same path repeatedly; the second write
+        // must replace the first (the rename-over-existing path, incl. the
+        // Windows fallback).
+        let path = tmp_path("overwrite");
+        save_atomic(&path, &sample(vec![1.0])).unwrap();
+        save_atomic(&path, &sample(vec![2.0, 3.0])).unwrap();
+        let back = load(&path).expect("load after overwrite");
+        assert_eq!(back.packed, vec![2.0, 3.0], "second write should win");
         remove(&path);
     }
 

@@ -176,6 +176,36 @@ fn disabled_ignores_existing_checkpoint() {
     checkpoint::remove(&path);
 }
 
+#[test]
+fn hashless_options_do_not_resume() {
+    // A checkpoint carrying hashes, but options with none: integrity can't be
+    // verified, so the run must NOT resume (None == None must not count as a
+    // match). It starts fresh from the model default.
+    let (model, pop) = load_model_and_pop();
+    let path = tmp_path("hashless");
+    checkpoint::remove(&path);
+    checkpoint::save_atomic(&path, &checkpoint_with_tvcl(&model, 0.25)).unwrap();
+
+    let mut opts = base_opts(&path);
+    opts.outer_maxiter = 0;
+    opts.checkpoint_model_hash = None;
+    opts.checkpoint_data_hash = None;
+
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+
+    assert!(
+        (result.theta[0] - 0.13).abs() < 1e-6,
+        "must not resume without an integrity check (got TVCL {})",
+        result.theta[0]
+    );
+    assert!(
+        !result.warnings.iter().any(|w| w.contains("Resuming")),
+        "no resume without verifiable hashes: {:?}",
+        result.warnings
+    );
+    checkpoint::remove(&path);
+}
+
 /// A real FOCEI fit with a zero-second interval writes at least one checkpoint
 /// during the run, then deletes it on success. Exercises the NLopt objective
 /// write site and `finish_success` end to end.

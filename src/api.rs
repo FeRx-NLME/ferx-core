@@ -4106,13 +4106,31 @@ fn fit_inner(
     // checkpoint (unless it fails the model/data integrity or layout check) and
     // arm the periodic writer. `start_stage` skips chain stages that were
     // already completed before the interruption.
+    //
+    // Clear any sink left active by a *previous* fit on this (pooled) worker
+    // thread that returned early with an error and so never hit
+    // `finish_success`. Without this, a subsequent checkpoint-disabled fit —
+    // which skips `init` below — would inherit the stale sink and leak writes /
+    // removals to the old path.
+    crate::io::checkpoint::abandon();
     let mut start_stage = 0usize;
     if options.checkpoint {
         if let Some(ckpt_path) = options.checkpoint_path.as_deref() {
             let coord_names = crate::estimation::parameterization::coordinate_names(init_params);
             if let Some(cp) = crate::io::checkpoint::load(ckpt_path) {
-                let hashes_ok = cp.model_hash == options.checkpoint_model_hash
+                // Resume only when both integrity hashes are present *and* match.
+                // Treating absent hashes (None == None) as a match would let a
+                // run resume with no integrity guarantee at all — exactly the
+                // stale-state resume this check exists to prevent. The file
+                // runner always supplies both hashes; a direct `fit()` caller
+                // that omits them simply starts fresh.
+                let hashes_present = cp.model_hash.is_some()
+                    && cp.data_hash.is_some()
+                    && options.checkpoint_model_hash.is_some()
+                    && options.checkpoint_data_hash.is_some();
+                let hashes_match = cp.model_hash == options.checkpoint_model_hash
                     && cp.data_hash == options.checkpoint_data_hash;
+                let hashes_ok = hashes_present && hashes_match;
                 let layout_ok = cp.coord_names == coord_names
                     && cp.stage_idx < n_stages
                     && cp.packed.len()
@@ -4136,10 +4154,18 @@ fn fit_inner(
                     }
                     accumulated_warnings.push(banner);
                 } else {
-                    let reason = if !hashes_ok {
+                    // Provably stale/incompatible = hashes present but different,
+                    // or a layout mismatch. Only then delete the file. When hashes
+                    // are simply unavailable we can't prove staleness, so we start
+                    // fresh but keep the checkpoint (a later run that does supply
+                    // hashes may still use it; a successful fit removes it anyway).
+                    let stale = (hashes_present && !hashes_match) || !layout_ok;
+                    let reason = if hashes_present && !hashes_match {
                         "model or data changed since it was written"
-                    } else {
+                    } else if !layout_ok {
                         "its parameter layout does not match this model"
+                    } else {
+                        "its model/data integrity hashes are unavailable"
                     };
                     let msg = format!(
                         "Ignoring checkpoint {} ({}); starting fresh.",
@@ -4149,7 +4175,9 @@ fn fit_inner(
                         eprintln!("{msg}");
                     }
                     accumulated_warnings.push(msg);
-                    crate::io::checkpoint::remove(ckpt_path);
+                    if stale {
+                        crate::io::checkpoint::remove(ckpt_path);
+                    }
                 }
             }
             crate::io::checkpoint::init(
