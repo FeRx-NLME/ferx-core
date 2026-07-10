@@ -12008,7 +12008,9 @@ mod sde_integration {
             .expect("SDE model should emit W_EXPERIMENTAL_SDE");
         assert_eq!(exp.severity, crate::diagnostics::Severity::Warning);
         assert_eq!(
-            crate::types::classify_warning(&exp.message).category,
+            crate::types::classify_warning(&exp.message)
+                .category
+                .as_str(),
             "experimental"
         );
 

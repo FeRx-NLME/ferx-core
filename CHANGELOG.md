@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Typed warning taxonomy** (#778): structured warnings
+  (`FitResult.warnings_structured`, surfaced in the JSON output) now carry a
+  typed `WarningCode` instead of a free-text category string — a stable,
+  exhaustive vocabulary an agent or the R wrapper can branch on. Each code
+  serializes as a fixed snake_case token (unchanged from the previous category
+  strings, so JSON consumers are unaffected), and each entry gains an optional
+  `details` payload for machine-readable numbers behind the message. See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
 - **Machine-readable JSON fit output** (#777): `ferx <model> --data <csv>
   --output-format json` (or `both`) writes `{model}-fit.json` — the *complete*
   fit result (every estimate, standard error, diagnostic, per-subject record,

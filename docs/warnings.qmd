@@ -1,0 +1,72 @@
+# Warnings
+
+A fit collects non-fatal issues into two parallel channels on `FitResult`:
+
+- `warnings` — a `Vec<String>` of human-readable messages, shown by the CLI and
+  written to the YAML / `.fitrx` bundle. This is the display channel.
+- `warnings_structured` — a `Vec<WarningEntry>`, the **machine-branchable**
+  channel. Each entry carries a typed [`WarningCode`](#warning-codes), a
+  severity, the message, an optional originating method, and an optional
+  numeric `details` payload. This is what a script, the R wrapper, or an
+  **agentic model-development loop** should read — it is serialized in the
+  [JSON output](output.qmd#fit-json-modelfitjson).
+
+```json
+{
+  "severity": "Warning",
+  "category": "dw_autocorrelation",
+  "message": "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).",
+  "source_method": null
+}
+```
+
+`category` is the stable snake_case token of a `WarningCode`. It is a public API
+surface: tokens never change or get repurposed once released, so a consumer can
+branch on them safely (new warning classes get new tokens). `details` is omitted
+when empty.
+
+## Severity {#severity}
+
+| Severity | Meaning | Typical agent response |
+|----------|---------|------------------------|
+| `Critical` | The result is untrustworthy as-is (no convergence, failed covariance, ill-conditioning). | Do not accept the model; change structure/inits and refit. |
+| `Warning` | The result stands but a caveat applies (autocorrelation, shrinkage, data quality). | Inspect; often iterate on error model, IIV structure, or data. |
+| `Info` | Informational note, no action implied. | Log; no action. |
+
+## Warning codes {#warning-codes}
+
+Each `WarningCode` token, what it flags, and a typical response.
+
+| Code (`category`) | Severity | Flags | Typical agent response |
+|-------------------|----------|-------|------------------------|
+| `convergence` | Critical | Optimizer did not converge. | Reject; adjust inits / method / bounds and refit. |
+| `covariance_step` | Critical / Warning / Info | Covariance step failed, was regularized, or is a cost note. | If failed: SEs unreliable — try `covariance_fallback = sir` or refit. |
+| `condition_number` | Critical | Ill-conditioned covariance / high condition number. | Over-parameterized — drop a random effect or covariate. |
+| `optimizer_health` | Warning | Trust-radius collapse / degeneracy. | Try a different optimizer or re-scale parameters. |
+| `dw_autocorrelation` | Warning | IWRES autocorrelation (Durbin–Watson out of range). | Revisit the residual-error / structural model. |
+| `eta_normality` | Warning | ETA departs from normality. | Consider a mixture or transform. |
+| `experimental` | Warning | An experimental feature (SDE, neural-network) was used. | Treat results with caution; validate. |
+| `bloq_method` | Warning | BLOQ / M3 censoring caveat. | Confirm the censoring semantics match intent. |
+| `sir` | Warning | SIR failed or was requested without a covariance. | Ensure a covariance exists before requesting SIR. |
+| `importance_sampling` | Warning | ESS = 0 / proposal collapse. | Increase samples or improve the proposal. |
+| `eps_shrinkage` | Warning | Residual (EPS) shrinkage high / negative. | Sparse data for the error model — simplify it. |
+| `data_quality` | Warning | Dataset issue (missing DV, ADDL/II, non-positive DV, …). | Fix the dataset before trusting the fit. |
+| `omega_structure` | Warning | Mixed lognormal / additive block in omega. | Make the block's parameterization consistent. |
+| `gradient_fallback` | Info | A gradient / sampler fallback was taken. | None; note the slower path. |
+| `mu_referencing` | Warning / Info | Missing or partial mu-referencing. | Prefer `CL = TVCL * exp(ETA_CL)` forms for SAEM/Bayes. |
+| `optimizer_config` | Warning / Info | `global_search` config note or failure. | Check the global-search setup if disabled unexpectedly. |
+| `multi_start` | Info | Multi-start note. | Inspect which start won. |
+| `cancelled` | Info | Run cancelled by the user. | None. |
+| `threads` | Info | Thread-count efficiency note. | Optionally tune `threads`. |
+| `general` | Warning | Unrecognised message (fallback bucket). | Read the message text. |
+
+## How codes are assigned
+
+Codes today are assigned centrally by `classify_warning()`, which maps each
+engine message to its `WarningCode` and severity. It is the single, type-checked
+source of the taxonomy — the `WarningCode` enum is exhaustive, so the vocabulary
+can no longer drift as a free string. Native at-source emission (each site
+constructing its own typed `WarningEntry` with a populated `details` payload) is
+being migrated incrementally; until a site is converted, its entry is classified
+from the message and has no `details` payload (the `details` key is omitted from
+the JSON; the Rust field is `None`).
