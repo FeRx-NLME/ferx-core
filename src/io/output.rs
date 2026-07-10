@@ -1554,7 +1554,6 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
     names
 }
 
-/// Write parameter estimates and uncertainty as YAML
 /// Write the complete fit result as machine-readable JSON to `path` (#777).
 ///
 /// Unlike the curated human YAML, this is the *entire* [`FitResult`] — every
