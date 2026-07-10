@@ -968,7 +968,7 @@ SAEM M-step now adds the TTE data term for TTE subjects. Sigma update is Gaussia
 
 Current SAEM uses a random-walk MH proposal. Replacing it with a Laplace-based independent
 proposal (f-SAEM) would accelerate convergence for all non-Gaussian models (§9.1); this is
-**Phase 3b · Track B** and remains **open** (no tracking issue filed yet). A related but distinct increment has landed: PR #265 ("SAEM
+**Phase 3b · Track B (#788)** and remains **open**. A related but distinct increment has landed: PR #265 ("SAEM
 conditional-distribution pass", merged 2026-06-21) characterises each subject's post-fit
 `p(η|y)` — conditional mean/SD/draws, the saemix `conddist` / Monolix analog — by
 *accumulating* the existing random-walk MH draws after the fit. It does **not** change the
@@ -2567,7 +2567,7 @@ from `tests/reference/pktte_joint/expected.md` plus the `$SIM` cross-tool anchor
 - Docs: `docs/estimation/rtte.qmd` with estimation method guidance
 - Tests: Tier 3 SAEM convergence; **Tier 3 SSE** (simulate RTTE → fit → recover)
 
-### Phase 3b — SAEM proposal option (can happen alongside Phase 3) · Track B
+### Phase 3b — SAEM proposal option (can happen alongside Phase 3) · Track B (#788)
 
 **Scope:** Add `saem_proposal = auto | laplace | random_walk` to `[fit_options]`.
 `auto` is the new default; existing behaviour (`random_walk`) remains available.
@@ -2729,7 +2729,7 @@ Phase-7 build:
 transition model + Phase 4.0 (discrete-state plumbing) for the data. The forward *primitive*,
 however, is zero-dependency and can be spiked at any time — its outcome may rewrite the §17 risk line.
 
-### Phase 8 — Custom `[ll_model]` escape hatch · Track E (independent leaf)
+### Phase 8 — Custom `[ll_model]` escape hatch · Track E (independent leaf, #789)
 
 User-specified log-likelihood expression; covers distributions not in the built-in list. **Needs
 only the generalized-NLL trunk (§2, built) + ferx's existing expression evaluator — no dependency on
@@ -3136,8 +3136,8 @@ on the whole categorical phase.
 |---|---|---|---|---|
 | **Trunk** (built) | §2 dispatch, FD-Hessian + log-det, `SimOutcome` | — | ✅ done | `survival` → default |
 | **A · Survival hardening** | #741, #763, #762, #740, #626, #764, Phase 3.4 docs; Phase 2 deferred (IntervalCensored+ODE, left-trunc+ODE); ferx-r `predict_survival` + e2e + ferx-r#210 | trunk | ✅ yes | `survival` |
-| **B · SAEM engine** | Phase 3b `saem_proposal = auto` *(no issue filed)* | trunk | ✅ yes | none |
-| **E · Custom likelihood** | Phase 8 `[ll_model]` *(no issue filed)* | trunk | ✅ yes | none |
+| **B · SAEM engine** | Phase 3b `saem_proposal = auto` (#788) | trunk | ✅ yes | none |
+| **E · Custom likelihood** | Phase 8 `[ll_model]` (#789) | trunk | ✅ yes | none |
 | **4.0 · Discrete-state slice** | Phase 4.0 (front of #760) | trunk | ✅ **merged #773** | (part of Phase 4) |
 | **matrix-exp module** | `src/markov`: `matrix_exp` + Van Loan + `ctmm_data_term` (§8.7) | none | ✅ **merged #771/#774** | `markov` |
 | **C · Categorical & count** | Phase 4 / #760 (binary·ordinal·Poisson·NB) | 4.0 ✅ (#773) | **ready now** | none |
