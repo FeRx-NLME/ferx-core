@@ -170,7 +170,7 @@ pub(crate) fn read_nonmem_csv_mapped(
         iov_column,
         None,
         None,
-        &HashSet::new(),
+        &ObsRouting::default(),
         column_map,
     )
     .map(|(pop, _)| pop)
@@ -222,7 +222,7 @@ pub(crate) fn read_nonmem_csv_with_covariates_mapped(
         iov_column,
         Some(decls),
         None,
-        &HashSet::new(),
+        &ObsRouting::default(),
         column_map,
     )?;
     Ok((
@@ -274,7 +274,7 @@ pub(crate) fn read_nonmem_csv_filtered_mapped(
         iov_column,
         None,
         Some(filter),
-        &HashSet::new(),
+        &ObsRouting::default(),
         column_map,
     )
     .map(|(pop, _)| pop)
@@ -332,13 +332,179 @@ pub(crate) fn read_nonmem_csv_with_covariates_filtered_mapped(
         iov_column,
         Some(decls),
         Some(filter),
-        &HashSet::new(),
+        &ObsRouting::default(),
         column_map,
     )?;
     Ok((
         pop,
         table.expect("covariate table is built whenever table_decls is Some"),
     ))
+}
+
+/// Which non-Gaussian [`ObsRecord`](crate::types::ObsRecord) variant each CMT's
+/// EVID=0 observation rows route to. Empty sets ⇒ every observation row takes the
+/// Gaussian parallel-Vec path (the all-Gaussian default).
+///
+/// The three sets must be pairwise disjoint — a CMT has exactly one endpoint kind
+/// (§8.1: routing is by the CMT's declared endpoint, never guessed from the DV).
+/// [`ObsRouting::validate`] enforces disjointness before any row is read.
+///
+/// Phase 4.0 introduces the discrete/count routing but no parser yet populates
+/// those sets; `discrete`/`count` are reachable only through
+/// [`read_nonmem_csv_filtered_routed`] (used by the reader unit tests). The
+/// production `api::read_population_for` path still builds a TTE-only routing.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ObsRouting {
+    /// CMTs whose rows become `ObsRecord::Event` (TTE / RTTE; `survival` feature).
+    pub tte: HashSet<usize>,
+    /// CMTs whose integer-DV rows become `ObsRecord::DiscreteState`
+    /// (binary / ordinal / Markov state index).
+    pub discrete: HashSet<usize>,
+    /// CMTs whose non-negative-integer-DV rows become `ObsRecord::Count`
+    /// (Poisson / negative-binomial).
+    pub count: HashSet<usize>,
+}
+
+impl ObsRouting {
+    /// TTE-only routing (the pre-Phase-4.0 behaviour): every CMT in `tte_cmts`
+    /// routes to `ObsRecord::Event`; nothing routes to discrete/count.
+    pub(crate) fn tte_only(tte_cmts: &HashSet<usize>) -> Self {
+        Self {
+            tte: tte_cmts.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// The integer-coded non-Gaussian endpoint kind (discrete-state or count) a
+    /// CMT routes to, if any. `None` ⇒ the CMT is TTE or Gaussian. The routing
+    /// sets are pairwise disjoint (validated up front), so this is unambiguous.
+    fn integer_kind(&self, cmt: usize) -> Option<IntDvKind> {
+        if self.discrete.contains(&cmt) {
+            Some(IntDvKind::DiscreteState)
+        } else if self.count.contains(&cmt) {
+            Some(IntDvKind::Count)
+        } else {
+            None
+        }
+    }
+
+    /// Reject a CMT declared under more than one endpoint kind — that would make
+    /// row routing ambiguous (one endpoint per CMT, §8.1).
+    fn validate(&self) -> Result<(), String> {
+        let overlap =
+            |a: &HashSet<usize>, b: &HashSet<usize>| a.iter().find(|c| b.contains(c)).copied();
+        if let Some(cmt) = overlap(&self.tte, &self.discrete) {
+            return Err(format!(
+                "CMT={cmt} is routed to both a TTE and a discrete-state endpoint; \
+                 each CMT may have only one endpoint type"
+            ));
+        }
+        if let Some(cmt) = overlap(&self.tte, &self.count) {
+            return Err(format!(
+                "CMT={cmt} is routed to both a TTE and a count endpoint; \
+                 each CMT may have only one endpoint type"
+            ));
+        }
+        if let Some(cmt) = overlap(&self.discrete, &self.count) {
+            return Err(format!(
+                "CMT={cmt} is routed to both a discrete-state and a count endpoint; \
+                 each CMT may have only one endpoint type"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// An integer-coded non-Gaussian observation endpoint: a discrete-state index
+/// (binary / ordinal / Markov state — unbounded `usize`) or a `u32` count
+/// (Poisson / negative-binomial). Selects the DV upper bound and the error
+/// wording in [`checked_integer_dv`].
+#[derive(Debug, Clone, Copy)]
+enum IntDvKind {
+    DiscreteState,
+    Count,
+}
+
+impl IntDvKind {
+    fn label(self) -> &'static str {
+        match self {
+            IntDvKind::DiscreteState => "discrete-state",
+            IntDvKind::Count => "count",
+        }
+    }
+
+    fn unit(self) -> &'static str {
+        match self {
+            IntDvKind::DiscreteState => "state index",
+            IntDvKind::Count => "count",
+        }
+    }
+
+    /// Exclusive upper bound on the rounded DV: a value `>=` this overflows the
+    /// `as usize` / `as u32` cast and is rejected (no domain cap in Phase 4.0 —
+    /// the bound only rejects values the cast could not represent). `type::MAX as
+    /// f64 + 1.0` is exact on both 32- and 64-bit: when `type::MAX` is
+    /// f64-representable the `+1` lands on the next integer; when it rounds up
+    /// (`usize::MAX` on 64-bit: `2^64 - 1` → `2^64`) the `+1` is absorbed, leaving
+    /// exactly the first saturating value. So `u32::MAX` / `usize::MAX` themselves
+    /// are accepted and only genuine overflow is rejected. Non-finite DVs are
+    /// rejected earlier.
+    fn exclusive_max(self) -> f64 {
+        match self {
+            IntDvKind::DiscreteState => usize::MAX as f64 + 1.0,
+            IntDvKind::Count => u32::MAX as f64 + 1.0,
+        }
+    }
+
+    /// Human-readable valid-range suffix for the out-of-range message; empty for
+    /// the state index (its `usize::MAX` bound is not a meaningful domain limit).
+    fn range_hint(self) -> &'static str {
+        match self {
+            IntDvKind::DiscreteState => "",
+            IntDvKind::Count => " (0..=4294967295)",
+        }
+    }
+}
+
+/// Validate a non-Gaussian integer-coded DV (discrete-state index or count) and
+/// return the rounded, non-negative magnitude. Rejects — with a caller-shaped
+/// message — non-finite, fractional, negative, and out-of-range (cast-overflowing)
+/// DVs (§8.1 integer-code rule, #192).
+///
+/// A **missing** DV (`.`/`NA`/blank) is skipped by the caller as MDV=1 (#258) and
+/// never reaches here. This function is the guard that stops the three silent
+/// mis-records a raw `dv.round() as usize`/`as u32` cast would otherwise produce:
+/// a `.`-coerced `0.0` → phantom `state:0`/`count:0`; an `inf` → saturated
+/// `usize::MAX`/`u32::MAX`; a `NaN` (whose every comparison is false) → `0`.
+fn checked_integer_dv(
+    dv: f64,
+    kind: IntDvKind,
+    id: &str,
+    cmt: usize,
+    time: f64,
+) -> Result<f64, String> {
+    let (label, unit) = (kind.label(), kind.unit());
+    if !dv.is_finite() {
+        return Err(format!(
+            "Subject {id}: {label} endpoint CMT={cmt} has non-finite DV={dv} at \
+             TIME={time}; the DV must be a non-negative integer {unit}"
+        ));
+    }
+    let dv_rounded = dv.round();
+    if (dv - dv_rounded).abs() > 1e-9 {
+        return Err(format!(
+            "Subject {id}: {label} endpoint CMT={cmt} has non-integer DV={dv} at \
+             TIME={time}; the DV must be a non-negative integer {unit}"
+        ));
+    }
+    if dv_rounded < 0.0 || dv_rounded >= kind.exclusive_max() {
+        return Err(format!(
+            "Subject {id}: {label} endpoint CMT={cmt} has out-of-range DV={dv} at \
+             TIME={time}; the DV must be a non-negative integer {unit}{hint}",
+            hint = kind.range_hint()
+        ));
+    }
+    Ok(dv_rounded)
 }
 
 // ── TTE-aware readers (pub(crate) — used by api::read_population_for) ────────
@@ -375,7 +541,7 @@ pub(crate) fn read_nonmem_csv_filtered_tte(
         iov_column,
         None,
         filter,
-        tte_cmts,
+        &ObsRouting::tte_only(tte_cmts),
         column_map,
     )
     .map(|(pop, _)| pop)
@@ -412,13 +578,25 @@ pub(crate) fn read_nonmem_csv_with_covariates_tte(
         iov_column,
         Some(decls),
         filter,
-        tte_cmts,
+        &ObsRouting::tte_only(tte_cmts),
         column_map,
     )?;
     Ok((
         pop,
         table.expect("covariate table is built whenever table_decls is Some"),
     ))
+}
+
+/// Reader entry point taking a full [`ObsRouting`] — the general form behind
+/// [`read_nonmem_csv_filtered_tte`]. Phase 4.0 exposes it so the discrete-state /
+/// count routing can be exercised directly from unit tests (no parser produces
+/// those sets yet). Disjointness is validated inside [`read_nonmem_csv_impl`].
+#[cfg(test)]
+pub(crate) fn read_nonmem_csv_filtered_routed(
+    path: &Path,
+    routing: &ObsRouting,
+) -> Result<Population, String> {
+    read_nonmem_csv_impl(path, None, None, None, None, routing, &[]).map(|(pop, _)| pop)
 }
 
 /// Shared CSV reader. `table_decls`, when `Some`, requests building a
@@ -428,17 +606,19 @@ pub(crate) fn read_nonmem_csv_with_covariates_tte(
 /// undeclared covariates) are read into the [`Population`] leniently. `None` on
 /// both is the legacy auto-detect [`read_nonmem_csv`] path.
 ///
-/// `tte_cmts`: CMTs whose EVID=0 rows should be routed to `Subject::obs_records`
-/// (TTE endpoint) instead of the Gaussian parallel Vecs. Empty for all-Gaussian models.
+/// `routing`: per-CMT non-Gaussian endpoint routing (`ObsRecord::Event` /
+/// `DiscreteState` / `Count`). Default (all sets empty) ⇒ every observation row
+/// takes the Gaussian parallel-Vec path. Disjointness is validated up front.
 fn read_nonmem_csv_impl(
     path: &Path,
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
     table_decls: Option<&[CovariateDecl]>,
     filter: Option<&SelectionFilter>,
-    tte_cmts: &HashSet<usize>,
+    routing: &ObsRouting,
     column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
+    routing.validate()?;
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
         .has_headers(true)
@@ -527,7 +707,7 @@ fn read_nonmem_csv_impl(
     let cens_col = col_idx_ci("cens");
     let addl_col = col_idx_ci("addl");
     // TENTRY column: left-truncation / delayed-entry time for TTE rows.
-    // Absent in Gaussian-only datasets; only used when tte_cmts is non-empty.
+    // Absent in Gaussian-only datasets; only read for `routing.tte` (Event) rows.
     let tentry_col = col_idx_ci("tentry");
 
     // FREMTYPE column (case-insensitive)
@@ -713,7 +893,7 @@ fn read_nonmem_csv_impl(
                 fremtype_col,
                 &cov_indices,
                 filter,
-                tte_cmts,
+                routing,
                 tentry_col,
             )?;
         total_occ_failures += occ_failures;
@@ -836,14 +1016,13 @@ fn read_nonmem_csv_impl(
     } else if subjects.iter().all(|s| s.doses.is_empty()) {
         // Zero dose events across the whole population. Warn only when scored
         // observations are present (an all-EVID=2 / covariate-only dataset is not
-        // a fit) and the dataset isn't TTE/survival (which legitimately has no PK
-        // doses) — otherwise this would be a noisy false positive.
+        // a fit) and the dataset carries no non-Gaussian observations — TTE/survival
+        // and discrete/count endpoints legitimately have no PK doses, so suppressing
+        // the warning for them avoids a noisy false positive. `obs_records` is
+        // unconditional since Phase 4.0, so this needs no feature split.
         let total_scored_obs: usize = subjects.iter().map(|s| s.observations.len()).sum();
-        #[cfg(feature = "survival")]
-        let any_tte = subjects.iter().any(|s| !s.obs_records.is_empty());
-        #[cfg(not(feature = "survival"))]
-        let any_tte = false;
-        if total_scored_obs > 0 && !any_tte {
+        let any_nongaussian_obs = subjects.iter().any(|s| !s.obs_records.is_empty());
+        if total_scored_obs > 0 && !any_nongaussian_obs {
             population_warnings.push(format!(
                 "W_NO_DOSES: parsed zero dose events across all {} subject(s) although scored \
                  observations are present. If this is a PK model, check that the dataset has an \
@@ -1025,6 +1204,91 @@ fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String
     ))
 }
 
+/// Validate a `SS` (steady-state) dataset cell.
+///
+/// NONMEM overloads `SS`: `0` = not steady state, `1` = reset the dose
+/// compartment to zero and initialise it at the steady state of the given
+/// regimen, `2` = *superimpose* that steady state on top of the compartment's
+/// pre-existing amounts (no reset). ferx implements `SS=1` only.
+///
+/// The engine carries steady state as a single `DoseEvent.ss: bool`, so once a
+/// cell is reduced to that flag the `1`-vs-`2` distinction is gone. Previously
+/// any `SS >= 0.5` — including `SS=2` — was collapsed to `ss = true` and run
+/// with `SS=1` (reset) semantics, so an `SS=2` record produced a wrong (reset)
+/// profile with no error. `0` maps to `false`, `1` to `true`; every other value
+/// (including `SS=2`) is rejected here. Full `SS=2` support is tracked in #694.
+///
+/// A missing / blank / non-numeric cell arrives as `0.0` (via [`parse_f64`]) and
+/// is treated as "not steady state", matching the NONMEM default. `time` is the
+/// user-written (`raw_time`) value so the message names the row's own time.
+fn validate_ss(ss: f64, id: &str, time: f64) -> Result<bool, String> {
+    if !ss.is_finite() {
+        return Err(format!(
+            "subject {id}, time {time}: SS={ss} is not finite; expected 0 (not \
+             steady state) or 1 (reset then dose to steady state)."
+        ));
+    }
+    // `SS` is a NONMEM integer code. Match on the integer form (mirrors
+    // `validate_dose_rate`); a non-integer `SS` is not a code. `ss as i64`
+    // saturates, so an out-of-range integer can't alias 0/1. Comparison against
+    // `0.0` is exempt from clippy::float_cmp.
+    let code = if ss.fract() == 0.0 {
+        Some(ss as i64)
+    } else {
+        None
+    };
+    match code {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => {
+            let hint = if code == Some(2) {
+                " SS=2 (superimpose the steady state without resetting the \
+                 compartment) is not yet supported — only SS=1 (reset then dose \
+                 to steady state) is implemented; see issue #694."
+            } else {
+                ""
+            };
+            Err(format!(
+                "subject {id}, time {time}: SS={ss} is not a supported \
+                 steady-state code; expected 0 (not steady state) or 1 (reset \
+                 then dose to steady state).{hint}"
+            ))
+        }
+    }
+}
+
+/// Build a dose that honors the row's `RATE` classification (#324/#722).
+///
+/// A coded `RATE=-1`/`-2` row yields a *modeled* infusion ([`DoseEvent::modeled`],
+/// whose concrete rate/duration are resolved per iteration from `R{cmt}`/`D{cmt}`);
+/// an ordinary row yields a [`RateMode::Fixed`] dose. Passing the raw `-1`/`-2`
+/// sentinel to [`DoseEvent::new`] instead would set `rate_mode = Fixed` with
+/// `duration = 0` (since `rate <= 0`), so `is_infusion()` is false and the dose
+/// silently collapses to an instantaneous bolus — and `check_modeled_dose_rates`
+/// skips `Fixed` doses, so the missing slot is never caught.
+///
+/// **Single construction site** for the primary dose *and* its `ADDL`-expanded
+/// copies, so the two cannot diverge — that divergence is exactly what silently
+/// collapsed `ADDL` modeled infusions to boluses (#722). `ADDL` doses pass
+/// `ss = false` (an expanded dose is never steady-state itself); everything else
+/// is identical to the primary row.
+fn dose_for_rate_mode(
+    time: f64,
+    amt: f64,
+    cmt: usize,
+    rate: f64,
+    ss: bool,
+    ii: f64,
+    rate_mode: RateMode,
+) -> DoseEvent {
+    match rate_mode {
+        RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
+        RateMode::ModeledDuration | RateMode::ModeledRate => {
+            DoseEvent::modeled(time, amt, cmt, ss, ii, rate_mode)
+        }
+    }
+}
+
 /// Compute a record's effective EVID.
 ///
 /// When an `EVID` column is present its value governs (a blank / `.` /
@@ -1089,10 +1353,10 @@ fn parse_subject(
     fremtype_col: Option<usize>,
     cov_indices: &[(String, usize)],
     filter: Option<&SelectionFilter>,
-    // CMTs to route to `obs_records` instead of the Gaussian parallel Vecs.
-    // Empty for Gaussian-only models. Always available; feature-gated routing
-    // runs inside `#[cfg(feature = "survival")]` blocks.
-    tte_cmts: &HashSet<usize>,
+    // Per-CMT non-Gaussian endpoint routing (Event / DiscreteState / Count).
+    // Empty for Gaussian-only models. Always available; the TTE (`Event`) arm is
+    // feature-gated behind `survival`, the discrete/count arms compile unconditionally.
+    routing: &ObsRouting,
     // Column index of the TENTRY (left-truncation time) column, if present.
     _tentry_col: Option<usize>,
 ) -> Result<(Subject, usize, usize, SubjectExclusion, Vec<String>, usize), String> {
@@ -1127,13 +1391,14 @@ fn parse_subject(
     // dose rows don't trip the warning.
     let mut amt_ignored_rows: usize = 0;
 
-    // TTE state — only meaningful when tte_cmts is non-empty.
-    // obs_records: finalised TTE observation records for this subject.
+    // Non-Gaussian observation records for this subject. Holds TTE `Event`s
+    // (pushed only under `survival`) and, unconditionally, discrete-state / count
+    // rows. Unconditional since Phase 4.0 so the categorical (Track C) and Markov
+    // (Track D) endpoints share one stream on the default build.
+    let mut obs_records: Vec<crate::types::ObsRecord> = Vec::new();
     // tte_pending_left: per-CMT pending DV=0 row (may be a left-bound for an interval
     //   or a right-censored event, depending on whether the next row is DV=2).
-    //   Map value is (time, entry_time).
-    #[cfg(feature = "survival")]
-    let mut tte_obs_records: Vec<crate::types::ObsRecord> = Vec::new();
+    //   Map value is (time, entry_time). TTE-only, hence `survival`-gated.
     #[cfg(feature = "survival")]
     let mut tte_pending_left: HashMap<usize, (f64, f64)> = HashMap::new();
 
@@ -1424,17 +1689,21 @@ fn parse_subject(
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64(s))
                 .unwrap_or(0.0);
-            let ss = ss_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s.trim()) >= 0.5)
-                .unwrap_or(false);
+            // Validate the `SS` cell: only `SS=0`/`SS=1` are supported. A missing
+            // or blank cell parses to `0.0` (not steady state). `SS=2` and other
+            // codes are rejected here (via `validate_ss`) rather than silently
+            // collapsed into the single `ss = true` flag and run with `SS=1`
+            // (reset) semantics. `raw_time` names the value the user wrote.
+            let ss = validate_ss(
+                ss_col
+                    .and_then(|c| row.get(c))
+                    .map(|s| parse_f64(s.trim()))
+                    .unwrap_or(0.0),
+                id,
+                raw_time,
+            )?;
 
-            doses.push(match rate_mode {
-                RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
-                RateMode::ModeledDuration | RateMode::ModeledRate => {
-                    DoseEvent::modeled(time, amt, cmt, ss, ii, rate_mode)
-                }
-            });
+            doses.push(dose_for_rate_mode(time, amt, cmt, rate, ss, ii, rate_mode));
             dose_rec.push(row_seq);
             if occ_col.is_some() {
                 dose_occasions.push(occ);
@@ -1477,10 +1746,13 @@ fn parse_subject(
                 } else {
                     for k in 1..=(addl as u32) {
                         let addl_time = time + (k as f64) * ii;
-                        doses.push(DoseEvent::new(
-                            addl_time, amt, cmt, rate,
-                            false, // expanded doses are never SS themselves
-                            ii,
+                        // Same construction as the primary dose (see
+                        // `dose_for_rate_mode`): an expanded dose of a coded
+                        // `RATE=-1`/`-2` row stays a modeled infusion rather than
+                        // collapsing to a `Fixed` bolus, and is never steady-state
+                        // itself (`ss = false`).
+                        doses.push(dose_for_rate_mode(
+                            addl_time, amt, cmt, rate, false, ii, rate_mode,
                         ));
                         dose_rec.push(row_seq);
                         if occ_col.is_some() {
@@ -1523,11 +1795,21 @@ fn parse_subject(
                 })
                 .unwrap_or(1);
 
-            // TTE row routing: when this CMT belongs to a TTE endpoint, route to
-            // obs_records instead of the Gaussian parallel Vecs.
-            // The `tte_cmts.contains` check is always compiled (HashSet is not
-            // feature-gated); the inner ObsRecord construction is cfg-gated.
-            if tte_cmts.contains(&cmt) {
+            // A missing DV cell (`.` / `NA` / blank) means "no observation":
+            // `parse_f64` coerced it to `0.0` above, so without this guard a
+            // forgotten MDV would inject a phantom scored row. NONMEM convention
+            // marks such rows MDV=1; treat a forgotten one the same way — skip it
+            // and count it for the single W_MISSING_DV summary (#258). Applied to
+            // every scored endpoint below (Gaussian, discrete-state, count); the
+            // TTE `Event` arm keeps its own DV-code semantics and does not use it.
+            let dv_missing = is_missing_cell(row.get(dv_col).map(|s| s.as_str()).unwrap_or(""));
+
+            // Non-Gaussian row routing: when this CMT belongs to a declared TTE /
+            // discrete-state / count endpoint, route the row to `obs_records`
+            // instead of the Gaussian parallel Vecs. The routing `.contains`
+            // checks are always compiled; only the TTE `Event` construction is
+            // `survival`-gated. The routing sets are disjoint (validated up front).
+            if routing.tte.contains(&cmt) {
                 #[cfg(feature = "survival")]
                 {
                     use crate::types::{EventType, ObsRecord};
@@ -1564,7 +1846,7 @@ fn parse_subject(
                             // interval-censored pair. Save as pending; flush on next row.
                             // Flush any existing pending for this CMT first.
                             if let Some((t_left, e_left)) = tte_pending_left.remove(&cmt) {
-                                tte_obs_records.push(ObsRecord::Event {
+                                obs_records.push(ObsRecord::Event {
                                     time: t_left,
                                     event_type: EventType::RightCensored,
                                     entry_time: e_left,
@@ -1576,14 +1858,14 @@ fn parse_subject(
                         1 => {
                             // DV=1: exact event. Flush any pending left for this CMT.
                             if let Some((t_left, e_left)) = tte_pending_left.remove(&cmt) {
-                                tte_obs_records.push(ObsRecord::Event {
+                                obs_records.push(ObsRecord::Event {
                                     time: t_left,
                                     event_type: EventType::RightCensored,
                                     entry_time: e_left,
                                     cmt,
                                 });
                             }
-                            tte_obs_records.push(ObsRecord::Event {
+                            obs_records.push(ObsRecord::Event {
                                 time,
                                 event_type: EventType::Exact,
                                 entry_time,
@@ -1600,7 +1882,7 @@ fn parse_subject(
                                 )
                             })?;
                             let (t_left, e_left) = left;
-                            tte_obs_records.push(ObsRecord::Event {
+                            obs_records.push(ObsRecord::Event {
                                 time,
                                 event_type: EventType::IntervalCensored {
                                     left: t_left,
@@ -1619,19 +1901,38 @@ fn parse_subject(
                         }
                     }
                 }
-                // Note: no fallback needed here. `tte_cmts` is always empty when the
-                // `survival` feature is off (callers pass `&HashSet::new()`), so this
-                // branch is never entered in that build. The dead cfg block was removed.
+                // No fallback arm needed: `routing.tte` is always empty when the
+                // `survival` feature is off (its only producer is a TTE endpoint),
+                // so this branch is never entered in that build.
+            } else if let Some(kind) = routing.integer_kind(cmt) {
+                // Non-Gaussian integer-coded observation (discrete-state index or
+                // count). A missing DV is skipped as MDV=1 — the same #258
+                // phantom-zero guard the Gaussian branch uses — so a forgotten MDV
+                // never records a spurious `state:0` / `count:0`. Otherwise the DV
+                // must be a finite, non-negative, in-range integer (`checked_integer_dv`,
+                // #192); no endpoint math here (Phase 4.0).
+                if dv_missing {
+                    missing_dv_skipped += 1;
+                    continue;
+                }
+                let magnitude = checked_integer_dv(dv, kind, id, cmt, time)?;
+                obs_records.push(match kind {
+                    IntDvKind::DiscreteState => crate::types::ObsRecord::DiscreteState {
+                        time,
+                        state: magnitude as usize,
+                        cmt,
+                    },
+                    IntDvKind::Count => crate::types::ObsRecord::Count {
+                        time,
+                        count: magnitude as u32,
+                        cmt,
+                    },
+                });
             } else {
-                // Gaussian path.
-                // Missing DV (`.` / `NA` / blank) on a scored observation row
-                // (EVID=0, MDV=0): NONMEM convention is to mark these MDV=1, but
-                // if the user didn't, `parse_f64` would coerce the cell to 0.0
-                // and inject a phantom zero observation into the likelihood.
-                // Treat a missing DV as MDV=1 — skip the row — and count it for a
-                // single summary warning (W_MISSING_DV; issue #258).
-                let dv_cell = row.get(dv_col).map(|s| s.as_str()).unwrap_or("");
-                if is_missing_cell(dv_cell) {
+                // Gaussian path. A missing DV (`.`/`NA`/blank) is skipped as MDV=1
+                // (see the `dv_missing` note above; #258) so a forgotten MDV never
+                // injects a phantom zero observation.
+                if dv_missing {
                     missing_dv_skipped += 1;
                     continue;
                 }
@@ -1758,7 +2059,7 @@ fn parse_subject(
     // following DV=2 — the subject was censored at its last observation time.
     #[cfg(feature = "survival")]
     for (cmt, (t_left, e_left)) in tte_pending_left {
-        tte_obs_records.push(crate::types::ObsRecord::Event {
+        obs_records.push(crate::types::ObsRecord::Event {
             time: t_left,
             event_type: crate::types::EventType::RightCensored,
             entry_time: e_left,
@@ -1784,8 +2085,7 @@ fn parse_subject(
             occasions,
             dose_occasions: sorted_dose_occ,
             fremtype,
-            #[cfg(feature = "survival")]
-            obs_records: tte_obs_records,
+            obs_records,
         },
         occ_parse_failures,
         missing_dv_skipped,
@@ -1879,6 +2179,28 @@ mod tests {
             "{:?}",
             pop.warnings
         );
+    }
+
+    #[test]
+    fn ss2_dose_row_is_rejected() {
+        // An `SS=2` dose (superimpose steady state without reset) must not load
+        // silently as `SS=1` (reset) — reading the dataset fails end-to-end with a
+        // message that identifies the row and points at the tracking issue. This
+        // is the wiring test for `validate_ss` on the real parse path.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
+                   1,0,.,1,100,1,0,1,2,24\n\
+                   1,1,5.0,0,.,1,0,0,0,0\n";
+        let f = write_csv(csv);
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("SS=2") && err.contains("#694"), "{err}");
+
+        // SS=1 on the same layout still loads (the regimen ferx does support).
+        let ok = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
+                  1,0,.,1,100,1,0,1,1,24\n\
+                  1,1,5.0,0,.,1,0,0,0,0\n";
+        let f = write_csv(ok);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(pop.subjects[0].doses[0].ss);
     }
 
     #[test]
@@ -2227,6 +2549,44 @@ mod tests {
         assert_eq!(validate_dose_rate(50.0, "1", 0.0).unwrap(), RateMode::Fixed);
     }
 
+    // ── NONMEM SS codes: only 0/1 supported ──────────────────────────────────
+    // The engine stores steady state as a single `DoseEvent.ss: bool`. `SS=1`
+    // (reset then equilibrate) and `SS=2` (superimpose without reset) are
+    // *different* regimens, but both used to collapse to `ss = true` (`SS >= 0.5`)
+    // and run with SS=1 semantics — so an SS=2 record silently produced a wrong
+    // (reset) profile. `validate_ss` is the unit under test: 0/1 pass, everything
+    // else (SS=2, other codes, non-integers, non-finite) is rejected loudly.
+    #[test]
+    fn validate_ss_accepts_0_and_1_rejects_others() {
+        // The only supported codes: 0 = not steady state, 1 = reset then dose to
+        // steady state.
+        assert!(!validate_ss(0.0, "1", 0.0).unwrap());
+        assert!(validate_ss(1.0, "1", 0.0).unwrap());
+
+        // SS=2 (superimpose without reset) is not supported — rejected loudly,
+        // not silently collapsed to SS=1. The message names the value, the row,
+        // and the tracking issue so the offending record is identifiable.
+        let e = validate_ss(2.0, "7", 12.0).unwrap_err();
+        assert!(
+            e.contains("SS=2") && e.contains("#694") && e.contains("subject 7"),
+            "{e}"
+        );
+
+        // Other codes and non-integers are not rounded into 0/1 — a stray SS is
+        // malformed, not a silent steady-state regimen.
+        for s in [3.0, -1.0, 0.5, 1.5] {
+            let e = validate_ss(s, "1", 0.0).unwrap_err();
+            assert!(e.contains(&format!("SS={s}")), "s={s}: {e}");
+        }
+
+        // Non-finite SS on a dose row is malformed (old code: `inf >= 0.5` was a
+        // silent steady-state dose).
+        for s in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let e = validate_ss(s, "1", 0.0).unwrap_err();
+            assert!(e.contains("not finite"), "s={s}: {e}");
+        }
+    }
+
     #[test]
     fn coded_rate_minus_one_on_dose_row_loads_as_modeled_rate() {
         // A RATE=-1 dose loads as a modeled-rate dose (the R{cmt} existence +
@@ -2246,6 +2606,75 @@ mod tests {
             dose.is_infusion() && !dose.is_fixed(),
             "modeled, not a bolus"
         );
+    }
+
+    #[test]
+    fn addl_expansion_preserves_coded_rate_mode() {
+        // Regression (ADDL + coded RATE): every ADDL-expanded dose of a coded
+        // `RATE=-2` (modeled-duration) row must stay modeled, not collapse to a
+        // `Fixed` bolus. The additional doses used to be built via
+        // `DoseEvent::new` with the raw `-2` sentinel → `rate_mode = Fixed`,
+        // `duration = 0` (since `rate <= 0`), so `is_infusion()` was false and
+        // each additional dose silently became an instantaneous bolus (and
+        // `check_modeled_dose_rates` skips `Fixed` doses, so the missing
+        // `D{cmt}` slot was never caught). One modeled infusion followed by N
+        // boluses is a silently-wrong regimen on fit/predict/simulate.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,ADDL\n\
+                   1,0,.,1,100,1,-2,1,24,2\n\
+                   1,1,5.0,0,.,.,.,0,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let doses = &pop.subjects[0].doses;
+        assert_eq!(doses.len(), 3, "primary + 2 ADDL doses");
+        for (k, d) in doses.iter().enumerate() {
+            assert_eq!(
+                d.rate_mode,
+                RateMode::ModeledDuration,
+                "dose {k} must stay modeled-duration, not Fixed"
+            );
+            assert!(
+                d.is_infusion() && !d.is_fixed(),
+                "dose {k} modeled, not a bolus"
+            );
+            assert_eq!(d.amt, 100.0);
+            assert_eq!(d.cmt, 1);
+        }
+        // Additional doses land at time + k*II.
+        assert_eq!(doses[1].time, 24.0);
+        assert_eq!(doses[2].time, 48.0);
+    }
+
+    #[test]
+    fn addl_expansion_preserves_modeled_rate() {
+        // Mirror of `addl_expansion_preserves_coded_rate_mode` for the OTHER
+        // coded mode, `RATE=-1` (modeled rate → `R{cmt}`). Both modes share the
+        // single `DoseEvent::modeled(...)` ADDL arm, so this locks in that the
+        // `ModeledRate` branch (which `modeled()` tags `InfusionDef::RateDefined`,
+        // vs `DurationDefined` for `RATE=-2`) is preserved across ADDL expansion,
+        // not just `ModeledDuration`. Without the fix these collapsed to `Fixed`
+        // boluses via `DoseEvent::new` with the raw `-1` sentinel.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,ADDL\n\
+                   1,0,.,1,100,1,-1,1,24,2\n\
+                   1,1,5.0,0,.,.,.,0,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let doses = &pop.subjects[0].doses;
+        assert_eq!(doses.len(), 3, "primary + 2 ADDL doses");
+        for (k, d) in doses.iter().enumerate() {
+            assert_eq!(
+                d.rate_mode,
+                RateMode::ModeledRate,
+                "dose {k} must stay modeled-rate, not Fixed"
+            );
+            assert!(
+                d.is_infusion() && !d.is_fixed(),
+                "dose {k} modeled, not a bolus"
+            );
+            assert_eq!(d.amt, 100.0);
+            assert_eq!(d.cmt, 1);
+        }
+        assert_eq!(doses[1].time, 24.0);
+        assert_eq!(doses[2].time, 48.0);
     }
 
     #[test]
@@ -2549,13 +2978,326 @@ mod tests {
             event_type,
             entry_time,
             ..
-        } = &recs[0];
+        } = &recs[0]
+        else {
+            panic!("expected a TTE Event record");
+        };
         assert_eq!(*time, 100.0, "event time stays on the raw data clock");
         assert_eq!(
             *entry_time, 90.0,
             "TENTRY must be the raw value, not shifted to first-row origin or clamped to 0"
         );
         assert!(matches!(event_type, EventType::Exact));
+    }
+
+    // ── Phase 4.0: discrete-state / count observation routing ────────────────
+    // The reader routes EVID=0 rows on a declared discrete/count CMT into
+    // `obs_records` as `DiscreteState` / `Count`, with an integer + non-negative
+    // guard (mirrors the TTE integer-code rule). No endpoint math yet — these
+    // exercise only the plumbing, via the `_routed` entry point (no parser
+    // populates the discrete/count sets in Phase 4.0). Default-features tests so
+    // the per-PR coverage gate measures them.
+
+    #[test]
+    fn discrete_state_cmt_routes_integer_dv_into_obs_records() {
+        use crate::types::ObsRecord;
+        let routing = ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        };
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,0,0,0,0,.,3\n\
+                   1,1,2,0,0,.,3\n\
+                   1,2,1,0,0,.,3\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        let subj = &pop.subjects[0];
+        assert!(
+            subj.observations.is_empty(),
+            "discrete rows must route to obs_records, not the Gaussian observation vec"
+        );
+        let states: Vec<(f64, usize)> = subj
+            .obs_records
+            .iter()
+            .map(|r| match r {
+                ObsRecord::DiscreteState { time, state, cmt } => {
+                    assert_eq!(*cmt, 3);
+                    (*time, *state)
+                }
+                other => panic!("expected DiscreteState, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(states, vec![(0.0, 0), (1.0, 2), (2.0, 1)]);
+    }
+
+    #[test]
+    fn count_cmt_routes_nonneg_integer_dv_into_obs_records() {
+        use crate::types::ObsRecord;
+        let routing = ObsRouting {
+            count: [4].into_iter().collect(),
+            ..Default::default()
+        };
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,0,5,0,0,.,4\n\
+                   1,1,0,0,0,.,4\n\
+                   1,2,12,0,0,.,4\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        let counts: Vec<(f64, u32)> = pop.subjects[0]
+            .obs_records
+            .iter()
+            .map(|r| match r {
+                ObsRecord::Count { time, count, cmt } => {
+                    assert_eq!(*cmt, 4);
+                    (*time, *count)
+                }
+                other => panic!("expected Count, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(counts, vec![(0.0, 5), (1.0, 0), (2.0, 12)]);
+    }
+
+    #[test]
+    fn discrete_state_endpoint_rejects_noninteger_dv() {
+        let routing = ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        };
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,1.5,0,0,.,3\n";
+        let f = write_csv(csv);
+        let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+        assert!(err.contains("non-integer"), "got: {err}");
+        assert!(err.contains("discrete-state"), "got: {err}");
+    }
+
+    #[test]
+    fn discrete_state_endpoint_rejects_negative_dv() {
+        let routing = ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        };
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,-1,0,0,.,3\n";
+        let f = write_csv(csv);
+        let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+        assert!(err.contains("negative"), "got: {err}");
+    }
+
+    #[test]
+    fn count_endpoint_rejects_noninteger_dv() {
+        let routing = ObsRouting {
+            count: [4].into_iter().collect(),
+            ..Default::default()
+        };
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,2.5,0,0,.,4\n";
+        let f = write_csv(csv);
+        let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+        assert!(err.contains("non-integer"), "got: {err}");
+        assert!(err.contains("count"), "got: {err}");
+    }
+
+    #[test]
+    fn count_endpoint_rejects_negative_or_overflow_dv() {
+        let routing = ObsRouting {
+            count: [4].into_iter().collect(),
+            ..Default::default()
+        };
+        // Below 0 and above u32::MAX both fail the count range check.
+        for bad in ["-3", "5000000000"] {
+            let csv = format!("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,{bad},0,0,.,4\n");
+            let f = write_csv(&csv);
+            let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+            assert!(err.contains("out-of-range"), "DV={bad} got: {err}");
+        }
+    }
+
+    #[test]
+    fn obs_routing_rejects_cmt_in_two_endpoint_kinds() {
+        // A CMT declared under two endpoint kinds is ambiguous; rejected before
+        // any row is read (ObsRouting::validate). Cover all three pairings.
+        let cases = [
+            ObsRouting {
+                tte: [3].into_iter().collect(),
+                discrete: [3].into_iter().collect(),
+                ..Default::default()
+            },
+            ObsRouting {
+                tte: [3].into_iter().collect(),
+                count: [3].into_iter().collect(),
+                ..Default::default()
+            },
+            ObsRouting {
+                discrete: [3].into_iter().collect(),
+                count: [3].into_iter().collect(),
+                ..Default::default()
+            },
+        ];
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,1,0,0,.,3\n";
+        for routing in cases {
+            let f = write_csv(csv);
+            let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+            assert!(err.contains("only one endpoint type"), "got: {err}");
+        }
+    }
+
+    // ── Phase 4.0 regression: DV guard gaps on discrete/count endpoints ───────
+    // A missing / non-finite DV must NOT silently become a phantom record. The
+    // integer guard `(dv - dv.round()).abs() > 1e-9` can't reject a non-finite
+    // `dv` (every NaN/inf comparison is false), and `parse_f64` coerces a missing
+    // cell to `0.0`; without the finiteness guard and the shared missing-DV skip,
+    // `.` → `state:0`/`count:0`, `inf` → saturated `usize::MAX`, `NaN` → `0`.
+
+    #[test]
+    fn discrete_and_count_endpoints_skip_missing_dv() {
+        // A missing DV on a discrete/count row is treated as MDV=1 (#258): the row
+        // is skipped (no phantom `state:0`/`count:0`) and folded into the single
+        // W_MISSING_DV summary, exactly like the Gaussian path. `.`, `NA`, and
+        // `NaN` (case-insensitive) are all missing tokens (`is_missing_cell`).
+        use crate::types::ObsRecord;
+        for set_name in ["discrete", "count"] {
+            for missing in [".", "NA", "NaN", "na", "nan"] {
+                let routing = match set_name {
+                    "discrete" => ObsRouting {
+                        discrete: [3].into_iter().collect(),
+                        ..Default::default()
+                    },
+                    _ => ObsRouting {
+                        count: [3].into_iter().collect(),
+                        ..Default::default()
+                    },
+                };
+                // Row at t=1 is missing; the t=0 and t=2 rows are valid.
+                let csv = format!(
+                    "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                     1,0,2,0,0,.,3\n\
+                     1,1,{missing},0,0,.,3\n\
+                     1,2,1,0,0,.,3\n"
+                );
+                let f = write_csv(&csv);
+                let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+                let subj = &pop.subjects[0];
+                // Exactly the two valid rows survive — the missing one is dropped,
+                // not recorded as a spurious zero at t=1.
+                let times: Vec<f64> =
+                    subj.obs_records
+                        .iter()
+                        .map(|r| match r {
+                            ObsRecord::DiscreteState { time, .. }
+                            | ObsRecord::Count { time, .. } => *time,
+                            other => panic!("{set_name}/{missing}: unexpected record {other:?}"),
+                        })
+                        .collect();
+                assert_eq!(
+                    times,
+                    vec![0.0, 2.0],
+                    "{set_name}/{missing}: missing-DV row must be skipped, not a phantom zero"
+                );
+                let warns = pop
+                    .warnings
+                    .iter()
+                    .filter(|w| w.starts_with("W_MISSING_DV"))
+                    .count();
+                assert_eq!(
+                    warns, 1,
+                    "{set_name}/{missing}: expected one W_MISSING_DV summary"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discrete_state_endpoint_rejects_nonfinite_dv() {
+        // `±inf` (including an overflow like `1e999`) must be rejected, not cast:
+        // `inf as usize` saturates to usize::MAX and `-inf as usize` is 0. The
+        // integer guard alone misses these because comparisons against a
+        // non-finite value are always false. (A literal `NaN`/`NA` cell is a
+        // *missing* token — covered by the skip test above, not here.)
+        let routing = ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        };
+        for bad in ["inf", "-inf", "1e999"] {
+            let csv = format!("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,{bad},0,0,.,3\n");
+            let f = write_csv(&csv);
+            let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+            assert!(err.contains("non-finite"), "DV={bad} got: {err}");
+            assert!(err.contains("discrete-state"), "DV={bad} got: {err}");
+        }
+    }
+
+    #[test]
+    fn count_endpoint_rejects_nonfinite_dv() {
+        let routing = ObsRouting {
+            count: [4].into_iter().collect(),
+            ..Default::default()
+        };
+        for bad in ["inf", "-inf", "1e999"] {
+            let csv = format!("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,{bad},0,0,.,4\n");
+            let f = write_csv(&csv);
+            let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+            assert!(err.contains("non-finite"), "DV={bad} got: {err}");
+            assert!(err.contains("count"), "DV={bad} got: {err}");
+        }
+    }
+
+    #[test]
+    fn discrete_state_endpoint_rejects_dv_above_usize_range() {
+        // A finite but astronomically large integer-valued DV (`1e300`) is beyond
+        // usize; without the upper-bound check `1e300 as usize` saturates to
+        // usize::MAX silently. Count already had this guard (via `> u32::MAX`);
+        // discrete now mirrors it (via the shared exclusive_max bound).
+        let routing = ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        };
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,1e300,0,0,.,3\n";
+        let f = write_csv(csv);
+        let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+        assert!(err.contains("out-of-range"), "got: {err}");
+    }
+
+    #[test]
+    fn count_endpoint_accepts_u32_max() {
+        // The upper bound is exclusive at `u32::MAX + 1`, so the full u32 range —
+        // including `u32::MAX` itself — is accepted, not rejected. (Locks the
+        // boundary against a future "tighten `>=`" that would drop `u32::MAX`.)
+        use crate::types::ObsRecord;
+        let routing = ObsRouting {
+            count: [4].into_iter().collect(),
+            ..Default::default()
+        };
+        let csv = format!("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,{},0,0,.,4\n", u32::MAX);
+        let f = write_csv(&csv);
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        assert!(
+            matches!(
+                pop.subjects[0].obs_records.as_slice(),
+                [ObsRecord::Count { count, .. }] if *count == u32::MAX
+            ),
+            "u32::MAX must be an accepted count, got {:?}",
+            pop.subjects[0].obs_records
+        );
+    }
+
+    #[test]
+    fn discrete_state_endpoint_accepts_large_valid_index() {
+        // A large but in-`usize` state index (`1e18` < 2^64) is a legitimate value
+        // and must be recorded exactly, not rejected by the overflow guard.
+        use crate::types::ObsRecord;
+        let routing = ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        };
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,1e18,0,0,.,3\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        assert!(
+            matches!(
+                pop.subjects[0].obs_records.as_slice(),
+                [ObsRecord::DiscreteState { state, .. }] if *state == 1_000_000_000_000_000_000
+            ),
+            "1e18 must be an accepted state index, got {:?}",
+            pop.subjects[0].obs_records
+        );
     }
 
     #[test]

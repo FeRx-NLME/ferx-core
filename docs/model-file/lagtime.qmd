@@ -74,6 +74,14 @@ NONMEM's per-compartment `ALAG1`, `ALAG2`, ... are mapped to a single
 For typical PK models (one absorption compartment, doses into the depot)
 this is equivalent to setting `ALAG1` on the depot compartment.
 
+On an **analytical** `pk` model, bind the lag through the bare `lagtime=`
+(alias `alag=`) argument. You may name the parameter `ALAG1`/`LAGTIME1` and map
+it — `pk(..., lagtime=ALAG1)` applies it exactly like `lagtime=TLAG` — but an
+`ALAG{n}`/`LAGTIME{n}` parameter left *unmapped* is a parse error, since on the
+single-route analytical engine it would otherwise be silently discarded (#725).
+Genuinely per-compartment lag (a different `ALAG{n}` per dose compartment) is an
+[ODE-model](ode-models.qmd) feature.
+
 ### Numeric cross-check against NONMEM 7.5.1
 
 The analytic FOCE/FOCEI lagtime gradient is the exact derivative (verified

@@ -202,7 +202,6 @@ fn template_population(n: usize) -> Population {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: vec![],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         })
         .collect();

@@ -2871,7 +2871,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -2975,7 +2974,6 @@ mod tests {
             occasions: vec![1; 6],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -3098,7 +3096,6 @@ mod tests {
             occasions: vec![1; 6],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -3531,7 +3528,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 0, 100], // last obs is FREM
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -3654,7 +3650,6 @@ mod iov_tests {
                 occasions: vec![1, 1, 2, 2],
                 dose_occasions: vec![1, 2],
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             }],
             covariate_names: Vec::new(),
@@ -3782,7 +3777,6 @@ mod iov_tests {
             occasions: vec![1; 5],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let subject = tvcov_subj();
@@ -3849,7 +3843,6 @@ mod iov_tests {
             occasions: vec![1, 1, 2, 2],
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         // FD subject: more occasion groups than the widened ODE IOV dispatch serves.
@@ -3873,7 +3866,6 @@ mod iov_tests {
             occasions: (1..=n_wide as u32).collect(),
             dose_occasions: (1..=n_wide as u32).collect(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -3919,7 +3911,6 @@ mod iov_tests {
             occasions: vec![1, 1, 2, 2],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -3969,7 +3960,6 @@ mod iov_tests {
             occasions: vec![1, 1, 2, 2],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         assert!(
@@ -4012,7 +4002,6 @@ mod iov_tests {
             occasions: vec![1, 1, 2, 2],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         assert!(
@@ -4055,7 +4044,6 @@ mod iov_tests {
             occasions: vec![1, 1, 2, 2],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         assert!(
@@ -4094,7 +4082,6 @@ mod iov_tests {
             occasions: vec![1, 1, 2, 2],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         assert!(
@@ -4208,7 +4195,6 @@ mod iov_tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -4268,7 +4254,6 @@ mod iov_tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let params = model.default_params.clone();
@@ -4357,7 +4342,6 @@ mod iov_tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let params = model.default_params.clone();
@@ -4457,7 +4441,6 @@ mod iov_tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -4681,7 +4664,6 @@ mod iov_tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let params = model.default_params.clone();
@@ -4782,7 +4764,6 @@ mod iov_tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let params = model.default_params.clone();
@@ -4895,7 +4876,6 @@ mod iov_tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let params = model.default_params.clone();
@@ -5012,7 +4992,6 @@ mod iov_tests {
                 occasions: vec![1, 1, 1, 2, 2, 2],
                 dose_occasions: vec![1, 2],
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             };
             let params = model.default_params.clone();
@@ -5125,7 +5104,6 @@ mod iov_tests {
                 occasions: vec![1, 1, 1, 2, 2, 2],
                 dose_occasions: vec![1, 2],
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             };
             let params = model.default_params.clone();
@@ -5237,7 +5215,6 @@ mod iov_tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let params = model.default_params.clone();
@@ -5455,7 +5432,6 @@ mod iov_tests {
             occasions: vec![1; 6],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let params = model.default_params.clone();
@@ -5523,7 +5499,6 @@ mod iov_tests {
             occasions: vec![1; 7],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         // A genuinely non-zero η, including the residual-error component.
@@ -5560,7 +5535,6 @@ mod iov_tests {
             occasions: vec![1; 7],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         check_inner_ruv_grad(&model, &subject, &[0.15, -0.10, 0.25]);
@@ -5643,7 +5617,6 @@ mod iov_tests {
             occasions: vec![1; 5],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         // Nonzero residuals: predictions at η=0.1 nudged, scored at a different η.
@@ -5687,7 +5660,6 @@ mod iov_tests {
             occasions: vec![1; 5],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         assert!(
@@ -5738,7 +5710,6 @@ mod iov_tests {
             occasions: vec![1; 5],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let preds = crate::pk::compute_predictions_with_tv(
@@ -5780,7 +5751,6 @@ mod iov_tests {
             occasions: vec![1; 7],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let preds = crate::pk::compute_predictions_with_tv(
@@ -5863,7 +5833,6 @@ mod iov_tests {
             occasions: vec![1; 5],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -5925,7 +5894,6 @@ mod iov_tests {
             occasions: vec![1; 7],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let theta = vec![0.22, 11.0, 1.4, 1.6];
@@ -6017,7 +5985,6 @@ mod iov_tests {
             occasions: vec![1; 7],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let preds = crate::pk::compute_predictions_with_tv(
@@ -6093,7 +6060,6 @@ mod iov_tests {
             occasions: vec![1; 7],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let preds = crate::pk::compute_predictions_with_tv(
@@ -6250,7 +6216,6 @@ mod iov_tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let params = model.default_params.clone();
@@ -6361,7 +6326,6 @@ mod iov_tests {
             cens: vec![0; 3],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let params = model.default_params.clone();

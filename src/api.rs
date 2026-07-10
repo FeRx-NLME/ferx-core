@@ -296,7 +296,7 @@ pub fn run_model_with_data_inits(
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
     let sel_filter = build_selection_filter(&parsed.fit_options)?;
-    let (population, covariate_table) = read_population_for(
+    let (mut population, covariate_table) = read_population_for(
         &parsed.model,
         &parsed.covariate_decls,
         data_path,
@@ -361,7 +361,29 @@ pub fn run_model_with_data_inits(
     result.model_hash = model_hash;
     result.data_hash = data_hash;
     result.model_text = std::fs::read_to_string(model_path).ok();
+    derive_output_occasions(&parsed.model, &parsed.fit_options, &mut population);
     Ok((result, population))
+}
+
+/// Mirror [`fit`]'s model-side IOV occasion derivation onto a caller-owned
+/// population so downstream output — sdtab's `OCC` column and any per-occasion
+/// diagnostic keyed on [`Subject::occasions`] — reflects the derived labels.
+/// `fit()` derives occasions only on its internal population clone, so without
+/// this the returned population still has empty `occasions` under a
+/// `dose`/`time(...)` rule and the OCC column silently vanishes versus an
+/// equivalent `iov_column` run (#757). No-op unless the model declares kappa and
+/// a derived rule is active; `had_column = false` + a throwaway sink because the
+/// override warning already fired inside `fit()`.
+fn derive_output_occasions(
+    model: &CompiledModel,
+    options: &FitOptions,
+    population: &mut Population,
+) {
+    if model.n_kappa == 0 || options.iov_occasion == IovOccasionRule::Column {
+        return;
+    }
+    let mut sink = Vec::new();
+    apply_iov_occasion_rule(population, &options.iov_occasion, false, &mut sink);
 }
 
 /// Run a model file with simulated data (from [simulation] block).
@@ -473,6 +495,11 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                     cmt,
                 })
                 .collect(),
+            // `obs_records` is unconditional since Phase 4.0, but the only records
+            // this synthetic TTE subject carries are `Event`s (survival-gated); with
+            // the feature off there is no TTE endpoint, so the vec is empty.
+            #[cfg(not(feature = "survival"))]
+            obs_records: Vec::new(),
         })
         .collect();
     let template = Population {
@@ -493,7 +520,10 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // planned study end (#522). `match_method = None` makes this identical to
     // `simulate_with_seed` for the Gaussian path (same seeded RNG, no matching),
     // and the `None`-matching branch cannot error.
-    let sim_results = simulate_with_options(
+    let SimulationOutput {
+        results: sim_results,
+        warnings: sim_warnings,
+    } = simulate_with_options_diag(
         &parsed.model,
         &template,
         &parsed.model.default_params,
@@ -610,6 +640,16 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     result.model_path = Some(model_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.model_text = std::fs::read_to_string(model_path).ok();
+    // Surface any per-subject simulation diagnostics (#762/#763) alongside the fit
+    // warnings so the CLI reports a degenerate simulated subject rather than dropping it.
+    // `fit()` already built `warnings_structured` from the fit warnings; rebuild it
+    // unconditionally so the appended sim warnings also reach the typed / JSON surface
+    // (#778/#779), where `classify_warning` tags them `WarningCode::Simulation`. The
+    // rebuild is idempotent — a pure function of `result.warnings` — so an empty
+    // `sim_warnings` (the common case, and every non-survival build) just reproduces the
+    // fit's structured list.
+    result.warnings.extend(sim_warnings);
+    rebuild_warnings_structured(&mut result);
     Ok((result, population))
 }
 
@@ -989,10 +1029,22 @@ fn check_per_cmt_error_model(model: &CompiledModel, population: &Population) -> 
 /// `fit()` so the first error is unchanged: covariates, scaling, error model,
 /// iov occasions.
 pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    // Default (no model-side occasion rule): occasions, if any, come from the data.
+    check_model_data_rule(model, population, &IovOccasionRule::Column)
+}
+
+/// [`check_model_data`] variant aware of the model-side IOV occasion rule, so the
+/// `E_IOV_MISSING_OCC` check can be skipped when `iov_occasion` will derive the
+/// labels at fit time. Used by `fit()` and the `ferx check` path.
+pub fn check_model_data_rule(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Vec<Diagnostic> {
     let mut diags = check_covariates(model, population);
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
-    diags.extend(check_iov_occasions(model, population));
+    diags.extend(check_iov_occasions(model, population, iov_rule));
     diags.extend(check_absorption_dosing(model, population));
     diags.extend(check_modeled_dose_rates(model, population));
     diags.extend(validate_output_columns(model, population));
@@ -1002,8 +1054,18 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
 /// IOV models require occasion labels in the dataset. When `n_kappa > 0` but
 /// every subject has an empty `occasions` vector the kappa random effects are
 /// silently ignored — catch this early instead.
-fn check_iov_occasions(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+fn check_iov_occasions(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Vec<Diagnostic> {
     if model.n_kappa == 0 {
+        return Vec::new();
+    }
+    // A model-side occasion rule (`iov_occasion = dose | time(...)`) populates the
+    // occasion labels at fit time from each subject's timeline, so the dataset need
+    // not carry them — the empty-occasions check does not apply.
+    if *iov_rule != IovOccasionRule::Column {
         return Vec::new();
     }
     // `all()` on an empty iterator is vacuously true; an empty population is not
@@ -1015,11 +1077,108 @@ fn check_iov_occasions(model: &CompiledModel, population: &Population) -> Vec<Di
     }
     vec![Diagnostic::error(
         "E_IOV_MISSING_OCC",
-        "Model declares kappa (IOV) parameters but no occasion labels were found in the \
-         dataset. Set `iov_column = \"OCC\"` (or the relevant column name) in \
-         [fit_options] so that per-occasion kappas can be estimated.",
+        "Model declares kappa (IOV) parameters but no occasion labels were found. Either set \
+         `iov_column = \"OCC\"` (or the relevant column name) to read occasions from the dataset, \
+         or set `iov_occasion = dose` / `iov_occasion = time(...)` to derive them in the model — \
+         both in [fit_options] — so that per-occasion kappas can be estimated.",
     )
     .with_block("fit_options")]
+}
+
+/// Derive each subject's IOV occasion labels from a model-side rule
+/// ([`IovOccasionRule::PerDose`] or [`IovOccasionRule::TimeWindows`]), writing
+/// `Subject::occasions` (parallel to `obs_times`) and `Subject::dose_occasions`
+/// (parallel to `doses`). This is the DSL alternative to a dataset occasion
+/// column; downstream grouping (`split_obs_by_occasion`) is identical either way.
+///
+/// When `had_column` is true the model *also* set `iov_column`; the DSL rule wins
+/// and a one-time override warning is pushed. A `Column` rule must never reach
+/// here (the caller only clones the population when a derived rule is active).
+fn apply_iov_occasion_rule(
+    population: &mut Population,
+    rule: &IovOccasionRule,
+    had_column: bool,
+    warnings: &mut Vec<String>,
+) {
+    if had_column {
+        warnings.push(
+            "iov_occasion is set in [fit_options], so the model-side occasion rule is used and \
+             the iov_column dataset column is ignored."
+                .to_string(),
+        );
+    }
+    // `Column` supplies no derived labels — nothing to do (the caller only clones
+    // the population for a derived rule, so this is a defensive no-op).
+    if *rule == IovOccasionRule::Column {
+        return;
+    }
+    // Occasion of a scalar time under a set of strictly-increasing breakpoints:
+    // the number of edges at or before `t` (so `time(24,48)` → 0 | 1 | 2).
+    let window_occ =
+        |edges: &[f64], t: f64| -> u32 { edges.iter().filter(|&&e| e <= t).count() as u32 };
+    for s in population.subjects.iter_mut() {
+        match rule {
+            IovOccasionRule::Column => unreachable!("handled by the early return above"),
+            IovOccasionRule::TimeWindows(edges) => {
+                // Bucket observations and doses on the *same* internal event clock.
+                // For reset-stacked subjects (EVID 3/4) that clock is monotonic and
+                // already shifted so each reset segment sits past the previous one,
+                // so the breakpoints separate periods correctly. Using the raw user
+                // TIME for observations (as an earlier version did) is wrong on two
+                // counts: it restarts each period — folding period 2 back into
+                // occasion 0 — and it puts observations on a different clock than the
+                // doses (whose only stored time is the internal one), so a dose could
+                // land in a different occasion than its co-timed samples (#757).
+                s.occasions = s.obs_times.iter().map(|&t| window_occ(edges, t)).collect();
+                s.dose_occasions = s.doses.iter().map(|d| window_occ(edges, d.time)).collect();
+            }
+            IovOccasionRule::PerDose => {
+                // Each distinct administration *time* opens a new occasion. Doses
+                // that share a time (e.g. a simultaneous depot + central bolus, or a
+                // split dual-route dose) share one occasion rather than each spawning
+                // its own — indexing by dose position would leave the earlier
+                // co-timed dose stranded in an empty occasion, since observations can
+                // only map to one of them (#757). Doses are stored time-sorted, so a
+                // running counter that ticks on each time change is the label.
+                let mut dose_occ = Vec::with_capacity(s.doses.len());
+                let mut occ = 0u32;
+                let mut prev: Option<f64> = None;
+                for d in &s.doses {
+                    if let Some(p) = prev {
+                        if d.time != p {
+                            occ += 1;
+                        }
+                    }
+                    dose_occ.push(occ);
+                    prev = Some(d.time);
+                }
+                s.dose_occasions = dose_occ;
+                // Distinct dose times, ascending (one per occasion label above).
+                let mut dose_times: Vec<f64> = Vec::new();
+                for d in &s.doses {
+                    if dose_times.last() != Some(&d.time) {
+                        dose_times.push(d.time);
+                    }
+                }
+                // Observation occasion = most recent dose at or before its time
+                // (dose-before-obs tie-break at equal TIME); pre-first-dose rows fold
+                // into occasion 0. obs_times are ascending, so a single forward walk
+                // over the distinct dose times is linear rather than O(obs*doses)
+                // (#757 cleanup).
+                let mut j = 0usize;
+                s.occasions = s
+                    .obs_times
+                    .iter()
+                    .map(|&t| {
+                        while j < dose_times.len() && dose_times[j] <= t {
+                            j += 1;
+                        }
+                        j.saturating_sub(1) as u32
+                    })
+                    .collect();
+            }
+        }
+    }
 }
 
 /// Built-in absorption input-rate models (e.g. `transit()`) are integrated
@@ -1305,10 +1464,13 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
 
 /// Features the analytic transit models (`one_cpt_transit`, `two_cpt_transit`) do
 /// not support in their first version (#386): the exponential-tilting closed form
-/// is a constant-parameter bolus superposition, so steady-state doses, IOV,
-/// within-subject time-varying covariates, and infusion doses are rejected up
+/// is a constant-parameter depot-bolus superposition, so steady-state doses, IOV,
+/// infusion doses, system resets, and non-depot (`CMT≠1`) doses are rejected up
 /// front — otherwise they would silently mis-predict or hit an `unreachable!` in
-/// the superposition dispatch. `fit()` surfaces this as an `Err`;
+/// the superposition dispatch. (Time-varying covariates and a `TIME`-dependent
+/// parameter are instead transparently rerouted to the plain form's ODE `transit()`
+/// twin via [`CompiledModel::effective_for`]; only a form outside that twin's scope
+/// rejects them.) `fit()` surfaces this as an `Err`;
 /// `predict()`/`simulate()` panic via [`assert_transit_support`], mirroring
 /// [`assert_modeled_doses_supported`]. Returns the first offending feature's
 /// message, or `None` when compatible.
@@ -1370,6 +1532,26 @@ pub(crate) fn check_transit_support(
             ));
         }
         for dose in &subject.doses {
+            if dose.cmt != 1 {
+                // The closed form folds *every* dose through the absorption chain into
+                // central ignoring `dose.cmt` (the `sens/provider.rs` superposition loop),
+                // while the ODE twin honours the compartment — a `CMT≠1` dose there falls to
+                // the direct-bolus branch and lands in a disposition compartment. So the two
+                // paths would silently disagree on a non-depot dose, and `effective_for`
+                // routes only TV-cov/`TIME` subjects to the twin, so a mixed population would
+                // even disagree with itself. A transit closed form only supports dosing the
+                // depot (`CMT=1`); reject anything else up front.
+                return Some(format!(
+                    "{name} does not support dosing into a non-depot compartment (subject \
+                     {}, CMT={}): the transit closed form routes every dose through the \
+                     absorption chain into central regardless of compartment, so a CMT≠1 dose \
+                     would be silently mistreated — and its ODE twin would instead bolus it \
+                     into a disposition compartment, so the two paths would disagree. Dose the \
+                     depot (CMT=1), or use an ODE transit model for direct central/peripheral \
+                     dosing.",
+                    subject.id, dose.cmt
+                ));
+            }
             if dose.ss {
                 return Some(format!(
                     "{name} does not support steady-state (SS) doses yet (subject \
@@ -1465,7 +1647,11 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                     event_type,
                     entry_time,
                     ..
-                } = r;
+                } = r
+                else {
+                    // Non-TTE records are handled by their own endpoint; skip them.
+                    continue;
+                };
                 if *c != cmt {
                     continue;
                 }
@@ -1567,6 +1753,104 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
     None
 }
 
+/// Reject a model / dataset where a **survival hazard references a time-varying
+/// covariate** — currently silently frozen at its baseline value (#741).
+///
+/// The analytic hazard [`crate::types::HazardParamFn`] takes no time argument and is
+/// evaluated with the subject's baseline covariate snapshot; the ODE-accumulated (joint
+/// PK-TTE) hazard is integrated with the PK-parameter vector frozen at `t=0`
+/// (`survival::ode_cumhaz_hazard`). In both cases a covariate that varies within a subject
+/// is read at one fixed value, so the fit / simulation would use the wrong hazard with no
+/// warning. Until time-varying covariates on hazards are supported, reject up front — as the
+/// PK-path TV-covariate paths already do (`check_transit_support`) — rather than silently
+/// mis-fit.
+///
+/// The scope is deliberately tight so a legitimate model is not rejected:
+///   * an **analytic** hazard rejects only when a covariate its *own* closed-form parameters
+///     reference (`hazard_covariates`) is time-varying — a covariate used solely by a shared
+///     PK model (a frailty-only joint fit) is fine, since the analytic hazard never reads it;
+///   * an **ODE-accumulated** hazard rejects on *any* time-varying covariate, because the
+///     survival ODE solve freezes the whole PK-parameter vector at `t=0`, so a covariate
+///     feeding the concentration (and hence the drug-driven hazard) is equally frozen.
+///
+/// Returns `None` when no TTE endpoint references a time-varying covariate. `fit()` surfaces
+/// the message as an `Err`; `predict()`/`simulate()` panic via [`assert_survival_tv_covariates`].
+#[cfg(feature = "survival")]
+pub(crate) fn check_survival_tv_covariates(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<String> {
+    use crate::types::{EndpointLikelihood, HazardSpec};
+    if !model.has_tte() {
+        return None;
+    }
+    for subject in &population.subjects {
+        let tv = subject.time_varying_covariate_names();
+        if tv.is_empty() {
+            continue;
+        }
+        let tv_set: std::collections::HashSet<&str> = tv.iter().map(String::as_str).collect();
+        for (cmt, endpoint) in &model.endpoints {
+            let EndpointLikelihood::Tte {
+                hazard,
+                hazard_covariates,
+                ..
+            } = endpoint
+            else {
+                continue;
+            };
+            match hazard {
+                HazardSpec::Analytic { .. } => {
+                    if let Some(name) = hazard_covariates
+                        .iter()
+                        .find(|c| tv_set.contains(c.as_str()))
+                    {
+                        return Some(format!(
+                            "[event_model] on CMT={cmt}: the survival hazard references covariate \
+                             `{name}`, which is time-varying for subject `{}`. Time-varying \
+                             covariates on a hazard are not yet supported — the analytic hazard is \
+                             evaluated at the baseline covariate value, so the fit would silently \
+                             use the wrong hazard (#741). Use a time-constant (baseline) covariate \
+                             on the hazard for now.",
+                            subject.id
+                        ));
+                    }
+                }
+                HazardSpec::OdeAccumulated { .. } => {
+                    // Any time-varying covariate is frozen by the survival ODE solve's t=0
+                    // PK-parameter snapshot; name the first one deterministically (`tv` is sorted).
+                    let name = &tv[0];
+                    return Some(format!(
+                        "[event_model] on CMT={cmt}: the ODE-accumulated (joint PK-TTE) hazard is \
+                         integrated with covariates frozen at their t=0 baseline, but covariate \
+                         `{name}` is time-varying for subject `{}`. Time-varying covariates on a \
+                         drug-driven hazard are not yet supported (#741). Hold the covariate \
+                         constant within each subject for now.",
+                        subject.id
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Panic wrapper over [`check_survival_tv_covariates`] for the non-`fit` entry points
+/// (`predict()`/`simulate()`), mirroring [`assert_transit_support`]: the same
+/// time-varying-covariate-on-hazard combination that `fit()` rejects as an `Err` cannot be
+/// honoured by prediction / simulation either (the hazard would be silently frozen), so fail
+/// loudly rather than return a subtly wrong result.
+#[cfg(feature = "survival")]
+pub(crate) fn assert_survival_tv_covariates(model: &CompiledModel, population: &Population) {
+    if let Some(msg) = check_survival_tv_covariates(model, population) {
+        panic!(
+            "predict()/simulate() received a survival model / data combination with a \
+             time-varying covariate on a hazard: {msg}\n(fit() reports this as an error rather \
+             than panicking.)"
+        );
+    }
+}
+
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
 /// the oral **depot** amount on a subject carrying an EVID=3/4 reset.
 ///
@@ -1605,6 +1889,73 @@ pub(crate) fn check_analytic_readout_support(
 /// [`assert_modeled_doses_supported`]). `fit()` returns these as an `Err`.
 pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Population) {
     if let Some(msg) = check_transit_support(model, population) {
+        panic!(
+            "predict()/simulate() received a model/data combination the transit closed form \
+             cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
+        );
+    }
+}
+
+/// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
+/// fall **outside the closed form's convergence domain** — the flip-flop regime
+/// (`ke ≥ KTR` 1-cpt / `α ≥ KTR` 2-cpt), or the 2-cpt confluent-eigenvalue edge
+/// (`|α − β| < 1e-12`) — where it returns an identically-zero profile that silently
+/// degenerates the objective (a proportional error model collapses `(σ·pred)²` to 0).
+/// Unlike a twin-carrying model — which [`crate::pk::effective_model_for_eval`]
+/// auto-reroutes to its exact ODE `transit()` twin — a twin-less form (one carrying a
+/// `lagtime`, bioavailability `f`, or a user `[odes]` / `[scaling]` /
+/// `[initial_conditions]` block, which the desugar declines) has nothing to reroute
+/// to. The boundary is parameter-dependent, so this can't be caught by
+/// [`check_transit_support`]'s structural checks — it is evaluated at the typical
+/// (η = 0) parameters via [`crate::pk::transit_flip_flop_at`], matching the
+/// informational `W_TRANSIT_FLIP_FLOP` warning that fires for the twin-carrying case.
+/// Returns the first offending subject's message, or `None` when no reject applies
+/// (non-transit, twin present, or in-domain). `fit()` / `ferx check` surface this as
+/// an error; `predict()`/`simulate()` panic via [`assert_transit_flip_flop_no_twin`],
+/// mirroring [`check_transit_support`] / [`assert_transit_support`].
+pub(crate) fn check_transit_flip_flop_no_twin(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Option<String> {
+    // A twin-carrying model is auto-rerouted (correct) — only warned, not rejected.
+    if !matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit
+    ) || model.transit_ode_equivalent.is_some()
+    {
+        return None;
+    }
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    for subject in &population.subjects {
+        if crate::pk::transit_flip_flop_at(model, subject, theta, &zero_eta) {
+            return Some(format!(
+                "{} starts outside the analytic transit closed form's convergence domain at \
+                 typical values (subject {}) — the flip-flop regime (disposition rate ≥ transit \
+                 rate KTR = (n+1)/mtt), or (2-cpt) coincident disposition eigenvalues — so it \
+                 returns an identically-zero concentration profile, which silently degenerates \
+                 the objective (a proportional error model collapses `(σ·pred)²` to 0). This \
+                 model has no ODE twin to fall back on (a `lagtime`, bioavailability `f`, or a \
+                 user `[odes]` / `[scaling]` / `[initial_conditions]` block declines the \
+                 desugar) — rewrite it as an explicit ODE `transit()` model, or check the MTT / \
+                 CL starting estimates.",
+                model.pk_model.canonical_name(),
+                subject.id
+            ));
+        }
+    }
+    None
+}
+
+/// Panic on a twin-less flip-flop transit model for the `Vec`-returning
+/// `predict()`/`simulate()` paths (mirrors [`assert_transit_support`]). `fit()`
+/// returns this as an `Err`.
+pub(crate) fn assert_transit_flip_flop_no_twin(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) {
+    if let Some(msg) = check_transit_flip_flop_no_twin(model, population, theta) {
         panic!(
             "predict()/simulate() received a model/data combination the transit closed form \
              cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
@@ -2187,15 +2538,35 @@ pub fn check_model_data_warnings(
     // hits this readily (a slow-absorption depot drug with large MTT easily has
     // `α ≥ KTR`). Evaluated on typical values (η = 0) per subject so a covariate on
     // MTT/CL that pushes the typical profile into the flip-flop regime is caught.
-    // Reported once, naming the first affected subject.
+    // Reported once, naming the first affected subject. Only a **twin-carrying**
+    // model is warned here — it is auto-rerouted per evaluation
+    // (`pk::effective_model_for_eval`), so the closed form's zero never reaches the
+    // objective and this is an informational heads-up. A **twin-less** flip-flop
+    // model (lagtime / `f` / user `[odes]`) has nothing to reroute to and is a hard
+    // error instead (`check_transit_flip_flop_no_twin`), rejected at
+    // fit / predict / simulate / `ferx check`.
     if matches!(
         model.pk_model,
         PkModel::OneCptTransit | PkModel::TwoCptTransit
-    ) {
+    ) && model.transit_ode_equivalent.is_some()
+    {
         for subject in &population.subjects {
             let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &subject.covariates, 0.0);
             let (cl, v1, n, mtt) = (pk.cl(), pk.v(), pk.n_transit(), pk.mtt());
-            if !(mtt > 0.0 && n >= 0.0 && v1 > 0.0 && cl > 0.0) {
+            // Mirror the validity guard `pk::transit_flip_flop_at` applies (the
+            // `q`/`v2` checks for 2-cpt), so this heads-up never fires on a parameter
+            // region the reroute treats as invalid rather than flip-flop. (The flip-flop
+            // *trigger* below stays the plain `α ≥ KTR` test; the twin-carrying
+            // confluent-eigenvalue corner is auto-rerouted and correctly not warned.)
+            let params_valid = mtt > 0.0
+                && n >= 0.0
+                && v1 > 0.0
+                && cl > 0.0
+                && match model.pk_model {
+                    PkModel::TwoCptTransit => pk.q() >= 0.0 && pk.v2() > 0.0,
+                    _ => true,
+                };
+            if !params_valid {
                 continue; // invalid params are a separate (fatal) domain check
             }
             let ktr = (n + 1.0) / mtt;
@@ -2206,21 +2577,23 @@ pub fn check_model_data_warnings(
                 _ => cl / v1,
             };
             if disp_rate >= ktr {
-                diags.push(Diagnostic::warning(
-                    "W_TRANSIT_FLIP_FLOP",
-                    format!(
-                        "{} disposition rate ({:.4}) ≥ transit rate KTR = (n+1)/mtt ({:.4}) at \
-                         typical values (subject {}): the analytic transit closed form is outside \
-                         its convergence domain and returns an identically-zero concentration \
-                         profile, which silently degenerates the objective (a proportional error \
-                         model collapses `(σ·pred)²` to 0). This is the flip-flop regime — check \
-                         the MTT / CL starting estimates, or use an ODE transit model.",
-                        model.pk_model.canonical_name(),
-                        disp_rate,
-                        ktr,
-                        subject.id
-                    ),
-                ));
+                // Auto-handled: the flip-flop reroute (`pk::effective_model_for_eval`)
+                // evaluates the ODE `transit()` twin for these parameters, so the profile
+                // is correct — an informational heads-up, not an error. (A twin-less flip-flop
+                // model is rejected up front by `check_transit_flip_flop_no_twin`.)
+                let msg = format!(
+                    "{} disposition rate ({:.4}) ≥ transit rate KTR = (n+1)/mtt ({:.4}) at \
+                     typical values (subject {}): the flip-flop regime, outside the analytic \
+                     transit closed form's convergence domain. ferx automatically evaluates \
+                     the equivalent ODE transit model for such parameters (correct, but slower \
+                     than the closed form) — check the MTT / CL starting estimates if the \
+                     flip-flop is unexpected.",
+                    model.pk_model.canonical_name(),
+                    disp_rate,
+                    ktr,
+                    subject.id
+                );
+                diags.push(Diagnostic::warning("W_TRANSIT_FLIP_FLOP", msg));
                 break;
             }
         }
@@ -2393,13 +2766,30 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     };
                     diags.push(Diagnostic::warning(code, w.clone()));
                 }
-                diags.extend(check_model_data(&parsed.model, &population));
+                diags.extend(check_model_data_rule(
+                    &parsed.model,
+                    &population,
+                    &parsed.fit_options.iov_occasion,
+                ));
                 let init_params = parsed.model.default_params.clone();
                 diags.extend(check_model_data_warnings(
                     &parsed.model,
                     &population,
                     &init_params,
                 ));
+                // Surface the structural transit rejects (IOV / SS / CMT≠1 / infusion /
+                // reset) so a clean `ferx check` and a `fit()` agree on transit models —
+                // previously only `fit()` reported these (#776 review).
+                if let Some(e) = check_transit_support(&parsed.model, &population) {
+                    diags.push(Diagnostic::error("E_TRANSIT_UNSUPPORTED", e));
+                }
+                // Twin-less flip-flop transit is a hard error, not a warning (#776):
+                // surface it the same way `fit()` does, so `ferx check` catches it up front.
+                if let Some(e) =
+                    check_transit_flip_flop_no_twin(&parsed.model, &population, &init_params.theta)
+                {
+                    diags.push(Diagnostic::error("E_TRANSIT_FLIP_FLOP", e));
+                }
             }
             Err(e) => {
                 diags.push(covariate_read_diagnostic(&e, path));
@@ -2542,6 +2932,13 @@ pub fn fit(
     if let Some(e) = check_transit_support(model, population) {
         return Err(e);
     }
+    // Reject a twin-less transit closed form that starts in the flip-flop regime (#776):
+    // it returns an identically-zero profile that silently degenerates the objective and,
+    // unlike a twin-carrying model, has no ODE twin to reroute to. Parameter-dependent, so
+    // evaluated at η = 0 typical values here rather than in `check_transit_support`.
+    if let Some(e) = check_transit_flip_flop_no_twin(model, population, &init_params.theta) {
+        return Err(e);
+    }
     // Reject a depot-referencing analytic Form C readout on reset subjects (#650):
     // the depot amount can't be superposed across an EVID=3/4 reset, so predicting
     // would silently read a zero depot. Fail loudly instead.
@@ -2554,6 +2951,13 @@ pub fn fit(
     // Reject a hand-built model/dataset up front.
     #[cfg(feature = "survival")]
     if let Some(e) = check_rtte_records(model, population) {
+        return Err(e);
+    }
+    // A survival hazard that references a time-varying covariate would be silently
+    // evaluated at the baseline value (analytic hazard) or with PK params frozen at t=0
+    // (ODE-accumulated hazard) — reject rather than mis-fit (#741).
+    #[cfg(feature = "survival")]
+    if let Some(e) = check_survival_tv_covariates(model, population) {
         return Err(e);
     }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
@@ -2629,7 +3033,11 @@ pub fn fit(
     // see the data. `ferx check` runs the same `check_model_data` to report
     // every finding; here we stop at the first error to preserve fit()'s
     // historical fail-fast behavior and exact error strings.
-    first_error(&check_model_data(model, population))?;
+    first_error(&check_model_data_rule(
+        model,
+        population,
+        &options.iov_occasion,
+    ))?;
     // If any subject has per-event covariate snapshots that don't carry
     // a variation in covariates the model actually references (e.g.
     // DAY / STIME columns in NONMEM-format datasets), clear those
@@ -2645,16 +3053,38 @@ pub fn fit(
     // it) unmodified, and avoids double-logging on repeated `fit()` calls.
     let needs_dv_log = model.log_transform && !model.dv_pre_logged;
     let mut ltbs_warnings: Vec<String> = Vec::new();
+    // A model-side IOV occasion rule (`iov_occasion = dose | time(...)`) derives
+    // the occasion labels from each subject's timeline instead of a data column.
+    // Only meaningful when the model actually declares kappa: without it the
+    // derived labels feed nothing, so skip the clone + derivation entirely and
+    // tell the user the option is a no-op rather than silently paying for it.
+    let iov_rule_set = options.iov_occasion != IovOccasionRule::Column;
+    if iov_rule_set && model.n_kappa == 0 {
+        ltbs_warnings.push(
+            "iov_occasion is set in [fit_options] but the model declares no kappa (IOV) \
+             random effects, so it has no effect and no occasions were derived."
+                .to_string(),
+        );
+    }
+    let derive_occ = iov_rule_set && model.n_kappa > 0;
     let pop_pruned: std::borrow::Cow<Population> = {
         let needs_prune = population.subjects.iter().any(|s| {
             !s.dose_covariates.is_empty()
                 || !s.obs_covariates.is_empty()
                 || !s.pk_only_covariates.is_empty()
         });
-        if needs_prune || needs_dv_log {
+        if needs_prune || needs_dv_log || derive_occ {
             let mut p = population.clone();
             if needs_prune {
                 p.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+            }
+            if derive_occ {
+                apply_iov_occasion_rule(
+                    &mut p,
+                    &options.iov_occasion,
+                    options.iov_column.is_some(),
+                    &mut ltbs_warnings,
+                );
             }
             if needs_dv_log {
                 let n_nonpos = log_transform_observations(&mut p);
@@ -2674,6 +3104,51 @@ pub fn fit(
         }
     };
     let pop_ref: &Population = &*pop_pruned;
+
+    // A model-side occasion rule must actually partition the timeline. The
+    // dataset-column path is guarded by `E_IOV_MISSING_OCC`; the derived path
+    // suppresses that check (labels arrive at fit time), so re-establish the same
+    // invariant on the *derived* labels here (#757):
+    //   - if every subject collapses to a single occasion, the per-occasion kappa
+    //     is added once per subject exactly like an eta — confounded with
+    //     between-subject variability and unidentifiable — so error, as the
+    //     column path would have;
+    //   - if the count explodes (e.g. `iov_occasion = dose` on an ADDL train,
+    //     where each expanded dose opens an occasion), the inner per-subject
+    //     problem balloons; warn so the multiplication isn't silent.
+    if derive_occ {
+        // Distinct occasion labels seen across observations and doses, per subject.
+        let distinct_occ = |s: &Subject| -> usize {
+            let mut occs: Vec<u32> = s.occasions.clone();
+            occs.extend_from_slice(&s.dose_occasions);
+            occs.sort_unstable();
+            occs.dedup();
+            occs.len()
+        };
+        let max_occ = pop_ref.subjects.iter().map(distinct_occ).max().unwrap_or(0);
+        if max_occ <= 1 {
+            return Err(
+                "The `iov_occasion` rule produced only a single occasion for every subject, \
+                 so the per-occasion kappa (IOV) cannot be separated from between-subject \
+                 variability (it is unidentifiable). Use `iov_occasion = time(...)` with \
+                 breakpoints inside the sampling window, `iov_occasion = dose` on a \
+                 multiple-dose design, or supply an `iov_column`."
+                    .to_string(),
+            );
+        }
+        // Above this many occasions per subject the derivation has almost
+        // certainly over-partitioned (e.g. a long ADDL dose train); the fit still
+        // runs but the inner kappa dimensionality is n_iov * max_occ per subject.
+        const IOV_OCCASION_WARN_LIMIT: usize = 20;
+        if max_occ > IOV_OCCASION_WARN_LIMIT {
+            ltbs_warnings.push(format!(
+                "iov_occasion derived {max_occ} occasions for at least one subject — the \
+                 inner per-subject problem grows with the occasion count. If this came from \
+                 an ADDL/steady-state dose train, prefer `iov_occasion = time(...)` windows \
+                 or an `iov_column` that groups administrations into fewer occasions."
+            ));
+        }
+    }
 
     // Single-start fast path (default)
     if options.n_starts <= 1 {
@@ -2810,12 +3285,169 @@ pub fn fit(
 ///
 /// Called after all late-injected warnings (LTBS splice, multi-start metadata)
 /// have been appended so the structured field is always in sync with the flat list.
+///
+/// Each message is classified into a typed [`crate::types::WarningCode`] +
+/// severity and — for the numeric diagnostics whose values are already stored
+/// as typed fields on the `FitResult` — enriched with a machine-readable
+/// `details` payload sourced from those fields (issue #781, increment 1). The
+/// numbers thus come from typed state, not from re-parsing the message prose;
+/// converting the remaining ~80 string push-sites to full at-source emission is
+/// a later increment.
 fn rebuild_warnings_structured(result: &mut FitResult) {
-    result.warnings_structured = result
+    // Entries emitted typed at source (`native_warnings`, already carrying a
+    // `details` payload) are keyed by message and take precedence; every other
+    // message is string-classified and then field-enriched. Keying by message
+    // keeps this idempotent — a second rebuild re-captures the native entries.
+    // Key by the *original* warning string: `classify_warning` strips a
+    // `[METHOD]` chain prefix into `source_method`, so a native entry produced
+    // in a multi-stage chain must reconstruct that prefix to match the raw
+    // `warnings` entry (an unprefixed entry keys by its message unchanged).
+    let native: std::collections::HashMap<String, crate::types::WarningEntry> =
+        std::mem::take(&mut result.warnings_structured)
+            .into_iter()
+            .map(|e| {
+                let key = match &e.source_method {
+                    Some(m) => format!("[{m}] {}", e.message),
+                    None => e.message.clone(),
+                };
+                (key, e)
+            })
+            .collect();
+    let stats = DiagStats {
+        dw_statistic: result.dw_statistic,
+        iwres_lag1_r: result.iwres_lag1_r,
+        shrinkage_eps: result.shrinkage_eps,
+        cov_condition_number: result.cov_condition_number,
+        cov_eigenvalues: result.cov_eigenvalues.as_deref(),
+        shrinkage_eta: &result.shrinkage_eta,
+        eta_names: &result.eta_names,
+    };
+    let entries: Vec<crate::types::WarningEntry> = result
         .warnings
         .iter()
-        .map(|w| crate::types::classify_warning(w))
+        .map(|w| {
+            if let Some(entry) = native.get(w) {
+                entry.clone()
+            } else {
+                let mut e = crate::types::classify_warning(w);
+                e.details = diagnostic_details(&e.category, &stats);
+                e
+            }
+        })
         .collect();
+    result.warnings_structured = entries;
+}
+
+/// Typed inputs for [`diagnostic_details`], sourced from `FitResult`'s fields.
+/// `Default` gives finite-zero scalars, `None` options, and empty slices, so a
+/// test can set only the fields a case needs via struct-update syntax.
+#[derive(Default)]
+struct DiagStats<'a> {
+    dw_statistic: f64,
+    iwres_lag1_r: f64,
+    shrinkage_eps: f64,
+    cov_condition_number: Option<f64>,
+    cov_eigenvalues: Option<&'a [f64]>,
+    shrinkage_eta: &'a [f64],
+    eta_names: &'a [String],
+}
+
+/// Machine-readable `details` payload for the numeric diagnostic warning codes,
+/// sourced from the typed `FitResult` fields rather than parsed from the message
+/// text. A non-finite (`NaN`/`±Inf`) statistic is never emitted as a JSON `null`
+/// (`serde_json` maps non-finite floats to `null`) — instead:
+///
+/// - the single/paired-stat codes (`DwAutocorrelation`, `EpsShrinkage`,
+///   `ConditionNumber`) return `None` (whole `details` key omitted) when a
+///   required statistic is missing or non-finite;
+/// - the covariance codes (`CovarianceFailed`, `CovarianceRegularized`) build a
+///   partial object, **skipping** individual non-finite/absent fields and
+///   emitting whatever is available; they return `None` only when nothing is.
+///
+/// `cov_condition_number` in particular is documented as `+Inf` for a
+/// near-singular parameter space, so it is dropped from the payload there.
+fn diagnostic_details(
+    code: &crate::types::WarningCode,
+    s: &DiagStats,
+) -> Option<serde_json::Value> {
+    use crate::types::WarningCode;
+    match code {
+        WarningCode::DwAutocorrelation
+            if s.dw_statistic.is_finite() && s.iwres_lag1_r.is_finite() =>
+        {
+            Some(serde_json::json!({
+                "durbin_watson": s.dw_statistic,
+                "iwres_lag1_autocorr": s.iwres_lag1_r,
+            }))
+        }
+        WarningCode::EpsShrinkage if s.shrinkage_eps.is_finite() => Some(serde_json::json!({
+            "eps_shrinkage": s.shrinkage_eps,
+            "eps_shrinkage_pct": 100.0 * s.shrinkage_eps,
+        })),
+        WarningCode::EtaShrinkage => {
+            // The high-shrinkage ETAs behind the message, with each shrinkage
+            // as a percent — sourced from the typed `shrinkage_eta` field.
+            let high: Vec<serde_json::Value> = high_shrinkage_eta_indices(s.shrinkage_eta)
+                .into_iter()
+                .map(|i| {
+                    serde_json::json!({
+                        "eta": eta_label(s.eta_names, i),
+                        "shrinkage_pct": 100.0 * s.shrinkage_eta[i],
+                    })
+                })
+                .collect();
+            if high.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!({
+                    "threshold_pct": 100.0 * ETA_SHRINKAGE_WARN_THRESHOLD,
+                    "high_shrinkage_etas": high,
+                }))
+            }
+        }
+        WarningCode::ConditionNumber => match s.cov_condition_number {
+            Some(c) if c.is_finite() => Some(serde_json::json!({ "condition_number": c })),
+            _ => None,
+        },
+        WarningCode::CovarianceFailed | WarningCode::CovarianceRegularized => {
+            covariance_details(s.cov_condition_number, s.cov_eigenvalues)
+        }
+        _ => None,
+    }
+}
+
+/// `details` for the covariance-step warning codes: the condition number and,
+/// when the covariance matrix was produced (so eigenvalues exist — typically
+/// the regularized case, not a hard failure), the smallest eigenvalue and the
+/// count of negative ones (which diagnose a non-PD Hessian). Non-finite values
+/// are skipped; returns `None` if nothing usable is available.
+fn covariance_details(
+    cov_condition_number: Option<f64>,
+    cov_eigenvalues: Option<&[f64]>,
+) -> Option<serde_json::Value> {
+    let mut obj = serde_json::Map::new();
+    if let Some(c) = cov_condition_number {
+        if c.is_finite() {
+            obj.insert("condition_number".to_string(), serde_json::json!(c));
+        }
+    }
+    if let Some(eigs) = cov_eigenvalues {
+        let finite: Vec<f64> = eigs.iter().copied().filter(|v| v.is_finite()).collect();
+        if !finite.is_empty() {
+            let min = finite.iter().copied().fold(f64::INFINITY, f64::min);
+            let n_neg = finite.iter().filter(|&&v| v < 0.0).count();
+            obj.insert("min_eigenvalue".to_string(), serde_json::json!(min));
+            obj.insert(
+                "n_negative_eigenvalues".to_string(),
+                serde_json::json!(n_neg),
+            );
+        }
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(obj))
+    }
 }
 
 /// Probe whether NLopt CRS2-LM (used for global_search) is available.
@@ -4569,6 +5201,10 @@ fn fit_inner(
 
     // Optional SIR step
     let mut warnings = result.warnings;
+    // Warnings emitted *typed at source* (with a `details` payload) rather than
+    // string-classified. Seeded into `FitResult.warnings_structured`;
+    // `rebuild_warnings_structured` prefers these over re-classifying the string.
+    let mut native_warnings: Vec<WarningEntry> = Vec::new();
 
     // Warn when [derived] expressions that reference compartments[i] will
     // silently evaluate to NaN due to unsupported model/subject configurations.
@@ -4780,6 +5416,15 @@ fn fit_inner(
     if let Some(w) = eps_shrinkage_warning(shrinkage_eps) {
         warnings.push(w);
     }
+    if let Some(w) = eta_shrinkage_warning(&shrinkage_eta, &result.params.omega.eta_names) {
+        warnings.push(w);
+    }
+    // Theta estimates pinned to an optimizer bound — emitted typed at source
+    // with a `details` payload (#781).
+    if let Some((msg, entry)) = boundary_estimate_warning(&result.params) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
@@ -4924,7 +5569,7 @@ fn fit_inner(
         n_iterations: result.n_iterations,
         interaction: options.interaction,
         warnings,
-        warnings_structured: vec![],
+        warnings_structured: native_warnings,
         // If the normal SIR ran, use that; otherwise use the fallback result.
         sir_ci_theta: sir_result
             .as_ref()
@@ -5649,6 +6294,156 @@ pub(crate) fn eps_shrinkage_warning(shrinkage_eps: f64) -> Option<String> {
     ))
 }
 
+/// ETA-shrinkage warning threshold (fraction). 0.30 is the classic
+/// Savic & Karlsson (2009) 30% rule of thumb: above it, an EBE-based
+/// diagnostic — and the individual estimates of that random effect — are
+/// poorly informed by the data (η shrinks toward 0).
+const ETA_SHRINKAGE_WARN_THRESHOLD: f64 = 0.30;
+
+/// Indices of the ETAs whose shrinkage meets/exceeds the warning threshold.
+/// `shrinkage` is per-ETA shrinkage as a fraction (0..1); non-finite entries
+/// are ignored.
+pub(crate) fn high_shrinkage_eta_indices(shrinkage: &[f64]) -> Vec<usize> {
+    shrinkage
+        .iter()
+        .enumerate()
+        .filter(|(_, &s)| s.is_finite() && s >= ETA_SHRINKAGE_WARN_THRESHOLD)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Label for the `i`-th ETA, falling back to a non-empty `eta_{i}` placeholder
+/// when the name is missing — so both the message and the `details` payload
+/// stay unambiguous.
+fn eta_label(eta_names: &[String], i: usize) -> String {
+    eta_names
+        .get(i)
+        .cloned()
+        .unwrap_or_else(|| format!("eta_{i}"))
+}
+
+/// Build the user-facing warning for high ETA shrinkage, or `None` when no ETA
+/// exceeds the threshold. `shrinkage` is per-ETA shrinkage as a fraction;
+/// `eta_names` labels them in the same order.
+pub(crate) fn eta_shrinkage_warning(shrinkage: &[f64], eta_names: &[String]) -> Option<String> {
+    let high = high_shrinkage_eta_indices(shrinkage);
+    if high.is_empty() {
+        return None;
+    }
+    let list = high
+        .iter()
+        .map(|&i| format!("{} ({:.0}%)", eta_label(eta_names, i), 100.0 * shrinkage[i]))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "High ETA shrinkage (\u{2265} {:.0}%): {}. EBE-based diagnostics for these \
+         random effects are unreliable and the data poorly inform their individual \
+         estimates; consider removing the IIV on the affected parameter(s) or \
+         collecting more informative data.",
+        100.0 * ETA_SHRINKAGE_WARN_THRESHOLD,
+        list
+    ))
+}
+
+/// Relative tolerance (a fraction of the packed bound range) within which a
+/// theta estimate counts as sitting on its lower/upper optimizer bound.
+const BOUNDARY_REL_TOL: f64 = 1e-3;
+
+/// Which bound a theta estimate is pinned to and the **effective** natural-space
+/// bound value the optimizer actually constrains to, or `None` when the estimate
+/// is interior. Evaluated in the optimizer's *packed* space (log when the lower
+/// bound is `>= 0`, else identity) so the proximity test is scale-appropriate —
+/// a log-scaled parameter is "at" its bound within a constant factor, not a
+/// constant absolute gap.
+///
+/// The floors/caps mirror `compute_bounds` / `pack_params`: a log-packed theta
+/// floors its estimate and lower bound at `1e-10` and caps the upper at `1e9`,
+/// so the reported bound matches the constraint that was actually active (and
+/// agrees with the estimate). Degenerate/non-finite bounds yield `None`.
+fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<(&'static str, f64)> {
+    use crate::estimation::parameterization::theta_packs_log;
+    let (lo_eff, hi_eff, pe, pl, pu) = if theta_packs_log(lower) {
+        let lo = lower.max(1e-10);
+        let hi = upper.min(1e9);
+        (lo, hi, est.max(1e-10).ln(), lo.ln(), hi.ln())
+    } else {
+        (lower, upper, est, lower, upper)
+    };
+    let range = pu - pl;
+    if !range.is_finite() || range <= 0.0 || !pe.is_finite() {
+        return None;
+    }
+    let frac = (pe - pl) / range;
+    if frac <= BOUNDARY_REL_TOL {
+        Some(("lower", lo_eff))
+    } else if frac >= 1.0 - BOUNDARY_REL_TOL {
+        Some(("upper", hi_eff))
+    } else {
+        None
+    }
+}
+
+/// Free (non-fixed) theta estimates pinned to an optimizer bound, as
+/// `(name, estimate, effective_bound, side)` per hit.
+fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'static str)> {
+    let mut hits = Vec::new();
+    for i in 0..params.theta.len() {
+        if params.theta_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let est = params.theta[i];
+        if let Some((side, bound)) =
+            theta_boundary_side(est, params.theta_lower[i], params.theta_upper[i])
+        {
+            let name = params
+                .theta_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("THETA{}", i + 1));
+            hits.push((name, est, bound, side));
+        }
+    }
+    hits
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// theta estimates pinned to an optimizer bound, or `None` when none are.
+fn boundary_estimate_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
+    let hits = boundary_estimates(params);
+    if hits.is_empty() {
+        return None;
+    }
+    let list = hits
+        .iter()
+        .map(|(name, est, _bound, side)| format!("{name} ({est:.4} at {side} bound)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let msg = format!(
+        "Parameter estimate(s) pinned to an optimizer bound: {list}. This often \
+         indicates non-identifiability or a too-tight bound; inspect the affected \
+         parameter(s) and consider relaxing the bound or simplifying the model."
+    );
+    let params_json: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|(name, est, bound, side)| {
+            serde_json::json!({
+                "parameter": name,
+                "estimate": est,
+                "bound": bound,
+                "side": side,
+            })
+        })
+        .collect();
+    let entry = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::BoundaryEstimate,
+        message: msg.clone(),
+        source_method: None,
+        details: Some(serde_json::json!({ "parameters": params_json })),
+    };
+    Some((msg, entry))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5871,7 +6666,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -6566,10 +7360,20 @@ pub struct SimulateOptions {
 /// Validate the preventable preconditions of TTE event-time simulation, returning a
 /// clear `Err` for a caller to act on.
 ///
-/// **Repeated events (RTTE, `type = rtte`) are rejected outright**: `simulate_tte`
-/// draws a single latent per cause, so an RTTE subject's records would be simulated as
-/// competing single events (earliest wins), not a recurrent stream. RTTE simulation is
-/// a later slice (3.3); fail loud rather than emit silently-wrong single-event data.
+/// **Repeated events (RTTE, `type = rtte`, Slice 3.3)** are simulated as a recurrent
+/// stream by `simulate_rtte_stream` (analytic hazards only). Several preconditions are
+/// *user-fixable* and would otherwise corrupt the stream silently, so they are rejected
+/// here (a clean `Err` from `simulate_with_options`; the `Vec`-returning entry points
+/// re-raise the same message as a panic):
+/// - a **finite, positive horizon** is required — the recurrent stream is generated up
+///   to that administrative window; there is no implicit one;
+/// - **left truncation** (`entry_time > 0`) is a deferred follow-up (conditional
+///   first-gap sampling past entry), so `entry_time == 0` is required;
+/// - exactly **one recurrent stream per subject** — multiple RTTE CMTs, or an RTTE
+///   cause mixed with a competing single-event TTE cause, are a later slice (they need
+///   a shared-horizon multi-stream draw);
+/// - **EVID-3/4 resets** are rejected — a reset would disturb the hazard clock
+///   mid-stream (selective per-state reset is a later slice).
 ///
 /// For **ODE-accumulated (joint PK-TTE)** endpoints, a model with no such endpoint is
 /// otherwise unaffected (returns `Ok`).
@@ -6593,11 +7397,31 @@ fn validate_tte_simulatable(
     horizon: Option<f64>,
 ) -> Result<(), String> {
     use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord, TteRecurrence};
-    // RTTE (repeated-event) simulation is a later slice (3.3): the single-latent draw in
-    // `simulate_tte` would turn a subject's K event rows into K competing single events
-    // (earliest wins, the rest censored) — a silent wrong answer. Reject it here so every
-    // simulate entry point (`simulate*`, uncertainty) fails loudly instead.
-    if model.endpoints.values().any(|e| {
+
+    // RTTE (repeated-event, Slice 3.3) preconditions. The stream generator
+    // (`survival::simulate_rtte_stream`) handles a single analytic recurrent cause
+    // per subject; the cases below are user-fixable and would otherwise corrupt the
+    // draw silently, so reject them at every simulate entry point (`simulate*`,
+    // uncertainty).
+    let is_rtte = |cmt: &usize| {
+        matches!(
+            model.endpoints.get(cmt),
+            Some(EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Repeated { .. },
+                ..
+            })
+        )
+    };
+    let is_single_tte = |cmt: &usize| {
+        matches!(
+            model.endpoints.get(cmt),
+            Some(EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Single,
+                ..
+            })
+        )
+    };
+    let has_rtte = model.endpoints.values().any(|e| {
         matches!(
             e,
             EndpointLikelihood::Tte {
@@ -6605,13 +7429,74 @@ fn validate_tte_simulatable(
                 ..
             }
         )
-    }) {
-        return Err(
-            "Repeated time-to-event (RTTE, `type = rtte`) simulation is not yet supported \
-             (Slice 3.3): `simulate()` would draw a single event per subject rather than a \
-             recurrent stream. Fitting RTTE is supported; simulation is a later slice."
-                .to_string(),
-        );
+    });
+    if has_rtte {
+        // A finite, positive administrative horizon bounds the recurrent stream.
+        match horizon {
+            Some(h) if h.is_finite() && h > 0.0 => {}
+            _ => {
+                return Err(
+                    "Repeated time-to-event (RTTE, `type = rtte`) simulation requires a finite, \
+                     positive administrative horizon: set `[simulation] horizon` (or \
+                     `SimulateOptions.horizon`). The recurrent event stream is generated up to \
+                     that horizon."
+                        .to_string(),
+                );
+            }
+        }
+        for subject in &population.subjects {
+            // Distinct RTTE CMTs on this subject, plus whether it also carries a
+            // competing single-event TTE cause (a non-recurrent `Tte` sibling).
+            let mut rtte_cmts = std::collections::BTreeSet::new();
+            let mut has_single_tte_sibling = false;
+            for r in &subject.obs_records {
+                let ObsRecord::Event {
+                    cmt, entry_time, ..
+                } = r
+                else {
+                    continue;
+                };
+                if is_rtte(cmt) {
+                    rtte_cmts.insert(*cmt);
+                    if *entry_time > 0.0 {
+                        return Err(format!(
+                            "RTTE (`type = rtte`) simulation does not support left truncation \
+                             (entry_time={entry_time} for subject '{}' on CMT={cmt}); conditional \
+                             first-gap sampling past entry is a deferred follow-up",
+                            subject.id
+                        ));
+                    }
+                } else if is_single_tte(cmt) {
+                    has_single_tte_sibling = true;
+                }
+            }
+            if rtte_cmts.is_empty() {
+                continue;
+            }
+            if rtte_cmts.len() > 1 {
+                return Err(format!(
+                    "RTTE simulation supports one recurrent stream per subject, but subject '{}' \
+                     has RTTE endpoints on multiple CMTs ({:?}); multi-cause RTTE simulation is a \
+                     later slice",
+                    subject.id, rtte_cmts
+                ));
+            }
+            if has_single_tte_sibling {
+                return Err(format!(
+                    "RTTE simulation does not support an RTTE cause combined with a competing \
+                     single-event TTE cause on subject '{}'; simulate them separately",
+                    subject.id
+                ));
+            }
+            if !subject.reset_times.is_empty() {
+                return Err(format!(
+                    "RTTE simulation does not support EVID=3/4 resets (a reset would disturb the \
+                     hazard clock mid-stream; selective per-state reset is a later slice); subject \
+                     '{}' has resets",
+                    subject.id
+                ));
+            }
+        }
     }
     let is_ode_tte = |cmt: &usize| {
         matches!(
@@ -6676,6 +7561,21 @@ fn validate_tte_simulatable(
     Ok(())
 }
 
+/// Simulate observations under `opts`, returning only the observation rows.
+///
+/// Thin wrapper over [`simulate_with_options_diag`] that discards the per-subject
+/// simulation diagnostics ([`SimulationOutput::warnings`]). Use the `_diag` form when a
+/// degenerate-subject warning (#762 / #763) must be surfaced (e.g. a population VPC).
+pub fn simulate_with_options(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+) -> Result<Vec<SimulationResult>, String> {
+    simulate_with_options_diag(model, population, params, n_sim, opts).map(|o| o.results)
+}
+
 /// Simulate observations, optionally with propensity-score matching.
 ///
 /// With `opts.match_method == None` this is identical to
@@ -6688,13 +7588,18 @@ fn validate_tte_simulatable(
 ///
 /// Returns `Err` if matching is requested but the population is empty or any
 /// subject has no observations.
-pub fn simulate_with_options(
+///
+/// This is the diagnostics-returning form: the [`SimulationOutput`] carries both the
+/// rows and any non-fatal per-subject warnings (a degenerate hazard draw, #763; a
+/// degenerate recurrent stream skipped, #762). [`simulate_with_options`] is the thin
+/// wrapper that returns only the rows.
+pub fn simulate_with_options_diag(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
     opts: &SimulateOptions,
-) -> Result<Vec<SimulationResult>, String> {
+) -> Result<SimulationOutput, String> {
     use rand::SeedableRng;
 
     // ODE-accumulated (joint PK-TTE) TTE simulation samples drug-driven event times
@@ -6729,7 +7634,9 @@ pub fn simulate_with_options(
         #[cfg(feature = "survival")]
         for subject in &population.subjects {
             for record in &subject.obs_records {
-                let crate::types::ObsRecord::Event { entry_time, .. } = record;
+                let crate::types::ObsRecord::Event { entry_time, .. } = record else {
+                    continue;
+                };
                 if *entry_time > h {
                     return Err(format!(
                         "SimulateOptions.horizon ({h}) is below subject '{}' entry_time \
@@ -6761,12 +7668,18 @@ pub fn simulate_with_options(
     // with a confusable "EBE did not converge" instead of the real cause.
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
+    assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    // A time-varying covariate on a survival hazard would be silently frozen — panic
+    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
+    #[cfg(feature = "survival")]
+    assert_survival_tv_covariates(model, population);
     assert_absorption_dosing_supported(model, population);
 
     let method = match opts.match_method {
         Some(m) => m,
         None => {
-            return Ok(simulate_inner_with_draw(
+            let mut warnings = Vec::new();
+            let results = simulate_inner_with_draw(
                 model,
                 population,
                 params,
@@ -6775,7 +7688,9 @@ pub fn simulate_with_options(
                 None,
                 opts.horizon,
                 &mut rng,
-            ));
+                &mut warnings,
+            );
+            return Ok(SimulationOutput { results, warnings });
         }
     };
 
@@ -6823,7 +7738,8 @@ pub fn simulate_with_options(
     }
 
     let omega_inv = &params.omega.inv;
-    Ok(simulate_inner_with_draw(
+    let mut warnings = Vec::new();
+    let results = simulate_inner_with_draw(
         model,
         population,
         params,
@@ -6832,7 +7748,9 @@ pub fn simulate_with_options(
         Some((&eta_hats, omega_inv, method)),
         opts.horizon,
         &mut rng,
-    ))
+        &mut warnings,
+    );
+    Ok(SimulationOutput { results, warnings })
 }
 
 fn simulate_inner<R: rand::Rng>(
@@ -6844,7 +7762,21 @@ fn simulate_inner<R: rand::Rng>(
 ) -> Vec<SimulationResult> {
     // `simulate` / `simulate_with_seed` carry no horizon; the per-record window
     // applies. An explicit `[simulation] horizon` enters via `simulate_with_options`.
-    simulate_inner_with_draw(model, population, params, n_sim, 1, None, None, rng)
+    // These entry points return only the rows; per-subject simulation diagnostics
+    // (#762 degenerate RTTE, #763 degenerate hazard draw) are collected but surfaced
+    // only on the `simulate_with_options` path (`SimulationOutput.warnings`).
+    let mut warnings = Vec::new();
+    simulate_inner_with_draw(
+        model,
+        population,
+        params,
+        n_sim,
+        1,
+        None,
+        None,
+        rng,
+        &mut warnings,
+    )
 }
 
 /// Emit all observation rows for one subject given a fully-formed `eta_slice`
@@ -6874,11 +7806,12 @@ fn emit_subject_rows<R: rand::Rng>(
     horizon: Option<f64>,
     rng: &mut R,
     results: &mut Vec<SimulationResult>,
+    warnings: &mut Vec<String>,
 ) {
-    // `horizon` is consumed only by the TTE path below; without the `survival`
-    // feature there are no TTE endpoints, so discard it to avoid an unused-arg warn.
+    // `horizon` and `warnings` are consumed only by the TTE path below; without the
+    // `survival` feature there are no TTE endpoints, so discard them to avoid unused-arg warns.
     #[cfg(not(feature = "survival"))]
-    let _ = horizon;
+    let _ = (horizon, &mut *warnings);
 
     // Predict IPRED. For IOV models (`n_kappa > 0`) route through the
     // occasion-aware `predict_iov`, drawing one independent κ ~ N(0, Ω_IOV) per
@@ -6996,6 +7929,7 @@ fn emit_subject_rows<R: rand::Rng>(
         horizon,
         rng,
         results,
+        warnings,
     );
 }
 
@@ -7110,6 +8044,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
     horizon: Option<f64>,
     rng: &mut R,
+    warnings: &mut Vec<String>,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
 
@@ -7119,6 +8054,11 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // data-check otherwise. #324.
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
+    assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    // A time-varying covariate on a survival hazard would be silently frozen — panic
+    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
+    #[cfg(feature = "survival")]
+    assert_survival_tv_covariates(model, population);
     assert_absorption_dosing_supported(model, population);
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
@@ -7167,6 +8107,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         horizon,
                         rng,
                         &mut results,
+                        &mut *warnings,
                     );
                 }
             }
@@ -7189,6 +8130,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         horizon,
                         rng,
                         &mut results,
+                        &mut *warnings,
                     );
                 }
             }
@@ -8259,6 +9201,11 @@ pub fn simulate_with_uncertainty(
     let total_obs: usize = population.subjects.iter().map(|s| s.obs_times.len()).sum();
     let mut results =
         Vec::with_capacity(opts.n_uncertainty_draws * opts.n_sim_per_draw * total_obs);
+    // Per-subject simulation diagnostics (#762/#763) are collected but not surfaced on
+    // this uncertainty-aggregation path (its return is the flat row vec); the underlying
+    // per-subject handling — no whole-run panic, degenerate subjects censored — still
+    // applies. Use `simulate_with_options` when the warnings matter.
+    let mut sim_warnings: Vec<String> = Vec::new();
     for (k, params) in draws.iter().enumerate() {
         let mut rows = simulate_inner_with_draw(
             model,
@@ -8269,6 +9216,7 @@ pub fn simulate_with_uncertainty(
             None,
             None,
             &mut rng,
+            &mut sim_warnings,
         );
         results.append(&mut rows);
     }
@@ -8301,6 +9249,24 @@ pub struct SimulationResult {
     pub outcome: SimOutcome,
 }
 
+/// The result of [`simulate_with_options`]: the simulated rows plus any non-fatal
+/// per-subject diagnostics collected during the run.
+///
+/// `warnings` is the simulation analogue of [`FitResult::warnings`]: a subject whose
+/// draw degenerates — a non-positive / non-finite analytic hazard rate that produces
+/// no event (#763), or a hazard so extreme its recurrent stream is skipped rather than
+/// materialised (#762) — is handled *per subject* (censored / skipped, the run
+/// continues) and named here, instead of silently vanishing into the censored rows or
+/// aborting the whole run. Empty for a clean simulation. The simpler `simulate()` /
+/// `simulate_with_seed()` entry points apply the same per-subject handling but return
+/// only the rows (no diagnostics channel) — use `simulate_with_options` when the
+/// warnings matter (e.g. a population VPC).
+#[derive(Debug, Clone, Default)]
+pub struct SimulationOutput {
+    pub results: Vec<SimulationResult>,
+    pub warnings: Vec<String>,
+}
+
 /// Predict concentrations for a population using given parameters (no random effects).
 ///
 /// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
@@ -8316,6 +9282,11 @@ pub fn predict(
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
+    assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    // A time-varying covariate on a survival hazard would be silently frozen — panic
+    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
+    #[cfg(feature = "survival")]
+    assert_survival_tv_covariates(model, population);
     assert_analytic_readout_support(model, population);
     assert_absorption_dosing_supported(model, population);
 
@@ -8437,9 +9408,20 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
+    // Deliberately no `assert_transit_flip_flop_no_twin` guard here (unlike
+    // `predict`/`simulate`): a survival prediction cannot be corrupted by a degenerate
+    // twin-less-flip-flop transit PK. A hazard that reads the PK is ODE-accumulated (the
+    // model then carries `ode_spec` and never takes the closed-form transit path), and a
+    // closed-form-family hazard does not read the PK at all — so the closed form's
+    // clamped `0` can never reach `S(t)`. See #776.
     use crate::survival::{
         cif_curves, hazard_and_cum_hazard, mean_survival, median_survival, tte_cause_params,
     };
+
+    // Like predict()/simulate(), the survival curves read the hazard at a frozen
+    // baseline covariate snapshot — a time-varying covariate on the hazard would be
+    // silently applied at its baseline, so fail loudly instead (#741).
+    assert_survival_tv_covariates(model, population);
 
     // The competing-risks CIF telescopes the all-cause survival drop, which
     // requires the grid in ascending time order; sort a local copy so the
@@ -8698,7 +9680,6 @@ mod iov_integration {
                 occasions: occasions.clone(),
                 dose_occasions: dose_occ.clone(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
             .collect();
@@ -9147,6 +10128,241 @@ mod iov_integration {
         assert_eq!(d.block.as_deref(), Some("fit_options"));
     }
 
+    // A model-side occasion rule (`iov_occasion`) supplies the labels at fit time,
+    // so the E_IOV_MISSING_OCC data check must NOT fire even with empty occasions.
+    #[test]
+    fn test_iov_occasion_rule_suppresses_missing_occ_check() {
+        let model = make_iov_model();
+        let mut pop = make_iov_population();
+        for subj in &mut pop.subjects {
+            subj.occasions.clear();
+            subj.dose_occasions.clear();
+        }
+        let rule = IovOccasionRule::TimeWindows(vec![3.5]);
+        let diags = super::check_model_data_rule(&model, &pop, &rule);
+        assert!(
+            !diags.iter().any(|d| d.code == "E_IOV_MISSING_OCC"),
+            "iov_occasion rule should suppress the missing-occasion error"
+        );
+        // Column rule (default) still flags the empty occasions.
+        let diags = super::check_model_data_rule(&model, &pop, &IovOccasionRule::Column);
+        assert!(diags.iter().any(|d| d.code == "E_IOV_MISSING_OCC"));
+    }
+
+    // TimeWindows breakpoints bucket obs and doses by (raw) time: `time(3.5)`
+    // splits the make_iov_population timeline (obs 1..6, doses at 0.0 and 3.5)
+    // into occasion 0 (t < 3.5) and occasion 1 (t ≥ 3.5).
+    #[test]
+    fn test_apply_iov_occasion_time_windows() {
+        let mut pop = make_iov_population();
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(
+            &mut pop,
+            &IovOccasionRule::TimeWindows(vec![3.5]),
+            false,
+            &mut warnings,
+        );
+        assert!(warnings.is_empty(), "no column set → no override warning");
+        for s in &pop.subjects {
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+            assert_eq!(s.dose_occasions, vec![0u32, 1]);
+        }
+    }
+
+    // PerDose opens a new occasion at each administration; an observation takes
+    // the occasion of the most recent dose (dose-before-obs at equal TIME). For
+    // make_iov_population (doses at 0.0 and 3.5) this yields the same partition
+    // as time(3.5): obs 1..3 → occasion 0, obs 4..6 → occasion 1.
+    #[test]
+    fn test_apply_iov_occasion_per_dose() {
+        let mut pop = make_iov_population();
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(&mut pop, &IovOccasionRule::PerDose, false, &mut warnings);
+        for s in &pop.subjects {
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+            assert_eq!(s.dose_occasions, vec![0u32, 1]);
+        }
+    }
+
+    // When both iov_column and a DSL rule are set, the DSL rule wins and a single
+    // override warning is emitted.
+    #[test]
+    fn test_apply_iov_occasion_coexistence_warns() {
+        let mut pop = make_iov_population();
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(
+            &mut pop,
+            &IovOccasionRule::PerDose,
+            /* had_column = */ true,
+            &mut warnings,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("iov_column"));
+    }
+
+    // NONMEM-equivalence by proxy: the column path is already NONMEM-validated
+    // (tests/warfarin_iov_nonmem.rs). A DSL `time(3.5)` rule that reproduces the
+    // same occasion partition must produce a bit-identical fit (same OFV, same
+    // per-occasion kappa structure) as reading the occasions from the column.
+    #[test]
+    fn test_iov_occasion_dsl_matches_column_fit() {
+        let model = make_iov_model();
+        let pop = make_iov_population(); // occasions [1,1,1,2,2,2] from the column
+
+        let opts_col = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        let r_col =
+            fit(&model, &pop, &model.default_params, &opts_col).expect("column fit should succeed");
+
+        // Same population, but derive occasions from the model instead. time(3.5)
+        // reproduces the column partition (relabeled 0/1 vs 1/2 — grouping is by
+        // label identity, so the estimation is identical).
+        let mut opts_dsl = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        opts_dsl.iov_occasion = IovOccasionRule::TimeWindows(vec![3.5]);
+        let r_dsl = fit(&model, &pop, &model.default_params, &opts_dsl)
+            .expect("DSL-occasion fit should succeed");
+
+        assert!(
+            (r_col.ofv - r_dsl.ofv).abs() < 1e-6,
+            "DSL occasion rule OFV {} must match column OFV {}",
+            r_dsl.ofv,
+            r_col.ofv
+        );
+        assert_eq!(r_col.ebe_kappas.len(), r_dsl.ebe_kappas.len());
+        for (a, b) in r_col.ebe_kappas.iter().zip(&r_dsl.ebe_kappas) {
+            assert_eq!(a.len(), b.len(), "same number of occasions per subject");
+        }
+    }
+
+    // #757: TimeWindows must bucket observations on the internal (monotonic)
+    // event clock, not the raw user clock. A reset-stacked crossover restarts
+    // the user TIME each period; if the derivation read `obs_raw_times` the
+    // second period's early samples would fold back into occasion 0 and split
+    // from their (internal-clock) doses.
+    #[test]
+    fn test_apply_iov_occasion_time_windows_uses_internal_clock() {
+        let mut pop = make_iov_population();
+        // Raw times that restart mid-series, as a period-2 reset would; the
+        // internal obs_times stay [1..6]. The rule must ignore these.
+        for s in &mut pop.subjects {
+            s.obs_raw_times = vec![1.0, 2.0, 3.0, 0.5, 1.5, 2.5];
+        }
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(
+            &mut pop,
+            &IovOccasionRule::TimeWindows(vec![3.5]),
+            false,
+            &mut warnings,
+        );
+        for s in &pop.subjects {
+            // Internal clock [1..6] with break at 3.5 → [0,0,0,1,1,1]. Had the raw
+            // times been used, the last three (all < 3.5) would be occasion 0.
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+        }
+    }
+
+    // #757: two doses administered at the same time (e.g. a simultaneous
+    // depot + central bolus) must share one occasion — the earlier one must not
+    // be stranded in an empty, observation-less occasion.
+    #[test]
+    fn test_apply_iov_occasion_per_dose_cotimed_doses_share_occasion() {
+        let mut pop = make_iov_population();
+        for s in &mut pop.subjects {
+            s.doses = vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(0.0, 50.0, 2, 0.0, false, 0.0), // co-timed
+                DoseEvent::new(3.5, 100.0, 1, 0.0, false, 0.0),
+            ];
+        }
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(&mut pop, &IovOccasionRule::PerDose, false, &mut warnings);
+        for s in &pop.subjects {
+            // Two co-timed doses at t=0 → occasion 0; dose at 3.5 → occasion 1.
+            assert_eq!(s.dose_occasions, vec![0u32, 0, 1]);
+            // Observation partition unchanged: 1..3 → occ 0, 4..6 → occ 1.
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+        }
+    }
+
+    // #757: a derived rule that collapses every subject to a single occasion
+    // leaves kappa confounded with BSV — the same unidentifiability the column
+    // path guards with E_IOV_MISSING_OCC. fit() must error rather than run.
+    #[test]
+    fn test_iov_occasion_degenerate_single_occasion_errors() {
+        let model = make_iov_model();
+        let pop = make_iov_population();
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        // Breakpoint past the last observation (max 6.0) → one occasion for all.
+        opts.iov_occasion = IovOccasionRule::TimeWindows(vec![100.0]);
+        let res = fit(&model, &pop, &model.default_params, &opts);
+        let msg = res.expect_err("single-occasion derivation must error");
+        assert!(
+            msg.contains("single occasion") || msg.contains("unidentifiable"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // #757: `iov_occasion` with no kappa in the model is a no-op — it must warn
+    // (so the user knows it had no effect) and skip the derivation entirely.
+    #[test]
+    fn test_iov_occasion_without_kappa_warns() {
+        let mut model = make_iov_model();
+        // Strip IOV so the rule has nothing to feed.
+        model.n_kappa = 0;
+        model.kappa_names.clear();
+        model.default_params.omega_iov = None;
+        model.default_params.kappa_fixed.clear();
+        let pop = make_iov_population();
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        opts.iov_occasion = IovOccasionRule::PerDose;
+        let res = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("iov_occasion") && w.contains("no effect")),
+            "expected a no-op warning, got: {:?}",
+            res.warnings
+        );
+    }
+
+    // #757: `run_model_*` mirrors the model-side occasion derivation onto the
+    // returned population so sdtab keeps its OCC column. Exercises the helper the
+    // CLI wrapper calls without a full fit.
+    #[test]
+    fn test_derive_output_occasions_matches_rule() {
+        let model = make_iov_model();
+        let empty = |p: &mut Population| {
+            for s in &mut p.subjects {
+                s.occasions.clear();
+                s.dose_occasions.clear();
+            }
+        };
+
+        // Derived rule → occasions written for output.
+        let mut pop = make_iov_population();
+        empty(&mut pop);
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        opts.iov_occasion = IovOccasionRule::PerDose;
+        super::derive_output_occasions(&model, &opts, &mut pop);
+        for s in &pop.subjects {
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+        }
+
+        // Column rule (default) → no-op, occasions stay empty.
+        let mut pop_col = make_iov_population();
+        empty(&mut pop_col);
+        let opts_col = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        super::derive_output_occasions(&model, &opts_col, &mut pop_col);
+        assert!(pop_col.subjects.iter().all(|s| s.occasions.is_empty()));
+
+        // Rule set but no kappa → no-op.
+        let mut model0 = make_iov_model();
+        model0.n_kappa = 0;
+        let mut pop0 = make_iov_population();
+        empty(&mut pop0);
+        super::derive_output_occasions(&model0, &opts, &mut pop0);
+        assert!(pop0.subjects.iter().all(|s| s.occasions.is_empty()));
+    }
+
     // `ferx check` must surface the same trust_region+IOV incompatibility that
     // `fit()` rejects — without it, a model could report `valid: true` and then
     // fail at fit time. `check_model_options` is the shared source of truth.
@@ -9267,6 +10483,7 @@ mod iov_integration {
                     param_fn: Box::new(|_theta, _eta, _cov| vec![0.1]),
                 },
                 recurrence: crate::types::TteRecurrence::Single,
+                hazard_covariates: Vec::new(),
             },
         );
 
@@ -9340,7 +10557,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -9429,7 +10645,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -9516,7 +10731,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -9611,7 +10825,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -9707,7 +10920,6 @@ mod iov_integration {
             occasions: vec![1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -10055,7 +11267,6 @@ mod iov_integration {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pop = Population {
@@ -10993,6 +12204,150 @@ mod simulate_with_uncertainty_tests {
         );
     }
 
+    // ---- #741: time-varying covariate on a survival hazard is rejected ----
+
+    /// A standalone TTE model with a covariate (`CRCL`) on the hazard via the PH
+    /// `loghr` term, so the parser records `CRCL` in the endpoint's
+    /// `hazard_covariates`. Used by the `check_survival_tv_covariates` tests.
+    #[cfg(feature = "survival")]
+    fn parse_tte_hazard_cov_model() -> CompiledModel {
+        use crate::parser::model_parser::parse_model_string;
+        const M: &str = r#"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  theta TVBETA(0.1, -5.0, 5.0)
+  omega ETA_LAMBDA ~ 0.09
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+  loghr  = TVBETA * CRCL
+[fit_options]
+  method = focei
+"#;
+        parse_model_string(M).expect("TTE + covariate-on-hazard model parses")
+    }
+
+    /// One-subject population whose per-observation covariate snapshots are `snaps`
+    /// (a covariate that differs across them is time-varying). `obs_records` are left
+    /// empty — `check_survival_tv_covariates` inspects only covariate snapshots and
+    /// the model endpoints.
+    #[cfg(feature = "survival")]
+    fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Population {
+        let n = snaps.len();
+        let base = snaps.first().cloned().unwrap_or_default();
+        let subject = Subject {
+            id: id.to_string(),
+            doses: Vec::new(),
+            obs_times: vec![0.0; n],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![2; n],
+            covariates: base,
+            dose_covariates: Vec::new(),
+            obs_covariates: snaps,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: Vec::new(),
+        };
+        Population {
+            subjects: vec![subject],
+            covariate_names: vec!["CRCL".to_string(), "WT".to_string()],
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn analytic_hazard_time_varying_covariate_is_rejected() {
+        let model = parse_tte_hazard_cov_model();
+        let pop = tte_cov_snapshot_pop(
+            "S1",
+            vec![
+                HashMap::from([("CRCL".to_string(), 100.0)]),
+                HashMap::from([("CRCL".to_string(), 60.0)]),
+            ],
+        );
+        let msg = check_survival_tv_covariates(&model, &pop)
+            .expect("a time-varying CRCL on the hazard must be rejected up front");
+        assert!(msg.contains("CRCL"), "must name the covariate: {msg}");
+        assert!(msg.contains("S1"), "must name the subject: {msg}");
+        assert!(msg.contains("#741"), "must cite the issue: {msg}");
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn analytic_hazard_constant_covariate_is_accepted() {
+        let model = parse_tte_hazard_cov_model();
+        let pop = tte_cov_snapshot_pop(
+            "S1",
+            vec![
+                HashMap::from([("CRCL".to_string(), 100.0)]),
+                HashMap::from([("CRCL".to_string(), 100.0)]),
+            ],
+        );
+        assert!(
+            check_survival_tv_covariates(&model, &pop).is_none(),
+            "a constant hazard covariate must not be rejected"
+        );
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn analytic_hazard_ignores_tv_covariate_it_does_not_reference() {
+        // WT is time-varying but the hazard references only CRCL (held constant). A
+        // time-varying covariate used solely by an unrelated (e.g. PK) part of a joint
+        // model must not trigger a false rejection — the analytic hazard never reads it.
+        let model = parse_tte_hazard_cov_model();
+        let pop = tte_cov_snapshot_pop(
+            "S1",
+            vec![
+                HashMap::from([("CRCL".to_string(), 100.0), ("WT".to_string(), 70.0)]),
+                HashMap::from([("CRCL".to_string(), 100.0), ("WT".to_string(), 80.0)]),
+            ],
+        );
+        assert!(
+            check_survival_tv_covariates(&model, &pop).is_none(),
+            "a time-varying covariate the hazard does not reference must not be rejected"
+        );
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn ode_accumulated_hazard_rejects_any_time_varying_covariate() {
+        // The survival ODE solve freezes the whole PK-parameter vector at t=0, so ANY
+        // time-varying covariate corrupts the drug-driven hazard — even one not listed in
+        // `hazard_covariates` (empty for the ODE variant).
+        let mut model = parse_tte_hazard_cov_model();
+        model.endpoints.insert(
+            2,
+            crate::types::EndpointLikelihood::Tte {
+                hazard: crate::types::HazardSpec::OdeAccumulated { chz_state: 0 },
+                recurrence: crate::types::TteRecurrence::Single,
+                hazard_covariates: Vec::new(),
+            },
+        );
+        let pop = tte_cov_snapshot_pop(
+            "S9",
+            vec![
+                HashMap::from([("WT".to_string(), 70.0)]),
+                HashMap::from([("WT".to_string(), 90.0)]),
+            ],
+        );
+        let msg = check_survival_tv_covariates(&model, &pop)
+            .expect("ODE-accumulated hazard + any TV covariate must be rejected");
+        assert!(msg.contains("WT"), "must name the covariate: {msg}");
+        assert!(msg.contains("#741"), "must cite the issue: {msg}");
+    }
+
     fn tiny_population() -> Population {
         let obs_times = vec![1.0, 2.0, 3.0];
         let subjects: Vec<Subject> = (0..2)
@@ -11013,7 +12368,6 @@ mod simulate_with_uncertainty_tests {
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
             .collect();
@@ -11238,6 +12592,292 @@ mod simulate_with_uncertainty_tests {
     }
 
     #[test]
+    fn diagnostic_details_covers_numeric_codes() {
+        use crate::types::WarningCode;
+        // Shim for the scalar codes (no ETA/eigenvalue inputs).
+        fn dd(
+            code: &crate::types::WarningCode,
+            dw: f64,
+            lag1: f64,
+            eps: f64,
+            cond: Option<f64>,
+        ) -> Option<serde_json::Value> {
+            super::diagnostic_details(
+                code,
+                &super::DiagStats {
+                    dw_statistic: dw,
+                    iwres_lag1_r: lag1,
+                    shrinkage_eps: eps,
+                    cov_condition_number: cond,
+                    ..Default::default()
+                },
+            )
+        }
+        // Durbin–Watson: both stored stats surface.
+        let d = dd(&WarningCode::DwAutocorrelation, 1.2, 0.4, f64::NAN, None).expect("DW details");
+        assert_eq!(d["durbin_watson"], 1.2);
+        assert_eq!(d["iwres_lag1_autocorr"], 0.4);
+        // EPS shrinkage: fraction + percent.
+        let d = dd(&WarningCode::EpsShrinkage, f64::NAN, 0.0, -0.083, None).expect("eps details");
+        assert_eq!(d["eps_shrinkage"], -0.083);
+        assert!((d["eps_shrinkage_pct"].as_f64().unwrap() + 8.3).abs() < 1e-9);
+        // Condition number: from the Option.
+        let d = dd(
+            &WarningCode::ConditionNumber,
+            f64::NAN,
+            0.0,
+            f64::NAN,
+            Some(1.4e6),
+        )
+        .expect("cond details");
+        assert_eq!(d["condition_number"], 1.4e6);
+        // None cases: missing stat, non-finite stat, and non-numeric code.
+        assert!(dd(&WarningCode::ConditionNumber, 0.0, 0.0, 0.0, None).is_none());
+        assert!(dd(
+            &WarningCode::DwAutocorrelation,
+            f64::INFINITY,
+            0.0,
+            0.0,
+            None
+        )
+        .is_none());
+        assert!(dd(&WarningCode::Convergence, 1.0, 0.0, 0.0, Some(1.0)).is_none());
+
+        // Non-finite *contributing* stats omit details rather than emit a
+        // null-valued payload (serde_json maps non-finite floats to null).
+        // cov_condition_number = +Inf (documented for near-singular spaces):
+        assert!(dd(
+            &WarningCode::ConditionNumber,
+            f64::NAN,
+            0.0,
+            f64::NAN,
+            Some(f64::INFINITY)
+        )
+        .is_none());
+        // finite Durbin-Watson but non-finite lag-1 autocorrelation:
+        assert!(dd(
+            &WarningCode::DwAutocorrelation,
+            1.20,
+            f64::NAN,
+            f64::NAN,
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn eta_shrinkage_warning_fires_above_threshold_only() {
+        let names = vec![
+            "eta_CL".to_string(),
+            "eta_V".to_string(),
+            "eta_KA".to_string(),
+        ];
+        // All low → no warning.
+        assert!(super::eta_shrinkage_warning(&[0.01, 0.05, 0.10], &names).is_none());
+        // NaN is ignored (not treated as high).
+        assert!(super::eta_shrinkage_warning(&[0.01, f64::NAN, 0.20], &names).is_none());
+        // One above the 30% threshold → warning names it with its percent.
+        let w = super::eta_shrinkage_warning(&[0.02, 0.42, 0.10], &names).expect("warning");
+        assert!(w.contains("eta_V (42%)"), "got: {w}");
+        assert!(w.to_lowercase().contains("eta shrinkage"));
+        // Boundary: exactly at threshold counts.
+        assert!(super::eta_shrinkage_warning(&[0.30], &["eta_CL".into()]).is_some());
+    }
+
+    #[test]
+    fn eta_shrinkage_details_lists_high_etas() {
+        use crate::types::WarningCode;
+        let ed = |shrink: &[f64], names: &[String]| {
+            super::diagnostic_details(
+                &WarningCode::EtaShrinkage,
+                &super::DiagStats {
+                    shrinkage_eta: shrink,
+                    eta_names: names,
+                    ..Default::default()
+                },
+            )
+        };
+        let names = vec!["eta_CL".to_string(), "eta_V".to_string()];
+        let d = ed(&[0.05, 0.42], &names).expect("eta details");
+        assert_eq!(d["threshold_pct"], 30.0);
+        let high = d["high_shrinkage_etas"].as_array().unwrap();
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0]["eta"], "eta_V");
+        assert!((high[0]["shrinkage_pct"].as_f64().unwrap() - 42.0).abs() < 1e-9);
+        // No high eta → no details payload.
+        assert!(ed(&[0.05, 0.10], &names).is_none());
+        // Missing name → non-empty `eta_{i}` placeholder, not "".
+        let d = ed(&[0.42], &[]).expect("details");
+        assert_eq!(d["high_shrinkage_etas"][0]["eta"], "eta_0");
+    }
+
+    #[test]
+    fn covariance_details_reports_eigenvalues_and_condition() {
+        use crate::types::WarningCode;
+        let cd = |cond: Option<f64>, eigs: Option<&[f64]>| {
+            super::diagnostic_details(
+                &WarningCode::CovarianceRegularized,
+                &super::DiagStats {
+                    cov_condition_number: cond,
+                    cov_eigenvalues: eigs,
+                    ..Default::default()
+                },
+            )
+        };
+        // Regularized (or failed) with eigenvalues present: min + negative count.
+        let d = cd(Some(1.4e6), Some(&[0.5, -1.0e-3, 2.1])).expect("cov details");
+        assert_eq!(d["condition_number"], 1.4e6);
+        assert!((d["min_eigenvalue"].as_f64().unwrap() + 1.0e-3).abs() < 1e-12);
+        assert_eq!(d["n_negative_eigenvalues"], 1);
+        // CovarianceFailed shares the same payload builder.
+        assert!(super::diagnostic_details(
+            &WarningCode::CovarianceFailed,
+            &super::DiagStats {
+                cov_condition_number: Some(9.9),
+                ..Default::default()
+            },
+        )
+        .is_some());
+        // Nothing available (hard failure: no matrix → no eigenvalues, no cond)
+        // → details omitted.
+        assert!(cd(None, None).is_none());
+        // Non-finite condition number is skipped.
+        assert!(cd(Some(f64::INFINITY), None).is_none());
+    }
+
+    #[test]
+    fn theta_boundary_side_detects_bounds() {
+        let side = |e, l, u| super::theta_boundary_side(e, l, u).map(|(s, _)| s);
+        // Identity-packed (lower < 0): interior, at-lower, at-upper.
+        assert_eq!(side(0.0, -1.0, 1.0), None);
+        assert_eq!(side(-1.0, -1.0, 1.0), Some("lower"));
+        assert_eq!(side(1.0, -1.0, 1.0), Some("upper"));
+        // Log-packed (lower >= 0): "at bound" is within a constant factor.
+        assert_eq!(side(1.0, 0.001, 1000.0), None);
+        assert_eq!(side(0.001, 0.001, 1000.0), Some("lower"));
+        // Degenerate bounds → None.
+        assert_eq!(side(1.0, 5.0, 5.0), None);
+        // Effective bound: a user lower bound of 0 (log-packed) is reported as
+        // the optimizer's 1e-10 floor, agreeing with the pinned estimate.
+        let (s, bound) = super::theta_boundary_side(1e-10, 0.0, 100.0).unwrap();
+        assert_eq!(s, "lower");
+        assert_eq!(bound, 1e-10);
+    }
+
+    #[test]
+    fn rebuild_native_key_reconstructs_chain_prefix() {
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        // A native entry produced inside a `[FOCEI]` chain: message is the
+        // stripped body, source_method carries the tag; the raw warning is the
+        // full prefixed string.
+        fit.warnings = vec!["[FOCEI] pinned to an optimizer bound: X".to_string()];
+        fit.warnings_structured = vec![crate::types::WarningEntry {
+            severity: crate::types::WarningSeverity::Warning,
+            category: crate::types::WarningCode::BoundaryEstimate,
+            message: "pinned to an optimizer bound: X".to_string(),
+            source_method: Some("FOCEI".to_string()),
+            details: Some(serde_json::json!({ "k": 1 })),
+        }];
+        super::rebuild_warnings_structured(&mut fit);
+        // Native entry (with details) is preferred despite the prefix.
+        assert_eq!(
+            fit.warnings_structured[0].category,
+            crate::types::WarningCode::BoundaryEstimate
+        );
+        assert_eq!(fit.warnings_structured[0].details.as_ref().unwrap()["k"], 1);
+    }
+
+    #[test]
+    fn boundary_estimate_warning_emits_typed_entry_with_details() {
+        use crate::types::WarningCode;
+        let mut params = tiny_model().default_params;
+        // No hit initially (estimates interior) — or at least assert whatever
+        // tiny_model starts with, then force a hit on theta 0 at its lower bound.
+        params.theta_fixed = vec![false; params.theta.len()];
+        params.theta[0] = params.theta_lower[0];
+        let (msg, entry) =
+            super::boundary_estimate_warning(&params).expect("expected a boundary hit");
+        assert!(msg.contains("optimizer bound"));
+        assert_eq!(entry.category, WarningCode::BoundaryEstimate);
+        let d = entry.details.as_ref().expect("details");
+        assert_eq!(d["parameters"][0]["side"], "lower");
+        assert_eq!(
+            d["parameters"][0]["parameter"],
+            params.theta_names[0].as_str()
+        );
+
+        // A fixed theta at its bound is not reported.
+        params.theta_fixed[0] = true;
+        assert!(super::boundary_estimate_warning(&params).is_none());
+    }
+
+    #[test]
+    fn rebuild_prefers_native_entry_and_is_idempotent() {
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        let msg = "Parameter estimate(s) pinned to an optimizer bound: CL (0.0010 at lower bound)."
+            .to_string();
+        fit.warnings = vec![msg.clone()];
+        // Native entry (with details) seeded as the fit pipeline would.
+        fit.warnings_structured = vec![crate::types::WarningEntry {
+            severity: crate::types::WarningSeverity::Warning,
+            category: crate::types::WarningCode::BoundaryEstimate,
+            message: msg.clone(),
+            source_method: None,
+            details: Some(serde_json::json!({ "parameters": [{ "parameter": "CL" }] })),
+        }];
+        super::rebuild_warnings_structured(&mut fit);
+        // Native entry preferred over re-classifying the string (details kept).
+        assert_eq!(fit.warnings_structured.len(), 1);
+        assert_eq!(
+            fit.warnings_structured[0].category,
+            crate::types::WarningCode::BoundaryEstimate
+        );
+        assert_eq!(
+            fit.warnings_structured[0].details.as_ref().unwrap()["parameters"][0]["parameter"],
+            "CL"
+        );
+        // Idempotent: a second rebuild re-captures the native entry, details intact.
+        super::rebuild_warnings_structured(&mut fit);
+        assert_eq!(
+            fit.warnings_structured[0].details.as_ref().unwrap()["parameters"][0]["parameter"],
+            "CL"
+        );
+    }
+
+    #[test]
+    fn rebuild_attaches_details_from_typed_fields() {
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        fit.warnings = vec![
+            "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).".to_string(),
+            "Outer optimization did not converge".to_string(),
+            "High ETA shrinkage (\u{2265} 30%): eta_V (42%). EBE-based diagnostics \
+             for these random effects are unreliable."
+                .to_string(),
+        ];
+        fit.dw_statistic = 1.20;
+        fit.iwres_lag1_r = 0.4;
+        fit.shrinkage_eta = vec![0.05, 0.42];
+        fit.eta_names = vec!["eta_CL".to_string(), "eta_V".to_string()];
+        super::rebuild_warnings_structured(&mut fit);
+
+        let dw = &fit.warnings_structured[0];
+        assert_eq!(dw.category, crate::types::WarningCode::DwAutocorrelation);
+        let details = dw.details.as_ref().expect("DW warning carries details");
+        assert_eq!(details["durbin_watson"], 1.20);
+        assert_eq!(details["iwres_lag1_autocorr"], 0.4);
+        // A non-numeric code keeps details omitted.
+        assert!(fit.warnings_structured[1].details.is_none());
+        // ETA shrinkage classifies + attaches its high-eta details.
+        let eta = &fit.warnings_structured[2];
+        assert_eq!(eta.category, crate::types::WarningCode::EtaShrinkage);
+        let ed = eta.details.as_ref().expect("ETA shrinkage details");
+        assert_eq!(ed["high_shrinkage_etas"][0]["eta"], "eta_V");
+    }
+
+    #[test]
     fn sir_path_reuses_pool() {
         let model = tiny_model();
         let pop = tiny_population();
@@ -11393,7 +13033,6 @@ mod sde_integration {
                 occasions: vec![1u32; 3],
                 dose_occasions: vec![1u32],
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
             .collect();
@@ -11524,7 +13163,6 @@ mod sde_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             };
             Population {
@@ -11566,7 +13204,9 @@ mod sde_integration {
             .expect("SDE model should emit W_EXPERIMENTAL_SDE");
         assert_eq!(exp.severity, crate::diagnostics::Severity::Warning);
         assert_eq!(
-            crate::types::classify_warning(&exp.message).category,
+            crate::types::classify_warning(&exp.message)
+                .category
+                .as_str(),
             "experimental"
         );
 
@@ -11847,7 +13487,6 @@ mod tests_sdtab_tv_cov {
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         // Sanity: this subject must be classified TV — that's the regime the
@@ -12017,7 +13656,6 @@ mod tests_sdtab_tv_cov {
             occasions: vec![1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let eta = DVector::from_vec(vec![0.0]);
@@ -12173,7 +13811,6 @@ mod tests_sdtab_tv_cov {
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         assert!(subject.has_tv_covariates());
@@ -12335,7 +13972,6 @@ mod tests_derived_session_clock {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -12574,7 +14210,6 @@ mod tests_derived_session_clock {
             occasions: vec![1, 1, 1],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -12717,7 +14352,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
             dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -12898,7 +14532,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0, 0],
             occasions: vec![1, 2],
             dose_occasions: vec![1, 2],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -12990,7 +14623,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13061,7 +14693,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13122,7 +14753,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13194,7 +14824,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0, 0],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13257,7 +14886,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13316,7 +14944,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13455,7 +15082,6 @@ mod adaptive_sim_tests {
             occasions: vec![1u32; n],
             dose_occasions: vec![1u32; n_dose],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -15385,7 +17011,6 @@ mod adaptive_snapshot_verify_tests {
             occasions: vec![1, 1],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -15713,7 +17338,6 @@ mod adaptive_snapshot_verify_tests {
             occasions: vec![1; decisions.len()],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pop = Population {

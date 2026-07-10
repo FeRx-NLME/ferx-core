@@ -6,6 +6,8 @@ pub mod environment;
 pub mod estimation;
 pub mod frem;
 pub mod io;
+#[cfg(feature = "markov")]
+pub mod markov;
 #[cfg(feature = "nn")]
 pub mod nn;
 pub mod ode;
@@ -13,6 +15,7 @@ pub mod parser;
 pub mod pk;
 pub mod propensity_match;
 pub mod sens;
+pub(crate) mod serde_nalgebra;
 pub mod sim;
 pub mod stats;
 pub mod suggest_start;
@@ -24,10 +27,10 @@ pub use api::{
     check_model_data, check_model_data_warnings, check_model_options, configure_global_thread_pool,
     fit, fit_from_files, predict, resolve_data_path, run_from_file, run_model_simulate,
     run_model_with_data, run_model_with_data_inits, simulate, simulate_adaptive,
-    simulate_adaptive_from_spec, simulate_with_options, simulate_with_seed,
-    simulate_with_uncertainty, validate_model_file, AdaptiveSimulateOptions,
+    simulate_adaptive_from_spec, simulate_with_options, simulate_with_options_diag,
+    simulate_with_seed, simulate_with_uncertainty, validate_model_file, AdaptiveSimulateOptions,
     AdaptiveSimulationResult, PredictionResult, SimulateOptions, SimulateUncertaintyOptions,
-    SimulationResult,
+    SimulationOutput, SimulationResult,
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, Severity};

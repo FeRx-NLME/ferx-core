@@ -2,6 +2,9 @@
 
 Each model run produces two output files (plus a third, `{model}-covtab.csv`,
 when the model declares a [`[covariates]`](model-file/covariates.qmd) block).
+The human-readable fit estimates default to YAML; pass
+[`--output-format json` or `both`](#fit-json-modelfitjson) to additionally emit
+a complete, machine-readable JSON result for programmatic or agentic consumers.
 
 ## Quick reference: where to find what
 
@@ -92,6 +95,59 @@ ID,TIME,EVID,WT,CRCL
 1,0.500000,0,70.600000,73.700000
 1,1.000000,0,70.600000,73.700000
 ```
+
+## Fit JSON (`{model}-fit.json`) {#fit-json-modelfitjson}
+
+The YAML above is a *curated, human-oriented* view of a fit. For programmatic
+consumers — a script, the R wrapper, or an **agentic model-development loop**
+that reads diagnostics and decides the next step — pass `--output-format` to get
+the **complete** `FitResult` as JSON:
+
+```bash
+ferx warfarin.ferx --data warfarin.csv --output-format json   # {model}-fit.json only
+ferx warfarin.ferx --data warfarin.csv --output-format both   # both YAML and JSON
+```
+
+`--output-format yaml` is the default and leaves current behaviour unchanged.
+The flag controls only the estimates file; the sdtab/covtab/conddist CSVs are
+written regardless.
+
+Unlike the YAML, the JSON is **not curated**: every field of the fit — all
+estimates, standard errors, the covariance matrix, condition number, shrinkage,
+per-subject records (`eta`, `ipred`, residuals, …), warnings, and provenance
+(model/data hashes, `ferx` version, environment) — is present.
+
+**Schema guarantees** (so consumers can pin against it):
+
+- A top-level `schema_version` integer. It is bumped only on a *breaking* change
+  (renamed/removed field, changed nesting); additive fields do not bump it.
+- Matrices (`omega`, `covariance_matrix`, …) serialize as
+  `{ "rows": r, "cols": c, "data": [..] }` with `data` in **row-major** order.
+  Vectors (a subject's `eta`, …) serialize as flat JSON arrays.
+- Enums serialize as their variant name (e.g. `"method": "FoceI"`); structured
+  warnings carry `{severity, category, message, source_method}` plus an optional
+  `details` payload, where `category` is a stable typed
+  [`WarningCode`](warnings.qmd#warning-codes) token.
+- Non-finite floats (`NaN`, `±Inf`) serialize as JSON `null`, matching the
+  empty-cell convention of the YAML/CSV writers.
+
+```json
+{
+  "schema_version": 1,
+  "converged": true,
+  "method": "FoceI",
+  "ofv": -280.36,
+  "theta": [0.133, 7.73, 0.725],
+  "theta_names": ["TVCL", "TVV", "TVKA"],
+  "omega": { "rows": 3, "cols": 3, "data": [0.0286, 0.0, 0.0, 0.0, 0.0096, 0.0, 0.0, 0.0, 0.349] },
+  "cov_condition_number": 2.64,
+  "shrinkage_eta": [0.0002, 0.0011, 0.0019],
+  "subjects": [ { "id": "1", "eta": [0.028, 0.066, 0.482], "ipred": [/* … */] } ]
+}
+```
+
+Library callers get the identical payload in-process, without touching the
+filesystem, via `FitResult::to_json_value() -> serde_json::Value`.
 
 ## Fit YAML (`{model}-fit.yaml`)
 

@@ -61,6 +61,36 @@ const ODE_D1: &str = r#"
   DV ~ proportional(PROP)
 "#;
 
+/// The `RATE=-1` (modeled-rate) twin of `ODE_D1`: the infusion RATE is the
+/// modeled `R1` parameter (`R{cmt}`), not a duration. `R1 = 20` delivers `AMT` at
+/// 20/h — i.e. over `AMT/R1 = 100/20 = 5 h`, the same physical infusion as
+/// `ODE_D1`'s `D1 = 5`, specified as a rate instead of a duration.
+const ODE_R1: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVR1(20.0, 0.1, 200.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  R1 = TVR1
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
 /// `ODE_D1` plus per-compartment bioavailability `F1 = 0.5`: the modeled-duration
 /// infusion must deliver `F1 * AMT` over `D1` (F applied exactly once).
 const ODE_D1_F1: &str = r#"
@@ -1104,4 +1134,120 @@ fn modeled_duration_matches_nonmem_closed_form() {
             rel_cf
         );
     }
+}
+
+#[test]
+fn modeled_duration_addl_matches_nonmem() {
+    // #722: an `ADDL` + `RATE=-2` regimen must expand EVERY additional dose as a
+    // modeled infusion, not a bolus. Before the fix, ADDL expansion built the
+    // additional doses with the raw `-2` sentinel via `DoseEvent::new`, so they
+    // collapsed to `Fixed` boluses — only the first dose stayed a modeled infusion.
+    //
+    // Regimen: AMT=100, RATE=-2, D1=5, ADDL=2, II=24 → three infusions (rate
+    // AMT/D1 = 20 over a 5 h window) at t=0, 24, 48. Anchored to NONMEM 7.6.0
+    // ADVAN1 `$SIMULATION` (`tests/nonmem/modeled_duration_addl.ctl`, CL=5 V=50
+    // D1=5 FIX, η=ε=0 → Y is the exact ADVAN1 profile):
+    const NONMEM_IPRED: &[(f64, f64)] = &[
+        (2.0, 0.72508),
+        (5.0, 1.5739),
+        (12.0, 0.78156),
+        (24.0, 0.23540),
+        (26.0, 0.91781), // 2 h into dose 2's infusion — the anti-bolus discriminator
+        (29.0, 1.7167),
+        (36.0, 0.85247),
+        (48.0, 0.25676),
+        (50.0, 0.93529), // 2 h into dose 3's infusion
+        (53.0, 1.7296),
+        (60.0, 0.85890),
+        (72.0, 0.25870),
+    ];
+    let obs: String = NONMEM_IPRED
+        .iter()
+        .map(|(t, _)| format!("1,{t},1,0,0,1,0,0,0,0\n"))
+        .collect();
+    let csv = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,ADDL,II\n1,0,.,1,100,1,-2,1,2,24\n{obs}");
+
+    let model = model_of(ODE_D1);
+    let preds = preds_of(&model, &csv);
+    assert_eq!(
+        preds.len(),
+        NONMEM_IPRED.len(),
+        "one prediction per observation"
+    );
+    for (p, (t, want)) in preds.iter().zip(NONMEM_IPRED) {
+        // NONMEM IPRED tabulated to 5 s.f.
+        assert!(
+            (p - want).abs() <= 1e-4 * want.max(1.0),
+            "t={t}: ferx {p} vs NONMEM IPRED {want}"
+        );
+    }
+    // Explicit anti-regression guard for #722: the mid-infusion samples (t=26, 50
+    // — indices 4 and 8) read the infusion value (~0.92). Had the ADDL doses
+    // collapsed to boluses, the full 100 mg would already be in the compartment,
+    // reading ~1.8 there. Pin them well below that.
+    assert!(
+        preds[4] < 1.2 && preds[8] < 1.2,
+        "ADDL doses must be modeled infusions, not boluses: t=26 {}, t=50 {} (a bolus 2nd/3rd dose would read ~1.8)",
+        preds[4],
+        preds[8]
+    );
+}
+
+#[test]
+fn modeled_rate_addl_matches_nonmem() {
+    // #722, the RATE=-1 twin of `modeled_duration_addl_matches_nonmem`: an `ADDL`
+    // + `RATE=-1` (modeled RATE → `R1`) regimen must expand EVERY additional dose
+    // as a modeled infusion, not a bolus. Before the fix the ADDL doses were built
+    // with the raw `-1` sentinel via `DoseEvent::new` and collapsed to `Fixed`
+    // boluses — only the first dose stayed a modeled infusion.
+    //
+    // Regimen: AMT=100, RATE=-1, R1=20, ADDL=2, II=24 → three infusions (rate
+    // R1 = 20 over AMT/R1 = 5 h) at t=0, 24, 48. R1=20 is the exact rate the
+    // RATE=-2/D1=5 anchor resolves to, so this reads the SAME ADVAN1 profile via
+    // the RATE=-1 code path. Anchored to NONMEM 7.6.0 ADVAN1 `$SIMULATION`
+    // (`tests/nonmem/modeled_rate_addl.ctl`, CL=5 V=50 R1=20 FIX, η=ε=0):
+    const NONMEM_IPRED: &[(f64, f64)] = &[
+        (2.0, 0.72508),
+        (5.0, 1.5739),
+        (12.0, 0.78156),
+        (24.0, 0.23540),
+        (26.0, 0.91781), // 2 h into dose 2's infusion — the anti-bolus discriminator
+        (29.0, 1.7167),
+        (36.0, 0.85247),
+        (48.0, 0.25676),
+        (50.0, 0.93529), // 2 h into dose 3's infusion
+        (53.0, 1.7296),
+        (60.0, 0.85890),
+        (72.0, 0.25870),
+    ];
+    let obs: String = NONMEM_IPRED
+        .iter()
+        .map(|(t, _)| format!("1,{t},1,0,0,1,0,0,0,0\n"))
+        .collect();
+    let csv = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,ADDL,II\n1,0,.,1,100,1,-1,1,2,24\n{obs}");
+
+    let model = model_of(ODE_R1);
+    let preds = preds_of(&model, &csv);
+    assert_eq!(
+        preds.len(),
+        NONMEM_IPRED.len(),
+        "one prediction per observation"
+    );
+    for (p, (t, want)) in preds.iter().zip(NONMEM_IPRED) {
+        // NONMEM IPRED tabulated to 5 s.f.
+        assert!(
+            (p - want).abs() <= 1e-4 * want.max(1.0),
+            "t={t}: ferx {p} vs NONMEM IPRED {want}"
+        );
+    }
+    // Anti-regression guard for #722 (RATE=-1): the mid-infusion samples (t=26, 50
+    // — indices 4 and 8) read the infusion value (~0.92). Had the ADDL doses
+    // collapsed to boluses, the full 100 mg would already be in the compartment,
+    // reading ~1.8 there. Pin them well below that.
+    assert!(
+        preds[4] < 1.2 && preds[8] < 1.2,
+        "ADDL doses must be modeled infusions, not boluses: t=26 {}, t=50 {} (a bolus 2nd/3rd dose would read ~1.8)",
+        preds[4],
+        preds[8]
+    );
 }

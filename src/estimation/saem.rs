@@ -433,7 +433,10 @@ fn obs_nll_subject_into_iov(
         use crate::survival::tte_data_term;
         use crate::types::EndpointLikelihood;
         for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard, recurrence } = endpoint {
+            if let EndpointLikelihood::Tte {
+                hazard, recurrence, ..
+            } = endpoint
+            {
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()
@@ -2656,7 +2659,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]);
@@ -2771,7 +2773,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -2869,7 +2870,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -3076,7 +3076,6 @@ mod tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         };
 
@@ -3232,7 +3231,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -3374,7 +3372,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -3474,7 +3471,6 @@ mod tests {
             occasions: vec![1u32, 1, 2, 2],
             dose_occasions: vec![1u32],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -3588,7 +3584,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {

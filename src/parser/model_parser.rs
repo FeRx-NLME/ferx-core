@@ -979,6 +979,23 @@ pub fn parse_model_string(content: &str) -> Result<CompiledModel, String> {
     Ok(parsed.model)
 }
 
+/// Register covariate names as required data columns: push each name not
+/// already present, then re-sort. Shared by the `[scaling]`, error-model
+/// selector, and `[initial_conditions]` blocks so all three declare their
+/// covariates identically — the divergence that let an unregistered init
+/// covariate silently evaluate to 0 (issue #765).
+fn register_referenced_covariates(
+    referenced: &mut Vec<String>,
+    covs: impl IntoIterator<Item = String>,
+) {
+    for cov in covs {
+        if !referenced.contains(&cov) {
+            referenced.push(cov);
+        }
+    }
+    referenced.sort();
+}
+
 /// Parse a full model string including all optional blocks.
 pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let mut extracted = extract_blocks(content)?;
@@ -1541,12 +1558,53 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 continue;
             };
             // NONMEM-faithful display of the attribute for diagnostics: the DSL
-            // parameter prefix, the RATE code that drives it, and the noun. `F`/
-            // `Lag` are not modeled-dose attributes on the analytical engine.
+            // parameter prefix, the RATE code that drives it, and the noun.
+            // Per-compartment `F{cmt}`/`ALAG{cmt}` are ODE-only (they route through
+            // the ODE `dose_attr_map`); the analytical engine has a single dose
+            // route reached via the bare `f=`/`lagtime=` mapping.
             let (param_prefix, rate_code, kind) = match attr {
                 crate::types::DoseAttr::Duration => ("D", "-2", "duration"),
                 crate::types::DoseAttr::Rate => ("R", "-1", "rate"),
-                crate::types::DoseAttr::F | crate::types::DoseAttr::Lag => continue,
+                crate::types::DoseAttr::F | crate::types::DoseAttr::Lag => {
+                    // A user may legitimately NAME their bioavailability / lag
+                    // parameter `F1`/`ALAG1` (a natural NONMEM-porting choice) and
+                    // bind it to the single analytical dose route via the bare
+                    // `f=`/`lagtime=` mapping — `pk(..., f=F1)` routes `F1` into
+                    // `PK_IDX_F` and applies it correctly. Accept that case (it is
+                    // bit-identical to the canonical `f=F` idiom). Reject only an
+                    // *unmapped* `F{cmt}`/`ALAG{cmt}`: with nothing binding it to the
+                    // dose route, its value lands in an unused spare slot and is
+                    // silently discarded — effective bioavailability stays 1 / lag
+                    // stays 0 with no effect — the porting footgun this guard exists
+                    // to catch. `alag`/`lagtime` both resolve to `PK_IDX_LAGTIME`
+                    // via `name_to_index`, so either spelling of the mapping counts.
+                    let target_slot = if matches!(attr, crate::types::DoseAttr::F) {
+                        crate::types::PK_IDX_F
+                    } else {
+                        crate::types::PK_IDX_LAGTIME
+                    };
+                    let bound_to_dose_route = pk_param_map.iter().any(|(key, value)| {
+                        value == name
+                            && crate::types::PkParams::name_to_index(key) == Some(target_slot)
+                    });
+                    if bound_to_dose_route {
+                        continue;
+                    }
+                    let (indexed, noun, bare) = if matches!(attr, crate::types::DoseAttr::F) {
+                        ("F", "bioavailability", "f")
+                    } else {
+                        ("ALAG", "lag time", "lagtime")
+                    };
+                    return Err(format!(
+                        "[individual_parameters]: `{name}` reads as a per-compartment {noun} \
+                         (`{indexed}{cmt}`), an ODE-only dose attribute, but nothing binds it to \
+                         the analytical `{}` model's single dose route — so its value would be \
+                         silently discarded (effective {noun} unchanged). Bind it via the bare \
+                         `{bare}=` argument in the `pk(...)` call (e.g. `{bare}={name}`), or use an \
+                         `ode(...)` model for a genuinely compartment-specific value.",
+                        pk_model.canonical_name(),
+                    ));
+                }
             };
             // Reject a `D{cmt}`/`R{cmt}` whose compartment the analytical engine
             // cannot infuse into — the central compartment for every model, plus
@@ -2307,24 +2365,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             }
         }
 
-        for cov in scaling_covariates {
-            if !model.referenced_covariates.contains(&cov) {
-                model.referenced_covariates.push(cov);
-            }
-        }
-        model.referenced_covariates.sort();
+        register_referenced_covariates(&mut model.referenced_covariates, scaling_covariates);
         model.scaling = scaling;
     }
 
     // Covariate-selected [error_model] (issue #658): the selector's covariates
     // are required data columns, so register them like scaling covariates.
     if !selector_covariates.is_empty() {
-        for cov in &selector_covariates {
-            if !model.referenced_covariates.contains(cov) {
-                model.referenced_covariates.push(cov.clone());
-            }
-        }
-        model.referenced_covariates.sort();
+        register_referenced_covariates(&mut model.referenced_covariates, selector_covariates);
     }
 
     // ── [initial_conditions] block (issue #521) ──
@@ -2333,7 +2381,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // init impulses layered onto the dose-driven prediction by
     // `pk::add_analytical_init`.
     if let Some(ic_lines) = blocks.get("initial_conditions") {
-        model.analytical_init = parse_initial_conditions_block(
+        let (analytical_init, init_covariates) = parse_initial_conditions_block(
             ic_lines,
             model.pk_model,
             model.ode_spec.is_some(),
@@ -2343,6 +2391,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.pk_indices,
             &model.kappa_names,
         )?;
+        model.analytical_init = analytical_init;
+        // Register init-expression covariates as required data columns, mirroring
+        // the scaling (`scaling_covariates`) and error-selector blocks above. Without
+        // this, a `[covariates]`-declared model never reads the column, and a miscased
+        // or absent init covariate silently evaluates to 0 (issue #765).
+        register_referenced_covariates(&mut model.referenced_covariates, init_covariates);
     }
 
     // ODE validation: the `NEEDS_FORM_C = usize::MAX` sentinel from
@@ -3871,6 +3925,10 @@ fn parse_event_model_block(
             EndpointLikelihood::Tte {
                 hazard: HazardSpec::OdeAccumulated { chz_state },
                 recurrence,
+                // The ODE-accumulated hazard's covariate dependencies flow through the
+                // injected `d/dt(__chz)` derivative; the whole-subject time-varying check
+                // (the ODE solve freezes PK params at t=0) guards them, not this list.
+                hazard_covariates: Vec::new(),
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -3922,7 +3980,7 @@ fn parse_event_model_block(
 
     // Collect covariate/theta/eta references from all expressions BEFORE they are
     // moved into the param_fn closure.
-    let event_model_covariates: Vec<String>;
+    let mut event_model_covariates: Vec<String>;
     let event_model_thetas: std::collections::HashSet<usize>;
     let event_model_etas: std::collections::HashSet<usize>;
     {
@@ -3990,6 +4048,25 @@ fn parse_event_model_block(
         keep.reverse();
         keep
     };
+
+    // A hazard sub-expression may reference an [individual_parameters] value (PR #442)
+    // whose own definition reads covariates — e.g. `scale = LAMBDA` with
+    // `LAMBDA = TVLAMBDA * exp(TVBETA * CRCL + ETA)`. The `param_fn` evaluates those kept
+    // statements, so the hazard transitively reads `CRCL` at the baseline snapshot. Union
+    // the covariates of the kept statements into the event-model covariate set so (a) they
+    // appear in the covariate table and (b) `hazard_covariates` is complete — otherwise a
+    // *time-varying* covariate reached only through an individual parameter slips past the
+    // #741 guard and is silently frozen (the exact bug #741 exists to reject).
+    {
+        let mut cov_set = std::collections::HashSet::new();
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut cov_set);
+        for c in cov_set {
+            if !event_model_covariates.contains(&c) {
+                event_model_covariates.push(c);
+            }
+        }
+        event_model_covariates.sort();
+    }
 
     // The hazard `param_fn` evaluates the kept statements with the BSV-only η it is
     // handed (kappas are PK/occasion-level, not part of a per-subject hazard), so a
@@ -4109,6 +4186,7 @@ fn parse_event_model_block(
         EndpointLikelihood::Tte {
             hazard: HazardSpec::Analytic { family, param_fn },
             recurrence,
+            hazard_covariates: event_model_covariates.clone(),
         },
         event_model_covariates,
         event_model_thetas,
@@ -4874,6 +4952,86 @@ fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
 ///
 /// Does NOT handle `method` (which has list-chain syntax) — that stays in
 /// the block parser.
+/// Parse the `iov_occasion` fit-option value into an [`IovOccasionRule`].
+///
+/// Accepts:
+///   - `column` (or empty/none/null/na) → [`IovOccasionRule::Column`]
+///   - `dose`                           → [`IovOccasionRule::PerDose`]
+///   - `time(24, 48)`                   → [`IovOccasionRule::TimeWindows`]
+///
+/// Breakpoints must be finite, strictly increasing, and must not include `0`
+/// (the first occasion already spans everything before the first breakpoint, so
+/// a leading `0` is implied and would only carve out an empty leading occasion).
+fn parse_iov_occasion(value: &str) -> Result<IovOccasionRule, String> {
+    let v = value.trim();
+    let lower = v.to_ascii_lowercase();
+    if lower.is_empty() || lower == "column" || lower == "none" || lower == "null" || lower == "na"
+    {
+        return Ok(IovOccasionRule::Column);
+    }
+    if lower == "dose" {
+        return Ok(IovOccasionRule::PerDose);
+    }
+    if let Some(rest) = lower.strip_prefix("time") {
+        let inner = rest.trim();
+        let inner = inner
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .ok_or_else(|| {
+                format!(
+                    "fit option `iov_occasion`: expected `time(edge1, edge2, ...)`, got `{value}`"
+                )
+            })?;
+        let mut edges = Vec::new();
+        for tok in inner.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            let x = tok.parse::<f64>().map_err(|_| {
+                format!("fit option `iov_occasion`: breakpoint `{tok}` is not a number")
+            })?;
+            if !x.is_finite() {
+                return Err(format!(
+                    "fit option `iov_occasion`: breakpoint `{tok}` must be finite"
+                ));
+            }
+            edges.push(x);
+        }
+        if edges.is_empty() {
+            return Err(
+                "fit option `iov_occasion`: `time(...)` needs at least one breakpoint".to_string(),
+            );
+        }
+        // A `0` breakpoint is redundant and wrong: the first occasion already
+        // spans everything before the first breakpoint — `[-inf, edge1)` — so a
+        // leading `0` only carves out an empty occasion for `t < 0` and shifts
+        // every real occasion up by one. Reject it with a message that names the
+        // fix (a common `c(0, 24, 48)`-style mistake).
+        if edges.iter().any(|&e| e == 0.0) {
+            return Err(format!(
+                "fit option `iov_occasion`: `time(...)` breakpoints must not include `0`. The \
+                 first occasion already covers everything before the first breakpoint (`[-inf, \
+                 edge1)`), and the last covers everything at or after the last breakpoint (to \
+                 `+inf`), so `0` is implied and does not need to be specified — a leading `0` \
+                 would create an empty leading occasion. Write `time(24, 48)`, not \
+                 `time(0, 24, 48)` (got `{value}`)."
+            ));
+        }
+        if edges.windows(2).any(|w| w[1] <= w[0]) {
+            return Err(format!(
+                "fit option `iov_occasion`: `time(...)` breakpoints must be strictly increasing, \
+                 got `{value}`"
+            ));
+        }
+        return Ok(IovOccasionRule::TimeWindows(edges));
+    }
+    Err(format!(
+        "fit option `iov_occasion`: unknown value `{value}` — expected `column`, `dose`, or \
+         `time(edge1, edge2, ...)`"
+    ))
+}
+
 pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result<bool, String> {
     let value = value.trim();
 
@@ -5250,6 +5408,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             } else {
                 Some(value.to_string())
             };
+        }
+        "iov_occasion" => {
+            opts.iov_occasion = parse_iov_occasion(value)?;
         }
         "optimizer_trace" => opts.optimizer_trace = parse_bool("optimizer_trace")?,
         "reconverge_gradient_interval" => {
@@ -5664,6 +5825,13 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
 /// Mirrors the Form-B `obs_scale` expression closure in [`build_obs_scale_spec`]:
 /// individual-parameter names resolve from the subject-static `pk_params`, so
 /// `init(central) = CONC0 * V` reads `V` from its PK slot.
+///
+/// The third tuple element is the covariate names the expression references (an
+/// identifier that is not a theta/eta/individual parameter parses as a
+/// `Covariate` leaf). The caller registers these in
+/// `CompiledModel.referenced_covariates` so they become required data columns —
+/// otherwise a miscased or absent init covariate silently evaluates to `0` and
+/// the baseline vanishes with no diagnostic (issue #765).
 #[allow(clippy::type_complexity)]
 fn build_init_amount_fn(
     value: &str,
@@ -5672,7 +5840,7 @@ fn build_init_amount_fn(
     indiv_var_names: &[String],
     pk_indices: &[usize],
     kappa_names: &[String],
-) -> Result<(ScaleFn, Option<ScaleDerivProgram>), String> {
+) -> Result<(ScaleFn, Option<ScaleDerivProgram>, Vec<String>), String> {
     // Build the differentiable `A₀` program from a (possibly resolved) expression
     // AST. Shares the `obs_scale` lowering (`compile_scale_deriv_program`) so the
     // init impulse and the scale divisor differentiate on the same ABI; this lets
@@ -5688,7 +5856,7 @@ fn build_init_amount_fn(
         let deriv = build_deriv(&Expression::Literal(k));
         let scale_fn: ScaleFn =
             Box::new(move |_: &[f64], _: &[f64], _: &HashMap<String, f64>, _: &PkParams| k);
-        return Ok((scale_fn, Some(deriv)));
+        return Ok((scale_fn, Some(deriv), Vec::new()));
     }
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
     let expr = parse_scalar_expression(value, ctx)
@@ -5710,6 +5878,13 @@ fn build_init_amount_fn(
         ));
     }
     let deriv = build_deriv(&expr);
+    // Covariate leaves (identifiers not resolved as theta/eta/individual param)
+    // must become required data columns — see the fn doc (issue #765).
+    let mut cov_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_covariates(&expr, &mut cov_set);
+    // Order is irrelevant: the caller pools these into a HashSet and the final
+    // `register_referenced_covariates` re-sorts, so don't sort here.
+    let covariates_ref: Vec<String> = cov_set.into_iter().collect();
     let indiv_to_pk_slot: HashMap<String, usize> = indiv_var_names
         .iter()
         .enumerate()
@@ -5731,7 +5906,7 @@ fn build_init_amount_fn(
             eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
         },
     );
-    Ok((scale_fn, Some(deriv)))
+    Ok((scale_fn, Some(deriv), covariates_ref))
 }
 
 /// Parse the `[initial_conditions]` block (issue #521) into the analytical
@@ -5747,7 +5922,7 @@ fn parse_initial_conditions_block(
     indiv_var_names: &[String],
     pk_indices: &[usize],
     kappa_names: &[String],
-) -> Result<Vec<crate::types::AnalyticalInit>, String> {
+) -> Result<(Vec<crate::types::AnalyticalInit>, Vec<String>), String> {
     if is_ode {
         return Err(
             "[initial_conditions]: this block is for analytical PK models; for an \
@@ -5757,6 +5932,9 @@ fn parse_initial_conditions_block(
     }
     let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut out = Vec::new();
+    // Covariate names referenced across all init expressions; the caller
+    // registers these as required data columns (issue #765).
+    let mut cov_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in lines {
         let (name, expr) = parse_init_line(line).ok_or_else(|| {
             format!(
@@ -5771,7 +5949,7 @@ fn parse_initial_conditions_block(
                 name
             ));
         }
-        let (amount_fn, amount_deriv) = build_init_amount_fn(
+        let (amount_fn, amount_deriv, covariates_ref) = build_init_amount_fn(
             &expr,
             theta_names,
             eta_names,
@@ -5779,13 +5957,16 @@ fn parse_initial_conditions_block(
             pk_indices,
             kappa_names,
         )?;
+        cov_refs.extend(covariates_ref);
         out.push(crate::types::AnalyticalInit {
             cmt,
             amount_fn,
             amount_deriv,
         });
     }
-    Ok(out)
+    // Return unsorted: the caller re-sorts via `register_referenced_covariates`.
+    let init_covariates: Vec<String> = cov_refs.into_iter().collect();
+    Ok((out, init_covariates))
 }
 
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
@@ -6448,43 +6629,54 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
 /// The equivalent shares the model's `[parameters]`/`[individual_parameters]`/… blocks
 /// verbatim and swaps only the disposition, so its θ/η layout matches the closed-form model
 /// exactly (the dispatch can hand it the same parameter vector). Scoped to the plain
-/// `cl/v/n/mtt` form with no `lagtime=`/`f=` mapping and no user `[odes]`/`[scaling]` block;
-/// anything else returns `None` (and stays closed-form, still rejected up front for the
-/// features it cannot serve) — extending it is a follow-up.
+/// `one_cpt_transit(cl,v,n,mtt)` and `two_cpt_transit(cl,v1,q,v2,n,mtt)` forms with no
+/// `lagtime=`/`f=` mapping and no user `[odes]`/`[scaling]` block; anything else returns
+/// `None` (and stays closed-form, still rejected up front for the features it cannot serve).
 fn transit_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<String> {
-    let transit_re = Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
-    let args_str = extracted
-        .unnamed
-        .get("structural_model")?
-        .iter()
-        .find_map(|l| transit_re.captures(l.trim()))?
-        .get(1)?
-        .as_str()
-        .to_string();
+    // Match the plain closed-form transit disposition — 1-cpt `cl/v/n/mtt` or
+    // 2-cpt `cl/v1/q/v2/n/mtt`. Any other structural form stays closed-form.
+    let structural = extracted.unnamed.get("structural_model")?;
+    let one_re = Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
+    let two_re = Regex::new(r"^pk\s+two_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
+    let (args_str, is_two_cpt, pk_label) =
+        if let Some(caps) = structural.iter().find_map(|l| one_re.captures(l.trim())) {
+            (
+                caps.get(1)?.as_str().to_string(),
+                false,
+                "pk one_cpt_transit",
+            )
+        } else if let Some(caps) = structural.iter().find_map(|l| two_re.captures(l.trim())) {
+            (
+                caps.get(1)?.as_str().to_string(),
+                true,
+                "pk two_cpt_transit",
+            )
+        } else {
+            return None;
+        };
     // A user-written [odes]/[scaling] block is outside the plain-form scope. An
-    // [initial_conditions] block is too: the equivalent's single `central` state cannot carry
-    // a transit `depot` seed, and transit-init has its own parse-time validation on the
-    // primary model — building the equivalent would pre-empt that with a confusing error.
+    // [initial_conditions] block is too: the equivalent's disposition states (central,
+    // and periph for 2-cpt) cannot carry a transit `depot` seed, and transit-init has its
+    // own parse-time validation on the primary model — building the equivalent would
+    // pre-empt that with a confusing error.
     if extracted.unnamed.contains_key("odes")
         || extracted.unnamed.contains_key("scaling")
         || extracted.unnamed.contains_key("initial_conditions")
     {
         return None;
     }
-    let roles = parse_role_pairs(&args_str, "pk one_cpt_transit").ok()?;
-    let allowed = ["cl", "v", "n", "mtt"];
+    let roles = parse_role_pairs(&args_str, pk_label).ok()?;
+    let allowed: &[&str] = if is_two_cpt {
+        &["cl", "v1", "q", "v2", "n", "mtt"]
+    } else {
+        &["cl", "v", "n", "mtt"]
+    };
     if roles.keys().any(|k| !allowed.contains(&k.as_str())) {
         return None; // a lagtime=/f= (or other) mapping — outside the scope.
     }
-    let (cl, v, n, mtt) = (
-        roles.get("cl")?,
-        roles.get("v")?,
-        roles.get("n")?,
-        roles.get("mtt")?,
-    );
     // Re-emit every block verbatim except the disposition (deterministic order), then append
     // the ODE twin. Parsing this source yields a normal ODE model — it contains no
-    // `pk one_cpt_transit`, so it does not recurse into this desugar.
+    // `pk one_cpt_transit`/`pk two_cpt_transit`, so it does not recurse into this desugar.
     let mut src = String::new();
     let mut names: Vec<&String> = extracted.unnamed.keys().collect();
     names.sort();
@@ -6513,11 +6705,38 @@ fn transit_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<String> 
         }
         src.push('\n');
     }
-    src.push_str("[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n");
-    src.push_str(&format!(
-        "[odes]\n  d/dt(central) = transit(n={n}, mtt={mtt}) - ({cl}/{v}) * central\n\n"
-    ));
-    src.push_str(&format!("[scaling]\n  obs_scale = {v}\n\n"));
+    // Disposition twin. The micro-constant flux mirrors `ode_template::generate`'s
+    // matching case exactly — 1-cpt: `ke = cl/v`; 2-cpt: `k10 = cl/v1`, `k12 = q/v1`,
+    // `k21 = q/v2`, observed on `central` — so the ODE twin describes the same linear
+    // system as the exponential-tilting closed form (pinned by the closed-form↔ODE
+    // equivalence test, `tests/transit_analytic_equivalence.rs`).
+    if is_two_cpt {
+        let (cl, v1, q, v2, n, mtt) = (
+            roles.get("cl")?,
+            roles.get("v1")?,
+            roles.get("q")?,
+            roles.get("v2")?,
+            roles.get("n")?,
+            roles.get("mtt")?,
+        );
+        src.push_str("[structural_model]\n  ode(obs_cmt=central, states=[central, periph])\n\n");
+        src.push_str(&format!(
+            "[odes]\n  d/dt(central) = transit(n={n}, mtt={mtt}) - ({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph\n  d/dt(periph) = ({q}/{v1}) * central - ({q}/{v2}) * periph\n\n"
+        ));
+        src.push_str(&format!("[scaling]\n  obs_scale = {v1}\n\n"));
+    } else {
+        let (cl, v, n, mtt) = (
+            roles.get("cl")?,
+            roles.get("v")?,
+            roles.get("n")?,
+            roles.get("mtt")?,
+        );
+        src.push_str("[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n");
+        src.push_str(&format!(
+            "[odes]\n  d/dt(central) = transit(n={n}, mtt={mtt}) - ({cl}/{v}) * central\n\n"
+        ));
+        src.push_str(&format!("[scaling]\n  obs_scale = {v}\n\n"));
+    }
     Some(src)
 }
 
@@ -20225,6 +20444,71 @@ mod tests {
         assert_eq!(parsed.fit_options.iov_column, Some("PERIOD".to_string()));
     }
 
+    #[test]
+    fn test_iov_occasion_dose_and_column() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(&mut opts, "iov_occasion", "dose"),
+            Ok(true)
+        );
+        assert_eq!(opts.iov_occasion, IovOccasionRule::PerDose);
+        apply_fit_option(&mut opts, "iov_occasion", "column").unwrap();
+        assert_eq!(opts.iov_occasion, IovOccasionRule::Column);
+    }
+
+    #[test]
+    fn test_iov_occasion_time_windows() {
+        let mut opts = FitOptions::default();
+        apply_fit_option(&mut opts, "iov_occasion", "time(24, 48)").unwrap();
+        assert_eq!(
+            opts.iov_occasion,
+            IovOccasionRule::TimeWindows(vec![24.0, 48.0])
+        );
+    }
+
+    #[test]
+    fn test_iov_occasion_rejects_bad_values() {
+        let mut opts = FitOptions::default();
+        // non-increasing breakpoints
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time(48, 24)").is_err());
+        // empty breakpoint list
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time()").is_err());
+        // unparseable breakpoint
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time(a)").is_err());
+        // unknown mode
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "weekly").is_err());
+        // malformed time() (missing parens)
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time 24").is_err());
+    }
+
+    // A leading `0` breakpoint (the `c(0, 24, 48)` habit) is redundant — the
+    // first occasion already spans `[-inf, edge1)` — and shifts every occasion
+    // up by one, so it is rejected with a message that names the fix.
+    #[test]
+    fn test_iov_occasion_rejects_zero_breakpoint() {
+        let mut opts = FitOptions::default();
+        let err = apply_fit_option(&mut opts, "iov_occasion", "time(0, 24, 48)")
+            .expect_err("a 0 breakpoint must be rejected");
+        assert!(
+            err.contains("must not include `0`") && err.contains("implied"),
+            "got: {err}"
+        );
+        // Also rejected as the sole breakpoint.
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time(0)").is_err());
+        // The non-zero form is still accepted.
+        apply_fit_option(&mut opts, "iov_occasion", "time(24, 48)").unwrap();
+    }
+
+    #[test]
+    fn test_iov_occasion_parsed_from_fit_options_block() {
+        let content = minimal_model_with_fit_options("  iov_occasion = time(24)");
+        let parsed = parse_full_model(&content).unwrap();
+        assert_eq!(
+            parsed.fit_options.iov_occasion,
+            IovOccasionRule::TimeWindows(vec![24.0])
+        );
+    }
+
     // ── block_kappa (Option B) ─────────────────────────────────────────────
 
     #[test]
@@ -21733,7 +22017,6 @@ if (WT > 70) {
             occasions: vec![1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -21801,7 +22084,6 @@ if (WT > 70) {
             occasions: vec![1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -23941,6 +24223,82 @@ if (WT > 70) {
         let cov = HashMap::new();
         let y = out_fn(&state, &pk, &[], &[], &cov);
         assert!((y - 2.0).abs() < 1e-12, "expected 100/50 = 2, got {}", y);
+    }
+
+    /// A covariate referenced only inside an `[initial_conditions]` expression
+    /// must be registered in `referenced_covariates` so it becomes a required
+    /// data column. Without this, a `[covariates]`-declared model never reads
+    /// the column and a miscased/absent init covariate silently evaluates to 0
+    /// (issue #765).
+    #[test]
+    fn test_initial_conditions_covariate_is_registered() {
+        let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+
+[initial_conditions]
+  init(central) = CONC0 * V
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+        let model = parse_model_string(content).expect("model parses");
+        assert_eq!(model.analytical_init.len(), 1, "init block parsed");
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == "CONC0"),
+            "init covariate CONC0 must be registered, got: {:?}",
+            model.referenced_covariates
+        );
+    }
+
+    /// An `[initial_conditions]` expression built only from parameters (no free
+    /// identifier) registers no covariate — `V` is an individual parameter, not
+    /// a data column, so it must not leak into `referenced_covariates` (#765).
+    #[test]
+    fn test_initial_conditions_param_only_registers_no_covariate() {
+        let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+
+[initial_conditions]
+  init(central) = 0.5 * V
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+        let model = parse_model_string(content).expect("model parses");
+        assert_eq!(model.analytical_init.len(), 1, "init block parsed");
+        assert!(
+            model.referenced_covariates.is_empty(),
+            "a param-only init must register no covariate, got: {:?}",
+            model.referenced_covariates
+        );
     }
 
     #[test]
@@ -26992,6 +27350,139 @@ CL V KA WT
             err.contains("compartment 3") && err.contains("D3") && err.contains("ode("),
             "error must name the compartment, the param, and point to ode(...): {err}"
         );
+    }
+
+    /// Assemble a minimal analytical one-cpt oral model from its
+    /// `[individual_parameters]` dose-attribute line and its `pk(...)` structural
+    /// line, so the `F{cmt}`/`ALAG{cmt}` tests below vary only the two lines that
+    /// matter. `TVATTR` (0.7) is a valid typical value for either bioavailability
+    /// or lag.
+    fn indexed_attr_model(indiv_attr_line: &str, pk_line: &str) -> String {
+        format!(
+            "[parameters]\n\
+             theta TVCL(5.0, 0.1, 100.0)\n\
+             theta TVV(50.0, 1.0, 500.0)\n\
+             theta TVKA(1.0, 0.01, 10.0)\n\
+             theta TVATTR(0.7, 0.01, 10.0)\n\
+             omega ETA_CL ~ 0.09\n\
+             sigma PROP ~ 0.04 (sd)\n\
+             \n\
+             [individual_parameters]\n\
+             CL = TVCL * exp(ETA_CL)\n\
+             V  = TVV\n\
+             KA = TVKA\n\
+             {indiv_attr_line}\n\
+             \n\
+             [structural_model]\n\
+             {pk_line}\n\
+             \n\
+             [error_model]\n\
+             DV ~ proportional(PROP)\n"
+        )
+    }
+
+    #[test]
+    fn analytical_indexed_f_and_alag_unmapped_are_rejected() {
+        // Per-compartment `F{cmt}` / `ALAG{cmt}` are ODE-only. On an analytical
+        // `pk ...` model, a name of that form that is NOT bound to the single dose
+        // route used to be silently dropped into an unused slot (effective F = 1 /
+        // lag = 0, no effect). That silent no-op must now be a loud, reason-specific
+        // parse error that names the param, says the value would be discarded, and
+        // points at the bare `f=` / `lagtime=` mapping. (The correctly-*mapped*
+        // case is accepted — see `analytical_indexed_f_and_alag_mapped_are_accepted`.)
+
+        // Unmapped `F1`.
+        let err = parse_full_model(&indexed_attr_model(
+            "F1 = TVATTR",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        ))
+        .err()
+        .expect("unmapped F1 on an analytical oral model must error, not be silently ignored");
+        assert!(
+            err.contains("F1")
+                && err.contains("reads as a per-compartment")
+                && err.contains("bioavailability")
+                && err.contains("silently discarded")
+                && err.contains("f=")
+                && err.contains("ode("),
+            "F error must be reason-specific: name the param, the noun, that it is discarded, \
+             the bare `f=` mapping, and ode(...): {err}"
+        );
+
+        // Unmapped per-compartment lag `ALAG1`.
+        let err = parse_full_model(&indexed_attr_model(
+            "ALAG1 = TVATTR",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        ))
+        .err()
+        .expect("unmapped ALAG1 on an analytical oral model must error");
+        assert!(
+            err.contains("ALAG1")
+                && err.contains("reads as a per-compartment")
+                && err.contains("lag time")
+                && err.contains("silently discarded")
+                && err.contains("lagtime="),
+            "lag error must be reason-specific and name the bare `lagtime=` mapping: {err}"
+        );
+
+        // The `LAGTIME{n}` alias hits the same guard as `ALAG{n}`.
+        let err = parse_full_model(&indexed_attr_model(
+            "LAGTIME1 = TVATTR",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        ))
+        .err()
+        .expect("unmapped LAGTIME1 (ALAG alias) on an analytical oral model must error");
+        assert!(
+            err.contains("LAGTIME1") && err.contains("lag time") && err.contains("lagtime="),
+            "LAGTIME1 alias must be rejected like ALAG1, naming the actual param: {err}"
+        );
+
+        // A higher index (`F2` — a compartment the 1-cpt model doesn't even have)
+        // is rejected the same way: an unmapped per-compartment F with no effect.
+        let err = parse_full_model(&indexed_attr_model(
+            "F2 = TVATTR",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        ))
+        .err()
+        .expect("unmapped F2 on an analytical oral model must error");
+        assert!(
+            err.contains("F2") && err.contains("bioavailability"),
+            "F2 must be rejected and named: {err}"
+        );
+    }
+
+    #[test]
+    fn analytical_indexed_f_and_alag_mapped_are_accepted() {
+        // Regression guard (PR #725 review): a user may NAME their bioavailability
+        // / lag parameter `F1` / `ALAG1` / `LAGTIME1` and bind it to the single
+        // analytical dose route via the bare `f=` / `lagtime=` / `alag=` mapping.
+        // The value IS applied (routed to `PK_IDX_F` / `PK_IDX_LAGTIME`),
+        // bit-identical to the canonical `f=F` idiom, so the guard must NOT reject
+        // it. Before the narrowing fix these all errored — a breaking regression on
+        // previously-working, numerically-correct models.
+        for (indiv, pk) in [
+            ("F1 = TVATTR", "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F1)"),
+            (
+                "ALAG1 = TVATTR",
+                "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG1)",
+            ),
+            // `alag=` alias for the mapping key, and the `LAGTIME{n}` param spelling.
+            (
+                "ALAG1 = TVATTR",
+                "pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=ALAG1)",
+            ),
+            (
+                "LAGTIME1 = TVATTR",
+                "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME1)",
+            ),
+        ] {
+            let res = parse_full_model(&indexed_attr_model(indiv, pk));
+            assert!(
+                res.is_ok(),
+                "correctly-mapped `{pk}` (with `{indiv}`) must be accepted, got: {:?}",
+                res.err()
+            );
+        }
     }
 
     #[test]

@@ -36,6 +36,16 @@ Each line is `init(NAME) = <expr>`, where:
   expression sees. So `init(central) = CONC0 * V` reads the data column `CONC0`
   and the per-subject `V`.
 
+::: {.callout-important}
+A covariate named in the init expression is a **required data column**, matched
+**case-sensitively**. `init(central) = CONC0 * V` needs a `CONC0` column; if the
+dataset header is `conc0`, either rename it in the `[data]` block
+(`CONC0 = conc0`) or lowercase the expression (`init(central) = conc0 * V`). A
+name that matches no column now fails the fit loudly with `E_MISSING_COVARIATE`
+listing the available columns — earlier versions silently evaluated the missing
+covariate to `0`, dropping the baseline with no warning (issue #765).
+:::
+
 ## How it works
 
 For a **linear** disposition, an initial amount $A_0$ in compartment $c$ is

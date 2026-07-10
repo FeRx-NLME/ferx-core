@@ -78,6 +78,7 @@ Estimates should be close to the single-dose warfarin values (`TVCL ≈ 0.134`, 
 ## Tips
 
 - **`SS` requires `II`**: every row with `SS=1` must also have a non-zero `II` (dosing interval in the same time units as `TIME`).
+- **`SS=1` only**: ferx implements `SS=1` (reset the compartment, then initialise it at the steady state of the given regimen). NONMEM's `SS=2` (superimpose that steady state *on top of* the compartment's existing amounts, without a reset) is **not** supported — a dataset with `SS=2` is rejected at read time with a clear error rather than silently treated as `SS=1`. Full `SS=2` support is tracked in [issue #694](https://github.com/FeRx-NLME/ferx-core/issues/694).
 - **Analytical solvers only**: the `SS=1` initialisation is currently implemented for the analytical 1-cpt and 2-cpt solvers. For ODE models at steady state, use a long ADDL pre-dosing sequence to approximate it.
 - **TAD at steady state**: `TAD` is computed relative to the SS dose row, so the first observation at `TIME=0.5` has `TAD=0.5`. TAFD is measured from the same row.
 - **Mixed designs**: a dataset may contain some subjects with `SS=1` and others without (e.g. a cross-over study). Each subject's dose rows are handled independently.

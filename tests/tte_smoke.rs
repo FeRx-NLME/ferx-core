@@ -364,6 +364,161 @@ mod survival_smoke {
         pop
     }
 
+    /// A single-TTE exponential model whose hazard carries a PH covariate (`CRCL`
+    /// via `loghr`), paired with one subject whose `CRCL` is time-varying. This is
+    /// the #741 fixture: the hazard would otherwise be silently evaluated at the
+    /// baseline `CRCL`.
+    fn tv_cov_hazard_model_and_pop() -> (ferx_core::types::CompiledModel, Population) {
+        use std::collections::HashMap;
+        const M: &str = r"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  theta TVBETA(0.1, -5.0, 5.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+  loghr  = TVBETA * CRCL
+
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+        let model = parse_model_string(M).expect("TV-cov hazard model must parse");
+        let mut pop = common::tte_pop_from_pairs(&[(30.0, 0)]);
+        pop.covariate_names = vec!["CRCL".to_string()];
+        pop.subjects[0].covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+        pop.subjects[0].obs_covariates = vec![
+            HashMap::from([("CRCL".to_string(), 100.0)]),
+            HashMap::from([("CRCL".to_string(), 60.0)]),
+        ];
+        (model, pop)
+    }
+
+    /// `fit()` rejects a time-varying covariate on a survival hazard rather than
+    /// silently freezing it at baseline (#741). Regression for the analytic path.
+    #[test]
+    fn tv_cov_hazard_fit_is_rejected() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("a time-varying covariate on the hazard must be rejected by fit()");
+        assert!(err.contains("#741"), "error must cite the issue: {err}");
+        assert!(err.contains("CRCL"), "error must name the covariate: {err}");
+    }
+
+    /// `predict()` panics on the same combination — the non-`fit` entry points cannot
+    /// honour a silently-frozen hazard either (#741).
+    #[test]
+    #[should_panic(expected = "#741")]
+    fn tv_cov_hazard_predict_panics() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let _ = ferx_core::predict(&model, &pop, &model.default_params);
+    }
+
+    /// `simulate()` panics on the same combination for the same reason (#741).
+    #[test]
+    #[should_panic(expected = "#741")]
+    fn tv_cov_hazard_simulate_panics() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 0);
+    }
+
+    /// `predict_survival()` panics too — the survival curves read the hazard at the
+    /// frozen baseline covariate, so a time-varying covariate must fail loudly (#741).
+    #[test]
+    #[should_panic(expected = "#741")]
+    fn tv_cov_hazard_predict_survival_panics() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let _ = ferx_core::predict_survival(&model, &pop, &model.default_params, &[1.0, 5.0, 10.0]);
+    }
+
+    /// A zero-rate hazard (`λ = 0`): every draw hits the degenerate sentinel, so each
+    /// subject is censored with no event — surfaced as a per-subject warning on the
+    /// `_diag` path rather than silently vanishing into the censored rows (#763).
+    #[test]
+    fn degenerate_hazard_simulation_warns_not_silent() {
+        use ferx_core::{simulate_with_options_diag, SimOutcome, SimulateOptions};
+        const M: &str = "
+[parameters]
+  theta TVLAMBDA(1.0, 0.0, 10.0)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * 0
+
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(M).expect("zero-rate model parses");
+        let pop = common::tte_pop_from_pairs(&[(20.0, 0), (20.0, 0)]);
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(20.0),
+        };
+        let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &opts)
+            .expect("a degenerate hazard still simulates (censored); it does not error");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("W_TTE_DEGENERATE_HAZARD") && w.contains("#763")),
+            "a degenerate hazard draw must be surfaced as a warning: {:?}",
+            out.warnings
+        );
+        assert!(
+            out.results
+                .iter()
+                .all(|r| matches!(r.outcome, SimOutcome::Event { observed, .. } if !observed)),
+            "every subject is censored (no event)"
+        );
+    }
+
+    /// An RTTE hazard so extreme it would fire ≫ MAX_EVENTS times: the degenerate
+    /// subject's stream is skipped (censored) with a warning and the run completes for the
+    /// whole population — no whole-run panic, no ~1e6 materialised rows (#762).
+    #[test]
+    fn degenerate_rtte_simulation_warns_and_continues() {
+        use ferx_core::{simulate_with_options_diag, SimulateOptions};
+        const M: &str = "
+[parameters]
+  theta TVLAMBDA(1000000.0, 0.001, 100000000.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(M).expect("high-rate RTTE model parses");
+        let pop = common::tte_pop_from_pairs(&[(30.0, 0), (30.0, 0)]);
+        let opts = SimulateOptions {
+            seed: Some(2),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &opts)
+            .expect("a degenerate RTTE stream must not abort the whole run");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("W_RTTE_DEGENERATE") && w.contains("#762")),
+            "a degenerate RTTE stream must warn: {:?}",
+            out.warnings
+        );
+        assert_eq!(
+            out.results.len(),
+            pop.subjects.len(),
+            "one administrative censor row per subject; the degenerate stream is not materialised"
+        );
+    }
+
     /// A clock-forward RTTE model fits end-to-end (finite OFV) through the telescoping
     /// likelihood, and — under the Laplace-based default method — surfaces the ω²
     /// underestimation warning. Tier-2: capped at 3 outer iterations, no convergence.
@@ -470,6 +625,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let pop = rtte_pop();
@@ -603,6 +759,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let mut pop = rtte_pop();
@@ -661,6 +818,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let mut pop = rtte_pop();
@@ -714,6 +872,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let mut pop = rtte_pop();
@@ -741,20 +900,223 @@ mod survival_smoke {
         );
     }
 
-    /// RTTE simulation is a later slice (3.3); `simulate*` must reject an RTTE model
-    /// loudly rather than draw a single event per subject (`simulate_tte` would collapse
-    /// a subject's repeated events into one competing-risks draw — a silent wrong answer).
+    /// RTTE simulation (Slice 3.3) regenerates a *recurrent* stream per subject: each
+    /// subject's rows are one event process to the horizon, not a single competing-risks
+    /// draw. With a horizon set, `simulate*` succeeds, at least one subject fires more
+    /// than one event, and every subject ends with an administrative censor at the
+    /// horizon — the round-trip layout the data reader reads back.
     #[test]
-    fn rtte_simulate_is_rejected() {
+    fn rtte_simulate_produces_recurrent_stream() {
+        use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
+        use std::collections::BTreeMap;
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let pop = rtte_pop();
+        let opts = SimulateOptions {
+            seed: Some(7),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect("RTTE simulation with a horizon must succeed");
+
+        let mut by_id: BTreeMap<String, Vec<(f64, bool)>> = BTreeMap::new();
+        for r in &sims {
+            match r.outcome {
+                SimOutcome::Event { time, observed } => {
+                    assert_eq!(r.cmt, 2, "RTTE rows stay on the endpoint CMT");
+                    by_id
+                        .entry(r.id.clone())
+                        .or_default()
+                        .push((time, observed));
+                }
+                ref o => panic!("expected an Event outcome, got {o:?}"),
+            }
+        }
+        assert_eq!(by_id.len(), pop.subjects.len(), "one group per subject");
+
+        let mut max_events = 0usize;
+        for (id, rows) in &by_id {
+            let (t_last, obs_last) = *rows.last().unwrap();
+            assert!(
+                !obs_last && t_last == 30.0,
+                "subject {id} must end with a censor at the horizon, got ({t_last}, {obs_last})"
+            );
+            let mut prev = 0.0_f64;
+            for &(t, obs) in &rows[..rows.len() - 1] {
+                assert!(
+                    obs && t > prev && t < 30.0,
+                    "subject {id} pre-censor rows are sorted events before the horizon: {t}"
+                );
+                prev = t;
+            }
+            max_events = max_events.max(rows.len() - 1);
+        }
+        assert!(
+            max_events > 1,
+            "at least one subject must fire multiple events (recurrent stream, not a single \
+             competing-risks draw); max events = {max_events}"
+        );
+    }
+
+    /// RTTE simulation needs a finite administrative horizon (the stream runs up to it);
+    /// without one, `simulate*` must fail loud rather than run unbounded.
+    #[test]
+    fn rtte_simulate_without_horizon_is_rejected() {
         use ferx_core::{simulate_with_options, SimulateOptions};
         let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
         let pop = rtte_pop();
-        let opts = SimulateOptions::default();
+        let opts = SimulateOptions::default(); // horizon: None
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
-            .expect_err("RTTE simulation must be rejected");
+            .expect_err("RTTE simulation without a horizon must be rejected");
         assert!(
-            err.contains("RTTE") && err.contains("not yet supported"),
-            "error should flag RTTE simulation as unsupported, got: {err}"
+            err.contains("RTTE") && err.contains("horizon"),
+            "error should require a horizon, got: {err}"
+        );
+    }
+
+    /// Left truncation (`entry_time > 0`) on an RTTE record is a deferred follow-up
+    /// (conditional first-gap sampling); simulation must reject it, not silently sample
+    /// the first gap from 0.
+    #[test]
+    fn rtte_simulate_left_truncation_is_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        let ObsRecord::Event { entry_time, .. } = &mut pop.subjects[0].obs_records[0] else {
+            panic!("expected a TTE Event record");
+        };
+        *entry_time = 2.0;
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("RTTE simulation with left truncation must be rejected");
+        assert!(
+            err.contains("left truncation"),
+            "error should flag left truncation, got: {err}"
+        );
+    }
+
+    /// EVID=3/4 resets on an RTTE subject would disturb the hazard clock mid-stream
+    /// (selective per-state reset is a later slice); simulation must reject them.
+    #[test]
+    fn rtte_simulate_resets_are_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        pop.subjects[0].reset_times = vec![10.0];
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("RTTE simulation with resets must be rejected");
+        assert!(
+            err.contains("resets"),
+            "error should flag EVID=3/4 resets, got: {err}"
+        );
+    }
+
+    /// A single recurrent stream per subject only: multiple RTTE CMTs are a later slice
+    /// (they need a shared-horizon multi-stream draw). Simulation must reject them
+    /// rather than regenerate only the first CMT's stream.
+    #[test]
+    fn rtte_simulate_multiple_rtte_cmts_are_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        const TWO_RTTE: &str = r"
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+
+[event_model a]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+
+[event_model b]
+  cmt    = 3
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+";
+        let model = parse_model_string(TWO_RTTE).expect("two-RTTE model must parse");
+        let mut pop = common::tte_pop_from_pairs(&[(30.0, 0)]);
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 3,
+            },
+        ];
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("multi-CMT RTTE simulation must be rejected");
+        assert!(
+            err.contains("multiple CMTs"),
+            "error should flag multiple RTTE CMTs, got: {err}"
+        );
+    }
+
+    /// An RTTE cause combined with a competing single-event TTE cause is a later slice;
+    /// simulation must reject it rather than mix a recurrent stream with a one-shot draw.
+    #[test]
+    fn rtte_simulate_competing_single_tte_sibling_is_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        const RTTE_PLUS_TTE: &str = r"
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+
+[event_model recurrent]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+
+[event_model single]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA
+";
+        let model = parse_model_string(RTTE_PLUS_TTE).expect("RTTE + TTE model must parse");
+        let mut pop = common::tte_pop_from_pairs(&[(30.0, 0)]);
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 3,
+            },
+        ];
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("RTTE + competing single-TTE simulation must be rejected");
+        assert!(
+            err.contains("competing single-event TTE"),
+            "error should flag the competing single-event TTE sibling, got: {err}"
         );
     }
 
@@ -1277,7 +1639,10 @@ mod survival_smoke {
                         entry_time,
                         time,
                         ..
-                    } = r;
+                    } = r
+                    else {
+                        panic!("expected a TTE Event record");
+                    };
                     assert_eq!(
                         *entry_time, 0.0,
                         "synthetic subjects have no left truncation"
@@ -1293,7 +1658,9 @@ mod survival_smoke {
                 .obs_records
                 .iter()
                 .filter(|r| {
-                    let ObsRecord::Event { event_type, .. } = r;
+                    let ObsRecord::Event { event_type, .. } = r else {
+                        return false;
+                    };
                     matches!(event_type, EventType::Exact)
                 })
                 .count();
@@ -1305,7 +1672,10 @@ mod survival_smoke {
                 for r in &subj.obs_records {
                     let ObsRecord::Event {
                         time, event_type, ..
-                    } = r;
+                    } = r
+                    else {
+                        panic!("expected a TTE Event record");
+                    };
                     assert!(matches!(event_type, EventType::RightCensored));
                     assert!(
                         (time - H).abs() < 1e-9,
@@ -1372,7 +1742,10 @@ mod survival_smoke {
                 event_type,
                 entry_time,
                 cmt,
-            } = &subj.obs_records[0];
+            } = &subj.obs_records[0]
+            else {
+                panic!("expected a TTE Event record");
+            };
             assert_eq!(*cmt, 2, "row on the cause CMT");
             assert_eq!(
                 *entry_time, 0.0,
@@ -1489,7 +1862,9 @@ mod survival_smoke {
             // One TTE row on the cause CMT, written by the TTE write-back. Reaching
             // this also drives the non-`Event` `filter_map` arm (the continuous rows).
             assert_eq!(subj.obs_records.len(), 1, "one TTE event row");
-            let ObsRecord::Event { time, cmt, .. } = &subj.obs_records[0];
+            let ObsRecord::Event { time, cmt, .. } = &subj.obs_records[0] else {
+                panic!("expected a TTE Event record");
+            };
             assert_eq!(*cmt, 2, "TTE row on the cause CMT");
             assert!(*time <= 14.0 + 1e-9, "TTE outcome within the horizon");
         }
@@ -1675,6 +2050,138 @@ mod survival_smoke {
         assert!(
             censored > 0,
             "some subjects must survive to the horizon (got {censored})"
+        );
+    }
+
+    // ── Phase 4.0 coexistence: TTE code paths skip non-Event records ─────────
+    // Once discrete/count endpoints coexist, a subject may carry non-TTE records
+    // on other CMTs. Every TTE fit/sim path iterating `obs_records` skips them
+    // (the `let ObsRecord::Event {..} = record else { continue }` guard), so
+    // adding one must not change the OFV or the simulated events. These exercise
+    // the guard end-to-end via the public `fit`/`simulate` APIs.
+
+    /// RTTE fit path (`check_rtte_records` + the telescoping NLL).
+    #[test]
+    fn rtte_fit_tolerates_interleaved_non_event_records() {
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let opts = FitOptions::default();
+        let baseline = fit(&model, &rtte_pop(), &model.default_params, &opts)
+            .expect("baseline RTTE fit")
+            .ofv;
+        let mut pop = rtte_pop();
+        pop.subjects[0].obs_records.insert(
+            1,
+            ObsRecord::DiscreteState {
+                time: 7.0,
+                state: 1,
+                cmt: 3,
+            },
+        );
+        let mixed = fit(&model, &pop, &model.default_params, &opts)
+            .expect("RTTE fit must tolerate a non-TTE record")
+            .ofv;
+        assert_eq!(
+            baseline, mixed,
+            "a discrete-state record must not change the RTTE OFV"
+        );
+    }
+
+    /// ODE-accumulated-hazard fit path (`tte_ode_nll`).
+    #[test]
+    fn ode_tte_fit_tolerates_interleaved_non_event_records() {
+        let model = parse_model_string(ODE_TTE_MODEL).expect("ODE-TTE model parses");
+        let build_pop = || {
+            let mut pop = common::tte_pop_from_pairs(&vec![(15.0, 1u8); 10]);
+            for s in pop.subjects.iter_mut() {
+                s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+                s.obs_records = vec![ObsRecord::Event {
+                    time: 15.0,
+                    event_type: EventType::Exact,
+                    entry_time: 0.0,
+                    cmt: 3,
+                }];
+            }
+            pop
+        };
+        let opts = FitOptions::default();
+        let baseline = fit(&model, &build_pop(), &model.default_params, &opts)
+            .expect("baseline ODE-TTE fit")
+            .ofv;
+        let mut pop = build_pop();
+        pop.subjects[0].obs_records.insert(
+            0,
+            ObsRecord::DiscreteState {
+                time: 5.0,
+                state: 0,
+                cmt: 4,
+            },
+        );
+        let mixed = fit(&model, &pop, &model.default_params, &opts)
+            .expect("ODE-TTE fit must tolerate a non-TTE record")
+            .ofv;
+        assert_eq!(
+            baseline, mixed,
+            "a discrete-state record must not change the ODE-TTE OFV"
+        );
+    }
+
+    /// ODE-hazard simulation path (`simulate_tte`, `draw_ode_tte_latent`,
+    /// `validate_tte_simulatable`, `simulate_with_options`).
+    #[test]
+    fn simulate_ode_tte_tolerates_interleaved_non_event_records() {
+        use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
+        const H: f64 = 30.0;
+        let model = parse_model_string(ODE_TTE_MODEL).expect("ODE-TTE model parses");
+        let build_pop = || {
+            let mut pop = common::tte_pop_from_pairs(&vec![(H, 0u8); 20]);
+            for s in pop.subjects.iter_mut() {
+                s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+                s.obs_records = vec![ObsRecord::Event {
+                    time: H,
+                    event_type: EventType::RightCensored,
+                    entry_time: 0.0,
+                    cmt: 3,
+                }];
+            }
+            pop
+        };
+        let opts = SimulateOptions {
+            seed: Some(17),
+            match_method: None,
+            horizon: Some(H),
+        };
+        let baseline = simulate_with_options(&model, &build_pop(), &model.default_params, 1, &opts)
+            .expect("baseline ODE-TTE sim");
+        let mut pop = build_pop();
+        pop.subjects[0].obs_records.insert(
+            0,
+            ObsRecord::Count {
+                time: 12.0,
+                count: 2,
+                cmt: 4,
+            },
+        );
+        let mixed = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect("ODE-TTE sim must tolerate a non-TTE record");
+        // Same seed + same TTE design ⇒ bit-identical simulated events on CMT 3.
+        let events = |sims: &[ferx_core::api::SimulationResult]| {
+            let mut v: Vec<(String, u64, bool)> = sims
+                .iter()
+                .filter(|r| r.cmt == 3)
+                .map(|r| match r.outcome {
+                    SimOutcome::Event { time, observed } => {
+                        (r.id.clone(), time.to_bits(), observed)
+                    }
+                    ref o => panic!("expected an Event outcome, got {o:?}"),
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            events(&baseline),
+            events(&mixed),
+            "a non-TTE record must not change the simulated TTE events"
         );
     }
 
@@ -2126,6 +2633,60 @@ mod survival_smoke {
         );
     }
 
+    /// #772 review (Finding 1): a hazard that references an `[individual_parameters]`
+    /// value (PR #442) which itself reads a covariate transitively reads that covariate
+    /// at the baseline snapshot when the analytic `param_fn` is evaluated. It MUST appear
+    /// in `hazard_covariates` so the #741 time-varying-covariate guard can reject a TV
+    /// covariate reached this way — otherwise it is silently frozen (the exact bug #741
+    /// exists to block). Here `CRCL` is read only through `SCALE_I → LAMBDA0`, never in a
+    /// direct hazard sub-expression.
+    #[test]
+    fn event_model_hazard_covariates_include_transitive_indiv_param_covariates() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVBASE(0.05, 0.001, 10.0)
+  theta TVEFF(2.0, 0.1, 10.0)
+  theta TVBETA(0.01, -1.0, 1.0)
+  omega ETA_BASE ~ 0.09
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  CL      = TVCL
+  V       = TVV
+  LAMBDA0 = TVBASE * exp(TVBETA * CRCL + ETA_BASE)
+  SCALE_I = LAMBDA0 * TVEFF
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = SCALE_I
+";
+        let model = parse_model_string(src).expect("model must parse");
+        let ep = model
+            .endpoints
+            .get(&2)
+            .expect("CMT=2 must be a TTE endpoint");
+        let EndpointLikelihood::Tte {
+            hazard_covariates, ..
+        } = ep
+        else {
+            panic!("expected Tte endpoint");
+        };
+        assert!(
+            hazard_covariates.iter().any(|c| c == "CRCL"),
+            "hazard_covariates must include the transitively-referenced covariate CRCL \
+             (reached via SCALE_I → LAMBDA0); got {hazard_covariates:?}"
+        );
+    }
+
     /// Issue #442 (review #1): a hazard that references an `[individual_parameters]`
     /// value whose definition uses an IOV **kappa** must be rejected at parse time,
     /// not crash the fit. The hazard `param_fn` is handed the BSV-only η, but a kappa
@@ -2422,7 +2983,9 @@ mod survival_smoke {
                 "subject {} has 1 TTE record (CMT 3)",
                 s.id
             );
-            let ObsRecord::Event { cmt, .. } = &s.obs_records[0];
+            let ObsRecord::Event { cmt, .. } = &s.obs_records[0] else {
+                panic!("expected a TTE Event record");
+            };
             assert_eq!(*cmt, 3, "the TTE record is routed to CMT 3");
         }
     }

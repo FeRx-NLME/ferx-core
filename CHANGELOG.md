@@ -30,6 +30,86 @@ section of the SDLC for the versioning policy).
   force a fresh start, or set `checkpoint = false` to disable saving. Works
   across all estimation methods (resume is a coarse warm-restart from the saved
   population estimates, not a bit-exact optimizer-state resume).
+- **`simulate_with_options_diag` surfaces per-subject simulation diagnostics** (#762,
+  #763): a new entry point returning `SimulationOutput { results, warnings }` — the
+  simulation analogue of `FitResult.warnings`. It reports subjects handled specially
+  during a run (a degenerate hazard draw, an over-large recurrent stream) instead of
+  letting them look like ordinary censoring. `simulate_with_options` is unchanged (a
+  thin wrapper returning just the rows), and `ferx <model> --simulate` now echoes these
+  warnings alongside the fit warnings — including in the structured `warnings_structured`
+  / JSON output, under a new typed `simulation` [`WarningCode`](https://ferx-nlme.github.io/ferx-core/warnings.html).
+- **Boundary-estimate warning** (#781): a fit now emits a `boundary_estimate`
+  warning when a free THETA estimate is pinned to an optimizer bound (evaluated
+  in the optimizer's packed/log space) — a sign of non-identifiability or a
+  too-tight bound. The structured warning carries `details` listing each
+  `{parameter, estimate, bound, side}`, and is emitted **typed at its source**
+  (the first warning to use the native at-source path rather than string
+  classification). See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+- **Finer covariance-step warning codes** (#781): the overloaded
+  `covariance_step` warning code is split by severity into `covariance_failed`
+  (Critical — no standard errors), `covariance_regularized` (Warning — SEs
+  degraded but present), and `covariance_step` (Info — cost notes), so an agent
+  can branch on the outcome. The failure/regularized codes carry `details` with
+  `condition_number`, `min_eigenvalue`, and `n_negative_eigenvalues` when those
+  were computed. See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+- **High ETA-shrinkage warning** (#781): a fit now emits an `eta_shrinkage`
+  warning when any random-effect (ETA) shrinkage exceeds ~30% (the Savic &
+  Karlsson rule of thumb) — the data poorly inform that IIV, so EBE-based
+  diagnostics for it are unreliable and removing the IIV is often warranted.
+  The structured warning carries `details` listing the affected ETAs and their
+  shrinkage percent. See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+- **Warning `details` payloads for numeric diagnostics** (#781): structured
+  warnings for `dw_autocorrelation`, `eps_shrinkage`, and `condition_number` now
+  carry a `details` object with the value behind the message (e.g.
+  `{"durbin_watson": 1.20, "iwres_lag1_autocorr": 0.40}`), sourced from the
+  fit's typed fields so an agent reads the number directly instead of parsing
+  prose. First increment of the at-source warning work; other codes omit
+  `details` until converted. See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html#details).
+- **Typed warning taxonomy** (#778): structured warnings
+  (`FitResult.warnings_structured`, surfaced in the JSON output) now carry a
+  typed `WarningCode` instead of a free-text category string — a stable,
+  exhaustive vocabulary an agent or the R wrapper can branch on. Each code
+  serializes as a fixed snake_case token (unchanged from the previous category
+  strings, so JSON consumers are unaffected), and each entry gains an optional
+  `details` payload for machine-readable numbers behind the message. See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+- **Machine-readable JSON fit output** (#777): `ferx <model> --data <csv>
+  --output-format json` (or `both`) writes `{model}-fit.json` — the *complete*
+  fit result (every estimate, standard error, diagnostic, per-subject record,
+  and provenance field), not the curated human YAML. It carries a top-level
+  `schema_version` so programmatic/agent consumers can pin, matrices serialize
+  as `{rows, cols, data}` (row-major) and vectors as flat arrays, and non-finite
+  floats become JSON `null`. `--output-format yaml` (the default) is unchanged.
+  Library callers can get the same payload in-process via
+  `FitResult::to_json_value()`. See the
+  [output documentation](https://ferx-nlme.github.io/ferx-core/output.html).
+- **Experimental `markov` feature — CTMM matrix-exponential foundation**
+  (#759): a new default-off `markov` cargo feature adds the numerical core for
+  continuous-time Markov models — transition probabilities
+  `P(Δt) = expm(Q·Δt)` (nalgebra's scaling-and-squaring Padé) with exact
+  Van Loan (1978) parameter gradients, plus a guarded individual CTMM
+  likelihood term. This is a library-internal primitive with **no model-file
+  syntax yet**; wiring it into estimation is a later phase (see
+  `plans/tte-survival-markov.md`).
+- **Declare IOV occasions in the model** (#756): a new `iov_occasion` key in
+  `[fit_options]` derives the occasion partition from each subject's timeline
+  instead of requiring a precomputed dataset column. `iov_occasion = dose`
+  starts a new occasion at each administration; `iov_occasion = time(24, 48)`
+  splits by time-window breakpoints. When both `iov_occasion` and `iov_column`
+  are set, the model-side rule wins (with a warning). Both rules bucket
+  observations and doses on the same internal event clock (correct for
+  reset-stacked crossover subjects), co-timed doses share one occasion, a
+  degenerate single-occasion partition errors instead of silently
+  under-identifying kappa, and the derived `OCC` column is written to `sdtab`
+  (#757). A `time(...)` breakpoint list must contain only interior boundaries
+  (the first occasion starts at `-∞`, the last runs to `+∞`); a leading `0`
+  (the `c(0, 24, 48)` habit) is rejected with a message pointing at the correct
+  `time(24, 48)` form. See the
+  [IOV documentation](https://ferx-nlme.github.io/ferx-core/model-file/iov.html).
 - **`ferx summary` compares multiple runs** (#749): pass two or more `.fitrx`
   bundles (`ferx summary run1.fitrx run2.fitrx run3.fitrx`) to print a Markdown
   table comparing them side by side — method, convergence, OFV/AIC/BIC, ΔOFV,
@@ -140,11 +220,24 @@ section of the SDLC for the versioning policy).
   al. 2009), fitting RTTE under a Laplace-based method with a frailty now emits a
   warning recommending `method = saem` or `method = imp` (fired only for a frailty
   model — `n_eta > 0` — whose chain's final estimating stage is Laplace-based, so a
-  warm-start like `[focei, saem]` does not false-warn). RTTE is **fit-only** for now:
-  `simulate()` and unsupported configurations (interval-censored or out-of-order or
-  non-finite repeated-event rows) are rejected with a clear error rather than
-  silently producing a wrong answer; `predict_survival()` reports first-event
-  survival for RTTE (use its `cum_hazard` field for the recurrent `E[N(t)]`).
+  warm-start like `[focei, saem]` does not false-warn). **`simulate()` draws a
+  recurrent event stream** per subject up to the administrative `[simulation]
+  horizon` — clock-forward via conditional inverse-CDF draws (each event conditioned
+  on survival past the previous), clock-reset via fresh gap draws — for the analytic
+  hazard families. Unsupported configurations (interval-censored, out-of-order,
+  non-finite, or — for simulation — left-truncated, multiple RTTE causes, an RTTE
+  cause mixed with a competing single-event cause, or EVID=3/4 resets) are rejected
+  with a clear error rather than silently producing a wrong answer;
+  `predict_survival()` reports first-event survival for RTTE (use its `cum_hazard`
+  field for the recurrent `E[N(t)]`).
+- **`two_cpt_transit` now supports time-varying covariates and `TIME`-dependent parameters** (#724):
+  a 2-cpt transit model whose disposition switches mid-profile is transparently routed to an exact
+  ODE `transit()` twin (`central` + `periph`), exactly as `one_cpt_transit` already was — instead
+  of being rejected. This removes the 1-cpt/2-cpt asymmetry. IOV, steady-state, infusion, and reset
+  doses on a transit closed form remain rejected (use an explicit ODE `transit()` model for those).
+  A non-depot (`CMT≠1`) dose on either transit closed form is now also rejected with a clear error
+  rather than silently mis-predicted — the closed form transits every dose into central regardless
+  of compartment, so it would disagree with the ODE twin (which honours the dose compartment).
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
   model.ferx`, `ferx check model.ferx`, and the public `fit_from_files()`
@@ -169,6 +262,36 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **A degenerate hazard draw in simulation no longer vanishes silently, and a pathological
+  RTTE hazard no longer aborts the whole run** (#762, #763). When an analytic hazard's
+  effective rate degenerates (non-positive / non-finite), the affected subject is censored
+  with no event — previously indistinguishable from ordinary administrative censoring; the
+  `simulate_with_options_diag` path now names it in a `W_TTE_DEGENERATE_HAZARD` warning. An
+  RTTE hazard so extreme it would fire more than a million times over the window is now
+  skipped (censored) with a `W_RTTE_DEGENERATE` warning and the run continues for the rest
+  of the population, instead of panicking the entire `simulate()` call — and without first
+  materialising ~1e6 rows. The `simulate()` / `simulate_with_seed()` entry points apply the
+  same per-subject handling (no panic) but return only the rows.
+- **A time-varying covariate on a survival hazard is now a hard error instead of a
+  silently frozen baseline value** (#741). A `[event_model]` hazard that references a
+  covariate whose value changes within a subject was evaluated at the covariate's
+  baseline — the analytic hazard families take no time argument, and the joint PK-TTE
+  ODE hazard integrates with the PK parameters frozen at `t=0` — so the fit or
+  simulation silently used the wrong hazard across every TTE / RTTE / competing-risks /
+  joint-PK-TTE endpoint. `fit()` now rejects it (and `predict()` / `simulate()` panic),
+  naming the covariate and the subject. A time-varying covariate the hazard does *not*
+  reference — e.g. one used only by a shared PK model in a frailty-only joint fit — is
+  unaffected. Hold the covariate constant within each subject for now.
+- **An `[initial_conditions]` covariate that matches no data column now fails the
+  fit loudly instead of silently dropping the baseline** (#765). A covariate named
+  only inside an init expression (e.g. `init(central) = CONC0 * V`) was never
+  registered as a required data column, so with a `[covariates]` block it was never
+  read, and under auto-detect a case mismatch (`CONC0` vs a `conc0` header) resolved
+  to `0` — zeroing the initial amount with no diagnostic (identical OFV with and
+  without the block). Init-expression covariates are now registered like every other
+  model covariate, so a missing or miscased name raises `E_MISSING_COVARIATE` listing
+  the available columns. Rename the column in `[data]` (`CONC0 = conc0`) or match the
+  header's case in the expression.
 - **A dataset with dose rows but no `AMT` column is now a hard error instead of a
   silent bad fit** (#753). When the amount column is named something other than
   `AMT` (e.g. a NONMEM export using `DOSE`), every dose parsed with amount 0, so no
@@ -192,6 +315,46 @@ section of the SDLC for the versioning policy).
   from `ferx check` or at fit time. Such an out-of-order reference is now rejected loudly,
   naming the offending variable; reorder the block so each name is declared before it is
   used. This mirrors the existing `[odes]` undefined-reference guard (#314).
+- **`ADDL` on a coded `RATE=-1`/`-2` dose no longer collapses to boluses** (#722):
+  additional doses expanded from a modeled-rate (`RATE=-1`/`R{cmt}`) or
+  modeled-duration (`RATE=-2`/`D{cmt}`) record now stay modeled infusions like
+  the first dose, instead of silently becoming instantaneous boluses. Previously
+  a regimen such as `AMT=100, RATE=-2, D1=2, ADDL=5, II=24` fitted (and predicted/
+  simulated) as one modeled infusion followed by five boluses, with no warning.
+- **`SS=2` steady-state dose records are now rejected instead of silently run as
+  `SS=1`** (#729): NONMEM `SS=2` (superimpose the steady state of a regimen on top
+  of the compartment's existing amounts, without resetting) was collapsed to the
+  same internal `ss = true` flag as `SS=1` (reset then equilibrate) — every
+  `SS >= 0.5` cell became `SS=1` — so an `SS=2` dataset fitted, predicted, and
+  simulated with the wrong (reset) initial conditions and no warning. The data
+  reader now accepts only `SS=0`/`SS=1` and rejects `SS=2` (and any other code)
+  with a clear message. Full `SS=2` support is tracked in #694.
+- **An *unmapped* per-compartment `F{cmt}`/`ALAG{cmt}` on an analytical `pk` model is now a clear
+  error** (#725): these are ODE-only dose attributes. Naming an analytical individual parameter
+  `F1`/`ALAG1` (or the `LAGTIME1` alias) *without* binding it to the model's single dose route used
+  to drop its value into an unused slot — so effective bioavailability stayed 1 / lag stayed 0 with
+  no effect (a footgun when porting a NONMEM `$PK` that sets `F1`/`ALAG1`). The parser now rejects
+  that silent no-op, pointing at the bare `f=`/`lagtime=` mapping (e.g. `f=F1`) or an `ode(...)`
+  model. A parameter that *is* correctly mapped (`pk(..., f=F1)`) is unaffected — its value was, and
+  remains, applied as bioavailability/lag.
+- **Flip-flop transit models now evaluate correctly instead of returning a zero
+  profile** (#733): when a `pk one_cpt_transit(...)` / `two_cpt_transit(...)` model's
+  individual parameters put the disposition rate at or above the transit rate
+  (`ke ≥ KTR`, or `α ≥ KTR` for 2-cpt — the flip-flop regime of a slow-absorption
+  depot), the exponential-tilting closed form is outside its convergence domain and
+  clamped the prediction *and its gradient* to `0`, silently degenerating a
+  proportional-error objective. `predict()`, `simulate()`, `fit()` and the
+  diagnostics now route such a model — per evaluation — to its exact ODE `transit()`
+  twin, which is valid in that regime (matched to a NONMEM ADVAN13 transit
+  simulation to ~1e-4); a twin-carrying flip-flop model gets an informational
+  `W_TRANSIT_FLIP_FLOP` heads-up. A flip-flop model that carries a `lagtime`,
+  bioavailability `f`, or a user `[odes]` / `[scaling]` / `[initial_conditions]` block
+  has **no** ODE twin to route to, so
+  rather than silently returning a zero profile that degenerates the objective it is
+  now **rejected with a hard error** (`fit()` returns `Err`, `predict()`/`simulate()`
+  panic, `ferx check` reports `E_TRANSIT_FLIP_FLOP`) — consistent with the other
+  unsupported-transit rejects. Rewrite such a model as an explicit ODE `transit()`
+  model, or adjust the MTT / CL starting estimates.
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point

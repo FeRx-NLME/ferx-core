@@ -30,6 +30,98 @@ fn pk_params_at_time(
     (model.pk_param_fn)(theta, eta, covariates, time)
 }
 
+/// Whether a transit-absorption closed form is in the **flip-flop** regime at
+/// this subject's individual parameters — the absorption rate matching or
+/// exceeding elimination, so the exponential-tilting closed form's convergence
+/// domain (`ke < KTR` for 1-cpt, `α < KTR` for 2-cpt, with `KTR = (n+1)/mtt`)
+/// is violated and [`crate::sens::one_cpt::one_cpt_transit_amt_g`] /
+/// [`crate::sens::two_cpt::transit_2cpt_domain_ok`] would clamp the prediction
+/// (and its sensitivities) to `0`.
+///
+/// Mirrors those exact guards — the 1-cpt arm inline, the 2-cpt arm by deferring
+/// to `transit_2cpt_domain_ok` itself (so both the flip-flop `!(α < KTR)` clamp
+/// *and* the confluent-eigenvalue `|α − β| < 1e-12` clamp are honoured) — so the
+/// prediction and every sensitivity path make the *same* routing decision.
+/// Returns `false` for a non-transit model, and for invalid parameters — there
+/// the closed form's `0` is a deliberate optimiser penalty, not a flip-flop to
+/// reroute to the ODE twin.
+pub(crate) fn transit_flip_flop_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> bool {
+    let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
+    let (n, mtt, cl, v1) = (pk.n_transit(), pk.mtt(), pk.cl(), pk.v());
+    if !(mtt > 0.0 && n >= 0.0 && cl > 0.0 && v1 > 0.0) {
+        return false;
+    }
+    match model.pk_model {
+        PkModel::OneCptTransit => {
+            // 1-cpt clamps inline (`one_cpt_transit_amt_g`) at `!(ke < KTR)`;
+            // mirror that single-exponential guard directly (there is no
+            // confluent-eigenvalue case for a single disposition rate).
+            let ktr = (n + 1.0) / mtt;
+            !(cl / v1 < ktr)
+        }
+        PkModel::TwoCptTransit => {
+            if !(pk.q() >= 0.0 && pk.v2() > 0.0) {
+                return false;
+            }
+            // Defer to the closed form's own domain guard rather than re-deriving
+            // it: `transit_2cpt_domain_ok` returns `None` (⇒ the closed form
+            // clamps to `0`) for *both* the flip-flop `!(α < KTR)` case and the
+            // confluent-eigenvalue `|α − β| < 1e-12` case. Rerouting exactly when
+            // it clamps keeps this predicate a faithful negation of the guard — no
+            // third copy of the rule to drift. Params are valid here, so a `None`
+            // always means "would clamp", never "invalid input".
+            crate::sens::two_cpt::transit_2cpt_domain_ok::<f64>(cl, v1, pk.q(), pk.v2(), n, mtt)
+                .is_none()
+        }
+        _ => false,
+    }
+}
+
+/// The model to evaluate this subject with at `(theta, eta)`: the structural
+/// [`CompiledModel::effective_for`] reroute (TV-covariate / `TIME` transit
+/// subjects → their ODE twin) **plus** a parameter-dependent flip-flop reroute.
+///
+/// A transit closed form clamps to `0` once `ke ≥ KTR` (absorption no faster
+/// than elimination). When the subject's parameters enter that regime and an
+/// ODE twin exists, evaluate the twin instead: it is the same model, integrated
+/// numerically, and is valid in both regimes — so the prediction and its
+/// sensitivities are correct rather than a spurious zero. Both the prediction
+/// and the sensitivity dispatchers route through here, and within an iteration
+/// they evaluate at the same `(theta, eta)`, so they agree on the decision.
+///
+/// A flip-flop transit model with no ODE twin (one carrying a lagtime, `f`, or a
+/// user `[odes]` / `[scaling]` / `[initial_conditions]` block, which the desugar
+/// declines) has nothing to reroute to, and is rejected up front at η = 0 typical
+/// values by [`crate::api::check_transit_flip_flop_no_twin`] (`fit()` → `Err`,
+/// `predict()`/`simulate()` panic) rather than silently returning the closed form's
+/// `0`. (This function still returns the closed form for it — the guard runs first.)
+pub(crate) fn effective_model_for_eval<'a>(
+    model: &'a CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> &'a CompiledModel {
+    let structural = model.effective_for(subject);
+    // No twin to route to (a non-transit model, or a lagtime / `f` / user-`[odes]`
+    // transit whose desugar declined): nothing parameter-dependent to decide.
+    let Some(twin) = &model.transit_ode_equivalent else {
+        return structural;
+    };
+    // Keep the structural (closed-form) model when it has already been rerouted to
+    // an ODE twin (TV-cov / `TIME`), or when this subject is not in the flip-flop
+    // regime. `||` short-circuits, so the predicate is evaluated only for
+    // closed-form transit subjects — the same work as before.
+    if structural.ode_spec.is_some() || !transit_flip_flop_at(model, subject, theta, eta) {
+        return structural;
+    }
+    twin.get_or_build()
+}
+
 /// Divide each prediction in-place by the scale derived from
 /// `model.scaling`. The convention is **divisive** so that
 /// `[scaling] obs_scale = 1000` maps mg/L → mg/mL (i.e. the user's number
@@ -872,24 +964,46 @@ pub fn predict_iov(
     // no-op. (Form C ODE output `y = <expr>` is applied inside the ODE solver,
     // not here; see the note below for the κ=0 limitation there.)
     if !matches!(model.scaling, ScalingSpec::None) {
-        let raw = preds.clone();
-        // Base pass with the BSV+κ=0 vector (`[η_bsv, 0…0]`, the same combination
-        // the non-IOV `compute_predictions_with_tv` path scales with). This scales
-        // every observation, including any not owned by an occasion group — most
-        // importantly an occasion-less subject (`simulate()` on data read without an
-        // `iov_column`), where the per-occasion loop below is empty and would
-        // otherwise leave `preds` UNSCALED and off by the full scale factor (#723
-        // review). When occasions are present every obs is owned by a group, so the
-        // loop overwrites this base pass entirely and the result is unchanged.
-        apply_scaling(model, subject, theta, &pk_only_combined, &mut preds);
-        // Per-occasion override: an observation carrying an occasion label is
-        // re-scaled with that occasion's κ, overwriting the base pass.
-        for (occ_id, obs_indices) in &occ_groups {
-            let combined = combined_for(*occ_id);
-            let mut scaled = raw.clone();
-            apply_scaling(model, subject, theta, &combined, &mut scaled);
-            for &j in obs_indices {
-                preds[j] = scaled[j];
+        // Guard on `subject.occasions`, NOT `occ_groups`: `iov_occasion_groups`
+        // appends *dose-only* occasions (a dose in an occasion with no co-timed
+        // sample) as groups with an EMPTY obs-index list, so `occ_groups` can be
+        // non-empty while no observation is owned by any group. The base pass
+        // below is what scales those otherwise-unowned observations, so it must
+        // run whenever the observations carry no occasion labels — the real
+        // condition is `subject.occasions.is_empty()` (#769 review). Keying on
+        // `occ_groups.is_empty()` would take the per-occasion branch for a
+        // dose-only-occasion subject and leave every observation UNSCALED.
+        if subject.occasions.is_empty() {
+            // No observation carries an occasion label (`simulate()` on data read
+            // without an `iov_column`, or a subject whose only occasion labels are
+            // dose-side): scale here with the BSV+κ=0 vector `[η_bsv, 0…0]` — the
+            // same combination the non-IOV `compute_predictions_with_tv` path
+            // scales with. Without this the predictions would be returned UNSCALED,
+            // off by the full scale factor (#723 review).
+            apply_scaling(model, subject, theta, &pk_only_combined, &mut preds);
+        } else {
+            // Every observation carries an occasion label and is owned by exactly
+            // one group (`subject.occasions` is parallel to the obs grid — either
+            // fully populated or empty, never partial), so the loop below
+            // determines *all* of `preds`. That makes a κ=0 base pass redundant
+            // here; skipping it avoids a full extra scaling evaluation on the
+            // estimation hot path (`predict_iov` runs in the IMP/SAEM/FOCEI inner
+            // loops) with a bit-identical result (#723 review / efficiency
+            // follow-up, #769).
+            let raw = preds.clone();
+            for (occ_id, obs_indices) in &occ_groups {
+                // Dose-only occasions own no observations, so their scaling pass
+                // would write nothing — skip the redundant full `apply_scaling`
+                // (+ clone) rather than compute and discard it.
+                if obs_indices.is_empty() {
+                    continue;
+                }
+                let combined = combined_for(*occ_id);
+                let mut scaled = raw.clone();
+                apply_scaling(model, subject, theta, &combined, &mut scaled);
+                for &j in obs_indices {
+                    preds[j] = scaled[j];
+                }
             }
         }
     }
@@ -1554,7 +1668,7 @@ pub fn compute_predictions_with_states(
     // the ODE integration (the `ode_spec` branch below) instead of the analytical
     // superposition path, which has no valid states for those subjects and would otherwise
     // return NaN. Matches the IPRED routing in `compute_predictions_with_tv` (#486).
-    let model = model.effective_for(subject);
+    let model = effective_model_for_eval(model, subject, theta, eta);
     let uses_time = model_uses_time_builtin(model);
     if let Some(ref ode) = model.ode_spec {
         // ODE path: both ipred and states come from a single ODE integration.
@@ -1852,7 +1966,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     // covariates) routes to the exact ODE `transit()` equivalent, which takes the ODE branch
     // below (that branch ignores the cached analytical `schedule`, so a stale one is
     // harmless); every other model is unchanged (#486).
-    let model = model.effective_for(subject);
+    let model = effective_model_for_eval(model, subject, theta, eta);
     let has_tv = subject.has_tv_covariates();
     let uses_time = model_uses_time_builtin(model);
 
@@ -2191,7 +2305,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pk = make_pk_params(10.0, 100.0);
@@ -2246,7 +2359,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -2436,7 +2548,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pk = make_pk_params(10.0, 100.0);
@@ -2943,6 +3054,80 @@ mod tests {
         }
     }
 
+    /// Regression (#769 review): `predict_iov` must apply `[scaling]` to a subject
+    /// that carries *dose* occasions but no *observation* occasions. In that state
+    /// `iov_occasion_groups` is non-empty — it appends the dose-only occasion as a
+    /// group with an EMPTY obs-index list — yet no observation is owned by any
+    /// group, so the per-occasion scaling loop writes nothing. The base pass is
+    /// what scales those observations; guarding it on `occ_groups.is_empty()`
+    /// (rather than `subject.occasions.is_empty()`) skips it here and returns the
+    /// predictions UNSCALED, off by the full scale factor — the #723 bug.
+    ///
+    /// The current data readers never build this state (they gate observation- and
+    /// dose-occasion labels on the same column), so it is constructed directly to
+    /// lock the guard against a future path that produces it.
+    #[test]
+    fn predict_iov_scales_subject_with_dose_only_occasions() {
+        let scale = 1000.0;
+        let mut model = cl_from_cr_model();
+        // A consistent IOV model — `dose_occasions` are only populated for IOV
+        // models. The κ block stays zero here, which is all this guard needs.
+        model.n_kappa = 1;
+        model.kappa_names = vec!["KAPPA_CL".to_string()];
+
+        // Observations present + a dose occasion, but NO observation occasions.
+        let mut dose_only = one_subject_for_scaling();
+        dose_only.dose_occasions = vec![1; dose_only.doses.len()];
+        assert!(
+            dose_only.occasions.is_empty() && !dose_only.dose_occasions.is_empty(),
+            "trigger state: dose occasions present, observation occasions absent"
+        );
+
+        // Unscaled reference (scaling off) — the predictions the scale divides.
+        model.scaling = ScalingSpec::None;
+        let raw = predict_iov(&model, &dose_only, &[1.0], &[], &[]);
+        assert!(
+            !raw.is_empty() && raw.iter().all(|v| v.is_finite() && *v > 0.0),
+            "sanity: positive concentrations to scale, got {raw:?}"
+        );
+
+        // Scaling on: every prediction must be divided by `scale`, not left as-is.
+        // Fails on the `occ_groups.is_empty()` guard (returns `raw`, `scale`× too big).
+        model.scaling = ScalingSpec::ScalarScale(scale);
+        let got = predict_iov(&model, &dose_only, &[1.0], &[], &[]);
+        assert_eq!(got.len(), raw.len());
+        for (g, r) in got.iter().zip(raw.iter()) {
+            assert_relative_eq!(*g, r / scale, epsilon = 1e-12);
+        }
+
+        // And identical to the fully occasion-less subject (the known-correct #723
+        // base-pass path, unchanged by #769): dose-only occasions must not move it.
+        let occasionless = one_subject_for_scaling(); // occasions=[] AND dose_occasions=[]
+        let reference = predict_iov(&model, &occasionless, &[1.0], &[], &[]);
+        assert_eq!(got.len(), reference.len());
+        for (g, r) in got.iter().zip(reference.iter()) {
+            assert_relative_eq!(*g, r, epsilon = 1e-12);
+        }
+
+        // Mixed subject — observations DO carry occasions, plus a second dose in an
+        // occasion with no co-timed sample. This takes the per-occasion (`else`)
+        // branch and exercises the dose-only-group `continue`: the empty group is
+        // skipped while every observation is still scaled per-occasion.
+        let mut mixed = one_subject_for_scaling();
+        mixed.doses.push(bolus_dose(0.0, 100.0));
+        mixed.occasions = vec![1, 1, 1]; // all observations in occasion 1
+        mixed.dose_occasions = vec![1, 2]; // second dose in occasion 2 (no observations)
+        model.scaling = ScalingSpec::None;
+        let raw_mixed = predict_iov(&model, &mixed, &[1.0], &[], &[]);
+        assert!(raw_mixed.iter().all(|v| v.is_finite() && *v > 0.0));
+        model.scaling = ScalingSpec::ScalarScale(scale);
+        let got_mixed = predict_iov(&model, &mixed, &[1.0], &[], &[]);
+        assert_eq!(got_mixed.len(), raw_mixed.len());
+        for (g, r) in got_mixed.iter().zip(raw_mixed.iter()) {
+            assert_relative_eq!(*g, r / scale, epsilon = 1e-12);
+        }
+    }
+
     #[test]
     fn test_apply_scaling_marks_bad_scale_as_nan() {
         // When a ScaleFn returns 0 / NaN / inf at runtime, apply_scaling
@@ -3273,7 +3458,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pk_dose: Vec<PkParams> = vec![pk.clone(); doses.len()];

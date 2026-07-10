@@ -397,3 +397,106 @@ fn report_serializes_to_json() {
     assert!(json.contains("\"model\":\"warfarin_bobyqa\""));
     assert!(json.contains("\"diagnostics\":[]"));
 }
+
+/// A twin-less flip-flop transit model (`lagtime=` declines the ODE-twin desugar;
+/// ke = CL/V = 0.5 ≥ KTR = (3+1)/20 = 0.2) is rejected by `ferx check` with a hard
+/// `E_TRANSIT_FLIP_FLOP` error, mirroring `fit()` (#776).
+#[test]
+fn twin_less_flip_flop_transit_is_rejected_by_check() {
+    let model = temp_model(
+        "flipflop_notwin",
+        "\
+[parameters]
+  theta TVCL(2.0, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+  LAGTIME = TVLAG
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAGTIME)
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+    );
+    let data = temp_data(
+        "flipflop_notwin",
+        "ID,TIME,AMT,EVID,DV,MDV\n1,0,100,1,.,1\n1,2,0,1.0,0\n",
+    );
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    assert!(!report.valid, "twin-less flip-flop must fail ferx check");
+    let d = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "E_TRANSIT_FLIP_FLOP")
+        .expect("expected E_TRANSIT_FLIP_FLOP diagnostic");
+    assert!(
+        d.message.contains("flip-flop") && d.message.contains("no ODE twin"),
+        "unexpected message: {}",
+        d.message
+    );
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
+}
+
+/// `ferx check` now also surfaces the structural transit rejects (here a steady-state
+/// dose) as `E_TRANSIT_UNSUPPORTED`, so a clean check and a fit agree on transit
+/// models — previously only `fit()` reported these (#776 review).
+#[test]
+fn unsupported_transit_feature_is_rejected_by_check() {
+    // In-domain (ke = 0.05 < KTR = 0.2), so this is NOT a flip-flop reject; the SS dose is.
+    let model = temp_model(
+        "transit_ss",
+        "\
+[parameters]
+  theta TVCL(0.5, 0.001, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+    );
+    let data = temp_data(
+        "transit_ss",
+        "ID,TIME,AMT,EVID,DV,MDV,SS,II\n1,0,100,1,.,1,1,24\n1,2,0,1.0,0,0,0\n",
+    );
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    assert!(!report.valid, "SS transit dose must fail ferx check");
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_TRANSIT_UNSUPPORTED"),
+        "expected E_TRANSIT_UNSUPPORTED, got: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| &d.code)
+            .collect::<Vec<_>>()
+    );
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
+}

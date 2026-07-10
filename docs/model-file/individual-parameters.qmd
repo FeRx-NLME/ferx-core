@@ -286,4 +286,6 @@ The parameter names on the left side of each assignment must map to recognized P
 | `F` | Bioavailability (default 1.0 if omitted) |
 | `LAGTIME` (alias: `ALAG`) | Dose/absorption lagtime (default 0.0 if omitted) — see [Lagtime](lagtime.qmd) |
 
+`F` and `LAGTIME`/`ALAG` are the analytical engine's single bioavailability and lag slots. A compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` name is an [ODE-model](ode-models.qmd) dose attribute; on an analytical `pk` model you may map such a name into the single slot (`pk(..., f=F1)`), but an *unmapped* `F{n}`/`ALAG{n}` is a parse error rather than a silent no-op ([#725](https://github.com/FeRx-NLME/ferx-core/issues/725)).
+
 For ODE models, the parameter names are user-defined and passed as a flat vector to the ODE right-hand side function.
