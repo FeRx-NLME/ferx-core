@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Restart of an interrupted run from a checkpoint** (#755): a fit now
+  periodically saves a small `{model}.tmp` resume point (throttled to
+  `[fit_options] checkpoint_interval_secs`, default 300 s, so short runs write
+  nothing). If the process is stopped, the next run of the same model + data
+  resumes from the last saved estimates instead of starting over, and the file
+  is deleted on successful completion. A model/data hash check invalidates a
+  stale checkpoint (the run then starts fresh). Pass the CLI flag `--clean` to
+  force a fresh start, or set `checkpoint = false` to disable saving. Works
+  across all estimation methods (resume is a coarse warm-restart from the saved
+  population estimates, not a bit-exact optimizer-state resume).
 - **`ferx summary` compares multiple runs** (#749): pass two or more `.fitrx`
   bundles (`ferx summary run1.fitrx run2.fitrx run3.fitrx`) to print a Markdown
   table comparing them side by side — method, convergence, OFV/AIC/BIC, ΔOFV,

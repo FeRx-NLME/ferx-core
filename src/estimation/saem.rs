@@ -1186,6 +1186,53 @@ pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) 
     }
 }
 
+/// Assemble a `ModelParameters` snapshot from the current SAEM `state`. Shared
+/// by the final post-loop parameter build and by the periodic resume checkpoint
+/// (#755) so the two never drift. `n_kappa > 0` preserves the IOV Ω structural
+/// free-mask (see the inline note at the call site).
+fn saem_state_to_params(
+    state: &SaemState,
+    init_params: &ModelParameters,
+    n_kappa: usize,
+) -> ModelParameters {
+    let omega = OmegaMatrix::from_matrix(
+        state.omega_mat.clone(),
+        init_params.omega.eta_names.clone(),
+        init_params.omega.diagonal,
+    );
+    ModelParameters {
+        theta: state.theta.clone(),
+        theta_names: init_params.theta_names.clone(),
+        theta_lower: init_params.theta_lower.clone(),
+        theta_upper: init_params.theta_upper.clone(),
+        theta_fixed: init_params.theta_fixed.clone(),
+        omega,
+        omega_fixed: init_params.omega_fixed.clone(),
+        sigma: SigmaVector {
+            values: state.sigma_vals.clone(),
+            names: init_params.sigma.names.clone(),
+        },
+        sigma_fixed: init_params.sigma_fixed.clone(),
+        omega_iov: if n_kappa > 0 {
+            // Use from_matrix_with_mask so the structural free_mask is preserved
+            // when this snapshot is handed to a chained estimator (e.g.
+            // [saem, foce]); from_matrix would infer the mask from nonzeros and
+            // could mark a legitimately-zero off-diagonal as structurally fixed.
+            init_params.omega_iov.as_ref().map(|iov_ref| {
+                OmegaMatrix::from_matrix_with_mask(
+                    state.omega_iov_mat.clone(),
+                    iov_ref.eta_names.clone(),
+                    iov_ref.diagonal,
+                    iov_ref.free_mask.clone(),
+                )
+            })
+        } else {
+            init_params.omega_iov.clone()
+        },
+        kappa_fixed: init_params.kappa_fixed.clone(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main SAEM loop
 // ---------------------------------------------------------------------------
@@ -2146,6 +2193,15 @@ pub fn run_saem(
                     &values,
                 );
             }
+
+            // Checkpoint (#755): snapshot the current SAEM estimates periodically
+            // so an interrupted run resumes near here. `cond_nll` stands in for
+            // the OFV (the FOCE OFV is not yet available mid-SAEM).
+            if crate::io::checkpoint::is_due() {
+                let snap = saem_state_to_params(&state, init_params, n_kappa);
+                let packed = crate::estimation::parameterization::pack_params(&snap);
+                crate::io::checkpoint::maybe_write(k, cond_nll, &packed);
+            }
         }
     }
 
@@ -2160,43 +2216,7 @@ pub fn run_saem(
     }
 
     // ---- Post-SAEM: build final parameters ----
-    let final_omega = OmegaMatrix::from_matrix(
-        state.omega_mat.clone(),
-        init_params.omega.eta_names.clone(),
-        init_params.omega.diagonal,
-    );
-    let final_params = ModelParameters {
-        theta: state.theta.clone(),
-        theta_names: init_params.theta_names.clone(),
-        theta_lower: init_params.theta_lower.clone(),
-        theta_upper: init_params.theta_upper.clone(),
-        theta_fixed: init_params.theta_fixed.clone(),
-        omega: final_omega,
-        omega_fixed: init_params.omega_fixed.clone(),
-        sigma: SigmaVector {
-            values: state.sigma_vals.clone(),
-            names: init_params.sigma.names.clone(),
-        },
-        sigma_fixed: init_params.sigma_fixed.clone(),
-        omega_iov: if n_kappa > 0 {
-            // Use from_matrix_with_mask so structural free_mask is preserved
-            // when this OuterResult is handed to a chained estimator (e.g.
-            // [saem, foce]); from_matrix would infer the mask from nonzeros
-            // and could mark a legitimately-zero off-diagonal as structurally
-            // fixed, corrupting the next estimator's parameterisation.
-            init_params.omega_iov.as_ref().map(|iov_ref| {
-                OmegaMatrix::from_matrix_with_mask(
-                    state.omega_iov_mat.clone(),
-                    iov_ref.eta_names.clone(),
-                    iov_ref.diagonal,
-                    iov_ref.free_mask.clone(),
-                )
-            })
-        } else {
-            init_params.omega_iov.clone()
-        },
-        kappa_fixed: init_params.kappa_fixed.clone(),
-    };
+    let final_params = saem_state_to_params(&state, init_params, n_kappa);
 
     if combined_additive_sigma_at_floor(model, &final_params) {
         warnings

@@ -340,6 +340,12 @@ pub fn run_foce_gn(
             );
         }
 
+        // Checkpoint (#755): persist the accepted point periodically. `x` is
+        // already the packed vector, so this is alloc-free until a write is due.
+        if crate::io::checkpoint::is_due() {
+            crate::io::checkpoint::maybe_write(iter, ofv, &x);
+        }
+
         if verbose {
             eprintln!(
                 "  GN iter {:>3}: OFV = {:.6}  (delta={:.2e}, radius={:.4})",

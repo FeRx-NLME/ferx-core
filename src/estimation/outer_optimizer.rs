@@ -1162,6 +1162,15 @@ fn optimize_nlopt(
                 grad_vec_for_trace.as_deref(),
             );
         }
+
+        // Checkpoint (#755): pack the current estimates only when a write is due.
+        // The objective runs once per eval, so gate on `is_due` to avoid a
+        // per-eval allocation on the (default) no-checkpoint-due path.
+        if crate::io::checkpoint::is_due() {
+            let packed = crate::estimation::parameterization::pack_params(&params);
+            crate::io::checkpoint::maybe_write(state.n_evals, ofv, &packed);
+        }
+
         state.prev_x = xs.to_vec();
 
         ofv
@@ -1741,6 +1750,13 @@ fn optimize_bfgs(
                 &values,
                 Some(&g_for_trace),
             );
+        }
+
+        // Checkpoint (#755): recompute the unscaled packed point when a write is
+        // due (the trace's `x_real` is scoped to the trace block above).
+        if crate::io::checkpoint::is_due() {
+            let x_real: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
+            crate::io::checkpoint::maybe_write(iter, f_val, &x_real);
         }
 
         let rel_change = (f_val - prev_ofv).abs() / (f_val.abs() + 1.0);

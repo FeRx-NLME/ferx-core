@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod datareader;
 pub mod filter_expr;
 pub mod fitrx;

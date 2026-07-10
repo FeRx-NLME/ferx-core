@@ -5341,6 +5341,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 Some(value.to_string())
             };
         }
+        "checkpoint" => opts.checkpoint = parse_bool("checkpoint")?,
+        "checkpoint_interval_secs" => {
+            opts.checkpoint_interval_secs = parse_usize("checkpoint_interval_secs")? as u64
+        }
         _ => return Ok(false),
     }
     opts.user_set_keys.push(key.to_string());
@@ -17496,6 +17500,28 @@ mod tests {
             assert!(
                 opts.unsupported_keys_warnings().is_empty(),
                 "method={method} spuriously warned on ODE-solver keys: {:?}",
+                opts.unsupported_keys_warnings()
+            );
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_keys_parse_and_do_not_warn() {
+        // checkpoint / checkpoint_interval_secs drive the resume-point writer,
+        // which is method-independent (#755) — framework-level, so they must
+        // parse and never be flagged "not used by method".
+        for method in ["focei", "foce", "saem", "imp", "gn"] {
+            let opts = parse_fit_options(&[
+                format!("method = {method}"),
+                "checkpoint = false".to_string(),
+                "checkpoint_interval_secs = 60".to_string(),
+            ])
+            .unwrap();
+            assert!(!opts.checkpoint, "method={method}: checkpoint should parse");
+            assert_eq!(opts.checkpoint_interval_secs, 60);
+            assert!(
+                opts.unsupported_keys_warnings().is_empty(),
+                "method={method} spuriously warned on checkpoint keys: {:?}",
                 opts.unsupported_keys_warnings()
             );
         }
