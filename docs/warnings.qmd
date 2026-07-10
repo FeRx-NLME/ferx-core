@@ -62,9 +62,10 @@ Each `WarningCode` token, what it flags, and a typical response.
 
 ## Details payloads {#details}
 
-Numeric diagnostics also carry a `details` object with the value behind the
+Numeric diagnostics **may** carry a `details` object with the value behind the
 message, so a consumer reads the number directly instead of parsing prose. The
 numbers are sourced from the fit's typed fields, not from the message text.
+Treat `details` as optional: check for its presence rather than assuming it.
 
 | Code | `details` keys |
 |------|----------------|
@@ -82,8 +83,9 @@ numbers are sourced from the fit's typed fields, not from the message text.
 }
 ```
 
-Codes without an associated stored statistic omit the `details` key entirely
-(the Rust field is `None`).
+A code omits the `details` key entirely (Rust field `None`) when it has no
+associated stored statistic, or when any contributing statistic is non-finite
+(`NaN`/`±Inf` — e.g. the condition number of a near-singular parameter space).
 
 ## How codes are assigned
 

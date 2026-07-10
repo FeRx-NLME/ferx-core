@@ -3177,8 +3177,11 @@ fn rebuild_warnings_structured(result: &mut FitResult) {
 
 /// Machine-readable `details` payload for the numeric diagnostic warning codes,
 /// sourced from the typed `FitResult` fields rather than parsed from the
-/// message text. Returns `None` for codes with no associated stored statistic
-/// (their `details` key is then omitted from the JSON).
+/// message text. Returns `None` for a code with no associated stored statistic,
+/// or when **any** contributing statistic is non-finite (`NaN`/`±Inf`) — the
+/// `details` key is then omitted from the JSON entirely, rather than emitting a
+/// `null` value (`serde_json` maps non-finite floats to `null`). `cov_condition_number`
+/// in particular is documented as `+Inf` for a near-singular parameter space.
 fn diagnostic_details(
     code: &crate::types::WarningCode,
     dw_statistic: f64,
@@ -3188,17 +3191,20 @@ fn diagnostic_details(
 ) -> Option<serde_json::Value> {
     use crate::types::WarningCode;
     match code {
-        WarningCode::DwAutocorrelation if dw_statistic.is_finite() => Some(serde_json::json!({
-            "durbin_watson": dw_statistic,
-            "iwres_lag1_autocorr": iwres_lag1_r,
-        })),
+        WarningCode::DwAutocorrelation if dw_statistic.is_finite() && iwres_lag1_r.is_finite() => {
+            Some(serde_json::json!({
+                "durbin_watson": dw_statistic,
+                "iwres_lag1_autocorr": iwres_lag1_r,
+            }))
+        }
         WarningCode::EpsShrinkage if shrinkage_eps.is_finite() => Some(serde_json::json!({
             "eps_shrinkage": shrinkage_eps,
             "eps_shrinkage_pct": 100.0 * shrinkage_eps,
         })),
-        WarningCode::ConditionNumber => {
-            cov_condition_number.map(|c| serde_json::json!({ "condition_number": c }))
-        }
+        WarningCode::ConditionNumber => match cov_condition_number {
+            Some(c) if c.is_finite() => Some(serde_json::json!({ "condition_number": c })),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -11879,6 +11885,27 @@ mod simulate_with_uncertainty_tests {
             super::diagnostic_details(&WarningCode::Convergence, 1.0, 0.0, 0.0, Some(1.0))
                 .is_none()
         );
+
+        // Non-finite *contributing* stats omit details rather than emit a
+        // null-valued payload (serde_json maps non-finite floats to null).
+        // cov_condition_number = +Inf (documented for near-singular spaces):
+        assert!(super::diagnostic_details(
+            &WarningCode::ConditionNumber,
+            f64::NAN,
+            0.0,
+            f64::NAN,
+            Some(f64::INFINITY)
+        )
+        .is_none());
+        // finite Durbin-Watson but non-finite lag-1 autocorrelation:
+        assert!(super::diagnostic_details(
+            &WarningCode::DwAutocorrelation,
+            1.20,
+            f64::NAN,
+            f64::NAN,
+            None
+        )
+        .is_none());
     }
 
     #[test]
