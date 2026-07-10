@@ -477,6 +477,11 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                     cmt,
                 })
                 .collect(),
+            // `obs_records` is unconditional since Phase 4.0, but the only records
+            // this synthetic TTE subject carries are `Event`s (survival-gated); with
+            // the feature off there is no TTE endpoint, so the vec is empty.
+            #[cfg(not(feature = "survival"))]
+            obs_records: Vec::new(),
         })
         .collect();
     let template = Population {
@@ -619,7 +624,13 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     result.model_text = std::fs::read_to_string(model_path).ok();
     // Surface any per-subject simulation diagnostics (#762/#763) alongside the fit
     // warnings so the CLI reports a degenerate simulated subject rather than dropping it.
-    result.warnings.extend(sim_warnings);
+    // `fit()` already built `warnings_structured` from the fit warnings; rebuild it so the
+    // appended sim warnings also reach the typed / JSON surface (#778/#779), where
+    // `classify_warning` tags them `WarningCode::Simulation`.
+    if !sim_warnings.is_empty() {
+        result.warnings.extend(sim_warnings);
+        rebuild_warnings_structured(&mut result);
+    }
     Ok((result, population))
 }
 
@@ -1434,10 +1445,13 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
 
 /// Features the analytic transit models (`one_cpt_transit`, `two_cpt_transit`) do
 /// not support in their first version (#386): the exponential-tilting closed form
-/// is a constant-parameter bolus superposition, so steady-state doses, IOV,
-/// within-subject time-varying covariates, and infusion doses are rejected up
+/// is a constant-parameter depot-bolus superposition, so steady-state doses, IOV,
+/// infusion doses, system resets, and non-depot (`CMT≠1`) doses are rejected up
 /// front — otherwise they would silently mis-predict or hit an `unreachable!` in
-/// the superposition dispatch. `fit()` surfaces this as an `Err`;
+/// the superposition dispatch. (Time-varying covariates and a `TIME`-dependent
+/// parameter are instead transparently rerouted to the plain form's ODE `transit()`
+/// twin via [`CompiledModel::effective_for`]; only a form outside that twin's scope
+/// rejects them.) `fit()` surfaces this as an `Err`;
 /// `predict()`/`simulate()` panic via [`assert_transit_support`], mirroring
 /// [`assert_modeled_doses_supported`]. Returns the first offending feature's
 /// message, or `None` when compatible.
@@ -1499,6 +1513,26 @@ pub(crate) fn check_transit_support(
             ));
         }
         for dose in &subject.doses {
+            if dose.cmt != 1 {
+                // The closed form folds *every* dose through the absorption chain into
+                // central ignoring `dose.cmt` (the `sens/provider.rs` superposition loop),
+                // while the ODE twin honours the compartment — a `CMT≠1` dose there falls to
+                // the direct-bolus branch and lands in a disposition compartment. So the two
+                // paths would silently disagree on a non-depot dose, and `effective_for`
+                // routes only TV-cov/`TIME` subjects to the twin, so a mixed population would
+                // even disagree with itself. A transit closed form only supports dosing the
+                // depot (`CMT=1`); reject anything else up front.
+                return Some(format!(
+                    "{name} does not support dosing into a non-depot compartment (subject \
+                     {}, CMT={}): the transit closed form routes every dose through the \
+                     absorption chain into central regardless of compartment, so a CMT≠1 dose \
+                     would be silently mistreated — and its ODE twin would instead bolus it \
+                     into a disposition compartment, so the two paths would disagree. Dose the \
+                     depot (CMT=1), or use an ODE transit model for direct central/peripheral \
+                     dosing.",
+                    subject.id, dose.cmt
+                ));
+            }
             if dose.ss {
                 return Some(format!(
                     "{name} does not support steady-state (SS) doses yet (subject \
@@ -1594,7 +1628,11 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                     event_type,
                     entry_time,
                     ..
-                } = r;
+                } = r
+                else {
+                    // Non-TTE records are handled by their own endpoint; skip them.
+                    continue;
+                };
                 if *c != cmt {
                     continue;
                 }
@@ -1832,6 +1870,73 @@ pub(crate) fn check_analytic_readout_support(
 /// [`assert_modeled_doses_supported`]). `fit()` returns these as an `Err`.
 pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Population) {
     if let Some(msg) = check_transit_support(model, population) {
+        panic!(
+            "predict()/simulate() received a model/data combination the transit closed form \
+             cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
+        );
+    }
+}
+
+/// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
+/// fall **outside the closed form's convergence domain** — the flip-flop regime
+/// (`ke ≥ KTR` 1-cpt / `α ≥ KTR` 2-cpt), or the 2-cpt confluent-eigenvalue edge
+/// (`|α − β| < 1e-12`) — where it returns an identically-zero profile that silently
+/// degenerates the objective (a proportional error model collapses `(σ·pred)²` to 0).
+/// Unlike a twin-carrying model — which [`crate::pk::effective_model_for_eval`]
+/// auto-reroutes to its exact ODE `transit()` twin — a twin-less form (one carrying a
+/// `lagtime`, bioavailability `f`, or a user `[odes]` / `[scaling]` /
+/// `[initial_conditions]` block, which the desugar declines) has nothing to reroute
+/// to. The boundary is parameter-dependent, so this can't be caught by
+/// [`check_transit_support`]'s structural checks — it is evaluated at the typical
+/// (η = 0) parameters via [`crate::pk::transit_flip_flop_at`], matching the
+/// informational `W_TRANSIT_FLIP_FLOP` warning that fires for the twin-carrying case.
+/// Returns the first offending subject's message, or `None` when no reject applies
+/// (non-transit, twin present, or in-domain). `fit()` / `ferx check` surface this as
+/// an error; `predict()`/`simulate()` panic via [`assert_transit_flip_flop_no_twin`],
+/// mirroring [`check_transit_support`] / [`assert_transit_support`].
+pub(crate) fn check_transit_flip_flop_no_twin(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Option<String> {
+    // A twin-carrying model is auto-rerouted (correct) — only warned, not rejected.
+    if !matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit
+    ) || model.transit_ode_equivalent.is_some()
+    {
+        return None;
+    }
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    for subject in &population.subjects {
+        if crate::pk::transit_flip_flop_at(model, subject, theta, &zero_eta) {
+            return Some(format!(
+                "{} starts outside the analytic transit closed form's convergence domain at \
+                 typical values (subject {}) — the flip-flop regime (disposition rate ≥ transit \
+                 rate KTR = (n+1)/mtt), or (2-cpt) coincident disposition eigenvalues — so it \
+                 returns an identically-zero concentration profile, which silently degenerates \
+                 the objective (a proportional error model collapses `(σ·pred)²` to 0). This \
+                 model has no ODE twin to fall back on (a `lagtime`, bioavailability `f`, or a \
+                 user `[odes]` / `[scaling]` / `[initial_conditions]` block declines the \
+                 desugar) — rewrite it as an explicit ODE `transit()` model, or check the MTT / \
+                 CL starting estimates.",
+                model.pk_model.canonical_name(),
+                subject.id
+            ));
+        }
+    }
+    None
+}
+
+/// Panic on a twin-less flip-flop transit model for the `Vec`-returning
+/// `predict()`/`simulate()` paths (mirrors [`assert_transit_support`]). `fit()`
+/// returns this as an `Err`.
+pub(crate) fn assert_transit_flip_flop_no_twin(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) {
+    if let Some(msg) = check_transit_flip_flop_no_twin(model, population, theta) {
         panic!(
             "predict()/simulate() received a model/data combination the transit closed form \
              cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
@@ -2414,15 +2519,35 @@ pub fn check_model_data_warnings(
     // hits this readily (a slow-absorption depot drug with large MTT easily has
     // `α ≥ KTR`). Evaluated on typical values (η = 0) per subject so a covariate on
     // MTT/CL that pushes the typical profile into the flip-flop regime is caught.
-    // Reported once, naming the first affected subject.
+    // Reported once, naming the first affected subject. Only a **twin-carrying**
+    // model is warned here — it is auto-rerouted per evaluation
+    // (`pk::effective_model_for_eval`), so the closed form's zero never reaches the
+    // objective and this is an informational heads-up. A **twin-less** flip-flop
+    // model (lagtime / `f` / user `[odes]`) has nothing to reroute to and is a hard
+    // error instead (`check_transit_flip_flop_no_twin`), rejected at
+    // fit / predict / simulate / `ferx check`.
     if matches!(
         model.pk_model,
         PkModel::OneCptTransit | PkModel::TwoCptTransit
-    ) {
+    ) && model.transit_ode_equivalent.is_some()
+    {
         for subject in &population.subjects {
             let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &subject.covariates, 0.0);
             let (cl, v1, n, mtt) = (pk.cl(), pk.v(), pk.n_transit(), pk.mtt());
-            if !(mtt > 0.0 && n >= 0.0 && v1 > 0.0 && cl > 0.0) {
+            // Mirror the validity guard `pk::transit_flip_flop_at` applies (the
+            // `q`/`v2` checks for 2-cpt), so this heads-up never fires on a parameter
+            // region the reroute treats as invalid rather than flip-flop. (The flip-flop
+            // *trigger* below stays the plain `α ≥ KTR` test; the twin-carrying
+            // confluent-eigenvalue corner is auto-rerouted and correctly not warned.)
+            let params_valid = mtt > 0.0
+                && n >= 0.0
+                && v1 > 0.0
+                && cl > 0.0
+                && match model.pk_model {
+                    PkModel::TwoCptTransit => pk.q() >= 0.0 && pk.v2() > 0.0,
+                    _ => true,
+                };
+            if !params_valid {
                 continue; // invalid params are a separate (fatal) domain check
             }
             let ktr = (n + 1.0) / mtt;
@@ -2433,21 +2558,23 @@ pub fn check_model_data_warnings(
                 _ => cl / v1,
             };
             if disp_rate >= ktr {
-                diags.push(Diagnostic::warning(
-                    "W_TRANSIT_FLIP_FLOP",
-                    format!(
-                        "{} disposition rate ({:.4}) ≥ transit rate KTR = (n+1)/mtt ({:.4}) at \
-                         typical values (subject {}): the analytic transit closed form is outside \
-                         its convergence domain and returns an identically-zero concentration \
-                         profile, which silently degenerates the objective (a proportional error \
-                         model collapses `(σ·pred)²` to 0). This is the flip-flop regime — check \
-                         the MTT / CL starting estimates, or use an ODE transit model.",
-                        model.pk_model.canonical_name(),
-                        disp_rate,
-                        ktr,
-                        subject.id
-                    ),
-                ));
+                // Auto-handled: the flip-flop reroute (`pk::effective_model_for_eval`)
+                // evaluates the ODE `transit()` twin for these parameters, so the profile
+                // is correct — an informational heads-up, not an error. (A twin-less flip-flop
+                // model is rejected up front by `check_transit_flip_flop_no_twin`.)
+                let msg = format!(
+                    "{} disposition rate ({:.4}) ≥ transit rate KTR = (n+1)/mtt ({:.4}) at \
+                     typical values (subject {}): the flip-flop regime, outside the analytic \
+                     transit closed form's convergence domain. ferx automatically evaluates \
+                     the equivalent ODE transit model for such parameters (correct, but slower \
+                     than the closed form) — check the MTT / CL starting estimates if the \
+                     flip-flop is unexpected.",
+                    model.pk_model.canonical_name(),
+                    disp_rate,
+                    ktr,
+                    subject.id
+                );
+                diags.push(Diagnostic::warning("W_TRANSIT_FLIP_FLOP", msg));
                 break;
             }
         }
@@ -2631,6 +2758,19 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     &population,
                     &init_params,
                 ));
+                // Surface the structural transit rejects (IOV / SS / CMT≠1 / infusion /
+                // reset) so a clean `ferx check` and a `fit()` agree on transit models —
+                // previously only `fit()` reported these (#776 review).
+                if let Some(e) = check_transit_support(&parsed.model, &population) {
+                    diags.push(Diagnostic::error("E_TRANSIT_UNSUPPORTED", e));
+                }
+                // Twin-less flip-flop transit is a hard error, not a warning (#776):
+                // surface it the same way `fit()` does, so `ferx check` catches it up front.
+                if let Some(e) =
+                    check_transit_flip_flop_no_twin(&parsed.model, &population, &init_params.theta)
+                {
+                    diags.push(Diagnostic::error("E_TRANSIT_FLIP_FLOP", e));
+                }
             }
             Err(e) => {
                 diags.push(covariate_read_diagnostic(&e, path));
@@ -2771,6 +2911,13 @@ pub fn fit(
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
     if let Some(e) = check_transit_support(model, population) {
+        return Err(e);
+    }
+    // Reject a twin-less transit closed form that starts in the flip-flop regime (#776):
+    // it returns an identically-zero profile that silently degenerates the objective and,
+    // unlike a twin-carrying model, has no ODE twin to reroute to. Parameter-dependent, so
+    // evaluated at η = 0 typical values here rather than in `check_transit_support`.
+    if let Some(e) = check_transit_flip_flop_no_twin(model, population, &init_params.theta) {
         return Err(e);
     }
     // Reject a depot-referencing analytic Form C readout on reset subjects (#650):
@@ -3119,12 +3266,145 @@ pub fn fit(
 ///
 /// Called after all late-injected warnings (LTBS splice, multi-start metadata)
 /// have been appended so the structured field is always in sync with the flat list.
+///
+/// Each message is classified into a typed [`crate::types::WarningCode`] +
+/// severity and — for the numeric diagnostics whose values are already stored
+/// as typed fields on the `FitResult` — enriched with a machine-readable
+/// `details` payload sourced from those fields (issue #781, increment 1). The
+/// numbers thus come from typed state, not from re-parsing the message prose;
+/// converting the remaining ~80 string push-sites to full at-source emission is
+/// a later increment.
 fn rebuild_warnings_structured(result: &mut FitResult) {
-    result.warnings_structured = result
+    let mut entries: Vec<crate::types::WarningEntry> = result
         .warnings
         .iter()
         .map(|w| crate::types::classify_warning(w))
         .collect();
+    let stats = DiagStats {
+        dw_statistic: result.dw_statistic,
+        iwres_lag1_r: result.iwres_lag1_r,
+        shrinkage_eps: result.shrinkage_eps,
+        cov_condition_number: result.cov_condition_number,
+        cov_eigenvalues: result.cov_eigenvalues.as_deref(),
+        shrinkage_eta: &result.shrinkage_eta,
+        eta_names: &result.eta_names,
+    };
+    for e in &mut entries {
+        e.details = diagnostic_details(&e.category, &stats);
+    }
+    result.warnings_structured = entries;
+}
+
+/// Typed inputs for [`diagnostic_details`], sourced from `FitResult`'s fields.
+/// `Default` gives finite-zero scalars, `None` options, and empty slices, so a
+/// test can set only the fields a case needs via struct-update syntax.
+#[derive(Default)]
+struct DiagStats<'a> {
+    dw_statistic: f64,
+    iwres_lag1_r: f64,
+    shrinkage_eps: f64,
+    cov_condition_number: Option<f64>,
+    cov_eigenvalues: Option<&'a [f64]>,
+    shrinkage_eta: &'a [f64],
+    eta_names: &'a [String],
+}
+
+/// Machine-readable `details` payload for the numeric diagnostic warning codes,
+/// sourced from the typed `FitResult` fields rather than parsed from the message
+/// text. A non-finite (`NaN`/`±Inf`) statistic is never emitted as a JSON `null`
+/// (`serde_json` maps non-finite floats to `null`) — instead:
+///
+/// - the single/paired-stat codes (`DwAutocorrelation`, `EpsShrinkage`,
+///   `ConditionNumber`) return `None` (whole `details` key omitted) when a
+///   required statistic is missing or non-finite;
+/// - the covariance codes (`CovarianceFailed`, `CovarianceRegularized`) build a
+///   partial object, **skipping** individual non-finite/absent fields and
+///   emitting whatever is available; they return `None` only when nothing is.
+///
+/// `cov_condition_number` in particular is documented as `+Inf` for a
+/// near-singular parameter space, so it is dropped from the payload there.
+fn diagnostic_details(
+    code: &crate::types::WarningCode,
+    s: &DiagStats,
+) -> Option<serde_json::Value> {
+    use crate::types::WarningCode;
+    match code {
+        WarningCode::DwAutocorrelation
+            if s.dw_statistic.is_finite() && s.iwres_lag1_r.is_finite() =>
+        {
+            Some(serde_json::json!({
+                "durbin_watson": s.dw_statistic,
+                "iwres_lag1_autocorr": s.iwres_lag1_r,
+            }))
+        }
+        WarningCode::EpsShrinkage if s.shrinkage_eps.is_finite() => Some(serde_json::json!({
+            "eps_shrinkage": s.shrinkage_eps,
+            "eps_shrinkage_pct": 100.0 * s.shrinkage_eps,
+        })),
+        WarningCode::EtaShrinkage => {
+            // The high-shrinkage ETAs behind the message, with each shrinkage
+            // as a percent — sourced from the typed `shrinkage_eta` field.
+            let high: Vec<serde_json::Value> = high_shrinkage_eta_indices(s.shrinkage_eta)
+                .into_iter()
+                .map(|i| {
+                    serde_json::json!({
+                        "eta": eta_label(s.eta_names, i),
+                        "shrinkage_pct": 100.0 * s.shrinkage_eta[i],
+                    })
+                })
+                .collect();
+            if high.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!({
+                    "threshold_pct": 100.0 * ETA_SHRINKAGE_WARN_THRESHOLD,
+                    "high_shrinkage_etas": high,
+                }))
+            }
+        }
+        WarningCode::ConditionNumber => match s.cov_condition_number {
+            Some(c) if c.is_finite() => Some(serde_json::json!({ "condition_number": c })),
+            _ => None,
+        },
+        WarningCode::CovarianceFailed | WarningCode::CovarianceRegularized => {
+            covariance_details(s.cov_condition_number, s.cov_eigenvalues)
+        }
+        _ => None,
+    }
+}
+
+/// `details` for the covariance-step warning codes: the condition number and,
+/// when the covariance matrix was produced (so eigenvalues exist — typically
+/// the regularized case, not a hard failure), the smallest eigenvalue and the
+/// count of negative ones (which diagnose a non-PD Hessian). Non-finite values
+/// are skipped; returns `None` if nothing usable is available.
+fn covariance_details(
+    cov_condition_number: Option<f64>,
+    cov_eigenvalues: Option<&[f64]>,
+) -> Option<serde_json::Value> {
+    let mut obj = serde_json::Map::new();
+    if let Some(c) = cov_condition_number {
+        if c.is_finite() {
+            obj.insert("condition_number".to_string(), serde_json::json!(c));
+        }
+    }
+    if let Some(eigs) = cov_eigenvalues {
+        let finite: Vec<f64> = eigs.iter().copied().filter(|v| v.is_finite()).collect();
+        if !finite.is_empty() {
+            let min = finite.iter().copied().fold(f64::INFINITY, f64::min);
+            let n_neg = finite.iter().filter(|&&v| v < 0.0).count();
+            obj.insert("min_eigenvalue".to_string(), serde_json::json!(min));
+            obj.insert(
+                "n_negative_eigenvalues".to_string(),
+                serde_json::json!(n_neg),
+            );
+        }
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(obj))
+    }
 }
 
 /// Probe whether NLopt CRS2-LM (used for global_search) is available.
@@ -4984,6 +5264,9 @@ fn fit_inner(
     if let Some(w) = eps_shrinkage_warning(shrinkage_eps) {
         warnings.push(w);
     }
+    if let Some(w) = eta_shrinkage_warning(&shrinkage_eta, &result.params.omega.eta_names) {
+        warnings.push(w);
+    }
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
@@ -5853,6 +6136,57 @@ pub(crate) fn eps_shrinkage_warning(shrinkage_eps: f64) -> Option<String> {
     ))
 }
 
+/// ETA-shrinkage warning threshold (fraction). 0.30 is the classic
+/// Savic & Karlsson (2009) 30% rule of thumb: above it, an EBE-based
+/// diagnostic — and the individual estimates of that random effect — are
+/// poorly informed by the data (η shrinks toward 0).
+const ETA_SHRINKAGE_WARN_THRESHOLD: f64 = 0.30;
+
+/// Indices of the ETAs whose shrinkage meets/exceeds the warning threshold.
+/// `shrinkage` is per-ETA shrinkage as a fraction (0..1); non-finite entries
+/// are ignored.
+pub(crate) fn high_shrinkage_eta_indices(shrinkage: &[f64]) -> Vec<usize> {
+    shrinkage
+        .iter()
+        .enumerate()
+        .filter(|(_, &s)| s.is_finite() && s >= ETA_SHRINKAGE_WARN_THRESHOLD)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Label for the `i`-th ETA, falling back to a non-empty `eta_{i}` placeholder
+/// when the name is missing — so both the message and the `details` payload
+/// stay unambiguous.
+fn eta_label(eta_names: &[String], i: usize) -> String {
+    eta_names
+        .get(i)
+        .cloned()
+        .unwrap_or_else(|| format!("eta_{i}"))
+}
+
+/// Build the user-facing warning for high ETA shrinkage, or `None` when no ETA
+/// exceeds the threshold. `shrinkage` is per-ETA shrinkage as a fraction;
+/// `eta_names` labels them in the same order.
+pub(crate) fn eta_shrinkage_warning(shrinkage: &[f64], eta_names: &[String]) -> Option<String> {
+    let high = high_shrinkage_eta_indices(shrinkage);
+    if high.is_empty() {
+        return None;
+    }
+    let list = high
+        .iter()
+        .map(|&i| format!("{} ({:.0}%)", eta_label(eta_names, i), 100.0 * shrinkage[i]))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "High ETA shrinkage (\u{2265} {:.0}%): {}. EBE-based diagnostics for these \
+         random effects are unreliable and the data poorly inform their individual \
+         estimates; consider removing the IIV on the affected parameter(s) or \
+         collecting more informative data.",
+        100.0 * ETA_SHRINKAGE_WARN_THRESHOLD,
+        list
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6075,7 +6409,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -6862,7 +7195,10 @@ fn validate_tte_simulatable(
             for r in &subject.obs_records {
                 let ObsRecord::Event {
                     cmt, entry_time, ..
-                } = r;
+                } = r
+                else {
+                    continue;
+                };
                 if is_rtte(cmt) {
                     rtte_cmts.insert(*cmt);
                     if *entry_time > 0.0 {
@@ -7041,7 +7377,9 @@ pub fn simulate_with_options_diag(
         #[cfg(feature = "survival")]
         for subject in &population.subjects {
             for record in &subject.obs_records {
-                let crate::types::ObsRecord::Event { entry_time, .. } = record;
+                let crate::types::ObsRecord::Event { entry_time, .. } = record else {
+                    continue;
+                };
                 if *entry_time > h {
                     return Err(format!(
                         "SimulateOptions.horizon ({h}) is below subject '{}' entry_time \
@@ -7073,6 +7411,7 @@ pub fn simulate_with_options_diag(
     // with a confusable "EBE did not converge" instead of the real cause.
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
+    assert_transit_flip_flop_no_twin(model, population, &params.theta);
     // A time-varying covariate on a survival hazard would be silently frozen — panic
     // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
     #[cfg(feature = "survival")]
@@ -7458,6 +7797,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // data-check otherwise. #324.
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
+    assert_transit_flip_flop_no_twin(model, population, &params.theta);
     // A time-varying covariate on a survival hazard would be silently frozen — panic
     // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
     #[cfg(feature = "survival")]
@@ -8685,6 +9025,7 @@ pub fn predict(
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
+    assert_transit_flip_flop_no_twin(model, population, &params.theta);
     // A time-varying covariate on a survival hazard would be silently frozen — panic
     // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
     #[cfg(feature = "survival")]
@@ -9076,7 +9417,6 @@ mod iov_integration {
                 occasions: occasions.clone(),
                 dose_occasions: dose_occ.clone(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
             .collect();
@@ -9954,7 +10294,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -10043,7 +10382,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -10130,7 +10468,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -10225,7 +10562,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -10321,7 +10657,6 @@ mod iov_integration {
             occasions: vec![1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -10669,7 +11004,6 @@ mod iov_integration {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pop = Population {
@@ -11771,7 +12105,6 @@ mod simulate_with_uncertainty_tests {
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
             .collect();
@@ -11996,6 +12329,191 @@ mod simulate_with_uncertainty_tests {
     }
 
     #[test]
+    fn diagnostic_details_covers_numeric_codes() {
+        use crate::types::WarningCode;
+        // Shim for the scalar codes (no ETA/eigenvalue inputs).
+        fn dd(
+            code: &crate::types::WarningCode,
+            dw: f64,
+            lag1: f64,
+            eps: f64,
+            cond: Option<f64>,
+        ) -> Option<serde_json::Value> {
+            super::diagnostic_details(
+                code,
+                &super::DiagStats {
+                    dw_statistic: dw,
+                    iwres_lag1_r: lag1,
+                    shrinkage_eps: eps,
+                    cov_condition_number: cond,
+                    ..Default::default()
+                },
+            )
+        }
+        // Durbin–Watson: both stored stats surface.
+        let d = dd(&WarningCode::DwAutocorrelation, 1.2, 0.4, f64::NAN, None).expect("DW details");
+        assert_eq!(d["durbin_watson"], 1.2);
+        assert_eq!(d["iwres_lag1_autocorr"], 0.4);
+        // EPS shrinkage: fraction + percent.
+        let d = dd(&WarningCode::EpsShrinkage, f64::NAN, 0.0, -0.083, None).expect("eps details");
+        assert_eq!(d["eps_shrinkage"], -0.083);
+        assert!((d["eps_shrinkage_pct"].as_f64().unwrap() + 8.3).abs() < 1e-9);
+        // Condition number: from the Option.
+        let d = dd(
+            &WarningCode::ConditionNumber,
+            f64::NAN,
+            0.0,
+            f64::NAN,
+            Some(1.4e6),
+        )
+        .expect("cond details");
+        assert_eq!(d["condition_number"], 1.4e6);
+        // None cases: missing stat, non-finite stat, and non-numeric code.
+        assert!(dd(&WarningCode::ConditionNumber, 0.0, 0.0, 0.0, None).is_none());
+        assert!(dd(
+            &WarningCode::DwAutocorrelation,
+            f64::INFINITY,
+            0.0,
+            0.0,
+            None
+        )
+        .is_none());
+        assert!(dd(&WarningCode::Convergence, 1.0, 0.0, 0.0, Some(1.0)).is_none());
+
+        // Non-finite *contributing* stats omit details rather than emit a
+        // null-valued payload (serde_json maps non-finite floats to null).
+        // cov_condition_number = +Inf (documented for near-singular spaces):
+        assert!(dd(
+            &WarningCode::ConditionNumber,
+            f64::NAN,
+            0.0,
+            f64::NAN,
+            Some(f64::INFINITY)
+        )
+        .is_none());
+        // finite Durbin-Watson but non-finite lag-1 autocorrelation:
+        assert!(dd(
+            &WarningCode::DwAutocorrelation,
+            1.20,
+            f64::NAN,
+            f64::NAN,
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn eta_shrinkage_warning_fires_above_threshold_only() {
+        let names = vec![
+            "eta_CL".to_string(),
+            "eta_V".to_string(),
+            "eta_KA".to_string(),
+        ];
+        // All low → no warning.
+        assert!(super::eta_shrinkage_warning(&[0.01, 0.05, 0.10], &names).is_none());
+        // NaN is ignored (not treated as high).
+        assert!(super::eta_shrinkage_warning(&[0.01, f64::NAN, 0.20], &names).is_none());
+        // One above the 30% threshold → warning names it with its percent.
+        let w = super::eta_shrinkage_warning(&[0.02, 0.42, 0.10], &names).expect("warning");
+        assert!(w.contains("eta_V (42%)"), "got: {w}");
+        assert!(w.to_lowercase().contains("eta shrinkage"));
+        // Boundary: exactly at threshold counts.
+        assert!(super::eta_shrinkage_warning(&[0.30], &["eta_CL".into()]).is_some());
+    }
+
+    #[test]
+    fn eta_shrinkage_details_lists_high_etas() {
+        use crate::types::WarningCode;
+        let ed = |shrink: &[f64], names: &[String]| {
+            super::diagnostic_details(
+                &WarningCode::EtaShrinkage,
+                &super::DiagStats {
+                    shrinkage_eta: shrink,
+                    eta_names: names,
+                    ..Default::default()
+                },
+            )
+        };
+        let names = vec!["eta_CL".to_string(), "eta_V".to_string()];
+        let d = ed(&[0.05, 0.42], &names).expect("eta details");
+        assert_eq!(d["threshold_pct"], 30.0);
+        let high = d["high_shrinkage_etas"].as_array().unwrap();
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0]["eta"], "eta_V");
+        assert!((high[0]["shrinkage_pct"].as_f64().unwrap() - 42.0).abs() < 1e-9);
+        // No high eta → no details payload.
+        assert!(ed(&[0.05, 0.10], &names).is_none());
+        // Missing name → non-empty `eta_{i}` placeholder, not "".
+        let d = ed(&[0.42], &[]).expect("details");
+        assert_eq!(d["high_shrinkage_etas"][0]["eta"], "eta_0");
+    }
+
+    #[test]
+    fn covariance_details_reports_eigenvalues_and_condition() {
+        use crate::types::WarningCode;
+        let cd = |cond: Option<f64>, eigs: Option<&[f64]>| {
+            super::diagnostic_details(
+                &WarningCode::CovarianceRegularized,
+                &super::DiagStats {
+                    cov_condition_number: cond,
+                    cov_eigenvalues: eigs,
+                    ..Default::default()
+                },
+            )
+        };
+        // Regularized (or failed) with eigenvalues present: min + negative count.
+        let d = cd(Some(1.4e6), Some(&[0.5, -1.0e-3, 2.1])).expect("cov details");
+        assert_eq!(d["condition_number"], 1.4e6);
+        assert!((d["min_eigenvalue"].as_f64().unwrap() + 1.0e-3).abs() < 1e-12);
+        assert_eq!(d["n_negative_eigenvalues"], 1);
+        // CovarianceFailed shares the same payload builder.
+        assert!(super::diagnostic_details(
+            &WarningCode::CovarianceFailed,
+            &super::DiagStats {
+                cov_condition_number: Some(9.9),
+                ..Default::default()
+            },
+        )
+        .is_some());
+        // Nothing available (hard failure: no matrix → no eigenvalues, no cond)
+        // → details omitted.
+        assert!(cd(None, None).is_none());
+        // Non-finite condition number is skipped.
+        assert!(cd(Some(f64::INFINITY), None).is_none());
+    }
+
+    #[test]
+    fn rebuild_attaches_details_from_typed_fields() {
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        fit.warnings = vec![
+            "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).".to_string(),
+            "Outer optimization did not converge".to_string(),
+            "High ETA shrinkage (\u{2265} 30%): eta_V (42%). EBE-based diagnostics \
+             for these random effects are unreliable."
+                .to_string(),
+        ];
+        fit.dw_statistic = 1.20;
+        fit.iwres_lag1_r = 0.4;
+        fit.shrinkage_eta = vec![0.05, 0.42];
+        fit.eta_names = vec!["eta_CL".to_string(), "eta_V".to_string()];
+        super::rebuild_warnings_structured(&mut fit);
+
+        let dw = &fit.warnings_structured[0];
+        assert_eq!(dw.category, crate::types::WarningCode::DwAutocorrelation);
+        let details = dw.details.as_ref().expect("DW warning carries details");
+        assert_eq!(details["durbin_watson"], 1.20);
+        assert_eq!(details["iwres_lag1_autocorr"], 0.4);
+        // A non-numeric code keeps details omitted.
+        assert!(fit.warnings_structured[1].details.is_none());
+        // ETA shrinkage classifies + attaches its high-eta details.
+        let eta = &fit.warnings_structured[2];
+        assert_eq!(eta.category, crate::types::WarningCode::EtaShrinkage);
+        let ed = eta.details.as_ref().expect("ETA shrinkage details");
+        assert_eq!(ed["high_shrinkage_etas"][0]["eta"], "eta_V");
+    }
+
+    #[test]
     fn sir_path_reuses_pool() {
         let model = tiny_model();
         let pop = tiny_population();
@@ -12151,7 +12669,6 @@ mod sde_integration {
                 occasions: vec![1u32; 3],
                 dose_occasions: vec![1u32],
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
             .collect();
@@ -12282,7 +12799,6 @@ mod sde_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             };
             Population {
@@ -12324,7 +12840,9 @@ mod sde_integration {
             .expect("SDE model should emit W_EXPERIMENTAL_SDE");
         assert_eq!(exp.severity, crate::diagnostics::Severity::Warning);
         assert_eq!(
-            crate::types::classify_warning(&exp.message).category,
+            crate::types::classify_warning(&exp.message)
+                .category
+                .as_str(),
             "experimental"
         );
 
@@ -12605,7 +13123,6 @@ mod tests_sdtab_tv_cov {
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         // Sanity: this subject must be classified TV — that's the regime the
@@ -12775,7 +13292,6 @@ mod tests_sdtab_tv_cov {
             occasions: vec![1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let eta = DVector::from_vec(vec![0.0]);
@@ -12931,7 +13447,6 @@ mod tests_sdtab_tv_cov {
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         assert!(subject.has_tv_covariates());
@@ -13093,7 +13608,6 @@ mod tests_derived_session_clock {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -13332,7 +13846,6 @@ mod tests_derived_session_clock {
             occasions: vec![1, 1, 1],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13475,7 +13988,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
             dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -13656,7 +14168,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0, 0],
             occasions: vec![1, 2],
             dose_occasions: vec![1, 2],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13748,7 +14259,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13819,7 +14329,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13880,7 +14389,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13952,7 +14460,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0, 0],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -14015,7 +14522,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -14074,7 +14580,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -14213,7 +14718,6 @@ mod adaptive_sim_tests {
             occasions: vec![1u32; n],
             dose_occasions: vec![1u32; n_dose],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -16143,7 +16647,6 @@ mod adaptive_snapshot_verify_tests {
             occasions: vec![1, 1],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -16471,7 +16974,6 @@ mod adaptive_snapshot_verify_tests {
             occasions: vec![1; decisions.len()],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pop = Population {

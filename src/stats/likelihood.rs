@@ -140,7 +140,11 @@ fn tte_ode_nll(
             event_type,
             entry_time,
             ..
-        } = r;
+        } = r
+        else {
+            // Non-TTE records don't contribute hazard times; skip them.
+            continue;
+        };
         if *entry_time > 0.0 {
             times.push(*entry_time);
         }
@@ -270,7 +274,11 @@ fn try_joint_pktte_shared_solve(
                 event_type,
                 entry_time,
                 cmt: rc,
-            } = r;
+            } = r
+            else {
+                // Non-TTE records don't contribute hazard times; skip them.
+                continue;
+            };
             if rc != cmt {
                 continue;
             }
@@ -719,9 +727,10 @@ pub(crate) fn obs_nll_subject_from_preds(
                 hazard, recurrence, ..
             } = endpoint
             {
-                // ObsRecord::Event is the only variant (DiscreteState/Count deferred);
-                // the `..` pattern captures all EventType variants (Exact, RightCensored,
-                // IntervalCensored), so this filter correctly passes every TTE record type.
+                // Keep only `ObsRecord::Event` records at this CMT; any `DiscreteState` /
+                // `Count` records (Phase 4.0) are correctly excluded from the TTE data term.
+                // The `..` pattern captures all EventType variants (Exact, RightCensored,
+                // IntervalCensored), so this filter passes every TTE record type.
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()
@@ -2464,7 +2473,6 @@ mod tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -3286,7 +3294,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 100],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let ipreds = vec![10.0, 20.0];
@@ -3338,7 +3345,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 0],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let ipreds = vec![10.0, 20.0];

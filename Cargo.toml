@@ -26,6 +26,11 @@ nn = []
 # Default-off while Phase 1 is in development; promoted to default-on after
 # nlmixr2/NONMEM validation (see plans/tte-survival-markov.md Phase 1).
 survival = []
+# Continuous-time Markov models (CTMM). Matrix-exponential transition
+# probabilities + exact Van Loan gradients on top of nalgebra's `expm`; no new
+# runtime deps. Default-off while maturing; promote after CAV-dataset / `msm`
+# validation (see plans/tte-survival-markov.md §8.7, D5).
+markov = []
 # Heavy fit-based tests (5–60 min wall each on a 2-core CI runner).
 # Default `cargo test` `#[ignore]`s them; a nightly/manual job opts in.
 slow-tests = []

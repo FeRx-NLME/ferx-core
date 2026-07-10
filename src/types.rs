@@ -711,7 +711,11 @@ pub struct Subject {
     /// Non-Gaussian observation records (TTE events, discrete states, counts).
     /// Empty for all-Gaussian subjects. Populated by the data reader when the
     /// model declares a non-Gaussian endpoint for the row's CMT.
-    #[cfg(feature = "survival")]
+    ///
+    /// Compiled unconditionally (Phase 4.0): the discrete-state / count plumbing
+    /// is the shared foundation for the categorical (Track C) and Markov
+    /// (Track D) endpoints, so it must be present on the default build. Only the
+    /// TTE `Event` variant it can hold stays behind the `survival` feature.
     pub obs_records: Vec<ObsRecord>,
 }
 
@@ -870,7 +874,7 @@ impl Subject {
 }
 
 /// Summary of records excluded by `[data_selection]` `ignore`/`accept` rules.
-#[derive(Debug, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct ExclusionSummary {
     /// Subject IDs that had all records removed (zero doses and observations remaining).
     pub excluded_subject_ids: Vec<String>,
@@ -1003,7 +1007,7 @@ pub struct CovariateDecl {
 }
 
 /// A single row of the [`CovariateTable`], echoing one input dataset record.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct CovariateRow {
     pub id: String,
     pub time: f64,
@@ -1019,7 +1023,7 @@ pub struct CovariateRow {
 /// sdtab). Produced at data-read time when a `[covariates]` block is present,
 /// and attached to [`FitResult::covariate_table`]. Missing values are
 /// `f64::NAN`. Restricted to declared columns to bound memory.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct CovariateTable {
     /// Declared covariate names, in declaration order. Parallel to each row's
     /// `values` and to `kinds`.
@@ -1451,7 +1455,7 @@ impl PkModel {
 }
 
 /// Supported residual error models
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorModel {
     Additive,
     Proportional,
@@ -1459,7 +1463,7 @@ pub enum ErrorModel {
 }
 
 /// How a sigma parameter enters the residual error model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigmaType {
     Proportional,
     Additive,
@@ -2170,7 +2174,7 @@ pub struct EndpointError {
 }
 
 /// Transformation applied to a theta on the natural scale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThetaTransform {
     /// Theta is on the natural scale (no transformation).
     Identity,
@@ -2185,7 +2189,7 @@ pub enum ThetaTransform {
 }
 
 /// Distribution / parameterisation of an ETA random effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EtaParamType {
     /// `TVCL * exp(ETA)` or `exp(THETA + ETA)` — log-normal.
     LogNormal,
@@ -2200,7 +2204,7 @@ pub enum EtaParamType {
 }
 
 /// Per-ETA transformation metadata, carried in `FitResult`.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct EtaParamInfo {
     pub eta_name: String,
     pub param_type: EtaParamType,
@@ -2571,10 +2575,17 @@ pub enum EventType {
     },
 }
 
-#[cfg(feature = "survival")]
 /// A single non-Gaussian observation record on a subject.
+///
+/// Compiled unconditionally (Phase 4.0) so the categorical/count (Track C) and
+/// Markov (Track D) endpoints share one observation stream on the default build.
+/// Only the TTE `Event` variant stays behind the `survival` feature — the same
+/// mixed-`cfg` shape `SimOutcome` already uses. The record variant is chosen by
+/// the CMT's declared endpoint, never guessed from the DV value (§8.1).
 #[derive(Debug, Clone)]
 pub enum ObsRecord {
+    /// TTE / survival event observation (gated behind the `survival` feature).
+    #[cfg(feature = "survival")]
     Event {
         time: f64,
         event_type: EventType,
@@ -2584,7 +2595,12 @@ pub enum ObsRecord {
         entry_time: f64,
         cmt: usize,
     },
-    // DiscreteState and Count variants deferred to Phase 4/5
+    /// Discrete-state observation: an integer category or Markov state index.
+    /// Serves binary/ordinal (Track C) and DTMM/CTMM state observations
+    /// (Track D); the CMT's declared endpoint disambiguates the meaning.
+    DiscreteState { time: f64, state: usize, cmt: usize },
+    /// Non-negative integer count observation (Poisson / negative-binomial, Track C).
+    Count { time: f64, count: u32, cmt: usize },
 }
 
 #[cfg(feature = "survival")]
@@ -2711,6 +2727,8 @@ impl std::fmt::Debug for EndpointLikelihood {
 ///
 /// `Continuous` preserves the existing Gaussian path unchanged.
 /// `Event` carries TTE-specific outputs (gated behind `survival` feature).
+/// `Category`/`Count` (Phase 4.0) are the shared categorical/count/Markov draw
+/// shapes; they compile unconditionally but have no producer until Track C/D.
 #[derive(Debug, Clone)]
 pub enum SimOutcome {
     /// Gaussian continuous prediction + residual noise (the only variant before Phase 1).
@@ -2718,6 +2736,10 @@ pub enum SimOutcome {
     /// TTE event: simulated event time and whether it occurred before the censoring horizon.
     #[cfg(feature = "survival")]
     Event { time: f64, observed: bool },
+    /// Categorical / discrete-state draw (binary, ordinal, DTMM/CTMM state) — Phase 4+.
+    Category { state: usize },
+    /// Count draw (Poisson / negative-binomial) — Phase 4+.
+    Count { count: u32 },
 }
 
 impl SimOutcome {
@@ -2733,6 +2755,13 @@ impl SimOutcome {
                 debug_assert!(
                     false,
                     "continuous_value() called on a TTE Event row — filter by CMT type first"
+                );
+                f64::NAN
+            }
+            SimOutcome::Category { .. } | SimOutcome::Count { .. } => {
+                debug_assert!(
+                    false,
+                    "continuous_value() called on a categorical/count row — filter by CMT type first"
                 );
                 f64::NAN
             }
@@ -3011,8 +3040,8 @@ pub struct CompiledModel {
     pub transit_ode_equivalent: Option<TransitOdeEquivalent>,
 }
 
-/// A lazily-built ODE representation of an analytical model that carries one (currently only
-/// `one_cpt_transit`). Holds the equivalent's reconstructed `.ferx` source and compiles the
+/// A lazily-built ODE representation of an analytical model that carries one (a plain
+/// `one_cpt_transit` or `two_cpt_transit`). Holds the equivalent's reconstructed `.ferx` source and compiles the
 /// boxed sub-model on first use, so a transit fit whose subjects never hit the fallback
 /// (constant-parameter, non-`TIME`) pays no extra parse or allocation. See
 /// [`CompiledModel::effective_for`] (#486).
@@ -3037,7 +3066,7 @@ impl TransitOdeEquivalent {
         self.built.get_or_init(|| {
             Box::new(
                 crate::parser::model_parser::parse_model_string(&self.source)
-                    .expect("internal: one_cpt_transit ODE equivalent failed to build"),
+                    .expect("internal: transit ODE equivalent failed to build"),
             )
         })
     }
@@ -3101,7 +3130,8 @@ impl CompiledModel {
 
     /// The model that should actually serve `subject`'s predictions / sensitivities.
     ///
-    /// For a `one_cpt_transit` model whose closed form cannot cope with this subject — a
+    /// For a transit closed form (`one_cpt_transit` / `two_cpt_transit`) whose closed form
+    /// cannot cope with this subject — a
     /// `TIME`-dependent structural parameter or time-varying covariates make the disposition
     /// switch mid-absorption, which the per-dose Gamma convolution assumes constant — return
     /// its exact ODE `transit()` equivalent (`transit_ode_equivalent`, built at parse time);
@@ -3531,9 +3561,10 @@ impl std::fmt::Debug for CompiledModel {
 }
 
 /// Per-subject estimation results
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SubjectResult {
     pub id: String,
+    #[serde(with = "crate::serde_nalgebra::dvector")]
     pub eta: DVector<f64>,
     pub ipred: Vec<f64>,
     pub pred: Vec<f64>,
@@ -3578,7 +3609,7 @@ pub struct SubjectResult {
 /// This is the SAEM analogue of saemix `conddist.saemix` / Monolix's
 /// "Conditional Distribution" task — the distribution `p(η_i | y_i; θ̂)` rather
 /// than just its mode (the EBE on `SubjectResult.eta`).
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CondDist {
     /// Conditional mean of η per subject: `cond_mean[i]` has length `n_eta`.
     pub cond_mean: Vec<Vec<f64>>,
@@ -3700,7 +3731,7 @@ pub enum IntegralStep {
 /// *partial* marginal likelihood that ignores κ uncertainty. (Legacy; no longer
 /// used for IOV models.)
 /// `NotApplicable` — model has no kappa declarations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KappaTreatment {
     NotApplicable,
     FixedAtMode,
@@ -3711,7 +3742,7 @@ pub enum KappaTreatment {
 ///
 /// Produced by the `Imp` stage in a method chain (`methods = [..., imp]`).
 /// Surfaced on `FitResult.importance_sampling`.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ImportanceSamplingResult {
     /// `−2 · Σᵢ log p(yᵢ | θ)` estimated by importance sampling. Lower-bias
     /// alternative to the FOCE/Laplace OFV when subject posteriors are
@@ -3744,7 +3775,7 @@ pub struct ImportanceSamplingResult {
 /// Analogous to one line in NONMEM's `.ext` file for `METHOD=IMPMAP`.
 /// Positive `iteration` values are EM iterations; special negative values
 /// mark the final (averaged) estimate and standard errors.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ImpmapTraceRow {
     /// EM iteration number (1-based). Special values:
     /// `-1_000_000_000` = final averaged estimate,
@@ -3762,7 +3793,7 @@ pub struct ImpmapTraceRow {
 ///
 /// Surfaced on `FitResult.impmap_trace` when the final estimating stage is
 /// IMPMAP. Column names follow NONMEM convention (`THETA1`, `OMEGA(1,1)`, …).
-#[derive(Debug, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct ImpmapTrace {
     pub rows: Vec<ImpmapTraceRow>,
     pub theta_names: Vec<String>,
@@ -3773,7 +3804,7 @@ pub struct ImpmapTrace {
 
 /// Posterior summary for a single scalar parameter, computed across all
 /// post-warmup, post-thinning draws from every chain.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PosteriorSummary {
     /// Parameter name (e.g. `TVCL`, `OMEGA(1,1)`, `SIGMA(1)`).
     pub name: String,
@@ -3800,7 +3831,7 @@ pub struct PosteriorSummary {
 /// instead of a single point estimate; the optimizer-style fields on
 /// `FitResult` (theta/omega/sigma) are populated with the posterior means so
 /// downstream consumers that expect a point estimate still work.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct BayesResult {
     /// Per-parameter posterior summaries, ordered θ, then Ω entries, then Σ.
     pub summaries: Vec<PosteriorSummary>,
@@ -3822,7 +3853,7 @@ pub struct BayesResult {
 }
 
 /// Outcome of the post-estimation covariance step.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub enum CovarianceStatus {
     /// User set `covariance = false`; step was not attempted.
     NotRequested,
@@ -3874,21 +3905,124 @@ pub enum WarningSeverity {
     Info,
 }
 
-/// A structured warning with severity, category, and message.
+/// Stable, typed taxonomy for a structured warning (issue #778).
+///
+/// Each variant is the machine-branchable *code* an agent or the R wrapper keys
+/// off — a stable contract, unlike free-text message wording. Serialized (and
+/// via [`WarningCode::as_str`]) as a fixed snake_case token; those tokens are a
+/// public API surface and must not change once released. Add variants as new
+/// warning classes appear; never repurpose an existing token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WarningCode {
+    /// Optimizer did not reach the convergence criterion.
+    Convergence,
+    /// Informational note about the covariance step (e.g. its evaluation cost).
+    CovarianceStep,
+    /// The covariance step failed — no standard errors are available.
+    CovarianceFailed,
+    /// The covariance step succeeded but was regularized / degraded (eigenvalue
+    /// floor applied, or a non-finite off-diagonal stencil); SEs may be
+    /// over-optimistic.
+    CovarianceRegularized,
+    /// Correlation / condition-number problem in the covariance.
+    ConditionNumber,
+    /// Optimizer-health issue (trust-radius collapse, degeneracy).
+    OptimizerHealth,
+    /// Residual (IWRES) autocorrelation — Durbin–Watson out of range.
+    DwAutocorrelation,
+    /// ETA distribution departs from normality (Shapiro–Wilk).
+    EtaNormality,
+    /// An experimental feature (SDE, neural-network components) was used.
+    Experimental,
+    /// BLOQ / M3 censoring handling caveat.
+    BloqMethod,
+    /// Sampling-importance-resampling (SIR) issue.
+    Sir,
+    /// Importance-sampling issue (ESS = 0, proposal collapse).
+    ImportanceSampling,
+    /// EPS (residual) shrinkage is notably high / negative.
+    EpsShrinkage,
+    /// One or more ETA (random-effect) shrinkages exceed the threshold — the
+    /// data poorly inform those individual random effects.
+    EtaShrinkage,
+    /// Dataset-quality issue (missing DV, ADDL/II, non-positive DV, …).
+    DataQuality,
+    /// Omega structure caveat (mixed lognormal / additive block).
+    OmegaStructure,
+    /// A gradient / sampler fallback was taken (e.g. HMC → Metropolis-Hastings).
+    GradientFallback,
+    /// Mu-referencing note or missing-mu-reference caveat.
+    MuReferencing,
+    /// Optimizer-configuration note (`global_search`).
+    OptimizerConfig,
+    /// Multi-start informational note.
+    MultiStart,
+    /// The run was cancelled by the user.
+    Cancelled,
+    /// Thread-count efficiency note.
+    Threads,
+    /// A simulation-time, per-subject diagnostic — a degenerate hazard draw, or an
+    /// over-large recurrent-event stream that was skipped/censored — surfaced by
+    /// `simulate_with_options_diag` and echoed into `FitResult.warnings` on a
+    /// `--simulate` run (#762, #763). Distinct from the fit-time optimizer/data codes:
+    /// it flags a pathological simulated subject, not an estimation problem.
+    Simulation,
+    /// Unrecognised message — fallback bucket.
+    General,
+}
+
+impl WarningCode {
+    /// The stable snake_case token (identical to the serde representation).
+    /// This is the string an agent / the R wrapper branches on.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WarningCode::Convergence => "convergence",
+            WarningCode::CovarianceStep => "covariance_step",
+            WarningCode::CovarianceFailed => "covariance_failed",
+            WarningCode::CovarianceRegularized => "covariance_regularized",
+            WarningCode::ConditionNumber => "condition_number",
+            WarningCode::OptimizerHealth => "optimizer_health",
+            WarningCode::DwAutocorrelation => "dw_autocorrelation",
+            WarningCode::EtaNormality => "eta_normality",
+            WarningCode::Experimental => "experimental",
+            WarningCode::BloqMethod => "bloq_method",
+            WarningCode::Sir => "sir",
+            WarningCode::ImportanceSampling => "importance_sampling",
+            WarningCode::EpsShrinkage => "eps_shrinkage",
+            WarningCode::EtaShrinkage => "eta_shrinkage",
+            WarningCode::DataQuality => "data_quality",
+            WarningCode::OmegaStructure => "omega_structure",
+            WarningCode::GradientFallback => "gradient_fallback",
+            WarningCode::MuReferencing => "mu_referencing",
+            WarningCode::OptimizerConfig => "optimizer_config",
+            WarningCode::MultiStart => "multi_start",
+            WarningCode::Cancelled => "cancelled",
+            WarningCode::Threads => "threads",
+            WarningCode::Simulation => "simulation",
+            WarningCode::General => "general",
+        }
+    }
+}
+
+impl std::fmt::Display for WarningCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A structured warning with severity, typed code, and message.
 ///
 /// Populated in parallel with `FitResult.warnings` (which remains for
-/// backward compatibility). The `category` is a fixed lowercase vocabulary:
-/// `convergence`, `covariance_step`, `optimizer_health`, `dw_autocorrelation`,
-/// `bloq_method`, `sir`, `importance_sampling`, `data_quality`,
-/// `omega_structure`, `ebe_convergence`, `gradient_fallback`,
-/// `mu_referencing`, `optimizer_config`, `multi_start`, `cancelled`,
-/// `threads`, `condition_number`, `eta_normality`, `eps_shrinkage`,
-/// `experimental`, `general` (fallback for unrecognised messages).
+/// backward compatibility). The `category` is a typed [`WarningCode`] — the
+/// stable, machine-branchable taxonomy — replacing the former free-text
+/// category string (issue #778).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WarningEntry {
     pub severity: WarningSeverity,
-    /// Fixed lowercase category string (see type-level docs).
-    pub category: String,
+    /// Typed warning code (stable snake_case serde token).
+    pub category: WarningCode,
     /// Human-readable message. For messages that carry a multi-stage chain
     /// prefix such as `[FOCEI] ...`, only the body after the prefix is stored
     /// here; the method tag is moved into `source_method`. For unprefixed
@@ -3897,6 +4031,13 @@ pub struct WarningEntry {
     pub message: String,
     /// For multi-stage chains, the method that produced this warning.
     pub source_method: Option<String>,
+    /// Optional structured payload with machine-readable numbers behind the
+    /// message (e.g. `{"durbin_watson": 1.2}` or `{"condition_number": 1.4e6}`),
+    /// so an agent reads the value directly instead of parsing prose. Populated
+    /// by native at-source emitters; `None` on the string-classified fallback
+    /// path ([`classify_warning`]). Omitted from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 /// Classify a free-text warning message into a structured `WarningEntry`.
@@ -3929,7 +4070,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")
     {
-        (WarningSeverity::Critical, "convergence")
+        (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("covariance step failed")
         || lower.contains("covariance failed")
         || (lower.contains("covariance step") && lower.contains("not positive definite"))
@@ -3939,51 +4080,59 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // Hessian is not positive definite") whose prefix differs from "failed:"
         // messages. It must be compound so that "SIR failed: covariance not
         // positive definite" (no "covariance step" token) still routes to "sir".
-        (WarningSeverity::Critical, "covariance_step")
+        (WarningSeverity::Critical, WarningCode::CovarianceFailed)
     } else if lower.contains("covariance step regularized")
         || lower.contains("off-diagonal fd stencil")
     {
         // Regularisation warning and off-diagonal NaN soft warning both indicate a
         // degraded-but-present covariance step result. Severity within the message
-        // (minor/moderate/severe, or "over-optimistic") informs guidance; the
-        // category is always covariance_step.
-        (WarningSeverity::Warning, "covariance_step")
+        // (minor/moderate/severe, or "over-optimistic") informs guidance.
+        (WarningSeverity::Warning, WarningCode::CovarianceRegularized)
     } else if lower.contains("ill-conditioned") || lower.contains("condition number") {
         // Note: "covariance step failed: Hessian has ill-conditioned entries" contains
         // "ill-conditioned" but is caught by "covariance step failed" above (else-if chain).
         // Any future covariance message that contains "ill-conditioned" but NOT "failed:"
         // would land here instead — keep this ordering in mind when adding new messages.
-        (WarningSeverity::Critical, "condition_number")
+        (WarningSeverity::Critical, WarningCode::ConditionNumber)
+    } else if lower.starts_with("w_tte_degenerate") || lower.starts_with("w_rtte_degenerate") {
+        // Simulation-time per-subject hazard diagnostics (#762/#763). Must precede the
+        // generic "degenerate" → optimizer-health branch below, whose substring these
+        // otherwise match — these flag a pathological *simulated subject*, not an
+        // estimation/optimizer problem.
+        (WarningSeverity::Warning, WarningCode::Simulation)
     } else if lower.contains("trust radius") || lower.contains("degenerate") {
-        (WarningSeverity::Warning, "optimizer_health")
+        (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {
-        (WarningSeverity::Warning, "dw_autocorrelation")
+        (WarningSeverity::Warning, WarningCode::DwAutocorrelation)
     } else if lower.contains("shapiro") || lower.contains("non-normal") {
-        (WarningSeverity::Warning, "eta_normality")
+        (WarningSeverity::Warning, WarningCode::EtaNormality)
     } else if lower.contains("experimental feature") {
         // Experimental-feature notices (issue #175): SDE and neural-network
         // components emit a runtime warning so results are applied with caution.
-        (WarningSeverity::Warning, "experimental")
+        (WarningSeverity::Warning, WarningCode::Experimental)
     } else if lower.contains("m3 bloq")
         || lower.contains("bloq handling")
         || lower.contains("m3 censoring")
         || lower.contains("censoring handling")
     {
-        (WarningSeverity::Warning, "bloq_method")
+        (WarningSeverity::Warning, WarningCode::BloqMethod)
     } else if lower.contains("sir failed") || lower.contains("sir requested") {
-        (WarningSeverity::Warning, "sir")
+        (WarningSeverity::Warning, WarningCode::Sir)
     } else if lower.contains("ess = 0") || lower.contains("proposal collapse") {
-        (WarningSeverity::Warning, "importance_sampling")
+        (WarningSeverity::Warning, WarningCode::ImportanceSampling)
     } else if lower.contains("eps shrinkage") {
-        (WarningSeverity::Warning, "eps_shrinkage")
+        (WarningSeverity::Warning, WarningCode::EpsShrinkage)
+    } else if lower.starts_with("eta shrinkage") || lower.contains(" eta shrinkage") {
+        // Word-boundary match so "beta shrinkage" (or similar) does not collide.
+        (WarningSeverity::Warning, WarningCode::EtaShrinkage)
     } else if lower.starts_with("w_addl_missing_ii") || lower.contains("addl > 0 but ii") {
-        (WarningSeverity::Warning, "data_quality")
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_iov_occ_missing")
         || lower.contains("missing or unparseable values in iov_column")
     {
-        (WarningSeverity::Warning, "data_quality")
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_missing_dv") {
-        (WarningSeverity::Warning, "data_quality")
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.contains("ltbs")
         || lower.contains("non-positive dv")
         || lower.contains("ss=1 dose")
@@ -3991,47 +4140,48 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || lower.contains("evid=3/4")
         || lower.contains("lagtime evaluates")
     {
-        (WarningSeverity::Warning, "data_quality")
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.contains("mixed lognormal") || lower.contains("mixed log-normal") {
-        (WarningSeverity::Warning, "omega_structure")
+        (WarningSeverity::Warning, WarningCode::OmegaStructure)
     } else if lower.contains("hmc is unavailable") {
         // "falls back to" intentionally removed: no emitted message uses that exact
         // phrase. The SAEM HMC message is fully covered by "hmc is unavailable".
-        (WarningSeverity::Info, "gradient_fallback")
+        (WarningSeverity::Info, WarningCode::GradientFallback)
     } else if lower.contains("not mu-referenced") {
-        (WarningSeverity::Warning, "mu_referencing")
+        (WarningSeverity::Warning, WarningCode::MuReferencing)
     } else if lower.contains("mu-ref") || lower.contains("mu-referencing") {
-        (WarningSeverity::Info, "mu_referencing")
+        (WarningSeverity::Info, WarningCode::MuReferencing)
     } else if lower.contains("global_search disabled") {
         // Runtime failure: CRS2-LM init failed — the optimiser ran without global search.
-        (WarningSeverity::Warning, "optimizer_config")
+        (WarningSeverity::Warning, WarningCode::OptimizerConfig)
     } else if lower.contains("global_search") {
-        (WarningSeverity::Info, "optimizer_config")
+        (WarningSeverity::Info, WarningCode::OptimizerConfig)
     } else if lower.contains("multi-start") {
-        (WarningSeverity::Info, "multi_start")
+        (WarningSeverity::Info, WarningCode::MultiStart)
     } else if lower.contains("cancelled by user") {
-        (WarningSeverity::Info, "cancelled")
+        (WarningSeverity::Info, WarningCode::Cancelled)
     } else if lower.contains("threads configured") || lower.contains("threads than subjects") {
-        (WarningSeverity::Info, "threads")
+        (WarningSeverity::Info, WarningCode::Threads)
     } else if lower.contains("n\u{00b2} ofv")
         || lower.contains("n^2 ofv")
         || (lower.contains("parameters") && lower.contains("covariance step:"))
     {
-        (WarningSeverity::Info, "covariance_step")
+        (WarningSeverity::Info, WarningCode::CovarianceStep)
     } else {
-        (WarningSeverity::Warning, "general")
+        (WarningSeverity::Warning, WarningCode::General)
     };
 
     WarningEntry {
         severity,
-        category: category.to_string(),
+        category,
         message: msg,
         source_method,
+        details: None,
     }
 }
 
 /// Full fit result
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct FitResult {
     /// Final method in the chain (same as `method_chain.last()`).
     pub method: EstimationMethod,
@@ -4045,6 +4195,7 @@ pub struct FitResult {
     pub theta_names: Vec<String>,
     /// Names of the random effects (etas), parallel to the omega diagonal.
     pub eta_names: Vec<String>,
+    #[serde(with = "crate::serde_nalgebra::dmatrix")]
     pub omega: DMatrix<f64>,
     pub sigma: Vec<f64>,
     /// Names of the sigma parameters, parallel to `sigma`.
@@ -4057,6 +4208,7 @@ pub struct FitResult {
     /// per-sigma classification and should be preferred by consumers that need
     /// to distinguish endpoints.
     pub error_model: ErrorModel,
+    #[serde(with = "crate::serde_nalgebra::option_dmatrix")]
     pub covariance_matrix: Option<DMatrix<f64>>,
     pub se_theta: Option<Vec<f64>>,
     /// Standard errors for omega elements.
@@ -4116,6 +4268,7 @@ pub struct FitResult {
     /// carries posterior summaries + convergence diagnostics. See [`BayesResult`].
     pub bayes: Option<BayesResult>,
     // IOV results (present when kappa declarations exist in the model)
+    #[serde(with = "crate::serde_nalgebra::option_dmatrix")]
     pub omega_iov: Option<DMatrix<f64>>,
     pub kappa_names: Vec<String>,
     pub kappa_fixed: Vec<bool>,
@@ -4138,6 +4291,7 @@ pub struct FitResult {
     /// Per-subject, per-occasion kappa EBEs.
     /// `ebe_kappas[i][k]` is the kappa vector for subject i, occasion k.
     /// Outer vec is empty when `n_kappa == 0`.
+    #[serde(with = "crate::serde_nalgebra::vec_vec_dvector")]
     pub ebe_kappas: Vec<Vec<DVector<f64>>>,
     /// Estimated OFV evaluations saved by the SAEM mu-ref gradient step M-step.
     /// Non-None only when method=saem and mu_referencing=true.
@@ -4232,9 +4386,11 @@ pub struct FitResult {
     /// the lognormal formula `(exp(ω_ij)−1)/√((exp(ω_ii)−1)(exp(ω_jj)−1))`
     /// when both etas are lognormal, otherwise falls back to
     /// `ω_ij/√(ω_ii·ω_jj)`.  `None` when omega is diagonal (no off-diagonals).
+    #[serde(with = "crate::serde_nalgebra::option_dmatrix")]
     pub omega_param_corr: Option<DMatrix<f64>>,
     /// Parameter-level correlation matrix for IOV block kappa, analogous to
     /// `omega_param_corr`.  `None` when `omega_iov` is absent or diagonal.
+    #[serde(with = "crate::serde_nalgebra::option_dmatrix")]
     pub omega_iov_param_corr: Option<DMatrix<f64>>,
     /// Path to the `.ferx` model file used for this fit, as supplied by the
     /// caller. `Some` when the fit was launched via `fit_from_files` or
@@ -4261,6 +4417,7 @@ pub struct FitResult {
     /// and `theta_names`.
     pub theta_init: Vec<f64>,
     /// Initial omega matrix (variance scale), same layout as `omega`.
+    #[serde(with = "crate::serde_nalgebra::dmatrix")]
     pub omega_init: DMatrix<f64>,
     /// Initial sigma values, parallel to `sigma` and `sigma_names`.
     pub sigma_init: Vec<f64>,
@@ -4345,6 +4502,33 @@ pub struct FitResult {
     /// were active during the fit (or the caller supplied `ignore`/`accept`
     /// expressions).  `None` means no filtering was requested.
     pub exclusions: Option<ExclusionSummary>,
+}
+
+impl FitResult {
+    /// Schema version for the machine-readable JSON serialization (#777).
+    ///
+    /// Bump on any breaking change to the JSON shape (renamed/removed fields,
+    /// changed nesting). Additive fields do not require a bump. Agent/tool
+    /// consumers pin on this via the top-level `schema_version` key.
+    pub const JSON_SCHEMA_VERSION: u32 = 1;
+
+    /// Serialize this fit to a complete, agent-friendly `serde_json::Value`,
+    /// with a top-level `schema_version` key injected alongside every field.
+    ///
+    /// This is the in-process counterpart to writing `{model}-fit.json`:
+    /// Rust/R callers get the structured payload without a file round-trip.
+    /// Non-finite floats (`NaN`/`±Inf`) serialize to JSON `null`, matching the
+    /// empty-cell convention of the YAML/CSV writers.
+    pub fn to_json_value(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).expect("FitResult is serializable");
+        if let serde_json::Value::Object(map) = &mut v {
+            map.insert(
+                "schema_version".to_string(),
+                serde_json::json!(Self::JSON_SCHEMA_VERSION),
+            );
+        }
+        v
+    }
 }
 
 /// Look up the SE for omega element (i, j) from the `se_omega` vector.
@@ -5223,7 +5407,7 @@ impl Optimizer {
 }
 
 /// Estimation method
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EstimationMethod {
     Foce,
     FoceI,
@@ -5875,7 +6059,6 @@ pub(crate) mod test_helpers {
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         (model, subject)
@@ -5886,6 +6069,49 @@ pub(crate) mod test_helpers {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// Phase 4.0: the `Category` / `Count` `SimOutcome` variants compile
+    /// unconditionally (shared categorical/count/Markov draw shapes) and derive
+    /// Debug/Clone. The Gaussian path is unchanged.
+    #[test]
+    fn sim_outcome_category_and_count_variants_construct() {
+        let c = SimOutcome::Category { state: 2 };
+        let n = SimOutcome::Count { count: 5 };
+        assert!(format!("{c:?}").contains("Category"));
+        assert!(format!("{n:?}").contains("Count"));
+        let _ = c.clone();
+        let _ = n.clone();
+        assert_eq!(
+            SimOutcome::Continuous { value: 4.25 }.continuous_value(),
+            4.25
+        );
+    }
+
+    /// `continuous_value()` returns NAN for the non-Gaussian outcomes. The
+    /// misuse `debug_assert` fires in debug builds, so this is asserted only when
+    /// debug-assertions are off — the profile CI and coverage use (`ci-test`,
+    /// which inherits `release`), where the NAN branch is actually taken.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn sim_outcome_category_and_count_continuous_value_is_nan() {
+        assert!(SimOutcome::Category { state: 3 }
+            .continuous_value()
+            .is_nan());
+        assert!(SimOutcome::Count { count: 9 }.continuous_value().is_nan());
+    }
+
+    /// The TTE `Event` outcome likewise has no continuous value. Same profile
+    /// caveat as above (the debug-assert fires in debug builds).
+    #[test]
+    #[cfg(all(feature = "survival", not(debug_assertions)))]
+    fn sim_outcome_event_continuous_value_is_nan() {
+        assert!(SimOutcome::Event {
+            time: 1.0,
+            observed: true,
+        }
+        .continuous_value()
+        .is_nan());
+    }
 
     /// `effective_cov_inner_tol` resolves the covariance-step reconvergence tolerance:
     /// an explicit `cov_inner_tol` wins; otherwise the fit's `inner_tol`, tightened to
@@ -5998,7 +6224,6 @@ mod tests {
             dose_occasions: vec![],
             // Row 0 = PK observation, row 1 = covariate pseudo-observation.
             fremtype: vec![0, 100],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -6048,7 +6273,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: vec![0],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let sigma = vec![0.3];
@@ -6290,7 +6514,7 @@ mod tests {
     fn classify_warning_convergence_is_critical() {
         let w = classify_warning("Outer optimization did not converge");
         assert_eq!(w.severity, WarningSeverity::Critical);
-        assert_eq!(w.category, "convergence");
+        assert_eq!(w.category.as_str(), "convergence");
         assert!(w.source_method.is_none());
     }
 
@@ -6298,21 +6522,21 @@ mod tests {
     fn classify_warning_covariance_is_critical() {
         let w = classify_warning("Covariance step failed");
         assert_eq!(w.severity, WarningSeverity::Critical);
-        assert_eq!(w.category, "covariance_step");
+        assert_eq!(w.category.as_str(), "covariance_failed");
     }
 
     #[test]
     fn classify_warning_dw_is_warning() {
         let w = classify_warning("Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).");
         assert_eq!(w.severity, WarningSeverity::Warning);
-        assert_eq!(w.category, "dw_autocorrelation");
+        assert_eq!(w.category.as_str(), "dw_autocorrelation");
     }
 
     #[test]
     fn classify_warning_mu_ref_is_info() {
         let w = classify_warning("mu-ref: CL, V");
         assert_eq!(w.severity, WarningSeverity::Info);
-        assert_eq!(w.category, "mu_referencing");
+        assert_eq!(w.category.as_str(), "mu_referencing");
     }
 
     #[test]
@@ -6322,7 +6546,7 @@ mod tests {
              affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
         );
         assert_eq!(w.severity, WarningSeverity::Warning);
-        assert_eq!(w.category, "mu_referencing");
+        assert_eq!(w.category.as_str(), "mu_referencing");
     }
 
     #[test]
@@ -6331,14 +6555,121 @@ mod tests {
         assert_eq!(w.source_method.as_deref(), Some("FOCEI"));
         assert_eq!(w.message, "Covariance step failed");
         assert_eq!(w.severity, WarningSeverity::Critical);
-        assert_eq!(w.category, "covariance_step");
+        assert_eq!(w.category.as_str(), "covariance_failed");
     }
 
     #[test]
     fn classify_warning_unknown_falls_back_to_general() {
         let w = classify_warning("some entirely novel message");
         assert_eq!(w.severity, WarningSeverity::Warning);
-        assert_eq!(w.category, "general");
+        assert_eq!(w.category.as_str(), "general");
+    }
+
+    #[test]
+    fn classify_warning_simulation_beats_optimizer_health_degenerate() {
+        // #762/#763 simulation diagnostics contain the word "degenerate", which the
+        // generic optimizer-health branch also keys on. The `w_tte/​w_rtte` prefix
+        // branch must precede it so a simulated-subject diagnostic is not mislabelled
+        // as an estimation/optimizer problem.
+        for msg in [
+            "W_TTE_DEGENERATE_HAZARD: subject '1' (CMT=1) drew a non-positive / \
+             non-finite effective hazard rate (#763).",
+            "W_RTTE_DEGENERATE: subject '1' (CMT=2) has a degenerate recurrent hazard (#762).",
+        ] {
+            let w = classify_warning(msg);
+            assert_eq!(w.category.as_str(), "simulation", "misclassified: {msg:?}");
+            assert_eq!(w.severity, WarningSeverity::Warning);
+            assert_ne!(w.category, WarningCode::OptimizerHealth);
+        }
+    }
+
+    #[test]
+    fn classify_warning_eta_shrinkage_is_word_bounded() {
+        // The real message classifies to eta_shrinkage.
+        assert_eq!(
+            classify_warning("High ETA shrinkage (>= 30%): eta_V (42%)")
+                .category
+                .as_str(),
+            "eta_shrinkage"
+        );
+        // A substring like "beta shrinkage" must NOT collide.
+        assert_ne!(
+            classify_warning("beta shrinkage looks odd")
+                .category
+                .as_str(),
+            "eta_shrinkage"
+        );
+    }
+
+    /// #778: the `WarningCode` serde token is a public API an agent / the R
+    /// wrapper pins against. This snapshot fails loudly if a variant's token
+    /// drifts, and asserts `as_str()` and the serde representation agree.
+    #[test]
+    fn warning_code_tokens_are_stable() {
+        use WarningCode::*;
+        let expected: &[(WarningCode, &str)] = &[
+            (Convergence, "convergence"),
+            (CovarianceStep, "covariance_step"),
+            (CovarianceFailed, "covariance_failed"),
+            (CovarianceRegularized, "covariance_regularized"),
+            (ConditionNumber, "condition_number"),
+            (OptimizerHealth, "optimizer_health"),
+            (DwAutocorrelation, "dw_autocorrelation"),
+            (EtaNormality, "eta_normality"),
+            (Experimental, "experimental"),
+            (BloqMethod, "bloq_method"),
+            (Sir, "sir"),
+            (ImportanceSampling, "importance_sampling"),
+            (EpsShrinkage, "eps_shrinkage"),
+            (EtaShrinkage, "eta_shrinkage"),
+            (DataQuality, "data_quality"),
+            (OmegaStructure, "omega_structure"),
+            (GradientFallback, "gradient_fallback"),
+            (MuReferencing, "mu_referencing"),
+            (OptimizerConfig, "optimizer_config"),
+            (MultiStart, "multi_start"),
+            (Cancelled, "cancelled"),
+            (Threads, "threads"),
+            (Simulation, "simulation"),
+            (General, "general"),
+        ];
+        for (code, token) in expected {
+            assert_eq!(code.as_str(), *token, "as_str drift for {code:?}");
+            // serde token == as_str token (rename_all = "snake_case").
+            assert_eq!(
+                serde_json::to_value(code).unwrap(),
+                serde_json::json!(token),
+                "serde token drift for {code:?}"
+            );
+            // and it round-trips back to the same variant.
+            let back: WarningCode = serde_json::from_value(serde_json::json!(token)).unwrap();
+            assert_eq!(back, *code);
+        }
+    }
+
+    /// #778: the optional `details` payload serializes when present (the
+    /// at-source numeric channel) and is omitted when `None`.
+    #[test]
+    fn warning_entry_details_serialize_when_present() {
+        let with = WarningEntry {
+            severity: WarningSeverity::Warning,
+            category: WarningCode::DwAutocorrelation,
+            message: "Positive IWRES autocorrelation".to_string(),
+            source_method: None,
+            details: Some(serde_json::json!({ "durbin_watson": 1.2 })),
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["category"], "dw_autocorrelation");
+        assert_eq!(v["details"]["durbin_watson"], 1.2);
+        // round-trips
+        let back: WarningEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.details, with.details);
+        assert_eq!(back.category, WarningCode::DwAutocorrelation);
+
+        // None -> key omitted entirely.
+        let without = classify_warning("some novel message");
+        let vo = serde_json::to_value(&without).unwrap();
+        assert!(vo.get("details").is_none());
     }
 
     /// Round-trip table covering every literal warning message emitted by the
@@ -6363,7 +6694,7 @@ mod tests {
                 Critical,
                 "convergence",
             ),
-            ("Covariance step failed", Critical, "covariance_step"),
+            ("Covariance step failed", Critical, "covariance_failed"),
             // global_search has two arms: explicit "disabled" is a runtime
             // failure (Warning); a bare mention without "disabled" is
             // informational.
@@ -6394,7 +6725,7 @@ mod tests {
             (
                 "Covariance step failed \u{2014} SEs not available",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             (
                 "saem_n_leapfrog > 0 but HMC is unavailable (requires an analytical PK model \
@@ -6438,6 +6769,12 @@ mod tests {
                 "IMP: 2 subject(s) had ESS = 0 (proposal collapse)",
                 Warning,
                 "importance_sampling",
+            ),
+            (
+                "High ETA shrinkage (\u{2265} 30%): eta_CL (42%). EBE-based diagnostics \
+                 for these random effects are unreliable.",
+                Warning,
+                "eta_shrinkage",
             ),
             (
                 "LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV",
@@ -6499,7 +6836,7 @@ mod tests {
                 "Covariance step: Hessian is not positive definite. \
                  Eigenvalues: [8.4000, 2.1000, -0.0100]. SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             // Covariance step regularised — present in all three severity tiers.
             (
@@ -6507,7 +6844,7 @@ mod tests {
                  (1 of 3 free-block eigenvalues clipped; min eig = 1.2e-6, floor = 8.4e-14; \
                  severity: minor). Standard errors are likely reliable.",
                 Warning,
-                "covariance_step",
+                "covariance_regularized",
             ),
             (
                 "Covariance step regularized: eigenvalue floor applied to FD Hessian \
@@ -6515,7 +6852,7 @@ mod tests {
                  severity: severe). Standard errors are likely unreliable; \
                  SIR-based confidence intervals are recommended.",
                 Warning,
-                "covariance_step",
+                "covariance_regularized",
             ),
             // Off-diagonal NaN soft warning — Success result, but correlation missing.
             (
@@ -6523,7 +6860,7 @@ mod tests {
                  Cross-partial correlation set to 0; SE for these parameter(s) \
                  may be over-optimistic. Try tuning fd_hessian_step.",
                 Warning,
-                "covariance_step",
+                "covariance_regularized",
             ),
             // Chain-prefixed off-diagonal warning.
             (
@@ -6531,7 +6868,7 @@ mod tests {
                  Cross-partial correlation set to 0; SE for these parameter(s) \
                  may be over-optimistic. Try tuning fd_hessian_step.",
                 Warning,
-                "covariance_step",
+                "covariance_regularized",
             ),
             // Unusable messages introduced in commit 2.
             (
@@ -6539,14 +6876,14 @@ mod tests {
                  (likely numerical overflow or underflow in model evaluation). \
                  SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             (
                 "Covariance step failed: Hessian has ill-conditioned entries for the \
                  following parameter(s) — theta[CL] (non-finite diagonal); \
                  sigma[1] (non-finite off-diagonal). SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             // Omega near-singular (tiny positive eigenvalue) — "near-singular" descriptor.
             (
@@ -6554,7 +6891,7 @@ mod tests {
                  convergence (min eigenvalue = 1.2e-10; eigenvalues: [0.5000, 1.2e-10]). \
                  SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             // Omega truly non-PD (negative eigenvalue) — "not positive definite" descriptor.
             (
@@ -6562,7 +6899,7 @@ mod tests {
                  convergence (min eigenvalue = -1.0e-3; eigenvalues: [0.5000, -1.0e-3]). \
                  SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             // SIR message that also contains "not positive definite" — must
             // still route to "sir", NOT to covariance_step.
@@ -6575,13 +6912,13 @@ mod tests {
             (
                 "[FOCEI] Covariance step failed",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             (
                 "[FOCEI] Covariance step: Hessian is not positive definite. \
                  Eigenvalues: [2.1000, -0.0100]. SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             (
                 "[SAEM] individual parameter(s) not mu-referenced: V",
@@ -6593,12 +6930,39 @@ mod tests {
                 Critical,
                 "convergence",
             ),
+            // -- survival/mod.rs simulation diagnostics (#762/#763) --------
+            // The `w_tte_degenerate` / `w_rtte_degenerate` prefixes must route to
+            // `simulation`, winning over the generic "degenerate" -> optimizer_health
+            // branch that their message body would otherwise match.
+            (
+                "W_TTE_DEGENERATE_HAZARD: subject '7' (CMT=1) drew a non-positive / \
+                 non-finite effective hazard rate; no event was generated and the \
+                 subject is censored at the observation window (#763). Check the \
+                 hazard parameters / covariate values.",
+                Warning,
+                "simulation",
+            ),
+            (
+                "W_RTTE_DEGENERATE: subject '7' (CMT=2) has a degenerate recurrent \
+                 hazard (~1.234e7 events expected before horizon 30); its event stream \
+                 was skipped and the subject censored at the horizon (#762). Check the \
+                 hazard parameters / covariate values.",
+                Warning,
+                "simulation",
+            ),
+            (
+                "W_RTTE_DEGENERATE: subject '7' (CMT=2) produced over 1000000 events \
+                 before horizon 30 (vanishing inter-event gaps); its stream was \
+                 truncated and the subject censored at the horizon (#762).",
+                Warning,
+                "simulation",
+            ),
         ];
 
         let mut failures: Vec<String> = Vec::new();
         for (msg, want_sev, want_cat) in table {
             let got = classify_warning(msg);
-            if got.severity != *want_sev || got.category != *want_cat {
+            if got.severity != *want_sev || got.category.as_str() != *want_cat {
                 failures.push(format!(
                     "  {msg:?} -> expected ({:?}, {:?}), got ({:?}, {:?})",
                     want_sev, want_cat, got.severity, got.category
@@ -7161,7 +7525,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         }
     }

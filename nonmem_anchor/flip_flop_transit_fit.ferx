@@ -1,0 +1,28 @@
+# Flip-flop 1-cpt transit — ferx side of the NONMEM anchor `flip_flop_transit.ctl`.
+#
+# ke = CL/V = 2/4 = 0.5 >= KTR = (N+1)/MTT = 4/20 = 0.2, so the analytic transit
+# closed form is outside its convergence domain (it would clamp to 0). ferx's
+# flip-flop reroute (pk::effective_model_for_eval) evaluates the equivalent ODE
+# transit twin instead — `d/dt(central) = transit(n, mtt) - (CL/V)*central`,
+# conc = central/V — which reproduces the NONMEM ADVAN13 transit profile to the
+# ODE-solver tolerance (~1e-4). See tests/transit_analytic_equivalence.rs
+# (`transit_flip_flop_routes_to_ode_twin`) for the profile comparison.
+[parameters]
+  theta TVCL(2.0, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(PROP)

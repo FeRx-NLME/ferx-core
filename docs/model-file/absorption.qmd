@@ -154,22 +154,34 @@ absorption *shape* is estimable), and `F` / `lagtime` map exactly as for
 absorption with `ka = 1/MTT`.
 
 **Domain.** The closed form converges for `ke = CL/V` below the transit rate
-`KTR = (N+1)/MTT` (the absorption-rate-limited regime — the usual case); the
-optimiser is kept inside this region automatically.
+`KTR = (N+1)/MTT` (the absorption-rate-limited regime — the usual case). At or above
+it (the flip-flop regime) ferx routes the model to its ODE twin automatically — see
+the flip-flop note below.
 
 **Scope (first version).** This analytic model supports single and multiple
-**bolus** doses, bioavailability, lag time, and a `central` initial amount.
-**Steady-state doses, IOV, time-varying covariates, infusions, system resets
-(EVID=3/4), and a `depot` initial amount are rejected** with an actionable message
+**bolus** doses into the depot (`CMT=1`), bioavailability, lag time, and a `central`
+initial amount. A model whose disposition switches mid-profile — a **time-varying
+covariate** or a `TIME`-dependent structural parameter — is transparently rerouted at
+parse time to an exact ODE `transit()` twin, so it is **supported**, not rejected.
+**Steady-state doses, IOV, infusions, system resets (EVID=3/4), a non-depot (`CMT≠1`)
+dose, and a `depot` initial amount are rejected** with an actionable message
 — use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
 tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
 drop-in choice when you need a feature the closed form does not yet cover.
 
-The closed form converges only when the disposition rate is below the transit rate
-`KTR = (n+1)/mtt`. Outside that domain (the **flip-flop** regime) it returns an
-identically-zero profile; a `W_TRANSIT_FLIP_FLOP` warning is emitted at the
-typical-value estimates so this fails loud rather than silently degenerating the
-objective — check the MTT / CL starting estimates, or use an ODE transit model.
+When the disposition rate reaches or exceeds the transit rate `KTR = (n+1)/mtt`
+(the **flip-flop** regime — a slow-absorption depot whose absorption rate-limits a
+faster disposition), the closed form is outside its convergence domain. ferx detects
+this *per evaluation* and routes the model to its exact ODE `transit()` twin, which
+is valid in both regimes (matched to a NONMEM ADVAN13 transit simulation to ~1e-4),
+so a flip-flop model fits and predicts correctly instead of returning a zero
+profile. A `W_TRANSIT_FLIP_FLOP` note still flags the regime at the typical-value
+estimates. The reroute needs an ODE twin: a closed-form transit model that also
+carries a `lagtime`, bioavailability `f`, or a user `[odes]` / `[scaling]` /
+`[initial_conditions]` block cannot be desugared, so there is no twin to route to. Rather than silently returning a zero profile that
+degenerates the objective, such a model is **rejected with a hard error**
+(`E_TRANSIT_FLIP_FLOP`) on `fit`, `predict`, `simulate`, and `ferx check` — rewrite
+it as an explicit ODE `transit()` model, or adjust the MTT / CL starting estimates.
 
 [`examples/one_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_transit.ferx)
 is a complete self-contained analytic transit model:
@@ -200,9 +212,11 @@ with `cα = (α−k21)/(α−β)`, `cβ = (k21−β)/(α−β)` (`cα + cβ = 1`
 **exact `Dual2` FOCE/FOCEI sensitivities** `∂C/∂{CL, V1, Q, V2, N, MTT, F, η}`, and
 with `N = 0` reduces exactly to 2-cpt first-order oral absorption with `ka = 1/MTT`.
 The **domain** (`α < KTR`, since `α ≥ β`) and **scope/limits** are identical to
-`one_cpt_transit` (bolus doses, bioavailability, lag time; SS / IOV / time-varying
-covariates / infusions / resets / `depot`-init rejected, and the same flip-flop
-`α ≥ KTR` warning — use an ODE transit model for those).
+`one_cpt_transit` (bolus doses into the depot, bioavailability, lag time; time-varying
+covariates and `TIME`-dependent parameters transparently rerouted to an exact 2-cpt ODE
+`transit()` twin; the flip-flop `α ≥ KTR` regime likewise auto-rerouted to that twin per
+evaluation — exactly as for `one_cpt_transit` above; SS / IOV / infusions / resets /
+non-depot (`CMT≠1`) doses / `depot`-init rejected — use an ODE transit model for those).
 
 [`examples/two_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_transit.ferx)
 is a complete self-contained example:

@@ -3158,7 +3158,7 @@ fn subject_eta_grad_impl(
     // Transit subject the closed form can't serve → its ODE `transit()` equivalent, which
     // takes the ODE-provider branch below (that branch ignores the analytical
     // `cached_schedule`, so a stale one is harmless). Unchanged for every other model (#486).
-    let model = model.effective_for(subject);
+    let model = crate::pk::effective_model_for_eval(model, subject, theta, eta);
     // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
     // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
     // scope the outer provider uses, so inner and outer stay on the same route.
@@ -4240,7 +4240,7 @@ fn subject_sensitivities_impl(
     // A `one_cpt_transit` subject the closed form can't serve (TIME switch / TV covariates)
     // routes to its exact ODE `transit()` equivalent, which then takes the ODE-provider
     // branch below; every other model is unchanged (#486).
-    let model = model.effective_for(subject);
+    let model = crate::pk::effective_model_for_eval(model, subject, theta, eta);
     // ODE models route to the ODE sensitivity provider (issue #367, Option A;
     // armed in #410) when in its supported scope; out-of-scope ODE subjects return
     // `None` and fall back to the prior path (gradient-free outer, FD inner). The
@@ -5984,7 +5984,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -6437,7 +6436,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -7408,7 +7406,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -8271,7 +8268,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         // θ = [TVCL, TVV, TVKA, TVLAG]; η = [ETA_CL, ETA_V, ETA_KA, ETA_LAG] (lag carries IIV).
@@ -8884,7 +8880,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -9325,7 +9320,6 @@ mod tests {
             occasions,
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -10524,7 +10518,6 @@ mod tests {
             occasions,
             dose_occasions: (1..=n_occ as u32).collect(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let theta = vec![0.2, 10.0];
@@ -10602,7 +10595,6 @@ mod tests {
             occasions,
             dose_occasions: (1..=n_occ as u32).collect(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let theta = vec![0.2, 10.0];
@@ -12452,7 +12444,6 @@ mod tests {
             occasions,
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -12744,7 +12735,6 @@ mod tests {
             occasions,
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }

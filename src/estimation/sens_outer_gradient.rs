@@ -3131,7 +3131,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let eta_ref = [0.12, -0.08, 0.2];
@@ -3592,7 +3591,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let eta_ref = [0.12, -0.08, 0.2, 0.0];
@@ -3836,7 +3834,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, &[0.12, -0.08]);
@@ -4410,7 +4407,6 @@ mod tests {
             occasions,
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let preds = crate::pk::predict_iov(
@@ -4450,7 +4446,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, eta_ref);
@@ -4865,7 +4860,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         assert!(subject.has_resets(), "fixture must carry a reset");
@@ -4936,7 +4930,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         assert!(
@@ -5303,7 +5296,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         assert!(
@@ -5497,7 +5489,6 @@ mod tests {
                 occasions: vec![1; n],
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             };
             let preds = crate::pk::compute_predictions_with_tv(&model, &s, &theta, &eta_ref);
@@ -5623,7 +5614,6 @@ mod tests {
                 occasions: vec![1; n],
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             };
             let eta_ref = [0.12, -0.08, 0.2, 0.1];
@@ -6344,7 +6334,6 @@ mod tests {
             occasions,
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         // Reference (η_bsv, κ_g0, κ_g1) → realistic ε ≠ 0.
@@ -6629,7 +6618,6 @@ mod tests {
             occasions,
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let preds = crate::pk::predict_iov(
@@ -7918,7 +7906,6 @@ mod tests {
             occasions,
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let preds = crate::pk::predict_iov(

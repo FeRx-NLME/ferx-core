@@ -31,8 +31,8 @@
 <g class="teal"><rect x="247" y="131" width="186" height="54" rx="6"/><text class="th" x="340" y="157" text-anchor="middle">SAEM engine</text><text class="ts" x="340" y="174" text-anchor="middle">B · f-SAEM (3b)</text></g>
 <g class="teal"><rect x="454" y="131" width="186" height="54" rx="6"/><text class="th" x="547" y="157" text-anchor="middle">Custom likelihood</text><text class="ts" x="547" y="174" text-anchor="middle">E · [ll_model] (Ph 8)</text></g>
 
-<g class="amber"><rect x="40" y="217" width="372" height="57" rx="6"/><text class="th" x="226" y="243" text-anchor="middle">Phase 4.0 · discrete-state slice</text><text class="ts" x="226" y="260" text-anchor="middle">thin shared foundation — unlocks C + D</text></g>
-<g class="teal"><rect x="432" y="217" width="208" height="57" rx="6"/><text class="th" x="536" y="243" text-anchor="middle">Matrix-exp module</text><text class="ts" x="536" y="260" text-anchor="middle">zero-dep · start now</text></g>
+<g class="green"><rect x="40" y="217" width="372" height="57" rx="6"/><text class="th" x="226" y="243" text-anchor="middle">Phase 4.0 · discrete-state slice</text><text class="ts" x="226" y="260" text-anchor="middle">merged · #773 — unlocks C + D</text></g>
+<g class="green"><rect x="432" y="217" width="208" height="57" rx="6"/><text class="th" x="536" y="243" text-anchor="middle">Matrix-exp module</text><text class="ts" x="536" y="260" text-anchor="middle">merged · #771/#774</text></g>
 
 <g class="purple"><rect x="40" y="299" width="250" height="61" rx="6"/><text class="th" x="165" y="325" text-anchor="middle">Categorical &amp; count</text><text class="ts" x="165" y="342" text-anchor="middle">C · binary · ordinal · Poisson · NB</text></g>
 <g class="purple"><rect x="360" y="299" width="280" height="61" rx="6"/><text class="th" x="500" y="325" text-anchor="middle">Markov / CTMM</text><text class="ts" x="500" y="342" text-anchor="middle">D · DTMM → mCTMM → CTMM → drug-Q</text></g>
@@ -40,8 +40,7 @@
 <g class="gray"><rect x="360" y="397" width="280" height="52" rx="6"/><text class="th" x="500" y="420" text-anchor="middle">Phase 7 · HMM</text><text class="ts" x="500" y="437" text-anchor="middle">needs CTMM + new inner-EM</text></g>
 
 <g class="green"><rect x="40" y="470" width="74" height="20" rx="10"/><text class="ts" x="77" y="484" text-anchor="middle">built</text></g>
-<g class="teal"><rect x="124" y="470" width="104" height="20" rx="10"/><text class="ts" x="176" y="484" text-anchor="middle">start now</text></g>
-<g class="amber"><rect x="238" y="470" width="150" height="20" rx="10"/><text class="ts" x="313" y="484" text-anchor="middle">foundation slice</text></g>
-<g class="purple"><rect x="398" y="470" width="120" height="20" rx="10"/><text class="ts" x="458" y="484" text-anchor="middle">needs slice</text></g>
-<g class="gray"><rect x="528" y="470" width="96" height="20" rx="10"/><text class="ts" x="576" y="484" text-anchor="middle">deferred</text></g>
+<g class="teal"><rect x="150" y="470" width="104" height="20" rx="10"/><text class="ts" x="202" y="484" text-anchor="middle">start now</text></g>
+<g class="purple"><rect x="290" y="470" width="140" height="20" rx="10"/><text class="ts" x="360" y="484" text-anchor="middle">next (endpoints)</text></g>
+<g class="gray"><rect x="466" y="470" width="96" height="20" rx="10"/><text class="ts" x="514" y="484" text-anchor="middle">deferred</text></g>
 </svg>

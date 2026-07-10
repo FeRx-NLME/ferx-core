@@ -1,5 +1,13 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
+**Latest (2026-07-10):** Two foundational merges landed. **(1)** CTMM matrix-exponential primitive —
+`matrix_exp` + exact Van Loan / Fréchet gradients + `ctmm_data_term`, feature-gated `markov`
+(#771/#774). **(2)** Phase 4.0 discrete-state/count plumbing — `ObsRecord::DiscreteState`/`Count`,
+`SimOutcome::Category`/`Count`, integer-DV datareader routing (#773). Both are still *unwired*:
+`EndpointLikelihood` has only `Gaussian`/`Tte`. **The critical path is now the endpoint-dispatch
+layer** — `EndpointLikelihood::Ctmm` + `[markov_model]` DSL (Track D, both prereqs now in), and the
+categorical variants + DSL (Track C). See §19.
+
 **Status:** Phase 1, Phase 1b, **Phase 2, and Phase 3 (RTTE) complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. **Phase 2 (Joint PK-TTE, ODE hazard accumulator) COMPLETE — Slice 2.1 fit path via PR #567 (squash `657800ee`) merged 2026-06-28, plus Slice 2.2 drug-driven event-time simulation + Slice 2.3 docs via PR #595 (squash `3f58c7d3`) merged 2026-06-29; both closing #564. ferx-r pin bump PR #208 merged.** Open follow-ups: **ferx-r#210** (bundled `pktte_joint` example + ODE-TTE simulation exposure — now sample-able after #595); **#570** (joint-fit double-solve perf) **SHIPPED via PR #613** — inner-NLL EBE + FOCEI at-mode now share one augmented solve (`solve_ode_dense` Hermite read-back, predictions bit-identical); the FD-Hessian's analytic CHZ η-sensitivities are split out as #626; #469 (FOCEI nonlinear-frailty ω²) **CLOSED via #571**. **Phase 3 (RTTE) — fit + simulation COMPLETE:** Slice 3.1 clock-forward (Andersen–Gill) fit via PR #718 (squash `0caf6212`) merged 2026-07-07; Slice 3.2 clock-reset (gap-time / renewal) fit via PR #720 (squash `2c860659`) merged 2026-07-08; Slice 3.3 analytic RTTE `simulate()` (closed-form inverse-CDF recurrent stream to the `[simulation] horizon`, both clocks) via PR #761 (squash `d8d0a247`) merged 2026-07-09 — each NONMEM-anchored (ferx FOCEI ≡ NONMEM LAPLACE to the decimal), all DSL-driven (no ferx-r changes). Open follow-ups: **#740** (clock-reset left-truncation support — currently fail-loud rejected); **#741** (time-varying covariates on survival hazards are silently frozen at baseline across *all* TTE/survival endpoints — support-or-warn); **#762** (RTTE-sim `MAX_EVENTS` cap panics the whole `simulate()` run for one pathological subject; note the two `rtte_cause` panic arms are intentional fail-loud and stay); **#763** (non-positive / non-finite effective hazard rate → silent censor-only subject across TTE simulation); **#764** (RTTE-simulation docs overstate simulate-path input-row rejections — the stream is regenerated from t=0). **NEXT: Phase 3.4 (RTTE docs polish) and/or Phase 3b (SAEM Laplace proposal); then Phase 4 (categorical / discrete-state likelihood, #760) as the Markov prerequisite.**  
 **Scope:** Phase 3 (RTTE) complete; next active phase = Phase 3b (SAEM Laplace) / Phase 4 (categorical, #760)  
 **Revised:** 2026-07-09 (Markov track cross-referenced — #759 tracks the Markov phases (4b DTMM /
@@ -358,16 +366,20 @@ log L_i(η) = Σ_{m=0}^{n_i−1} log [P(Δt_m)]_{s_m, s_{m+1}}
 
 Dataset: `(ID, TIME, STATE)` pairs — **no EVID=3 rows**. DV carries integer state index.
 
-For **gradients of P w.r.t. Q entries**, the Van Loan (1978) block-matrix Padé identity
-(this is **exact**, not an approximation):
+For **gradients of P w.r.t. the rate parameters**, the Van Loan (1978)
+block-matrix Padé identity gives the Fréchet derivative in a direction `E` (this
+is **exact**, not an approximation):
 
 ```
-∂/∂λ_jk expm(Q) = [expm([[Q, E_jk], [0, Q]])]_{1:S, S+1:2S}
+L(Q, E) = ∂/∂t expm(Q + tE)|₀ = [expm([[Q, E], [0, Q]])]_{1:S, S+1:2S}
 ```
 
-where `E_jk` is the matrix with 1 in position (j,k) and 0 elsewhere. One 2S×2S matrix
-exponential per parameter gives the exact derivative without finite differences.
-For S=3 states: a 6×6 matrix exponential per parameter (fast).
+One 2S×2S matrix exponential per direction gives the exact derivative without
+finite differences (for S=3, a 6×6 exp per parameter — fast). **The direction is
+constrained:** a generator's diagonal is fixed by its off-diagonals
+(`q_jj = −Σ_{k≠j} q_jk`), so the derivative w.r.t. rate `q_jk` uses
+`E = (E_jk − E_jj)·Δt`, not a bare single-entry `E_jk` — see §9.7. (Details and
+the implemented `matrix_exp_frechet` primitive: §8.7.)
 
 #### mCTMM (minimal CTMM) — highly recommended as stepping stone
 
@@ -892,12 +904,14 @@ survival data.
 
 ## 5. Gap Analysis — What ferx-core Currently Lacks
 
-### 5.1 Observation type system ✅ *Resolved — PRs #190, #192*
+### 5.1 Observation type system ✅ *Resolved — PRs #190, #192, #773*
 
-`ObsRecord::Event`, `EventType`, and `Subject.obs_records` added (behind
-`#[cfg(feature = "survival")]`). `CompiledModel.endpoints: HashMap<usize,
-EndpointLikelihood>` populated by `[event_model]` parser (PR #192). Binary/ordinal/count
-variants deferred to Phase 4.
+`ObsRecord::Event`, `EventType`, and `Subject.obs_records` added (PRs #190/#192).
+`CompiledModel.endpoints: HashMap<usize, EndpointLikelihood>` populated by `[event_model]` parser
+(PR #192). **#773 (Phase 4.0)** added the `ObsRecord::{DiscreteState, Count}` observation variants and
+ungated `ObsRecord`/`obs_records` to **default-on** (only the `Event` variant stays `survival`-gated).
+The *endpoint-likelihood* variants that consume them (Binary/Ordinal/Poisson/NegBin → **Track C,
+#760**; Ctmm/Dtmm → **Track D, #759**) are still to build (dispatch spec in §8.5).
 
 ### 5.2 Individual NLL dispatch ✅ *Resolved — PRs #192, #206*
 
@@ -917,7 +931,9 @@ FD Hessian + `½ log|det H_total|` for TTE CMTs; combined with Gaussian Almquist
 `[event_model]` parser landed in PR #192 (Exponential, Weibull, Gompertz; named blocks
 for competing risks; `loghr` PH term). PR #206: `[structural_model]`, `[error_model]`,
 `[individual_parameters]` all optional when `[event_model]` is the sole endpoint.
-Binary/ordinal/count/Markov rate-matrix blocks deferred to Phase 4+.
+Binary/ordinal/count DSL blocks (`[ordinal_model]`/`[count_model]`, §8.4) → **Phase 4 · Track C
+(#760)**; the `[markov_model]` rate-matrix block → **Phases 4b/4c/5/6 · Track D (#759)**. Grammar +
+dispatch are already spec'd (§8.4/§8.5); the remaining work is wiring, not design.
 
 ### 5.5 Cumulative hazard integration ✅ *Resolved — PRs #567, #595*
 
@@ -926,15 +942,22 @@ parser auto-appends `__chz_<cmt>' = hazard` to `OdeSpec` (init 0). The existing 
 augmented state on both the fit path (#567, Slice 2.1) and the simulation path (#595, Slice 2.2 —
 `solve_ode_until_threshold` root-finder for drug-driven event times).
 
-### 5.6 Matrix exponential *(open — Phase 5)*
+### 5.6 Matrix exponential ✅ *Resolved (primitive) — PRs #771, #774*
 
-No expm implementation. Need Padé approximant for CTMM. Van Loan trick for gradients.
+`src/markov/mod.rs` (feature `markov`): `matrix_exp` (scaling-and-squaring via nalgebra),
+`matrix_exp_frechet` + `generator_rate_direction` (exact directional Van Loan / Fréchet gradients),
+and a guarded `ctmm_data_term`; closed-form 3-state chain test anchor in #774. **Primitive only** —
+not yet wired to an endpoint (no `[markov_model]` DSL, no `EndpointLikelihood::Ctmm`); that wiring
+is the remaining **Phase 5 · Track D (#759)** work (§12) — its Phase 4.0 data-plumbing prerequisite
+is now merged (#773).
 
-### 5.7 Data reader extensions ✅ *Resolved — PR #192*
+### 5.7 Data reader extensions ✅ *Resolved — PRs #192, #773*
 
 DV=0/1/2 routed to `subject.obs_records` for TTE CMTs; `TENTRY` column auto-detected
-for left truncation; non-integer DV on TTE CMT → hard error. State-index and count
-routing deferred to Phase 4.
+for left truncation; non-integer DV on TTE CMT → hard error. **State-index and count routing landed
+via #773 (Phase 4.0):** an `ObsRouting { tte, discrete, count }` 3-target dispatch with a disjointness
+guard and a shared `checked_integer_dv` (missing DV skipped as MDV=1 per #258; non-integer, negative,
+non-finite, and out-of-range DVs rejected) — covered by 13 reader tests.
 
 ### 5.8 SAEM sigma update for non-Gaussian ✅ *Resolved — PR #206*
 
@@ -945,7 +968,7 @@ SAEM M-step now adds the TTE data term for TTE subjects. Sigma update is Gaussia
 
 Current SAEM uses a random-walk MH proposal. Replacing it with a Laplace-based independent
 proposal (f-SAEM) would accelerate convergence for all non-Gaussian models (§9.1); this is
-Phase 3b and remains **open**. A related but distinct increment has landed: PR #265 ("SAEM
+**Phase 3b · Track B (#788)** and remains **open**. A related but distinct increment has landed: PR #265 ("SAEM
 conditional-distribution pass", merged 2026-06-21) characterises each subject's post-fit
 `p(η|y)` — conditional mean/SD/draws, the saemix `conddist` / Monolix analog — by
 *accumulating* the existing random-walk MH draws after the fit. It does **not** change the
@@ -1439,36 +1462,57 @@ fn laplace_objective_nongaussian(
 
 ### 8.7 CTMM matrix exponential module
 
-New file `src/markov/mod.rs`:
+`src/markov/mod.rs` — gated behind the `markov` cargo feature. **The matrix
+exponential is not hand-rolled:** nalgebra 0.35 already ships the Higham (2005)
+scaling-and-squaring Padé as `DMatrix::exp()` (see D4), so `matrix_exp` is a thin
+wrapper and the module adds **zero dependencies**. Public API as built (leaf PR,
+#759):
 
 ```rust
-/// 13th-order scaling-and-squaring Padé approximant (Higham 2005).
-/// Stable for any Q with ‖Q‖ reasonable; rescale if ‖Q‖₁ > 1.
+/// P(Δt) = expm(A) for A = Q·Δt. Thin wrapper over nalgebra's `DMatrix::exp()`
+/// (Higham 2005 scaling-and-squaring Padé). Round-off is NOT clamped here — the
+/// likelihood inspects only the one selected entry.
 pub fn matrix_exp(a: &DMatrix<f64>) -> DMatrix<f64>;
 
-/// Gradient of matrix_exp(Q) w.r.t. Q[j,k] using the Van Loan (1978) block trick:
-///   ∂ expm(Q) / ∂ Q[j,k] = [expm([[Q, E_jk],[0,Q]])]_{1:S, S+1:2S}
-/// Returns a slice of S×S gradient matrices, one per non-zero Q entry.
-pub fn matrix_exp_grad(q: &DMatrix<f64>, entries: &[(usize,usize)]) -> Vec<DMatrix<f64>>;
+/// Exact Fréchet derivative L(A,E) = d/dt expm(A + tE)|₀ via the Van Loan (1978)
+/// block trick: [ expm([[A,E],[0,A]]) ]_{upper-right}. DIRECTIONAL — the caller
+/// supplies the perturbation E — because a generator's rate parameters are
+/// CONSTRAINED (rows sum to 0), so ∂/∂q_jk is the derivative in the direction
+/// (E_jk − E_jj)·Δt, NOT the derivative w.r.t. a single free matrix entry. (An
+/// earlier draft of this section returned "one gradient per Q entry", which
+/// silently ignores the row-sum-zero constraint — the corrected primitive is
+/// directional.)
+pub fn matrix_exp_frechet(a: &DMatrix<f64>, e: &DMatrix<f64>) -> DMatrix<f64>;
 
-/// CTMM individual data term: -Σ log P[s_{k+1} | s_k, Δt_k, Q(η,θ)]
-pub fn ctmm_data_term(q: &DMatrix<f64>, records: &[(f64, usize)]) -> f64;
+/// The constrained direction (E_jk − E_jj)·dt for rate parameter q_jk of an
+/// s-state generator. Feed with A = Q·dt to `matrix_exp_frechet` for ∂P(dt)/∂q_jk.
+pub fn generator_rate_direction(s: usize, j: usize, k: usize, dt: f64) -> DMatrix<f64>;
 
-/// Time-inhomogeneous transition: solve dP/dt = Q(C(t))·P, P(0)=I using RK45.
-/// Returns P(Δt) as S×S matrix.
-pub fn ctmm_inhomogeneous_transition(
-    q_at_c: impl Fn(f64) -> DMatrix<f64>,
-    delta_t: f64,
-    n_states: usize,
-) -> DMatrix<f64>;
-
-/// Forward algorithm for HMM (future phase): O(T×S²), log-sum-exp stable.
-pub fn hmm_log_likelihood(
-    transitions: &DMatrix<f64>,     // P(s'|s) row-stochastic
-    emissions:   &[Vec<f64>],       // p(y_t | s) for each time
-    init_dist:   &[f64],
-) -> f64;
+/// Individual CTMM NLL = −Σ log P(Δtₘ)[sₘ, sₘ₊₁] for a PREBUILT generator.
+/// Fail-loud guard layer (never a silent −inf, never a panic on bad input):
+///   • structural/data errors → Err(MarkovError): non-square/too-small Q, state
+///     index out of range, non-finite time, decreasing time, two distinct states
+///     at Δt=0;
+///   • parameter-driven degeneracy (an observed transition whose probability
+///     underflowed to non-positive) → Ok(1e20) sentinel, matching the `survival`
+///     module's convention (repels the optimizer, keeps the fit alive).
+pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovError>;
 ```
+
+**Deferred to later phases — NOT in the leaf** (shipping their signatures now
+would be dead code and a coverage hole behind the same flag):
+
+```rust
+/// Phase 6 — time-inhomogeneous transition: solve dP/dt = Q(C(t))·P, P(0)=I (RK45).
+pub fn ctmm_inhomogeneous_transition(q_at_c: impl Fn(f64) -> DMatrix<f64>, delta_t: f64, n_states: usize) -> DMatrix<f64>;
+
+/// Phase 7 — HMM forward algorithm: O(T×S²), log-sum-exp stable.
+pub fn hmm_log_likelihood(transitions: &DMatrix<f64>, emissions: &[Vec<f64>], init_dist: &[f64]) -> f64;
+```
+
+The leaf ships `matrix_exp` + `matrix_exp_frechet` + `generator_rate_direction`
++ `ctmm_data_term` + a Tier-1 test battery (§14.10). Building `Q(η,θ)` from the
+model, the FOCEI/SAEM wiring, and the `Population → StateObs` reader are Phase 5.
 
 ### 8.8 Simulation, Prediction & Diagnostics
 
@@ -1535,9 +1579,9 @@ pub struct SimulationResult {
 **Breaking change:** `dv_sim: f64` field removed; callers must use
 `row.outcome.continuous_value()`. Version bumped 0.1.5 → 0.1.6.
 
-**Future variants** (`Category`, `Count`) will be added to `SimOutcome` unconditionally
-(no feature flag) once Phase 4 lands. The `Event` variant will likewise be promoted
-to default-on after Phase 1 validation.
+**`SimOutcome::Category` and `Count`** landed via #773 (Phase 4.0), unconditional (no feature flag) —
+but only the output *shape*; the sampler/producer that emits them is Track C/D (still open). The
+`Event` variant remains `survival`-gated.
 
 The target `Prediction` enum and `SurvivalPredictionResult` remain as planned:
 
@@ -1844,22 +1888,34 @@ significant. Expose as `[fit_options] cila_samples = 50`.
 
 ### 9.7 Van Loan block trick for CTMM gradients
 
-For computing `∂ expm(Q) / ∂ Q[j,k]` without finite differences:
+The primitive computes the Fréchet derivative in an **arbitrary direction** `E`
+(not w.r.t. a single entry) — `L(A,E) = d/dt expm(A + tE)|₀` — because a
+generator's rate parameters are constrained (see below):
 
 ```rust
-fn matrix_exp_param_grad(q: &DMatrix<f64>, j: usize, k: usize) -> DMatrix<f64> {
-    let s = q.nrows();
+fn matrix_exp_frechet(a: &DMatrix<f64>, e: &DMatrix<f64>) -> DMatrix<f64> {
+    let s = a.nrows();
     let mut c = DMatrix::zeros(2*s, 2*s);
-    c.view_mut((0,0), (s,s)).copy_from(q);
-    c.view_mut((s,s), (s,s)).copy_from(q);
-    c[(j, s + k)] = 1.0;   // E_jk in the upper-right block
+    c.view_mut((0,0), (s,s)).copy_from(a);
+    c.view_mut((s,s), (s,s)).copy_from(a);
+    c.view_mut((0,s), (s,s)).copy_from(e);   // E in the upper-right block
     let ec = matrix_exp(&c);
-    ec.view((0,s), (s,s)).into_owned()  // upper-right block = the gradient
+    ec.view((0,s), (s,s)).into_owned()        // upper-right block = L(A,E)
 }
 ```
 
-One 2S×2S matrix exponential per parameter gives the exact gradient. For S=3 and
-5 free parameters: 5 matrix exponentials of a 6×6 matrix — negligible cost.
+**The row-sum-zero constraint matters.** A generator's diagonal is fixed by its
+off-diagonals (`q_jj = −Σ_{k≠j} q_jk`), so raising the *rate parameter* `q_jk`
+also lowers `q_jj`. The derivative of `expm(Q·Δt)` w.r.t. that rate is therefore
+`L(Q·Δt, (E_jk − E_jj)·Δt)`, **not** the single-entry `L(Q·Δt, E_jk)`. A
+per-entry API (an earlier draft) silently computes the wrong thing; the directional
+form above takes the constrained direction explicitly (built by
+`generator_rate_direction`). One 2S×2S matrix exponential per parameter gives the
+exact gradient — for S=3 and 5 rate parameters, five 6×6 exponentials, negligible.
+*(A complex-step alternative `L(A,E) = Im(expm(A + i·h·E))/h` needs one complex
+S×S exp per direction — ~2× cheaper — but it's an unvalidated Phase-5
+optimization; the leaf uses real Van Loan, validated to 1e-13 against
+Daleckii–Krein.)*
 
 ---
 
@@ -2511,7 +2567,7 @@ from `tests/reference/pktte_joint/expected.md` plus the `$SIM` cross-tool anchor
 - Docs: `docs/estimation/rtte.qmd` with estimation method guidance
 - Tests: Tier 3 SAEM convergence; **Tier 3 SSE** (simulate RTTE → fit → recover)
 
-### Phase 3b — SAEM proposal option (can happen alongside Phase 3) · Track B
+### Phase 3b — SAEM proposal option (can happen alongside Phase 3) · Track B (#788)
 
 **Scope:** Add `saem_proposal = auto | laplace | random_walk` to `[fit_options]`.
 `auto` is the new default; existing behaviour (`random_walk`) remains available.
@@ -2529,33 +2585,40 @@ not an approximation. Low regression risk: `random_walk` path is unchanged code.
 - Benchmark: convergence iterations (warfarin SAEM + RTTE dataset) for all three modes
 - Docs: `docs/model-file/fit-options.qmd` — `saem_proposal` entry with guidance table
 
-### Phase 4.0 — Discrete-state observation plumbing (thin shared slice) · shared foundation (unlocks Tracks C + D)
+### Phase 4.0 — Discrete-state observation plumbing (thin shared slice) · ✅ MERGED #773
+
+**Status: ✅ merged (#773, 2026-07-10).** `ObsRecord::DiscreteState`/`Count`,
+`SimOutcome::Category`/`Count`, and the integer-DV datareader routing are on `main`. Both the Track-C
+(categorical) and Track-D (CTMM) endpoints are now unblocked — their `EndpointLikelihood` variants +
+DSL parsers are the next step.
 
 **Tracking:** front slice of #760. **The pivot that lets the categorical track (C) and the Markov
 track (D) proceed in parallel** — see the track map (§19).
 
-Today `types.rs` carries only `ObsRecord::Event`, `EndpointLikelihood::{Gaussian,Tte}`, and
-`SimOutcome::{Continuous,Event}` (the discrete/count variants are commented out, "deferred to
-Phase 4/5"). The Markov phases are nominally blocked on *all* of Phase 4, but they consume only the
-discrete-state *plumbing*, not the ordinal/Poisson/NB *distributions*. Carve that plumbing out as
-its own small slice:
+Rationale for carving this thin slice off the front of Phase 4: the Markov phases were nominally
+blocked on *all* of Phase 4, but they consume only the discrete-state *plumbing*, not the
+ordinal/Poisson/NB *distributions*. #773 shipped exactly that plumbing (record types, reader routing,
+sim-output shapes — no likelihood/DSL/producer), all **default-on**:
 
-- `ObsRecord::DiscreteState { time, state, cmt }` and `ObsRecord::Count { time, count, cmt }` (the
-  §8.1 variants). The datareader routes integer-DV rows on a declared discrete/count CMT into them
-  (two-pass read: parse the `[..._model]` blocks first, then dispatch each row by its CMT, §8.1). A
-  non-integer DV on such a CMT is a hard error (mirror the TTE rule from #192).
-- `SimOutcome::Category { state }` and `SimOutcome::Count { count }` (added unconditionally, §8.8.1)
-  plus the `Prediction::CatProbs { probs }` output shape.
-- **No likelihood math here** — only the record types, the reader routing, and the output shapes.
+- ✅ `ObsRecord::DiscreteState { time, state, cmt }` and `Count { time, count, cmt }` (default-on;
+  only `Event` stays `survival`-gated). The datareader's `ObsRouting { tte, discrete, count }` routes
+  integer-DV rows on a declared discrete/count CMT into them, with a disjointness guard and
+  `checked_integer_dv` validation (missing DV skipped as MDV=1 per #258; non-integer / negative /
+  non-finite / out-of-range DV rejected).
+- ✅ `SimOutcome::Category { state }` and `Count { count }` (unconditional).
+- ⬜ **Not** in #773 (these belong with the endpoint / prediction, Track C/D): `Prediction::CatProbs`
+  (there is no `Prediction` enum yet), the `EndpointLikelihood` variants, the `[..._model]` DSL blocks,
+  and any sampler/producer — i.e. no likelihood math and nothing that *emits* a category/count.
 
 **What consumes it.** Track C (binary/ordinal/Poisson/NB data terms, §3.5) and Track D
 (DTMM/mCTMM/CTMM state observations, §3.4). CTMM (4c/5/6) needs *only* this slice plus its own
 matrix-exp NLL — it does **not** need the categorical distributions; only DTMM (4b) additionally
 reuses Track C's categorical-logit primitive.
 
-**Deliverables:** the `types.rs` variants above; `io/datareader.rs` integer-DV state/count routing
-+ non-integer guard; a Tier-2 test that a `DiscreteState`-CMT dataset reads into `obs_records`; no
-estimator change (no endpoint math yet). **Files:** `src/types.rs`, `src/io/datareader.rs`.
+**Delivered (#773):** the `types.rs` variants above (+ ungate of `ObsRecord`/`obs_records` to
+default-on, a mechanical cascade across ~14 files); the `io/datareader.rs` `ObsRouting` 3-target
+routing + DV validation; 13 reader tests. No estimator change (no endpoint math).
+**Files:** `src/types.rs`, `src/io/datareader.rs`.
 
 ### Phase 4 — Categorical and Count Models · Track C
 
@@ -2604,13 +2667,22 @@ full CTMM. Validates state-observation data reader and CTMM NLL before matrix ex
 
 **Scope:** Full Q matrix; Padé matrix exponential; Van Loan gradient.
 
+**Status: numerical core merged (#771/#774); Phase 4.0 plumbing merged (#773); endpoint wiring open.**
+The `src/markov` primitive, its Tier-1 anchor, *and* the discrete-state routing it consumes are all on
+`main` — both prerequisites are in. What remains is the endpoint itself: an `EndpointLikelihood::Ctmm`
+variant + dispatch (calling `ctmm_data_term`) and the `[markov_model]` DSL parser.
+
 **Deliverables:**
-- `src/markov/mod.rs`: `matrix_exp`, `matrix_exp_param_grad`, `ctmm_data_term`
+- ✅ `src/markov/mod.rs`: `matrix_exp`, `matrix_exp_frechet` (+ `generator_rate_direction` for exact
+  generator-rate gradients), `ctmm_data_term` — merged #771 (realized as a directional Fréchet
+  derivative, not a per-entry `matrix_exp_param_grad`; same exact gradient)
+- ✅ Tier 1 unit test: `matrix_exp` + `ctmm_data_term` vs. closed-form 3-state chain — merged #774
+- ✅ `ObsRecord::DiscreteState` routing — merged #773 (Phase 4.0)
+- **`EndpointLikelihood::Ctmm` variant + dispatch (calls `ctmm_data_term`) — the next step**
 - `[markov_model]` DSL; `type = ctmm`
 - **Simulation**: Gillespie/Doob path generator (`src/markov/simulate.rs`); observe the
   simulated path on `[simulation] obs_schedule` (§8.8.2, §8.8.4)
 - **Prediction**: state-occupancy vector `π(t) = π₀·expm(Q·t)` → `Prediction::CatProbs`
-- Tier 1 unit test: `matrix_exp` vs. series expansion for 2×2 and 3×3 Q
 - Tier 3 convergence test: 3-state CTMM vs. R `msm` (CAV dataset)
 - **Tier 3 SSE**: simulate path → fit Q → recover rates
 - Docs: `docs/estimation/ctmm.qmd` with NONMEM infeasibility rationale
@@ -2657,7 +2729,7 @@ Phase-7 build:
 transition model + Phase 4.0 (discrete-state plumbing) for the data. The forward *primitive*,
 however, is zero-dependency and can be spiked at any time — its outcome may rewrite the §17 risk line.
 
-### Phase 8 — Custom `[ll_model]` escape hatch · Track E (independent leaf)
+### Phase 8 — Custom `[ll_model]` escape hatch · Track E (independent leaf, #789)
 
 User-specified log-likelihood expression; covers distributions not in the built-in list. **Needs
 only the generalized-NLL trunk (§2, built) + ferx's existing expression evaluator — no dependency on
@@ -2695,7 +2767,7 @@ are out of scope for v1. **No `simulate()`** by default (an arbitrary `ll` has n
 fit/predict only; document the limitation.
 
 **Validation:** Tier-1 — a custom-Poisson `[ll_model]` reproduces the analytic Poisson data term to
-1e-10; Tier-2 — parse + `fit()` in ≤3 iters; once Phase 4 lands, cross-check vs. the built-in
+1e-10; Tier-2 — parse + `fit()` in ≤3 iters; once the Track-C Poisson endpoint lands, cross-check vs. the built-in
 Poisson. **Files:** the four above + new `docs/model-file/ll-model.qmd`.
 
 ---
@@ -2762,12 +2834,36 @@ Simulated 3-state mCTMM; single τ parameter; vs. R `msm` restricted model.
 CAV (cardiac allograft vasculopathy); 3 states. Available in R `msm`.
 Reference: `msm::msm()`. Accept: Q entries ±15%; OFV ±1.0.
 
-### 14.10 Matrix exponential unit test (Tier 1, fast)
+### 14.10 Matrix exponential unit test (Tier 1, fast) — **built (leaf PR #759)**
 
-Verify `matrix_exp(A)` matches `Σ Aᵏ/k!` (k=0..20) to 1e-10 for:
-- 2×2 diagonal Q (analytic solution available)
-- 3×3 dense Q
-Verify `matrix_exp_param_grad` matches FD gradient to 1e-8.
+The `src/markov` leaf ships this battery as inline `#[cfg(test)]` tests. Value:
+- `matrix_exp(A)` vs `Σ Aᵏ/k!` for a 2×2 generator and a 3×3 dense generator
+  (to 1e-12), and vs the **closed-form 2-state** transition matrix (to 1e-13).
+- `expm(0) = I` exactly.
+
+Generator invariants (a floating `expm` is not guaranteed stochastic):
+- rows sum to 1 and entries ∈ [0,1] for a generator;
+- semigroup/inverse `expm(A)·expm(−A) = I`;
+- `det(expm A) = exp(tr A)`;
+- large-norm stress (‖Q·Δt‖ ~ 1e4, near-absorbing): rows still sum to 1 even
+  where individual entries underflow to exactly 0 — the log(0) hazard the
+  `ctmm_data_term` guard handles.
+
+Gradient — **exact**, not just vs FD:
+- `matrix_exp_frechet` vs the **Daleckii–Krein** divided-difference reference in
+  the eigenbasis of a symmetric `A` (to 1e-13) — independent of both FD and the
+  `expm` internals;
+- Fréchet linearity `L(A,αE) = α·L(A,E)`;
+- the constrained rate direction `(E_jk − E_jj)·Δt` vs central FD of the full
+  `expm(Q(a)·Δt)` (to 1e-8).
+
+Guard layer (fail-loud, no silent −inf):
+- each structural error returns its typed `MarkovError` **and the message is
+  asserted** (non-square/too-small Q, out-of-range state, non-finite time —
+  matched via `is_nan()` since `NaN != NaN` — decreasing time, Δt=0 with a state
+  change);
+- an underflowed observed transition returns the `1e20` sentinel;
+- Δt=0 with the same state, and <2 observations, contribute 0.
 
 ### 14.11 Simulation-estimation (SSE) — every endpoint (license-free)
 
@@ -2870,8 +2966,21 @@ these have no residual variance).
 
 ### D4: Matrix exponential crate vs. in-house
 
-Implement inline using nalgebra — ~150 lines, no new dependency, full control,
-testable against series definition. The `expm` crate on crates.io is unmaintained (2019).
+**nalgebra already ships it — no hand-rolled Padé.** `nalgebra 0.35`'s
+`Matrix::exp()` (`src/linalg/exp.rs`) *is* the Higham (2005) scaling-and-squaring
+Padé approximant this design needs, and it works on `DMatrix`. So there is **no
+~150-line inline Padé** and no new dependency: `src/markov::matrix_exp` is a
+thin, documented wrapper over `DMatrix::exp()`, and the parameter gradient
+(`matrix_exp_frechet`, §8.7/§9.7) is the Van Loan block trick built on the same
+call. Validated in-repo against the Taylor series, the closed-form 2-state
+transition matrix, and the exact Daleckii–Krein Fréchet reference (§14.10) — the
+unmaintained `expm` crate (2019) is moot.
+
+*(This note originally called for a hand-rolled inline Padé; that predated the
+discovery that nalgebra's built-in `.exp()` is exactly the required algorithm. An
+empirical probe confirmed it reproduces the closed-form 2-state solution to
+1e-16, satisfies the stochasticity / semigroup / `det = exp(tr)` identities, and
+supports an exact Van Loan Fréchet to machine precision.)*
 
 ### D5: Feature flag for markov module
 
@@ -3014,7 +3123,7 @@ on the whole categorical phase.
   |-- A. Survival hardening ........ independent (Track A)
   |-- B. SAEM engine (Phase 3b) .... independent (Track B)
   |-- E. Custom [ll_model] (Ph 8) .. independent (Track E)
-  |-- matrix-exp module (§8.7) ..... zero-dep, start now
+  |-- matrix-exp module (§8.7) ..... ✅ MERGED (#771/#774)
   |-- Phase 4.0 discrete-state slice   <-- the pivot
         |
         |-- C. Categorical & count (Phase 4) ... Track C
@@ -3027,17 +3136,25 @@ on the whole categorical phase.
 |---|---|---|---|---|
 | **Trunk** (built) | §2 dispatch, FD-Hessian + log-det, `SimOutcome` | — | ✅ done | `survival` → default |
 | **A · Survival hardening** | #741, #763, #762, #740, #626, #764, Phase 3.4 docs; Phase 2 deferred (IntervalCensored+ODE, left-trunc+ODE); ferx-r `predict_survival` + e2e + ferx-r#210 | trunk | ✅ yes | `survival` |
-| **B · SAEM engine** | Phase 3b `saem_proposal = auto` | trunk | ✅ yes | none |
-| **E · Custom likelihood** | Phase 8 `[ll_model]` | trunk | ✅ yes | none |
-| **4.0 · Discrete-state slice** | Phase 4.0 (front of #760) | trunk | ✅ yes (thin) | (part of Phase 4) |
-| **matrix-exp module** | `src/markov`: `matrix_exp` + Van Loan (§8.7) | none | ✅ yes | `markov` |
-| **C · Categorical & count** | Phase 4 / #760 (binary·ordinal·Poisson·NB) | 4.0 | after 4.0 | none |
-| **D · Markov / CTMM** | Phases 4b/4c/5/6 / #759 | 4.0 (+ matrix-exp; 4b also on C's logit) | after 4.0 | `markov` |
+| **B · SAEM engine** | Phase 3b `saem_proposal = auto` (#788) | trunk | ✅ yes | none |
+| **E · Custom likelihood** | Phase 8 `[ll_model]` (#789) | trunk | ✅ yes | none |
+| **4.0 · Discrete-state slice** | Phase 4.0 (front of #760) | trunk | ✅ **merged #773** | (part of Phase 4) |
+| **matrix-exp module** | `src/markov`: `matrix_exp` + Van Loan + `ctmm_data_term` (§8.7) | none | ✅ **merged #771/#774** | `markov` |
+| **C · Categorical & count** | Phase 4 / #760 (binary·ordinal·Poisson·NB) | 4.0 ✅ (#773) | **ready now** | none |
+| **D · Markov / CTMM** | Phases 4b/4c/5/6 / #759 — **matrix-exp core merged #771/#774** | 4.0 ✅ (#773) + matrix-exp ✅ | **endpoint ready** (both prereqs in) | `markov` |
 | **Phase 7 · HMM** | Phase 7 (Track D tail) | D (Phase 5) + inner-EM spike | tail | `markov` |
 
-**Sequencing.** Start in parallel with zero coordination: **A, B, E, the matrix-exp module, and the
-4.0 slice** — five workstreams, no shared files of consequence. Once 4.0 lands (small), **C and the
-CTMM chain (4c → 5 → 6) proceed in parallel**; only **4b DTMM** waits on C's categorical-logit
-primitive. HMM is last (needs Phase 5), but its forward primitive can be spiked at any time (Phase
-7). This is the parallel-workstream view of the linear §18 milestone order — the two are consistent:
-§18 is the safe serial order, §19 is where the parallelism is.
+**Sequencing.** Start in parallel with zero coordination: **A, B, E, and the 4.0 slice** — plus the
+**matrix-exp module, now ✅ merged (#771/#774)**. Once 4.0 lands (small), **C and the CTMM chain
+(4c → 5 → 6) proceed in parallel**; only **4b DTMM** waits on C's categorical-logit primitive. HMM is
+last (needs Phase 5), but its forward primitive can be spiked at any time (Phase 7). This is the
+parallel-workstream view of the linear §18 milestone order — the two are consistent: §18 is the safe
+serial order, §19 is where the parallelism is.
+
+**Update (2026-07-10).** Two foundational lanes landed fast — the matrix-exp core (#771/#774) *and*
+Phase 4.0 discrete-state/count plumbing (#773) — validating the split (both collision-free: a new
+`src/markov` file and additive `types.rs`/`datareader.rs` routing). Both are still *unwired*:
+`EndpointLikelihood` has only `Gaussian`/`Tte`. **The critical path is now the endpoint-dispatch
+layer** — `EndpointLikelihood::Ctmm` + `[markov_model]` DSL (Track D, both prereqs now in) and the
+categorical variants + DSL (Track C). Tracks A, B, E are untouched by these merges and remain
+independent.

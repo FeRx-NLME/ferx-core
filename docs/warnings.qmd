@@ -1,0 +1,106 @@
+# Warnings
+
+A fit collects non-fatal issues into two parallel channels on `FitResult`:
+
+- `warnings` — a `Vec<String>` of human-readable messages, shown by the CLI and
+  written to the YAML / `.fitrx` bundle. This is the display channel.
+- `warnings_structured` — a `Vec<WarningEntry>`, the **machine-branchable**
+  channel. Each entry carries a typed [`WarningCode`](#warning-codes), a
+  severity, the message, an optional originating method, and an optional
+  numeric `details` payload. This is what a script, the R wrapper, or an
+  **agentic model-development loop** should read — it is serialized in the
+  [JSON output](output.qmd#fit-json-modelfitjson).
+
+```json
+{
+  "severity": "Warning",
+  "category": "dw_autocorrelation",
+  "message": "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).",
+  "source_method": null
+}
+```
+
+`category` is the stable snake_case token of a `WarningCode`. It is a public API
+surface: tokens never change or get repurposed once released, so a consumer can
+branch on them safely (new warning classes get new tokens). `details` is omitted
+when empty.
+
+## Severity {#severity}
+
+| Severity | Meaning | Typical agent response |
+|----------|---------|------------------------|
+| `Critical` | The result is untrustworthy as-is (no convergence, failed covariance, ill-conditioning). | Do not accept the model; change structure/inits and refit. |
+| `Warning` | The result stands but a caveat applies (autocorrelation, shrinkage, data quality). | Inspect; often iterate on error model, IIV structure, or data. |
+| `Info` | Informational note, no action implied. | Log; no action. |
+
+## Warning codes {#warning-codes}
+
+Each `WarningCode` token, what it flags, and a typical response.
+
+| Code (`category`) | Severity | Flags | Typical agent response |
+|-------------------|----------|-------|------------------------|
+| `convergence` | Critical | Optimizer did not converge. | Reject; adjust inits / method / bounds and refit. |
+| `covariance_failed` | Critical | Covariance step failed — no standard errors. | SEs unavailable — try `covariance_fallback = sir` or refit with different inits. |
+| `covariance_regularized` | Warning | Covariance step succeeded but was regularized / degraded. | SEs may be over-optimistic — inspect eigenvalues; consider SIR intervals. |
+| `covariance_step` | Info | Covariance-step informational note (e.g. evaluation cost). | None. |
+| `condition_number` | Critical | Ill-conditioned covariance / high condition number. | Over-parameterized — drop a random effect or covariate. |
+| `optimizer_health` | Warning | Trust-radius collapse / degeneracy. | Try a different optimizer or re-scale parameters. |
+| `dw_autocorrelation` | Warning | IWRES autocorrelation (Durbin–Watson out of range). | Revisit the residual-error / structural model. |
+| `eta_normality` | Warning | ETA departs from normality. | Consider a mixture or transform. |
+| `experimental` | Warning | An experimental feature (SDE, neural-network) was used. | Treat results with caution; validate. |
+| `bloq_method` | Warning | BLOQ / M3 censoring caveat. | Confirm the censoring semantics match intent. |
+| `sir` | Warning | SIR failed or was requested without a covariance. | Ensure a covariance exists before requesting SIR. |
+| `importance_sampling` | Warning | ESS = 0 / proposal collapse. | Increase samples or improve the proposal. |
+| `eps_shrinkage` | Warning | Residual (EPS) shrinkage high / negative. | Sparse data for the error model — simplify it. |
+| `eta_shrinkage` | Warning | One or more ETA shrinkages exceed ~30%. | Data poorly inform that IIV — consider removing it on the affected parameter(s). |
+| `data_quality` | Warning | Dataset issue (missing DV, ADDL/II, non-positive DV, …). | Fix the dataset before trusting the fit. |
+| `omega_structure` | Warning | Mixed lognormal / additive block in omega. | Make the block's parameterization consistent. |
+| `gradient_fallback` | Info | A gradient / sampler fallback was taken. | None; note the slower path. |
+| `mu_referencing` | Warning / Info | Missing or partial mu-referencing. | Prefer `CL = TVCL * exp(ETA_CL)` forms for SAEM/Bayes. |
+| `optimizer_config` | Warning / Info | `global_search` config note or failure. | Check the global-search setup if disabled unexpectedly. |
+| `multi_start` | Info | Multi-start note. | Inspect which start won. |
+| `cancelled` | Info | Run cancelled by the user. | None. |
+| `threads` | Info | Thread-count efficiency note. | Optionally tune `threads`. |
+| `simulation` | Warning | A simulated subject was handled specially — a degenerate hazard draw (censored, no event) or an over-large recurrent-event stream (skipped/truncated). Surfaced by `simulate_with_options_diag` and on `--simulate` runs (#762/#763). | Inspect the named subject's hazard parameters / covariate values; the estimated model is unaffected. |
+| `general` | Warning | Unrecognised message (fallback bucket). | Read the message text. |
+
+## Details payloads {#details}
+
+Numeric diagnostics **may** carry a `details` object with the value behind the
+message, so a consumer reads the number directly instead of parsing prose. The
+numbers are sourced from the fit's typed fields, not from the message text.
+Treat `details` as optional: check for its presence rather than assuming it.
+
+| Code | `details` keys |
+|------|----------------|
+| `dw_autocorrelation` | `durbin_watson`, `iwres_lag1_autocorr` |
+| `eps_shrinkage` | `eps_shrinkage` (fraction), `eps_shrinkage_pct` |
+| `eta_shrinkage` | `threshold_pct`, `high_shrinkage_etas` (array of `{eta, shrinkage_pct}`) |
+| `covariance_failed`, `covariance_regularized` | `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys) |
+| `condition_number` | `condition_number` |
+
+```json
+{
+  "severity": "Warning",
+  "category": "dw_autocorrelation",
+  "message": "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).",
+  "source_method": null,
+  "details": { "durbin_watson": 1.20, "iwres_lag1_autocorr": 0.40 }
+}
+```
+
+A code omits the `details` key entirely (Rust field `None`) when it has no
+associated stored statistic, or when any contributing statistic is non-finite
+(`NaN`/`±Inf` — e.g. the condition number of a near-singular parameter space).
+
+## How codes are assigned
+
+Codes are assigned centrally by `classify_warning()`, which maps each engine
+message to its `WarningCode` and severity, then `details` is attached from the
+fit's typed numeric fields for the codes above. `classify_warning()` is the
+single, type-checked source of the taxonomy — the `WarningCode` enum is
+exhaustive, so the vocabulary can no longer drift as a free string. Full native
+at-source emission (each site constructing its own typed `WarningEntry` with a
+`details` payload, and the human `warnings` strings derived from the structured
+list) is being migrated incrementally; `details` for the numeric diagnostics is
+the first step.
