@@ -3885,6 +3885,9 @@ pub enum WarningCode {
     ImportanceSampling,
     /// EPS (residual) shrinkage is notably high / negative.
     EpsShrinkage,
+    /// One or more ETA (random-effect) shrinkages exceed the threshold — the
+    /// data poorly inform those individual random effects.
+    EtaShrinkage,
     /// Dataset-quality issue (missing DV, ADDL/II, non-positive DV, …).
     DataQuality,
     /// Omega structure caveat (mixed lognormal / additive block).
@@ -3921,6 +3924,7 @@ impl WarningCode {
             WarningCode::Sir => "sir",
             WarningCode::ImportanceSampling => "importance_sampling",
             WarningCode::EpsShrinkage => "eps_shrinkage",
+            WarningCode::EtaShrinkage => "eta_shrinkage",
             WarningCode::DataQuality => "data_quality",
             WarningCode::OmegaStructure => "omega_structure",
             WarningCode::GradientFallback => "gradient_fallback",
@@ -4045,6 +4049,8 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, WarningCode::ImportanceSampling)
     } else if lower.contains("eps shrinkage") {
         (WarningSeverity::Warning, WarningCode::EpsShrinkage)
+    } else if lower.contains("eta shrinkage") {
+        (WarningSeverity::Warning, WarningCode::EtaShrinkage)
     } else if lower.starts_with("w_addl_missing_ii") || lower.contains("addl > 0 but ii") {
         (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_iov_occ_missing")
@@ -6503,6 +6509,7 @@ mod tests {
             (Sir, "sir"),
             (ImportanceSampling, "importance_sampling"),
             (EpsShrinkage, "eps_shrinkage"),
+            (EtaShrinkage, "eta_shrinkage"),
             (DataQuality, "data_quality"),
             (OmegaStructure, "omega_structure"),
             (GradientFallback, "gradient_fallback"),
@@ -6649,6 +6656,12 @@ mod tests {
                 "IMP: 2 subject(s) had ESS = 0 (proposal collapse)",
                 Warning,
                 "importance_sampling",
+            ),
+            (
+                "High ETA shrinkage (\u{2265} 30%): eta_CL (42%). EBE-based diagnostics \
+                 for these random effects are unreliable.",
+                Warning,
+                "eta_shrinkage",
             ),
             (
                 "LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV",
