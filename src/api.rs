@@ -1758,21 +1758,23 @@ pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Populat
     }
 }
 
-/// Reject a transit closed form with **no ODE twin** that is in the **flip-flop**
-/// regime at η = 0 typical values. Unlike a twin-carrying model — which
-/// [`crate::pk::effective_model_for_eval`] auto-reroutes to its exact ODE
-/// `transit()` twin — a twin-less form (one carrying a `lagtime`, bioavailability
-/// `f`, or user `[odes]` / `[scaling]` block, which the desugar declines) has
-/// nothing to reroute to: the closed form returns an identically-zero profile that
-/// silently degenerates the objective (a proportional error model collapses
-/// `(σ·pred)²` to 0). The flip-flop boundary is parameter-dependent, so this can't
-/// be caught by [`check_transit_support`]'s structural checks — it is evaluated at
-/// the typical (η = 0) parameters, matching the informational
-/// `W_TRANSIT_FLIP_FLOP` warning that fires for the twin-carrying case. Returns the
-/// first offending subject's message, or `None` when no reject applies (non-transit,
-/// twin present, or not flip-flop). `fit()` / `ferx check` surface this as an error;
-/// `predict()`/`simulate()` panic via [`assert_transit_flip_flop_no_twin`], mirroring
-/// [`check_transit_support`] / [`assert_transit_support`].
+/// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
+/// fall **outside the closed form's convergence domain** — the flip-flop regime
+/// (`ke ≥ KTR` 1-cpt / `α ≥ KTR` 2-cpt), or the 2-cpt confluent-eigenvalue edge
+/// (`|α − β| < 1e-12`) — where it returns an identically-zero profile that silently
+/// degenerates the objective (a proportional error model collapses `(σ·pred)²` to 0).
+/// Unlike a twin-carrying model — which [`crate::pk::effective_model_for_eval`]
+/// auto-reroutes to its exact ODE `transit()` twin — a twin-less form (one carrying a
+/// `lagtime`, bioavailability `f`, or a user `[odes]` / `[scaling]` /
+/// `[initial_conditions]` block, which the desugar declines) has nothing to reroute
+/// to. The boundary is parameter-dependent, so this can't be caught by
+/// [`check_transit_support`]'s structural checks — it is evaluated at the typical
+/// (η = 0) parameters via [`crate::pk::transit_flip_flop_at`], matching the
+/// informational `W_TRANSIT_FLIP_FLOP` warning that fires for the twin-carrying case.
+/// Returns the first offending subject's message, or `None` when no reject applies
+/// (non-transit, twin present, or in-domain). `fit()` / `ferx check` surface this as
+/// an error; `predict()`/`simulate()` panic via [`assert_transit_flip_flop_no_twin`],
+/// mirroring [`check_transit_support`] / [`assert_transit_support`].
 pub(crate) fn check_transit_flip_flop_no_twin(
     model: &CompiledModel,
     population: &Population,
@@ -1790,14 +1792,15 @@ pub(crate) fn check_transit_flip_flop_no_twin(
     for subject in &population.subjects {
         if crate::pk::transit_flip_flop_at(model, subject, theta, &zero_eta) {
             return Some(format!(
-                "{} is in the flip-flop regime (disposition rate ≥ transit rate \
-                 KTR = (n+1)/mtt) at typical values (subject {}): the analytic transit closed \
-                 form is outside its convergence domain and returns an identically-zero \
-                 concentration profile, which silently degenerates the objective (a \
-                 proportional error model collapses `(σ·pred)²` to 0). This model has no ODE \
-                 twin to fall back on (a `lagtime`, bioavailability `f`, or user `[odes]` block \
-                 declines the desugar) — rewrite it as an explicit ODE `transit()` model, or \
-                 check the MTT / CL starting estimates.",
+                "{} starts outside the analytic transit closed form's convergence domain at \
+                 typical values (subject {}) — the flip-flop regime (disposition rate ≥ transit \
+                 rate KTR = (n+1)/mtt), or (2-cpt) coincident disposition eigenvalues — so it \
+                 returns an identically-zero concentration profile, which silently degenerates \
+                 the objective (a proportional error model collapses `(σ·pred)²` to 0). This \
+                 model has no ODE twin to fall back on (a `lagtime`, bioavailability `f`, or a \
+                 user `[odes]` / `[scaling]` / `[initial_conditions]` block declines the \
+                 desugar) — rewrite it as an explicit ODE `transit()` model, or check the MTT / \
+                 CL starting estimates.",
                 model.pk_model.canonical_name(),
                 subject.id
             ));
@@ -2412,9 +2415,11 @@ pub fn check_model_data_warnings(
         for subject in &population.subjects {
             let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &subject.covariates, 0.0);
             let (cl, v1, n, mtt) = (pk.cl(), pk.v(), pk.n_transit(), pk.mtt());
-            // Mirror the exact validity guard `pk::transit_flip_flop_at` applies
-            // (incl. `q`/`v2` for 2-cpt), so this heads-up never fires on a
-            // parameter region the reroute treats as invalid rather than flip-flop.
+            // Mirror the validity guard `pk::transit_flip_flop_at` applies (the
+            // `q`/`v2` checks for 2-cpt), so this heads-up never fires on a parameter
+            // region the reroute treats as invalid rather than flip-flop. (The flip-flop
+            // *trigger* below stays the plain `α ≥ KTR` test; the twin-carrying
+            // confluent-eigenvalue corner is auto-rerouted and correctly not warned.)
             let params_valid = mtt > 0.0
                 && n >= 0.0
                 && v1 > 0.0
@@ -2634,6 +2639,12 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     &population,
                     &init_params,
                 ));
+                // Surface the structural transit rejects (IOV / SS / CMT≠1 / infusion /
+                // reset) so a clean `ferx check` and a `fit()` agree on transit models —
+                // previously only `fit()` reported these (#776 review).
+                if let Some(e) = check_transit_support(&parsed.model, &population) {
+                    diags.push(Diagnostic::error("E_TRANSIT_UNSUPPORTED", e));
+                }
                 // Twin-less flip-flop transit is a hard error, not a warning (#776):
                 // surface it the same way `fit()` does, so `ferx check` catches it up front.
                 if let Some(e) =

@@ -1194,10 +1194,10 @@ fn two_cpt_transit_flip_flop_routes_to_ode_twin() {
 }
 
 /// A flip-flop transit model carrying a `lagtime=` (or `f=`) mapping cannot be
-/// desugared to an ODE twin, so the reroute can't fire and the closed form still
-/// returns 0. The `W_TRANSIT_FLIP_FLOP` warning must then keep its **actionable**
-/// "rewrite as an explicit ODE model" wording, not the informational auto-routed
-/// one — covering the twin-less branch of the diagnostic.
+/// desugared to an ODE twin, so there is nothing to reroute to. Rather than silently
+/// returning a zero profile, it is a **hard error** at every entry point (#776):
+/// `fit()` returns `Err` and no `W_TRANSIT_FLIP_FLOP` warning fires (that
+/// informational note is reserved for the twin-carrying, auto-rerouted case).
 #[test]
 fn transit_flip_flop_without_twin_is_rejected() {
     // ke = CL/V = 0.5 ≥ KTR = 4/20 = 0.2 (flip-flop); the lagtime declines the desugar,

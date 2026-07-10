@@ -95,8 +95,11 @@ pub(crate) fn transit_flip_flop_at(
 /// they evaluate at the same `(theta, eta)`, so they agree on the decision.
 ///
 /// A flip-flop transit model with no ODE twin (one carrying a lagtime, `f`, or a
-/// user `[odes]` block, which the desugar declines) keeps the closed form's
-/// `0` and the existing `W_TRANSIT_FLIP_FLOP` warning — nothing to reroute to.
+/// user `[odes]` / `[scaling]` / `[initial_conditions]` block, which the desugar
+/// declines) has nothing to reroute to, and is rejected up front at η = 0 typical
+/// values by [`crate::api::check_transit_flip_flop_no_twin`] (`fit()` → `Err`,
+/// `predict()`/`simulate()` panic) rather than silently returning the closed form's
+/// `0`. (This function still returns the closed form for it — the guard runs first.)
 pub(crate) fn effective_model_for_eval<'a>(
     model: &'a CompiledModel,
     subject: &Subject,

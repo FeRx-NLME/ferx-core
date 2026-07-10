@@ -261,7 +261,8 @@ section of the SDLC for the versioning policy).
   twin, which is valid in that regime (matched to a NONMEM ADVAN13 transit
   simulation to ~1e-4); a twin-carrying flip-flop model gets an informational
   `W_TRANSIT_FLIP_FLOP` heads-up. A flip-flop model that carries a `lagtime`,
-  bioavailability `f`, or user `[odes]` block has **no** ODE twin to route to, so
+  bioavailability `f`, or a user `[odes]` / `[scaling]` / `[initial_conditions]` block
+  has **no** ODE twin to route to, so
   rather than silently returning a zero profile that degenerates the objective it is
   now **rejected with a hard error** (`fit()` returns `Err`, `predict()`/`simulate()`
   panic, `ferx check` reports `E_TRANSIT_FLIP_FLOP`) — consistent with the other
