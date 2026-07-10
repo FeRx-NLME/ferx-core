@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Warning `details` payloads for numeric diagnostics** (#781): structured
+  warnings for `dw_autocorrelation`, `eps_shrinkage`, and `condition_number` now
+  carry a `details` object with the value behind the message (e.g.
+  `{"durbin_watson": 1.20, "iwres_lag1_autocorr": 0.40}`), sourced from the
+  fit's typed fields so an agent reads the number directly instead of parsing
+  prose. First increment of the at-source warning work; other codes omit
+  `details` until converted. See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html#details).
 - **Typed warning taxonomy** (#778): structured warnings
   (`FitResult.warnings_structured`, surfaced in the JSON output) now carry a
   typed `WarningCode` instead of a free-text category string — a stable,
