@@ -40,7 +40,9 @@ Each `WarningCode` token, what it flags, and a typical response.
 | Code (`category`) | Severity | Flags | Typical agent response |
 |-------------------|----------|-------|------------------------|
 | `convergence` | Critical | Optimizer did not converge. | Reject; adjust inits / method / bounds and refit. |
-| `covariance_step` | Critical / Warning / Info | Covariance step failed, was regularized, or is a cost note. | If failed: SEs unreliable — try `covariance_fallback = sir` or refit. |
+| `covariance_failed` | Critical | Covariance step failed — no standard errors. | SEs unavailable — try `covariance_fallback = sir` or refit with different inits. |
+| `covariance_regularized` | Warning | Covariance step succeeded but was regularized / degraded. | SEs may be over-optimistic — inspect eigenvalues; consider SIR intervals. |
+| `covariance_step` | Info | Covariance-step informational note (e.g. evaluation cost). | None. |
 | `condition_number` | Critical | Ill-conditioned covariance / high condition number. | Over-parameterized — drop a random effect or covariate. |
 | `optimizer_health` | Warning | Trust-radius collapse / degeneracy. | Try a different optimizer or re-scale parameters. |
 | `dw_autocorrelation` | Warning | IWRES autocorrelation (Durbin–Watson out of range). | Revisit the residual-error / structural model. |
@@ -73,6 +75,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `dw_autocorrelation` | `durbin_watson`, `iwres_lag1_autocorr` |
 | `eps_shrinkage` | `eps_shrinkage` (fraction), `eps_shrinkage_pct` |
 | `eta_shrinkage` | `threshold_pct`, `high_shrinkage_etas` (array of `{eta, shrinkage_pct}`) |
+| `covariance_failed`, `covariance_regularized` | `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys) |
 | `condition_number` | `condition_number` |
 
 ```json
