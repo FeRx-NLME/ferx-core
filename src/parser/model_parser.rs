@@ -3983,17 +3983,23 @@ fn parse_event_model_block(
     let mut event_model_covariates: Vec<String>;
     let event_model_thetas: std::collections::HashSet<usize>;
     let event_model_etas: std::collections::HashSet<usize>;
+    // The hazard's parameter expressions in optimizer-parameter order, bound once
+    // and reused by the three scans below — reference collection, the direct-kappa
+    // reject (#770), and the transitive needed-statement collection (#442) — so a
+    // future family parameter can't be added to one walk and silently forgotten in
+    // another.
+    let hazard_param_exprs = [
+        &scale_expr,
+        &shape_expr,
+        &alpha_expr,
+        &gamma_expr,
+        &loghr_expr,
+    ];
     {
         let mut cov_set = std::collections::HashSet::new();
         let mut theta_set = std::collections::HashSet::new();
         let mut eta_set = std::collections::HashSet::new();
-        for expr_opt in [
-            &scale_expr,
-            &shape_expr,
-            &alpha_expr,
-            &gamma_expr,
-            &loghr_expr,
-        ] {
+        for expr_opt in hazard_param_exprs {
             if let Some(expr) = expr_opt {
                 collect_covariates(expr, &mut cov_set);
                 collect_theta_eta(expr, &mut theta_set, &mut eta_set);
@@ -4015,16 +4021,7 @@ fn parse_event_model_block(
     // otherwise fall back to a leniently-read 0.0 covariate (see the "read
     // leniently" note above), silently dropping the IOV term. Reject it fail-loud
     // instead (#770).
-    for expr in [
-        &scale_expr,
-        &shape_expr,
-        &alpha_expr,
-        &gamma_expr,
-        &loghr_expr,
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for expr in hazard_param_exprs.into_iter().flatten() {
         if let Some(k) = expr_references_kappa(expr, kappa_names) {
             return Err(format!(
                 "[event_model]: a hazard expression references the inter-occasion (IOV) \
@@ -4047,16 +4044,7 @@ fn parse_event_model_block(
     // `visit_stmt_nodes`).
     let needed_indiv_stmts: Vec<Statement> = {
         let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for expr in [
-            &scale_expr,
-            &shape_expr,
-            &alpha_expr,
-            &gamma_expr,
-            &loghr_expr,
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for expr in hazard_param_exprs.into_iter().flatten() {
             collect_variable_names(expr, &mut needed);
         }
         let mut keep: Vec<Statement> = Vec::new();
