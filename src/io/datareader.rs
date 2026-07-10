@@ -375,6 +375,19 @@ impl ObsRouting {
         }
     }
 
+    /// The integer-coded non-Gaussian endpoint kind (discrete-state or count) a
+    /// CMT routes to, if any. `None` ⇒ the CMT is TTE or Gaussian. The routing
+    /// sets are pairwise disjoint (validated up front), so this is unambiguous.
+    fn integer_kind(&self, cmt: usize) -> Option<IntDvKind> {
+        if self.discrete.contains(&cmt) {
+            Some(IntDvKind::DiscreteState)
+        } else if self.count.contains(&cmt) {
+            Some(IntDvKind::Count)
+        } else {
+            None
+        }
+    }
+
     /// Reject a CMT declared under more than one endpoint kind — that would make
     /// row routing ambiguous (one endpoint per CMT, §8.1).
     fn validate(&self) -> Result<(), String> {
@@ -400,6 +413,98 @@ impl ObsRouting {
         }
         Ok(())
     }
+}
+
+/// An integer-coded non-Gaussian observation endpoint: a discrete-state index
+/// (binary / ordinal / Markov state — unbounded `usize`) or a `u32` count
+/// (Poisson / negative-binomial). Selects the DV upper bound and the error
+/// wording in [`checked_integer_dv`].
+#[derive(Debug, Clone, Copy)]
+enum IntDvKind {
+    DiscreteState,
+    Count,
+}
+
+impl IntDvKind {
+    fn label(self) -> &'static str {
+        match self {
+            IntDvKind::DiscreteState => "discrete-state",
+            IntDvKind::Count => "count",
+        }
+    }
+
+    fn unit(self) -> &'static str {
+        match self {
+            IntDvKind::DiscreteState => "state index",
+            IntDvKind::Count => "count",
+        }
+    }
+
+    /// Exclusive upper bound on the rounded DV: a value `>=` this overflows the
+    /// `as usize` / `as u32` cast and is rejected (no domain cap in Phase 4.0 —
+    /// the bound only rejects values the cast could not represent). `type::MAX as
+    /// f64 + 1.0` is exact on both 32- and 64-bit: when `type::MAX` is
+    /// f64-representable the `+1` lands on the next integer; when it rounds up
+    /// (`usize::MAX` on 64-bit: `2^64 - 1` → `2^64`) the `+1` is absorbed, leaving
+    /// exactly the first saturating value. So `u32::MAX` / `usize::MAX` themselves
+    /// are accepted and only genuine overflow is rejected. Non-finite DVs are
+    /// rejected earlier.
+    fn exclusive_max(self) -> f64 {
+        match self {
+            IntDvKind::DiscreteState => usize::MAX as f64 + 1.0,
+            IntDvKind::Count => u32::MAX as f64 + 1.0,
+        }
+    }
+
+    /// Human-readable valid-range suffix for the out-of-range message; empty for
+    /// the state index (its `usize::MAX` bound is not a meaningful domain limit).
+    fn range_hint(self) -> &'static str {
+        match self {
+            IntDvKind::DiscreteState => "",
+            IntDvKind::Count => " (0..=4294967295)",
+        }
+    }
+}
+
+/// Validate a non-Gaussian integer-coded DV (discrete-state index or count) and
+/// return the rounded, non-negative magnitude. Rejects — with a caller-shaped
+/// message — non-finite, fractional, negative, and out-of-range (cast-overflowing)
+/// DVs (§8.1 integer-code rule, #192).
+///
+/// A **missing** DV (`.`/`NA`/blank) is skipped by the caller as MDV=1 (#258) and
+/// never reaches here. This function is the guard that stops the three silent
+/// mis-records a raw `dv.round() as usize`/`as u32` cast would otherwise produce:
+/// a `.`-coerced `0.0` → phantom `state:0`/`count:0`; an `inf` → saturated
+/// `usize::MAX`/`u32::MAX`; a `NaN` (whose every comparison is false) → `0`.
+fn checked_integer_dv(
+    dv: f64,
+    kind: IntDvKind,
+    id: &str,
+    cmt: usize,
+    time: f64,
+) -> Result<f64, String> {
+    let (label, unit) = (kind.label(), kind.unit());
+    if !dv.is_finite() {
+        return Err(format!(
+            "Subject {id}: {label} endpoint CMT={cmt} has non-finite DV={dv} at \
+             TIME={time}; the DV must be a non-negative integer {unit}"
+        ));
+    }
+    let dv_rounded = dv.round();
+    if (dv - dv_rounded).abs() > 1e-9 {
+        return Err(format!(
+            "Subject {id}: {label} endpoint CMT={cmt} has non-integer DV={dv} at \
+             TIME={time}; the DV must be a non-negative integer {unit}"
+        ));
+    }
+    if dv_rounded < 0.0 || dv_rounded >= kind.exclusive_max() {
+        return Err(format!(
+            "Subject {id}: {label} endpoint CMT={cmt} has out-of-range DV={dv} at \
+             TIME={time}; the DV must be a non-negative integer {unit}{hint}",
+            hint = kind.range_hint()
+        ));
+    }
+    Ok(dv_rounded)
 }
 
 // ── TTE-aware readers (pub(crate) — used by api::read_population_for) ────────
@@ -1690,6 +1795,15 @@ fn parse_subject(
                 })
                 .unwrap_or(1);
 
+            // A missing DV cell (`.` / `NA` / blank) means "no observation":
+            // `parse_f64` coerced it to `0.0` above, so without this guard a
+            // forgotten MDV would inject a phantom scored row. NONMEM convention
+            // marks such rows MDV=1; treat a forgotten one the same way — skip it
+            // and count it for the single W_MISSING_DV summary (#258). Applied to
+            // every scored endpoint below (Gaussian, discrete-state, count); the
+            // TTE `Event` arm keeps its own DV-code semantics and does not use it.
+            let dv_missing = is_missing_cell(row.get(dv_col).map(|s| s.as_str()).unwrap_or(""));
+
             // Non-Gaussian row routing: when this CMT belongs to a declared TTE /
             // discrete-state / count endpoint, route the row to `obs_records`
             // instead of the Gaussian parallel Vecs. The routing `.contains`
@@ -1790,60 +1904,35 @@ fn parse_subject(
                 // No fallback arm needed: `routing.tte` is always empty when the
                 // `survival` feature is off (its only producer is a TTE endpoint),
                 // so this branch is never entered in that build.
-            } else if routing.discrete.contains(&cmt) {
-                // Discrete-state observation (binary / ordinal / Markov state).
-                // The DV is a non-negative integer state index; reject fractional
-                // or negative values rather than silently truncating (mirrors the
-                // TTE integer-code rule, #192). No endpoint math here (Phase 4.0).
-                let dv_rounded = dv.round();
-                if (dv - dv_rounded).abs() > 1e-9 {
-                    return Err(format!(
-                        "Subject {id}: discrete-state endpoint CMT={cmt} has non-integer \
-                         DV={dv} at TIME={time}; the DV must be a non-negative integer state index"
-                    ));
+            } else if let Some(kind) = routing.integer_kind(cmt) {
+                // Non-Gaussian integer-coded observation (discrete-state index or
+                // count). A missing DV is skipped as MDV=1 — the same #258
+                // phantom-zero guard the Gaussian branch uses — so a forgotten MDV
+                // never records a spurious `state:0` / `count:0`. Otherwise the DV
+                // must be a finite, non-negative, in-range integer (`checked_integer_dv`,
+                // #192); no endpoint math here (Phase 4.0).
+                if dv_missing {
+                    missing_dv_skipped += 1;
+                    continue;
                 }
-                if dv_rounded < 0.0 {
-                    return Err(format!(
-                        "Subject {id}: discrete-state endpoint CMT={cmt} has negative \
-                         DV={dv} at TIME={time}; the DV must be a non-negative integer state index"
-                    ));
-                }
-                obs_records.push(crate::types::ObsRecord::DiscreteState {
-                    time,
-                    state: dv_rounded as usize,
-                    cmt,
-                });
-            } else if routing.count.contains(&cmt) {
-                // Count observation (Poisson / negative-binomial). The DV is a
-                // non-negative integer count that must fit u32.
-                let dv_rounded = dv.round();
-                if (dv - dv_rounded).abs() > 1e-9 {
-                    return Err(format!(
-                        "Subject {id}: count endpoint CMT={cmt} has non-integer DV={dv} \
-                         at TIME={time}; the DV must be a non-negative integer count"
-                    ));
-                }
-                if dv_rounded < 0.0 || dv_rounded > u32::MAX as f64 {
-                    return Err(format!(
-                        "Subject {id}: count endpoint CMT={cmt} has out-of-range DV={dv} \
-                         at TIME={time}; the DV must be a non-negative integer count (0..=4294967295)"
-                    ));
-                }
-                obs_records.push(crate::types::ObsRecord::Count {
-                    time,
-                    count: dv_rounded as u32,
-                    cmt,
+                let magnitude = checked_integer_dv(dv, kind, id, cmt, time)?;
+                obs_records.push(match kind {
+                    IntDvKind::DiscreteState => crate::types::ObsRecord::DiscreteState {
+                        time,
+                        state: magnitude as usize,
+                        cmt,
+                    },
+                    IntDvKind::Count => crate::types::ObsRecord::Count {
+                        time,
+                        count: magnitude as u32,
+                        cmt,
+                    },
                 });
             } else {
-                // Gaussian path.
-                // Missing DV (`.` / `NA` / blank) on a scored observation row
-                // (EVID=0, MDV=0): NONMEM convention is to mark these MDV=1, but
-                // if the user didn't, `parse_f64` would coerce the cell to 0.0
-                // and inject a phantom zero observation into the likelihood.
-                // Treat a missing DV as MDV=1 — skip the row — and count it for a
-                // single summary warning (W_MISSING_DV; issue #258).
-                let dv_cell = row.get(dv_col).map(|s| s.as_str()).unwrap_or("");
-                if is_missing_cell(dv_cell) {
+                // Gaussian path. A missing DV (`.`/`NA`/blank) is skipped as MDV=1
+                // (see the `dv_missing` note above; #258) so a forgotten MDV never
+                // injects a phantom zero observation.
+                if dv_missing {
                     missing_dv_skipped += 1;
                     continue;
                 }
@@ -3048,6 +3137,167 @@ mod tests {
             let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
             assert!(err.contains("only one endpoint type"), "got: {err}");
         }
+    }
+
+    // ── Phase 4.0 regression: DV guard gaps on discrete/count endpoints ───────
+    // A missing / non-finite DV must NOT silently become a phantom record. The
+    // integer guard `(dv - dv.round()).abs() > 1e-9` can't reject a non-finite
+    // `dv` (every NaN/inf comparison is false), and `parse_f64` coerces a missing
+    // cell to `0.0`; without the finiteness guard and the shared missing-DV skip,
+    // `.` → `state:0`/`count:0`, `inf` → saturated `usize::MAX`, `NaN` → `0`.
+
+    #[test]
+    fn discrete_and_count_endpoints_skip_missing_dv() {
+        // A missing DV on a discrete/count row is treated as MDV=1 (#258): the row
+        // is skipped (no phantom `state:0`/`count:0`) and folded into the single
+        // W_MISSING_DV summary, exactly like the Gaussian path. `.`, `NA`, and
+        // `NaN` (case-insensitive) are all missing tokens (`is_missing_cell`).
+        use crate::types::ObsRecord;
+        for set_name in ["discrete", "count"] {
+            for missing in [".", "NA", "NaN", "na", "nan"] {
+                let routing = match set_name {
+                    "discrete" => ObsRouting {
+                        discrete: [3].into_iter().collect(),
+                        ..Default::default()
+                    },
+                    _ => ObsRouting {
+                        count: [3].into_iter().collect(),
+                        ..Default::default()
+                    },
+                };
+                // Row at t=1 is missing; the t=0 and t=2 rows are valid.
+                let csv = format!(
+                    "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                     1,0,2,0,0,.,3\n\
+                     1,1,{missing},0,0,.,3\n\
+                     1,2,1,0,0,.,3\n"
+                );
+                let f = write_csv(&csv);
+                let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+                let subj = &pop.subjects[0];
+                // Exactly the two valid rows survive — the missing one is dropped,
+                // not recorded as a spurious zero at t=1.
+                let times: Vec<f64> =
+                    subj.obs_records
+                        .iter()
+                        .map(|r| match r {
+                            ObsRecord::DiscreteState { time, .. }
+                            | ObsRecord::Count { time, .. } => *time,
+                            other => panic!("{set_name}/{missing}: unexpected record {other:?}"),
+                        })
+                        .collect();
+                assert_eq!(
+                    times,
+                    vec![0.0, 2.0],
+                    "{set_name}/{missing}: missing-DV row must be skipped, not a phantom zero"
+                );
+                let warns = pop
+                    .warnings
+                    .iter()
+                    .filter(|w| w.starts_with("W_MISSING_DV"))
+                    .count();
+                assert_eq!(
+                    warns, 1,
+                    "{set_name}/{missing}: expected one W_MISSING_DV summary"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discrete_state_endpoint_rejects_nonfinite_dv() {
+        // `±inf` (including an overflow like `1e999`) must be rejected, not cast:
+        // `inf as usize` saturates to usize::MAX and `-inf as usize` is 0. The
+        // integer guard alone misses these because comparisons against a
+        // non-finite value are always false. (A literal `NaN`/`NA` cell is a
+        // *missing* token — covered by the skip test above, not here.)
+        let routing = ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        };
+        for bad in ["inf", "-inf", "1e999"] {
+            let csv = format!("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,{bad},0,0,.,3\n");
+            let f = write_csv(&csv);
+            let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+            assert!(err.contains("non-finite"), "DV={bad} got: {err}");
+            assert!(err.contains("discrete-state"), "DV={bad} got: {err}");
+        }
+    }
+
+    #[test]
+    fn count_endpoint_rejects_nonfinite_dv() {
+        let routing = ObsRouting {
+            count: [4].into_iter().collect(),
+            ..Default::default()
+        };
+        for bad in ["inf", "-inf", "1e999"] {
+            let csv = format!("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,{bad},0,0,.,4\n");
+            let f = write_csv(&csv);
+            let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+            assert!(err.contains("non-finite"), "DV={bad} got: {err}");
+            assert!(err.contains("count"), "DV={bad} got: {err}");
+        }
+    }
+
+    #[test]
+    fn discrete_state_endpoint_rejects_dv_above_usize_range() {
+        // A finite but astronomically large integer-valued DV (`1e300`) is beyond
+        // usize; without the upper-bound check `1e300 as usize` saturates to
+        // usize::MAX silently. Count already had this guard (via `> u32::MAX`);
+        // discrete now mirrors it (via the shared exclusive_max bound).
+        let routing = ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        };
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,1e300,0,0,.,3\n";
+        let f = write_csv(csv);
+        let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+        assert!(err.contains("out-of-range"), "got: {err}");
+    }
+
+    #[test]
+    fn count_endpoint_accepts_u32_max() {
+        // The upper bound is exclusive at `u32::MAX + 1`, so the full u32 range —
+        // including `u32::MAX` itself — is accepted, not rejected. (Locks the
+        // boundary against a future "tighten `>=`" that would drop `u32::MAX`.)
+        use crate::types::ObsRecord;
+        let routing = ObsRouting {
+            count: [4].into_iter().collect(),
+            ..Default::default()
+        };
+        let csv = format!("ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,{},0,0,.,4\n", u32::MAX);
+        let f = write_csv(&csv);
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        assert!(
+            matches!(
+                pop.subjects[0].obs_records.as_slice(),
+                [ObsRecord::Count { count, .. }] if *count == u32::MAX
+            ),
+            "u32::MAX must be an accepted count, got {:?}",
+            pop.subjects[0].obs_records
+        );
+    }
+
+    #[test]
+    fn discrete_state_endpoint_accepts_large_valid_index() {
+        // A large but in-`usize` state index (`1e18` < 2^64) is a legitimate value
+        // and must be recorded exactly, not rejected by the overflow guard.
+        use crate::types::ObsRecord;
+        let routing = ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        };
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n1,0,1e18,0,0,.,3\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        assert!(
+            matches!(
+                pop.subjects[0].obs_records.as_slice(),
+                [ObsRecord::DiscreteState { state, .. }] if *state == 1_000_000_000_000_000_000
+            ),
+            "1e18 must be an accepted state index, got {:?}",
+            pop.subjects[0].obs_records
+        );
     }
 
     #[test]
