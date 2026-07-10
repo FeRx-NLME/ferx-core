@@ -2633,6 +2633,60 @@ mod survival_smoke {
         );
     }
 
+    /// #772 review (Finding 1): a hazard that references an `[individual_parameters]`
+    /// value (PR #442) which itself reads a covariate transitively reads that covariate
+    /// at the baseline snapshot when the analytic `param_fn` is evaluated. It MUST appear
+    /// in `hazard_covariates` so the #741 time-varying-covariate guard can reject a TV
+    /// covariate reached this way — otherwise it is silently frozen (the exact bug #741
+    /// exists to block). Here `CRCL` is read only through `SCALE_I → LAMBDA0`, never in a
+    /// direct hazard sub-expression.
+    #[test]
+    fn event_model_hazard_covariates_include_transitive_indiv_param_covariates() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVBASE(0.05, 0.001, 10.0)
+  theta TVEFF(2.0, 0.1, 10.0)
+  theta TVBETA(0.01, -1.0, 1.0)
+  omega ETA_BASE ~ 0.09
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  CL      = TVCL
+  V       = TVV
+  LAMBDA0 = TVBASE * exp(TVBETA * CRCL + ETA_BASE)
+  SCALE_I = LAMBDA0 * TVEFF
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = SCALE_I
+";
+        let model = parse_model_string(src).expect("model must parse");
+        let ep = model
+            .endpoints
+            .get(&2)
+            .expect("CMT=2 must be a TTE endpoint");
+        let EndpointLikelihood::Tte {
+            hazard_covariates, ..
+        } = ep
+        else {
+            panic!("expected Tte endpoint");
+        };
+        assert!(
+            hazard_covariates.iter().any(|c| c == "CRCL"),
+            "hazard_covariates must include the transitively-referenced covariate CRCL \
+             (reached via SCALE_I → LAMBDA0); got {hazard_covariates:?}"
+        );
+    }
+
     /// Issue #442 (review #1): a hazard that references an `[individual_parameters]`
     /// value whose definition uses an IOV **kappa** must be rejected at parse time,
     /// not crash the fit. The hazard `param_fn` is handed the BSV-only η, but a kappa

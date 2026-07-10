@@ -856,13 +856,24 @@ fn simulate_rtte_stream<R: rand::Rng>(
     const MAX_EVENTS: usize = 1_000_000;
 
     // Pre-flight degeneracy guard (#762): estimate the expected number of events over the
-    // window from the cumulative hazard. A hazard so extreme it would fire far more than
-    // `MAX_EVENTS` times (e.g. `λ·horizon ≫ 1e6`) — or a non-finite cumulative hazard — is
-    // degenerate. Skip its stream up front rather than materialise ~1e6 rows only to abort:
-    // record just the administrative censor plus a warning, and let the rest of the
-    // population simulate. `cum_hazard(family, horizon, params)` is the clock-forward mean
-    // count and a sound upper-bound proxy for the renewal (reset) clock.
-    let expected = cum_hazard(family, horizon, params);
+    // window and skip the stream up front — recording just the administrative censor plus a
+    // warning — rather than materialise ~1e6 rows only to abort, letting the rest of the
+    // population simulate. The estimate is clock-specific (#772 review):
+    //   * Forward clock — Poisson process with cumulative hazard, so `E[N] = H(horizon)`
+    //     exactly (`cum_hazard`).
+    //   * Reset clock — a renewal process with i.i.d. gaps, so `E[N] ≈ horizon / E[gap]`.
+    //     The forward-clock `H(horizon)` massively OVER-counts here for an increasing-hazard
+    //     family (e.g. an IFR Weibull, where `H(horizon)` can be ~1e6 while the true renewal
+    //     count is a few dozen), which would wrongly skip a perfectly legitimate subject. Use
+    //     the median gap — the family's inverse-survival at `u = 0.5`, the same inverse the
+    //     loop draws — as a cheap, family-agnostic proxy for the mean gap: a vanishing median
+    //     gap → `+∞` estimate → skip; a rate-0 (infinite) gap → `~0` estimate → not skipped
+    //     (correctly: no events, not a flood). It is a pure computation on the fixed `0.5`, so
+    //     it draws no RNG and leaves the sequence (and the SSE tests) untouched.
+    let expected = match clock {
+        RtteClock::Forward => cum_hazard(family, horizon, params),
+        RtteClock::Reset => horizon / sample_event_time(family, params, 0.5),
+    };
     if !expected.is_finite() || expected > MAX_EVENTS as f64 {
         warnings.push(format!(
             "W_RTTE_DEGENERATE: subject '{id}' (CMT={cmt}) has a degenerate recurrent hazard \
@@ -2289,6 +2300,78 @@ mod tests {
                 warnings[0]
             );
         }
+    }
+
+    #[test]
+    fn rtte_reset_ifr_weibull_not_skipped_despite_large_forward_cum_hazard() {
+        use rand::SeedableRng;
+        // #772 review (Finding 2): under the RESET clock an increasing-hazard (IFR) Weibull is
+        // a renewal of iid gaps, so its expected count is `horizon / mean_gap` — a few dozen,
+        // NOT degenerate. But the forward-clock cumulative hazard
+        // `H(100) = (100/5.49)^5 ≈ 2e6 ≫ MAX_EVENTS`, so using `H(horizon)` as the reset
+        // pre-flight threshold (the pre-fix bug) would wrongly skip this legitimate subject.
+        // The pre-flight is now clock-specific (reset uses the median gap), so the stream runs.
+        let params = [5.49_f64, 5.0]; // Weibull [scale, shape], strongly increasing hazard.
+        let horizon = 100.0_f64;
+
+        // Reset: a real multi-event renewal stream, and NO degenerate warning.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(20);
+        let mut results = Vec::new();
+        let mut warnings = Vec::new();
+        simulate_rtte_stream(
+            HazardFamily::Weibull,
+            &params,
+            RtteClock::Reset,
+            horizon,
+            2,
+            "S1",
+            0,
+            1,
+            &mut rng,
+            &mut results,
+            &mut warnings,
+        );
+        let observed = results
+            .iter()
+            .filter(|r| matches!(r.outcome, SimOutcome::Event { observed: true, .. }))
+            .count();
+        assert!(
+            observed >= 5,
+            "reset IFR Weibull renews ~horizon/mean_gap ≈ 20 events — not skipped (got {observed})"
+        );
+        assert!(
+            warnings.is_empty(),
+            "reset IFR Weibull is a legitimate subject, no degenerate warning: {warnings:?}"
+        );
+
+        // Contrast: the SAME params under the FORWARD clock are genuinely pathological
+        // (`E[N] = H(horizon) ≈ 2e6`), so that stream IS still skipped with a warning — the
+        // guard is clock-specific, not disabled.
+        let mut rng2 = rand::rngs::StdRng::seed_from_u64(20);
+        let mut fwd_results = Vec::new();
+        let mut fwd_warnings = Vec::new();
+        simulate_rtte_stream(
+            HazardFamily::Weibull,
+            &params,
+            RtteClock::Forward,
+            horizon,
+            2,
+            "S1",
+            0,
+            1,
+            &mut rng2,
+            &mut fwd_results,
+            &mut fwd_warnings,
+        );
+        assert_eq!(
+            fwd_results.len(),
+            1,
+            "forward H(horizon)≈2e6 is degenerate → skipped to the single censor row"
+        );
+        assert!(
+            fwd_warnings.len() == 1 && fwd_warnings[0].contains("W_RTTE_DEGENERATE"),
+            "forward clock still warns degenerate for the same params: {fwd_warnings:?}"
+        );
     }
 
     #[test]
