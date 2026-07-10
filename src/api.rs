@@ -6424,40 +6424,39 @@ fn inflated_rse_warning(
 /// collinear/non-identified. `0.95` is a common rule of thumb.
 const CORRELATION_WARN_THRESHOLD: f64 = 0.95;
 
-/// Parameter pairs whose estimate correlation exceeds the threshold, as
-/// `(name_a, name_b, correlation)`. The correlation is computed over the free
-/// (positive-variance) entries of the parameter covariance matrix, in the
-/// optimizer's packed space. Empty when there is no covariance matrix or fewer
-/// than two free parameters.
+/// THETA (fixed-effect) pairs whose estimate correlation exceeds the threshold,
+/// as `(name_a, name_b, correlation)`. Restricted to the THETA block — it
+/// occupies the first `theta_names.len()` packed entries with unambiguous names,
+/// and fixed-effect collinearity is the most actionable/interpretable case
+/// (omega/sigma live in Cholesky space, where both the correlation and the
+/// packed labels are murkier). Fixed / zero-variance thetas (diagonal `<= 0`)
+/// are skipped. Empty when there is no covariance matrix.
 fn high_correlation_pairs(
     cov: Option<&DMatrix<f64>>,
-    names: &[String],
+    theta_names: &[String],
 ) -> Vec<(String, String, f64)> {
     let Some(cov) = cov else {
         return Vec::new();
     };
-    let n = cov.nrows();
-    let free: Vec<usize> = (0..n).filter(|&i| cov[(i, i)] > 0.0).collect();
-    if free.len() < 2 {
-        return Vec::new();
-    }
-    let label = |i: usize| {
-        names
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("P{}", i + 1))
-    };
+    let n_theta = theta_names.len().min(cov.nrows());
     let mut pairs = Vec::new();
-    for a in 0..free.len() {
-        for b in (a + 1)..free.len() {
-            let (ia, ib) = (free[a], free[b]);
-            let denom = (cov[(ia, ia)] * cov[(ib, ib)]).sqrt();
+    for a in 0..n_theta {
+        if cov[(a, a)] <= 0.0 {
+            continue;
+        }
+        for b in (a + 1)..n_theta {
+            if cov[(b, b)] <= 0.0 {
+                continue;
+            }
+            // sqrt(var_a) * sqrt(var_b) avoids the overflow/underflow that
+            // `(var_a * var_b).sqrt()` can hit for extreme variances.
+            let denom = cov[(a, a)].sqrt() * cov[(b, b)].sqrt();
             if denom <= 0.0 || !denom.is_finite() {
                 continue;
             }
-            let r = cov[(ia, ib)] / denom;
+            let r = cov[(a, b)] / denom;
             if r.is_finite() && r.abs() >= CORRELATION_WARN_THRESHOLD {
-                pairs.push((label(ia), label(ib), r));
+                pairs.push((theta_names[a].clone(), theta_names[b].clone(), r));
             }
         }
     }
@@ -6465,11 +6464,9 @@ fn high_correlation_pairs(
 }
 
 /// Build the human message + native structured entry (with `details`) for
-/// highly correlated parameter pairs in the fit's covariance matrix, or `None`.
+/// highly correlated THETA pairs in the fit's covariance matrix, or `None`.
 fn high_correlation_warning(result: &FitResult) -> Option<(String, WarningEntry)> {
-    let cov = result.covariance_matrix.as_ref()?;
-    let names = crate::io::output::packed_param_names(result, cov.nrows());
-    let pairs = high_correlation_pairs(Some(cov), &names);
+    let pairs = high_correlation_pairs(result.covariance_matrix.as_ref(), &result.theta_names);
     if pairs.is_empty() {
         return None;
     }
@@ -12839,6 +12836,14 @@ mod simulate_with_uncertainty_tests {
         assert!(super::high_correlation_pairs(Some(&cov2), &names).is_empty());
         // No covariance matrix → nothing.
         assert!(super::high_correlation_pairs(None, &names).is_empty());
+        // Theta-only scope: a strong correlation involving a non-theta packed
+        // entry (index >= n_theta) is NOT flagged. With 2 theta names but a 3x3
+        // covariance, the (0,2) correlation lies outside the theta block.
+        let mut cov3 = DMatrix::identity(3, 3) * 0.01;
+        cov3[(0, 2)] = 0.0099;
+        cov3[(2, 0)] = 0.0099;
+        let theta2 = vec!["A".to_string(), "B".to_string()];
+        assert!(super::high_correlation_pairs(Some(&cov3), &theta2).is_empty());
     }
 
     #[test]

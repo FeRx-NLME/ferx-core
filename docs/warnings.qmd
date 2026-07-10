@@ -55,7 +55,7 @@ Each `WarningCode` token, what it flags, and a typical response.
 | `eta_shrinkage` | Warning | One or more ETA shrinkages exceed ~30%. | Data poorly inform that IIV — consider removing it on the affected parameter(s). |
 | `boundary_estimate` | Warning | One or more THETA estimates are pinned to an optimizer bound. | Non-identifiability or a too-tight bound — inspect; relax the bound or simplify. |
 | `inflated_rse` | Warning | One or more THETA estimates have RSE > ~50%. | Imprecisely estimated — often over-parameterization; consider simplifying. |
-| `high_correlation` | Warning | One or more parameter pairs have \|correlation\| ≥ 0.95. | Over-parameterization / non-identifiability — fix or remove one of each pair. |
+| `high_correlation` | Warning | One or more THETA (fixed-effect) pairs have \|correlation\| ≥ 0.95. | Over-parameterization / non-identifiability — fix or remove one of each pair. |
 | `data_quality` | Warning | Dataset issue (missing DV, ADDL/II, non-positive DV, …). | Fix the dataset before trusting the fit. |
 | `omega_structure` | Warning | Mixed lognormal / additive block in omega. | Make the block's parameterization consistent. |
 | `gradient_fallback` | Info | A gradient / sampler fallback was taken. | None; note the slower path. |

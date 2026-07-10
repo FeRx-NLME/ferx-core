@@ -1461,7 +1461,7 @@ fn yaml_quote(s: &str) -> String {
 /// For a full-block omega/kappa the column-major lower-triangle entries are
 /// `log_chol_{eta_i}` on the diagonal (`log(L_ii)`) and `chol_{eta_i}_{eta_j}`
 /// (i > j) off-diagonal (`L_ij`, not log-transformed).
-pub(crate) fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
+fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
     let n_theta = result.theta_names.len();
     let n_eta = result.omega.nrows();
     let n_sigma = result.sigma_names.len();

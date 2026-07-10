@@ -21,8 +21,8 @@ section of the SDLC for the versioning policy).
 
 ### Added
 - **High parameter-correlation warning** (#781): a fit now emits a
-  `high_correlation` warning when a parameter pair's estimate correlation
-  (from the covariance matrix, in packed space) has |r| ≥ 0.95 — a sign of
+  `high_correlation` warning when a THETA (fixed-effect) pair's estimate
+  correlation (from the covariance matrix) has |r| ≥ 0.95 — a sign of
   over-parameterization / non-identifiability that names the specific culprits
   (complementing the aggregate `condition_number`). Emitted typed at source with
   `details` listing each `{parameter_a, parameter_b, correlation}`. See the
