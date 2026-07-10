@@ -44,6 +44,13 @@ jobs:
       - name: cargo check (survival + slow-tests gated tests)
         run: cargo check --tests --no-default-features --features ci,survival,slow-tests
 
+      # The `markov` module (CTMM matrix-exp) is behind `#[cfg(feature = "markov")]`
+      # and compiled by neither the base `ci` check nor the survival check. A fast,
+      # uninstrumented compile-check here surfaces a break in ~1 min instead of
+      # waiting on the instrumented markov coverage job below.
+      - name: cargo check (markov-gated module + tests)
+        run: cargo check --tests --no-default-features --features ci,markov
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -125,6 +132,48 @@ jobs:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  markov:
+    name: Markov (CTMM)
+    runs-on: ubuntu-latest
+    # Same rationale as the Survival job: no nightly-only code, so pin stable to
+    # keep the instrumented (coverage-RUSTFLAGS) cache warm across runs.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal -c llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Instrumented build (coverage RUSTFLAGS) needs its own key, like the
+          # other coverage jobs (survival -> ci-cov-survival, coverage-pr -> ci-cov).
+          shared-key: ci-cov-markov
+      - name: Install cargo-llvm-cov
+        # Prebuilt binary (no compile) so this job stays fast.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # All CTMM code is behind `#[cfg(feature = "markov")]`, so neither the default
+      # `ci` jobs nor the `fast`/`slow` coverage jobs compile it — Codecov would
+      # report its lines as missed even though they're exercised, so a PR touching
+      # `src/markov` would fail its own patch gate at 0% (#293). Like the survival
+      # job, this both GATES the markov code (a break fails it) and MEASURES it,
+      # uploading the `markov` flag, which Codecov merges with `fast`/`slow`. The
+      # tests are pure matrix math (milliseconds), so `--tests --profile ci-test`
+      # stays cheap.
+      - name: Generate markov coverage report
+        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,markov --profile ci-test --lcov --output-path lcov.info
+
+      - name: Upload to Codecov (markov flag)
+        uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          flags: markov
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -137,7 +186,10 @@ jobs:
         with:
           shared-key: ci
       - name: cargo clippy
-        run: cargo clippy --no-default-features --features ci
+        # Include `markov` so the CTMM module is linted too (it is compiled by
+        # neither the base `ci` build nor the survival job). Survival stays out
+        # of clippy per existing precedent; markov opts in from the start.
+        run: cargo clippy --no-default-features --features ci,markov
 
   fmt:
     name: Format
