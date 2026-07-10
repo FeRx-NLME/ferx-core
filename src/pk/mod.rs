@@ -30,52 +30,73 @@ fn pk_params_at_time(
     (model.pk_param_fn)(theta, eta, covariates, time)
 }
 
-/// Whether a transit-absorption closed form is in the **flip-flop** regime at
-/// this subject's individual parameters — the absorption rate matching or
-/// exceeding elimination, so the exponential-tilting closed form's convergence
-/// domain (`ke < KTR` for 1-cpt, `α < KTR` for 2-cpt, with `KTR = (n+1)/mtt`)
-/// is violated and [`crate::sens::one_cpt::one_cpt_transit_amt_g`] /
-/// [`crate::sens::two_cpt::transit_2cpt_domain_ok`] would clamp the prediction
-/// (and its sensitivities) to `0`.
+/// Whether a closed-form absorption model (transit or inverse-Gaussian) is in the
+/// **flip-flop** regime at this subject's individual parameters — the absorption
+/// rate matching or exceeding elimination, so the exponential-tilting closed form's
+/// convergence domain is violated and the `*_amt_g` closed form would clamp the
+/// prediction (and its sensitivities) to `0`. The domain is `ke < KTR = (n+1)/mtt`
+/// (transit) / `ke < 1/(2·MAT·CV²)` (IG) for 1-cpt, and the analogous `α < …` for
+/// 2-cpt (since `α ≥ β`, guarding `α` suffices).
 ///
-/// Mirrors those exact guards — the 1-cpt arm inline, the 2-cpt arm by deferring
-/// to `transit_2cpt_domain_ok` itself (so both the flip-flop `!(α < KTR)` clamp
-/// *and* the confluent-eigenvalue `|α − β| < 1e-12` clamp are honoured) — so the
-/// prediction and every sensitivity path make the *same* routing decision.
-/// Returns `false` for a non-transit model, and for invalid parameters — there
-/// the closed form's `0` is a deliberate optimiser penalty, not a flip-flop to
-/// reroute to the ODE twin.
-pub(crate) fn transit_flip_flop_at(
+/// Mirrors those exact guards — the 1-cpt arm inline, the 2-cpt arm by deferring to
+/// the closed form's own `*_2cpt_domain_ok` (so both the flip-flop and the confluent
+/// `|α − β| < 1e-12` clamp are honoured) — so the prediction and every sensitivity
+/// path make the *same* routing decision. Returns `false` for a non-absorption-closed-form
+/// model, and for invalid parameters — there the closed form's `0` is a deliberate
+/// optimiser penalty, not a flip-flop to reroute to the ODE twin.
+pub(crate) fn absorption_flip_flop_at(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> bool {
     let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
-    let (n, mtt, cl, v1) = (pk.n_transit(), pk.mtt(), pk.cl(), pk.v());
-    if !(mtt > 0.0 && n >= 0.0 && cl > 0.0 && v1 > 0.0) {
+    let (cl, v1) = (pk.cl(), pk.v());
+    if !(cl > 0.0 && v1 > 0.0) {
         return false;
     }
     match model.pk_model {
         PkModel::OneCptTransit => {
-            // 1-cpt clamps inline (`one_cpt_transit_amt_g`) at `!(ke < KTR)`;
-            // mirror that single-exponential guard directly (there is no
-            // confluent-eigenvalue case for a single disposition rate).
+            let (n, mtt) = (pk.n_transit(), pk.mtt());
+            if !(mtt > 0.0 && n >= 0.0) {
+                return false;
+            }
+            // 1-cpt clamps inline (`one_cpt_transit_amt_g`) at `!(ke < KTR)`; mirror
+            // that single-exponential guard directly (no confluent-eigenvalue case).
             let ktr = (n + 1.0) / mtt;
             !(cl / v1 < ktr)
         }
         PkModel::TwoCptTransit => {
-            if !(pk.q() >= 0.0 && pk.v2() > 0.0) {
+            let (n, mtt) = (pk.n_transit(), pk.mtt());
+            if !(mtt > 0.0 && n >= 0.0 && pk.q() >= 0.0 && pk.v2() > 0.0) {
                 return false;
             }
-            // Defer to the closed form's own domain guard rather than re-deriving
-            // it: `transit_2cpt_domain_ok` returns `None` (⇒ the closed form
-            // clamps to `0`) for *both* the flip-flop `!(α < KTR)` case and the
-            // confluent-eigenvalue `|α − β| < 1e-12` case. Rerouting exactly when
-            // it clamps keeps this predicate a faithful negation of the guard — no
-            // third copy of the rule to drift. Params are valid here, so a `None`
-            // always means "would clamp", never "invalid input".
+            // Defer to the closed form's own domain guard rather than re-deriving it:
+            // `transit_2cpt_domain_ok` returns `None` (⇒ the closed form clamps to `0`)
+            // for *both* the flip-flop `!(α < KTR)` case and the confluent-eigenvalue
+            // `|α − β| < 1e-12` case. Rerouting exactly when it clamps keeps this a
+            // faithful negation of the guard. Params are valid here, so `None` always
+            // means "would clamp", never "invalid input".
             crate::sens::two_cpt::transit_2cpt_domain_ok::<f64>(cl, v1, pk.q(), pk.v2(), n, mtt)
+                .is_none()
+        }
+        PkModel::OneCptIg => {
+            let (mat, cv2) = (pk.mat(), pk.cv2());
+            if !(mat > 0.0 && cv2 > 0.0) {
+                return false;
+            }
+            // 1-cpt IG clamps inline (`one_cpt_ig_amt_g`) at `!(ke < 1/(2·MAT·CV²))`.
+            let abscissa = 1.0 / (2.0 * mat * cv2);
+            !(cl / v1 < abscissa)
+        }
+        PkModel::TwoCptIg => {
+            let (mat, cv2) = (pk.mat(), pk.cv2());
+            if !(mat > 0.0 && cv2 > 0.0 && pk.q() >= 0.0 && pk.v2() > 0.0) {
+                return false;
+            }
+            // Defer to the IG closed form's own domain guard (flip-flop + confluent),
+            // mirroring the transit arm.
+            crate::sens::two_cpt::ig_2cpt_domain_ok::<f64>(cl, v1, pk.q(), pk.v2(), mat, cv2)
                 .is_none()
         }
         _ => false,
@@ -83,21 +104,21 @@ pub(crate) fn transit_flip_flop_at(
 }
 
 /// The model to evaluate this subject with at `(theta, eta)`: the structural
-/// [`CompiledModel::effective_for`] reroute (TV-covariate / `TIME` transit
+/// [`CompiledModel::effective_for`] reroute (TV-covariate / `TIME` transit or IG
 /// subjects → their ODE twin) **plus** a parameter-dependent flip-flop reroute.
 ///
-/// A transit closed form clamps to `0` once `ke ≥ KTR` (absorption no faster
-/// than elimination). When the subject's parameters enter that regime and an
-/// ODE twin exists, evaluate the twin instead: it is the same model, integrated
-/// numerically, and is valid in both regimes — so the prediction and its
-/// sensitivities are correct rather than a spurious zero. Both the prediction
-/// and the sensitivity dispatchers route through here, and within an iteration
-/// they evaluate at the same `(theta, eta)`, so they agree on the decision.
+/// A transit / IG closed form clamps to `0` once `ke` reaches the tilting abscissa
+/// (absorption no faster than elimination). When the subject's parameters enter that
+/// regime and an ODE twin exists, evaluate the twin instead: it is the same model,
+/// integrated numerically, and is valid in both regimes — so the prediction and its
+/// sensitivities are correct rather than a spurious zero. Both the prediction and the
+/// sensitivity dispatchers route through here, and within an iteration they evaluate at
+/// the same `(theta, eta)`, so they agree on the decision.
 ///
-/// A flip-flop transit model with no ODE twin (one carrying a lagtime, `f`, or a
+/// A flip-flop absorption model with no ODE twin (one carrying a lagtime, `f`, or a
 /// user `[odes]` / `[scaling]` / `[initial_conditions]` block, which the desugar
 /// declines) has nothing to reroute to, and is rejected up front at η = 0 typical
-/// values by [`crate::api::check_transit_flip_flop_no_twin`] (`fit()` → `Err`,
+/// values by [`crate::api::check_absorption_flip_flop_no_twin`] (`fit()` → `Err`,
 /// `predict()`/`simulate()` panic) rather than silently returning the closed form's
 /// `0`. (This function still returns the closed form for it — the guard runs first.)
 pub(crate) fn effective_model_for_eval<'a>(
@@ -107,16 +128,16 @@ pub(crate) fn effective_model_for_eval<'a>(
     eta: &[f64],
 ) -> &'a CompiledModel {
     let structural = model.effective_for(subject);
-    // No twin to route to (a non-transit model, or a lagtime / `f` / user-`[odes]`
-    // transit whose desugar declined): nothing parameter-dependent to decide.
-    let Some(twin) = &model.transit_ode_equivalent else {
+    // No twin to route to (a non-absorption model, or a lagtime / `f` / user-`[odes]`
+    // transit/IG whose desugar declined): nothing parameter-dependent to decide.
+    let Some(twin) = &model.absorption_ode_equivalent else {
         return structural;
     };
-    // Keep the structural (closed-form) model when it has already been rerouted to
-    // an ODE twin (TV-cov / `TIME`), or when this subject is not in the flip-flop
-    // regime. `||` short-circuits, so the predicate is evaluated only for
-    // closed-form transit subjects — the same work as before.
-    if structural.ode_spec.is_some() || !transit_flip_flop_at(model, subject, theta, eta) {
+    // Keep the structural (closed-form) model when it has already been rerouted to an
+    // ODE twin (TV-cov / `TIME`), or when this subject is not in the flip-flop regime.
+    // `||` short-circuits, so the predicate is evaluated only for closed-form
+    // transit/IG subjects — the same work as before.
+    if structural.ode_spec.is_some() || !absorption_flip_flop_at(model, subject, theta, eta) {
         return structural;
     }
     twin.get_or_build()
@@ -449,12 +470,14 @@ pub(crate) fn analytical_init_concentration_g<T: crate::sens::num::PkNum>(
     if cmt == central {
         // IV-bolus impulse directly into the central compartment.
         match pk_model {
-            PkModel::OneCptIv | PkModel::OneCptOral | PkModel::OneCptTransit => {
-                one_cpt_iv_bolus_amt_g(a0, t, cl, v)
-            }
-            PkModel::TwoCptIv | PkModel::TwoCptOral | PkModel::TwoCptTransit => {
-                two_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2)
-            }
+            PkModel::OneCptIv
+            | PkModel::OneCptOral
+            | PkModel::OneCptTransit
+            | PkModel::OneCptIg => one_cpt_iv_bolus_amt_g(a0, t, cl, v),
+            PkModel::TwoCptIv
+            | PkModel::TwoCptOral
+            | PkModel::TwoCptTransit
+            | PkModel::TwoCptIg => two_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2),
             PkModel::ThreeCptIv | PkModel::ThreeCptOral => {
                 three_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2, q3, v3)
             }
@@ -1100,13 +1123,19 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
 
     let raw = if dose.ss && dose.ii > 0.0 {
         match pk_model {
-            // Transit rejects SS doses at parse (#386); the periodic-sum SS closed
-            // form is a follow-up, so this arm is unreachable for a valid model.
+            // Transit / IG reject SS doses at parse (#386/#790); the periodic-sum SS
+            // closed form is a follow-up, so these arms are unreachable for a valid model.
             PkModel::OneCptTransit => {
                 unreachable!("one_cpt_transit does not support SS doses (rejected at parse)")
             }
             PkModel::TwoCptTransit => {
                 unreachable!("two_cpt_transit does not support SS doses (rejected at parse)")
+            }
+            PkModel::OneCptIg => {
+                unreachable!("one_cpt_ig does not support SS doses (rejected at parse)")
+            }
+            PkModel::TwoCptIg => {
+                unreachable!("two_cpt_ig does not support SS doses (rejected at parse)")
             }
             PkModel::OneCptIv => {
                 if infusion {
@@ -1202,6 +1231,14 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
                     p.f_bio(),
                 )
             }
+            PkModel::OneCptIg => {
+                // IG rejects infusions at parse, so only the absorbed bolus exists.
+                one_cpt_ig_f(dose, tau, cl, v, p.mat(), p.cv2(), p.f_bio())
+            }
+            PkModel::TwoCptIg => {
+                // IG rejects infusions at parse, so only the absorbed bolus exists.
+                two_cpt_ig_f(dose, tau, cl, v, p.q(), p.v2(), p.mat(), p.cv2(), p.f_bio())
+            }
             PkModel::TwoCptIv => {
                 if infusion {
                     two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
@@ -1286,12 +1323,18 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
     // SS dispatch here (they lack the internal guard in their non-SS variants).
     let mut state = if dose.ss && dose.ii > 0.0 {
         match pk_model {
-            // Transit rejects SS doses at parse (#386) — unreachable for a valid model.
+            // Transit / IG reject SS doses at parse (#386/#790) — unreachable for a valid model.
             PkModel::OneCptTransit => {
                 unreachable!("one_cpt_transit does not support SS doses (rejected at parse)")
             }
             PkModel::TwoCptTransit => {
                 unreachable!("two_cpt_transit does not support SS doses (rejected at parse)")
+            }
+            PkModel::OneCptIg => {
+                unreachable!("one_cpt_ig does not support SS doses (rejected at parse)")
+            }
+            PkModel::TwoCptIg => {
+                unreachable!("two_cpt_ig does not support SS doses (rejected at parse)")
             }
             PkModel::OneCptIv => {
                 let c = if infusion {
@@ -1457,6 +1500,33 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                 );
                 vec![depot, central, periph]
             }
+            PkModel::OneCptIg => {
+                // [depot = unabsorbed IG mass, central]; IG rejects infusions at
+                // parse, so only the absorbed bolus exists.
+                let depot = one_cpt_ig_depot(dose, tau, p.mat(), p.cv2(), p.f_bio());
+                let central = one_cpt_ig_f(dose, tau, cl, v, p.mat(), p.cv2(), p.f_bio());
+                vec![depot, central]
+            }
+            PkModel::TwoCptIg => {
+                // [depot = unabsorbed IG mass, central, peripheral]; IG rejects
+                // infusions at parse, so only the absorbed bolus exists.
+                let depot =
+                    two_cpt_ig_depot(dose, tau, cl, v, p.q(), p.v2(), p.mat(), p.cv2(), p.f_bio());
+                let central =
+                    two_cpt_ig_f(dose, tau, cl, v, p.q(), p.v2(), p.mat(), p.cv2(), p.f_bio());
+                let periph = two_cpt_ig_peripheral(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.mat(),
+                    p.cv2(),
+                    p.f_bio(),
+                );
+                vec![depot, central, periph]
+            }
             PkModel::TwoCptIv => {
                 let central = if infusion {
                     two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
@@ -1562,9 +1632,11 @@ pub fn analytical_state_at_times(
         PkModel::OneCptIv => 1,
         PkModel::OneCptOral => 2,
         PkModel::OneCptTransit => 2,
+        PkModel::OneCptIg => 2,
         PkModel::TwoCptIv => 2,
         PkModel::TwoCptOral => 3,
         PkModel::TwoCptTransit => 3,
+        PkModel::TwoCptIg => 3,
         PkModel::ThreeCptIv => 3,
         PkModel::ThreeCptOral => 4,
     };
@@ -2422,7 +2494,7 @@ mod tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         }
     }
 
@@ -3567,7 +3639,71 @@ mod tests {
         );
     }
 
-    /// SS doses are rejected at parse for transit (`check_transit_support`), so the
+    /// IG is a 2-state `[depot, central]` model: `single_dose_states` must return the
+    /// unabsorbed-IG "depot" amount and the central concentration for a bolus, covering
+    /// the `single_dose_states` IG arm and `one_cpt_ig_depot` / `one_cpt_ig_f` (#790).
+    /// Params in-domain (`ke = 0.05 < 1/(2·MAT·CV²) = 1.111`).
+    #[test]
+    fn single_dose_states_ig_returns_depot_and_central() {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = 0.5;
+        p.values[crate::types::PK_IDX_V] = 10.0;
+        p.values[crate::types::PK_IDX_MAT] = 1.5;
+        p.values[crate::types::PK_IDX_CV2] = 0.3;
+        let d = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        let states = single_dose_states(PkModel::OneCptIg, &d, 2.0, &p);
+        assert_eq!(states.len(), 2, "IG exposes [depot, central]");
+        assert!(
+            states[0] > 0.0 && states[1] > 0.0,
+            "both amounts positive mid-absorption: {states:?}"
+        );
+        // Central state must equal the standalone concentration entry point.
+        let c = single_dose_concentration(PkModel::OneCptIg, &d, 2.0, &p);
+        assert!((states[1] - c).abs() <= 1e-9 * c.abs().max(1.0));
+    }
+
+    /// 2-cpt IG is a 3-state `[depot, central, peripheral]` model, covering
+    /// `two_cpt_ig_depot` / `two_cpt_ig_f` / `two_cpt_ig_peripheral` (#790).
+    #[test]
+    fn single_dose_states_two_cpt_ig_returns_depot_central_periph() {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = 0.5;
+        p.values[crate::types::PK_IDX_V] = 10.0; // V1
+        p.values[crate::types::PK_IDX_Q] = 1.0;
+        p.values[crate::types::PK_IDX_V2] = 20.0;
+        p.values[crate::types::PK_IDX_MAT] = 1.5;
+        p.values[crate::types::PK_IDX_CV2] = 0.3;
+        let d = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        let states = single_dose_states(PkModel::TwoCptIg, &d, 2.0, &p);
+        assert_eq!(states.len(), 3, "2-cpt IG exposes [depot, central, periph]");
+        assert!(
+            states.iter().all(|&x| x > 0.0),
+            "all three amounts positive mid-absorption: {states:?}"
+        );
+        let c = single_dose_concentration(PkModel::TwoCptIg, &d, 2.0, &p);
+        assert!((states[1] - c).abs() <= 1e-9 * c.abs().max(1.0));
+    }
+
+    /// SS doses are rejected at parse for IG; the SS arms of
+    /// `single_dose_concentration` / `single_dose_states` are `unreachable!` — calling
+    /// them directly with an SS dose must hit those guards (covers the defensive arms).
+    #[test]
+    #[should_panic(expected = "one_cpt_ig does not support SS")]
+    fn single_dose_concentration_one_cpt_ig_ss_unreachable() {
+        let p = PkParams::default();
+        let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+        let _ = single_dose_concentration(PkModel::OneCptIg, &ss, 2.0, &p);
+    }
+
+    #[test]
+    #[should_panic(expected = "two_cpt_ig does not support SS")]
+    fn single_dose_states_two_cpt_ig_ss_unreachable() {
+        let p = PkParams::default();
+        let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+        let _ = single_dose_states(PkModel::TwoCptIg, &ss, 2.0, &p);
+    }
+
+    /// SS doses are rejected at parse for transit (`check_absorption_closed_form_support`), so the
     /// SS arm of `single_dose_concentration` is `unreachable!`; calling it directly
     /// with an SS dose must hit that guard (covers the defensive arm + its message).
     #[test]

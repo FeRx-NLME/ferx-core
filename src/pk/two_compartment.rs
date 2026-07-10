@@ -1,8 +1,9 @@
-use crate::pk::analytical_absorption::{convolve_2cpt_peripheral, TransitAbsorption};
-use crate::pk::one_compartment::one_cpt_transit_depot;
+use crate::pk::analytical_absorption::{convolve_2cpt_peripheral, IgAbsorption, TransitAbsorption};
+use crate::pk::one_compartment::{one_cpt_ig_depot, one_cpt_transit_depot};
 use crate::sens::two_cpt::{
-    transit_2cpt_domain_ok, two_cpt_infusion_g, two_cpt_infusion_ss_g, two_cpt_iv_bolus_g,
-    two_cpt_iv_bolus_ss_g, two_cpt_oral_g, two_cpt_oral_ss_g, two_cpt_transit_g,
+    ig_2cpt_domain_ok, transit_2cpt_domain_ok, two_cpt_ig_g, two_cpt_infusion_g,
+    two_cpt_infusion_ss_g, two_cpt_iv_bolus_g, two_cpt_iv_bolus_ss_g, two_cpt_oral_g,
+    two_cpt_oral_ss_g, two_cpt_transit_g,
 };
 use crate::types::DoseEvent;
 
@@ -127,6 +128,82 @@ pub(crate) fn two_cpt_transit_peripheral(
         return 0.0;
     };
     let abs = TransitAbsorption { n, mtt };
+    let k12 = q / v1;
+    convolve_2cpt_peripheral(&abs, tau, alpha, beta, k12, (f_bio * dose.amt) / v2)
+}
+
+/// 2-cpt inverse-Gaussian absorption central concentration (#790). `F` is baked into
+/// the kernel; IG rejects infusion/SS doses at parse, so only the absorbed-bolus route
+/// exists. Delegates to the generic source at `T = f64`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn two_cpt_ig_f(
+    dose: &DoseEvent,
+    t: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    mat: f64,
+    cv2: f64,
+    f_bio: f64,
+) -> f64 {
+    two_cpt_ig_g::<f64>(dose.amt, t, cl, v1, q, v2, mat, cv2, f_bio)
+}
+
+/// Unabsorbed amount still in the IG absorption process for a single 2-cpt bolus at
+/// elapsed time `tau`: `F·Dose·(1 − F_IG(tau))`. The lumped depot-side state of the
+/// analytic 2-cpt IG model; disposition-independent, so it reuses the 1-cpt IG depot
+/// verbatim (mirroring [`two_cpt_transit_depot`], #790). Used for `[derived]` amounts.
+/// Returns 0 for invalid params / infusion doses, and — so `[derived]` mass stays
+/// balanced — in the confluent / flip-flop `α ≥ 1/(2·MAT·CV²)` regime where the central
+/// and peripheral closed forms both collapse to 0.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn two_cpt_ig_depot(
+    dose: &DoseEvent,
+    tau: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    mat: f64,
+    cv2: f64,
+    f_bio: f64,
+) -> f64 {
+    if ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2).is_none() {
+        return 0.0;
+    }
+    one_cpt_ig_depot(dose, tau, mat, cv2, f_bio)
+}
+
+/// Peripheral-compartment concentration `A2/V2` for a single 2-cpt IG bolus at elapsed
+/// time `tau` (#790) — the IG density convolved with the peripheral IV-bolus impulse
+/// response ([`convolve_2cpt_peripheral`]). Used for `[derived]` peripheral amounts;
+/// the likelihood reads only central ([`two_cpt_ig_f`]). Returns 0 for invalid params,
+/// infusion doses, the confluent `α = β` edge, or flip-flop `α ≥ 1/(2·MAT·CV²)`
+/// (mirrors the central guards).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn two_cpt_ig_peripheral(
+    dose: &DoseEvent,
+    tau: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    mat: f64,
+    cv2: f64,
+    f_bio: f64,
+) -> f64 {
+    if tau < 0.0 || dose.is_infusion() {
+        return 0.0;
+    }
+    let Some((alpha, beta, _k21)) = ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2) else {
+        return 0.0;
+    };
+    let abs = IgAbsorption {
+        mat,
+        lambda: mat / cv2,
+    };
     let k12 = q / v1;
     convolve_2cpt_peripheral(&abs, tau, alpha, beta, k12, (f_bio * dose.amt) / v2)
 }

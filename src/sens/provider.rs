@@ -34,13 +34,13 @@
 use super::dual1::Dual1;
 use super::dual2::Dual2;
 use super::num::PkNum;
-use super::one_cpt::{one_cpt_conc_g, one_cpt_transit_conc_g};
+use super::one_cpt::{one_cpt_conc_g, one_cpt_ig_conc_g, one_cpt_transit_conc_g};
 use super::three_cpt::three_cpt_conc_g;
-use super::two_cpt::{two_cpt_conc_g, two_cpt_transit_conc_g};
+use super::two_cpt::{two_cpt_conc_g, two_cpt_ig_conc_g, two_cpt_transit_conc_g};
 use crate::types::{
-    CompiledModel, DoseEvent, GradientMethod, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_F,
-    PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_MTT, PK_IDX_N, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2,
-    PK_IDX_V3,
+    CompiledModel, DoseEvent, GradientMethod, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_CV2,
+    PK_IDX_F, PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_MAT, PK_IDX_MTT, PK_IDX_N, PK_IDX_Q, PK_IDX_Q3,
+    PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
 };
 
 /// Exact sensitivities of one observation w.r.t. η and θ. Hessian-shaped fields
@@ -142,6 +142,13 @@ fn slot_to_dim(slot: usize) -> Option<usize> {
         // them, so they are differentiated like the other structural slots.
         PK_IDX_N => Some(9),
         PK_IDX_MTT => Some(10),
+        // Inverse-Gaussian `mat`/`cv2` (#790); the analytic `one_cpt_ig` closed form
+        // reads them, so they are differentiated too. WITHOUT these arms an IG model's
+        // `pk_indices` (slots 11/12) fail `analytical_supported_core`'s
+        // `slot_to_dim(s).is_some()` check and the whole model silently falls back to
+        // finite-difference gradients — defeating the closed form's exact-`Dual2` point.
+        PK_IDX_MAT => Some(11),
+        PK_IDX_CV2 => Some(12),
         _ => None,
     }
 }
@@ -298,9 +305,11 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
         PkModel::OneCptIv
             | PkModel::OneCptOral
             | PkModel::OneCptTransit
+            | PkModel::OneCptIg
             | PkModel::TwoCptIv
             | PkModel::TwoCptOral
             | PkModel::TwoCptTransit
+            | PkModel::TwoCptIg
             | PkModel::ThreeCptIv
             | PkModel::ThreeCptOral
     ) && model.ode_spec.is_none()
@@ -3219,6 +3228,8 @@ fn subject_eta_grad_impl(
     let three_cpt = matches!(model.pk_model, PkModel::ThreeCptIv | PkModel::ThreeCptOral);
     let transit = matches!(model.pk_model, PkModel::OneCptTransit);
     let two_cpt_transit = matches!(model.pk_model, PkModel::TwoCptTransit);
+    let ig = matches!(model.pk_model, PkModel::OneCptIg);
+    let two_cpt_ig = matches!(model.pk_model, PkModel::TwoCptIg);
 
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
 
@@ -3275,8 +3286,8 @@ fn subject_eta_grad_impl(
         ($($n:literal),+) => {
             match slots.len() {
                 $($n => Some(run_obs_grad::<$n>(
-                    &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit, subject,
-                    &dp_deta, n_eta, readout,
+                    &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit, ig,
+                    two_cpt_ig, subject, &dp_deta, n_eta, readout,
                 )),)+
                 _ => None,
             }
@@ -3352,6 +3363,8 @@ fn run_obs_grad<const N: usize>(
     three_cpt: bool,
     transit: bool,
     two_cpt_transit: bool,
+    ig: bool,
+    two_cpt_ig: bool,
     subject: &Subject,
     dp_deta: &[Vec<f64>],
     n_eta: usize,
@@ -3385,9 +3398,12 @@ fn run_obs_grad<const N: usize>(
     // (`elapsed = (t_obs − dose.time) − lagtime`), so seed it as its own dual axis.
     let lag_val = pk.lagtime();
     let lag_d = dv(PK_IDX_LAGTIME, lag_val);
-    // Transit `n`/`mtt` (#386), seeded like the other structural params.
+    // Transit `n`/`mtt` (#386) and IG `mat`/`cv2` (#790), seeded like the other
+    // structural params.
     let n_d = dv(PK_IDX_N, pk.n_transit());
     let mtt_d = dv(PK_IDX_MTT, pk.mtt());
+    let mat_d = dv(PK_IDX_MAT, pk.mat());
+    let cv2_d = dv(PK_IDX_CV2, pk.cv2());
 
     // Analytic Form C readout (#650): PK-slot dual vector + scratch, built once
     // (subject-static). Mirrors the outer `run_obs`, on `Dual1<N>` (η-grad only).
@@ -3428,6 +3444,10 @@ fn run_obs_grad<const N: usize>(
                 one_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, n_d, mtt_d, f_d)
             } else if two_cpt_transit {
                 two_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, n_d, mtt_d, f_d)
+            } else if ig {
+                one_cpt_ig_conc_g(dose, elapsed, cl_d, v1_d, mat_d, cv2_d, f_d)
+            } else if two_cpt_ig {
+                two_cpt_ig_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, mat_d, cv2_d, f_d)
             } else if three_cpt {
                 three_cpt_conc_g(
                     dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
@@ -4305,6 +4325,8 @@ fn subject_sensitivities_impl(
     let three_cpt = matches!(model.pk_model, PkModel::ThreeCptIv | PkModel::ThreeCptOral);
     let transit = matches!(model.pk_model, PkModel::OneCptTransit);
     let two_cpt_transit = matches!(model.pk_model, PkModel::TwoCptTransit);
+    let ig = matches!(model.pk_model, PkModel::OneCptIg);
+    let two_cpt_ig = matches!(model.pk_model, PkModel::TwoCptIg);
 
     // PK parameter values at (θ, η): pk_s = tv_s·exp(sel·η). pk_param_fn folds η.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
@@ -4383,8 +4405,11 @@ fn subject_sensitivities_impl(
             PkModel::TwoCptOral => Some(ExKind::TwoCptOral),
             PkModel::ThreeCptIv => Some(ExKind::ThreeCptIv),
             PkModel::ThreeCptOral => Some(ExKind::ThreeCptOral),
-            // Transit has no hand-written explicit kernel; use the generic Dual2 path.
-            PkModel::OneCptTransit | PkModel::TwoCptTransit => None,
+            // Transit / IG have no hand-written explicit kernel; use the generic Dual2 path.
+            PkModel::OneCptTransit
+            | PkModel::TwoCptTransit
+            | PkModel::OneCptIg
+            | PkModel::TwoCptIg => None,
         }
     };
 
@@ -4402,8 +4427,8 @@ fn subject_sensitivities_impl(
             match slots.len() {
                 $($n => Some(SubjectSens {
                     obs: run_obs::<$n>(
-                        &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit,
-                        explicit_kind, subject, &pd, n_eta, n_theta, readout,
+                        &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit, ig,
+                        two_cpt_ig, explicit_kind, subject, &pd, n_eta, n_theta, readout,
                     ),
                 }),)+
                 _ => None,
@@ -4571,6 +4596,8 @@ fn run_obs<const N: usize>(
     three_cpt: bool,
     transit: bool,
     two_cpt_transit: bool,
+    ig: bool,
+    two_cpt_ig: bool,
     explicit_kind: Option<ExKind>,
     subject: &Subject,
     pd: &crate::sens::ode_provider::ParamDerivs,
@@ -4656,9 +4683,12 @@ fn run_obs<const N: usize>(
             // argument; seed it as its own dual axis (`∂elapsed/∂lagtime = −1`).
             let lag_val = pk.lagtime();
             let lag_d = dv(PK_IDX_LAGTIME, lag_val);
-            // Transit `n`/`mtt` (#386), seeded like the other structural params.
+            // Transit `n`/`mtt` (#386) and IG `mat`/`cv2` (#790), seeded like the
+            // other structural params.
             let n_d = dv(PK_IDX_N, pk.n_transit());
             let mtt_d = dv(PK_IDX_MTT, pk.mtt());
+            let mat_d = dv(PK_IDX_MAT, pk.mat());
+            let cv2_d = dv(PK_IDX_CV2, pk.cv2());
 
             // Superpose dose contributions: f = Σ conc(dose, elapsed), restricted
             // to the current reset segment (`dose.time >= reset_floor`); `elapsed`
@@ -4676,6 +4706,10 @@ fn run_obs<const N: usize>(
                     one_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, n_d, mtt_d, f_d)
                 } else if two_cpt_transit {
                     two_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, n_d, mtt_d, f_d)
+                } else if ig {
+                    one_cpt_ig_conc_g(dose, elapsed, cl_d, v1_d, mat_d, cv2_d, f_d)
+                } else if two_cpt_ig {
+                    two_cpt_ig_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, mat_d, cv2_d, f_d)
                 } else if three_cpt {
                     three_cpt_conc_g(
                         dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
@@ -5045,6 +5079,69 @@ mod tests {
     use crate::pk::compute_predictions_with_tv;
     use crate::types::{test_helpers, DoseEvent, Subject};
     use std::collections::HashMap;
+
+    /// Regression: an analytic `pk one_cpt_ig` / `two_cpt_ig` model must take the
+    /// **exact `Dual2` analytic** gradient path, not the finite-difference fallback —
+    /// the whole point of the #790 closed form. This pins `slot_to_dim` covering the
+    /// IG `mat`/`cv2` slots (11/12); without those arms `analytical_supported_core`'s
+    /// `pk_indices.iter().all(slot_to_dim(s).is_some())` fails and the model silently
+    /// falls back to FD (equivalence/anchor OFV tests would still pass on FD, so only
+    /// this assertion catches it).
+    #[test]
+    fn ig_models_use_the_analytic_gradient_path() {
+        const ONE_CPT_IG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.3, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  MAT = TVMAT
+  CV2 = TVCV2
+[structural_model]
+  pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        const TWO_CPT_IG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(10.0, 0.1, 200.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVMAT(1.5, 0.05, 24.0)
+  theta TVCV2(0.3, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  MAT = TVMAT
+  CV2 = TVCV2
+[structural_model]
+  pk two_cpt_ig(cl=CL, v1=V1, q=Q, v2=V2, mat=MAT, cv2=CV2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        for (label, src) in [("one_cpt_ig", ONE_CPT_IG), ("two_cpt_ig", TWO_CPT_IG)] {
+            let m = parse_model_string(src).unwrap_or_else(|e| panic!("[{label}] parse: {e}"));
+            // The IG structural slots must be recognised as differentiable.
+            assert!(
+                slot_to_dim(PK_IDX_MAT).is_some() && slot_to_dim(PK_IDX_CV2).is_some(),
+                "[{label}] slot_to_dim must map MAT/CV2"
+            );
+            assert!(
+                analytical_supported(&m),
+                "[{label}] must use the exact Dual2 analytic gradient path, not FD"
+            );
+        }
+    }
 
     #[test]
     fn analytic_outer_gradient_available_tracks_scope_and_fd() {
@@ -8920,7 +9017,7 @@ mod tests {
         let m = parse_model_string(ONECPT_TRANSIT_MODEL).expect("parse transit");
         assert_eq!(m.pk_model, PkModel::OneCptTransit);
         assert!(
-            m.transit_ode_equivalent.is_some(),
+            m.absorption_ode_equivalent.is_some(),
             "a plain transit model carries an ODE equivalent"
         );
         let theta = [5.0, 50.0, 1.0, 3.0];
@@ -8940,7 +9037,7 @@ mod tests {
         assert!(
             std::ptr::eq(
                 m.effective_for(&tv),
-                m.transit_ode_equivalent.as_ref().unwrap().get_or_build()
+                m.absorption_ode_equivalent.as_ref().unwrap().get_or_build()
             ),
             "TV-cov transit subject must be served by the ODE equivalent"
         );

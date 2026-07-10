@@ -3029,7 +3029,7 @@ mod tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         };
 
         // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.

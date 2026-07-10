@@ -336,6 +336,12 @@ pub const PK_IDX_LAGTIME: usize = 8;
 pub const PK_IDX_N: usize = 9;
 /// Mean transit time `mtt` for the analytic `one_cpt_transit` model (#386).
 pub const PK_IDX_MTT: usize = 10;
+/// Mean absorption time `mat` (`μ`) for the analytic `one_cpt_ig` inverse-Gaussian
+/// absorption model (#790). Spare-region slot (≥9), read only by the IG models.
+pub const PK_IDX_MAT: usize = 11;
+/// Relative dispersion `cv2` (`CV²`) of the inverse-Gaussian absorption-time
+/// distribution for the analytic `one_cpt_ig` model (#790); shape `λ = mat/cv2`.
+pub const PK_IDX_CV2: usize = 12;
 
 /// The engine-reserved PK slots: bioavailability (`F`) and absorption lag
 /// (`lagtime`). `ode_param_slots` keeps these free for an undeclared F/lagtime
@@ -549,6 +555,16 @@ impl PkParams {
     pub fn mtt(&self) -> f64 {
         self.values[PK_IDX_MTT]
     }
+    /// Mean absorption time `mat` (`μ`) for the analytic `one_cpt_ig` model (#790);
+    /// `0` for every other model.
+    pub fn mat(&self) -> f64 {
+        self.values[PK_IDX_MAT]
+    }
+    /// Relative dispersion `cv2` (`CV²`) for the analytic `one_cpt_ig` model (#790);
+    /// the IG shape is `λ = mat/cv2`.
+    pub fn cv2(&self) -> f64 {
+        self.values[PK_IDX_CV2]
+    }
     pub fn f_bio(&self) -> f64 {
         self.values[PK_IDX_F]
     }
@@ -601,6 +617,9 @@ impl PkParams {
             // Savic transit-absorption params for `pk one_cpt_transit` (#386).
             "n" => Some(PK_IDX_N),
             "mtt" => Some(PK_IDX_MTT),
+            // Inverse-Gaussian absorption params for `pk one_cpt_ig` (#790).
+            "mat" => Some(PK_IDX_MAT),
+            "cv2" => Some(PK_IDX_CV2),
             _ => None,
         }
     }
@@ -1226,6 +1245,12 @@ pub enum PkModel {
     /// exponential-tilting closed form (#386). Requires `cl`, `v`, `n` (transit
     /// count), `mtt` (mean transit time); `f`/`lagtime` optional as for oral.
     OneCptTransit,
+    /// 1-cpt with Freijer & Post inverse-Gaussian absorption via the analytic
+    /// exponential-tilting closed form (#790) — the same `igd(mat, cv2)` density the
+    /// ODE forcing path implements, skipping the ODE solve. Requires `cl`, `v`,
+    /// `mat` (mean absorption time), `cv2` (relative dispersion); `f`/`lagtime`
+    /// optional as for oral.
+    OneCptIg,
     TwoCptIv,
     TwoCptOral,
     /// 2-cpt with Savic transit-compartment absorption via the analytic
@@ -1233,6 +1258,11 @@ pub enum PkModel {
     /// `v2`, `n` (transit count), `mtt` (mean transit time); `f`/`lagtime`
     /// optional as for oral.
     TwoCptTransit,
+    /// 2-cpt with Freijer & Post inverse-Gaussian absorption via the analytic
+    /// exponential-tilting closed form (#790). Requires `cl`, `v1`, `q`, `v2`,
+    /// `mat` (mean absorption time), `cv2` (relative dispersion); `f`/`lagtime`
+    /// optional as for oral.
+    TwoCptIg,
     ThreeCptIv,
     ThreeCptOral,
 }
@@ -1257,6 +1287,12 @@ impl PkModel {
                 (PK_IDX_N, "n"),
                 (PK_IDX_MTT, "mtt"),
             ],
+            PkModel::OneCptIg => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v"),
+                (PK_IDX_MAT, "mat"),
+                (PK_IDX_CV2, "cv2"),
+            ],
             PkModel::TwoCptIv => &[
                 (PK_IDX_CL, "cl"),
                 (PK_IDX_V, "v1"),
@@ -1277,6 +1313,14 @@ impl PkModel {
                 (PK_IDX_V2, "v2"),
                 (PK_IDX_N, "n"),
                 (PK_IDX_MTT, "mtt"),
+            ],
+            PkModel::TwoCptIg => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_MAT, "mat"),
+                (PK_IDX_CV2, "cv2"),
             ],
             PkModel::ThreeCptIv => &[
                 (PK_IDX_CL, "cl"),
@@ -1310,9 +1354,11 @@ impl PkModel {
             PkModel::OneCptIv => "one_cpt_iv",
             PkModel::OneCptOral => "one_cpt_oral",
             PkModel::OneCptTransit => "one_cpt_transit",
+            PkModel::OneCptIg => "one_cpt_ig",
             PkModel::TwoCptIv => "two_cpt_iv",
             PkModel::TwoCptOral => "two_cpt_oral",
             PkModel::TwoCptTransit => "two_cpt_transit",
+            PkModel::TwoCptIg => "two_cpt_ig",
             PkModel::ThreeCptIv => "three_cpt_iv",
             PkModel::ThreeCptOral => "three_cpt_oral",
         }
@@ -1340,11 +1386,17 @@ impl PkModel {
             // modeled-duration infusions are unsupported in v1, so a `D{cmt}` on a
             // transit model is rejected at parse (#386).
             PkModel::OneCptTransit => &[],
+            // Inverse-Gaussian, like transit: absorbs an instantaneous bolus through
+            // the IG absorption-time density; modeled-duration infusions are
+            // unsupported, so a `D{cmt}` on an IG model is rejected at parse (#790).
+            PkModel::OneCptIg => &[],
             PkModel::TwoCptIv => &[1, 2],
             PkModel::TwoCptOral => &[1, 2],
             // Like the 1-cpt transit: modeled-duration infusions unsupported in v1,
             // so a `D{cmt}` on a 2-cpt transit model is rejected at parse (#386).
             PkModel::TwoCptTransit => &[],
+            // Inverse-Gaussian 2-cpt: same as the 1-cpt IG (#790).
+            PkModel::TwoCptIg => &[],
             PkModel::ThreeCptIv => &[1, 2, 3],
             PkModel::ThreeCptOral => &[1, 2],
         }
@@ -1365,9 +1417,11 @@ impl PkModel {
             "one_cpt_iv" | "one_compartment_iv" => Some(PkModel::OneCptIv),
             "one_cpt_oral" | "one_compartment_oral" => Some(PkModel::OneCptOral),
             "one_cpt_transit" | "one_compartment_transit" => Some(PkModel::OneCptTransit),
+            "one_cpt_ig" | "one_compartment_ig" => Some(PkModel::OneCptIg),
             "two_cpt_iv" | "two_compartment_iv" => Some(PkModel::TwoCptIv),
             "two_cpt_oral" | "two_compartment_oral" => Some(PkModel::TwoCptOral),
             "two_cpt_transit" | "two_compartment_transit" => Some(PkModel::TwoCptTransit),
+            "two_cpt_ig" | "two_compartment_ig" => Some(PkModel::TwoCptIg),
             "three_cpt_iv" | "three_compartment_iv" => Some(PkModel::ThreeCptIv),
             "three_cpt_oral" | "three_compartment_oral" => Some(PkModel::ThreeCptOral),
             _ => None,
@@ -1387,8 +1441,10 @@ impl PkModel {
             self,
             PkModel::OneCptOral
                 | PkModel::OneCptTransit
+                | PkModel::OneCptIg
                 | PkModel::TwoCptOral
                 | PkModel::TwoCptTransit
+                | PkModel::TwoCptIg
                 | PkModel::ThreeCptOral
         )
     }
@@ -2974,30 +3030,33 @@ pub struct CompiledModel {
     /// covariates / theta; the FOCE/FOCEI likelihood then scales each
     /// observation's sigma loadings by [`RuvMagnitude::eval_obs`].
     pub ruv_magnitude: Option<RuvMagnitude>,
-    /// A synthesized ODE representation of an analytical model that carries one, used as a
-    /// runtime fallback when the closed form cannot serve a particular subject. Currently
-    /// only `one_cpt_transit`: the closed form assumes constant parameters over each
+    /// A synthesized ODE representation of an analytical absorption model that carries one,
+    /// used as a runtime fallback when the closed form cannot serve a particular subject. The
+    /// analytic transit (`one_cpt_transit` / `two_cpt_transit`, #386) and inverse-Gaussian
+    /// (`one_cpt_ig` / `two_cpt_ig`, #790) closed forms assume constant parameters over each
     /// absorption window, so a mid-profile `TIME` switch or time-varying covariates route to
-    /// this exact ODE `transit()` equivalent instead (a full boxed sub-model, built lazily so
-    /// it reuses the whole ODE prediction/sensitivity path unchanged and costs nothing for a
-    /// transit fit whose subjects never need it). `None` when the model needs no fallback
-    /// (not transit, or a transit form outside the desugar's scope). See
+    /// this exact ODE (`transit()` / `igd()`) equivalent instead (a full boxed sub-model, built
+    /// lazily so it reuses the whole ODE prediction/sensitivity path unchanged and costs
+    /// nothing for a fit whose subjects never need it). It is also the target of the
+    /// parameter-dependent flip-flop reroute (`ke` outside the tilting convergence domain). `None`
+    /// when the model needs no fallback (not a closed-form absorption model, or a form outside
+    /// the desugar's scope — a `lagtime`/`f` mapping or user `[odes]`). See
     /// [`CompiledModel::effective_for`] and the parser's
-    /// `transit_ode_equivalent_source` (#486).
-    pub transit_ode_equivalent: Option<TransitOdeEquivalent>,
+    /// `absorption_ode_equivalent_source` (#486, #790).
+    pub absorption_ode_equivalent: Option<AbsorptionOdeEquivalent>,
 }
 
-/// A lazily-built ODE representation of an analytical model that carries one (a plain
-/// `one_cpt_transit` or `two_cpt_transit`). Holds the equivalent's reconstructed `.ferx` source and compiles the
-/// boxed sub-model on first use, so a transit fit whose subjects never hit the fallback
-/// (constant-parameter, non-`TIME`) pays no extra parse or allocation. See
-/// [`CompiledModel::effective_for`] (#486).
-pub struct TransitOdeEquivalent {
+/// A lazily-built ODE representation of an analytical absorption model that carries one (a
+/// plain `one_cpt_transit` / `two_cpt_transit`, or `one_cpt_ig` / `two_cpt_ig`). Holds the
+/// equivalent's reconstructed `.ferx` source and compiles the boxed sub-model on first use, so
+/// a fit whose subjects never hit the fallback (constant-parameter, non-`TIME`, in-domain) pays
+/// no extra parse or allocation. See [`CompiledModel::effective_for`] (#486, #790).
+pub struct AbsorptionOdeEquivalent {
     source: String,
     built: std::sync::OnceLock<Box<CompiledModel>>,
 }
 
-impl TransitOdeEquivalent {
+impl AbsorptionOdeEquivalent {
     pub(crate) fn new(source: String) -> Self {
         Self {
             source,
@@ -3013,7 +3072,7 @@ impl TransitOdeEquivalent {
         self.built.get_or_init(|| {
             Box::new(
                 crate::parser::model_parser::parse_model_string(&self.source)
-                    .expect("internal: transit ODE equivalent failed to build"),
+                    .expect("internal: absorption ODE equivalent failed to build"),
             )
         })
     }
@@ -3077,16 +3136,17 @@ impl CompiledModel {
 
     /// The model that should actually serve `subject`'s predictions / sensitivities.
     ///
-    /// For a transit closed form (`one_cpt_transit` / `two_cpt_transit`) whose closed form
-    /// cannot cope with this subject — a
-    /// `TIME`-dependent structural parameter or time-varying covariates make the disposition
-    /// switch mid-absorption, which the per-dose Gamma convolution assumes constant — return
-    /// its exact ODE `transit()` equivalent (`transit_ode_equivalent`, built at parse time);
-    /// otherwise `self`. Constant-parameter transit subjects keep the fast, exact closed form.
-    /// The equivalent shares this model's θ/η layout, so callers pass the same parameter
-    /// vector (#486). A no-op (`self`) for every non-transit model.
+    /// For a closed-form absorption model (transit `one_cpt_transit` / `two_cpt_transit`, or
+    /// inverse-Gaussian `one_cpt_ig` / `two_cpt_ig`) whose closed form cannot cope with this
+    /// subject — a `TIME`-dependent structural parameter or time-varying covariates make the
+    /// disposition switch mid-absorption, which the per-dose absorption convolution assumes
+    /// constant — return its exact ODE (`transit()` / `igd()`) equivalent
+    /// (`absorption_ode_equivalent`, built at parse time); otherwise `self`. Constant-parameter
+    /// subjects keep the fast, exact closed form. The equivalent shares this model's θ/η layout,
+    /// so callers pass the same parameter vector (#486, #790). A no-op (`self`) for every model
+    /// without an ODE twin.
     pub fn effective_for<'a>(&'a self, subject: &Subject) -> &'a CompiledModel {
-        if let Some(eq) = &self.transit_ode_equivalent {
+        if let Some(eq) = &self.absorption_ode_equivalent {
             if crate::parser::model_parser::compiled_model_uses_time_builtin(self)
                 || subject.has_tv_covariates()
             {
@@ -3478,9 +3538,11 @@ impl CompiledModel {
             PkModel::OneCptIv => names!(ONE_CMT_IV, "central"),
             PkModel::OneCptOral => names!(ONE_CMT_ORAL, "depot", "central"),
             PkModel::OneCptTransit => names!(ONE_CMT_TRANSIT, "depot", "central"),
+            PkModel::OneCptIg => names!(ONE_CMT_IG, "depot", "central"),
             PkModel::TwoCptIv => names!(TWO_CMT_IV, "central", "peripheral"),
             PkModel::TwoCptOral => names!(TWO_CMT_ORAL, "depot", "central", "peripheral"),
             PkModel::TwoCptTransit => names!(TWO_CMT_TRANSIT, "depot", "central", "peripheral"),
+            PkModel::TwoCptIg => names!(TWO_CMT_IG, "depot", "central", "peripheral"),
             PkModel::ThreeCptIv => names!(THREE_CMT_IV, "central", "peripheral1", "peripheral2"),
             PkModel::ThreeCptOral => names!(
                 THREE_CMT_ORAL,
@@ -5878,7 +5940,7 @@ pub(crate) mod test_helpers {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         }
     }
 
@@ -5967,7 +6029,7 @@ pub(crate) mod test_helpers {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -6299,8 +6361,12 @@ mod tests {
         let cases: &[(PkModel, &[&str])] = &[
             (OneCptIv, &["cl", "v"]),
             (OneCptOral, &["cl", "v", "ka"]),
+            (OneCptTransit, &["cl", "v", "n", "mtt"]),
+            (OneCptIg, &["cl", "v", "mat", "cv2"]),
             (TwoCptIv, &["cl", "v1", "q", "v2"]),
             (TwoCptOral, &["cl", "v1", "q", "v2", "ka"]),
+            (TwoCptTransit, &["cl", "v1", "q", "v2", "n", "mtt"]),
+            (TwoCptIg, &["cl", "v1", "q", "v2", "mat", "cv2"]),
             (ThreeCptIv, &["cl", "v1", "q2", "v2", "q3", "v3"]),
             (ThreeCptOral, &["cl", "v1", "q2", "v2", "q3", "v3", "ka"]),
         ];
@@ -6331,8 +6397,12 @@ mod tests {
         use PkModel::*;
         assert_eq!(OneCptIv.canonical_name(), "one_cpt_iv");
         assert_eq!(OneCptOral.canonical_name(), "one_cpt_oral");
+        assert_eq!(OneCptTransit.canonical_name(), "one_cpt_transit");
+        assert_eq!(OneCptIg.canonical_name(), "one_cpt_ig");
         assert_eq!(TwoCptIv.canonical_name(), "two_cpt_iv");
         assert_eq!(TwoCptOral.canonical_name(), "two_cpt_oral");
+        assert_eq!(TwoCptTransit.canonical_name(), "two_cpt_transit");
+        assert_eq!(TwoCptIg.canonical_name(), "two_cpt_ig");
         assert_eq!(ThreeCptIv.canonical_name(), "three_cpt_iv");
         assert_eq!(ThreeCptOral.canonical_name(), "three_cpt_oral");
     }

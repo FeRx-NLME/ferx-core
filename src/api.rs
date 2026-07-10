@@ -1431,72 +1431,73 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
     }
 }
 
-/// Features the analytic transit models (`one_cpt_transit`, `two_cpt_transit`) do
-/// not support in their first version (#386): the exponential-tilting closed form
-/// is a constant-parameter depot-bolus superposition, so steady-state doses, IOV,
-/// infusion doses, system resets, and non-depot (`CMT≠1`) doses are rejected up
-/// front — otherwise they would silently mis-predict or hit an `unreachable!` in
-/// the superposition dispatch. (Time-varying covariates and a `TIME`-dependent
-/// parameter are instead transparently rerouted to the plain form's ODE `transit()`
-/// twin via [`CompiledModel::effective_for`]; only a form outside that twin's scope
-/// rejects them.) `fit()` surfaces this as an `Err`;
-/// `predict()`/`simulate()` panic via [`assert_transit_support`], mirroring
-/// [`assert_modeled_doses_supported`]. Returns the first offending feature's
-/// message, or `None` when compatible.
-pub(crate) fn check_transit_support(
+/// Features the analytic closed-form absorption models — transit (`one_cpt_transit`,
+/// `two_cpt_transit`, #386) and inverse-Gaussian (`one_cpt_ig`, `two_cpt_ig`, #790) —
+/// do not support: the exponential-tilting closed form is a constant-parameter
+/// depot-bolus superposition, so steady-state doses, IOV, infusion doses, system
+/// resets, and non-depot (`CMT≠1`) doses are rejected up front — otherwise they would
+/// silently mis-predict or hit an `unreachable!` in the superposition dispatch.
+/// (Time-varying covariates and a `TIME`-dependent parameter are instead transparently
+/// rerouted to the plain form's ODE twin — `transit()` / `igd()` forcing — via
+/// [`CompiledModel::effective_for`]; only a form outside that twin's scope rejects
+/// them.) `fit()` surfaces this as an `Err`; `predict()`/`simulate()` panic via
+/// [`assert_absorption_closed_form_support`], mirroring
+/// [`assert_modeled_doses_supported`]. Returns the first offending feature's message,
+/// or `None` when compatible.
+pub(crate) fn check_absorption_closed_form_support(
     model: &CompiledModel,
     population: &Population,
 ) -> Option<String> {
     if !matches!(
         model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
     ) {
         return None;
     }
     let name = model.pk_model.canonical_name();
     if model.n_kappa > 0 {
         return Some(format!(
-            "{name} does not support IOV (n_kappa > 0): the transit closed form \
-             assumes constant disposition over each absorption window. Use an ODE transit \
-             model (transit() forcing in [odes]) for IOV."
+            "{name} does not support IOV (n_kappa > 0): the analytic absorption closed form \
+             assumes constant disposition over each absorption window. Use an ODE absorption \
+             model (transit()/igd() forcing in [odes]) for IOV."
         ));
     }
     // A `TIME`-built-in structural parameter makes the disposition switch mid-profile — the
-    // transit closed form assumes constant parameters over each absorption window, so it
-    // cannot serve it. The plain `cl/v/n/mtt` form carries a `transit_ode_equivalent`
-    // (built at parse time), which the runtime dispatch routes such subjects to, so it is
-    // NOT rejected. Only a form outside the desugar's scope (a `lagtime=`/`f=` mapping or a
-    // custom `[scaling]` — no equivalent) is rejected here rather than mis-predict.
+    // closed form assumes constant parameters over each absorption window, so it cannot serve
+    // it. The plain form carries an `absorption_ode_equivalent` (built at parse time), which
+    // the runtime dispatch routes such subjects to, so it is NOT rejected. Only a form outside
+    // the desugar's scope (a `lagtime=`/`f=` mapping or a custom `[scaling]` — no equivalent)
+    // is rejected here rather than mis-predict.
     if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
-        && model.transit_ode_equivalent.is_none()
+        && model.absorption_ode_equivalent.is_none()
     {
         return Some(format!(
             "{name} does not support a TIME-dependent structural parameter in this form: \
-             the transit closed form assumes constant parameters over each absorption \
-             window, and this form is outside the automatic ODE-equivalent rewrite. Write \
-             the model as an ODE transit() forcing in [odes] directly."
+             the analytic absorption closed form assumes constant parameters over each \
+             absorption window, and this form is outside the automatic ODE-equivalent rewrite. \
+             Write the model as an ODE transit()/igd() forcing in [odes] directly."
         ));
     }
     for subject in &population.subjects {
         // Time-varying covariates make the disposition switch mid-absorption, which the
-        // closed form cannot serve. The plain form's `transit_ode_equivalent` handles it
+        // closed form cannot serve. The plain form's `absorption_ode_equivalent` handles it
         // (the runtime dispatch routes TV-cov subjects there), so reject only the
         // out-of-scope forms that carry no equivalent.
-        if subject.has_tv_covariates() && model.transit_ode_equivalent.is_none() {
+        if subject.has_tv_covariates() && model.absorption_ode_equivalent.is_none() {
             return Some(format!(
                 "{name} does not support within-subject time-varying covariates \
-                 (subject {}): the transit closed form assumes constant parameters over each \
-                 absorption window. Use an ODE transit model.",
+                 (subject {}): the analytic absorption closed form assumes constant parameters \
+                 over each absorption window. Use an ODE absorption model.",
                 subject.id
             ));
         }
         if subject.has_resets() {
             return Some(format!(
                 "{name} does not support system resets (EVID=3/4) (subject {}): resets zero \
-                 compartment amounts mid-profile, which the transit superposition closed form \
+                 compartment amounts mid-profile, which the absorption superposition closed form \
                  cannot express (it silently ignores the reset while the sensitivity path washes \
-                 out pre-reset doses, so fit() and predict() would disagree). Use an ODE transit \
-                 model.",
+                 out pre-reset doses, so fit() and predict() would disagree). Use an ODE \
+                 absorption model.",
                 subject.id
             ));
         }
@@ -1508,15 +1509,15 @@ pub(crate) fn check_transit_support(
                 // the direct-bolus branch and lands in a disposition compartment. So the two
                 // paths would silently disagree on a non-depot dose, and `effective_for`
                 // routes only TV-cov/`TIME` subjects to the twin, so a mixed population would
-                // even disagree with itself. A transit closed form only supports dosing the
-                // depot (`CMT=1`); reject anything else up front.
+                // even disagree with itself. A closed-form absorption model only supports
+                // dosing the depot (`CMT=1`); reject anything else up front.
                 return Some(format!(
                     "{name} does not support dosing into a non-depot compartment (subject \
-                     {}, CMT={}): the transit closed form routes every dose through the \
-                     absorption chain into central regardless of compartment, so a CMT≠1 dose \
-                     would be silently mistreated — and its ODE twin would instead bolus it \
+                     {}, CMT={}): the analytic absorption closed form routes every dose through \
+                     the absorption process into central regardless of compartment, so a CMT≠1 \
+                     dose would be silently mistreated — and its ODE twin would instead bolus it \
                      into a disposition compartment, so the two paths would disagree. Dose the \
-                     depot (CMT=1), or use an ODE transit model for direct central/peripheral \
+                     depot (CMT=1), or use an ODE absorption model for direct central/peripheral \
                      dosing.",
                     subject.id, dose.cmt
                 ));
@@ -1525,15 +1526,15 @@ pub(crate) fn check_transit_support(
                 return Some(format!(
                     "{name} does not support steady-state (SS) doses yet (subject \
                      {}): the periodic-sum SS closed form is a follow-up. Use a non-SS \
-                     multiple-dose schedule, or an ODE transit model.",
+                     multiple-dose schedule, or an ODE absorption model.",
                     subject.id
                 ));
             }
             if dose.is_infusion() {
                 return Some(format!(
-                    "{name} does not support infusion doses (subject {}): the transit \
-                     closed form absorbs an instantaneous bolus through the transit chain. Use \
-                     an ODE transit model for a zero-order input.",
+                    "{name} does not support infusion doses (subject {}): the analytic \
+                     absorption closed form absorbs an instantaneous bolus through the \
+                     absorption process. Use an ODE absorption model for a zero-order input.",
                     subject.id
                 ));
             }
@@ -1755,14 +1756,18 @@ pub(crate) fn check_analytic_readout_support(
     None
 }
 
-/// Panic on an unsupported transit model/data combination, for the
+/// Panic on an unsupported transit / IG closed-form model/data combination, for the
 /// `Vec`-returning `predict()`/`simulate()` paths (mirrors
 /// [`assert_modeled_doses_supported`]). `fit()` returns these as an `Err`.
-pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Population) {
-    if let Some(msg) = check_transit_support(model, population) {
+pub(crate) fn assert_absorption_closed_form_support(
+    model: &CompiledModel,
+    population: &Population,
+) {
+    if let Some(msg) = check_absorption_closed_form_support(model, population) {
         panic!(
-            "predict()/simulate() received a model/data combination the transit closed form \
-             cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
+            "predict()/simulate() received a model/data combination the analytic absorption \
+             closed form cannot honour: {msg}\n(fit() reports this as an error rather than \
+             panicking.)"
         );
     }
 }
@@ -1777,14 +1782,14 @@ pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Populat
 /// `lagtime`, bioavailability `f`, or a user `[odes]` / `[scaling]` /
 /// `[initial_conditions]` block, which the desugar declines) has nothing to reroute
 /// to. The boundary is parameter-dependent, so this can't be caught by
-/// [`check_transit_support`]'s structural checks — it is evaluated at the typical
-/// (η = 0) parameters via [`crate::pk::transit_flip_flop_at`], matching the
+/// [`check_absorption_closed_form_support`]'s structural checks — it is evaluated at the typical
+/// (η = 0) parameters via [`crate::pk::absorption_flip_flop_at`], matching the
 /// informational `W_TRANSIT_FLIP_FLOP` warning that fires for the twin-carrying case.
 /// Returns the first offending subject's message, or `None` when no reject applies
 /// (non-transit, twin present, or in-domain). `fit()` / `ferx check` surface this as
-/// an error; `predict()`/`simulate()` panic via [`assert_transit_flip_flop_no_twin`],
-/// mirroring [`check_transit_support`] / [`assert_transit_support`].
-pub(crate) fn check_transit_flip_flop_no_twin(
+/// an error; `predict()`/`simulate()` panic via [`assert_absorption_flip_flop_no_twin`],
+/// mirroring [`check_absorption_closed_form_support`] / [`assert_absorption_closed_form_support`].
+pub(crate) fn check_absorption_flip_flop_no_twin(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
@@ -1792,24 +1797,31 @@ pub(crate) fn check_transit_flip_flop_no_twin(
     // A twin-carrying model is auto-rerouted (correct) — only warned, not rejected.
     if !matches!(
         model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit
-    ) || model.transit_ode_equivalent.is_some()
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+    ) || model.absorption_ode_equivalent.is_some()
     {
         return None;
     }
+    // Model-family-specific domain / ODE-forcing wording (the tilting abscissa and the
+    // `[odes]` forcing differ between transit and IG).
+    let (domain, ode_fn, params) = match model.pk_model {
+        PkModel::OneCptTransit | PkModel::TwoCptTransit => {
+            ("transit rate KTR = (n+1)/mtt", "transit()", "MTT / CL")
+        }
+        _ => ("1/(2·MAT·CV²)", "igd()", "MAT / CV² / CL"),
+    };
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     for subject in &population.subjects {
-        if crate::pk::transit_flip_flop_at(model, subject, theta, &zero_eta) {
+        if crate::pk::absorption_flip_flop_at(model, subject, theta, &zero_eta) {
             return Some(format!(
-                "{} starts outside the analytic transit closed form's convergence domain at \
-                 typical values (subject {}) — the flip-flop regime (disposition rate ≥ transit \
-                 rate KTR = (n+1)/mtt), or (2-cpt) coincident disposition eigenvalues — so it \
-                 returns an identically-zero concentration profile, which silently degenerates \
-                 the objective (a proportional error model collapses `(σ·pred)²` to 0). This \
-                 model has no ODE twin to fall back on (a `lagtime`, bioavailability `f`, or a \
-                 user `[odes]` / `[scaling]` / `[initial_conditions]` block declines the \
-                 desugar) — rewrite it as an explicit ODE `transit()` model, or check the MTT / \
-                 CL starting estimates.",
+                "{} starts outside the analytic absorption closed form's convergence domain at \
+                 typical values (subject {}) — the flip-flop regime (disposition rate ≥ {domain}), \
+                 or (2-cpt) coincident disposition eigenvalues — so it returns an \
+                 identically-zero concentration profile, which silently degenerates the objective \
+                 (a proportional error model collapses `(σ·pred)²` to 0). This model has no ODE \
+                 twin to fall back on (a `lagtime`, bioavailability `f`, or a user `[odes]` / \
+                 `[scaling]` / `[initial_conditions]` block declines the desugar) — rewrite it as \
+                 an explicit ODE `{ode_fn}` model, or check the {params} starting estimates.",
                 model.pk_model.canonical_name(),
                 subject.id
             ));
@@ -1818,17 +1830,17 @@ pub(crate) fn check_transit_flip_flop_no_twin(
     None
 }
 
-/// Panic on a twin-less flip-flop transit model for the `Vec`-returning
-/// `predict()`/`simulate()` paths (mirrors [`assert_transit_support`]). `fit()`
+/// Panic on a twin-less flip-flop absorption model for the `Vec`-returning
+/// `predict()`/`simulate()` paths (mirrors [`assert_absorption_closed_form_support`]). `fit()`
 /// returns this as an `Err`.
-pub(crate) fn assert_transit_flip_flop_no_twin(
+pub(crate) fn assert_absorption_flip_flop_no_twin(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
 ) {
-    if let Some(msg) = check_transit_flip_flop_no_twin(model, population, theta) {
+    if let Some(msg) = check_absorption_flip_flop_no_twin(model, population, theta) {
         panic!(
-            "predict()/simulate() received a model/data combination the transit closed form \
+            "predict()/simulate() received a model/data combination the absorption closed form \
              cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
         );
     }
@@ -1836,7 +1848,7 @@ pub(crate) fn assert_transit_flip_flop_no_twin(
 
 /// Panic on a depot-referencing analytic Form C readout + reset subject, for the
 /// `Vec`-returning `predict()`/`simulate()` paths (mirrors
-/// [`assert_transit_support`]). `fit()` returns this as an `Err`.
+/// [`assert_absorption_closed_form_support`]). `fit()` returns this as an `Err`.
 pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population: &Population) {
     if let Some(msg) = check_analytic_readout_support(model, population) {
         panic!(
@@ -1851,7 +1863,7 @@ pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population:
 /// a pathway-fraction value out of `(0, 1]` or not summing to 1, an out-of-domain
 /// forcing parameter, or an SS / infusion / `[diffusion]` dose into an input-rate
 /// compartment — for the `Vec`-returning `predict()` / `simulate()` paths (mirrors
-/// [`assert_transit_support`]). `fit()` (and `ferx check`) surface these as an `Err`
+/// [`assert_absorption_closed_form_support`]). `fit()` (and `ferx check`) surface these as an `Err`
 /// via [`check_model_data`], but the simulate/predict paths run no data-check, so
 /// without this a malformed multi-pathway model would be simulated with silently
 /// wrong dose delivery (#588). The data-independent *structural* fraction rules are
@@ -2399,74 +2411,91 @@ pub fn check_model_data_warnings(
         }
     }
 
-    // Analytic transit flip-flop diagnostic (#634 review finding 3). The transit
-    // closed forms converge only when the disposition rate is below the transit
-    // rate `KTR = (n+1)/mtt` (for 2-cpt, the *fast* macro-rate `α`; for 1-cpt,
-    // `ke = CL/V`). Outside that domain the closed form returns an identically-zero
-    // profile — which is parameter-dependent, so `check_transit_support` can't
-    // reject it up front, and with a proportional error model an all-zero IPRED
-    // silently degenerates the likelihood with no other diagnostic. The 2-cpt case
-    // hits this readily (a slow-absorption depot drug with large MTT easily has
-    // `α ≥ KTR`). Evaluated on typical values (η = 0) per subject so a covariate on
-    // MTT/CL that pushes the typical profile into the flip-flop regime is caught.
-    // Reported once, naming the first affected subject. Only a **twin-carrying**
-    // model is warned here — it is auto-rerouted per evaluation
-    // (`pk::effective_model_for_eval`), so the closed form's zero never reaches the
-    // objective and this is an informational heads-up. A **twin-less** flip-flop
-    // model (lagtime / `f` / user `[odes]`) has nothing to reroute to and is a hard
-    // error instead (`check_transit_flip_flop_no_twin`), rejected at
+    // Analytic absorption flip-flop diagnostic (#634 review finding 3; IG #790). The
+    // transit / IG closed forms converge only when the disposition rate is below the
+    // tilting abscissa — `KTR = (n+1)/mtt` (transit) / `1/(2·MAT·CV²)` (IG), with the
+    // *fast* macro-rate `α` for 2-cpt and `ke = CL/V` for 1-cpt. Outside that domain the
+    // closed form returns an identically-zero profile — parameter-dependent, so
+    // `check_absorption_closed_form_support` can't reject it up front, and with a
+    // proportional error model an all-zero IPRED silently degenerates the likelihood with
+    // no other diagnostic. Evaluated on typical values (η = 0) per subject so a covariate
+    // pushing the typical profile into the flip-flop regime is caught. Reported once,
+    // naming the first affected subject. Only a **twin-carrying** model is warned here — it
+    // is auto-rerouted per evaluation (`pk::effective_model_for_eval`), so the closed form's
+    // zero never reaches the objective and this is an informational heads-up. A **twin-less**
+    // flip-flop model (lagtime / `f` / user `[odes]`) has nothing to reroute to and is a hard
+    // error instead (`check_absorption_flip_flop_no_twin`), rejected at
     // fit / predict / simulate / `ferx check`.
     if matches!(
         model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit
-    ) && model.transit_ode_equivalent.is_some()
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+    ) && model.absorption_ode_equivalent.is_some()
     {
+        let is_transit = matches!(
+            model.pk_model,
+            PkModel::OneCptTransit | PkModel::TwoCptTransit
+        );
         for subject in &population.subjects {
-            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &subject.covariates, 0.0);
-            let (cl, v1, n, mtt) = (pk.cl(), pk.v(), pk.n_transit(), pk.mtt());
-            // Mirror the validity guard `pk::transit_flip_flop_at` applies (the
-            // `q`/`v2` checks for 2-cpt), so this heads-up never fires on a parameter
-            // region the reroute treats as invalid rather than flip-flop. (The flip-flop
-            // *trigger* below stays the plain `α ≥ KTR` test; the twin-carrying
-            // confluent-eigenvalue corner is auto-rerouted and correctly not warned.)
-            let params_valid = mtt > 0.0
-                && n >= 0.0
-                && v1 > 0.0
-                && cl > 0.0
-                && match model.pk_model {
-                    PkModel::TwoCptTransit => pk.q() >= 0.0 && pk.v2() > 0.0,
-                    _ => true,
-                };
-            if !params_valid {
-                continue; // invalid params are a separate (fatal) domain check
+            // Reuse the exact runtime reroute decision (validity + domain + confluent), so
+            // this heads-up fires precisely when a flip-flop reroute happens.
+            if !crate::pk::absorption_flip_flop_at(model, subject, &init_params.theta, &zero_eta) {
+                continue;
             }
-            let ktr = (n + 1.0) / mtt;
+            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &subject.covariates, 0.0);
+            let (cl, v1) = (pk.cl(), pk.v());
+            // The fast disposition rate (2-cpt macro-rate `α`, else `ke`) and the tilting
+            // abscissa, for the informational message.
             let disp_rate = match model.pk_model {
-                PkModel::TwoCptTransit => {
+                PkModel::TwoCptTransit | PkModel::TwoCptIg => {
                     crate::sens::two_cpt::macro_rates_g::<f64>(cl, v1, pk.q(), pk.v2()).0
                 }
                 _ => cl / v1,
             };
-            if disp_rate >= ktr {
-                // Auto-handled: the flip-flop reroute (`pk::effective_model_for_eval`)
-                // evaluates the ODE `transit()` twin for these parameters, so the profile
-                // is correct — an informational heads-up, not an error. (A twin-less flip-flop
-                // model is rejected up front by `check_transit_flip_flop_no_twin`.)
-                let msg = format!(
-                    "{} disposition rate ({:.4}) ≥ transit rate KTR = (n+1)/mtt ({:.4}) at \
-                     typical values (subject {}): the flip-flop regime, outside the analytic \
-                     transit closed form's convergence domain. ferx automatically evaluates \
-                     the equivalent ODE transit model for such parameters (correct, but slower \
-                     than the closed form) — check the MTT / CL starting estimates if the \
-                     flip-flop is unexpected.",
-                    model.pk_model.canonical_name(),
-                    disp_rate,
-                    ktr,
-                    subject.id
-                );
-                diags.push(Diagnostic::warning("W_TRANSIT_FLIP_FLOP", msg));
-                break;
+            let (abscissa, abscissa_label, code, ode_fn, params) = if is_transit {
+                (
+                    (pk.n_transit() + 1.0) / pk.mtt(),
+                    "transit rate KTR = (n+1)/mtt",
+                    "W_TRANSIT_FLIP_FLOP",
+                    "transit",
+                    "MTT / CL",
+                )
+            } else {
+                (
+                    1.0 / (2.0 * pk.mat() * pk.cv2()),
+                    "IG abscissa 1/(2·MAT·CV²)",
+                    "W_IG_FLIP_FLOP",
+                    "igd",
+                    "MAT / CV² / CL",
+                )
+            };
+            // `absorption_flip_flop_at` also returns true on the 2-cpt confluent-eigenvalue
+            // corner (`|α−β|<1e-12`), where `disp_rate = α < abscissa`. That corner is
+            // physically unreachable for positive params, but skip the flip-flop-worded
+            // heads-up there anyway so its "disposition rate ≥ abscissa" claim can never
+            // misreport (the reroute to the ODE twin is still correct either way).
+            if disp_rate < abscissa {
+                continue;
             }
+            // Auto-handled: the flip-flop reroute (`pk::effective_model_for_eval`) evaluates
+            // the ODE twin for these parameters, so the profile is correct — an informational
+            // heads-up, not an error. (A twin-less flip-flop model is rejected up front by
+            // `check_absorption_flip_flop_no_twin`.)
+            let msg = format!(
+                "{} disposition rate ({:.4}) ≥ {} ({:.4}) at typical values (subject {}): the \
+                 flip-flop regime, outside the analytic absorption closed form's convergence \
+                 domain. ferx automatically evaluates the equivalent ODE {} model for such \
+                 parameters (correct, but slower than the closed form) — check the {} starting \
+                 estimates if the flip-flop is unexpected.",
+                model.pk_model.canonical_name(),
+                disp_rate,
+                abscissa_label,
+                abscissa,
+                subject.id,
+                ode_fn,
+                params
+            );
+            diags.push(Diagnostic::warning(code, msg));
+            break;
         }
     }
 
@@ -2648,18 +2677,32 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     &population,
                     &init_params,
                 ));
-                // Surface the structural transit rejects (IOV / SS / CMT≠1 / infusion /
-                // reset) so a clean `ferx check` and a `fit()` agree on transit models —
-                // previously only `fit()` reported these (#776 review).
-                if let Some(e) = check_transit_support(&parsed.model, &population) {
-                    diags.push(Diagnostic::error("E_TRANSIT_UNSUPPORTED", e));
+                // Surface the structural absorption-closed-form rejects (IOV / SS / CMT≠1 /
+                // infusion / reset) so a clean `ferx check` and a `fit()` agree on transit /
+                // IG models — previously only `fit()` reported these (#776 review, IG #790).
+                // Model-family-specific code so an IG model reads `E_IG_*` not `E_TRANSIT_*`.
+                let is_ig = matches!(parsed.model.pk_model, PkModel::OneCptIg | PkModel::TwoCptIg);
+                if let Some(e) = check_absorption_closed_form_support(&parsed.model, &population) {
+                    let code = if is_ig {
+                        "E_IG_UNSUPPORTED"
+                    } else {
+                        "E_TRANSIT_UNSUPPORTED"
+                    };
+                    diags.push(Diagnostic::error(code, e));
                 }
-                // Twin-less flip-flop transit is a hard error, not a warning (#776):
-                // surface it the same way `fit()` does, so `ferx check` catches it up front.
-                if let Some(e) =
-                    check_transit_flip_flop_no_twin(&parsed.model, &population, &init_params.theta)
-                {
-                    diags.push(Diagnostic::error("E_TRANSIT_FLIP_FLOP", e));
+                // Twin-less flip-flop is a hard error, not a warning (#776): surface it the
+                // same way `fit()` does, so `ferx check` catches it up front.
+                if let Some(e) = check_absorption_flip_flop_no_twin(
+                    &parsed.model,
+                    &population,
+                    &init_params.theta,
+                ) {
+                    let code = if is_ig {
+                        "E_IG_FLIP_FLOP"
+                    } else {
+                        "E_TRANSIT_FLIP_FLOP"
+                    };
+                    diags.push(Diagnostic::error(code, e));
                 }
             }
             Err(e) => {
@@ -2800,14 +2843,14 @@ pub fn fit(
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
-    if let Some(e) = check_transit_support(model, population) {
+    if let Some(e) = check_absorption_closed_form_support(model, population) {
         return Err(e);
     }
     // Reject a twin-less transit closed form that starts in the flip-flop regime (#776):
     // it returns an identically-zero profile that silently degenerates the objective and,
     // unlike a twin-carrying model, has no ODE twin to reroute to. Parameter-dependent, so
-    // evaluated at η = 0 typical values here rather than in `check_transit_support`.
-    if let Some(e) = check_transit_flip_flop_no_twin(model, population, &init_params.theta) {
+    // evaluated at η = 0 typical values here rather than in `check_absorption_closed_form_support`.
+    if let Some(e) = check_absorption_flip_flop_no_twin(model, population, &init_params.theta) {
         return Err(e);
     }
     // Reject a depot-referencing analytic Form C readout on reset subjects (#650):
@@ -7273,8 +7316,8 @@ pub fn simulate_with_options(
     // integrates the whole warm-EBE pass first and fails only at the chokepoint,
     // with a confusable "EBE did not converge" instead of the real cause.
     assert_modeled_doses_supported(model, population);
-    assert_transit_support(model, population);
-    assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    assert_absorption_closed_form_support(model, population);
+    assert_absorption_flip_flop_no_twin(model, population, &params.theta);
     assert_absorption_dosing_supported(model, population);
 
     let method = match opts.match_method {
@@ -7632,8 +7675,8 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // precondition once per call, as `predict()` does — `simulate()` runs no
     // data-check otherwise. #324.
     assert_modeled_doses_supported(model, population);
-    assert_transit_support(model, population);
-    assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    assert_absorption_closed_form_support(model, population);
+    assert_absorption_flip_flop_no_twin(model, population, &params.theta);
     assert_absorption_dosing_supported(model, population);
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
@@ -8830,8 +8873,8 @@ pub fn predict(
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
-    assert_transit_support(model, population);
-    assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    assert_absorption_closed_form_support(model, population);
+    assert_absorption_flip_flop_no_twin(model, population, &params.theta);
     assert_analytic_readout_support(model, population);
     assert_absorption_dosing_supported(model, population);
 
@@ -8953,7 +8996,7 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
-    // Deliberately no `assert_transit_flip_flop_no_twin` guard here (unlike
+    // Deliberately no `assert_absorption_flip_flop_no_twin` guard here (unlike
     // `predict`/`simulate`): a survival prediction cannot be corrupted by a degenerate
     // twin-less-flip-flop transit PK. A hazard that reads the PK is ODE-accumulated (the
     // model then carries `ode_spec` and never takes the closed-form transit path), and a
@@ -9180,7 +9223,7 @@ mod iov_integration {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         }
     }
 
@@ -11686,7 +11729,7 @@ mod simulate_with_uncertainty_tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         }
     }
 
@@ -11735,7 +11778,7 @@ mod simulate_with_uncertainty_tests {
             crate::parser::model_parser::compiled_model_uses_time_builtin(&model),
             "fixture must use the TIME built-in"
         );
-        let msg = check_transit_support(&model, &tiny_population())
+        let msg = check_absorption_closed_form_support(&model, &tiny_population())
             .expect("transit + TIME (lagtime form) must be rejected up front");
         assert!(
             msg.contains("TIME"),
@@ -12745,7 +12788,7 @@ mod tests_sdtab_tv_cov {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -13076,7 +13119,7 @@ mod tests_sdtab_tv_cov {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -13236,7 +13279,7 @@ mod tests_derived_session_clock {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         }
     }
 
@@ -13555,7 +13598,7 @@ mod tests_derived_iov_kappa {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,

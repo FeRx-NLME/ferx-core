@@ -50,11 +50,16 @@
     `InputRateKind::FirstOrder` (`first_order(ka)`) so the existing first-order absorption can be
     composed in `[odes]`, **plus** the zero-order-channel fraction (for `mixed` — #388 rejects
     `FR*zero_order` today, since that delivery channel doesn't carry the scale yet).
-- **Phase 3 — #386 — analytical incomplete-gamma / exponential tilting** for
-  transit + IG. Now *speed-only* (#430 already gave transit/IG exact gradients on
-  the ODE path), so this only removes the ODE solve. Lowest urgency. Weibull never
-  reaches Phase 3 (no closed form) — its only exact-gradient route is the #430
-  generic forcing.
+- **Phase 3 — analytical incomplete-gamma / exponential tilting** for transit
+  (**#386 — ✅ MERGED**) + IG (**#790 — ✅ MERGED**). Removes the ODE solve —
+  `pk one_cpt_transit`/`two_cpt_transit` and `pk one_cpt_ig`/`two_cpt_ig` now run the
+  closed form. **Caveat learned at #790:** this is a *speed* win only when the ODE is
+  the bottleneck — true for transit (~28–31× faster), **false for IG**, whose `igd()`
+  ODE is non-stiff/cheap; the IG closed form is actually ~2× slower per eval (its
+  normal-CDF rides the incomplete-gamma continued fraction) and ships as a
+  consistency/exactness feature (exact tolerance-free `Dual2` gradients + uniform
+  interface), not a performance one. Weibull never reaches Phase 3 (no closed form) —
+  its only exact-gradient route is the #430 generic forcing.
 
 Recommended sequence: Weibull (#498), zero-order (#504), and the shared **fraction
 multiplier #388** (biphasic IG) are all **✅ merged** (ferx-core + ferx-r). **NEXT =
@@ -353,9 +358,9 @@ Everything else integrates.
 | `sequential` (0→1st) | yes (piecewise: zero-order fill, then first-order) | analytical |
 | `mixed` (0 + 1st) | yes (superpose zero-order + first-order) | analytical |
 | `transit` (Savic), **integer N** | yes (generalized Bateman / sum of N+1 terms) | analytical |
-| `transit` (Savic), **continuous N** | yes — exponential tilting of the Gamma distribution: `∫₀ᵗ R_in·e^(k·u)du = M(k)·P(n+1,(KTR−k)·t)` where P is the regularized incomplete gamma; condition `k < KTR` | analytical (Phase 3) |
+| `transit` (Savic), **continuous N** | yes — exponential tilting of the Gamma distribution: `∫₀ᵗ R_in·e^(k·u)du = M(k)·P(n+1,(KTR−k)·t)` where P is the regularized incomplete gamma; condition `k < KTR` | analytical ✅ **#386** (`pk one_cpt_transit`/`two_cpt_transit`) |
 | `weibull` | **no** elementary closed form | numerical (analytic ∂ only via the `PkNum`-generic forcing — see Engine §) |
-| `inverse_gaussian` (Freijer & Post) | yes — exponential tilting of the IG distribution: `∫₀ᵗ f_IG(u;μ,λ)·e^(k·u)du = M(k)·F_IG(t;μ*,λ)` where `μ*=μ/√(1−2μ²k/λ)` and `M(k)=exp(λ/μ·(1−√(1−2μ²k/λ)))`; condition `k < λ/(2μ²)` | analytical (Phase 3) |
+| `inverse_gaussian` (Freijer & Post) | yes — exponential tilting of the IG distribution: `∫₀ᵗ f_IG(u;μ,λ)·e^(k·u)du = M(k)·F_IG(t;μ*,λ)` where `μ*=μ/√(1−2μ²k/λ)` and `M(k)=exp(λ/μ·(1−√(1−2μ²k/λ)))`; condition `k < λ/(2μ²)` | analytical ✅ **#790** (`pk one_cpt_ig`/`two_cpt_ig`) |
 
 The first-order / zero-order / parallel / sequential / mixed family and integer-N transit
 are superpositions of closed forms ferx already has (e.g. `parallel` = two `two_cpt_oral`
@@ -606,19 +611,24 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   incomplete gamma). Condition: `k < KTR = (n+1)/mtt`. Sanity check: n=0 recovers Bateman
   exactly (since `P(1,x) = 1−e^(−x)`).
 
-  **IG** (`IgAbsorption { mat, lambda }` with `lambda = mat/cv2`): IG is closed under
-  exponential tilting. `mgf(k) = exp(λ/μ·(1−√(1−2μ²k/λ)))`,
+  **IG** (`IgAbsorption { mat, lambda }` with `lambda = mat/cv2`) — **✅ MERGED (#790)**: IG
+  is closed under exponential tilting. `mgf(k) = exp(λ/μ·(1−√(1−2μ²k/λ)))`,
   `tilted_cdf(t,k) = F_IG(t; μ*, λ)` with `μ* = μ/√(1−2μ²k/λ)`, and F_IG expressed via
-  the normal CDF Φ (the known IG CDF formula). Condition: `k < λ/(2μ²) = 1/(2·MAT·CV²)` —
-  satisfied for virtually all PK parameters. Reference: the tilting identity is a standard
-  result; the IG closed form was identified by working through the issue #322 comment thread
-  (2026-06-17). The Hof & Bridge (2021) paper (doi:10.1007/s10928-020-09719-8) confirms the
-  analogous result for transit.
+  the normal CDF Φ (the known IG CDF formula), the second term as
+  `exp(2λ/μ* + ln Φ(z₂))` for far-tail stability at small CV². Condition:
+  `k < λ/(2μ²) = 1/(2·MAT·CV²)` — satisfied for virtually all PK parameters; outside it a
+  plain model reroutes to its ODE `igd()` twin (the transit flip-flop machinery, #724/#776),
+  and a twin-less form (lagtime/`f`/user-`[odes]`) is a hard error. Reference: the tilting
+  identity is a standard result; the IG closed form was identified by working through the
+  issue #322 comment thread (2026-06-17). The Hof & Bridge (2021) paper
+  (doi:10.1007/s10928-020-09719-8) confirms the analogous result for transit.
 
-  **Special functions needed** (`src/stats/special.rs`):
-  - `regularized_gamma_p(a, x)` — series for `x < a+1`, continued fraction for `x >= a+1`;
-    `ln_gamma` (Lanczos) already present.
-  - `normal_cdf(x)` — `0.5 * erfc(-x / sqrt(2))`.
+  **Special functions** (`src/stats/special.rs`) — **✅ done**:
+  - `regularized_gamma_p(a, x)` / `regularized_gamma_q(a, x)` — series for `x < a+1`,
+    continued fraction for `x >= a+1`; `ln_gamma` (Lanczos) already present.
+  - `erf_g` / `erfc_g` / `normal_cdf_g` / `log_normal_cdf_g` — `PkNum`-generic siblings with
+    exact `Dual2` derivatives, built on the `erf(x)=sign(x)·P(½,x²)` / `erfc(x)=Q(½,x²)`
+    identities (so both value and jets reuse the incomplete gamma, no A&S-derivative error).
 
   **Error rule update:** after Phase 3 merges, the "analytical `pk` + absorption" hard error
   no longer applies to transit or IG — they route to `convolve_1cpt`/`convolve_2cpt`

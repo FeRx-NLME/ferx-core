@@ -1,6 +1,7 @@
+use crate::pk::analytical_absorption::{IgAbsorption, TiltedAbsorption};
 use crate::sens::one_cpt::{
-    one_cpt_infusion_g, one_cpt_infusion_ss_g, one_cpt_iv_bolus_g, one_cpt_iv_bolus_ss_g,
-    one_cpt_oral_g, one_cpt_oral_ss_g, one_cpt_transit_g,
+    one_cpt_ig_g, one_cpt_infusion_g, one_cpt_infusion_ss_g, one_cpt_iv_bolus_g,
+    one_cpt_iv_bolus_ss_g, one_cpt_oral_g, one_cpt_oral_ss_g, one_cpt_transit_g,
 };
 use crate::stats::special::regularized_gamma_p;
 use crate::types::DoseEvent;
@@ -73,6 +74,41 @@ pub(crate) fn one_cpt_transit_depot(
     }
     let ktr = (n + 1.0) / mtt;
     let absorbed_frac = regularized_gamma_p::<f64>(n + 1.0, ktr * tau);
+    f_bio * dose.amt * (1.0 - absorbed_frac)
+}
+
+/// One-compartment inverse-Gaussian absorption with bioavailability (#790). `F` is
+/// baked into the kernel, so the superposition path takes the `1.0` `route_f_scale`
+/// branch (like the transit/oral-depot forms). IG rejects infusion/SS doses at parse,
+/// so only the absorbed-bolus route exists here.
+#[inline]
+pub fn one_cpt_ig_f(
+    dose: &DoseEvent,
+    t: f64,
+    cl: f64,
+    v: f64,
+    mat: f64,
+    cv2: f64,
+    f_bio: f64,
+) -> f64 {
+    one_cpt_ig_g::<f64>(dose.amt, t, cl, v, mat, cv2, f_bio)
+}
+
+/// Unabsorbed amount still in the IG absorption process for a single bolus at elapsed
+/// time `tau`: `F·Dose·(1 − F_IG(tau; μ=mat, λ=mat/cv2))`, with `F_IG` the
+/// inverse-Gaussian CDF (the untilted `k = 0` [`IgAbsorption::tilted_cdf`], i.e. the
+/// absorbed fraction). The IG counterpart of [`one_cpt_transit_depot`] — its only
+/// depot-side state for `[derived]` amounts (#790). Returns 0 for invalid params or
+/// infusion doses (which IG rejects at parse).
+pub(crate) fn one_cpt_ig_depot(dose: &DoseEvent, tau: f64, mat: f64, cv2: f64, f_bio: f64) -> f64 {
+    if tau < 0.0 || mat <= 0.0 || cv2 <= 0.0 || dose.is_infusion() {
+        return 0.0;
+    }
+    let absorbed_frac = IgAbsorption {
+        mat,
+        lambda: mat / cv2,
+    }
+    .tilted_cdf(tau, 0.0);
     f_bio * dose.amt * (1.0 - absorbed_frac)
 }
 

@@ -1,0 +1,65 @@
+# Inverse-Gaussian (Freijer & Post) absorption — analytic closed form
+#
+# One-compartment oral disposition with a Freijer & Post (1997) inverse-Gaussian
+# absorption-time distribution, via the **analytic** `pk one_cpt_ig(...)` closed
+# form (#790). This is the exponential-tilting closed form of the same `igd(mat,
+# cv2)` density the ODE forcing path uses (examples/igd_inverse_gaussian.ferx). It
+# gives exact `Dual2` FOCE/FOCEI gradients that don't depend on ODE-solver
+# tolerance, and a uniform `pk`-line interface matching the analytic transit models.
+# Note: unlike transit (whose stiff-ish ODE makes its closed form much faster), IG's
+# `igd()` ODE is non-stiff/cheap, so this closed form is a consistency/exactness
+# feature, not a speed one (it is ~2× slower per eval than the `igd()` forcing).
+#
+# The IG density has mean absorption time MAT and relative dispersion CV2
+# (= Var/mean², shape λ = MAT/CV2). The whole dose is absorbed through the IG
+# process into central (no downstream first-order `ka`); F and lagtime are
+# optional, as for a first-order oral model.
+#
+# ── Domain ───────────────────────────────────────────────────────────────────
+# The closed form converges when elimination is slower than the absorption rate,
+# i.e. ke = CL/V < 1/(2·MAT·CV2) (here 0.1 < 1/(2·2·0.3) = 0.833 ✓). Outside that
+# "flip-flop" regime a plain model is transparently rerouted to its ODE `igd()`
+# twin; a model carrying a `lagtime=`/`f=` mapping has no twin and is rejected.
+#
+# Self-contained: run it with no data file
+#   cargo run --release -- examples/one_cpt_ig.ferx --simulate
+# True simulation parameters: TVCL=5, TVV=50, TVMAT=2, TVCV2=0.3,
+#   omega_CL=omega_V=0.09, sigma_prop=0.15.
+
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)    # typical clearance (L/h)
+  theta TVV(50.0,   5.0, 500.0)    # typical central volume (L)
+  theta TVMAT(2.0, 0.05,  24.0)    # mean absorption time (h)
+  theta TVCV2(0.3, 0.001, 10.0)    # relative dispersion of absorption time (Var/mean²)
+
+  omega ETA_CL ~ 0.09              # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09              # IIV on V  (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)       # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL  = TVCL  * exp(ETA_CL)
+  V   = TVV   * exp(ETA_V)
+  MAT = TVMAT
+  CV2 = TVCV2
+
+[structural_model]
+  # Analytic inverse-Gaussian absorption into a 1-cpt disposition. `y = central/V`
+  # (concentration) is applied automatically. Swap for `two_cpt_ig(cl=, v1=, q=,
+  # v2=, mat=, cv2=)` for a 2-cpt disposition.
+  pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7

@@ -60,8 +60,8 @@ pub fn generate(
     let model = PkModel::from_name(model_name).ok_or_else(|| {
         format!(
             "Unknown ode_template model: {model_name}. Valid names are one_cpt_iv, \
-             one_cpt_oral, one_cpt_transit, two_cpt_iv, two_cpt_oral, two_cpt_transit, \
-             three_cpt_iv, three_cpt_oral."
+             one_cpt_oral, one_cpt_transit, one_cpt_ig, two_cpt_iv, two_cpt_oral, \
+             two_cpt_transit, two_cpt_ig, three_cpt_iv, three_cpt_oral."
         )
     })?;
     let name = model.canonical_name();
@@ -112,6 +112,20 @@ pub fn generate(
                 vec![dt(
                     "central",
                     format!("transit(n={n}, mtt={mtt}) - ({cl}/{v}) * central"),
+                )],
+            )
+        }
+        PkModel::OneCptIg => {
+            // The analytic `pk one_cpt_ig` desugars to the Freijer & Post
+            // inverse-Gaussian forcing `igd(mat, cv2)` delivered straight into
+            // central (#790), the ODE analogue of the exponential-tilting closed form.
+            let (cl, v, mat, cv2) = (g("cl"), g("v"), g("mat"), g("cv2"));
+            (
+                vec!["central"],
+                v,
+                vec![dt(
+                    "central",
+                    format!("igd(mat={mat}, cv2={cv2}) - ({cl}/{v}) * central"),
                 )],
             )
         }
@@ -184,6 +198,29 @@ pub fn generate(
                         "central",
                         format!(
                             "transit(n={n}, mtt={mtt}) \
+                             - ({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph"
+                        ),
+                    ),
+                    dt(
+                        "periph",
+                        format!("({q}/{v1}) * central - ({q}/{v2}) * periph"),
+                    ),
+                ],
+            )
+        }
+        PkModel::TwoCptIg => {
+            // The analytic `pk two_cpt_ig` desugars to the inverse-Gaussian forcing
+            // `igd(mat, cv2)` delivered straight into central, on a 2-cpt disposition
+            // (#790) — the ODE analogue of the exponential-tilting closed form.
+            let (cl, v1, q, v2, mat, cv2) = (g("cl"), g("v1"), g("q"), g("v2"), g("mat"), g("cv2"));
+            (
+                vec!["central", "periph"],
+                v1,
+                vec![
+                    dt(
+                        "central",
+                        format!(
+                            "igd(mat={mat}, cv2={cv2}) \
                              - ({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph"
                         ),
                     ),
