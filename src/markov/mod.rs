@@ -369,6 +369,28 @@ mod tests {
         )
     }
 
+    /// Closed-form transition matrix for the acyclic 3-state chain `0 → 1 → 2`
+    /// (state 2 absorbing) with `Q = [[-a, a, 0], [0, -b, b], [0, 0, 0]]`. Derived
+    /// by solving the Kolmogorov forward ODE directly (occupancy of a two-stage
+    /// process), so it is **independent of `expm`'s own `Σ Aᵏ/k!` definition** —
+    /// unlike `series_exp`. Valid for `a != b`.
+    fn exact_seq3(a: f64, b: f64, t: f64) -> DMatrix<f64> {
+        let (ea, eb) = ((-a * t).exp(), (-b * t).exp());
+        let p00 = ea;
+        let p01 = a / (b - a) * (ea - eb);
+        let p02 = 1.0 - p00 - p01;
+        let p12 = 1.0 - eb;
+        DMatrix::from_row_slice(
+            3,
+            3,
+            &[
+                p00, p01, p02, // row 0: from state 0
+                0.0, eb, p12, // row 1: from state 1
+                0.0, 0.0, 1.0, // row 2: absorbing
+            ],
+        )
+    }
+
     /// Build a valid 3-state generator from off-diagonal rates (diagonal filled
     /// to make each row sum to zero).
     fn generator_3() -> DMatrix<f64> {
@@ -400,6 +422,22 @@ mod tests {
     fn expm_matches_series_3state_dense() {
         let qdt = generator_3() * 1.5;
         assert!(max_abs_diff(&matrix_exp(&qdt), &series_exp(&qdt, 50)) < 1e-12);
+    }
+
+    #[test]
+    fn expm_matches_closed_form_3state_chain() {
+        // Independent analytic anchor for the 3-state case: the acyclic 0→1→2
+        // chain has a closed-form P(t) from the Kolmogorov ODE, NOT from expm's own
+        // Σ Aᵏ/k! definition. `expm_matches_series_3state_dense` only compares
+        // against that series; this pins the 3-state result to a separate source.
+        let (a, b, t) = (0.6, 0.9, 1.75);
+        let q = DMatrix::from_row_slice(3, 3, &[-a, a, 0.0, 0.0, -b, b, 0.0, 0.0, 0.0]);
+        let p = matrix_exp(&(&q * t));
+        assert!(max_abs_diff(&p, &exact_seq3(a, b, t)) < 1e-12);
+        // A generator's exponential is stochastic: rows sum to 1.
+        for i in 0..3 {
+            assert!((p.row(i).sum() - 1.0).abs() < 1e-13, "row {i} sums to 1");
+        }
     }
 
     #[test]
@@ -584,6 +622,34 @@ mod tests {
         let p1 = exact_2state(a, b, 1.0)[(0, 1)];
         let p2 = exact_2state(a, b, 2.0)[(1, 1)];
         let expected = -(p1.ln()) - (p2.ln());
+        let got = ctmm_data_term(&q, &obs).unwrap();
+        assert!((got - expected).abs() < 1e-12, "got {got}, want {expected}");
+    }
+
+    #[test]
+    fn data_term_matches_hand_computed_3state() {
+        // 3-state acyclic chain 0→1→2 with two *off-diagonal* transitions (0→1
+        // then 1→2) — richer than the 2-state case, and hand-computed against the
+        // independent closed form `exact_seq3` (not against `matrix_exp` itself).
+        let (a, b) = (0.6, 0.9);
+        let q = DMatrix::from_row_slice(3, 3, &[-a, a, 0.0, 0.0, -b, b, 0.0, 0.0, 0.0]);
+        let obs = [
+            StateObs {
+                time: 0.0,
+                state: 0,
+            },
+            StateObs {
+                time: 1.0,
+                state: 1,
+            },
+            StateObs {
+                time: 2.5,
+                state: 2,
+            },
+        ];
+        let p01 = exact_seq3(a, b, 1.0)[(0, 1)]; // 0 → 1 over Δt = 1.0
+        let p12 = exact_seq3(a, b, 1.5)[(1, 2)]; // 1 → 2 over Δt = 1.5
+        let expected = -(p01.ln()) - (p12.ln());
         let got = ctmm_data_term(&q, &obs).unwrap();
         assert!((got - expected).abs() < 1e-12, "got {got}, want {expected}");
     }
