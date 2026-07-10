@@ -3999,11 +3999,9 @@ fn parse_event_model_block(
         let mut cov_set = std::collections::HashSet::new();
         let mut theta_set = std::collections::HashSet::new();
         let mut eta_set = std::collections::HashSet::new();
-        for expr_opt in hazard_param_exprs {
-            if let Some(expr) = expr_opt {
-                collect_covariates(expr, &mut cov_set);
-                collect_theta_eta(expr, &mut theta_set, &mut eta_set);
-            }
+        for expr in hazard_param_exprs.into_iter().flatten() {
+            collect_covariates(expr, &mut cov_set);
+            collect_theta_eta(expr, &mut theta_set, &mut eta_set);
         }
         let mut v: Vec<String> = cov_set.into_iter().collect();
         v.sort();
