@@ -4002,6 +4002,35 @@ fn parse_event_model_block(
         event_model_etas = eta_set;
     }
 
+    // A hazard expression that references an IOV kappa **by name directly**
+    // (e.g. `scale = TVLAMBDA * exp(KAPPA_CL)`) is as ill-defined as one that
+    // reaches a kappa through an [individual_parameters] value (rejected just
+    // below, #442): the hazard is evaluated once per subject, with no occasion
+    // context. The hazard parse scope is BSV-only, so a kappa name here parses as
+    // an unresolved identifier (Variable/Covariate) rather than `Eta(i)` and would
+    // otherwise fall back to a leniently-read 0.0 covariate (see the "read
+    // leniently" note above), silently dropping the IOV term. Reject it fail-loud
+    // instead (#770).
+    for expr in [
+        &scale_expr,
+        &shape_expr,
+        &alpha_expr,
+        &gamma_expr,
+        &loghr_expr,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(k) = expr_references_kappa(expr, kappa_names) {
+            return Err(format!(
+                "[event_model]: a hazard expression references the inter-occasion (IOV) \
+                 random effect `{k}` directly. The hazard is evaluated once per subject, with \
+                 no occasion context, so an IOV kappa has no well-defined value here — write \
+                 the hazard in terms of θ/η, or reference an IOV-free parameter."
+            ));
+        }
+    }
+
     // Restrict the individual-parameter statements the hazard closures evaluate to
     // just those the hazard references, transitively. This bounds the per-eval work
     // and scopes the IOV/NN checks below to what the hazard actually depends on (an

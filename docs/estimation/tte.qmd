@@ -37,10 +37,11 @@ Add one `[event_model]` block per TTE endpoint.
 > theta / eta / covariate namespace, and may also reference names defined in
 > `[individual_parameters]` (e.g. `LAMBDA`); those are resolved per subject at
 > evaluation time. Writing the full expression in terms of `theta` and `eta`
-> names directly also works. A referenced individual parameter may **not** depend
-> on an inter-occasion (IOV/kappa) random effect — the hazard is evaluated once
-> per subject, with no occasion context — and such a reference is rejected with an
-> error.
+> names directly also works. A hazard may **not** depend on an inter-occasion
+> (IOV/kappa) random effect — whether by referencing an `[individual_parameters]`
+> value that uses one, or by naming a `kappa` directly in the hazard expression —
+> because it is evaluated once per subject, with no occasion context; either is
+> rejected with an error.
 
 For Weibull, a `shape` parameter is also required:
 
