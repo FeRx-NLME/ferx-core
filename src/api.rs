@@ -624,13 +624,14 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     result.model_text = std::fs::read_to_string(model_path).ok();
     // Surface any per-subject simulation diagnostics (#762/#763) alongside the fit
     // warnings so the CLI reports a degenerate simulated subject rather than dropping it.
-    // `fit()` already built `warnings_structured` from the fit warnings; rebuild it so the
-    // appended sim warnings also reach the typed / JSON surface (#778/#779), where
-    // `classify_warning` tags them `WarningCode::Simulation`.
-    if !sim_warnings.is_empty() {
-        result.warnings.extend(sim_warnings);
-        rebuild_warnings_structured(&mut result);
-    }
+    // `fit()` already built `warnings_structured` from the fit warnings; rebuild it
+    // unconditionally so the appended sim warnings also reach the typed / JSON surface
+    // (#778/#779), where `classify_warning` tags them `WarningCode::Simulation`. The
+    // rebuild is idempotent — a pure function of `result.warnings` — so an empty
+    // `sim_warnings` (the common case, and every non-survival build) just reproduces the
+    // fit's structured list.
+    result.warnings.extend(sim_warnings);
+    rebuild_warnings_structured(&mut result);
     Ok((result, population))
 }
 
