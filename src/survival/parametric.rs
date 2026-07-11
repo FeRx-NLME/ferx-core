@@ -719,6 +719,32 @@ mod tests {
     }
 
     #[test]
+    fn median_gompertz_gamma_negative_finite_with_loghr() {
+        // γ<0 with a NONZERO loghr: exp_lhr must thread through x = ln2·γ/(α·e^{loghr}), so the
+        // S(∞)=0.5 boundary shifts with the PH covariate term. Guards a regression that drops
+        // exp_lhr from the γ<0 median (invisible to every loghr=0 test above). The round-trip is
+        // the teeth — hazard_and_cum_hazard re-applies loghr independently, so H(median)=ln2
+        // holds only if both the median and H use exp_lhr.
+        //   α=0.002, γ=−0.001, loghr=ln2 ⇒ α·e^{loghr}=0.004, H(∞)=4.0, S(∞)=e^{−4}≈0.0183 < 0.5.
+        let params = [0.002_f64, -0.001_f64, std::f64::consts::LN_2];
+        let a_eff = 0.002_f64 * std::f64::consts::LN_2.exp(); // α·e^{loghr} = 0.004
+        assert!(
+            (-(a_eff / 0.001)).exp() < 0.5,
+            "test setup: cure fraction must be below 0.5"
+        );
+        let t_50 = median_survival(HazardFamily::Gompertz, &params);
+        assert!(
+            t_50.is_finite() && t_50 > 0.0,
+            "γ<0 median with loghr must be finite and positive, got {t_50}"
+        );
+        let (_, cum) = hazard_and_cum_hazard(HazardFamily::Gompertz, t_50, &params);
+        assert!(
+            (cum - std::f64::consts::LN_2).abs() < 1e-10,
+            "H(median)={cum}, expected ln2 (loghr must thread through both median and H)"
+        );
+    }
+
+    #[test]
     fn median_gompertz_gamma_negative_nan_when_cure_at_least_half() {
         // γ<0 with S(∞)≥0.5: more than half never event, so the median is genuinely
         // +∞/undefined and NaN is correct.
@@ -757,6 +783,16 @@ mod tests {
         assert!(
             m_above.is_nan(),
             "S(∞) just above 0.5 must give NaN median, got {m_above}"
+        );
+
+        // Exact knife-edge x == −1.0 (S(∞)=0.5 exactly). With α=LN_2, γ=−1.0, loghr=0 the ratio
+        // x = LN_2·(−1.0)/(LN_2·1.0) folds to exactly −1.0 in IEEE (−d/d). The strict `x > -1.0`
+        // gate must reject it → NaN (the true median is +∞, not a finite value).
+        let ln2 = std::f64::consts::LN_2;
+        let m_exact = median_survival(HazardFamily::Gompertz, &[ln2, -1.0_f64, 0.0_f64]);
+        assert!(
+            m_exact.is_nan(),
+            "x=−1.0 exactly (S(∞)=0.5) must give NaN, got {m_exact}"
         );
     }
 
