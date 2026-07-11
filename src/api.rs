@@ -1930,9 +1930,11 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
                  or (2-cpt) coincident disposition eigenvalues — so it returns an \
                  identically-zero concentration profile, which silently degenerates the objective \
                  (a proportional error model collapses `(σ·pred)²` to 0). This model has no ODE \
-                 twin to fall back on (a `lagtime`, bioavailability `f`, or a user `[odes]` / \
-                 `[scaling]` / `[initial_conditions]` block declines the desugar) — rewrite it as \
-                 an explicit ODE `{ode_fn}` model, or check the {params} starting estimates.",
+                 twin to fall back on (a user `[odes]` / `[scaling]` / `[initial_conditions]` \
+                 block, or a parameter whose name collides with a reserved `f`/`lagtime` slot, \
+                 declines the desugar — a `lagtime=`/`f=` mapping alone now auto-routes, #735) — \
+                 rewrite it as an explicit ODE `{ode_fn}` model, or check the {params} starting \
+                 estimates.",
                 model.pk_model.canonical_name(),
                 subject.id
             ));
@@ -6615,8 +6617,9 @@ fn absorption_flip_flop_ebe_warning(
          eigenvalues — at their fitted empirical-Bayes estimates, where the closed form returns \
          an identically-zero concentration profile, silently degenerating those subjects' \
          likelihood contributions. The typical-value (η = 0) parameters are in-domain, so this \
-         is not caught at fit start, and this twin-less model (a `lagtime`, `f`, or user \
-         `[odes]` / `[scaling]` / `[initial_conditions]` form) has no ODE twin to reroute to. \
+         is not caught at fit start, and this twin-less model (a user `[odes]` / `[scaling]` / \
+         `[initial_conditions]` form, or a parameter whose name collides with a reserved \
+         `f`/`lagtime` slot) has no ODE twin to reroute to. \
          Rewrite it as an explicit ODE `{}` model (which reroutes per-eval at the actual η), or \
          check the {} starting estimates.",
         model.pk_model.canonical_name(),
@@ -12810,7 +12813,7 @@ mod simulate_with_uncertainty_tests {
         let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
         assert!(
             model.absorption_ode_equivalent.is_none(),
-            "a lagtime= transit model is twin-less"
+            "a [scaling] transit model is twin-less"
         );
         let pop = tiny_population();
         // Subject S1 in-domain (η=0), subject S2 crosses.
