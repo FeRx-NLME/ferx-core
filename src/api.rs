@@ -6610,13 +6610,15 @@ fn absorption_flip_flop_ebe_warning(
     };
     let id_list = crossers.join(", ");
     let msg = format!(
-        "{} subject(s) [{}] reach the flip-flop regime (disposition rate ≥ {}) at their \
-         fitted empirical-Bayes estimates, where the analytic absorption closed form returns an \
-         identically-zero concentration profile — silently degenerating those subjects' \
+        "{} subject(s) [{}] enter the analytic absorption closed form's clamp region — the \
+         flip-flop regime (disposition rate ≥ {}), or (for a 2-cpt model) coincident disposition \
+         eigenvalues — at their fitted empirical-Bayes estimates, where the closed form returns \
+         an identically-zero concentration profile, silently degenerating those subjects' \
          likelihood contributions. The typical-value (η = 0) parameters are in-domain, so this \
          is not caught at fit start, and this twin-less model (a `lagtime`, `f`, or user \
-         `[odes]` form) has no ODE twin to reroute to. Rewrite it as an explicit ODE `{}` model \
-         (which reroutes per-eval at the actual η), or check the {} starting estimates.",
+         `[odes]` / `[scaling]` / `[initial_conditions]` form) has no ODE twin to reroute to. \
+         Rewrite it as an explicit ODE `{}` model (which reroutes per-eval at the actual η), or \
+         check the {} starting estimates.",
         model.pk_model.canonical_name(),
         id_list,
         abscissa_label,
@@ -12819,6 +12821,12 @@ mod simulate_with_uncertainty_tests {
             !msg.contains("S1"),
             "must not name the in-domain subject: {msg}"
         );
+        // The real emitter's message must itself classify to `flip_flop` — pins the
+        // classify branch against wording drift (not a hand-copied proxy string).
+        assert_eq!(
+            crate::types::classify_warning(&msg).category,
+            crate::types::WarningCode::FlipFlop
+        );
         let details = entry.details.expect("native entry carries details");
         assert_eq!(details["phase"], "ebe");
         assert_eq!(details["subjects"], serde_json::json!(["S2"]));
@@ -12895,6 +12903,25 @@ mod simulate_with_uncertainty_tests {
         .is_none());
     }
 
+    /// #785: an EBE whose length ≠ `n_eta + n_kappa` is defensively skipped rather
+    /// than fed to `pk_params_at_time` (which would panic reading `eta[0]` of a
+    /// zero-length vector). Even a would-be crosser given the wrong shape yields no
+    /// warning — proving the guard, not a panic.
+    #[test]
+    fn flip_flop_ebe_warning_skips_wrong_length_eta() {
+        let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+        let pop = tiny_population();
+        // S1 valid (in-domain, len 1); S2 has a zero-length eta (≠ n_eta = 1).
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[])];
+        assert!(absorption_flip_flop_ebe_warning(
+            &model,
+            &pop,
+            &model.default_params.theta,
+            &eta_hats
+        )
+        .is_none());
+    }
+
     /// #786: `simulate_with_uncertainty` on a twin-less transit model whose point
     /// estimate is in-domain but whose covariance spreads some draws into the
     /// flip-flop regime must NOT panic (pre-fix: the per-draw
@@ -12930,6 +12957,21 @@ mod simulate_with_uncertainty_tests {
             draws.len() < 30,
             "some flip-flop draws must be skipped (got {} of 30)",
             draws.len()
+        );
+
+        // The per-draw skip warning is pushed into `sim_warnings`, which this
+        // aggregated-uncertainty entry point discards (it returns only the row vec),
+        // so the message is not observable here. Pin the skip *predicate* directly:
+        // a flip-flop-theta draw is flagged, the in-domain point estimate is not.
+        let mut crossing = model.default_params.theta.clone();
+        crossing[0] = 1.0; // TVCL = 1.0 → ke = 1.0/4 = 0.25 ≥ KTR = 0.2 (flip-flop)
+        assert!(
+            check_absorption_flip_flop_no_twin(&model, &pop, &crossing).is_some(),
+            "a flip-flop-theta draw must be flagged for skipping"
+        );
+        assert!(
+            check_absorption_flip_flop_no_twin(&model, &pop, &model.default_params.theta).is_none(),
+            "the in-domain point estimate must not be flagged"
         );
     }
 

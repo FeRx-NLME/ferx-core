@@ -302,8 +302,10 @@ section of the SDLC for the versioning policy).
   flip-flop regime** (#786). For a twin-less transit / IG closed form whose point
   estimate is in-domain, a sampled uncertainty draw that crossed the flip-flop
   boundary previously aborted the *entire* simulation via a panic. Such draws are
-  now skipped (recorded as a simulation warning) so the remaining draws still yield
-  results; the single-shot `predict()` / `simulate()` panic paths are unchanged.
+  now skipped so the remaining draws still yield results (the run no longer panics;
+  this aggregated-uncertainty entry point returns only the rows, so a skipped draw is
+  not surfaced as a warning — use `simulate_with_options` when a skip must be
+  visible). The single-shot `predict()` / `simulate()` panic paths are unchanged.
 - **A time-to-event hazard that references an inter-occasion (IOV) `kappa` by name
   is now rejected at parse instead of silently using zero** (#770). A hazard is
   evaluated once per subject with no occasion context, so an IOV `kappa` has no

@@ -6691,18 +6691,21 @@ mod tests {
     fn classify_warning_flip_flop_beats_optimizer_health() {
         // Both absorption flip-flop warnings — the twin-carrying heads-up (#776) and
         // the twin-less EBE warning (#785) — say "flip-flop regime". The EBE message
-        // also contains "degenerate", which the generic optimizer-health branch keys
-        // on, so the flip-flop branch must precede it to type these `flip_flop`.
+        // also contains "degenerating", which the generic optimizer-health branch keys
+        // on ("degenerate"), so the flip-flop branch must precede it to type these
+        // `flip_flop`. These are representative proxies of the real emitters
+        // (src/api.rs ~2596 and ~6613); the drift-proof end-to-end check on the actual
+        // emitted string lives in `flip_flop_ebe_warning_fires_for_twinless_transit_crosser`.
         for msg in [
             "one_cpt_transit disposition rate (0.5000) ≥ transit rate KTR = (n+1)/mtt \
              (0.2000) at typical values (subject 3): the flip-flop regime, outside the \
              analytic absorption closed form's convergence domain. ferx automatically \
              evaluates the equivalent ODE transit model for such parameters.",
-            "one_cpt_transit subject(s) [3] reach the flip-flop regime (disposition rate \
-             ≥ transit rate KTR = (n+1)/mtt) at their fitted empirical-Bayes estimates, \
-             where the analytic absorption closed form returns an identically-zero \
-             concentration profile — silently degenerating those subjects' likelihood \
-             contributions.",
+            "one_cpt_transit subject(s) [3] enter the analytic absorption closed form's \
+             clamp region — the flip-flop regime (disposition rate ≥ transit rate KTR = \
+             (n+1)/mtt), or (for a 2-cpt model) coincident disposition eigenvalues — at \
+             their fitted empirical-Bayes estimates, silently degenerating those \
+             subjects' likelihood contributions.",
         ] {
             let w = classify_warning(msg);
             assert_eq!(w.category, WarningCode::FlipFlop, "misclassified: {msg:?}");
