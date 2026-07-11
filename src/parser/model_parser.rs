@@ -6718,14 +6718,66 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
         return None;
     }
     let roles = parse_role_pairs(&args_str, pk_label).ok()?;
-    let allowed: &[&str] = match (is_two_cpt, is_ig) {
+    let disposition: &[&str] = match (is_two_cpt, is_ig) {
         (false, false) => &["cl", "v", "n", "mtt"],
         (true, false) => &["cl", "v1", "q", "v2", "n", "mtt"],
         (false, true) => &["cl", "v", "mat", "cv2"],
         (true, true) => &["cl", "v1", "q", "v2", "mat", "cv2"],
     };
-    if roles.keys().any(|k| !allowed.contains(&k.as_str())) {
-        return None; // a lagtime=/f= (or other) mapping — outside the scope.
+    // #735: absorption `f=` / `lagtime=` (`alag=`) are now carried into the twin (alias
+    // emission below); any *other* unrecognised role stays outside the plain-form scope.
+    const ABS_ATTRS: &[&str] = &["f", "lagtime", "alag"];
+    if roles
+        .keys()
+        .any(|k| !disposition.contains(&k.as_str()) && !ABS_ATTRS.contains(&k.as_str()))
+    {
+        return None; // an unknown mapping — outside the plain-form scope.
+    }
+    // The ODE twin routes F / lagtime by an individual parameter *named* `f` / `lagtime`
+    // / `alag` (`ode_param_slots`), whereas the closed form binds them via this pk() role
+    // map under arbitrary names. Bridge with reserved-name alias lines — but only when the
+    // mapped parameter does not already self-route (a param literally named `F` / `LAGTIME`
+    // / `ALAG` lowercases to the canonical slot name, so an alias would double-bind it and
+    // `ode_param_slots` would reject). #735.
+    let mut alias_lines: Vec<String> = Vec::new();
+    if let Some(fp) = roles.get("f") {
+        if fp.to_lowercase() != "f" {
+            alias_lines.push(format!("  f = {fp}"));
+        }
+    }
+    if let Some(lp) = roles.get("lagtime").or_else(|| roles.get("alag")) {
+        if !matches!(lp.to_lowercase().as_str(), "lagtime" | "alag") {
+            alias_lines.push(format!("  lagtime = {lp}"));
+        }
+    }
+    // Silent-divergence guard (#735): the ODE twin routes *any* individual parameter whose
+    // lowercased name is a reserved slot name (`f` / `lagtime` / `alag`) into that F/lagtime
+    // slot (`ode_param_slots`), even one the closed form never treated as F/lag. The only
+    // params that may occupy those slots are the intended `f=` / `lagtime=` / `alag=`
+    // mappings. If any *other* declared parameter shadows a reserved name — a disposition
+    // role bound to such a param (`mtt=ALAG`), or a stray covariate/derived param literally
+    // named `f` — decline the twin: the model stays closed-form (matching the closed form,
+    // which never applied that param as F/lag) and, if it is also flip-flop, is rejected up
+    // front, rather than the twin silently applying an extra F/lagtime the closed form did not.
+    let intended: std::collections::HashSet<&str> = ["f", "lagtime", "alag"]
+        .iter()
+        .filter_map(|r| roles.get(*r).map(String::as_str))
+        .collect();
+    if let Some(ip_lines) = extracted.unnamed.get("individual_parameters") {
+        for line in ip_lines {
+            let lhs = line
+                .split(|c| c == '=' || c == '#')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !lhs.is_empty()
+                && lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && matches!(lhs.to_lowercase().as_str(), "f" | "lagtime" | "alag")
+                && !intended.contains(lhs)
+            {
+                return None; // shadows a reserved F/lagtime slot — decline (see above).
+            }
+        }
     }
     // The absorption forcing term, `transit(n, mtt)` or `igd(mat, cv2)`.
     let forcing = if is_ig {
@@ -6748,6 +6800,15 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
         for line in &extracted.unnamed[name] {
             src.push_str(line);
             src.push('\n');
+        }
+        // #735: append the reserved-name F/lagtime aliases to [individual_parameters]
+        // so the ODE twin applies them (the closed form's pk() role map has no ODE
+        // analogue — see `ode_param_slots`).
+        if name == "individual_parameters" {
+            for alias in &alias_lines {
+                src.push_str(alias);
+                src.push('\n');
+            }
         }
         src.push('\n');
     }

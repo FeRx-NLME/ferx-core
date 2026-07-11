@@ -176,12 +176,14 @@ this *per evaluation* and routes the model to its exact ODE `transit()` twin, wh
 is valid in both regimes (matched to a NONMEM ADVAN13 transit simulation to ~1e-4),
 so a flip-flop model fits and predicts correctly instead of returning a zero
 profile. A `W_TRANSIT_FLIP_FLOP` note still flags the regime at the typical-value
-estimates. The reroute needs an ODE twin: a closed-form transit model that also
-carries a `lagtime`, bioavailability `f`, or a user `[odes]` / `[scaling]` /
-`[initial_conditions]` block cannot be desugared, so there is no twin to route to. Rather than silently returning a zero profile that
-degenerates the objective, such a model is **rejected with a hard error**
-(`E_TRANSIT_FLIP_FLOP`) on `fit`, `predict`, `simulate`, and `ferx check` — rewrite
-it as an explicit ODE `transit()` model, or adjust the MTT / CL starting estimates.
+estimates. The reroute needs an ODE twin. A closed-form transit model that carries a
+`lagtime` or bioavailability `f` mapping is desugared to a twin that applies them too
+(since #735), so it auto-routes just like the plain form. Only a model with a user
+`[odes]` / `[scaling]` / `[initial_conditions]` block cannot be desugared (no unique
+twin); rather than silently returning a zero profile that degenerates the objective,
+such a twin-less model is **rejected with a hard error** (`E_TRANSIT_FLIP_FLOP`) on
+`fit`, `predict`, `simulate`, and `ferx check` — rewrite it as an explicit ODE
+`transit()` model, or adjust the MTT / CL starting estimates.
 
 [`examples/one_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_transit.ferx)
 is a complete self-contained analytic transit model:
