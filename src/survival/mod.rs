@@ -945,7 +945,7 @@ fn simulate_rtte_stream<R: rand::Rng>(
             };
             cum_hazard(family, horizon, params) - h_entry
         }
-        RtteClock::Reset => (horizon - entry) / sample_event_time(family, params, 0.5),
+        RtteClock::Reset => (horizon - entry.max(0.0)) / sample_event_time(family, params, 0.5),
     };
     if !expected.is_finite() || expected > MAX_EVENTS as f64 {
         warnings.push(format!(
@@ -962,8 +962,11 @@ fn simulate_rtte_stream<R: rand::Rng>(
     // clock, so left truncation just seeds that clock at `entry` (`entry == 0` ⇒ `0`,
     // identical to before). Clock-reset renews each gap from 0, so its FIRST sojourn is the
     // only one conditioned on survival to `entry` (handled in the loop via `n_events == 0`).
+    // A non-positive `entry` means "no truncation" — clamp to 0 so it can never seed a
+    // pre-origin clock (matching the `expected` estimate above, the reset arm's `entry > 0.0`
+    // gate, and the fit side's `entry_lower_limit`; `entry == 0` stays `0.0`, bit-identical).
     let mut t_prev = match clock {
-        RtteClock::Forward => entry,
+        RtteClock::Forward => entry.max(0.0),
         RtteClock::Reset => 0.0_f64,
     };
     let mut n_events = 0usize;
@@ -2986,6 +2989,94 @@ mod tests {
             "left-truncated stream must fit, got {nll}"
         );
         assert_abs_diff_eq!(nll, expected, epsilon = 1e-9);
+    }
+
+    /// The discriminating pin (simulate dual of the fit-side `..._conditions_on_entry`): the
+    /// FIRST simulated sojourn under delayed entry must equal convention B's closed form
+    /// `sample_conditional_event_time(entry, u₁)` and must NOT equal the rejected
+    /// renewal-from-entry A (`entry + sample_event_time(u₁)`). A time-varying (Weibull) hazard
+    /// is essential — for the memoryless exponential A ≡ B, so the shift test cannot see this,
+    /// and the round-trip test above is convention-agnostic (it recomputes B on whatever was
+    /// drawn). Pins BOTH clocks (both draw the first event conditional on survival to entry).
+    #[test]
+    fn rtte_left_truncation_first_sojourn_is_convention_b_not_a() {
+        use rand::SeedableRng;
+        let params = [40.0_f64, 1.6_f64]; // Weibull scale=40, shape=1.6 (time-varying)
+        let entry = 15.0_f64;
+        let horizon = 300.0_f64;
+        let seed = 0xB17E_5EED_u64;
+        for clock in [RtteClock::Forward, RtteClock::Reset] {
+            // The exact first uniform the stream will consume (same seed + same Open01 draw).
+            let mut probe = rand::rngs::StdRng::seed_from_u64(seed);
+            let u1: f64 = probe.sample(rand::distr::Open01);
+            let b = sample_conditional_event_time(HazardFamily::Weibull, &params, entry, u1);
+            let a = entry + sample_event_time(HazardFamily::Weibull, &params, u1);
+            assert!(
+                b < horizon,
+                "setup: first B event must land before the horizon"
+            );
+            assert!(
+                (a - b).abs() > 0.5,
+                "setup: A ({a}) and B ({b}) must differ materially for a time-varying hazard"
+            );
+            let mut stream = rand::rngs::StdRng::seed_from_u64(seed);
+            let events = collect_rtte_events(
+                HazardFamily::Weibull,
+                &params,
+                clock,
+                horizon,
+                entry,
+                &mut stream,
+            );
+            assert!(!events.is_empty(), "{clock:?}: expected a first event");
+            assert_abs_diff_eq!(events[0], b, epsilon = 1e-12);
+            assert!(
+                (events[0] - a).abs() > 0.5,
+                "{clock:?}: first sojourn must be convention B ({b}), not renewal-from-entry A ({a}); got {}",
+                events[0]
+            );
+        }
+    }
+
+    /// A non-positive `entry` means "no truncation" everywhere — the datareader clamps `TENTRY`
+    /// to `≥ 0`, and the fit's `entry_lower_limit` / the reset draw gate on `entry > 0`. A
+    /// hand-built `Population` can bypass the datareader and pass a negative entry straight to
+    /// `simulate()`; it must then behave exactly as `entry == 0` for BOTH clocks — never seed a
+    /// pre-origin clock or emit a negative-time event. (Guards the forward-clock `entry.max(0.0)`
+    /// clamp and the reset estimate clamp.)
+    #[test]
+    fn rtte_left_truncation_negative_entry_is_no_truncation() {
+        use rand::SeedableRng;
+        let params = [40.0_f64, 1.6_f64];
+        let horizon = 300.0_f64;
+        for clock in [RtteClock::Forward, RtteClock::Reset] {
+            let mut r_neg = rand::rngs::StdRng::seed_from_u64(0x0000_DEAD);
+            let mut r_zero = rand::rngs::StdRng::seed_from_u64(0x0000_DEAD);
+            let neg = collect_rtte_events(
+                HazardFamily::Weibull,
+                &params,
+                clock,
+                horizon,
+                -5.0,
+                &mut r_neg,
+            );
+            let zero = collect_rtte_events(
+                HazardFamily::Weibull,
+                &params,
+                clock,
+                horizon,
+                0.0,
+                &mut r_zero,
+            );
+            assert_eq!(
+                neg, zero,
+                "{clock:?}: a negative entry must produce exactly the no-truncation stream"
+            );
+            assert!(
+                neg.iter().all(|&t| t > 0.0),
+                "{clock:?}: no simulated event may land at or before the origin"
+            );
+        }
     }
 
     // ── resolve_competing_risks: earliest cause wins, else administrative censor ──
