@@ -74,8 +74,11 @@ pub fn cum_hazard(family: HazardFamily, t: f64, params: &[f64]) -> f64 {
 
 /// Median survival time: the unique T satisfying H(T) = ln 2.
 ///
-/// Computed analytically for all three families.  Returns `f64::NAN` if
-/// the parameters are degenerate (e.g. `alpha ≤ 0` for Gompertz).
+/// Computed analytically for all three families.  Returns `f64::NAN` if the
+/// parameters are degenerate (e.g. `alpha ≤ 0` for Gompertz) or the median is
+/// undefined — a declining-hazard (`γ < 0`) Gompertz has no median when its cure
+/// fraction `S(∞) = exp(−α·e^{loghr}/|γ|) ≥ 0.5` (more than half never event); when
+/// `S(∞) < 0.5` the median is finite and returned (#805).
 pub fn median_survival(family: HazardFamily, params: &[f64]) -> f64 {
     use std::f64::consts::LN_2;
     match family {
@@ -115,12 +118,21 @@ pub fn median_survival(family: HazardFamily, params: &[f64]) -> f64 {
             if gamma == 0.0 {
                 // γ=0: Gompertz degenerates to Exponential with rate α·exp(loghr)
                 LN_2 / (alpha * exp_lhr)
-            } else if gamma > 0.0 {
-                // ln_1p is numerically stable when γ is small (avoids cancellation in (1+x).ln())
-                let x = LN_2 * gamma / (alpha * exp_lhr);
-                x.ln_1p() / gamma
             } else {
-                f64::NAN
+                // γ ≠ 0: exp(γT) = 1 + x with x = ln2·γ/(α·e^{loghr}). ln_1p is numerically
+                // stable when |γ| is small (avoids cancellation in (1+x).ln()).
+                //   γ > 0 ⇒ x > 0, so x > −1 always: finite median (behavior unchanged).
+                //   γ < 0 ⇒ x < 0, with a finite limiting cumulative hazard H(∞)=α·e^{loghr}/|γ|.
+                //     The median exists iff ln2 < H(∞) ⟺ x > −1 ⟺ cure fraction S(∞) < 0.5
+                //     (then ln_1p(x) < 0 and γ < 0 give T > 0); otherwise it is +∞/undefined
+                //     → NaN. Same γ<0 boundary as the samplers (#803/#804); here in the
+                //     diagnostic path (#805).
+                let x = LN_2 * gamma / (alpha * exp_lhr);
+                if x > -1.0 {
+                    x.ln_1p() / gamma
+                } else {
+                    f64::NAN
+                }
             }
         }
     }
@@ -130,7 +142,9 @@ pub fn median_survival(family: HazardFamily, params: &[f64]) -> f64 {
 ///
 /// Uses the analytic form `1 / (λ · exp(loghr))` for the Exponential family and
 /// the midpoint rule (2 000 steps to 40 × median) for Weibull and Gompertz.
-/// Returns `f64::NAN` for degenerate parameters.
+/// Returns `f64::NAN` for degenerate parameters, and for a declining-hazard
+/// (`γ < 0`) Gompertz — whose positive cure fraction makes the mean genuinely
+/// infinite (#805).
 pub fn mean_survival(family: HazardFamily, params: &[f64]) -> f64 {
     match family {
         HazardFamily::Exponential => {
@@ -157,6 +171,15 @@ pub fn mean_survival(family: HazardFamily, params: &[f64]) -> f64 {
                 } else {
                     f64::NAN
                 };
+            }
+            // Gompertz γ<0 is a declining hazard with a positive cure fraction
+            // S(∞)=exp(−α·e^{loghr}/|γ|) > 0, so S(t) never decays to 0 and the mean
+            // E[T]=∫₀^∞ S diverges. Return NaN explicitly: since #805 median_survival now
+            // yields a *finite* γ<0 median (when S(∞)<0.5), the median-based integration
+            // below would otherwise run over [0, 40·median], miss the non-decaying tail,
+            // and report a bogus finite mean.
+            if matches!(family, HazardFamily::Gompertz) && params[1] < 0.0 {
+                return f64::NAN;
             }
             let t_med = median_survival(family, params);
             if !t_med.is_finite() || t_med <= 0.0 {
@@ -664,6 +687,97 @@ mod tests {
             ((-cum).exp() - 0.5).abs() < 1e-8,
             "S(median)={} for small-γ Gompertz",
             (-cum).exp()
+        );
+    }
+
+    #[test]
+    fn median_gompertz_gamma_negative_finite_when_cure_below_half() {
+        // Declining-hazard Gompertz (#805): γ<0 has a finite limiting cumulative hazard
+        // H(∞)=α·e^{loghr}/|γ| and cure fraction S(∞)=exp(−H(∞)). When S(∞)<0.5 (fewer than
+        // half are "cured") a finite median genuinely exists and must be returned — the old
+        // code blanket-returned NaN for every γ<0.
+        //   α=0.002, γ=−0.001, loghr=0 ⇒ H(∞)=2.0, S(∞)=e^{−2}≈0.1353 < 0.5.
+        let params = [0.002_f64, -0.001_f64, 0.0_f64];
+        let s_inf = (-(0.002_f64 / 0.001)).exp(); // exp(−H(∞))
+        assert!(s_inf < 0.5, "test setup: cure fraction must be below 0.5");
+        let t_50 = median_survival(HazardFamily::Gompertz, &params);
+        assert!(
+            t_50.is_finite() && t_50 > 0.0,
+            "γ<0 median must be finite and positive when S(∞)<0.5, got {t_50}"
+        );
+        // Round-trips the defining equation H(median)=ln2 ⟺ S(median)=0.5.
+        let (_, cum) = hazard_and_cum_hazard(HazardFamily::Gompertz, t_50, &params);
+        assert!(
+            (cum - std::f64::consts::LN_2).abs() < 1e-10,
+            "H(median)={cum}, expected ln2"
+        );
+        assert!(
+            ((-cum).exp() - 0.5).abs() < 1e-10,
+            "S(median)={} for γ<0 Gompertz",
+            (-cum).exp()
+        );
+    }
+
+    #[test]
+    fn median_gompertz_gamma_negative_nan_when_cure_at_least_half() {
+        // γ<0 with S(∞)≥0.5: more than half never event, so the median is genuinely
+        // +∞/undefined and NaN is correct.
+        //   α=0.002, γ=−0.005, loghr=0 ⇒ H(∞)=0.4, S(∞)=e^{−0.4}≈0.6703 ≥ 0.5.
+        let params = [0.002_f64, -0.005_f64, 0.0_f64];
+        let s_inf = (-(0.002_f64 / 0.005)).exp();
+        assert!(s_inf >= 0.5, "test setup: cure fraction must be ≥ 0.5");
+        let t_50 = median_survival(HazardFamily::Gompertz, &params);
+        assert!(
+            t_50.is_nan(),
+            "γ<0 median must be NaN when S(∞)≥0.5, got {t_50}"
+        );
+    }
+
+    #[test]
+    fn median_gompertz_gamma_negative_boundary_s_inf_half() {
+        // Boundary S(∞)=0.5 (⟺ x=−1): the median is undefined (+∞). Bracket it — a cure
+        // fraction a hair below 0.5 (H(∞) just above ln2) yields a large finite median; a hair
+        // above 0.5 (H(∞) just below ln2) yields NaN. Construct α from a target H(∞) via
+        // α = H(∞)·|γ| (loghr=0).
+        let gamma = -0.001_f64;
+        let just_below_half = {
+            let h_inf = std::f64::consts::LN_2 * (1.0 + 1e-6); // S(∞) just below 0.5
+            [h_inf * 0.001, gamma, 0.0_f64]
+        };
+        let just_above_half = {
+            let h_inf = std::f64::consts::LN_2 * (1.0 - 1e-6); // S(∞) just above 0.5
+            [h_inf * 0.001, gamma, 0.0_f64]
+        };
+        let m_below = median_survival(HazardFamily::Gompertz, &just_below_half);
+        assert!(
+            m_below.is_finite() && m_below > 0.0,
+            "S(∞) just below 0.5 must give a finite median, got {m_below}"
+        );
+        let m_above = median_survival(HazardFamily::Gompertz, &just_above_half);
+        assert!(
+            m_above.is_nan(),
+            "S(∞) just above 0.5 must give NaN median, got {m_above}"
+        );
+    }
+
+    #[test]
+    fn mean_gompertz_gamma_negative_is_nan_even_with_finite_median() {
+        // The #805 trap: a γ<0 Gompertz with S(∞)<0.5 has a *finite median* (so the
+        // median-based integration bound would fire) but an *infinite mean* — S(t) floors at
+        // S(∞)>0 and never decays, so ∫₀^∞ S diverges. mean_survival must return NaN via its
+        // explicit γ<0 guard, NOT a finite value from integrating [0, 40·median]. Uses the same
+        // finite-median params as `median_gompertz_gamma_negative_finite_when_cure_below_half`,
+        // so this test fails the moment that guard is removed.
+        let params = [0.002_f64, -0.001_f64, 0.0_f64];
+        // Precondition: the median really is finite here (else this wouldn't guard the trap).
+        assert!(
+            median_survival(HazardFamily::Gompertz, &params).is_finite(),
+            "test precondition: median must be finite for the trap to bite"
+        );
+        let m = mean_survival(HazardFamily::Gompertz, &params);
+        assert!(
+            m.is_nan(),
+            "γ<0 Gompertz mean is infinite (positive cure fraction) ⇒ must be NaN, got {m}"
         );
     }
 
