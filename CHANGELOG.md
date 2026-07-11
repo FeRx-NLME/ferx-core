@@ -322,6 +322,17 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **Declining-hazard (`γ < 0`) Gompertz median/mean survival diagnostics** (#805):
+  `median_survival` returned `NaN` for *every* `γ < 0` Gompertz, even when a finite median
+  genuinely exists — the closed form generalizes to `γ < 0`, so the reported TTE median is
+  now finite whenever the cure fraction `S(∞) = e^{−α·e^{loghr}/|γ|} < 0.5` (and stays
+  `NaN` when `S(∞) ≥ 0.5`, where more than half never event and the median is undefined).
+  `mean_survival` now returns `NaN` for any `γ < 0` Gompertz via an explicit guard: its
+  mean is genuinely infinite (a positive cure fraction leaves a non-decaying survival
+  tail), which the previous code reported correctly only by coincidence through the `NaN`
+  median. Diagnostic/reporting only (`predict_survival` summaries); does not touch
+  estimation or simulation numerics. Same `γ < 0` boundary fixed for the samplers in
+  #803 / #804.
 - **Declining-hazard (`γ < 0`) Gompertz simulation no longer censors every event**
   (#803): the analytic inverse-CDF event-time samplers guarded the Gompertz draw with
   `inner ≤ 1`, which fires for *every* `u ∈ (0,1)` when the shape `γ < 0`, so a
