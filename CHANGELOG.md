@@ -287,6 +287,25 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **A twin-less transit / inverse-Gaussian absorption fit no longer silently
+  degenerates a subject whose fitted random effects reach the flip-flop regime**
+  (#785). An analytic `one_cpt_transit`/`two_cpt_transit` (or `one_cpt_ig`/
+  `two_cpt_ig`) model carrying a `lagtime` / `f` / user-`[odes]` mapping declines the
+  ODE-twin desugar, and was only checked for the flip-flop regime at typical (η = 0)
+  values at fit start. A subject whose empirical-Bayes estimate drove `ke = CL/V`
+  past the tilting abscissa still hit the closed form's identically-zero profile,
+  silently collapsing that subject's likelihood contribution. The fit now emits a
+  typed `flip_flop` warning naming the affected subject(s) and pointing at the ODE
+  `transit()`/`igd()` forcing form (which reroutes per subject at the actual η). See
+  the [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+- **`simulate_with_uncertainty` no longer panics when a parameter draw enters the
+  flip-flop regime** (#786). For a twin-less transit / IG closed form whose point
+  estimate is in-domain, a sampled uncertainty draw that crossed the flip-flop
+  boundary previously aborted the *entire* simulation via a panic. Such draws are
+  now skipped so the remaining draws still yield results (the run no longer panics;
+  this aggregated-uncertainty entry point returns only the rows, so a skipped draw is
+  not surfaced as a warning — use `simulate_with_options` when a skip must be
+  visible). The single-shot `predict()` / `simulate()` panic paths are unchanged.
 - **A time-to-event hazard that references an inter-occasion (IOV) `kappa` by name
   is now rejected at parse instead of silently using zero** (#770). A hazard is
   evaluated once per subject with no occasion context, so an IOV `kappa` has no
