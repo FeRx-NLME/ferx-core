@@ -4040,6 +4040,13 @@ pub enum WarningCode {
     /// `--simulate` run (#762, #763). Distinct from the fit-time optimizer/data codes:
     /// it flags a pathological simulated subject, not an estimation problem.
     Simulation,
+    /// A transit / inverse-Gaussian absorption closed form entered the flip-flop
+    /// regime (disposition rate ≥ the tilting abscissa), where it returns an
+    /// identically-zero profile. Either auto-rerouted to the ODE twin (an
+    /// informational heads-up, #776) or — for a twin-less model at a subject's
+    /// fitted EBE — a silently degenerate likelihood contribution the η = 0
+    /// fit-start reject could not catch (#785).
+    FlipFlop,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -4075,6 +4082,7 @@ impl WarningCode {
             WarningCode::Cancelled => "cancelled",
             WarningCode::Threads => "threads",
             WarningCode::Simulation => "simulation",
+            WarningCode::FlipFlop => "flip_flop",
             WarningCode::General => "general",
         }
     }
@@ -4174,6 +4182,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // otherwise match — these flag a pathological *simulated subject*, not an
         // estimation/optimizer problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
+    } else if lower.contains("flip-flop regime") {
+        // Transit / IG absorption closed form in the flip-flop regime (#776/#785):
+        // auto-rerouted to the ODE twin (informational) or, twin-less at a fitted
+        // EBE, a silently degenerate subject. Precedes the generic "degenerate"
+        // branch so a flip-flop message never misroutes to optimizer-health.
+        (WarningSeverity::Warning, WarningCode::FlipFlop)
     } else if lower.contains("trust radius") || lower.contains("degenerate") {
         (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {
@@ -6668,6 +6682,31 @@ mod tests {
         ] {
             let w = classify_warning(msg);
             assert_eq!(w.category.as_str(), "simulation", "misclassified: {msg:?}");
+            assert_eq!(w.severity, WarningSeverity::Warning);
+            assert_ne!(w.category, WarningCode::OptimizerHealth);
+        }
+    }
+
+    #[test]
+    fn classify_warning_flip_flop_beats_optimizer_health() {
+        // Both absorption flip-flop warnings — the twin-carrying heads-up (#776) and
+        // the twin-less EBE warning (#785) — say "flip-flop regime". The EBE message
+        // also contains "degenerate", which the generic optimizer-health branch keys
+        // on, so the flip-flop branch must precede it to type these `flip_flop`.
+        for msg in [
+            "one_cpt_transit disposition rate (0.5000) ≥ transit rate KTR = (n+1)/mtt \
+             (0.2000) at typical values (subject 3): the flip-flop regime, outside the \
+             analytic absorption closed form's convergence domain. ferx automatically \
+             evaluates the equivalent ODE transit model for such parameters.",
+            "one_cpt_transit subject(s) [3] reach the flip-flop regime (disposition rate \
+             ≥ transit rate KTR = (n+1)/mtt) at their fitted empirical-Bayes estimates, \
+             where the analytic absorption closed form returns an identically-zero \
+             concentration profile — silently degenerating those subjects' likelihood \
+             contributions.",
+        ] {
+            let w = classify_warning(msg);
+            assert_eq!(w.category, WarningCode::FlipFlop, "misclassified: {msg:?}");
+            assert_eq!(w.category.as_str(), "flip_flop");
             assert_eq!(w.severity, WarningSeverity::Warning);
             assert_ne!(w.category, WarningCode::OptimizerHealth);
         }

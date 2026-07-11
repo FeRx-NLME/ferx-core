@@ -65,6 +65,7 @@ Each `WarningCode` token, what it flags, and a typical response.
 | `cancelled` | Info | Run cancelled by the user. | None. |
 | `threads` | Info | Thread-count efficiency note. | Optionally tune `threads`. |
 | `simulation` | Warning | A simulated subject was handled specially — a degenerate hazard draw (censored, no event) or an over-large recurrent-event stream (skipped/truncated). Surfaced by `simulate_with_options_diag` and on `--simulate` runs (#762/#763). | Inspect the named subject's hazard parameters / covariate values; the estimated model is unaffected. |
+| `flip_flop` | Warning | A transit / inverse-Gaussian absorption closed form entered the flip-flop regime (disposition rate ≥ the tilting abscissa). Either auto-rerouted to the ODE twin (informational) or — for a twin-less model at a subject's fitted EBE (#785) — a silently degenerate likelihood contribution. | Rewrite as an explicit ODE `transit()`/`igd()` model (which reroutes per subject), or check the named subject's MTT/CL (transit) or MAT/CV²/CL (IG) estimates. |
 | `general` | Warning | Unrecognised message (fallback bucket). | Read the message text. |
 
 ## Details payloads {#details}
@@ -82,6 +83,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `boundary_estimate` | `parameters` (array of `{parameter, estimate, bound, side}`) |
 | `inflated_rse` | `threshold_pct`, `parameters` (array of `{parameter, estimate, se, rse_pct}`) |
 | `high_correlation` | `threshold`, `pairs` (array of `{parameter_a, parameter_b, correlation}`) |
+| `flip_flop` | `phase` (`"ebe"`), `model`, `subjects` (array of affected subject IDs) |
 | `covariance_failed`, `covariance_regularized` | `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys) |
 | `condition_number` | `condition_number` |
 

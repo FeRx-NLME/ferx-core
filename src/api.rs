@@ -5351,6 +5351,15 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
+    // Twin-less transit/IG absorption closed form whose fitted per-subject EBE crosses
+    // into the flip-flop regime — a silently degenerate subject the η = 0 fit-start
+    // reject could not catch (#785). Emitted typed at source.
+    if let Some((msg, entry)) =
+        absorption_flip_flop_ebe_warning(model, population, &result.params.theta, &result.eta_hats)
+    {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
@@ -6537,6 +6546,92 @@ fn high_correlation_warning(result: &FitResult) -> Option<(String, WarningEntry)
         details: Some(serde_json::json!({
             "threshold": CORRELATION_WARN_THRESHOLD,
             "pairs": pairs_json,
+        })),
+    };
+    Some((msg, entry))
+}
+
+/// Build the human message + native structured entry for a **twin-less** transit /
+/// IG absorption closed form whose *fitted* per-subject EBE crosses into the
+/// flip-flop regime, or `None`.
+///
+/// The up-front [`check_absorption_flip_flop_no_twin`] reject only samples η = 0
+/// typical values. The flip-flop boundary is parameter-dependent, so a subject
+/// whose empirical-Bayes CL/V (or MTT/N, MAT/CV²) drives `ke` past the tilting
+/// abscissa passes that check but still hits the closed form's clamp — an
+/// identically-zero profile that silently degenerates *that subject's* likelihood
+/// contribution (#785). A twin-*carrying* model reroutes such subjects to the ODE
+/// twin per-eval (correct), so this fires only when there is no twin (a `lagtime` /
+/// `f` / user-`[odes]` form declined the desugar).
+///
+/// Runs at fit end, once the EBEs are known, and *warns* rather than erroring — the
+/// fit already completed — pointing at the ODE `transit()`/`igd()` forcing form,
+/// which reroutes per-eval at the actual η.
+fn absorption_flip_flop_ebe_warning(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    eta_hats: &[DVector<f64>],
+) -> Option<(String, WarningEntry)> {
+    // Only a twin-less transit/IG closed form can degenerate this way: a twin-carrying
+    // model reroutes per-eval, a non-absorption model has no flip-flop regime.
+    if !matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+    ) || model.absorption_ode_equivalent.is_some()
+    {
+        return None;
+    }
+    // Twin-less transit/IG closed forms reject IOV up front, so `eta_hats` carry exactly
+    // the `n_eta` BSV etas (`n_kappa == 0`). Guard the length so an unexpected shape
+    // skips the subject rather than panicking inside `pk_params_at_time`.
+    let expected = model.n_eta + model.n_kappa;
+    let crossers: Vec<String> = population
+        .subjects
+        .iter()
+        .zip(eta_hats)
+        .filter(|(subject, eta)| {
+            eta.len() == expected
+                && crate::pk::absorption_flip_flop_at(model, subject, theta, eta.as_slice())
+        })
+        .map(|(subject, _)| subject.id.clone())
+        .collect();
+    if crossers.is_empty() {
+        return None;
+    }
+    let is_transit = matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit
+    );
+    let (abscissa_label, ode_fn, params) = if is_transit {
+        ("transit rate KTR = (n+1)/mtt", "transit()", "MTT / CL")
+    } else {
+        ("IG abscissa 1/(2·MAT·CV²)", "igd()", "MAT / CV² / CL")
+    };
+    let id_list = crossers.join(", ");
+    let msg = format!(
+        "{} subject(s) [{}] reach the flip-flop regime (disposition rate ≥ {}) at their \
+         fitted empirical-Bayes estimates, where the analytic absorption closed form returns an \
+         identically-zero concentration profile — silently degenerating those subjects' \
+         likelihood contributions. The typical-value (η = 0) parameters are in-domain, so this \
+         is not caught at fit start, and this twin-less model (a `lagtime`, `f`, or user \
+         `[odes]` form) has no ODE twin to reroute to. Rewrite it as an explicit ODE `{}` model \
+         (which reroutes per-eval at the actual η), or check the {} starting estimates.",
+        model.pk_model.canonical_name(),
+        id_list,
+        abscissa_label,
+        ode_fn,
+        params
+    );
+    let entry = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::FlipFlop,
+        message: msg.clone(),
+        source_method: None,
+        details: Some(serde_json::json!({
+            "phase": "ebe",
+            "model": model.pk_model.canonical_name(),
+            "subjects": crossers,
         })),
     };
     Some((msg, entry))
@@ -9305,6 +9400,18 @@ pub fn simulate_with_uncertainty(
     // applies. Use `simulate_with_options` when the warnings matter.
     let mut sim_warnings: Vec<String> = Vec::new();
     for (k, params) in draws.iter().enumerate() {
+        // A parameter draw can land in the flip-flop regime even when the point
+        // estimate is in-domain. For a twin-less transit/IG closed form,
+        // `simulate_inner_with_draw`'s `assert_absorption_flip_flop_no_twin` would then
+        // panic — aborting the *entire* uncertainty run. Skip such a draw with a
+        // recorded warning instead, so the remaining draws still yield results (#786).
+        // The single-shot `predict()`/`simulate()` paths keep the panic (their
+        // Vec-returning contract). Twin-carrying models return `None` here and proceed
+        // (they reroute per-eval), so this only skips genuinely un-simulatable draws.
+        if let Some(msg) = check_absorption_flip_flop_no_twin(model, population, &params.theta) {
+            sim_warnings.push(format!("uncertainty draw {} skipped — {}", k + 1, msg));
+            continue;
+        }
         let mut rows = simulate_inner_with_draw(
             model,
             population,
@@ -12594,6 +12701,236 @@ mod simulate_with_uncertainty_tests {
             covariate_table: None,
             exclusions: None,
         }
+    }
+
+    // ── #785 / #786 flip-flop follow-up fixtures & tests ─────────────────────────
+    // A twin-*less* (a `lagtime=` mapping declines the ODE-twin desugar) transit /
+    // IG closed form whose *typical* parameters are IN-DOMAIN (`ke = CL/V` below the
+    // tilting abscissa) — so it passes the η=0 fit-start reject — but which a large
+    // positive `ETA_CL` drives into the flip-flop regime. ke0 = 0.5/4 = 0.125 < KTR =
+    // (3+1)/20 = 0.2.
+    const INDOMAIN_TWINLESS_TRANSIT_SRC: &str = "\
+[parameters]
+  theta TVCL(0.5, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+  LAGTIME = TVLAG
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAGTIME)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+    // IG analogue: ke0 = 5/50 = 0.1 < 1/(2·MAT·CV²) = 1/(2·2·0.3) = 0.833 (in-domain);
+    // the `lagtime=` mapping declines the twin.
+    const INDOMAIN_TWINLESS_IG_SRC: &str = "\
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.3, 0.001, 10.0)
+  theta TVLAG(0.2, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.15 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  MAT = TVMAT
+  CV2 = TVCV2
+  LAGTIME = TVLAG
+
+[structural_model]
+  pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2, lagtime=LAGTIME)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+    // Plain transit — no lagtime, so the ODE-twin desugar succeeds (twin-*carrying*):
+    // a flip-flop subject reroutes per-eval, so the EBE warning must NOT fire.
+    const PLAIN_TWIN_TRANSIT_SRC: &str = "\
+[parameters]
+  theta TVCL(0.5, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+    fn parse_fixture(src: &str) -> CompiledModel {
+        crate::parser::model_parser::parse_full_model(src)
+            .expect("fixture model parses")
+            .model
+    }
+
+    fn eta_vec(values: &[f64]) -> nalgebra::DVector<f64> {
+        nalgebra::DVector::from_column_slice(values)
+    }
+
+    /// #785: a twin-less transit closed form in-domain at η=0 but whose second
+    /// subject's fitted EBE (`ETA_CL = 0.6` → CL/V = 0.911/4 = 0.228 ≥ KTR = 0.2)
+    /// crosses the flip-flop boundary must surface a typed `FlipFlop` warning naming
+    /// that subject — the silent-degeneration case the η=0 reject cannot catch.
+    #[test]
+    fn flip_flop_ebe_warning_fires_for_twinless_transit_crosser() {
+        let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+        assert!(
+            model.absorption_ode_equivalent.is_none(),
+            "a lagtime= transit model is twin-less"
+        );
+        let pop = tiny_population();
+        // Subject S1 in-domain (η=0), subject S2 crosses.
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[0.6])];
+        let (msg, entry) =
+            absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
+                .expect("a crossing EBE must warn");
+        assert_eq!(entry.category, crate::types::WarningCode::FlipFlop);
+        assert_eq!(entry.message, msg);
+        assert!(msg.contains("flip-flop regime"), "wording: {msg}");
+        assert!(msg.contains("transit()"), "transit ODE hint: {msg}");
+        assert!(msg.contains("S2"), "must name the crossing subject: {msg}");
+        assert!(
+            !msg.contains("S1"),
+            "must not name the in-domain subject: {msg}"
+        );
+        let details = entry.details.expect("native entry carries details");
+        assert_eq!(details["phase"], "ebe");
+        assert_eq!(details["subjects"], serde_json::json!(["S2"]));
+    }
+
+    /// #785: the IG closed form takes the same path, with IG-specific wording.
+    /// ke crosses when CL/V ≥ 1/(2·MAT·CV²) = 0.833; `ETA_CL = 2.3` → CL/V ≈ 0.998.
+    #[test]
+    fn flip_flop_ebe_warning_fires_for_twinless_ig_crosser() {
+        let model = parse_fixture(INDOMAIN_TWINLESS_IG_SRC);
+        assert!(model.absorption_ode_equivalent.is_none());
+        let pop = tiny_population();
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[2.3])];
+        let (msg, entry) =
+            absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
+                .expect("a crossing IG EBE must warn");
+        assert_eq!(entry.category, crate::types::WarningCode::FlipFlop);
+        assert!(msg.contains("igd()"), "IG ODE hint: {msg}");
+        assert!(msg.contains("S2"), "must name the crossing subject: {msg}");
+    }
+
+    /// #785: every subject in-domain at its EBE → no warning.
+    #[test]
+    fn flip_flop_ebe_warning_silent_when_all_in_domain() {
+        let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+        let pop = tiny_population();
+        // CL/V = 0.5·e^{0.1}/4 = 0.138 < 0.2 for both.
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[0.1])];
+        assert!(absorption_flip_flop_ebe_warning(
+            &model,
+            &pop,
+            &model.default_params.theta,
+            &eta_hats
+        )
+        .is_none());
+    }
+
+    /// #785: a twin-*carrying* model reroutes per-eval, so even a crossing EBE must
+    /// not warn (the fit is correct for it).
+    #[test]
+    fn flip_flop_ebe_warning_silent_for_twin_carrying() {
+        let model = parse_fixture(PLAIN_TWIN_TRANSIT_SRC);
+        assert!(
+            model.absorption_ode_equivalent.is_some(),
+            "a plain transit model carries an ODE twin"
+        );
+        let pop = tiny_population();
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[0.6])];
+        assert!(absorption_flip_flop_ebe_warning(
+            &model,
+            &pop,
+            &model.default_params.theta,
+            &eta_hats
+        )
+        .is_none());
+    }
+
+    /// #785: a non-absorption model has no flip-flop regime → no warning.
+    #[test]
+    fn flip_flop_ebe_warning_silent_for_non_absorption() {
+        let model = tiny_model();
+        assert!(!matches!(
+            model.pk_model,
+            PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+        ));
+        let pop = tiny_population();
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[3.0])];
+        assert!(absorption_flip_flop_ebe_warning(
+            &model,
+            &pop,
+            &model.default_params.theta,
+            &eta_hats
+        )
+        .is_none());
+    }
+
+    /// #786: `simulate_with_uncertainty` on a twin-less transit model whose point
+    /// estimate is in-domain but whose covariance spreads some draws into the
+    /// flip-flop regime must NOT panic (pre-fix: the per-draw
+    /// `assert_absorption_flip_flop_no_twin` aborted the whole run). The crossing
+    /// draws are skipped; the rest still yield rows.
+    #[test]
+    fn uncertainty_skips_flip_flop_draws_without_panicking() {
+        let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+        let pop = tiny_population();
+        let mut fit = synthetic_fit(&model.default_params);
+        // Inflate the log-TVCL variance (packed index 0) so a good fraction of draws
+        // push ke = CL/V past KTR = 0.2 (needs TVCL ≥ 0.8, a +0.47 log-shift).
+        if let Some(cov) = fit.covariance_matrix.as_mut() {
+            cov[(0, 0)] = 4.0;
+        }
+        let opts = SimulateUncertaintyOptions {
+            n_uncertainty_draws: 30,
+            n_sim_per_draw: 1,
+            method: UncertaintyMethod::Asymptotic,
+            seed: Some(7),
+        };
+        // Must return Ok rather than panicking (the #786 regression).
+        let rows = simulate_with_uncertainty(&model, &pop, &fit, &opts)
+            .expect("flip-flop draws must be skipped, not panic the run");
+        assert!(
+            !rows.is_empty(),
+            "surviving in-domain draws must still yield rows"
+        );
+        let mut draws: Vec<usize> = rows.iter().map(|r| r.draw).collect();
+        draws.sort();
+        draws.dedup();
+        assert!(
+            draws.len() < 30,
+            "some flip-flop draws must be skipped (got {} of 30)",
+            draws.len()
+        );
     }
 
     #[test]
