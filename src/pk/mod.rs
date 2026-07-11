@@ -115,9 +115,10 @@ pub(crate) fn absorption_flip_flop_at(
 /// sensitivity dispatchers route through here, and within an iteration they evaluate at
 /// the same `(theta, eta)`, so they agree on the decision.
 ///
-/// A flip-flop absorption model with no ODE twin (one carrying a lagtime, `f`, or a
-/// user `[odes]` / `[scaling]` / `[initial_conditions]` block, which the desugar
-/// declines) has nothing to reroute to, and is rejected up front at η = 0 typical
+/// A flip-flop absorption model with no ODE twin (one with a user `[odes]` / `[scaling]` /
+/// `[initial_conditions]` block, or a parameter name that shadows / collides with a reserved
+/// F/lagtime slot, which the desugar declines — a `lagtime=`/`f=` mapping alone now auto-routes,
+/// #735) has nothing to reroute to, and is rejected up front at η = 0 typical
 /// values by [`crate::api::check_absorption_flip_flop_no_twin`] (`fit()` → `Err`,
 /// `predict()`/`simulate()` panic) rather than silently returning the closed form's
 /// `0`. (This function still returns the closed form for it — the guard runs first.)
@@ -128,8 +129,9 @@ pub(crate) fn effective_model_for_eval<'a>(
     eta: &[f64],
 ) -> &'a CompiledModel {
     let structural = model.effective_for(subject);
-    // No twin to route to (a non-absorption model, or a lagtime / `f` / user-`[odes]`
-    // transit/IG whose desugar declined): nothing parameter-dependent to decide.
+    // No twin to route to (a non-absorption model, or a transit/IG whose desugar declined —
+    // a user `[odes]`/`[scaling]`/`[initial_conditions]` block or a reserved-slot shadow/
+    // collision): nothing parameter-dependent to decide.
     let Some(twin) = &model.absorption_ode_equivalent else {
         return structural;
     };

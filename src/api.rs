@@ -1919,9 +1919,11 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
                  or (2-cpt) coincident disposition eigenvalues — so it returns an \
                  identically-zero concentration profile, which silently degenerates the objective \
                  (a proportional error model collapses `(σ·pred)²` to 0). This model has no ODE \
-                 twin to fall back on (a `lagtime`, bioavailability `f`, or a user `[odes]` / \
-                 `[scaling]` / `[initial_conditions]` block declines the desugar) — rewrite it as \
-                 an explicit ODE `{ode_fn}` model, or check the {params} starting estimates.",
+                 twin to fall back on (a user `[odes]` / `[scaling]` / `[initial_conditions]` \
+                 block, or a parameter whose name collides with a reserved `f`/`lagtime` slot, \
+                 declines the desugar — a `lagtime=`/`f=` mapping alone now auto-routes, #735) — \
+                 rewrite it as an explicit ODE `{ode_fn}` model, or check the {params} starting \
+                 estimates.",
                 model.pk_model.canonical_name(),
                 subject.id
             ));
@@ -6604,8 +6606,9 @@ fn absorption_flip_flop_ebe_warning(
          eigenvalues — at their fitted empirical-Bayes estimates, where the closed form returns \
          an identically-zero concentration profile, silently degenerating those subjects' \
          likelihood contributions. The typical-value (η = 0) parameters are in-domain, so this \
-         is not caught at fit start, and this twin-less model (a `lagtime`, `f`, or user \
-         `[odes]` / `[scaling]` / `[initial_conditions]` form) has no ODE twin to reroute to. \
+         is not caught at fit start, and this twin-less model (a user `[odes]` / `[scaling]` / \
+         `[initial_conditions]` form, or a parameter whose name collides with a reserved \
+         `f`/`lagtime` slot) has no ODE twin to reroute to. \
          Rewrite it as an explicit ODE `{}` model (which reroutes per-eval at the actual η), or \
          check the {} starting estimates.",
         model.pk_model.canonical_name(),
@@ -12368,13 +12371,12 @@ mod simulate_with_uncertainty_tests {
         }
     }
 
-    /// A `one_cpt_transit` + `TIME` model that the ODE desugar does NOT cover — here because
-    /// of a `lagtime=` mapping (the desugar is scoped to the plain `cl/v/n/mtt` form) — stays
-    /// on the closed form and must be rejected up front rather than silently freezing `TIME`
-    /// at the first record. (The plain form is instead rewritten to the ODE `transit()`
-    /// equivalent and works; see the parser test `transit_time_desugars_to_ode_equivalent`.)
+    /// #735: a `one_cpt_transit` + `TIME` model carrying a `lagtime=` mapping now AUTO-ROUTES
+    /// to its ODE twin instead of being rejected. Before #735 the lagtime form declined the
+    /// twin, so the `TIME` switch had nothing to route to and was rejected up front; now the
+    /// twin is built (carrying the lagtime), so the `TIME` / lagtime subjects are served by it.
     #[test]
-    fn transit_with_time_and_lagtime_is_rejected() {
+    fn transit_with_time_and_lagtime_autoroutes() {
         use crate::parser::model_parser::parse_model_string;
         const TRANSIT_TIME_LAG: &str = r#"
 [parameters]
@@ -12407,17 +12409,20 @@ mod simulate_with_uncertainty_tests {
         assert_eq!(
             model.pk_model,
             crate::types::PkModel::OneCptTransit,
-            "the lagtime= form is outside the desugar scope, so it stays closed-form"
+            "the closed-form shorthand stays OneCptTransit; the twin serves TIME/lagtime subjects"
         );
         assert!(
             crate::parser::model_parser::compiled_model_uses_time_builtin(&model),
             "fixture must use the TIME built-in"
         );
-        let msg = check_absorption_closed_form_support(&model, &tiny_population())
-            .expect("transit + TIME (lagtime form) must be rejected up front");
         assert!(
-            msg.contains("TIME"),
-            "rejection message must name the TIME limitation: {msg}"
+            model.absorption_ode_equivalent.is_some(),
+            "#735: a lagtime= transit model now carries an ODE twin (auto-routes)"
+        );
+        // No longer rejected — the twin handles both the TIME switch and the lagtime.
+        assert!(
+            check_absorption_closed_form_support(&model, &tiny_population()).is_none(),
+            "transit + TIME + lagtime is now served via the twin, not rejected up front"
         );
     }
 
@@ -12716,18 +12721,19 @@ mod simulate_with_uncertainty_tests {
     }
 
     // ── #785 / #786 flip-flop follow-up fixtures & tests ─────────────────────────
-    // A twin-*less* (a `lagtime=` mapping declines the ODE-twin desugar) transit /
-    // IG closed form whose *typical* parameters are IN-DOMAIN (`ke = CL/V` below the
-    // tilting abscissa) — so it passes the η=0 fit-start reject — but which a large
-    // positive `ETA_CL` drives into the flip-flop regime. ke0 = 0.5/4 = 0.125 < KTR =
-    // (3+1)/20 = 0.2.
+    // A twin-*less* transit / IG closed form whose *typical* parameters are IN-DOMAIN
+    // (`ke = CL/V` below the tilting abscissa) — so it passes the η=0 fit-start reject —
+    // but which a large positive `ETA_CL` drives into the flip-flop regime. ke0 = 0.5/4 =
+    // 0.125 < KTR = (3+1)/20 = 0.2.
+    // Genuinely twin-less: a user `[scaling]` block declines the ODE-twin desugar. (A
+    // `lagtime=`/`f=` mapping no longer declines it — those auto-route now, #735 — so a
+    // `[scaling]` form is what keeps this the twin-less case the #785 EBE warning targets.)
     const INDOMAIN_TWINLESS_TRANSIT_SRC: &str = "\
 [parameters]
   theta TVCL(0.5, 0.001, 50.0)
   theta TVV(4.0, 0.1, 500.0)
   theta TVNTR(3.0, 0.0, 20.0)
   theta TVMTT(20.0, 0.05, 200.0)
-  theta TVLAG(0.3, 0.0, 5.0)
   omega ETA_CL ~ 0.09
   sigma PROP ~ 0.01 (sd)
 
@@ -12736,24 +12742,25 @@ mod simulate_with_uncertainty_tests {
   V = TVV
   NTR = TVNTR
   MTT = TVMTT
-  LAGTIME = TVLAG
 
 [structural_model]
-  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAGTIME)
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[scaling]
+  obs_scale = V
 
 [error_model]
   DV ~ proportional(PROP)
 ";
 
     // IG analogue: ke0 = 5/50 = 0.1 < 1/(2·MAT·CV²) = 1/(2·2·0.3) = 0.833 (in-domain);
-    // the `lagtime=` mapping declines the twin.
+    // the `[scaling]` block declines the twin (twin-less).
     const INDOMAIN_TWINLESS_IG_SRC: &str = "\
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
   theta TVV(50.0, 5.0, 500.0)
   theta TVMAT(2.0, 0.05, 24.0)
   theta TVCV2(0.3, 0.001, 10.0)
-  theta TVLAG(0.2, 0.0, 5.0)
   omega ETA_CL ~ 0.09
   sigma PROP ~ 0.15 (sd)
 
@@ -12762,10 +12769,12 @@ mod simulate_with_uncertainty_tests {
   V = TVV
   MAT = TVMAT
   CV2 = TVCV2
-  LAGTIME = TVLAG
 
 [structural_model]
-  pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2, lagtime=LAGTIME)
+  pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)
+
+[scaling]
+  obs_scale = V
 
 [error_model]
   DV ~ proportional(PROP)
@@ -12814,7 +12823,7 @@ mod simulate_with_uncertainty_tests {
         let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
         assert!(
             model.absorption_ode_equivalent.is_none(),
-            "a lagtime= transit model is twin-less"
+            "a [scaling] transit model is twin-less"
         );
         let pop = tiny_population();
         // Subject S1 in-domain (η=0), subject S2 crosses.

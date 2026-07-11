@@ -213,6 +213,107 @@ fn ig_1cpt_lag_and_fbio_match_ode() {
     assert_equiv(&a, &o, "1cpt-lag+f", &pop, ACCUM_RTOL);
 }
 
+/// #735: a FLIP-FLOP inverse-Gaussian model carrying `lagtime=` and `f=` now auto-routes to
+/// its ODE `igd()` twin (instead of being rejected) and matches the hand-written ODE
+/// reference with the same lag/F. Flip-flop: ke = CL/V = 5/4 = 1.25 ≥ 1/(2·MAT·CV²) =
+/// 1/(2·2·0.3) = 0.833.
+#[test]
+fn ig_flipflop_lag_f_autoroutes_and_matches_twin() {
+    let header = "\
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.3, 0.001, 10.0)
+  theta TVLAG(0.4, 0.0, 5.0)
+  theta TVF(0.7, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  MAT = TVMAT
+  CV2 = TVCV2
+  LAGTIME = TVLAG
+  F = TVF
+";
+    let an_src = format!(
+        "{header}\n[structural_model]\n  \
+         pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2, lagtime=LAGTIME, f=F)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let ode_src = format!(
+        "{header}\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let an = parse_full_model(&an_src).expect("analytic IG parses").model;
+    assert!(
+        an.absorption_ode_equivalent.is_some(),
+        "a flip-flop lag/f IG closed form must now auto-route to an ODE twin (#735)"
+    );
+    let pop = population(
+        vec![bolus(0.0, 100.0)],
+        vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+    );
+    let pa = predict(&an, &pop, &an.default_params);
+    assert!(
+        pa.iter().map(|p| p.pred).fold(0.0_f64, f64::max) > 0.01,
+        "the IG twin must produce a non-zero profile (not the closed form's flip-flop clamp)"
+    );
+    assert_equiv(&an_src, &ode_src, "ig-flipflop-lag+f", &pop, ACCUM_RTOL);
+}
+
+/// #735: the IG alias path — a non-canonically-named mapping (`lagtime=LAG`, `f=FBIO`) must route
+/// into the twin's reserved slots via the emitted `lagtime = LAG` / `f = FBIO` alias lines, so it
+/// predicts identically to the same flip-flop IG model whose params ARE named canonically
+/// (`LAGTIME`/`F`, which self-route). If the alias were missing (or the `is_ig` branch diverged),
+/// LAG/FBIO would not reach the F/lagtime slots and the profiles would diverge. Mirrors the
+/// transit alias test so IG alias emission is not left unexercised.
+#[test]
+fn ig_flipflop_noncanonical_lag_f_alias_matches_canonical() {
+    let mk = |lag_name: &str, f_name: &str| {
+        format!(
+            "[parameters]\n  \
+             theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+             theta TVMAT(2.0, 0.05, 24.0)\n  theta TVCV2(0.3, 0.001, 10.0)\n  \
+             theta TVLAG(0.4, 0.0, 5.0)\n  theta TVF(0.7, 0.01, 1.0)\n  \
+             omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  \
+             MAT = TVMAT\n  CV2 = TVCV2\n  {lag_name} = TVLAG\n  {f_name} = TVF\n\n\
+             [structural_model]\n  \
+             pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2, lagtime={lag_name}, f={f_name})\n\n\
+             [error_model]\n  DV ~ proportional(PROP)\n"
+        )
+    };
+    let canonical = parse_full_model(&mk("LAGTIME", "F"))
+        .expect("canonical parses")
+        .model;
+    let aliased = parse_full_model(&mk("LAG", "FBIO"))
+        .expect("aliased parses")
+        .model;
+    assert!(aliased.absorption_ode_equivalent.is_some());
+    let pop = population(
+        vec![bolus(0.0, 100.0)],
+        vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+    );
+    let pc = predict(&canonical, &pop, &canonical.default_params);
+    let pl = predict(&aliased, &pop, &aliased.default_params);
+    assert_eq!(pc.len(), pl.len());
+    assert!(pc.iter().map(|p| p.pred).fold(0.0_f64, f64::max) > 0.01);
+    for (x, y) in pc.iter().zip(pl.iter()) {
+        assert!(
+            (x.pred - y.pred).abs() <= ATOL + ACCUM_RTOL * x.pred.abs(),
+            "t={:.3}: canonical-name {:.6} vs aliased-name {:.6} — IG alias failed to route lag/f",
+            x.time,
+            x.pred,
+            y.pred
+        );
+    }
+}
+
 // ── 2-cpt ────────────────────────────────────────────────────────────────────
 
 #[test]

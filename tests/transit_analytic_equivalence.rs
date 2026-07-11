@@ -1193,20 +1193,23 @@ fn two_cpt_transit_flip_flop_routes_to_ode_twin() {
     );
 }
 
-/// A flip-flop transit model carrying a `lagtime=` (or `f=`) mapping cannot be
-/// desugared to an ODE twin, so there is nothing to reroute to. Rather than silently
-/// returning a zero profile, it is a **hard error** at every entry point (#776):
-/// `fit()` returns `Err` and no `W_TRANSIT_FLIP_FLOP` warning fires (that
-/// informational note is reserved for the twin-carrying, auto-rerouted case).
+/// A flip-flop transit model made twin-less by a user `[scaling]` block (or `[odes]` /
+/// `[initial_conditions]`) cannot be desugared to an ODE twin, so there is nothing to reroute
+/// to. Rather than silently returning a zero profile, it is a **hard error** at every entry
+/// point (#776): `fit()` returns `Err` and no `W_TRANSIT_FLIP_FLOP` warning fires (that
+/// informational note is reserved for the twin-carrying, auto-rerouted case). (A `lagtime=` /
+/// `f=` transit model now gets a twin and auto-routes instead — see #735.)
 #[test]
 fn transit_flip_flop_without_twin_is_rejected() {
-    // ke = CL/V = 0.5 ≥ KTR = 4/20 = 0.2 (flip-flop); the lagtime declines the desugar,
-    // so there is no ODE twin to reroute to — now a hard error (#776), not a warning.
+    // ke = CL/V = 0.5 ≥ KTR = 4/20 = 0.2 (flip-flop); the [scaling] block declines the
+    // desugar, so there is no ODE twin to reroute to — a hard error (#776), not a warning.
     let src = TWIN_LESS_FLIP_FLOP_SRC;
-    let model = parse_full_model(src).expect("lagtime transit parses").model;
+    let model = parse_full_model(src)
+        .expect("[scaling] transit parses")
+        .model;
     assert!(
         model.absorption_ode_equivalent.is_none(),
-        "a lagtime= transit model has no ODE twin (the desugar declines it)"
+        "a [scaling] transit model has no ODE twin (the desugar declines it)"
     );
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
 
@@ -1233,7 +1236,7 @@ fn transit_flip_flop_without_twin_is_rejected() {
 #[should_panic(expected = "flip-flop regime")]
 fn transit_flip_flop_without_twin_panics_in_predict() {
     let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
-        .expect("lagtime transit parses")
+        .expect("[scaling] transit parses")
         .model;
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
     let _ = predict(&model, &pop, &model.default_params);
@@ -1246,22 +1249,28 @@ fn transit_flip_flop_without_twin_panics_in_predict() {
 #[should_panic(expected = "flip-flop regime")]
 fn transit_flip_flop_without_twin_panics_in_simulate() {
     let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
-        .expect("lagtime transit parses")
+        .expect("[scaling] transit parses")
         .model;
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
     let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
 }
 
-/// A twin-less `one_cpt_transit` whose typical parameters put `ke = CL/V` at or above the
-/// transit rate `KTR = (n+1)/mtt` — the flip-flop regime the closed form cannot serve, with
-/// a `lagtime=` mapping that declines the ODE-twin desugar (#776).
-const TWIN_LESS_FLIP_FLOP_SRC: &str = "\
+/// #735: a FLIP-FLOP transit model carrying `lagtime=` and `f=` now auto-routes to its
+/// ODE twin (instead of being rejected) and predicts identically to the hand-written ODE
+/// `transit()` reference carrying the same lag/F — proving the twin applies both. Params
+/// named `LAGTIME`/`F` self-route in the ODE (their lowercased names are the canonical
+/// slot names), so this pins the allowlist change + twin build.
+#[test]
+fn transit_flipflop_lag_f_autoroutes_and_matches_twin() {
+    // Flip-flop: ke = CL/V = 2.0/4.0 = 0.5 ≥ KTR = (3+1)/20 = 0.2 (closed form clamps to 0).
+    let header = "\
 [parameters]
   theta TVCL(2.0, 0.001, 50.0)
   theta TVV(4.0, 0.1, 500.0)
   theta TVNTR(3.0, 0.0, 20.0)
   theta TVMTT(20.0, 0.05, 200.0)
-  theta TVLAG(0.3, 0.0, 5.0)
+  theta TVLAG(0.5, 0.0, 5.0)
+  theta TVF(0.7, 0.01, 1.0)
   omega ETA_CL ~ 0.09
   sigma PROP ~ 0.01 (sd)
 
@@ -1271,9 +1280,224 @@ const TWIN_LESS_FLIP_FLOP_SRC: &str = "\
   NTR = TVNTR
   MTT = TVMTT
   LAGTIME = TVLAG
+  F = TVF
+";
+    let an_src = format!(
+        "{header}\n[structural_model]\n  \
+         pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAGTIME, f=F)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let ode_src = format!(
+        "{header}\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = transit(n=NTR, mtt=MTT) - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let an = parse_full_model(&an_src).expect("analytic parses").model;
+    assert!(
+        an.absorption_ode_equivalent.is_some(),
+        "a flip-flop lag/f transit closed form must now auto-route to an ODE twin (#735)"
+    );
+    let ode = parse_full_model(&ode_src).expect("ODE parses").model;
+    let pop = population(
+        vec![bolus(0.0, 100.0)],
+        vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+    );
+    let pa = predict(&an, &pop, &an.default_params);
+    let po = predict(&ode, &pop, &ode.default_params);
+    assert_eq!(pa.len(), po.len());
+    assert!(
+        pa.iter().map(|p| p.pred).fold(0.0_f64, f64::max) > 0.01,
+        "the twin must produce a non-zero profile (not the closed form's flip-flop clamp)"
+    );
+    for (x, y) in pa.iter().zip(po.iter()) {
+        assert!(
+            (x.pred - y.pred).abs() <= ATOL + ACCUM_RTOL * x.pred.abs(),
+            "t={:.3}: analytic(twin) {:.6} vs hand ODE {:.6}",
+            x.time,
+            x.pred,
+            y.pred
+        );
+    }
+}
+
+/// #735: the alias path — a non-canonically-named mapping (`lagtime=LAG`, `f=FBIO`) must
+/// route into the twin's reserved slots via the emitted `lagtime = LAG` / `f = FBIO` alias
+/// lines, so it predicts identically to the same flip-flop model whose params ARE named
+/// canonically (`LAGTIME`/`F`, which self-route). If the alias were missing, LAG/FBIO would
+/// not reach the F/lagtime slots and the profiles would diverge.
+#[test]
+fn transit_flipflop_noncanonical_lag_f_alias_matches_canonical() {
+    let mk = |lag_name: &str, f_name: &str| {
+        format!(
+            "[parameters]\n  \
+             theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+             theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  \
+             theta TVLAG(0.5, 0.0, 5.0)\n  theta TVF(0.7, 0.01, 1.0)\n  \
+             omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  \
+             NTR = TVNTR\n  MTT = TVMTT\n  {lag_name} = TVLAG\n  {f_name} = TVF\n\n\
+             [structural_model]\n  \
+             pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime={lag_name}, f={f_name})\n\n\
+             [error_model]\n  DV ~ proportional(PROP)\n"
+        )
+    };
+    let canonical = parse_full_model(&mk("LAGTIME", "F"))
+        .expect("canonical parses")
+        .model;
+    let aliased = parse_full_model(&mk("LAG", "FBIO"))
+        .expect("aliased parses")
+        .model;
+    assert!(aliased.absorption_ode_equivalent.is_some());
+    let pop = population(
+        vec![bolus(0.0, 100.0)],
+        vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+    );
+    let pc = predict(&canonical, &pop, &canonical.default_params);
+    let pl = predict(&aliased, &pop, &aliased.default_params);
+    assert_eq!(pc.len(), pl.len());
+    assert!(pc.iter().map(|p| p.pred).fold(0.0_f64, f64::max) > 0.01);
+    for (x, y) in pc.iter().zip(pl.iter()) {
+        assert!(
+            (x.pred - y.pred).abs() <= ATOL + ACCUM_RTOL * x.pred.abs(),
+            "t={:.3}: canonical-name {:.6} vs aliased-name {:.6} — alias failed to route lag/f",
+            x.time,
+            x.pred,
+            y.pred
+        );
+    }
+}
+
+/// #735 silent-divergence guard: a transit model binding a disposition role to a param whose
+/// name shadows a reserved F/lagtime slot (`mtt=ALAG`) declines the ODE twin — the twin would
+/// otherwise route `ALAG` to the lagtime slot (`ode_param_slots`) and apply a lag the closed
+/// form never did. It stays closed-form (matching the closed form, which reads `ALAG` as MTT).
+#[test]
+fn transit_reserved_name_shadow_declines_twin() {
+    let src = "\
+[parameters]\n  theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  \
+omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
+[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  NTR = TVNTR\n  \
+ALAG = TVMTT\n\n\
+[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=ALAG)\n\n\
+[error_model]\n  DV ~ proportional(PROP)\n";
+    let model = parse_full_model(src).expect("parses").model;
+    assert!(
+        model.absorption_ode_equivalent.is_none(),
+        "a param named ALAG bound to a disposition role must decline the twin (shadow guard)"
+    );
+}
+
+/// #735 shadow guard, **cross-role** case: the `f=` mapping's param is *named* `LAGTIME`, so in
+/// the ODE twin it name-routes to the *lagtime* slot (`ode_param_slots`) — applying a lag the
+/// closed form never did — in addition to the `f = LAGTIME` alias. The intended-mapping
+/// exemption is per-slot, so this declines the twin too (it is not the `lagtime=` mapping).
+#[test]
+fn transit_cross_role_shadow_declines_twin() {
+    let src = "\
+[parameters]\n  theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVF(0.7, 0.01, 1.0)\n  \
+omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
+[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n  \
+LAGTIME = TVF\n\n\
+[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, f=LAGTIME)\n\n\
+[error_model]\n  DV ~ proportional(PROP)\n";
+    let model = parse_full_model(src).expect("parses").model;
+    assert!(
+        model.absorption_ode_equivalent.is_none(),
+        "an `f=` param named LAGTIME shadows the lagtime slot — the twin must be declined"
+    );
+}
+
+/// #735 collision guard (regression): a `f=` value that is an individual parameter whose *name*
+/// routes to an already-taken *disposition* slot (`f=V1`, where `V1` name-routes to the V slot
+/// held by `v=V`) is not a reserved-name shadow, so the shadow guard passes it — but the
+/// generated twin's `ode_param_slots` rejects the duplicate V slot. Before the collision guard
+/// the twin was built (`is_some`) and `predict`/`fit`/`simulate` PANICKED in
+/// `get_or_build().expect(...)`. It must now decline the twin (`is_none`).
+#[test]
+fn transit_flipflop_f_param_named_disposition_slot_declines_twin() {
+    // Flip-flop: ke = CL/V = 2.0/4.0 = 0.5 ≥ KTR = (3+1)/20 = 0.2.
+    let src = "\
+[parameters]\n  theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVF(0.7, 0.01, 1.0)\n  \
+omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
+[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n  \
+V1 = TVF\n\n\
+[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, f=V1)\n\n\
+[error_model]\n  DV ~ proportional(PROP)\n";
+    let model = parse_full_model(src).expect("parses").model;
+    assert!(
+        model.absorption_ode_equivalent.is_none(),
+        "an `f=` param named `V1` collides with the twin's V disposition slot — the twin must be \
+         declined (not built into a source that panics in ode_param_slots)"
+    );
+}
+
+/// #735 collision guard: the declined-twin flip-flop `f=V1` model reaches the *clean* twin-less
+/// flip-flop rejection (`predict()` panics with "flip-flop regime"), NOT the internal
+/// "same PK slot" build panic it hit before the guard.
+#[test]
+#[should_panic(expected = "flip-flop regime")]
+fn transit_flipflop_f_param_named_disposition_slot_predict_panics_cleanly() {
+    let src = "\
+[parameters]\n  theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVF(0.7, 0.01, 1.0)\n  \
+omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
+[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n  \
+V1 = TVF\n\n\
+[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, f=V1)\n\n\
+[error_model]\n  DV ~ proportional(PROP)\n";
+    let model = parse_full_model(src).expect("parses").model;
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
+    let _ = predict(&model, &pop, &model.default_params);
+}
+
+/// #735 shadow guard, **stray reserved-name** case (exercises the `f` arm's decline branch): an
+/// individual parameter literally named `F` bound to a *disposition* role (`n=F`, not the `f=`
+/// mapping) would name-route to the F/bioavailability slot in the ODE twin — applying an F the
+/// closed form (which reads it as the transit count) never did. The guard declines the twin.
+#[test]
+fn transit_stray_f_named_param_declines_twin() {
+    let src = "\
+[parameters]\n  theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  \
+omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
+[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  F = TVNTR\n  MTT = TVMTT\n\n\
+[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=F, mtt=MTT)\n\n\
+[error_model]\n  DV ~ proportional(PROP)\n";
+    let model = parse_full_model(src).expect("parses").model;
+    assert!(
+        model.absorption_ode_equivalent.is_none(),
+        "a param literally named `F` bound to the n= role must decline the twin (shadow guard `f` arm)"
+    );
+}
+
+/// A twin-less `one_cpt_transit` whose typical parameters put `ke = CL/V` at or above the
+/// transit rate `KTR = (n+1)/mtt` — the flip-flop regime the closed form cannot serve, made
+/// twin-less by a user `[scaling]` block that declines the ODE-twin desugar (#776; the
+/// `lagtime=` form now auto-routes instead, #735).
+const TWIN_LESS_FLIP_FLOP_SRC: &str = "\
+[parameters]
+  theta TVCL(2.0, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
 
 [structural_model]
-  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAGTIME)
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[scaling]
+  obs_scale = V
 
 [error_model]
   DV ~ proportional(PROP)

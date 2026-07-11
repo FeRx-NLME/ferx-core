@@ -182,6 +182,25 @@ section of the SDLC for the versioning policy).
   [Data → Column mapping](https://ferx-nlme.github.io/ferx-core/model-file/data.html).
 
 ### Changed
+- **Flip-flop transit / inverse-Gaussian models with `lagtime` / `f` now auto-route
+  to their ODE twin** (#735) instead of being rejected. The analytic
+  `pk one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` / `two_cpt_ig` closed forms
+  clamp to an identically-zero profile outside their tilting-convergence domain (the
+  flip-flop regime) and are transparently rerouted to the equivalent ODE `transit()` /
+  `igd()` model — but previously only when the model carried no `lagtime=` / `f=`
+  mapping. Those mappings now carry into the generated twin (via reserved-name
+  individual parameters), so a flip-flop model with absorption lag or bioavailability —
+  including a `TIME` / time-varying-covariate model that *requires* the twin — now fits
+  and predicts correctly instead of erroring or returning zero. Validated by
+  closed-form↔ODE equivalence tests (`tests/transit_analytic_equivalence.rs`,
+  `tests/ig_analytic_equivalence.rs`) for lag, f, and both. A guard declines the twin
+  (keeping the model closed-form, and rejected up front if flip-flop) whenever building it
+  would misbehave: a parameter name that *shadows* a reserved F/lagtime slot it was not
+  mapped to (which would silently apply an extra F/lag), or an `f=`/`lagtime=` parameter
+  whose name *collides* with a disposition slot (e.g. a bioavailability parameter named
+  `V1`, which would otherwise make the twin fail to build). User `[odes]` / `[scaling]` /
+  `[initial_conditions]` forms remain twin-less (no unique desugar) and are still rejected
+  up front in the flip-flop regime.
 - **Default thread count capped at 8** (#707): when `threads` is unset (or
   `0`/`auto`) — via `[fit_options] threads`, the CLI `--threads` flag, or the R
   binding — the engine now defaults to `available cores - 1` (floored at 1),
