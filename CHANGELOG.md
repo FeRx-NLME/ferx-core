@@ -287,6 +287,15 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **Adaptive/feedback dosing now runs the same dose-precondition guards as the
+  static paths, instead of silently mis-delivering a dose** (#721). The reactive
+  entry points (`simulate_adaptive()` / `simulate_adaptive_from_spec()`) skipped the
+  modeled-`RATE` (#324), analytic-absorption closed-form, and built-in-absorption
+  (#588) checks that `simulate()` / `predict()` / `fit()` all run before integrating,
+  so a feedback-dosed model with malformed built-in-absorption pathway fractions or an
+  out-of-domain absorption parameter simulated with a silently wrong absorbed dose.
+  The guards now run at the adaptive chokepoint and fail with the same typed error
+  before any decision is taken.
 - **A twin-less transit / inverse-Gaussian absorption fit no longer silently
   degenerates a subject whose fitted random effects reach the flip-flop regime**
   (#785). An analytic `one_cpt_transit`/`two_cpt_transit` (or `one_cpt_ig`/
