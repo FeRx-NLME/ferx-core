@@ -322,6 +322,16 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **Declining-hazard (`γ < 0`) Gompertz simulation no longer censors every event**
+  (#803): the analytic inverse-CDF event-time samplers guarded the Gompertz draw with
+  `inner ≤ 1`, which fires for *every* `u ∈ (0,1)` when the shape `γ < 0`, so a
+  declining-hazard Gompertz simulated an empty / all-censored stream even though `fit()`
+  scored the same `γ < 0` with finite density — simulate was not the inverse of fit for
+  this family, breaking simulate→fit round-trips (VPC/SBC). A `γ < 0` Gompertz has a
+  finite limiting cumulative hazard `H(∞) = −α·e^{loghr}/γ`, i.e. a genuine cure fraction
+  `S(∞) = e^{−H(∞)}`; the guard now rejects only that true cure fraction (`inner ≤ 0`), so
+  a draw above it produces a valid finite event. Affects single-event TTE, clock-forward
+  RTTE, and the clock-reset first sojourn for any `γ < 0`.
 - **A dose landing exactly on a subject's last observation is now applied before that
   observation is read (post-dose) on the constant-parameter ODE engine, fixing a
   false rejection by the adaptive frozen-replay verifier** (#731). The engine applied

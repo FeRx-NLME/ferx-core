@@ -213,8 +213,14 @@ pub fn sample_event_time(family: HazardFamily, params: &[f64], u: f64) -> f64 {
             // H(T) = -log U  =>  (alpha/gamma)*(exp(gamma*T)-1)*exp(loghr) = neg_log_u
             // exp(gamma*T) = 1 + neg_log_u * gamma / (alpha * exp(loghr))
             let inner = 1.0 + neg_log_u * gamma / (alpha * exp_loghr);
-            if inner <= 1.0 {
-                // Numerically degenerate (should not happen for valid params)
+            // γ < 0 is a declining hazard with a finite limiting cumulative hazard
+            // H(∞) = −α·exp(loghr)/γ, i.e. a genuine cure fraction S(∞) = exp(−H(∞)) > 0.
+            // A draw whose −log U exceeds H(∞) (u below the cure fraction) yields inner ≤ 0 and
+            // has no event; inner ∈ (0, 1) is a valid finite event (T = ln(inner)/γ > 0). For
+            // γ > 0 the hazard grows unboundedly and inner > 1 always, so this guard then only
+            // catches numerically degenerate draws. Rejecting inner ≤ 1 would wrongly censor
+            // *every* γ < 0 event (#803).
+            if inner <= 0.0 {
                 return f64::MAX;
             }
             inner.ln() / gamma
@@ -270,7 +276,11 @@ pub fn sample_conditional_event_time(
             // exp(gamma*T) = exp(gamma*entry) + neg_log_u * gamma / (alpha * exp_loghr)
             let exp_entry = (gamma * entry_time).exp();
             let inner = exp_entry + neg_log_u * gamma / (alpha * exp_loghr);
-            if inner <= 1.0 {
+            // As in `sample_event_time`, γ < 0 has a cure fraction beyond `entry`: inner ≤ 0 means
+            // −log U exceeds the remaining cumulative hazard H(∞) − H(entry), so there is no event.
+            // inner ∈ (0, exp_entry) is a valid event with T > entry; γ > 0 keeps inner > 1. The
+            // old inner ≤ 1 guard censored every γ < 0 event (#803).
+            if inner <= 0.0 {
                 return f64::MAX;
             }
             inner.ln() / gamma
@@ -347,6 +357,90 @@ mod tests {
         assert!(
             (cum - expected).abs() < 1e-9,
             "H = {cum}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn gompertz_gamma_negative_samples_events_and_cure_fraction() {
+        // Declining-hazard Gompertz (#803): γ < 0 has a finite limiting cumulative hazard
+        // H(∞) = −α·exp(loghr)/γ and a genuine cure fraction S(∞) = exp(−H(∞)).
+        //   α = 0.002, γ = −0.005, loghr = 0  ⇒  H(∞) = 0.002/0.005 = 0.4, S(∞) = e^{-0.4} ≈ 0.6703.
+        let params = &[0.002, -0.005, 0.0];
+        let cure = (-0.4_f64).exp();
+
+        // u above the cure fraction ⇒ a valid finite event that round-trips H(T) = −ln u.
+        // Under the old `inner <= 1.0` guard this returned the `f64::MAX` no-event sentinel
+        // for every draw. The `t < f64::MAX` bound is the direct regression signal (an actual
+        // event was produced, not the sentinel — note `f64::MAX` is itself finite and > 0, so
+        // the earlier checks alone would not catch it); the round-trip below then confirms the
+        // event time is numerically correct.
+        let u = 0.8_f64;
+        assert!(u > cure, "test setup: u must exceed the cure fraction");
+        let t = sample_event_time(HazardFamily::Gompertz, params, u);
+        assert!(
+            t.is_finite() && t > 0.0 && t < f64::MAX,
+            "γ<0 above-cure draw must yield a real event, not the no-event sentinel; got {t}"
+        );
+        let (_, cum) = hazard_and_cum_hazard(HazardFamily::Gompertz, t, params);
+        assert!(
+            (cum - (-u.ln())).abs() < 1e-9,
+            "H(T) = {cum}, expected {}",
+            -u.ln()
+        );
+
+        // u below the cure fraction ⇒ no event (the true cure fraction), sentinel returned.
+        let u_cured = 0.5_f64;
+        assert!(
+            u_cured < cure,
+            "test setup: u must be below the cure fraction"
+        );
+        let t_cured = sample_event_time(HazardFamily::Gompertz, params, u_cured);
+        assert_eq!(t_cured, f64::MAX, "γ<0 below-cure draw must be censored");
+    }
+
+    #[test]
+    fn gompertz_gamma_negative_conditional_events_and_cure_fraction() {
+        // Conditional (left-truncated) declining-hazard Gompertz (#803). The remaining cumulative
+        // hazard beyond `entry` is H(∞) − H(entry); a draw with −ln u above it has no event.
+        let params = &[0.002, -0.005, 0.0];
+        let entry = 20.0_f64;
+        let h_entry = cum_hazard(HazardFamily::Gompertz, entry, params);
+        let remaining = 0.4 - h_entry; // H(∞) = 0.4 for these params
+        let cond_cure = (-remaining).exp();
+
+        // u above the conditional cure fraction ⇒ finite event later than entry, round-tripping
+        // H(T) − H(entry) = −ln u. The old guard returned the `f64::MAX` sentinel for all of
+        // these; `t < f64::MAX` is the direct regression signal (the sentinel is finite and
+        // > entry, so it would otherwise slip past), the round-trip confirms correctness.
+        let u = 0.9_f64;
+        assert!(
+            u > cond_cure,
+            "test setup: u must exceed the conditional cure fraction"
+        );
+        let t = sample_conditional_event_time(HazardFamily::Gompertz, params, entry, u);
+        assert!(
+            t.is_finite() && t > entry && t < f64::MAX,
+            "conditional γ<0 above-cure draw must yield a real event > entry, not the sentinel; got {t}"
+        );
+        let h_t = cum_hazard(HazardFamily::Gompertz, t, params);
+        assert!(
+            (h_t - h_entry - (-u.ln())).abs() < 1e-8,
+            "H(T)-H(entry) = {}, expected {}",
+            h_t - h_entry,
+            -u.ln()
+        );
+
+        // u below the conditional cure fraction ⇒ censored at the sentinel.
+        let u_cured = 0.5_f64;
+        assert!(
+            u_cured < cond_cure,
+            "test setup: u must be below the conditional cure fraction"
+        );
+        let t_cured = sample_conditional_event_time(HazardFamily::Gompertz, params, entry, u_cured);
+        assert_eq!(
+            t_cured,
+            f64::MAX,
+            "conditional γ<0 below-cure draw must be censored"
         );
     }
 
