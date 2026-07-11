@@ -7551,8 +7551,10 @@ pub struct SimulateOptions {
 /// re-raise the same message as a panic):
 /// - a **finite, positive horizon** is required — the recurrent stream is generated up
 ///   to that administrative window; there is no implicit one;
-/// - **left truncation** (`entry_time > 0`) is a deferred follow-up (conditional
-///   first-gap sampling past entry), so `entry_time == 0` is required;
+/// - **left truncation** (`entry_time > 0`) *is* supported (#740): the stream is drawn on
+///   the time origin conditioned on survival to entry, the simulate dual of the fit-side
+///   conditioning (clock-forward seeds its clock at entry; clock-reset conditions its first
+///   sojourn, convention B). `entry_time == 0` is byte-identical to the non-truncated draw;
 /// - exactly **one recurrent stream per subject** — multiple RTTE CMTs, or an RTTE
 ///   cause mixed with a competing single-event TTE cause, are a later slice (they need
 ///   a shared-horizon multi-stream draw);
@@ -7634,22 +7636,17 @@ fn validate_tte_simulatable(
             let mut rtte_cmts = std::collections::BTreeSet::new();
             let mut has_single_tte_sibling = false;
             for r in &subject.obs_records {
-                let ObsRecord::Event {
-                    cmt, entry_time, ..
-                } = r
-                else {
+                let ObsRecord::Event { cmt, .. } = r else {
                     continue;
                 };
+                // Left truncation (delayed entry, entry_time > 0) IS supported for RTTE
+                // simulation (#740): the stream is drawn on the time origin conditioned on
+                // survival to entry — clock-forward seeds its conditioning clock at entry,
+                // clock-reset conditions its first sojourn (convention B). This is the
+                // simulate dual of the fit-side conditioning; see
+                // [`crate::survival::simulate_rtte_stream`].
                 if is_rtte(cmt) {
                     rtte_cmts.insert(*cmt);
-                    if *entry_time > 0.0 {
-                        return Err(format!(
-                            "RTTE (`type = rtte`) simulation does not support left truncation \
-                             (entry_time={entry_time} for subject '{}' on CMT={cmt}); conditional \
-                             first-gap sampling past entry is a deferred follow-up",
-                            subject.id
-                        ));
-                    }
                 } else if is_single_tte(cmt) {
                     has_single_tte_sibling = true;
                 }

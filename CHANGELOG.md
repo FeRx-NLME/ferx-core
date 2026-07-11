@@ -29,7 +29,13 @@ section of the SDLC for the versioning policy).
   (condition on survival past entry, never restart the clock at entry). Assumes the
   time origin `t = 0` is the renewal origin of the first sojourn; coincides with the
   pure renewal form (and with clock-forward) for a memoryless exponential hazard.
-  Simulation of left-truncated RTTE streams remains a separate follow-up.
+- **Left truncation for RTTE _simulation_** (#740): `simulate()` now accepts
+  `TENTRY > 0` for repeated events on both clocks, drawing the stream on the time
+  origin conditioned on survival to entry (clock-forward seeds its conditioning clock
+  at `TENTRY`; clock-reset draws its first sojourn conditional on entry, then renews
+  from 0) — the simulate dual of the fit-side conditioning, so a simulated
+  left-truncated stream refits under the same convention. `TENTRY = 0` stays
+  byte-identical to the non-truncated draw.
 - **Analytic inverse-Gaussian (IG) absorption closed form** (#790): the Freijer &
   Post inverse-Gaussian absorption model is now available as the analytic
   structural models `pk one_cpt_ig(cl, v, mat, cv2)` and
