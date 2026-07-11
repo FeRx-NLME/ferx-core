@@ -387,6 +387,13 @@ pub fn rtte_forward_nll_from_curves(
 /// (enforced at data load), `IntervalCensored` unsupported (folds to the `1e20`
 /// sentinel). Returns the sentinel on a non-positive hazard at an event, a non-monotone
 /// cumulative hazard on a gap, or a non-finite total.
+///
+/// As on the clock-forward path, only the **first** record's `entry_time` conditions the
+/// likelihood; a per-record `entry_time` on a *later* record is ignored (that gap is a fresh
+/// renewal from 0, so re-conditioning on entry would double-count survival to entry). Real
+/// left-truncated data carries a single subject-level `TENTRY`, for which this is exactly
+/// convention B; an inconsistent per-row `TENTRY` is silently reduced to the first record's
+/// value rather than rejected — matching clock-forward, not the pre-#740 loud rejection.
 pub fn rtte_reset_nll_from_curves(
     records: &[ObsRecord],
     cumhaz_at: impl Fn(f64) -> f64,
@@ -2060,8 +2067,11 @@ mod tests {
     fn rtte_reset_left_truncation_equals_forward_for_exponential() {
         // A constant hazard is memoryless, so convention B's entry-conditioned first sojourn
         // (H(t₁) − H(entry)) coincides with the pure renewal form AND with clock-forward even
-        // under delayed entry. This pins that reset left truncation conditions via H(entry) —
-        // the same lower limit clock-forward uses — rather than restarting the clock at entry.
+        // under delayed entry. This pins B ≡ clock-forward for a memoryless hazard (the
+        // reduction-to-anchored-machinery invariant). It does NOT by itself discriminate B from
+        // the rejected convention A — the two are numerically identical when the hazard is
+        // memoryless; that discrimination is pinned by the time-varying Weibull test
+        // `rtte_reset_left_truncation_conditions_on_entry` (where B differs from A by > 1 nat).
         let lambda = 0.05_f64;
         let entry = 4.0;
         let records = vec![
