@@ -12725,6 +12725,10 @@ mod simulate_with_uncertainty_tests {
     // Genuinely twin-less: a user `[scaling]` block declines the ODE-twin desugar. (A
     // `lagtime=`/`f=` mapping no longer declines it — those auto-route now, #735 — so a
     // `[scaling]` form is what keeps this the twin-less case the #785 EBE warning targets.)
+    // `obs_scale = 1` is an inert identity divisor — it declines the twin without perturbing the
+    // `pk` block's built-in concentration output. (Using the volume `V` would divide by V a
+    // second time and emit the #712 double-scale warning; the flip-flop detection keys off
+    // `CL/V`, so the scale value is otherwise immaterial here.)
     const INDOMAIN_TWINLESS_TRANSIT_SRC: &str = "\
 [parameters]
   theta TVCL(0.5, 0.001, 50.0)
@@ -12744,14 +12748,14 @@ mod simulate_with_uncertainty_tests {
   pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
 
 [scaling]
-  obs_scale = V
+  obs_scale = 1
 
 [error_model]
   DV ~ proportional(PROP)
 ";
 
     // IG analogue: ke0 = 5/50 = 0.1 < 1/(2·MAT·CV²) = 1/(2·2·0.3) = 0.833 (in-domain);
-    // the `[scaling]` block declines the twin (twin-less).
+    // the inert `[scaling] obs_scale = 1` block declines the twin (twin-less; see above).
     const INDOMAIN_TWINLESS_IG_SRC: &str = "\
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
@@ -12771,7 +12775,7 @@ mod simulate_with_uncertainty_tests {
   pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)
 
 [scaling]
-  obs_scale = V
+  obs_scale = 1
 
 [error_model]
   DV ~ proportional(PROP)
@@ -12822,6 +12826,17 @@ mod simulate_with_uncertainty_tests {
             model.absorption_ode_equivalent.is_none(),
             "a [scaling] transit model is twin-less"
         );
+        // The inert `obs_scale = 1` must not double-scale the `pk` block's built-in concentration
+        // output: no #712 volume double-scale warning (reverting to `obs_scale = V` would
+        // reintroduce it and this pins that regression).
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("divides by")),
+            "twin-less fixture must not emit the obs_scale double-scale warning: {:?}",
+            model.parse_warnings
+        );
         let pop = tiny_population();
         // Subject S1 in-domain (η=0), subject S2 crosses.
         let eta_hats = [eta_vec(&[0.0]), eta_vec(&[0.6])];
@@ -12854,6 +12869,15 @@ mod simulate_with_uncertainty_tests {
     fn flip_flop_ebe_warning_fires_for_twinless_ig_crosser() {
         let model = parse_fixture(INDOMAIN_TWINLESS_IG_SRC);
         assert!(model.absorption_ode_equivalent.is_none());
+        // The inert `obs_scale = 1` must not double-scale the IG closed form (no #712 warning).
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("divides by")),
+            "twin-less IG fixture must not emit the obs_scale double-scale warning: {:?}",
+            model.parse_warnings
+        );
         let pop = tiny_population();
         let eta_hats = [eta_vec(&[0.0]), eta_vec(&[2.3])];
         let (msg, entry) =

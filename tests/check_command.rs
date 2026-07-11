@@ -398,9 +398,9 @@ fn report_serializes_to_json() {
     assert!(json.contains("\"diagnostics\":[]"));
 }
 
-/// A twin-less flip-flop transit model (a user `[scaling]` block declines the ODE-twin
-/// desugar; ke = CL/V = 0.5 ≥ KTR = (3+1)/20 = 0.2) is rejected by `ferx check` with a hard
-/// `E_TRANSIT_FLIP_FLOP` error, mirroring `fit()` (#776). (A `lagtime=`/`f=` form now gets a
+/// A twin-less flip-flop transit model (an inert `[scaling] obs_scale = 1` block declines the
+/// ODE-twin desugar; ke = CL/V = 0.5 ≥ KTR = (3+1)/20 = 0.2) is rejected by `ferx check` with a
+/// hard `E_TRANSIT_FLIP_FLOP` error, mirroring `fit()` (#776). (A `lagtime=`/`f=` form now gets a
 /// twin and auto-routes instead — see #735.)
 #[test]
 fn twin_less_flip_flop_transit_is_rejected_by_check() {
@@ -425,7 +425,7 @@ fn twin_less_flip_flop_transit_is_rejected_by_check() {
   pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
 
 [scaling]
-  obs_scale = V
+  obs_scale = 1
 
 [error_model]
   DV ~ proportional(PROP)
