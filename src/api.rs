@@ -12872,6 +12872,15 @@ mod simulate_with_uncertainty_tests {
     fn flip_flop_ebe_warning_fires_for_twinless_ig_crosser() {
         let model = parse_fixture(INDOMAIN_TWINLESS_IG_SRC);
         assert!(model.absorption_ode_equivalent.is_none());
+        // The inert `obs_scale = 1` must not double-scale the IG closed form (no #712 warning).
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("divides by")),
+            "twin-less IG fixture must not emit the obs_scale double-scale warning: {:?}",
+            model.parse_warnings
+        );
         let pop = tiny_population();
         let eta_hats = [eta_vec(&[0.0]), eta_vec(&[2.3])];
         let (msg, entry) =

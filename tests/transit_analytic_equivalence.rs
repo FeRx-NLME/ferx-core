@@ -1211,6 +1211,15 @@ fn transit_flip_flop_without_twin_is_rejected() {
         model.absorption_ode_equivalent.is_none(),
         "a [scaling] transit model has no ODE twin (the desugar declines it)"
     );
+    // The inert `obs_scale = 1` must not double-scale the closed form (no #712 warning).
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("divides by")),
+        "twin-less fixture must not emit the obs_scale double-scale warning: {:?}",
+        model.parse_warnings
+    );
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
 
     // fit() rejects it with a clear, actionable error (not a silent zero-degenerate fit).
