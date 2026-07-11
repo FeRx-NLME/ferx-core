@@ -287,6 +287,16 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **A dose landing exactly on a subject's last observation is now applied before that
+  observation is read (post-dose) on the constant-parameter ODE engine, fixing a
+  false rejection by the adaptive frozen-replay verifier** (#731). The engine applied
+  doses only at each integration segment's left boundary and treated the timeline's
+  final break as an endpoint only, so a dose coinciding with the last observation was
+  dropped and that observation read the pre-dose state — disagreeing with the
+  analytical engine, the reactive adaptive driver, and NONMEM (all post-dose). This
+  surfaced as the default-on adaptive frozen-replay verifier rejecting a valid
+  constant-covariate run whose final dosing decision coincided with the last sample.
+  Interior breaks were already handled post-dose.
 - **A twin-less transit / inverse-Gaussian absorption fit no longer silently
   degenerates a subject whose fitted random effects reach the flip-flop regime**
   (#785). An analytic `one_cpt_transit`/`two_cpt_transit` (or `one_cpt_ig`/
