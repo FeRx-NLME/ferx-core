@@ -413,6 +413,19 @@ time) restarts the hazard clock at each event (`Σ_k log h(Δ_k) − Σ_k H(Δ_k
 inter-event gaps). For a time-homogeneous hazard the two coincide. See
 [Repeated events](../model-file/event-model.qmd#rtte) for the DSL details.
 
+Both clocks accept **left truncation** (a `TENTRY` column; see [above](#left-truncation-delayed-entry)).
+Under `clock = forward` the cumulative hazard integrates from `H(TENTRY)`. Under
+`clock = reset` the *first* sojourn is measured from the time origin and conditioned on
+survival to entry — `H(t₁) − H(TENTRY) − log h(t₁)` — after which the renewal clock takes
+over for later gaps. This is the same delayed-entry conditioning across every survival
+endpoint: `TENTRY` always means "condition on survival past entry", never "restart the
+clock at entry" (the two would differ for a time-varying hazard, and only the former is a
+standard, anchorable left-truncation model). Reset left truncation assumes the time origin
+`t = 0` is the renewal origin of the first sojourn (the subject was event-free and at risk
+from 0); it coincides with clock-forward for a memoryless (exponential) hazard. Simulating
+a left-truncated RTTE stream is a separate follow-up — `simulate()` still requires
+`TENTRY = 0` for repeated events.
+
 ::: {.callout-warning}
 ## Prefer SAEM/IMP for RTTE
 

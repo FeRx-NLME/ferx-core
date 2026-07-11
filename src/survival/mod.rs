@@ -357,15 +357,31 @@ pub fn rtte_forward_nll_from_curves(
 /// from cumulative-hazard / hazard curves:
 ///
 /// ```text
-///   −log L = Σ_k [ H(Δ_k) − log h(Δ_k) ]  +  H(Δ_censor)
+///   −log L = [ H(t₁) − H(entry) − log h(t₁) ]      first sojourn, absolute clock from 0
+///          + Σ_{k≥2} [ H(Δ_k) − log h(Δ_k) ]       renewal gaps, Δ_k = t_k − t_{k−1}
+///          + H(Δ_censor)
 /// ```
 ///
-/// The hazard clock **resets to 0 at each event**, so each inter-event gap
-/// `Δ_k = t_k − t_{k−1}` (with `t_0` = the subject's `entry_time`) is an independent
-/// single-event contribution evaluated on its own *duration* — `cumhaz_at`/`hazard_at`
-/// are called at `Δ_k`, not at absolute time. This is the renewal-process form (§3.3);
-/// for a time-homogeneous hazard (exponential) it coincides with the clock-forward
-/// likelihood, and differs once the hazard varies with time (Weibull/Gompertz).
+/// The hazard clock **resets to 0 at each event**, so each *inter-event* gap
+/// `Δ_k = t_k − t_{k−1}` (k ≥ 2) is an independent single-event contribution evaluated on
+/// its own *duration* — `cumhaz_at`/`hazard_at` are called at `Δ_k`, not at absolute time.
+/// This is the renewal-process form (§3.3); for a time-homogeneous hazard (exponential) it
+/// coincides with the clock-forward likelihood, and differs once the hazard varies with
+/// time (Weibull/Gompertz).
+///
+/// **Left truncation (delayed entry, `entry_time > 0`), convention B (#740).** The *first*
+/// sojourn is the interval from the time origin (`t = 0`) to the first record, measured in
+/// **absolute** time and **conditioned on survival to `entry`**: its contribution is
+/// `H(t₁) − H(entry) [− log h(t₁)]` — the exact clock-forward first-record term, and the
+/// same delayed-entry conditioning used for single-event TTE and clock-forward RTTE (one
+/// left-truncation semantics across every path: `entry` always means "condition on survival
+/// past entry", never "restart the clock at entry"). For a memoryless (exponential) hazard
+/// this collapses to `H(t₁ − entry)` and coincides with the pure renewal form; for a
+/// time-varying hazard it does **not** — the rejected alternative (renewal clock restarting
+/// at `entry`, first gap `Δ = t₁ − entry` from 0) is a different, unanchored model. This
+/// convention assumes the time origin `t = 0` is the renewal origin of the first sojourn
+/// (the subject was event-free and at risk from 0); when `entry == 0` the term is exactly
+/// the pure renewal `H(t₁)` and this function is bit-identical to a clock from 0.
 ///
 /// Preconditions match [`rtte_forward_nll_from_curves`]: records nondecreasing in `time`
 /// (enforced at data load), `IntervalCensored` unsupported (folds to the `1e20`
@@ -378,8 +394,7 @@ pub fn rtte_reset_nll_from_curves(
     tol: MonoTol,
 ) -> f64 {
     let mut nll = 0.0_f64;
-    // Start of the current gap: the previous record's time, or the subject's entry on
-    // the first record.
+    // End of the previous sojourn (a renewal point): `None` until the first record.
     let mut prev_time: Option<f64> = None;
 
     for record in records {
@@ -395,31 +410,50 @@ pub fn rtte_reset_nll_from_curves(
             continue;
         };
 
-        let gap = time - prev_time.unwrap_or(*entry_time);
-        // A negative gap means out-of-order records (guarded at data load); the H(Δ) with
-        // Δ<0 is meaningless, so fail closed.
-        if gap < 0.0 {
+        // Where to evaluate the hazard clock for this record (`arg`) and the lower
+        // cumulative-hazard limit to subtract (`h_lo`):
+        //   * first record  → absolute time `t₁` on the clock from the origin, lower limit
+        //     H(entry) (delayed-entry conditioning, convention B); reduces to (t₁, 0) when
+        //     entry == 0.
+        //   * later records → gap `t − t_prev` on a clock reset at the previous event,
+        //     lower limit H(0) = 0.
+        let (arg, h_lo) = match prev_time {
+            None => {
+                let h_entry = if *entry_time > 0.0 {
+                    cumhaz_at(*entry_time)
+                } else {
+                    0.0
+                };
+                (*time, h_entry)
+            }
+            Some(prev) => (*time - prev, 0.0),
+        };
+        // A negative clock argument means out-of-order records (a later record's gap); the
+        // H(Δ) with Δ<0 is meaningless, so fail closed. An `entry > t₁` on the first record
+        // leaves `arg = t₁ ≥ 0` but drives `H(arg) < h_lo`, caught by the monotone check
+        // below (same fold as the clock-forward path).
+        if arg < 0.0 {
             return 1e20;
         }
 
         match event_type {
             EventType::RightCensored => {
-                let h_gap = cumhaz_at(gap); // H(Δ) from a reset clock (lower limit 0)
-                if cumhaz_monotone_violation(h_gap, 0.0, tol) {
+                let h_arg = cumhaz_at(arg);
+                if cumhaz_monotone_violation(h_arg, h_lo, tol) {
                     return 1e20;
                 }
-                nll += h_gap;
+                nll += h_arg - h_lo;
             }
             EventType::Exact => {
-                let h_val = hazard_at(gap);
+                let h_val = hazard_at(arg);
                 if h_val <= 0.0 {
                     return 1e20;
                 }
-                let h_gap = cumhaz_at(gap);
-                if cumhaz_monotone_violation(h_gap, 0.0, tol) {
+                let h_arg = cumhaz_at(arg);
+                if cumhaz_monotone_violation(h_arg, h_lo, tol) {
                     return 1e20;
                 }
-                nll += h_gap - h_val.ln();
+                nll += (h_arg - h_lo) - h_val.ln();
             }
             // RTTE + interval censoring is unsupported (rejected at parse); sentinel.
             EventType::IntervalCensored { .. } => return 1e20,
@@ -1969,6 +2003,121 @@ mod tests {
             (reset - forward).abs() > 1.0,
             "reset ({reset}) and forward ({forward}) must differ for a time-varying hazard"
         );
+    }
+
+    #[test]
+    fn rtte_reset_left_truncation_conditions_on_entry() {
+        // Convention B (#740): with delayed entry the FIRST sojourn is measured in absolute
+        // time from the origin and conditioned on survival to `entry` — H(t₁) − H(entry) −
+        // log h(t₁), exactly the clock-forward first-record term. Every later gap is a fresh
+        // renewal draw from 0. Weibull scale=10, shape=2 is time-varying, so B differs from
+        // the rejected alternative (renewal clock restarting at entry, first gap t₁ − entry).
+        let cumhaz_at = |t: f64| (t / 10.0).powi(2);
+        let hazard_at = |t: f64| 0.2 * (t / 10.0);
+        let entry = 8.0;
+        // Enter the risk set at 8; events at 10 and 13; administrative censor at 20.
+        let records = vec![
+            ObsRecord::Event {
+                time: 10.0,
+                event_type: EventType::Exact,
+                entry_time: entry,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 13.0,
+                event_type: EventType::Exact,
+                entry_time: entry,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 20.0,
+                event_type: EventType::RightCensored,
+                entry_time: entry,
+                cmt: 2,
+            },
+        ];
+        let reset = rtte_reset_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+
+        // B: first sojourn conditioned on entry (absolute clock), then renewal gaps 3 and 7.
+        let expected_b = (cumhaz_at(10.0) - cumhaz_at(entry) - hazard_at(10.0).ln()) // first sojourn
+            + (cumhaz_at(3.0) - hazard_at(3.0).ln())                                 // gap 13−10
+            + cumhaz_at(7.0); // censor gap 20−13
+        assert_abs_diff_eq!(reset, expected_b, epsilon = 1e-12);
+
+        // The rejected convention A (renewal clock restarts at entry: first gap Δ = t₁ −
+        // entry evaluated from 0) would use the residual 2.0 for the first term — materially
+        // different for a time-varying hazard. Pin that the implementation is B, not A.
+        let convention_a = (cumhaz_at(10.0 - entry) - hazard_at(10.0 - entry).ln())
+            + (cumhaz_at(3.0) - hazard_at(3.0).ln())
+            + cumhaz_at(7.0);
+        assert!(
+            (reset - convention_a).abs() > 1.0,
+            "reset NLL ({reset}) must use convention B, not the renewal-from-entry A ({convention_a})"
+        );
+    }
+
+    #[test]
+    fn rtte_reset_left_truncation_equals_forward_for_exponential() {
+        // A constant hazard is memoryless, so convention B's entry-conditioned first sojourn
+        // (H(t₁) − H(entry)) coincides with the pure renewal form AND with clock-forward even
+        // under delayed entry. This pins that reset left truncation conditions via H(entry) —
+        // the same lower limit clock-forward uses — rather than restarting the clock at entry.
+        let lambda = 0.05_f64;
+        let entry = 4.0;
+        let records = vec![
+            ObsRecord::Event {
+                time: 6.0,
+                event_type: EventType::Exact,
+                entry_time: entry,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 12.0,
+                event_type: EventType::Exact,
+                entry_time: entry,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: entry,
+                cmt: 2,
+            },
+        ];
+        let cumhaz_at = |t: f64| lambda * t;
+        let hazard_at = |_t: f64| lambda;
+        let reset = rtte_reset_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+        let forward =
+            rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+        assert_abs_diff_eq!(reset, forward, epsilon = 1e-12);
+        // Closed form: λ(T − entry) − 2·log λ = 0.05·(30 − 4) − 2·log(0.05).
+        assert_abs_diff_eq!(
+            reset,
+            lambda * (30.0 - entry) - 2.0 * lambda.ln(),
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn rtte_reset_left_truncation_censored_first_record() {
+        // A late entrant censored before any event: the single contribution is the entry-
+        // conditioned survival H(t) − H(entry) (convention B), exactly the clock-forward
+        // censored term. Guards the RightCensored-first-record path with a nonzero lower
+        // limit H(entry) (the other reset-truncation tests fire an event first).
+        let cumhaz_at = |t: f64| (t / 10.0).powi(2);
+        let hazard_at = |t: f64| 0.2 * (t / 10.0);
+        let entry = 5.0;
+        let records = vec![ObsRecord::Event {
+            time: 12.0,
+            event_type: EventType::RightCensored,
+            entry_time: entry,
+            cmt: 2,
+        }];
+        let reset = rtte_reset_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+        assert_abs_diff_eq!(reset, cumhaz_at(12.0) - cumhaz_at(entry), epsilon = 1e-12);
+        let forward =
+            rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+        assert_abs_diff_eq!(reset, forward, epsilon = 1e-12);
     }
 
     #[test]

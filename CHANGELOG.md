@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Left truncation (delayed entry) for clock-reset RTTE** (#740): repeated
+  time-to-event models with `clock = reset` now accept a `TENTRY > 0` entry time
+  instead of rejecting it. The first inter-event sojourn is conditioned on survival
+  to entry in absolute time (`H(t₁) − H(TENTRY)`), then the renewal clock takes over
+  for later gaps — the same delayed-entry convention already used for single-event
+  and clock-forward RTTE, so `TENTRY` means one thing across every survival endpoint
+  (condition on survival past entry, never restart the clock at entry). Assumes the
+  time origin `t = 0` is the renewal origin of the first sojourn; coincides with the
+  pure renewal form (and with clock-forward) for a memoryless exponential hazard.
+  Simulation of left-truncated RTTE streams remains a separate follow-up.
 - **Analytic inverse-Gaussian (IG) absorption closed form** (#790): the Freijer &
   Post inverse-Gaussian absorption model is now available as the analytic
   structural models `pk one_cpt_ig(cl, v, mat, cv2)` and

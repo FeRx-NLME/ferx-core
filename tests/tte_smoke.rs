@@ -852,13 +852,14 @@ mod survival_smoke {
         );
     }
 
-    /// Left truncation (delayed entry, entry_time > 0) is not yet supported for clock-reset
-    /// RTTE: the first-gap conditioning convention (renewal clock from entry vs. clock from 0
-    /// conditioned on survival to entry) is unratified and unanchored, and the two differ for
-    /// a time-varying hazard. Fail loud rather than silently pick one; clock-forward supports
-    /// left truncation and is the documented route for such data.
+    /// Left truncation (delayed entry, entry_time > 0) IS supported for clock-reset RTTE
+    /// (#740, convention B): the first sojourn is conditioned on survival to `entry` in
+    /// absolute time (H(t₁) − H(entry)), matching single-event and clock-forward delayed
+    /// entry. The fit boundary must accept such data and produce a real objective rather than
+    /// reject it or fold to the 1e20 sentinel. (The closed-form conditioning is pinned in the
+    /// Tier-1 `rtte_reset_left_truncation_*` unit tests; this is the end-to-end boundary.)
     #[test]
-    fn rtte_reset_left_truncation_is_rejected() {
+    fn rtte_reset_left_truncation_fits() {
         use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
         let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
         let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
@@ -892,11 +893,15 @@ mod survival_smoke {
             },
         ];
         let opts = FitOptions::default();
-        let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("left-truncated clock=reset must be rejected");
+        let result = fit(&model, &pop, &model.default_params, &opts)
+            .expect("left-truncated clock=reset RTTE must fit, not error");
+        // A real objective, not the sentinel: a poisoned fit sums per-subject 1e20 to ~n·1e20
+        // (still finite), so `< 1e6` cleanly separates a genuine conditioned fit from one
+        // folded to the sentinel (cf. `rtte_clock_reset_hand_built_fits`).
         assert!(
-            err.contains("left-truncation") && err.contains("CMT=2"),
-            "error should flag the delayed entry, got: {err}"
+            result.ofv.is_finite() && result.ofv < 1e6,
+            "left-truncated clock-reset OFV must be a real objective (finite, < 1e6); got {}",
+            result.ofv
         );
     }
 
