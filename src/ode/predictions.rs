@@ -1519,18 +1519,18 @@ fn ode_predictions_with_extra_breaks_and_stats(
     );
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
-    // Degenerate single-instant timeline (e.g. one observation, no dose, off
-    // zero): keep a second identical break so the loop runs once and records
-    // observations at the first record from the initial (post-dose) state,
-    // rather than leaving them at NaN. Integration over the zero-length segment
-    // is a no-op.
-    if break_times.len() < 2 {
-        break_times.push(break_times[0]);
-    }
 
-    for k in 0..(break_times.len() - 1) {
+    // Walk every break as a left boundary — bound `0..len`, not the old `0..len-1`
+    // (#731) — so a dose / observation / CHZ landing on the final break is applied and
+    // read post-dose, matching the reactive driver (`ode_predictions_adaptive_impl`)
+    // and the per-event replay (`adaptive_frozen_replay_tv`). `break_times` always
+    // holds the integration start, so even a degenerate single-instant timeline is a
+    // 1-element vector the loop runs once (recording the record from the initial
+    // post-dose state, integration skipped by the `k + 1 < len` guard below). The
+    // timeline is deduped at 1e-15, so no two adjacent breaks are equal and no break is
+    // ever visited twice.
+    for k in 0..break_times.len() {
         let t_start = break_times[k];
-        let t_end = break_times[k + 1];
 
         // Apply dose effects at t_start in a single pass over the dose
         // list. Ordering inside the pass matters:
@@ -1607,41 +1607,50 @@ fn ode_predictions_with_extra_breaks_and_stats(
             }
         }
 
-        // Integrate the open interval `(t_start, t_end]` from the carried state,
-        // recording observations inside it and advancing `u` to `t_end`. The
-        // left-boundary discontinuities and the `t_start` observation were applied
-        // above; `integrate_segment` owns only the integration — the piece a
-        // reactive (state-dependent) driver reuses unchanged (#391 S1.2).
-        // #570: soft (TTE) times in the *half-open* interval `(t_start, t_end]`, read
-        // off the same integration (the closed `t_start` boundary was handled above).
-        // `chz_times` is sorted, so this slice is too.
-        let seg_chz: Vec<f64> = chz_times
-            .iter()
-            .copied()
-            .filter(|&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
-            .collect();
-        let soft = integrate_segment(
-            ode,
-            &mut u,
-            t_start,
-            t_end,
-            subject,
-            &dose_lagtimes,
-            &dose_f_bio,
-            &mut ext_params,
-            pk_params_flat,
-            theta,
-            eta,
-            &obs_map,
-            &mut predictions,
-            stats.as_deref_mut(),
-            &seg_chz,
-        );
-        // Place each soft sample at its global `chz_times` index (NaN slots left for
-        // any time no segment covered).
-        for (t, state) in seg_chz.iter().zip(soft) {
-            if let Ok(gi) = chz_times.binary_search_by(|x| x.partial_cmp(t).unwrap()) {
-                chz_states[gi] = state;
+        // Integrate the open interval `(t_start, t_end]` to the next break, if there is
+        // one, recording observations inside it and advancing `u` to `t_end`. The final
+        // break time has no successor: its left-boundary discontinuities and `t_start`
+        // observation were applied above, but there is nothing left to integrate.
+        // Visiting that final break as a left boundary — rather than stopping the loop
+        // one short of it (the old `0..len-1` bound, #731) — is what applies a dose
+        // landing at the maximum time and reads a coincident observation post-dose,
+        // matching the reactive driver (`ode_predictions_adaptive_impl`) and the
+        // per-event replay (`adaptive_frozen_replay_tv`), both of which walk every break.
+        // `integrate_segment` owns only the integration — the piece a reactive
+        // (state-dependent) driver reuses unchanged (#391 S1.2).
+        if k + 1 < break_times.len() {
+            let t_end = break_times[k + 1];
+            // #570: soft (TTE) times in the *half-open* interval `(t_start, t_end]`, read
+            // off the same integration (the closed `t_start` boundary was handled above).
+            // `chz_times` is sorted, so this slice is too.
+            let seg_chz: Vec<f64> = chz_times
+                .iter()
+                .copied()
+                .filter(|&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+                .collect();
+            let soft = integrate_segment(
+                ode,
+                &mut u,
+                t_start,
+                t_end,
+                subject,
+                &dose_lagtimes,
+                &dose_f_bio,
+                &mut ext_params,
+                pk_params_flat,
+                theta,
+                eta,
+                &obs_map,
+                &mut predictions,
+                stats.as_deref_mut(),
+                &seg_chz,
+            );
+            // Place each soft sample at its global `chz_times` index (NaN slots left for
+            // any time no segment covered).
+            for (t, state) in seg_chz.iter().zip(soft) {
+                if let Ok(gi) = chz_times.binary_search_by(|x| x.partial_cmp(t).unwrap()) {
+                    chz_states[gi] = state;
+                }
             }
         }
     }
@@ -3718,11 +3727,8 @@ pub fn ode_predictions_with_states(
 
     let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();
 
-    for w in break_times.windows(2) {
-        let (t_start, t_end) = (w[0], w[1]);
-        if (t_end - t_start).abs() < 1e-15 {
-            continue;
-        }
+    for k in 0..break_times.len() {
+        let t_start = break_times[k];
 
         // SS + lagtime: at the dose *record* time (strictly before the lagged pulse
         // arrives) seed the previous interval's steady-state tail, exactly mirroring
@@ -3783,6 +3789,17 @@ pub fn ode_predictions_with_states(
                 states[obs_idx] = u.clone();
             }
         }
+
+        // #731: integrate the open interval `(t_start, t_end]` to the next break, if
+        // there is one. The final break has no successor — its dose was applied and its
+        // observation read post-dose above, as a left boundary, with nothing left to
+        // integrate. Mirrors `ode_predictions`' `0..len` + `k + 1 < len` shape (and the
+        // matching fix in `ode_dense_solve_states`); this doc says any dose-event change
+        // in `ode_predictions` must be mirrored here.
+        if k + 1 >= break_times.len() {
+            continue;
+        }
+        let t_end = break_times[k + 1];
 
         let mut saveat: Vec<f64> = subject
             .obs_times
@@ -4293,6 +4310,40 @@ pub fn ode_dense_solve_states(
         }
     }
 
+    // #731: the `windows(2)` loop visits the final break `t_last` only as a segment
+    // *end*, so a dose landing exactly on it is never applied and a `saveat` there
+    // reads the pre-dose state — the same terminal-break bug fixed on the
+    // constant-parameter engine (`ode_predictions_and_chz`). Visit `t_last` once more
+    // as a left boundary (dose applied via the shared `apply_segment_boundary`, then
+    // the `saveat` re-read post-dose) so the two paths agree and #570's
+    // one-solve == two-solve equivalence holds at a dose-on-`t_last`. When no dose
+    // lands there this re-reads the identical carried `u`, so it stays byte-identical
+    // everywhere else. Guarded to a timeline the loop actually ran (`len >= 2`); a
+    // single-instant `saveat` keeps its prior behaviour.
+    if break_times.len() >= 2 {
+        let t_last_break = break_times[break_times.len() - 1];
+        let _ = apply_segment_boundary(
+            ode,
+            subject,
+            &dose_lagtimes,
+            &dose_f_bio,
+            &zo_windows,
+            pk_params_flat,
+            n,
+            &opts,
+            t_last_break,
+            t_last_break,
+            &mut u,
+            &mut active_infusions,
+            &mut ext_params,
+        );
+        if let Some(idxs) = saveat_map.get(&t_last_break.to_bits()) {
+            for &i in idxs {
+                result[i] = u.clone();
+            }
+        }
+    }
+
     // `theta` and `eta` are accepted for API symmetry with sibling ODE functions
     // (e.g. `ode_predictions_with_states`) but are not consumed here: this
     // function returns the raw ODE state vector `u` without applying any
@@ -4640,6 +4691,49 @@ mod tests {
                 assert_relative_eq!(st[j], chz_ref[i][j], max_relative = 1e-5);
             }
         }
+    }
+
+    /// #731 / #570 parity: a dose landing **exactly on the terminal CHZ time**
+    /// (`t_last`) must read post-dose on *both* the shared solve
+    /// (`ode_predictions_and_chz`) and the dedicated two-solve reference
+    /// (`ode_dense_solve_states`). The shared solve was fixed by #731 to visit the
+    /// final break as a left boundary; this pins that the dense reference now does
+    /// too, so the one-solve == two-solve equivalence holds at a dose-on-`t_last`.
+    /// Before the dense-side fix this read the pre-dose state (`≈9.07`), diverging
+    /// from the shared solve's post-dose `≈109.07` — the gap that broke #570.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn terminal_dose_on_chz_time_reads_post_dose_on_both_paths() {
+        let ode = one_cpt_chz_ode_spec();
+        // Boluses at t=0 and t=24; max obs = 6, so t_last = max(6, chz 24) = 24 — a
+        // dose lands exactly on the terminal break and the terminal CHZ time.
+        let subject = make_subject(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            vec![6.0],
+        );
+        let pk = pk_one(10.0, 100.0); // ke = CL/V = 0.1
+        let chz_times = vec![24.0];
+
+        let (_ipred, chz_states) =
+            ode_predictions_and_chz(&ode, &pk.values, &[], &[], &subject, &chz_times);
+        let chz_ref = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &chz_times);
+
+        // (1) The two paths agree at the dose-coincident terminal time — full state,
+        // PK compartment (slot 0) and CHZ accumulator (slot 1).
+        for j in 0..ode.n_states {
+            assert_relative_eq!(chz_states[0][j], chz_ref[0][j], max_relative = 1e-5);
+        }
+        // (2) And the read is genuinely post-dose: the t=0 bolus decayed 24 h plus the
+        // fresh 100 mg (≈109.07), not the pre-dose ≈9.07 the dropped-dose bug produced.
+        let ke = 0.1_f64;
+        assert_relative_eq!(
+            chz_states[0][0],
+            100.0 * (-ke * 24.0).exp() + 100.0,
+            max_relative = 1e-4
+        );
     }
 
     /// A threshold above the asymptotic cumulative hazard (`CHZ → 100`) is never
@@ -6508,6 +6602,56 @@ mod tests {
     }
 
     #[test]
+    fn ode_predictions_applies_a_dose_landing_on_the_last_observation() {
+        // #731: a bolus coinciding with the LAST observation time must be applied
+        // before that observation is read (post-dose) — exactly as every INTERIOR
+        // dose already is, and as the reactive driver and analytical engine do. The
+        // old `0..len-1` loop treated the final break as an integration endpoint
+        // only, so a terminal dose was silently dropped and the last obs read
+        // pre-dose. Pinned against the exact 1-cpt closed form.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0); // ke = CL/V = 0.1
+        let ke = 0.1_f64;
+        // Boluses at t=0 and t=24; the second lands exactly on the last obs (t=24).
+        let subject = make_subject(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            vec![6.0, 24.0],
+        );
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subject);
+        // t=6: only the t=0 dose has been given.
+        assert_relative_eq!(preds[0], 100.0 * (-ke * 6.0).exp(), max_relative = 1e-5);
+        // t=24: the first dose decayed 24 h PLUS the fresh post-dose 100 mg bolus.
+        // Before #731 this read the pre-dose 100·e^{-2.4} ≈ 9.07 (the dose dropped).
+        assert_relative_eq!(
+            preds[1],
+            100.0 * (-ke * 24.0).exp() + 100.0,
+            max_relative = 1e-5
+        );
+    }
+
+    #[test]
+    fn ode_predictions_single_instant_dose_and_obs_not_double_applied() {
+        // #731: a subject whose only records are a bolus and an observation at the
+        // SAME instant (t=0) has a 1-element `[t0]` timeline. The `0..len` loop runs it
+        // exactly once (k=0), applying the dose and reading the obs post-dose with no
+        // trailing integration (`k + 1 < len` is false) — so the dose is applied once
+        // (100), not twice (200). Guards against a regression that double-visits the
+        // sole break.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let subject = make_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![0.0],
+        );
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subject);
+        // Exactly one 100 mg bolus (readout is the compartment amount, ke·t = 0 at t=0).
+        assert_relative_eq!(preds[0], 100.0, max_relative = 1e-9);
+    }
+
+    #[test]
     fn adaptive_final_decision_at_max_time_still_fires() {
         // Regression: the last decision must fire even when it lands on the
         // schedule's maximum time (i.e. at or after the last observation). Here
@@ -6515,9 +6659,10 @@ mod tests {
         // is the maximum break time; it must still dose, reach the ledger, and
         // make the t=24 observation read the *post*-dose state.
         //
-        // Checked against the exact 1-cpt closed form (ke = CL/V = 0.1), not
-        // `ode_predictions`: the static engine likewise never applies a dose on
-        // its terminal break, so a static comparison would mask the bug.
+        // Checked against the exact 1-cpt closed form (ke = CL/V = 0.1). Since #731
+        // the constant-parameter `ode_predictions` engine also applies a dose on its
+        // terminal break, so a static comparison would no longer mask the bug; the
+        // closed form remains the tightest oracle and is kept.
         let ode = one_cpt_ode_spec();
         let pk = pk_one(1.0, 10.0); // ke = 0.1
         let decisions = [0.0, 24.0];
@@ -9393,6 +9538,39 @@ mod tests {
             states[0][0] > 0.0 && states[0][0].is_finite(),
             "compartment state is wrong after empty inter-dose segment: {}",
             states[0][0]
+        );
+    }
+
+    /// #731 regression: a dose landing exactly on the LAST observation must be applied
+    /// before that observation is read (post-dose) on the states path too — the doc on
+    /// `ode_predictions_with_states` requires it to mirror `ode_predictions`, and its
+    /// `windows(2)` loop used to treat the final break as an endpoint only, dropping a
+    /// terminal dose. Both the returned ipred and the compartment state must match the
+    /// (fixed) primary path, i.e. read the fresh post-dose bolus.
+    #[test]
+    fn ode_with_states_applies_dose_on_last_observation() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0); // ke = CL/V = 0.1
+        let ke = 0.1_f64;
+        let subj = make_subject(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0), // lands on the last obs
+            ],
+            vec![6.0, 24.0],
+        );
+        let (preds, states) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subj);
+        let preds_ref = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+        // ipred must match the fixed primary path at both observations.
+        for i in 0..2 {
+            assert_relative_eq!(preds[i], preds_ref[i], max_relative = 1e-6);
+        }
+        // And t=24 is genuinely post-dose: decayed t=0 bolus + fresh 100 mg (≈109.07),
+        // not the pre-dose ≈9.07 the dropped-dose bug produced. State[0] carries it.
+        assert_relative_eq!(
+            states[1][0],
+            100.0 * (-ke * 24.0).exp() + 100.0,
+            max_relative = 1e-5
         );
     }
 

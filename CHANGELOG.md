@@ -297,6 +297,22 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **A dose landing exactly on a subject's last observation is now applied before that
+  observation is read (post-dose) on the constant-parameter ODE engine, fixing a
+  false rejection by the adaptive frozen-replay verifier** (#731). The engine applied
+  doses only at each integration segment's left boundary and treated the timeline's
+  final break as an endpoint only, so a dose coinciding with the last observation was
+  dropped and that observation read the pre-dose state — disagreeing with the
+  analytical engine, the reactive adaptive driver, and NONMEM (all post-dose). This
+  surfaced as the default-on adaptive frozen-replay verifier rejecting a valid
+  constant-covariate run whose final dosing decision coincided with the last sample.
+  Interior breaks were already handled post-dose. The same terminal-break fix is
+  applied to the two sibling break-walking paths so a terminal dose is read post-dose
+  consistently everywhere: the dedicated dense state solve (`ode_dense_solve_states`),
+  keeping the joint PK-TTE hazard (#570) consistent between its shared one-solve and
+  two-solve paths when an event time coincides with a dose at the subject's last time
+  point; and the per-compartment states path (`ode_predictions_with_states`), so the
+  post-fit sdtab IPRED and compartment states agree with the fitted IPRED in that case.
 - **Adaptive/feedback dosing now runs the same dose-precondition guards as the
   static paths, instead of silently mis-delivering a dose** (#721). The reactive
   entry points (`simulate_adaptive()` / `simulate_adaptive_from_spec()`) skipped the
