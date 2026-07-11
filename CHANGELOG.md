@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Left truncation (delayed entry) for clock-reset RTTE** (#740): repeated
+  time-to-event models with `clock = reset` now accept a `TENTRY > 0` entry time
+  instead of rejecting it. The first inter-event sojourn is conditioned on survival
+  to entry in absolute time (`H(t₁) − H(TENTRY)`), then the renewal clock takes over
+  for later gaps — the same delayed-entry convention already used for single-event
+  and clock-forward RTTE, so `TENTRY` means one thing across every survival endpoint
+  (condition on survival past entry, never restart the clock at entry). Assumes the
+  time origin `t = 0` is the renewal origin of the first sojourn; coincides with the
+  pure renewal form (and with clock-forward) for a memoryless exponential hazard.
+  Simulation of left-truncated RTTE streams remains a separate follow-up.
 - **Analytic inverse-Gaussian (IG) absorption closed form** (#790): the Freijer &
   Post inverse-Gaussian absorption model is now available as the analytic
   structural models `pk one_cpt_ig(cl, v, mat, cv2)` and
@@ -303,6 +313,15 @@ section of the SDLC for the versioning policy).
   two-solve paths when an event time coincides with a dose at the subject's last time
   point; and the per-compartment states path (`ode_predictions_with_states`), so the
   post-fit sdtab IPRED and compartment states agree with the fitted IPRED in that case.
+- **Adaptive/feedback dosing now runs the same dose-precondition guards as the
+  static paths, instead of silently mis-delivering a dose** (#721). The reactive
+  entry points (`simulate_adaptive()` / `simulate_adaptive_from_spec()`) skipped the
+  modeled-`RATE` (#324), analytic-absorption closed-form, and built-in-absorption
+  (#588) checks that `simulate()` / `predict()` / `fit()` all run before integrating,
+  so a feedback-dosed model with malformed built-in-absorption pathway fractions or an
+  out-of-domain absorption parameter simulated with a silently wrong absorbed dose.
+  The guards now run at the adaptive chokepoint and fail with the same typed error
+  before any decision is taken.
 - **A twin-less transit / inverse-Gaussian absorption fit no longer silently
   degenerates a subject whose fitted random effects reach the flip-flop regime**
   (#785). An analytic `one_cpt_transit`/`two_cpt_transit` (or `one_cpt_ig`/

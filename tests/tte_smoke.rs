@@ -852,13 +852,64 @@ mod survival_smoke {
         );
     }
 
-    /// Left truncation (delayed entry, entry_time > 0) is not yet supported for clock-reset
-    /// RTTE: the first-gap conditioning convention (renewal clock from entry vs. clock from 0
-    /// conditioned on survival to entry) is unratified and unanchored, and the two differ for
-    /// a time-varying hazard. Fail loud rather than silently pick one; clock-forward supports
-    /// left truncation and is the documented route for such data.
+    /// The shared `entry_time > TIME` guard (`api::check_rtte_records`) is the sole remaining
+    /// loud gate for clock-reset left truncation now that `entry_time > 0` is *accepted* (#740):
+    /// an entry after the record's own event/censoring time drives `H(t₁) < H(entry)` and would
+    /// otherwise fold to the silent `1e20` sentinel (a poisoned fit). It must reject up front for
+    /// a RESET endpoint too — not only the clock-forward path — so a future refactor that
+    /// rescoped that guard cannot silently regress reset into sentinel poisoning. Companion to
+    /// the forward-clock `rtte_entry_time_after_time_is_rejected`.
     #[test]
-    fn rtte_reset_left_truncation_is_rejected() {
+    fn rtte_reset_entry_time_after_time_is_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+                hazard_covariates: Vec::new(),
+            },
+        );
+        let mut pop = rtte_pop();
+        // First record's entry (12.0) is after its event TIME (5.0), under clock=reset.
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 12.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("entry_time after TIME under clock=reset must be rejected");
+        assert!(
+            err.contains("entry_time") && err.contains("CMT=2"),
+            "error should flag the entry-after-time record on the reset endpoint, got: {err}"
+        );
+    }
+
+    /// Left truncation (delayed entry, entry_time > 0) IS supported for clock-reset RTTE
+    /// (#740, convention B): the first sojourn is conditioned on survival to `entry` in
+    /// absolute time (H(t₁) − H(entry)), matching single-event and clock-forward delayed
+    /// entry. The fit boundary must accept such data and produce a real objective rather than
+    /// reject it or fold to the 1e20 sentinel. (The closed-form conditioning is pinned in the
+    /// Tier-1 `rtte_reset_left_truncation_*` unit tests; this is the end-to-end boundary.)
+    #[test]
+    fn rtte_reset_left_truncation_fits() {
         use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
         let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
         let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
@@ -892,11 +943,15 @@ mod survival_smoke {
             },
         ];
         let opts = FitOptions::default();
-        let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("left-truncated clock=reset must be rejected");
+        let result = fit(&model, &pop, &model.default_params, &opts)
+            .expect("left-truncated clock=reset RTTE must fit, not error");
+        // A real objective, not the sentinel: a poisoned fit sums per-subject 1e20 to ~n·1e20
+        // (still finite), so `< 1e6` cleanly separates a genuine conditioned fit from one
+        // folded to the sentinel (cf. `rtte_clock_reset_hand_built_fits`).
         assert!(
-            err.contains("left-truncation") && err.contains("CMT=2"),
-            "error should flag the delayed entry, got: {err}"
+            result.ofv.is_finite() && result.ofv < 1e6,
+            "left-truncated clock-reset OFV must be a real objective (finite, < 1e6); got {}",
+            result.ofv
         );
     }
 

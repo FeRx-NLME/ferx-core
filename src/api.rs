@@ -1588,10 +1588,11 @@ pub(crate) fn check_absorption_closed_form_support(
 ///     renewal is a later slice.
 ///   * **tied event times** — two events at the same `TIME` give a zero gap `Δ = 0`, which
 ///     the gap-time hazard cannot represent (`h(0)` folds to the sentinel).
-///   * **left truncation (`entry_time > 0`)** — delayed entry is not yet supported for
-///     gap-time RTTE: the first-gap conditioning convention (renewal clock from entry vs.
-///     clock from 0 conditioned on survival to entry) is unratified and unanchored, and the
-///     two differ for a time-varying hazard. Clock-forward supports it via `H(entry)`.
+///
+/// Left truncation (`entry_time > 0`) is **accepted** for clock-reset (#740): the first
+/// sojourn is conditioned on survival to `entry` in absolute time (`H(t₁) − H(entry)`,
+/// convention B), identical to the single-event and clock-forward delayed-entry handling —
+/// see [`crate::survival::rtte_reset_nll_from_curves`].
 ///
 /// Returns `None` when there is no RTTE endpoint or every subject's rows are valid.
 #[cfg(feature = "survival")]
@@ -1707,24 +1708,12 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                             subject.id
                         ));
                     }
-                    // Left truncation (delayed entry, entry_time > 0) is not yet supported for
-                    // gap-time RTTE. The first gap's convention is unratified — renewal clock
-                    // restarts at entry (`Δ = time − entry`, H from 0) vs. clock from 0
-                    // conditioned on survival to entry (`H(t) − H(entry)`) — and the two differ
-                    // for a time-varying hazard (they coincide only for the memoryless
-                    // exponential). There is no NONMEM/survreg anchor for either, so fail loud
-                    // rather than silently pick one. Clock-forward *does* support left truncation
-                    // (it conditions via `H(entry)`), so route such data there or set TENTRY=0.
-                    if *entry_time > 0.0 {
-                        return Some(format!(
-                            "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has a \
-                             left-truncation entry_time={entry_time} > 0. Delayed entry is not \
-                             yet supported for gap-time RTTE (the first-gap conditioning \
-                             convention is unratified). Use clock=forward, which supports left \
-                             truncation, or set the entry time to 0.",
-                            subject.id
-                        ));
-                    }
+                    // Left truncation (delayed entry, entry_time > 0) IS supported for
+                    // clock-reset (#740): the first sojourn is conditioned on survival to
+                    // entry in absolute time (H(t₁) − H(entry), convention B), matching the
+                    // single-event and clock-forward delayed-entry handling. No guard here —
+                    // `rtte_reset_nll_from_curves` applies the conditioning. (An `entry > TIME`
+                    // is still rejected above, shared with clock-forward.)
                     if matches!(event_type, EventType::RightCensored) {
                         seen_censor = true;
                     }
@@ -8575,6 +8564,27 @@ where
     // time-varying covariates, resets, SDE) with a typed error — never a silent
     // wrong answer (#391). Both public entry points funnel through here.
     reject_unsupported_adaptive(model, population)?;
+
+    // #721: the reactive path skipped the shared dose-precondition guards that
+    // `simulate()` / `predict()` / `fit()` all run before integrating — modeled `RATE`
+    // (#324), analytic-absorption closed-form model/data compatibility, and built-in
+    // absorption input-rate pathway fractions / SS / infusion / domain (#588). Without
+    // them a feedback-dosed model with, e.g., malformed absorption fractions, an
+    // out-of-domain absorption parameter, or (once base regimens are supported, #702) a
+    // modeled `RATE` would silently mis-deliver the dose — the exact class #588 closed
+    // for the static paths. Surface them as a typed error (the `check_*` form `fit()`
+    // uses, and the form `reject_unsupported_adaptive` just above already uses) rather
+    // than the panic `simulate()` / `predict()` raise via `assert_*`: this
+    // `Result`-returning chokepoint — and its ferx-r FFI surface — then fails with one
+    // uniform, recoverable error contract instead of aborting the process.
+    // (`check_absorption_closed_form_support` is a no-op here — it returns `None` unless
+    // the model is an analytic absorption closed form, which this ODE-only path rejects
+    // up front — but is wired for parity and #702 base-regimen support.)
+    first_error(&check_modeled_dose_rates(model, population))?;
+    if let Some(msg) = check_absorption_closed_form_support(model, population) {
+        return Err(msg);
+    }
+    first_error(&check_absorption_dosing(model, population))?;
 
     // The occasion bookkeeping assumes a strictly-increasing decision schedule:
     // `occasion_of` (per-decision-window κ selection) scans ascending and stops at the
@@ -16594,6 +16604,70 @@ mod adaptive_sim_tests {
             err.to_lowercase().contains("auc_target")
                 && err.to_lowercase().contains("time-varying"),
             "error should cite auc_target + time-varying: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_rejects_malformed_absorption_fractions() {
+        // #721: `run_adaptive_population` now runs the same built-in-absorption
+        // dose-precondition guard (#588) that `simulate()` / `predict()` / `fit()`
+        // enforce. This parallel-first-order model's pathway fractions sum to 1.2
+        // (FR1 = FR2 = 0.6), not 1 — the input rate would deliver 1.2× the dose. The
+        // fraction check evaluates typical parameters (η = 0) with no dose, so it fires
+        // on the dose-free adaptive base at the chokepoint, before any decision — the
+        // same typed error the static paths raise, instead of a silent 1.2× run.
+        const SPEC: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  FR1 = TVFR1
+  FR2 = TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[adaptive_dosing]
+  observe = central
+  at = [0, 24, 48]
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 5 : increase 25%
+"#;
+        let parsed = parse_full_model(SPEC).expect("malformed-fraction model still parses");
+        let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing]");
+        let pop = population(vec![subj("1", vec![0.0, 24.0, 48.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        let err = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect_err("malformed absorption fractions must be rejected on the adaptive path");
+        assert!(
+            err.to_lowercase().contains("fraction"),
+            "expected an absorption-fraction error, got: {err}"
         );
     }
 
