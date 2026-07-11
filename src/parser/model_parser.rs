@@ -6752,17 +6752,22 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     }
     // Silent-divergence guard (#735): the ODE twin routes *any* individual parameter whose
     // lowercased name is a reserved slot name (`f` / `lagtime` / `alag`) into that F/lagtime
-    // slot (`ode_param_slots`), even one the closed form never treated as F/lag. The only
-    // params that may occupy those slots are the intended `f=` / `lagtime=` / `alag=`
-    // mappings. If any *other* declared parameter shadows a reserved name — a disposition
-    // role bound to such a param (`mtt=ALAG`), or a stray covariate/derived param literally
-    // named `f` — decline the twin: the model stays closed-form (matching the closed form,
-    // which never applied that param as F/lag) and, if it is also flip-flop, is rejected up
-    // front, rather than the twin silently applying an extra F/lagtime the closed form did not.
-    let intended: std::collections::HashSet<&str> = ["f", "lagtime", "alag"]
-        .iter()
-        .filter_map(|r| roles.get(*r).map(String::as_str))
-        .collect();
+    // slot (`ode_param_slots`), even one the closed form never treated as F/lag. A param name
+    // that lowercases to a reserved slot is allowed only when it IS the intended mapping for
+    // *that specific* slot: a param named `f` must be the `f=` mapping; a param named
+    // `lagtime`/`alag` must be the `lagtime=`/`alag=` mapping. Anything else declines the twin —
+    // a disposition role bound to such a param (`mtt=ALAG`), a stray covariate/derived param
+    // literally named `f`, OR a cross-role mapping whose param name routes to a *different*
+    // reserved slot than its role (`f=LAGTIME`: the `LAGTIME` param name-routes to the lagtime
+    // slot the closed form never used it for, so the twin would apply it as both F and lag).
+    // Declining keeps the model closed-form (matching the closed form, which never applied that
+    // param as the shadowed F/lag) and, if it is also flip-flop, rejected up front — rather than
+    // the twin silently applying an extra F/lagtime the closed form did not.
+    let f_param = roles.get("f").map(String::as_str);
+    let lag_param = roles
+        .get("lagtime")
+        .or_else(|| roles.get("alag"))
+        .map(String::as_str);
     if let Some(ip_lines) = extracted.unnamed.get("individual_parameters") {
         for line in ip_lines {
             let lhs = line
@@ -6770,11 +6775,15 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
                 .next()
                 .unwrap_or("")
                 .trim();
-            if !lhs.is_empty()
-                && lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && matches!(lhs.to_lowercase().as_str(), "f" | "lagtime" | "alag")
-                && !intended.contains(lhs)
-            {
+            if lhs.is_empty() || !lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            let shadows = match lhs.to_lowercase().as_str() {
+                "f" => f_param != Some(lhs),
+                "lagtime" | "alag" => lag_param != Some(lhs),
+                _ => false,
+            };
+            if shadows {
                 return None; // shadows a reserved F/lagtime slot — decline (see above).
             }
         }

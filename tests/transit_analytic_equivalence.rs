@@ -1389,6 +1389,27 @@ ALAG = TVMTT\n\n\
     );
 }
 
+/// #735 shadow guard, **cross-role** case: the `f=` mapping's param is *named* `LAGTIME`, so in
+/// the ODE twin it name-routes to the *lagtime* slot (`ode_param_slots`) — applying a lag the
+/// closed form never did — in addition to the `f = LAGTIME` alias. The intended-mapping
+/// exemption is per-slot, so this declines the twin too (it is not the `lagtime=` mapping).
+#[test]
+fn transit_cross_role_shadow_declines_twin() {
+    let src = "\
+[parameters]\n  theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVF(0.7, 0.01, 1.0)\n  \
+omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
+[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n  \
+LAGTIME = TVF\n\n\
+[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, f=LAGTIME)\n\n\
+[error_model]\n  DV ~ proportional(PROP)\n";
+    let model = parse_full_model(src).expect("parses").model;
+    assert!(
+        model.absorption_ode_equivalent.is_none(),
+        "an `f=` param named LAGTIME shadows the lagtime slot — the twin must be declined"
+    );
+}
+
 /// A twin-less `one_cpt_transit` whose typical parameters put `ke = CL/V` at or above the
 /// transit rate `KTR = (n+1)/mtt` — the flip-flop regime the closed form cannot serve, made
 /// twin-less by a user `[scaling]` block that declines the ODE-twin desugar (#776; the

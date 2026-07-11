@@ -12708,11 +12708,10 @@ mod simulate_with_uncertainty_tests {
     }
 
     // ── #785 / #786 flip-flop follow-up fixtures & tests ─────────────────────────
-    // A twin-*less* (a `lagtime=` mapping declines the ODE-twin desugar) transit /
-    // IG closed form whose *typical* parameters are IN-DOMAIN (`ke = CL/V` below the
-    // tilting abscissa) — so it passes the η=0 fit-start reject — but which a large
-    // positive `ETA_CL` drives into the flip-flop regime. ke0 = 0.5/4 = 0.125 < KTR =
-    // (3+1)/20 = 0.2.
+    // A twin-*less* transit / IG closed form whose *typical* parameters are IN-DOMAIN
+    // (`ke = CL/V` below the tilting abscissa) — so it passes the η=0 fit-start reject —
+    // but which a large positive `ETA_CL` drives into the flip-flop regime. ke0 = 0.5/4 =
+    // 0.125 < KTR = (3+1)/20 = 0.2.
     // Genuinely twin-less: a user `[scaling]` block declines the ODE-twin desugar. (A
     // `lagtime=`/`f=` mapping no longer declines it — those auto-route now, #735 — so a
     // `[scaling]` form is what keeps this the twin-less case the #785 EBE warning targets.)
