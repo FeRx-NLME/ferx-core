@@ -1029,28 +1029,53 @@ mod survival_smoke {
         );
     }
 
-    /// Left truncation (`entry_time > 0`) on an RTTE record is a deferred follow-up
-    /// (conditional first-gap sampling); simulation must reject it, not silently sample
-    /// the first gap from 0.
+    /// Left truncation (`entry_time > 0`) on an RTTE record IS supported for simulation
+    /// (#740): the stream is drawn conditioned on survival to entry (convention B for
+    /// clock-reset; the conditioning clock seeded at entry for clock-forward), not rejected.
+    /// Exercises the public boundary — the relaxed `validate_tte_simulatable` guard — and
+    /// asserts a valid stream whose observed events all land at or past the entry time.
+    /// (The Tier-1 `rtte_left_truncation_*` unit tests pin the draw distribution; this is the
+    /// end-to-end boundary, the simulate dual of `rtte_reset_left_truncation_fits`.)
     #[test]
-    fn rtte_simulate_left_truncation_is_rejected() {
-        use ferx_core::{simulate_with_options, SimulateOptions};
+    fn rtte_simulate_left_truncation_is_accepted() {
+        use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
         let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
         let mut pop = rtte_pop();
-        let ObsRecord::Event { entry_time, .. } = &mut pop.subjects[0].obs_records[0] else {
-            panic!("expected a TTE Event record");
-        };
-        *entry_time = 2.0;
+        let entry = 6.0_f64;
+        // Stamp the delayed entry on every RTTE row (a subject-level property).
+        for subject in &mut pop.subjects {
+            for r in &mut subject.obs_records {
+                if let ObsRecord::Event { entry_time, .. } = r {
+                    *entry_time = entry;
+                }
+            }
+        }
         let opts = SimulateOptions {
             seed: Some(1),
             match_method: None,
-            horizon: Some(30.0),
+            horizon: Some(60.0),
         };
-        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
-            .expect_err("RTTE simulation with left truncation must be rejected");
+        let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect("left-truncated RTTE simulation must now succeed (#740)");
+        let mut observed = 0usize;
+        for r in &sims {
+            if let SimOutcome::Event {
+                time,
+                observed: obs,
+            } = r.outcome
+            {
+                if obs {
+                    assert!(
+                        time >= entry,
+                        "a left-truncated simulated event must not precede entry {entry}: {time}"
+                    );
+                    observed += 1;
+                }
+            }
+        }
         assert!(
-            err.contains("left truncation"),
-            "error should flag left truncation, got: {err}"
+            observed > 0,
+            "left-truncated RTTE simulation should still fire events before the horizon"
         );
     }
 

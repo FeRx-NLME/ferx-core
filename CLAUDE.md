@@ -75,6 +75,20 @@ These run nightly via `slow-tests.yml` and on any push to `main` that touches es
 
 > **Exception — adaptive / feedback dosing simulations (epic #391) do not use NONMEM.** NONMEM has no native feedback dosing (a controller reading simulated state to choose the next dose), so there is no equivalent NONMEM run to anchor against. Validate these features instead with: (c) a **degenerate oracle** — a controller that re-emits a fixed regimen must equal `simulate()` on that regimen bit-for-bit; the **frozen-schedule replay verifier** — rebuild a static subject from the realized dose ledger and assert bit-equality with the static engine (the exact internal analogue of a NONMEM dose-bookkeeping anchor); and, for genuinely reactive behaviour, (b) reproduction of a published **mrgsolve** dynamic-dosing example (e.g. vancomycin AUC-target TDM, the platelet ladder). mrgsolve — not NONMEM — is the external comparator for this family, since it actually does feedback dosing. See issue #391's Validation section.
 
+> **Exception — survival-likelihood terms with no equivalent NONMEM/survreg estimator.** A few
+> recurrent-event objects have no standard tool to anchor against as a single object — e.g.
+> recurrent **left truncation** under gap-time (clock-reset) RTTE (#740), which NONMEM / survreg
+> / flexsurv have no native estimator for. Validate these instead with: (a) **exact closed
+> forms** — Tier-1 unit tests pinning the −log L (or the simulated stream) on hand-computed
+> values; (b) **reduction to an already-anchored term** — the delayed-entry first sojourn
+> `H(t₁) − H(entry)` *is* the single-event left-truncation contribution that single-event / clock-
+> forward TTE already validate against NONMEM, so no new formula is anchored from scratch; and,
+> for the simulate side, (c) a **round-trip / degenerate oracle** — `entry = 0` must be
+> bit-identical to the non-truncated draw, and a simulated left-truncated stream must refit under
+> the same convention it was drawn from. A committed external reference dataset (e.g. flexsurv) is
+> added when that tool is available in the environment; its absence does not block the closed-form
+> + reduction validation above.
+
 **Coverage is gated per PR.** A PR's changed lines must carry their own tests — the Codecov `patch` status enforces ≥90% coverage on the diff, and a 90% project floor is enforced on the weekly `main` run (see `codecov.yml`). This is the automated backstop to the rules above; slow-tests never run on PRs, so unit / Tier-2 tests are what register coverage. When excluding code from coverage, **scope `ignore`s by role, not by coverage %**: leave code out for *what it is* — dev-only tooling (e.g. `src/bin/generate_data.rs`), generated code (`build.rs`), or test scaffolding (`tests/`) — never because it reads red. (Feature-gated code that the coverage build doesn't compile reads as "missed" but is a measurement gap, not an ignore target — see #293.)
 
 ## Documentation

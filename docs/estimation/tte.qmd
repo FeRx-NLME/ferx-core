@@ -422,9 +422,15 @@ endpoint: `TENTRY` always means "condition on survival past entry", never "resta
 clock at entry" (the two would differ for a time-varying hazard, and only the former is a
 standard, anchorable left-truncation model). Reset left truncation assumes the time origin
 `t = 0` is the renewal origin of the first sojourn (the subject was event-free and at risk
-from 0); it coincides with clock-forward for a memoryless (exponential) hazard. Simulating
-a left-truncated RTTE stream is a separate follow-up — `simulate()` still requires
-`TENTRY = 0` for repeated events.
+from 0); it coincides with clock-forward for a memoryless (exponential) hazard.
+
+`simulate()` accepts left truncation for repeated events too (#740): the stream is drawn on
+the same time origin conditioned on survival to `TENTRY` — clock-forward seeds its
+conditioning clock at `TENTRY`, clock-reset draws its first sojourn conditional on survival to
+entry and renews from 0 thereafter — so a simulated left-truncated stream refits under the same
+convention it was drawn from. `TENTRY = 0` is byte-identical to the non-truncated draw. (The
+simulated event rows carry the drawn times; as with single-event TTE simulation, `TENTRY`
+itself is a property of the input design, not re-emitted onto the output rows.)
 
 ::: {.callout-warning}
 ## Prefer SAEM/IMP for RTTE
