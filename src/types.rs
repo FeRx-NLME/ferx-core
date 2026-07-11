@@ -2744,6 +2744,25 @@ pub enum TteRecurrence {
 }
 
 #[cfg(feature = "survival")]
+/// Link function for a categorical endpoint's linear predictor. Only `Logit`
+/// (log-odds) is implemented in Phase 4 slice 1; probit/cloglog are rejected at
+/// parse with a "not yet supported" error so the surface stays forward-compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkFn {
+    /// Logistic (log-odds) link: `p = 1 / (1 + exp(-lp))`.
+    Logit,
+}
+
+#[cfg(feature = "survival")]
+/// Closure computing a categorical endpoint's linear predictor `lp` from
+/// `(theta, eta, covariates)` — the log-odds for a `Binary` logit endpoint.
+/// Mirrors [`HazardParamFn`]: evaluated once per observation record with a
+/// *baseline* covariate snapshot (no time argument), so a time-varying covariate
+/// on the predictor would be silently frozen and is guarded at parse.
+pub type LinearPredictorFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
+
+#[cfg(feature = "survival")]
 /// Per-CMT endpoint likelihood specification.
 pub enum EndpointLikelihood {
     Gaussian(EndpointError),
@@ -2762,7 +2781,21 @@ pub enum EndpointLikelihood {
         /// by the whole-subject time-varying-covariate check instead.
         hazard_covariates: Vec<String>,
     },
-    // Binary, Ordinal, Poisson, NegBin, Ctmm, Dtmm deferred to Phase 4/5
+    /// Binary / Bernoulli endpoint — mixed-effects logistic regression (§3.5 of
+    /// `plans/categorical-endpoint-phase4.md`). `state ∈ {0,1}` is observed via
+    /// [`ObsRecord::DiscreteState`]; the data term is `−Σ[y·log p + (1−y)·log(1−p)]`
+    /// with `p = link⁻¹(lp)`.
+    Binary {
+        link: LinkFn,
+        /// Linear predictor `lp` (log-odds) as a function of (theta, eta, covariates).
+        lp_fn: LinearPredictorFn,
+        /// Covariate names referenced by the linear predictor. Evaluated at a
+        /// baseline snapshot (the [`LinearPredictorFn`] takes no time argument), so a
+        /// time-varying covariate here is rejected at parse — the categorical analogue
+        /// of [`Self::Tte`]'s `hazard_covariates` (#741).
+        lp_covariates: Vec<String>,
+    },
+    // Ordinal, Poisson, NegBin, Ctmm, Dtmm deferred to Phase 4/5
 }
 
 #[cfg(feature = "survival")]
@@ -2775,6 +2808,7 @@ impl std::fmt::Debug for EndpointLikelihood {
             } => {
                 write!(f, "Tte({hazard:?}, {recurrence:?})")
             }
+            EndpointLikelihood::Binary { link, .. } => write!(f, "Binary({link:?})"),
         }
     }
 }
@@ -3307,10 +3341,57 @@ impl CompiledModel {
         })
     }
 
+    /// True if any endpoint is a [`Binary`](EndpointLikelihood::Binary) (logistic)
+    /// endpoint — Phase 4 categorical, Track C (#760).
+    #[cfg(feature = "survival")]
+    pub fn has_binary(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|e| matches!(e, EndpointLikelihood::Binary { .. }))
+    }
+
+    /// CMTs routed to a `Binary` endpoint, sorted ascending. The datareader routes
+    /// these rows to [`ObsRecord::DiscreteState`] via `ObsRouting.discrete`.
+    #[cfg(feature = "survival")]
+    pub fn binary_cmts(&self) -> Vec<usize> {
+        let mut c: Vec<usize> = self
+            .endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| matches!(ep, EndpointLikelihood::Binary { .. }).then_some(*cmt))
+            .collect();
+        c.sort_unstable();
+        c
+    }
+
+    /// True if the model carries **any non-Gaussian endpoint** (TTE/RTTE or the
+    /// Phase-4 categorical/count families). This is the predicate the estimation
+    /// machinery gates on when choosing the **FD-Hessian Laplace** inner/outer path
+    /// and disabling the analytic outer gradient — those choices are correct for every
+    /// non-Gaussian data term, not TTE specifically. Equals [`has_tte`](Self::has_tte)
+    /// exactly when no categorical endpoint is present, so existing TTE behaviour is
+    /// unchanged.
+    #[cfg(feature = "survival")]
+    pub fn has_non_gaussian(&self) -> bool {
+        self.has_tte() || self.has_binary()
+    }
+
     /// Always false without the `survival` feature - TTE endpoints can't be
     /// parsed, so no model can carry one.
     #[cfg(not(feature = "survival"))]
     pub fn has_tte(&self) -> bool {
+        false
+    }
+
+    /// Always false without the `survival` feature - no non-Gaussian endpoint
+    /// (TTE or categorical) can be parsed.
+    #[cfg(not(feature = "survival"))]
+    pub fn has_non_gaussian(&self) -> bool {
+        false
+    }
+
+    /// Always false without the `survival` feature - `[binary_model]` can't be parsed.
+    #[cfg(not(feature = "survival"))]
+    pub fn has_binary(&self) -> bool {
         false
     }
 

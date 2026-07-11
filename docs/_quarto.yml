@@ -77,6 +77,7 @@ website:
           - model-file/simulation.qmd
           - model-file/adaptive-dosing.qmd
           - model-file/event-model.qmd
+          - model-file/categorical.qmd
       - text: "Estimation Methods"
         href: estimation/index.qmd
         contents:
@@ -90,6 +91,7 @@ website:
           - estimation/bayes.qmd
           - estimation/optimizers.qmd
           - estimation/tte.qmd
+          - estimation/categorical.qmd
       - text: "Data Format"
         href: data-format.qmd
       - text: "CLI Reference"

@@ -864,7 +864,18 @@ pub fn read_population_for(
     #[cfg(not(feature = "survival"))]
     let tte_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    if tte_cmts.is_empty() {
+    // Binary/categorical (#760) CMTs route to `ObsRecord::DiscreteState` (integer DV),
+    // like TTE rows route to `ObsRecord::Event` — both need the non-Gaussian reader path.
+    #[cfg(feature = "survival")]
+    let binary_cmts: std::collections::HashSet<usize> = model
+        .endpoints
+        .iter()
+        .filter_map(|(&cmt, ep)| matches!(ep, EndpointLikelihood::Binary { .. }).then_some(cmt))
+        .collect();
+    #[cfg(not(feature = "survival"))]
+    let binary_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    if tte_cmts.is_empty() && binary_cmts.is_empty() {
         // Gaussian-only model: use the existing (faster) path without TTE overhead.
         match (covariate_decls, filter) {
             (Some(decls), Some(sel)) => {
@@ -922,6 +933,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
+                    &binary_cmts,
                     column_map,
                 )?;
                 Ok((pop, Some(table)))
@@ -933,6 +945,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
+                    &binary_cmts,
                     column_map,
                 )?;
                 Ok((pop, None))
@@ -2975,6 +2988,16 @@ pub fn fit(
     #[cfg(feature = "survival")]
     if let Some(e) = check_survival_tv_covariates(model, population) {
         return Err(e);
+    }
+    // Binary/categorical (#760): reject an observed state outside {0,1} up front. The
+    // datareader accepts any non-negative integer DV on a discrete CMT (it can't tell
+    // binary from ordinal), so the Bernoulli endpoint must reject `state ≥ 2` itself —
+    // fail-loud rather than silently score a non-binary code.
+    #[cfg(feature = "survival")]
+    for cmt in model.binary_cmts() {
+        for subject in &population.subjects {
+            crate::categorical::validate_binary_states(cmt, &subject.obs_records)?;
+        }
     }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
     // enforces these for `.ferx` models, but a Rust caller could otherwise set

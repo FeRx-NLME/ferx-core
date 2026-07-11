@@ -366,11 +366,14 @@ pub(crate) struct ObsRouting {
 }
 
 impl ObsRouting {
-    /// TTE-only routing (the pre-Phase-4.0 behaviour): every CMT in `tte_cmts`
-    /// routes to `ObsRecord::Event`; nothing routes to discrete/count.
-    pub(crate) fn tte_only(tte_cmts: &HashSet<usize>) -> Self {
+    /// Routing for a model with TTE and/or binary/categorical endpoints: `tte` →
+    /// `ObsRecord::Event`, `discrete` → `ObsRecord::DiscreteState` (binary/categorical,
+    /// #760). Count endpoints are not produced yet, so that set stays empty. Pass an
+    /// empty `discrete` set for the pre-Phase-4.0 TTE-only behaviour.
+    pub(crate) fn tte_and_discrete(tte: &HashSet<usize>, discrete: &HashSet<usize>) -> Self {
         Self {
-            tte: tte_cmts.clone(),
+            tte: tte.clone(),
+            discrete: discrete.clone(),
             ..Default::default()
         }
     }
@@ -519,6 +522,7 @@ pub(crate) fn read_nonmem_csv_filtered_tte(
     iov_column: Option<&str>,
     filter: Option<&SelectionFilter>,
     tte_cmts: &HashSet<usize>,
+    discrete_cmts: &HashSet<usize>,
     column_map: &[(String, String)],
 ) -> Result<Population, String> {
     let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
@@ -541,7 +545,7 @@ pub(crate) fn read_nonmem_csv_filtered_tte(
         iov_column,
         None,
         filter,
-        &ObsRouting::tte_only(tte_cmts),
+        &ObsRouting::tte_and_discrete(tte_cmts, discrete_cmts),
         column_map,
     )
     .map(|(pop, _)| pop)
@@ -556,6 +560,7 @@ pub(crate) fn read_nonmem_csv_with_covariates_tte(
     iov_column: Option<&str>,
     filter: Option<&SelectionFilter>,
     tte_cmts: &HashSet<usize>,
+    discrete_cmts: &HashSet<usize>,
     column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
     let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
@@ -578,7 +583,7 @@ pub(crate) fn read_nonmem_csv_with_covariates_tte(
         iov_column,
         Some(decls),
         filter,
-        &ObsRouting::tte_only(tte_cmts),
+        &ObsRouting::tte_and_discrete(tte_cmts, discrete_cmts),
         column_map,
     )?;
     Ok((
@@ -2970,7 +2975,16 @@ mod tests {
         let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n\
                    1,100,1,0,0,.,1,90\n";
         let f = write_csv(csv);
-        let pop = read_nonmem_csv_filtered_tte(f.path(), None, None, None, &tte_cmts, &[]).unwrap();
+        let pop = read_nonmem_csv_filtered_tte(
+            f.path(),
+            None,
+            None,
+            None,
+            &tte_cmts,
+            &HashSet::new(),
+            &[],
+        )
+        .unwrap();
         let recs = &pop.subjects[0].obs_records;
         assert_eq!(recs.len(), 1);
         let ObsRecord::Event {
@@ -4083,9 +4097,16 @@ mod tests {
         // branch; the filter then drops STUDY==2 (subject 2).
         let cols: &[&str] = &["WT"];
         let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[]).unwrap();
-        let pop =
-            read_nonmem_csv_filtered_tte(f.path(), Some(cols), None, Some(&filter), &no_tte, &[])
-                .unwrap();
+        let pop = read_nonmem_csv_filtered_tte(
+            f.path(),
+            Some(cols),
+            None,
+            Some(&filter),
+            &no_tte,
+            &HashSet::new(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             pop.subjects
                 .iter()
@@ -4114,6 +4135,7 @@ mod tests {
             None,
             Some(&drop_age40),
             &no_tte,
+            &HashSet::new(),
             &[],
         )
         .unwrap();

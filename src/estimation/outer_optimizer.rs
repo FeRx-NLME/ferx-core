@@ -773,16 +773,21 @@ fn resolve_scaling(ps: ParameterScaling, opt: Optimizer) -> ParameterScaling {
 /// Resolve the derivative-free `bobyqa` outer optimizer's `ftol_rel` stop tolerance.
 ///
 /// `override_ftol` (`[fit_options] outer_ftol`) wins when set. Otherwise auto-select:
-/// `1e-8` for a **pure-TTE** model — its hazard objective is evaluated *exactly*, so
-/// the looser historical `1e-6` stopped BOBYQA short of the optimum on the near-flat
-/// frailty-ω² ridge (#469: a Weibull shape-frailty read 0.204 vs the NONMEM/nlmixr2
-/// 0.175 consensus; `1e-8` lands 0.176) — and `1e-6` for everything else. The non-TTE
-/// floor is deliberate: on a **noisy** objective (ODE solver error, or an FD-inner
-/// FOCE model such as LTBS) `1e-8` is unreachable, so BOBYQA would grind toward its
-/// maxeval budget instead of converging (≈3× the evaluations on an ODE fit). A TTE
-/// endpoint carried on an ODE disposition (`is_ode` true) therefore keeps `1e-6`.
-fn resolve_outer_ftol(has_tte: bool, is_ode: bool, override_ftol: Option<f64>) -> f64 {
-    override_ftol.unwrap_or(if has_tte && !is_ode { 1e-8 } else { 1e-6 })
+/// `1e-8` for a **pure non-Gaussian** model (TTE or the Phase-4 categorical family,
+/// #760) — its data objective is evaluated *exactly*, so the looser historical `1e-6`
+/// stopped BOBYQA short of the optimum on the near-flat frailty/random-effect-ω² ridge
+/// (#469: a Weibull shape-frailty read 0.204 vs the NONMEM/nlmixr2 0.175 consensus;
+/// `1e-8` lands 0.176) — and `1e-6` for everything else. The floor is deliberate: on a
+/// **noisy** objective (ODE solver error, or an FD-inner FOCE model such as LTBS) `1e-8`
+/// is unreachable, so BOBYQA would grind toward its maxeval budget instead of converging
+/// (≈3× the evaluations on an ODE fit). A non-Gaussian endpoint carried on an ODE
+/// disposition (`is_ode` true) therefore keeps `1e-6`.
+fn resolve_outer_ftol(is_non_gaussian: bool, is_ode: bool, override_ftol: Option<f64>) -> f64 {
+    override_ftol.unwrap_or(if is_non_gaussian && !is_ode {
+        1e-8
+    } else {
+        1e-6
+    })
 }
 
 fn optimize_nlopt(
@@ -1189,8 +1194,12 @@ fn optimize_nlopt(
         // is plenty tight for NLME work.
         opt.set_xtol_rel(options.outer_xtol).unwrap();
         // ftol_rel is the objective-change stop; see `resolve_outer_ftol` for the
-        // `None` auto-selection (1e-8 pure-TTE, 1e-6 otherwise) and #469 rationale.
-        let ftol = resolve_outer_ftol(model.has_tte(), model.is_ode_based(), options.outer_ftol);
+        // `None` auto-selection (1e-8 pure non-Gaussian, 1e-6 otherwise) and #469 rationale.
+        let ftol = resolve_outer_ftol(
+            model.has_non_gaussian(),
+            model.is_ode_based(),
+            options.outer_ftol,
+        );
         opt.set_ftol_rel(ftol).unwrap();
         // NLopt's default rhobeg is 25% of the bound-width — huge in our
         // log-space packing (theta bounds can span 40+ log units), so the

@@ -1,0 +1,58 @@
+---
+title: "Categorical endpoints (binary / logistic)"
+---
+
+A [`[binary_model]`](../model-file/categorical.qmd) endpoint is fit with the same
+generalized negative-log-likelihood machinery as time-to-event: the per-subject data
+term is the Bernoulli `−log L`, and the population parameters are optimized with the
+appropriate marginal likelihood.
+
+## Estimation method
+
+| Method | Binary | Notes |
+|--------|:------:|-------|
+| **FOCEI** (Laplace) | ✓ | Default. A finite-difference Hessian of the data term w.r.t. η plus the `½ log\|H̃\|` correction (the logit likelihood has no closed-form analytic η-Hessian, so the inner gradient and outer Laplace are FD, as for TTE). |
+| **SAEM** | ✓ | Preferred for sparse binary data — no Laplace approximation. |
+| **IMP** (importance sampling) | ✓ | Unbiased marginal likelihood; use a larger `isample` for non-Gaussian endpoints. |
+| **FOCE** (no interaction) | — | Drops the log-det correction and is biased for a non-Gaussian data term; use `focei`. |
+| Pure Gauss–Newton | — | The `J'R⁻¹J` structure is Gaussian-specific; use FOCEI or SAEM. |
+
+The **fixed-effects** (`n_eta = 0`) case has no inner loop — the objective reduces to
+the plain Bernoulli likelihood `Σ_j −log L_j`, and the outer optimizer fits `θ` by
+direct maximum likelihood. This is ordinary logistic regression.
+
+## Objective function
+
+ferx reports the OFV on the **`−2 log L` (deviance) scale**, matching NONMEM. For a
+fixed-effects logistic fit this equals the residual deviance reported by R `glm`.
+
+## Validation — exact agreement with R `glm`
+
+A fixed-effects logistic fit *is* ordinary logistic regression, so it can be checked
+**exactly** against base-R `glm(DV ~ …, family = binomial)` — a license-free,
+deterministic reference. Using the committed dataset `data/binary_logistic.csv`
+(60 subjects × 3 times; data-generating `TH0 = −0.4`, `THX = 0.9`, `THT = 0.5`) with
+`examples/binary_logistic.ferx`:
+
+| Parameter | ferx | R `glm` | Δ |
+|-----------|-----:|--------:|--:|
+| `TH0` (intercept) | −0.774849 | −0.775172 | 0.0003 |
+| `THX` (× `X`)     |  0.870901 |  0.870140 | 0.0008 |
+| `THT` (× `TIME`)  |  0.826837 |  0.827029 | 0.0002 |
+| **OFV / deviance** | **213.5955** | **213.5955** | 2 × 10⁻⁵ |
+
+The OFV equals the glm deviance (`−2 log L`) to five decimals — this pins the
+Bernoulli likelihood constant *and* form; the θ estimates match the glm MLE to the
+derivative-free optimizer tolerance. NONMEM's `F_FLAG = 1` logistic reproduces the
+same glm fit, so `glm` is used here as the canonical exact reference. The comparison
+is guarded by the Tier-3 test `tests/categorical_convergence.rs`, and the
+simulate → fit recovery (SSE) guard is added with the categorical simulation slice.
+
+## Reference R session
+
+```r
+d   <- read.csv("data/binary_logistic.csv")
+fit <- glm(DV ~ X + TIME, family = binomial, data = d)
+coef(fit)      # (Intercept) -0.775172   X 0.870140   TIME 0.827029
+fit$deviance   # 213.5955
+```
