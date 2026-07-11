@@ -1410,6 +1410,70 @@ LAGTIME = TVF\n\n\
     );
 }
 
+/// #735 collision guard (regression): a `f=` value that is an individual parameter whose *name*
+/// routes to an already-taken *disposition* slot (`f=V1`, where `V1` name-routes to the V slot
+/// held by `v=V`) is not a reserved-name shadow, so the shadow guard passes it — but the
+/// generated twin's `ode_param_slots` rejects the duplicate V slot. Before the collision guard
+/// the twin was built (`is_some`) and `predict`/`fit`/`simulate` PANICKED in
+/// `get_or_build().expect(...)`. It must now decline the twin (`is_none`).
+#[test]
+fn transit_flipflop_f_param_named_disposition_slot_declines_twin() {
+    // Flip-flop: ke = CL/V = 2.0/4.0 = 0.5 ≥ KTR = (3+1)/20 = 0.2.
+    let src = "\
+[parameters]\n  theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVF(0.7, 0.01, 1.0)\n  \
+omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
+[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n  \
+V1 = TVF\n\n\
+[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, f=V1)\n\n\
+[error_model]\n  DV ~ proportional(PROP)\n";
+    let model = parse_full_model(src).expect("parses").model;
+    assert!(
+        model.absorption_ode_equivalent.is_none(),
+        "an `f=` param named `V1` collides with the twin's V disposition slot — the twin must be \
+         declined (not built into a source that panics in ode_param_slots)"
+    );
+}
+
+/// #735 collision guard: the declined-twin flip-flop `f=V1` model reaches the *clean* twin-less
+/// flip-flop rejection (`predict()` panics with "flip-flop regime"), NOT the internal
+/// "same PK slot" build panic it hit before the guard.
+#[test]
+#[should_panic(expected = "flip-flop regime")]
+fn transit_flipflop_f_param_named_disposition_slot_predict_panics_cleanly() {
+    let src = "\
+[parameters]\n  theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVF(0.7, 0.01, 1.0)\n  \
+omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
+[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n  \
+V1 = TVF\n\n\
+[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, f=V1)\n\n\
+[error_model]\n  DV ~ proportional(PROP)\n";
+    let model = parse_full_model(src).expect("parses").model;
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
+    let _ = predict(&model, &pop, &model.default_params);
+}
+
+/// #735 shadow guard, **stray reserved-name** case (exercises the `f` arm's decline branch): an
+/// individual parameter literally named `F` bound to a *disposition* role (`n=F`, not the `f=`
+/// mapping) would name-route to the F/bioavailability slot in the ODE twin — applying an F the
+/// closed form (which reads it as the transit count) never did. The guard declines the twin.
+#[test]
+fn transit_stray_f_named_param_declines_twin() {
+    let src = "\
+[parameters]\n  theta TVCL(2.0, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  \
+omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
+[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  F = TVNTR\n  MTT = TVMTT\n\n\
+[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=F, mtt=MTT)\n\n\
+[error_model]\n  DV ~ proportional(PROP)\n";
+    let model = parse_full_model(src).expect("parses").model;
+    assert!(
+        model.absorption_ode_equivalent.is_none(),
+        "a param literally named `F` bound to the n= role must decline the twin (shadow guard `f` arm)"
+    );
+}
+
 /// A twin-less `one_cpt_transit` whose typical parameters put `ke = CL/V` at or above the
 /// transit rate `KTR = (n+1)/mtt` — the flip-flop regime the closed form cannot serve, made
 /// twin-less by a user `[scaling]` block that declines the ODE-twin desugar (#776; the

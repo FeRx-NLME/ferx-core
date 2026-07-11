@@ -6637,6 +6637,16 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
     Ok(())
 }
 
+/// The reserved F / lagtime PK slot a parameter or `pk(...)` role name routes to in the ODE
+/// twin — `Some(PK_IDX_F)` / `Some(PK_IDX_LAGTIME)` — or `None` if it routes to a disposition /
+/// structural slot. Derived from the real routing (`PkParams::name_to_index` filtered by
+/// `RESERVED_PK_SLOTS`) so the twin-builder's F/lagtime allowlist, alias emission, and
+/// shadow guard can never drift from `ode_param_slots`. #735.
+fn reserved_flag_slot(name: &str) -> Option<usize> {
+    crate::types::PkParams::name_to_index(&name.to_lowercase())
+        .filter(|s| crate::types::RESERVED_PK_SLOTS.contains(s))
+}
+
 /// For a closed-form `pk one_cpt_transit(cl, v, n, mtt)` / `pk one_cpt_ig(cl, v, mat, cv2)`
 /// model (and the 2-cpt forms), build the full `.ferx` source of its exact ODE equivalent
 /// (`transit()` / `igd()` forcing) — otherwise `None`.
@@ -6656,9 +6666,12 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
 /// The equivalent shares the model's `[parameters]`/`[individual_parameters]`/… blocks
 /// verbatim and swaps only the disposition, so its θ/η layout matches the closed-form model
 /// exactly (the dispatch can hand it the same parameter vector). Scoped to the plain
-/// `one_cpt_transit(cl,v,n,mtt)` / `one_cpt_ig(cl,v,mat,cv2)` (and 2-cpt) forms with no
-/// `lagtime=`/`f=` mapping and no user `[odes]`/`[scaling]` block; anything else returns
-/// `None` (and stays closed-form, still rejected up front for the features it cannot serve).
+/// `one_cpt_transit(cl,v,n,mtt)` / `one_cpt_ig(cl,v,mat,cv2)` (and 2-cpt) forms, optionally
+/// with a `lagtime=`/`f=` (`alag=`) mapping carried into the twin as a reserved-name alias
+/// (#735), and with no user `[odes]`/`[scaling]`/`[initial_conditions]` block. Anything else —
+/// an unknown role, a parameter name that shadows or collides with a reserved F/lagtime slot,
+/// or a user disposition block — returns `None` (and stays closed-form, still rejected up front
+/// for the features it cannot serve).
 fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<String> {
     // Match a plain closed-form transit or IG disposition — 1-cpt `cl/v/<abs>` or 2-cpt
     // `cl/v1/q/v2/<abs>`, where `<abs>` is `n/mtt` (transit) or `mat/cv2` (IG). Any other
@@ -6726,10 +6739,11 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     };
     // #735: absorption `f=` / `lagtime=` (`alag=`) are now carried into the twin (alias
     // emission below); any *other* unrecognised role stays outside the plain-form scope.
-    const ABS_ATTRS: &[&str] = &["f", "lagtime", "alag"];
+    // `reserved_flag_slot` recognises exactly the role names that route to the F/lagtime slots
+    // (derived from the real routing, so this can never drift from `ode_param_slots`).
     if roles
         .keys()
-        .any(|k| !disposition.contains(&k.as_str()) && !ABS_ATTRS.contains(&k.as_str()))
+        .any(|k| !disposition.contains(&k.as_str()) && reserved_flag_slot(k).is_none())
     {
         return None; // an unknown mapping — outside the plain-form scope.
     }
@@ -6737,56 +6751,82 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // / `alag` (`ode_param_slots`), whereas the closed form binds them via this pk() role
     // map under arbitrary names. Bridge with reserved-name alias lines — but only when the
     // mapped parameter does not already self-route (a param literally named `F` / `LAGTIME`
-    // / `ALAG` lowercases to the canonical slot name, so an alias would double-bind it and
+    // / `ALAG` routes to the canonical slot already, so an alias would double-bind it and
     // `ode_param_slots` would reject). #735.
     let mut alias_lines: Vec<String> = Vec::new();
+    let mut alias_names: Vec<&str> = Vec::new();
     if let Some(fp) = roles.get("f") {
-        if fp.to_lowercase() != "f" {
+        if reserved_flag_slot(fp) != Some(crate::types::PK_IDX_F) {
             alias_lines.push(format!("  f = {fp}"));
+            alias_names.push("f");
         }
     }
     if let Some(lp) = roles.get("lagtime").or_else(|| roles.get("alag")) {
-        if !matches!(lp.to_lowercase().as_str(), "lagtime" | "alag") {
+        if reserved_flag_slot(lp) != Some(crate::types::PK_IDX_LAGTIME) {
             alias_lines.push(format!("  lagtime = {lp}"));
+            alias_names.push("lagtime");
         }
     }
     // Silent-divergence guard (#735): the ODE twin routes *any* individual parameter whose
-    // lowercased name is a reserved slot name (`f` / `lagtime` / `alag`) into that F/lagtime
-    // slot (`ode_param_slots`), even one the closed form never treated as F/lag. A param name
-    // that lowercases to a reserved slot is allowed only when it IS the intended mapping for
-    // *that specific* slot: a param named `f` must be the `f=` mapping; a param named
-    // `lagtime`/`alag` must be the `lagtime=`/`alag=` mapping. Anything else declines the twin —
-    // a disposition role bound to such a param (`mtt=ALAG`), a stray covariate/derived param
-    // literally named `f`, OR a cross-role mapping whose param name routes to a *different*
-    // reserved slot than its role (`f=LAGTIME`: the `LAGTIME` param name-routes to the lagtime
-    // slot the closed form never used it for, so the twin would apply it as both F and lag).
-    // Declining keeps the model closed-form (matching the closed form, which never applied that
-    // param as the shadowed F/lag) and, if it is also flip-flop, rejected up front — rather than
-    // the twin silently applying an extra F/lagtime the closed form did not.
+    // name routes to a reserved slot (`f` / `lagtime` / `alag`) into that F/lagtime slot
+    // (`ode_param_slots`), even one the closed form never treated as F/lag. A param whose name
+    // routes to a reserved slot is allowed only when it IS the intended mapping for *that
+    // specific* slot: a param named `f` must be the `f=` mapping; a param named `lagtime`/`alag`
+    // must be the `lagtime=`/`alag=` mapping. Anything else declines the twin — a disposition
+    // role bound to such a param (`mtt=ALAG`), a stray covariate/derived param literally named
+    // `f`, OR a cross-role mapping whose param name routes to a *different* reserved slot than
+    // its role (`f=LAGTIME`: the `LAGTIME` param name-routes to the lagtime slot the closed form
+    // never used it for, so the twin would apply it as both F and lag). Declining keeps the model
+    // closed-form (matching the closed form, which never applied that param as the shadowed
+    // F/lag) and, if it is also flip-flop, rejected up front — rather than the twin silently
+    // applying an extra F/lagtime the closed form did not.
+    //
+    // The same pass records the twin's individual-parameter names for the collision guard below.
     let f_param = roles.get("f").map(String::as_str);
     let lag_param = roles
         .get("lagtime")
         .or_else(|| roles.get("alag"))
         .map(String::as_str);
+    let mut twin_param_names: Vec<String> = Vec::new();
     if let Some(ip_lines) = extracted.unnamed.get("individual_parameters") {
         for line in ip_lines {
-            let lhs = line
-                .split(|c| c == '=' || c == '#')
-                .next()
-                .unwrap_or("")
-                .trim();
+            // `extract_blocks` has already stripped `#`/`//` comments, so the LHS is the text
+            // before the first `=`; the alphanumeric check skips `if`/`else`/brace lines.
+            let lhs = line.split('=').next().unwrap_or("").trim();
             if lhs.is_empty() || !lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 continue;
             }
-            let shadows = match lhs.to_lowercase().as_str() {
-                "f" => f_param != Some(lhs),
-                "lagtime" | "alag" => lag_param != Some(lhs),
-                _ => false,
+            let shadows = match reserved_flag_slot(lhs) {
+                Some(slot) if slot == crate::types::PK_IDX_F => f_param != Some(lhs),
+                Some(_) => lag_param != Some(lhs), // PK_IDX_LAGTIME
+                None => false,
             };
             if shadows {
                 return None; // shadows a reserved F/lagtime slot — decline (see above).
             }
+            twin_param_names.push(lhs.to_string());
         }
+    }
+    // Collision guard (#735): a `f=`/`lagtime=` value that is an individual parameter whose
+    // *name* routes to an already-taken *disposition* slot (e.g. `f=V1`, where `V1` name-routes
+    // to the V slot held by `v=V`) is not a reserved-name shadow, so it passes the guard above —
+    // but the generated twin's `ode_param_slots` would reject it as two parameters mapping to one
+    // slot, which `AbsorptionOdeEquivalent::get_or_build` surfaces as a *panic*. The closed form
+    // binds F/lagtime by role, so the collision is harmless there. Dry-run the real slot
+    // assignment on the twin's projected parameter names. This list is a superset of the twin's
+    // real (filtered) parameter set, so it catches every real collision — at worst it declines an
+    // *unused* colliding name the real twin would not hit, which is harmless (the model stays
+    // closed-form). If it fails, decline the twin so the model stays closed-form — and, if
+    // flip-flop, is rejected up front with a clean error rather than panicking at eval time.
+    twin_param_names.extend(alias_names.iter().map(|s| s.to_string()));
+    // A parameter assigned in several `if`/`else` branches appears once in the twin's real
+    // parameter list (`unconditionally_assigned_vars` de-duplicates), so counting each raw LHS
+    // occurrence would be a spurious self-collision (`CL` in both branches of a `TIME` switch).
+    // De-duplicate by exact name, preserving first-occurrence order, before the slot check.
+    let mut seen = std::collections::HashSet::new();
+    twin_param_names.retain(|n| seen.insert(n.clone()));
+    if ode_param_slots(&twin_param_names).is_err() {
+        return None;
     }
     // The absorption forcing term, `transit(n, mtt)` or `igd(mat, cv2)`.
     let forcing = if is_ig {

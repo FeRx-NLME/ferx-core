@@ -183,10 +183,14 @@ section of the SDLC for the versioning policy).
   including a `TIME` / time-varying-covariate model that *requires* the twin — now fits
   and predicts correctly instead of erroring or returning zero. Validated by
   closed-form↔ODE equivalence tests (`tests/transit_analytic_equivalence.rs`,
-  `tests/ig_analytic_equivalence.rs`) for lag, f, and both, and a silent-divergence
-  guard declines the twin if a disposition parameter's name shadows a reserved F/lagtime
-  slot. User `[odes]` / `[scaling]` / `[initial_conditions]` forms remain twin-less (no
-  unique desugar) and are still rejected up front in the flip-flop regime.
+  `tests/ig_analytic_equivalence.rs`) for lag, f, and both. A guard declines the twin
+  (keeping the model closed-form, and rejected up front if flip-flop) whenever building it
+  would misbehave: a parameter name that *shadows* a reserved F/lagtime slot it was not
+  mapped to (which would silently apply an extra F/lag), or an `f=`/`lagtime=` parameter
+  whose name *collides* with a disposition slot (e.g. a bioavailability parameter named
+  `V1`, which would otherwise make the twin fail to build). User `[odes]` / `[scaling]` /
+  `[initial_conditions]` forms remain twin-less (no unique desugar) and are still rejected
+  up front in the flip-flop regime.
 - **Default thread count capped at 8** (#707): when `threads` is unset (or
   `0`/`auto`) — via `[fit_options] threads`, the CLI `--threads` flag, or the R
   binding — the engine now defaults to `available cores - 1` (floored at 1),
