@@ -296,7 +296,13 @@ section of the SDLC for the versioning policy).
   analytical engine, the reactive adaptive driver, and NONMEM (all post-dose). This
   surfaced as the default-on adaptive frozen-replay verifier rejecting a valid
   constant-covariate run whose final dosing decision coincided with the last sample.
-  Interior breaks were already handled post-dose.
+  Interior breaks were already handled post-dose. The same terminal-break fix is
+  applied to the two sibling break-walking paths so a terminal dose is read post-dose
+  consistently everywhere: the dedicated dense state solve (`ode_dense_solve_states`),
+  keeping the joint PK-TTE hazard (#570) consistent between its shared one-solve and
+  two-solve paths when an event time coincides with a dose at the subject's last time
+  point; and the per-compartment states path (`ode_predictions_with_states`), so the
+  post-fit sdtab IPRED and compartment states agree with the fitted IPRED in that case.
 - **A twin-less transit / inverse-Gaussian absorption fit no longer silently
   degenerates a subject whose fitted random effects reach the flip-flop regime**
   (#785). An analytic `one_cpt_transit`/`two_cpt_transit` (or `one_cpt_ig`/
