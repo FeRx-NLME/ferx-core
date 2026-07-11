@@ -1477,7 +1477,8 @@ omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01 (sd)\n\n\
 /// A twin-less `one_cpt_transit` whose typical parameters put `ke = CL/V` at or above the
 /// transit rate `KTR = (n+1)/mtt` — the flip-flop regime the closed form cannot serve, made
 /// twin-less by a user `[scaling]` block that declines the ODE-twin desugar (#776; the
-/// `lagtime=` form now auto-routes instead, #735).
+/// `lagtime=` form now auto-routes instead, #735). `obs_scale = 1` is an inert identity divisor
+/// (using `V` would double-scale the closed form's built-in concentration and warn, #712).
 const TWIN_LESS_FLIP_FLOP_SRC: &str = "\
 [parameters]
   theta TVCL(2.0, 0.001, 50.0)
@@ -1497,7 +1498,7 @@ const TWIN_LESS_FLIP_FLOP_SRC: &str = "\
   pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
 
 [scaling]
-  obs_scale = V
+  obs_scale = 1
 
 [error_model]
   DV ~ proportional(PROP)
