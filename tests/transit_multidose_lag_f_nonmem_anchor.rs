@@ -109,12 +109,16 @@ fn transit_multidose_lag_f_objective_matches_nonmem() {
         result.ofv, NM_OFV_NO_CONST, diff
     );
     // ODE-twin path, no IOV (so the #810 ODE-IOV-marginal gap does not apply); this is the same
-    // evaluate-at-optimum check the igd/weibull anchors pass to ~0.01-0.02. A gap here would signal
-    // a wrong lagtime / bioavailability / multi-dose superposition on the transit ODE twin.
+    // evaluate-at-optimum check the igd/weibull anchors pass, and it reproduces NONMEM *exactly*
+    // here (observed |gap| = 0.0000). The band is a tight regression guard, not a loose agreement
+    // tolerance: 0.1 OFV units sits far above any RK45/ADVAN13 floating-point drift on a single
+    // fixed-point objective evaluation, yet catches a genuine lagtime / bioavailability /
+    // multi-dose-superposition bug on the transit ODE twin (≥ 0.1 on a −2464 objective). Tightened
+    // from the initial 0.5 (which was 25–50× the actual agreement).
     assert!(
-        result.ofv.is_finite() && diff < 0.5,
+        result.ofv.is_finite() && diff < 0.1,
         "ferx FOCEI transit multidose+lag+F at NONMEM's optimum = {:.4}; NONMEM #OBJV = {:.4}; \
-         |gap| {:.4} exceeds the agreement band (0.5 OFV units) — a wrong lagtime / F / multi-dose \
+         |gap| {:.4} exceeds the agreement band (0.1 OFV units) — a wrong lagtime / F / multi-dose \
          superposition on the transit ODE twin",
         result.ofv,
         NM_OFV_NO_CONST,

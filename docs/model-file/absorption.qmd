@@ -165,7 +165,12 @@ covariate** or a `TIME`-dependent structural parameter — or that carries
 **inter-occasion variability** (IOV, `n_kappa > 0`) is transparently rerouted per subject
 to an exact ODE `transit()` twin, so it is **supported**, not rejected. (IOV needs
 cross-occasion dose carryover the closed-form superposition cannot express, so it is served
-by the twin's exact integration — matched to NONMEM FOCEI in
+by the twin's exact integration. The rerouted predictions match the hand-written `transit()`
+ODE forcing **bit-for-bit** at non-zero per-occasion κ, including multiple doses
+(`tests/transit_analytic_equivalence.rs`); the transit+IOV FOCEI *objective* itself sits a
+small, pre-existing ~8 OFV units from NONMEM — an ODE-path IOV marginal offset shared by every
+ODE+IOV model, orthogonal to this reroute, tracked in
+[#810](https://github.com/FeRx-NLME/ferx-core/issues/810) and guarded (not asserted-equal) by
 `tests/transit_iov_nonmem_anchor.rs`.) **Steady-state doses, infusions, system resets
 (EVID=3/4), a non-depot (`CMT≠1`) dose, and a `depot` initial amount are rejected** with an
 actionable message — use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver

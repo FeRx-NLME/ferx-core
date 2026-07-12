@@ -1555,11 +1555,13 @@ pub(crate) fn check_absorption_closed_form_support(
                 // The closed form folds *every* dose through the absorption chain into
                 // central ignoring `dose.cmt` (the `sens/provider.rs` superposition loop),
                 // while the ODE twin honours the compartment — a `CMT≠1` dose there falls to
-                // the direct-bolus branch and lands in a disposition compartment. So the two
-                // paths would silently disagree on a non-depot dose, and `effective_for`
-                // routes only TV-cov/`TIME` subjects to the twin, so a mixed population would
-                // even disagree with itself. A closed-form absorption model only supports
-                // dosing the depot (`CMT=1`); reject anything else up front.
+                // the direct-bolus branch and lands in a disposition compartment, bypassing the
+                // transit/IG absorption the model asks for. Neither reading of a non-depot dose
+                // on an absorption model is well-defined: a subject on the closed form and one
+                // rerouted to the twin (TV-cov / `TIME` / IOV `n_kappa > 0`, #719) would
+                // disagree, and the twin's direct-bolus reading is not the intended transit
+                // input either. A closed-form absorption model only supports dosing the depot
+                // (`CMT=1`); reject anything else up front.
                 return Some(format!(
                     "{name} does not support dosing into a non-depot compartment (subject \
                      {}, CMT={}): the analytic absorption closed form routes every dose through \

@@ -685,6 +685,79 @@ fn transit_iov_matches_hand_written_ode_forcing() {
     }
 }
 
+/// Build the (analytic, ODE) pair for a transit model carrying **IOV on V** (`KAPPA_V`). Unlike
+/// IOV-on-CL, this makes the twin's `obs_scale = V` divisor **κ-dependent** (V changes per
+/// occasion), and κ on V also moves `ke = CL/V` — so it exercises the per-occasion
+/// ExpressionScale-IOV path (the obs_scale divisor varying with κ) that every IOV-on-CL test
+/// leaves untouched.
+fn build_iov_on_v_pair() -> (String, String) {
+    let header = "[parameters]\n  \
+        theta TVCL(0.13, 0.001, 10.0)\n  \
+        theta TVV(8.0, 0.1, 500.0)\n  \
+        theta TVNTR(3.0, 0.0, 20.0)\n  \
+        theta TVMTT(1.5, 0.05, 50.0)\n  \
+        omega ETA_CL ~ 0.09\n  \
+        kappa KAPPA_V ~ 0.04\n  \
+        sigma PROP ~ 0.01 (sd)\n\n\
+        [individual_parameters]\n  \
+        CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(KAPPA_V)\n  NTR = TVNTR\n  MTT = TVMTT\n\n";
+    let analytical = format!(
+        "{header}[structural_model]\n  \
+         pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let ode = format!(
+        "{header}[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = transit(n=NTR, mtt=MTT) - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    (analytical, ode)
+}
+
+/// IOV on the **volume** (`KAPPA_V`): the twin's `obs_scale = V` divisor becomes κ-dependent, so
+/// this covers the per-occasion ExpressionScale-IOV axis that the IOV-on-CL tests (and the NONMEM
+/// anchor) do not. The analytic reroute must still match the hand-written `transit()` forcing twin
+/// at non-zero per-occasion κ — pinning the κ-varying obs_scale to the twin's exact integration.
+#[test]
+fn transit_iov_on_v_matches_hand_written_ode_forcing() {
+    let (an_src, ode_src) = build_iov_on_v_pair();
+    let an = parse_full_model(&an_src)
+        .expect("analytic IOV-on-V transit parses")
+        .model;
+    let ode = parse_full_model(&ode_src)
+        .expect("ODE IOV-on-V transit parses")
+        .model;
+    let pop = iov_subject();
+    let subject = &pop.subjects[0];
+    let theta = &an.default_params.theta;
+    let eta_bsv = [0.0]; // one BSV eta (ETA_CL)
+    let kappas = [vec![0.20], vec![-0.30]];
+
+    let pa = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &kappas);
+    let po = ferx_core::pk::predict_iov(&ode, subject, theta, &eta_bsv, &kappas);
+    assert_eq!(
+        pa.len(),
+        subject.obs_times.len(),
+        "one prediction per observation"
+    );
+    // κ on V must move the predictions (the κ-dependent obs_scale=V divisor and ke=CL/V).
+    let pa0 = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &[vec![0.0], vec![0.0]]);
+    assert!(
+        pa.iter().zip(pa0.iter()).any(|(a, b)| (a - b).abs() > 1e-6),
+        "non-zero KAPPA_V should change the predictions (κ-dependent obs_scale = V)"
+    );
+    for (i, (x, y)) in pa.iter().zip(po.iter()).enumerate() {
+        let tol = ATOL + ACCUM_RTOL * x.abs();
+        assert!(
+            (x - y).abs() <= tol,
+            "obs {i}: analytic-twin {x:.6} vs hand-written ODE {y:.6} (|diff| {:.2e} > tol {:.2e})",
+            (x - y).abs(),
+            tol
+        );
+    }
+}
+
 /// A transit form outside the ODE-equivalent's scope — here a user `[scaling]` block — carries
 /// no twin, so IOV cannot be rerouted and is still rejected up front (#719): the closed form
 /// alone cannot serve cross-occasion carryover.

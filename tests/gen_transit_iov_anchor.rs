@@ -7,8 +7,8 @@
 //! central compartment + IOV on CL) can be run on the same data and the OFV / estimates
 //! compared.
 //!
-//! Design rationale: **one dose per occasion, three occasions 24 h apart, with near-complete
-//! washout between them** (ke = CL/V ≈ 0.3/h ⇒ >10 half-lives per interval). This matters for
+//! Design rationale: **one dose per occasion, three occasions 48 h apart, with near-complete
+//! washout between them** (ke = CL/V ≈ 0.3/h ⇒ >20 half-lives per interval). This matters for
 //! the anchor: ferx superposes the transit input of *every* dose, while a NONMEM `$DES` that
 //! captures only the most-recent dose (`PODO`/`TDOS`) sees a single dose per occasion — with
 //! washout the two coincide exactly, so any OFV gap is real signal, not a multi-dose bookkeeping

@@ -5,7 +5,7 @@ $PROBLEM one_cpt_transit + IOV on CL -- NONMEM anchor for ferx analytic transit 
 ; so this is ONE compartment: F1=0 suppresses the depot bolus and the Savic density is delivered
 ; as R_in in $DES. IOV on CL is one ETA per occasion (OCC 1/2/3), sharing one IOV variance via
 ; $OMEGA BLOCK SAME. Data (nonmem_anchor/transit_iov.csv) is one dose per occasion, three
-; occasions 24 h apart with near-complete washout, so the $DES single-dose R_in (PODO/TDOS)
+; occasions 48 h apart with near-complete washout, so the $DES single-dose R_in (PODO/TDOS)
 ; equals ferx's dose superposition. Fit this, then fit ferx on the SAME csv and compare OFV +
 ; THETA/OMEGA (generator: tests/gen_transit_iov_anchor.rs prints the ferx side).
 

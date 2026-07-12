@@ -105,13 +105,16 @@ fn transit_multidose_cov_objective_matches_nonmem() {
         result.ofv, NM_OFV_NO_CONST, diff
     );
     // Analytic path, no IOV/twin — the closed form's multi-dose superposition and the WT-on-CL
-    // covariate must reproduce NONMEM's explicit integer-N chain to the same ~0.01 the other
-    // analytic anchors reach. A gap here would signal a wrong multi-dose superposition or covariate
-    // application on the analytic transit closed form.
+    // covariate reproduce NONMEM's explicit integer-N chain *exactly* at the shared optimum
+    // (observed |gap| = 0.0000, i.e. below print precision). The band is therefore a tight
+    // regression guard, not a loose agreement tolerance: 0.1 OFV units sits far above any
+    // platform floating-point drift on a single fixed-point objective evaluation, yet catches a
+    // genuine multi-dose-superposition or covariate-application bug (which moves a −2055 objective
+    // by ≥ 0.1). Tightened from the initial 0.5 (which was 25–50× the actual agreement).
     assert!(
-        result.ofv.is_finite() && diff < 0.5,
+        result.ofv.is_finite() && diff < 0.1,
         "ferx FOCEI transit multidose+cov at NONMEM's optimum = {:.4}; NONMEM #OBJV = {:.4}; \
-         |gap| {:.4} exceeds the agreement band (0.5 OFV units) — a wrong multi-dose superposition \
+         |gap| {:.4} exceeds the agreement band (0.1 OFV units) — a wrong multi-dose superposition \
          or covariate application on the analytic transit closed form",
         result.ofv,
         NM_OFV_NO_CONST,
