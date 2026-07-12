@@ -355,6 +355,17 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **Inner EBE line search no longer aborts on a non-finite objective** (#719
+  follow-up): the FOCEI inner-loop backtracking line search
+  (`estimation/inner_optimizer.rs`) could panic with `clamp(NaN, NaN)` (a process
+  `SIGABRT`) when a trial η drove the objective non-finite — e.g. an absorption
+  closed form (transit/IG) evaluated at a step outside its convergence region, or a
+  blown-up BFGS direction giving `dg = ±inf`. The quadratic step-length safeguard
+  then produced `inf/inf = NaN`, which poisoned the step length and crashed the
+  next `clamp`. The search now rejects non-finite trials (falling back to plain
+  halving) and non-finite directions up front, degrading gracefully to "no step"
+  instead of crashing — surfaced while building the transit multi-dose + covariate
+  NONMEM anchor. Regression tests in `estimation/inner_optimizer.rs`.
 - **Declining-hazard (`γ < 0`) Gompertz median/mean survival diagnostics** (#805):
   `median_survival` returned `NaN` for *every* `γ < 0` Gompertz, even when a finite median
   genuinely exists — the closed form generalizes to `γ < 0`, so the reported TTE median is
