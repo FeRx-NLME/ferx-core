@@ -1,0 +1,55 @@
+# NONMEM run scratch + per-run byproducts written by running `nmfe*` inside this
+# directory. The anchor convention commits only the INPUTS at this level
+# (<name>.ctl, <name>.csv, <name>_fit.ferx, simulate_*.py, *.md) and the curated
+# OUTPUTS under results/ (<name>.{ext,lst,cov,...}). Everything NONMEM writes
+# in-place is disposable — this keeps `git status` clean after a run so anchor
+# scratch is never accidentally committed. `results/` is deliberately NOT ignored.
+
+# --- fixed-name NONMEM scratch (identical every run) ---
+/FCON
+/FDATA
+/FDATA.csv
+/FMSG
+/FORIG
+/FREPL
+/FREPORT
+/FSIZES
+/FSTREAM
+/FSUBS
+/FSUBS.f90
+/FSUBS2
+/FSUBS_MU.F90
+/GFCOMPILE.BAT
+/INTER
+/LINK.LNK
+/LINKC.LNK
+/PRDERR
+/PRSIZES.f90
+/compile.lnk
+/gfortran.txt
+/nmprd4p.mod
+/nonmem
+/fort.*
+/*.o
+/temp_dir/
+/background_*
+
+# --- per-run NONMEM outputs written in-place at this level ---
+# (the curated copies to keep live under results/, which is not ignored)
+/*.clt
+/*.coi
+/*.cor
+/*.cov
+/*.cpu
+/*.ext
+/*.grd
+/*.lst
+/*.phi
+/*.shk
+/*.shm
+/*.tab
+/*.xml
+/*.smt
+/*.rmt
+/*.msf
+/*.mode

@@ -2589,8 +2589,12 @@ fn backtracking_line_search(
 ) -> (f64, f64) {
     let c1 = 1e-4;
     let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
-    // Not a descent direction: nothing to do (caller falls back / stops).
-    if !(dg < 0.0) {
+    // Not a *finite* descent direction: nothing to do (caller falls back / stops).
+    // `dg` must be finite as well as negative: a BFGS update that produced a
+    // non-finite search direction gives `dg = ±inf`, and then `-dg·α²/denom`
+    // below evaluates to `inf/inf = NaN`, which poisons `alpha` and makes the
+    // `clamp` on the *next* trial panic (its bounds `0.1·α`/`0.5·α` become NaN).
+    if !(dg < 0.0) || !dg.is_finite() {
         return (0.0, f0);
     }
 
@@ -2601,15 +2605,19 @@ fn backtracking_line_search(
             x_new[i] = x[i] + alpha * d[i];
         }
         let f_new = obj(&x_new);
-        if f_new <= f0 + c1 * alpha * dg {
+        if f_new.is_finite() && f_new <= f0 + c1 * alpha * dg {
             return (alpha, f_new);
         }
         // Minimiser of the quadratic matching f0, dg (slope at 0) and f_new at
         // the current alpha. Safeguard into [0.1·α, 0.5·α] so a flat/non-convex
         // sample still makes definite progress (never larger than plain halving,
-        // never a near-zero collapse).
+        // never a near-zero collapse). A non-finite `f_new` (an out-of-domain
+        // trial η where an absorption closed form leaves its convergence region
+        // and returns ±inf/NaN) carries no interpolation information, so fall
+        // back to plain halving — this also keeps `alpha` finite, so the clamp
+        // bounds below can never become NaN.
         let denom = 2.0 * (f_new - f0 - dg * alpha);
-        let alpha_quad = if denom > 0.0 {
+        let alpha_quad = if f_new.is_finite() && denom > 0.0 {
             -dg * alpha * alpha / denom
         } else {
             0.5 * alpha
@@ -3235,6 +3243,47 @@ mod tests {
         let x = [0.0];
         let g = [2.0 * (x[0] - 3.0)]; // = −6
         let d = [g[0]]; // SAME sign as g → dg = +36 ≥ 0 (ascent)
+        let f0 = obj(&x);
+        let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, 1, f0);
+        assert_eq!(alpha, 0.0);
+        assert_eq!(f_new, f0);
+    }
+
+    /// A trial point where the objective goes **non-finite** — an out-of-domain η
+    /// where an absorption closed form leaves its convergence region and returns
+    /// ±inf/NaN — must not crash the line search. The quadratic safeguard has no
+    /// finite sample to interpolate, so it falls back to plain halving and
+    /// eventually reports "no step" (`alpha == 0`). Regression for the
+    /// `clamp(NaN, NaN)` SIGABRT surfaced by the transit multi-dose + covariate
+    /// anchor (#719 close-out): a non-finite `f_new` used to poison `alpha`, and
+    /// the next trial's `clamp(0.1·α, 0.5·α)` — bounds both NaN — aborted.
+    #[test]
+    fn line_search_survives_non_finite_objective() {
+        let x = [0.0];
+        let g = [-6.0];
+        let d = [6.0]; // dg = −36 < 0 (a genuine descent direction)
+        let f0 = 10.0;
+        // Every trial step returns NaN — must not panic, must report no step.
+        let nan_obj = |_: &[f64]| -> f64 { f64::NAN };
+        let (alpha, f_new) = backtracking_line_search(&nan_obj, &x, &d, &g, 1, f0);
+        assert_eq!(alpha, 0.0, "a never-finite objective yields no step");
+        assert_eq!(f_new, f0, "baseline objective is returned unchanged");
+        // +inf trials behave identically (never accepted, never a panic).
+        let inf_obj = |_: &[f64]| -> f64 { f64::INFINITY };
+        let (alpha, f_new) = backtracking_line_search(&inf_obj, &x, &d, &g, 1, f0);
+        assert_eq!(alpha, 0.0);
+        assert_eq!(f_new, f0);
+    }
+
+    /// A **non-finite search direction** (`dg = ±inf`, from a blown-up BFGS
+    /// update) is rejected up front rather than driving `−dg·α²/denom` to
+    /// `inf/inf = NaN`. Companion regression to the clamp-panic fix.
+    #[test]
+    fn line_search_rejects_non_finite_direction() {
+        let obj = |x: &[f64]| -> f64 { (x[0] - 3.0) * (x[0] - 3.0) };
+        let x = [0.0];
+        let g = [-6.0];
+        let d = [f64::INFINITY]; // dg = −inf: a non-finite "descent" direction
         let f0 = obj(&x);
         let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, 1, f0);
         assert_eq!(alpha, 0.0);

@@ -104,7 +104,7 @@ pub(crate) fn absorption_flip_flop_at(
 }
 
 /// The model to evaluate this subject with at `(theta, eta)`: the structural
-/// [`CompiledModel::effective_for`] reroute (TV-covariate / `TIME` transit or IG
+/// [`CompiledModel::effective_for`] reroute (TV-covariate / `TIME` / IOV transit or IG
 /// subjects → their ODE twin) **plus** a parameter-dependent flip-flop reroute.
 ///
 /// A transit / IG closed form clamps to `0` once `ke` reaches the tilting abscissa
@@ -859,6 +859,12 @@ pub fn predict_iov(
     kappas: &[Vec<f64>],
 ) -> Vec<f64> {
     use std::collections::HashMap;
+    // Closed-form transit/IG IOV reroutes to its `transit()`/`igd()` ODE twin (issue #719):
+    // the per-dose superposition cannot carry drug across occasion boundaries (#104), but the
+    // twin integrates it exactly (#663). A no-op for every other model (`effective_for` returns
+    // `self`). The twin shares this model's θ/η/κ layout, so the per-occasion params below are
+    // built identically and the `ode_spec` dispatch arm serves them.
+    let model = model.effective_for(subject);
     let n_kappa = model.n_kappa;
 
     // occasion id -> kappa-group index (iov_occasion_groups order).
