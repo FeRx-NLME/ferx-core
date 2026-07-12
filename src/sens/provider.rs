@@ -595,20 +595,20 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 /// noisy FD gradient). The per-eval `reconverge_gradient_interval` override is
 /// orthogonal and handled at the dispatch site, not here.
 ///
-/// TTE (`[event_model]`) endpoints are excluded: the hazard log-likelihood has no
-/// analytic outer gradient (the sensitivity provider only covers the structural
-/// PK/PD model), so a TTE — or mixed PK+TTE — objective must be differentiated by
-/// finite differences. Without this guard a TTE model would report an analytic
-/// gradient it cannot supply, so `resolve_auto` would pick a gradient-based
-/// optimizer that then stalls on a meaningless gradient (TTE is FD-only — see
-/// `docs/estimation/tte.qmd`).
+/// Non-Gaussian endpoints — `[event_model]` TTE and `[binary_model]` logistic (#760) —
+/// are excluded: their data log-likelihood has no analytic outer gradient (the
+/// sensitivity provider only covers the structural PK/PD model), so such an objective
+/// (or a mixed PK + non-Gaussian objective) must be differentiated by finite differences.
+/// Without this guard the model would report an analytic gradient it cannot supply, so
+/// `resolve_auto` would pick a gradient-based optimizer that then stalls on a meaningless
+/// gradient (these endpoints are FD-only — see `docs/estimation/tte.qmd`).
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
         // Correlated residual (`block_sigma`, #627) now has an analytic outer gradient
         // for the analytical (diagonal-R) scope: the dense Almquist assembly reduces to
         // the scalar path fed correlation-aware `(r,d,d2)` (`corr_residual_diag`). A rare
         // off-diagonal-R subject bails per-subject to FD via `corr_residual_diag` → `None`.
-        && !model.has_tte()
+        && !model.has_non_gaussian()
         // Custom / time-varying residual-error magnitude (#484/#576/#486): `mult(θ)`
         // makes `R` depend on θ directly, which `sens_outer_gradient::theta_block`
         // now carries via a `Dual1`-differentiated direct-θ channel — bounded by the

@@ -1,0 +1,97 @@
+---
+title: "Categorical endpoints — `[binary_model]`"
+---
+
+Categorical (discrete-state) endpoints let a model score a **non-Gaussian**
+observation — a category index rather than a continuous concentration. The first
+member of the family is the **binary / Bernoulli** endpoint: mixed-effects
+**logistic regression**, declared with a `[binary_model]` block.
+
+> Ordinal (proportional-odds), Poisson, and negative-binomial endpoints are planned
+> follow-ups in the same family. This page documents the binary endpoint only.
+
+## The `[binary_model]` block
+
+```ini
+[binary_model]
+cmt   = 3
+logit = TH0 + THX * X + THT * TIME     ; log-odds of P(DV = 1)
+; link = logit                          ; optional; logit is the default
+```
+
+Observations for the block's `cmt` carry `DV ∈ {0, 1}` (`EVID = 0`). The model
+computes a per-observation probability
+
+$$
+p = \operatorname{logit}^{-1}(\eta_\text{lp}) = \frac{1}{1 + e^{-\eta_\text{lp}}},
+$$
+
+where the **linear predictor** `logit` (the log-odds) is any expression over the
+same namespace the hazard and error blocks use — population parameters `θ`, random
+effects `η`, data covariates, values from `[individual_parameters]`, and the
+per-record `TIME` builtin. The data term is the negative Bernoulli log-likelihood
+
+$$
+-\log L = -\sum_j \big[\, y_j \log p_j + (1 - y_j)\log(1 - p_j) \,\big].
+$$
+
+### Keys
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `cmt`   | yes | Data-file `CMT` column value for this endpoint's rows. |
+| `logit` | yes | Linear predictor (log-odds of `DV = 1`). Any θ/η/covariate/`[individual_parameters]`/`TIME` expression. |
+| `link`  | no  | Link function. Only `logit` is available; `probit`/`cloglog` are planned. |
+
+### Random effects and the fixed-effects special case
+
+A per-subject random effect in the predictor (`logit = TH0 + ETA_I`) gives a
+**mixed-effects** logistic model — a random intercept (or slope). Omitting all
+random effects (no `omega`, `n_eta = 0`) gives ordinary **fixed-effects logistic
+regression**, exactly analogous to base-R `glm(..., family = binomial)`. Both are
+supported; the fixed-effects case needs no `[structural_model]`, `[error_model]`, or
+`[individual_parameters]` blocks (a logistic-only model can be just `[parameters]` +
+`[binary_model]` + `[fit_options]`).
+
+Covariates on the predictor may vary **with time via the `TIME` builtin** (evaluated
+per observation). A time-varying covariate *column* on the predictor is not yet
+supported; declare a `[covariates]` value used at baseline instead.
+
+## Data format
+
+`DV` holds the 0/1 outcome directly (there is no censoring code). One row per
+observation; no dose rows are needed for a logistic-only model.
+
+```csv
+ID,TIME,DV,CMT,EVID,MDV,X
+1,0,0,3,0,0,1.07
+1,1,0,3,0,0,1.07
+1,2,1,3,0,0,1.07
+2,0,1,3,0,0,-1.01
+```
+
+A `DV` value of `2` or more on a binary CMT is a data error — the fit stops with a
+clear message (an ordered response with more than two categories needs an ordinal
+endpoint, which is not yet available).
+
+## Example
+
+`examples/binary_logistic.ferx` (with `data/binary_logistic.csv`) fits a
+fixed-effects logistic model with a subject covariate `X` and a `TIME` effect:
+
+```ini
+[parameters]
+  theta TH0(0.0, -10.0, 10.0)
+  theta THX(0.0, -10.0, 10.0)
+  theta THT(0.0, -10.0, 10.0)
+
+[covariates]
+  X continuous
+
+[binary_model]
+  cmt   = 3
+  logit = TH0 + THX * X + THT * TIME
+```
+
+See [Categorical estimation](../estimation/categorical.qmd) for the estimator
+guidance and the validation against R `glm`.

@@ -126,3 +126,39 @@ pub fn tte_competing_pop(rows: &[(f64, u8)]) -> ferx_core::types::Population {
         subjects,
     }
 }
+
+/// Build a binary / logistic population (#760): `subjects[i] = (x, &[(time, state)])`
+/// is one subject with baseline covariate `X = x` and the given binary observations
+/// on `cmt` (`state ∈ {0,1}`, though the state validation is exercised separately by
+/// passing a `2`). Times feed the per-record `TIME` builtin in the logit predictor.
+/// One `DiscreteState` `ObsRecord` per observation; no doses.
+#[cfg(feature = "survival")]
+pub fn binary_pop(subjects: &[(f64, Vec<(f64, u8)>)], cmt: usize) -> ferx_core::types::Population {
+    use ferx_core::types::{ObsRecord, Population};
+    let subjects = subjects
+        .iter()
+        .enumerate()
+        .map(|(i, (x, obs))| {
+            let mut s = subject(&format!("{}", i + 1), vec![], vec![], vec![], vec![]);
+            s.covariates.insert("X".to_string(), *x);
+            s.obs_records = obs
+                .iter()
+                .map(|&(t, st)| ObsRecord::DiscreteState {
+                    time: t,
+                    state: st as usize,
+                    cmt,
+                })
+                .collect();
+            s
+        })
+        .collect();
+
+    Population {
+        covariate_names: vec!["X".to_string()],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects,
+    }
+}

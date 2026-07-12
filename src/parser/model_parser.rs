@@ -1068,22 +1068,33 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     #[cfg(not(feature = "survival"))]
     let has_event_model_block = false;
 
+    // A `[binary_model]` (Phase 4 categorical / logistic, #760) endpoint likewise makes
+    // the Gaussian PK blocks optional — a logistic-only model needs none of them.
+    #[cfg(feature = "survival")]
+    let has_binary_model_block = blocks.contains_key("binary_model")
+        || extracted
+            .named
+            .get("binary_model")
+            .is_some_and(|m| !m.is_empty());
+    #[cfg(not(feature = "survival"))]
+    let has_binary_model_block = false;
+
     let struct_lines_opt = blocks.get("structural_model");
     let error_lines_opt = blocks.get("error_model");
     let indiv_lines_opt = blocks.get("individual_parameters");
     // All three Gaussian blocks must be absent together for a valid TTE-only model.
     // Partial omission (e.g. [structural_model] present but no [individual_parameters])
     // would create an invalid mixed-model state.
-    let is_tte_only = has_event_model_block
+    let is_endpoint_only = (has_event_model_block || has_binary_model_block)
         && struct_lines_opt.is_none()
         && error_lines_opt.is_none()
         && indiv_lines_opt.is_none();
-    if struct_lines_opt.is_none() && !is_tte_only {
+    if struct_lines_opt.is_none() && !is_endpoint_only {
         return Err("Missing [structural_model] block".to_string());
     }
     let struct_lines: &[String] = struct_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
 
-    if error_lines_opt.is_none() && !is_tte_only {
+    if error_lines_opt.is_none() && !is_endpoint_only {
         return Err("Missing [error_model] block".to_string());
     }
     let (parsed_error_model, ltbs_flags, iiv_on_ruv_name) =
@@ -1104,7 +1115,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         );
     }
 
-    if indiv_lines_opt.is_none() && !is_tte_only {
+    if indiv_lines_opt.is_none() && !is_endpoint_only {
         return Err("Missing [individual_parameters] block".to_string());
     }
     let indiv_lines: &[String] = indiv_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
@@ -1776,19 +1787,19 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     }
     // set here after diffusion thetas are appended above
     n_theta = theta_names.len();
-    // A `[event_model]` (TTE) endpoint makes a fixed-effects model legitimate:
-    // the hazard parameters can be pure theta/covariate, so n_eta = 0 (an empty
-    // BSV Omega) is valid — even though `build_omega_matrix` rejects an empty
-    // Omega for ordinary PK models. Detect the block from the raw parse so the
-    // same `.ferx` parses identically with or without the `survival` feature
-    // compiled in (the actual TTE endpoints are only built under `survival`).
+    // A `[event_model]` (TTE) or `[binary_model]` (categorical, #760) endpoint makes a
+    // fixed-effects model legitimate: the endpoint parameters can be pure theta/covariate,
+    // so n_eta = 0 (an empty BSV Omega) is valid — even though `build_omega_matrix` rejects
+    // an empty Omega for ordinary PK models. Detect the block from the raw parse so the same
+    // `.ferx` parses identically with or without the `survival` feature compiled in (the
+    // actual endpoints are only built under `survival`).
     let has_event_model = blocks.get("event_model").is_some()
         || extracted
             .named
             .get("event_model")
             .is_some_and(|m| !m.is_empty());
     // BSV omega is built from the BSV-only eta names (no kappas)
-    let omega = if eta_names_bsv.is_empty() && has_event_model {
+    let omega = if eta_names_bsv.is_empty() && (has_event_model || has_binary_model_block) {
         // 0×0 Omega — `from_matrix` handles the empty matrix (cholesky of a
         // 0-dim matrix is trivial, log|Ω| = 0); `build_omega_fixed` below
         // already returns an empty `Vec` for an empty eta list.
@@ -2669,6 +2680,42 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             event_model_used_thetas.extend(blk_thetas);
             event_model_used_etas.extend(blk_etas);
         }
+
+        // ── [binary_model] blocks (Phase 4 categorical / logistic, #760) ──────────
+        // Unnamed `[binary_model]` and any named `[binary_model LABEL]`, each keyed by CMT.
+        let mut binary_blocks: Vec<&Vec<String>> = Vec::new();
+        if let Some(lines) = blocks.get("binary_model") {
+            binary_blocks.push(lines);
+        }
+        if let Some(named_map) = extracted.named.get("binary_model") {
+            for lines in named_map.values() {
+                binary_blocks.push(lines);
+            }
+        }
+        for lines in binary_blocks {
+            let (cmt, endpoint, bin_covs, blk_thetas, blk_etas) = parse_binary_model_block(
+                lines,
+                &theta_names,
+                &eta_names,
+                &indiv_stmts,
+                &model.kappa_names,
+                &model.error_spec,
+            )?;
+            if model.endpoints.contains_key(&cmt) {
+                return Err(format!(
+                    "[binary_model]: CMT={cmt} already declared by another endpoint"
+                ));
+            }
+            model.endpoints.insert(cmt, endpoint);
+            for cov in bin_covs {
+                if !model.referenced_covariates.contains(&cov) {
+                    model.referenced_covariates.push(cov);
+                }
+            }
+            event_model_used_thetas.extend(blk_thetas);
+            event_model_used_etas.extend(blk_etas);
+        }
+
         model.referenced_covariates.sort();
     }
 
@@ -4208,6 +4255,242 @@ fn parse_event_model_block(
         event_model_covariates,
         event_model_thetas,
         event_model_etas,
+    ))
+}
+
+/// Parse one `[binary_model]` block — a binary / Bernoulli (logistic) endpoint
+/// (Phase 4 categorical, Track C — #760). Mirrors [`parse_event_model_block`] but
+/// carries a single linear-predictor expression instead of a hazard family.
+///
+/// Returns `(cmt, EndpointLikelihood::Binary { .. }, covariates, thetas, etas)` ready
+/// to insert into `CompiledModel::endpoints`.
+///
+/// Supported keys:
+/// - `cmt`   — required; positive integer (data-file CMT column value)
+/// - `logit` — required; the linear predictor `lp` (log-odds of `P(Y=1)`) as a
+///   θ/η/covariate/`[individual_parameters]` expression. `TIME` resolves per observation
+///   (the data term sets the model-time guard per record).
+/// - `link`  — optional; `logit` (default). `probit`/`cloglog` are not yet supported.
+#[cfg(feature = "survival")]
+fn parse_binary_model_block(
+    lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_stmts: &[Statement],
+    kappa_names: &[String],
+    error_spec: &ErrorSpec,
+) -> Result<
+    (
+        usize,
+        crate::types::EndpointLikelihood,
+        Vec<String>,
+        std::collections::HashSet<usize>,
+        std::collections::HashSet<usize>,
+    ),
+    String,
+> {
+    use crate::types::{EndpointLikelihood, LinkFn};
+
+    // Like `[event_model]`, the `logit` predictor may reference `[individual_parameters]`
+    // names (resolved per subject from `needed_indiv_stmts` below); anything else falls back
+    // to a leniently-read covariate. `kappa_names` rejects IOV references the per-subject
+    // predictor cannot evaluate.
+    let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+    let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
+
+    let mut cmt_opt: Option<usize> = None;
+    let mut logit_expr: Option<Expression> = None;
+    let mut link = LinkFn::Logit;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.splitn(2, '=').map(|s| s.trim()).collect();
+        if parts.len() != 2 {
+            return Err(format!(
+                "[binary_model]: invalid line `{trimmed}` — expected `key = value`"
+            ));
+        }
+        let (key, value) = (parts[0], parts[1]);
+        match key {
+            "cmt" => {
+                cmt_opt = Some(value.parse::<usize>().map_err(|_| {
+                    format!("[binary_model]: invalid cmt `{value}` — expected a positive integer")
+                })?);
+            }
+            "logit" => {
+                logit_expr = Some(parse_scalar_expression(value, ctx)?);
+            }
+            "link" => {
+                link = match value {
+                    "logit" => LinkFn::Logit,
+                    other => {
+                        return Err(format!(
+                            "[binary_model]: link `{other}` is not yet supported — only `logit` \
+                             (the default) is available; probit/cloglog are planned."
+                        ))
+                    }
+                };
+            }
+            other => {
+                return Err(format!(
+                    "[binary_model]: unknown key `{other}` — valid keys: cmt, logit, link"
+                ));
+            }
+        }
+    }
+
+    let cmt = cmt_opt.ok_or("[binary_model]: missing required key `cmt`")?;
+    let logit_expr = logit_expr.ok_or("[binary_model]: missing required key `logit`")?;
+
+    // Same CMT can't be both Gaussian and binary (parallels the event-model guard).
+    if let ErrorSpec::PerCmt(cmt_map) = error_spec {
+        if cmt_map.contains_key(&cmt) {
+            return Err(format!(
+                "[binary_model]: CMT={cmt} is already declared as a Gaussian endpoint in \
+                 [error_model] — the same CMT cannot be both Gaussian and binary"
+            ));
+        }
+    }
+
+    // Collect covariate/theta/eta references BEFORE the expression is moved into the closure.
+    let mut lp_covariates: Vec<String>;
+    let lp_thetas: std::collections::HashSet<usize>;
+    let lp_etas: std::collections::HashSet<usize>;
+    {
+        let mut cov_set = std::collections::HashSet::new();
+        let mut theta_set = std::collections::HashSet::new();
+        let mut eta_set = std::collections::HashSet::new();
+        collect_covariates(&logit_expr, &mut cov_set);
+        collect_theta_eta(&logit_expr, &mut theta_set, &mut eta_set);
+        let mut v: Vec<String> = cov_set.into_iter().collect();
+        v.sort();
+        lp_covariates = v;
+        lp_thetas = theta_set;
+        lp_etas = eta_set;
+    }
+
+    // Reject a direct IOV-kappa reference (#770 analogue): the predictor is evaluated with
+    // BSV-only η, so a kappa name here would silently read 0.0 — fail loud instead.
+    if let Some(k) = expr_references_kappa(&logit_expr, kappa_names) {
+        return Err(format!(
+            "[binary_model]: the logit predictor references the inter-occasion (IOV) random \
+             effect `{k}` directly. The predictor is evaluated with per-subject (BSV) η only, so \
+             an IOV kappa has no well-defined value here — write it in terms of θ/η, or reference \
+             an IOV-free parameter."
+        ));
+    }
+
+    // Restrict the individual-parameter statements the predictor evaluates to just those it
+    // references, transitively (mirrors the hazard path; bounds per-eval work and scopes the
+    // IOV/NN checks below to what the predictor actually depends on).
+    let needed_indiv_stmts: Vec<Statement> = {
+        let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        collect_variable_names(&logit_expr, &mut needed);
+        let mut keep: Vec<Statement> = Vec::new();
+        for s in indiv_stmts.iter().rev() {
+            let stmt = std::slice::from_ref(s);
+            if assigned_vars_in_order(stmt)
+                .iter()
+                .any(|n| needed.contains(n))
+            {
+                visit_stmt_nodes(stmt, &mut |e: &Expression| {
+                    if let Expression::Variable(name) = e {
+                        needed.insert(name.clone());
+                    }
+                });
+                keep.push(s.clone());
+            }
+        }
+        keep.reverse();
+        keep
+    };
+
+    // Union covariates reached transitively through `[individual_parameters]` so a
+    // time-varying covariate can't slip past a future TV-covariate guard silently frozen
+    // (the #741 concern, applied to the categorical predictor).
+    {
+        let mut cov_set = std::collections::HashSet::new();
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut cov_set);
+        for c in cov_set {
+            if !lp_covariates.contains(&c) {
+                lp_covariates.push(c);
+            }
+        }
+        lp_covariates.sort();
+    }
+
+    // Reject an `[individual_parameters]` value that depends on an IOV kappa (BSV-only η here).
+    {
+        let n_eta = eta_names.len();
+        let mut kappa_hit: Option<String> = None;
+        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
+            if let Expression::Eta(i) = e {
+                if *i >= n_eta && kappa_hit.is_none() {
+                    kappa_hit = Some(
+                        kappa_names
+                            .get(*i - n_eta)
+                            .cloned()
+                            .unwrap_or_else(|| "<kappa>".to_string()),
+                    );
+                }
+            }
+        });
+        if let Some(k) = kappa_hit {
+            return Err(format!(
+                "[binary_model]: the logit predictor references an [individual_parameters] value \
+                 that depends on the inter-occasion (IOV) random effect `{k}`. The predictor is \
+                 evaluated with per-subject (BSV) η only — reference an IOV-free parameter, or \
+                 write the predictor in terms of θ/η directly."
+            ));
+        }
+    }
+
+    // An `[individual_parameters]` value that reads a `[covariate_nn]` output would silently
+    // resolve to 0.0 here (the predictor evaluates these statements without the network
+    // forward pass). Reject it — gated to `nn` like the hazard guard (#293 measurement gap,
+    // not missed coverage, in the survival build).
+    #[cfg(feature = "nn")]
+    {
+        let mut nn_hit = false;
+        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
+            if matches!(e, Expression::NnOutput { .. }) {
+                nn_hit = true;
+            }
+        });
+        if nn_hit {
+            return Err(
+                "[binary_model]: the logit predictor references an [individual_parameters] value \
+                 whose definition uses a [covariate_nn] output. Neural-network-driven individual \
+                 parameters are not available to the predictor — reference an NN-free parameter."
+                    .to_string(),
+            );
+        }
+    }
+
+    // Build the lp_fn closure over (θ, η, covariates). Expression nodes hold only indices, so
+    // they are safe to move; `TIME` resolves via the model-time guard `binary_data_term` sets
+    // per record.
+    let indiv = needed_indiv_stmts;
+    let lp_fn: crate::types::LinearPredictorFn = Box::new(
+        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
+            let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+            eval_expression(&logit_expr, theta, eta, covariates, &vars, &[])
+        },
+    );
+
+    Ok((
+        cmt,
+        EndpointLikelihood::Binary {
+            link,
+            lp_fn,
+            lp_covariates: lp_covariates.clone(),
+        },
+        lp_covariates,
+        lp_thetas,
+        lp_etas,
     ))
 }
 
@@ -18133,16 +18416,19 @@ mod tests {
                     continue;
                 }
             }
-            // TTE-only files (no [structural_model] block) require the survival feature.
-            // Use a line-start check so the comment "# Note: [structural_model] ..."
-            // present in example file headers does not falsely count as a block.
+            // Endpoint-only files (no [structural_model] block) — TTE `[event_model]` or the
+            // #760 `[binary_model]` — require the survival feature to parse (the endpoint
+            // block is unrecognized without it, so the parser demands the Gaussian PK blocks).
+            // Use a line-start check so a comment like "# Note: [structural_model] ..." in an
+            // example header does not falsely count as a block.
             if !cfg!(feature = "survival") {
                 let src = std::fs::read_to_string(&path).unwrap_or_default();
-                let has_event_model = src.contains("[event_model");
+                let has_nongaussian_endpoint =
+                    src.contains("[event_model") || src.contains("[binary_model");
                 let has_struct_block = src
                     .lines()
                     .any(|l| l.trim_start().starts_with("[structural_model"));
-                if has_event_model && !has_struct_block {
+                if has_nongaussian_endpoint && !has_struct_block {
                     continue;
                 }
             }

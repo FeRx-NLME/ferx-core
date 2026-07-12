@@ -1,6 +1,8 @@
 pub mod api;
 pub mod build_info;
 pub mod cancel;
+#[cfg(feature = "survival")]
+pub mod categorical;
 pub mod diagnostics;
 pub mod environment;
 pub mod estimation;
