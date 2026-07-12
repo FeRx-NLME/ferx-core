@@ -867,11 +867,7 @@ pub fn read_population_for(
     // Binary/categorical (#760) CMTs route to `ObsRecord::DiscreteState` (integer DV),
     // like TTE rows route to `ObsRecord::Event` — both need the non-Gaussian reader path.
     #[cfg(feature = "survival")]
-    let binary_cmts: std::collections::HashSet<usize> = model
-        .endpoints
-        .iter()
-        .filter_map(|(&cmt, ep)| matches!(ep, EndpointLikelihood::Binary { .. }).then_some(cmt))
-        .collect();
+    let binary_cmts: std::collections::HashSet<usize> = model.binary_cmts().into_iter().collect();
     #[cfg(not(feature = "survival"))]
     let binary_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
@@ -1766,7 +1762,7 @@ pub(crate) fn check_survival_tv_covariates(
     population: &Population,
 ) -> Option<String> {
     use crate::types::{EndpointLikelihood, HazardSpec};
-    if !model.has_tte() {
+    if !model.has_non_gaussian() {
         return None;
     }
     for subject in &population.subjects {
@@ -1776,6 +1772,24 @@ pub(crate) fn check_survival_tv_covariates(
         }
         let tv_set: std::collections::HashSet<&str> = tv.iter().map(String::as_str).collect();
         for (cmt, endpoint) in &model.endpoints {
+            // Binary/categorical (#760): the logit predictor is evaluated at the baseline
+            // covariate snapshot (its closure takes no time argument), so a time-varying
+            // covariate on it would be silently frozen — the same #741 failure mode the
+            // hazard guard below rejects. `lp_covariates` includes covariates reached
+            // transitively through `[individual_parameters]`.
+            if let EndpointLikelihood::Binary { lp_covariates, .. } = endpoint {
+                if let Some(name) = lp_covariates.iter().find(|c| tv_set.contains(c.as_str())) {
+                    return Some(format!(
+                        "[binary_model] on CMT={cmt}: the logit predictor references covariate \
+                         `{name}`, which is time-varying for subject `{}`. Time-varying covariates \
+                         on the predictor are not yet supported — it is evaluated at the baseline \
+                         covariate value, so the fit would silently use the wrong log-odds (#741). \
+                         Use a time-constant (baseline) covariate for now.",
+                        subject.id
+                    ));
+                }
+                continue;
+            }
             let EndpointLikelihood::Tte {
                 hazard,
                 hazard_covariates,
@@ -2049,6 +2063,40 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         // so it needs no SDE-specific case here.
     }
 
+    // Binary / categorical (#760) endpoint compatibility. FOCEI (default), SAEM, and IMP
+    // are supported; the Gauss-Newton gradient is Gaussian-specific (plan §13), and IOV is
+    // not yet folded into the *outer* FOCE-IOV objective (the term enters only the inner
+    // EBE objective). Reject both fail-loud rather than silently mis-fit.
+    if model.has_binary() {
+        if chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid))
+        {
+            diags.push(
+                Diagnostic::error(
+                    "E_BINARY_GN_UNSUPPORTED",
+                    "method = gn / gn_hybrid is not supported with a [binary_model] endpoint. \
+                     The Gauss-Newton gradient is built from the Gaussian residual structure and \
+                     ignores the logistic likelihood, so it would not move the parameters. Use \
+                     method = focei (default), saem, or imp.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if model.n_kappa > 0 {
+            diags.push(
+                Diagnostic::error(
+                    "E_BINARY_IOV_UNSUPPORTED",
+                    "a [binary_model] endpoint is not yet supported together with inter-occasion \
+                     variability ([iov] / κ): the binary term enters the inner EBE objective but \
+                     not the outer IOV objective, so estimates would be biased. Fit the binary \
+                     endpoint without [iov] for now.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
     // IMPMAP does not yet support inter-occasion variability (κ / [iov]); the κ
     // sufficient statistics and Ω_iov M-step are a planned follow-up. Surface it
     // at check time so `ferx check` rejects it rather than the fit failing at
@@ -2183,16 +2231,16 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-        // TTE is unsupported for every method: the TTE Laplace path
-        // (foce_subject_nll_interaction_with_tte) accumulates R diagonally and
-        // cannot represent the cross-endpoint covariance, so it would silently
-        // drop the correlation for FOCE as well as SAEM.
-        if model.has_tte() {
+        // Every non-Gaussian endpoint is unsupported for every method: the Laplace path
+        // (foce_subject_nll_interaction_with_tte) accumulates R diagonally and cannot
+        // represent the cross-endpoint covariance, so it would silently drop the correlation
+        // for FOCE as well as SAEM — for TTE and the #760 binary/categorical endpoint alike.
+        if model.has_non_gaussian() {
             diags.push(
                 Diagnostic::error(
                     "E_BLOCK_SIGMA_TTE_UNSUPPORTED",
                     "block_sigma correlated residual errors are not yet supported with \
-                     time-to-event endpoints.",
+                     time-to-event or binary/categorical endpoints.",
                 )
                 .with_block("fit_options"),
             );
@@ -12505,6 +12553,58 @@ mod simulate_with_uncertainty_tests {
             exclusions: None,
             warnings: vec![],
         }
+    }
+
+    /// Binary model whose `logit` references covariate `X`, so the parser records `X`
+    /// in the endpoint's `lp_covariates` (the categorical analogue of `hazard_covariates`).
+    #[cfg(feature = "survival")]
+    fn parse_binary_lp_cov_model() -> CompiledModel {
+        use crate::parser::model_parser::parse_model_string;
+        const M: &str = r#"
+[parameters]
+  theta TH0(0.0, -10.0, 10.0)
+  theta THX(0.0, -10.0, 10.0)
+[binary_model]
+  cmt   = 3
+  logit = TH0 + THX * X
+[fit_options]
+  method = focei
+"#;
+        parse_model_string(M).expect("binary + covariate-in-logit model parses")
+    }
+
+    /// #741 analogue for the binary endpoint: a time-varying covariate in the `logit`
+    /// predictor is rejected at fit setup — it would otherwise be silently frozen at the
+    /// baseline snapshot (the bug the PR-807 review caught; the `types.rs` doc had claimed
+    /// this was guarded when it was not).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn binary_logit_time_varying_covariate_is_rejected() {
+        let model = parse_binary_lp_cov_model();
+        let pop = tte_cov_snapshot_pop(
+            "S1",
+            vec![
+                HashMap::from([("X".to_string(), 1.0)]),
+                HashMap::from([("X".to_string(), 2.0)]),
+            ],
+        );
+        let msg = check_survival_tv_covariates(&model, &pop)
+            .expect("a time-varying X in the logit must be rejected up front");
+        assert!(msg.contains("[binary_model]"), "must name the block: {msg}");
+        assert!(msg.contains('X'), "must name the covariate: {msg}");
+        assert!(msg.contains("#741"), "must cite the issue: {msg}");
+        // A time-constant X is accepted.
+        let pop_ok = tte_cov_snapshot_pop(
+            "S1",
+            vec![
+                HashMap::from([("X".to_string(), 1.0)]),
+                HashMap::from([("X".to_string(), 1.0)]),
+            ],
+        );
+        assert!(
+            check_survival_tv_covariates(&model, &pop_ok).is_none(),
+            "a constant logit covariate must not be rejected"
+        );
     }
 
     #[cfg(feature = "survival")]

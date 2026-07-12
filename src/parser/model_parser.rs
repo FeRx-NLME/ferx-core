@@ -1071,8 +1071,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // A `[binary_model]` (Phase 4 categorical / logistic, #760) endpoint likewise makes
     // the Gaussian PK blocks optional — a logistic-only model needs none of them.
     #[cfg(feature = "survival")]
-    let has_binary_model_block =
-        blocks.contains_key("binary_model") || extracted.named.contains_key("binary_model");
+    let has_binary_model_block = blocks.contains_key("binary_model")
+        || extracted
+            .named
+            .get("binary_model")
+            .is_some_and(|m| !m.is_empty());
     #[cfg(not(feature = "survival"))]
     let has_binary_model_block = false;
 

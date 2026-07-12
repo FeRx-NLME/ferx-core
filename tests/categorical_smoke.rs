@@ -13,7 +13,10 @@ mod common;
 #[cfg(feature = "survival")]
 mod binary_smoke {
     use crate::common;
+    use ferx_core::api::check_model_options;
+    use ferx_core::diagnostics::Diagnostic;
     use ferx_core::parser::model_parser::parse_model_string;
+    use ferx_core::types::EstimationMethod;
     use ferx_core::{fit, fit_from_files, EndpointLikelihood, FitOptions};
 
     /// Mixed-effects logistic: a per-subject random intercept `ETA_I` plus a covariate.
@@ -111,6 +114,132 @@ mod binary_smoke {
         assert!(
             err.contains("cmt = 3"),
             "message should name the CMT, got: {err}"
+        );
+    }
+
+    /// Joint PK + binary model declaring inter-occasion variability (κ) — used to check that
+    /// binary + IOV is rejected (the outer FOCE-IOV objective omits the binary term).
+    const IOV_MODEL: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TH0(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP ~ 0.05
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[binary_model]
+  cmt   = 3
+  logit = TH0
+
+[fit_options]
+  method     = focei
+  iov_column = OCC
+";
+
+    fn has_error(diags: &[Diagnostic], code: &str) -> bool {
+        diags.iter().any(|d| d.code == code)
+    }
+
+    /// SAEM — the preferred estimator for categorical data — runs a short binary fit and
+    /// returns a finite OFV. Exercises the SAEM M-step site (`obs_nll_subject_from_preds`),
+    /// which the FOCEI smoke tests above do not reach.
+    #[test]
+    fn binary_saem_runs() {
+        let model = parse_model_string(MIXED_MODEL).unwrap();
+        let subjects: Vec<(f64, Vec<(f64, u8)>)> = vec![
+            (1.0, vec![(0.0, 1), (1.0, 1), (2.0, 0)]),
+            (-0.5, vec![(0.0, 0), (1.0, 0), (2.0, 1)]),
+            (0.3, vec![(0.0, 1), (1.0, 0), (2.0, 0)]),
+            (-1.2, vec![(0.0, 0), (1.0, 0), (2.0, 0)]),
+            (0.8, vec![(0.0, 1), (1.0, 1), (2.0, 1)]),
+            (-0.1, vec![(0.0, 0), (1.0, 1), (2.0, 0)]),
+        ];
+        let pop = common::binary_pop(&subjects, 3);
+        let opts = FitOptions {
+            method: EstimationMethod::Saem,
+            saem_n_exploration: 2,
+            saem_n_convergence: 2,
+            ..Default::default()
+        };
+        let res = fit(&model, &pop, &model.default_params, &opts)
+            .expect("SAEM binary fit must return Ok");
+        assert!(res.ofv.is_finite(), "OFV must be finite, got {}", res.ofv);
+    }
+
+    /// The Gauss-Newton gradient is Gaussian-specific (plan §13), so `method = gn` on a binary
+    /// model is rejected fail-loud — the review found GN silently drops the logit term.
+    #[test]
+    fn binary_gauss_newton_rejected() {
+        let model = parse_model_string(MIXED_MODEL).unwrap();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceGn,
+            ..Default::default()
+        };
+        assert!(
+            has_error(
+                &check_model_options(&model, &opts),
+                "E_BINARY_GN_UNSUPPORTED"
+            ),
+            "method = gn + binary must be rejected"
+        );
+    }
+
+    /// Binary + inter-occasion variability is rejected: the binary term enters the inner EBE
+    /// objective but not the outer FOCE-IOV objective (the inner/outer mismatch the review found).
+    #[test]
+    fn binary_iov_rejected() {
+        let model = parse_model_string(IOV_MODEL).expect("joint PK + binary + IOV model parses");
+        assert!(model.n_kappa > 0, "fixture must declare a κ");
+        assert!(
+            has_error(
+                &check_model_options(&model, &FitOptions::default()),
+                "E_BINARY_IOV_UNSUPPORTED"
+            ),
+            "binary + IOV must be rejected"
+        );
+    }
+
+    /// The `[binary_model]` parser rejects its error cases fail-loud (unsupported link, unknown
+    /// key, missing required keys) rather than mis-parsing.
+    #[test]
+    fn binary_parser_rejections() {
+        let wrap = |block: &str| {
+            format!("[parameters]\n  theta TH0(0.0, -10.0, 10.0)\n{block}\n[fit_options]\n  method = focei\n")
+        };
+        // Unsupported link.
+        assert!(parse_model_string(&wrap(
+            "[binary_model]\n  cmt = 3\n  logit = TH0\n  link = probit"
+        ))
+        .is_err());
+        // Unknown key.
+        assert!(parse_model_string(&wrap(
+            "[binary_model]\n  cmt = 3\n  logit = TH0\n  bogus = 1"
+        ))
+        .is_err());
+        // Missing `logit`.
+        assert!(parse_model_string(&wrap("[binary_model]\n  cmt = 3")).is_err());
+        // Missing `cmt`.
+        assert!(parse_model_string(&wrap("[binary_model]\n  logit = TH0")).is_err());
+    }
+
+    /// A logit predictor that references an IOV κ directly is rejected at parse (BSV-only scope).
+    #[test]
+    fn binary_logit_direct_kappa_rejected() {
+        let m = IOV_MODEL.replace("logit = TH0", "logit = TH0 + KAPPA_CL");
+        assert!(
+            parse_model_string(&m).is_err(),
+            "a direct κ reference in the logit must be rejected at parse"
         );
     }
 }

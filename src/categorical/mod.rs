@@ -30,23 +30,25 @@ fn softplus(x: f64) -> f64 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
-/// Negative Bernoulli log-likelihood for one subject's binary records on a single
-/// CMT. `records` are the subject's [`ObsRecord::DiscreteState`] entries for the
-/// endpoint's CMT (already filtered by the caller); any non-`DiscreteState` entry
-/// is ignored. States are assumed validated to `{0,1}` by [`validate_binary_states`]
-/// at fit setup; a `debug_assert` backstops that here, and a release-safe clamp keeps
-/// a mis-validated `state ≥ 2` from injecting a wild `y` into the sum.
+/// Negative Bernoulli log-likelihood for one subject's binary records on `cmt`.
+/// Scans `records` (typically the subject's full `obs_records`) and scores only the
+/// [`ObsRecord::DiscreteState`] rows on `cmt` — filtering by CMT here (rather than
+/// trusting the caller) keeps a second binary CMT's rows from being double-counted and
+/// lets the caller pass `&subject.obs_records` with zero allocation. States are assumed
+/// validated to `{0,1}` by [`validate_binary_states`] at fit setup; a `debug_assert`
+/// backstops that, and a release-safe clamp keeps a mis-validated `state ≥ 2` from
+/// injecting a wild `y` into the sum.
 ///
 /// The linear predictor is evaluated **once per record** inside [`with_model_time`]
 /// so a `TIME` term resolves to that record's time; a predictor without `TIME` is
 /// constant across records (the guard is a cheap thread-local set/restore).
 ///
 /// Returns the raw NLL (positive). Callers apply the same `2·` OFV-scale factor they
-/// apply to `tte_endpoint_nll`, and the shared non-finite `1e20` sentinel guards an
-/// overflowed predictor downstream.
+/// apply to `tte_endpoint_nll`.
 pub(crate) fn binary_data_term(
     link: LinkFn,
     lp_fn: &LinearPredictorFn,
+    cmt: usize,
     records: &[ObsRecord],
     theta: &[f64],
     eta: &[f64],
@@ -54,9 +56,27 @@ pub(crate) fn binary_data_term(
 ) -> f64 {
     let mut nll = 0.0;
     for r in records {
-        if let ObsRecord::DiscreteState { time, state, .. } = r {
+        if let ObsRecord::DiscreteState {
+            time,
+            state,
+            cmt: c,
+        } = r
+        {
+            if *c != cmt {
+                continue; // a DiscreteState row for a different endpoint's CMT
+            }
             debug_assert!(*state <= 1, "binary state must be 0/1 (validated pre-fit)");
             let lp = with_model_time(*time, || lp_fn(theta, eta, covariates));
+            if !lp.is_finite() {
+                // An overflowed predictor (extreme θ / covariate) makes
+                // `softplus(±∞) − y·(±∞)` a NaN/∞ that the FOCEI outer objective
+                // (`foce_subject_nll_interaction_with_tte`) does not guard at its final
+                // return — repel the optimizer with the survival module's `1e20`
+                // sentinel instead (fail-loud-but-alive), as `tte_data_term` does for
+                // its own degenerate cases.
+                nll += 1e20;
+                continue;
+            }
             let y = (*state as f64).min(1.0);
             nll += match link {
                 // p = inv_logit(lp): −[y·log p + (1−y)·log(1−p)] = softplus(lp) − y·lp.
@@ -88,19 +108,13 @@ pub(crate) fn binary_subject_nll(
     let mut nll = 0.0;
     for (cmt, endpoint) in &model.endpoints {
         if let EndpointLikelihood::Binary { link, lp_fn, .. } = endpoint {
-            let records_for_cmt: Vec<ObsRecord> = subject
-                .obs_records
-                .iter()
-                .filter(|r| matches!(r, ObsRecord::DiscreteState { cmt: c, .. } if c == cmt))
-                .cloned()
-                .collect();
-            if records_for_cmt.is_empty() {
-                continue;
-            }
+            // `binary_data_term` filters `obs_records` by `cmt` itself — no per-call
+            // allocation, even inside the FD-Hessian closure (site 921).
             nll += binary_data_term(
                 *link,
                 lp_fn,
-                &records_for_cmt,
+                *cmt,
+                &subject.obs_records,
                 theta,
                 eta,
                 &subject.covariates,
@@ -157,7 +171,7 @@ mod tests {
         let recs = [rec(0.0, 1), rec(5.0, 0), rec(9.0, 1)];
         // Two events (y=1) and one non-event (y=0).
         let expect = -(2.0 * p.ln() + (1.0 - p).ln());
-        let got = binary_data_term(LinkFn::Logit, &const_lp(lp), &recs, &[], &[], &cov);
+        let got = binary_data_term(LinkFn::Logit, &const_lp(lp), 3, &recs, &[], &[], &cov);
         assert!((got - expect).abs() < 1e-12, "got {got}, expect {expect}");
     }
 
@@ -166,7 +180,7 @@ mod tests {
     fn binary_data_term_half_probability() {
         let cov = HashMap::new();
         let recs = [rec(0.0, 0), rec(1.0, 1)];
-        let got = binary_data_term(LinkFn::Logit, &const_lp(0.0), &recs, &[], &[], &cov);
+        let got = binary_data_term(LinkFn::Logit, &const_lp(0.0), 3, &recs, &[], &[], &cov);
         assert!((got - 2.0 * std::f64::consts::LN_2).abs() < 1e-12);
     }
 
@@ -176,39 +190,27 @@ mod tests {
     fn binary_data_term_stable_at_extremes() {
         let cov = HashMap::new();
         // lp = +40, y = 1 ⇒ p ≈ 1 ⇒ −log p ≈ 0.
-        let got1 = binary_data_term(
-            LinkFn::Logit,
-            &const_lp(40.0),
-            &[rec(0.0, 1)],
-            &[],
-            &[],
-            &cov,
-        );
-        assert!(got1.is_finite() && got1 < 1e-16, "got {got1}");
+        let nll = |lp: f64, state: usize| {
+            binary_data_term(
+                LinkFn::Logit,
+                &const_lp(lp),
+                3,
+                &[rec(0.0, state)],
+                &[],
+                &[],
+                &cov,
+            )
+        };
+        // lp = +40, y = 1 ⇒ p ≈ 1 ⇒ −log p ≈ 0.
+        assert!(nll(40.0, 1).is_finite() && nll(40.0, 1) < 1e-16);
         // lp = −40, y = 1 ⇒ p ≈ 0 ⇒ −log p ≈ 40.
-        let got2 = binary_data_term(
-            LinkFn::Logit,
-            &const_lp(-40.0),
-            &[rec(0.0, 1)],
-            &[],
-            &[],
-            &cov,
-        );
-        assert!((got2 - 40.0).abs() < 1e-9, "got {got2}");
-        // lp = 800 (naive e^lp = inf): softplus stays finite ≈ lp for y = 0.
-        let got3 = binary_data_term(
-            LinkFn::Logit,
-            &const_lp(800.0),
-            &[rec(0.0, 0)],
-            &[],
-            &[],
-            &cov,
-        );
-        assert!(
-            got3.is_finite() && (got3 - 800.0).abs() < 1e-9,
-            "got {got3}"
-        );
+        assert!((nll(-40.0, 1) - 40.0).abs() < 1e-9);
+        // lp = 800 (naive e^lp overflows to ∞): softplus stays finite ≈ lp for y = 0.
+        assert!((nll(800.0, 0) - 800.0).abs() < 1e-9);
         assert!((1.0_f64 + 800.0_f64.exp()).ln().is_infinite()); // the naive form does overflow
+                                                                 // Non-finite lp (overflowed predictor) → the 1e20 sentinel, never NaN/∞.
+        assert_eq!(nll(f64::INFINITY, 1), 1e20);
+        assert_eq!(nll(f64::NEG_INFINITY, 0), 1e20);
     }
 
     /// `validate_binary_states` rejects a non-Bernoulli code with a message that names

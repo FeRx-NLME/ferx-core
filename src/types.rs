@@ -2789,10 +2789,12 @@ pub enum EndpointLikelihood {
         link: LinkFn,
         /// Linear predictor `lp` (log-odds) as a function of (theta, eta, covariates).
         lp_fn: LinearPredictorFn,
-        /// Covariate names referenced by the linear predictor. Evaluated at a
-        /// baseline snapshot (the [`LinearPredictorFn`] takes no time argument), so a
-        /// time-varying covariate here is rejected at parse — the categorical analogue
-        /// of [`Self::Tte`]'s `hazard_covariates` (#741).
+        /// Covariate names referenced by the linear predictor (including any reached
+        /// transitively through `[individual_parameters]`). Evaluated at a baseline
+        /// snapshot (the [`LinearPredictorFn`] takes no time argument), so a covariate
+        /// listed here that turns out to be time-varying in the data is rejected at fit
+        /// setup by [`crate::api::check_survival_tv_covariates`] — the categorical
+        /// analogue of [`Self::Tte`]'s `hazard_covariates` (#741).
         lp_covariates: Vec<String>,
     },
     // Ordinal, Poisson, NegBin, Ctmm, Dtmm deferred to Phase 4/5
