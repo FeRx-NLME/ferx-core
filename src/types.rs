@@ -3365,16 +3365,29 @@ impl CompiledModel {
         c
     }
 
+    /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint — the
+    /// binary / Bernoulli family today; ordinal / Poisson / negative-binomial extend this
+    /// match. This is the family-agnostic gate for the discrete data term and its FD-Hessian
+    /// contribution, so a new discrete family is enabled here and in `discrete_subject_nll`
+    /// without editing a likelihood dispatch site. Equals [`has_binary`](Self::has_binary)
+    /// today.
+    #[cfg(feature = "survival")]
+    pub fn has_discrete(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|e| matches!(e, EndpointLikelihood::Binary { .. }))
+    }
+
     /// True if the model carries **any non-Gaussian endpoint** (TTE/RTTE or the
     /// Phase-4 categorical/count families). This is the predicate the estimation
     /// machinery gates on when choosing the **FD-Hessian Laplace** inner/outer path
     /// and disabling the analytic outer gradient — those choices are correct for every
     /// non-Gaussian data term, not TTE specifically. Equals [`has_tte`](Self::has_tte)
-    /// exactly when no categorical endpoint is present, so existing TTE behaviour is
+    /// exactly when no discrete endpoint is present, so existing TTE behaviour is
     /// unchanged.
     #[cfg(feature = "survival")]
     pub fn has_non_gaussian(&self) -> bool {
-        self.has_tte() || self.has_binary()
+        self.has_tte() || self.has_discrete()
     }
 
     /// Always false without the `survival` feature - TTE endpoints can't be
@@ -3394,6 +3407,13 @@ impl CompiledModel {
     /// Always false without the `survival` feature - `[binary_model]` can't be parsed.
     #[cfg(not(feature = "survival"))]
     pub fn has_binary(&self) -> bool {
+        false
+    }
+
+    /// Always false without the `survival` feature - no discrete (categorical/count)
+    /// endpoint can be parsed.
+    #[cfg(not(feature = "survival"))]
+    pub fn has_discrete(&self) -> bool {
         false
     }
 

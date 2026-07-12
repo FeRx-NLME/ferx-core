@@ -206,7 +206,7 @@ fn tte_ode_nll_from_curves(
 /// at the TTE event/censor/entry times — so the inner NLL no longer integrates the
 /// same system a second time via `ode_cumhaz_hazard`.
 #[cfg(feature = "survival")]
-struct JointPkTteSolve {
+pub(crate) struct JointPkTteSolve {
     /// Scaled Gaussian predictions — bit-identical to the standalone prediction path.
     preds: Vec<f64>,
     /// Sorted-unique union of every OdeAccumulated endpoint's record times.
@@ -379,6 +379,81 @@ fn tte_endpoint_nll(
     }
 }
 
+/// Accumulate every non-Gaussian endpoint's data-term NLL into `acc`, applying `factor` to
+/// each contribution. This is the single seam the FOCEI, SAEM θ-M-step, and IOV likelihood
+/// paths share: TTE endpoints are scored by [`tte_endpoint_nll`] (an `OdeAccumulated`
+/// joint-PK-TTE hazard reads `H`/`h` off the #570 shared solve when `joint_share` is `Some`);
+/// the discrete families — binary today, ordinal / Poisson / negative-binomial later — by
+/// [`crate::categorical::discrete_subject_nll`]. A new endpoint family is enabled by one arm
+/// in those two callees, touching no dispatch site.
+///
+/// It accumulates **into `acc` per term** — one `factor * term` add per TTE endpoint (in
+/// `model.endpoints` iteration order), then one for the discrete term — rather than returning
+/// a folded sum, so a running `data_ll` that already holds the Gaussian residual term stays
+/// **bit-identical** to the previously-inlined loop. Returning `-> f64` and adding
+/// `factor * sum` once would reassociate the floating-point adds and perturb the FOCEI hot
+/// path for multi-endpoint (competing-risks / TTE+binary) subjects.
+///
+/// `factor` is the site's OFV-scale weight (`2·` on the halved FOCEI/IOV `data_ll`, `1·` on
+/// the raw SAEM / non-interaction NLL). `joint_share` is `None` on every path that does not
+/// build the shared solve, and passing it is faithful to what each inlined:
+/// - the two **IOV** sites (`individual_nll_iov`, `obs_nll_subject_into_iov`) inlined
+///   `tte_data_term`, which equals `tte_endpoint_nll` here because an IOV model's hazard is
+///   always `Analytic` — IOV + joint-PK-TTE is rejected at parse;
+/// - the **SAEM θ-M-step** (`obs_nll_subject_from_preds`) already inlined `tte_endpoint_nll`
+///   and *may* carry an `OdeAccumulated` endpoint (SAEM + joint-PK-TTE is not rejected); the
+///   `_` arm re-solves it via `tte_ode_nll`, exactly as that site did before the fold.
+#[cfg(feature = "survival")]
+pub(crate) fn accumulate_non_gaussian_nll(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    joint_share: Option<&JointPkTteSolve>,
+    factor: f64,
+    acc: &mut f64,
+) {
+    // Callers gate on `!subject.obs_records.is_empty()`, so an empty subject never reaches
+    // here; both loops below are also natural no-ops on one.
+    // TTE endpoints — one `factor * raw` add each, in endpoints iteration order.
+    for (cmt, endpoint) in &model.endpoints {
+        if let EndpointLikelihood::Tte {
+            hazard, recurrence, ..
+        } = endpoint
+        {
+            let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                .obs_records
+                .iter()
+                .filter(|r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt))
+                .cloned()
+                .collect();
+            if records_for_cmt.is_empty() {
+                continue; // subject has no records for this TTE CMT
+            }
+            let raw = match (joint_share, hazard) {
+                (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
+                    model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
+                    s,
+                    *chz_state,
+                    &records_for_cmt,
+                ),
+                _ => tte_endpoint_nll(
+                    model,
+                    subject,
+                    hazard,
+                    *recurrence,
+                    &records_for_cmt,
+                    theta,
+                    eta,
+                ),
+            };
+            *acc += factor * raw;
+        }
+    }
+    // Discrete families (binary today; ordinal/Poisson/… later) — one add, matching the TTE terms.
+    *acc += factor * crate::categorical::discrete_subject_nll(model, subject, theta, eta);
+}
+
 /// Hot-path variant that additionally threads through a pre-built
 /// [`pk::event_driven::EventSchedule`]. The FOCE inner-loop obj closure
 /// and Jacobian build the schedule once per `find_ebe` call and reuse
@@ -493,57 +568,20 @@ pub fn individual_nll_into_with_schedule(
         }
     }
 
-    // TTE data term: add −log p(events | η, θ) for each TTE endpoint.
-    // Only compiled and executed when the `survival` feature is enabled and
-    // the subject has non-Gaussian obs_records.
+    // Non-Gaussian data term: −log p for each TTE endpoint plus the discrete
+    // (binary/categorical) endpoints, at the 2× OFV-scale (the whole objective is halved at
+    // the end). #570: an OdeAccumulated endpoint reads `H`/`h` off the shared joint solve.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
-        use crate::types::EndpointLikelihood;
-        // Iterate model.endpoints (typically 1–3 entries) rather than scanning
-        // obs_records for unique CMTs — avoids the HashSet and one pass over records.
-        for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte {
-                hazard, recurrence, ..
-            } = endpoint
-            {
-                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                    .obs_records
-                    .iter()
-                    .filter(
-                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
-                    )
-                    .cloned()
-                    .collect();
-                if records_for_cmt.is_empty() {
-                    continue; // subject has no records for this TTE CMT
-                }
-                // tte_endpoint_nll returns a raw NLL; multiply by 2 to match the
-                // Gaussian data_ll convention (everything is halved at the end).
-                // #570: when the shared joint solve is active, an OdeAccumulated
-                // endpoint reads `H`/`h` off it instead of integrating again; every
-                // other case keeps the established per-endpoint dispatch.
-                let raw = match (joint_share.as_ref(), hazard) {
-                    (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
-                        model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
-                        s,
-                        *chz_state,
-                        &records_for_cmt,
-                    ),
-                    _ => tte_endpoint_nll(
-                        model,
-                        subject,
-                        hazard,
-                        *recurrence,
-                        &records_for_cmt,
-                        theta,
-                        eta,
-                    ),
-                };
-                data_ll += 2.0 * raw;
-            }
-        }
-        // Binary/categorical (#760): same 2× OFV-scale as the TTE term above.
-        data_ll += 2.0 * crate::categorical::binary_subject_nll(model, subject, theta, eta);
+        accumulate_non_gaussian_nll(
+            model,
+            subject,
+            theta,
+            eta,
+            joint_share.as_ref(),
+            2.0,
+            &mut data_ll,
+        );
     }
 
     let nll = 0.5 * (eta_prior + log_det_omega + data_ll);
@@ -719,44 +757,12 @@ pub(crate) fn obs_nll_subject_from_preds(
         }
     }
 
-    // TTE data term: add −log p(events | η, θ) so the SAEM theta M-step
-    // gradient receives TTE hazard contributions, not just Gaussian residuals.
+    // Non-Gaussian data term at raw-NLL weight (1×) so the SAEM θ M-step gradient receives
+    // the TTE hazard + discrete (binary/categorical) contributions, not just Gaussian
+    // residuals. No joint-share on this path (it re-solves per endpoint).
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
-        use crate::types::EndpointLikelihood;
-        for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte {
-                hazard, recurrence, ..
-            } = endpoint
-            {
-                // Keep only `ObsRecord::Event` records at this CMT; any `DiscreteState` /
-                // `Count` records (Phase 4.0) are correctly excluded from the TTE data term.
-                // The `..` pattern captures all EventType variants (Exact, RightCensored,
-                // IntervalCensored), so this filter passes every TTE record type.
-                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                    .obs_records
-                    .iter()
-                    .filter(
-                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
-                    )
-                    .cloned()
-                    .collect();
-                if records_for_cmt.is_empty() {
-                    continue;
-                }
-                nll += tte_endpoint_nll(
-                    model,
-                    subject,
-                    hazard,
-                    *recurrence,
-                    &records_for_cmt,
-                    theta,
-                    eta,
-                );
-            }
-        }
-        // Binary/categorical (#760): raw-NLL weight (1×), matching the TTE term above.
-        nll += crate::categorical::binary_subject_nll(model, subject, theta, eta);
+        accumulate_non_gaussian_nll(model, subject, theta, eta, None, 1.0, &mut nll);
     }
 
     nll
@@ -969,17 +975,18 @@ pub fn foce_subject_nll(
             }
         }
 
-        // Binary/categorical (#760): fold its NLL at the mode and FD Hessian w.r.t. η
-        // into the same accumulators, so log|H̃| includes the logit curvature. A pure-binary
-        // subject has an empty Gaussian h_matrix; hrh then comes entirely from here.
-        if model.has_binary() {
-            let bin_fn = |eta_eval: &[f64]| {
-                crate::categorical::binary_subject_nll(model, subject, theta, eta_eval)
+        // Discrete endpoints (#760: binary; ordinal/Poisson/… later): fold their NLL at the
+        // mode and FD Hessian w.r.t. η into the same accumulators, so log|H̃| includes the
+        // discrete curvature. A pure-discrete subject has an empty Gaussian h_matrix; hrh then
+        // comes entirely from here. `has_discrete()` gates a new family in without a change here.
+        if model.has_discrete() {
+            let discrete_fn = |eta_eval: &[f64]| {
+                crate::categorical::discrete_subject_nll(model, subject, theta, eta_eval)
             };
-            tte_nll_at_mode += bin_fn(eta_hat.as_slice());
+            tte_nll_at_mode += discrete_fn(eta_hat.as_slice());
             if n_eta > 0 {
-                let steps = shi_step_sizes(&bin_fn, eta_hat.as_slice());
-                tte_h += data_term_hessian_fd(&bin_fn, eta_hat.as_slice(), &steps);
+                let steps = shi_step_sizes(&discrete_fn, eta_hat.as_slice());
+                tte_h += data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps);
             }
         }
 
@@ -2424,42 +2431,14 @@ pub fn individual_nll_iov(
         }
     }
 
-    // TTE data term: same convention as individual_nll_into_with_schedule —
-    // multiply by 2.0 so the final 0.5 factor gives a net weight of 1.0×.
-    // Kappas are PK-only; the hazard param_fn uses BSV eta, not kappas.
+    // Non-Gaussian data term at 2× (the final 0.5 gives net 1.0×): TTE endpoints plus the
+    // discrete (binary/categorical) term. Kappas are PK-only; the hazard param_fn uses BSV η,
+    // not kappas. No joint-share on the IOV path (it never carries a joint-PK-TTE endpoint),
+    // so the TTE term is analytic and `tte_endpoint_nll` matches the `tte_data_term` this
+    // site inlined.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
-        use crate::survival::tte_data_term;
-        use crate::types::EndpointLikelihood;
-        for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte {
-                hazard, recurrence, ..
-            } = endpoint
-            {
-                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                    .obs_records
-                    .iter()
-                    .filter(
-                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
-                    )
-                    .cloned()
-                    .collect();
-                if records_for_cmt.is_empty() {
-                    continue;
-                }
-                data_ll += 2.0
-                    * tte_data_term(
-                        &records_for_cmt,
-                        hazard,
-                        *recurrence,
-                        theta,
-                        eta,
-                        &subject.covariates,
-                    );
-            }
-        }
-        // Binary/categorical (#760): same 2× OFV-scale as the TTE term above.
-        data_ll += 2.0 * crate::categorical::binary_subject_nll(model, subject, theta, eta);
+        accumulate_non_gaussian_nll(model, subject, theta, eta, None, 2.0, &mut data_ll);
     }
 
     0.5 * (eta_prior + log_det_omega + kappa_prior + (k_occasions as f64) * log_det_iov + data_ll)

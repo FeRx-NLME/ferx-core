@@ -426,40 +426,21 @@ fn obs_nll_subject_into_iov(
         }
     }
 
-    // TTE term: same convention as obs_nll_subject_into (weight 1.0 to match
-    // the true NLL, since Gaussian obs already contribute at 0.5*(log v + r²/v)).
+    // Non-Gaussian data term at raw-NLL weight (1×) to match the true NLL (Gaussian obs
+    // already contribute at 0.5·(log v + r²/v)): TTE endpoints plus the discrete
+    // (binary/categorical) term. No joint-share on the IOV M-step path, and its analytic TTE
+    // term matches the `tte_data_term` this site inlined.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
-        use crate::survival::tte_data_term;
-        use crate::types::EndpointLikelihood;
-        for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte {
-                hazard, recurrence, ..
-            } = endpoint
-            {
-                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                    .obs_records
-                    .iter()
-                    .filter(
-                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
-                    )
-                    .cloned()
-                    .collect();
-                if records_for_cmt.is_empty() {
-                    continue;
-                }
-                total_nll += tte_data_term(
-                    &records_for_cmt,
-                    hazard,
-                    *recurrence,
-                    theta,
-                    eta,
-                    &subject.covariates,
-                );
-            }
-        }
-        // Binary/categorical (#760): raw-NLL weight (1×), matching the TTE term above.
-        total_nll += crate::categorical::binary_subject_nll(model, subject, theta, eta);
+        crate::stats::likelihood::accumulate_non_gaussian_nll(
+            model,
+            subject,
+            theta,
+            eta,
+            None,
+            1.0,
+            &mut total_nll,
+        );
     }
 
     total_nll
