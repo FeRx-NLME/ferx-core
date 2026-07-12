@@ -15,8 +15,10 @@
 //!
 //! ferx's OFV is on the `-2logL` (deviance) scale, so it must equal the glm deviance —
 //! the strongest correctness signal, pinning the Bernoulli likelihood constant *and*
-//! form against an independent, license-free tool. (NONMEM `F_FLAG=1` logistic would
-//! reproduce the same glm fit; glm is the canonical exact reference here.)
+//! form against an independent tool. NONMEM `F_FLAG=1` was also run and reproduces the
+//! same fit to 6 sig figs (OFV 213.59548; control file + numbers in
+//! `tests/reference/binary_logistic/`), so this test asserts against the shared glm /
+//! NONMEM values.
 
 #![cfg(all(feature = "survival", feature = "slow-tests"))]
 
