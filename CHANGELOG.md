@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Restart of an interrupted run from a checkpoint** (#755): a fit now
+  periodically saves a small `{model}.tmp` resume point (throttled to
+  `[fit_options] checkpoint_interval_secs`, default 300 s, so short runs write
+  nothing). If the process is stopped, the next run of the same model + data
+  resumes from the last saved estimates instead of starting over, and the file
+  is deleted on successful completion. A model/data hash check invalidates a
+  stale checkpoint (the run then starts fresh). Pass the CLI flag `--clean` to
+  force a fresh start, or set `checkpoint = false` to disable saving. Works
+  across all estimation methods (resume is a coarse warm-restart from the saved
+  population estimates, not a bit-exact optimizer-state resume).
 - **Binary / logistic endpoint** (`[binary_model]`, #760): mixed-effects logistic
   regression as a first-class non-Gaussian endpoint (Phase 4, Track C). Declare a
   binary observation compartment with `cmt` and a `logit` linear predictor over
@@ -200,57 +210,6 @@ section of the SDLC for the versioning policy).
   surviving column) fail loudly. See
   [Data → Column mapping](https://ferx-nlme.github.io/ferx-core/model-file/data.html).
 
-### Changed
-- **Flip-flop transit / inverse-Gaussian models with `lagtime` / `f` now auto-route
-  to their ODE twin** (#735) instead of being rejected. The analytic
-  `pk one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` / `two_cpt_ig` closed forms
-  clamp to an identically-zero profile outside their tilting-convergence domain (the
-  flip-flop regime) and are transparently rerouted to the equivalent ODE `transit()` /
-  `igd()` model — but previously only when the model carried no `lagtime=` / `f=`
-  mapping. Those mappings now carry into the generated twin (via reserved-name
-  individual parameters), so a flip-flop model with absorption lag or bioavailability —
-  including a `TIME` / time-varying-covariate model that *requires* the twin — now fits
-  and predicts correctly instead of erroring or returning zero. Validated by
-  closed-form↔ODE equivalence tests (`tests/transit_analytic_equivalence.rs`,
-  `tests/ig_analytic_equivalence.rs`) for lag, f, and both. A guard declines the twin
-  (keeping the model closed-form, and rejected up front if flip-flop) whenever building it
-  would misbehave: a parameter name that *shadows* a reserved F/lagtime slot it was not
-  mapped to (which would silently apply an extra F/lag), or an `f=`/`lagtime=` parameter
-  whose name *collides* with a disposition slot (e.g. a bioavailability parameter named
-  `V1`, which would otherwise make the twin fail to build). User `[odes]` / `[scaling]` /
-  `[initial_conditions]` forms remain twin-less (no unique desugar) and are still rejected
-  up front in the flip-flop regime.
-- **Default thread count capped at 8** (#707): when `threads` is unset (or
-  `0`/`auto`) — via `[fit_options] threads`, the CLI `--threads` flag, or the R
-  binding — the engine now defaults to `available cores - 1` (floored at 1),
-  capped at 8, instead of one worker per logical core. Most fits gain little from
-  scaling past a handful of cores, and not all cores are equal on
-  asymmetric platforms (e.g. Apple Silicon's E-cores). An explicit
-  `threads = N` / `--threads N` still pins the exact count requested.
-- **CLI default output no longer writes a separate `{model}-timing.txt` file** (#704):
-  the estimation step's wall-clock time and thread count now live under a new
-  `estimation:` section in `{model}-fit.yaml` (narrower in scope than the old
-  file, which also covered model parsing and data loading), alongside a new
-  `environment:` section (OS, CPU architecture, whether running in Docker, OS
-  username, ferx version) for troubleshooting and reproducibility. Both are also carried on
-  `FitResult.environment` and round-trip through `.fitrx` bundles.
-- **`simulate()` now samples inter-occasion variability (kappa)** (#723): simulating
-  an IOV model draws an independent `kappa ~ N(0, Omega_IOV)` for each occasion
-  (matching NONMEM `$SIM`), instead of holding every kappa at zero. Simulated /
-  VPC datasets from IOV models now carry the between-occasion spread the model
-  parameterizes; previously they silently under-dispersed relative to the fitted
-  model. Non-IOV models are unaffected (bit-identical output).
-- **The adaptive frozen-replay verifier now independently validates its snapshots** (#748):
-  the default-on safety net for `simulate_adaptive` / `simulate_adaptive_from_spec` reused the
-  same precomputed per-occasion / per-event PK snapshots the reactive driver did, so it checked
-  that the two *consumed* them identically but never that they were *correct* — a mis-built
-  snapshot (a wrong covariate, occasion, or `kappa` fed to a parameter) was applied by both sides
-  and passed the replay bit-exact. The verifier now re-derives each snapshot from the run's
-  primitives via the canonical helpers and bit-asserts it against what the driver was handed, so a
-  build that mis-resolves a covariate or occasion (the class fixed in #732 / #739) fails loudly for
-  every model instead of slipping past the replay. No effect on correct models.
-
-### Added
 - **Adaptive (feedback) dosing now supports time-varying covariates** (#700): the
   reactive driver recomputes each subject's PK per event/segment from the covariate
   active in that segment (the same NONMEM end-of-interval convention `predict()` /
@@ -333,6 +292,56 @@ section of the SDLC for the versioning policy).
   transform — just flagged, since ferx can't tell intent from mistake.
   `docs/model-file/scaling.qmd` now documents the raw-output convention per
   structural-model type.
+
+### Changed
+- **Flip-flop transit / inverse-Gaussian models with `lagtime` / `f` now auto-route
+  to their ODE twin** (#735) instead of being rejected. The analytic
+  `pk one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` / `two_cpt_ig` closed forms
+  clamp to an identically-zero profile outside their tilting-convergence domain (the
+  flip-flop regime) and are transparently rerouted to the equivalent ODE `transit()` /
+  `igd()` model — but previously only when the model carried no `lagtime=` / `f=`
+  mapping. Those mappings now carry into the generated twin (via reserved-name
+  individual parameters), so a flip-flop model with absorption lag or bioavailability —
+  including a `TIME` / time-varying-covariate model that *requires* the twin — now fits
+  and predicts correctly instead of erroring or returning zero. Validated by
+  closed-form↔ODE equivalence tests (`tests/transit_analytic_equivalence.rs`,
+  `tests/ig_analytic_equivalence.rs`) for lag, f, and both. A guard declines the twin
+  (keeping the model closed-form, and rejected up front if flip-flop) whenever building it
+  would misbehave: a parameter name that *shadows* a reserved F/lagtime slot it was not
+  mapped to (which would silently apply an extra F/lag), or an `f=`/`lagtime=` parameter
+  whose name *collides* with a disposition slot (e.g. a bioavailability parameter named
+  `V1`, which would otherwise make the twin fail to build). User `[odes]` / `[scaling]` /
+  `[initial_conditions]` forms remain twin-less (no unique desugar) and are still rejected
+  up front in the flip-flop regime.
+- **Default thread count capped at 8** (#707): when `threads` is unset (or
+  `0`/`auto`) — via `[fit_options] threads`, the CLI `--threads` flag, or the R
+  binding — the engine now defaults to `available cores - 1` (floored at 1),
+  capped at 8, instead of one worker per logical core. Most fits gain little from
+  scaling past a handful of cores, and not all cores are equal on
+  asymmetric platforms (e.g. Apple Silicon's E-cores). An explicit
+  `threads = N` / `--threads N` still pins the exact count requested.
+- **CLI default output no longer writes a separate `{model}-timing.txt` file** (#704):
+  the estimation step's wall-clock time and thread count now live under a new
+  `estimation:` section in `{model}-fit.yaml` (narrower in scope than the old
+  file, which also covered model parsing and data loading), alongside a new
+  `environment:` section (OS, CPU architecture, whether running in Docker, OS
+  username, ferx version) for troubleshooting and reproducibility. Both are also carried on
+  `FitResult.environment` and round-trip through `.fitrx` bundles.
+- **`simulate()` now samples inter-occasion variability (kappa)** (#723): simulating
+  an IOV model draws an independent `kappa ~ N(0, Omega_IOV)` for each occasion
+  (matching NONMEM `$SIM`), instead of holding every kappa at zero. Simulated /
+  VPC datasets from IOV models now carry the between-occasion spread the model
+  parameterizes; previously they silently under-dispersed relative to the fitted
+  model. Non-IOV models are unaffected (bit-identical output).
+- **The adaptive frozen-replay verifier now independently validates its snapshots** (#748):
+  the default-on safety net for `simulate_adaptive` / `simulate_adaptive_from_spec` reused the
+  same precomputed per-occasion / per-event PK snapshots the reactive driver did, so it checked
+  that the two *consumed* them identically but never that they were *correct* — a mis-built
+  snapshot (a wrong covariate, occasion, or `kappa` fed to a parameter) was applied by both sides
+  and passed the replay bit-exact. The verifier now re-derives each snapshot from the run's
+  primitives via the canonical helpers and bit-asserts it against what the driver was handed, so a
+  build that mis-resolves a covariate or occasion (the class fixed in #732 / #739) fails loudly for
+  every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
 - **Declining-hazard (`γ < 0`) Gompertz median/mean survival diagnostics** (#805):

@@ -323,6 +323,28 @@ pub fn run_model_with_data_inits(
     } else {
         parsed.fit_options.gradient_method
     };
+
+    // Hash both inputs up front (needed before the fit for the checkpoint
+    // integrity check, #755) and reuse the digests for the post-fit result
+    // stamping below — so we still hash each file only once. Errors are
+    // non-fatal: a missing hash just disables the resume/integrity checks.
+    let model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
+    let data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+
+    // Checkpoint / restart (#755): write `{model_stem}.tmp` next to the CLI
+    // outputs and resume from it on a re-run of the same model + data. Disabled
+    // by `[fit_options] checkpoint = false`. The CLI's `--clean` flag removes an
+    // existing checkpoint before this runs, forcing a fresh start.
+    if parsed.fit_options.checkpoint {
+        let stem = Path::new(model_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model");
+        parsed.fit_options.checkpoint_path = Some(format!("{stem}.tmp"));
+        parsed.fit_options.checkpoint_model_hash = model_hash.clone();
+        parsed.fit_options.checkpoint_data_hash = data_hash.clone();
+    }
+
     let mut result = fit(
         &parsed.model,
         &population,
@@ -334,14 +356,10 @@ pub fn run_model_with_data_inits(
         result.warnings.push(w);
         rebuild_warnings_structured(&mut result);
     }
-    // Hash both inputs *after* the fit so we don't double up disk reads
-    // (the model and CSV are already in the page cache from parse + read
-    // upstream). Errors here are non-fatal: the fit already succeeded, and
-    // a missing hash just disables the integrity check in run_sir.
     result.model_path = Some(model_path.to_string());
     result.data_path = Some(data_path.to_string());
-    result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
-    result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    result.model_hash = model_hash;
+    result.data_hash = data_hash;
     result.model_text = std::fs::read_to_string(model_path).ok();
     derive_output_occasions(&parsed.model, &parsed.fit_options, &mut population);
     Ok((result, population))
@@ -4820,10 +4838,109 @@ fn fit_inner(
     let mut method_wall_times_secs: Vec<f64> = Vec::with_capacity(n_stages);
     let mut covariance_wall_time_secs: f64 = 0.0;
 
+    // ── Checkpoint / restart (#755) ──────────────────────────────────────────
+    // With a checkpoint path configured, resume from a compatible saved
+    // checkpoint (unless it fails the model/data integrity or layout check) and
+    // arm the periodic writer. `start_stage` skips chain stages that were
+    // already completed before the interruption.
+    //
+    // Clear any sink left active by a *previous* fit on this (pooled) worker
+    // thread that returned early with an error and so never hit
+    // `finish_success`. Without this, a subsequent checkpoint-disabled fit —
+    // which skips `init` below — would inherit the stale sink and leak writes /
+    // removals to the old path.
+    crate::io::checkpoint::abandon();
+    let mut start_stage = 0usize;
+    if options.checkpoint {
+        if let Some(ckpt_path) = options.checkpoint_path.as_deref() {
+            let coord_names = crate::estimation::parameterization::coordinate_names(init_params);
+            if let Some(cp) = crate::io::checkpoint::load(ckpt_path) {
+                // Resume only when both integrity hashes are present *and* match.
+                // Treating absent hashes (None == None) as a match would let a
+                // run resume with no integrity guarantee at all — exactly the
+                // stale-state resume this check exists to prevent. The file
+                // runner always supplies both hashes; a direct `fit()` caller
+                // that omits them simply starts fresh.
+                let hashes_present = cp.model_hash.is_some()
+                    && cp.data_hash.is_some()
+                    && options.checkpoint_model_hash.is_some()
+                    && options.checkpoint_data_hash.is_some();
+                let hashes_match = cp.model_hash == options.checkpoint_model_hash
+                    && cp.data_hash == options.checkpoint_data_hash;
+                let hashes_ok = hashes_present && hashes_match;
+                let layout_ok = cp.coord_names == coord_names
+                    && cp.stage_idx < n_stages
+                    && cp.packed.len()
+                        == crate::estimation::parameterization::packed_len(init_params);
+                if hashes_ok && layout_ok {
+                    stage_params =
+                        crate::estimation::parameterization::unpack_params(&cp.packed, init_params);
+                    start_stage = cp.stage_idx;
+                    let banner = format!(
+                        "Resuming from checkpoint {}: stage {}/{} ({}), iteration {}, OFV {:.4}. \
+                         Pass --clean to start fresh.",
+                        ckpt_path,
+                        cp.stage_idx + 1,
+                        n_stages,
+                        chain.get(cp.stage_idx).map(|m| m.label()).unwrap_or("?"),
+                        cp.iter,
+                        cp.ofv,
+                    );
+                    if options.verbose {
+                        eprintln!("{banner}");
+                    }
+                    accumulated_warnings.push(banner);
+                } else {
+                    // Provably stale/incompatible = hashes present but different,
+                    // or a layout mismatch. Only then delete the file. When hashes
+                    // are simply unavailable we can't prove staleness, so we start
+                    // fresh but keep the checkpoint (a later run that does supply
+                    // hashes may still use it; a successful fit removes it anyway).
+                    let stale = (hashes_present && !hashes_match) || !layout_ok;
+                    let reason = if hashes_present && !hashes_match {
+                        "model or data changed since it was written"
+                    } else if !layout_ok {
+                        "its parameter layout does not match this model"
+                    } else {
+                        "its model/data integrity hashes are unavailable"
+                    };
+                    let msg = format!(
+                        "Ignoring checkpoint {} ({}); starting fresh.",
+                        ckpt_path, reason
+                    );
+                    if options.verbose {
+                        eprintln!("{msg}");
+                    }
+                    accumulated_warnings.push(msg);
+                    if stale {
+                        crate::io::checkpoint::remove(ckpt_path);
+                    }
+                }
+            }
+            crate::io::checkpoint::init(
+                ckpt_path.to_string(),
+                env!("CARGO_PKG_VERSION").to_string(),
+                options.checkpoint_model_hash.clone(),
+                options.checkpoint_data_hash.clone(),
+                chain.iter().map(|m| m.label().to_string()).collect(),
+                coord_names,
+                options.checkpoint_interval_secs,
+            );
+        }
+    }
+
     for (stage_idx, &method) in chain.iter().enumerate() {
+        // Resume: stages before the checkpoint's stage are already done. Record
+        // zero wall time for them so `method_wall_times_secs` stays parallel to
+        // `chain` (downstream reporting zips the two).
+        if stage_idx < start_stage {
+            method_wall_times_secs.push(0.0);
+            continue;
+        }
         if crate::cancel::is_cancelled(&options.cancel) {
             return Err("cancelled by user".to_string());
         }
+        crate::io::checkpoint::set_stage(stage_idx);
         let stage_start = std::time::Instant::now();
         let is_last = stage_idx + 1 == n_stages;
         let mut stage_opts = options.clone();
@@ -5381,6 +5498,12 @@ fn fit_inner(
 
     // Flush and close the trace file; capture path for FitResult.
     let trace_path = crate::estimation::trace::finish();
+
+    // Estimation completed: delete the resume checkpoint (nothing left to
+    // resume). Any post-estimation error below still returns Err, but a fresh
+    // fit — not a resume — is the right recovery for those. No-op when
+    // checkpointing was not active.
+    crate::io::checkpoint::finish_success();
 
     // Shrinkage
     let shrinkage_eta = compute_eta_shrinkage(&subjects, &result.params.omega.matrix);

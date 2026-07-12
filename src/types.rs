@@ -5265,6 +5265,28 @@ pub struct FitOptions {
     pub frem_predictions: Option<String>,
     /// FREM covariate sigma name (e.g. "EPSCOV").
     pub frem_sigma: Option<String>,
+    /// Enable periodic checkpointing so an interrupted run can be resumed from
+    /// its last saved state (#755). When `true` *and* `checkpoint_path` is set,
+    /// the current population estimates (θ/Ω/Σ), stage index, iteration and OFV
+    /// are written to `checkpoint_path` no more often than every
+    /// `checkpoint_interval_secs` seconds, and the file is removed on successful
+    /// completion. A run shorter than the interval never writes a checkpoint.
+    /// Settable from `[fit_options]`; default `true`.
+    pub checkpoint: bool,
+    /// Minimum wall-clock seconds between checkpoint writes. Settable from
+    /// `[fit_options]`; default `300` (5 minutes).
+    pub checkpoint_interval_secs: u64,
+    /// Where to read/write the `.tmp` checkpoint. Set by the file runner from the
+    /// model name (`{stem}.tmp`); `None` disables checkpointing regardless of
+    /// `checkpoint`. Runtime-only — not settable from `[fit_options]`.
+    pub checkpoint_path: Option<String>,
+    /// SHA-256 of the model file at fit time; stored in the checkpoint and
+    /// checked on resume so an edited model never silently continues from stale
+    /// state. Runtime-only; set by the file runner alongside `checkpoint_path`.
+    pub checkpoint_model_hash: Option<String>,
+    /// SHA-256 of the data CSV at fit time; checked on resume like
+    /// `checkpoint_model_hash`. Runtime-only.
+    pub checkpoint_data_hash: Option<String>,
 }
 
 impl Default for FitOptions {
@@ -5405,6 +5427,11 @@ impl Default for FitOptions {
             ignore_subjects: Vec::new(),
             frem_predictions: None,
             frem_sigma: None,
+            checkpoint: true,
+            checkpoint_interval_secs: 300,
+            checkpoint_path: None,
+            checkpoint_model_hash: None,
+            checkpoint_data_hash: None,
         }
     }
 }
@@ -5840,6 +5867,11 @@ pub fn framework_keys() -> &'static [&'static str] {
         "ode_reltol",
         "ode_abstol",
         "ode_max_steps",
+        // Checkpoint / restart (#755): the periodic resume-point writer is driven
+        // by the fit runner independent of the estimation method, so these are
+        // framework-level — every method honours them.
+        "checkpoint",
+        "checkpoint_interval_secs",
     ]
 }
 

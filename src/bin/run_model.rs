@@ -5,7 +5,7 @@ use std::time::Instant;
 /// Top-level usage/help text, shared by the no-args error path (stderr, exit 1)
 /// and `ferx -h`/`--help` (stdout, exit 0) so the two can't drift apart.
 const MAIN_USAGE: &str = "\
-Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]] [--output-format yaml|json|both]
+Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]] [--output-format yaml|json|both] [--clean]
        ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]
        ferx check <model.ferx> [--data <data.csv>] [--json]
        ferx summary <run.fitrx> [<run2.fitrx> ...]
@@ -30,6 +30,11 @@ Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
 --inits-from-nca[=METHOD]  derive NCA-based starting values before fitting,
                overriding the model file. METHOD is nca, nca_sweep (default),
                or nca_ebe; a bare --inits-from-nca means nca_sweep.
+
+--clean        ignore any resume checkpoint ({model}.tmp) and start fresh.
+               By default a run periodically checkpoints and, if interrupted,
+               resumes automatically on the next run of the same model + data.
+               Disable checkpointing entirely with [fit_options] checkpoint = false.
 
 -h, --help     print this help and exit
 ";
@@ -110,6 +115,24 @@ fn main() {
     let include_data = args.iter().any(|a| a == "--include-data");
     if include_data && output_path.is_none() {
         eprintln!("Warning: --include-data has no effect without --output");
+    }
+
+    // `--clean` forces a fresh start (#755): delete any resume checkpoint left
+    // by an interrupted run of this model before fitting. Without it, a run
+    // resumes automatically from `{model}.tmp` when present and compatible.
+    if args.iter().any(|a| a == "--clean") {
+        if let Some(stem) = std::path::Path::new(model_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        {
+            let tmp = format!("{stem}.tmp");
+            if std::path::Path::new(&tmp).exists() {
+                match std::fs::remove_file(&tmp) {
+                    Ok(()) => eprintln!("Removed checkpoint {tmp} (--clean)"),
+                    Err(e) => eprintln!("Warning: could not remove checkpoint {tmp}: {e}"),
+                }
+            }
+        }
     }
     // Honor --threads by sizing rayon's global pool (build_global() is once-per-process,
     // correct for a CLI binary) so fit()'s default pool — sized to current_num_threads()
