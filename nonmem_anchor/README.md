@@ -453,3 +453,104 @@ R_in(0⁺)`) is exact — the ongoing `∂R_in/∂lag` chain rule through the du
 time-after-dose alone (no jump correction) would have under-counted the lagtime
 gradient and pulled `ALAG1` off its true value under FOCEI's gradient-based
 inner/outer loops.
+
+---
+
+# Multi-dose transit — lagtime / F / TV-covariate (#719 close-out)
+
+Direct NONMEM anchors that exercise the cross-cutting functionalities on the built-in
+**transit** absorption model under **multiple overlapping doses** (100 mg q6h × 5) — the
+combinations the earlier single-dose structural anchors (`savic_transit.ctl` etc.) did not
+cover. Two anchors split the two engine paths:
+
+| Anchor | ferx path | Exercises | Control | ferx model / test |
+|--------|-----------|-----------|---------|-------------------|
+| **transit + multi-dose + covariate** | analytic closed form | multi-dose superposition + an estimated **WT-on-CL** power covariate | `transit_multidose_cov.ctl` | `tests/transit_multidose_cov_nonmem_anchor.rs` |
+| **transit + multi-dose + lag + F** | ODE twin (#735) | multi-dose superposition + estimated **lagtime** + fixed **bioavailability F** | `transit_multidose_lag_f.ctl` | `tests/transit_multidose_lag_f_nonmem_anchor.rs` |
+
+## Explicit integer-N chain = native multi-dose
+
+Both controls deliver `one_cpt_transit(n = 3)` as an **explicit 4-transit-compartment Erlang
+chain** (dose → t1 → t2 → t3 → t4 → central, every transfer rate `ktr = (n+1)/MTT`, elimination
+`k10 = CL/V` from central). For **integer** `n` this chain's input rate into central *is* the
+Savic density `R_in = D·ktr·(ktr·t)^n·e^{-ktr·t}/n!` exactly, so NONMEM reproduces ferx's
+`one_cpt_transit(n = 3 FIX)` — and, because the chain is linear, NONMEM's **native** dose
+bookkeeping superposes the five q6h doses automatically. That sidesteps the multi-dose weakness
+of a `$DES` Savic density (which via `PODO`/`TDOS` sees only the most-recent dose), and lagtime /
+bioavailability become the NONMEM-native compartment-1 dose attributes `ALAG1` / `F1` — no
+hand-coded `$DES` time shift (which choked LSODA in the `first_order_alag` experiment).
+
+`MTT = 3 h` (density tail ≈ 8 h) with `ke = CL/V ≈ 0.15/h` (t½ ≈ 4.6 h, ~1.7× accumulation at
+q6h) makes the five doses genuinely overlap in both absorption and elimination, so the
+cross-dose superposition is exercised, not a sequence of washed-out single doses.
+
+Both datasets are simulated **from ferx** (`tests/gen_transit_multidose_{cov,lag_f}_anchor.rs`),
+so both engines also recover the truths. ferx observes CMT 1 (its single disposition
+compartment); the committed `data/…csv` re-keys the obs CMT from the NONMEM copy's CMT 5 (the
+chain's central) — likelihood-identical.
+
+Both anchors pin ferx's FOCEI **objective at NONMEM's optimum** (every parameter FIXed at
+NONMEM's MLE) — the igd/weibull/transit_iov evaluate-at-optimum pattern, which isolates objective
+agreement from any optimiser-path difference and stays fast/deterministic.
+
+## RESULT — transit + multi-dose + WT-on-CL covariate (analytic path, FOCEI, 24 subj / 600 obs)
+
+NONMEM run: `results/transit_multidose_cov.*` (`ADVAN13 TOL=9`, MINIMIZATION SUCCESSFUL,
+`#OBJV = −2055.172`), recovering:
+
+| Quantity | NONMEM | Truth |
+|----------|-------:|------:|
+| TVCL | 9.31957 | 9.0 |
+| TVV | 61.3411 | 60.0 |
+| TVMTT | 2.98576 | 3.0 |
+| **dWTCL** (WT-on-CL power) | **0.509006** | 0.75 |
+| ω²(CL) | 0.0137998 | 0.01 |
+| ω²(V) | 0.0667750 | 0.09 |
+| σ² (prop) | 0.0110428 | 0.01 |
+
+| Quantity | NONMEM `#OBJV` | ferx FOCEI objective at NONMEM optimum | Agreement |
+|----------|---------------:|---------------------------------------:|----------:|
+| FOCEI objective | −2055.1716 | **−2055.1716** | **0.0000** |
+
+**Verdict.** ferx's analytic multi-dose transit + WT-on-CL-covariate FOCEI objective reproduces
+NONMEM's to **0.0000 OFV units** at the shared optimum. `dWTCL` recovers to **0.509** (not the
+simulated 0.75) on this 24-subject realization — an accidental η_CL–WT sample correlation, **not**
+a ferx artifact: NONMEM independently lands at the same 0.509. The design uses small CL IIV
+(ω² = 0.01) and a wide WT range (42–134 kg) so `dWTCL` is identifiable and exercised at a material
+non-zero value rather than absorbed into η.
+
+## RESULT — transit + multi-dose + lagtime + F (ODE-twin path, FOCEI, 24 subj / 600 obs)
+
+NONMEM run: `results/transit_multidose_lag_f.*` (`ADVAN13 TOL=9` + `ALAG1`/`F1`, MINIMIZATION
+SUCCESSFUL, `#OBJV = −2463.833`). Because the transit **ODE twin** free fit at `TOL=9`-equivalent
+tolerances is expensive, the ferx anchor (`tests/transit_multidose_lag_f_nonmem_anchor.rs`) pins
+ferx's FOCEI **objective at NONMEM's optimum** (the igd/weibull/transit_iov evaluate-at-optimum
+pattern), which isolates objective agreement from any optimiser-path difference:
+
+| Quantity | NONMEM | Truth |
+|----------|-------:|------:|
+| OFV (no constant) | −2463.833 | — |
+| TVCL | 8.9556 | 9.0 |
+| TVV | 53.999 | 60.0 |
+| TVMTT | 3.0101 | 3.0 |
+| **TVLAG** (absorption lagtime) | **0.50142** | **0.5** |
+| F (bioavailability, FIXed) | 0.70 | 0.7 |
+| ω²(CL) | 0.06697 | 0.09 |
+| ω²(V) | 0.07293 | 0.09 |
+| σ² (prop) | 0.009776 | 0.01 |
+
+| Quantity | NONMEM `#OBJV` | ferx FOCEI objective at NONMEM optimum | Agreement |
+|----------|---------------:|---------------------------------------:|----------:|
+| FOCEI objective | −2463.8329 | **−2463.8329** | **0.0000** |
+
+F is FIXed at 0.70 in both engines (structurally non-identifiable on single-route oral data —
+only CL/F, V/F are), so this anchors that ferx **applies** F (scales the absorbed amount)
+identically to NONMEM, not that it estimates it. A fixed allometric `CL = TVCL·(WT/70)^0.75`
+composes on the twin path.
+
+**Verdict.** ferx's transit ODE-twin FOCEI objective under an estimated lagtime, a fixed
+bioavailability, and multiple overlapping doses reproduces NONMEM's to **0.0000 OFV units** at the
+shared optimum, and NONMEM recovers the lagtime (0.501 vs truth 0.5) and disposition parameters.
+Together with the analytic covariate anchor above, lagtime, F, TV-covariates, and multi-dose
+superposition are now each NONMEM-anchored on the transit absorption model across both the analytic
+and ODE-twin engines.
