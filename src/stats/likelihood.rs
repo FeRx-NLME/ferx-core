@@ -395,9 +395,14 @@ fn tte_endpoint_nll(
 /// path for multi-endpoint (competing-risks / TTE+binary) subjects.
 ///
 /// `factor` is the site's OFV-scale weight (`2·` on the halved FOCEI/IOV `data_ll`, `1·` on
-/// the raw SAEM / non-interaction NLL). `joint_share` is `None` on every path without the
-/// shared solve — the SAEM and IOV sites, which never carry a joint-PK-TTE endpoint, so their
-/// TTE terms are analytic and `tte_endpoint_nll` equals the `tte_data_term` they inlined.
+/// the raw SAEM / non-interaction NLL). `joint_share` is `None` on every path that does not
+/// build the shared solve, and passing it is faithful to what each inlined:
+/// - the two **IOV** sites (`individual_nll_iov`, `obs_nll_subject_into_iov`) inlined
+///   `tte_data_term`, which equals `tte_endpoint_nll` here because an IOV model's hazard is
+///   always `Analytic` — IOV + joint-PK-TTE is rejected at parse;
+/// - the **SAEM θ-M-step** (`obs_nll_subject_from_preds`) already inlined `tte_endpoint_nll`
+///   and *may* carry an `OdeAccumulated` endpoint (SAEM + joint-PK-TTE is not rejected); the
+///   `_` arm re-solves it via `tte_ode_nll`, exactly as that site did before the fold.
 #[cfg(feature = "survival")]
 pub(crate) fn accumulate_non_gaussian_nll(
     model: &CompiledModel,

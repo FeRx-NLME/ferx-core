@@ -3746,11 +3746,19 @@ fn restrict_and_validate_indiv_stmts(
     kappa_names: &[String],
     block: &str,
 ) -> Result<(Vec<Statement>, Vec<String>), String> {
+    // Block-appropriate noun for the predictor in error messages — `[event_model]` carries a
+    // hazard, `[binary_model]` the logit — so a user sees the same wording as before the two
+    // blocks shared this helper.
+    let predictor = match block {
+        "event_model" => "a hazard expression",
+        "binary_model" => "the logit predictor",
+        _ => "a predictor expression",
+    };
     // (1) Direct IOV-κ reference — fail loud (#770).
     for expr in exprs {
         if let Some(k) = expr_references_kappa(expr, kappa_names) {
             return Err(format!(
-                "[{block}]: a predictor expression references the inter-occasion (IOV) random \
+                "[{block}]: {predictor} references the inter-occasion (IOV) random \
                  effect `{k}` directly. The predictor is evaluated once per subject with \
                  per-subject (BSV) η only, so an IOV kappa has no well-defined value here — write \
                  it in terms of θ/η, or reference an IOV-free parameter."
@@ -3820,7 +3828,7 @@ fn restrict_and_validate_indiv_stmts(
         });
         if let Some(k) = kappa_hit {
             return Err(format!(
-                "[{block}]: a predictor expression references an [individual_parameters] value \
+                "[{block}]: {predictor} references an [individual_parameters] value \
                  that depends on the inter-occasion (IOV) random effect `{k}`. The predictor is \
                  evaluated with per-subject (BSV) η only — reference an IOV-free parameter, or \
                  write the predictor in terms of θ/η directly."
@@ -3843,7 +3851,7 @@ fn restrict_and_validate_indiv_stmts(
         });
         if nn_hit {
             return Err(format!(
-                "[{block}]: a predictor expression references an [individual_parameters] value \
+                "[{block}]: {predictor} references an [individual_parameters] value \
                  whose definition uses a [covariate_nn] output. Neural-network-driven individual \
                  parameters are not available to the predictor (it is evaluated without the \
                  network forward pass) — reference an NN-free parameter instead."

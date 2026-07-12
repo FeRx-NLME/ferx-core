@@ -80,11 +80,15 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     if model.has_tte() {
         return Some("time-to-event ([event_model]) hazard likelihood");
     }
-    // Binary/categorical (`[binary_model]`, #760): the logit data term has no Dual2
-    // analytic eta-sensitivity (its linear-predictor closure is evaluated numerically),
-    // so - exactly like TTE - it routes to the FD inner gradient. (False without `survival`.)
-    if model.has_binary() {
-        return Some("binary ([binary_model]) logistic likelihood");
+    // Discrete / categorical (`[binary_model]`, #760; ordinal/Poisson/… later): the data term
+    // has no Dual2 analytic eta-sensitivity (its linear-predictor closure is evaluated
+    // numerically), so - exactly like TTE - it routes to the FD inner gradient. Gated on the
+    // family-agnostic `has_discrete()` so a future discrete family routes here automatically
+    // rather than silently falling through to the (sensitivity-free) analytic gradient.
+    // (`has_discrete()` == `has_binary()` today, so this is unchanged for binary models. False
+    // without `survival`.)
+    if model.has_discrete() {
+        return Some("discrete ([binary_model]) likelihood");
     }
     None
 }

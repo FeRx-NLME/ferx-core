@@ -96,7 +96,7 @@ pub(crate) fn binary_data_term(
 ///
 /// A new discrete endpoint family adds **one arm here** and needs no new likelihood
 /// dispatch-site edit: every FOCEI / IOV / SAEM path, the FD-Hessian closure, and IMP reach
-/// it through the single `non_gaussian_subject_nll` seam. It also doubles as the FD-Hessian
+/// it through the single `accumulate_non_gaussian_nll` seam. It also doubles as the FD-Hessian
 /// closure at the FOCEI interaction site: evaluated at a perturbed η it re-scores every
 /// discrete record, so `data_term_hessian_fd` picks up the curvature w.r.t. η.
 pub(crate) fn discrete_subject_nll(
