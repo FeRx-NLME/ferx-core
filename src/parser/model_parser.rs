@@ -18390,16 +18390,19 @@ mod tests {
                     continue;
                 }
             }
-            // TTE-only files (no [structural_model] block) require the survival feature.
-            // Use a line-start check so the comment "# Note: [structural_model] ..."
-            // present in example file headers does not falsely count as a block.
+            // Endpoint-only files (no [structural_model] block) — TTE `[event_model]` or the
+            // #760 `[binary_model]` — require the survival feature to parse (the endpoint
+            // block is unrecognized without it, so the parser demands the Gaussian PK blocks).
+            // Use a line-start check so a comment like "# Note: [structural_model] ..." in an
+            // example header does not falsely count as a block.
             if !cfg!(feature = "survival") {
                 let src = std::fs::read_to_string(&path).unwrap_or_default();
-                let has_event_model = src.contains("[event_model");
+                let has_nongaussian_endpoint =
+                    src.contains("[event_model") || src.contains("[binary_model");
                 let has_struct_block = src
                     .lines()
                     .any(|l| l.trim_start().starts_with("[structural_model"));
-                if has_event_model && !has_struct_block {
+                if has_nongaussian_endpoint && !has_struct_block {
                     continue;
                 }
             }
