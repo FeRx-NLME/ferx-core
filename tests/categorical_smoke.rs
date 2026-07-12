@@ -231,6 +231,57 @@ mod binary_smoke {
         assert!(parse_model_string(&wrap("[binary_model]\n  cmt = 3")).is_err());
         // Missing `cmt`.
         assert!(parse_model_string(&wrap("[binary_model]\n  logit = TH0")).is_err());
+        // Non-integer cmt.
+        assert!(parse_model_string(&wrap("[binary_model]\n  cmt = xx\n  logit = TH0")).is_err());
+        // Malformed line (no `=`).
+        assert!(
+            parse_model_string(&wrap("[binary_model]\n  cmt = 3\n  logit = TH0\n  oops")).is_err()
+        );
+    }
+
+    /// A binary `logit` that references an `[individual_parameters]` value which itself reads a
+    /// covariate — exercises the parser's transitive needed-indiv-statements restriction and the
+    /// covariate-union-through-`[individual_parameters]` path (the #741 completeness guard).
+    #[test]
+    fn binary_logit_references_individual_parameter() {
+        const M: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBETA(0.1, -5.0, 5.0)
+  theta TH0(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.05
+
+[covariates]
+  AGE continuous
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  LP = TH0 + TVBETA * AGE
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[binary_model]
+  cmt   = 3
+  logit = LP
+
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(M).expect("binary logit referencing an indiv param parses");
+        // AGE is used only by LP (the value the logit references), so it can only appear in the
+        // model's covariate set via the binary covariate-union-through-[individual_parameters].
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == "AGE"),
+            "AGE (reached via the indiv-param the logit references) must be collected: {:?}",
+            model.referenced_covariates
+        );
     }
 
     /// A logit predictor that references an IOV κ directly is rejected at parse (BSV-only scope).
@@ -240,6 +291,19 @@ mod binary_smoke {
         assert!(
             parse_model_string(&m).is_err(),
             "a direct κ reference in the logit must be rejected at parse"
+        );
+    }
+
+    /// A κ reached *through* an `[individual_parameters]` value is also rejected in the logit
+    /// (the predictor is BSV-only) — the transitive analogue of the direct check.
+    #[test]
+    fn binary_logit_indirect_kappa_rejected() {
+        let m = IOV_MODEL
+            .replace("  V  = TVV\n", "  V  = TVV\n  LP = TH0 + KAPPA_CL\n")
+            .replace("logit = TH0", "logit = LP");
+        assert!(
+            parse_model_string(&m).is_err(),
+            "a κ reached via an [individual_parameters] value must be rejected in the logit"
         );
     }
 }
