@@ -87,16 +87,19 @@ pub(crate) fn binary_data_term(
     nll
 }
 
-/// Sum the binary-endpoint NLL over all `Binary` CMTs for one subject, mirroring the
-/// per-endpoint TTE dispatch. Returns `0.0` when the model has no binary endpoint or the
-/// subject has no binary records for it. Callers apply the site's OFV-scale factor (`2·`
-/// on the halved FOCEI/IOV `data_ll`, `1·` on the raw SAEM / non-interaction paths) — the
-/// same factor they apply to `tte_endpoint_nll` / `tte_data_term`.
+/// Sum the per-subject NLL of every **discrete** (non-Gaussian, non-TTE) endpoint — the
+/// binary / Bernoulli term today; ordinal / Poisson / negative-binomial are future arms of
+/// the same match. Returns `0.0` when the model has no discrete endpoint or the subject has
+/// no records for one. Callers apply the site's OFV-scale factor (`2·` on the halved
+/// FOCEI/IOV `data_ll`, `1·` on the raw SAEM / non-interaction paths) — the same factor they
+/// apply to the TTE term.
 ///
-/// This doubles as the FD-Hessian closure at the FOCEI interaction site: evaluated at a
-/// perturbed η it re-scores every binary record, so `data_term_hessian_fd` picks up the
-/// logit curvature w.r.t. η.
-pub(crate) fn binary_subject_nll(
+/// A new discrete endpoint family adds **one arm here** and needs no new likelihood
+/// dispatch-site edit: every FOCEI / IOV / SAEM path, the FD-Hessian closure, and IMP reach
+/// it through the single `non_gaussian_subject_nll` seam. It also doubles as the FD-Hessian
+/// closure at the FOCEI interaction site: evaluated at a perturbed η it re-scores every
+/// discrete record, so `data_term_hessian_fd` picks up the curvature w.r.t. η.
+pub(crate) fn discrete_subject_nll(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
@@ -107,9 +110,12 @@ pub(crate) fn binary_subject_nll(
     }
     let mut nll = 0.0;
     for (cmt, endpoint) in &model.endpoints {
+        // Binary today; a new discrete family (ordinal / Poisson / negative-binomial …) adds
+        // its branch here — reached through this one function, so no likelihood dispatch site
+        // changes. (Gaussian is scored by the residual path, TTE by the hazard dispatch.)
         if let EndpointLikelihood::Binary { link, lp_fn, .. } = endpoint {
             // `binary_data_term` filters `obs_records` by `cmt` itself — no per-call
-            // allocation, even inside the FD-Hessian closure (site 921).
+            // allocation, even inside the FD-Hessian closure.
             nll += binary_data_term(
                 *link,
                 lp_fn,

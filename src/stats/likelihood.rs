@@ -543,7 +543,7 @@ pub fn individual_nll_into_with_schedule(
             }
         }
         // Binary/categorical (#760): same 2× OFV-scale as the TTE term above.
-        data_ll += 2.0 * crate::categorical::binary_subject_nll(model, subject, theta, eta);
+        data_ll += 2.0 * crate::categorical::discrete_subject_nll(model, subject, theta, eta);
     }
 
     let nll = 0.5 * (eta_prior + log_det_omega + data_ll);
@@ -756,7 +756,7 @@ pub(crate) fn obs_nll_subject_from_preds(
             }
         }
         // Binary/categorical (#760): raw-NLL weight (1×), matching the TTE term above.
-        nll += crate::categorical::binary_subject_nll(model, subject, theta, eta);
+        nll += crate::categorical::discrete_subject_nll(model, subject, theta, eta);
     }
 
     nll
@@ -974,7 +974,7 @@ pub fn foce_subject_nll(
         // subject has an empty Gaussian h_matrix; hrh then comes entirely from here.
         if model.has_binary() {
             let bin_fn = |eta_eval: &[f64]| {
-                crate::categorical::binary_subject_nll(model, subject, theta, eta_eval)
+                crate::categorical::discrete_subject_nll(model, subject, theta, eta_eval)
             };
             tte_nll_at_mode += bin_fn(eta_hat.as_slice());
             if n_eta > 0 {
@@ -2459,7 +2459,7 @@ pub fn individual_nll_iov(
             }
         }
         // Binary/categorical (#760): same 2× OFV-scale as the TTE term above.
-        data_ll += 2.0 * crate::categorical::binary_subject_nll(model, subject, theta, eta);
+        data_ll += 2.0 * crate::categorical::discrete_subject_nll(model, subject, theta, eta);
     }
 
     0.5 * (eta_prior + log_det_omega + kappa_prior + (k_occasions as f64) * log_det_iov + data_ll)
