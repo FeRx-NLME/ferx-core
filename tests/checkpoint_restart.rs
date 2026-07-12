@@ -81,8 +81,24 @@ fn checkpoint_with_tvcl(model: &CompiledModel, tvcl: f64) -> Checkpoint {
     }
 }
 
+/// Serializes these tests. Every one drives a real `fit()`, and `fit()` runs
+/// the checkpoint sink lifecycle (`init` / `maybe_write` / `finish_success`)
+/// inside the process-shared rayon pool. The sink is thread-local, so two fits
+/// interleaved onto the same pool worker (rayon work-stealing) would clobber
+/// each other's sink and delete the wrong checkpoint file — a schedule-dependent
+/// flake. Holding this lock for the whole test keeps a single active sink in
+/// flight at a time.
+static FIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn fit_guard() -> std::sync::MutexGuard<'static, ()> {
+    // Ignore poisoning: a panicking test still leaves the lock usable so the
+    // remaining tests report their own result rather than a lock error.
+    FIT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn resume_seeds_params_and_emits_banner() {
+    let _guard = fit_guard();
     let (model, pop) = load_model_and_pop();
     let path = tmp_path("resume");
     checkpoint::remove(&path);
@@ -112,6 +128,7 @@ fn resume_seeds_params_and_emits_banner() {
 
 #[test]
 fn hash_mismatch_starts_fresh() {
+    let _guard = fit_guard();
     let (model, pop) = load_model_and_pop();
     let path = tmp_path("mismatch");
     checkpoint::remove(&path);
@@ -147,6 +164,7 @@ fn hash_mismatch_starts_fresh() {
 
 #[test]
 fn disabled_ignores_existing_checkpoint() {
+    let _guard = fit_guard();
     let (model, pop) = load_model_and_pop();
     let path = tmp_path("disabled");
     checkpoint::remove(&path);
@@ -178,6 +196,7 @@ fn disabled_ignores_existing_checkpoint() {
 
 #[test]
 fn hashless_options_do_not_resume() {
+    let _guard = fit_guard();
     // A checkpoint carrying hashes, but options with none: integrity can't be
     // verified, so the run must NOT resume (None == None must not count as a
     // match). It starts fresh from the model default.
@@ -211,6 +230,7 @@ fn hashless_options_do_not_resume() {
 /// write site and `finish_success` end to end.
 #[test]
 fn focei_fit_writes_then_removes_checkpoint() {
+    let _guard = fit_guard();
     let (model, pop) = load_model_and_pop();
     let path = tmp_path("focei_run");
     checkpoint::remove(&path);
@@ -232,6 +252,7 @@ fn focei_fit_writes_then_removes_checkpoint() {
 /// different site.
 #[test]
 fn gauss_newton_fit_checkpoints_and_cleans_up() {
+    let _guard = fit_guard();
     let (model, pop) = load_model_and_pop();
     let path = tmp_path("gn_run");
     checkpoint::remove(&path);
@@ -253,6 +274,7 @@ fn gauss_newton_fit_checkpoints_and_cleans_up() {
 /// And for SAEM, whose write site snapshots the sampler state.
 #[test]
 fn saem_fit_checkpoints_and_cleans_up() {
+    let _guard = fit_guard();
     let (model, pop) = load_model_and_pop();
     let path = tmp_path("saem_run");
     checkpoint::remove(&path);
