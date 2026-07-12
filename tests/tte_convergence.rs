@@ -122,6 +122,45 @@ const RTTE_WEIBULL_FWD_PIT_TRUTH: &str = r"
   shape  = TVSHAPE
 ";
 
+/// RTTE **declining-hazard Gompertz** truth (#803): fixed-effects (no frailty),
+/// clock-forward, with a NEGATIVE shape `γ = −0.03`. The intensity `h(t) =
+/// α·exp(γt)` decays, so the cumulative hazard has a finite limit `H(∞) =
+/// −α/γ = 5` and only `H(40) = 5·(1 − e^{−1.2}) ≈ 3.49` events are expected per
+/// subject over the horizon. `γ` uses a lower bound of `−1.0` (identity packing,
+/// see `parameterization::theta_packs_log`) and an upper bound of `+1.0` so the
+/// fit is free to (wrongly) cross into a growing hazard — the recovery of a
+/// clearly negative `γ` is then a real result, not a bound artefact.
+const RTTE_GOMPERTZ_DECLINING_TRUTH: &str = r"
+[parameters]
+  theta TVALPHA(0.15, 1e-4, 5.0)
+  theta TVGAMMA(-0.03, -1.0, 1.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  clock  = forward
+  family = gompertz
+  alpha  = TVALPHA
+  gamma  = TVGAMMA
+";
+
+/// RTTE declining-Gompertz **fit** model, started away from the truth (α ~2/3,
+/// γ ~1/3 toward zero) so recovering `α ≈ 0.15` and a clearly negative `γ` is a
+/// genuine test that the simulate→fit round-trip is intact for `γ < 0`.
+const RTTE_GOMPERTZ_DECLINING_FIT: &str = r"
+[parameters]
+  theta TVALPHA(0.10, 1e-4, 5.0)
+  theta TVGAMMA(-0.01, -1.0, 1.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  clock  = forward
+  family = gompertz
+  alpha  = TVALPHA
+  gamma  = TVGAMMA
+";
+
 /// Competing-risks "truth" model: two exponential causes (CMT 2, CMT 3) linked
 /// by a shared log-frailty `ETA_F` (ω²=0.25). The cause-specific *rates* are
 /// well-identified and recover tightly; the shared frailty ω² is weakly
@@ -986,6 +1025,90 @@ fn rtte_sse_forward_exponential_recovers_rate() {
         "FOCEI ω² {omega2:.5} outside the expected bracket for this realization"
     );
     assert!(r.ofv.is_finite(), "RTTE SSE OFV must be finite");
+}
+
+/// **#803 regression — declining-hazard (γ < 0) Gompertz RTTE round-trip.** The
+/// bug: the analytic inverse-CDF samplers guarded the Gompertz draw with
+/// `inner <= 1.0`, which fires on *every* `u ∈ (0,1)` when `γ < 0`, so `simulate()`
+/// returned an empty (all-censored) stream while `fit()` still scored `γ < 0` with
+/// finite density — simulate was not the inverse of fit for this family.
+///
+/// This simulates a fixed-effects clock-forward Gompertz RTTE with `γ = −0.03`,
+/// then (a) asserts the streams actually carry events — the direct symptom, since
+/// the pre-fix sampler produced *zero* — and (b) refits, recovering `α ≈ 0.15` and a
+/// clearly negative `γ` (not a collapse toward 0). Fixed effects (no frailty) keep it
+/// a clean MLE-style recovery with no weakly-identified `ω²` noise. Bands are set to
+/// this seed's realized fit; a re-broken guard drops the event count to zero and trips
+/// the first assertion long before the parameter bands.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn rtte_sse_forward_gompertz_declining_recovers_negative_gamma() {
+    use ferx_core::{simulate_with_options, SimulateOptions};
+    const N: usize = 1200;
+    const HORIZON: f64 = 40.0;
+    const SEED: u64 = 20260711;
+
+    let truth =
+        parse_model_string(RTTE_GOMPERTZ_DECLINING_TRUTH).expect("Gompertz truth model must parse");
+    let template = common::tte_pop_from_pairs(&vec![(HORIZON, 0u8); N]);
+    let opts = SimulateOptions {
+        seed: Some(SEED),
+        match_method: None,
+        horizon: Some(HORIZON),
+    };
+    let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
+        .expect("declining-Gompertz RTTE simulation must succeed");
+
+    // (a) Regression core: the streams must carry events. Under the old `inner <= 1.0`
+    // guard EVERY γ<0 draw was censored, so `total` was exactly 0.
+    let counts = rtte_event_counts(&sims, N);
+    let total: f64 = counts.iter().sum();
+    let mean_c = total / N as f64;
+    let max_events = counts.iter().cloned().fold(0.0_f64, f64::max);
+    eprintln!("[SSE-RTTE-GOMPERTZ] total={total} mean/subj={mean_c:.3} (~3.49) max={max_events}");
+    assert!(
+        total > 0.0,
+        "declining-hazard Gompertz RTTE produced ZERO events — the γ<0 sampler censored \
+         every draw (#803 regression)"
+    );
+    // Clock-forward E[N] over [0,H] = H(H) = (α/γ)(e^{γH}−1) = 5·(1−e^{−1.2}) ≈ 3.49.
+    assert!(
+        (3.1..3.9).contains(&mean_c),
+        "mean events/subject {mean_c:.3} off H(40) ≈ 3.49 for the declining hazard"
+    );
+    assert!(
+        max_events >= 6.0,
+        "a declining recurrent stream should still reach several events; got {max_events}"
+    );
+
+    // (b) Refit must recover α ≈ 0.15 and a clearly NEGATIVE γ (declining hazard).
+    let fit_pop = rtte_pop_from_sims(&sims);
+    let model =
+        parse_model_string(RTTE_GOMPERTZ_DECLINING_FIT).expect("Gompertz fit model must parse");
+    let r = fit(&model, &fit_pop, &model.default_params, &fit_opts())
+        .expect("declining-Gompertz RTTE SSE fit must succeed");
+    let alpha = r.theta[0];
+    let gamma = r.theta[1];
+    eprintln!(
+        "[SSE-RTTE-GOMPERTZ] FOCEI α={alpha:.5} (truth 0.15) γ={gamma:.5} (truth −0.03) OFV={:.4}",
+        r.ofv
+    );
+    assert!(
+        (0.11..0.19).contains(&alpha),
+        "α not recovered: got {alpha:.5}, expected ~0.15"
+    );
+    assert!(
+        (-0.06..-0.012).contains(&gamma),
+        "γ not recovered as a declining hazard: got {gamma:.5}, expected ~−0.03 — it must stay \
+         clearly negative, not collapse toward 0 (the pre-fix simulate→fit inconsistency)"
+    );
+    assert!(
+        r.ofv.is_finite(),
+        "declining-Gompertz RTTE SSE OFV must be finite"
+    );
 }
 
 const RTTE_SIM_ANCHOR_CSV: &str = concat!(

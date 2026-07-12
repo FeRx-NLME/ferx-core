@@ -92,6 +92,111 @@ pub fn log_normal_cdf(z: f64) -> f64 {
     }
 }
 
+// ── PkNum-generic siblings for the analytical inverse-Gaussian absorption
+//    closed form (#790) ───────────────────────────────────────────────────────
+//
+// The `igd()` analytic closed form (exponential tilting of the inverse-Gaussian,
+// `src/pk/analytical_absorption.rs`) needs the normal CDF `Φ` — and, where a huge
+// `exp(2λ/μ*)` prefactor multiplies a vanishing `Φ` in the far tail, its
+// numerically-stable log `ln Φ` — evaluated over `T: PkNum` so the FOCE/FOCEI
+// `Dual2` sensitivities ride through exactly, the same way `regularized_gamma_p`
+// (#604) enabled transit. All three are built on the `erf(x) = sign(x)·P(½, x²)` /
+// `erfc(x) = Q(½, x²)` identities, reusing the already-mutation-tested incomplete
+// gamma [`regularized_gamma_p`] / [`regularized_gamma_q`] so both the value and the
+// exact dual jets come for free. They are the exact-derivative counterparts of the
+// f64 `erf` / `normal_cdf` / `log_normal_cdf` above; those stay on the fast A&S
+// 7.1.26 approximation for the M3/BLOQ likelihood, where the ~1.5e-7 value error is
+// immaterial and speed matters.
+
+/// `2/√π` — the factor of `erf'(x) = (2/√π)·e^{−x²}` and of the small-argument
+/// `erf(x) ≈ (2/√π)·(x − x³/3 + …)` germ.
+const TWO_OVER_SQRT_PI: f64 = std::f64::consts::FRAC_2_SQRT_PI;
+
+/// `erf`'s germ half-width: below `|x| = NEAR_ZERO` the cubic germ replaces the
+/// `P(½, x²)` identity (whose `x = 0` clamp would zero `erf'`); `1e-3` keeps the
+/// germ's `O(x³)` Hessian error ~1e-9 while sitting far above the `x²` underflow.
+const ERF_GERM_HALF_WIDTH: f64 = 1e-3;
+
+/// Error function `erf(x)` over [`PkNum`], with exact 1st/2nd-order `Dual2`
+/// derivatives — the exact-derivative sibling of the f64 [`erf`].
+///
+/// Built on the identity `erf(x) = sign(x)·P(½, x²)` with `P` the regularized
+/// lower incomplete gamma [`regularized_gamma_p`], so it inherits that function's
+/// convergent series / continued-fraction value accuracy (~1e-12) **and** its
+/// exact dual jets — rather than differentiating a fixed rational approximation
+/// (whose derivative would carry a separate ~1e-5 error). `erf'(x) = (2/√π)e^{−x²}`
+/// then falls out of the chain rule `sign(x)·P_x(½,x²)·2x` (with
+/// `P_x(½,u) = e^{−u}/(√u·√π)`, and `sign(x)·x/√(x²) ≡ 1`), so no hand-written
+/// dual rule is needed.
+///
+/// Near `x = 0` the identity is replaced by the cubic germ
+/// `erf(x) ≈ (2/√π)·(x − x³/3)`: `P(½, x²)` at `x = 0` hits `regularized_gamma_p`'s
+/// flat `x ≤ 0` clamp (zero jet), which would drop the finite `erf'(0) = 2/√π`; the
+/// germ carries the exact value **and** its 1st/2nd derivatives there (the `O(x⁵)`
+/// remainder touches only 3rd+ order). This is on the live gradient path — `Φ(0)`
+/// (i.e. `x = 0`) is a real point of the IG CDF, reached at observation time
+/// `t = MAT`.
+pub fn erf_g<T: PkNum>(x: T) -> T {
+    if x.val().abs() < ERF_GERM_HALF_WIDTH {
+        // erf(x) = (2/√π)(x − x³/3 + …); the cubic germ is accurate in value, grad,
+        // and Hessian through x = 0 (where the raw `P(½,x²)` clamp loses erf'(0)).
+        let c = T::from_f64(TWO_OVER_SQRT_PI);
+        return c * (x - x * x * x / T::from_f64(3.0));
+    }
+    let sign = if x.val() < 0.0 { -1.0 } else { 1.0 };
+    T::from_f64(sign) * regularized_gamma_p(T::from_f64(0.5), x * x)
+}
+
+/// Complementary error function `erfc(x) = 1 − erf(x)` over [`PkNum`], computed
+/// **without** the `1 − erf` cancellation in the upper tail — the exact-derivative,
+/// tail-safe sibling of the f64 [`erfc`].
+///
+/// For `x > 1` it is the upper incomplete gamma `Q(½, x²)` ([`regularized_gamma_q`])
+/// **directly** (its continued fraction, not `1 − P`), so it stays accurate where
+/// `erf → 1` and `1 − erf` would lose every significant digit — the regime the IG
+/// closed form's far-tail `Φ` term lives in. For `x ≤ 1`, `1 − erf(x)` is
+/// well-conditioned (`erf ≤ erf(1) ≈ 0.843`) and reuses [`erf_g`]'s near-zero germ,
+/// so `erfc'(0) = −2/√π` stays exact.
+pub fn erfc_g<T: PkNum>(x: T) -> T {
+    if x.val() > 1.0 {
+        regularized_gamma_q(T::from_f64(0.5), x * x)
+    } else {
+        T::from_f64(1.0) - erf_g(x)
+    }
+}
+
+/// Standard normal CDF `Φ(z) = ½·erfc(−z/√2)` over [`PkNum`], with exact `Dual2`
+/// derivatives (`Φ'(z) = φ(z)`). The exact-derivative sibling of the f64
+/// [`normal_cdf`].
+///
+/// Routing through [`erfc_g`] (rather than `½·(1 + erf)`) keeps **both** tails
+/// cancellation-free: the lower tail is `½·Q(½, z²/2)` directly, so a far-negative
+/// `z` gives an accurate tiny `Φ` instead of a `0.5·(1 − 1) = 0`.
+pub fn normal_cdf_g<T: PkNum>(z: T) -> T {
+    T::from_f64(0.5) * erfc_g(-z * T::from_f64(INV_SQRT_2))
+}
+
+/// Numerically-stable `ln Φ(z)` over [`PkNum`], with exact `Dual2` derivatives
+/// (`(ln Φ)'(z) = φ(z)/Φ(z)`, the inverse Mills ratio) — the exact-derivative,
+/// tail-safe sibling of the f64 [`log_normal_cdf`].
+///
+/// The IG closed form's second CDF term is `exp(2λ/μ*)·Φ(z₂)` with `z₂` deep in the
+/// left tail and `exp(2λ/μ*)` astronomically large for small `CV²`; forming it as
+/// `exp(2λ/μ* + ln Φ(z₂))` (this function) sidesteps the catastrophic cancellation
+/// of a direct `Φ(z₂)` (which underflows to `0`, making the product a spurious `0`
+/// instead of the true `O(1)` value). Because `Φ(z) = ½·erfc(−z/√2)` here evaluates
+/// the lower tail as the direct `Q(½, z²/2)`, `ln Φ` needs **no** Mills asymptotic —
+/// it stays accurate (and its `φ/Φ` jet exact) until `Φ` itself underflows below
+/// [`MIN_PROB`], where it clamps flat to avoid `−∞` contaminating the likelihood.
+pub fn log_normal_cdf_g<T: PkNum>(z: T) -> T {
+    let p = normal_cdf_g(z);
+    if p.val() < MIN_PROB {
+        T::from_f64(MIN_PROB.ln())
+    } else {
+        p.ln()
+    }
+}
+
 /// Inverse Mills ratio `h = φ(z)/Φ(z)`, evaluated through logs (via
 /// [`log_normal_cdf`]) so it stays finite in the far tail where `Φ(z) → 0`.
 /// Single source for the M3-censored kernels (the closed-form and ODE inner
@@ -359,6 +464,29 @@ pub fn regularized_gamma_p<T: PkNum>(a: T, x: T) -> T {
         gamma_p_series(a, x)
     } else {
         T::from_f64(1.0) - gamma_q_cf(a, x)
+    }
+}
+
+/// Regularized **upper** incomplete gamma `Q(a, x) = 1 − P(a, x) = Γ(a, x)/Γ(a)` —
+/// the complement of [`regularized_gamma_p`], computed **without** the `1 − P`
+/// cancellation in the upper tail (`x ≥ a + 1`): there `Q` is the continued
+/// fraction [`gamma_q_cf`] *directly*, so it keeps full precision where `P → 1` and
+/// `1 − P` would collapse to `0` (e.g. `erfc` far in its tail — the regime the IG
+/// closed form's second `Φ` term evaluates, #790). For `x < a + 1` the series side
+/// is well-conditioned, so `Q = 1 − P_series`. `x ≤ 0 ⇒ Q = 1`.
+///
+/// Generic over [`PkNum`] with the same exact 1st/2nd-order dual jets as
+/// [`regularized_gamma_p`] (it shares the very same [`gamma_p_series`] /
+/// [`gamma_q_cf`] iterations), so `Q + P = 1` holds for the values **and** their
+/// derivatives cancel to zero.
+pub fn regularized_gamma_q<T: PkNum>(a: T, x: T) -> T {
+    if x.val() <= 0.0 {
+        return T::from_f64(1.0);
+    }
+    if x.val() < a.val() + 1.0 {
+        T::from_f64(1.0) - gamma_p_series(a, x)
+    } else {
+        gamma_q_cf(a, x)
     }
 }
 
@@ -856,6 +984,211 @@ mod tests {
             assert_relative_eq!(dual.hess[0][0], d2a, max_relative = 5e-3, epsilon = 1e-5);
             assert_relative_eq!(dual.hess[1][1], d2x, max_relative = 5e-3, epsilon = 1e-5);
             assert_relative_eq!(dual.hess[0][1], d2ax, max_relative = 5e-3, epsilon = 1e-5);
+        }
+    }
+
+    // ── PkNum-generic erf / normal_cdf / log_normal_cdf (#790) ───────────────
+
+    /// `erf_g::<f64>` must match tabulated `erf` values to ~1e-9 — far tighter than
+    /// the f64 A&S [`erf`]'s 1.5e-7 (it rides the ~1e-12 `regularized_gamma_p`), and
+    /// odd symmetry `erf(−x) = −erf(x)` must hold (the `sign(x)` branch).
+    #[test]
+    fn erf_g_matches_tabulated_values_and_is_odd() {
+        // (x, erf(x)) from standard tables.
+        for &(x, want) in &[
+            (0.0_f64, 0.0_f64),
+            (0.1, 0.112_462_916_018_284_9),
+            (0.5, 0.520_499_877_813_046_5),
+            (1.0, 0.842_700_792_949_714_9),
+            (1.5, 0.966_105_146_475_310_7),
+            (2.0, 0.995_322_265_018_952_7),
+            (3.0, 0.999_977_909_503_001_4),
+            (4.0, 0.999_999_984_582_742_1),
+        ] {
+            assert_relative_eq!(erf_g::<f64>(x), want, epsilon = 1e-9, max_relative = 1e-9);
+            assert_relative_eq!(erf_g::<f64>(-x), -want, epsilon = 1e-9, max_relative = 1e-9);
+        }
+    }
+
+    /// `normal_cdf_g::<f64>` against tabulated `Φ` values (tight, ~1e-9).
+    #[test]
+    fn normal_cdf_g_matches_tabulated_values() {
+        for &(z, want) in &[
+            (0.0_f64, 0.5_f64),
+            (1.0, 0.841_344_746_068_542_9),
+            (1.96, 0.975_002_104_851_780_2),
+            (-1.96, 0.024_997_895_148_219_8),
+            (2.0, 0.977_249_868_051_820_8),
+            (-3.0, 0.001_349_898_031_630_1),
+        ] {
+            assert_relative_eq!(
+                normal_cdf_g::<f64>(z),
+                want,
+                epsilon = 1e-9,
+                max_relative = 1e-8
+            );
+        }
+    }
+
+    /// The point of the generic form: exact `Dual2` `erf'(x) = (2/√π)e^{−x²}` and
+    /// `erf''(x) = −2x·(2/√π)e^{−x²}`, validated **both** against the analytic
+    /// Gaussian (the mutation check — a wrong transcription of the identity or the
+    /// near-zero germ fails here) **and** against a central FD of the `f64` value.
+    /// `x = 0` exercises the linear germ (where the raw `P(½,x²)` clamp would lose
+    /// `erf'(0)`); the rest span both `regularized_gamma_p` branches.
+    #[test]
+    fn erf_g_dual_derivatives_are_exact_gaussian_and_match_fd() {
+        use crate::sens::dual2::Dual2;
+        // Includes points either side of the germ seam (±1e-3) and both
+        // `regularized_gamma_p` branches.
+        for &x in &[
+            0.0_f64, 1e-7, -1e-7, 5e-4, -5e-4, 1.5e-3, -1.5e-3, 0.3, -0.7, 1.0, -1.5, 2.5, -3.0,
+        ] {
+            let d = erf_g(Dual2::<1>::var(x, 0));
+            let gauss = TWO_OVER_SQRT_PI * (-x * x).exp(); // erf'(x)
+            let gauss2 = -2.0 * x * gauss; // erf''(x)
+            assert_relative_eq!(d.grad[0], gauss, max_relative = 1e-6, epsilon = 1e-9);
+            assert_relative_eq!(d.hess[0][0], gauss2, max_relative = 1e-5, epsilon = 1e-8);
+            // Central FD of the f64 value (self-consistency / mutation check).
+            let h = 1e-6;
+            let fd = (erf_g::<f64>(x + h) - erf_g::<f64>(x - h)) / (2.0 * h);
+            assert_relative_eq!(d.grad[0], fd, max_relative = 1e-5, epsilon = 1e-8);
+        }
+    }
+
+    /// `normal_cdf_g` `Dual2` 1st/2nd derivatives are exactly `φ(z)` and
+    /// `φ'(z) = −z·φ(z)`, including `z = 0` (the live IG-CDF point at `t = MAT`).
+    #[test]
+    fn normal_cdf_g_dual_derivative_is_phi() {
+        use crate::sens::dual2::Dual2;
+        for &z in &[0.0_f64, 0.5, -1.0, 1.96, -2.5, 3.0] {
+            let d = normal_cdf_g(Dual2::<1>::var(z, 0));
+            let phi = INV_SQRT_2PI * (-0.5 * z * z).exp();
+            assert_relative_eq!(d.grad[0], phi, max_relative = 1e-6, epsilon = 1e-9);
+            assert_relative_eq!(d.hess[0][0], -z * phi, max_relative = 1e-5, epsilon = 1e-9);
+        }
+    }
+
+    /// The cubic germ and the `P(½,x²)` identity must agree **at the same point**
+    /// `x = ERF_GERM_HALF_WIDTH` (both value and dual derivative), so the branch
+    /// switch introduces no kink on the gradient path. (Comparing two *different*
+    /// points either side would just measure the true slope, not a jump.)
+    #[test]
+    fn erf_g_germ_and_p_branches_agree_at_seam() {
+        use crate::sens::dual2::Dual2;
+        let x = Dual2::<1>::var(ERF_GERM_HALF_WIDTH, 0);
+        // Germ branch, evaluated explicitly.
+        let c = Dual2::<1>::from_f64(TWO_OVER_SQRT_PI);
+        let germ = c * (x - x * x * x / Dual2::from_f64(3.0));
+        // P(½,x²) branch, evaluated explicitly.
+        let p = regularized_gamma_p(Dual2::<1>::from_f64(0.5), x * x);
+        assert_relative_eq!(germ.value, p.value, max_relative = 1e-11);
+        assert_relative_eq!(germ.grad[0], p.grad[0], max_relative = 1e-9);
+    }
+
+    /// `erfc_g::<f64>` against tabulated `erfc` values, spanning the `x = 1`
+    /// small-arg (`1 − erf`) / large-arg (`Q(½,x²)`) seam, and cancellation-free deep
+    /// in the tail where `1 − erf` would collapse to `0` (the regime the IG closed
+    /// form's second `Φ` term needs).
+    #[test]
+    fn erfc_g_matches_tabulated_values_including_far_tail() {
+        for &(x, want) in &[
+            (0.0_f64, 1.0_f64),
+            (0.5, 0.479_500_122_186_953_5),
+            (1.0, 0.157_299_207_050_285_1),
+            (2.0, 0.004_677_734_981_047_265),
+            (3.0, 2.209_049_699_858_544e-5),
+            (5.0, 1.537_459_794_428_035e-12),
+            (8.0, 1.122_429_717_298_292e-29), // far tail: `1 − erf(8)` would give 0
+        ] {
+            assert_relative_eq!(erfc_g::<f64>(x), want, max_relative = 1e-9);
+        }
+        // erfc(−x) = 2 − erfc(x) (odd erf), the well-conditioned near-2 side.
+        assert_relative_eq!(
+            erfc_g::<f64>(-2.0),
+            2.0 - erfc_g::<f64>(2.0),
+            max_relative = 1e-12
+        );
+    }
+
+    /// `log_normal_cdf_g` is accurate on moderate `z` (vs `ln` of tabulated `Φ`),
+    /// stays finite/accurate deep in the left tail (where a direct `ln Φ` would be
+    /// `ln 0 = −∞`), is consistent with `ln(normal_cdf_g)`, and is monotone.
+    #[test]
+    fn log_normal_cdf_g_value_is_accurate_and_tail_stable() {
+        // Moderate z: ln of well-known Φ values.
+        for &(z, want) in &[
+            (0.0_f64, -std::f64::consts::LN_2), // ln Φ(0) = ln 0.5
+            (-1.0, -1.841_021_645_009_877_6),   // ln Φ(−1)
+            (-3.0, -6.607_726_219_040_6),       // ln Φ(−3)
+        ] {
+            assert_relative_eq!(log_normal_cdf_g::<f64>(z), want, max_relative = 1e-5);
+        }
+        // Deep tail: finite, and matches the documented ≈ −203.917 (external ref).
+        assert!(log_normal_cdf_g::<f64>(-40.0).is_finite());
+        assert_relative_eq!(log_normal_cdf_g::<f64>(-20.0), -203.917, epsilon = 0.01);
+        // Consistent with ln(normal_cdf_g) wherever Φ ≥ MIN_PROB.
+        for &z in &[-6.0_f64, -2.0, 0.0, 1.5] {
+            assert_relative_eq!(
+                log_normal_cdf_g::<f64>(z),
+                normal_cdf_g::<f64>(z).ln(),
+                max_relative = 1e-12
+            );
+        }
+        // Monotone increasing.
+        let mut prev = log_normal_cdf_g::<f64>(-30.0);
+        for &z in &[-25.0, -10.0, -6.0, -1.414, -1.0, 0.0, 2.0] {
+            let v = log_normal_cdf_g::<f64>(z);
+            assert!(v >= prev - 1e-9, "non-monotone at z={z}: {v} < {prev}");
+            prev = v;
+        }
+    }
+
+    /// `log_normal_cdf_g`'s exact `Dual2` derivative is the inverse Mills ratio
+    /// `φ(z)/Φ(z)` — the tail term of the IG closed form's second CDF piece rides
+    /// this, so a wrong tail jet would bias the IG sensitivities exactly where the
+    /// huge `exp(2λ/μ*)` prefactor amplifies it. Referenced against the analytic
+    /// `φ(z)/Φ(z)` (using the accurate `normal_cdf_g` for `Φ`, so it stays valid deep
+    /// in the tail — unlike the f64 [`inv_mills`], which inherits the A&S tail error),
+    /// **and** a central FD of the `f64` value. Points span the `erfc_g` `x = 1` seam
+    /// (`z = ∓√2`) and the far tail.
+    #[test]
+    fn log_normal_cdf_g_dual_derivative_is_inv_mills() {
+        use crate::sens::dual2::Dual2;
+        for &z in &[-12.0_f64, -6.0, -1.415, -1.413, -1.0, 0.0, 1.5] {
+            let d = log_normal_cdf_g(Dual2::<1>::var(z, 0));
+            // Analytic φ/Φ with the accurate Φ (valid until φ underflows, |z| < 26).
+            let phi_over_phi = (INV_SQRT_2PI * (-0.5 * z * z).exp()) / normal_cdf_g::<f64>(z);
+            assert_relative_eq!(d.grad[0], phi_over_phi, max_relative = 1e-6, epsilon = 1e-9);
+            let h = 1e-6;
+            let fd = (log_normal_cdf_g::<f64>(z + h) - log_normal_cdf_g::<f64>(z - h)) / (2.0 * h);
+            assert_relative_eq!(d.grad[0], fd, max_relative = 1e-5, epsilon = 1e-7);
+            // 2nd order vs central FD of the exact dual 1st-derivative.
+            let h2 = 1e-4;
+            let gp = log_normal_cdf_g(Dual2::<1>::var(z + h2, 0)).grad[0];
+            let gm = log_normal_cdf_g(Dual2::<1>::var(z - h2, 0)).grad[0];
+            assert_relative_eq!(
+                d.hess[0][0],
+                (gp - gm) / (2.0 * h2),
+                max_relative = 1e-4,
+                epsilon = 1e-6
+            );
+        }
+    }
+
+    /// `erfc_g`'s two branches — `1 − erf` (`x ≤ 1`) and `Q(½,x²)` (`x > 1`) — must
+    /// agree **at the same point** (value and dual derivative) across the `x = 1`
+    /// seam, so the branch switch is a no-op on the gradient path. Evaluated
+    /// explicitly at points in `(1, 1.5)` where the two formulas coexist.
+    #[test]
+    fn erfc_g_branches_agree_at_seam() {
+        use crate::sens::dual2::Dual2;
+        for &xv in &[1.02_f64, 1.1, 1.22, 1.4] {
+            let x = Dual2::<1>::var(xv, 0);
+            let one_minus_erf = Dual2::<1>::from_f64(1.0) - erf_g(x);
+            let q = regularized_gamma_q(Dual2::<1>::from_f64(0.5), x * x);
+            assert_relative_eq!(one_minus_erf.value, q.value, max_relative = 1e-10);
+            assert_relative_eq!(one_minus_erf.grad[0], q.grad[0], max_relative = 1e-9);
         }
     }
 }

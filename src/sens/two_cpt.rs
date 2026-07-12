@@ -8,7 +8,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::num::PkNum;
-use crate::pk::analytical_absorption::{convolve_2cpt, TransitAbsorption};
+use crate::pk::analytical_absorption::{convolve_2cpt, IgAbsorption, TransitAbsorption};
 use crate::types::DoseEvent;
 
 /// Macro-rate constants `(α, β, k21)` from the PK params, via Vieta's `β = d/α`
@@ -262,6 +262,113 @@ pub fn two_cpt_transit_conc_g<T: PkNum>(
     f_bio: T,
 ) -> T {
     two_cpt_transit_amt_g(T::from_f64(dose.amt), t, cl, v1, q, v2, n, mtt, f_bio)
+}
+
+/// Shared domain guard for the analytic 2-cpt inverse-Gaussian closed forms (#790) —
+/// the IG counterpart of [`transit_2cpt_domain_ok`]. Returns the macro-rates
+/// `(α, β, k21)` when the disposition params are physical, the eigenvalues are
+/// distinct (non-confluent — `convolve_2cpt`'s `1/(α−β)` residues are otherwise
+/// undefined), and the fast macro-rate is inside the tilting convergence domain
+/// `α < 1/(2·MAT·CV²)` (since `α ≥ β`, guarding `α` suffices); `None` otherwise. The
+/// `!(α < abscissa)` form makes a transient `NaN` short-circuit to `None`, matching
+/// the central/peripheral readers so they can't drift.
+pub(crate) fn ig_2cpt_domain_ok<T: PkNum>(
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    mat: T,
+    cv2: T,
+) -> Option<(T, T, T)> {
+    if v1.val() <= 0.0
+        || cl.val() <= 0.0
+        || q.val() < 0.0
+        || v2.val() <= 0.0
+        || mat.val() <= 0.0
+        || cv2.val() <= 0.0
+    {
+        return None;
+    }
+    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
+    if (alpha - beta).val().abs() < 1e-12 {
+        return None;
+    }
+    let abscissa = T::from_f64(1.0) / (T::from_f64(2.0) * mat * cv2);
+    if !(alpha.val() < abscissa.val()) {
+        return None;
+    }
+    Some((alpha, beta, k21))
+}
+
+/// 2-cpt with Freijer & Post inverse-Gaussian absorption (`igd(mat, cv2)`) — the
+/// 2-cpt counterpart of [`crate::sens::one_cpt::one_cpt_ig_g`] (#790). The IG
+/// absorption time feeds a 2-cpt disposition via the exponential-tilting closed form
+/// ([`convolve_2cpt`]), so `T = f64` gives the central concentration and
+/// `T = Dual2<N>` gives exact `∂C/∂{cl,v1,q,v2,mat,cv2,f}` (+ 2nd order).
+#[allow(clippy::too_many_arguments)]
+pub fn two_cpt_ig_g<T: PkNum>(
+    amt: f64,
+    t: T,
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    mat: T,
+    cv2: T,
+    f_bio: T,
+) -> T {
+    two_cpt_ig_amt_g(T::from_f64(amt), t, cl, v1, q, v2, mat, cv2, f_bio)
+}
+
+/// As [`two_cpt_ig_g`] but with a generic amount `amt` (issue #524 init path).
+///
+/// Domain: converges only when **both** macro-rates lie below the IG MGF abscissa
+/// `1/(2·MAT·CV²)`; since `α ≥ β`, guarding `α < 1/(2·MAT·CV²)` suffices. Outside it —
+/// invalid params, confluent eigenvalues, or the flip-flop `α ≥ 1/(2·MAT·CV²)` — this
+/// returns `0.0` (the sibling closed forms' invalid-parameter convention), with the
+/// NaN-safe `!(α < abscissa)` form of [`ig_2cpt_domain_ok`].
+#[allow(clippy::too_many_arguments)]
+pub fn two_cpt_ig_amt_g<T: PkNum>(
+    amt: T,
+    t: T,
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    mat: T,
+    cv2: T,
+    f_bio: T,
+) -> T {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    let Some((alpha, beta, k21)) = ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2) else {
+        return T::from_f64(0.0);
+    };
+    let abs = IgAbsorption {
+        mat,
+        lambda: mat / cv2,
+    };
+    convolve_2cpt(&abs, t, alpha, beta, k21, (f_bio * amt) / v1)
+}
+
+/// Inverse-Gaussian counterpart to [`two_cpt_transit_conc_g`] for the analytic
+/// `two_cpt_ig` model (#790), used by the sensitivity provider. IG rejects
+/// infusion/SS doses at parse, so only the absorbed-bolus route exists — a thin
+/// wrapper over [`two_cpt_ig_amt_g`] with `F` baked into the kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn two_cpt_ig_conc_g<T: PkNum>(
+    dose: &DoseEvent,
+    t: T,
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    mat: T,
+    cv2: T,
+    f_bio: T,
+) -> T {
+    two_cpt_ig_amt_g(T::from_f64(dose.amt), t, cl, v1, q, v2, mat, cv2, f_bio)
 }
 
 /// SS geometric-series factor `1/(1 − e^{−λ·ii})`.

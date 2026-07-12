@@ -30,6 +30,57 @@ section of the SDLC for the versioning policy).
   force a fresh start, or set `checkpoint = false` to disable saving. Works
   across all estimation methods (resume is a coarse warm-restart from the saved
   population estimates, not a bit-exact optimizer-state resume).
+- **Left truncation (delayed entry) for clock-reset RTTE** (#740): repeated
+  time-to-event models with `clock = reset` now accept a `TENTRY > 0` entry time
+  instead of rejecting it. The first inter-event sojourn is conditioned on survival
+  to entry in absolute time (`H(t₁) − H(TENTRY)`), then the renewal clock takes over
+  for later gaps — the same delayed-entry convention already used for single-event
+  and clock-forward RTTE, so `TENTRY` means one thing across every survival endpoint
+  (condition on survival past entry, never restart the clock at entry). Assumes the
+  time origin `t = 0` is the renewal origin of the first sojourn; coincides with the
+  pure renewal form (and with clock-forward) for a memoryless exponential hazard.
+- **Left truncation for RTTE _simulation_** (#740): `simulate()` now accepts
+  `TENTRY > 0` for repeated events on both clocks, drawing the stream on the time
+  origin conditioned on survival to entry (clock-forward seeds its conditioning clock
+  at `TENTRY`; clock-reset draws its first sojourn conditional on entry, then renews
+  from 0) — the simulate dual of the fit-side conditioning, so a simulated
+  left-truncated stream refits under the same convention. `TENTRY = 0` stays
+  byte-identical to the non-truncated draw.
+- **Analytic inverse-Gaussian (IG) absorption closed form** (#790): the Freijer &
+  Post inverse-Gaussian absorption model is now available as the analytic
+  structural models `pk one_cpt_ig(cl, v, mat, cv2)` and
+  `pk two_cpt_ig(cl, v1, q, v2, mat, cv2)` — the exponential-tilting closed form of
+  the same `igd(mat, cv2)` density the ODE path uses, giving exact `Dual2`
+  FOCE/FOCEI gradients that are independent of ODE-solver tolerance, and a uniform
+  `pk`-line interface consistent with the analytic transit models. Supports
+  absorption `lagtime`, bioavailability `f`, IIV, and time-varying covariates
+  (auto-rerouted to the ODE `igd()` twin per subject); IOV / steady-state /
+  infusion / non-depot doses are rejected with a clear error, as for the transit
+  closed form. Outside the tilting convergence domain (`ke ≥ 1/(2·MAT·CV²)`) a plain
+  model transparently falls back to its ODE twin. **Note on performance:** unlike
+  the analytic *transit* models (whose stiff-ish ODE makes the closed form ~28–31×
+  faster), IG's `igd()` ODE is non-stiff and cheap, so the closed form is not a
+  speed win — it is ~2× slower per objective evaluation than the `igd()` forcing;
+  use the ODE `igd()` forcing if raw speed matters, and this closed form when you
+  want exact tolerance-free gradients or the uniform interface. Validated against
+  the numerical `igd()` ODE (`tests/ig_analytic_equivalence.rs`, 1-/2-cpt) and
+  directly against NONMEM `$DES` on an in-domain IG-truth dataset
+  (`tests/ig_analytic_nonmem_anchor.rs`: ferx −1303.528 vs NONMEM −1303.639). See
+  [examples/one_cpt_ig.ferx](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_ig.ferx).
+- **High parameter-correlation warning** (#781): a fit now emits a
+  `high_correlation` warning when a THETA (fixed-effect) pair's estimate
+  correlation (from the covariance matrix) has |r| ≥ 0.95 — a sign of
+  over-parameterization / non-identifiability that names the specific culprits
+  (complementing the aggregate `condition_number`). Emitted typed at source with
+  `details` listing each `{parameter_a, parameter_b, correlation}`. See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+- **Inflated-RSE warning** (#781): a fit now emits an `inflated_rse` warning
+  when a free THETA's relative standard error (`100 · se / |estimate|`) exceeds
+  ~50% — an imprecisely estimated parameter, often a sign of
+  over-parameterization. Emitted typed at source with `details` listing each
+  `{parameter, estimate, se, rse_pct}`. Requires a successful covariance step
+  (no SEs → no warning). See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
 - **`simulate_with_options_diag` surfaces per-subject simulation diagnostics** (#762,
   #763): a new entry point returning `SimulationOutput { results, warnings }` — the
   simulation analogue of `FitResult.warnings`. It reports subjects handled specially
@@ -146,38 +197,6 @@ section of the SDLC for the versioning policy).
   surviving column) fail loudly. See
   [Data → Column mapping](https://ferx-nlme.github.io/ferx-core/model-file/data.html).
 
-### Changed
-- **Default thread count capped at 8** (#707): when `threads` is unset (or
-  `0`/`auto`) — via `[fit_options] threads`, the CLI `--threads` flag, or the R
-  binding — the engine now defaults to `available cores - 1` (floored at 1),
-  capped at 8, instead of one worker per logical core. Most fits gain little from
-  scaling past a handful of cores, and not all cores are equal on
-  asymmetric platforms (e.g. Apple Silicon's E-cores). An explicit
-  `threads = N` / `--threads N` still pins the exact count requested.
-- **CLI default output no longer writes a separate `{model}-timing.txt` file** (#704):
-  the estimation step's wall-clock time and thread count now live under a new
-  `estimation:` section in `{model}-fit.yaml` (narrower in scope than the old
-  file, which also covered model parsing and data loading), alongside a new
-  `environment:` section (OS, CPU architecture, whether running in Docker, OS
-  username, ferx version) for troubleshooting and reproducibility. Both are also carried on
-  `FitResult.environment` and round-trip through `.fitrx` bundles.
-- **`simulate()` now samples inter-occasion variability (kappa)** (#723): simulating
-  an IOV model draws an independent `kappa ~ N(0, Omega_IOV)` for each occasion
-  (matching NONMEM `$SIM`), instead of holding every kappa at zero. Simulated /
-  VPC datasets from IOV models now carry the between-occasion spread the model
-  parameterizes; previously they silently under-dispersed relative to the fitted
-  model. Non-IOV models are unaffected (bit-identical output).
-- **The adaptive frozen-replay verifier now independently validates its snapshots** (#748):
-  the default-on safety net for `simulate_adaptive` / `simulate_adaptive_from_spec` reused the
-  same precomputed per-occasion / per-event PK snapshots the reactive driver did, so it checked
-  that the two *consumed* them identically but never that they were *correct* — a mis-built
-  snapshot (a wrong covariate, occasion, or `kappa` fed to a parameter) was applied by both sides
-  and passed the replay bit-exact. The verifier now re-derives each snapshot from the run's
-  primitives via the canonical helpers and bit-asserts it against what the driver was handed, so a
-  build that mis-resolves a covariate or occasion (the class fixed in #732 / #739) fails loudly for
-  every model instead of slipping past the replay. No effect on correct models.
-
-### Added
 - **Adaptive (feedback) dosing now supports time-varying covariates** (#700): the
   reactive driver recomputes each subject's PK per event/segment from the covariate
   active in that segment (the same NONMEM end-of-interval convention `predict()` /
@@ -261,7 +280,131 @@ section of the SDLC for the versioning policy).
   `docs/model-file/scaling.qmd` now documents the raw-output convention per
   structural-model type.
 
+### Changed
+- **Flip-flop transit / inverse-Gaussian models with `lagtime` / `f` now auto-route
+  to their ODE twin** (#735) instead of being rejected. The analytic
+  `pk one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` / `two_cpt_ig` closed forms
+  clamp to an identically-zero profile outside their tilting-convergence domain (the
+  flip-flop regime) and are transparently rerouted to the equivalent ODE `transit()` /
+  `igd()` model — but previously only when the model carried no `lagtime=` / `f=`
+  mapping. Those mappings now carry into the generated twin (via reserved-name
+  individual parameters), so a flip-flop model with absorption lag or bioavailability —
+  including a `TIME` / time-varying-covariate model that *requires* the twin — now fits
+  and predicts correctly instead of erroring or returning zero. Validated by
+  closed-form↔ODE equivalence tests (`tests/transit_analytic_equivalence.rs`,
+  `tests/ig_analytic_equivalence.rs`) for lag, f, and both. A guard declines the twin
+  (keeping the model closed-form, and rejected up front if flip-flop) whenever building it
+  would misbehave: a parameter name that *shadows* a reserved F/lagtime slot it was not
+  mapped to (which would silently apply an extra F/lag), or an `f=`/`lagtime=` parameter
+  whose name *collides* with a disposition slot (e.g. a bioavailability parameter named
+  `V1`, which would otherwise make the twin fail to build). User `[odes]` / `[scaling]` /
+  `[initial_conditions]` forms remain twin-less (no unique desugar) and are still rejected
+  up front in the flip-flop regime.
+- **Default thread count capped at 8** (#707): when `threads` is unset (or
+  `0`/`auto`) — via `[fit_options] threads`, the CLI `--threads` flag, or the R
+  binding — the engine now defaults to `available cores - 1` (floored at 1),
+  capped at 8, instead of one worker per logical core. Most fits gain little from
+  scaling past a handful of cores, and not all cores are equal on
+  asymmetric platforms (e.g. Apple Silicon's E-cores). An explicit
+  `threads = N` / `--threads N` still pins the exact count requested.
+- **CLI default output no longer writes a separate `{model}-timing.txt` file** (#704):
+  the estimation step's wall-clock time and thread count now live under a new
+  `estimation:` section in `{model}-fit.yaml` (narrower in scope than the old
+  file, which also covered model parsing and data loading), alongside a new
+  `environment:` section (OS, CPU architecture, whether running in Docker, OS
+  username, ferx version) for troubleshooting and reproducibility. Both are also carried on
+  `FitResult.environment` and round-trip through `.fitrx` bundles.
+- **`simulate()` now samples inter-occasion variability (kappa)** (#723): simulating
+  an IOV model draws an independent `kappa ~ N(0, Omega_IOV)` for each occasion
+  (matching NONMEM `$SIM`), instead of holding every kappa at zero. Simulated /
+  VPC datasets from IOV models now carry the between-occasion spread the model
+  parameterizes; previously they silently under-dispersed relative to the fitted
+  model. Non-IOV models are unaffected (bit-identical output).
+- **The adaptive frozen-replay verifier now independently validates its snapshots** (#748):
+  the default-on safety net for `simulate_adaptive` / `simulate_adaptive_from_spec` reused the
+  same precomputed per-occasion / per-event PK snapshots the reactive driver did, so it checked
+  that the two *consumed* them identically but never that they were *correct* — a mis-built
+  snapshot (a wrong covariate, occasion, or `kappa` fed to a parameter) was applied by both sides
+  and passed the replay bit-exact. The verifier now re-derives each snapshot from the run's
+  primitives via the canonical helpers and bit-asserts it against what the driver was handed, so a
+  build that mis-resolves a covariate or occasion (the class fixed in #732 / #739) fails loudly for
+  every model instead of slipping past the replay. No effect on correct models.
+
 ### Fixed
+- **Declining-hazard (`γ < 0`) Gompertz median/mean survival diagnostics** (#805):
+  `median_survival` returned `NaN` for *every* `γ < 0` Gompertz, even when a finite median
+  genuinely exists — the closed form generalizes to `γ < 0`, so the reported TTE median is
+  now finite whenever the cure fraction `S(∞) = e^{−α·e^{loghr}/|γ|} < 0.5` (and stays
+  `NaN` when `S(∞) ≥ 0.5`, where more than half never event and the median is undefined).
+  `mean_survival` now returns `NaN` for any `γ < 0` Gompertz via an explicit guard: its
+  mean is genuinely infinite (a positive cure fraction leaves a non-decaying survival
+  tail), which the previous code reported correctly only by coincidence through the `NaN`
+  median. Diagnostic/reporting only (`predict_survival` summaries); does not touch
+  estimation or simulation numerics. Same `γ < 0` boundary fixed for the samplers in
+  #803 / #804.
+- **Declining-hazard (`γ < 0`) Gompertz simulation no longer censors every event**
+  (#803): the analytic inverse-CDF event-time samplers guarded the Gompertz draw with
+  `inner ≤ 1`, which fires for *every* `u ∈ (0,1)` when the shape `γ < 0`, so a
+  declining-hazard Gompertz simulated an empty / all-censored stream even though `fit()`
+  scored the same `γ < 0` with finite density — simulate was not the inverse of fit for
+  this family, breaking simulate→fit round-trips (VPC/SBC). A `γ < 0` Gompertz has a
+  finite limiting cumulative hazard `H(∞) = −α·e^{loghr}/γ`, i.e. a genuine cure fraction
+  `S(∞) = e^{−H(∞)}`; the guard now rejects only that true cure fraction (`inner ≤ 0`), so
+  a draw above it produces a valid finite event. Affects single-event TTE, clock-forward
+  RTTE, and the clock-reset first sojourn for any `γ < 0`.
+- **A dose landing exactly on a subject's last observation is now applied before that
+  observation is read (post-dose) on the constant-parameter ODE engine, fixing a
+  false rejection by the adaptive frozen-replay verifier** (#731). The engine applied
+  doses only at each integration segment's left boundary and treated the timeline's
+  final break as an endpoint only, so a dose coinciding with the last observation was
+  dropped and that observation read the pre-dose state — disagreeing with the
+  analytical engine, the reactive adaptive driver, and NONMEM (all post-dose). This
+  surfaced as the default-on adaptive frozen-replay verifier rejecting a valid
+  constant-covariate run whose final dosing decision coincided with the last sample.
+  Interior breaks were already handled post-dose. The same terminal-break fix is
+  applied to the two sibling break-walking paths so a terminal dose is read post-dose
+  consistently everywhere: the dedicated dense state solve (`ode_dense_solve_states`),
+  keeping the joint PK-TTE hazard (#570) consistent between its shared one-solve and
+  two-solve paths when an event time coincides with a dose at the subject's last time
+  point; and the per-compartment states path (`ode_predictions_with_states`), so the
+  post-fit sdtab IPRED and compartment states agree with the fitted IPRED in that case.
+- **Adaptive/feedback dosing now runs the same dose-precondition guards as the
+  static paths, instead of silently mis-delivering a dose** (#721). The reactive
+  entry points (`simulate_adaptive()` / `simulate_adaptive_from_spec()`) skipped the
+  modeled-`RATE` (#324), analytic-absorption closed-form, and built-in-absorption
+  (#588) checks that `simulate()` / `predict()` / `fit()` all run before integrating,
+  so a feedback-dosed model with malformed built-in-absorption pathway fractions or an
+  out-of-domain absorption parameter simulated with a silently wrong absorbed dose.
+  The guards now run at the adaptive chokepoint and fail with the same typed error
+  before any decision is taken.
+- **A twin-less transit / inverse-Gaussian absorption fit no longer silently
+  degenerates a subject whose fitted random effects reach the flip-flop regime**
+  (#785). An analytic `one_cpt_transit`/`two_cpt_transit` (or `one_cpt_ig`/
+  `two_cpt_ig`) model carrying a `lagtime` / `f` / user-`[odes]` mapping declines the
+  ODE-twin desugar, and was only checked for the flip-flop regime at typical (η = 0)
+  values at fit start. A subject whose empirical-Bayes estimate drove `ke = CL/V`
+  past the tilting abscissa still hit the closed form's identically-zero profile,
+  silently collapsing that subject's likelihood contribution. The fit now emits a
+  typed `flip_flop` warning naming the affected subject(s) and pointing at the ODE
+  `transit()`/`igd()` forcing form (which reroutes per subject at the actual η). See
+  the [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
+- **`simulate_with_uncertainty` no longer panics when a parameter draw enters the
+  flip-flop regime** (#786). For a twin-less transit / IG closed form whose point
+  estimate is in-domain, a sampled uncertainty draw that crossed the flip-flop
+  boundary previously aborted the *entire* simulation via a panic. Such draws are
+  now skipped so the remaining draws still yield results (the run no longer panics;
+  this aggregated-uncertainty entry point returns only the rows, so a skipped draw is
+  not surfaced as a warning — use `simulate_with_options` when a skip must be
+  visible). The single-shot `predict()` / `simulate()` panic paths are unchanged.
+- **A time-to-event hazard that references an inter-occasion (IOV) `kappa` by name
+  is now rejected at parse instead of silently using zero** (#770). A hazard is
+  evaluated once per subject with no occasion context, so an IOV `kappa` has no
+  well-defined value there. Referencing one *through* an `[individual_parameters]`
+  value was already rejected (#442); a hazard expression that names a `kappa`
+  **directly** (e.g. `scale = TVLAMBDA * exp(KAPPA_CL)`) previously fell back to a
+  leniently-read `0.0` covariate, silently dropping the IOV term. It now fails
+  loud, naming the offending random effect — write the hazard in terms of θ/η, or
+  reference an IOV-free parameter.
 - **A degenerate hazard draw in simulation no longer vanishes silently, and a pathological
   RTTE hazard no longer aborts the whole run** (#762, #763). When an analytic hazard's
   effective rate degenerates (non-positive / non-finite), the affected subject is censored

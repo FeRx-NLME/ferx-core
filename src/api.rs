@@ -1462,72 +1462,73 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
     }
 }
 
-/// Features the analytic transit models (`one_cpt_transit`, `two_cpt_transit`) do
-/// not support in their first version (#386): the exponential-tilting closed form
-/// is a constant-parameter depot-bolus superposition, so steady-state doses, IOV,
-/// infusion doses, system resets, and non-depot (`CMT≠1`) doses are rejected up
-/// front — otherwise they would silently mis-predict or hit an `unreachable!` in
-/// the superposition dispatch. (Time-varying covariates and a `TIME`-dependent
-/// parameter are instead transparently rerouted to the plain form's ODE `transit()`
-/// twin via [`CompiledModel::effective_for`]; only a form outside that twin's scope
-/// rejects them.) `fit()` surfaces this as an `Err`;
-/// `predict()`/`simulate()` panic via [`assert_transit_support`], mirroring
-/// [`assert_modeled_doses_supported`]. Returns the first offending feature's
-/// message, or `None` when compatible.
-pub(crate) fn check_transit_support(
+/// Features the analytic closed-form absorption models — transit (`one_cpt_transit`,
+/// `two_cpt_transit`, #386) and inverse-Gaussian (`one_cpt_ig`, `two_cpt_ig`, #790) —
+/// do not support: the exponential-tilting closed form is a constant-parameter
+/// depot-bolus superposition, so steady-state doses, IOV, infusion doses, system
+/// resets, and non-depot (`CMT≠1`) doses are rejected up front — otherwise they would
+/// silently mis-predict or hit an `unreachable!` in the superposition dispatch.
+/// (Time-varying covariates and a `TIME`-dependent parameter are instead transparently
+/// rerouted to the plain form's ODE twin — `transit()` / `igd()` forcing — via
+/// [`CompiledModel::effective_for`]; only a form outside that twin's scope rejects
+/// them.) `fit()` surfaces this as an `Err`; `predict()`/`simulate()` panic via
+/// [`assert_absorption_closed_form_support`], mirroring
+/// [`assert_modeled_doses_supported`]. Returns the first offending feature's message,
+/// or `None` when compatible.
+pub(crate) fn check_absorption_closed_form_support(
     model: &CompiledModel,
     population: &Population,
 ) -> Option<String> {
     if !matches!(
         model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
     ) {
         return None;
     }
     let name = model.pk_model.canonical_name();
     if model.n_kappa > 0 {
         return Some(format!(
-            "{name} does not support IOV (n_kappa > 0): the transit closed form \
-             assumes constant disposition over each absorption window. Use an ODE transit \
-             model (transit() forcing in [odes]) for IOV."
+            "{name} does not support IOV (n_kappa > 0): the analytic absorption closed form \
+             assumes constant disposition over each absorption window. Use an ODE absorption \
+             model (transit()/igd() forcing in [odes]) for IOV."
         ));
     }
     // A `TIME`-built-in structural parameter makes the disposition switch mid-profile — the
-    // transit closed form assumes constant parameters over each absorption window, so it
-    // cannot serve it. The plain `cl/v/n/mtt` form carries a `transit_ode_equivalent`
-    // (built at parse time), which the runtime dispatch routes such subjects to, so it is
-    // NOT rejected. Only a form outside the desugar's scope (a `lagtime=`/`f=` mapping or a
-    // custom `[scaling]` — no equivalent) is rejected here rather than mis-predict.
+    // closed form assumes constant parameters over each absorption window, so it cannot serve
+    // it. The plain form carries an `absorption_ode_equivalent` (built at parse time), which
+    // the runtime dispatch routes such subjects to, so it is NOT rejected. Only a form outside
+    // the desugar's scope (a `lagtime=`/`f=` mapping or a custom `[scaling]` — no equivalent)
+    // is rejected here rather than mis-predict.
     if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
-        && model.transit_ode_equivalent.is_none()
+        && model.absorption_ode_equivalent.is_none()
     {
         return Some(format!(
             "{name} does not support a TIME-dependent structural parameter in this form: \
-             the transit closed form assumes constant parameters over each absorption \
-             window, and this form is outside the automatic ODE-equivalent rewrite. Write \
-             the model as an ODE transit() forcing in [odes] directly."
+             the analytic absorption closed form assumes constant parameters over each \
+             absorption window, and this form is outside the automatic ODE-equivalent rewrite. \
+             Write the model as an ODE transit()/igd() forcing in [odes] directly."
         ));
     }
     for subject in &population.subjects {
         // Time-varying covariates make the disposition switch mid-absorption, which the
-        // closed form cannot serve. The plain form's `transit_ode_equivalent` handles it
+        // closed form cannot serve. The plain form's `absorption_ode_equivalent` handles it
         // (the runtime dispatch routes TV-cov subjects there), so reject only the
         // out-of-scope forms that carry no equivalent.
-        if subject.has_tv_covariates() && model.transit_ode_equivalent.is_none() {
+        if subject.has_tv_covariates() && model.absorption_ode_equivalent.is_none() {
             return Some(format!(
                 "{name} does not support within-subject time-varying covariates \
-                 (subject {}): the transit closed form assumes constant parameters over each \
-                 absorption window. Use an ODE transit model.",
+                 (subject {}): the analytic absorption closed form assumes constant parameters \
+                 over each absorption window. Use an ODE absorption model.",
                 subject.id
             ));
         }
         if subject.has_resets() {
             return Some(format!(
                 "{name} does not support system resets (EVID=3/4) (subject {}): resets zero \
-                 compartment amounts mid-profile, which the transit superposition closed form \
+                 compartment amounts mid-profile, which the absorption superposition closed form \
                  cannot express (it silently ignores the reset while the sensitivity path washes \
-                 out pre-reset doses, so fit() and predict() would disagree). Use an ODE transit \
-                 model.",
+                 out pre-reset doses, so fit() and predict() would disagree). Use an ODE \
+                 absorption model.",
                 subject.id
             ));
         }
@@ -1539,15 +1540,15 @@ pub(crate) fn check_transit_support(
                 // the direct-bolus branch and lands in a disposition compartment. So the two
                 // paths would silently disagree on a non-depot dose, and `effective_for`
                 // routes only TV-cov/`TIME` subjects to the twin, so a mixed population would
-                // even disagree with itself. A transit closed form only supports dosing the
-                // depot (`CMT=1`); reject anything else up front.
+                // even disagree with itself. A closed-form absorption model only supports
+                // dosing the depot (`CMT=1`); reject anything else up front.
                 return Some(format!(
                     "{name} does not support dosing into a non-depot compartment (subject \
-                     {}, CMT={}): the transit closed form routes every dose through the \
-                     absorption chain into central regardless of compartment, so a CMT≠1 dose \
-                     would be silently mistreated — and its ODE twin would instead bolus it \
+                     {}, CMT={}): the analytic absorption closed form routes every dose through \
+                     the absorption process into central regardless of compartment, so a CMT≠1 \
+                     dose would be silently mistreated — and its ODE twin would instead bolus it \
                      into a disposition compartment, so the two paths would disagree. Dose the \
-                     depot (CMT=1), or use an ODE transit model for direct central/peripheral \
+                     depot (CMT=1), or use an ODE absorption model for direct central/peripheral \
                      dosing.",
                     subject.id, dose.cmt
                 ));
@@ -1556,15 +1557,15 @@ pub(crate) fn check_transit_support(
                 return Some(format!(
                     "{name} does not support steady-state (SS) doses yet (subject \
                      {}): the periodic-sum SS closed form is a follow-up. Use a non-SS \
-                     multiple-dose schedule, or an ODE transit model.",
+                     multiple-dose schedule, or an ODE absorption model.",
                     subject.id
                 ));
             }
             if dose.is_infusion() {
                 return Some(format!(
-                    "{name} does not support infusion doses (subject {}): the transit \
-                     closed form absorbs an instantaneous bolus through the transit chain. Use \
-                     an ODE transit model for a zero-order input.",
+                    "{name} does not support infusion doses (subject {}): the analytic \
+                     absorption closed form absorbs an instantaneous bolus through the \
+                     absorption process. Use an ODE absorption model for a zero-order input.",
                     subject.id
                 ));
             }
@@ -1605,10 +1606,11 @@ pub(crate) fn check_transit_support(
 ///     renewal is a later slice.
 ///   * **tied event times** — two events at the same `TIME` give a zero gap `Δ = 0`, which
 ///     the gap-time hazard cannot represent (`h(0)` folds to the sentinel).
-///   * **left truncation (`entry_time > 0`)** — delayed entry is not yet supported for
-///     gap-time RTTE: the first-gap conditioning convention (renewal clock from entry vs.
-///     clock from 0 conditioned on survival to entry) is unratified and unanchored, and the
-///     two differ for a time-varying hazard. Clock-forward supports it via `H(entry)`.
+///
+/// Left truncation (`entry_time > 0`) is **accepted** for clock-reset (#740): the first
+/// sojourn is conditioned on survival to `entry` in absolute time (`H(t₁) − H(entry)`,
+/// convention B), identical to the single-event and clock-forward delayed-entry handling —
+/// see [`crate::survival::rtte_reset_nll_from_curves`].
 ///
 /// Returns `None` when there is no RTTE endpoint or every subject's rows are valid.
 #[cfg(feature = "survival")]
@@ -1724,24 +1726,12 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                             subject.id
                         ));
                     }
-                    // Left truncation (delayed entry, entry_time > 0) is not yet supported for
-                    // gap-time RTTE. The first gap's convention is unratified — renewal clock
-                    // restarts at entry (`Δ = time − entry`, H from 0) vs. clock from 0
-                    // conditioned on survival to entry (`H(t) − H(entry)`) — and the two differ
-                    // for a time-varying hazard (they coincide only for the memoryless
-                    // exponential). There is no NONMEM/survreg anchor for either, so fail loud
-                    // rather than silently pick one. Clock-forward *does* support left truncation
-                    // (it conditions via `H(entry)`), so route such data there or set TENTRY=0.
-                    if *entry_time > 0.0 {
-                        return Some(format!(
-                            "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has a \
-                             left-truncation entry_time={entry_time} > 0. Delayed entry is not \
-                             yet supported for gap-time RTTE (the first-gap conditioning \
-                             convention is unratified). Use clock=forward, which supports left \
-                             truncation, or set the entry time to 0.",
-                            subject.id
-                        ));
-                    }
+                    // Left truncation (delayed entry, entry_time > 0) IS supported for
+                    // clock-reset (#740): the first sojourn is conditioned on survival to
+                    // entry in absolute time (H(t₁) − H(entry), convention B), matching the
+                    // single-event and clock-forward delayed-entry handling. No guard here —
+                    // `rtte_reset_nll_from_curves` applies the conditioning. (An `entry > TIME`
+                    // is still rejected above, shared with clock-forward.)
                     if matches!(event_type, EventType::RightCensored) {
                         seen_censor = true;
                     }
@@ -1836,7 +1826,7 @@ pub(crate) fn check_survival_tv_covariates(
 }
 
 /// Panic wrapper over [`check_survival_tv_covariates`] for the non-`fit` entry points
-/// (`predict()`/`simulate()`), mirroring [`assert_transit_support`]: the same
+/// (`predict()`/`simulate()`), mirroring [`assert_absorption_closed_form_support`]: the same
 /// time-varying-covariate-on-hazard combination that `fit()` rejects as an `Err` cannot be
 /// honoured by prediction / simulation either (the hazard would be silently frozen), so fail
 /// loudly rather than return a subtly wrong result.
@@ -1884,14 +1874,18 @@ pub(crate) fn check_analytic_readout_support(
     None
 }
 
-/// Panic on an unsupported transit model/data combination, for the
+/// Panic on an unsupported transit / IG closed-form model/data combination, for the
 /// `Vec`-returning `predict()`/`simulate()` paths (mirrors
 /// [`assert_modeled_doses_supported`]). `fit()` returns these as an `Err`.
-pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Population) {
-    if let Some(msg) = check_transit_support(model, population) {
+pub(crate) fn assert_absorption_closed_form_support(
+    model: &CompiledModel,
+    population: &Population,
+) {
+    if let Some(msg) = check_absorption_closed_form_support(model, population) {
         panic!(
-            "predict()/simulate() received a model/data combination the transit closed form \
-             cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
+            "predict()/simulate() received a model/data combination the analytic absorption \
+             closed form cannot honour: {msg}\n(fit() reports this as an error rather than \
+             panicking.)"
         );
     }
 }
@@ -1906,14 +1900,14 @@ pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Populat
 /// `lagtime`, bioavailability `f`, or a user `[odes]` / `[scaling]` /
 /// `[initial_conditions]` block, which the desugar declines) has nothing to reroute
 /// to. The boundary is parameter-dependent, so this can't be caught by
-/// [`check_transit_support`]'s structural checks — it is evaluated at the typical
-/// (η = 0) parameters via [`crate::pk::transit_flip_flop_at`], matching the
+/// [`check_absorption_closed_form_support`]'s structural checks — it is evaluated at the typical
+/// (η = 0) parameters via [`crate::pk::absorption_flip_flop_at`], matching the
 /// informational `W_TRANSIT_FLIP_FLOP` warning that fires for the twin-carrying case.
 /// Returns the first offending subject's message, or `None` when no reject applies
 /// (non-transit, twin present, or in-domain). `fit()` / `ferx check` surface this as
-/// an error; `predict()`/`simulate()` panic via [`assert_transit_flip_flop_no_twin`],
-/// mirroring [`check_transit_support`] / [`assert_transit_support`].
-pub(crate) fn check_transit_flip_flop_no_twin(
+/// an error; `predict()`/`simulate()` panic via [`assert_absorption_flip_flop_no_twin`],
+/// mirroring [`check_absorption_closed_form_support`] / [`assert_absorption_closed_form_support`].
+pub(crate) fn check_absorption_flip_flop_no_twin(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
@@ -1921,24 +1915,33 @@ pub(crate) fn check_transit_flip_flop_no_twin(
     // A twin-carrying model is auto-rerouted (correct) — only warned, not rejected.
     if !matches!(
         model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit
-    ) || model.transit_ode_equivalent.is_some()
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+    ) || model.absorption_ode_equivalent.is_some()
     {
         return None;
     }
+    // Model-family-specific domain / ODE-forcing wording (the tilting abscissa and the
+    // `[odes]` forcing differ between transit and IG).
+    let (domain, ode_fn, params) = match model.pk_model {
+        PkModel::OneCptTransit | PkModel::TwoCptTransit => {
+            ("transit rate KTR = (n+1)/mtt", "transit()", "MTT / CL")
+        }
+        _ => ("1/(2·MAT·CV²)", "igd()", "MAT / CV² / CL"),
+    };
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     for subject in &population.subjects {
-        if crate::pk::transit_flip_flop_at(model, subject, theta, &zero_eta) {
+        if crate::pk::absorption_flip_flop_at(model, subject, theta, &zero_eta) {
             return Some(format!(
-                "{} starts outside the analytic transit closed form's convergence domain at \
-                 typical values (subject {}) — the flip-flop regime (disposition rate ≥ transit \
-                 rate KTR = (n+1)/mtt), or (2-cpt) coincident disposition eigenvalues — so it \
-                 returns an identically-zero concentration profile, which silently degenerates \
-                 the objective (a proportional error model collapses `(σ·pred)²` to 0). This \
-                 model has no ODE twin to fall back on (a `lagtime`, bioavailability `f`, or a \
-                 user `[odes]` / `[scaling]` / `[initial_conditions]` block declines the \
-                 desugar) — rewrite it as an explicit ODE `transit()` model, or check the MTT / \
-                 CL starting estimates.",
+                "{} starts outside the analytic absorption closed form's convergence domain at \
+                 typical values (subject {}) — the flip-flop regime (disposition rate ≥ {domain}), \
+                 or (2-cpt) coincident disposition eigenvalues — so it returns an \
+                 identically-zero concentration profile, which silently degenerates the objective \
+                 (a proportional error model collapses `(σ·pred)²` to 0). This model has no ODE \
+                 twin to fall back on (a user `[odes]` / `[scaling]` / `[initial_conditions]` \
+                 block, or a parameter whose name collides with a reserved `f`/`lagtime` slot, \
+                 declines the desugar — a `lagtime=`/`f=` mapping alone now auto-routes, #735) — \
+                 rewrite it as an explicit ODE `{ode_fn}` model, or check the {params} starting \
+                 estimates.",
                 model.pk_model.canonical_name(),
                 subject.id
             ));
@@ -1947,17 +1950,17 @@ pub(crate) fn check_transit_flip_flop_no_twin(
     None
 }
 
-/// Panic on a twin-less flip-flop transit model for the `Vec`-returning
-/// `predict()`/`simulate()` paths (mirrors [`assert_transit_support`]). `fit()`
+/// Panic on a twin-less flip-flop absorption model for the `Vec`-returning
+/// `predict()`/`simulate()` paths (mirrors [`assert_absorption_closed_form_support`]). `fit()`
 /// returns this as an `Err`.
-pub(crate) fn assert_transit_flip_flop_no_twin(
+pub(crate) fn assert_absorption_flip_flop_no_twin(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
 ) {
-    if let Some(msg) = check_transit_flip_flop_no_twin(model, population, theta) {
+    if let Some(msg) = check_absorption_flip_flop_no_twin(model, population, theta) {
         panic!(
-            "predict()/simulate() received a model/data combination the transit closed form \
+            "predict()/simulate() received a model/data combination the absorption closed form \
              cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
         );
     }
@@ -1965,7 +1968,7 @@ pub(crate) fn assert_transit_flip_flop_no_twin(
 
 /// Panic on a depot-referencing analytic Form C readout + reset subject, for the
 /// `Vec`-returning `predict()`/`simulate()` paths (mirrors
-/// [`assert_transit_support`]). `fit()` returns this as an `Err`.
+/// [`assert_absorption_closed_form_support`]). `fit()` returns this as an `Err`.
 pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population: &Population) {
     if let Some(msg) = check_analytic_readout_support(model, population) {
         panic!(
@@ -1980,7 +1983,7 @@ pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population:
 /// a pathway-fraction value out of `(0, 1]` or not summing to 1, an out-of-domain
 /// forcing parameter, or an SS / infusion / `[diffusion]` dose into an input-rate
 /// compartment — for the `Vec`-returning `predict()` / `simulate()` paths (mirrors
-/// [`assert_transit_support`]). `fit()` (and `ferx check`) surface these as an `Err`
+/// [`assert_absorption_closed_form_support`]). `fit()` (and `ferx check`) surface these as an `Err`
 /// via [`check_model_data`], but the simulate/predict paths run no data-check, so
 /// without this a malformed multi-pathway model would be simulated with silently
 /// wrong dose delivery (#588). The data-independent *structural* fraction rules are
@@ -2528,74 +2531,91 @@ pub fn check_model_data_warnings(
         }
     }
 
-    // Analytic transit flip-flop diagnostic (#634 review finding 3). The transit
-    // closed forms converge only when the disposition rate is below the transit
-    // rate `KTR = (n+1)/mtt` (for 2-cpt, the *fast* macro-rate `α`; for 1-cpt,
-    // `ke = CL/V`). Outside that domain the closed form returns an identically-zero
-    // profile — which is parameter-dependent, so `check_transit_support` can't
-    // reject it up front, and with a proportional error model an all-zero IPRED
-    // silently degenerates the likelihood with no other diagnostic. The 2-cpt case
-    // hits this readily (a slow-absorption depot drug with large MTT easily has
-    // `α ≥ KTR`). Evaluated on typical values (η = 0) per subject so a covariate on
-    // MTT/CL that pushes the typical profile into the flip-flop regime is caught.
-    // Reported once, naming the first affected subject. Only a **twin-carrying**
-    // model is warned here — it is auto-rerouted per evaluation
-    // (`pk::effective_model_for_eval`), so the closed form's zero never reaches the
-    // objective and this is an informational heads-up. A **twin-less** flip-flop
-    // model (lagtime / `f` / user `[odes]`) has nothing to reroute to and is a hard
-    // error instead (`check_transit_flip_flop_no_twin`), rejected at
+    // Analytic absorption flip-flop diagnostic (#634 review finding 3; IG #790). The
+    // transit / IG closed forms converge only when the disposition rate is below the
+    // tilting abscissa — `KTR = (n+1)/mtt` (transit) / `1/(2·MAT·CV²)` (IG), with the
+    // *fast* macro-rate `α` for 2-cpt and `ke = CL/V` for 1-cpt. Outside that domain the
+    // closed form returns an identically-zero profile — parameter-dependent, so
+    // `check_absorption_closed_form_support` can't reject it up front, and with a
+    // proportional error model an all-zero IPRED silently degenerates the likelihood with
+    // no other diagnostic. Evaluated on typical values (η = 0) per subject so a covariate
+    // pushing the typical profile into the flip-flop regime is caught. Reported once,
+    // naming the first affected subject. Only a **twin-carrying** model is warned here — it
+    // is auto-rerouted per evaluation (`pk::effective_model_for_eval`), so the closed form's
+    // zero never reaches the objective and this is an informational heads-up. A **twin-less**
+    // flip-flop model (lagtime / `f` / user `[odes]`) has nothing to reroute to and is a hard
+    // error instead (`check_absorption_flip_flop_no_twin`), rejected at
     // fit / predict / simulate / `ferx check`.
     if matches!(
         model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit
-    ) && model.transit_ode_equivalent.is_some()
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+    ) && model.absorption_ode_equivalent.is_some()
     {
+        let is_transit = matches!(
+            model.pk_model,
+            PkModel::OneCptTransit | PkModel::TwoCptTransit
+        );
         for subject in &population.subjects {
-            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &subject.covariates, 0.0);
-            let (cl, v1, n, mtt) = (pk.cl(), pk.v(), pk.n_transit(), pk.mtt());
-            // Mirror the validity guard `pk::transit_flip_flop_at` applies (the
-            // `q`/`v2` checks for 2-cpt), so this heads-up never fires on a parameter
-            // region the reroute treats as invalid rather than flip-flop. (The flip-flop
-            // *trigger* below stays the plain `α ≥ KTR` test; the twin-carrying
-            // confluent-eigenvalue corner is auto-rerouted and correctly not warned.)
-            let params_valid = mtt > 0.0
-                && n >= 0.0
-                && v1 > 0.0
-                && cl > 0.0
-                && match model.pk_model {
-                    PkModel::TwoCptTransit => pk.q() >= 0.0 && pk.v2() > 0.0,
-                    _ => true,
-                };
-            if !params_valid {
-                continue; // invalid params are a separate (fatal) domain check
+            // Reuse the exact runtime reroute decision (validity + domain + confluent), so
+            // this heads-up fires precisely when a flip-flop reroute happens.
+            if !crate::pk::absorption_flip_flop_at(model, subject, &init_params.theta, &zero_eta) {
+                continue;
             }
-            let ktr = (n + 1.0) / mtt;
+            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &subject.covariates, 0.0);
+            let (cl, v1) = (pk.cl(), pk.v());
+            // The fast disposition rate (2-cpt macro-rate `α`, else `ke`) and the tilting
+            // abscissa, for the informational message.
             let disp_rate = match model.pk_model {
-                PkModel::TwoCptTransit => {
+                PkModel::TwoCptTransit | PkModel::TwoCptIg => {
                     crate::sens::two_cpt::macro_rates_g::<f64>(cl, v1, pk.q(), pk.v2()).0
                 }
                 _ => cl / v1,
             };
-            if disp_rate >= ktr {
-                // Auto-handled: the flip-flop reroute (`pk::effective_model_for_eval`)
-                // evaluates the ODE `transit()` twin for these parameters, so the profile
-                // is correct — an informational heads-up, not an error. (A twin-less flip-flop
-                // model is rejected up front by `check_transit_flip_flop_no_twin`.)
-                let msg = format!(
-                    "{} disposition rate ({:.4}) ≥ transit rate KTR = (n+1)/mtt ({:.4}) at \
-                     typical values (subject {}): the flip-flop regime, outside the analytic \
-                     transit closed form's convergence domain. ferx automatically evaluates \
-                     the equivalent ODE transit model for such parameters (correct, but slower \
-                     than the closed form) — check the MTT / CL starting estimates if the \
-                     flip-flop is unexpected.",
-                    model.pk_model.canonical_name(),
-                    disp_rate,
-                    ktr,
-                    subject.id
-                );
-                diags.push(Diagnostic::warning("W_TRANSIT_FLIP_FLOP", msg));
-                break;
+            let (abscissa, abscissa_label, code, ode_fn, params) = if is_transit {
+                (
+                    (pk.n_transit() + 1.0) / pk.mtt(),
+                    "transit rate KTR = (n+1)/mtt",
+                    "W_TRANSIT_FLIP_FLOP",
+                    "transit",
+                    "MTT / CL",
+                )
+            } else {
+                (
+                    1.0 / (2.0 * pk.mat() * pk.cv2()),
+                    "IG abscissa 1/(2·MAT·CV²)",
+                    "W_IG_FLIP_FLOP",
+                    "igd",
+                    "MAT / CV² / CL",
+                )
+            };
+            // `absorption_flip_flop_at` also returns true on the 2-cpt confluent-eigenvalue
+            // corner (`|α−β|<1e-12`), where `disp_rate = α < abscissa`. That corner is
+            // physically unreachable for positive params, but skip the flip-flop-worded
+            // heads-up there anyway so its "disposition rate ≥ abscissa" claim can never
+            // misreport (the reroute to the ODE twin is still correct either way).
+            if disp_rate < abscissa {
+                continue;
             }
+            // Auto-handled: the flip-flop reroute (`pk::effective_model_for_eval`) evaluates
+            // the ODE twin for these parameters, so the profile is correct — an informational
+            // heads-up, not an error. (A twin-less flip-flop model is rejected up front by
+            // `check_absorption_flip_flop_no_twin`.)
+            let msg = format!(
+                "{} disposition rate ({:.4}) ≥ {} ({:.4}) at typical values (subject {}): the \
+                 flip-flop regime, outside the analytic absorption closed form's convergence \
+                 domain. ferx automatically evaluates the equivalent ODE {} model for such \
+                 parameters (correct, but slower than the closed form) — check the {} starting \
+                 estimates if the flip-flop is unexpected.",
+                model.pk_model.canonical_name(),
+                disp_rate,
+                abscissa_label,
+                abscissa,
+                subject.id,
+                ode_fn,
+                params
+            );
+            diags.push(Diagnostic::warning(code, msg));
+            break;
         }
     }
 
@@ -2777,18 +2797,32 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     &population,
                     &init_params,
                 ));
-                // Surface the structural transit rejects (IOV / SS / CMT≠1 / infusion /
-                // reset) so a clean `ferx check` and a `fit()` agree on transit models —
-                // previously only `fit()` reported these (#776 review).
-                if let Some(e) = check_transit_support(&parsed.model, &population) {
-                    diags.push(Diagnostic::error("E_TRANSIT_UNSUPPORTED", e));
+                // Surface the structural absorption-closed-form rejects (IOV / SS / CMT≠1 /
+                // infusion / reset) so a clean `ferx check` and a `fit()` agree on transit /
+                // IG models — previously only `fit()` reported these (#776 review, IG #790).
+                // Model-family-specific code so an IG model reads `E_IG_*` not `E_TRANSIT_*`.
+                let is_ig = matches!(parsed.model.pk_model, PkModel::OneCptIg | PkModel::TwoCptIg);
+                if let Some(e) = check_absorption_closed_form_support(&parsed.model, &population) {
+                    let code = if is_ig {
+                        "E_IG_UNSUPPORTED"
+                    } else {
+                        "E_TRANSIT_UNSUPPORTED"
+                    };
+                    diags.push(Diagnostic::error(code, e));
                 }
-                // Twin-less flip-flop transit is a hard error, not a warning (#776):
-                // surface it the same way `fit()` does, so `ferx check` catches it up front.
-                if let Some(e) =
-                    check_transit_flip_flop_no_twin(&parsed.model, &population, &init_params.theta)
-                {
-                    diags.push(Diagnostic::error("E_TRANSIT_FLIP_FLOP", e));
+                // Twin-less flip-flop is a hard error, not a warning (#776): surface it the
+                // same way `fit()` does, so `ferx check` catches it up front.
+                if let Some(e) = check_absorption_flip_flop_no_twin(
+                    &parsed.model,
+                    &population,
+                    &init_params.theta,
+                ) {
+                    let code = if is_ig {
+                        "E_IG_FLIP_FLOP"
+                    } else {
+                        "E_TRANSIT_FLIP_FLOP"
+                    };
+                    diags.push(Diagnostic::error(code, e));
                 }
             }
             Err(e) => {
@@ -2929,14 +2963,14 @@ pub fn fit(
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
-    if let Some(e) = check_transit_support(model, population) {
+    if let Some(e) = check_absorption_closed_form_support(model, population) {
         return Err(e);
     }
     // Reject a twin-less transit closed form that starts in the flip-flop regime (#776):
     // it returns an identically-zero profile that silently degenerates the objective and,
     // unlike a twin-carrying model, has no ODE twin to reroute to. Parameter-dependent, so
-    // evaluated at η = 0 typical values here rather than in `check_transit_support`.
-    if let Some(e) = check_transit_flip_flop_no_twin(model, population, &init_params.theta) {
+    // evaluated at η = 0 typical values here rather than in `check_absorption_closed_form_support`.
+    if let Some(e) = check_absorption_flip_flop_no_twin(model, population, &init_params.theta) {
         return Err(e);
     }
     // Reject a depot-referencing analytic Form C readout on reset subjects (#650):
@@ -5425,6 +5459,21 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
+    // Imprecisely estimated thetas (high relative standard error) — likewise
+    // emitted typed at source with `details` (#781).
+    if let Some((msg, entry)) = inflated_rse_warning(&se_theta, &result.params) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
+    // Twin-less transit/IG absorption closed form whose fitted per-subject EBE crosses
+    // into the flip-flop regime — a silently degenerate subject the η = 0 fit-start
+    // reject could not catch (#785). Emitted typed at source.
+    if let Some((msg, entry)) =
+        absorption_flip_flop_ebe_warning(model, population, &result.params.theta, &result.eta_hats)
+    {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
@@ -5537,7 +5586,7 @@ fn fit_inner(
         }
     };
 
-    let fit_result = FitResult {
+    let mut fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
         method_wall_times_secs,
@@ -5720,6 +5769,15 @@ fn fit_inner(
             ms(jac_fd_n),
             avg_us(jac_fd_n, jac_fd_c)
         );
+    }
+
+    // Highly correlated parameter pairs — emitted typed at source with a
+    // `details` payload (#781). Appended post-construction because it needs the
+    // packed parameter names, which are derived from the assembled `FitResult`;
+    // `rebuild_warnings_structured` preserves this native entry by message.
+    if let Some((msg, entry)) = high_correlation_warning(&fit_result) {
+        fit_result.warnings.push(msg);
+        fit_result.warnings_structured.push(entry);
     }
 
     Ok(fit_result)
@@ -6440,6 +6498,258 @@ fn boundary_estimate_warning(params: &ModelParameters) -> Option<(String, Warnin
         message: msg.clone(),
         source_method: None,
         details: Some(serde_json::json!({ "parameters": params_json })),
+    };
+    Some((msg, entry))
+}
+
+/// Relative-standard-error threshold (percent) above which a free THETA is
+/// flagged as imprecisely estimated. 50% is a common rule of thumb for fixed
+/// effects (well-estimated parameters typically sit well below it).
+const RSE_WARN_THRESHOLD_PCT: f64 = 50.0;
+
+/// Free (non-fixed) THETA estimates with a relative standard error above the
+/// threshold, as `(name, estimate, se, rse_pct)`. Empty when the covariance
+/// step produced no SEs, or none are imprecise. `RSE = 100 * se / |estimate|`.
+fn inflated_rse_thetas(
+    se_theta: &Option<Vec<f64>>,
+    params: &ModelParameters,
+) -> Vec<(String, f64, f64, f64)> {
+    let Some(se) = se_theta else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for i in 0..params.theta.len() {
+        if params.theta_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let (est, se_i) = (params.theta[i], se.get(i).copied().unwrap_or(f64::NAN));
+        if est.abs() <= 1e-12 || !se_i.is_finite() {
+            continue;
+        }
+        let rse = 100.0 * se_i / est.abs();
+        if rse.is_finite() && rse > RSE_WARN_THRESHOLD_PCT {
+            let name = params
+                .theta_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("THETA{}", i + 1));
+            hits.push((name, est, se_i, rse));
+        }
+    }
+    hits
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// free THETAs whose relative standard error exceeds the threshold, or `None`.
+fn inflated_rse_warning(
+    se_theta: &Option<Vec<f64>>,
+    params: &ModelParameters,
+) -> Option<(String, WarningEntry)> {
+    let hits = inflated_rse_thetas(se_theta, params);
+    if hits.is_empty() {
+        return None;
+    }
+    let list = hits
+        .iter()
+        // One decimal so a borderline value (e.g. 50.4%) is not displayed as
+        // "50%" — which would read as below the threshold it just tripped.
+        .map(|(name, _est, _se, rse)| format!("{name} ({rse:.1}%)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let msg = format!(
+        "High relative standard error (RSE > {:.0}%): {list}. These parameter(s) \
+         are imprecisely estimated — often a sign of over-parameterization or \
+         data that do not inform them; consider simplifying the model.",
+        RSE_WARN_THRESHOLD_PCT
+    );
+    let params_json: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|(name, est, se, rse)| {
+            serde_json::json!({
+                "parameter": name,
+                "estimate": est,
+                "se": se,
+                "rse_pct": rse,
+            })
+        })
+        .collect();
+    let entry = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::InflatedRse,
+        message: msg.clone(),
+        source_method: None,
+        details: Some(serde_json::json!({
+            "threshold_pct": RSE_WARN_THRESHOLD_PCT,
+            "parameters": params_json,
+        })),
+    };
+    Some((msg, entry))
+}
+
+/// Absolute correlation above which a parameter pair is flagged as
+/// collinear/non-identified. `0.95` is a common rule of thumb.
+const CORRELATION_WARN_THRESHOLD: f64 = 0.95;
+
+/// THETA (fixed-effect) pairs whose estimate correlation exceeds the threshold,
+/// as `(name_a, name_b, correlation)`. Restricted to the THETA block — it
+/// occupies the first `theta_names.len()` packed entries with unambiguous names,
+/// and fixed-effect collinearity is the most actionable/interpretable case
+/// (omega/sigma live in Cholesky space, where both the correlation and the
+/// packed labels are murkier). Fixed / zero-variance thetas (diagonal `<= 0`)
+/// are skipped. Empty when there is no covariance matrix.
+fn high_correlation_pairs(
+    cov: Option<&DMatrix<f64>>,
+    theta_names: &[String],
+) -> Vec<(String, String, f64)> {
+    let Some(cov) = cov else {
+        return Vec::new();
+    };
+    let n_theta = theta_names.len().min(cov.nrows());
+    let mut pairs = Vec::new();
+    for a in 0..n_theta {
+        if cov[(a, a)] <= 0.0 {
+            continue;
+        }
+        for b in (a + 1)..n_theta {
+            if cov[(b, b)] <= 0.0 {
+                continue;
+            }
+            // sqrt(var_a) * sqrt(var_b) avoids the overflow/underflow that
+            // `(var_a * var_b).sqrt()` can hit for extreme variances.
+            let denom = cov[(a, a)].sqrt() * cov[(b, b)].sqrt();
+            if denom <= 0.0 || !denom.is_finite() {
+                continue;
+            }
+            let r = cov[(a, b)] / denom;
+            if r.is_finite() && r.abs() >= CORRELATION_WARN_THRESHOLD {
+                pairs.push((theta_names[a].clone(), theta_names[b].clone(), r));
+            }
+        }
+    }
+    pairs
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// highly correlated THETA pairs in the fit's covariance matrix, or `None`.
+fn high_correlation_warning(result: &FitResult) -> Option<(String, WarningEntry)> {
+    let pairs = high_correlation_pairs(result.covariance_matrix.as_ref(), &result.theta_names);
+    if pairs.is_empty() {
+        return None;
+    }
+    let list = pairs
+        .iter()
+        .map(|(a, b, r)| format!("{a} ~ {b} ({r:.2})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let msg = format!(
+        "Highly correlated parameter pair(s) (|r| >= {CORRELATION_WARN_THRESHOLD:.2}): \
+         {list}. Highly correlated estimates indicate over-parameterization or \
+         non-identifiability; consider fixing or removing one of each pair."
+    );
+    let pairs_json: Vec<serde_json::Value> = pairs
+        .iter()
+        .map(
+            |(a, b, r)| serde_json::json!({ "parameter_a": a, "parameter_b": b, "correlation": r }),
+        )
+        .collect();
+    let entry = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::HighCorrelation,
+        message: msg.clone(),
+        source_method: None,
+        details: Some(serde_json::json!({
+            "threshold": CORRELATION_WARN_THRESHOLD,
+            "pairs": pairs_json,
+        })),
+    };
+    Some((msg, entry))
+}
+
+/// Build the human message + native structured entry for a **twin-less** transit /
+/// IG absorption closed form whose *fitted* per-subject EBE crosses into the
+/// flip-flop regime, or `None`.
+///
+/// The up-front [`check_absorption_flip_flop_no_twin`] reject only samples η = 0
+/// typical values. The flip-flop boundary is parameter-dependent, so a subject
+/// whose empirical-Bayes CL/V (or MTT/N, MAT/CV²) drives `ke` past the tilting
+/// abscissa passes that check but still hits the closed form's clamp — an
+/// identically-zero profile that silently degenerates *that subject's* likelihood
+/// contribution (#785). A twin-*carrying* model reroutes such subjects to the ODE
+/// twin per-eval (correct), so this fires only when there is no twin (a `lagtime` /
+/// `f` / user-`[odes]` form declined the desugar).
+///
+/// Runs at fit end, once the EBEs are known, and *warns* rather than erroring — the
+/// fit already completed — pointing at the ODE `transit()`/`igd()` forcing form,
+/// which reroutes per-eval at the actual η.
+fn absorption_flip_flop_ebe_warning(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    eta_hats: &[DVector<f64>],
+) -> Option<(String, WarningEntry)> {
+    // Only a twin-less transit/IG closed form can degenerate this way: a twin-carrying
+    // model reroutes per-eval, a non-absorption model has no flip-flop regime.
+    if !matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+    ) || model.absorption_ode_equivalent.is_some()
+    {
+        return None;
+    }
+    // Twin-less transit/IG closed forms reject IOV up front, so `eta_hats` carry exactly
+    // the `n_eta` BSV etas (`n_kappa == 0`). Guard the length so an unexpected shape
+    // skips the subject rather than panicking inside `pk_params_at_time`.
+    let expected = model.n_eta + model.n_kappa;
+    let crossers: Vec<String> = population
+        .subjects
+        .iter()
+        .zip(eta_hats)
+        .filter(|(subject, eta)| {
+            eta.len() == expected
+                && crate::pk::absorption_flip_flop_at(model, subject, theta, eta.as_slice())
+        })
+        .map(|(subject, _)| subject.id.clone())
+        .collect();
+    if crossers.is_empty() {
+        return None;
+    }
+    let is_transit = matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit
+    );
+    let (abscissa_label, ode_fn, params) = if is_transit {
+        ("transit rate KTR = (n+1)/mtt", "transit()", "MTT / CL")
+    } else {
+        ("IG abscissa 1/(2·MAT·CV²)", "igd()", "MAT / CV² / CL")
+    };
+    let id_list = crossers.join(", ");
+    let msg = format!(
+        "{} subject(s) [{}] enter the analytic absorption closed form's clamp region — the \
+         flip-flop regime (disposition rate ≥ {}), or (for a 2-cpt model) coincident disposition \
+         eigenvalues — at their fitted empirical-Bayes estimates, where the closed form returns \
+         an identically-zero concentration profile, silently degenerating those subjects' \
+         likelihood contributions. The typical-value (η = 0) parameters are in-domain, so this \
+         is not caught at fit start, and this twin-less model (a user `[odes]` / `[scaling]` / \
+         `[initial_conditions]` form, or a parameter whose name collides with a reserved \
+         `f`/`lagtime` slot) has no ODE twin to reroute to. \
+         Rewrite it as an explicit ODE `{}` model (which reroutes per-eval at the actual η), or \
+         check the {} starting estimates.",
+        model.pk_model.canonical_name(),
+        id_list,
+        abscissa_label,
+        ode_fn,
+        params
+    );
+    let entry = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::FlipFlop,
+        message: msg.clone(),
+        source_method: None,
+        details: Some(serde_json::json!({
+            "phase": "ebe",
+            "model": model.pk_model.canonical_name(),
+            "subjects": crossers,
+        })),
     };
     Some((msg, entry))
 }
@@ -7367,8 +7677,10 @@ pub struct SimulateOptions {
 /// re-raise the same message as a panic):
 /// - a **finite, positive horizon** is required — the recurrent stream is generated up
 ///   to that administrative window; there is no implicit one;
-/// - **left truncation** (`entry_time > 0`) is a deferred follow-up (conditional
-///   first-gap sampling past entry), so `entry_time == 0` is required;
+/// - **left truncation** (`entry_time > 0`) *is* supported (#740): the stream is drawn on
+///   the time origin conditioned on survival to entry, the simulate dual of the fit-side
+///   conditioning (clock-forward seeds its clock at entry; clock-reset conditions its first
+///   sojourn, convention B). `entry_time == 0` is byte-identical to the non-truncated draw;
 /// - exactly **one recurrent stream per subject** — multiple RTTE CMTs, or an RTTE
 ///   cause mixed with a competing single-event TTE cause, are a later slice (they need
 ///   a shared-horizon multi-stream draw);
@@ -7450,22 +7762,17 @@ fn validate_tte_simulatable(
             let mut rtte_cmts = std::collections::BTreeSet::new();
             let mut has_single_tte_sibling = false;
             for r in &subject.obs_records {
-                let ObsRecord::Event {
-                    cmt, entry_time, ..
-                } = r
-                else {
+                let ObsRecord::Event { cmt, .. } = r else {
                     continue;
                 };
+                // Left truncation (delayed entry, entry_time > 0) IS supported for RTTE
+                // simulation (#740): the stream is drawn on the time origin conditioned on
+                // survival to entry — clock-forward seeds its conditioning clock at entry,
+                // clock-reset conditions its first sojourn (convention B). This is the
+                // simulate dual of the fit-side conditioning; see
+                // [`crate::survival::simulate_rtte_stream`].
                 if is_rtte(cmt) {
                     rtte_cmts.insert(*cmt);
-                    if *entry_time > 0.0 {
-                        return Err(format!(
-                            "RTTE (`type = rtte`) simulation does not support left truncation \
-                             (entry_time={entry_time} for subject '{}' on CMT={cmt}); conditional \
-                             first-gap sampling past entry is a deferred follow-up",
-                            subject.id
-                        ));
-                    }
                 } else if is_single_tte(cmt) {
                     has_single_tte_sibling = true;
                 }
@@ -7667,8 +7974,8 @@ pub fn simulate_with_options_diag(
     // integrates the whole warm-EBE pass first and fails only at the chokepoint,
     // with a confusable "EBE did not converge" instead of the real cause.
     assert_modeled_doses_supported(model, population);
-    assert_transit_support(model, population);
-    assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    assert_absorption_closed_form_support(model, population);
+    assert_absorption_flip_flop_no_twin(model, population, &params.theta);
     // A time-varying covariate on a survival hazard would be silently frozen — panic
     // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
     #[cfg(feature = "survival")]
@@ -8053,8 +8360,8 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // precondition once per call, as `predict()` does — `simulate()` runs no
     // data-check otherwise. #324.
     assert_modeled_doses_supported(model, population);
-    assert_transit_support(model, population);
-    assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    assert_absorption_closed_form_support(model, population);
+    assert_absorption_flip_flop_no_twin(model, population, &params.theta);
     // A time-varying covariate on a survival hazard would be silently frozen — panic
     // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
     #[cfg(feature = "survival")]
@@ -8380,6 +8687,27 @@ where
     // time-varying covariates, resets, SDE) with a typed error — never a silent
     // wrong answer (#391). Both public entry points funnel through here.
     reject_unsupported_adaptive(model, population)?;
+
+    // #721: the reactive path skipped the shared dose-precondition guards that
+    // `simulate()` / `predict()` / `fit()` all run before integrating — modeled `RATE`
+    // (#324), analytic-absorption closed-form model/data compatibility, and built-in
+    // absorption input-rate pathway fractions / SS / infusion / domain (#588). Without
+    // them a feedback-dosed model with, e.g., malformed absorption fractions, an
+    // out-of-domain absorption parameter, or (once base regimens are supported, #702) a
+    // modeled `RATE` would silently mis-deliver the dose — the exact class #588 closed
+    // for the static paths. Surface them as a typed error (the `check_*` form `fit()`
+    // uses, and the form `reject_unsupported_adaptive` just above already uses) rather
+    // than the panic `simulate()` / `predict()` raise via `assert_*`: this
+    // `Result`-returning chokepoint — and its ferx-r FFI surface — then fails with one
+    // uniform, recoverable error contract instead of aborting the process.
+    // (`check_absorption_closed_form_support` is a no-op here — it returns `None` unless
+    // the model is an analytic absorption closed form, which this ODE-only path rejects
+    // up front — but is wired for parity and #702 base-regimen support.)
+    first_error(&check_modeled_dose_rates(model, population))?;
+    if let Some(msg) = check_absorption_closed_form_support(model, population) {
+        return Err(msg);
+    }
+    first_error(&check_absorption_dosing(model, population))?;
 
     // The occasion bookkeeping assumes a strictly-increasing decision schedule:
     // `occasion_of` (per-decision-window κ selection) scans ascending and stops at the
@@ -9207,6 +9535,18 @@ pub fn simulate_with_uncertainty(
     // applies. Use `simulate_with_options` when the warnings matter.
     let mut sim_warnings: Vec<String> = Vec::new();
     for (k, params) in draws.iter().enumerate() {
+        // A parameter draw can land in the flip-flop regime even when the point
+        // estimate is in-domain. For a twin-less transit/IG closed form,
+        // `simulate_inner_with_draw`'s `assert_absorption_flip_flop_no_twin` would then
+        // panic — aborting the *entire* uncertainty run. Skip such a draw with a
+        // recorded warning instead, so the remaining draws still yield results (#786).
+        // The single-shot `predict()`/`simulate()` paths keep the panic (their
+        // Vec-returning contract). Twin-carrying models return `None` here and proceed
+        // (they reroute per-eval), so this only skips genuinely un-simulatable draws.
+        if let Some(msg) = check_absorption_flip_flop_no_twin(model, population, &params.theta) {
+            sim_warnings.push(format!("uncertainty draw {} skipped — {}", k + 1, msg));
+            continue;
+        }
         let mut rows = simulate_inner_with_draw(
             model,
             population,
@@ -9281,8 +9621,8 @@ pub fn predict(
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
-    assert_transit_support(model, population);
-    assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    assert_absorption_closed_form_support(model, population);
+    assert_absorption_flip_flop_no_twin(model, population, &params.theta);
     // A time-varying covariate on a survival hazard would be silently frozen — panic
     // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
     #[cfg(feature = "survival")]
@@ -9408,7 +9748,7 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
-    // Deliberately no `assert_transit_flip_flop_no_twin` guard here (unlike
+    // Deliberately no `assert_absorption_flip_flop_no_twin` guard here (unlike
     // `predict`/`simulate`): a survival prediction cannot be corrupted by a degenerate
     // twin-less-flip-flop transit PK. A hazard that reads the PK is ODE-accumulated (the
     // model then carries `ode_spec` and never takes the closed-form transit path), and a
@@ -9640,7 +9980,7 @@ mod iov_integration {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         }
     }
 
@@ -12147,17 +12487,16 @@ mod simulate_with_uncertainty_tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         }
     }
 
-    /// A `one_cpt_transit` + `TIME` model that the ODE desugar does NOT cover — here because
-    /// of a `lagtime=` mapping (the desugar is scoped to the plain `cl/v/n/mtt` form) — stays
-    /// on the closed form and must be rejected up front rather than silently freezing `TIME`
-    /// at the first record. (The plain form is instead rewritten to the ODE `transit()`
-    /// equivalent and works; see the parser test `transit_time_desugars_to_ode_equivalent`.)
+    /// #735: a `one_cpt_transit` + `TIME` model carrying a `lagtime=` mapping now AUTO-ROUTES
+    /// to its ODE twin instead of being rejected. Before #735 the lagtime form declined the
+    /// twin, so the `TIME` switch had nothing to route to and was rejected up front; now the
+    /// twin is built (carrying the lagtime), so the `TIME` / lagtime subjects are served by it.
     #[test]
-    fn transit_with_time_and_lagtime_is_rejected() {
+    fn transit_with_time_and_lagtime_autoroutes() {
         use crate::parser::model_parser::parse_model_string;
         const TRANSIT_TIME_LAG: &str = r#"
 [parameters]
@@ -12190,17 +12529,20 @@ mod simulate_with_uncertainty_tests {
         assert_eq!(
             model.pk_model,
             crate::types::PkModel::OneCptTransit,
-            "the lagtime= form is outside the desugar scope, so it stays closed-form"
+            "the closed-form shorthand stays OneCptTransit; the twin serves TIME/lagtime subjects"
         );
         assert!(
             crate::parser::model_parser::compiled_model_uses_time_builtin(&model),
             "fixture must use the TIME built-in"
         );
-        let msg = check_transit_support(&model, &tiny_population())
-            .expect("transit + TIME (lagtime form) must be rejected up front");
         assert!(
-            msg.contains("TIME"),
-            "rejection message must name the TIME limitation: {msg}"
+            model.absorption_ode_equivalent.is_some(),
+            "#735: a lagtime= transit model now carries an ODE twin (auto-routes)"
+        );
+        // No longer rejected — the twin handles both the TIME switch and the lagtime.
+        assert!(
+            check_absorption_closed_form_support(&model, &tiny_population()).is_none(),
+            "transit + TIME + lagtime is now served via the twin, not rejected up front"
         );
     }
 
@@ -12498,6 +12840,304 @@ mod simulate_with_uncertainty_tests {
         }
     }
 
+    // ── #785 / #786 flip-flop follow-up fixtures & tests ─────────────────────────
+    // A twin-*less* transit / IG closed form whose *typical* parameters are IN-DOMAIN
+    // (`ke = CL/V` below the tilting abscissa) — so it passes the η=0 fit-start reject —
+    // but which a large positive `ETA_CL` drives into the flip-flop regime. ke0 = 0.5/4 =
+    // 0.125 < KTR = (3+1)/20 = 0.2.
+    // Genuinely twin-less: a user `[scaling]` block declines the ODE-twin desugar. (A
+    // `lagtime=`/`f=` mapping no longer declines it — those auto-route now, #735 — so a
+    // `[scaling]` form is what keeps this the twin-less case the #785 EBE warning targets.)
+    // `obs_scale = 1` is an inert identity divisor — it declines the twin without perturbing the
+    // `pk` block's built-in concentration output. (Using the volume `V` would divide by V a
+    // second time and emit the #712 double-scale warning; the flip-flop detection keys off
+    // `CL/V`, so the scale value is otherwise immaterial here.)
+    const INDOMAIN_TWINLESS_TRANSIT_SRC: &str = "\
+[parameters]
+  theta TVCL(0.5, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[scaling]
+  obs_scale = 1
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+    // IG analogue: ke0 = 5/50 = 0.1 < 1/(2·MAT·CV²) = 1/(2·2·0.3) = 0.833 (in-domain);
+    // the inert `[scaling] obs_scale = 1` block declines the twin (twin-less; see above).
+    const INDOMAIN_TWINLESS_IG_SRC: &str = "\
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.3, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.15 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  MAT = TVMAT
+  CV2 = TVCV2
+
+[structural_model]
+  pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)
+
+[scaling]
+  obs_scale = 1
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+    // Plain transit — no lagtime, so the ODE-twin desugar succeeds (twin-*carrying*):
+    // a flip-flop subject reroutes per-eval, so the EBE warning must NOT fire.
+    const PLAIN_TWIN_TRANSIT_SRC: &str = "\
+[parameters]
+  theta TVCL(0.5, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+    fn parse_fixture(src: &str) -> CompiledModel {
+        crate::parser::model_parser::parse_full_model(src)
+            .expect("fixture model parses")
+            .model
+    }
+
+    fn eta_vec(values: &[f64]) -> nalgebra::DVector<f64> {
+        nalgebra::DVector::from_column_slice(values)
+    }
+
+    /// #785: a twin-less transit closed form in-domain at η=0 but whose second
+    /// subject's fitted EBE (`ETA_CL = 0.6` → CL/V = 0.911/4 = 0.228 ≥ KTR = 0.2)
+    /// crosses the flip-flop boundary must surface a typed `FlipFlop` warning naming
+    /// that subject — the silent-degeneration case the η=0 reject cannot catch.
+    #[test]
+    fn flip_flop_ebe_warning_fires_for_twinless_transit_crosser() {
+        let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+        assert!(
+            model.absorption_ode_equivalent.is_none(),
+            "a [scaling] transit model is twin-less"
+        );
+        // The inert `obs_scale = 1` must not double-scale the `pk` block's built-in concentration
+        // output: no #712 volume double-scale warning (reverting to `obs_scale = V` would
+        // reintroduce it and this pins that regression).
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("divides by")),
+            "twin-less fixture must not emit the obs_scale double-scale warning: {:?}",
+            model.parse_warnings
+        );
+        let pop = tiny_population();
+        // Subject S1 in-domain (η=0), subject S2 crosses.
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[0.6])];
+        let (msg, entry) =
+            absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
+                .expect("a crossing EBE must warn");
+        assert_eq!(entry.category, crate::types::WarningCode::FlipFlop);
+        assert_eq!(entry.message, msg);
+        assert!(msg.contains("flip-flop regime"), "wording: {msg}");
+        assert!(msg.contains("transit()"), "transit ODE hint: {msg}");
+        assert!(msg.contains("S2"), "must name the crossing subject: {msg}");
+        assert!(
+            !msg.contains("S1"),
+            "must not name the in-domain subject: {msg}"
+        );
+        // The real emitter's message must itself classify to `flip_flop` — pins the
+        // classify branch against wording drift (not a hand-copied proxy string).
+        assert_eq!(
+            crate::types::classify_warning(&msg).category,
+            crate::types::WarningCode::FlipFlop
+        );
+        let details = entry.details.expect("native entry carries details");
+        assert_eq!(details["phase"], "ebe");
+        assert_eq!(details["subjects"], serde_json::json!(["S2"]));
+    }
+
+    /// #785: the IG closed form takes the same path, with IG-specific wording.
+    /// ke crosses when CL/V ≥ 1/(2·MAT·CV²) = 0.833; `ETA_CL = 2.3` → CL/V ≈ 0.998.
+    #[test]
+    fn flip_flop_ebe_warning_fires_for_twinless_ig_crosser() {
+        let model = parse_fixture(INDOMAIN_TWINLESS_IG_SRC);
+        assert!(model.absorption_ode_equivalent.is_none());
+        // The inert `obs_scale = 1` must not double-scale the IG closed form (no #712 warning).
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("divides by")),
+            "twin-less IG fixture must not emit the obs_scale double-scale warning: {:?}",
+            model.parse_warnings
+        );
+        let pop = tiny_population();
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[2.3])];
+        let (msg, entry) =
+            absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
+                .expect("a crossing IG EBE must warn");
+        assert_eq!(entry.category, crate::types::WarningCode::FlipFlop);
+        assert!(msg.contains("igd()"), "IG ODE hint: {msg}");
+        assert!(msg.contains("S2"), "must name the crossing subject: {msg}");
+    }
+
+    /// #785: every subject in-domain at its EBE → no warning.
+    #[test]
+    fn flip_flop_ebe_warning_silent_when_all_in_domain() {
+        let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+        let pop = tiny_population();
+        // CL/V = 0.5·e^{0.1}/4 = 0.138 < 0.2 for both.
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[0.1])];
+        assert!(absorption_flip_flop_ebe_warning(
+            &model,
+            &pop,
+            &model.default_params.theta,
+            &eta_hats
+        )
+        .is_none());
+    }
+
+    /// #785: a twin-*carrying* model reroutes per-eval, so even a crossing EBE must
+    /// not warn (the fit is correct for it).
+    #[test]
+    fn flip_flop_ebe_warning_silent_for_twin_carrying() {
+        let model = parse_fixture(PLAIN_TWIN_TRANSIT_SRC);
+        assert!(
+            model.absorption_ode_equivalent.is_some(),
+            "a plain transit model carries an ODE twin"
+        );
+        let pop = tiny_population();
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[0.6])];
+        assert!(absorption_flip_flop_ebe_warning(
+            &model,
+            &pop,
+            &model.default_params.theta,
+            &eta_hats
+        )
+        .is_none());
+    }
+
+    /// #785: a non-absorption model has no flip-flop regime → no warning.
+    #[test]
+    fn flip_flop_ebe_warning_silent_for_non_absorption() {
+        let model = tiny_model();
+        assert!(!matches!(
+            model.pk_model,
+            PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+        ));
+        let pop = tiny_population();
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[3.0])];
+        assert!(absorption_flip_flop_ebe_warning(
+            &model,
+            &pop,
+            &model.default_params.theta,
+            &eta_hats
+        )
+        .is_none());
+    }
+
+    /// #785: an EBE whose length ≠ `n_eta + n_kappa` is defensively skipped rather
+    /// than fed to `pk_params_at_time` (which would panic reading `eta[0]` of a
+    /// zero-length vector). Even a would-be crosser given the wrong shape yields no
+    /// warning — proving the guard, not a panic.
+    #[test]
+    fn flip_flop_ebe_warning_skips_wrong_length_eta() {
+        let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+        let pop = tiny_population();
+        // S1 valid (in-domain, len 1); S2 has a zero-length eta (≠ n_eta = 1).
+        let eta_hats = [eta_vec(&[0.0]), eta_vec(&[])];
+        assert!(absorption_flip_flop_ebe_warning(
+            &model,
+            &pop,
+            &model.default_params.theta,
+            &eta_hats
+        )
+        .is_none());
+    }
+
+    /// #786: `simulate_with_uncertainty` on a twin-less transit model whose point
+    /// estimate is in-domain but whose covariance spreads some draws into the
+    /// flip-flop regime must NOT panic (pre-fix: the per-draw
+    /// `assert_absorption_flip_flop_no_twin` aborted the whole run). The crossing
+    /// draws are skipped; the rest still yield rows.
+    #[test]
+    fn uncertainty_skips_flip_flop_draws_without_panicking() {
+        let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+        let pop = tiny_population();
+        let mut fit = synthetic_fit(&model.default_params);
+        // Inflate the log-TVCL variance (packed index 0) so a good fraction of draws
+        // push ke = CL/V past KTR = 0.2 (needs TVCL ≥ 0.8, a +0.47 log-shift).
+        if let Some(cov) = fit.covariance_matrix.as_mut() {
+            cov[(0, 0)] = 4.0;
+        }
+        let opts = SimulateUncertaintyOptions {
+            n_uncertainty_draws: 30,
+            n_sim_per_draw: 1,
+            method: UncertaintyMethod::Asymptotic,
+            seed: Some(7),
+        };
+        // Must return Ok rather than panicking (the #786 regression).
+        let rows = simulate_with_uncertainty(&model, &pop, &fit, &opts)
+            .expect("flip-flop draws must be skipped, not panic the run");
+        assert!(
+            !rows.is_empty(),
+            "surviving in-domain draws must still yield rows"
+        );
+        let mut draws: Vec<usize> = rows.iter().map(|r| r.draw).collect();
+        draws.sort();
+        draws.dedup();
+        assert!(
+            draws.len() < 30,
+            "some flip-flop draws must be skipped (got {} of 30)",
+            draws.len()
+        );
+
+        // The per-draw skip warning is pushed into `sim_warnings`, which this
+        // aggregated-uncertainty entry point discards (it returns only the row vec),
+        // so the message is not observable here. Pin the skip *predicate* directly:
+        // a flip-flop-theta draw is flagged, the in-domain point estimate is not.
+        let mut crossing = model.default_params.theta.clone();
+        crossing[0] = 1.0; // TVCL = 1.0 → ke = 1.0/4 = 0.25 ≥ KTR = 0.2 (flip-flop)
+        assert!(
+            check_absorption_flip_flop_no_twin(&model, &pop, &crossing).is_some(),
+            "a flip-flop-theta draw must be flagged for skipping"
+        );
+        assert!(
+            check_absorption_flip_flop_no_twin(&model, &pop, &model.default_params.theta).is_none(),
+            "the in-domain point estimate must not be flagged"
+        );
+    }
+
     #[test]
     fn asymptotic_row_count_and_draw_range() {
         let model = tiny_model();
@@ -12765,6 +13405,58 @@ mod simulate_with_uncertainty_tests {
     }
 
     #[test]
+    fn high_correlation_pairs_flags_collinear_estimates() {
+        let names = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        // 3x3 covariance: A~B correlation 0.99 (0.0099/0.01), A~C and B~C ~0.
+        let mut cov = DMatrix::identity(3, 3) * 0.01;
+        cov[(0, 1)] = 0.0099;
+        cov[(1, 0)] = 0.0099;
+        let pairs = super::high_correlation_pairs(Some(&cov), &names);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!((pairs[0].0.as_str(), pairs[0].1.as_str()), ("A", "B"));
+        assert!((pairs[0].2 - 0.99).abs() < 1e-9);
+        // A fixed / zero-variance parameter (diag == 0) is excluded.
+        let mut cov2 = DMatrix::identity(2, 2) * 0.01;
+        cov2[(1, 1)] = 0.0;
+        assert!(super::high_correlation_pairs(Some(&cov2), &names).is_empty());
+        // No covariance matrix → nothing.
+        assert!(super::high_correlation_pairs(None, &names).is_empty());
+        // Theta-only scope: a strong correlation involving a non-theta packed
+        // entry (index >= n_theta) is NOT flagged. With 2 theta names but a 3x3
+        // covariance, the (0,2) correlation lies outside the theta block.
+        let mut cov3 = DMatrix::identity(3, 3) * 0.01;
+        cov3[(0, 2)] = 0.0099;
+        cov3[(2, 0)] = 0.0099;
+        let theta2 = vec!["A".to_string(), "B".to_string()];
+        assert!(super::high_correlation_pairs(Some(&cov3), &theta2).is_empty());
+    }
+
+    #[test]
+    fn high_correlation_warning_emits_typed_entry_with_details() {
+        use crate::types::WarningCode;
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        // synthetic_fit's covariance is a scaled identity (no correlation) →
+        // no warning.
+        assert!(super::high_correlation_warning(&fit).is_none());
+        // Inject a strong theta0~theta1 correlation into the packed covariance.
+        let n = fit.covariance_matrix.as_ref().unwrap().nrows();
+        assert!(n >= 2);
+        let mut cov = DMatrix::identity(n, n) * 0.01;
+        cov[(0, 1)] = 0.0098; // r = 0.98
+        cov[(1, 0)] = 0.0098;
+        fit.covariance_matrix = Some(cov);
+        let (msg, entry) = super::high_correlation_warning(&fit).expect("expected a pair");
+        assert!(msg.contains("highly correlated") || msg.contains("Highly correlated"));
+        assert_eq!(entry.category, WarningCode::HighCorrelation);
+        let d = entry.details.as_ref().expect("details");
+        assert_eq!(d["threshold"], 0.95);
+        assert!((d["pairs"][0]["correlation"].as_f64().unwrap() - 0.98).abs() < 1e-9);
+        // The labels are the packed parameter names (first two thetas here).
+        assert_eq!(d["pairs"][0]["parameter_a"], fit.theta_names[0].as_str());
+    }
+
+    #[test]
     fn rebuild_native_key_reconstructs_chain_prefix() {
         let model = tiny_model();
         let mut fit = synthetic_fit(&model.default_params);
@@ -12810,6 +13502,48 @@ mod simulate_with_uncertainty_tests {
         // A fixed theta at its bound is not reported.
         params.theta_fixed[0] = true;
         assert!(super::boundary_estimate_warning(&params).is_none());
+    }
+
+    #[test]
+    fn inflated_rse_warning_emits_typed_entry_with_details() {
+        use crate::types::WarningCode;
+        let mut params = tiny_model().default_params;
+        params.theta_fixed = vec![false; params.theta.len()];
+        // No SEs (covariance step didn't run) → no warning.
+        assert!(super::inflated_rse_warning(&None, &params).is_none());
+        // theta[0] with SE = |est| → RSE 100% (> 50%); theta[1] SE tiny → fine.
+        let mut se = vec![0.0; params.theta.len()];
+        se[0] = params.theta[0].abs();
+        let (msg, entry) =
+            super::inflated_rse_warning(&Some(se.clone()), &params).expect("expected an RSE hit");
+        assert!(msg.contains("relative standard error"));
+        assert_eq!(entry.category, WarningCode::InflatedRse);
+        let d = entry.details.as_ref().expect("details");
+        assert_eq!(d["threshold_pct"], 50.0);
+        assert_eq!(
+            d["parameters"][0]["parameter"],
+            params.theta_names[0].as_str()
+        );
+        assert!((d["parameters"][0]["rse_pct"].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        // A fixed theta with a huge SE is not reported.
+        params.theta_fixed[0] = true;
+        assert!(super::inflated_rse_warning(&Some(se), &params).is_none());
+        // A near-zero estimate is skipped (avoids divide-by-~0 blowups).
+        params.theta_fixed[0] = false;
+        params.theta[0] = 0.0;
+        assert!(
+            super::inflated_rse_warning(&Some(vec![1.0; params.theta.len()]), &params).is_none()
+        );
+
+        // Borderline value renders with a decimal (not rounded to the
+        // threshold): RSE = 50.4% must show "50.4%", not "50%".
+        let mut p2 = tiny_model().default_params;
+        p2.theta_fixed = vec![false; p2.theta.len()];
+        p2.theta[0] = 1.0;
+        let mut se2 = vec![0.0; p2.theta.len()];
+        se2[0] = 0.504; // RSE = 50.4%
+        let (msg2, _) = super::inflated_rse_warning(&Some(se2), &p2).expect("borderline hit");
+        assert!(msg2.contains("50.4%"), "got: {msg2}");
     }
 
     #[test]
@@ -13451,7 +14185,7 @@ mod tests_sdtab_tv_cov {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -13782,7 +14516,7 @@ mod tests_sdtab_tv_cov {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -13942,7 +14676,7 @@ mod tests_derived_session_clock {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
         }
     }
 
@@ -14261,7 +14995,7 @@ mod tests_derived_iov_kappa {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
+            absorption_ode_equivalent: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
@@ -16023,6 +16757,70 @@ mod adaptive_sim_tests {
             err.to_lowercase().contains("auc_target")
                 && err.to_lowercase().contains("time-varying"),
             "error should cite auc_target + time-varying: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_rejects_malformed_absorption_fractions() {
+        // #721: `run_adaptive_population` now runs the same built-in-absorption
+        // dose-precondition guard (#588) that `simulate()` / `predict()` / `fit()`
+        // enforce. This parallel-first-order model's pathway fractions sum to 1.2
+        // (FR1 = FR2 = 0.6), not 1 — the input rate would deliver 1.2× the dose. The
+        // fraction check evaluates typical parameters (η = 0) with no dose, so it fires
+        // on the dose-free adaptive base at the chokepoint, before any decision — the
+        // same typed error the static paths raise, instead of a silent 1.2× run.
+        const SPEC: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  FR1 = TVFR1
+  FR2 = TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[adaptive_dosing]
+  observe = central
+  at = [0, 24, 48]
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 5 : increase 25%
+"#;
+        let parsed = parse_full_model(SPEC).expect("malformed-fraction model still parses");
+        let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing]");
+        let pop = population(vec![subj("1", vec![0.0, 24.0, 48.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        let err = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect_err("malformed absorption fractions must be rejected on the adaptive path");
+        assert!(
+            err.to_lowercase().contains("fraction"),
+            "expected an absorption-fraction error, got: {err}"
         );
     }
 

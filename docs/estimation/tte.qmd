@@ -37,10 +37,11 @@ Add one `[event_model]` block per TTE endpoint.
 > theta / eta / covariate namespace, and may also reference names defined in
 > `[individual_parameters]` (e.g. `LAMBDA`); those are resolved per subject at
 > evaluation time. Writing the full expression in terms of `theta` and `eta`
-> names directly also works. A referenced individual parameter may **not** depend
-> on an inter-occasion (IOV/kappa) random effect — the hazard is evaluated once
-> per subject, with no occasion context — and such a reference is rejected with an
-> error.
+> names directly also works. A hazard may **not** depend on an inter-occasion
+> (IOV/kappa) random effect — whether by referencing an `[individual_parameters]`
+> value that uses one, or by naming a `kappa` directly in the hazard expression —
+> because it is evaluated once per subject, with no occasion context; either is
+> rejected with an error.
 
 For Weibull, a `shape` parameter is also required:
 
@@ -411,6 +412,25 @@ hazard once across the whole window (`Σ_k log h(t_k) − H(T)`); `clock = reset
 time) restarts the hazard clock at each event (`Σ_k log h(Δ_k) − Σ_k H(Δ_k)` over
 inter-event gaps). For a time-homogeneous hazard the two coincide. See
 [Repeated events](../model-file/event-model.qmd#rtte) for the DSL details.
+
+Both clocks accept **left truncation** (a `TENTRY` column; see [above](#left-truncation-delayed-entry)).
+Under `clock = forward` the cumulative hazard integrates from `H(TENTRY)`. Under
+`clock = reset` the *first* sojourn is measured from the time origin and conditioned on
+survival to entry — `H(t₁) − H(TENTRY) − log h(t₁)` — after which the renewal clock takes
+over for later gaps. This is the same delayed-entry conditioning across every survival
+endpoint: `TENTRY` always means "condition on survival past entry", never "restart the
+clock at entry" (the two would differ for a time-varying hazard, and only the former is a
+standard, anchorable left-truncation model). Reset left truncation assumes the time origin
+`t = 0` is the renewal origin of the first sojourn (the subject was event-free and at risk
+from 0); it coincides with clock-forward for a memoryless (exponential) hazard.
+
+`simulate()` accepts left truncation for repeated events too (#740): the stream is drawn on
+the same time origin conditioned on survival to `TENTRY` — clock-forward seeds its
+conditioning clock at `TENTRY`, clock-reset draws its first sojourn conditional on survival to
+entry and renews from 0 thereafter — so a simulated left-truncated stream refits under the same
+convention it was drawn from. `TENTRY = 0` is byte-identical to the non-truncated draw. (The
+simulated event rows carry the drawn times; as with single-event TTE simulation, `TENTRY`
+itself is a property of the input design, not re-emitted onto the output rows.)
 
 ::: {.callout-warning}
 ## Prefer SAEM/IMP for RTTE

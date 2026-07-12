@@ -1,16 +1,22 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Latest (2026-07-10):** Two foundational merges landed. **(1)** CTMM matrix-exponential primitive —
+**Latest (2026-07-11):** Two foundational merges landed. **(1)** CTMM matrix-exponential primitive —
 `matrix_exp` + exact Van Loan / Fréchet gradients + `ctmm_data_term`, feature-gated `markov`
 (#771/#774). **(2)** Phase 4.0 discrete-state/count plumbing — `ObsRecord::DiscreteState`/`Count`,
 `SimOutcome::Category`/`Count`, integer-DV datareader routing (#773). Both are still *unwired*:
 `EndpointLikelihood` has only `Gaussian`/`Tte`. **The critical path is now the endpoint-dispatch
 layer** — `EndpointLikelihood::Ctmm` + `[markov_model]` DSL (Track D, both prereqs now in), and the
-categorical variants + DSL (Track C). See §19.
+categorical variants + DSL (Track C). See §19. **Track A (survival hardening) is now
+correctness-complete** — PR #804 (declining-hazard γ<0 Gompertz sampler, #803) is **merged**, so Track A correctness is complete; the
+recommended next net-new build is Track C — Phase 4 categorical/count (#760).
 
-**Status:** Phase 1, Phase 1b, **Phase 2, and Phase 3 (RTTE) complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. **Phase 2 (Joint PK-TTE, ODE hazard accumulator) COMPLETE — Slice 2.1 fit path via PR #567 (squash `657800ee`) merged 2026-06-28, plus Slice 2.2 drug-driven event-time simulation + Slice 2.3 docs via PR #595 (squash `3f58c7d3`) merged 2026-06-29; both closing #564. ferx-r pin bump PR #208 merged.** Open follow-ups: **ferx-r#210** (bundled `pktte_joint` example + ODE-TTE simulation exposure — now sample-able after #595); **#570** (joint-fit double-solve perf) **SHIPPED via PR #613** — inner-NLL EBE + FOCEI at-mode now share one augmented solve (`solve_ode_dense` Hermite read-back, predictions bit-identical); the FD-Hessian's analytic CHZ η-sensitivities are split out as #626; #469 (FOCEI nonlinear-frailty ω²) **CLOSED via #571**. **Phase 3 (RTTE) — fit + simulation COMPLETE:** Slice 3.1 clock-forward (Andersen–Gill) fit via PR #718 (squash `0caf6212`) merged 2026-07-07; Slice 3.2 clock-reset (gap-time / renewal) fit via PR #720 (squash `2c860659`) merged 2026-07-08; Slice 3.3 analytic RTTE `simulate()` (closed-form inverse-CDF recurrent stream to the `[simulation] horizon`, both clocks) via PR #761 (squash `d8d0a247`) merged 2026-07-09 — each NONMEM-anchored (ferx FOCEI ≡ NONMEM LAPLACE to the decimal), all DSL-driven (no ferx-r changes). Open follow-ups: **#740** (clock-reset left-truncation support — currently fail-loud rejected); **#741** (time-varying covariates on survival hazards are silently frozen at baseline across *all* TTE/survival endpoints — support-or-warn); **#762** (RTTE-sim `MAX_EVENTS` cap panics the whole `simulate()` run for one pathological subject; note the two `rtte_cause` panic arms are intentional fail-loud and stay); **#763** (non-positive / non-finite effective hazard rate → silent censor-only subject across TTE simulation); **#764** (RTTE-simulation docs overstate simulate-path input-row rejections — the stream is regenerated from t=0). **NEXT: Phase 3.4 (RTTE docs polish) and/or Phase 3b (SAEM Laplace proposal); then Phase 4 (categorical / discrete-state likelihood, #760) as the Markov prerequisite.**  
-**Scope:** Phase 3 (RTTE) complete; next active phase = Phase 3b (SAEM Laplace) / Phase 4 (categorical, #760)  
-**Revised:** 2026-07-09 (Markov track cross-referenced — #759 tracks the Markov phases (4b DTMM /
+**Status:** Phase 1, Phase 1b, **Phase 2, and Phase 3 (RTTE) complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. **Phase 2 (Joint PK-TTE, ODE hazard accumulator) COMPLETE — Slice 2.1 fit path via PR #567 (squash `657800ee`) merged 2026-06-28, plus Slice 2.2 drug-driven event-time simulation + Slice 2.3 docs via PR #595 (squash `3f58c7d3`) merged 2026-06-29; both closing #564. ferx-r pin bump PR #208 merged.** Open follow-ups: **ferx-r#210** (bundled `pktte_joint` example + ODE-TTE simulation exposure — now sample-able after #595); **#570** (joint-fit double-solve perf) **SHIPPED via PR #613** — inner-NLL EBE + FOCEI at-mode now share one augmented solve (`solve_ode_dense` Hermite read-back, predictions bit-identical); the FD-Hessian's analytic CHZ η-sensitivities are split out as #626; #469 (FOCEI nonlinear-frailty ω²) **CLOSED via #571**. **Phase 3 (RTTE) — fit + simulation COMPLETE:** Slice 3.1 clock-forward (Andersen–Gill) fit via PR #718 (squash `0caf6212`) merged 2026-07-07; Slice 3.2 clock-reset (gap-time / renewal) fit via PR #720 (squash `2c860659`) merged 2026-07-08; Slice 3.3 analytic RTTE `simulate()` (closed-form inverse-CDF recurrent stream to the `[simulation] horizon`, both clocks) via PR #761 (squash `d8d0a247`) merged 2026-07-09 — each NONMEM-anchored (ferx FOCEI ≡ NONMEM LAPLACE to the decimal), all DSL-driven (no ferx-r changes). Phase 3 / Track-A follow-ups **now closed**: **#741/#762/#763/#764** (survival-wide TV-cov baseline-freeze, RTTE `MAX_EVENTS` whole-run panic, silent censor-only on non-positive/non-finite hazard, sim-doc overstatement) via PR #772; **#770** (IOV κ held at 0 on the TTE hazard sim path) via PR #792; **#740** (clock-reset left-truncation, **Convention B** — first sojourn conditioned on entry) via PR #799 (fit) + #801 (simulate, both clocks) merged 2026-07-11. Remaining Track-A tail is non-blocking: **#803** (declining-hazard γ<0 Gompertz sampler censored every draw — simulate ≠ fit) **merged via PR #804** (`ba99c1dd`), leaving a minor follow-up **#805** (`median_survival` γ<0→NaN); **#626** (analytic CHZ η-sensitivities, joint-fit perf — not urgent); Phase 3.4 RTTE docs split (low value — RTTE + left-truncation already documented in `docs/estimation/tte.qmd`); Phase 2 deferred `IntervalCensored`+ODE / left-trunc+ODE for joint simulation; ferx-r `predict_survival` + e2e test + ferx-r#210. **NEXT: with Track A correctness now complete (#804 merged), the highest-value net-new build is Phase 4 (categorical / count, #760) — both prerequisites (the trunk + the #773 discrete-state plumbing) are in. Phase 3b SAEM proposal (#788) and Phase 8 `[ll_model]` (#789) are independent parallel leaves.**  
+**Scope:** Phases 1–3 complete; Track A (survival hardening) correctness complete (#804 merged); next active build = **Phase 4 categorical/count (#760)**, with Phase 3b (#788) / Phase 8 (#789) as independent parallel leaves  
+**Revised:** 2026-07-11 (Track A survival-hardening close-out — #741/#762/#763/#764 merged via #772,
+#770 via #792, and #740 left-truncation (Convention B) via #799 (fit) + #801 (simulate); #803
+(declining-hazard γ<0 Gompertz sampler) → PR #804 merged `ba99c1dd` (follow-up #805); §19 Track-A row + header NEXT
+refreshed to recommend Phase 4 categorical (#760) as the next net-new build. Earlier 2026-07-09:
+Markov track cross-referenced — #759 tracks the Markov phases (4b DTMM /
 4c mCTMM / 5–6 CTMM), companion **#760** filed for Phase 4 (categorical / discrete-state
 likelihood); §8.4 gains #759's ergonomic Option-A `[markov_model]` DSL + a design note (homogeneous
 CTMM = matrix-exp + Van Loan, not the `dP/dt=QᵀP` probability ODE, which is Phase 6 only; `msm` not
@@ -3077,11 +3083,11 @@ the track map, §19.)*
 3. **Phase 2** ✅ — Joint PK-TTE, ODE hazard accumulator (Slice 2.1 fit path #564/#567; Slice 2.2 simulation + 2.3 docs #595)  
    Most clinically demanded. Extends Phase 1 via ODE.
 
-4. **Phase 3** ✅ — RTTE (clock-forward + clock-reset; fit + analytic simulation) — 3.1 #718 / 3.2 #720 / 3.3 sim #761  
-   **Phase 3.4** (RTTE docs polish) + **Phase 3b** (`saem_proposal = auto`, improves all SAEM globally) ← **NEXT**.
+4. **Phase 3** ✅ — RTTE (clock-forward + clock-reset; fit + analytic simulation) — 3.1 #718 / 3.2 #720 / 3.3 sim #761; left-truncation #799 (fit) / #801 (sim)  
+   **Phase 3.4** (RTTE docs polish) is low-value (already covered in `tte.qmd`); **Phase 3b** (`saem_proposal = auto`, #788) and **Phase 8** (`[ll_model]`, #789) are independent leaves that can land any time.
 
-5. **Phase 4** — Binary + Ordinal + Poisson + NB  
-   Validates generalized NLL for well-understood distributions. Low risk.
+5. **Phase 4** — Binary + Ordinal + Poisson + NB (#760) ← **NEXT net-new build**  
+   Validates generalized NLL for well-understood distributions. Low risk; both prerequisites in (trunk + #773 plumbing).
 
 6. **Phase 4b** — DTMM  
    Stepping stone; validates state-observation data reader.
@@ -3135,7 +3141,7 @@ on the whole categorical phase.
 | Track | Phases / issues | Depends on | Start today? | Gate |
 |---|---|---|---|---|
 | **Trunk** (built) | §2 dispatch, FD-Hessian + log-det, `SimOutcome` | — | ✅ done | `survival` → default |
-| **A · Survival hardening** | #741, #763, #762, #740, #626, #764, Phase 3.4 docs; Phase 2 deferred (IntervalCensored+ODE, left-trunc+ODE); ferx-r `predict_survival` + e2e + ferx-r#210 | trunk | ✅ yes | `survival` |
+| **A · Survival hardening** | ✅ #741/#762/#763/#764 (#772), #770 (#792), #740 left-trunc (#799/#801), #803 sampler (#804); **remaining:** #805 `median_survival` γ<0 (minor), #626 perf (not urgent), Phase 3.4 docs (low value), Phase 2 deferred (IntervalCensored+ODE, left-trunc+ODE), ferx-r `predict_survival` + e2e + ferx-r#210 | trunk | ✅ **correctness done** | `survival` |
 | **B · SAEM engine** | Phase 3b `saem_proposal = auto` (#788) | trunk | ✅ yes | none |
 | **E · Custom likelihood** | Phase 8 `[ll_model]` (#789) | trunk | ✅ yes | none |
 | **4.0 · Discrete-state slice** | Phase 4.0 (front of #760) | trunk | ✅ **merged #773** | (part of Phase 4) |
@@ -3158,3 +3164,15 @@ Phase 4.0 discrete-state/count plumbing (#773) — validating the split (both co
 layer** — `EndpointLikelihood::Ctmm` + `[markov_model]` DSL (Track D, both prereqs now in) and the
 categorical variants + DSL (Track C). Tracks A, B, E are untouched by these merges and remain
 independent.
+
+**Update (2026-07-11).** **Track A (survival hardening) is now correctness-complete.** The #772 batch
+(#741/#762/#763/#764), #770 (#792), and #740 left-truncation (Convention B; #799 fit + #801 simulate)
+are all merged, and #803 (declining-hazard γ<0 Gompertz sampler censoring every draw, simulate ≠ fit)
+is **merged via PR #804** (`ba99c1dd`) — **Track A correctness is complete.** A minor follow-up #805
+(`median_survival` γ<0→NaN) and the rest of Track A's residue are non-blocking:
+#626 perf (not urgent), Phase 3.4 docs (already in `tte.qmd`), the deferred Phase-2 ODE
+interval-censoring / left-truncation, and the ferx-r surfacing (`predict_survival`, e2e test,
+ferx-r#210). **The recommended next net-new build is Track C — Phase 4 categorical/count (#760):** both
+prerequisites (trunk + #773) are in, it is the highest-value endpoint work, and it later unlocks 4b
+DTMM (which reuses C's categorical-logit primitive). Tracks B (#788, f-SAEM) and E (#789, `[ll_model]`)
+remain independent parallel leaves.

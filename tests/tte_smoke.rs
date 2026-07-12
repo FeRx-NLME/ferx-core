@@ -852,13 +852,64 @@ mod survival_smoke {
         );
     }
 
-    /// Left truncation (delayed entry, entry_time > 0) is not yet supported for clock-reset
-    /// RTTE: the first-gap conditioning convention (renewal clock from entry vs. clock from 0
-    /// conditioned on survival to entry) is unratified and unanchored, and the two differ for
-    /// a time-varying hazard. Fail loud rather than silently pick one; clock-forward supports
-    /// left truncation and is the documented route for such data.
+    /// The shared `entry_time > TIME` guard (`api::check_rtte_records`) is the sole remaining
+    /// loud gate for clock-reset left truncation now that `entry_time > 0` is *accepted* (#740):
+    /// an entry after the record's own event/censoring time drives `H(t₁) < H(entry)` and would
+    /// otherwise fold to the silent `1e20` sentinel (a poisoned fit). It must reject up front for
+    /// a RESET endpoint too — not only the clock-forward path — so a future refactor that
+    /// rescoped that guard cannot silently regress reset into sentinel poisoning. Companion to
+    /// the forward-clock `rtte_entry_time_after_time_is_rejected`.
     #[test]
-    fn rtte_reset_left_truncation_is_rejected() {
+    fn rtte_reset_entry_time_after_time_is_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+                hazard_covariates: Vec::new(),
+            },
+        );
+        let mut pop = rtte_pop();
+        // First record's entry (12.0) is after its event TIME (5.0), under clock=reset.
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 12.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("entry_time after TIME under clock=reset must be rejected");
+        assert!(
+            err.contains("entry_time") && err.contains("CMT=2"),
+            "error should flag the entry-after-time record on the reset endpoint, got: {err}"
+        );
+    }
+
+    /// Left truncation (delayed entry, entry_time > 0) IS supported for clock-reset RTTE
+    /// (#740, convention B): the first sojourn is conditioned on survival to `entry` in
+    /// absolute time (H(t₁) − H(entry)), matching single-event and clock-forward delayed
+    /// entry. The fit boundary must accept such data and produce a real objective rather than
+    /// reject it or fold to the 1e20 sentinel. (The closed-form conditioning is pinned in the
+    /// Tier-1 `rtte_reset_left_truncation_*` unit tests; this is the end-to-end boundary.)
+    #[test]
+    fn rtte_reset_left_truncation_fits() {
         use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
         let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
         let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
@@ -892,11 +943,15 @@ mod survival_smoke {
             },
         ];
         let opts = FitOptions::default();
-        let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("left-truncated clock=reset must be rejected");
+        let result = fit(&model, &pop, &model.default_params, &opts)
+            .expect("left-truncated clock=reset RTTE must fit, not error");
+        // A real objective, not the sentinel: a poisoned fit sums per-subject 1e20 to ~n·1e20
+        // (still finite), so `< 1e6` cleanly separates a genuine conditioned fit from one
+        // folded to the sentinel (cf. `rtte_clock_reset_hand_built_fits`).
         assert!(
-            err.contains("left-truncation") && err.contains("CMT=2"),
-            "error should flag the delayed entry, got: {err}"
+            result.ofv.is_finite() && result.ofv < 1e6,
+            "left-truncated clock-reset OFV must be a real objective (finite, < 1e6); got {}",
+            result.ofv
         );
     }
 
@@ -974,28 +1029,53 @@ mod survival_smoke {
         );
     }
 
-    /// Left truncation (`entry_time > 0`) on an RTTE record is a deferred follow-up
-    /// (conditional first-gap sampling); simulation must reject it, not silently sample
-    /// the first gap from 0.
+    /// Left truncation (`entry_time > 0`) on an RTTE record IS supported for simulation
+    /// (#740): the stream is drawn conditioned on survival to entry (convention B for
+    /// clock-reset; the conditioning clock seeded at entry for clock-forward), not rejected.
+    /// Exercises the public boundary — the relaxed `validate_tte_simulatable` guard — and
+    /// asserts a valid stream whose observed events all land at or past the entry time.
+    /// (The Tier-1 `rtte_left_truncation_*` unit tests pin the draw distribution; this is the
+    /// end-to-end boundary, the simulate dual of `rtte_reset_left_truncation_fits`.)
     #[test]
-    fn rtte_simulate_left_truncation_is_rejected() {
-        use ferx_core::{simulate_with_options, SimulateOptions};
+    fn rtte_simulate_left_truncation_is_accepted() {
+        use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
         let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
         let mut pop = rtte_pop();
-        let ObsRecord::Event { entry_time, .. } = &mut pop.subjects[0].obs_records[0] else {
-            panic!("expected a TTE Event record");
-        };
-        *entry_time = 2.0;
+        let entry = 6.0_f64;
+        // Stamp the delayed entry on every RTTE row (a subject-level property).
+        for subject in &mut pop.subjects {
+            for r in &mut subject.obs_records {
+                if let ObsRecord::Event { entry_time, .. } = r {
+                    *entry_time = entry;
+                }
+            }
+        }
         let opts = SimulateOptions {
             seed: Some(1),
             match_method: None,
-            horizon: Some(30.0),
+            horizon: Some(60.0),
         };
-        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
-            .expect_err("RTTE simulation with left truncation must be rejected");
+        let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect("left-truncated RTTE simulation must now succeed (#740)");
+        let mut observed = 0usize;
+        for r in &sims {
+            if let SimOutcome::Event {
+                time,
+                observed: obs,
+            } = r.outcome
+            {
+                if obs {
+                    assert!(
+                        time >= entry,
+                        "a left-truncated simulated event must not precede entry {entry}: {time}"
+                    );
+                    observed += 1;
+                }
+            }
+        }
         assert!(
-            err.contains("left truncation"),
-            "error should flag left truncation, got: {err}"
+            observed > 0,
+            "left-truncated RTTE simulation should still fire events before the horizon"
         );
     }
 
@@ -2721,6 +2801,48 @@ mod survival_smoke {
         let err = parse_model_string(src).expect_err(
             "a hazard referencing a kappa-bearing individual parameter must be rejected, \
              not OOB-panic",
+        );
+        assert!(
+            err.contains("inter-occasion") && err.contains("KAPPA_CL"),
+            "the error should name the offending IOV random effect; got: {err}"
+        );
+    }
+
+    /// Issue #770: a hazard that references an IOV **kappa by name directly**
+    /// (not through an [individual_parameters] value) must also be rejected at
+    /// parse. The hazard parse scope is BSV-only, so `KAPPA_CL` here would
+    /// otherwise fall back to a leniently-read 0.0 covariate — silently dropping
+    /// the IOV term instead of failing loud. Sibling to
+    /// `event_model_referencing_kappa_indiv_param_is_rejected`, which covers the
+    /// *indirect* case (`scale = CL` with `CL = TVCL * exp(ETA_CL + KAPPA_CL)`).
+    #[test]
+    fn event_model_referencing_kappa_by_name_is_rejected() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TVLAMBDA(0.05, 0.001, 5.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma SIGMA_ADD ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_ADD)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(KAPPA_CL)
+";
+        let err = parse_model_string(src).expect_err(
+            "a hazard referencing an IOV kappa by name must be rejected, not read as 0.0",
         );
         assert!(
             err.contains("inter-occasion") && err.contains("KAPPA_CL"),

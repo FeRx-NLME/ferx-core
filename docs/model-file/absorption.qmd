@@ -176,12 +176,14 @@ this *per evaluation* and routes the model to its exact ODE `transit()` twin, wh
 is valid in both regimes (matched to a NONMEM ADVAN13 transit simulation to ~1e-4),
 so a flip-flop model fits and predicts correctly instead of returning a zero
 profile. A `W_TRANSIT_FLIP_FLOP` note still flags the regime at the typical-value
-estimates. The reroute needs an ODE twin: a closed-form transit model that also
-carries a `lagtime`, bioavailability `f`, or a user `[odes]` / `[scaling]` /
-`[initial_conditions]` block cannot be desugared, so there is no twin to route to. Rather than silently returning a zero profile that
-degenerates the objective, such a model is **rejected with a hard error**
-(`E_TRANSIT_FLIP_FLOP`) on `fit`, `predict`, `simulate`, and `ferx check` — rewrite
-it as an explicit ODE `transit()` model, or adjust the MTT / CL starting estimates.
+estimates. The reroute needs an ODE twin. A closed-form transit model that carries a
+`lagtime` or bioavailability `f` mapping is desugared to a twin that applies them too
+(since #735), so it auto-routes just like the plain form. Only a model with a user
+`[odes]` / `[scaling]` / `[initial_conditions]` block cannot be desugared (no unique
+twin); rather than silently returning a zero profile that degenerates the objective,
+such a twin-less model is **rejected with a hard error** (`E_TRANSIT_FLIP_FLOP`) on
+`fit`, `predict`, `simulate`, and `ferx check` — rewrite it as an explicit ODE
+`transit()` model, or adjust the MTT / CL starting estimates.
 
 [`examples/one_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_transit.ferx)
 is a complete self-contained analytic transit model:
@@ -223,6 +225,75 @@ is a complete self-contained example:
 
 ```bash
 cargo run --release -- examples/two_cpt_transit.ferx --simulate
+```
+
+## Analytic inverse-Gaussian — `pk one_cpt_ig(cl, v, mat, cv2)` / `pk two_cpt_ig(...)`
+
+The Freijer & Post `igd()` forcing (below) also has a fast **analytic** closed form,
+`pk one_cpt_ig(...)` (and the 2-cpt `pk two_cpt_ig(...)`), that needs no ODE solver:
+
+```
+[structural_model]
+  pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)
+```
+
+It is the exponential-tilting closed form of the same inverse-Gaussian absorption-time
+density (mean `MAT`, relative dispersion `CV2`, shape `λ = MAT/CV2`) absorbed directly
+into central,
+
+```
+  C(t) = (F·Dose/V) · M(ke) · exp(−ke·t) · F_IG(t; μ*, λ),   ke = CL/V
+```
+
+where `M(k) = exp((λ/μ)(1 − √(1 − 2μ²k/λ)))` is the IG moment-generating function and
+`F_IG(·; μ*, λ)` the IG CDF of the exponentially-tilted density (`μ* = μ/√(1 − 2μ²k/λ)`),
+expressed through the normal CDF `Φ`. The closed form carries **exact `Dual2`
+FOCE/FOCEI sensitivities** `∂C/∂{CL, V, MAT, CV2, F, η}` — the same gradients the
+estimator uses — so an IG fit avoids both the ODE solve and finite differences. `F` /
+`lagtime` map exactly as for `one_cpt_oral`. The 2-cpt form
+`pk two_cpt_ig(cl=CL, v1=V1, q=Q, v2=V2, mat=MAT, cv2=CV2)` convolves the IG density
+with the bi-exponential 2-cpt impulse response, carrying
+`∂C/∂{CL, V1, Q, V2, MAT, CV2, F, η}`.
+
+**Domain.** The closed form converges for `ke = CL/V` below the IG abscissa
+`1/(2·MAT·CV²)` (the 2-cpt guard is `α < 1/(2·MAT·CV²)`, since `α ≥ β`). At or above it
+(the flip-flop regime) ferx routes the model to its ODE `igd()` twin automatically.
+
+**Scope / limits.** Identical to the analytic transit models above: single and multiple
+**bolus** doses into the depot (`CMT=1`), bioavailability, lag time, and a `central`
+initial amount are supported; **time-varying covariates** and `TIME`-dependent
+parameters are transparently rerouted to an exact ODE `igd()` twin (so they are
+supported, not rejected); the **flip-flop** regime (`ke ≥ 1/(2·MAT·CV²)`) is likewise
+auto-rerouted to that twin per evaluation, with a `W_IG_FLIP_FLOP` note at the
+typical-value estimates. **Steady-state doses, IOV, infusions, system resets
+(EVID=3/4), a non-depot (`CMT≠1`) dose, and a `depot` initial amount are rejected**
+with an actionable message — use the `igd()` ODE forcing below for those. A flip-flop
+model carrying a `lagtime`/`f`/user-`[odes]` mapping has no ODE twin to route to and is
+**rejected with a hard error** (`E_IG_FLIP_FLOP`). The analytic and ODE paths agree to
+ODE-solver tolerance (`tests/ig_analytic_equivalence.rs`, 1- and 2-cpt), and the closed
+form is anchored **directly** against NONMEM `$DES` on an in-domain IG-truth dataset
+(`tests/ig_analytic_nonmem_anchor.rs`: ferx −1303.528 vs NONMEM −1303.639).
+
+::: {.callout-note}
+## Not a speed optimisation (unlike analytic transit)
+
+The analytic *transit* models are ~28–31× faster than their ODE forcing because the
+transit chain is comparatively expensive to integrate — the closed form's win is
+*avoiding that integration*. IG has no such win: its `igd()` ODE is **non-stiff and
+cheap** (and not even tolerance-sensitive — ~134 ms/eval at default tol, ~157 ms at
+`TOL=9`), so the closed form — whose normal-CDF terms go through the exact-derivative
+incomplete-gamma continued fraction — is actually **~2× slower per objective
+evaluation** than the `igd()` forcing on a typical dataset. `pk one_cpt_ig` is a
+**consistency / correctness** feature: exact `Dual2` gradients that don't depend on
+ODE-solver tolerance, and a uniform `pk`-line interface matching the transit models.
+**If raw fit speed is what you need, prefer the `igd()` ODE forcing** below.
+:::
+
+[`examples/one_cpt_ig.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_ig.ferx)
+is a complete self-contained analytic IG model:
+
+```bash
+cargo run --release -- examples/one_cpt_ig.ferx --simulate
 ```
 
 ## Worked example

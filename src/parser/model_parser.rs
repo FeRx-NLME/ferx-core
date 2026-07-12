@@ -1005,17 +1005,19 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // the rest of this function — including ODE detection below — sees a normal
     // ODE model with no special-casing.
     apply_ode_template(&mut extracted)?;
-    // Prepare the `one_cpt_transit` ODE-equivalent (#486): the transit closed form assumes
-    // constant parameters over each absorption window, so it cannot serve a subject whose
-    // parameters switch mid-profile (a `TIME`-dependent parameter or time-varying covariates).
-    // For a plain-form transit model we reconstruct its exact ODE `transit()` equivalent
-    // *source* here and stash it on the model; `CompiledModel::effective_for` compiles it
-    // lazily and routes only the subjects that need it to this fallback, so a plain transit
-    // fit whose subjects never need it keeps its fast, exact closed form at zero extra cost.
-    // Non-transit / out-of-scope forms yield `None`. (The equivalent is a normal ODE model
-    // with no `pk one_cpt_transit`, so building it later does not re-enter this branch.)
-    let transit_ode_equivalent: Option<crate::types::TransitOdeEquivalent> =
-        transit_ode_equivalent_source(&extracted).map(crate::types::TransitOdeEquivalent::new);
+    // Prepare the absorption ODE-equivalent (#486; IG #790): the transit / IG closed forms
+    // assume constant parameters over each absorption window, so they cannot serve a subject
+    // whose parameters switch mid-profile (a `TIME`-dependent parameter or time-varying
+    // covariates). For a plain-form transit / IG model we reconstruct its exact ODE
+    // (`transit()` / `igd()`) equivalent *source* here and stash it on the model;
+    // `CompiledModel::effective_for` compiles it lazily and routes only the subjects that need
+    // it to this fallback, so a plain fit whose subjects never need it keeps its fast, exact
+    // closed form at zero extra cost. Non-absorption / out-of-scope forms yield `None`. (The
+    // equivalent is a normal ODE model with no `pk one_cpt_transit`/`pk one_cpt_ig`/…, so
+    // building it later does not re-enter this branch.)
+    let absorption_ode_equivalent: Option<crate::types::AbsorptionOdeEquivalent> =
+        absorption_ode_equivalent_source(&extracted)
+            .map(crate::types::AbsorptionOdeEquivalent::new);
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
     // this (large) function reads unchanged. Named blocks are pulled from
     // `extracted.named` directly where they're consumed below.
@@ -2124,7 +2126,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         analytic_readout: None,
         // Populated below from the [error_model] magnitude expressions (#484).
         ruv_magnitude: None,
-        transit_ode_equivalent: None,
+        absorption_ode_equivalent: None,
     };
 
     // ── Optional blocks ──
@@ -2609,7 +2611,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
     // Attach the `one_cpt_transit` ODE-equivalent sub-model built above (`None` for
     // non-transit / out-of-scope forms). The runtime dispatch reads it off the model.
-    model.transit_ode_equivalent = transit_ode_equivalent;
+    model.absorption_ode_equivalent = absorption_ode_equivalent;
 
     // ── [event_model] / [event_model NAME] blocks ──────────────────────────────
     // Unnamed: `[event_model]` — one TTE endpoint.
@@ -3983,27 +3985,51 @@ fn parse_event_model_block(
     let mut event_model_covariates: Vec<String>;
     let event_model_thetas: std::collections::HashSet<usize>;
     let event_model_etas: std::collections::HashSet<usize>;
+    // The hazard's parameter expressions in optimizer-parameter order, bound once
+    // and reused by the three scans below — reference collection, the direct-kappa
+    // reject (#770), and the transitive needed-statement collection (#442) — so a
+    // future family parameter can't be added to one walk and silently forgotten in
+    // another.
+    let hazard_param_exprs = [
+        &scale_expr,
+        &shape_expr,
+        &alpha_expr,
+        &gamma_expr,
+        &loghr_expr,
+    ];
     {
         let mut cov_set = std::collections::HashSet::new();
         let mut theta_set = std::collections::HashSet::new();
         let mut eta_set = std::collections::HashSet::new();
-        for expr_opt in [
-            &scale_expr,
-            &shape_expr,
-            &alpha_expr,
-            &gamma_expr,
-            &loghr_expr,
-        ] {
-            if let Some(expr) = expr_opt {
-                collect_covariates(expr, &mut cov_set);
-                collect_theta_eta(expr, &mut theta_set, &mut eta_set);
-            }
+        for expr in hazard_param_exprs.into_iter().flatten() {
+            collect_covariates(expr, &mut cov_set);
+            collect_theta_eta(expr, &mut theta_set, &mut eta_set);
         }
         let mut v: Vec<String> = cov_set.into_iter().collect();
         v.sort();
         event_model_covariates = v;
         event_model_thetas = theta_set;
         event_model_etas = eta_set;
+    }
+
+    // A hazard expression that references an IOV kappa **by name directly**
+    // (e.g. `scale = TVLAMBDA * exp(KAPPA_CL)`) is as ill-defined as one that
+    // reaches a kappa through an [individual_parameters] value (rejected just
+    // below, #442): the hazard is evaluated once per subject, with no occasion
+    // context. The hazard parse scope is BSV-only, so a kappa name here parses as
+    // an unresolved identifier (Variable/Covariate) rather than `Eta(i)` and would
+    // otherwise fall back to a leniently-read 0.0 covariate (see the "read
+    // leniently" note above), silently dropping the IOV term. Reject it fail-loud
+    // instead (#770).
+    for expr in hazard_param_exprs.into_iter().flatten() {
+        if let Some(k) = expr_references_kappa(expr, kappa_names) {
+            return Err(format!(
+                "[event_model]: a hazard expression references the inter-occasion (IOV) \
+                 random effect `{k}` directly. The hazard is evaluated once per subject, with \
+                 no occasion context, so an IOV kappa has no well-defined value here — write \
+                 the hazard in terms of θ/η, or reference an IOV-free parameter."
+            ));
+        }
     }
 
     // Restrict the individual-parameter statements the hazard closures evaluate to
@@ -4018,16 +4044,7 @@ fn parse_event_model_block(
     // `visit_stmt_nodes`).
     let needed_indiv_stmts: Vec<Statement> = {
         let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for expr in [
-            &scale_expr,
-            &shape_expr,
-            &alpha_expr,
-            &gamma_expr,
-            &loghr_expr,
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for expr in hazard_param_exprs.into_iter().flatten() {
             collect_variable_names(expr, &mut needed);
         }
         let mut keep: Vec<Statement> = Vec::new();
@@ -5766,12 +5783,20 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
         match lname.as_str() {
             "central" => central,
             "depot" if depot_seedable => 1,
-            "depot" if matches!(pk_model, PkModel::OneCptTransit | PkModel::TwoCptTransit) => {
+            "depot"
+                if matches!(
+                    pk_model,
+                    PkModel::OneCptTransit
+                        | PkModel::TwoCptTransit
+                        | PkModel::OneCptIg
+                        | PkModel::TwoCptIg
+                ) =>
+            {
                 return Err(format!(
-                    "[initial_conditions]: `{}` (analytic transit) does not support a `depot` \
-                     initial amount — its transit chain is a lumped convolution with no closed \
-                     form for a pre-loaded depot. Use `central`, or an ODE transit model \
-                     (transit() forcing in [odes]) for a depot initial condition.",
+                    "[initial_conditions]: `{}` (analytic absorption) does not support a `depot` \
+                     initial amount — its absorption chain is a lumped convolution with no closed \
+                     form for a pre-loaded depot. Use `central`, or an ODE absorption model \
+                     (transit()/igd() forcing in [odes]) for a depot initial condition.",
                     pk_model.canonical_name()
                 ));
             }
@@ -5795,13 +5820,17 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
 
     if cmt == central || (depot_seedable && cmt == 1) {
         Ok(cmt)
-    } else if matches!(pk_model, PkModel::OneCptTransit | PkModel::TwoCptTransit) && cmt == 1 {
-        // Numeric `init(1)` on transit: same lumped-convolution limitation as
-        // the named `depot` form above (#386).
+    } else if matches!(
+        pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+    ) && cmt == 1
+    {
+        // Numeric `init(1)` on transit / IG: same lumped-convolution limitation as
+        // the named `depot` form above (#386/#790).
         Err(format!(
-            "[initial_conditions]: `{}` (analytic transit) does not support a depot (cmt 1) \
-             initial amount — its transit chain is a lumped convolution with no closed form \
-             for a pre-loaded depot. Use `central` (cmt 2), or an ODE transit model.",
+            "[initial_conditions]: `{}` (analytic absorption) does not support a depot (cmt 1) \
+             initial amount — its absorption chain is a lumped convolution with no closed form \
+             for a pre-loaded depot. Use `central` (cmt 2), or an ODE absorption model.",
             pk_model.canonical_name()
         ))
     } else {
@@ -6612,52 +6641,92 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
     Ok(())
 }
 
-/// For a closed-form `pk one_cpt_transit(cl, v, n, mtt)` model, build the full `.ferx`
-/// source of its exact ODE `transit()` equivalent — otherwise `None`.
+/// The reserved F / lagtime PK slot a parameter or `pk(...)` role name routes to in the ODE
+/// twin — `Some(PK_IDX_F)` / `Some(PK_IDX_LAGTIME)` — or `None` if it routes to a disposition /
+/// structural slot. Derived from the real routing (`PkParams::name_to_index` filtered by
+/// `RESERVED_PK_SLOTS`) so the twin-builder's F/lagtime allowlist, alias emission, and
+/// shadow guard can never drift from `ode_param_slots`. #735.
+fn reserved_flag_slot(name: &str) -> Option<usize> {
+    crate::types::PkParams::name_to_index(&name.to_lowercase())
+        .filter(|s| crate::types::RESERVED_PK_SLOTS.contains(s))
+}
+
+/// For a closed-form `pk one_cpt_transit(cl, v, n, mtt)` / `pk one_cpt_ig(cl, v, mat, cv2)`
+/// model (and the 2-cpt forms), build the full `.ferx` source of its exact ODE equivalent
+/// (`transit()` / `igd()` forcing) — otherwise `None`.
 ///
-/// The transit closed form assumes constant parameters over each absorption window, so it
-/// cannot serve a subject whose parameters switch mid-profile (a `TIME`-dependent structural
-/// parameter, or time-varying covariates). The ODE twin
-/// `d/dt(central) = transit(n, mtt) − (CL/V)·central` with `obs_scale = V` is the exact
-/// numerical equivalent (validated in `tests/transit_analytic_equivalence.rs`) and carries
+/// The transit / IG closed forms assume constant parameters over each absorption window, so
+/// they cannot serve a subject whose parameters switch mid-profile (a `TIME`-dependent
+/// structural parameter, or time-varying covariates). The ODE twin
+/// `d/dt(central) = <forcing> − (CL/V)·central` with `obs_scale = V` (`<forcing>` =
+/// `transit(n, mtt)` / `igd(mat, cv2)`) is the exact numerical equivalent (validated in
+/// `tests/transit_analytic_equivalence.rs` / `tests/ig_analytic_equivalence.rs`) and carries
 /// those per-event through the event-driven walk (analytically for `TIME` since #664). The
 /// parser compiles this source into a sub-model stored on
-/// [`CompiledModel::transit_ode_equivalent`]; the runtime dispatch
-/// ([`CompiledModel::effective_for`]) uses it only for the subjects that need
-/// it, so a plain transit fit keeps its fast, exact closed form (#486).
+/// [`CompiledModel::absorption_ode_equivalent`]; the runtime dispatch
+/// ([`CompiledModel::effective_for`]) uses it only for the subjects that need it, so a plain
+/// transit / IG fit keeps its fast, exact closed form (#486, #790).
 ///
 /// The equivalent shares the model's `[parameters]`/`[individual_parameters]`/… blocks
 /// verbatim and swaps only the disposition, so its θ/η layout matches the closed-form model
 /// exactly (the dispatch can hand it the same parameter vector). Scoped to the plain
-/// `one_cpt_transit(cl,v,n,mtt)` and `two_cpt_transit(cl,v1,q,v2,n,mtt)` forms with no
-/// `lagtime=`/`f=` mapping and no user `[odes]`/`[scaling]` block; anything else returns
-/// `None` (and stays closed-form, still rejected up front for the features it cannot serve).
-fn transit_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<String> {
-    // Match the plain closed-form transit disposition — 1-cpt `cl/v/n/mtt` or
-    // 2-cpt `cl/v1/q/v2/n/mtt`. Any other structural form stays closed-form.
+/// `one_cpt_transit(cl,v,n,mtt)` / `one_cpt_ig(cl,v,mat,cv2)` (and 2-cpt) forms, optionally
+/// with a `lagtime=`/`f=` (`alag=`) mapping carried into the twin as a reserved-name alias
+/// (#735), and with no user `[odes]`/`[scaling]`/`[initial_conditions]` block. Anything else —
+/// an unknown role, a parameter name that shadows or collides with a reserved F/lagtime slot,
+/// or a user disposition block — returns `None` (and stays closed-form, still rejected up front
+/// for the features it cannot serve).
+fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<String> {
+    // Match a plain closed-form transit or IG disposition — 1-cpt `cl/v/<abs>` or 2-cpt
+    // `cl/v1/q/v2/<abs>`, where `<abs>` is `n/mtt` (transit) or `mat/cv2` (IG). Any other
+    // structural form stays closed-form.
     let structural = extracted.unnamed.get("structural_model")?;
-    let one_re = Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
-    let two_re = Regex::new(r"^pk\s+two_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
-    let (args_str, is_two_cpt, pk_label) =
-        if let Some(caps) = structural.iter().find_map(|l| one_re.captures(l.trim())) {
-            (
-                caps.get(1)?.as_str().to_string(),
-                false,
-                "pk one_cpt_transit",
-            )
-        } else if let Some(caps) = structural.iter().find_map(|l| two_re.captures(l.trim())) {
-            (
-                caps.get(1)?.as_str().to_string(),
-                true,
-                "pk two_cpt_transit",
-            )
-        } else {
-            return None;
-        };
+    let transit_one = Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
+    let transit_two = Regex::new(r"^pk\s+two_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
+    let ig_one = Regex::new(r"^pk\s+one_cpt_ig\s*\(([^)]*)\)\s*$").unwrap();
+    let ig_two = Regex::new(r"^pk\s+two_cpt_ig\s*\(([^)]*)\)\s*$").unwrap();
+    // (args, is_two_cpt, is_ig, pk_label)
+    let (args_str, is_two_cpt, is_ig, pk_label) = if let Some(caps) = structural
+        .iter()
+        .find_map(|l| transit_one.captures(l.trim()))
+    {
+        (
+            caps.get(1)?.as_str().to_string(),
+            false,
+            false,
+            "pk one_cpt_transit",
+        )
+    } else if let Some(caps) = structural
+        .iter()
+        .find_map(|l| transit_two.captures(l.trim()))
+    {
+        (
+            caps.get(1)?.as_str().to_string(),
+            true,
+            false,
+            "pk two_cpt_transit",
+        )
+    } else if let Some(caps) = structural.iter().find_map(|l| ig_one.captures(l.trim())) {
+        (
+            caps.get(1)?.as_str().to_string(),
+            false,
+            true,
+            "pk one_cpt_ig",
+        )
+    } else if let Some(caps) = structural.iter().find_map(|l| ig_two.captures(l.trim())) {
+        (
+            caps.get(1)?.as_str().to_string(),
+            true,
+            true,
+            "pk two_cpt_ig",
+        )
+    } else {
+        return None;
+    };
     // A user-written [odes]/[scaling] block is outside the plain-form scope. An
     // [initial_conditions] block is too: the equivalent's disposition states (central,
-    // and periph for 2-cpt) cannot carry a transit `depot` seed, and transit-init has its
-    // own parse-time validation on the primary model — building the equivalent would
+    // and periph for 2-cpt) cannot carry an absorption `depot` seed, and absorption-init has
+    // its own parse-time validation on the primary model — building the equivalent would
     // pre-empt that with a confusing error.
     if extracted.unnamed.contains_key("odes")
         || extracted.unnamed.contains_key("scaling")
@@ -6666,17 +6735,113 @@ fn transit_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<String> 
         return None;
     }
     let roles = parse_role_pairs(&args_str, pk_label).ok()?;
-    let allowed: &[&str] = if is_two_cpt {
-        &["cl", "v1", "q", "v2", "n", "mtt"]
-    } else {
-        &["cl", "v", "n", "mtt"]
+    let disposition: &[&str] = match (is_two_cpt, is_ig) {
+        (false, false) => &["cl", "v", "n", "mtt"],
+        (true, false) => &["cl", "v1", "q", "v2", "n", "mtt"],
+        (false, true) => &["cl", "v", "mat", "cv2"],
+        (true, true) => &["cl", "v1", "q", "v2", "mat", "cv2"],
     };
-    if roles.keys().any(|k| !allowed.contains(&k.as_str())) {
-        return None; // a lagtime=/f= (or other) mapping — outside the scope.
+    // #735: absorption `f=` / `lagtime=` (`alag=`) are now carried into the twin (alias
+    // emission below); any *other* unrecognised role stays outside the plain-form scope.
+    // `reserved_flag_slot` recognises exactly the role names that route to the F/lagtime slots
+    // (derived from the real routing, so this can never drift from `ode_param_slots`).
+    if roles
+        .keys()
+        .any(|k| !disposition.contains(&k.as_str()) && reserved_flag_slot(k).is_none())
+    {
+        return None; // an unknown mapping — outside the plain-form scope.
     }
+    // The ODE twin routes F / lagtime by an individual parameter *named* `f` / `lagtime`
+    // / `alag` (`ode_param_slots`), whereas the closed form binds them via this pk() role
+    // map under arbitrary names. Bridge with reserved-name alias lines — but only when the
+    // mapped parameter does not already self-route (a param literally named `F` / `LAGTIME`
+    // / `ALAG` routes to the canonical slot already, so an alias would double-bind it and
+    // `ode_param_slots` would reject). #735.
+    let mut alias_lines: Vec<String> = Vec::new();
+    let mut alias_names: Vec<&str> = Vec::new();
+    if let Some(fp) = roles.get("f") {
+        if reserved_flag_slot(fp) != Some(crate::types::PK_IDX_F) {
+            alias_lines.push(format!("  f = {fp}"));
+            alias_names.push("f");
+        }
+    }
+    if let Some(lp) = roles.get("lagtime").or_else(|| roles.get("alag")) {
+        if reserved_flag_slot(lp) != Some(crate::types::PK_IDX_LAGTIME) {
+            alias_lines.push(format!("  lagtime = {lp}"));
+            alias_names.push("lagtime");
+        }
+    }
+    // Silent-divergence guard (#735): the ODE twin routes *any* individual parameter whose
+    // name routes to a reserved slot (`f` / `lagtime` / `alag`) into that F/lagtime slot
+    // (`ode_param_slots`), even one the closed form never treated as F/lag. A param whose name
+    // routes to a reserved slot is allowed only when it IS the intended mapping for *that
+    // specific* slot: a param named `f` must be the `f=` mapping; a param named `lagtime`/`alag`
+    // must be the `lagtime=`/`alag=` mapping. Anything else declines the twin — a disposition
+    // role bound to such a param (`mtt=ALAG`), a stray covariate/derived param literally named
+    // `f`, OR a cross-role mapping whose param name routes to a *different* reserved slot than
+    // its role (`f=LAGTIME`: the `LAGTIME` param name-routes to the lagtime slot the closed form
+    // never used it for, so the twin would apply it as both F and lag). Declining keeps the model
+    // closed-form (matching the closed form, which never applied that param as the shadowed
+    // F/lag) and, if it is also flip-flop, rejected up front — rather than the twin silently
+    // applying an extra F/lagtime the closed form did not.
+    //
+    // The same pass records the twin's individual-parameter names for the collision guard below.
+    let f_param = roles.get("f").map(String::as_str);
+    let lag_param = roles
+        .get("lagtime")
+        .or_else(|| roles.get("alag"))
+        .map(String::as_str);
+    let mut twin_param_names: Vec<String> = Vec::new();
+    if let Some(ip_lines) = extracted.unnamed.get("individual_parameters") {
+        for line in ip_lines {
+            // `extract_blocks` has already stripped `#`/`//` comments, so the LHS is the text
+            // before the first `=`; the alphanumeric check skips `if`/`else`/brace lines.
+            let lhs = line.split('=').next().unwrap_or("").trim();
+            if lhs.is_empty() || !lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            let shadows = match reserved_flag_slot(lhs) {
+                Some(slot) if slot == crate::types::PK_IDX_F => f_param != Some(lhs),
+                Some(_) => lag_param != Some(lhs), // PK_IDX_LAGTIME
+                None => false,
+            };
+            if shadows {
+                return None; // shadows a reserved F/lagtime slot — decline (see above).
+            }
+            twin_param_names.push(lhs.to_string());
+        }
+    }
+    // Collision guard (#735): a `f=`/`lagtime=` value that is an individual parameter whose
+    // *name* routes to an already-taken *disposition* slot (e.g. `f=V1`, where `V1` name-routes
+    // to the V slot held by `v=V`) is not a reserved-name shadow, so it passes the guard above —
+    // but the generated twin's `ode_param_slots` would reject it as two parameters mapping to one
+    // slot, which `AbsorptionOdeEquivalent::get_or_build` surfaces as a *panic*. The closed form
+    // binds F/lagtime by role, so the collision is harmless there. Dry-run the real slot
+    // assignment on the twin's projected parameter names. This list is a superset of the twin's
+    // real (filtered) parameter set, so it catches every real collision — at worst it declines an
+    // *unused* colliding name the real twin would not hit, which is harmless (the model stays
+    // closed-form). If it fails, decline the twin so the model stays closed-form — and, if
+    // flip-flop, is rejected up front with a clean error rather than panicking at eval time.
+    twin_param_names.extend(alias_names.iter().map(|s| s.to_string()));
+    // A parameter assigned in several `if`/`else` branches appears once in the twin's real
+    // parameter list (`unconditionally_assigned_vars` de-duplicates), so counting each raw LHS
+    // occurrence would be a spurious self-collision (`CL` in both branches of a `TIME` switch).
+    // De-duplicate by exact name, preserving first-occurrence order, before the slot check.
+    let mut seen = std::collections::HashSet::new();
+    twin_param_names.retain(|n| seen.insert(n.clone()));
+    if ode_param_slots(&twin_param_names).is_err() {
+        return None;
+    }
+    // The absorption forcing term, `transit(n, mtt)` or `igd(mat, cv2)`.
+    let forcing = if is_ig {
+        format!("igd(mat={}, cv2={})", roles.get("mat")?, roles.get("cv2")?)
+    } else {
+        format!("transit(n={}, mtt={})", roles.get("n")?, roles.get("mtt")?)
+    };
     // Re-emit every block verbatim except the disposition (deterministic order), then append
     // the ODE twin. Parsing this source yields a normal ODE model — it contains no
-    // `pk one_cpt_transit`/`pk two_cpt_transit`, so it does not recurse into this desugar.
+    // `pk one_cpt_transit`/`pk two_cpt_transit`/`pk one_cpt_ig`/`pk two_cpt_ig`, so it does
+    // not recurse into this desugar.
     let mut src = String::new();
     let mut names: Vec<&String> = extracted.unnamed.keys().collect();
     names.sort();
@@ -6688,6 +6853,15 @@ fn transit_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<String> 
         for line in &extracted.unnamed[name] {
             src.push_str(line);
             src.push('\n');
+        }
+        // #735: append the reserved-name F/lagtime aliases to [individual_parameters]
+        // so the ODE twin applies them (the closed form's pk() role map has no ODE
+        // analogue — see `ode_param_slots`).
+        if name == "individual_parameters" {
+            for alias in &alias_lines {
+                src.push_str(alias);
+                src.push('\n');
+            }
         }
         src.push('\n');
     }
@@ -6709,31 +6883,25 @@ fn transit_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<String> 
     // matching case exactly — 1-cpt: `ke = cl/v`; 2-cpt: `k10 = cl/v1`, `k12 = q/v1`,
     // `k21 = q/v2`, observed on `central` — so the ODE twin describes the same linear
     // system as the exponential-tilting closed form (pinned by the closed-form↔ODE
-    // equivalence test, `tests/transit_analytic_equivalence.rs`).
+    // equivalence tests, `tests/transit_analytic_equivalence.rs` / `ig_analytic_equivalence.rs`).
+    // `{forcing}` is the absorption input (`transit(n, mtt)` / `igd(mat, cv2)`).
     if is_two_cpt {
-        let (cl, v1, q, v2, n, mtt) = (
+        let (cl, v1, q, v2) = (
             roles.get("cl")?,
             roles.get("v1")?,
             roles.get("q")?,
             roles.get("v2")?,
-            roles.get("n")?,
-            roles.get("mtt")?,
         );
         src.push_str("[structural_model]\n  ode(obs_cmt=central, states=[central, periph])\n\n");
         src.push_str(&format!(
-            "[odes]\n  d/dt(central) = transit(n={n}, mtt={mtt}) - ({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph\n  d/dt(periph) = ({q}/{v1}) * central - ({q}/{v2}) * periph\n\n"
+            "[odes]\n  d/dt(central) = {forcing} - ({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph\n  d/dt(periph) = ({q}/{v1}) * central - ({q}/{v2}) * periph\n\n"
         ));
         src.push_str(&format!("[scaling]\n  obs_scale = {v1}\n\n"));
     } else {
-        let (cl, v, n, mtt) = (
-            roles.get("cl")?,
-            roles.get("v")?,
-            roles.get("n")?,
-            roles.get("mtt")?,
-        );
+        let (cl, v) = (roles.get("cl")?, roles.get("v")?);
         src.push_str("[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n");
         src.push_str(&format!(
-            "[odes]\n  d/dt(central) = transit(n={n}, mtt={mtt}) - ({cl}/{v}) * central\n\n"
+            "[odes]\n  d/dt(central) = {forcing} - ({cl}/{v}) * central\n\n"
         ));
         src.push_str(&format!("[scaling]\n  obs_scale = {v}\n\n"));
     }
@@ -15298,7 +15466,7 @@ mod tests {
             "the primary transit model is not itself an ODE model"
         );
         let eq = model
-            .transit_ode_equivalent
+            .absorption_ode_equivalent
             .as_ref()
             .expect("transit + TIME must carry an ODE equivalent")
             .get_or_build();
