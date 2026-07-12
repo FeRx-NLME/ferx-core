@@ -20,6 +20,19 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Binary / logistic endpoint** (`[binary_model]`, #760): mixed-effects logistic
+  regression as a first-class non-Gaussian endpoint (Phase 4, Track C). Declare a
+  binary observation compartment with `cmt` and a `logit` linear predictor over
+  θ/η/covariates (and the per-record `TIME` builtin); `DV ∈ {0,1}` on that CMT is
+  scored with the Bernoulli likelihood `−Σ[y·log p + (1−y)·log(1−p)]`,
+  `p = logit⁻¹(lp)`. Works with FOCEI (FD-Laplace), SAEM, and IMP, and supports the
+  fixed-effects (`n_eta = 0`) special case — ordinary logistic regression. Validated
+  exactly against base-R `glm(DV ~ X + TIME, family = binomial)` and NONMEM `F_FLAG=1`:
+  ferx reproduces the glm/NONMEM coefficients and its OFV equals the glm deviance /
+  NONMEM −2 log L to 5 decimals (see `examples/binary_logistic.ferx`,
+  `docs/estimation/categorical.qmd`, `tests/reference/binary_logistic/`). A non-Bernoulli
+  code (`DV ≥ 2`) on a binary CMT is rejected fail-loud. Ordinal / Poisson / negative
+  binomial are planned follow-up slices.
 - **Left truncation (delayed entry) for clock-reset RTTE** (#740): repeated
   time-to-event models with `clock = reset` now accept a `TENTRY > 0` entry time
   instead of rejecting it. The first inter-event sojourn is conditioned on survival
