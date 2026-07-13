@@ -78,6 +78,7 @@ website:
           - model-file/adaptive-dosing.qmd
           - model-file/event-model.qmd
           - model-file/categorical.qmd
+          - model-file/markov-model.qmd
       - text: "Estimation Methods"
         href: estimation/index.qmd
         contents:
@@ -92,6 +93,7 @@ website:
           - estimation/optimizers.qmd
           - estimation/tte.qmd
           - estimation/categorical.qmd
+          - estimation/ctmm.qmd
       - text: "Data Format"
         href: data-format.qmd
       - text: "CLI Reference"

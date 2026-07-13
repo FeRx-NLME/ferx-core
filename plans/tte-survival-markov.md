@@ -389,7 +389,7 @@ the implemented `matrix_exp_frechet` primitive: §8.7.)
 
 #### mCTMM (minimal CTMM) — highly recommended as stepping stone
 
-Savic & Karlsson (AAPS J, 2017): under the constraint that transition rates between
+Schindler & Karlsson (AAPS J, 2017): under the constraint that transition rates between
 adjacent states are state-independent, the CTMM reduces to a single parameter model:
 `q_jk = q` (constant) for all adjacent (j,k) pairs. The mean equilibration time is
 `τ = 1/q`. Steady-state probabilities follow a proportional odds model.
@@ -1051,7 +1051,10 @@ Requires special handling in inner optimizer (EM over hidden states, not BFGS ov
 - **Ooi EHS, Plan EL, Bergstrand M (2025).** "Practical guidance for Markov models in drug
   development." CPT:PSP 14:197–216. — DTMM, mCTMM, HMM, IRT+Markov; annotated NONMEM code
   in supplementary.
-- **Savic RM, Karlsson MO (2017, AAPS J).** mCTMM (minimal CTMM) parameterization.
+- **Schindler E, Karlsson MO (2017).** A Minimal Continuous-Time Markov Pharmacometric
+  Model. *AAPS J* 19(5):1424–1435. doi:10.1208/s12248-017-0109-1. PMID: 28634883. — mCTMM
+  (minimal CTMM) parameterization: single mean-equilibration-time parameter, proportional-odds
+  steady state.
 - **Jackson CH (2011).** msm package; J Stat Softw. — Matrix exponential CTMM; CAV dataset.
 - **Sctmm paper (PMC11247187).** Scalable CTMM via SGD + block-Padé; 13,320 MS patients.
 
@@ -1391,10 +1394,19 @@ q32 = LAMBDA32
 > on the existing `[odes]` engine. ferx does that **only for the time-inhomogeneous** (drug-driven
 > `Q(t)`) case — Phase 6. For the **time-homogeneous** case ferx uses the **matrix exponential**
 > `P(Δt) = expm(QΔt)` with **exact Van Loan (1978) gradients** (§3.4, §8.7), *not* the probability
-> ODE: cleaner and exactly differentiable. Comparator likewise differs — CTMM/mCTMM anchor to R
-> `msm`, not NONMEM (whose EVID=3 CTMM mechanism ferx rejects, §3.4); only DTMM anchors to NONMEM
-> (§7.8). The categorical observation likelihood these consume is Phase 4 (§2, §3.5), tracked
-> separately as #760 (the #759 companion).
+> ODE: cleaner and exactly differentiable. The categorical observation likelihood these
+> consume is Phase 4 (§2, §3.5), tracked separately as #760 (the #759 companion).
+>
+> **Comparator — updated (#759 Phase 5 build, overriding the earlier `msm` choice).** The plan
+> originally anchored CTMM/mCTMM to R `msm` on the grounds that NONMEM's *dataset* CTMM mechanism
+> (EVID=3 + A0_FLG) is incompatible with ferx's reader (§3.4). That objection is about the dataset
+> encoding, **not** the likelihood: NONMEM scores the identical panel/snapshot CTMM likelihood
+> through its general `F_FLAG=1` (LIKELIHOOD) route, with the closed-form transition matrix written
+> in `$PRED`. For a **fixed-effects** (`n_eta = 0`) CTMM both engines minimise the same exact
+> `−2 Σ log P(Δt)`, so NONMEM is the stronger external anchor and the Phase-5 build uses it — the
+> 2-state model matches NONMEM 7.5.1 to 4 decimals on the OFV (`tests/nonmem/ctmm_2state.ctl`,
+> `tests/markov_nonmem.rs`). `msm` remains the natural comparator for the *mixed-effects* /
+> multi-state cases where the `F_FLAG` closed form is harder to write by hand.
 
 **Custom log-likelihood (escape hatch):**
 ```
@@ -2695,7 +2707,7 @@ variant + dispatch (calling `ctmm_data_term`) and the `[markov_model]` DSL parse
 
 Gate: `#[cfg(feature = "markov")]` initially.
 
-### Phase 6 — Time-inhomogeneous CTMM (drug-driven Q) · Track D
+### Phase 6 — Time-inhomogeneous CTMM (drug-driven Q) · Track D · #817
 
 **Scope:** Q(t) = f(C(t)); matrix ODE; joint PK-CTMM.
 

@@ -2762,6 +2762,20 @@ pub enum LinkFn {
 pub type LinearPredictorFn =
     Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
 
+#[cfg(feature = "markov")]
+/// Closure building a CTMM generator matrix `Q(θ, η, covariates)` — the S×S
+/// transition-intensity (generator) matrix for a continuous-time Markov endpoint.
+///
+/// The off-diagonals `q_jk ≥ 0` (`j ≠ k`) are the `[markov_model] transition`
+/// intensities; the builder fills the diagonal row-sum-zero
+/// (`q_jj = −Σ_{k≠j} q_jk`) so the caller always receives a valid generator.
+/// Mirrors [`LinearPredictorFn`]: evaluated once per subject from a *baseline*
+/// covariate snapshot (time-homogeneous — a drug-driven `Q(t)` is Phase 6), so a
+/// time-varying covariate on an intensity would be silently frozen and is
+/// guarded at parse/fit-setup.
+pub type GeneratorFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> nalgebra::DMatrix<f64> + Send + Sync>;
+
 #[cfg(feature = "survival")]
 /// Per-CMT endpoint likelihood specification.
 pub enum EndpointLikelihood {
@@ -2797,7 +2811,37 @@ pub enum EndpointLikelihood {
         /// analogue of [`Self::Tte`]'s `hazard_covariates` (#741).
         lp_covariates: Vec<String>,
     },
-    // Ordinal, Poisson, NegBin, Ctmm, Dtmm deferred to Phase 4/5
+    /// Continuous-time Markov model (CTMM) endpoint — the discrete state
+    /// `s ∈ {0..S−1}` is observed via [`ObsRecord::DiscreteState`] at irregular
+    /// times, and the per-subject data term is `−Σ_m log P(Δt_m)[s_m, s_{m+1}]`
+    /// with the transition-probability matrix `P(Δt) = expm(Q·Δt)` (§3.4/§8.7 of
+    /// `plans/tte-survival-markov.md`). **Time-homogeneous** (Phase 5): the
+    /// generator `Q(θ,η,cov)` is built once per subject from a baseline covariate
+    /// snapshot; a drug-driven `Q(t)` is Phase 6. Gated behind `markov`
+    /// (which implies `survival`).
+    #[cfg(feature = "markov")]
+    Ctmm {
+        /// Number of states `S` (the generator is `S×S`).
+        n_states: usize,
+        /// Data DV code for each state, indexed by 0-based generator index:
+        /// `state_codes[i]` is the integer DV value that denotes state `i`. The
+        /// endpoint maps an observed [`ObsRecord::DiscreteState`] `state` (the raw
+        /// DV code) back to its generator index through this table, so states may
+        /// be coded with any non-negative integers (e.g. `1`/`2`), not only
+        /// `0..S−1`. Length `== n_states`; codes are unique (checked at parse).
+        state_codes: Vec<usize>,
+        /// Builds the generator `Q(θ,η,cov)` — see [`GeneratorFn`].
+        generator_fn: GeneratorFn,
+        /// Covariate names referenced by any transition intensity (including any
+        /// reached transitively through `[individual_parameters]`). Evaluated at a
+        /// baseline snapshot, so a covariate listed here that is time-varying in
+        /// the data is rejected at fit setup by
+        /// [`crate::api::check_survival_tv_covariates`] — the CTMM analogue of
+        /// [`Self::Tte`]'s `hazard_covariates` and [`Self::Binary`]'s
+        /// `lp_covariates` (#741).
+        generator_covariates: Vec<String>,
+    },
+    // Ordinal, Poisson, NegBin, Dtmm deferred to Phase 4/4b
 }
 
 #[cfg(feature = "survival")]
@@ -2811,6 +2855,12 @@ impl std::fmt::Debug for EndpointLikelihood {
                 write!(f, "Tte({hazard:?}, {recurrence:?})")
             }
             EndpointLikelihood::Binary { link, .. } => write!(f, "Binary({link:?})"),
+            #[cfg(feature = "markov")]
+            EndpointLikelihood::Ctmm {
+                n_states,
+                state_codes,
+                ..
+            } => write!(f, "Ctmm(n_states={n_states}, codes={state_codes:?})"),
         }
     }
 }
@@ -3426,6 +3476,29 @@ impl CompiledModel {
         c
     }
 
+    /// True if any endpoint is a [`Ctmm`](EndpointLikelihood::Ctmm)
+    /// (continuous-time Markov) endpoint — Phase 5, Track D (#759).
+    #[cfg(feature = "markov")]
+    pub fn has_ctmm(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|e| matches!(e, EndpointLikelihood::Ctmm { .. }))
+    }
+
+    /// CMTs routed to a `Ctmm` endpoint, sorted ascending. The datareader routes
+    /// these rows to [`ObsRecord::DiscreteState`] via `ObsRouting.discrete`, the
+    /// same discrete-state plumbing the `Binary` endpoint uses.
+    #[cfg(feature = "markov")]
+    pub fn ctmm_cmts(&self) -> Vec<usize> {
+        let mut c: Vec<usize> = self
+            .endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| matches!(ep, EndpointLikelihood::Ctmm { .. }).then_some(*cmt))
+            .collect();
+        c.sort_unstable();
+        c
+    }
+
     /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint — the
     /// binary / Bernoulli family today; ordinal / Poisson / negative-binomial extend this
     /// match. This is the family-agnostic gate for the discrete data term and its FD-Hessian
@@ -3439,16 +3512,21 @@ impl CompiledModel {
             .any(|e| matches!(e, EndpointLikelihood::Binary { .. }))
     }
 
-    /// True if the model carries **any non-Gaussian endpoint** (TTE/RTTE or the
-    /// Phase-4 categorical/count families). This is the predicate the estimation
-    /// machinery gates on when choosing the **FD-Hessian Laplace** inner/outer path
-    /// and disabling the analytic outer gradient — those choices are correct for every
-    /// non-Gaussian data term, not TTE specifically. Equals [`has_tte`](Self::has_tte)
-    /// exactly when no discrete endpoint is present, so existing TTE behaviour is
+    /// True if the model carries **any non-Gaussian endpoint** (TTE/RTTE, the
+    /// Phase-4 categorical/count families, or a Phase-5 CTMM). This is the
+    /// predicate the estimation machinery gates on when choosing the **FD-Hessian
+    /// Laplace** inner/outer path and disabling the analytic outer gradient —
+    /// those choices are correct for every non-Gaussian data term, not TTE
+    /// specifically. Equals [`has_tte`](Self::has_tte) exactly when no
+    /// discrete/Markov endpoint is present, so existing TTE behaviour is
     /// unchanged.
     #[cfg(feature = "survival")]
     pub fn has_non_gaussian(&self) -> bool {
-        self.has_tte() || self.has_discrete()
+        #[cfg(feature = "markov")]
+        let ctmm = self.has_ctmm();
+        #[cfg(not(feature = "markov"))]
+        let ctmm = false;
+        self.has_tte() || self.has_discrete() || ctmm
     }
 
     /// Always false without the `survival` feature - TTE endpoints can't be

@@ -452,6 +452,11 @@ pub(crate) fn accumulate_non_gaussian_nll(
     }
     // Discrete families (binary today; ordinal/Poisson/… later) — one add, matching the TTE terms.
     *acc += factor * crate::categorical::discrete_subject_nll(model, subject, theta, eta);
+    // CTMM (#759): continuous-time Markov endpoint, same per-endpoint add.
+    #[cfg(feature = "markov")]
+    {
+        *acc += factor * crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta);
+    }
 }
 
 /// Hot-path variant that additionally threads through a pre-built
@@ -870,6 +875,16 @@ pub(crate) fn ruv_scale_from(eta: &[f64], residual_error_eta: Option<usize>) -> 
     }
 }
 
+/// Threshold separating a healthy CTMM likelihood / FD-Hessian entry from a
+/// degeneracy-sentinel-poisoned one. The CTMM data term repels with a `1e20`
+/// objective (an underflowed transition or a negative off-diagonal); a mode value
+/// or FD-Hessian entry at or beyond this bound is that sentinel leaking into the
+/// Laplace curvature, not a real value, and is dropped rather than folded into
+/// `log|H̃|`. Sits far above any legitimate CTMM curvature and far below the `1e20`
+/// sentinel. See [`foce_subject_nll`]'s CTMM FD-Hessian block (#759 review).
+#[cfg(feature = "markov")]
+const CTMM_FD_SENTINEL_GUARD: f64 = 1e18;
+
 pub fn foce_subject_nll(
     model: &CompiledModel,
     subject: &Subject,
@@ -987,6 +1002,36 @@ pub fn foce_subject_nll(
             if n_eta > 0 {
                 let steps = shi_step_sizes(&discrete_fn, eta_hat.as_slice());
                 tte_h += data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps);
+            }
+        }
+
+        // CTMM (#759): same treatment — fold its NLL at the mode and FD Hessian
+        // w.r.t. η (the generator's η-curvature) into the accumulators.
+        #[cfg(feature = "markov")]
+        if model.has_ctmm() {
+            let ctmm_fn = |eta_eval: &[f64]| {
+                crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta_eval)
+            };
+            let mode = ctmm_fn(eta_hat.as_slice());
+            tte_nll_at_mode += mode;
+            // A perturbed-η CTMM evaluation can hit the 1e20 degeneracy sentinel (an
+            // observed transition underflowing, or a negative off-diagonal, under the
+            // perturbed generator). That sentinel in a central-difference stencil yields a
+            // ~1e24 curvature entry that would poison log|H̃| and hence the OFV / SEs. When
+            // the mode itself is already the sentinel the subject is repelled by
+            // `tte_nll_at_mode` alone; otherwise fold the FD Hessian only if every entry is
+            // finite and of sane magnitude, dropping a sentinel-poisoned block. On the
+            // healthy path (no sentinel) this is bit-identical to folding unconditionally.
+            // See #759 review.
+            if n_eta > 0 && mode < CTMM_FD_SENTINEL_GUARD {
+                let steps = shi_step_sizes(&ctmm_fn, eta_hat.as_slice());
+                let h_ctmm = data_term_hessian_fd(&ctmm_fn, eta_hat.as_slice(), &steps);
+                if h_ctmm
+                    .iter()
+                    .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
+                {
+                    tte_h += h_ctmm;
+                }
             }
         }
 
@@ -2438,6 +2483,9 @@ pub fn individual_nll_iov(
     // site inlined.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
+        // No CTMM term reaches this IOV path in practice: a CTMM endpoint with IOV
+        // (n_kappa > 0) is rejected at fit setup (its intensities are evaluated with
+        // BSV-only η), so the helper's CTMM add is a no-op here.
         accumulate_non_gaussian_nll(model, subject, theta, eta, None, 2.0, &mut data_ll);
     }
 
