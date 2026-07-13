@@ -17,7 +17,7 @@ ferx-core includes several example models in the `examples/` directory with corr
 | [Derived Columns and Output](derived-output.qmd) | 1-cpt | Oral | `[derived]` and `[output]` blocks, NCA metrics |
 | [Data Selection](data-selection.qmd) | 1-cpt | Oral | `[data_selection]` IGNORE/ACCEPT filter |
 | [ODE with Lag Time](ode-lagtime.qmd) | 1-cpt ODE | Oral | `LAGTIME` keyword, IIV on lag, `obs_scale = V` |
-| [Transit Absorption](transit-absorption.qmd) | 2-cpt ODE | Oral | Transit chain, allometric scaling, FOCEI |
+| [Transit Absorption](transit-absorption.qmd) | 2-cpt ODE | Oral | `transit()` shortcut (continuous n), FOCEI |
 | [Stochastic Differential Equations](sde.qmd) | 1-cpt ODE | Oral | `[diffusion]` block, EKF process noise |
 | [Multi-start](multistart.qmd) | 1-cpt ODE | Oral | Multiple starting values to avoid local minima |
 
@@ -66,8 +66,8 @@ ferx examples/warfarin_data_selection.ferx --data data/warfarin.csv
 # ODE model with absorption lag time
 ferx examples/warfarin_ode_lagtime.ferx --data data/warfarin_ode_lagtime.csv
 
-# Transit-compartment absorption (2-cpt ODE, allometric scaling)
-ferx examples/transit_2cpt.ferx --data data/transit_2cpt.csv
+# Transit-compartment absorption (2-cpt ODE, transit() shortcut, continuous n)
+ferx examples/transit_2cpt_shortcut.ferx --simulate
 
 # Stochastic differential equations (EKF process noise)
 ferx examples/warfarin_sde.ferx --data data/warfarin_sde.csv
