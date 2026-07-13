@@ -4569,6 +4569,11 @@ fn parse_markov_model_block(
                 )
             })?;
         match key {
+            // `type` is optional and defaults to `ctmm` — the only endpoint family
+            // implemented today. The default is explicit: a block with no `type` line
+            // parses as a CTMM (see the required-key checks below, which do not include
+            // `type`). When mCTMM/DTMM land they must NOT silently inherit this default —
+            // dispatch on the value read here rather than widening the fall-through.
             "type" => match value {
                 "ctmm" => {}
                 "mctmm" | "dtmm" => {

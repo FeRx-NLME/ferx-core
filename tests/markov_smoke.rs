@@ -485,6 +485,33 @@ mod ctmm_smoke {
         );
     }
 
+    /// `type` is optional and defaults to `ctmm`: a block omitting the `type` line parses
+    /// as a CTMM endpoint (the explicit default — locks the behaviour so a future
+    /// mCTMM/DTMM addition cannot silently change it).
+    #[test]
+    fn ctmm_type_defaults_to_ctmm_when_omitted() {
+        const M: &str = r"
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+
+[markov_model]
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01)
+  transition asleep -> awake  = exp(LQ10)
+";
+        let model =
+            parse_model_string(M).expect("a [markov_model] with no `type` defaults to ctmm");
+        assert!(
+            matches!(
+                model.endpoints.get(&5),
+                Some(EndpointLikelihood::Ctmm { .. })
+            ),
+            "omitting `type` must yield a Ctmm endpoint"
+        );
+    }
+
     /// Bare numeric state codes (no labels) parse and map to generator indices in order.
     #[test]
     fn ctmm_bare_numeric_states_parse() {

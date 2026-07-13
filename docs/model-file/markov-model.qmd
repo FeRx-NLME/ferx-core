@@ -43,6 +43,9 @@ transition with its intensity:
 - **`cmt`** — the CMT column value carrying the state observations. Rows on this CMT are
   read as integer states; the same CMT cannot also be a Gaussian (`[error_model]`)
   endpoint.
+- **`type`** — optional; **defaults to `ctmm`**, the only family available today. Omitting
+  the line parses as a CTMM. `mctmm` / `dtmm` are recognized but rejected as "not yet
+  supported".
 
 ### Bare numeric states
 
