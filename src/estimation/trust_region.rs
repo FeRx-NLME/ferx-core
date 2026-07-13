@@ -457,7 +457,12 @@ pub fn optimize_trust_region(
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
-        packed_estimate: None,
+        // The exact packed vector this stage's inline covariance step used
+        // (`compute_covariance(&best_x, …)` above). The trust-region optimizer
+        // works in packed Cholesky space, so `best_x`'s omega block is the exact
+        // factor `L`; carrying it lets `run_covariance` reproduce this covariance
+        // step bit-for-bit instead of re-decomposing `omega` (#816 follow-up).
+        packed_estimate: Some(best_x.clone()),
     }
 }
 
@@ -479,6 +484,37 @@ mod tests {
         assert_eq!(adaptive_steihaug_budget(100), 10);
         // Budget never exceeds n_params.
         assert!(adaptive_steihaug_budget(4) <= 4.max(5));
+    }
+
+    /// #816 follow-up regression: the trust-region optimizer works in packed
+    /// Cholesky space, so its covariance step uses the optimizer's exact factor
+    /// `L`. It must carry `packed_estimate` so a standalone `run_covariance`
+    /// reproduces the inline covariance bit-for-bit. Fails if the return regresses
+    /// to `None` (which would silently drop the standalone step back to the
+    /// re-decomposition fallback that diverges on ill-conditioned ω).
+    #[test]
+    fn trust_region_carries_packed_estimate() {
+        use crate::estimation::parameterization::packed_len;
+        use crate::io::datareader::read_nonmem_csv;
+        use crate::parser::model_parser::parse_model_file;
+        use std::path::Path;
+
+        let model = parse_model_file(Path::new("examples/warfarin.ferx"))
+            .expect("warfarin model must parse");
+        let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data must load");
+        // One outer step, no covariance step: only assert propagation, stay fast.
+        let opts = FitOptions {
+            outer_maxiter: 1,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let res = optimize_trust_region(&model, &population, &model.default_params, &opts);
+        let packed = res
+            .packed_estimate
+            .expect("trust_region must carry packed_estimate");
+        assert_eq!(packed.len(), packed_len(&model.default_params));
     }
 
     /// Verify the dynamic cache-state contract between `cost()` and `compute_ad_grads()`:

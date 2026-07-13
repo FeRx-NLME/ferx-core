@@ -364,9 +364,11 @@ section of the SDLC for the versioning policy).
   up to ~10% on an ill-conditioned variance (e.g. a warfarin ω²(KA) with ~115%
   RSE), giving standard errors that disagreed with an equivalent
   `covariance = true` fit. The step now reuses the optimizer's exact packed vector
-  when the fit carries one, so the covariance matrix and SEs match exactly. Fits
-  reloaded from `.fitrx`, or from SAEM/GN/IMP/Bayes, are unaffected (they already
-  agreed). Surfaced during the #816 review.
+  when the fit carries one, so the covariance matrix and SEs match exactly — for
+  every in-memory packed-Cholesky-space optimizer (NLopt, BFGS, trust region,
+  Gauss-Newton). Fits reloaded from `.fitrx`, or from SAEM/importance-sampling/Bayes
+  (which rebuild `omega` from the reported matrix on both paths), are unaffected —
+  they already agreed. Surfaced during the #816 review.
 - **Inner EBE line search no longer aborts on a non-finite objective** (#719
   follow-up): the FOCEI inner-loop backtracking line search
   (`estimation/inner_optimizer.rs`) could panic with `clamp(NaN, NaN)` (a process

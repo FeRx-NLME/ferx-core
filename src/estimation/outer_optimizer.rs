@@ -57,11 +57,14 @@ pub struct OuterResult {
     pub cond_dist: Option<CondDist>,
     /// The optimizer's **exact** final packed parameter vector (log-theta,
     /// Cholesky-omega lower triangle, log-sigma, over the free parameters) — the
-    /// same vector this stage's inline covariance step used. `Some` for the
-    /// packed-space FOCE/FOCEI paths (including `outer_maxiter = 0` evaluation);
-    /// `None` for estimators that do not optimize in packed Cholesky space (SAEM,
-    /// GN, trust-region, IMP, Bayes), whose covariance step re-packs from `omega`
-    /// on both the inline and `run_covariance` paths and so already agrees.
+    /// same vector this stage's inline covariance step used. `Some` for every
+    /// packed-Cholesky-space optimizer — BOBYQA/SLSQP/MMA (NLopt), the hand-rolled
+    /// BFGS, the trust region, and Gauss-Newton (pure and hybrid) — including
+    /// `outer_maxiter = 0` evaluation. `None` for SAEM and importance-sampling,
+    /// whose covariance step rebuilds `omega` from the reported matrix (so its
+    /// Cholesky factor re-decomposes identically on both the inline and
+    /// `run_covariance` paths and already agrees), and for Bayes (no Hessian
+    /// covariance step).
     ///
     /// Carried so `run_covariance` can reproduce the inline FD-Hessian bit-for-bit
     /// by reusing this exact Cholesky factor instead of re-decomposing `omega`
@@ -219,10 +222,13 @@ fn evaluate_at_initial_params(
         };
 
     OuterResult {
-        // Evaluation-only (`outer_maxiter = 0`): no optimizer ran, so there is no
-        // converged packed vector to reuse; `run_covariance` re-packs from omega
-        // (identical result, since the params equal the unoptimized init).
-        packed_estimate: None,
+        // Evaluation-only (`outer_maxiter = 0`): no optimizer ran, but the eval
+        // still packs the init in Cholesky space and the inline covariance step
+        // above used `&x` as its FD center. Carry that exact vector so a later
+        // `run_covariance` reproduces this step bit-for-bit — the re-decomposition
+        // fallback (`chol(L·Lᵀ) ≠ L`) would otherwise diverge on an ill-conditioned
+        // init omega just as it does for a converged fit (#816 follow-up).
+        packed_estimate: Some(x.clone()),
         params,
         ofv,
         converged: false,

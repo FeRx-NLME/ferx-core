@@ -4710,9 +4710,11 @@ pub struct FitResult {
     /// Cholesky factor instead of re-decomposing `omega` (which is not the
     /// round-trip inverse of the stored `L·Lᵀ`; the FD Hessian amplifies the
     /// difference on ill-conditioned ω directions — the divergence #816 review
-    /// surfaced). `None` for estimators that do not pack in Cholesky space (SAEM,
-    /// GN, trust-region, IMP, Bayes — already agree without it) and for hand-built
-    /// results.
+    /// surfaced). `Some` for every packed-Cholesky-space optimizer — the NLopt and
+    /// BFGS outer loops, the trust region, and Gauss-Newton (pure and hybrid). `None`
+    /// for SAEM and importance-sampling (which rebuild `omega` from the reported
+    /// matrix, so both paths re-decompose identically and already agree), for Bayes
+    /// (no Hessian covariance step), and for hand-built results.
     ///
     /// **Transient (`#[serde(skip)]`):** it is an in-process optimisation for a
     /// `run_covariance` called right after a fit; a fit reloaded from `.fitrx`
