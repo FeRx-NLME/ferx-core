@@ -11,6 +11,7 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | **Biphasic IG** | `FR1*igd(...) + FR2*igd(...)` — [#388](https://github.com/FeRx-NLME/ferx-core/issues/388) | `freijer_biphasic_ig.ctl` | `biphasic_ig_fit.ferx` |
 | **Parallel** | `FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2)` — [#505](https://github.com/FeRx-NLME/ferx-core/issues/505) | `parallel_first_order.ctl` | `parallel_first_order_fit.ferx` |
 | **Mixed** | `FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR)` — [#505](https://github.com/FeRx-NLME/ferx-core/issues/505) | `mixed_zero_first.ctl` | `mixed_zero_first_fit.ferx` |
+| **Steady-state absorption** | `SS=1` into `first_order(ka)` — [#719](https://github.com/FeRx-NLME/ferx-core/issues/719) gap 1 (`ADVAN2` exact analytic SS; `KA` slow so the absorption tail spans `II`) | `ss_first_order.ctl` | *(in `tests/ss_absorption_nonmem_anchor.rs`)* |
 
 The transit control runs on `transit_oral.csv`; the IG and Weibull controls run
 on `igd_oral.csv` (the same data re-keyed to a 1-compartment layout — every record

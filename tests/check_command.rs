@@ -451,12 +451,14 @@ fn twin_less_flip_flop_transit_is_rejected_by_check() {
     let _ = std::fs::remove_file(&data);
 }
 
-/// `ferx check` now also surfaces the structural transit rejects (here a steady-state
-/// dose) as `E_TRANSIT_UNSUPPORTED`, so a clean check and a fit agree on transit
-/// models — previously only `fit()` reported these (#776 review).
+/// `ferx check` surfaces the structural transit rejects (here an infusion into the
+/// absorption compartment) as `E_TRANSIT_UNSUPPORTED`, so a clean check and a fit agree on
+/// transit models — previously only `fit()` reported these (#776 review). (Steady-state
+/// dosing is no longer among these rejects — it reroutes to the ODE twin, #719 — so this
+/// test now exercises the still-unsupported infusion case.)
 #[test]
 fn unsupported_transit_feature_is_rejected_by_check() {
-    // In-domain (ke = 0.05 < KTR = 0.2), so this is NOT a flip-flop reject; the SS dose is.
+    // In-domain (ke = 0.05 < KTR = 0.2), so this is NOT a flip-flop reject; the infusion is.
     let model = temp_model(
         "transit_ss",
         "\
@@ -482,11 +484,14 @@ fn unsupported_transit_feature_is_rejected_by_check() {
 ",
     );
     let data = temp_data(
-        "transit_ss",
-        "ID,TIME,AMT,EVID,DV,MDV,SS,II\n1,0,100,1,.,1,1,24\n1,2,0,1.0,0,0,0\n",
+        "transit_inf",
+        "ID,TIME,AMT,EVID,DV,MDV,RATE\n1,0,100,1,.,1,50\n1,2,0,0,1.0,0,0\n",
     );
     let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
-    assert!(!report.valid, "SS transit dose must fail ferx check");
+    assert!(
+        !report.valid,
+        "infusion into a transit compartment must fail ferx check"
+    );
     assert!(
         report
             .diagnostics

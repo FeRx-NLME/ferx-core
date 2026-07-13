@@ -3323,16 +3323,25 @@ impl CompiledModel {
     /// subject — a `TIME`-dependent structural parameter or time-varying covariates make the
     /// disposition switch mid-absorption, which the per-dose absorption convolution assumes
     /// constant, or IOV (`n_kappa > 0`, #719) needs cross-occasion dose carryover (#104) that
-    /// the superposition cannot express — return its exact ODE (`transit()` / `igd()`) equivalent
+    /// the superposition cannot express, or a **steady-state** (`SS=1`) dose (#719) needs the
+    /// periodic pulse train equilibrated through the absorption kernel — which the ODE twin
+    /// does (`ode::predictions::equilibrate_ss_state`) but the closed form has no periodic-sum
+    /// form for — return its exact ODE (`transit()` / `igd()`) equivalent
     /// (`absorption_ode_equivalent`, built at parse time); otherwise `self`. Constant-parameter,
-    /// non-IOV subjects keep the fast, exact closed form. The equivalent shares this model's θ/η layout,
-    /// so callers pass the same parameter vector (#486, #790). A no-op (`self`) for every model
-    /// without an ODE twin.
+    /// non-IOV, non-SS subjects keep the fast, exact closed form. The equivalent shares this
+    /// model's θ/η layout, so callers pass the same parameter vector (#486, #790). A no-op
+    /// (`self`) for every model without an ODE twin.
     pub fn effective_for<'a>(&'a self, subject: &Subject) -> &'a CompiledModel {
         if let Some(eq) = &self.absorption_ode_equivalent {
             if crate::parser::model_parser::compiled_model_uses_time_builtin(self)
                 || subject.has_tv_covariates()
                 || self.n_kappa > 0
+                // Steady-state doses reroute to the ODE twin (#719): the closed-form
+                // superposition has no periodic-sum SS form, but the twin equilibrates the
+                // dose through the absorption kernel (a pulse-train trough + periodic forward
+                // `R_in`). The SS + lagtime combination the twin can't yet serve is rejected
+                // upfront by `check_absorption_closed_form_support`, so it never reaches here.
+                || subject.has_periodic_ss_dose()
             {
                 return eq.get_or_build();
             }

@@ -217,14 +217,18 @@ fn transit_normal_dosing_passes_data_checks() {
 }
 
 #[test]
-fn ss_dose_into_transit_compartment_is_rejected() {
-    // Steady-state dosing into a transit compartment is not yet supported and
-    // must be rejected loudly rather than silently mis-modeled as a bolus train.
+fn ss_dose_into_transit_compartment_is_supported() {
+    // Steady-state dosing into a built-in transit compartment is now supported (#719): the
+    // dose is equilibrated through the absorption kernel (pulse-train trough + periodic
+    // forward R_in), so `check_model_data` must NOT raise E_ABSORPTION_SS, and `predict()`
+    // returns finite steady-state values. (The numerical fidelity vs an explicit run-in is
+    // pinned by `ode::predictions::tests::ss_into_*_matches_explicit_run_in`.)
     let model = parse_full_model(TRANSIT_MODEL)
         .expect("transit model parses")
         .model;
     let ss_dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0); // SS=1, II=12
-    let n = 2;
+    let obs = vec![1.0, 6.0, 11.5];
+    let n = obs.len();
     let pop = Population {
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
@@ -234,16 +238,22 @@ fn ss_dose_into_transit_compartment_is_rejected() {
         subjects: vec![common::subject(
             "1",
             vec![ss_dose],
-            vec![1.0, 6.0],
+            obs,
             vec![0.0; n],
             vec![2; n],
         )],
     };
     let diags = check_model_data(&model, &pop);
     assert!(
-        diags.iter().any(|d| d.code == "E_ABSORPTION_SS"),
-        "expected E_ABSORPTION_SS, got {:?}",
+        !diags.iter().any(|d| d.code.starts_with("E_ABSORPTION_SS")),
+        "SS into a transit compartment is supported and must not raise an SS reject, got {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+    let preds = ferx_core::predict(&model, &pop, &model.default_params);
+    assert_eq!(preds.len(), n);
+    assert!(
+        preds.iter().all(|p| p.pred.is_finite() && p.pred >= 0.0),
+        "SS transit predictions must be finite: {preds:?}"
     );
 }
 

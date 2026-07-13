@@ -561,6 +561,17 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };
+    // Steady-state dosing into a built-in absorption input-rate compartment (#719) stays on
+    // the FD fallback: the dual SS equilibration (`equilibrate_ss_state_g`) still seeds a
+    // bolus/infusion trough and does not spread the periodic absorption `R_in` over the cycle,
+    // so its (θ,η) sensitivity is not yet validated against the corrected f64 SS prediction.
+    // The f64 predictor *is* correct for this case (the pulse-train equilibration trough plus
+    // the periodic forward `R_in` in `ode::predictions`), so FD differences the right
+    // prediction — this mirrors the IOV gate (`ode_iov_subject_supported`) declining the same
+    // combination, and the analytic dual SS-equilibration through the kernel is a follow-up.
+    if has_ss && !ode.input_rate.is_empty() {
+        return false;
+    }
     // Built-in absorption input-rate forcing (transit/igd/weibull/first_order, #486):
     // the TV-cov event-driven walk (`integrate_tvcov_g`) now carries `R_in` via the
     // shared `add_prepared_input_rate_forcing` helper, exactly as the static walk
@@ -7463,6 +7474,53 @@ mod tests {
   ode_reltol = 1e-10
   ode_abstol = 1e-12
 "#;
+
+    /// Steady-state × a built-in absorption **input-rate forcing** is declined by both non-IOV
+    /// analytic gates — the static `ode_subject_supported` (all SS) and the event-driven
+    /// `ode_tvcov_supported` (SS × input-rate specifically) — so such a subject routes to the
+    /// finite-difference sensitivity fallback rather than the dual SS-equilibration, which is
+    /// still bolus-only for an input-rate compartment. The f64 prediction FD differences is
+    /// exact (the closed-form fixed-point trough + periodic `R_in`), so the fit is correct; a
+    /// full-speed analytic dual SS-equilibration through the kernel is a follow-up (#719).
+    #[test]
+    fn ode_gates_decline_ss_into_input_rate_forcing() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVKA(0.5, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(M).expect("parse first_order forcing");
+        assert!(
+            !model.ode_spec.as_ref().unwrap().input_rate.is_empty(),
+            "model must carry an input-rate forcing"
+        );
+        let mut subject = bolus_subject(&[1.0, 4.0, 8.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0)]; // SS=1, II=8
+        assert!(subject.has_periodic_ss_dose());
+        assert!(
+            !ode_tvcov_supported(&model, &subject),
+            "SS × input-rate must decline the event-driven analytic walk (→ FD fallback, #719)"
+        );
+        assert!(
+            !ode_subject_supported(&model, &subject),
+            "SS also declines the static analytic walk"
+        );
+    }
 
     /// **Steady-state (SS=1) bolus dose.** The dual SS-equilibration loads the
     /// infinite-past pulse-train trough (carrying `∂SS/∂(θ,η)`) at the SS dose, then the

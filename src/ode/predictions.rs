@@ -151,6 +151,17 @@ pub(crate) const SS_EQUILIBRATION_CYCLES: usize = 50;
 /// trips it and runs the full [`SS_EQUILIBRATION_CYCLES`] — identical to the old behaviour.
 pub(crate) const SS_EQUILIBRATION_TOL: f64 = 1e-12;
 
+/// Relative floor for truncating the steady-state **input-rate periodic sum** (#719). An
+/// `SS=1` dose into a built-in absorption compartment stands for an infinite past pulse
+/// train, so its appearance rate at time `t` is `Σ_{j≥0} R_in(tad + j·II)` — the tail of
+/// every prior pulse still arriving (see [`add_prepared_input_rate_forcing`]). The absorption
+/// density is eventually monotone-decreasing, so once a term falls below this fraction of the
+/// running sum the remaining tail is spent and the sum stops (hard-capped at
+/// [`SS_EQUILIBRATION_CYCLES`] so a pathologically slow absorption — mode ≫ II — still
+/// terminates, matching the trough's own cycle budget). Conservative (`1e-10`): the dropped
+/// tail is far below the provider-vs-production parity tolerance.
+pub(crate) const SS_TAIL_REL_FLOOR: f64 = 1e-10;
+
 /// Whether the SS-equilibration trough has converged between two successive cycles. Shared
 /// by the f64 predictor, the event-driven f64 loop, and the dual gradient path so every path
 /// truncates on the *same* criterion — the dual feeds the value parts (`PkNum::val`) of its
@@ -262,6 +273,109 @@ pub(crate) fn with_full_ss_equilibration<R>(f: impl FnOnce() -> R) -> R {
 #[inline(always)]
 pub(crate) fn record_ss_equilibration_cycles(_n: usize) {}
 
+/// Closed-form periodic steady-state trough for an `SS=1` dose into a built-in absorption
+/// input-rate compartment on a **linear** disposition (#719).
+///
+/// The system is `du/dt = A·u + f(t)`, where `A` is the (constant) disposition and `f` is the
+/// periodic absorption `R_in` (period `II`, the superposed pulse train — see
+/// [`add_prepared_input_rate_forcing`]'s SS branch). A linear periodic system has a closed-form
+/// boundary value:
+///
+/// ```text
+///   u_ss = (I − M)⁻¹ · b,   M = e^{A·II},   b = ∫₀^II e^{A(II−s)} f(s) ds.
+/// ```
+///
+/// `M` is built column-by-column from the *unforced* propagator (`ode.rhs` alone integrated one
+/// cycle), differenced against the unforced zero-state evolution so a constant source term
+/// (`rhs(0) ≠ 0`, an affine disposition) cancels; `b` is one forced cycle from a zero state under
+/// the periodic `R_in`. This costs `n_states + 3` ODE solves versus the up-to-50-cycle iteration.
+///
+/// Returns `None` — so the caller falls back to the iterative equilibration — when the disposition
+/// is **nonlinear**: the returned `u_ss` is checked against one true forced cycle
+/// (`one_cycle(u_ss) == u_ss`), which only a linear (or affine) one-cycle map satisfies. Also
+/// declines on a singular `I − M` or any non-finite intermediate.
+fn equilibrate_ss_input_rate_fixed_point(
+    ode: &crate::ode::OdeSpec,
+    pk_params_flat: &[f64],
+    dose: &DoseEvent,
+    f_bio: f64,
+    opts: &OdeSolverOptions,
+) -> Option<Vec<f64>> {
+    use nalgebra::{DMatrix, DVector};
+    let n = ode.n_states;
+    let ii = dose.ii;
+    if !(ii > 0.0) || n == 0 {
+        return None;
+    }
+
+    // Forced one-cycle RHS: the disposition plus the periodic absorption `R_in` of a single
+    // local SS pulse at t = 0 (its SS branch superposes the prior-pulse tails). Reused for `b`
+    // and for the fixed-point verification.
+    let prepared = prepare_input_rates(ode, pk_params_flat);
+    let local_ss = [DoseEvent::new(0.0, dose.amt, dose.cmt, 0.0, true, ii)];
+    let local_f_bio = [f_bio];
+    let no_lag: [f64; 0] = [];
+    let no_zero: [(usize, f64); 0] = [];
+    let forced_rhs = wrap_rhs_with_forcings(
+        ode,
+        &local_ss,
+        &no_lag,
+        &local_f_bio,
+        f64::NEG_INFINITY,
+        &prepared,
+        InfusionInput::Spanning(Vec::new()),
+        &no_zero,
+    );
+
+    let solve_to_ii =
+        |rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64]| -> Option<Vec<f64>> {
+            let sol = solve_ode(rhs, u0, (0.0, ii), pk_params_flat, &[ii], opts);
+            sol.last().map(|p| p.u.clone())
+        };
+
+    let zero = vec![0.0; n];
+    // Unforced zero-state evolution (constant-source drift, zero for a homogeneous RHS).
+    let z0 = solve_to_ii(ode.rhs.as_ref(), &zero)?;
+    // b: forced response over one cycle from a zero state (includes any constant drift + R_in).
+    let b = solve_to_ii(&forced_rhs, &zero)?;
+    // M = e^{A·II}: column i is the *homogeneous* one-cycle response of eᵢ, with the constant
+    // drift z0 removed so an affine disposition still yields the true linear propagator.
+    let mut m = DMatrix::<f64>::zeros(n, n);
+    for i in 0..n {
+        let mut ei = zero.clone();
+        ei[i] = 1.0;
+        let evolved = solve_to_ii(ode.rhs.as_ref(), &ei)?;
+        for r in 0..n {
+            m[(r, i)] = evolved[r] - z0[r];
+        }
+    }
+
+    let i_minus_m = DMatrix::<f64>::identity(n, n) - &m;
+    let u_ss = i_minus_m.lu().solve(&DVector::from_row_slice(&b))?;
+    let u_ss: Vec<f64> = u_ss.iter().copied().collect();
+    if u_ss.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+
+    // Verify (and thereby confirm linearity): one true forced cycle from u_ss must return u_ss.
+    // The tolerance is scaled to the ODE solver's *own* accuracy — a linear (or affine) one-cycle
+    // map reproduces u_ss to solver precision, whereas a genuinely nonlinear map diverges by
+    // O(scale). Keying the check on solver tolerance (not a fixed 1e-8) is what keeps the fast
+    // path from being falsely abandoned on a model integrated at a loose `ode_reltol`.
+    let u_check = solve_to_ii(&forced_rhs, &u_ss)?;
+    let scale = u_ss.iter().fold(1e-12_f64, |a, &x| a.max(x.abs()));
+    let vtol = (32.0 * opts.reltol + 1e-9) * scale + 32.0 * opts.abstol;
+    let linear = u_check
+        .iter()
+        .zip(&u_ss)
+        .all(|(&c, &u)| (c - u).abs() <= vtol);
+    if linear {
+        Some(u_ss)
+    } else {
+        None
+    }
+}
+
 /// Pre-equilibrate the ODE state to its steady-state value for an SS=1
 /// dose with interval `dose.ii`. NONMEM SS=1 semantics: at the time of
 /// the SS dose, the compartments are loaded with the steady-state
@@ -311,6 +425,74 @@ fn equilibrate_ss_state(
     let (inf_rate, t_inf) = dose.bioavailable_infusion(f_bio);
     if is_inf && t_inf > dose.ii {
         // Overlapping infusions; no closed-form / simple equilibration.
+        return u;
+    }
+
+    // Steady-state into a built-in absorption input-rate compartment (#719): the dose does
+    // not enter as an instantaneous bolus — it drives the compartment through the absorption
+    // kernel `R_in(tad)` (transit/igd/weibull/first_order). Equilibrate by integrating an
+    // explicit periodic pulse train (a non-SS pulse per cycle at local times 0, II, 2II, …)
+    // through the *same* input-rate forcing the forward walk uses. Because the whole train
+    // stays present and `R_in` is re-evaluated by absolute age every RHS call, each pulse's
+    // absorption keeps contributing across cycle boundaries — an absorption tail longer than
+    // II is not truncated (unlike the bolus loop, which would lose it). The state at the final
+    // pre-pulse trough is the SS carryover (disposition + any depot amount); the current
+    // pulse and the prior pulses' still-arriving tails are then superposed by the forward
+    // `add_prepared_input_rate_forcing` periodic sum, which is disjoint from this trough. SS
+    // *infusion* into an absorption compartment is out of scope here (gap 2, #719) — this
+    // branch is bolus-record SS only.
+    if !is_inf && input_rate_consumes_cmt(ode, dose.cmt) {
+        // Fast path: a *linear* disposition has a closed-form periodic steady state
+        // `u_ss = (I − M)⁻¹ b` (`equilibrate_ss_input_rate_fixed_point`), costing a handful of
+        // solves rather than the up-to-`SS_EQUILIBRATION_CYCLES` pulse-train iteration below.
+        // It self-verifies (a nonlinear RHS fails the fixed-point check), so a nonlinear
+        // disposition transparently falls through to the exact-but-slower iteration.
+        if let Some(u_ss) =
+            equilibrate_ss_input_rate_fixed_point(ode, pk_params_flat, dose, f_bio, opts)
+        {
+            record_ss_equilibration_cycles(1);
+            return u_ss;
+        }
+        let prepared = prepare_input_rates(ode, pk_params_flat);
+        let n_pulses = SS_EQUILIBRATION_CYCLES;
+        let local_doses: Vec<DoseEvent> = (0..n_pulses)
+            .map(|m| DoseEvent::new(m as f64 * dose.ii, dose.amt, dose.cmt, 0.0, false, 0.0))
+            .collect();
+        let local_f_bio = vec![f_bio; n_pulses];
+        let no_lag: [f64; 0] = [];
+        let no_zero_order: [(usize, f64); 0] = [];
+        let wrapped = wrap_rhs_with_forcings(
+            ode,
+            &local_doses,
+            &no_lag,
+            &local_f_bio,
+            f64::NEG_INFINITY,
+            &prepared,
+            InfusionInput::Spanning(Vec::new()),
+            &no_zero_order,
+        );
+        let mut tracker = SsStopTracker::default();
+        let mut cycles_run = 0usize;
+        for m in 0..n_pulses {
+            let seg_start = m as f64 * dose.ii;
+            let seg_end = seg_start + dose.ii;
+            let sol = solve_ode(
+                &wrapped,
+                &u,
+                (seg_start, seg_end),
+                pk_params_flat,
+                &[seg_end],
+                opts,
+            );
+            if let Some(last) = sol.last() {
+                u.copy_from_slice(&last.u);
+            }
+            cycles_run = m + 1;
+            if tracker.should_stop(m, &u) {
+                break;
+            }
+        }
+        record_ss_equilibration_cycles(cycles_run);
         return u;
     }
 
@@ -810,12 +992,44 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
                 continue;
             }
             let tad = T::from_f64(t) - t_eff;
-            if tad.val() <= 0.0 {
-                continue;
-            }
             let dose_mass =
                 dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
-            acc = acc + prep.rate(tad, dose_mass);
+            if d.ss && d.ii > 0.0 {
+                // Steady-state dose into a built-in absorption compartment (#719): the single
+                // SS data record stands for an infinite past pulse train dosed at `d.time −
+                // j·II`. Because `R_in` is the (stateless, dose-scaled) per-dose kernel and the
+                // absorption chain is linear, the appearance rate at `t` is the superposition of
+                // every pulse's tail still arriving — `Σ_{j≥0} R_in(tad + j·II)`. The *already-
+                // absorbed* mass of those prior pulses (now distributing/clearing) is supplied
+                // separately as the initial state by `equilibrate_ss_state`'s trough; this loop
+                // adds only the still-in-flight absorption, so the two are disjoint and there is
+                // no double count. Terms decay past the density's mode, so the sum truncates once
+                // a tail term is negligible relative to the running total, hard-capped at
+                // [`SS_EQUILIBRATION_CYCLES`] (the same budget the trough uses).
+                let ii = T::from_f64(d.ii);
+                let mut j = 0usize;
+                while j < SS_EQUILIBRATION_CYCLES {
+                    let tad_j = tad + ii * T::from_f64(j as f64);
+                    if tad_j.val() > 0.0 {
+                        let term = prep.rate(tad_j, dose_mass);
+                        acc = acc + term;
+                        // Past the mode the density is monotone-decreasing, so a term below the
+                        // relative floor means the remaining periodic tail is spent.
+                        if j >= 1
+                            && acc.val().abs() > 0.0
+                            && term.val().abs() <= SS_TAIL_REL_FLOOR * acc.val().abs()
+                        {
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+            } else {
+                if tad.val() <= 0.0 {
+                    continue;
+                }
+                acc = acc + prep.rate(tad, dose_mass);
+            }
         }
         // Pathway fraction (#388): a `FR*fn(...)` term scales its whole `R_in` by
         // the declared fraction `FR`; `frac = 1` for an unfractioned single-pathway
@@ -7919,6 +8133,229 @@ mod tests {
         p.values[7] = mtt;
         p.values[crate::types::PK_IDX_F] = f;
         p
+    }
+
+    /// One-compartment disposition fed by a built-in `first_order(ka)` absorption
+    /// forcing into central: `d/dt(central) = first_order(ka) − (CL/V)·central`.
+    /// `ka` @ free slot 4; CL/V at the canonical slots. Used to check steady-state
+    /// dosing into a built-in absorption compartment against an explicit run-in (#719).
+    fn first_order_one_cpt_spec() -> OdeSpec {
+        OdeSpec {
+            rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ke * y[0];
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: vec![InputRateForcing {
+                cmt: 0,
+                kind: InputRateKind::FirstOrder,
+                arg_slots: vec![4],
+                frac_slot: None,
+            }],
+            init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+        }
+    }
+
+    /// Steady-state (`SS=1`) dosing into a built-in `first_order()` absorption
+    /// compartment must reproduce a long explicit run-in of the same `q-II` schedule
+    /// (#719, gap 1). `ka` is deliberately slow relative to `II` so each dose's
+    /// absorption tail spills across more than one interval — that is exactly the
+    /// carryover the periodic-sum forward `R_in` and the pulse-train equilibration
+    /// trough must capture, so a bolus-only SS treatment would fail this.
+    #[test]
+    fn ss_into_first_order_absorption_matches_explicit_run_in() {
+        let mut ode = first_order_one_cpt_spec();
+        ode.solver_opts.reltol = 1e-11;
+        ode.solver_opts.abstol = 1e-11;
+
+        let ka = 0.2; // t½,abs ≈ 3.5 h — absorption tail spans ~2 intervals
+        let ii = 8.0;
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 1.0;
+        pk.values[crate::types::PK_IDX_V] = 20.0; // ke = 0.05/h ⇒ ~3× accumulation
+        pk.values[4] = ka;
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+
+        let obs_offsets = [0.5, 1.0, 2.0, 4.0, 6.0, 7.9];
+
+        // SS subject: a single SS=1 record standing for the infinite pulse train.
+        let ss_subj = make_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, ii)],
+            obs_offsets.to_vec(),
+        );
+        let ss_preds = ode_predictions(&ode, &pk.values, &[], &[], &ss_subj);
+
+        // Explicit run-in: 40 q-II doses; observe in the final interval at the same offsets.
+        let n = 40usize;
+        let runin_doses: Vec<DoseEvent> = (0..n)
+            .map(|k| DoseEvent::new(k as f64 * ii, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        let last = (n - 1) as f64 * ii;
+        let runin_obs: Vec<f64> = obs_offsets.iter().map(|o| last + o).collect();
+        let runin_subj = make_subject(runin_doses, runin_obs);
+        let runin_preds = ode_predictions(&ode, &pk.values, &[], &[], &runin_subj);
+
+        assert_eq!(ss_preds.len(), runin_preds.len());
+        for (i, (&ss, &ri)) in ss_preds.iter().zip(&runin_preds).enumerate() {
+            assert!(ss.is_finite() && ri > 0.0, "non-finite pred at offset {i}");
+            let rel = (ss - ri).abs() / ri;
+            assert!(
+                rel < 1e-6,
+                "offset {}: SS {ss:.8} vs explicit run-in {ri:.8} (rel {rel:.2e})",
+                obs_offsets[i]
+            );
+        }
+    }
+
+    /// Transit absorption into an explicit **depot** state, then first-order `KA` into
+    /// central: `d/dt(depot) = transit(n,mtt) − KA·depot; d/dt(central) = KA·depot −
+    /// (CL/V)·central`. `n,mtt` @ slots 6,7; `KA` @ slot 4. Observable is central (state 1).
+    fn transit_one_cpt_oral_spec() -> OdeSpec {
+        OdeSpec {
+            rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ka = p[4];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ka * y[0];
+                dy[1] = ka * y[0] - ke * y[1];
+            }),
+            n_states: 2,
+            state_names: vec!["depot".into(), "central".into()],
+            readout: OdeReadout::ObsCmt(1),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: vec![InputRateForcing {
+                cmt: 0,
+                kind: InputRateKind::Transit,
+                arg_slots: vec![6, 7],
+                frac_slot: None,
+            }],
+            init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+        }
+    }
+
+    /// Steady-state into a `transit()` depot (the incomplete-gamma density kind, feeding a
+    /// real depot state that itself carries un-absorbed mass across intervals) must also
+    /// equal an explicit run-in (#719). `mtt` is a large fraction of `II` so the Erlang
+    /// absorption is still delivering into the depot when the next dose lands — carryover on
+    /// both the depot *and* the periodic R_in.
+    #[test]
+    fn ss_into_transit_depot_absorption_matches_explicit_run_in() {
+        let mut ode = transit_one_cpt_oral_spec();
+        ode.solver_opts.reltol = 1e-11;
+        ode.solver_opts.abstol = 1e-11;
+
+        let ii = 6.0;
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 3.0;
+        pk.values[crate::types::PK_IDX_V] = 30.0; // ke = 0.1/h
+        pk.values[4] = 1.0; // KA
+        pk.values[6] = 3.0; // n transit compartments
+        pk.values[7] = 4.0; // MTT = 4 h vs II = 6 h ⇒ tail spills into the next interval
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+
+        let obs_offsets = [0.5, 1.5, 3.0, 5.0, 5.9];
+
+        let ss_subj = make_subject(
+            vec![DoseEvent::new(0.0, 50.0, 1, 0.0, true, ii)],
+            obs_offsets.to_vec(),
+        );
+        let ss_preds = ode_predictions(&ode, &pk.values, &[], &[], &ss_subj);
+
+        let n = 60usize;
+        let runin_doses: Vec<DoseEvent> = (0..n)
+            .map(|k| DoseEvent::new(k as f64 * ii, 50.0, 1, 0.0, false, 0.0))
+            .collect();
+        let last = (n - 1) as f64 * ii;
+        let runin_obs: Vec<f64> = obs_offsets.iter().map(|o| last + o).collect();
+        let runin_preds = ode_predictions(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &make_subject(runin_doses, runin_obs),
+        );
+
+        assert_eq!(ss_preds.len(), runin_preds.len());
+        for (i, (&ss, &ri)) in ss_preds.iter().zip(&runin_preds).enumerate() {
+            assert!(ss.is_finite() && ri > 0.0, "non-finite pred at offset {i}");
+            let rel = (ss - ri).abs() / ri;
+            assert!(
+                rel < 1e-6,
+                "offset {}: SS {ss:.8} vs explicit run-in {ri:.8} (rel {rel:.2e})",
+                obs_offsets[i]
+            );
+        }
+    }
+
+    /// `first_order(ka)` absorption into a compartment with **Michaelis–Menten** (nonlinear)
+    /// elimination: the one-cycle map is not affine, so the closed-form SS fixed point must
+    /// decline (`equilibrate_ss_input_rate_fixed_point` → `None`) and the caller falls back to
+    /// the iterative pulse-train equilibration, which handles the nonlinearity and still returns
+    /// a finite steady-state profile (#719).
+    #[test]
+    fn ss_input_rate_nonlinear_disposition_falls_back_to_iteration() {
+        let ode = OdeSpec {
+            // Vmax reuses the CL slot, Km the V slot; `first_order` ka at slot 4.
+            rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let vmax = p[crate::types::PK_IDX_CL];
+                let km = p[crate::types::PK_IDX_V];
+                dy[0] = -vmax * y[0] / (km + y[0]);
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: vec![InputRateForcing {
+                cmt: 0,
+                kind: InputRateKind::FirstOrder,
+                arg_slots: vec![4],
+                frac_slot: None,
+            }],
+            init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+        };
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 5.0; // Vmax
+        pk.values[crate::types::PK_IDX_V] = 8.0; // Km
+        pk.values[4] = 0.5; // ka
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+        let ss = DoseEvent::new(0.0, 50.0, 1, 0.0, true, 8.0);
+
+        // The closed-form fixed point declines on the nonlinear one-cycle map.
+        assert!(
+            equilibrate_ss_input_rate_fixed_point(&ode, &pk.values, &ss, 1.0, &ode.solver_opts)
+                .is_none(),
+            "nonlinear disposition must decline the closed-form SS fixed point"
+        );
+
+        // The full equilibration still produces finite predictions via the iteration fallback.
+        let subj = make_subject(vec![ss], vec![1.0, 4.0, 7.9]);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+        assert_eq!(preds.len(), 3);
+        assert!(
+            preds.iter().all(|p| p.is_finite() && *p >= 0.0),
+            "nonlinear SS predictions (iteration fallback) must be finite: {preds:?}"
+        );
     }
 
     #[test]
