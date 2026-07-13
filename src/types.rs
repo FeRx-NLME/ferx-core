@@ -3135,6 +3135,17 @@ pub struct CompiledModel {
     pub absorption_ode_equivalent: Option<AbsorptionOdeEquivalent>,
 }
 
+/// The three call-time-configurable ODE solver tolerances ([`FitOptions::ode_reltol`],
+/// `ode_abstol`, `ode_max_steps`) to stamp onto the absorption ODE twin when it is built. Only
+/// these three fields are carried; the twin keeps the parse defaults for the other
+/// [`crate::ode::OdeSolverOptions`] fields (step-size seeds). See #814.
+#[derive(Clone, Copy)]
+struct TwinSolverOpts {
+    reltol: f64,
+    abstol: f64,
+    max_steps: usize,
+}
+
 /// A lazily-built ODE representation of an analytical absorption model that carries one (a
 /// plain `one_cpt_transit` / `two_cpt_transit`, or `one_cpt_ig` / `two_cpt_ig`). Holds the
 /// equivalent's reconstructed `.ferx` source and compiles the boxed sub-model on first use, so
@@ -3142,6 +3153,14 @@ pub struct CompiledModel {
 /// no extra parse or allocation. See [`CompiledModel::effective_for`] (#486, #790).
 pub struct AbsorptionOdeEquivalent {
     source: String,
+    /// Call-time ODE solver tolerances (from the `[fit_options]`-merged runtime [`FitOptions`])
+    /// to apply when the twin is built. `None` until a caller syncs them via
+    /// [`CompiledModel::sync_ode_solver_opts`]; the twin then integrates at the requested
+    /// accuracy instead of the parse-default baked into its reconstructed source. Without this,
+    /// a closed-form transit/IG primary is analytic — its `sync_ode_solver_opts` was a no-op —
+    /// so every rerouted (TV-cov / `TIME` / IOV) subject silently integrated at the twin
+    /// source's default tolerance (#814).
+    solver_opts_override: Option<TwinSolverOpts>,
     built: std::sync::OnceLock<Box<CompiledModel>>,
 }
 
@@ -3149,6 +3168,7 @@ impl AbsorptionOdeEquivalent {
     pub(crate) fn new(source: String) -> Self {
         Self {
             source,
+            solver_opts_override: None,
             built: std::sync::OnceLock::new(),
         }
     }
@@ -3159,11 +3179,34 @@ impl AbsorptionOdeEquivalent {
     /// silently degrading the fit.
     pub(crate) fn get_or_build(&self) -> &CompiledModel {
         self.built.get_or_init(|| {
-            Box::new(
-                crate::parser::model_parser::parse_model_string(&self.source)
-                    .expect("internal: absorption ODE equivalent failed to build"),
-            )
+            let mut built = crate::parser::model_parser::parse_model_string(&self.source)
+                .expect("internal: absorption ODE equivalent failed to build");
+            // The twin's own `[fit_options]` (re-emitted into its source) were applied during
+            // that parse; a call-time override recorded before the build wins over them (#814).
+            if let (Some(ov), Some(ode)) = (self.solver_opts_override, built.ode_spec.as_mut()) {
+                ode.solver_opts.reltol = ov.reltol;
+                ode.solver_opts.abstol = ov.abstol;
+                ode.solver_opts.max_steps = ov.max_steps;
+            }
+            Box::new(built)
         })
+    }
+
+    /// Record the call-time ODE solver tolerances so the lazily-built twin integrates at the
+    /// requested accuracy. If the twin is **already** built (a second fit reusing this model
+    /// with new tolerances), stamp them onto it immediately as well. Called by
+    /// [`CompiledModel::sync_ode_solver_opts`]; see #814.
+    pub(crate) fn sync_solver_opts(&mut self, opts: &FitOptions) {
+        self.solver_opts_override = Some(TwinSolverOpts {
+            reltol: opts.ode_reltol,
+            abstol: opts.ode_abstol,
+            max_steps: opts.ode_max_steps,
+        });
+        if let Some(built) = self.built.get_mut() {
+            // The twin is itself an ODE model, so this stamps its `ode_spec.solver_opts`; it
+            // carries no nested twin, so the twin-branch in `sync_ode_solver_opts` is a no-op.
+            built.sync_ode_solver_opts(opts);
+        }
     }
 }
 
@@ -3260,12 +3303,20 @@ impl CompiledModel {
     }
 
     /// Copy the configured ODE solver tolerances from `opts` onto this model's
-    /// [`OdeSpec`] (no-op for analytical models). Call this once after the
-    /// model file's `[fit_options]` and any call-time `settings` overrides have
-    /// been merged into `opts`, so the integrator uses the requested accuracy.
+    /// [`OdeSpec`] (no-op for the `OdeSpec` of an analytical model). Call this once
+    /// after the model file's `[fit_options]` and any call-time `settings` overrides
+    /// have been merged into `opts`, so the integrator uses the requested accuracy.
     /// The parser calls it at parse time, so `.ferx` `[fit_options]` and any
     /// entry that integrates the parsed spec as-is (`predict`, `fit_from_files`)
     /// already use the configured accuracy.
+    ///
+    /// Also carries the same tolerances into the absorption ODE twin
+    /// ([`AbsorptionOdeEquivalent`]) when the model has one, so a closed-form
+    /// transit/IG model — analytic itself, but whose TV-cov / `TIME` / IOV subjects
+    /// integrate on the twin — honors a call-time `ode_reltol`/`ode_abstol`/
+    /// `ode_max_steps` on the rerouted path too (#814). This runs even though the
+    /// primary's own `ode_spec` is `None`, so on such a model the call is no longer a
+    /// full no-op.
     ///
     /// Note: [`fit`](crate::fit) takes `&CompiledModel` and does **not** call
     /// this. The integrator reads [`OdeSpec::solver_opts`], never
@@ -3278,6 +3329,14 @@ impl CompiledModel {
             ode.solver_opts.reltol = opts.ode_reltol;
             ode.solver_opts.abstol = opts.ode_abstol;
             ode.solver_opts.max_steps = opts.ode_max_steps;
+        }
+        // Also carry the call-time tolerances into the absorption ODE twin (#814). A
+        // closed-form transit/IG primary is analytic — the block above is a no-op — but its
+        // TV-cov / `TIME` / IOV subjects integrate on the twin (`effective_for`), which must
+        // honor the requested accuracy rather than the parse-default baked into its source.
+        // Runs whether or not the primary carries an `ode_spec`.
+        if let Some(eq) = self.absorption_ode_equivalent.as_mut() {
+            eq.sync_solver_opts(opts);
         }
     }
 
@@ -8320,5 +8379,125 @@ mod tests {
             !model.has_residual_error_for_cmt(2, &[0.1, 0.2]),
             "a Combined endpoint with too few sigma indices is not drawable"
         );
+    }
+
+    /// The transit/IG source used by the #814 twin-tolerance tests. A closed-form
+    /// `one_cpt_transit` + IOV model: analytic primary (`ode_spec == None`), carries an ODE
+    /// twin, and every subject reroutes to it (`n_kappa > 0`). Its `[fit_options]` sets a
+    /// distinctive `ode_reltol = 1e-8` (≠ `OdeSolverOptions::default` 1e-4) so a source-default
+    /// read is distinguishable from a call-time override.
+    const TRANSIT_IOV_TOL_SRC: &str = "\
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVMTT(1.0, 0.01, 50.0)
+  theta TVN(3.0, 0.5, 20.0)
+  omega ETA_V ~ 0.09
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(KAPPA_CL)
+  V   = TVV  * exp(ETA_V)
+  MTT = TVMTT
+  NTR = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method        = focei
+  iov_column    = OCC
+  ode_reltol    = 1e-8
+  ode_abstol    = 1e-8
+  ode_max_steps = 5000
+";
+
+    #[test]
+    fn call_time_ode_tolerances_reach_the_absorption_twin() {
+        // #814: a closed-form transit/IG model is analytic (`ode_spec == None`), but its IOV /
+        // TV-cov subjects integrate on the ODE twin. A call-time `ode_reltol`/`ode_abstol`/
+        // `ode_max_steps` — merged into the runtime FitOptions and applied via
+        // `sync_ode_solver_opts`, exactly as ferx-r's `ferx_fit` does — must reach that twin
+        // rather than be silently dropped at the twin source's parse default.
+        use crate::parser::model_parser::parse_model_string;
+
+        // Lazy branch: sync BEFORE the twin is built, so the override is applied at build time.
+        let mut lazy = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
+        assert!(
+            lazy.absorption_ode_equivalent.is_some(),
+            "one_cpt_transit carries an ODE twin"
+        );
+        assert!(lazy.n_kappa > 0, "model has IOV");
+        assert!(
+            lazy.ode_spec.is_none(),
+            "the closed-form transit primary is analytic"
+        );
+
+        let mut opts = FitOptions::default();
+        opts.ode_reltol = 1e-10;
+        opts.ode_abstol = 1e-11;
+        opts.ode_max_steps = 77_777;
+        lazy.sync_ode_solver_opts(&opts);
+
+        // IOV ⇒ every subject reroutes to the twin; its OdeSpec must carry the *call-time*
+        // tolerances, not the source's 1e-8 / 5000.
+        let twin = lazy.effective_for(&bare_subject("1"));
+        let so = twin
+            .ode_spec
+            .as_ref()
+            .expect("IOV transit subject is served by the ODE twin")
+            .solver_opts;
+        assert_eq!(so.reltol, 1e-10, "call-time reltol reaches the twin");
+        assert_eq!(so.abstol, 1e-11, "call-time abstol reaches the twin");
+        assert_eq!(so.max_steps, 77_777, "call-time max_steps reaches the twin");
+
+        // Default-path regression: with no call-time sync, the twin keeps its source
+        // `[fit_options]` (1e-8 / 5000), NOT `OdeSolverOptions::default()` and NOT a leaked
+        // override from another model.
+        let untouched = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
+        let dso = untouched
+            .effective_for(&bare_subject("2"))
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .solver_opts;
+        assert_eq!(dso.reltol, 1e-8, "un-synced twin keeps its source reltol");
+        assert_eq!(dso.abstol, 1e-8, "un-synced twin keeps its source abstol");
+        assert_eq!(
+            dso.max_steps, 5000,
+            "un-synced twin keeps its source max_steps"
+        );
+
+        // Already-built branch: build the twin first, THEN sync — the override must still land
+        // on the cached model (a second fit reusing the model with new tolerances).
+        let mut prebuilt = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
+        let built_reltol = prebuilt
+            .effective_for(&bare_subject("3"))
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .solver_opts
+            .reltol;
+        assert_eq!(
+            built_reltol, 1e-8,
+            "twin builds at source tol before any sync"
+        );
+        let mut tight = FitOptions::default();
+        tight.ode_reltol = 1e-12;
+        tight.ode_abstol = 1e-13;
+        tight.ode_max_steps = 4242;
+        prebuilt.sync_ode_solver_opts(&tight);
+        let rso = prebuilt
+            .effective_for(&bare_subject("4"))
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .solver_opts;
+        assert_eq!(
+            rso.reltol, 1e-12,
+            "sync after build updates the already-built twin"
+        );
+        assert_eq!(rso.abstol, 1e-13);
+        assert_eq!(rso.max_steps, 4242);
     }
 }

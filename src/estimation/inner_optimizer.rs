@@ -205,7 +205,14 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if !crate::sens::provider::iov_sens_supported(model) {
         return "model outside IOV analytic scope";
     }
-    if model.ode_spec.is_some() {
+    // #814: attribute against the *effective* model for this subject. A closed-form
+    // transit/IG + IOV (or TV-cov / `TIME`) subject evaluates its objective on the ODE twin
+    // (`effective_for`, #719), so its FD-fallback reason is a twin-ODE reason even though the
+    // analytic primary's own `ode_spec` is `None` — the same reroute `is_ode_iov` and
+    // `inner_stall_enabled` already track. `effective_for` returns `self` for a genuine ODE
+    // model and for every non-rerouted subject, so this is unchanged for them.
+    let eff = model.effective_for(subject);
+    if eff.ode_spec.is_some() {
         // Single scan for the periodic steady-state predicate, mirroring
         // `ode_iov_subject_supported`'s hoisted `has_ss` so the attribution order and
         // the gate can't drift.
@@ -216,7 +223,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         // per-cycle active/quiet split), EXCEPT when a `D{cmt}`/`R{cmt}` slot is absent —
         // mirror `ode_iov_subject_supported`'s screen so this attribution can't drift.
         if !subject.all_doses_fixed() {
-            let attr_map = model.active_dose_attr_map();
+            let attr_map = eff.active_dose_attr_map();
             let all_slots_present = subject.doses.iter().all(|d| {
                 matches!(d.rate_mode, crate::types::RateMode::Fixed)
                     || crate::sens::ode_provider::modeled_slot_for(attr_map, d).is_some()
@@ -231,7 +238,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         // steady-state rate-defined infusion under `F ≠ 1`, and steady-state combined
         // with an estimated lagtime, are both analytic now (#486).
         if has_ss
-            && model
+            && eff
                 .ode_spec
                 .as_ref()
                 .and_then(|o| o.rhs_program.as_ref())
@@ -240,12 +247,12 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
             return "steady-state dose + time-dependent ODE RHS";
         }
         // #486: a steady-state dose combined with a built-in absorption input-rate forcing
-        // (`zero_order`/`first_order`) declines to FD — the dual SS equilibration does not
-        // spread a periodic zero-order window / first-order tail over the cycle. Mirror
-        // `ode_iov_subject_supported`'s bail, in the same order, so this attribution can't
-        // drift.
+        // (`zero_order`/`first_order`, or a transit/IG twin's `transit()`/`igd()` forcing)
+        // declines to FD — the dual SS equilibration does not spread a periodic zero-order
+        // window / first-order tail over the cycle. Mirror `ode_iov_subject_supported`'s bail,
+        // in the same order, so this attribution can't drift.
         if has_ss
-            && model
+            && eff
                 .ode_spec
                 .as_ref()
                 .is_some_and(|o| !o.input_rate.is_empty())
@@ -256,8 +263,8 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         if occ_groups.is_empty() {
             return "no observation occasions";
         }
-        let n_stacked = model.n_eta + occ_groups.len() * model.n_kappa;
-        let m_dim = model.n_theta + n_stacked;
+        let n_stacked = eff.n_eta + occ_groups.len() * eff.n_kappa;
+        let m_dim = eff.n_theta + n_stacked;
         if m_dim > crate::sens::ode_provider::MAX_ODE_IOV_AXES {
             return "ODE IOV stacked axis cap";
         }
@@ -510,8 +517,14 @@ fn argmin_inner_fallback(
 /// these models is the expensive one this module special-cases (per-vertex ODE +
 /// steady-state work), so both the Nelder-Mead skip and the start-rejection gate key off
 /// this single classifier (#603 review #8).
+///
+/// A closed-form transit/IG model with IOV counts too (#814): `n_kappa > 0` routes every one
+/// of its subjects to the ODE twin (`effective_for`, #719), so its inner EBE carries the same
+/// per-vertex ODE cost as a hand-written `[odes]` IOV model even though the primary's own
+/// `ode_spec` is `None`. The reroute is subject-static here (driven by `n_kappa`, not by data),
+/// so the model-only classifier is exact.
 fn is_ode_iov(model: &CompiledModel) -> bool {
-    model.ode_spec.is_some() && model.n_kappa > 0
+    model.n_kappa > 0 && (model.ode_spec.is_some() || model.absorption_ode_equivalent.is_some())
 }
 
 /// Nelder-Mead is a useful last-resort recovery for low-dimensional closed-form EBEs, but
@@ -536,6 +549,26 @@ fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> 
     let threshold =
         ODE_IOV_START_REJECT_NLL_MIN.max(ODE_IOV_START_REJECT_NLL_PER_OBS * n_obs.max(1) as f64);
     nll > threshold
+}
+
+/// Whether the inner BFGS objective-stall convergence stop should be enabled for this subject.
+///
+/// The stall stop (`#555`) exists to tolerate the adaptive-RK45 gradient-noise floor of an ODE
+/// objective, which can sit above `tol` and block the pure `gnorm < tol` criterion. It must key
+/// off the **effective** model, not the raw one: a closed-form transit/IG subject rerouted to its
+/// ODE twin (TV-cov / `TIME` / IOV — `effective_for`, #719/#814) evaluates its objective on the
+/// twin's RK45 integration and so carries that same noise floor, even though the primary model is
+/// analytic (`ode_spec == None`). Basing the flag on `model.ode_spec` left it `false` for every
+/// rerouted subject, so one that dropped to the FD inner gradient could run to `MAX_INNER` and
+/// return an under-converged EBE.
+///
+/// The reroute considered here is subject-static (TV-cov / `TIME` / IOV via `effective_for`), so
+/// a non-rerouted subject — including a constant-parameter, in-domain subject of a twin-carrying
+/// model, or a purely analytic model — keeps the exact `gnorm < tol` behaviour and stays
+/// bit-identical to prior releases. (`effective_for` returns `self` without building the twin for
+/// those, so this adds no cost on the common path.)
+fn inner_stall_enabled(model: &CompiledModel, subject: &Subject) -> bool {
+    model.effective_for(subject).ode_spec.is_some()
 }
 
 /// Find Empirical Bayes Estimates (EBEs) for a single subject via BFGS.
@@ -706,11 +739,12 @@ pub fn find_ebe(
     // instead of the FD gradient's ~2·n_eta+1 predictions, and exact → fewer
     // steps. Per-point FD fallback if the provider can't serve a given (θ, η).
     //
-    // Enable the objective-stall convergence stop only for ODE models, whose adaptive
-    // RK45 objective carries a gradient-noise floor that can sit above `tol` (#555).
-    // Analytical/event-driven objectives are exact, so they keep the pure `gnorm < tol`
-    // criterion and stay bit-identical to prior releases.
-    let enable_stall = model.ode_spec.is_some();
+    // Enable the objective-stall convergence stop only when the objective carries the adaptive
+    // RK45 gradient-noise floor that can sit above `tol` (#555) — i.e. when the *effective*
+    // model for this subject is ODE, which includes a closed-form transit/IG subject rerouted to
+    // its ODE twin (TV-cov / `TIME`; #719/#814). Analytical/event-driven objectives are exact, so
+    // they keep the pure `gnorm < tol` criterion and stay bit-identical to prior releases.
+    let enable_stall = inner_stall_enabled(model, subject);
     // Single gradient closure used by *both* the optimizer and the fallback's stationarity
     // check, so the two agree on convergence: the exact analytic η-gradient (Almquist 2015,
     // one provider eval per step) when in scope with a per-point FD fallback, else FD
@@ -944,9 +978,10 @@ fn find_ebe_iov(
         && omega_iov_ref.is_some()
         && !analytic_inner_common_bail(model)
         && !subject_has_survival_records(subject);
-    // ODE objectives carry the adaptive-solver gradient-noise floor; enable the
-    // objective-stall stop only for them (see `find_ebe`).
-    let enable_stall = model.ode_spec.is_some();
+    // ODE objectives carry the adaptive-solver gradient-noise floor; enable the objective-stall
+    // stop only for them — including a closed-form transit/IG + IOV subject, whose objective is
+    // evaluated on the ODE twin (`effective_for`, #719/#814). See `inner_stall_enabled`/`find_ebe`.
+    let enable_stall = inner_stall_enabled(model, subject);
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here rather than inside `agrad` (see `find_ebe`).
     let mult = model.ruv_obs_mult(subject, &params.theta);
@@ -4153,6 +4188,56 @@ mod iov_tests {
         );
     }
 
+    /// #814: `iov_fd_reason` must attribute against the *effective* (ODE-twin) model. A
+    /// closed-form `one_cpt_transit` + IOV subject with a steady-state dose declines to FD for a
+    /// twin-specific reason — the twin's built-in `transit()` absorption forcing under an SS dose
+    /// — the analytic-primary analogue of `iov_fd_reason_attributes_ss_input_rate`'s hand-written
+    /// `zero_order` twin. Before the effective-model switch, `iov_fd_reason` read the analytic
+    /// primary's `ode_spec` (`None`), skipped the whole ODE attribution block, and mislabeled this
+    /// the generic "subject outside IOV analytic scope".
+    #[test]
+    fn iov_fd_reason_attributes_transit_twin_ss_forcing() {
+        let model = crate::parser::model_parser::parse_model_string(TRANSIT_IOV_MODEL)
+            .expect("parse transit IOV");
+        assert!(
+            model.ode_spec.is_none(),
+            "the closed-form transit primary is analytic"
+        );
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        assert!(
+            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
+            "SS + transit-twin absorption forcing must route to FD under IOV"
+        );
+        assert_eq!(
+            iov_fd_reason(&model, &subject),
+            "steady-state dose + built-in absorption forcing",
+            "#814: attribution must read the effective (twin) model, not the analytic primary"
+        );
+    }
+
+    /// A closed-form `one_cpt_transit` + IOV model (#814): analytic primary
+    /// (`ode_spec == None`) that carries an ODE twin and reroutes every subject to it
+    /// (`n_kappa > 0`, #719). Used to assert the inner loop treats it as ODE+IOV.
+    const TRANSIT_IOV_MODEL: &str = "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVMTT(1.0,0.01,50.0)\n  theta TVN(3.0,0.5,20.0)\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  MTT = TVMTT\n  NTR = TVN\n[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n";
+
     fn make_iov_model() -> CompiledModel {
         let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
         let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
@@ -4661,6 +4746,20 @@ mod iov_tests {
 
         let closed_form_iov = make_iov_model();
         assert!(!skip_ode_iov_nm_fallback(&closed_form_iov));
+
+        // #814: a closed-form transit + IOV model reroutes every subject to its ODE twin, so it
+        // carries the same per-vertex ODE cost — it must skip the impractical NM inner fallback
+        // like a hand-written [odes] + IOV model, even though its own `ode_spec` is `None`.
+        let transit_iov = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
+        assert!(
+            transit_iov.ode_spec.is_none(),
+            "transit primary is analytic"
+        );
+        assert!(
+            transit_iov.absorption_ode_equivalent.is_some(),
+            "transit+IOV carries an ODE twin"
+        );
+        assert!(skip_ode_iov_nm_fallback(&transit_iov));
     }
 
     #[test]
@@ -4682,6 +4781,62 @@ mod iov_tests {
             4,
             1_000_000.0
         ));
+
+        // #814: the transit + IOV twin puts the model in the ODE+IOV cost class, so the
+        // degenerate-warm-start rejection guard applies to it too (inactive before the fix).
+        let transit_iov = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
+        assert!(!reject_ode_iov_inner_start(&transit_iov, 4, 999.0));
+        assert!(reject_ode_iov_inner_start(&transit_iov, 4, 1_001.0));
+        assert!(reject_ode_iov_inner_start(&transit_iov, 20, f64::NAN));
+    }
+
+    #[test]
+    fn inner_stall_enabled_tracks_the_effective_model() {
+        // #814: the inner objective-stall stop (#555) must key off the *effective* model. A
+        // closed-form transit/IG + IOV subject evaluates its objective on the ODE twin
+        // (`effective_for`), so it needs the ODE gradient-noise stall even though the primary
+        // model is analytic (`ode_spec == None`) — basing it on the raw model wrongly disabled it.
+        use crate::parser::model_parser::parse_model_string;
+        let subject = Subject {
+            id: "1".into(),
+            doses: Vec::new(),
+            obs_times: vec![1.0, 6.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0],
+            obs_cmts: vec![1; 2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 2],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+
+        // Plain closed-form IOV (no twin): objective is exact → no stall (bit-identical path).
+        assert!(!inner_stall_enabled(&make_iov_model(), &subject));
+
+        // Hand-written [odes] + IOV: RK45 objective → stall (unchanged pre-existing behaviour).
+        let ode_iov = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+        assert!(inner_stall_enabled(&ode_iov, &subject));
+
+        // Closed-form transit + IOV: analytic primary, but IOV reroutes to the ODE twin → stall.
+        let transit_iov = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
+        assert!(
+            transit_iov.ode_spec.is_none(),
+            "transit primary is analytic"
+        );
+        assert!(
+            inner_stall_enabled(&transit_iov, &subject),
+            "#814: the twin reroute must enable the inner stall for transit+IOV"
+        );
     }
 
     /// Closed-form IOV + `iiv_on_ruv` (#4b): the analytic stacked-η inner gradient
