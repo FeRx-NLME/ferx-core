@@ -489,6 +489,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             reset_times: Vec::new(),
             cens: vec![0; sim_spec.obs_times.len()],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             // One right-censored template row per cause CMT, at the administrative
@@ -2769,6 +2770,92 @@ pub fn check_model_data_warnings(
             );
             diags.push(Diagnostic::warning(code, msg));
             break;
+        }
+    }
+
+    // An `L2` column that nothing consumes (#830). `L2` is a reserved level-2
+    // grouping data item, so the reader always treats it as the block_sigma
+    // pairing id and never as a covariate. If the model declares no block_sigma
+    // correlated residual, an `L2` column is inert — and if the user actually
+    // meant it as a covariate it has silently vanished. Surface that.
+    if model.residual_correlations.is_empty()
+        && population.subjects.iter().any(|s| !s.obs_l2.is_empty())
+    {
+        diags.push(Diagnostic::warning(
+            "W_L2_UNUSED",
+            "The dataset has an `L2` column but the model declares no block_sigma \
+             correlated residual, so `L2` is read as the reserved level-2 grouping \
+             id and is not available as a covariate. Rename the column if you \
+             intended it as a covariate."
+                .to_string(),
+        ));
+    }
+
+    // block_sigma cross correlations with an ambiguous (time, occasion) fallback
+    // pairing (#830). Without an `L2` grouping column the reader pairs co-temporal
+    // correlated rows one-to-one in file row order. That is unambiguous for the
+    // standard two-row layout (one total + one unbound per draw), but when a
+    // (time, occasion) group holds a row that could correlate with two or more
+    // others — e.g. replicate assays written as total1, unbound1, total2, unbound2
+    // — the resulting cross covariances depend on the physical CSV row order.
+    // Point the user at an explicit `L2` column, which makes the grouping
+    // order-independent.
+    if !model.residual_correlations.is_empty() {
+        use crate::stats::residual_error::loadings_share_correlation;
+        let n_sigma = init_params.sigma.values.len();
+        let corrs = &model.residual_correlations;
+        let n_ambiguous = population
+            .subjects
+            .iter()
+            // A subject that already carries any L2 id is explicitly grouped —
+            // its pairing does not depend on row order.
+            .filter(|s| !s.obs_l2.iter().any(|&id| id != 0))
+            .filter(|s| {
+                let loads: Vec<Vec<(usize, f64)>> = s
+                    .obs_cmts
+                    .iter()
+                    .map(|&cmt| model.error_spec.sigma_loadings(cmt, 1.0, n_sigma))
+                    .collect();
+                // Group observation indices by (time, occasion) and flag any group
+                // where a row structurally shares a correlation with ≥2 others —
+                // the case where greedy row-order pairing is ambiguous.
+                let n = s.obs_times.len();
+                let key = |j: usize| {
+                    (
+                        s.obs_times.get(j).copied().unwrap_or(0.0).to_bits(),
+                        s.occasions.get(j).copied().unwrap_or(0),
+                    )
+                };
+                (0..n).any(|j| {
+                    if loads.get(j).is_none_or(|l| l.is_empty()) {
+                        return false;
+                    }
+                    let degree = (0..n)
+                        .filter(|&k| k != j && key(k) == key(j))
+                        .filter(|&k| {
+                            loads
+                                .get(k)
+                                .zip(loads.get(j))
+                                .is_some_and(|(lk, lj)| loadings_share_correlation(lj, lk, corrs))
+                        })
+                        .count();
+                    degree >= 2
+                })
+            })
+            .count();
+        if n_ambiguous > 0 {
+            diags.push(Diagnostic::warning(
+                "W_BLOCK_SIGMA_L2_ORDER",
+                format!(
+                    "{} subject(s) have a block_sigma correlated residual whose \
+                     co-temporal rows can pair more than one way, and the dataset \
+                     has no L2 grouping column — the cross covariances are paired \
+                     one-to-one in CSV row order, so reordering rows would change \
+                     the fit. Add an explicit `L2` column giving each correlated \
+                     unit its own id to make the pairing order-independent.",
+                    n_ambiguous
+                ),
+            ));
         }
     }
 
@@ -7160,6 +7247,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -8459,6 +8547,7 @@ fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             &params.sigma.values,
             &model.residual_correlations,
             mult,
@@ -8470,6 +8559,7 @@ fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             &params.sigma.values,
             &model.residual_correlations,
         ),
@@ -10216,6 +10306,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 6],
                 occasions: occasions.clone(),
+                obs_l2: Vec::new(),
                 dose_occasions: dose_occ.clone(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11093,6 +11184,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 4],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11181,6 +11273,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 4],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11267,6 +11360,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 3],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11361,6 +11455,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 3],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11456,6 +11551,7 @@ mod iov_integration {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -11803,6 +11899,7 @@ mod iov_integration {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -12791,6 +12888,7 @@ mod simulate_with_uncertainty_tests {
             reset_times: Vec::new(),
             cens: vec![0; n],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),
@@ -12958,6 +13056,7 @@ mod simulate_with_uncertainty_tests {
                 reset_times: Vec::new(),
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -14016,6 +14115,7 @@ mod sde_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 3],
                 occasions: vec![1u32; 3],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1u32],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -14146,6 +14246,7 @@ mod sde_integration {
                 reset_times: Vec::new(),
                 cens: vec![0],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -14470,6 +14571,7 @@ mod tests_sdtab_tv_cov {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -14639,6 +14741,7 @@ mod tests_sdtab_tv_cov {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -14794,6 +14897,7 @@ mod tests_sdtab_tv_cov {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -14955,6 +15059,7 @@ mod tests_derived_session_clock {
             reset_times: vec![5.0], // boundary at shifted t=5
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -15193,6 +15298,7 @@ mod tests_derived_session_clock {
             reset_times: Vec::new(),
             cens: vec![0; 3],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -15336,6 +15442,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             obs_records: vec![],
         }
@@ -15516,6 +15623,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             obs_records: vec![],
         };
@@ -15607,6 +15715,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -15677,6 +15786,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -15737,6 +15847,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -15758,6 +15869,159 @@ mod tests_derived_iov_kappa {
             !diags.iter().any(|d| d.message.contains("ALAG")),
             "no compartment-indexed ALAGn warning for an analytical (non-ODE) model"
         );
+    }
+
+    // ── #830: block_sigma L2 pairing warnings ───────────────────────────────
+
+    /// A two-endpoint block_sigma model correlating cmt-1 (slot 0) with cmt-2
+    /// (slot 1) via ρ.
+    fn block_sigma_two_endpoint_model() -> CompiledModel {
+        let mut m = minimal_iov_model(vec![]);
+        m.error_spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                crate::types::EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+            (
+                2,
+                crate::types::EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+        ]));
+        m.error_model = ErrorModel::Proportional;
+        m.n_epsilon = 2;
+        m.default_params.sigma = SigmaVector {
+            values: vec![0.3, 0.4],
+            names: vec!["S1".into(), "S2".into()],
+        };
+        m.default_params.sigma_fixed = vec![false, false];
+        m.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        m
+    }
+
+    fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject {
+        let n = cmts.len();
+        Subject {
+            fremtype: Vec::new(),
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: times.clone(),
+            obs_raw_times: times,
+            observations: vec![1.0; n],
+            obs_cmts: cmts,
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            obs_l2: l2,
+            dose_occasions: vec![1],
+            obs_records: vec![],
+        }
+    }
+
+    fn population_of(subject: Subject) -> Population {
+        Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Four co-temporal rows (total1, unbound1, total2, unbound2) with a
+    /// block_sigma correlation and NO L2 column: a total row can pair with either
+    /// unbound row, so the greedy row-order pairing is ambiguous and must warn.
+    #[test]
+    fn block_sigma_ambiguous_pairing_without_l2_warns() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(
+            vec![1, 2, 1, 2],
+            vec![1.0, 1.0, 1.0, 1.0],
+            Vec::new(),
+        ));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
+            "ambiguous co-temporal pairing with no L2 must warn"
+        );
+    }
+
+    /// The same four rows grouped by an explicit L2 id are unambiguous — no warning.
+    #[test]
+    fn block_sigma_l2_grouped_pairing_does_not_warn() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(
+            vec![1, 2, 1, 2],
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![1, 1, 2, 2],
+        ));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            !diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
+            "explicit L2 grouping is order-independent — must not warn"
+        );
+    }
+
+    /// A clean two-row draw (one total + one unbound) has only one possible
+    /// pairing even without L2 — no warning.
+    #[test]
+    fn block_sigma_two_row_layout_does_not_warn() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(vec![1, 2], vec![1.0, 1.0], Vec::new()));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            !diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
+            "an unambiguous two-row draw must not warn"
+        );
+    }
+
+    /// An L2 column present while the model declares no block_sigma correlation
+    /// means L2 is inert (and a covariate of that name was silently reserved) —
+    /// warn W_L2_UNUSED.
+    #[test]
+    fn l2_column_without_block_sigma_warns_unused() {
+        let model = minimal_iov_model(vec![]); // no residual_correlations
+        let pop = population_of(obs_only_subject(vec![1], vec![1.0], vec![0]));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_L2_UNUSED"),
+            "an L2 column unused by any block_sigma model must warn"
+        );
+    }
+
+    /// No L2 column and no block_sigma: nothing to warn about.
+    #[test]
+    fn no_l2_column_no_block_sigma_is_quiet() {
+        let model = minimal_iov_model(vec![]);
+        let pop = population_of(obs_only_subject(vec![1], vec![1.0], Vec::new()));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(!diags.iter().any(|d| d.code == "W_L2_UNUSED"));
+        assert!(!diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"));
+    }
+
+    /// A block_sigma model whose data DOES carry an L2 column must not raise
+    /// W_L2_UNUSED — the column is consumed.
+    #[test]
+    fn block_sigma_with_l2_is_not_flagged_unused() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(vec![1, 2], vec![1.0, 1.0], vec![1, 1]));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(!diags.iter().any(|d| d.code == "W_L2_UNUSED"));
     }
 
     /// An SS=1 dose combined with an [initial_conditions] baseline double-counts
@@ -15808,6 +16072,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             obs_records: vec![],
         };
@@ -15870,6 +16135,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             obs_records: vec![],
         };
@@ -15928,6 +16194,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -16065,6 +16332,7 @@ mod adaptive_sim_tests {
             reset_times: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1u32; n],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1u32; n_dose],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -18058,6 +18326,7 @@ mod adaptive_snapshot_verify_tests {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -18385,6 +18654,7 @@ mod adaptive_snapshot_verify_tests {
             reset_times: Vec::new(),
             cens: vec![0; decisions.len()],
             occasions: vec![1; decisions.len()],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],

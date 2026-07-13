@@ -2064,6 +2064,7 @@ pub(crate) fn compute_posterior_hessian(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             sigma,
             &model.residual_correlations,
         );
@@ -2183,6 +2184,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0; 3],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             // 3rd row is a FREM covariate pseudo-observation.
             fremtype: vec![0, 0, 5],
@@ -2517,6 +2519,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: Vec::new(),
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype,
             obs_records: Vec::new(),
@@ -2732,6 +2735,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 0, 100],
             obs_records: vec![],

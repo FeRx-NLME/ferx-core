@@ -4680,6 +4680,7 @@ mod tests {
                 reset_times: Vec::new(),
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -5360,6 +5361,7 @@ mod tests {
                 reset_times: Vec::new(),
                 cens: vec![0; 6],
                 occasions: vec![1, 1, 1, 2, 2, 2],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1],
                 obs_records: vec![],
             })

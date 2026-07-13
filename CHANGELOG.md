@@ -20,6 +20,20 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`L2` data column for correlated observation units** (#827): the reader now
+  recognizes NONMEM's level-2 grouping item. Observation rows sharing an `L2`
+  value within a subject are paired into one correlated unit for a `block_sigma`
+  residual (e.g. the total + unbound rows of one blood draw), giving the user
+  explicit control over which records the cross covariance couples instead of
+  relying on co-temporal row order. See
+  [Data format](https://ferx-nlme.github.io/ferx-core/data-format.html).
+- **Two `block_sigma` / `L2` data diagnostics** (#830), reported by `fit()` and
+  `ferx check`: `W_BLOCK_SIGMA_L2_ORDER` when a correlated residual has a
+  co-temporal group that can pair more than one way and no `L2` column is present
+  (the fallback pairs in CSV row order, so reordering rows changes the fit — add
+  an `L2` column); and `W_L2_UNUSED` when the data has an `L2` column but the
+  model declares no `block_sigma` correlation (the reserved column is inert and,
+  if it was meant as a covariate, was silently dropped).
 - **Continuous-time Markov model (CTMM) endpoint** (#759): a new
   `[markov_model]` block fits a discrete-state Markov process observed at
   irregular times. Declare states bound to their integer DV code
@@ -368,6 +382,35 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **`block_sigma` correlated residuals no longer collapse the objective when a
+  subject has two samples at the same time** (#827): with a `block_sigma` +
+  covariate-selected / per-CMT error model (the free-vs-total assay pattern),
+  replicate assays at one `TIME` were cross-correlated all-to-all, making the
+  dense residual `R` indefinite so the FOCEI objective returned the invalid
+  sentinel and the optimizer was repelled from the correct (correlated) optimum.
+  Rows are now paired into disjoint correlated units — by the new `L2` column
+  when present, otherwise one-to-one in co-temporal row order — keeping `R`
+  positive-definite. On the fluconazole
+  2-cpt binding model this recovers the NONMEM fit (OFV 742 vs NONMEM 734.6,
+  previously stuck ~140 higher with a collapsed peripheral Q).
+- **`block_sigma` cross covariances within one `L2` group are now correlated
+  all-to-all** (#830): an explicit `L2` group is the user's declared correlated
+  unit, so a genuine block of 3+ distinct endpoints (e.g. parent + two
+  metabolites, each pair correlated) keeps its full cross-covariance structure
+  instead of only one greedy pair. The disjoint one-to-one pairing that keeps
+  co-temporal replicates positive-definite still applies to the implicit
+  `(time, occasion)` fallback, where replicate rows cannot be told apart.
+- **Float-formatted `L2` ids are no longer silently ungrouped** (#830):
+  pandas/R exports float-format the whole `L2` column (`"10.0"`) when any row is
+  blank; the reader now accepts integer and float-formatted ids, so the user's
+  `block_sigma` grouping is honoured instead of every record falling back to
+  ungrouped `(time, occasion)` pairing.
+- **`block_sigma` cross derivative is no longer dropped when a prediction hits
+  zero** (#830): the observation pairing is now decided from the loadings'
+  sigma-slot structure rather than the value covariance, so a pure proportional
+  paired endpoint whose prediction is momentarily `f = 0` keeps its (nonzero)
+  slope cross term in `∂R/∂f`. This also stops the pairing from flickering as a
+  prediction crosses zero between iterations.
 - **Standalone covariance step (`run_covariance`) now reproduces the inline
   covariance bit-for-bit for FOCE/FOCEI fits**: running the covariance step after a
   fit (`covariance = false` then `run_covariance`, e.g. the R wrapper's standalone
