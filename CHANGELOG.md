@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`L2` data column for correlated observation units** (#827): the reader now
+  recognizes NONMEM's level-2 grouping item. Observation rows sharing an `L2`
+  value within a subject are paired into one correlated unit for a `block_sigma`
+  residual (e.g. the total + unbound rows of one blood draw), giving the user
+  explicit control over which records the cross covariance couples instead of
+  relying on co-temporal row order. See
+  [Data format](https://ferx-nlme.github.io/ferx-core/data-format.html).
 - **Continuous-time Markov model (CTMM) endpoint** (#759): a new
   `[markov_model]` block fits a discrete-state Markov process observed at
   irregular times. Declare states bound to their integer DV code
@@ -374,8 +381,9 @@ section of the SDLC for the versioning policy).
   replicate assays at one `TIME` were cross-correlated all-to-all, making the
   dense residual `R` indefinite so the FOCEI objective returned the invalid
   sentinel and the optimizer was repelled from the correct (correlated) optimum.
-  Co-temporal opposite-branch rows are now paired one-to-one in row order (the
-  standard NONMEM `L2` layout), keeping `R` positive-definite. On the fluconazole
+  Rows are now paired into disjoint correlated units — by the new `L2` column
+  when present, otherwise one-to-one in co-temporal row order — keeping `R`
+  positive-definite. On the fluconazole
   2-cpt binding model this recovers the NONMEM fit (OFV 742 vs NONMEM 734.6,
   previously stuck ~140 higher with a collapsed peripheral Q).
 - **Standalone covariance step (`run_covariance`) now reproduces the inline

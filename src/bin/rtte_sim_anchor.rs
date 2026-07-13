@@ -70,6 +70,7 @@ fn main() {
                 reset_times: vec![],
                 cens: vec![],
                 occasions: vec![],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![],
                 fremtype: vec![],
                 obs_records: vec![ObsRecord::Event {
@@ -151,6 +152,7 @@ fn main() {
                 reset_times: vec![],
                 cens: vec![],
                 occasions: vec![],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![],
                 fremtype: vec![],
                 obs_records: vec![ObsRecord::Event {

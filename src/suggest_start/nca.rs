@@ -683,6 +683,7 @@ mod tests {
             cens: vec![0; 7],
             obs_cmts: vec![1; 7],
             occasions: vec![],
+            obs_l2: Vec::new(),
             dose_occasions: vec![],
             fremtype: Vec::new(),
             obs_records: vec![],

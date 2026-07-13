@@ -714,6 +714,9 @@ fn read_nonmem_csv_impl(
     // TENTRY column: left-truncation / delayed-entry time for TTE rows.
     // Absent in Gaussian-only datasets; only read for `routing.tte` (Event) rows.
     let tentry_col = col_idx_ci("tentry");
+    // L2 column: NONMEM level-2 grouping id. Records sharing an L2 value form one
+    // correlated observation unit (`block_sigma` cross covariance). Optional.
+    let l2_col = col_idx_ci("l2");
 
     // FREMTYPE column (case-insensitive)
     let fremtype_col: Option<usize> = col_idx_ci("fremtype");
@@ -729,7 +732,7 @@ fn read_nonmem_csv_impl(
 
     const STANDARD_COLS: &[&str] = &[
         "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens", "addl",
-        "tentry", "fremtype",
+        "tentry", "fremtype", "l2",
     ];
     let is_standard = |h: &str| {
         STANDARD_COLS.iter().any(|s| h.eq_ignore_ascii_case(s))
@@ -896,6 +899,7 @@ fn read_nonmem_csv_impl(
                 occ_col,
                 addl_col,
                 fremtype_col,
+                l2_col,
                 &cov_indices,
                 filter,
                 routing,
@@ -1356,6 +1360,7 @@ fn parse_subject(
     occ_col: Option<usize>,
     addl_col: Option<usize>,
     fremtype_col: Option<usize>,
+    l2_col: Option<usize>,
     cov_indices: &[(String, usize)],
     filter: Option<&SelectionFilter>,
     // Per-CMT non-Gaussian endpoint routing (Event / DiscreteState / Count).
@@ -1379,6 +1384,7 @@ fn parse_subject(
     let mut occasions: Vec<u32> = Vec::new();
     let mut dose_occasions: Vec<u32> = Vec::new();
     let mut fremtype: Vec<u16> = Vec::new();
+    let mut obs_l2: Vec<i64> = Vec::new();
     let mut occ_parse_failures: usize = 0;
     // EVID=0/MDV=0 rows whose DV cell was missing and were skipped (issue #258).
     let mut missing_dv_skipped: usize = 0;
@@ -1973,6 +1979,15 @@ fn parse_subject(
                         .unwrap_or(0);
                     fremtype.push(ft);
                 }
+                if l2_col.is_some() {
+                    // NONMEM writes L2 as an integer id; a blank / unparsable
+                    // cell means "ungrouped" (0), matching the empty-vector case.
+                    let l2 = l2_col
+                        .and_then(|c| row.get(c))
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .unwrap_or(0);
+                    obs_l2.push(l2);
+                }
                 if any_tv {
                     obs_covariates.push(locf_state.clone());
                 }
@@ -2088,6 +2103,7 @@ fn parse_subject(
             reset_times,
             cens,
             occasions,
+            obs_l2,
             dose_occasions: sorted_dose_occ,
             fremtype,
             obs_records,
@@ -2934,6 +2950,33 @@ mod tests {
         let pop = read_nonmem_csv(f.path(), None, None).unwrap();
         assert!(pop.subjects[0].reset_times.is_empty());
         assert!(!pop.subjects[0].has_resets());
+    }
+
+    #[test]
+    fn test_l2_column_populates_obs_l2_and_is_not_a_covariate() {
+        // Two paired draws: each L2 id tags a total (FREE=0) + unbound (FREE=1)
+        // row of the same sample. obs_l2 is parallel to obs_times.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,FREE,L2\n\
+                   1,0,.,1,1,100,0,0\n\
+                   1,1,30.0,0,0,.,0,10\n\
+                   1,1,3.0,0,0,.,1,10\n\
+                   1,5,20.0,0,0,.,0,11\n\
+                   1,5,2.0,0,0,.,1,11\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(subj.obs_l2, vec![10, 10, 11, 11]);
+        assert_eq!(subj.obs_l2.len(), subj.obs_times.len());
+        // L2 is a recognized data item, never surfaced as a covariate.
+        assert!(!pop.covariate_names.contains(&"L2".to_string()));
+    }
+
+    #[test]
+    fn test_no_l2_column_leaves_obs_l2_empty() {
+        let csv = "ID,TIME,DV,EVID,MDV,AMT\n1,0,.,1,1,100\n1,1,5.0,0,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(pop.subjects[0].obs_l2.is_empty());
     }
 
     #[test]

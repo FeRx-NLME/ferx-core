@@ -71,13 +71,28 @@ fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
     occasions.get(j).copied().unwrap_or(0)
 }
 
+/// Do observations `j` and `k` belong to the same correlated residual block?
+///
+/// When the data carries an `L2` grouping id (NONMEM's level-2 data item), it is
+/// authoritative: a row with a nonzero `L2` pairs **only** with rows sharing that
+/// id, so the user controls exactly which records form one correlated
+/// observation unit (total/unbound of a draw, replicate assays, any paired
+/// endpoints). Rows with no `L2` id (`0`, or an empty `obs_l2` when the dataset
+/// has no `L2` column) fall back to the implicit `(time, occasion)` rule.
 fn same_residual_block(
     obs_times: &[f64],
     _obs_raw_times: &[f64],
     occasions: &[u32],
+    obs_l2: &[i64],
     j: usize,
     k: usize,
 ) -> bool {
+    let l2j = obs_l2.get(j).copied().unwrap_or(0);
+    let l2k = obs_l2.get(k).copied().unwrap_or(0);
+    if l2j != 0 || l2k != 0 {
+        // At least one row is explicitly grouped: pair iff same L2 id.
+        return l2j == l2k;
+    }
     observation_time_key(obs_times, j) == observation_time_key(obs_times, k)
         && observation_occasion_key(occasions, j) == observation_occasion_key(occasions, k)
 }
@@ -135,21 +150,21 @@ fn cross_observation_covariance(
 /// residual block, so the dense `R` stays block-diagonal in disjoint
 /// observation pairs rather than coupling every co-temporal row to every other.
 ///
-/// [`same_residual_block`] groups rows by `(time, occasion)`. That is the right
-/// pairing when a subject has at most one physical sample per time — the total
-/// and unbound rows of one draw. But a subject with **two samples at the same
-/// time** (replicate assays, distinguished in NONMEM by the `L2` data item)
-/// puts all four co-temporal rows in one group, and an all-to-all cross
-/// covariance would correlate each total with *both* unbound rows. That 4×4
-/// block is indefinite, so `R.cholesky()` fails and the whole-fit objective
-/// collapses to the invalid sentinel (issue #827).
+/// [`same_residual_block`] decides which rows may pair. With an explicit `L2`
+/// grouping id the pairing is exactly the user's sample grouping; without one it
+/// falls back to `(time, occasion)`. Either way, a block with more than two
+/// complementary rows — e.g. two physical samples at the same time (replicate
+/// assays) reaching the fallback rule — must **not** be correlated all-to-all:
+/// correlating each total with *both* unbound rows makes that 4×4 block
+/// indefinite, so `R.cholesky()` fails and the whole-fit objective collapses to
+/// the invalid sentinel (issue #827).
 ///
-/// ferx has no `L2` equivalent, so partners are matched **greedily in row
-/// order**: each unmatched row takes the first later unmatched row in its block
-/// whose loadings give a nonzero cross covariance. For the standard NONMEM
-/// layout — total/unbound rows written contiguously per sample — this
-/// reproduces the `L2` pairing exactly; in every case it yields disjoint pairs,
-/// so each per-pair 2×2 block is positive-definite and `R` stays PD.
+/// So partners are matched **one-to-one, greedily in row order**: each unmatched
+/// row takes the first later unmatched row in its block whose loadings give a
+/// nonzero cross covariance. This yields disjoint pairs, so each per-pair 2×2
+/// block is positive-definite and `R` stays PD. With `L2` the block already
+/// contains exactly the user's paired rows (usually two), so the matching is
+/// unambiguous; the greedy order only disambiguates the fallback case.
 ///
 /// Returns `partner[j] = Some(k)` (symmetric: `partner[k] = Some(j)`) for
 /// matched pairs, `None` for unmatched rows. `loadings[j]` are observation `j`'s
@@ -160,6 +175,7 @@ fn match_partners(
     obs_times: &[f64],
     obs_raw_times: &[f64],
     occasions: &[u32],
+    obs_l2: &[i64],
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> Vec<Option<usize>> {
@@ -172,7 +188,7 @@ fn match_partners(
         for k in (j + 1)..n {
             if partner[k].is_some()
                 || loadings[k].is_empty()
-                || !same_residual_block(obs_times, obs_raw_times, occasions, j, k)
+                || !same_residual_block(obs_times, obs_raw_times, occasions, obs_l2, j, k)
             {
                 continue;
             }
@@ -208,6 +224,7 @@ pub fn compute_r_matrix_with_correlations(
     obs_times: &[f64],
     obs_raw_times: &[f64],
     occasions: &[u32],
+    obs_l2: &[i64],
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> DMatrix<f64> {
@@ -247,6 +264,7 @@ pub fn compute_r_matrix_with_correlations(
         obs_times,
         obs_raw_times,
         occasions,
+        obs_l2,
         sigma_values,
         correlations,
     );
@@ -282,6 +300,7 @@ pub fn compute_r_matrix_with_correlations_scaled(
     obs_times: &[f64],
     obs_raw_times: &[f64],
     occasions: &[u32],
+    obs_l2: &[i64],
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
     mult: &[Vec<f64>],
@@ -316,6 +335,7 @@ pub fn compute_r_matrix_with_correlations_scaled(
         obs_times,
         obs_raw_times,
         occasions,
+        obs_l2,
         sigma_values,
         correlations,
     );
@@ -362,6 +382,7 @@ pub fn compute_dr_df_matrices(
     obs_times: &[f64],
     obs_raw_times: &[f64],
     occasions: &[u32],
+    obs_l2: &[i64],
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
     mult: Option<&[Vec<f64>]>,
@@ -404,6 +425,7 @@ pub fn compute_dr_df_matrices(
         obs_times,
         obs_raw_times,
         occasions,
+        obs_l2,
         sigma_values,
         correlations,
     );
@@ -498,6 +520,7 @@ pub fn compute_d2r_df2_matrices(
     obs_times: &[f64],
     obs_raw_times: &[f64],
     occasions: &[u32],
+    obs_l2: &[i64],
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
     mult: Option<&[Vec<f64>]>,
@@ -539,6 +562,7 @@ pub fn compute_d2r_df2_matrices(
         obs_times,
         obs_raw_times,
         occasions,
+        obs_l2,
         sigma_values,
         correlations,
     );
@@ -860,6 +884,7 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
         );
@@ -911,6 +936,7 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
         );
@@ -927,6 +953,64 @@ mod tests {
             r.cholesky().is_some(),
             "replicate-time residual R must be positive-definite"
         );
+    }
+
+    // #827: an explicit `L2` grouping id is authoritative — it pairs rows the
+    // user grouped even across different times, and it keeps co-temporal rows in
+    // *different* groups uncorrelated. Four rows all at t = 1.0, two total
+    // (cmt 1) and two unbound (cmt 2), grouped L2 = {row0,row2} and {row1,row3}
+    // — i.e. the pairing crosses the file order deliberately.
+    #[test]
+    fn test_l2_grouping_controls_pairing_over_time_and_order() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let ipreds = [50.0, 5.0, 40.0, 4.0];
+        let cmts = [1usize, 2, 2, 1];
+        // Row times deliberately mixed: rows 0 and 2 share L2=10 but sit at
+        // different times, proving L2 overrides the (time, occasion) fallback.
+        let times = [1.0, 1.0, 9.0, 9.0];
+        let obs_l2 = [10i64, 20, 10, 20];
+        let sigma = [0.671, 0.644];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.93,
+        };
+        let r = compute_r_matrix_with_correlations(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &obs_l2,
+            &sigma,
+            &[corr],
+        );
+        // L2=10 pairs rows (0,2) across different times; L2=20 pairs (1,3).
+        assert!(r[(0, 2)] != 0.0 && r[(2, 0)] != 0.0);
+        assert!(r[(1, 3)] != 0.0 && r[(3, 1)] != 0.0);
+        // Co-temporal but different-L2 (rows 0 & 1 both at t=1) stay uncorrelated,
+        // as do all other cross-group entries.
+        assert_eq!(r[(0, 1)], 0.0);
+        assert_eq!(r[(0, 3)], 0.0);
+        assert_eq!(r[(1, 2)], 0.0);
+        assert_eq!(r[(2, 3)], 0.0);
+        assert!(r.cholesky().is_some(), "L2-grouped residual R must be PD");
     }
 
     // The derivative builders must use the SAME disjoint pairing as
@@ -966,13 +1050,24 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
             None,
         );
         let n = ipreds.len();
         let r_at = |f: &[f64]| {
-            compute_r_matrix_with_correlations(&spec, f, &cmts, &times, &[], &[], &sigma, &[corr])
+            compute_r_matrix_with_correlations(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &[],
+                &sigma,
+                &[corr],
+            )
         };
         let h = 1e-4;
         for m in 0..n {
@@ -1031,13 +1126,24 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
             None,
         );
         let n = ipreds.len();
         let r_at = |f: &[f64]| {
-            compute_r_matrix_with_correlations(&spec, f, &cmts, &times, &[], &[], &sigma, &[corr])
+            compute_r_matrix_with_correlations(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &[],
+                &sigma,
+                &[corr],
+            )
         };
         let h = 1e-4;
         for m in 0..n {
@@ -1102,6 +1208,7 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
             Some(&mult),
@@ -1113,6 +1220,7 @@ mod tests {
                 f,
                 &cmts,
                 &times,
+                &[],
                 &[],
                 &[],
                 &sigma,
@@ -1179,13 +1287,25 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
             None,
         );
         let n = ipreds.len();
         let dr_at = |f: &[f64]| {
-            compute_dr_df_matrices(&spec, f, &cmts, &times, &[], &[], &sigma, &[corr], None)
+            compute_dr_df_matrices(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &[],
+                &sigma,
+                &[corr],
+                None,
+            )
         };
         let h = 1e-4;
         for b in 0..n {
@@ -1253,6 +1373,7 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
             Some(&mult),
@@ -1264,6 +1385,7 @@ mod tests {
                 f,
                 &cmts,
                 &times,
+                &[],
                 &[],
                 &[],
                 &sigma,
@@ -1317,6 +1439,7 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
             None,
@@ -1361,6 +1484,7 @@ mod tests {
             &cmts,
             &shifted_times,
             &raw_times,
+            &[],
             &[],
             &sigma,
             &[corr],
@@ -1471,7 +1595,8 @@ mod tests {
             reassociated.to_bits(),
             "fixture must be a pair where the two associations differ"
         );
-        let r = compute_r_matrix_with_correlations(&spec, &[f], &[1], &[0.0], &[], &[], &[s], &[]);
+        let r =
+            compute_r_matrix_with_correlations(&spec, &[f], &[1], &[0.0], &[], &[], &[], &[s], &[]);
         assert_eq!(
             r[(0, 0)].to_bits(),
             legacy.to_bits(),
