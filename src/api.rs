@@ -2223,6 +2223,50 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // ── AGQ (#251) ────────────────────────────────────────────────────────────
+    if chain.iter().any(|&m| m == EstimationMethod::Agq) {
+        // The quadrature integrates over the BSV random effects η only. With IOV the
+        // marginal is a joint integral over (η, κ₁..κ_K), whose tensor grid is
+        // `n_agq^(n_eta + n_occ·n_iov)` — combinatorially hopeless even at 2 nodes, quite
+        // apart from the joint-Hessian work. Reject rather than quietly integrating the
+        // wrong (η-only) marginal and reporting a confidently wrong OFV.
+        if model.n_kappa > 0 {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_IOV_UNSUPPORTED",
+                    "method = agq does not support inter-occasion variability (κ / [iov]): the \
+                     marginal would be a joint integral over η and every occasion's κ, and the \
+                     tensor grid is intractable at that dimension. Use method = focei, saem, or \
+                     imp for IOV models.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        // The tensor rule costs `n_agq^n_eta` full likelihood evaluations per subject per
+        // outer iteration. Past the cap that is not "slow", it is a fit that will never
+        // finish — so it is worth failing at check time, with the two levers spelled out.
+        let n_nodes = options.n_agq.max(1);
+        let grid = crate::estimation::agq::grid_size(n_nodes, model.n_eta);
+        if grid > crate::estimation::agq::MAX_AGQ_GRID {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_GRID_TOO_LARGE",
+                    format!(
+                        "method = agq with n_agq = {n_nodes} and {} random effects needs a \
+                         {n_nodes}^{} = {grid}-node tensor grid per subject per iteration, over \
+                         the {} limit. Lower n_agq (n_agq = 1 is the Laplace approximation, i.e. \
+                         FOCEI-equivalent cost), reduce the number of random effects, or use \
+                         method = saem / imp, whose cost does not grow with the η dimension.",
+                        model.n_eta,
+                        model.n_eta,
+                        crate::estimation::agq::MAX_AGQ_GRID,
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
     // Explicit `gradient_method = ad`: the Enzyme autodiff path was retired in
     // favour of the hand-rolled `Dual2` analytic sensitivities. Reject it rather
     // than silently running a different method. `auto` (analytic where in scope,
@@ -4840,6 +4884,9 @@ fn fit_inner(
         // (FOCE/FOCEI/GN) are driven by the inner-loop gradient; IMP consumes
         // the EBE Hessian built via that same route. SAEM is sampling-based, so
         // it reports its E-step kernel (MH/HMC) instead of a gradient route.
+        // AGQ included: it runs the same inner EBE solve as FOCE/FOCEI (it only replaces
+        // the *population* objective), so the inner analytic-vs-FD η-gradient route this
+        // reports is exactly as relevant to it.
         let uses_gradient_route = chain.iter().any(|m| {
             matches!(
                 m,
@@ -4849,6 +4896,7 @@ fn fit_inner(
                     | EstimationMethod::FoceGnHybrid
                     | EstimationMethod::Imp
                     | EstimationMethod::Impmap
+                    | EstimationMethod::Agq
             )
         });
         if uses_gradient_route {
@@ -4944,6 +4992,7 @@ fn fit_inner(
                 | EstimationMethod::FoceGnHybrid
                 | EstimationMethod::Imp
                 | EstimationMethod::Impmap
+                | EstimationMethod::Agq
         )
     }) {
         if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning(
@@ -5148,6 +5197,16 @@ fn fit_inner(
             EstimationMethod::FoceI => stage_opts.interaction = true,
             EstimationMethod::Foce => stage_opts.interaction = false,
             _ => {}
+        }
+        // AGQ minimises the quadrature marginal, which has no analytic gradient — so
+        // `auto` must not resolve to the gradient-based optimizer it picks for in-scope
+        // FOCE/FOCEI models. That choice is conditioned on an exact gradient existing
+        // (#490); with only finite differences available, `auto`'s documented answer is
+        // the derivative-free one, and `build_info::gradient_method_outer` already reports
+        // AGQ as FD. Pinning it here keeps the two in agreement. An explicit
+        // `optimizer = ...` is still honoured.
+        if matches!(method, EstimationMethod::Agq) && stage_opts.optimizer == Optimizer::Auto {
+            stage_opts.optimizer = Optimizer::Bobyqa;
         }
         // Run the covariance step (and SIR) only on the last *estimating* stage,
         // so a chain doesn't recompute the expensive FD covariance after every

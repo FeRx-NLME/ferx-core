@@ -5164,6 +5164,16 @@ pub struct FitOptions {
     // `imp_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
     // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` at the fixed input parameters
     // without updating them.
+    /// Gauss–Hermite nodes **per random effect** for `method = agq` (#251). Default 3.
+    ///
+    /// `n_agq = 1` is the Laplace approximation exactly (see
+    /// [`crate::estimation::agq`]); larger values refine the marginal and are what make
+    /// AGQ unbiased on strongly non-Gaussian integrands. The tensor grid costs
+    /// `n_agq^n_eta` likelihood evaluations per subject per outer iteration, so raise it
+    /// deliberately — odd values are conventional (they keep a node exactly at the mode).
+    /// Capped by [`crate::estimation::agq::MAX_AGQ_NODES`], with the *grid* additionally
+    /// capped by [`crate::estimation::agq::MAX_AGQ_GRID`].
+    pub n_agq: usize,
     /// Number of importance samples per subject. Default 1000. Recommended
     /// 2000–5000 for publication-quality MC SE (cost scales linearly).
     pub imp_samples: usize,
@@ -5565,6 +5575,7 @@ impl Default for FitOptions {
             sir_seed: None,
             sir_keep_samples: false,
             sir_df: 5.0,
+            n_agq: 3,
             imp_samples: 1000,
             imp_proposal_df: 5.0,
             imp_seed: None,
@@ -5838,6 +5849,17 @@ pub enum EstimationMethod {
     /// σ²: inverse-gamma, mu-referenced θ: normal). Reports posterior summaries +
     /// convergence diagnostics on `FitResult.bayes`, not a point estimate.
     Bayes,
+    /// Adaptive Gauss–Hermite quadrature (#251) — the Laplace approximation generalised.
+    /// Reuses the FOCE/Laplace inner loop to find each subject's EBE mode, then evaluates
+    /// the **exact** conditional likelihood on a Gauss–Hermite grid laid around that mode
+    /// (`n_agq` nodes per random effect). At `n_agq = 1` it is Laplace identically; above
+    /// that the marginal improves and — because it integrates the model's real likelihood
+    /// rather than a Gaussian-residual surrogate — it is the only method here that handles
+    /// non-Gaussian endpoints (TTE, categorical) without approximation. Deterministic, so
+    /// unlike [`Saem`](Self::Saem) / [`Imp`](Self::Imp) its OFV carries no Monte-Carlo noise.
+    /// Cost is `n_agq^n_eta` likelihood evaluations per subject per iteration; see
+    /// [`crate::estimation::agq::MAX_AGQ_GRID`].
+    Agq,
 }
 
 impl EstimationMethod {
@@ -5851,6 +5873,7 @@ impl EstimationMethod {
             EstimationMethod::Imp => "IMP",
             EstimationMethod::Impmap => "IMPMAP",
             EstimationMethod::Bayes => "BAYES",
+            EstimationMethod::Agq => "AGQ",
         }
     }
 }
@@ -5864,6 +5887,21 @@ impl FitOptions {
         } else {
             self.methods.clone()
         }
+    }
+
+    /// The AGQ node count when this (stage's) method is AGQ, else `None`.
+    ///
+    /// The **single predicate** every AGQ-aware branch consults — the population objective
+    /// ([`crate::estimation::outer_optimizer::pop_nll_opts`]), the outer-gradient dispatch,
+    /// and the optimizer/report classification. Keeping it in one place is what stops the
+    /// objective and the gradient from disagreeing about which method is running: an
+    /// outer loop minimising the AGQ objective while fed the analytic *FOCE* gradient
+    /// would converge, silently, to the wrong parameters.
+    ///
+    /// Reads `self.method` (the per-stage method — `api::fit_inner` rewrites it for each
+    /// stage of a chain), so it is correct inside a chained fit too.
+    pub fn agq_nodes(&self) -> Option<usize> {
+        (self.method == EstimationMethod::Agq).then(|| self.n_agq.max(1))
     }
 
     /// Covariance-step inner EBE-reconvergence tolerance that **closed-form,
@@ -6082,6 +6120,24 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "global_maxeval",
             "stagnation_guard",
             "reconverge_gradient_interval",
+        ],
+        // AGQ drives the same outer loop and the same inner EBE solve as FOCE/FOCEI —
+        // it only swaps the population objective — so it accepts that method's keys,
+        // plus the node count. It has no analytic outer gradient, so
+        // `reconverge_gradient_interval` (an analytic-path escape hatch) does not apply.
+        EstimationMethod::Agq => &[
+            "n_agq",
+            "maxiter",
+            "inner_maxiter",
+            "inner_tol",
+            "inner_optimizer",
+            "optimizer",
+            "outer_xtol",
+            "outer_ftol",
+            "steihaug_max_iters",
+            "global_search",
+            "global_maxeval",
+            "stagnation_guard",
         ],
         EstimationMethod::FoceGn => &[
             "maxiter",

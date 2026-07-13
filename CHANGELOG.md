@@ -47,6 +47,19 @@ section of the SDLC for the versioning policy).
   and [CTMM estimation](https://ferx-nlme.github.io/ferx-core/estimation/ctmm.html)
   pages. (mCTMM/DTMM, drug-driven `Q(t)`, and CTMM simulation are planned
   follow-ups.)
+- **Adaptive Gaussian quadrature (`method = agq`)** (#251): a new estimation
+  method that generalises Laplace. Instead of approximating each subject's
+  marginal likelihood with a single Gaussian at the empirical-Bayes mode, it
+  evaluates the *exact* conditional likelihood on a Gauss-Hermite grid laid
+  around that mode (`[fit_options] n_agq`, default 3 nodes per random effect).
+  `n_agq = 1` reproduces the Laplace approximation identically. Because it makes
+  no Gaussian-residual assumption it handles non-Gaussian endpoints (TTE,
+  categorical) that FOCE/FOCEI structurally cannot, and unlike SAEM/IMP its
+  objective is deterministic — the OFV is bit-identical run to run. Validated
+  against ferx's importance sampler on warfarin (agreement to 0.02 OFV units).
+  Cost is `n_agq ^ n_eta` per subject per iteration, so it suits models with few
+  random effects; grids over 100 000 nodes and IOV models are rejected at check
+  time. See the [AGQ docs page](https://ferx-nlme.github.io/ferx-core/estimation/agq.html).
 - **Restart of an interrupted run from a checkpoint** (#755): a fit now
   periodically saves a small `{model}.tmp` resume point (throttled to
   `[fit_options] checkpoint_interval_secs`, default 300 s, so short runs write

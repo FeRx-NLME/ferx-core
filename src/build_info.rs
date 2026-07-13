@@ -108,6 +108,10 @@ pub fn gradient_method_outer(
         | EstimationMethod::Imp
         | EstimationMethod::Impmap
         | EstimationMethod::Bayes => GradientMethodKind::NotApplicable,
+        // AGQ's objective is the quadrature marginal, which has no analytic gradient here —
+        // `population_gradient` central-differences it. Reported truthfully so this can't
+        // disagree with the live dispatch (the #490 invariant).
+        EstimationMethod::Agq => GradientMethodKind::FiniteDifferences,
         EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
             GradientMethodKind::FiniteDifferences
         }

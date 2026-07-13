@@ -1,0 +1,181 @@
+# AGQ — Adaptive Gaussian Quadrature
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+`agq` (aliases `aghq`, `gauss_hermite`, `adaptive_gaussian_quadrature`)
+generalises the Laplace approximation. Where [FOCE/FOCEI](foce.qmd) approximate
+each subject's marginal likelihood with a *single* Gaussian centred at the
+empirical-Bayes mode, AGQ keeps that centring but evaluates the integrand on a
+Gauss–Hermite grid laid around the mode. One node reproduces Laplace exactly;
+more nodes refine the marginal.
+
+Its two defining properties:
+
+- **It integrates the model's real likelihood.** Nothing is linearised and no
+  Gaussian-residual assumption is made, so count, categorical and
+  time-to-event endpoints are handled by the same engine, without the
+  approximation FOCE/FOCEI structurally depend on.
+- **It is deterministic.** The grid is fixed, so the objective carries no
+  Monte-Carlo noise — unlike [SAEM](saem.qmd) or [IMP](importance-sampling.qmd),
+  it needs no common random numbers, no step-size schedule, and returns a
+  bit-identical OFV run to run.
+
+## Usage
+
+```ini
+[fit_options]
+  method = agq
+  n_agq  = 3      # Gauss-Hermite nodes per random effect (default 3)
+```
+
+From R:
+
+```r
+fit <- ferx_fit(model, data, method = "agq", settings = list(n_agq = 5))
+```
+
+`n_agq` is the number of nodes **per random effect**. Odd values are
+conventional — they keep a node exactly at the mode. `n_agq = 1` *is* the
+Laplace approximation (see below).
+
+## Cost, and the dimensionality limit
+
+The grid is a tensor product: `n_agq ^ n_eta` likelihood evaluations per subject
+per outer iteration. That is the whole cost model, and it is exponential in the
+number of random effects.
+
+| n_eta | `n_agq = 1` | `n_agq = 3` | `n_agq = 5` | `n_agq = 7` |
+|-------|-------------|-------------|-------------|-------------|
+| 2     | 1           | 9           | 25          | 49          |
+| 3     | 1           | 27          | 125         | 343         |
+| 5     | 1           | 243         | 3 125       | 16 807      |
+| 8     | 1           | 6 561       | 390 625     | 5.7 M       |
+
+ferx rejects a fit whose grid exceeds **100 000 nodes** rather than start work
+that will not finish. If you hit that, lower `n_agq`, reduce the number of
+random effects, or use [SAEM](saem.qmd) / [IMP](importance-sampling.qmd) —
+Monte-Carlo methods whose cost does not grow with the η dimension. AGQ is at its
+best at **n_eta ≤ 4**.
+
+> **Note on grid pruning.** A natural-looking optimisation — dropping nodes whose
+> Gauss–Hermite weight is negligible — is *unsound* here and ferx does not do it.
+> The adaptive rule multiplies each weight by `exp(‖z‖²)`, which exactly cancels
+> the `e^{−z²}` decay the Hermite weights carry, so the corrected weights are
+> `Θ(1)` right across the grid. A node with a tiny raw weight can carry a
+> perfectly ordinary share of the integral. Sparse (Smolyak) grids are the real
+> answer for `n_eta = 5..8` and are tracked as future work.
+
+## `n_agq = 1` is exactly Laplace
+
+With one node the rule is `z = 0` with weight `√π`, and the quadrature sum
+collapses, term for term, to
+
+$$
+L_i \approx (2\pi)^{d/2}\,|H|^{-1/2}\,\exp\!\big(l_i(\hat\eta)\big),
+$$
+
+which is the Laplace approximation. This is an identity, not a numerical
+coincidence.
+
+**AGQ(1) is Laplace with the *exact* Hessian — NONMEM's `$EST METHOD=1
+LAPLACIAN`.** It is deliberately *not* identical to ferx's FOCEI, which is
+Laplace with the **Gauss-Newton** Hessian `CᵀC + Ω⁻¹` (that form drops
+`∂²f/∂η²`). ferx computes `H` by central differences of the true conditional
+NLL, because the Gauss-Newton form carries *no curvature at all* from TTE or
+categorical endpoints — it is blind on precisely the models AGQ exists to serve.
+
+The grid scaling only affects accuracy at finite `n` (AGQ converges to the same
+marginal under any invertible scaling), but at `n_agq = 1` it enters the
+objective directly through `½·log|H|`. So the two Laplace variants differ by
+exactly that term, and no more.
+
+## Validation
+
+Warfarin (32 subjects, 1-cpt oral, 3 random effects, proportional error), OFV
+evaluated at identical initial parameters and identical EBEs — so the *only*
+thing varying across rows is the marginal approximation.
+
+| Method | OFV | What it approximates |
+|--------|-----|----------------------|
+| FOCE   | 16.475 | Sheiner–Beal *linearised* marginal |
+| FOCEI  |  7.497 | Laplace, Gauss-Newton Hessian |
+| **AGQ `n_agq = 1`** | **7.899** | **Laplace, exact Hessian** |
+| AGQ `n_agq = 3` |  7.697 | |
+| AGQ `n_agq = 5` |  7.501 | |
+| AGQ `n_agq = 7` |  7.483 | |
+| AGQ `n_agq = 11` | **7.480** | ← converged |
+| **IMP** (20 000 samples) | **7.457** | Monte-Carlo marginal (independent) |
+
+The last row is the check that matters. Importance sampling estimates the *same
+integral* by a completely different route — a Student-t proposal with
+self-normalised weights: no quadrature, no Hessian, no Laplace. AGQ's refined
+grid lands within **0.02 OFV units** of it, which is inside IS's own Monte-Carlo
+error at 20 000 samples. Two estimators sharing no code path agree, which
+certifies both the marginal and the likelihood's constant convention (an error
+in either would show as tens of OFV units, not hundredths).
+
+Note that FOCEI's 7.497 is *closer* to the truth than AGQ(1)'s 7.899 here. That
+is not a defect: both are one-term approximations, and on this model FOCEI's
+Gauss-Newton Hessian error happens to partially cancel the Laplace error. The
+point of AGQ is that you do not have to rely on that cancellation — you add nodes
+and watch the number stop moving.
+
+### Converged fit
+
+Full fit of the same model, `maxiter = 500`, covariance step on:
+
+| Parameter | FOCEI | AGQ (`n_agq = 3`) |
+|-----------|-------|-------------------|
+| OFV       | −286.004 | −285.973 |
+| TVCL      | 0.132673 | 0.132684 |
+| TVV       | 7.73806  | 7.73881  |
+| TVKA      | 0.809975 | 0.811433 |
+| ω²(ETA_V) | 0.009593 | 0.009589 |
+| ω²(ETA_KA)| 0.336241 | 0.337807 |
+| PROP_ERR  | 0.010565 | 0.010561 |
+
+On a well-behaved Gaussian PK model Laplace is already accurate, so AGQ
+reproduces the FOCEI estimates to ~0.2% — which is the expected and desired
+result. AGQ earns its cost on models where that assumption *fails*: non-Gaussian
+endpoints, sparse data, and large `ω²`.
+
+## What runs under the hood
+
+AGQ reuses the FOCE/Laplace machinery almost entirely:
+
+1. **Inner loop — unchanged.** The per-subject EBE mode `η̂` comes from the same
+   solver FOCE/FOCEI use, including the analytic `Dual2` η-gradient where the
+   model is in the sensitivity provider's scope. AGQ does **not** re-optimise the
+   mode; it only lays the grid around it.
+2. **Hessian.** `H` is central-differenced from the true conditional NLL at `η̂`.
+3. **Grid.** Gauss–Hermite nodes/weights are computed by Golub–Welsch, then
+   transformed to `η_j = η̂ + √2·Σ^{1/2}·z_j` with `Σ = H⁻¹`.
+4. **Objective.** The exact conditional likelihood is evaluated at each node.
+5. **Outer loop.** The quadrature marginal has no analytic gradient, so the outer
+   optimizer central-differences it, and `optimizer = auto` resolves to
+   derivative-free **BOBYQA** (the same policy every finite-difference-only fit
+   in ferx follows). The covariance step differences the AGQ objective too, so
+   the reported standard errors belong to the likelihood that was actually
+   optimised.
+
+Subjects are evaluated in parallel (rayon); the node sweep is serial within a
+subject. The population sum is reduced in a fixed subject order, so the OFV does
+not depend on the thread count.
+
+## Limitations
+
+- **No IOV.** Under inter-occasion variability the marginal is a joint integral
+  over `η` *and* every occasion's `κ`; the tensor grid is intractable at that
+  dimension. AGQ rejects `[iov]` models rather than silently integrating the
+  η-only marginal. Use [FOCEI](foce.qmd), [SAEM](saem.qmd) or
+  [IMP](importance-sampling.qmd).
+- **Exponential in `n_eta`** — see the cost table above.
+- No analytic outer gradient, so each outer iteration is more expensive than an
+  analytic-gradient FOCEI iteration on the same model.
+
+## References
+
+- Pinheiro & Bates (1995), *Approximations to the log-likelihood function in the
+  nonlinear mixed-effects model*, J Comput Graph Stat 4(1):12–35.
+- Adaptive Gaussian quadrature as a generalisation of the Laplacian method, as
+  implemented in Phoenix NLME (ADPO), J Pharmacokinet Pharmacodyn (2025).

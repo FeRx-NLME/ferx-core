@@ -438,6 +438,7 @@ fn method_to_str(m: EstimationMethod) -> &'static str {
         EstimationMethod::Imp => "imp",
         EstimationMethod::Impmap => "impmap",
         EstimationMethod::Bayes => "bayes",
+        EstimationMethod::Agq => "agq",
     }
 }
 
@@ -451,6 +452,7 @@ fn method_from_str(s: &str) -> Result<EstimationMethod, FitrxError> {
         "saem" => EstimationMethod::Saem,
         "imp" => EstimationMethod::Imp,
         "bayes" => EstimationMethod::Bayes,
+        "agq" => EstimationMethod::Agq,
         _ => return Err(FitrxError::Corrupt(format!("unknown method {:?}", s))),
     })
 }
