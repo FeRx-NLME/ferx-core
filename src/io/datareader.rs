@@ -1128,8 +1128,11 @@ fn parse_usize(s: &str) -> usize {
 /// exports commonly float-format the whole column (`"10.0"`, `"11.0"`) once any
 /// row is blank — so a strict `i64` parse would silently ungroup every record
 /// and discard the user's block_sigma pairing (#830). Accept an integer literal
-/// or a float-formatted integer; a blank / non-finite / unparseable cell means
-/// "ungrouped" (`None` → 0).
+/// or a *float-formatted integer* (fractional part exactly 0, within `i64`
+/// range). A genuinely non-integer value (`"2.4"`), an out-of-range magnitude, a
+/// blank, or an unparseable cell means "ungrouped" (`None` → 0) — left ungrouped
+/// rather than silently rounded/saturated into a group, which would mis-pair the
+/// residual correlation in a hard-to-debug way.
 fn parse_l2_id(s: &str) -> Option<i64> {
     let t = s.trim();
     if is_missing_cell(t) {
@@ -1138,10 +1141,12 @@ fn parse_l2_id(s: &str) -> Option<i64> {
     if let Ok(i) = t.parse::<i64>() {
         return Some(i);
     }
-    t.parse::<f64>()
-        .ok()
-        .filter(|f| f.is_finite())
-        .map(|f| f.round() as i64)
+    let f = t.parse::<f64>().ok()?;
+    if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+        Some(f as i64)
+    } else {
+        None
+    }
 }
 
 fn parse_cens(s: &str) -> i8 {
@@ -3936,8 +3941,13 @@ mod tests {
         // blank ("10.0"); a strict i64 parse would ungroup everything.
         assert_eq!(parse_l2_id("10.0"), Some(10));
         assert_eq!(parse_l2_id("11.0"), Some(11));
-        assert_eq!(parse_l2_id("2.4"), Some(2)); // rounds to nearest
-                                                 // Blank / missing / non-finite → ungrouped.
+        // A genuinely non-integer value is left ungrouped, NOT rounded into a
+        // group — silently mis-grouping would change the correlation pairing.
+        assert_eq!(parse_l2_id("2.4"), None);
+        assert_eq!(parse_l2_id("10.5"), None);
+        // Out-of-range magnitude is rejected rather than saturated.
+        assert_eq!(parse_l2_id("1e30"), None);
+        // Blank / missing / non-finite / unparseable → ungrouped.
         assert_eq!(parse_l2_id(""), None);
         assert_eq!(parse_l2_id("."), None);
         assert_eq!(parse_l2_id("NA"), None);
