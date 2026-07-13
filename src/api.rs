@@ -1482,13 +1482,14 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
 /// Features the analytic closed-form absorption models — transit (`one_cpt_transit`,
 /// `two_cpt_transit`, #386) and inverse-Gaussian (`one_cpt_ig`, `two_cpt_ig`, #790) —
 /// do not support: the exponential-tilting closed form is a constant-parameter
-/// depot-bolus superposition, so steady-state doses, IOV, infusion doses, system
+/// depot-bolus superposition, so steady-state doses, infusion doses, system
 /// resets, and non-depot (`CMT≠1`) doses are rejected up front — otherwise they would
 /// silently mis-predict or hit an `unreachable!` in the superposition dispatch.
-/// (Time-varying covariates and a `TIME`-dependent parameter are instead transparently
-/// rerouted to the plain form's ODE twin — `transit()` / `igd()` forcing — via
-/// [`CompiledModel::effective_for`]; only a form outside that twin's scope rejects
-/// them.) `fit()` surfaces this as an `Err`; `predict()`/`simulate()` panic via
+/// (Time-varying covariates, a `TIME`-dependent parameter, and IOV (`n_kappa > 0`, #719)
+/// are instead transparently rerouted to the plain form's ODE twin — `transit()` / `igd()`
+/// forcing — via [`CompiledModel::effective_for`]: the twin integrates the cross-occasion
+/// dose carryover (#104/#663) the superposition cannot. Only a form outside that twin's
+/// scope rejects them.) `fit()` surfaces this as an `Err`; `predict()`/`simulate()` panic via
 /// [`assert_absorption_closed_form_support`], mirroring
 /// [`assert_modeled_doses_supported`]. Returns the first offending feature's message,
 /// or `None` when compatible.
@@ -1503,11 +1504,19 @@ pub(crate) fn check_absorption_closed_form_support(
         return None;
     }
     let name = model.pk_model.canonical_name();
-    if model.n_kappa > 0 {
+    // IOV (n_kappa > 0): the closed-form superposition cannot express cross-occasion dose
+    // carryover (#104) — a dose whose drug persists into a later occasion must decay with that
+    // occasion's disposition. The plain form carries an `absorption_ode_equivalent` (the
+    // `transit()`/`igd()` forcing twin) that `effective_for` routes IOV subjects to (it
+    // integrates the carryover exactly, #663), so it is NOT rejected. Only a twin-less form (a
+    // user `[odes]`/`[scaling]`/`[initial_conditions]` block, or a role shadowing a reserved
+    // F/lagtime slot) is rejected here rather than mis-fit.
+    if model.n_kappa > 0 && model.absorption_ode_equivalent.is_none() {
         return Some(format!(
-            "{name} does not support IOV (n_kappa > 0): the analytic absorption closed form \
-             assumes constant disposition over each absorption window. Use an ODE absorption \
-             model (transit()/igd() forcing in [odes]) for IOV."
+            "{name} does not support IOV (n_kappa > 0) in this form: the analytic absorption \
+             closed form assumes constant disposition over each absorption window, and this \
+             form is outside the automatic ODE-equivalent rewrite. Write the model as an ODE \
+             transit()/igd() forcing in [odes] directly."
         ));
     }
     // A `TIME`-built-in structural parameter makes the disposition switch mid-profile — the
@@ -1554,11 +1563,13 @@ pub(crate) fn check_absorption_closed_form_support(
                 // The closed form folds *every* dose through the absorption chain into
                 // central ignoring `dose.cmt` (the `sens/provider.rs` superposition loop),
                 // while the ODE twin honours the compartment — a `CMT≠1` dose there falls to
-                // the direct-bolus branch and lands in a disposition compartment. So the two
-                // paths would silently disagree on a non-depot dose, and `effective_for`
-                // routes only TV-cov/`TIME` subjects to the twin, so a mixed population would
-                // even disagree with itself. A closed-form absorption model only supports
-                // dosing the depot (`CMT=1`); reject anything else up front.
+                // the direct-bolus branch and lands in a disposition compartment, bypassing the
+                // transit/IG absorption the model asks for. Neither reading of a non-depot dose
+                // on an absorption model is well-defined: a subject on the closed form and one
+                // rerouted to the twin (TV-cov / `TIME` / IOV `n_kappa > 0`, #719) would
+                // disagree, and the twin's direct-bolus reading is not the intended transit
+                // input either. A closed-form absorption model only supports dosing the depot
+                // (`CMT=1`); reject anything else up front.
                 return Some(format!(
                     "{name} does not support dosing into a non-depot compartment (subject \
                      {}, CMT={}): the analytic absorption closed form routes every dose through \

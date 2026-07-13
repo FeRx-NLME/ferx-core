@@ -3279,15 +3279,17 @@ impl CompiledModel {
     /// inverse-Gaussian `one_cpt_ig` / `two_cpt_ig`) whose closed form cannot cope with this
     /// subject — a `TIME`-dependent structural parameter or time-varying covariates make the
     /// disposition switch mid-absorption, which the per-dose absorption convolution assumes
-    /// constant — return its exact ODE (`transit()` / `igd()`) equivalent
-    /// (`absorption_ode_equivalent`, built at parse time); otherwise `self`. Constant-parameter
-    /// subjects keep the fast, exact closed form. The equivalent shares this model's θ/η layout,
+    /// constant, or IOV (`n_kappa > 0`, #719) needs cross-occasion dose carryover (#104) that
+    /// the superposition cannot express — return its exact ODE (`transit()` / `igd()`) equivalent
+    /// (`absorption_ode_equivalent`, built at parse time); otherwise `self`. Constant-parameter,
+    /// non-IOV subjects keep the fast, exact closed form. The equivalent shares this model's θ/η layout,
     /// so callers pass the same parameter vector (#486, #790). A no-op (`self`) for every model
     /// without an ODE twin.
     pub fn effective_for<'a>(&'a self, subject: &Subject) -> &'a CompiledModel {
         if let Some(eq) = &self.absorption_ode_equivalent {
             if crate::parser::model_parser::compiled_model_uses_time_builtin(self)
                 || subject.has_tv_covariates()
+                || self.n_kappa > 0
             {
                 return eq.get_or_build();
             }
@@ -3438,13 +3440,26 @@ impl CompiledModel {
         c
     }
 
+    /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint — the
+    /// binary / Bernoulli family today; ordinal / Poisson / negative-binomial extend this
+    /// match. This is the family-agnostic gate for the discrete data term and its FD-Hessian
+    /// contribution, so a new discrete family is enabled here and in `discrete_subject_nll`
+    /// without editing a likelihood dispatch site. Equals [`has_binary`](Self::has_binary)
+    /// today.
+    #[cfg(feature = "survival")]
+    pub fn has_discrete(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|e| matches!(e, EndpointLikelihood::Binary { .. }))
+    }
+
     /// True if the model carries **any non-Gaussian endpoint** (TTE/RTTE, the
     /// Phase-4 categorical/count families, or a Phase-5 CTMM). This is the
     /// predicate the estimation machinery gates on when choosing the **FD-Hessian
     /// Laplace** inner/outer path and disabling the analytic outer gradient —
     /// those choices are correct for every non-Gaussian data term, not TTE
     /// specifically. Equals [`has_tte`](Self::has_tte) exactly when no
-    /// categorical/Markov endpoint is present, so existing TTE behaviour is
+    /// discrete/Markov endpoint is present, so existing TTE behaviour is
     /// unchanged.
     #[cfg(feature = "survival")]
     pub fn has_non_gaussian(&self) -> bool {
@@ -3452,7 +3467,7 @@ impl CompiledModel {
         let ctmm = self.has_ctmm();
         #[cfg(not(feature = "markov"))]
         let ctmm = false;
-        self.has_tte() || self.has_binary() || ctmm
+        self.has_tte() || self.has_discrete() || ctmm
     }
 
     /// Always false without the `survival` feature - TTE endpoints can't be
@@ -3472,6 +3487,13 @@ impl CompiledModel {
     /// Always false without the `survival` feature - `[binary_model]` can't be parsed.
     #[cfg(not(feature = "survival"))]
     pub fn has_binary(&self) -> bool {
+        false
+    }
+
+    /// Always false without the `survival` feature - no discrete (categorical/count)
+    /// endpoint can be parsed.
+    #[cfg(not(feature = "survival"))]
+    pub fn has_discrete(&self) -> bool {
         false
     }
 

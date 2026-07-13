@@ -3765,6 +3765,156 @@ fn eval_indiv_param_vars(
     vars
 }
 
+/// Shared predictor validation + `[individual_parameters]` restriction for the
+/// `[event_model]` and `[binary_model]` blocks.
+///
+/// Both blocks carry a linear predictor over θ/η/covariates/`[individual_parameters]`
+/// — a hazard parameter expression, or the `logit` log-odds — and both must enforce
+/// the same four invariants on it (previously duplicated verbatim in each block):
+///
+/// 1. reject a **direct** IOV-κ reference (#770): the predictor is evaluated once per
+///    subject with BSV-only η, so a kappa name has no occasion context and would
+///    otherwise fall back to a leniently-read `0.0` covariate, silently dropping it;
+/// 2. restrict the individual-parameter statements to those the predictor references,
+///    transitively (#442) — bounding per-eval work and scoping checks 3–4 to the
+///    parameters the predictor actually depends on;
+/// 3. reject an individual-parameter value that reaches an IOV-κ through η (#442);
+/// 4. reject an individual-parameter value that reads a `[covariate_nn]` output
+///    (#293, `nn`-gated) — it would silently resolve to `0.0` without the forward pass.
+///
+/// Returns the restricted statements (for the predictor closure) and the predictor's
+/// covariate set — the **union** of covariates referenced directly and transitively
+/// through the kept statements, so a time-varying covariate reached only via an
+/// individual parameter cannot slip past the #741 TV-covariate guard silently frozen.
+/// θ/η index collection stays with each caller (it returns those for its own
+/// dead-parameter census). `block` names the block for error messages.
+///
+/// The two blocks previously each carried these four steps verbatim; keeping them here
+/// once means a fix to any #770/#442/#741/#293 invariant lands for both endpoints.
+#[cfg(feature = "survival")]
+fn restrict_and_validate_indiv_stmts(
+    exprs: &[&Expression],
+    indiv_stmts: &[Statement],
+    eta_names: &[String],
+    kappa_names: &[String],
+    block: &str,
+) -> Result<(Vec<Statement>, Vec<String>), String> {
+    // Block-appropriate noun for the predictor in error messages — `[event_model]` carries a
+    // hazard, `[binary_model]` the logit — so a user sees the same wording as before the two
+    // blocks shared this helper.
+    let predictor = match block {
+        "event_model" => "a hazard expression",
+        "binary_model" => "the logit predictor",
+        _ => "a predictor expression",
+    };
+    // (1) Direct IOV-κ reference — fail loud (#770).
+    for expr in exprs {
+        if let Some(k) = expr_references_kappa(expr, kappa_names) {
+            return Err(format!(
+                "[{block}]: {predictor} references the inter-occasion (IOV) random \
+                 effect `{k}` directly. The predictor is evaluated once per subject with \
+                 per-subject (BSV) η only, so an IOV kappa has no well-defined value here — write \
+                 it in terms of θ/η, or reference an IOV-free parameter."
+            ));
+        }
+    }
+
+    // (2) Restrict `[individual_parameters]` to what the predictor references, transitively.
+    // Walk declarations in reverse so a needed parameter pulls in the earlier-declared
+    // parameters it depends on. Conditional (`if (...) CL = ...`) parameters are handled by
+    // keying on every assigned name (`assigned_vars_in_order`) and pulling in every referenced
+    // name (`visit_stmt_nodes`, covering RHS, conditions, and both branches).
+    let needed_indiv_stmts: Vec<Statement> = {
+        let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for expr in exprs {
+            collect_variable_names(expr, &mut needed);
+        }
+        let mut keep: Vec<Statement> = Vec::new();
+        for s in indiv_stmts.iter().rev() {
+            let stmt = std::slice::from_ref(s);
+            if assigned_vars_in_order(stmt)
+                .iter()
+                .any(|n| needed.contains(n))
+            {
+                visit_stmt_nodes(stmt, &mut |e: &Expression| {
+                    if let Expression::Variable(name) = e {
+                        needed.insert(name.clone());
+                    }
+                });
+                keep.push(s.clone());
+            }
+        }
+        keep.reverse();
+        keep
+    };
+
+    // (3) Covariate set: union of covariates referenced directly by the predictor and
+    // transitively through the kept individual-parameter statements (#741).
+    let covariates: Vec<String> = {
+        let mut cov_set = std::collections::HashSet::new();
+        for expr in exprs {
+            collect_covariates(expr, &mut cov_set);
+        }
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut cov_set);
+        let mut v: Vec<String> = cov_set.into_iter().collect();
+        v.sort();
+        v
+    };
+
+    // (4) An individual-parameter value that depends on an IOV-κ (BSV-only η here) — fail
+    // loud (#442). `eta_names` is BSV-only, so any `Eta(i)` with `i >= n_eta` is the kappa at
+    // position `i - n_eta` in `kappa_names`.
+    {
+        let n_eta = eta_names.len();
+        let mut kappa_hit: Option<String> = None;
+        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
+            if let Expression::Eta(i) = e {
+                if *i >= n_eta && kappa_hit.is_none() {
+                    kappa_hit = Some(
+                        kappa_names
+                            .get(*i - n_eta)
+                            .cloned()
+                            .unwrap_or_else(|| "<kappa>".to_string()),
+                    );
+                }
+            }
+        });
+        if let Some(k) = kappa_hit {
+            return Err(format!(
+                "[{block}]: {predictor} references an [individual_parameters] value \
+                 that depends on the inter-occasion (IOV) random effect `{k}`. The predictor is \
+                 evaluated with per-subject (BSV) η only — reference an IOV-free parameter, or \
+                 write the predictor in terms of θ/η directly."
+            ));
+        }
+    }
+
+    // (5) An individual-parameter value whose definition reads a `[covariate_nn]` output would
+    // silently resolve to `0.0` (the predictor evaluates these statements without the network
+    // forward pass). Reject it — gated to `nn` like the rest: `Expression::NnOutput` nodes only
+    // exist under the `nn` feature, so the survival coverage build (no `nn`) does not compile
+    // this — a measurement gap, not missed coverage (#293) — and it is unreachable without `nn`.
+    #[cfg(feature = "nn")]
+    {
+        let mut nn_hit = false;
+        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
+            if matches!(e, Expression::NnOutput { .. }) {
+                nn_hit = true;
+            }
+        });
+        if nn_hit {
+            return Err(format!(
+                "[{block}]: {predictor} references an [individual_parameters] value \
+                 whose definition uses a [covariate_nn] output. Neural-network-driven individual \
+                 parameters are not available to the predictor (it is evaluated without the \
+                 network forward pass) — reference an NN-free parameter instead."
+            ));
+        }
+    }
+
+    Ok((needed_indiv_stmts, covariates))
+}
+
 /// Parse one `[event_model]` (or `[event_model NAME]`) block.
 ///
 /// Returns `(cmt, EndpointLikelihood::Tte { hazard })` ready to insert into
@@ -4080,16 +4230,11 @@ fn parse_event_model_block(
         }
     }
 
-    // Collect covariate/theta/eta references from all expressions BEFORE they are
-    // moved into the param_fn closure.
-    let mut event_model_covariates: Vec<String>;
-    let event_model_thetas: std::collections::HashSet<usize>;
-    let event_model_etas: std::collections::HashSet<usize>;
-    // The hazard's parameter expressions in optimizer-parameter order, bound once
-    // and reused by the three scans below — reference collection, the direct-kappa
-    // reject (#770), and the transitive needed-statement collection (#442) — so a
-    // future family parameter can't be added to one walk and silently forgotten in
-    // another.
+    // The hazard's parameter expressions in optimizer-parameter order. The covariate
+    // union, `[individual_parameters]` restriction, and the direct/via-indiv IOV-κ
+    // (#770/#442) and `[covariate_nn]` (#293) rejects are shared with `[binary_model]`
+    // through `restrict_and_validate_indiv_stmts`; only the θ/η index sets (for the
+    // dead-parameter census) are collected here, since each block returns its own.
     let hazard_param_exprs = [
         &scale_expr,
         &shape_expr,
@@ -4097,153 +4242,22 @@ fn parse_event_model_block(
         &gamma_expr,
         &loghr_expr,
     ];
-    {
-        let mut cov_set = std::collections::HashSet::new();
+    let hazard_exprs: Vec<&Expression> = hazard_param_exprs.into_iter().flatten().collect();
+    let (event_model_thetas, event_model_etas) = {
         let mut theta_set = std::collections::HashSet::new();
         let mut eta_set = std::collections::HashSet::new();
-        for expr in hazard_param_exprs.into_iter().flatten() {
-            collect_covariates(expr, &mut cov_set);
+        for expr in hazard_exprs.iter().copied() {
             collect_theta_eta(expr, &mut theta_set, &mut eta_set);
         }
-        let mut v: Vec<String> = cov_set.into_iter().collect();
-        v.sort();
-        event_model_covariates = v;
-        event_model_thetas = theta_set;
-        event_model_etas = eta_set;
-    }
-
-    // A hazard expression that references an IOV kappa **by name directly**
-    // (e.g. `scale = TVLAMBDA * exp(KAPPA_CL)`) is as ill-defined as one that
-    // reaches a kappa through an [individual_parameters] value (rejected just
-    // below, #442): the hazard is evaluated once per subject, with no occasion
-    // context. The hazard parse scope is BSV-only, so a kappa name here parses as
-    // an unresolved identifier (Variable/Covariate) rather than `Eta(i)` and would
-    // otherwise fall back to a leniently-read 0.0 covariate (see the "read
-    // leniently" note above), silently dropping the IOV term. Reject it fail-loud
-    // instead (#770).
-    for expr in hazard_param_exprs.into_iter().flatten() {
-        if let Some(k) = expr_references_kappa(expr, kappa_names) {
-            return Err(format!(
-                "[event_model]: a hazard expression references the inter-occasion (IOV) \
-                 random effect `{k}` directly. The hazard is evaluated once per subject, with \
-                 no occasion context, so an IOV kappa has no well-defined value here — write \
-                 the hazard in terms of θ/η, or reference an IOV-free parameter."
-            ));
-        }
-    }
-
-    // Restrict the individual-parameter statements the hazard closures evaluate to
-    // just those the hazard references, transitively. This bounds the per-eval work
-    // and scopes the IOV/NN checks below to what the hazard actually depends on (an
-    // unrelated PK parameter that uses an IOV kappa or an NN output must not make a
-    // kappa-free hazard fail). Walking declarations in reverse lets a needed
-    // parameter pull in the (earlier-declared) parameters it depends on. NONMEM-style
-    // `if (...) CL = ...` conditional parameters are handled by keying on every name
-    // the statement assigns (across branches, via `assigned_vars_in_order`) and
-    // pulling in every name it references (RHS, conditions, and both branches, via
-    // `visit_stmt_nodes`).
-    let needed_indiv_stmts: Vec<Statement> = {
-        let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for expr in hazard_param_exprs.into_iter().flatten() {
-            collect_variable_names(expr, &mut needed);
-        }
-        let mut keep: Vec<Statement> = Vec::new();
-        for s in indiv_stmts.iter().rev() {
-            let stmt = std::slice::from_ref(s);
-            if assigned_vars_in_order(stmt)
-                .iter()
-                .any(|n| needed.contains(n))
-            {
-                visit_stmt_nodes(stmt, &mut |e: &Expression| {
-                    if let Expression::Variable(name) = e {
-                        needed.insert(name.clone());
-                    }
-                });
-                keep.push(s.clone());
-            }
-        }
-        keep.reverse();
-        keep
+        (theta_set, eta_set)
     };
-
-    // A hazard sub-expression may reference an [individual_parameters] value (PR #442)
-    // whose own definition reads covariates — e.g. `scale = LAMBDA` with
-    // `LAMBDA = TVLAMBDA * exp(TVBETA * CRCL + ETA)`. The `param_fn` evaluates those kept
-    // statements, so the hazard transitively reads `CRCL` at the baseline snapshot. Union
-    // the covariates of the kept statements into the event-model covariate set so (a) they
-    // appear in the covariate table and (b) `hazard_covariates` is complete — otherwise a
-    // *time-varying* covariate reached only through an individual parameter slips past the
-    // #741 guard and is silently frozen (the exact bug #741 exists to reject).
-    {
-        let mut cov_set = std::collections::HashSet::new();
-        collect_covariates_in_stmts(&needed_indiv_stmts, &mut cov_set);
-        for c in cov_set {
-            if !event_model_covariates.contains(&c) {
-                event_model_covariates.push(c);
-            }
-        }
-        event_model_covariates.sort();
-    }
-
-    // The hazard `param_fn` evaluates the kept statements with the BSV-only η it is
-    // handed (kappas are PK/occasion-level, not part of a per-subject hazard), so a
-    // kept statement referencing an IOV kappa would index η out of bounds and abort
-    // the fit (issue #442). Reject it here with a clear error instead. `eta_names` is
-    // BSV-only (it is `model.eta_names`), so any `Eta(i)` with `i >= eta_names.len()`
-    // is the kappa at position `i - n_eta` in `kappa_names`.
-    {
-        let n_eta = eta_names.len();
-        let mut kappa_hit: Option<String> = None;
-        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
-            if let Expression::Eta(i) = e {
-                if *i >= n_eta && kappa_hit.is_none() {
-                    kappa_hit = Some(
-                        kappa_names
-                            .get(*i - n_eta)
-                            .cloned()
-                            .unwrap_or_else(|| "<kappa>".to_string()),
-                    );
-                }
-            }
-        });
-        if let Some(k) = kappa_hit {
-            return Err(format!(
-                "[event_model]: a hazard expression references an [individual_parameters] \
-                 value that depends on the inter-occasion (IOV) random effect `{k}`. The \
-                 hazard is evaluated once per subject, with no occasion context, so an IOV \
-                 parameter has no well-defined value here — reference an IOV-free parameter, \
-                 or write the hazard in terms of θ/η directly."
-            ));
-        }
-    }
-
-    // An `[individual_parameters]` value whose definition reads a `[covariate_nn]`
-    // output would silently resolve to 0.0 in the hazard, because the hazard
-    // `param_fn` evaluates these statements without the network forward pass. Reject
-    // such a reference. `Expression::NnOutput` nodes only exist under the `nn`
-    // feature (they come from `[covariate_nn]` dot-access), so this guard is gated to
-    // it: the survival coverage build (`--features ci,survival`, no `nn`) does not
-    // compile it — a measurement gap, not missed coverage (#293) — and it is
-    // unreachable in any build without `nn`.
-    #[cfg(feature = "nn")]
-    {
-        let mut nn_hit = false;
-        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
-            if matches!(e, Expression::NnOutput { .. }) {
-                nn_hit = true;
-            }
-        });
-        if nn_hit {
-            return Err(
-                "[event_model]: a hazard expression references an [individual_parameters] \
-                 value whose definition uses a [covariate_nn] output. Neural-network-driven \
-                 individual parameters are not available to hazard expressions (the hazard is \
-                 evaluated without the network forward pass) — reference an NN-free parameter \
-                 instead."
-                    .to_string(),
-            );
-        }
-    }
+    let (needed_indiv_stmts, event_model_covariates) = restrict_and_validate_indiv_stmts(
+        &hazard_exprs,
+        indiv_stmts,
+        eta_names,
+        kappa_names,
+        "event_model",
+    )?;
 
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
@@ -4408,120 +4422,24 @@ fn parse_binary_model_block(
         }
     }
 
-    // Collect covariate/theta/eta references BEFORE the expression is moved into the closure.
-    let mut lp_covariates: Vec<String>;
-    let lp_thetas: std::collections::HashSet<usize>;
-    let lp_etas: std::collections::HashSet<usize>;
-    {
-        let mut cov_set = std::collections::HashSet::new();
+    // The covariate union, `[individual_parameters]` restriction, and the direct/via-indiv
+    // IOV-κ (#770/#442) and `[covariate_nn]` (#293) rejects are shared with `[event_model]`
+    // through `restrict_and_validate_indiv_stmts`; only the θ/η index sets (for the
+    // dead-parameter census) are collected here, since each block returns its own.
+    let lp_exprs: [&Expression; 1] = [&logit_expr];
+    let (lp_thetas, lp_etas) = {
         let mut theta_set = std::collections::HashSet::new();
         let mut eta_set = std::collections::HashSet::new();
-        collect_covariates(&logit_expr, &mut cov_set);
         collect_theta_eta(&logit_expr, &mut theta_set, &mut eta_set);
-        let mut v: Vec<String> = cov_set.into_iter().collect();
-        v.sort();
-        lp_covariates = v;
-        lp_thetas = theta_set;
-        lp_etas = eta_set;
-    }
-
-    // Reject a direct IOV-kappa reference (#770 analogue): the predictor is evaluated with
-    // BSV-only η, so a kappa name here would silently read 0.0 — fail loud instead.
-    if let Some(k) = expr_references_kappa(&logit_expr, kappa_names) {
-        return Err(format!(
-            "[binary_model]: the logit predictor references the inter-occasion (IOV) random \
-             effect `{k}` directly. The predictor is evaluated with per-subject (BSV) η only, so \
-             an IOV kappa has no well-defined value here — write it in terms of θ/η, or reference \
-             an IOV-free parameter."
-        ));
-    }
-
-    // Restrict the individual-parameter statements the predictor evaluates to just those it
-    // references, transitively (mirrors the hazard path; bounds per-eval work and scopes the
-    // IOV/NN checks below to what the predictor actually depends on).
-    let needed_indiv_stmts: Vec<Statement> = {
-        let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        collect_variable_names(&logit_expr, &mut needed);
-        let mut keep: Vec<Statement> = Vec::new();
-        for s in indiv_stmts.iter().rev() {
-            let stmt = std::slice::from_ref(s);
-            if assigned_vars_in_order(stmt)
-                .iter()
-                .any(|n| needed.contains(n))
-            {
-                visit_stmt_nodes(stmt, &mut |e: &Expression| {
-                    if let Expression::Variable(name) = e {
-                        needed.insert(name.clone());
-                    }
-                });
-                keep.push(s.clone());
-            }
-        }
-        keep.reverse();
-        keep
+        (theta_set, eta_set)
     };
-
-    // Union covariates reached transitively through `[individual_parameters]` so a
-    // time-varying covariate can't slip past a future TV-covariate guard silently frozen
-    // (the #741 concern, applied to the categorical predictor).
-    {
-        let mut cov_set = std::collections::HashSet::new();
-        collect_covariates_in_stmts(&needed_indiv_stmts, &mut cov_set);
-        for c in cov_set {
-            if !lp_covariates.contains(&c) {
-                lp_covariates.push(c);
-            }
-        }
-        lp_covariates.sort();
-    }
-
-    // Reject an `[individual_parameters]` value that depends on an IOV kappa (BSV-only η here).
-    {
-        let n_eta = eta_names.len();
-        let mut kappa_hit: Option<String> = None;
-        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
-            if let Expression::Eta(i) = e {
-                if *i >= n_eta && kappa_hit.is_none() {
-                    kappa_hit = Some(
-                        kappa_names
-                            .get(*i - n_eta)
-                            .cloned()
-                            .unwrap_or_else(|| "<kappa>".to_string()),
-                    );
-                }
-            }
-        });
-        if let Some(k) = kappa_hit {
-            return Err(format!(
-                "[binary_model]: the logit predictor references an [individual_parameters] value \
-                 that depends on the inter-occasion (IOV) random effect `{k}`. The predictor is \
-                 evaluated with per-subject (BSV) η only — reference an IOV-free parameter, or \
-                 write the predictor in terms of θ/η directly."
-            ));
-        }
-    }
-
-    // An `[individual_parameters]` value that reads a `[covariate_nn]` output would silently
-    // resolve to 0.0 here (the predictor evaluates these statements without the network
-    // forward pass). Reject it — gated to `nn` like the hazard guard (#293 measurement gap,
-    // not missed coverage, in the survival build).
-    #[cfg(feature = "nn")]
-    {
-        let mut nn_hit = false;
-        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
-            if matches!(e, Expression::NnOutput { .. }) {
-                nn_hit = true;
-            }
-        });
-        if nn_hit {
-            return Err(
-                "[binary_model]: the logit predictor references an [individual_parameters] value \
-                 whose definition uses a [covariate_nn] output. Neural-network-driven individual \
-                 parameters are not available to the predictor — reference an NN-free parameter."
-                    .to_string(),
-            );
-        }
-    }
+    let (needed_indiv_stmts, lp_covariates) = restrict_and_validate_indiv_stmts(
+        &lp_exprs,
+        indiv_stmts,
+        eta_names,
+        kappa_names,
+        "binary_model",
+    )?;
 
     // Build the lp_fn closure over (θ, η, covariates). Expression nodes hold only indices, so
     // they are safe to move; `TIME` resolves via the model-time guard `binary_data_term` sets

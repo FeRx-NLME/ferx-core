@@ -530,16 +530,258 @@ fn transit_infusion_dose_rejected() {
     );
 }
 
+/// Build the (analytic, ODE) `.ferx` pair for a transit model carrying **IOV on CL**
+/// (`KAPPA_CL`) — the disposition-IOV case where a dose's drug can persist into a later
+/// occasion and must decay with *that* occasion's clearance (cross-occasion carryover, #104),
+/// which the closed-form superposition cannot express. Both sides share the same
+/// `[parameters]`/`[individual_parameters]`, so the analytic form's auto-built ODE twin is the
+/// exact hand-written `transit()` forcing model.
+fn build_iov_pair() -> (String, String) {
+    let header = "[parameters]\n  \
+        theta TVCL(0.13, 0.001, 10.0)\n  \
+        theta TVV(8.0, 0.1, 500.0)\n  \
+        theta TVNTR(3.0, 0.0, 20.0)\n  \
+        theta TVMTT(1.5, 0.05, 50.0)\n  \
+        omega ETA_CL ~ 0.09\n  \
+        kappa KAPPA_CL ~ 0.04\n  \
+        sigma PROP ~ 0.01 (sd)\n\n\
+        [individual_parameters]\n  \
+        CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n\n";
+    let analytical = format!(
+        "{header}[structural_model]\n  \
+         pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let ode = format!(
+        "{header}[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = transit(n=NTR, mtt=MTT) - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    (analytical, ode)
+}
+
+/// A two-occasion, multi-dose transit subject with cross-occasion carryover: dose 1 (occ 0,
+/// t=0) still has drug on board when occ 1's observations (t=13, 18) are taken, so occ 1's
+/// `KAPPA_CL` governs that tail — exactly the case a per-dose superposition gets wrong (#104).
+fn iov_subject() -> Population {
+    let mut pop = population(
+        vec![bolus(0.0, 100.0), bolus(12.0, 100.0)],
+        vec![1.0, 6.0, 13.0, 18.0],
+    );
+    pop.subjects[0].occasions = vec![0, 0, 1, 1];
+    pop.subjects[0].dose_occasions = vec![0, 1];
+    pop
+}
+
+/// Multiple-dose IOV: **four** doses across two occasions (two per occasion), observations
+/// interleaved through both. The analytic transit IOV model (auto-routed to its `transit()`
+/// ODE twin) must still match the hand-written forcing model — confirming the superposition of
+/// several doses under per-occasion kappa (and cross-occasion carryover) composes correctly
+/// (#719). Directly exercises multi-dose regimen data.
 #[test]
-fn transit_iov_rejected() {
-    // Mark the (otherwise basic) transit model as carrying IOV; the up-front guard
-    // must reject it before any n_kappa-dependent prediction runs.
-    let (an_src, _) = build_pair(false, false);
-    let mut model = parse_full_model(&an_src).expect("parses").model;
-    model.n_kappa = 1;
-    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
+fn transit_iov_multidose_matches_hand_written_ode_forcing() {
+    let (an_src, ode_src) = build_iov_pair();
+    let an = parse_full_model(&an_src).expect("analytic parses").model;
+    let ode = parse_full_model(&ode_src).expect("ODE parses").model;
+    // Occasion 0 = [0,24): doses at 0, 12; occasion 1 = [24,48): doses at 24, 36.
+    let mut pop = population(
+        vec![
+            bolus(0.0, 100.0),
+            bolus(12.0, 100.0),
+            bolus(24.0, 100.0),
+            bolus(36.0, 100.0),
+        ],
+        vec![1.0, 6.0, 13.0, 20.0, 25.0, 30.0, 37.0, 44.0],
+    );
+    pop.subjects[0].occasions = vec![0, 0, 0, 0, 1, 1, 1, 1];
+    pop.subjects[0].dose_occasions = vec![0, 0, 1, 1];
+    let subject = &pop.subjects[0];
+    let theta = &an.default_params.theta;
+    let eta_bsv = [0.0];
+    let kappas = [vec![0.20], vec![-0.30]];
+    let pa = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &kappas);
+    let po = ferx_core::pk::predict_iov(&ode, subject, theta, &eta_bsv, &kappas);
+    assert_eq!(pa.len(), 8, "one prediction per observation");
+    for (i, (x, y)) in pa.iter().zip(po.iter()).enumerate() {
+        let tol = ATOL + ACCUM_RTOL * x.abs();
+        assert!(
+            (x - y).abs() <= tol,
+            "obs {i}: analytic-twin {x:.6} vs hand-written ODE {y:.6} (|diff| {:.2e} > tol {:.2e})",
+            (x - y).abs(),
+            tol
+        );
+    }
+}
+
+/// A plain `one_cpt_transit` model carrying IOV (`n_kappa > 0`) now **works** (#719): the
+/// closed-form superposition cannot carry a dose's drug across an occasion boundary (#104), so
+/// an IOV subject routes to the model's exact `transit()` ODE twin, which integrates the
+/// carryover (#663). No longer rejected — replaces the pre-#719 `transit_iov_rejected`.
+#[test]
+fn transit_iov_now_served_by_ode_equivalent() {
+    let (an_src, _) = build_iov_pair();
+    let model = parse_full_model(&an_src).expect("IOV transit parses").model;
+    assert_eq!(model.n_kappa, 1, "KAPPA_CL registered as one IOV kappa");
+    assert!(
+        model.absorption_ode_equivalent.is_some(),
+        "plain IOV transit carries an ODE equivalent"
+    );
+    let pop = iov_subject();
+    // The closed form must reroute an IOV subject to its ODE twin.
+    assert!(
+        model.effective_for(&pop.subjects[0]).ode_spec.is_some(),
+        "IOV subject routes the closed-form transit model to its ODE twin"
+    );
+    // And it fits (via the twin, exercising the analytic IOV gradient reroute) instead of
+    // erroring on the old n_kappa>0 reject.
+    fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect("IOV transit now fits via the ODE equivalent");
+}
+
+/// Correctness anchor for the reroute: the analytic transit IOV model (auto-routed to its ODE
+/// twin) must predict identically to the hand-written `transit()` forcing IOV model at non-zero
+/// per-occasion kappas. Pins the cross-occasion carryover to the twin's exact integration
+/// (#104/#663) rather than any superposition approximation.
+#[test]
+fn transit_iov_matches_hand_written_ode_forcing() {
+    let (an_src, ode_src) = build_iov_pair();
+    let an = parse_full_model(&an_src)
+        .expect("analytic IOV transit parses")
+        .model;
+    let ode = parse_full_model(&ode_src)
+        .expect("ODE IOV transit parses")
+        .model;
+    let pop = iov_subject();
+    let subject = &pop.subjects[0];
+
+    // Distinct, non-zero kappa per occasion (group order = first appearance: occ 0, then occ 1).
+    let theta = &an.default_params.theta;
+    let eta_bsv = [0.0]; // one BSV eta (ETA_CL)
+    let kappas = [vec![0.20], vec![-0.30]];
+
+    let pa = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &kappas);
+    let po = ferx_core::pk::predict_iov(&ode, subject, theta, &eta_bsv, &kappas);
+    assert_eq!(pa.len(), po.len(), "prediction count mismatch");
+    assert_eq!(
+        pa.len(),
+        subject.obs_times.len(),
+        "one prediction per observation"
+    );
+    // Kappa must actually move the predictions (guards against a silent kappa=0 path).
+    let pa0 = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &[vec![0.0], vec![0.0]]);
+    assert!(
+        pa.iter().zip(pa0.iter()).any(|(a, b)| (a - b).abs() > 1e-6),
+        "non-zero kappa should change the IOV transit predictions"
+    );
+    for (i, (x, y)) in pa.iter().zip(po.iter()).enumerate() {
+        let tol = ATOL + ACCUM_RTOL * x.abs();
+        assert!(
+            (x - y).abs() <= tol,
+            "obs {i}: analytic-twin {x:.6} vs hand-written ODE {y:.6} (|diff| {:.2e} > tol {:.2e})",
+            (x - y).abs(),
+            tol
+        );
+    }
+}
+
+/// Build the (analytic, ODE) pair for a transit model carrying **IOV on V** (`KAPPA_V`). Unlike
+/// IOV-on-CL, this makes the twin's `obs_scale = V` divisor **κ-dependent** (V changes per
+/// occasion), and κ on V also moves `ke = CL/V` — so it exercises the per-occasion
+/// ExpressionScale-IOV path (the obs_scale divisor varying with κ) that every IOV-on-CL test
+/// leaves untouched.
+fn build_iov_on_v_pair() -> (String, String) {
+    let header = "[parameters]\n  \
+        theta TVCL(0.13, 0.001, 10.0)\n  \
+        theta TVV(8.0, 0.1, 500.0)\n  \
+        theta TVNTR(3.0, 0.0, 20.0)\n  \
+        theta TVMTT(1.5, 0.05, 50.0)\n  \
+        omega ETA_CL ~ 0.09\n  \
+        kappa KAPPA_V ~ 0.04\n  \
+        sigma PROP ~ 0.01 (sd)\n\n\
+        [individual_parameters]\n  \
+        CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(KAPPA_V)\n  NTR = TVNTR\n  MTT = TVMTT\n\n";
+    let analytical = format!(
+        "{header}[structural_model]\n  \
+         pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let ode = format!(
+        "{header}[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = transit(n=NTR, mtt=MTT) - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    (analytical, ode)
+}
+
+/// IOV on the **volume** (`KAPPA_V`): the twin's `obs_scale = V` divisor becomes κ-dependent, so
+/// this covers the per-occasion ExpressionScale-IOV axis that the IOV-on-CL tests (and the NONMEM
+/// anchor) do not. The analytic reroute must still match the hand-written `transit()` forcing twin
+/// at non-zero per-occasion κ — pinning the κ-varying obs_scale to the twin's exact integration.
+#[test]
+fn transit_iov_on_v_matches_hand_written_ode_forcing() {
+    let (an_src, ode_src) = build_iov_on_v_pair();
+    let an = parse_full_model(&an_src)
+        .expect("analytic IOV-on-V transit parses")
+        .model;
+    let ode = parse_full_model(&ode_src)
+        .expect("ODE IOV-on-V transit parses")
+        .model;
+    let pop = iov_subject();
+    let subject = &pop.subjects[0];
+    let theta = &an.default_params.theta;
+    let eta_bsv = [0.0]; // one BSV eta (ETA_CL)
+    let kappas = [vec![0.20], vec![-0.30]];
+
+    let pa = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &kappas);
+    let po = ferx_core::pk::predict_iov(&ode, subject, theta, &eta_bsv, &kappas);
+    assert_eq!(
+        pa.len(),
+        subject.obs_times.len(),
+        "one prediction per observation"
+    );
+    // κ on V must move the predictions (the κ-dependent obs_scale=V divisor and ke=CL/V).
+    let pa0 = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &[vec![0.0], vec![0.0]]);
+    assert!(
+        pa.iter().zip(pa0.iter()).any(|(a, b)| (a - b).abs() > 1e-6),
+        "non-zero KAPPA_V should change the predictions (κ-dependent obs_scale = V)"
+    );
+    for (i, (x, y)) in pa.iter().zip(po.iter()).enumerate() {
+        let tol = ATOL + ACCUM_RTOL * x.abs();
+        assert!(
+            (x - y).abs() <= tol,
+            "obs {i}: analytic-twin {x:.6} vs hand-written ODE {y:.6} (|diff| {:.2e} > tol {:.2e})",
+            (x - y).abs(),
+            tol
+        );
+    }
+}
+
+/// A transit form outside the ODE-equivalent's scope — here a user `[scaling]` block — carries
+/// no twin, so IOV cannot be rerouted and is still rejected up front (#719): the closed form
+/// alone cannot serve cross-occasion carryover.
+#[test]
+fn transit_iov_without_twin_rejected() {
+    let src = "[parameters]\n  \
+        theta TVCL(0.13, 0.001, 10.0)\n  theta TVV(8.0, 0.1, 500.0)\n  \
+        theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(1.5, 0.05, 50.0)\n  \
+        omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n  sigma PROP ~ 0.01 (sd)\n\n\
+        [scaling]\n  obs_scale = 2.0\n\n\
+        [individual_parameters]\n  \
+        CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n\n\
+        [structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\n\
+        [error_model]\n  DV ~ proportional(PROP)\n";
+    let model = parse_full_model(src)
+        .expect("transit + [scaling] parses")
+        .model;
+    assert!(
+        model.absorption_ode_equivalent.is_none(),
+        "a [scaling] block suppresses the ODE twin"
+    );
+    let pop = iov_subject();
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("transit + IOV should be rejected");
+        .expect_err("twin-less IOV transit should be rejected");
     assert!(
         e.contains("IOV"),
         "expected an IOV-rejection message, got: {e}"
@@ -1547,20 +1789,81 @@ fn two_cpt_transit_non_depot_dose_rejected() {
     );
 }
 
-/// The IOV guard also covers the 2-cpt model, naming it (shared `check_transit_support`,
-/// the 2-cpt counterpart of `transit_iov_rejected`).
-#[test]
-fn two_cpt_transit_iov_rejected() {
-    let (an_src, _) = build_pair_2cpt(false, false);
-    let mut model = parse_full_model(&an_src).expect("parses").model;
-    model.n_kappa = 1;
-    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
-    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("2cpt transit + IOV should be rejected");
-    assert!(
-        e.contains("two_cpt_transit") && e.contains("IOV"),
-        "expected a two_cpt_transit IOV-rejection message, got: {e}"
+/// Build the (analytic, ODE) `.ferx` pair for a **2-cpt** transit model carrying IOV on CL
+/// (`KAPPA_CL`) — the 2-cpt counterpart of `build_iov_pair`.
+fn build_iov_pair_2cpt() -> (String, String) {
+    let header = "[parameters]\n  \
+        theta TVCL(0.13, 0.001, 10.0)\n  \
+        theta TVV1(8.0, 0.1, 500.0)\n  \
+        theta TVQ(0.5, 0.01, 50.0)\n  \
+        theta TVV2(20.0, 0.1, 1000.0)\n  \
+        theta TVNTR(3.0, 0.0, 20.0)\n  \
+        theta TVMTT(1.5, 0.05, 50.0)\n  \
+        omega ETA_CL ~ 0.09\n  \
+        kappa KAPPA_CL ~ 0.04\n  \
+        sigma PROP ~ 0.01 (sd)\n\n\
+        [individual_parameters]\n  \
+        CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V1 = TVV1\n  Q = TVQ\n  V2 = TVV2\n  \
+        NTR = TVNTR\n  MTT = TVMTT\n\n";
+    let analytical = format!(
+        "{header}[structural_model]\n  \
+         pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=V2, n=NTR, mtt=MTT)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
     );
+    let ode = format!(
+        "{header}[structural_model]\n  ode(obs_cmt=central, states=[central, periph])\n\n\
+         [odes]\n  \
+         d/dt(central) = transit(n=NTR, mtt=MTT) - (CL/V1 + Q/V1) * central + (Q/V2) * periph\n  \
+         d/dt(periph) = (Q/V1) * central - (Q/V2) * periph\n\n\
+         [scaling]\n  obs_scale = V1\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    (analytical, ode)
+}
+
+/// The 2-cpt analytic transit model carries IOV the same way (#719): an IOV subject routes to
+/// its 2-cpt `transit()` ODE twin, which must predict identically to the hand-written 2-cpt
+/// forcing model at non-zero per-occasion kappas. Replaces the pre-#719
+/// `two_cpt_transit_iov_rejected`.
+#[test]
+fn two_cpt_transit_iov_matches_hand_written_ode_forcing() {
+    let (an_src, ode_src) = build_iov_pair_2cpt();
+    let an = parse_full_model(&an_src)
+        .expect("analytic 2cpt IOV transit parses")
+        .model;
+    let ode = parse_full_model(&ode_src)
+        .expect("ODE 2cpt IOV transit parses")
+        .model;
+    assert_eq!(an.n_kappa, 1);
+    assert!(
+        an.absorption_ode_equivalent.is_some(),
+        "2cpt IOV transit carries an ODE twin"
+    );
+    let pop = iov_subject();
+    let subject = &pop.subjects[0];
+    assert!(
+        an.effective_for(subject).ode_spec.is_some(),
+        "IOV subject routes the 2cpt closed form to its ODE twin"
+    );
+    let theta = &an.default_params.theta;
+    let eta_bsv = [0.0];
+    let kappas = [vec![0.20], vec![-0.30]];
+    let pa = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &kappas);
+    let po = ferx_core::pk::predict_iov(&ode, subject, theta, &eta_bsv, &kappas);
+    let pa0 = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &[vec![0.0], vec![0.0]]);
+    assert!(
+        pa.iter().zip(pa0.iter()).any(|(a, b)| (a - b).abs() > 1e-6),
+        "non-zero kappa should change the 2cpt IOV transit predictions"
+    );
+    for (i, (x, y)) in pa.iter().zip(po.iter()).enumerate() {
+        let tol = ATOL + ACCUM_RTOL * x.abs();
+        assert!(
+            (x - y).abs() <= tol,
+            "obs {i}: analytic-twin {x:.6} vs hand-written ODE {y:.6} (|diff| {:.2e} > tol {:.2e})",
+            (x - y).abs(),
+            tol
+        );
+    }
 }
 
 /// The infusion guard also covers the 2-cpt model, naming it (shared `check_transit_support`,

@@ -56,6 +56,17 @@ section of the SDLC for the versioning policy).
   `docs/estimation/categorical.qmd`, `tests/reference/binary_logistic/`). A non-Bernoulli
   code (`DV ≥ 2`) on a binary CMT is rejected fail-loud. Ordinal / Poisson / negative
   binomial are planned follow-up slices.
+- **IOV (inter-occasion variability) for the analytic absorption models** (#719):
+  `pk one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` / `two_cpt_ig` now accept IOV
+  (`kappa` parameters with an `iov_column` or `iov_occasion` rule). A subject carrying IOV
+  is transparently rerouted to the model's exact `transit()` / `igd()` ODE twin, which
+  integrates the cross-occasion dose carryover the closed-form superposition cannot express
+  (#104) — so fits and predictions are correct on both the analytic and ODE engines, for IOV
+  specified either via a dataset `OCC` column or a model-code `iov_occasion` rule. Previously
+  rejected with a clear error; twin-less forms (a user `[odes]`/`[scaling]`/`[initial_conditions]`
+  block) still are. Validated by exact analytic≡ODE-`transit()`/`igd()`-forcing equivalence at
+  non-zero per-occasion κ, including multiple-dose regimens
+  (`tests/transit_analytic_equivalence.rs`, `tests/ig_analytic_equivalence.rs`).
 - **Left truncation (delayed entry) for clock-reset RTTE** (#740): repeated
   time-to-event models with `clock = reset` now accept a `TENTRY > 0` entry time
   instead of rejecting it. The first inter-event sojourn is conditioned on survival
@@ -357,6 +368,17 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **Inner EBE line search no longer aborts on a non-finite objective** (#719
+  follow-up): the FOCEI inner-loop backtracking line search
+  (`estimation/inner_optimizer.rs`) could panic with `clamp(NaN, NaN)` (a process
+  `SIGABRT`) when a trial η drove the objective non-finite — e.g. an absorption
+  closed form (transit/IG) evaluated at a step outside its convergence region, or a
+  blown-up BFGS direction giving `dg = ±inf`. The quadratic step-length safeguard
+  then produced `inf/inf = NaN`, which poisoned the step length and crashed the
+  next `clamp`. The search now rejects non-finite trials (falling back to plain
+  halving) and non-finite directions up front, degrading gracefully to "no step"
+  instead of crashing — surfaced while building the transit multi-dose + covariate
+  NONMEM anchor. Regression tests in `estimation/inner_optimizer.rs`.
 - **Declining-hazard (`γ < 0`) Gompertz median/mean survival diagnostics** (#805):
   `median_survival` returned `NaN` for *every* `γ < 0` Gompertz, even when a finite median
   genuinely exists — the closed form generalizes to `γ < 0`, so the reported TTE median is

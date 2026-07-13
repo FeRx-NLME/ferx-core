@@ -33,6 +33,10 @@ CL = TVCL * exp(ETA_CL + KAPPA_CL)
 
 At each occasion *k*, the effective individual CL is `TVCL * exp(ETA_CL_i + KAPPA_CL_ik)`. The BSV eta captures stable between-subject differences; the kappa captures occasion-to-occasion fluctuation within a subject.
 
+### Structural-model scope
+
+IOV composes with every structural model, including the **analytic absorption closed forms** — `pk one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` / `two_cpt_ig`. Because a per-dose closed-form superposition cannot carry a dose's drug across an occasion boundary where the disposition changes, a subject with IOV on such a model is **transparently rerouted to the model's exact `transit()` / `igd()` ODE twin**, which integrates the cross-occasion carryover exactly (the same reroute used for time-varying covariates). This is automatic — no model change is needed — and covered on the [Absorption](absorption.qmd) page. A closed-form absorption model that has *no* ODE twin (one carrying a user `[odes]` / `[scaling]` / `[initial_conditions]` block, or a role that shadows a reserved `F`/lagtime slot) still rejects IOV with an actionable message.
+
 ## Option A: Diagonal IOV (independent kappas)
 
 Each kappa is declared independently, giving a **diagonal** Ω_IOV:

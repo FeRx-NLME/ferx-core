@@ -601,3 +601,172 @@ fn ig_non_depot_dose_rejected() {
         "expected a non-depot dose rejection message, got: {e}"
     );
 }
+
+// ── IOV (#719): the analytic IG closed form now serves inter-occasion variability by routing
+//    IOV subjects to its `igd()` ODE twin, which integrates cross-occasion dose carryover (#104)
+//    exactly and is the #486/#663-validated analytic IOV path. Mirrors the transit IOV tests. ──
+
+/// Build the (analytic, ODE) `.ferx` pair for a 1-cpt IG model carrying IOV on CL (`KAPPA_CL`).
+fn build_iov_pair_1cpt() -> (String, String) {
+    let header = "[parameters]\n  \
+        theta TVCL(5.0, 0.1, 100.0)\n  \
+        theta TVV(50.0, 5.0, 500.0)\n  \
+        theta TVMAT(2.0, 0.05, 24.0)\n  \
+        theta TVCV2(0.3, 0.001, 10.0)\n  \
+        omega ETA_CL ~ 0.09\n  \
+        kappa KAPPA_CL ~ 0.04\n  \
+        sigma PROP ~ 0.01 (sd)\n\n\
+        [individual_parameters]\n  \
+        CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n  MAT = TVMAT\n  CV2 = TVCV2\n\n";
+    let analytical = format!(
+        "{header}[structural_model]\n  \
+         pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let ode = format!(
+        "{header}[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    (analytical, ode)
+}
+
+/// Build the (analytic, ODE) `.ferx` pair for a 2-cpt IG model carrying IOV on CL (`KAPPA_CL`).
+fn build_iov_pair_2cpt() -> (String, String) {
+    let header = "[parameters]\n  \
+        theta TVCL(5.0, 0.1, 100.0)\n  \
+        theta TVV1(50.0, 5.0, 500.0)\n  \
+        theta TVQ(10.0, 0.1, 200.0)\n  \
+        theta TVV2(100.0, 5.0, 1000.0)\n  \
+        theta TVMAT(1.5, 0.05, 24.0)\n  \
+        theta TVCV2(0.3, 0.001, 10.0)\n  \
+        omega ETA_CL ~ 0.09\n  \
+        kappa KAPPA_CL ~ 0.04\n  \
+        sigma PROP ~ 0.01 (sd)\n\n\
+        [individual_parameters]\n  \
+        CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V1 = TVV1\n  Q = TVQ\n  V2 = TVV2\n  \
+        MAT = TVMAT\n  CV2 = TVCV2\n\n";
+    let analytical = format!(
+        "{header}[structural_model]\n  \
+         pk two_cpt_ig(cl=CL, v1=V1, q=Q, v2=V2, mat=MAT, cv2=CV2)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let ode = format!(
+        "{header}[structural_model]\n  ode(obs_cmt=central, states=[central, periph])\n\n\
+         [odes]\n  \
+         d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V1 + Q/V1) * central + (Q/V2) * periph\n  \
+         d/dt(periph) = (Q/V1) * central - (Q/V2) * periph\n\n\
+         [scaling]\n  obs_scale = V1\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    (analytical, ode)
+}
+
+/// A two-occasion, multi-dose subject with cross-occasion carryover (dose 1 in occ 0 still has
+/// drug on board at occ 1's observations, t=13/18) — the case a per-dose superposition gets
+/// wrong (#104), so occ 1's `KAPPA_CL` must govern that tail via the twin's integration.
+fn iov_subject() -> Population {
+    let mut pop = population(
+        vec![bolus(0.0, 100.0), bolus(12.0, 100.0)],
+        vec![1.0, 6.0, 13.0, 18.0],
+    );
+    pop.subjects[0].occasions = vec![0, 0, 1, 1];
+    pop.subjects[0].dose_occasions = vec![0, 1];
+    pop
+}
+
+/// The analytic IG IOV model (auto-routed to its `igd()` ODE twin) must predict identically to
+/// the hand-written `igd()` forcing IOV model at non-zero per-occasion kappas — the correctness
+/// anchor for the reroute (cross-occasion carryover via the twin's exact integration, #104/#663).
+fn assert_iov_matches_ode(an_src: &str, ode_src: &str, label: &str) {
+    let an = parse_full_model(an_src)
+        .unwrap_or_else(|e| panic!("[{label}] analytic IG IOV parses: {e}"))
+        .model;
+    let ode = parse_full_model(ode_src)
+        .unwrap_or_else(|e| panic!("[{label}] ODE IG IOV parses: {e}"))
+        .model;
+    assert_eq!(an.n_kappa, 1, "[{label}] one IOV kappa");
+    assert!(
+        an.absorption_ode_equivalent.is_some(),
+        "[{label}] IG IOV carries an ODE twin"
+    );
+    let pop = iov_subject();
+    let subject = &pop.subjects[0];
+    assert!(
+        an.effective_for(subject).ode_spec.is_some(),
+        "[{label}] IOV subject routes the closed form to its igd() ODE twin"
+    );
+    let theta = &an.default_params.theta;
+    let eta_bsv = [0.0]; // one BSV eta (ETA_CL)
+    let kappas = [vec![0.20], vec![-0.30]];
+    let pa = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &kappas);
+    let po = ferx_core::pk::predict_iov(&ode, subject, theta, &eta_bsv, &kappas);
+    assert_eq!(pa.len(), po.len(), "[{label}] prediction count mismatch");
+    let pa0 = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &[vec![0.0], vec![0.0]]);
+    assert!(
+        pa.iter().zip(pa0.iter()).any(|(a, b)| (a - b).abs() > 1e-6),
+        "[{label}] non-zero kappa should change the IG IOV predictions"
+    );
+    for (i, (x, y)) in pa.iter().zip(po.iter()).enumerate() {
+        let tol = ATOL + ACCUM_RTOL * x.abs();
+        assert!(
+            (x - y).abs() <= tol,
+            "[{label}] obs {i}: analytic-twin {x:.6} vs hand-written ODE {y:.6} (|diff| {:.2e} > tol {:.2e})",
+            (x - y).abs(),
+            tol
+        );
+    }
+}
+
+#[test]
+fn ig_1cpt_iov_matches_hand_written_ode_forcing() {
+    let (an, ode) = build_iov_pair_1cpt();
+    assert_iov_matches_ode(&an, &ode, "ig-1cpt-iov");
+}
+
+#[test]
+fn ig_2cpt_iov_matches_hand_written_ode_forcing() {
+    let (an, ode) = build_iov_pair_2cpt();
+    assert_iov_matches_ode(&an, &ode, "ig-2cpt-iov");
+}
+
+/// A bounded FOCEI fit of an IG IOV model — drives the analytic IOV **sensitivity** reroute
+/// (`subject_sensitivities_iov` / `subject_eta_grad_iov` → the `igd()` twin's ODE-IOV gradients,
+/// #663), the path `predict_iov` alone does not exercise. Tier-2: returns after two outer
+/// iterations with a finite OFV, not convergence.
+#[test]
+fn ig_iov_now_served_and_drives_analytic_sens() {
+    let (an_src, _) = build_iov_pair_1cpt();
+    let model = parse_full_model(&an_src).expect("IG IOV parses").model;
+    assert_eq!(model.n_kappa, 1);
+    assert!(
+        model.absorption_ode_equivalent.is_some(),
+        "IG IOV carries an ODE twin"
+    );
+    let template = iov_subject();
+    let base = predict(&model, &template, &model.default_params);
+    // Two IOV subjects (each with two occasions) so the fit is identifiable; observations are
+    // the eta=0 predictions, lightly perturbed per subject.
+    let subjects: Vec<_> = [1.0_f64, 1.1]
+        .iter()
+        .enumerate()
+        .map(|(i, &f)| {
+            let mut s = template.subjects[0].clone();
+            s.id = format!("{}", i + 1);
+            s.observations = base.iter().map(|p| (p.pred * f).max(1e-6)).collect();
+            s
+        })
+        .collect();
+    let pop = Population {
+        subjects,
+        ..template
+    };
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::FoceI;
+    opts.outer_maxiter = 2;
+    opts.run_covariance_step = false;
+    let r = fit(&model, &pop, &model.default_params, &opts)
+        .expect("IG IOV fits via the igd() ODE equivalent");
+    assert!(r.ofv.is_finite(), "IG IOV fit OFV not finite: {}", r.ofv);
+}

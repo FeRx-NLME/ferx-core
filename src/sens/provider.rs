@@ -1019,6 +1019,16 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
 /// per subject with per-subject reconverged-FD salvage), the IOV analogue of
 /// [`sens_supported`] (#439 ODE IOV).
 pub fn iov_sens_supported(model: &CompiledModel) -> bool {
+    // A closed-form transit/IG IOV model is served by its ODE twin (issue #719, routed
+    // per-subject by `CompiledModel::effective_for`), so its analytic-IOV outer-gradient scope
+    // is the twin's ODE-IOV scope. (`get_or_build` is cached; the twin is built for the fit
+    // anyway.)
+    if model.n_kappa > 0 {
+        if let Some(eq) = &model.absorption_ode_equivalent {
+            return ODE_SENS_ENABLED
+                && crate::sens::ode_provider::ode_iov_supported(eq.get_or_build());
+        }
+    }
     iov_analytical_supported(model)
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_iov_supported(model))
 }
@@ -1034,6 +1044,9 @@ pub(crate) fn subject_eta_grad_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    // Closed-form transit/IG IOV → its ODE twin (issue #719); no-op otherwise. See
+    // `subject_sensitivities_iov`.
+    let model = model.effective_for(subject);
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
             return crate::sens::ode_provider::ode_subject_eta_grad_iov(
@@ -1063,6 +1076,11 @@ pub fn subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
+    // Closed-form transit/IG IOV is served by its ODE twin (issue #719) — the twin carries
+    // cross-occasion dose amounts exactly (#104/#663), which the closed-form superposition
+    // cannot. A no-op for every other model, so the `ode_spec` branch below then picks up the
+    // twin's analytic ODE-IOV sensitivities.
+    let model = model.effective_for(subject);
     // ODE IOV: route RHS-program models to the ODE provider, which runs the same
     // stacked-`(θ, η_bsv, κ)` layout over the event-driven RK45 walk (the TV-cov
     // walk fed per-occasion params). Returns the identical `SubjectSens` shape, so
