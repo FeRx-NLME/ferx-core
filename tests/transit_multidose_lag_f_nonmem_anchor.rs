@@ -1,14 +1,17 @@
 //! NONMEM FOCEI cross-check for **transit absorption under multiple doses + lagtime + F** (#719
 //! close-out: "lag/F/covariate are also anchored vs NONMEM, incl. multiple dose"). This is the
-//! ODE-twin-path counterpart to `transit_multidose_cov_nonmem_anchor.rs` (the analytic path).
+//! lagtime + F sibling of `transit_multidose_cov_nonmem_anchor.rs` (the covariate anchor); both
+//! run the analytic closed form.
 //!
-//! ferx's `pk one_cpt_transit(..., lagtime=LAG, f=FB)` routes each subject to its `transit()` ODE
-//! twin (#735, because a lagtime/F mapping is present) and fits **multiple overlapping doses**
-//! (100 mg q6h × 5) with:
+//! ferx's `pk one_cpt_transit(..., lagtime=LAG, f=FB)` handles lagtime and F **analytically** — the
+//! lagtime as a differentiable time-shift in the exponential-tilting closed form, F as a dose
+//! scale; no ODE twin is involved (`effective_for` reroutes only TIME / TV-covariate / IOV
+//! subjects, not lagtime/F — verified 0 ODE solves during #812). It fits **multiple overlapping
+//! doses** (100 mg q6h × 5) with:
 //!   * an **estimated absorption lagtime** (`TVLAG`, truth 0.5 h — NONMEM recovers 0.501);
 //!   * a **fixed bioavailability** `F = 0.7` (structurally non-identifiable on single-route oral —
 //!     both engines FIX it; the anchor checks that ferx *applies* F identically to NONMEM);
-//!   * a fixed allometric `CL = TVCL·(WT/70)^0.75` covariate composing on the twin path.
+//!   * a fixed allometric `CL = TVCL·(WT/70)^0.75` covariate composing on the analytic closed form.
 //!
 //! The matching NONMEM control (`nonmem_anchor/transit_multidose_lag_f.ctl`) is the same explicit
 //! integer-N (n = 3 → 4 transit compartments) Erlang chain, now with the NONMEM-native
@@ -17,9 +20,8 @@
 //! (`tests/gen_transit_multidose_lag_f_anchor.rs`); NONMEM 7.6.0 FOCEI MINIMIZATION SUCCESSFUL,
 //! #OBJV = −2463.833, recovering TVLAG = 0.501 (truth 0.5) and F FIXed at 0.70.
 //!
-//! The transit **ODE twin** free fit at `TOL=9`-equivalent tolerances is expensive (transit
-//! multi-dose fit-speed is tracked in #812), so this pins ferx's FOCEI **objective at NONMEM's
-//! optimum** (every parameter FIXed at NONMEM's MLE) — the same evaluate-at-optimum check the
+//! This pins ferx's FOCEI **objective at NONMEM's optimum** (every parameter FIXed at NONMEM's
+//! MLE) — the same evaluate-at-optimum check the
 //! `igd`/`weibull`/`transit_iov` anchors use, which isolates the objective agreement from any
 //! optimiser-path difference. ferx observes CMT 1 (its single disposition compartment); the
 //! committed data file re-keys the obs CMT from the NONMEM copy's CMT 5 — likelihood-identical.
@@ -108,18 +110,19 @@ fn transit_multidose_lag_f_objective_matches_nonmem() {
         "FERX transit multidose+lag+F @ NONMEM optimum = {:.4}; NONMEM #OBJV = {:.4}; |gap| = {:.4}",
         result.ofv, NM_OFV_NO_CONST, diff
     );
-    // ODE-twin path, no IOV (so the #810 ODE-IOV-marginal gap does not apply); this is the same
-    // evaluate-at-optimum check the igd/weibull anchors pass, and it reproduces NONMEM *exactly*
-    // here (observed |gap| = 0.0000). The band is a tight regression guard, not a loose agreement
-    // tolerance: 0.1 OFV units sits far above any RK45/ADVAN13 floating-point drift on a single
-    // fixed-point objective evaluation, yet catches a genuine lagtime / bioavailability /
-    // multi-dose-superposition bug on the transit ODE twin (≥ 0.1 on a −2464 objective). Tightened
+    // Analytic path (lagtime/F in the closed form), no IOV (so the #810 ODE-IOV-marginal gap does
+    // not apply); this is the same evaluate-at-optimum check the igd/weibull anchors pass, and it
+    // reproduces NONMEM *exactly* here (observed |gap| = 0.0000). The band is a tight regression
+    // guard, not a loose agreement tolerance: 0.1 OFV units sits far above any closed-form vs
+    // ADVAN13 floating-point drift on a single fixed-point objective evaluation, yet catches a
+    // genuine lagtime / bioavailability / multi-dose-superposition bug on the analytic transit
+    // closed form (≥ 0.1 on a −2464 objective). Tightened
     // from the initial 0.5 (which was 25–50× the actual agreement).
     assert!(
         result.ofv.is_finite() && diff < 0.1,
         "ferx FOCEI transit multidose+lag+F at NONMEM's optimum = {:.4}; NONMEM #OBJV = {:.4}; \
          |gap| {:.4} exceeds the agreement band (0.1 OFV units) — a wrong lagtime / F / multi-dose \
-         superposition on the transit ODE twin",
+         superposition on the analytic transit closed form",
         result.ofv,
         NM_OFV_NO_CONST,
         diff
