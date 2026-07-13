@@ -2717,11 +2717,16 @@ Gate: `#[cfg(feature = "markov")]` initially.
   RK45 (`crate::ode::solve_ode`), occupancy matrix flattened row-major into the ODE state.
   Tier-1 anchors: constant-`Q` ⇒ `expm(Q·Δt)` (agrees with the homogeneous path); scalar
   `Q(τ)=g(τ)·Q₀` ⇒ `expm(Q₀·∫g)` (closed form independent of `expm`); zero-Δt ⇒ `I`.
-- **Slice 2 — DSL + detection.** Let a `[markov_model]` intensity reference a PK/ODE state
-  (concentration written `central/V`, as the joint PK-TTE hazard does — no `Cc` builtin).
-  Detect such a reference at parse → mark the endpoint inhomogeneous; lift the Phase-5
-  TIME / TV-covariate / (drug-driven) guards for those CMTs. Thread the PK state into the
-  generator evaluation (extend `GeneratorFn` / intensity eval to resolve state names).
+- ✅ **Slice 2 — DSL + detection.** A `[markov_model]` intensity may reference a model ODE
+  state by name (concentration written `central/V`, or any PD/response state — no `Cc`
+  builtin). Parse detects a state reference (a `Variable`/`Covariate` leaf matching an ODE
+  state name), records it in `EndpointLikelihood::Ctmm::generator_states` (non-empty ⇒
+  inhomogeneous), and strips it from `generator_covariates` (it is a state, not a data
+  covariate). `GeneratorFn` gains a `state: &[f64]` argument; the generator overlays the
+  referenced state values into the covariates map so `eval_expression` resolves them. A
+  state reached only transitively through an `[individual_parameters]` value is rejected
+  (no state channel there). Interim: the fit path rejects an inhomogeneous CTMM fail-loud
+  until Slice 3 supplies the state trajectory.
 - **Slice 3 — endpoint wiring.** Solve PK once, build the per-gap `q_at(τ)` closure that
   samples `Q(C(t_m+τ))`, integrate via the Slice-1 leaf, dispatch through the existing FD
   inner/outer path (CTMM already routes to FD — no new analytic gradient).

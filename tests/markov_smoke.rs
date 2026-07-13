@@ -485,6 +485,145 @@ mod ctmm_smoke {
         );
     }
 
+    /// A one-compartment-oral PK model with a **drug-driven** CTMM intensity that references
+    /// the model state `central` (Phase 6, #817). Concentration is written `central / V`,
+    /// matching the joint PK-TTE hazard convention.
+    const DRUG_DRIVEN_MODEL: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta SLOPE(0.1, -5.0, 5.0)
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + SLOPE * (central / V))
+  transition asleep -> awake  = exp(LQ10)
+";
+
+    /// Slice 2 (#817): an intensity referencing an ODE state parses as a CTMM endpoint that
+    /// records the state in `generator_states` (marking it time-inhomogeneous), and the
+    /// generator threads the passed state value into the intensity (Q varies with the state).
+    #[test]
+    fn ctmm_drug_driven_intensity_threads_state() {
+        let model = parse_model_string(DRUG_DRIVEN_MODEL).expect("drug-driven CTMM must parse");
+        let ep = model.endpoints.get(&5).expect("CTMM endpoint on CMT 5");
+        let (generator_fn, generator_states) = match ep {
+            EndpointLikelihood::Ctmm {
+                generator_fn,
+                generator_states,
+                ..
+            } => (generator_fn, generator_states),
+            other => panic!("expected a Ctmm endpoint, got {other:?}"),
+        };
+        // `central` is ODE state index 1 (states = [depot, central]); it is the only state
+        // referenced, and `V` is an individual parameter (not a state), so it is excluded.
+        assert_eq!(
+            generator_states,
+            &vec![("central".to_string(), 1)],
+            "the intensity references the `central` state at ODE index 1"
+        );
+
+        // Evaluate the generator at two central amounts: Q[awake→asleep] = exp(LQ01 +
+        // SLOPE·central/V) must move with the state (V = TVV = 10, LQ01 = -0.7, SLOPE = 0.1).
+        let theta = &model.default_params.theta;
+        let q_low = generator_fn(theta, &[], &std::collections::HashMap::new(), &[0.0, 0.0]);
+        let q_high = generator_fn(theta, &[], &std::collections::HashMap::new(), &[0.0, 20.0]);
+        // central = 0 ⇒ conc 0 ⇒ rate exp(-0.7); central = 20 ⇒ conc 2 ⇒ rate exp(-0.5).
+        assert!(
+            (q_low[(0, 1)] - (-0.7_f64).exp()).abs() < 1e-9,
+            "q_low {q_low}"
+        );
+        assert!(
+            (q_high[(0, 1)] - (-0.5_f64).exp()).abs() < 1e-9,
+            "q_high {q_high}"
+        );
+        // The state-independent transition (asleep→awake = exp(LQ10)) is unchanged.
+        assert!((q_low[(1, 0)] - q_high[(1, 0)]).abs() < 1e-12);
+    }
+
+    /// The drug-driven CTMM fit path is not wired yet (Slice 3): a model whose intensity
+    /// references a model state is rejected fail-loud at fit setup rather than scored with a
+    /// frozen/zero state.
+    #[test]
+    fn ctmm_drug_driven_fit_rejected_until_slice3() {
+        let model = parse_model_string(DRUG_DRIVEN_MODEL).unwrap();
+        let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
+        let err = fit(&model, &pop, &model.default_params, &smoke_opts())
+            .expect_err("drug-driven CTMM must be rejected until Slice 3");
+        assert!(
+            err.contains("cmt = 5") && err.contains("central") && err.contains("#817"),
+            "message should name the CMT, the state, and the tracking issue, got: {err}"
+        );
+    }
+
+    /// A model state reached only *transitively* through an `[individual_parameters]` value is
+    /// rejected at parse (that value is evaluated with no state channel, so the state would
+    /// silently resolve to 0) — the user must reference the state directly in the transition.
+    #[test]
+    fn ctmm_state_via_individual_parameter_rejected() {
+        const M: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta SLOPE(0.1, -5.0, 5.0)
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+  KA = TVKA
+  LQ = LQ01 + SLOPE * central
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [a=0, b=1]
+  transition a -> b = exp(LQ)
+  transition b -> a = exp(LQ10)
+";
+        let err = parse_model_string(M).expect_err(
+            "a state reached through an [individual_parameters] value must be rejected",
+        );
+        assert!(
+            err.contains("central") && err.contains("directly"),
+            "message should name the state and point at the direct-reference form, got: {err}"
+        );
+    }
+
     /// `type` is optional and defaults to `ctmm`: a block omitting the `type` line parses
     /// as a CTMM endpoint (the explicit default — locks the behaviour so a future
     /// mCTMM/DTMM addition cannot silently change it).

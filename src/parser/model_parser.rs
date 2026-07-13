@@ -2744,6 +2744,16 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     markov_blocks.push(lines);
                 }
             }
+            // ODE state names (in state-vector order) let an intensity reference a model
+            // state for the time-inhomogeneous path (#817). `build_ode_spec` has already
+            // run, so `model.ode_spec` is populated for an ODE model; analytic/no-ODE
+            // models pass an empty slice (no state to drive Q, so any such reference stays
+            // an unresolved identifier as before).
+            let ode_state_names: &[String] = model
+                .ode_spec
+                .as_ref()
+                .map(|s| s.state_names.as_slice())
+                .unwrap_or(&[]);
             for lines in markov_blocks {
                 let (cmt, endpoint, ctmm_covs, blk_thetas, blk_etas) = parse_markov_model_block(
                     lines,
@@ -2752,6 +2762,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     &indiv_stmts,
                     &model.kappa_names,
                     &model.error_spec,
+                    ode_state_names,
                 )?;
                 if model.endpoints.contains_key(&cmt) {
                     return Err(format!(
@@ -4501,6 +4512,10 @@ fn parse_markov_model_block(
     indiv_stmts: &[Statement],
     kappa_names: &[String],
     error_spec: &ErrorSpec,
+    // ODE state names in state-vector order (empty for a non-ODE / analytic model).
+    // An intensity that references one of these is time-inhomogeneous (drug/PD-driven
+    // Q(t), Phase 6 #817): the referenced state is threaded into the generator.
+    ode_state_names: &[String],
 ) -> Result<
     (
         usize,
@@ -4872,20 +4887,102 @@ fn parse_markov_model_block(
         }
     }
 
+    // ── Time-inhomogeneous (drug/PD-driven Q(t), Phase 6 #817) detection ──────────
+    // An intensity may reference a model **ODE state** by name (e.g. a concentration
+    // `central/V` or a PD response compartment), evaluated at the current time as the
+    // state evolves. An identifier that is neither θ/η nor an `[individual_parameters]`
+    // name parses as an `Expression::Covariate` leaf (resolved from the covariates map at
+    // eval); a state name lands there too. Collect every Variable **and** Covariate leaf
+    // used directly in the transitions, and keep the ones that name an ODE state (and are
+    // not shadowed by an individual-parameter name — those resolve to the parameter).
+    // `generator_states` pairs each with its ODE-state-vector index; non-empty ⇒ the
+    // endpoint is inhomogeneous.
+    let generator_states: Vec<(String, usize)> = {
+        let mut referenced: HashSet<String> = HashSet::new();
+        for (_, _, expr) in &transitions {
+            visit_expr_nodes(expr, &mut |e: &Expression| {
+                if let Expression::Variable(name) | Expression::Covariate(name) = e {
+                    referenced.insert(name.clone());
+                }
+            });
+        }
+        let indiv_set: HashSet<&String> = indiv_param_names.iter().collect();
+        ode_state_names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| referenced.contains(*name) && !indiv_set.contains(name))
+            .map(|(idx, name)| (name.clone(), idx))
+            .collect()
+    };
+
+    // A referenced ODE state parsed as a `Covariate` leaf, so it was pooled into `cov_set`
+    // by the covariate scan above. It is a model **state**, not a data covariate — drop it
+    // so it is neither registered as a required data column nor caught by the TV-covariate
+    // guard (its time variation is intrinsic and handled by the occupancy integration).
+    let state_name_set: HashSet<&String> = generator_states.iter().map(|(n, _)| n).collect();
+    cov_set.retain(|c| !state_name_set.contains(c));
     let mut generator_covariates: Vec<String> = cov_set.into_iter().collect();
     generator_covariates.sort();
 
-    // Build the generator closure over (θ, η, covariates): place each intensity at
-    // its off-diagonal entry and subtract it from the diagonal so every row sums to
-    // zero — the caller always receives a valid generator.
+    // A state reached only *transitively* through an `[individual_parameters]` value is
+    // not supported yet: `eval_indiv_param_vars` evaluates those with no state channel,
+    // so the state would silently resolve to 0. Reject fail-loud, pointing the user to
+    // reference the state directly in the transition intensity.
+    if !ode_state_names.is_empty() {
+        let mut indiv_refs: HashSet<String> = HashSet::new();
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut indiv_refs); // covariate leaves
+        for s in &needed_indiv_stmts {
+            visit_stmt_nodes(std::slice::from_ref(s), &mut |e: &Expression| {
+                if let Expression::Variable(name) = e {
+                    indiv_refs.insert(name.clone());
+                }
+            });
+        }
+        let indiv_set: HashSet<&String> = indiv_param_names.iter().collect();
+        if let Some(name) = ode_state_names
+            .iter()
+            .find(|n| indiv_refs.contains(*n) && !indiv_set.contains(n))
+        {
+            return Err(format!(
+                "[markov_model]: an [individual_parameters] value referenced by a transition \
+                 intensity reads the model state `{name}`. A state-driven (time-inhomogeneous) \
+                 intensity must reference the state directly in the `transition` line (e.g. \
+                 `transition A -> B = exp(LQ + SLOPE * ({name} / V))`), not through an \
+                 [individual_parameters] value."
+            ));
+        }
+    }
+
+    // Build the generator closure over (θ, η, covariates, state): place each intensity
+    // at its off-diagonal entry and subtract it from the diagonal so every row sums to
+    // zero — the caller always receives a valid generator. On the inhomogeneous path the
+    // caller passes the ODE `state` at the current time; each referenced state name is
+    // injected into the variable map so `eval_expression` resolves it. On the homogeneous
+    // path `generator_states` is empty and `state` is ignored.
     let n_states = states.len();
     let indiv = needed_indiv_stmts;
+    let gen_states = generator_states.clone();
     let generator_fn: crate::types::GeneratorFn = Box::new(
-        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-            let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, state: &[f64]| {
+            // A referenced ODE state parses as a `Covariate` leaf, so `eval_expression`
+            // resolves it from the covariates map. On the inhomogeneous path overlay the
+            // current state values there; the homogeneous path leaves `gen_states` empty and
+            // uses the caller's map unchanged (no clone).
+            let cov_owned;
+            let cov: &HashMap<String, f64> = if gen_states.is_empty() {
+                covariates
+            } else {
+                let mut c = covariates.clone();
+                for (name, idx) in &gen_states {
+                    c.insert(name.clone(), state.get(*idx).copied().unwrap_or(0.0));
+                }
+                cov_owned = c;
+                &cov_owned
+            };
+            let vars = eval_indiv_param_vars(&indiv, theta, eta, cov);
             let mut q = nalgebra::DMatrix::<f64>::zeros(n_states, n_states);
             for (j, k, expr) in &transitions {
-                let rate = eval_expression(expr, theta, eta, covariates, &vars, &[]);
+                let rate = eval_expression(expr, theta, eta, cov, &vars, &[]);
                 q[(*j, *k)] += rate;
                 q[(*j, *j)] -= rate;
             }
@@ -4900,6 +4997,7 @@ fn parse_markov_model_block(
             state_codes,
             generator_fn,
             generator_covariates: generator_covariates.clone(),
+            generator_states,
         },
         generator_covariates,
         theta_set,

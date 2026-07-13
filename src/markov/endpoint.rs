@@ -107,7 +107,10 @@ fn ctmm_endpoint_nll(
     if obs.len() < 2 {
         return 0.0;
     }
-    let q = generator_fn(theta, eta, covariates);
+    // Time-homogeneous path: no ODE state drives Q, so the state slice is empty.
+    // The time-inhomogeneous (drug/PD-driven) path is scored by a separate integrator
+    // (Phase 6, #817) that supplies the evolving state per gap — see `ctmm_subject_nll`.
+    let q = generator_fn(theta, eta, covariates, &[]);
     debug_assert_eq!(
         q.nrows(),
         n_states,
@@ -244,11 +247,13 @@ mod tests {
     use crate::types::GeneratorFn;
     use nalgebra::DMatrix;
 
-    /// A constant 2-state generator `Q = [[-a, a], [b, -b]]`, ignoring θ/η/cov.
+    /// A constant 2-state generator `Q = [[-a, a], [b, -b]]`, ignoring θ/η/cov/state.
     fn const_gen(a: f64, b: f64) -> GeneratorFn {
-        Box::new(move |_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| {
-            DMatrix::from_row_slice(2, 2, &[-a, a, b, -b])
-        })
+        Box::new(
+            move |_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>, _s: &[f64]| {
+                DMatrix::from_row_slice(2, 2, &[-a, a, b, -b])
+            },
+        )
     }
 
     fn disc(time: f64, state: usize, cmt: usize) -> ObsRecord {
