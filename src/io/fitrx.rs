@@ -1919,6 +1919,9 @@ fn wire_to_fit_result(
         // round-tripped result therefore has no covariate table.
         covariate_table: None,
         exclusions: None,
+        // Transient (`#[serde(skip)]`) and not persisted: a reloaded fit has no
+        // optimizer packed vector, so `run_covariance` re-packs from omega (#816).
+        packed_estimate: None,
     })
 }
 
@@ -2137,6 +2140,7 @@ mod tests {
             neural_networks: Vec::new(),
             covariate_table: None,
             exclusions: None,
+            packed_estimate: None,
         }
     }
 

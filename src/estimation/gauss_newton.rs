@@ -458,6 +458,7 @@ pub fn run_foce_gn(
             impmap_trace: None,
             bayes: None,
             cond_dist: None,
+            packed_estimate: None,
         };
     }
 
@@ -578,6 +579,7 @@ pub fn run_foce_gn(
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
+        packed_estimate: None,
     }
 }
 

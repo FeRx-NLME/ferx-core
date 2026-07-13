@@ -457,6 +457,7 @@ pub fn optimize_trust_region(
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
+        packed_estimate: None,
     }
 }
 

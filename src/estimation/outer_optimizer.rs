@@ -55,6 +55,19 @@ pub struct OuterResult {
     /// `method = saem` and `saem_conddist = true`; `None` for every other
     /// estimator and for SAEM runs that did not request the pass (#257).
     pub cond_dist: Option<CondDist>,
+    /// The optimizer's **exact** final packed parameter vector (log-theta,
+    /// Cholesky-omega lower triangle, log-sigma, over the free parameters) — the
+    /// same vector this stage's inline covariance step used. `Some` for the
+    /// packed-space FOCE/FOCEI paths (including `outer_maxiter = 0` evaluation);
+    /// `None` for estimators that do not optimize in packed Cholesky space (SAEM,
+    /// GN, trust-region, IMP, Bayes), whose covariance step re-packs from `omega`
+    /// on both the inline and `run_covariance` paths and so already agrees.
+    ///
+    /// Carried so `run_covariance` can reproduce the inline FD-Hessian bit-for-bit
+    /// by reusing this exact Cholesky factor instead of re-decomposing `omega`
+    /// (`omega → chol` is not the round-trip inverse of the stored `L·Lᵀ`, and the
+    /// FD Hessian amplifies the difference on ill-conditioned ω directions).
+    pub packed_estimate: Option<Vec<f64>>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -206,6 +219,10 @@ fn evaluate_at_initial_params(
         };
 
     OuterResult {
+        // Evaluation-only (`outer_maxiter = 0`): no optimizer ran, so there is no
+        // converged packed vector to reuse; `run_covariance` re-packs from omega
+        // (identical result, since the params equal the unoptimized init).
+        packed_estimate: None,
         params,
         ofv,
         converged: false,
@@ -1418,6 +1435,9 @@ fn optimize_nlopt(
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
+        // The exact packed vector this stage's inline covariance step used (#816
+        // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
+        packed_estimate: Some(x0.clone()),
     }
 }
 
@@ -1842,6 +1862,9 @@ fn optimize_bfgs(
     }
 
     OuterResult {
+        // The exact packed vector this stage's inline covariance step used (#816
+        // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
+        packed_estimate: Some(x_final.clone()),
         params: final_params,
         ofv: final_ofv,
         converged,

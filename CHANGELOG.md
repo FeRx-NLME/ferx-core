@@ -355,6 +355,18 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **Standalone covariance step (`run_covariance`) now reproduces the inline
+  covariance bit-for-bit for FOCE/FOCEI fits**: running the covariance step after a
+  fit (`covariance = false` then `run_covariance`, e.g. the R wrapper's standalone
+  SE step) previously rebuilt the parameters by re-decomposing the reported `omega`
+  (`chol(L·Lᵀ) ≠ L` to machine precision). The resulting `Ω⁻¹` differed slightly
+  from the one the inline step used, which the finite-difference Hessian amplified —
+  up to ~10% on an ill-conditioned variance (e.g. a warfarin ω²(KA) with ~115%
+  RSE), giving standard errors that disagreed with an equivalent
+  `covariance = true` fit. The step now reuses the optimizer's exact packed vector
+  when the fit carries one, so the covariance matrix and SEs match exactly. Fits
+  reloaded from `.fitrx`, or from SAEM/GN/IMP/Bayes, are unaffected (they already
+  agreed). Surfaced during the #816 review.
 - **Inner EBE line search no longer aborts on a non-finite objective** (#719
   follow-up): the FOCEI inner-loop backtracking line search
   (`estimation/inner_optimizer.rs`) could panic with `clamp(NaN, NaN)` (a process

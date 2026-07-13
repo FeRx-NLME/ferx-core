@@ -2344,6 +2344,7 @@ pub fn run_saem(
         impmap_trace: None,
         bayes: None,
         cond_dist,
+        packed_estimate: None,
     })
 }
 
