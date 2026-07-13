@@ -18840,6 +18840,22 @@ mod tests {
                     continue;
                 }
             }
+            // A `[markov_model]` (CTMM) endpoint-only file needs the `markov` feature
+            // specifically (`markov` implies `survival`, so the `survival`-only build above
+            // does not cover it): without `markov` the block is unrecognized and the parser
+            // demands the Gaussian PK blocks. Skip such a file whenever `markov` is off.
+            if !cfg!(feature = "markov") {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                let has_markov_endpoint = src
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("[markov_model"));
+                let has_struct_block = src
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("[structural_model"));
+                if has_markov_endpoint && !has_struct_block {
+                    continue;
+                }
+            }
             seen += 1;
             if let Err(e) = parse_full_model_file(&path) {
                 panic!("failed to parse {}: {}", path.display(), e);
