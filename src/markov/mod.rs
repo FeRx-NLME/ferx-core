@@ -45,6 +45,8 @@
 //! constructs exactly the constrained direction, so the caller cannot get the
 //! constraint wrong.
 
+pub mod endpoint;
+
 use nalgebra::DMatrix;
 
 /// Finite sentinel for a numerically ill-defined individual likelihood.

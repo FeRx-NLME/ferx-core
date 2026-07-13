@@ -20,6 +20,19 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Continuous-time Markov model (CTMM) endpoint** (#759): a new
+  `[markov_model]` block fits a discrete-state Markov process observed at
+  irregular times. Declare states bound to their integer DV code
+  (`states = [awake=0, asleep=1]`) and one `transition A -> B = <intensity>`
+  line per allowed transition; ferx fills the generator's row-sum-zero diagonal
+  and scores each consecutive observation pair with the exact transition
+  matrix `P(Δt) = expm(Q·Δt)`. Time-homogeneous generators fit with FOCEI
+  (default), SAEM, or IMP; intensities may carry covariates and between-subject
+  random effects. Requires the `markov` cargo feature. See the
+  [Markov models](https://ferx-nlme.github.io/ferx-core/model-file/markov-model.html)
+  and [CTMM estimation](https://ferx-nlme.github.io/ferx-core/estimation/ctmm.html)
+  pages. (mCTMM/DTMM, drug-driven `Q(t)`, and CTMM simulation are planned
+  follow-ups.)
 - **Restart of an interrupted run from a checkpoint** (#755): a fit now
   periodically saves a small `{model}.tmp` resume point (throttled to
   `[fit_options] checkpoint_interval_secs`, default 300 s, so short runs write
@@ -369,6 +382,21 @@ section of the SDLC for the versioning policy).
   Gauss-Newton). Fits reloaded from `.fitrx`, or from SAEM/importance-sampling/Bayes
   (which rebuild `omega` from the reported matrix on both paths), are unaffected —
   they already agreed. Surfaced during the #816 review.
+- **Closed-form transit/IG absorption under IOV / time-varying covariates now honors
+  call-time ODE tolerances and converges its EBEs correctly** (#814, #719 follow-up): a
+  `one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` / `two_cpt_ig` model routes its IOV,
+  time-varying-covariate, and `TIME`-switch subjects to an internally generated ODE "twin".
+  Three fixes to that reroute: (1) a call-time `ode_reltol` / `ode_abstol` / `ode_max_steps`
+  (e.g. from `ferx_fit(settings = …)`) now reaches the twin's solver — previously the twin
+  silently integrated at its parse-default tolerance, ignoring the requested accuracy for the
+  whole fit/predict; (2) the inner EBE loop's ODE gradient-noise convergence stop is now
+  enabled for those rerouted subjects, so an individual estimate that dropped to the
+  finite-difference inner gradient no longer risks running to the iteration cap and returning
+  an under-converged EBE; (3) when such a subject falls back to the FD inner gradient, the
+  emitted diagnostic now names the precise twin-ODE reason (e.g. "steady-state dose + built-in
+  absorption forcing") instead of a generic "outside IOV analytic scope". The converged
+  population objective is unchanged (still NONMEM-anchored by the #719 transit+IOV cross-check).
+  Regression tests in `types.rs` / `estimation/inner_optimizer.rs`.
 - **Inner EBE line search no longer aborts on a non-finite objective** (#719
   follow-up): the FOCEI inner-loop backtracking line search
   (`estimation/inner_optimizer.rs`) could panic with `clamp(NaN, NaN)` (a process
