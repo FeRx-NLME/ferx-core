@@ -1,7 +1,7 @@
 //! NONMEM FOCEI cross-check for **analytic transit absorption under multiple doses + a TV
 //! covariate** (#719 close-out: "lag/F/covariate are also anchored vs NONMEM, incl. multiple
-//! dose"). This is the analytic-path counterpart to `transit_multidose_lag_f_nonmem_anchor.rs`
-//! (the ODE-twin path).
+//! dose"). This is the covariate sibling of `transit_multidose_lag_f_nonmem_anchor.rs` (the
+//! lagtime + F anchor); both run the analytic closed form (neither touches an ODE twin).
 //!
 //! ferx's `pk one_cpt_transit(cl, v, n, mtt)` with `CL = TVCL·(WT/70)^dWTCL·exp(η)` (an estimated
 //! allometric covariate) fits **multiple overlapping doses** (100 mg q6h × 5) on its analytic
@@ -18,9 +18,11 @@
 //!
 //! This pins ferx's FOCEI **objective at NONMEM's optimum** (every parameter FIXed at NONMEM's
 //! MLE) — the igd/weibull/transit_iov evaluate-at-optimum pattern, which isolates objective
-//! agreement from any optimiser-path difference and stays fast/deterministic (the free fit at
-//! `TOL=9`-equivalent tolerances is expensive and, on the TVCL↔dWTCL ridge, optimiser-path
-//! sensitive — the fit-speed of transit multi-dose models is tracked in #812). ferx observes CMT 1
+//! agreement from any optimiser-path difference and stays deterministic across CI. (An
+//! independent free fit is also viable — it converges to NONMEM's optimum in ~2 s — but
+//! evaluate-at-optimum is the robust, sibling-consistent choice; #812 found the earlier
+//! "expensive free fit" was a CPU-contention measurement artifact, not the closed-form kernel.)
+//! ferx observes CMT 1
 //! (its single disposition compartment); the committed data file
 //! re-keys the obs CMT from the NONMEM copy's CMT 5 (the chain's central) — likelihood-identical.
 
