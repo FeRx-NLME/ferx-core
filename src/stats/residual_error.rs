@@ -146,6 +146,34 @@ fn cross_observation_covariance(
     cov
 }
 
+/// Do observations `j` and `k` share at least one `block_sigma` cross
+/// correlation, judged purely from which sigma slots their loadings occupy?
+///
+/// This mirrors the slot bookkeeping of [`cross_observation_covariance`]
+/// (identical within-observation skip) but ignores the loading *coefficients*,
+/// so the answer is independent of the prediction values. A pure proportional
+/// row at `f = 0` keeps its slot (as `(idx, 0.0)`), so it still pairs with its
+/// partner and the derivative builders keep emitting the nonzero slope-loading
+/// cross term.
+pub(crate) fn loadings_share_correlation(
+    load_j: &[(usize, f64)],
+    load_k: &[(usize, f64)],
+    correlations: &[ResidualCorrelation],
+) -> bool {
+    correlations.iter().any(|corr| {
+        let j_has_i = load_j.iter().any(|(idx, _)| *idx == corr.sigma_i);
+        let j_has_j = load_j.iter().any(|(idx, _)| *idx == corr.sigma_j);
+        let k_has_i = load_k.iter().any(|(idx, _)| *idx == corr.sigma_i);
+        let k_has_j = load_k.iter().any(|(idx, _)| *idx == corr.sigma_j);
+        // A row carrying both slots owns the correlation as a within-observation
+        // term, not a cross-observation one (matches `cross_observation_covariance`).
+        if (j_has_i && j_has_j) || (k_has_i && k_has_j) {
+            return false;
+        }
+        (j_has_i && k_has_j) || (j_has_j && k_has_i)
+    })
+}
+
 /// Match observations into cross-covariance pairs within each residual block.
 ///
 /// [`same_residual_block`] decides which rows may pair, and the grouping source
@@ -197,15 +225,21 @@ fn match_partners(
             {
                 continue;
             }
+            // Gate the pairing on the *structural* slot overlap, not the value
+            // covariance: a pure proportional row whose prediction is momentarily
+            // `f = 0` has a zero value-loading covariance but a nonzero slope
+            // (derivative) cross term. Deciding on `cov != 0.0` would drop the
+            // pair — and with it that derivative term — exactly at `f ≈ 0`, and
+            // would let the pairing flicker as `f` crosses 0 across iterations.
+            if !loadings_share_correlation(&loadings[j], &loadings[k], correlations) {
+                continue;
+            }
             let cov = cross_observation_covariance(
                 &loadings[j],
                 &loadings[k],
                 sigma_values,
                 correlations,
             );
-            if cov == 0.0 {
-                continue;
-            }
             pairs.push((j, k, cov));
             let explicit = obs_l2.get(j).copied().unwrap_or(0) != 0
                 && obs_l2.get(k).copied().unwrap_or(0) != 0;
@@ -1142,6 +1176,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    // #830: the pairing is structural (slot overlap), not value-based, so a
+    // paired proportional row whose prediction is momentarily f = 0 keeps its
+    // partner and the derivative builder still emits the (nonzero) slope-loading
+    // cross term. Gating on `cov != 0.0` would drop it exactly at f ≈ 0.
+    #[test]
+    fn test_cross_derivative_survives_zero_prediction() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+        ]));
+        // Row 0's prediction is exactly zero — its value loading (and hence the
+        // value cross covariance) vanishes, but its slope loading does not.
+        let ipreds = [0.0, 5.0];
+        let cmts = [1usize, 2];
+        let times = [1.0, 1.0];
+        let sigma = [0.3, 0.4];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        // R's off-diagonal is genuinely 0 at f = 0 (value covariance), and the
+        // block stays PD.
+        let r = compute_r_matrix_with_correlations(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+        );
+        assert_eq!(r[(0, 1)], 0.0);
+        // ∂R_01/∂f_0 = slope_0 · value_1 · ρ·σ0·σ1 = 1·5·0.5·0.3·0.4 = 0.3.
+        let dr = compute_dr_df_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+            None,
+        );
+        assert_relative_eq!(dr[0][(0, 1)], 0.3, epsilon = 1e-12);
+        assert_relative_eq!(dr[0][(1, 0)], 0.3, epsilon = 1e-12);
+        assert!(
+            dr[0][(0, 1)] != 0.0,
+            "cross derivative must survive a zero prediction"
+        );
     }
 
     // The derivative builders must use the SAME disjoint pairing as

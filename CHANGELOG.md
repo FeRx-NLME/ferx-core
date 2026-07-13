@@ -27,6 +27,13 @@ section of the SDLC for the versioning policy).
   explicit control over which records the cross covariance couples instead of
   relying on co-temporal row order. See
   [Data format](https://ferx-nlme.github.io/ferx-core/data-format.html).
+- **Two `block_sigma` / `L2` data diagnostics** (#830), reported by `fit()` and
+  `ferx check`: `W_BLOCK_SIGMA_L2_ORDER` when a correlated residual has a
+  co-temporal group that can pair more than one way and no `L2` column is present
+  (the fallback pairs in CSV row order, so reordering rows changes the fit — add
+  an `L2` column); and `W_L2_UNUSED` when the data has an `L2` column but the
+  model declares no `block_sigma` correlation (the reserved column is inert and,
+  if it was meant as a covariate, was silently dropped).
 - **Continuous-time Markov model (CTMM) endpoint** (#759): a new
   `[markov_model]` block fits a discrete-state Markov process observed at
   irregular times. Declare states bound to their integer DV code
@@ -398,6 +405,12 @@ section of the SDLC for the versioning policy).
   blank; the reader now accepts integer and float-formatted ids, so the user's
   `block_sigma` grouping is honoured instead of every record falling back to
   ungrouped `(time, occasion)` pairing.
+- **`block_sigma` cross derivative is no longer dropped when a prediction hits
+  zero** (#830): the observation pairing is now decided from the loadings'
+  sigma-slot structure rather than the value covariance, so a pure proportional
+  paired endpoint whose prediction is momentarily `f = 0` keeps its (nonzero)
+  slope cross term in `∂R/∂f`. This also stops the pairing from flickering as a
+  prediction crosses zero between iterations.
 - **Standalone covariance step (`run_covariance`) now reproduces the inline
   covariance bit-for-bit for FOCE/FOCEI fits**: running the covariance step after a
   fit (`covariance = false` then `run_covariance`, e.g. the R wrapper's standalone

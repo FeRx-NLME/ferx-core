@@ -319,7 +319,13 @@ Rules and restrictions:
   This reproduces `L2` grouping for the standard NONMEM layout
   where a sample's rows are written contiguously; add an explicit `L2` column
   when your row order does not follow that convention, or when a group holds more
-  than two correlated endpoints.
+  than two correlated endpoints. When a co-temporal group *could* pair more than
+  one way and no `L2` column is present, ferx warns (`W_BLOCK_SIGMA_L2_ORDER`)
+  that the fit depends on row order — add an `L2` column to remove the ambiguity.
+- **Note:** `L2` is a reserved data item and is never read as a covariate. If the
+  dataset carries an `L2` column but the model declares no `block_sigma`
+  correlation, ferx warns (`W_L2_UNUSED`) that the column is inert — rename it if
+  you meant it as a covariate.
 - **LTBS** (`log(DV) ~ ...` / `log_additive`) is not supported inside a branch.
 - **SDE / `[diffusion]` models are not supported.** The EKF measurement-noise
   path uses a single error model and cannot switch per observation, so the
