@@ -389,7 +389,7 @@ the implemented `matrix_exp_frechet` primitive: §8.7.)
 
 #### mCTMM (minimal CTMM) — highly recommended as stepping stone
 
-Savic & Karlsson (AAPS J, 2017): under the constraint that transition rates between
+Schindler & Karlsson (AAPS J, 2017): under the constraint that transition rates between
 adjacent states are state-independent, the CTMM reduces to a single parameter model:
 `q_jk = q` (constant) for all adjacent (j,k) pairs. The mean equilibration time is
 `τ = 1/q`. Steady-state probabilities follow a proportional odds model.
@@ -1051,7 +1051,10 @@ Requires special handling in inner optimizer (EM over hidden states, not BFGS ov
 - **Ooi EHS, Plan EL, Bergstrand M (2025).** "Practical guidance for Markov models in drug
   development." CPT:PSP 14:197–216. — DTMM, mCTMM, HMM, IRT+Markov; annotated NONMEM code
   in supplementary.
-- **Savic RM, Karlsson MO (2017, AAPS J).** mCTMM (minimal CTMM) parameterization.
+- **Schindler E, Karlsson MO (2017).** A Minimal Continuous-Time Markov Pharmacometric
+  Model. *AAPS J* 19(5):1424–1435. doi:10.1208/s12248-017-0109-1. PMID: 28634883. — mCTMM
+  (minimal CTMM) parameterization: single mean-equilibration-time parameter, proportional-odds
+  steady state.
 - **Jackson CH (2011).** msm package; J Stat Softw. — Matrix exponential CTMM; CAV dataset.
 - **Sctmm paper (PMC11247187).** Scalable CTMM via SGD + block-Padé; 13,320 MS patients.
 
