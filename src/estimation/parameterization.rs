@@ -1450,6 +1450,58 @@ mod tests {
     }
 
     #[test]
+    fn test_unpack_omega_iov_depends_only_on_vector_and_structure() {
+        // The mechanism behind the IOV `run_covariance` bit-exactness (#823):
+        // `unpack_params` rebuilds `omega_iov` from the packed vector and the
+        // template's *structure* (diagonal flag, names, free_mask) alone — the
+        // template's numeric Ω_IOV **values** never leak in. So the inline
+        // covariance step (template = the fit's init params) and the standalone
+        // step (template = `fitted_params_from_result`, carrying the *converged*
+        // Ω_IOV) reconstruct a byte-identical Ω_IOV from the same `packed_estimate`,
+        // even though their templates hold different variances. The diagonal-IOV
+        // branch runs `OmegaMatrix::from_diagonal` (square-then-re-decompose)
+        // rather than the BSV's `from_chol_factor`, so pin every cached field
+        // (`matrix`, `chol`, `inv`, `log_det`) it derives, not just the variance.
+        let t_init = make_iov_template(); // IOV variance 0.01
+
+        // Structurally identical, different values (variance 0.05, and shifted
+        // theta/omega/sigma). `theta_lower` must match `t_init` — it drives the
+        // log-vs-identity packing decision, part of the "structure".
+        let mut t_conv = make_iov_template();
+        t_conv.theta = vec![7.3];
+        t_conv.omega = OmegaMatrix::from_diagonal(&[0.21], vec!["ETA_CL".into()]);
+        t_conv.sigma.values = vec![0.11];
+        t_conv.omega_iov = Some(OmegaMatrix::from_diagonal(&[0.05], vec!["KAPPA_CL".into()]));
+
+        // A packed vector at a converged-ish point (not `pack(t_init)`), so the
+        // unpacked Ω_IOV is a genuine reconstruction, not an identity round-trip.
+        let v = pack_params(&t_conv);
+        assert_eq!(v.len(), packed_len(&t_init));
+
+        let from_init = unpack_params(&v, &t_init);
+        let from_conv = unpack_params(&v, &t_conv);
+
+        let a = from_init.omega_iov.as_ref().unwrap();
+        let b = from_conv.omega_iov.as_ref().unwrap();
+        // Bit-for-bit on every cached field — this is the `1e-12` the fit-level
+        // parity test observes, reduced to its root cause.
+        assert_eq!(
+            a.matrix, b.matrix,
+            "Ω_IOV matrix must not depend on template values"
+        );
+        assert_eq!(
+            a.chol, b.chol,
+            "Ω_IOV chol must not depend on template values"
+        );
+        assert_eq!(a.inv, b.inv, "Ω_IOV inv must not depend on template values");
+        assert_eq!(
+            a.log_det.to_bits(),
+            b.log_det.to_bits(),
+            "Ω_IOV log_det must not depend on template values"
+        );
+    }
+
+    #[test]
     fn test_fixed_kappa_pins_bounds() {
         let mut template = make_iov_template();
         template.kappa_fixed[0] = true;
