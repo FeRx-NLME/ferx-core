@@ -2411,24 +2411,34 @@ fn moving_bounds_separable(
             return false;
         }
     }
-    // (2) Moving-vs-fixed: an observation / reset / covariate-change time must not sit on
-    // a moving break. (A dose arrival is itself a moving break here, so dose-vs-dose
+    // (2) Moving-vs-fixed: an observation / reset / covariate-change time must not sit on a
+    // moving break. (A dose arrival is itself a moving break here, so dose-vs-dose
     // coincidences are covered by (1), not by this check.)
     //
-    // Gated on `has_lag` so a model with no lagtime keeps exactly its pre-#486 scope: a
-    // *modeled infusion end* that coincides with an observation has always been admitted,
-    // and re-deciding that case is out of scope here (tracked separately — an obs sampled
-    // at a moving end is a plausible latent gap, but it is not this change's to fix).
-    if has_lag {
-        let fixed = subject
-            .obs_times
-            .iter()
-            .chain(subject.pk_only_times.iter())
-            .chain(subject.reset_times.iter());
-        for &f in fixed {
-            if moving.iter().any(|&(t, _)| (t - f).abs() < 1e-9) {
-                return false;
-            }
+    // This applies to a **modeled infusion end** as much as to a lagged arrival, and closes a
+    // pre-#486 hole. An observation sampled exactly at `t + D` (a modeled `RATE=-1/-2` window
+    // end) used to be admitted, and the walk then read that observation's state at the *moving*
+    // boundary — differentiating `x(end(D))` along the boundary instead of taking `∂x/∂D` at
+    // the observation's own fixed time. The prediction is genuinely **non-differentiable** in
+    // `D` there: for `D` above the coincidence the infusion is still running at the sample (only
+    // the rate `amt/D` matters), while below it the dose has finished and a decay term appears,
+    // so the one-sided slopes differ (measured on a 1-cpt modeled-duration fixture: `+2.3` vs
+    // `−8.6`, with central FD returning their average `−3.2`). The walk returned `−1.9` — not
+    // either one-sided derivative, and not the average.
+    //
+    // There is no correct jet to hand back at a kink, so decline to FD, exactly as for the
+    // other degenerate coincidences. The FD fallback differentiates the same objective the
+    // optimizer sees and lands on the two-sided average. Measure-zero (`D` is estimated, so it
+    // sweeps through the sample time at most transiently), and per-subject, so a subject only
+    // takes the FD path on the iterations where the coincidence actually holds.
+    let fixed = subject
+        .obs_times
+        .iter()
+        .chain(subject.pk_only_times.iter())
+        .chain(subject.reset_times.iter());
+    for &f in fixed {
+        if moving.iter().any(|&(t, _)| (t - f).abs() < 1e-9) {
+            return false;
         }
     }
     true
@@ -7086,6 +7096,54 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
 
+    /// An observation sampled **exactly at a modeled infusion end** declines to FD (#486).
+    ///
+    /// This closes a pre-existing hole. The walk reads each observation's state at the interval
+    /// boundary, and a modeled `RATE=-1/-2` window end is a *moving* boundary — so when a sample
+    /// time coincides with it, the walk differentiated `x(end(D))` **along the boundary** rather
+    /// than taking `∂x/∂D` at the sample's own fixed time. The prediction is genuinely
+    /// non-differentiable in `D` at that point (above the coincidence the infusion is still
+    /// running at the sample, so only the rate `amt/D` matters; below it the dose has finished
+    /// and a decay term appears), so no single jet is right: on this fixture the one-sided slopes
+    /// are `+2.26` and `−8.57`, central FD gives their average `−3.15`, and the walk returned
+    /// `−1.92` — neither. Declining hands the subject to FD, which differentiates the same
+    /// objective the optimizer sees.
+    ///
+    /// The coincidence is measure-zero (`D` is estimated, so it sweeps past a fixed sample time
+    /// at most transiently) and the decline is **per-subject**, so an ordinary modeled-dose
+    /// subject — sampled anywhere else — stays analytic. Both are asserted here.
+    #[test]
+    fn obs_on_modeled_infusion_end_declines_to_fd() {
+        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+        let theta = [10.0, 50.0, 2.0];
+        // η_D1 = 0 ⇒ D1 = TVD1 = 2.0 exactly, so an observation at t = 2.0 sits on the window end.
+        let eta = [0.12, -0.08, 0.0];
+        let dose = || {
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            )
+        };
+
+        let on_end = subject_with_dose(dose(), &[1.0, 2.0, 3.0]);
+        assert!(
+            subject_sensitivities(&model, &on_end, &theta, &eta).is_none(),
+            "an observation on the moving infusion end must decline to FD (no correct jet at the kink)"
+        );
+        assert!(
+            subject_eta_grad(&model, &on_end, &theta, &eta).is_none(),
+            "inner must decline in lockstep with the outer (no split scope)"
+        );
+
+        // Sampled away from the window end: still analytic, and still exact.
+        let off_end = subject_with_dose(dose(), &[1.0, 2.5, 3.0]);
+        check_full_provider_vs_fd(&model, &off_end, &theta, &eta);
+    }
+
     /// A modeled-duration `RATE=-2` subject must now route to the event-driven walk
     /// and be served analytically (the closed-form twin of the ODE #635 path), not
     /// fall back to FD (#486). Both the full outer provider and the light inner
@@ -7616,7 +7674,12 @@ mod tests {
         ];
         // TVD1 == TVD2 == 2.0, both doses at t=0 → both infusions end at t=2 with
         // distinct backing slots ⇒ not separable ⇒ decline to FD.
-        let coincident = subject_with_doses_and_resets(doses.clone(), &[0.5, 1.5, 3.0], Vec::new());
+        //
+        // Sample times deliberately avoid every window end (2.0 / 3.0 below): an observation
+        // *on* a moving infusion end declines for its own reason (the prediction has a kink in
+        // `D` there — `obs_on_modeled_infusion_end_declines_to_fd`), which would mask the
+        // distinct-slot separability this test is actually about.
+        let coincident = subject_with_doses_and_resets(doses.clone(), &[0.5, 1.5, 3.5], Vec::new());
         assert!(
             subject_sensitivities(
                 &model,
