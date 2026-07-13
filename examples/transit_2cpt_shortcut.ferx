@@ -18,12 +18,14 @@
 # straight into a concentration state — hence the amount + [scaling] form.
 #
 # States (CMT numbers):
-#   1  central    -- oral dose lands here (amount, mg); transit() delivers F·Dose
+#   1  central    -- dose record (AMT/CMT) targets here; transit() consumes it and
+#                    delivers F·Dose over time (no instantaneous bolus is added)
 #   2  peripheral -- (amount, mg)
 #
 # Self-contained: the [simulation] block below lets you run it with no data file
 #   cargo run --release -- examples/transit_2cpt_shortcut.ferx --simulate
-# which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
+# which simulates a 100 mg oral dose record on CMT=1 (delivered over time by the
+# transit() forcing, not as a bolus), observed as concentration, and
 # fits it back. True simulation parameters: TVCL=5, TVV1=50, TVQ=10, TVV2=100,
 #   TVMTT=1.0, TVN=3, omega_CL=omega_V1=0.09, sigma_prop=0.15.
 

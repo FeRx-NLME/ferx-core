@@ -66,7 +66,7 @@ This is the contents of [`examples/transit_2cpt_shortcut.ferx`](https://github.c
 ```
 
 Key design choices:
-- **`transit(n=NTR, mtt=MTT)`** replaces the hand-coded transit chain. The single input-rate term delivers the full dose (`∫₀^∞ R_in dt = F·Dose`) into `central` over time with the Savic transit-density shape — so the dose record is a plain bolus into CMT=1 (the dose feeds the function, **not** an additional instantaneous bolus). See [Transit-compartment absorption](../model-file/absorption.qmd#transit-compartment-absorption-transitn-mtt).
+- **`transit(n=NTR, mtt=MTT)`** replaces the hand-coded transit chain. The single input-rate term delivers the full dose (`∫₀^∞ R_in dt = F·Dose`) into `central` over time with the Savic transit-density shape. The AMT/CMT dose record on CMT=1 is **consumed by the forcing** — the dose feeds the function and is **not** also applied as an instantaneous bolus to the state. See [Transit-compartment absorption](../model-file/absorption.qmd#transit-compartment-absorption-transitn-mtt).
 - **Continuous `n`**: because `NTR` is an ordinary individual parameter, the number of compartments — the absorption *shape* — is estimated, not fixed at an integer. This is the shortcut's main advantage over the explicit chain, which fixes `n` structurally.
 - **Amount states + `[scaling]`**: the transit input carries dose **mass**, so `central`/`peripheral` are written as amounts (mg) and concentration is formed in `[scaling]` (`y = central / V1`, the NONMEM `A(1)/V` convention). `transit()` may not be scaled or divided, so it cannot be written straight into a concentration state — hence the amount form.
 
@@ -78,7 +78,7 @@ Run it on the built-in simulation with no data file:
 ferx examples/transit_2cpt_shortcut.ferx --simulate
 ```
 
-or point it at your own NONMEM-format CSV (oral bolus into CMT=1, concentration observed on CMT=1):
+or point it at your own NONMEM-format CSV (AMT dose record on CMT=1 — delivered over time by the forcing — with concentration observed on CMT=1):
 
 ```bash
 ferx examples/transit_2cpt_shortcut.ferx --data your_data.csv
