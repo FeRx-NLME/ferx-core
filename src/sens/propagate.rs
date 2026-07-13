@@ -857,6 +857,7 @@ fn propagate_bounds_g<T: PkNum>(
             pk_model,
             reset_floor,
             mid,
+            false,
         );
         apply_step_g(state, dt, pk, pk_model, rates);
     }
@@ -869,8 +870,15 @@ fn propagate_bounds_g<T: PkNum>(
 ///
 /// Shared by the interval walk ([`propagate_bounds_g`]) and the observation-on-a-moving-boundary
 /// correction in [`event_driven_sens_with_doses_g`], so the two cannot drift apart on which
-/// infusions are considered active at a given instant. The window test is inclusive at both
-/// ends (`t_start <= mid && t_end >= mid`), matching production.
+/// infusions are considered active at a given instant.
+///
+/// `strict_start` selects the window convention at the query point itself:
+/// * `false` — `t_start <= mid && t_end >= mid`, inclusive at both ends, matching production.
+///   This is what the interval walk wants, where `mid` is strictly inside a sub-interval.
+/// * `true` — `t_start < mid`, i.e. the rates on the segment *immediately before* `mid`. The
+///   observation correction wants exactly this: an infusion **ending** at `mid` is still
+///   contributing (production's full-containment convention), while one **starting** at `mid`
+///   is not yet, since the walk propagated into that instant under the old rate set.
 #[allow(clippy::too_many_arguments)]
 fn active_rates_g<T: PkNum>(
     doses: &[DoseEvent],
@@ -880,6 +888,7 @@ fn active_rates_g<T: PkNum>(
     pk_model: PkModel,
     reset_floor: f64,
     mid: f64,
+    strict_start: bool,
 ) -> (T, T, T, T) {
     let mut rate_central = T::from_f64(0.0);
     let mut rate_periph1 = T::from_f64(0.0);
@@ -892,7 +901,12 @@ fn active_rates_g<T: PkNum>(
         if t_start < reset_floor {
             continue;
         }
-        if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
+        let started = if strict_start {
+            t_start < mid
+        } else {
+            t_start <= mid
+        };
+        if d.rate > 0.0 && d.duration > 0.0 && started && t_end >= mid {
             let r = match dose_inf_dual.get(k).copied().flatten() {
                 Some((rate_bare, _)) => pk.f * rate_bare,
                 None => pk.f * T::from_f64(d.rate),
@@ -999,51 +1013,66 @@ fn apply_step_g<T: PkNum>(
     }
 }
 
-/// `Δ = end(p) − t` for an observation time `t` that lands exactly on a **moving infusion end**,
-/// or `None` when it doesn't (the overwhelmingly common case).
+/// The correction an observation needs when its clock time lands exactly on a **moving
+/// boundary** — a dose arrival `t_dose + ALAG`, or an infusion window end `t_dose + ALAG + D`.
 ///
-/// `Δ` has **value zero** — the boundary and the sample coincide at the current parameters — but
-/// a non-zero *jet*, because the window end `t_start + D` moves with the estimated `D{cmt}`/`R{cmt}`
-/// (and, under a lagtime, with the arrival it rides on). That jet is exactly what the correction in
-/// [`event_driven_sens_with_doses_g`] needs.
+/// Returns `Δ = boundary(p) − t` and the window convention to evaluate the sliver's rates under.
+/// `Δ` has **value zero** — boundary and sample coincide at the current parameters — but a live
+/// *jet*, because the boundary moves with the estimated lagtime and/or `D{cmt}`/`R{cmt}`. That jet
+/// is exactly the along-the-boundary term the observation must not inherit: its own clock time
+/// does not move.
 ///
-/// Only **infusion ends** qualify. A dose *arrival* landing on an observation is a different animal:
-/// a bolus arrival makes the prediction **discontinuous** in the arrival time (the sample lands
-/// before or after an instantaneous jump in amount), so no derivative exists at all and the provider
-/// declines such a subject to FD upstream rather than correcting anything.
-fn moving_infusion_end_delta<T: PkNum>(
+/// The caller steps the state back over `−Δ`, i.e. it re-evolves it across the sliver that lies
+/// between the sample and the boundary. Which rates act on that sliver depends on which side of
+/// the boundary it is on, and that is the returned `strict_start` flag:
+///
+/// * **Arrival** (`strict_start = false`). The branch that defines the value here is the one where
+///   the dose *has landed* (production orders `Dose` before `Obs`), so the sliver lies **after**
+///   the arrival: the dose is in the state and, if it is an infusion, that infusion is running.
+///   Inclusive rates. The deposited bolus stays in the state — it has had `t_obs − τ` to act.
+/// * **Infusion end** (`strict_start = true`). The sliver lies **before** the end, inside the
+///   window, so the ending infusion is still contributing (production's full-containment
+///   convention) while an infusion merely *starting* at this instant is not.
+///
+/// `None` (the overwhelmingly common case) when the sample sits on no moving boundary, or when
+/// nothing about the coincident boundary actually moves (a fixed window with no lagtime). The
+/// caller declines subjects where *several* moving boundaries coincide with one observation, so at
+/// most one applies here.
+fn obs_boundary_correction<T: PkNum>(
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
     dose_lag_dual: &[T],
     dose_inf_dual: &[Option<(T, T)>],
     reset_floor: f64,
     t: f64,
-) -> Option<T> {
+) -> Option<(T, bool)> {
     let has_lag = !dose_lag_dual.is_empty();
     for (k, d) in doses.iter().enumerate() {
-        if !(d.rate > 0.0 && d.duration > 0.0) {
-            continue;
-        }
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let t_start = d.time + lag;
         if t_start < reset_floor {
-            continue;
-        }
-        let end = t_start + d.duration;
-        if (end - t).abs() >= 1e-9 {
             continue;
         }
         let dual_start = match dose_lag_dual.get(k) {
             Some(&lag_d) => T::from_f64(d.time) + lag_d,
             None => T::from_f64(t_start),
         };
-        let dual_end = match dose_inf_dual.get(k).copied().flatten() {
-            Some((_, dur_bare)) => dual_start + dur_bare,
-            None if has_lag => dual_start + T::from_f64(d.duration),
-            // A fixed window with no lagtime: the end does not move, so there is nothing to correct.
-            None => continue,
-        };
-        return Some(dual_end - T::from_f64(t));
+
+        // (a) The sample sits on this dose's *arrival*. Only moving under a lagtime.
+        if has_lag && (t_start - t).abs() < 1e-9 {
+            return Some((dual_start - T::from_f64(t), false));
+        }
+
+        // (b) The sample sits on this dose's infusion *end*.
+        if d.rate > 0.0 && d.duration > 0.0 && ((t_start + d.duration) - t).abs() < 1e-9 {
+            let dual_end = match dose_inf_dual.get(k).copied().flatten() {
+                Some((_, dur_bare)) => dual_start + dur_bare,
+                None if has_lag => dual_start + T::from_f64(d.duration),
+                // A fixed window with no lagtime: the end does not move, nothing to correct.
+                None => continue,
+            };
+            return Some((dual_end - T::from_f64(t), true));
+        }
     }
     None
 }
@@ -1284,28 +1313,33 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 }
             }
             EventKind::Obs => {
-                // **Observation sitting exactly on a moving infusion end** (#486).
+                // **Observation sitting exactly on a moving boundary** (#486) — a dose arrival
+                // `t + ALAG`, or an infusion end `t + ALAG + D`.
                 //
-                // The walk propagates *through* the moving boundary, so `state` here is
-                // `x(end(D))` — the state at the boundary, which is what every *later* event
-                // needs. But an observation's time does not move with `D`: we want `x(t_obs)`
-                // at the sample's own fixed clock time. Differentiating `x(end(D))` instead
-                // adds a spurious `ẋ·∂end/∂D` and yields a value that is not even a subgradient.
+                // The walk propagates *through* such a boundary, so `state` here is the state at
+                // the boundary, `x(bound(p))` — which is what every later event needs. But an
+                // observation's clock time does **not** move with the parameters. Reading it here
+                // differentiates along the boundary and adds a spurious `ẋ·∂bound/∂p`, giving a
+                // value that is not even a subgradient in general.
                 //
-                // Correct it by stepping a copy of the state **back** across the zero-length
-                // sliver `Δ = end(D) − t_obs` with the infusion still running. `Δ` has value 0
-                // (boundary and sample coincide) but a live jet, so the step leaves the
-                // prediction's *value* untouched and removes exactly the along-the-boundary
-                // term from its derivatives — to second order, since the dual carries it.
+                // Correct it by stepping a **copy** of the state back across the zero-length
+                // sliver `Δ = bound(p) − t_obs`, under the rate set of the segment immediately
+                // *before* the sample (`strict_start`). `Δ` has value 0 but a live jet, so the
+                // step leaves the prediction's *value* untouched and removes exactly the
+                // along-the-boundary term from its derivatives — to second order, since the dual
+                // carries it. The main walk's state is untouched, so later observations keep the
+                // boundary sensitivity they need.
                 //
-                // What comes out is the **one-sided** (pre-jump) derivative: the branch where
-                // the infusion is still running at the sample. That is the same convention the
-                // ODE engine's jump/saltation sensitivities already use, so the two engines now
-                // agree here (pinned by `provider_obs_on_modeled_infusion_end_matches_ode_twin`).
-                // The prediction is genuinely kinked in `D` at this point, so no two-sided
-                // derivative exists — a one-sided one is the strongest correct answer available.
+                // What comes out is the **one-sided** derivative of the branch that production's
+                // own event ordering uses to define the value here: `Dose` before `Obs` (the dose
+                // has landed), and the infusion-end break *after* `Obs` (the infusion is still
+                // contributing). That is the same convention — and the same number — the ODE
+                // engine's jump/saltation sensitivities produce, which is what the ODE-twin
+                // equivalence tests pin. A bolus deposited at this very instant is lifted off
+                // before the step and put back after: it does not decay across a zero-length
+                // window.
                 let mut obs_state;
-                let read = match moving_infusion_end_delta(
+                let read = match obs_boundary_correction(
                     eff_doses,
                     &schedule.dose_lagtimes,
                     dose_lag_dual,
@@ -1313,7 +1347,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     reset_floor,
                     ev.time,
                 ) {
-                    Some(delta) => {
+                    Some((delta, strict_start)) => {
                         obs_state = state.clone();
                         let rates = active_rates_g(
                             eff_doses,
@@ -1323,6 +1357,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                             pk_model,
                             reset_floor,
                             ev.time,
+                            strict_start,
                         );
                         apply_step_g(
                             &mut obs_state,

@@ -375,8 +375,8 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
-- **Wrong analytic gradient for an observation sampled exactly at a modeled infusion
-  end** (#486). With a modeled `RATE=-1`/`-2` dose the infusion window end moves with the
+- **Wrong analytic gradient for an observation sampled exactly on a moving dose boundary**
+  (#486) — a modeled infusion end, or a lagged dose arrival. With a modeled `RATE=-1`/`-2` dose the infusion window end moves with the
   estimated `D{cmt}`/`R{cmt}`. An observation whose time coincided with that end had its
   gradient taken *along the moving boundary* rather than at the sample's own fixed clock
   time, adding a spurious term: on a 1-cpt fixture it returned `−1.9`, which is not even a
@@ -390,10 +390,20 @@ section of the SDLC for the versioning policy).
   infusion is still running at the sample, just below it the dose has finished and a decay term
   appears — so no two-sided derivative exists there (the one-sided slopes are `−8.6` and
   `+2.3`, and a central finite difference returns their average, `−3.2`). ferx returns the
-  **one-sided** derivative, which is the same convention its ODE engine's jump/saltation
-  sensitivities already used; the two engines now agree on this case, which is what pins the
-  value. A finite-difference gradient will still disagree with the analytic one *at exactly*
-  that point, and that is expected rather than a defect.
+  **one-sided** derivative — specifically, the derivative of the branch ferx's own event
+  ordering already uses to define the *value* there (an infusion at its end is still
+  contributing; a dose at its arrival has landed). That is the same convention its ODE engine's
+  jump/saltation sensitivities already used, and the two engines now return the same number.
+
+  The same correction applies to an observation landing on a **lagged dose arrival**, where it
+  matters more than it looks: on an oral model the prediction's *value* at that instant is zero
+  (the depot bolus has only just landed, so the central compartment is still empty) while its
+  derivative is not — the closed form previously reported a derivative of zero, which looks
+  innocuous and is wrong.
+
+  Note the deliberate consequence: at *exactly* such a coincidence an analytic gradient and a
+  finite-difference gradient legitimately disagree — FD averages across a branch switch the
+  model does not make there. That is a property of a kinked model, not a defect.
 - **`run_covariance` now reproduces the inline covariance step exactly.** A standalone
   covariance step (`run_covariance`, `ferx` covariance on a saved fit) returned a covariance
   matrix and standard errors that differed from the same fit run with `covariance = true`

@@ -2414,29 +2414,29 @@ fn moving_bounds_separable(
             return false;
         }
     }
-    // (2) Moving-vs-fixed: an observation / reset / covariate-change time must not sit on a
-    // moving break. (A dose arrival is itself a moving break here, so dose-vs-dose
-    // coincidences are covered by (1), not by this check.)
+    // (2) Moving-vs-fixed: a reset / covariate-change time must not sit on a moving break.
     //
-    // **Observations on a moving infusion end are exempt** — the walk corrects them rather than
-    // declining (`event_driven_sens_with_doses_g` steps the read-out state back across the
-    // zero-length sliver `end(D) − t_obs`, recovering the one-sided derivative the ODE engine's
-    // jump sensitivities also return). Everything else still declines:
+    // **Observations are exempt** — the walk *corrects* them rather than declining.
+    // `event_driven_sens_with_doses_g` steps the read-out state back across the zero-length
+    // sliver `bound(p) − t_obs`, recovering the derivative at the sample's own fixed clock time.
+    // What it recovers is the one-sided derivative of the branch production's own event ordering
+    // already uses to define the value there — `Dose` before `Obs` (the dose has landed) and the
+    // infusion end after `Obs` (the infusion is still contributing) — which is the same
+    // convention, and the same number, the ODE engine's jump/saltation sensitivities produce.
+    // Pinned against the ODE twin, for both an infusion end and a lagged bolus arrival.
     //
-    // * an observation on a moving **arrival**. A bolus arrival makes the prediction
-    //   *discontinuous* in the arrival time — the sample lands on one side or the other of an
-    //   instantaneous jump in amount — so there is no derivative to recover, one-sided or
-    //   otherwise. (An infusion *start* is continuous, but the walk reads the state before the
-    //   dose event is applied, so it is not correctable by the same sliver; it declines too,
-    //   conservatively.)
-    // * a **reset** or **covariate-change** (`PkOnly`) time on any moving break. Those events are
-    //   not read-outs, so there is no state to correct — the walk would simply apply them at the
-    //   moving clock position instead of their own fixed one.
+    // The one case the correction cannot resolve is **several** moving boundaries landing on a
+    // single observation: it applies one sliver, under one rate set. That declines.
+    //
+    // A **reset** or **covariate-change** (`PkOnly`) on a moving break still declines outright:
+    // those events are not read-outs, so there is no state to correct — the walk would simply
+    // apply them at the moving clock position instead of their own fixed one.
     for &f in &subject.obs_times {
-        // Only a moving *arrival* disqualifies an observation; a moving end is corrected.
         if moving
             .iter()
-            .any(|&(t, _, is_arrival)| is_arrival && (t - f).abs() < 1e-9)
+            .filter(|&&(t, _, _)| (t - f).abs() < 1e-9)
+            .count()
+            > 1
         {
             return false;
         }
@@ -9559,17 +9559,65 @@ mod tests {
         );
     }
 
-    /// A moving break landing exactly on a fixed one (here: an observation sampled at the
-    /// lagged arrival `t + ALAG = 0.75`) is not representable — the walk resolves one dual
-    /// position per break time, so it would drag the fixed observation along with the moving
-    /// arrival. Such a (measure-zero) subject declines to FD rather than returning a subtly
-    /// wrong jet.
+    /// An observation sampled **exactly at a lagged bolus arrival** gets the one-sided analytic
+    /// derivative, matching the ODE twin (#486).
+    ///
+    /// This is the sharper sibling of the infusion-end case. Here the prediction is not merely
+    /// kinked in `ALAG` — it is **discontinuous**: for a lag just below the coincidence the dose
+    /// has landed by the sample, for a lag just above it has not, so the value jumps by the whole
+    /// bolus. Production resolves that by ordering `Dose` before `Obs` (`kind_order`), which makes
+    /// the prediction *left*-continuous — the sample sees the dose. The derivative consistent with
+    /// the model's own semantics is therefore the derivative of that branch, and it is finite.
+    ///
+    /// A finite-difference gradient is **actively worse** here: a central difference straddles the
+    /// jump and returns `≈ −jump / 2h`, an enormous bogus value that would wreck a line search. So
+    /// declining to FD (the earlier behaviour) was the wrong instinct. The walk instead lifts the
+    /// just-deposited bolus off the state, steps back across the sliver under the pre-arrival rate
+    /// set, and puts the bolus back — the bolus does not decay across a zero-length window.
+    ///
+    /// The ODE twin is the oracle: it reaches the same value from the same convention by an
+    /// entirely different route (it captures the observation *before* injecting the arrival's
+    /// saltation, since `K_OBS` sorts before the infusion/rate events and `K_DOSE` before `K_OBS`).
+    /// Central-FD parity is deliberately not asserted — it cannot hold across a discontinuity.
     #[test]
-    fn lagtime_break_coinciding_with_observation_declines_to_fd() {
-        let model = parse_model_string(ONECPT_ORAL_LAG_TVCOV).expect("parse lag + tvcov");
+    fn obs_on_lagged_bolus_arrival_matches_ode_twin() {
+        const ODE_TWIN: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVLAG(0.75, 0.01, 5.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_LAG ~ 0.05
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[scaling]
+  y = central / V
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let cf = parse_model_string(ONECPT_ORAL_LAG_TVCOV).expect("parse cf lag + tvcov");
+        let ode = parse_model_string(ODE_TWIN).expect("parse ode twin");
         let theta = [0.22, 11.0, 1.4, 0.7, 0.8];
-        // η_LAG = 0 ⇒ ALAG = TVLAG = 0.7 exactly, so an observation at t = 0.7 sits on the
-        // arrival of the t = 0 dose.
+        // η_LAG = 0 ⇒ ALAG = TVLAG = 0.7 exactly, so the t = 0.7 sample sits on the arrival of
+        // the t = 0 bolus.
         let eta = [0.12, -0.08, 0.15, 0.0];
         let subject = tvcov_subject(
             vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -9580,10 +9628,48 @@ mod tests {
             Vec::new(),
             &[],
         );
-        assert!(
-            subject_sensitivities(&model, &subject, &theta, &eta).is_none(),
-            "an observation coinciding with a moving arrival must decline to FD"
-        );
+
+        let cf_sens = subject_sensitivities(&cf, &subject, &theta, &eta)
+            .expect("closed form must stay analytic on a coincident arrival (corrected read-out)");
+        let ode_sens = subject_sensitivities(&ode, &subject, &theta, &eta)
+            .expect("ODE twin serves it via jump sensitivities");
+
+        // At the coincident sample the *value* is zero (the depot bolus has only just landed, so
+        // central is still empty) while ∂f/∂ALAG is emphatically not — it is the rate at which
+        // central would have filled had the dose arrived earlier. The closed form used to return
+        // zero here, which looks perfectly innocent and is wrong.
+        for (c, o) in cf_sens.obs.iter().zip(ode_sens.obs.iter()) {
+            approx::assert_relative_eq!(c.f, o.f, max_relative = 1e-5, epsilon = 1e-8);
+            for m in 0..theta.len() {
+                approx::assert_relative_eq!(
+                    c.df_dtheta[m],
+                    o.df_dtheta[m],
+                    max_relative = 1e-4,
+                    epsilon = 1e-6
+                );
+            }
+            for k in 0..cf.n_eta {
+                approx::assert_relative_eq!(
+                    c.df_deta[k],
+                    o.df_deta[k],
+                    max_relative = 1e-4,
+                    epsilon = 1e-6
+                );
+            }
+        }
+
+        // Inner must carry the same correction as outer — no split scope.
+        let inner = subject_eta_grad(&cf, &subject, &theta, &eta).expect("inner analytic");
+        for (o, i) in cf_sens.obs.iter().zip(inner.iter()) {
+            for k in 0..cf.n_eta {
+                approx::assert_relative_eq!(
+                    o.df_deta[k],
+                    i.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-12
+                );
+            }
+        }
     }
 
     const ONECPT_TRANSIT_MODEL: &str = r#"
