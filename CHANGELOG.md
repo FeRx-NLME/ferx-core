@@ -355,6 +355,19 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **Closed-form transit/IG absorption under IOV / time-varying covariates now honors
+  call-time ODE tolerances and converges its EBEs correctly** (#814, #719 follow-up): a
+  `one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` / `two_cpt_ig` model routes its IOV,
+  time-varying-covariate, and `TIME`-switch subjects to an internally generated ODE "twin".
+  Two fixes to that reroute: (1) a call-time `ode_reltol` / `ode_abstol` / `ode_max_steps`
+  (e.g. from `ferx_fit(settings = …)`) now reaches the twin's solver — previously the twin
+  silently integrated at its parse-default tolerance, ignoring the requested accuracy for the
+  whole fit/predict; (2) the inner EBE loop's ODE gradient-noise convergence stop is now
+  enabled for those rerouted subjects, so an individual estimate that dropped to the
+  finite-difference inner gradient no longer risks running to the iteration cap and returning
+  an under-converged EBE. The converged population objective is unchanged (still NONMEM-anchored
+  by the #719 transit+IOV cross-check). Regression tests in `types.rs` /
+  `estimation/inner_optimizer.rs`.
 - **Inner EBE line search no longer aborts on a non-finite objective** (#719
   follow-up): the FOCEI inner-loop backtracking line search
   (`estimation/inner_optimizer.rs`) could panic with `clamp(NaN, NaN)` (a process
