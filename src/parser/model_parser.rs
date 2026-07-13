@@ -1079,6 +1079,21 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     #[cfg(not(feature = "survival"))]
     let has_binary_model_block = false;
 
+    // A `[markov_model]` (Phase 5 CTMM, #759) endpoint is likewise a non-Gaussian
+    // endpoint that makes the Gaussian PK blocks optional.
+    #[cfg(feature = "markov")]
+    let has_markov_model_block = blocks.contains_key("markov_model")
+        || extracted
+            .named
+            .get("markov_model")
+            .is_some_and(|m| !m.is_empty());
+    #[cfg(not(feature = "markov"))]
+    let has_markov_model_block = false;
+
+    // Fold the CTMM block into the same "endpoint present" predicate the binary
+    // block uses, so a CTMM-only model may omit the Gaussian PK blocks / empty Ω.
+    let has_binary_model_block = has_binary_model_block || has_markov_model_block;
+
     let struct_lines_opt = blocks.get("structural_model");
     let error_lines_opt = blocks.get("error_model");
     let indiv_lines_opt = blocks.get("individual_parameters");
@@ -2714,6 +2729,44 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             }
             event_model_used_thetas.extend(blk_thetas);
             event_model_used_etas.extend(blk_etas);
+        }
+
+        // ── [markov_model] blocks (Phase 5 CTMM, #759) ────────────────────────────
+        // Unnamed `[markov_model]` and any named `[markov_model LABEL]`, each keyed by CMT.
+        #[cfg(feature = "markov")]
+        {
+            let mut markov_blocks: Vec<&Vec<String>> = Vec::new();
+            if let Some(lines) = blocks.get("markov_model") {
+                markov_blocks.push(lines);
+            }
+            if let Some(named_map) = extracted.named.get("markov_model") {
+                for lines in named_map.values() {
+                    markov_blocks.push(lines);
+                }
+            }
+            for lines in markov_blocks {
+                let (cmt, endpoint, ctmm_covs, blk_thetas, blk_etas) = parse_markov_model_block(
+                    lines,
+                    &theta_names,
+                    &eta_names,
+                    &indiv_stmts,
+                    &model.kappa_names,
+                    &model.error_spec,
+                )?;
+                if model.endpoints.contains_key(&cmt) {
+                    return Err(format!(
+                        "[markov_model]: CMT={cmt} already declared by another endpoint"
+                    ));
+                }
+                model.endpoints.insert(cmt, endpoint);
+                for cov in ctmm_covs {
+                    if !model.referenced_covariates.contains(&cov) {
+                        model.referenced_covariates.push(cov);
+                    }
+                }
+                event_model_used_thetas.extend(blk_thetas);
+                event_model_used_etas.extend(blk_etas);
+            }
         }
 
         model.referenced_covariates.sort();
@@ -4491,6 +4544,393 @@ fn parse_binary_model_block(
         lp_covariates,
         lp_thetas,
         lp_etas,
+    ))
+}
+
+/// True if `key` is an Option-B matrix-rate key like `q12` (`q` + ≥2 digits).
+/// Used only to steer the "not yet supported" error toward the Option-A form.
+#[cfg(feature = "markov")]
+fn is_matrix_rate_key(key: &str) -> bool {
+    key.strip_prefix('q')
+        .is_some_and(|rest| rest.len() >= 2 && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Parse one `[markov_model]` block — a continuous-time Markov (CTMM) endpoint
+/// (Phase 5, Track D — #759; §8.4 of `plans/tte-survival-markov.md`).
+///
+/// Returns `(cmt, EndpointLikelihood::Ctmm { .. }, generator_covariates, thetas, etas)`
+/// ready to insert into `CompiledModel::endpoints`.
+///
+/// Supported lines (Option A — the ergonomic transition-list form):
+/// - `type`   — optional; `ctmm` (default). `mctmm`/`dtmm` are not yet supported.
+/// - `cmt`    — required; positive integer (data-file CMT column value).
+/// - `states` — required; `[label=code, ...]` or bare `[code, ...]`. `code` is the
+///   integer DV value that denotes the state; the optional `label` names it for the
+///   transitions and output. States may be coded with any non-negative integers.
+/// - `transition A -> B = <expr>` — one per allowed transition; `<expr>` is the
+///   intensity `q_{A→B} ≥ 0` (θ/η/covariate/`[individual_parameters]` expression,
+///   evaluated per subject at a baseline covariate snapshot). The generator's
+///   diagonal `q_jj = −Σ_{k≠j} q_jk` is filled automatically.
+///
+/// Option B (the `q12 = …` matrix spelling), `init`, and `type = mctmm|dtmm` are
+/// rejected with a "not yet supported" message so the surface stays honest.
+#[cfg(feature = "markov")]
+#[allow(clippy::type_complexity)]
+fn parse_markov_model_block(
+    lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_stmts: &[Statement],
+    kappa_names: &[String],
+    error_spec: &ErrorSpec,
+) -> Result<
+    (
+        usize,
+        crate::types::EndpointLikelihood,
+        Vec<String>,
+        std::collections::HashSet<usize>,
+        std::collections::HashSet<usize>,
+    ),
+    String,
+> {
+    use crate::types::EndpointLikelihood;
+    use std::collections::{HashMap as StdHashMap, HashSet};
+
+    // Like `[binary_model]`, transition intensities may reference
+    // `[individual_parameters]` names (resolved per subject) plus θ/η/covariates.
+    let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+    let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
+
+    let mut cmt_opt: Option<usize> = None;
+    let mut states_seen = false;
+    let mut states: Vec<(String, usize)> = Vec::new(); // ordered (label, DV code)
+    let mut transitions_raw: Vec<(String, String, Expression)> = Vec::new();
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // `transition A -> B = <intensity>`
+        if let Some(rest) = trimmed.strip_prefix("transition") {
+            if !rest.starts_with(char::is_whitespace) {
+                return Err(format!(
+                    "[markov_model]: unknown key in `{trimmed}` — a transition reads \
+                     `transition A -> B = <intensity>`"
+                ));
+            }
+            let (lhs, rhs) = rest.split_once('=').ok_or_else(|| {
+                format!(
+                    "[markov_model]: transition `{trimmed}` needs an intensity: \
+                     `transition A -> B = <intensity>`"
+                )
+            })?;
+            let (from, to) = lhs.split_once("->").ok_or_else(|| {
+                format!("[markov_model]: transition `{trimmed}` needs `A -> B` before `=`")
+            })?;
+            let (from, to) = (from.trim().to_string(), to.trim().to_string());
+            if from.is_empty() || to.is_empty() {
+                return Err(format!(
+                    "[markov_model]: transition `{trimmed}` has an empty state name"
+                ));
+            }
+            let expr = parse_scalar_expression(rhs.trim(), ctx)?;
+            transitions_raw.push((from, to, expr));
+            continue;
+        }
+
+        // `key = value`
+        let (key, value) = trimmed
+            .split_once('=')
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .ok_or_else(|| {
+                format!(
+                    "[markov_model]: invalid line `{trimmed}` — expected `key = value` or \
+                     `transition A -> B = <intensity>`"
+                )
+            })?;
+        match key {
+            "type" => match value {
+                "ctmm" => {}
+                "mctmm" | "dtmm" => {
+                    return Err(format!(
+                        "[markov_model]: type `{value}` is not yet supported — only `ctmm` \
+                         (time-homogeneous CTMM) is available; mCTMM/DTMM are planned \
+                         (Phase 4b/4c)."
+                    ))
+                }
+                other => {
+                    return Err(format!(
+                        "[markov_model]: unknown type `{other}` — expected `ctmm`"
+                    ))
+                }
+            },
+            "cmt" => {
+                cmt_opt = Some(value.parse::<usize>().map_err(|_| {
+                    format!("[markov_model]: invalid cmt `{value}` — expected a positive integer")
+                })?);
+            }
+            "states" => {
+                states_seen = true;
+                let inner = value
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .ok_or_else(|| {
+                        format!(
+                            "[markov_model]: states `{value}` must be a bracketed list, e.g. \
+                             [awake=0, asleep=1] or [0, 1]"
+                        )
+                    })?;
+                for tok in inner.split(',') {
+                    let tok = tok.trim();
+                    if tok.is_empty() {
+                        continue;
+                    }
+                    // `label=code` or bare `code` (label defaults to the code text).
+                    let (label, code_str) = match tok.split_once('=') {
+                        Some((l, c)) => (l.trim().to_string(), c.trim()),
+                        None => (tok.to_string(), tok),
+                    };
+                    let code = code_str.parse::<usize>().map_err(|_| {
+                        format!(
+                            "[markov_model]: state code `{code_str}` must be a non-negative \
+                             integer (the DV value that denotes the state)"
+                        )
+                    })?;
+                    states.push((label, code));
+                }
+            }
+            "init" => {
+                return Err(
+                    "[markov_model]: `init` (starting occupancy) is not yet supported — the CTMM \
+                     fit conditions on each subject's first observed state; `init` will drive \
+                     prediction/simulation in a later slice."
+                        .to_string(),
+                )
+            }
+            other => {
+                if other == "n_states" || is_matrix_rate_key(other) {
+                    return Err(format!(
+                        "[markov_model]: the matrix spelling (`{other} = …`, Option B) is not yet \
+                         supported — use the transition list (Option A): `states = [...]` plus \
+                         `transition A -> B = <intensity>` lines."
+                    ));
+                }
+                return Err(format!(
+                    "[markov_model]: unknown key `{other}` — valid keys: type, cmt, states, and \
+                     `transition A -> B = <intensity>` lines"
+                ));
+            }
+        }
+    }
+
+    let cmt = cmt_opt.ok_or("[markov_model]: missing required key `cmt`")?;
+    if !states_seen {
+        return Err("[markov_model]: missing required key `states`".to_string());
+    }
+    if states.len() < 2 {
+        return Err(format!(
+            "[markov_model]: a CTMM needs at least 2 states; got {}",
+            states.len()
+        ));
+    }
+    if transitions_raw.is_empty() {
+        return Err(
+            "[markov_model]: no `transition` lines — declare at least one \
+             `transition A -> B = <intensity>`"
+                .to_string(),
+        );
+    }
+
+    // Same CMT can't be both Gaussian and CTMM (parallels the binary/event guard).
+    if let ErrorSpec::PerCmt(cmt_map) = error_spec {
+        if cmt_map.contains_key(&cmt) {
+            return Err(format!(
+                "[markov_model]: CMT={cmt} is already declared as a Gaussian endpoint in \
+                 [error_model] — the same CMT cannot be both Gaussian and CTMM"
+            ));
+        }
+    }
+
+    // Build the label→index map and the ordered DV-code table, rejecting duplicate
+    // labels and duplicate codes (a duplicate code would make the DV→index mapping
+    // ambiguous).
+    let mut label_to_idx: StdHashMap<String, usize> = StdHashMap::new();
+    let mut code_owner: StdHashMap<usize, String> = StdHashMap::new();
+    let mut state_codes: Vec<usize> = Vec::with_capacity(states.len());
+    for (i, (label, code)) in states.iter().enumerate() {
+        if label_to_idx.insert(label.clone(), i).is_some() {
+            return Err(format!("[markov_model]: duplicate state label `{label}`"));
+        }
+        if let Some(prev) = code_owner.insert(*code, label.clone()) {
+            return Err(format!(
+                "[markov_model]: duplicate state code {code} (states `{prev}` and `{label}`)"
+            ));
+        }
+        state_codes.push(*code);
+    }
+
+    // Resolve each transition's labels to generator indices, rejecting unknown
+    // states, self-transitions (a rate is off-diagonal), and duplicate pairs.
+    let mut pair_seen: HashSet<(usize, usize)> = HashSet::new();
+    let mut transitions: Vec<(usize, usize, Expression)> =
+        Vec::with_capacity(transitions_raw.len());
+    for (from, to, expr) in transitions_raw {
+        let j = *label_to_idx.get(&from).ok_or_else(|| {
+            format!("[markov_model]: transition references unknown state `{from}`")
+        })?;
+        let k = *label_to_idx
+            .get(&to)
+            .ok_or_else(|| format!("[markov_model]: transition references unknown state `{to}`"))?;
+        if j == k {
+            return Err(format!(
+                "[markov_model]: self-transition `{from} -> {to}` is not allowed — an intensity is \
+                 an off-diagonal generator entry"
+            ));
+        }
+        if !pair_seen.insert((j, k)) {
+            return Err(format!(
+                "[markov_model]: transition `{from} -> {to}` is declared more than once"
+            ));
+        }
+        transitions.push((j, k, expr));
+    }
+
+    // Collect covariate/theta/eta references across every intensity BEFORE the
+    // expressions move into the generator closure.
+    let mut cov_set: HashSet<String> = HashSet::new();
+    let mut theta_set: HashSet<usize> = HashSet::new();
+    let mut eta_set: HashSet<usize> = HashSet::new();
+    for (_, _, expr) in &transitions {
+        collect_covariates(expr, &mut cov_set);
+        collect_theta_eta(expr, &mut theta_set, &mut eta_set);
+    }
+
+    // Reject a direct IOV-kappa reference: intensities are evaluated with BSV-only η,
+    // so a kappa would silently read 0.0 (#770 analogue).
+    for (_, _, expr) in &transitions {
+        if let Some(k) = expr_references_kappa(expr, kappa_names) {
+            return Err(format!(
+                "[markov_model]: a transition intensity references the inter-occasion (IOV) random \
+                 effect `{k}`. Intensities are evaluated with per-subject (BSV) η only — write the \
+                 intensity in terms of θ/η, or reference an IOV-free parameter."
+            ));
+        }
+    }
+
+    // Restrict the `[individual_parameters]` statements to those any intensity
+    // references, transitively (mirrors the binary/hazard path).
+    let needed_indiv_stmts: Vec<Statement> = {
+        let mut needed: HashSet<String> = HashSet::new();
+        for (_, _, expr) in &transitions {
+            collect_variable_names(expr, &mut needed);
+        }
+        let mut keep: Vec<Statement> = Vec::new();
+        for s in indiv_stmts.iter().rev() {
+            let stmt = std::slice::from_ref(s);
+            if assigned_vars_in_order(stmt)
+                .iter()
+                .any(|n| needed.contains(n))
+            {
+                visit_stmt_nodes(stmt, &mut |e: &Expression| {
+                    if let Expression::Variable(name) = e {
+                        needed.insert(name.clone());
+                    }
+                });
+                keep.push(s.clone());
+            }
+        }
+        keep.reverse();
+        keep
+    };
+
+    // Union covariates reached transitively through `[individual_parameters]` so a
+    // time-varying covariate can't slip past the TV-covariate guard silently frozen.
+    {
+        let mut c2: HashSet<String> = HashSet::new();
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut c2);
+        cov_set.extend(c2);
+    }
+
+    // Reject an `[individual_parameters]` value that depends on an IOV kappa (BSV-only η here).
+    {
+        let n_eta = eta_names.len();
+        let mut kappa_hit: Option<String> = None;
+        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
+            if let Expression::Eta(i) = e {
+                if *i >= n_eta && kappa_hit.is_none() {
+                    kappa_hit = Some(
+                        kappa_names
+                            .get(*i - n_eta)
+                            .cloned()
+                            .unwrap_or_else(|| "<kappa>".to_string()),
+                    );
+                }
+            }
+        });
+        if let Some(k) = kappa_hit {
+            return Err(format!(
+                "[markov_model]: a transition intensity references an [individual_parameters] \
+                 value that depends on the inter-occasion (IOV) random effect `{k}`. Intensities \
+                 are evaluated with per-subject (BSV) η only — reference an IOV-free parameter."
+            ));
+        }
+    }
+
+    // An `[individual_parameters]` value reading a `[covariate_nn]` output would
+    // silently resolve to 0.0 here (no network forward pass). Reject it — gated to
+    // `nn` like the binary/hazard guard.
+    #[cfg(feature = "nn")]
+    {
+        let mut nn_hit = false;
+        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
+            if matches!(e, Expression::NnOutput { .. }) {
+                nn_hit = true;
+            }
+        });
+        if nn_hit {
+            return Err(
+                "[markov_model]: a transition intensity references an [individual_parameters] value \
+                 whose definition uses a [covariate_nn] output. Neural-network-driven individual \
+                 parameters are not available to CTMM intensities — reference an NN-free parameter."
+                    .to_string(),
+            );
+        }
+    }
+
+    let mut generator_covariates: Vec<String> = cov_set.into_iter().collect();
+    generator_covariates.sort();
+
+    // Build the generator closure over (θ, η, covariates): place each intensity at
+    // its off-diagonal entry and subtract it from the diagonal so every row sums to
+    // zero — the caller always receives a valid generator.
+    let n_states = states.len();
+    let indiv = needed_indiv_stmts;
+    let generator_fn: crate::types::GeneratorFn = Box::new(
+        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
+            let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+            let mut q = nalgebra::DMatrix::<f64>::zeros(n_states, n_states);
+            for (j, k, expr) in &transitions {
+                let rate = eval_expression(expr, theta, eta, covariates, &vars, &[]);
+                q[(*j, *k)] += rate;
+                q[(*j, *j)] -= rate;
+            }
+            q
+        },
+    );
+
+    Ok((
+        cmt,
+        EndpointLikelihood::Ctmm {
+            n_states,
+            state_codes,
+            generator_fn,
+            generator_covariates: generator_covariates.clone(),
+        },
+        generator_covariates,
+        theta_set,
+        eta_set,
     ))
 }
 

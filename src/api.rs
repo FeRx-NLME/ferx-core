@@ -882,10 +882,18 @@ pub fn read_population_for(
     #[cfg(not(feature = "survival"))]
     let tte_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    // Binary/categorical (#760) CMTs route to `ObsRecord::DiscreteState` (integer DV),
-    // like TTE rows route to `ObsRecord::Event` — both need the non-Gaussian reader path.
+    // Discrete-state CMTs route to `ObsRecord::DiscreteState` (integer DV), like TTE
+    // rows route to `ObsRecord::Event` — both need the non-Gaussian reader path. This
+    // set covers binary/categorical (#760) and CTMM (#759) endpoints, which share the
+    // discrete-state plumbing.
     #[cfg(feature = "survival")]
-    let binary_cmts: std::collections::HashSet<usize> = model.binary_cmts().into_iter().collect();
+    let binary_cmts: std::collections::HashSet<usize> = {
+        let mut discrete: std::collections::HashSet<usize> =
+            model.binary_cmts().into_iter().collect();
+        #[cfg(feature = "markov")]
+        discrete.extend(model.ctmm_cmts());
+        discrete
+    };
     #[cfg(not(feature = "survival"))]
     let binary_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
@@ -1808,6 +1816,31 @@ pub(crate) fn check_survival_tv_covariates(
                 }
                 continue;
             }
+            // CTMM (#759): the generator is built once per subject from the baseline
+            // covariate snapshot (time-homogeneous — a drug-driven Q(t) is Phase 6), so a
+            // time-varying covariate on a transition intensity would be silently frozen.
+            #[cfg(feature = "markov")]
+            if let EndpointLikelihood::Ctmm {
+                generator_covariates,
+                ..
+            } = endpoint
+            {
+                if let Some(name) = generator_covariates
+                    .iter()
+                    .find(|c| tv_set.contains(c.as_str()))
+                {
+                    return Some(format!(
+                        "[markov_model] on CMT={cmt}: a transition intensity references covariate \
+                         `{name}`, which is time-varying for subject `{}`. Time-varying covariates \
+                         on the generator are not yet supported — the generator is evaluated at the \
+                         baseline covariate value (time-homogeneous CTMM), so the fit would \
+                         silently use the wrong intensity (#741). A drug-driven Q(t) is Phase 6; \
+                         use a time-constant (baseline) covariate for now.",
+                        subject.id
+                    ));
+                }
+                continue;
+            }
             let EndpointLikelihood::Tte {
                 hazard,
                 hazard_covariates,
@@ -2109,6 +2142,41 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                      variability ([iov] / κ): the binary term enters the inner EBE objective but \
                      not the outer IOV objective, so estimates would be biased. Fit the binary \
                      endpoint without [iov] for now.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
+    // CTMM (#759) endpoint compatibility — same shape as the binary case above. FOCEI
+    // (default), SAEM, and IMP are supported; the Gauss-Newton gradient is Gaussian-
+    // specific, and IOV is not folded into the outer FOCE-IOV objective (the generator
+    // is built with BSV-only η). Reject both fail-loud rather than silently mis-fit.
+    #[cfg(feature = "markov")]
+    if model.has_ctmm() {
+        if chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid))
+        {
+            diags.push(
+                Diagnostic::error(
+                    "E_CTMM_GN_UNSUPPORTED",
+                    "method = gn / gn_hybrid is not supported with a [markov_model] (CTMM) \
+                     endpoint. The Gauss-Newton gradient is built from the Gaussian residual \
+                     structure and ignores the Markov transition likelihood, so it would not move \
+                     the parameters. Use method = focei (default), saem, or imp.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if model.n_kappa > 0 {
+            diags.push(
+                Diagnostic::error(
+                    "E_CTMM_IOV_UNSUPPORTED",
+                    "a [markov_model] (CTMM) endpoint is not yet supported together with \
+                     inter-occasion variability ([iov] / κ): the generator is built with \
+                     per-subject (BSV) η only, so κ would be ignored. Fit the CTMM endpoint \
+                     without [iov] for now.",
                 )
                 .with_block("fit_options"),
             );
@@ -3063,6 +3131,21 @@ pub fn fit(
     for cmt in model.binary_cmts() {
         for subject in &population.subjects {
             crate::categorical::validate_binary_states(cmt, &subject.obs_records)?;
+        }
+    }
+    // CTMM (#759): reject an observed DV code that is not one of the endpoint's declared
+    // `states` up front (the datareader accepts any non-negative integer on a discrete
+    // CMT). Otherwise the code→index map would miss and fold into a silent sentinel.
+    #[cfg(feature = "markov")]
+    for (cmt, endpoint) in &model.endpoints {
+        if let EndpointLikelihood::Ctmm { state_codes, .. } = endpoint {
+            for subject in &population.subjects {
+                crate::markov::endpoint::validate_ctmm_states(
+                    *cmt,
+                    state_codes,
+                    &subject.obs_records,
+                )?;
+            }
         }
     }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already

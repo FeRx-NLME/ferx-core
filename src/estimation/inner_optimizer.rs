@@ -86,6 +86,13 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     if model.has_binary() {
         return Some("binary ([binary_model]) logistic likelihood");
     }
+    // CTMM (`[markov_model]`, #759): the matrix-exponential transition likelihood has
+    // no Dual2 analytic eta-sensitivity (its generator closure is evaluated numerically),
+    // so it routes to the FD inner gradient, exactly like TTE / binary.
+    #[cfg(feature = "markov")]
+    if model.has_ctmm() {
+        return Some("CTMM ([markov_model]) transition likelihood");
+    }
     None
 }
 

@@ -460,6 +460,11 @@ fn obs_nll_subject_into_iov(
         }
         // Binary/categorical (#760): raw-NLL weight (1×), matching the TTE term above.
         total_nll += crate::categorical::binary_subject_nll(model, subject, theta, eta);
+        // CTMM (#759): raw-NLL weight (1×).
+        #[cfg(feature = "markov")]
+        {
+            total_nll += crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta);
+        }
     }
 
     total_nll

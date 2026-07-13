@@ -20,6 +20,19 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Continuous-time Markov model (CTMM) endpoint** (#759): a new
+  `[markov_model]` block fits a discrete-state Markov process observed at
+  irregular times. Declare states bound to their integer DV code
+  (`states = [awake=0, asleep=1]`) and one `transition A -> B = <intensity>`
+  line per allowed transition; ferx fills the generator's row-sum-zero diagonal
+  and scores each consecutive observation pair with the exact transition
+  matrix `P(Δt) = expm(Q·Δt)`. Time-homogeneous generators fit with FOCEI
+  (default), SAEM, or IMP; intensities may carry covariates and between-subject
+  random effects. Requires the `markov` cargo feature. See the
+  [Markov models](https://ferx-nlme.github.io/ferx-core/model-file/markov-model.html)
+  and [CTMM estimation](https://ferx-nlme.github.io/ferx-core/estimation/ctmm.html)
+  pages. (mCTMM/DTMM, drug-driven `Q(t)`, and CTMM simulation are planned
+  follow-ups.)
 - **Restart of an interrupted run from a checkpoint** (#755): a fit now
   periodically saves a small `{model}.tmp` resume point (throttled to
   `[fit_options] checkpoint_interval_secs`, default 300 s, so short runs write

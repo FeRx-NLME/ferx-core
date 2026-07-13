@@ -1,0 +1,115 @@
+---
+title: "Markov models ([markov_model])"
+---
+
+A `[markov_model]` block declares a **continuous-time Markov model (CTMM)** endpoint:
+the observed variable is a discrete *state* recorded at irregular times, and the
+dynamics are the transition intensities between states. ferx builds the generator
+matrix `Q`, forms the transition-probability matrix `P(Δt) = expm(Q·Δt)`, and scores
+each consecutive pair of state observations — see
+[Continuous-time Markov models](../estimation/ctmm.qmd) for the estimation side.
+
+::: {.callout-note}
+The CTMM endpoint requires the `markov` cargo feature
+(`cargo build --features markov`). It is opt-in while maturing; see the plan.
+:::
+
+## The transition-list form (recommended)
+
+Declare the states — each bound to its integer **DV code** — and one line per allowed
+transition with its intensity:
+
+```default
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)   # log intensity awake -> asleep
+  theta LQ10(-1.2, -6.0, 3.0)   # log intensity asleep -> awake
+
+[markov_model]
+  type   = ctmm                     # ctmm (only value for now)
+  cmt    = 5                        # data-file CMT for the state observations
+  states = [awake=0, asleep=1]      # label = DV integer code (explicit, never positional)
+  transition awake  -> asleep = exp(LQ01)   # intensity q_{awake→asleep} ≥ 0
+  transition asleep -> awake  = exp(LQ10)
+```
+
+- **`states`** — a bracketed list of `label=code` entries. `code` is the integer value
+  that appears in the `DV` column for that state; `label` names the state for the
+  `transition` lines. States may be coded with any non-negative integers (e.g. `1`/`2`),
+  not only `0…S−1`. Codes must be unique.
+- **`transition A -> B = <expr>`** — one per allowed transition. `<expr>` is the
+  intensity `q_{A→B} ≥ 0`, written as any θ/η/covariate/`[individual_parameters]`
+  expression (wrap it in `exp(...)` to keep it positive, as above). The generator's
+  diagonal `q_jj = −Σ_{k≠j} q_jk` is filled automatically — **you never write it**.
+- **`cmt`** — the CMT column value carrying the state observations. Rows on this CMT are
+  read as integer states; the same CMT cannot also be a Gaussian (`[error_model]`)
+  endpoint.
+
+### Bare numeric states
+
+Labels are optional. A purely numeric model reads:
+
+```default
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [0, 1]
+  transition 0 -> 1 = exp(LQ01)
+  transition 1 -> 0 = exp(LQ10)
+```
+
+## Data format
+
+The `DV` column holds the **integer state code** for each observation — the same numeric
+convention as every other ferx endpoint (no string labels). Rows are ordinary
+observations (`EVID = 0`, `MDV = 0`); a missing `DV` is skipped as `MDV = 1`. The
+likelihood conditions on each subject's first observed state, so no `EVID = 3` /
+occupancy-flag rows are needed (unlike the NONMEM CTMM dataset convention).
+
+```default
+ID,TIME,DV,CMT,EVID,MDV
+1,0.0,0,5,0,0
+1,1.1,0,5,0,0
+1,1.8,1,5,0,0
+1,4.6,0,5,0,0
+```
+
+An observed `DV` that is not one of the declared `states` codes is rejected fail-loud at
+fit setup (naming the CMT and the offending value).
+
+## Random effects and covariates
+
+An intensity may carry between-subject variability and covariates:
+
+```default
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta BAGE(0.0, -3.0, 3.0)
+  omega ETA_Q ~ 0.1
+
+[covariates]
+  AGE continuous
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + BAGE * AGE + ETA_Q)
+  transition asleep -> awake  = exp(LQ10)
+```
+
+The generator is built once per subject from a **baseline** covariate snapshot (the CTMM
+is *time-homogeneous*). A covariate that is time-varying in the data is therefore
+rejected at fit setup rather than silently frozen; a genuinely drug-driven `Q(t)` is a
+planned extension. Intensities are evaluated with per-subject (BSV) η only, so an
+inter-occasion (`[iov]` / κ) reference is rejected.
+
+## Current limitations
+
+The first CTMM slice covers the **fit path** for a time-homogeneous generator:
+
+- `type = mctmm` / `type = dtmm` (minimal-CTMM and discrete-time Markov) — planned.
+- The matrix (`q12 = …`) spelling and an `init` occupancy vector — planned.
+- Simulation / prediction of a CTMM endpoint — planned.
+- Estimators: `focei` (default), `saem`, and `imp`. Gauss–Newton (`gn`/`gn_hybrid`) is
+  rejected (its gradient is Gaussian-specific).

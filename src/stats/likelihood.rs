@@ -544,6 +544,11 @@ pub fn individual_nll_into_with_schedule(
         }
         // Binary/categorical (#760): same 2× OFV-scale as the TTE term above.
         data_ll += 2.0 * crate::categorical::binary_subject_nll(model, subject, theta, eta);
+        // CTMM (#759): same 2× OFV-scale.
+        #[cfg(feature = "markov")]
+        {
+            data_ll += 2.0 * crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta);
+        }
     }
 
     let nll = 0.5 * (eta_prior + log_det_omega + data_ll);
@@ -757,6 +762,11 @@ pub(crate) fn obs_nll_subject_from_preds(
         }
         // Binary/categorical (#760): raw-NLL weight (1×), matching the TTE term above.
         nll += crate::categorical::binary_subject_nll(model, subject, theta, eta);
+        // CTMM (#759): raw-NLL weight (1×).
+        #[cfg(feature = "markov")]
+        {
+            nll += crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta);
+        }
     }
 
     nll
@@ -980,6 +990,20 @@ pub fn foce_subject_nll(
             if n_eta > 0 {
                 let steps = shi_step_sizes(&bin_fn, eta_hat.as_slice());
                 tte_h += data_term_hessian_fd(&bin_fn, eta_hat.as_slice(), &steps);
+            }
+        }
+
+        // CTMM (#759): same treatment — fold its NLL at the mode and FD Hessian
+        // w.r.t. η (the generator's η-curvature) into the accumulators.
+        #[cfg(feature = "markov")]
+        if model.has_ctmm() {
+            let ctmm_fn = |eta_eval: &[f64]| {
+                crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta_eval)
+            };
+            tte_nll_at_mode += ctmm_fn(eta_hat.as_slice());
+            if n_eta > 0 {
+                let steps = shi_step_sizes(&ctmm_fn, eta_hat.as_slice());
+                tte_h += data_term_hessian_fd(&ctmm_fn, eta_hat.as_slice(), &steps);
             }
         }
 
@@ -2460,6 +2484,9 @@ pub fn individual_nll_iov(
         }
         // Binary/categorical (#760): same 2× OFV-scale as the TTE term above.
         data_ll += 2.0 * crate::categorical::binary_subject_nll(model, subject, theta, eta);
+        // No CTMM term on the IOV path: a CTMM endpoint with IOV (n_kappa > 0) is
+        // rejected at fit setup (its intensities are evaluated with BSV-only η), so
+        // this per-occasion path never carries one.
     }
 
     0.5 * (eta_prior + log_det_omega + kappa_prior + (k_occasions as f64) * log_det_iov + data_ll)

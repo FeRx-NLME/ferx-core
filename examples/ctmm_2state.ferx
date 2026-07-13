@@ -1,0 +1,34 @@
+# Continuous-time Markov model (CTMM) — 2-state, Phase 5 (Track D, #759).
+#
+# Two states (awake = 0, asleep = 1) are observed via the integer DV column at
+# irregular times on CMT 5. The transition intensities q_{0->1} and q_{1->0} are
+# estimated on the log scale; ferx fills the generator's diagonal row-sum-zero
+# (q_jj = -Σ q_jk) automatically and scores each consecutive observation pair with
+# the transition-probability matrix P(Δt) = expm(Q·Δt). This is a fixed-effects
+# (n_eta = 0) CTMM — the ferx analogue of a two-state R `msm` model.
+#
+# Data: data/ctmm_2state.csv (60 subjects × ~12 observations; a Gillespie-simulated
+# 2-state chain with data-generating q_{0->1} = 0.5, q_{1->0} = 0.3, i.e.
+# LQ01 = ln 0.5 = -0.693, LQ10 = ln 0.3 = -1.204). ferx recovers LQ01 = -0.539 (SE
+# 0.137) and LQ10 = -1.215 (SE 0.144); OFV = 606.98 — matching NONMEM 7.5.1 to 4
+# decimals (see tests/nonmem/ctmm_2state.ctl, tests/markov_nonmem.rs).
+#
+# Requires the `markov` cargo feature.
+#
+# Run:
+#   cargo run --release --features markov -- examples/ctmm_2state.ferx --data data/ctmm_2state.csv
+
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)   # log intensity awake -> asleep
+  theta LQ10(-1.2, -6.0, 3.0)   # log intensity asleep -> awake
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01)
+  transition asleep -> awake  = exp(LQ10)
+
+[fit_options]
+  method  = focei
+  maxiter = 300
