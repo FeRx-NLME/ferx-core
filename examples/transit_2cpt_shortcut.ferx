@@ -1,0 +1,76 @@
+# Two-compartment transit absorption — built-in `transit()` shortcut
+#
+# The Savic et al. (2007) transit-chain absorption delay written as a single
+# `transit(n, mtt)` input-rate term feeding the central compartment directly,
+# instead of a hand-coded chain of explicit transit ODE states. `N` is a single
+# CONTINUOUS (estimable) parameter, so the absorption *shape* itself is fit —
+# not fixed at an integer `n`.
+#
+# Contrast examples/transit_2cpt.ferx, which codes the same idea as three
+# EXPLICIT transit ODE states (fixed integer n = 3); the built-in transit()
+# collapses that chain to one line. For a NO-ODE closed form, see the analytic
+# `pk two_cpt_transit(...)` (examples/two_cpt_transit.ferx) — this file is its
+# numerical-ODE counterpart.
+#
+# The transit input carries dose MASS, so `central`/`peripheral` are written as
+# AMOUNTS (mg) and concentration is formed in [scaling] (the NONMEM A(1)/V
+# convention). transit() may not be scaled or divided, so it cannot be written
+# straight into a concentration state — hence the amount + [scaling] form.
+#
+# States (CMT numbers):
+#   1  central    -- oral dose lands here (amount, mg); transit() delivers F·Dose
+#   2  peripheral -- (amount, mg)
+#
+# Self-contained: the [simulation] block below lets you run it with no data file
+#   cargo run --release -- examples/transit_2cpt_shortcut.ferx --simulate
+# which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
+# fits it back. True simulation parameters: TVCL=5, TVV1=50, TVQ=10, TVV2=100,
+#   TVMTT=1.0, TVN=3, omega_CL=omega_V1=0.09, sigma_prop=0.15.
+
+[parameters]
+  theta TVCL(5.0,    0.1,  100.0)   # typical clearance (L/h)
+  theta TVV1(50.0,   5.0,  500.0)   # typical central volume (L)
+  theta TVQ(10.0,    0.5,  200.0)   # typical intercompartmental CL (L/h)
+  theta TVV2(100.0,  5.0, 1000.0)   # typical peripheral volume (L)
+  theta TVMTT(1.0,  0.05,   24.0)   # mean transit time (h); KTR = (N+1)/MTT
+  theta TVN(3.0,     0.0,   30.0)   # number of transit compartments (continuous)
+
+  omega ETA_CL ~ 0.09               # IIV on CL  (~30% CV)
+  omega ETA_V1 ~ 0.09               # IIV on V1  (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)        # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V1  = TVV1 * exp(ETA_V1)
+  Q   = TVQ
+  V2  = TVV2
+  MTT = TVMTT
+  NTR = TVN
+
+[structural_model]
+  ode(states=[central, peripheral])
+
+[odes]
+  # transit() delivers F·Dose into central over time with the Savic transit-chain
+  # shape; central/peripheral are amounts (mg), converted to concentration below.
+  d/dt(central)    = transit(n=NTR, mtt=MTT) - (CL/V1 + Q/V1)*central + (Q/V2)*peripheral
+  d/dt(peripheral) = (Q/V1)*central - (Q/V2)*peripheral
+
+[scaling]
+  y = central / V1                  # observable = concentration (mg/L)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7
