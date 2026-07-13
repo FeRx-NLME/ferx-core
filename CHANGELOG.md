@@ -368,6 +368,16 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **`block_sigma` correlated residuals no longer collapse the objective when a
+  subject has two samples at the same time** (#827): with a `block_sigma` +
+  covariate-selected / per-CMT error model (the free-vs-total assay pattern),
+  replicate assays at one `TIME` were cross-correlated all-to-all, making the
+  dense residual `R` indefinite so the FOCEI objective returned the invalid
+  sentinel and the optimizer was repelled from the correct (correlated) optimum.
+  Co-temporal opposite-branch rows are now paired one-to-one in row order (the
+  standard NONMEM `L2` layout), keeping `R` positive-definite. On the fluconazole
+  2-cpt binding model this recovers the NONMEM fit (OFV 742 vs NONMEM 734.6,
+  previously stuck ~140 higher with a collapsed peripheral Q).
 - **Standalone covariance step (`run_covariance`) now reproduces the inline
   covariance bit-for-bit for FOCE/FOCEI fits**: running the covariance step after a
   fit (`covariance = false` then `run_covariance`, e.g. the R wrapper's standalone

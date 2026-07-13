@@ -297,6 +297,16 @@ Rules and restrictions:
   covariance `ρ·σ_i·σ_j` from each row's own loadings. The method restrictions
   on `block_sigma` (see the [Sigma scale](#sigma-scale) section) apply
   unchanged.
+- **Replicate samples at the same time** (two physical draws of a subject at one
+  `TIME`, each written as a total + unbound row) are paired **one-to-one in row
+  order** — the first total pairs with the first unbound, and so on — so the
+  dense `R` stays block-diagonal in disjoint sample pairs and positive-definite
+  (#827). ferx has no `L2` data item; instead it relies on the standard NONMEM
+  layout where the two rows of one sample are written contiguously. Order the
+  paired rows per sample (total then unbound, sample after sample) and the
+  pairing matches NONMEM's `L2` grouping exactly. Before #827, all co-temporal
+  rows were cross-correlated all-to-all, which made `R` indefinite and collapsed
+  the objective.
 - **LTBS** (`log(DV) ~ ...` / `log_additive`) is not supported inside a branch.
 - **SDE / `[diffusion]` models are not supported.** The EKF measurement-noise
   path uses a single error model and cannot switch per observation, so the
