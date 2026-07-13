@@ -438,9 +438,10 @@ pub fn optimize_trust_region(
 
     OuterResult {
         params: final_params,
-        // No packed optimizer vector at the converged point on this path; a later
-        // `run_covariance` reconstructs one from the reported estimates.
-        packed_estimates: None,
+        // `best_x` is the vector the covariance step above differentiated around — carry it so a
+        // later `run_covariance` reproduces that step bit-for-bit instead of falling back to the
+        // lossy Cholesky round-trip.
+        packed_estimates: Some(best_x.clone()),
         ofv: final_ofv,
         converged,
         n_iterations: 0,

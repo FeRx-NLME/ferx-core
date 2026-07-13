@@ -22,6 +22,60 @@ use crate::io::hash::sha256_file;
 use crate::types::*;
 use std::path::Path;
 
+/// Does `x` decode, under `template`, back to the θ/Ω/σ this fit reports?
+///
+/// The guard on reusing `FitResult::packed_estimates`. A stored vector is only usable if it was
+/// packed in the *same space* the template unpacks in — and that is not implied by its length (see
+/// the call site). Rather than trying to enumerate the ways a packing convention can differ, this
+/// simply round-trips the vector and checks it reproduces the reported estimates. Tolerance is
+/// loose enough to absorb the `exp`/`ln` round-trip (~1 ULP, which is the whole reason the vector is
+/// carried) and far tighter than any real mismatch, which changes θ by orders of magnitude.
+fn decodes_to_reported(
+    x: &[f64],
+    template: &ModelParameters,
+    fit: &FitResult,
+    model: &crate::types::CompiledModel,
+) -> bool {
+    const TOL: f64 = 1e-8;
+    let close = |a: f64, b: f64| (a - b).abs() <= TOL * a.abs().max(b.abs()).max(1.0);
+
+    let p = unpack_params(x, template);
+    if p.theta.len() != fit.theta.len() || p.sigma.values.len() != fit.sigma.len() {
+        return false;
+    }
+    if !p
+        .theta
+        .iter()
+        .zip(fit.theta.iter())
+        .all(|(&a, &b)| close(a, b))
+    {
+        return false;
+    }
+    if !p
+        .sigma
+        .values
+        .iter()
+        .zip(fit.sigma.iter())
+        .all(|(&a, &b)| close(a, b))
+    {
+        return false;
+    }
+    if p.omega.matrix.shape() != fit.omega.shape() {
+        return false;
+    }
+    if !p
+        .omega
+        .matrix
+        .iter()
+        .zip(fit.omega.iter())
+        .all(|(&a, &b)| close(a, b))
+    {
+        return false;
+    }
+    let _ = model;
+    true
+}
+
 /// Run the covariance step against an existing fit. Returns a new `FitResult`
 /// that is a clone of `fit` with the covariance fields refreshed:
 /// `covariance_matrix`, `se_theta` / `se_omega` / `se_sigma` / `se_kappa`,
@@ -205,8 +259,25 @@ pub fn run_covariance(
     // vector) fall back to reconstruction — correct, just not bit-identical to an inline run.
     let template = fitted_params_from_result(fit, model_ref);
     let reconstructed = pack_params(&template);
+    // A length match is **not** enough to trust the stored vector. `pack_params` chooses log vs
+    // identity packing per θ from `theta_lower` (`theta_packs_log`), and `template` takes its
+    // bounds from the *model file*, whereas `fit()` accepts caller-supplied `initial_params` whose
+    // bounds may differ (relaxing a covariate exponent's lower bound below zero, say). Both pack
+    // to one slot per θ, so a length check passes while the two vectors live in **different packing
+    // spaces** — `unpack_params` would then read an identity-packed 0.75 as log-packed and hand the
+    // covariance step θ = e^0.75. It would differentiate around a point nowhere near the reported
+    // estimates and return SEs for it, silently.
+    //
+    // So verify the thing that actually matters: that the vector *decodes back to the reported
+    // estimates* under this template. That catches a packing-space mismatch, a stale vector, and a
+    // structurally-wrong one alike, without having to enumerate the ways they can differ.
     let x_hat = match fit.packed_estimates.as_ref() {
-        Some(x) if x.len() == reconstructed.len() => x.clone(),
+        Some(x)
+            if x.len() == reconstructed.len()
+                && decodes_to_reported(x, &template, fit, model_ref) =>
+        {
+            x.clone()
+        }
         _ => reconstructed,
     };
     // Derive the parameters from that same vector, so the EBE warm-start below is computed at

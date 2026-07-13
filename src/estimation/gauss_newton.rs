@@ -439,9 +439,9 @@ pub fn run_foce_gn(
 
         return OuterResult {
             params: gn_params,
-            // No packed optimizer vector at the converged point on this path; a later
-            // `run_covariance` reconstructs one from the reported estimates.
-            packed_estimates: None,
+            // `x` is the converged packed vector — carry it so a later `run_covariance` runs at
+            // exactly this point rather than reconstructing it from the reported estimates.
+            packed_estimates: Some(x.clone()),
             ofv,
             converged,
             n_iterations: maxiter,
@@ -515,6 +515,11 @@ pub fn run_foce_gn(
         final_kappas = kappas;
     }
 
+    // The converged point in packed space. Computed once and carried on the `OuterResult`, so a
+    // standalone `run_covariance` differentiates around the *same* vector the inline step below
+    // does rather than reconstructing one from the reported θ/Ω/σ (a lossy Cholesky round-trip).
+    let final_packed = pack_params(&final_params);
+
     // ---- Covariance step ----
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     let (covariance_matrix, covariance_wall_time_secs) =
@@ -523,9 +528,8 @@ pub fn run_foce_gn(
                 eprintln!("Running covariance step...");
             }
             let cov_timer = std::time::Instant::now();
-            let packed = pack_params(&final_params);
             let cm = match compute_covariance(
-                &packed,
+                &final_packed,
                 &final_params,
                 model,
                 population,
@@ -562,9 +566,9 @@ pub fn run_foce_gn(
 
     OuterResult {
         params: final_params,
-        // No packed optimizer vector at the converged point on this path; a later
-        // `run_covariance` reconstructs one from the reported estimates.
-        packed_estimates: None,
+        // The exact vector the covariance step above differentiated around — see
+        // `OuterResult::packed_estimates`.
+        packed_estimates: Some(final_packed.clone()),
         ofv: final_ofv,
         converged,
         n_iterations: maxiter,

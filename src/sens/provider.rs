@@ -552,12 +552,22 @@ const _: () = assert!(
 /// ≤ m_dim`) dispatch tables both enumerate `1..=MAX_TVCOV_AXES`, and
 /// `tvcov_analytical_supported` bounds the model here, so both resolve and the
 /// inner/outer analytic scope stays matched (#449 re-review #2).
-/// Raised 24 → 32 (#486). On a closed-form **IOV** subject this table is indexed by the
-/// *stacked* axis count `n_theta + n_eta + K·n_kappa`, so a many-occasion study exhausted
-/// it long before a wide covariate model did (the ODE twin gets `MAX_ODE_IOV_AXES = 96`).
-const MAX_TVCOV_AXES: usize = 32;
+/// Raised 16 → 24 alongside `MAX_ODE_AXES` (#486).
+///
+/// **Must not exceed `MAX_ODE_AXES`** (static assert below). The *inner* TV-cov walk
+/// (`run_obs_grad_tvcov`) obtains its `∂p/∂η` from `param_derivatives_at_cov`, whose dispatch
+/// table is bounded by `MAX_ODE_AXES`; a model admitted here but wider than that would take the
+/// analytic **outer** gradient while the inner declined via `?` — an analytic outer against a
+/// fixed-EBE FD inner, exactly the split `subject_eta_grad_tvcov_with_schedule` forbids
+/// (#449 re-review #2). Raise the two together, never this one alone.
+const MAX_TVCOV_AXES: usize = 24;
 
-// Five `disp!(1..=32)` dispatch tables key on `MAX_TVCOV_AXES` with a silent `_ => None`:
+const _: () = assert!(
+    MAX_TVCOV_AXES <= crate::sens::ode_provider::MAX_ODE_AXES,
+    "MAX_TVCOV_AXES exceeds MAX_ODE_AXES: the TV-cov walk would admit a model whose inner      `param_derivatives_at_cov` dispatch declines, splitting inner/outer analytic scope"
+);
+
+// Five `disp!(1..=24)` dispatch tables key on `MAX_TVCOV_AXES` with a silent `_ => None`:
 // `lognormal_param_derivatives`, `subject_sensitivities_iov`,
 // `subject_eta_grad_iov_analytical`, `subject_sensitivities_tvcov`, and
 // `subject_eta_grad_tvcov`. Keep all five in lockstep with the const — bumping it without
@@ -565,8 +575,8 @@ const MAX_TVCOV_AXES: usize = 32;
 // back to FD. The mirror of the `MAX_ODE_AXES` tripwire in `ode_provider.rs` (#466 review
 // round 4 #12).
 const _: () = assert!(
-    MAX_TVCOV_AXES == 32,
-    "MAX_TVCOV_AXES changed: widen the disp!(1..=32) tables in lognormal_param_derivatives, \
+    MAX_TVCOV_AXES == 24,
+    "MAX_TVCOV_AXES changed: widen the disp!(1..=24) tables in lognormal_param_derivatives, \
      subject_sensitivities_iov, subject_eta_grad_iov_analytical, subject_sensitivities_tvcov, \
      and subject_eta_grad_tvcov to match, then update this assert"
 );
@@ -856,10 +866,7 @@ pub(crate) fn iov_combined_derivs_dyn(
             }
         };
     }
-    disp!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-        26, 27, 28, 29, 30, 31, 32
-    )
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
 }
 
 /// Evaluate the compiled `[individual_parameters]` program over `Dual2<MP>` seeded
@@ -1096,6 +1103,13 @@ pub fn subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
+    // Cheap, model/subject-only decline before any dual seeding (#822 review #9) — see
+    // `subject_sensitivities_tvcov`. Harmless for the ODE-twin branch below: an ODE model has no
+    // closed-form walk to decline for, and `ss_lagtime_walk_unsupported` is about that walk's
+    // missing pre-arrival SS overlay.
+    if !model.ode_spec.is_some() && ss_lagtime_walk_unsupported(model, subject) {
+        return None;
+    }
     // Closed-form transit/IG IOV is served by its ODE twin (issue #719) — the twin carries
     // cross-occasion dose amounts exactly (#104/#663), which the closed-form superposition
     // cannot. A no-op for every other model, so the `ode_spec` branch below then picks up the
@@ -1147,8 +1161,7 @@ pub fn subject_sensitivities_iov(
         };
     }
     let mut sens = disp!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-        26, 27, 28, 29, 30, 31, 32
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
     )?;
     // LTBS (#486): apply the `ln(f)` jet LAST — after the in-walk scale quotient / Form C
     // readout / init impulse — so the outer θ/Ω/σ gradient matches production's scale-then-log
@@ -1478,6 +1491,10 @@ fn subject_eta_grad_iov_analytical(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    // Cheap decline before any dual seeding (#822 review #9) — see `subject_sensitivities_tvcov`.
+    if ss_lagtime_walk_unsupported(model, subject) {
+        return None;
+    }
     if !iov_analytical_supported(model) {
         return None;
     }
@@ -1502,10 +1519,7 @@ fn subject_eta_grad_iov_analytical(
             }
         };
     }
-    disp!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-        26, 27, 28, 29, 30, 31, 32
-    )
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
 }
 
 /// The dual-width-`M` inner of [`subject_sensitivities_iov`] (`M = n_theta +
@@ -1651,10 +1665,6 @@ fn run_obs_iov<const M: usize>(
     // break landing on a fixed obs/reset/cov-change time — aren't representable by the
     // single-`dt` walk; decline to FD (#486 review #2).
     if !moving_bounds_separable(model, subject, &eff_doses, &dose_lagtimes) {
-        return None;
-    }
-    // SS × lagtime on the walk has no dual twin of production's pre-arrival overlay (#486).
-    if ss_lagtime_walk_unsupported(model, subject) {
         return None;
     }
     let slot_dual = |k: usize, slot: usize| -> Dual2<M> {
@@ -1970,10 +1980,6 @@ fn run_obs_iov_eta<const N: usize>(
     // break landing on a fixed obs/reset/cov-change time — aren't representable by the
     // single-`dt` walk; decline to FD (#486 review #2).
     if !moving_bounds_separable(model, subject, &eff_doses, &dose_lagtimes) {
-        return None;
-    }
-    // SS × lagtime on the walk has no dual twin of production's pre-arrival overlay (#486).
-    if ss_lagtime_walk_unsupported(model, subject) {
         return None;
     }
     let slot_dual = |k: usize, slot: usize| -> Dual1<N> {
@@ -2336,39 +2342,37 @@ fn dose_lag_duals<T: crate::sens::num::PkNum>(
         .collect()
 }
 
-/// Identity of the jet a **moving** break on the event walk carries. Two breaks that
-/// coincide in `f64` are representable by the walk only if they carry the *same* jet:
-/// `dual_pos` resolves a break to a single dual position, so it cannot hand two
-/// different dual lengths to one sub-interval.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BoundJet {
-    /// A dose *arrival* `t + ALAG`, or a fixed-duration infusion end riding it. Every
-    /// analytical dose shares the one bare `PK_IDX_LAGTIME` slot, so all such breaks
-    /// carry an identical `∂ALAG` jet and coincidences among them are exact.
-    Lag,
-    /// A **modeled** infusion end `t + ALAG + D{slot}` — carries the window slot's jet
-    /// on top of the arrival's.
-    ModeledEnd(usize),
-}
-
-/// True when the walk's **moving** breaks are separable, i.e. representable by the
-/// single-`dt` dual walk. A break moves when the model has an estimated lagtime (every
-/// dose arrival, and every infusion end riding it) or when a dose is a modeled
-/// `RATE=-1/-2` infusion (its end). Such a subject declines to FD when either
+/// True when the walk's **moving** breaks are separable, i.e. representable by the single-`dt`
+/// dual walk. A break moves when the model has an estimated lagtime (every dose arrival, and
+/// every infusion end riding it) or when a dose is a modeled `RATE=-1/-2` infusion (its end).
 ///
-/// 1. two moving breaks coincide while carrying **different** jets — e.g. two modeled
-///    ends backed by distinct `D`/`R` slots (#486 review #2), or a modeled end landing
-///    exactly on another dose's arrival (the end carries `∂ALAG + ∂D`, the arrival only
-///    `∂ALAG`); or
-/// 2. a moving break coincides with a **fixed** break — an observation, a reset, or a
-///    covariate-change (`PkOnly`) time. Those times do not move with `(θ, η)`, but the
-///    walk resolves one dual position per break time, so it would wrongly drag the fixed
-///    event along with the moving one.
+/// The walk resolves a break time to **one** dual position (`dual_pos`, first match within 1e-9).
+/// So the subject declines to FD when either
 ///
-/// Both are degenerate, measure-zero coincidences; declining them keeps the analytic
-/// gradient exact rather than subtly wrong. `eff` are the resolved doses the walk sees;
-/// the modeled-slot identity is read from the original `subject.doses` (`resolve_rate`
-/// erases `rate_mode` to `Fixed`).
+/// 1. **two distinct moving breaks coincide.** They generally carry *different* jets, and the walk
+///    would silently hand the first one's jet to both.
+///
+///    This is deliberately conservative — it declines even breaks that happen to share a `D`/`R`
+///    slot. It has to be: since #486 each dose's lagtime and window are seeded from **that dose's
+///    own snapshot** (its occasion under IOV, its covariates under TV-cov, its event time under
+///    `TIME`), so two breaks backed by the same PK slot no longer imply the same dual. Keying the
+///    check on the slot — as it used to — would admit, say, a κ-on-`ALAG` subject whose occasion-2
+///    arrival lands on occasion-1's infusion end, and differentiate one with respect to the other's
+///    jet. The duals themselves are not comparable here (this runs on `f64` times, before any is
+///    built), so coincidence alone is the decline.
+///
+/// 2. a moving break coincides with a **fixed** break — a reset, a covariate-change (`PkOnly`), or,
+///    when the model has no lagtime, a **dose event time** (with a lagtime every arrival is itself a
+///    moving break, so those are covered by (1) instead). Those times do not move with `(θ, η)`, but
+///    the walk resolves one dual position per break, so it would drag the fixed event along with the
+///    moving one.
+///
+///    **Observations are exempt**: the walk *corrects* them instead of declining, stepping the
+///    read-out state back across the sliver between the sample and the boundary
+///    ([`crate::sens::propagate::event_driven_sens_with_doses_g`]). An observation landing on *two*
+///    moving breaks is still declined — by (1), since those two breaks coincide with each other.
+///
+/// Both are degenerate, measure-zero coincidences. `eff` are the resolved doses the walk sees.
 fn moving_bounds_separable(
     model: &CompiledModel,
     subject: &Subject,
@@ -2377,76 +2381,45 @@ fn moving_bounds_separable(
 ) -> bool {
     let attr_map = model.active_dose_attr_map();
     let has_lag = model.has_lagtime();
-    // `(time, jet, is_arrival)`. Arrivals and infusion ends are treated differently against a
-    // *fixed* break below: an observation on a moving **end** is corrected by the walk, but one
-    // on a moving **arrival** cannot be (see (2)).
-    let mut moving: Vec<(f64, BoundJet, bool)> = Vec::new();
+    let mut moving: Vec<f64> = Vec::new();
     for (k, d) in subject.doses.iter().enumerate() {
-        let modeled_slot =
-            crate::sens::ode_provider::modeled_slot_for(attr_map, d).map(|(_mode, slot)| slot);
         // The walk's break times are the *lagged* arrivals, so compare on those.
         let t_start = eff[k].time + dose_lagtimes.get(k).copied().unwrap_or(0.0);
         // Dose arrival: moves only under a lagtime.
         if has_lag {
-            moving.push((t_start, BoundJet::Lag, true));
+            moving.push(t_start);
         }
         // Infusion end: moves under a lagtime (riding the arrival) and/or when modeled.
         if eff[k].rate > 0.0 && eff[k].duration > 0.0 {
-            let jet = match modeled_slot {
-                Some(slot) => Some(BoundJet::ModeledEnd(slot)),
-                None if has_lag => Some(BoundJet::Lag),
-                None => None,
-            };
-            if let Some(jet) = jet {
-                moving.push((t_start + eff[k].duration, jet, false));
+            let modeled = crate::sens::ode_provider::modeled_slot_for(attr_map, d).is_some();
+            if modeled || has_lag {
+                moving.push(t_start + eff[k].duration);
             }
         }
     }
     if moving.is_empty() {
         return true;
     }
-    // (1) Moving-vs-moving: coincident breaks must agree on their jet.
-    for (i, &(t, jet, _)) in moving.iter().enumerate() {
-        if moving[..i]
-            .iter()
-            .any(|&(u, j, _)| j != jet && (u - t).abs() < 1e-9)
-        {
+    // (1) Two distinct moving breaks may not coincide.
+    for (i, &t) in moving.iter().enumerate() {
+        if moving[..i].iter().any(|&u| (u - t).abs() < 1e-9) {
             return false;
         }
     }
-    // (2) Moving-vs-fixed: a reset / covariate-change time must not sit on a moving break.
-    //
-    // **Observations are exempt** — the walk *corrects* them rather than declining.
-    // `event_driven_sens_with_doses_g` steps the read-out state back across the zero-length
-    // sliver `bound(p) − t_obs`, recovering the derivative at the sample's own fixed clock time.
-    // What it recovers is the one-sided derivative of the branch production's own event ordering
-    // already uses to define the value there — `Dose` before `Obs` (the dose has landed) and the
-    // infusion end after `Obs` (the infusion is still contributing) — which is the same
-    // convention, and the same number, the ODE engine's jump/saltation sensitivities produce.
-    // Pinned against the ODE twin, for both an infusion end and a lagged bolus arrival.
-    //
-    // The one case the correction cannot resolve is **several** moving boundaries landing on a
-    // single observation: it applies one sliver, under one rate set. That declines.
-    //
-    // A **reset** or **covariate-change** (`PkOnly`) on a moving break still declines outright:
-    // those events are not read-outs, so there is no state to correct — the walk would simply
-    // apply them at the moving clock position instead of their own fixed one.
-    for &f in &subject.obs_times {
-        if moving
-            .iter()
-            .filter(|&&(t, _, _)| (t - f).abs() < 1e-9)
-            .count()
-            > 1
-        {
-            return false;
-        }
-    }
-    for &f in subject
+    // (2) A moving break may not land on a fixed one. Observations are corrected, not declined.
+    let mut fixed: Vec<f64> = subject
         .pk_only_times
         .iter()
         .chain(subject.reset_times.iter())
-    {
-        if moving.iter().any(|&(t, _, _)| (t - f).abs() < 1e-9) {
+        .copied()
+        .collect();
+    if !has_lag {
+        // Without a lagtime a dose lands at its record time, which is a fixed break the walk must
+        // not drag along with someone else's moving infusion end.
+        fixed.extend(eff.iter().map(|d| d.time));
+    }
+    for f in fixed {
+        if moving.iter().any(|&t| (t - f).abs() < 1e-9) {
             return false;
         }
     }
@@ -2636,6 +2609,13 @@ pub fn subject_sensitivities_tvcov(
     // need the state-propagating walk rather than dose superposition. A structural
     // parameter reading the `TIME` built-in is piecewise/time-varying for the same
     // reason, so it routes here too even with no TV covariates (#486 / #610).
+    // Cheap, model/subject-only declines go **before** any dual seeding (#822 review #9): a
+    // permanently-declining subject (a lagtime model with an SS dose, say) would otherwise pay a
+    // full second-order dual pass on every gradient evaluation and every inner BFGS step, throw it
+    // away, and then pay the FD fallback on top.
+    if ss_lagtime_walk_unsupported(model, subject) {
+        return None;
+    }
     if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
         return None;
     }
@@ -2695,8 +2675,7 @@ pub fn subject_sensitivities_tvcov(
         };
     }
     let mut sens = disp!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-        26, 27, 28, 29, 30, 31, 32
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
     )?;
 
     // Analytic `[initial_conditions]` impulse (#486): layer `A₀·kernel(t, pk)` and its exact
@@ -2852,10 +2831,6 @@ fn run_obs_tvcov<const M: usize>(
     if !moving_bounds_separable(model, subject, &eff_doses, &dose_lagtimes) {
         return None;
     }
-    // SS × lagtime on the walk has no dual twin of production's pre-arrival overlay (#486).
-    if ss_lagtime_walk_unsupported(model, subject) {
-        return None;
-    }
     let schedule = EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
     let slot_dual = |k: usize, slot: usize| -> Dual2<M> {
         let cov = subject.dose_cov(k);
@@ -2891,7 +2866,21 @@ fn run_obs_tvcov<const M: usize>(
     // those slots at each observation's snapshot — value from `pk_param_fn`, jet from the same
     // program derivatives the structural slots are seeded from — so `eval_readout_jet` sees them
     // exactly as the static superposition path already does. Empty for a readout-free model.
-    let ro_extra: Vec<(crate::types::PkParams, Vec<(usize, Dual2<M>)>)> = if readout.is_some() {
+    // Which slots above the eight structural ones does the program actually differentiate? Almost
+    // always none — and then there is nothing to materialize, so skip the per-observation pass
+    // entirely rather than running a full second-order `pd_from_program` per observation and
+    // discarding it (#822 review #8). The readout never reads those slots in that case, so the
+    // `_` arm's `constant(0.0)` is unobservable.
+    let ro_slots: Vec<usize> = if readout.is_some() {
+        (PK_IDX_V3 + 1..N_PK)
+            .filter(|&s| slot_row[s].is_some())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let ro_extra: Vec<(crate::types::PkParams, Vec<(usize, Dual2<M>)>)> = if ro_slots.is_empty() {
+        Vec::new()
+    } else {
         (0..subject.obs_times.len())
             .map(|j| {
                 let cov = subject.obs_cov(j);
@@ -2899,9 +2888,9 @@ fn run_obs_tvcov<const M: usize>(
                 let _guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, t);
                 let pk = (model.pk_param_fn)(theta, eta, cov, t);
                 let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
-                let extras = (PK_IDX_V3 + 1..N_PK)
-                    .filter(|&s| slot_row[s].is_some())
-                    .map(|s| {
+                let extras = ro_slots
+                    .iter()
+                    .map(|&s| {
                         let d = pk_slot_dual_outer::<M>(
                             s,
                             pk.values.get(s).copied().unwrap_or(0.0),
@@ -2916,8 +2905,6 @@ fn run_obs_tvcov<const M: usize>(
                 (pk, extras)
             })
             .collect()
-    } else {
-        Vec::new()
     };
 
     // Analytic Form C readout (#650): scratch for the per-observation dual eval.
@@ -2947,7 +2934,7 @@ fn run_obs_tvcov<const M: usize>(
             // differentiates comes from `ro_extra` (seeded on the same `(θ,η)` axes), and any
             // other higher slot is its static value — not zero, which is what the walk used to
             // substitute (#486).
-            let (ro_pk, ro_ext) = &ro_extra[j];
+            let extra = ro_extra.get(j);
             let params: [Dual2<M>; N_PK] = std::array::from_fn(|s| match s {
                 PK_IDX_CL => pkd.cl,
                 PK_IDX_V => pkd.v,
@@ -2957,13 +2944,18 @@ fn run_obs_tvcov<const M: usize>(
                 PK_IDX_F => pkd.f,
                 PK_IDX_Q3 => pkd.q3,
                 PK_IDX_V3 => pkd.v3,
-                _ => ro_ext
-                    .iter()
-                    .find(|&&(slot, _)| slot == s)
-                    .map(|&(_, d)| d)
-                    .unwrap_or_else(|| {
-                        Dual2::<M>::constant(ro_pk.values.get(s).copied().unwrap_or(0.0))
-                    }),
+                // Empty when the readout differentiates no slot up here — it then never reads
+                // them, so the zero is unobservable (see `ro_slots`).
+                _ => match extra {
+                    Some((ro_pk, ro_ext)) => ro_ext
+                        .iter()
+                        .find(|&&(slot, _)| slot == s)
+                        .map(|&(_, d)| d)
+                        .unwrap_or_else(|| {
+                            Dual2::<M>::constant(ro_pk.values.get(s).copied().unwrap_or(0.0))
+                        }),
+                    None => Dual2::<M>::constant(0.0),
+                },
             });
             // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
             // thread-local; enter this observation's time to match production's
@@ -3037,6 +3029,13 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     eta: &[f64],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
+    // Cheap, model/subject-only declines go **before** any dual seeding (#822 review #9): a
+    // permanently-declining subject (a lagtime model with an SS dose, say) would otherwise pay a
+    // full second-order dual pass on every gradient evaluation and every inner BFGS step, throw it
+    // away, and then pay the FD fallback on top.
+    if ss_lagtime_walk_unsupported(model, subject) {
+        return None;
+    }
     if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
         return None;
     }
@@ -3094,8 +3093,7 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     // tables resolve, so the inner and outer analytic scope stay matched rather than
     // splitting to a fixed-EBE FD inner (#449 re-review #2).
     let mut out = disp!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-        26, 27, 28, 29, 30, 31, 32
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
     )?;
 
     // Analytic `[initial_conditions]` impulse (#486): η-gradient only, layered BEFORE scaling —
@@ -3218,10 +3216,6 @@ fn run_obs_grad_tvcov<const N: usize>(
     if !moving_bounds_separable(model, subject, &eff_doses, &dose_lagtimes) {
         return None;
     }
-    // SS × lagtime on the walk has no dual twin of production's pre-arrival overlay (#486).
-    if ss_lagtime_walk_unsupported(model, subject) {
-        return None;
-    }
     let slot_dual = |k: usize, slot: usize| -> Dual1<N> {
         let cov = subject.dose_cov(k);
         let _guard =
@@ -3308,7 +3302,7 @@ fn run_obs_grad_tvcov<const N: usize>(
         };
         let c: Dual1<N> = if let Some(ro) = readout {
             let pkd = &pk_at_obs[j];
-            let (ro_pk, ro_ext) = &ro_extra[j];
+            let extra = ro_extra.get(j);
             let params: [Dual1<N>; N_PK] = std::array::from_fn(|s| match s {
                 PK_IDX_CL => pkd.cl,
                 PK_IDX_V => pkd.v,
@@ -3318,13 +3312,16 @@ fn run_obs_grad_tvcov<const N: usize>(
                 PK_IDX_F => pkd.f,
                 PK_IDX_Q3 => pkd.q3,
                 PK_IDX_V3 => pkd.v3,
-                _ => ro_ext
-                    .iter()
-                    .find(|&&(slot, _)| slot == s)
-                    .map(|&(_, d)| d)
-                    .unwrap_or_else(|| {
-                        Dual1::<N>::constant(ro_pk.values.get(s).copied().unwrap_or(0.0))
-                    }),
+                _ => match extra {
+                    Some((ro_pk, ro_ext)) => ro_ext
+                        .iter()
+                        .find(|&&(slot, _)| slot == s)
+                        .map(|&(_, d)| d)
+                        .unwrap_or_else(|| {
+                            Dual1::<N>::constant(ro_pk.values.get(s).copied().unwrap_or(0.0))
+                        }),
+                    None => Dual1::<N>::constant(0.0),
+                },
             });
             let _time_guard =
                 crate::parser::model_parser::ModelTimeGuard::enter(subject.obs_times[j]);

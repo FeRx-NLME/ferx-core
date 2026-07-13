@@ -798,7 +798,11 @@ fn iov_lagtime_analytic_matches_fd_estimates() {
         .expect("IOV + lagtime model parses");
     assert!(model.has_lagtime());
     assert_eq!(model.n_kappa, 1);
-    // The cell this test exists for: the model must be in analytic IOV scope now.
+    // Model-level scope is necessary but NOT sufficient, and asserting only it would let this
+    // test pass vacuously: the walk's declines are **per-subject**, and the population gradient is
+    // all-or-nothing — one declining subject sends the whole population to FD, so the `Auto` arm
+    // below would quietly compare FD against FD and go green for a feature that never ran. Assert
+    // the route that actually resolves: every subject's IOV provider must return `Some`.
     assert!(
         ferx_core::sens::provider::iov_sens_supported(&model),
         "lagtime + IOV must take the analytic gradient (#486)"
@@ -806,6 +810,21 @@ fn iov_lagtime_analytic_matches_fd_estimates() {
 
     let pop = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
         .expect("warfarin_iov data loads");
+
+    {
+        let theta = &model.default_params.theta;
+        let n_kappa = model.n_kappa;
+        for s in &pop.subjects {
+            let k_groups = ferx_core::stats::likelihood::iov_occasion_groups(s).len();
+            let stacked = vec![0.0; model.n_eta + k_groups * n_kappa];
+            assert!(
+                ferx_core::sens::provider::subject_sensitivities_iov(&model, s, theta, &stacked)
+                    .is_some(),
+                "subject {} must be served by the analytic IOV walk — if it declines, the whole                  population silently drops to FD and this test compares FD with FD",
+                s.id
+            );
+        }
+    }
 
     let run = |gm: ferx_core::GradientMethod| -> FitResult {
         let mut opts = FitOptions::default();

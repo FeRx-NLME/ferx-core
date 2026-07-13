@@ -404,7 +404,7 @@ section of the SDLC for the versioning policy).
   Note the deliberate consequence: at *exactly* such a coincidence an analytic gradient and a
   finite-difference gradient legitimately disagree — FD averages across a branch switch the
   model does not make there. That is a property of a kinked model, not a defect.
-- **`run_covariance` now reproduces the inline covariance step exactly.** A standalone
+- **`run_covariance` now reproduces the inline covariance step exactly** (#486). A standalone
   covariance step (`run_covariance`, `ferx` covariance on a saved fit) returned a covariance
   matrix and standard errors that differed from the same fit run with `covariance = true`
   inline — by up to ~6e-4 on the warfarin example, enough to be visible in reported SEs. The
