@@ -1124,6 +1124,26 @@ fn parse_usize(s: &str) -> usize {
     s.parse::<usize>().unwrap_or(0)
 }
 
+/// Parse an `L2` grouping-id cell. NONMEM writes an integer, but pandas/R
+/// exports commonly float-format the whole column (`"10.0"`, `"11.0"`) once any
+/// row is blank — so a strict `i64` parse would silently ungroup every record
+/// and discard the user's block_sigma pairing (#830). Accept an integer literal
+/// or a float-formatted integer; a blank / non-finite / unparseable cell means
+/// "ungrouped" (`None` → 0).
+fn parse_l2_id(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if is_missing_cell(t) {
+        return None;
+    }
+    if let Ok(i) = t.parse::<i64>() {
+        return Some(i);
+    }
+    t.parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite())
+        .map(|f| f.round() as i64)
+}
+
 fn parse_cens(s: &str) -> i8 {
     let t = s.trim();
     if is_missing_cell(t) {
@@ -1984,7 +2004,7 @@ fn parse_subject(
                     // cell means "ungrouped" (0), matching the empty-vector case.
                     let l2 = l2_col
                         .and_then(|c| row.get(c))
-                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .and_then(|s| parse_l2_id(s))
                         .unwrap_or(0);
                     obs_l2.push(l2);
                 }
@@ -3905,6 +3925,24 @@ mod tests {
         assert_eq!(parse_evid("."), 0);
         assert_eq!(parse_evid("NA"), 0);
         assert_eq!(parse_evid("x"), 0);
+    }
+
+    #[test]
+    fn test_parse_l2_id_accepts_integer_and_float_formats() {
+        // Plain integer ids.
+        assert_eq!(parse_l2_id("10"), Some(10));
+        assert_eq!(parse_l2_id(" 11 "), Some(11));
+        // #830: pandas/R exports float-format the whole column when any row is
+        // blank ("10.0"); a strict i64 parse would ungroup everything.
+        assert_eq!(parse_l2_id("10.0"), Some(10));
+        assert_eq!(parse_l2_id("11.0"), Some(11));
+        assert_eq!(parse_l2_id("2.4"), Some(2)); // rounds to nearest
+                                                 // Blank / missing / non-finite → ungrouped.
+        assert_eq!(parse_l2_id(""), None);
+        assert_eq!(parse_l2_id("."), None);
+        assert_eq!(parse_l2_id("NA"), None);
+        assert_eq!(parse_l2_id("NaN"), None);
+        assert_eq!(parse_l2_id("x"), None);
     }
 
     #[test]

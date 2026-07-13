@@ -386,6 +386,18 @@ section of the SDLC for the versioning policy).
   positive-definite. On the fluconazole
   2-cpt binding model this recovers the NONMEM fit (OFV 742 vs NONMEM 734.6,
   previously stuck ~140 higher with a collapsed peripheral Q).
+- **`block_sigma` cross covariances within one `L2` group are now correlated
+  all-to-all** (#830): an explicit `L2` group is the user's declared correlated
+  unit, so a genuine block of 3+ distinct endpoints (e.g. parent + two
+  metabolites, each pair correlated) keeps its full cross-covariance structure
+  instead of only one greedy pair. The disjoint one-to-one pairing that keeps
+  co-temporal replicates positive-definite still applies to the implicit
+  `(time, occasion)` fallback, where replicate rows cannot be told apart.
+- **Float-formatted `L2` ids are no longer silently ungrouped** (#830):
+  pandas/R exports float-format the whole `L2` column (`"10.0"`) when any row is
+  blank; the reader now accepts integer and float-formatted ids, so the user's
+  `block_sigma` grouping is honoured instead of every record falling back to
+  ungrouped `(time, occasion)` pairing.
 - **Standalone covariance step (`run_covariance`) now reproduces the inline
   covariance bit-for-bit for FOCE/FOCEI fits**: running the covariance step after a
   fit (`covariance = false` then `run_covariance`, e.g. the R wrapper's standalone

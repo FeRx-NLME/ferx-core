@@ -146,30 +146,31 @@ fn cross_observation_covariance(
     cov
 }
 
-/// Match each observation to at most **one** cross-covariance partner within its
-/// residual block, so the dense `R` stays block-diagonal in disjoint
-/// observation pairs rather than coupling every co-temporal row to every other.
+/// Match observations into cross-covariance pairs within each residual block.
 ///
-/// [`same_residual_block`] decides which rows may pair. With an explicit `L2`
-/// grouping id the pairing is exactly the user's sample grouping; without one it
-/// falls back to `(time, occasion)`. Either way, a block with more than two
-/// complementary rows — e.g. two physical samples at the same time (replicate
-/// assays) reaching the fallback rule — must **not** be correlated all-to-all:
-/// correlating each total with *both* unbound rows makes that 4×4 block
-/// indefinite, so `R.cholesky()` fails and the whole-fit objective collapses to
-/// the invalid sentinel (issue #827).
+/// [`same_residual_block`] decides which rows may pair, and the grouping source
+/// sets the pairing rule:
 ///
-/// So partners are matched **one-to-one, greedily in row order**: each unmatched
-/// row takes the first later unmatched row in its block whose loadings give a
-/// nonzero cross covariance. This yields disjoint pairs, so each per-pair 2×2
-/// block is positive-definite and `R` stays PD. With `L2` the block already
-/// contains exactly the user's paired rows (usually two), so the matching is
-/// unambiguous; the greedy order only disambiguates the fallback case.
+/// * **Explicit `L2` group** — the rows are one user-declared correlated unit,
+///   so **every** complementary pair in the group is correlated (all-to-all). A
+///   genuine 3+ endpoint block (e.g. parent + two metabolites, each pair
+///   correlated and jointly positive-definite) keeps its full cross-covariance
+///   structure. Over-grouping true replicates into one L2 unit would make that
+///   block indefinite and fail `R.cholesky()` loudly — which is the user telling
+///   the fit their grouping is wrong, not a silent drop.
+/// * **`(time, occasion)` fallback** — replicate assays cannot be told apart, so
+///   partners are matched **one-to-one, greedily in row order**: each unmatched
+///   row takes the first later unmatched row in its block with a nonzero cross
+///   covariance. This yields disjoint 2×2 pairs, so a co-temporal 4-row
+///   replicate block stays PD instead of collapsing to the invalid sentinel
+///   (issue #827).
 ///
-/// Returns `partner[j] = Some(k)` (symmetric: `partner[k] = Some(j)`) for
-/// matched pairs, `None` for unmatched rows. `loadings[j]` are observation `j`'s
-/// sigma value loadings (slot presence is identical for slope loadings, so the
-/// same matching drives the derivative builders).
+/// Returns `(j, k, cov)` triples with `j < k`. `cov` is the value-loading cross
+/// covariance the two `R` builders reuse directly (avoiding a recompute); the
+/// derivative builders take only the `(j, k)` pairing and recompute with slope
+/// loadings. `loadings[j]` are observation `j`'s sigma value loadings (slot
+/// presence is identical for slope loadings, so the same pairing drives the
+/// derivative builders).
 fn match_partners(
     loadings: &[Vec<(usize, f64)>],
     obs_times: &[f64],
@@ -178,15 +179,19 @@ fn match_partners(
     obs_l2: &[i64],
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
-) -> Vec<Option<usize>> {
+) -> Vec<(usize, usize, f64)> {
     let n = loadings.len();
-    let mut partner = vec![None; n];
+    let mut pairs = Vec::new();
+    // Fallback (no L2) pairing is one-to-one: once a row is matched it is
+    // consumed and starts no further pairs. Explicit L2 rows are never consumed,
+    // so each pairs with every complementary row in its group (all-to-all).
+    let mut consumed = vec![false; n];
     for j in 0..n {
-        if partner[j].is_some() || loadings[j].is_empty() {
+        if consumed[j] || loadings[j].is_empty() {
             continue;
         }
         for k in (j + 1)..n {
-            if partner[k].is_some()
+            if consumed[k]
                 || loadings[k].is_empty()
                 || !same_residual_block(obs_times, obs_raw_times, occasions, obs_l2, j, k)
             {
@@ -198,14 +203,34 @@ fn match_partners(
                 sigma_values,
                 correlations,
             );
-            if cov != 0.0 {
-                partner[j] = Some(k);
-                partner[k] = Some(j);
+            if cov == 0.0 {
+                continue;
+            }
+            pairs.push((j, k, cov));
+            let explicit = obs_l2.get(j).copied().unwrap_or(0) != 0
+                && obs_l2.get(k).copied().unwrap_or(0) != 0;
+            if !explicit {
+                // (time, occasion) fallback: consume both rows and stop scanning
+                // for more partners of `j` — disjoint one-to-one pairing.
+                consumed[j] = true;
+                consumed[k] = true;
                 break;
             }
+            // Explicit L2 group: keep scanning so `j` pairs with every
+            // complementary row in its group (all-to-all).
         }
     }
-    partner
+    pairs
+}
+
+/// Write the off-diagonal cross-covariance entries of `R` from the matched pairs
+/// produced by [`match_partners`]. Shared by both `R` builders so the
+/// pairing-to-matrix fill lives in one place.
+fn fill_cross_covariances(r: &mut DMatrix<f64>, pairs: &[(usize, usize, f64)]) {
+    for &(j, k, cov) in pairs {
+        r[(j, k)] = cov;
+        r[(k, j)] = cov;
+    }
 }
 
 /// Build the subject-level residual covariance matrix `R`.
@@ -259,7 +284,7 @@ pub fn compute_r_matrix_with_correlations(
         .zip(obs_cmts.iter())
         .map(|(&f, &cmt)| error_spec.sigma_loadings(cmt, f, sigma_values.len()))
         .collect();
-    let partner = match_partners(
+    let pairs = match_partners(
         &loadings,
         obs_times,
         obs_raw_times,
@@ -268,16 +293,7 @@ pub fn compute_r_matrix_with_correlations(
         sigma_values,
         correlations,
     );
-    for j in 0..n {
-        let Some(k) = partner[j] else { continue };
-        if j >= k {
-            continue;
-        }
-        let cov =
-            cross_observation_covariance(&loadings[j], &loadings[k], sigma_values, correlations);
-        r[(j, k)] = cov;
-        r[(k, j)] = cov;
-    }
+    fill_cross_covariances(&mut r, &pairs);
     r
 }
 
@@ -330,7 +346,7 @@ pub fn compute_r_matrix_with_correlations_scaled(
             .collect()
     };
     let loadings: Vec<Vec<(usize, f64)>> = (0..n).map(scale_loadings).collect();
-    let partner = match_partners(
+    let pairs = match_partners(
         &loadings,
         obs_times,
         obs_raw_times,
@@ -339,16 +355,7 @@ pub fn compute_r_matrix_with_correlations_scaled(
         sigma_values,
         correlations,
     );
-    for j in 0..n {
-        let Some(k) = partner[j] else { continue };
-        if j >= k {
-            continue;
-        }
-        let cov =
-            cross_observation_covariance(&loadings[j], &loadings[k], sigma_values, correlations);
-        r[(j, k)] = cov;
-        r[(k, j)] = cov;
-    }
+    fill_cross_covariances(&mut r, &pairs);
     r
 }
 
@@ -420,7 +427,7 @@ pub fn compute_dr_df_matrices(
         })
         .collect();
 
-    let partner = match_partners(
+    let pairs = match_partners(
         &vload,
         obs_times,
         obs_raw_times,
@@ -435,14 +442,18 @@ pub fn compute_dr_df_matrices(
             continue;
         }
         out[m][(m, m)] = diag_self_deriv(&vload[m], &sload[m], sigma_values, correlations);
-        // ∂R_mk/∂f_m for m's single cross-covariance partner (mirrors the
-        // disjoint pairing that builds `R`): slope loadings of `m`, value
-        // loadings of `k`.
-        if let Some(k) = partner[m] {
-            let d = cross_observation_covariance(&sload[m], &vload[k], sigma_values, correlations);
-            out[m][(m, k)] = d;
-            out[m][(k, m)] = d;
-        }
+    }
+    // ∂R_jk/∂f_j for each matched pair (mirrors the pairing that builds `R`):
+    // slope loadings of the differentiated row, value loadings of its partner.
+    // Each row picks up one cross term per partner (all-to-all within an L2
+    // group), so `dr[j]` and `dr[k]` carry independent slopes.
+    for &(j, k, _) in &pairs {
+        let djk = cross_observation_covariance(&sload[j], &vload[k], sigma_values, correlations);
+        out[j][(j, k)] = djk;
+        out[j][(k, j)] = djk;
+        let dkj = cross_observation_covariance(&sload[k], &vload[j], sigma_values, correlations);
+        out[k][(k, j)] = dkj;
+        out[k][(j, k)] = dkj;
     }
     out
 }
@@ -557,7 +568,7 @@ pub fn compute_d2r_df2_matrices(
         })
         .collect();
 
-    let partner = match_partners(
+    let pairs = match_partners(
         &vload,
         obs_times,
         obs_raw_times,
@@ -573,18 +584,15 @@ pub fn compute_d2r_df2_matrices(
         }
         // Diagonal curvature ∂²R_mm/∂f_m².
         out[m][m][(m, m)] = diag_self_second_deriv(&sload[m], sigma_values, correlations);
-        // Mixed partial ∂²R_mk/∂f_m∂f_k for m's single cross-covariance partner.
-        if let Some(k) = partner[m] {
-            if m < k {
-                let d =
-                    cross_observation_covariance(&sload[m], &sload[k], sigma_values, correlations);
-                if d != 0.0 {
-                    out[m][k][(m, k)] = d;
-                    out[m][k][(k, m)] = d;
-                    out[k][m][(m, k)] = d;
-                    out[k][m][(k, m)] = d;
-                }
-            }
+    }
+    // Mixed partial ∂²R_jk/∂f_j∂f_k for each matched pair (both slope loadings).
+    for &(j, k, _) in &pairs {
+        let d = cross_observation_covariance(&sload[j], &sload[k], sigma_values, correlations);
+        if d != 0.0 {
+            out[j][k][(j, k)] = d;
+            out[j][k][(k, j)] = d;
+            out[k][j][(j, k)] = d;
+            out[k][j][(k, j)] = d;
         }
     }
     out
@@ -1011,6 +1019,129 @@ mod tests {
         assert_eq!(r[(1, 2)], 0.0);
         assert_eq!(r[(2, 3)], 0.0);
         assert!(r.cholesky().is_some(), "L2-grouped residual R must be PD");
+    }
+
+    // #830: within one explicit `L2` group the rows form a single correlated
+    // unit, so a genuine 3-endpoint block (parent + two metabolites, each pair
+    // correlated and jointly positive-definite) must keep ALL THREE cross
+    // covariances — not just one greedy pair. The disjoint greedy fallback would
+    // pair only (0,1) and silently zero the (0,2)/(1,2) terms; all-to-all within
+    // the L2 group restores the full block.
+    #[test]
+    fn test_l2_group_correlates_three_endpoints_all_to_all() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                3,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![2],
+                },
+            ),
+        ]));
+        let ipreds = [10.0, 20.0, 30.0];
+        let cmts = [1usize, 2, 3];
+        let times = [1.0, 1.0, 1.0];
+        let obs_l2 = [7i64, 7, 7];
+        let sigma = [0.3, 0.3, 0.3];
+        // Three pairwise correlations at a mild rho so the 3×3 block stays PD.
+        let corrs = [
+            crate::types::ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 1,
+                rho: 0.3,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 2,
+                rho: 0.3,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 2,
+                rho: 0.3,
+            },
+        ];
+        let r = compute_r_matrix_with_correlations(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &obs_l2,
+            &sigma,
+            &corrs,
+        );
+        // All three off-diagonals are populated (greedy one-to-one would leave
+        // row 2 unmatched, zeroing r[(0,2)] and r[(1,2)]).
+        assert!(r[(0, 1)] != 0.0 && r[(1, 0)] != 0.0);
+        assert!(r[(0, 2)] != 0.0 && r[(2, 0)] != 0.0);
+        assert!(r[(1, 2)] != 0.0 && r[(2, 1)] != 0.0);
+        assert!(
+            r.cholesky().is_some(),
+            "PD 3-endpoint L2 block must stay positive-definite"
+        );
+
+        // The derivative builder must track the same all-to-all pairing: ∂R/∂f
+        // matches a central difference of R for every observation.
+        let dr = compute_dr_df_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &obs_l2,
+            &sigma,
+            &corrs,
+            None,
+        );
+        let n = ipreds.len();
+        let r_at = |f: &[f64]| {
+            compute_r_matrix_with_correlations(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &obs_l2,
+                &sigma,
+                &corrs,
+            )
+        };
+        let h = 1e-4;
+        for m in 0..n {
+            let mut fp = ipreds.to_vec();
+            let mut fm = ipreds.to_vec();
+            fp[m] += h;
+            fm[m] -= h;
+            let fd = (r_at(&fp) - r_at(&fm)) / (2.0 * h);
+            for p in 0..n {
+                for q in 0..n {
+                    assert_relative_eq!(
+                        dr[m][(p, q)],
+                        fd[(p, q)],
+                        epsilon = 1e-5,
+                        max_relative = 1e-4
+                    );
+                }
+            }
+        }
     }
 
     // The derivative builders must use the SAME disjoint pairing as

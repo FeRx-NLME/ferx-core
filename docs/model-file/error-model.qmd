@@ -301,19 +301,25 @@ Rules and restrictions:
   `block_sigma` correlates is controlled by the dataset's optional [`L2`
   column](../data-format.qmd) (NONMEM's level-2 grouping item): observation rows
   sharing an `L2` value within a subject form one correlated observation unit and
-  receive the cross covariance; rows with different `L2` ids do not, even at the
-  same time. This lets you pair the total and unbound rows of one blood draw
-  explicitly — and generalizes to any paired/grouped endpoints. When a subject
-  has **two samples at the same time** (replicate assays), `L2` keeps each
-  sample's pair separate; without it, all co-temporal rows would be correlated
-  together, which makes the dense `R` indefinite and collapses the objective
-  (#827).
+  are correlated **all-to-all** within the group; rows with different `L2` ids do
+  not, even at the same time. This lets you pair the total and unbound rows of one
+  blood draw explicitly — and generalizes to a block of **3+ distinct endpoints**
+  (e.g. parent + two metabolites, each pair correlated): every complementary pair
+  in the group keeps its cross covariance, so a jointly positive-definite block is
+  fitted in full rather than losing terms. When a subject has **two samples at the
+  same time** (replicate assays), give each sample its own `L2` id so the pairs
+  stay separate; grouping true replicates into one `L2` unit makes the dense `R`
+  indefinite and fails the Cholesky loudly — the fit telling you the grouping is
+  wrong. `L2` ids may be written as integers or float-formatted integers (`10` or
+  `10.0`, as pandas/R export a column that also carries blanks).
 - **No `L2` column?** ferx falls back to grouping co-temporal rows by
   `(time, occasion)` and pairs them **one-to-one in row order** (first total with
   first unbound, and so on), so `R` still stays block-diagonal and
-  positive-definite. This reproduces `L2` grouping for the standard NONMEM layout
+  positive-definite even for replicate samples the fallback cannot tell apart.
+  This reproduces `L2` grouping for the standard NONMEM layout
   where a sample's rows are written contiguously; add an explicit `L2` column
-  when your row order does not follow that convention.
+  when your row order does not follow that convention, or when a group holds more
+  than two correlated endpoints.
 - **LTBS** (`log(DV) ~ ...` / `log_additive`) is not supported inside a branch.
 - **SDE / `[diffusion]` models are not supported.** The EKF measurement-noise
   path uses a single error model and cannot switch per observation, so the
