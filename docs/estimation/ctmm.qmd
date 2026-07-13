@@ -1,0 +1,86 @@
+---
+title: "Continuous-time Markov models (CTMM)"
+---
+
+A [`[markov_model]`](../model-file/markov-model.qmd) endpoint is fit with the same
+generalized negative-log-likelihood machinery as the time-to-event and categorical
+endpoints. The observed process is a discrete **state** `s ∈ {0…S−1}` recorded at
+irregular times; between two consecutive observations `Δt` apart the per-subject data
+term is
+
+$$
+-\log L = -\sum_m \log P(\Delta t_m)_{s_m,\,s_{m+1}},
+\qquad P(\Delta t) = \exp(Q\,\Delta t),
+$$
+
+where `Q` is the transition-intensity (generator) matrix — off-diagonals `q_{jk} ≥ 0`
+are the declared `transition` intensities and the diagonal is fixed row-sum-zero
+(`q_{jj} = −Σ_{k≠j} q_{jk}`).
+
+## Why the matrix exponential, not a probability ODE
+
+A CTMM's state-occupancy probabilities obey `dP/dt = Qᵀ P`. For a **time-homogeneous**
+generator this has the exact closed-form solution `P(Δt) = expm(Q·Δt)`, so ferx forms the
+transition matrix directly with a matrix exponential (nalgebra's Higham scaling-and-
+squaring Padé) rather than integrating the ODE. The parameter gradients are the exact
+Van Loan (1978) Fréchet derivatives of the exponential — cleaner and exactly
+differentiable, with no ODE solver in the loop. (A genuinely drug-driven, time-varying
+`Q(t)` would need the occupancy ODE and is a planned extension.)
+
+ferx does **not** use the NONMEM `EVID=3` / occupancy-flag CTMM dataset mechanism: it
+reads ordinary `(ID, TIME, STATE)` rows and conditions on each subject's first observed
+state (see the [data format](../model-file/markov-model.qmd#data-format)).
+
+## Estimation method
+
+| Method | CTMM | Notes |
+|--------|:----:|-------|
+| **FOCEI** (Laplace) | ✓ | Default. A finite-difference Hessian of the data term w.r.t. η plus the `½ log\|H̃\|` correction (the transition likelihood has no closed-form analytic η-Hessian, so the inner gradient and outer Laplace are FD, as for TTE / binary). |
+| **SAEM** | ✓ | Preferred for sparse state data — no Laplace approximation. |
+| **IMP** (importance sampling) | ✓ | Unbiased marginal likelihood. |
+| **FOCE** (no interaction) | — | Drops the log-det correction and is biased for a non-Gaussian data term; use `focei`. |
+| Pure Gauss–Newton | — | The `J'R⁻¹J` structure is Gaussian-specific; rejected fail-loud. |
+
+The **fixed-effects** (`n_eta = 0`) case has no inner loop — the objective reduces to the
+plain transition likelihood `Σ_j −log L_j`, and the outer optimizer fits the log-
+intensities by direct maximum likelihood. This is the ferx analogue of a two-state R
+`msm` model.
+
+## Validation — exact agreement with NONMEM
+
+A fixed-effects CTMM minimises the exact panel/snapshot likelihood
+`−2 Σ log P(Δt)_{s,s'}`, and NONMEM can score that identical likelihood through its
+general `F_FLAG=1` (LIKELIHOOD) route — the closed-form 2-state transition matrix
+written directly in `$PRED`. So the fit is anchored **against NONMEM** (not R `msm`):
+NONMEM's *dataset* CTMM mechanism (`EVID=3` + `A0_FLG`) is architecturally incompatible
+with ferx's reader, but its *likelihood* is not, and for `n_eta = 0` both engines
+optimise the same objective.
+
+A 2-state chain was Gillespie-simulated with data-generating intensities
+`q_{0→1} = 0.5`, `q_{1→0} = 0.3` (so `LQ01 = log 0.5 = −0.693`,
+`LQ10 = log 0.3 = −1.204`) and observed on an irregular grid (`data/ctmm_2state.csv`,
+60 subjects × ~12 observations). Fitting `examples/ctmm_2state.ferx` and the matching
+NONMEM control stream (`tests/nonmem/ctmm_2state.ctl`, `METHOD=0`):
+
+| Parameter | ferx | NONMEM 7.5.1 | Data-generating |
+|-----------|-----:|-------------:|----------------:|
+| `LQ01` (log `q_{0→1}`) | −0.539011 | −0.540113 | −0.693 |
+| `LQ10` (log `q_{1→0}`) | −1.215053 | −1.215660 | −1.204 |
+| **OFV (−2 log L)** | **606.9817** | **606.98181** | — |
+
+The OFV agrees to four decimals; the log-intensities agree to ~0.001 (well under 0.01 of
+the ~0.14 standard errors — the likelihood is flat near the optimum, so the two
+optimizers stop at sub-tolerance-different points on the same objective). Both estimates
+sit within sampling error of the data-generating truth (a single stochastic realisation).
+The comparison is a `slow-tests`-gated test, `tests/markov_nonmem.rs`.
+
+The numerical core is additionally anchored in-repo, license-free: the `matrix_exp` /
+`ctmm_data_term` primitives are unit-tested against the exact 2-state generator solution
+and the truncated Taylor series (`src/markov`), and the endpoint data term against the
+closed-form `P(Δt)_{00} = (b + a·e^{-(a+b)Δt})/(a+b)` for `Q = [[-a,a],[b,-b]]`.
+
+## Current scope
+
+The first CTMM slice ships the **fit path** for a time-homogeneous generator (parse →
+datareader routing → FOCEI/SAEM/IMP). Minimal-CTMM (`mctmm`), discrete-time Markov
+(`dtmm`), drug-driven `Q(t)`, and CTMM simulation/prediction are planned follow-ups.

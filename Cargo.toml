@@ -30,7 +30,12 @@ survival = []
 # probabilities + exact Van Loan gradients on top of nalgebra's `expm`; no new
 # runtime deps. Default-off while maturing; promote after CAV-dataset / `msm`
 # validation (see plans/tte-survival-markov.md §8.7, D5).
-markov = []
+#
+# Implies `survival`: the CTMM endpoint (`EndpointLikelihood::Ctmm`) plugs into
+# the shared non-Gaussian endpoint machinery (the `EndpointLikelihood` enum,
+# per-CMT dispatch, discrete-state datareader routing), which lives behind the
+# `survival` gate (D8). Turning on `markov` therefore turns on that trunk.
+markov = ["survival"]
 # Heavy fit-based tests (5–60 min wall each on a 2-core CI runner).
 # Default `cargo test` `#[ignore]`s them; a nightly/manual job opts in.
 slow-tests = []

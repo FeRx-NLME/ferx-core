@@ -195,11 +195,6 @@ struct FitWire {
     method_wall_times_secs: Vec<f64>,
     #[serde(default)]
     covariance_wall_time_secs: f64,
-    /// The exact packed optimizer vector at the converged point. Absent on bundles saved
-    /// before it was persisted; `run_covariance` then reconstructs one from the reported
-    /// estimates (correct, just not bit-identical to an inline covariance step).
-    #[serde(default)]
-    packed_estimates: Option<Vec<f64>>,
     n_threads_used: usize,
     uses_ode_solver: bool,
     uses_sde: bool,
@@ -684,7 +679,6 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         wall_time_secs: r.wall_time_secs,
         method_wall_times_secs: r.method_wall_times_secs.clone(),
         covariance_wall_time_secs: r.covariance_wall_time_secs,
-        packed_estimates: r.packed_estimates.clone(),
         n_threads_used: r.n_threads_used,
         uses_ode_solver: r.uses_ode_solver,
         uses_sde: r.uses_sde,
@@ -1817,7 +1811,6 @@ fn wire_to_fit_result(
         ofv: w.ofv,
         aic: w.aic,
         bic: w.bic,
-        packed_estimates: w.packed_estimates,
         theta: w.theta.estimates,
         theta_names: w.theta.names,
         eta_names: w.omega.names,
@@ -1926,6 +1919,9 @@ fn wire_to_fit_result(
         // round-tripped result therefore has no covariate table.
         covariate_table: None,
         exclusions: None,
+        // Transient (`#[serde(skip)]`) and not persisted: a reloaded fit has no
+        // optimizer packed vector, so `run_covariance` re-packs from omega (#816).
+        packed_estimate: None,
     })
 }
 
@@ -2021,7 +2017,6 @@ mod tests {
     fn minimal_fit_result() -> FitResult {
         let n_eta = 2;
         FitResult {
-            packed_estimates: None,
             method: EstimationMethod::FoceI,
             method_chain: vec![EstimationMethod::FoceI],
             method_wall_times_secs: vec![1.234],
@@ -2145,6 +2140,7 @@ mod tests {
             neural_networks: Vec::new(),
             covariate_table: None,
             exclusions: None,
+            packed_estimate: None,
         }
     }
 

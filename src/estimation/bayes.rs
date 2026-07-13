@@ -1278,9 +1278,6 @@ pub fn run_bayes(
 
     Ok(OuterResult {
         params: mean_params,
-        // No packed optimizer vector at the converged point on this path; a later
-        // `run_covariance` reconstructs one from the reported estimates.
-        packed_estimates: None,
         ofv,
         converged: max_rhat.is_finite() && max_rhat < RHAT_CONVERGENCE_THRESHOLD,
         n_iterations: n_warmup + n_sample,
@@ -1300,6 +1297,7 @@ pub fn run_bayes(
         impmap_trace: None,
         bayes: Some(bayes),
         cond_dist: None,
+        packed_estimate: None,
     })
 }
 

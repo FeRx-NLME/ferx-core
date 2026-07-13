@@ -36,10 +36,25 @@ section of the SDLC for the versioning policy).
   slots (e.g. a sigmoid-Emax readout on a 3-compartment oral model) fell back to finite
   differences on the time-varying-covariate path; it is now analytic.
 - **Wider models keep the analytic gradient** (#486): the monomorphisation caps that decide
-  when a model is too wide for the exact gradient were raised — `θ + η` from 16 to 24 (ODE
-  and output-scaling paths) and from 24 to 32 on the closed-form event walk. A mid-sized
-  covariate model (5 structural θ + 6 covariate-effect θ + 5 η) sat at exactly the old
-  limit, so adding one more covariate silently dropped the whole fit to finite differences.
+  when a model is too wide for the exact gradient were raised from 16 to 24 `θ + η` (the ODE
+  and output-scaling paths). A mid-sized covariate model (5 structural θ + 6 covariate-effect
+  θ + 5 η) sat at exactly the old limit, so adding one more covariate silently dropped the
+  whole fit to finite differences. The closed-form event walk's cap is now coupled to the ODE
+  one, closing a pre-existing gap where a 17–24-axis model took an analytic *outer* gradient
+  against a finite-difference *inner* one.
+- **Continuous-time Markov model (CTMM) endpoint** (#759): a new
+  `[markov_model]` block fits a discrete-state Markov process observed at
+  irregular times. Declare states bound to their integer DV code
+  (`states = [awake=0, asleep=1]`) and one `transition A -> B = <intensity>`
+  line per allowed transition; ferx fills the generator's row-sum-zero diagonal
+  and scores each consecutive observation pair with the exact transition
+  matrix `P(Δt) = expm(Q·Δt)`. Time-homogeneous generators fit with FOCEI
+  (default), SAEM, or IMP; intensities may carry covariates and between-subject
+  random effects. Requires the `markov` cargo feature. See the
+  [Markov models](https://ferx-nlme.github.io/ferx-core/model-file/markov-model.html)
+  and [CTMM estimation](https://ferx-nlme.github.io/ferx-core/estimation/ctmm.html)
+  pages. (mCTMM/DTMM, drug-driven `Q(t)`, and CTMM simulation are planned
+  follow-ups.)
 - **Restart of an interrupted run from a checkpoint** (#755): a fit now
   periodically saves a small `{model}.tmp` resume point (throttled to
   `[fit_options] checkpoint_interval_secs`, default 300 s, so short runs write
@@ -404,20 +419,35 @@ section of the SDLC for the versioning policy).
   Note the deliberate consequence: at *exactly* such a coincidence an analytic gradient and a
   finite-difference gradient legitimately disagree — FD averages across a branch switch the
   model does not make there. That is a property of a kinked model, not a defect.
-- **`run_covariance` now reproduces the inline covariance step exactly** (#486). A standalone
-  covariance step (`run_covariance`, `ferx` covariance on a saved fit) returned a covariance
-  matrix and standard errors that differed from the same fit run with `covariance = true`
-  inline — by up to ~6e-4 on the warfarin example, enough to be visible in reported SEs. The
-  cause was that `run_covariance` rebuilt the optimizer's packed parameter vector from the
-  *reported* θ/Ω/σ, which re-derives Ω's Cholesky factor from the reported matrix and shifts
-  the packed values by ~1 ULP. That looks negligible, but the covariance step takes **second
-  differences** of an objective that is itself only reproducible to ~1e-10 (the inner EBE loop
-  is iterative), so the FD Hessian's `1/h²` — and then the matrix inverse — amplified a
-  last-bit input difference into the fourth decimal of the covariance. The exact converged
-  vector is now carried on `FitResult` (`packed_estimates`, also persisted in `.fitrx`), so
-  the standalone step differentiates around precisely the point the inline step used and the
-  two agree to the last bits. Fits saved before this change still work — they fall back to the
-  old reconstruction.
+- **Standalone covariance step (`run_covariance`) now reproduces the inline
+  covariance bit-for-bit for FOCE/FOCEI fits**: running the covariance step after a
+  fit (`covariance = false` then `run_covariance`, e.g. the R wrapper's standalone
+  SE step) previously rebuilt the parameters by re-decomposing the reported `omega`
+  (`chol(L·Lᵀ) ≠ L` to machine precision). The resulting `Ω⁻¹` differed slightly
+  from the one the inline step used, which the finite-difference Hessian amplified —
+  up to ~10% on an ill-conditioned variance (e.g. a warfarin ω²(KA) with ~115%
+  RSE), giving standard errors that disagreed with an equivalent
+  `covariance = true` fit. The step now reuses the optimizer's exact packed vector
+  when the fit carries one, so the covariance matrix and SEs match exactly — for
+  every in-memory packed-Cholesky-space optimizer (NLopt, BFGS, trust region,
+  Gauss-Newton). Fits reloaded from `.fitrx`, or from SAEM/importance-sampling/Bayes
+  (which rebuild `omega` from the reported matrix on both paths), are unaffected —
+  they already agreed. Surfaced during the #816 review.
+- **Closed-form transit/IG absorption under IOV / time-varying covariates now honors
+  call-time ODE tolerances and converges its EBEs correctly** (#814, #719 follow-up): a
+  `one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` / `two_cpt_ig` model routes its IOV,
+  time-varying-covariate, and `TIME`-switch subjects to an internally generated ODE "twin".
+  Three fixes to that reroute: (1) a call-time `ode_reltol` / `ode_abstol` / `ode_max_steps`
+  (e.g. from `ferx_fit(settings = …)`) now reaches the twin's solver — previously the twin
+  silently integrated at its parse-default tolerance, ignoring the requested accuracy for the
+  whole fit/predict; (2) the inner EBE loop's ODE gradient-noise convergence stop is now
+  enabled for those rerouted subjects, so an individual estimate that dropped to the
+  finite-difference inner gradient no longer risks running to the iteration cap and returning
+  an under-converged EBE; (3) when such a subject falls back to the FD inner gradient, the
+  emitted diagnostic now names the precise twin-ODE reason (e.g. "steady-state dose + built-in
+  absorption forcing") instead of a generic "outside IOV analytic scope". The converged
+  population objective is unchanged (still NONMEM-anchored by the #719 transit+IOV cross-check).
+  Regression tests in `types.rs` / `estimation/inner_optimizer.rs`.
 - **Inner EBE line search no longer aborts on a non-finite objective** (#719
   follow-up): the FOCEI inner-loop backtracking line search
   (`estimation/inner_optimizer.rs`) could panic with `clamp(NaN, NaN)` (a process

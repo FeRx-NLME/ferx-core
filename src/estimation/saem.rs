@@ -2322,9 +2322,6 @@ pub fn run_saem(
 
     Ok(OuterResult {
         params: final_params,
-        // No packed optimizer vector at the converged point on this path; a later
-        // `run_covariance` reconstructs one from the reported estimates.
-        packed_estimates: None,
         ofv,
         // A finite-but-enormous OFV is the bounded blowup of a runaway, not a
         // converged fit — guard against it the same way IMP/IMPMAP does, since
@@ -2347,6 +2344,7 @@ pub fn run_saem(
         impmap_trace: None,
         bayes: None,
         cond_dist,
+        packed_estimate: None,
     })
 }
 
