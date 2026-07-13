@@ -2711,8 +2711,22 @@ Gate: `#[cfg(feature = "markov")]` initially.
 
 **Scope:** Q(t) = f(C(t)); matrix ODE; joint PK-CTMM.
 
-- `ctmm_inhomogeneous_transition` using existing RK45
-- `q12 = f(Cc)` DSL expression
+**Slicing (leaf-first, mirroring Phase 5):**
+- ✅ **Slice 1 — numerical leaf.** `ctmm_inhomogeneous_transition(q_at, Δt, n_states)` in
+  `src/markov/mod.rs`: integrates `dP/dτ = Q(τ)·P`, `P(0)=I` on the shared Dormand–Prince
+  RK45 (`crate::ode::solve_ode`), occupancy matrix flattened row-major into the ODE state.
+  Tier-1 anchors: constant-`Q` ⇒ `expm(Q·Δt)` (agrees with the homogeneous path); scalar
+  `Q(τ)=g(τ)·Q₀` ⇒ `expm(Q₀·∫g)` (closed form independent of `expm`); zero-Δt ⇒ `I`.
+- **Slice 2 — DSL + detection.** Let a `[markov_model]` intensity reference a PK/ODE state
+  (concentration written `central/V`, as the joint PK-TTE hazard does — no `Cc` builtin).
+  Detect such a reference at parse → mark the endpoint inhomogeneous; lift the Phase-5
+  TIME / TV-covariate / (drug-driven) guards for those CMTs. Thread the PK state into the
+  generator evaluation (extend `GeneratorFn` / intensity eval to resolve state names).
+- **Slice 3 — endpoint wiring.** Solve PK once, build the per-gap `q_at(τ)` closure that
+  samples `Q(C(t_m+τ))`, integrate via the Slice-1 leaf, dispatch through the existing FD
+  inner/outer path (CTMM already routes to FD — no new analytic gradient).
+- **Slice 4 — joint PK-CTMM + NONMEM anchor + docs.** Drug-driven anchor via `F_FLAG=1` with
+  `P(Δt)` from the model's own ODEs in `$DES` (mirrors `tests/nonmem/ctmm_2state.ctl`).
 
 ### Phase 7 — HMM (Hidden Markov Models) · Track D (tail)
 

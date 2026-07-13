@@ -336,6 +336,98 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
     Ok(nll)
 }
 
+/// Time-**inhomogeneous** transition-probability matrix `P(Δt)` for a generator
+/// that varies within the interval — the drug-driven CTMM (`Q(t) = f(C(t))`),
+/// Phase 6, Track D (#817).
+///
+/// Solves the matrix occupancy ODE
+///
+/// ```text
+///   dP/dτ = Q(τ)·P,   P(0) = I,   τ ∈ [0, Δt]
+/// ```
+///
+/// on the shared Dormand–Prince RK45 engine ([`crate::ode::solve_ode`]) and
+/// returns `P(Δt)`. `q_at(τ)` supplies the `n_states × n_states` generator at
+/// **elapsed time `τ` within the interval** (`0` at the left endpoint); the
+/// caller maps `τ` to an absolute model time and hence to the PK state / drug
+/// concentration that drives `Q`. Unlike the time-homogeneous
+/// [`ctmm_data_term`], there is no closed form here (the matrix exponential
+/// `expm(Q·Δt)` is exact only when `Q` is constant), so the interval transition
+/// is obtained by integration.
+///
+/// **Reduction to the matrix exponential.** When `q_at` returns a *constant* `Q`,
+/// the time-ordered solution collapses to `P(Δt) = expm(Q·Δt)` — this is the
+/// Tier-1 anchor (`ctmm_inhomogeneous_matches_matrix_exp_for_constant_q`), so the
+/// homogeneous and inhomogeneous paths agree in the limit they share. More
+/// generally, if `Q(τ) = g(τ)·Q₀` for a scalar `g` and a fixed `Q₀` (the family
+/// commutes across time), `P(Δt) = expm(Q₀ · ∫₀^{Δt} g)` — a second closed-form
+/// anchor independent of `expm`'s own definition.
+///
+/// The likelihood term is unchanged: `−Σ_m log P(Δt_m)[s_m, s_{m+1}]`, with each
+/// `P(Δt_m)` from this function instead of `matrix_exp`.
+///
+/// The occupancy matrix is flattened **row-major** into the ODE state vector
+/// (length `n_states²`); the RHS reshapes it, forms `Q(τ)·P`, and flattens back.
+/// A non-positive `delta_t` returns the identity (`P(0) = I`; a zero-length gap
+/// between identical states contributes `log 1 = 0`, exactly as the homogeneous
+/// kernel treats it).
+///
+/// # Panics (debug builds only)
+/// Debug-asserts that `q_at(0)` is `n_states × n_states`.
+#[must_use]
+pub fn ctmm_inhomogeneous_transition(
+    q_at: impl Fn(f64) -> DMatrix<f64>,
+    delta_t: f64,
+    n_states: usize,
+) -> DMatrix<f64> {
+    let s = n_states;
+    if delta_t <= 0.0 || delta_t.is_nan() {
+        // P(0) = I; also the guard for a NaN/negative gap (validated upstream).
+        return DMatrix::identity(s, s);
+    }
+    debug_assert_eq!(
+        q_at(0.0).shape(),
+        (s, s),
+        "q_at must return an n_states×n_states generator"
+    );
+
+    // Flattened matrix ODE: u ↔ P row-major (u[i*s + j] = P[i, j]).
+    // `du = Q(t)·P`. `params` is unused — `q_at` captures everything it needs.
+    let rhs = |u: &[f64], _params: &[f64], t: f64, du: &mut [f64]| {
+        let p = DMatrix::from_row_slice(s, s, u);
+        let dp = q_at(t) * p;
+        for i in 0..s {
+            for j in 0..s {
+                du[i * s + j] = dp[(i, j)];
+            }
+        }
+    };
+
+    // u0 = flattened identity.
+    let mut u0 = vec![0.0_f64; s * s];
+    for i in 0..s {
+        u0[i * s + i] = 1.0;
+    }
+
+    // Tighter than the PK default (reltol 1e-4): a transition probability feeds a
+    // log-likelihood, and the Tier-1 anchors compare against exact closed forms, so
+    // integrate to near machine precision. Cost is trivial (one small S²-state solve
+    // per observation gap).
+    let opts = crate::ode::OdeSolverOptions {
+        abstol: 1e-12,
+        reltol: 1e-10,
+        ..Default::default()
+    };
+    let sol = crate::ode::solve_ode(&rhs, &u0, (0.0, delta_t), &[], &[delta_t], &opts);
+
+    match sol.last() {
+        Some(pt) => DMatrix::from_row_slice(s, s, &pt.u),
+        // The solver always returns at least the final save; identity is the
+        // conservative fallback (never observed) rather than a panic in a hot loop.
+        None => DMatrix::identity(s, s),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,5 +1108,73 @@ mod tests {
             }
         );
         assert!(err.to_string().contains("Δt > 0"));
+    }
+
+    // ---- ctmm_inhomogeneous_transition (Phase 6, #817) --------------------
+
+    /// The defining reduction: a **constant** `Q(τ)` makes the time-ordered
+    /// occupancy ODE collapse to `P(Δt) = expm(Q·Δt)`. The RK45-integrated
+    /// transition must therefore match `matrix_exp` (the homogeneous path) — both
+    /// the 2-state closed form and a dense 3-state generator.
+    #[test]
+    fn ctmm_inhomogeneous_matches_matrix_exp_for_constant_q() {
+        // 2-state, closed form.
+        let (a, b, dt) = (0.7, 0.3, 2.0);
+        let q2 = DMatrix::from_row_slice(2, 2, &[-a, a, b, -b]);
+        let p2 = ctmm_inhomogeneous_transition(|_t| q2.clone(), dt, 2);
+        assert!(
+            max_abs_diff(&p2, &exact_2state(a, b, dt)) < 1e-8,
+            "constant-Q 2-state must match the closed form; got {p2}"
+        );
+
+        // 3-state dense generator vs. the exact matrix exponential.
+        let q3 = generator_3();
+        let p3 = ctmm_inhomogeneous_transition(|_t| q3.clone(), 1.5, 3);
+        assert!(
+            max_abs_diff(&p3, &matrix_exp(&(&q3 * 1.5))) < 1e-8,
+            "constant-Q 3-state must match expm(Q·Δt)"
+        );
+        // A valid generator's transition matrix is stochastic (rows sum to 1).
+        for i in 0..3 {
+            assert!((p3.row(i).sum() - 1.0).abs() < 1e-8, "row {i} sums to 1");
+        }
+    }
+
+    /// A genuinely time-varying but **scalar-commuting** generator `Q(τ) = g(τ)·Q₀`
+    /// has the closed form `P(Δt) = expm(Q₀ · ∫₀^{Δt} g)` — the family commutes
+    /// across time, so the time-ordered exponential reduces to an ordinary one.
+    /// This anchors the integrator on a non-constant `Q` **independently of `expm`'s
+    /// own reduction** (the integral is hand-computed), so it is not a repeat of the
+    /// constant-Q test.
+    #[test]
+    fn ctmm_inhomogeneous_scalar_time_varying_matches_closed_form() {
+        // Q₀ off-diagonals (0.7, 0.3); g(τ) = 1 + τ ⇒ ∫₀^{Δt}(1+τ)dτ = Δt + Δt²/2.
+        let (a, b, dt) = (0.7_f64, 0.3, 2.0);
+        let q0 = DMatrix::from_row_slice(2, 2, &[-a, a, b, -b]);
+        let integral = dt + 0.5 * dt * dt; // 2 + 2 = 4
+        let expected = exact_2state(a, b, integral); // expm(Q₀·∫g)
+
+        let p = ctmm_inhomogeneous_transition(|t| (1.0 + t) * q0.clone(), dt, 2);
+        assert!(
+            max_abs_diff(&p, &expected) < 1e-7,
+            "scalar-time-varying Q must match expm(Q₀·∫g); got {p}, want {expected}"
+        );
+        for i in 0..2 {
+            assert!((p.row(i).sum() - 1.0).abs() < 1e-8, "row {i} sums to 1");
+        }
+    }
+
+    /// A non-positive interval returns the identity (`P(0) = I`) without touching the
+    /// solver — the zero-length-gap case the homogeneous kernel also treats as `log 1 = 0`.
+    #[test]
+    fn ctmm_inhomogeneous_zero_dt_is_identity() {
+        // `q_at` is deliberately a panic: a zero-length gap must short-circuit before
+        // evaluating the generator at all.
+        let p = ctmm_inhomogeneous_transition(
+            |_t| panic!("q_at must not be called for Δt = 0"),
+            0.0,
+            3,
+        );
+        assert_eq!(p, DMatrix::identity(3, 3));
     }
 }
