@@ -1297,6 +1297,7 @@ pub fn run_bayes(
         impmap_trace: None,
         bayes: Some(bayes),
         cond_dist: None,
+        packed_estimate: None,
     })
 }
 

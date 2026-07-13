@@ -434,6 +434,7 @@ mod tests {
             neural_networks: Vec::new(),
             covariate_table: None,
             exclusions: None,
+            packed_estimate: None,
         }
     }
 

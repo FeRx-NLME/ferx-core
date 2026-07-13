@@ -5145,6 +5145,7 @@ fn fit_inner(
                     impmap_trace: None,
                     bayes: None,
                     cond_dist: None,
+                    packed_estimate: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -5784,6 +5785,10 @@ fn fit_inner(
         sigma_names: result.params.sigma.names.clone(),
         error_model: model.error_model,
         covariance_matrix: result.covariance_matrix,
+        // The optimizer's exact packed vector (FOCE/FOCEI paths), so a later
+        // `run_covariance` reproduces this fit's covariance step bit-for-bit (#816
+        // follow-up). `None` for estimators that don't pack in Cholesky space.
+        packed_estimate: result.packed_estimate,
         se_theta,
         se_omega,
         se_sigma,
@@ -13082,6 +13087,7 @@ mod simulate_with_uncertainty_tests {
             neural_networks: Vec::new(),
             covariate_table: None,
             exclusions: None,
+            packed_estimate: None,
         }
     }
 

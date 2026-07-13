@@ -4840,6 +4840,26 @@ pub struct FitResult {
     /// were active during the fit (or the caller supplied `ignore`/`accept`
     /// expressions).  `None` means no filtering was requested.
     pub exclusions: Option<ExclusionSummary>,
+    /// The optimizer's **exact** final packed parameter vector (log-theta,
+    /// Cholesky-omega lower triangle, log-sigma, over the free parameters), lifted
+    /// from [`OuterResult::packed_estimate`]. Lets [`run_covariance`] reproduce the
+    /// inline covariance step's FD-Hessian bit-for-bit by reusing this exact
+    /// Cholesky factor instead of re-decomposing `omega` (which is not the
+    /// round-trip inverse of the stored `L·Lᵀ`; the FD Hessian amplifies the
+    /// difference on ill-conditioned ω directions — the divergence #816 review
+    /// surfaced). `Some` for every packed-Cholesky-space optimizer — the NLopt and
+    /// BFGS outer loops, the trust region, and Gauss-Newton (pure and hybrid). `None`
+    /// for SAEM and importance-sampling (which rebuild `omega` from the reported
+    /// matrix, so both paths re-decompose identically and already agree), for Bayes
+    /// (no Hessian covariance step), and for hand-built results.
+    ///
+    /// **Transient (`#[serde(skip)]`):** it is an in-process optimisation for a
+    /// `run_covariance` called right after a fit; a fit reloaded from `.fitrx`
+    /// carries `None` and `run_covariance` falls back to re-packing from `omega`
+    /// (the documented "~1e-5, platform dependent" path). Never serialized, so no
+    /// `.fitrx` / ferx-r format change.
+    #[serde(skip)]
+    pub packed_estimate: Option<Vec<f64>>,
 }
 
 impl FitResult {
