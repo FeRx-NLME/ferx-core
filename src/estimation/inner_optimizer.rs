@@ -205,7 +205,14 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if !crate::sens::provider::iov_sens_supported(model) {
         return "model outside IOV analytic scope";
     }
-    if model.ode_spec.is_some() {
+    // #814: attribute against the *effective* model for this subject. A closed-form
+    // transit/IG + IOV (or TV-cov / `TIME`) subject evaluates its objective on the ODE twin
+    // (`effective_for`, #719), so its FD-fallback reason is a twin-ODE reason even though the
+    // analytic primary's own `ode_spec` is `None` — the same reroute `is_ode_iov` and
+    // `inner_stall_enabled` already track. `effective_for` returns `self` for a genuine ODE
+    // model and for every non-rerouted subject, so this is unchanged for them.
+    let eff = model.effective_for(subject);
+    if eff.ode_spec.is_some() {
         // Single scan for the periodic steady-state predicate, mirroring
         // `ode_iov_subject_supported`'s hoisted `has_ss` so the attribution order and
         // the gate can't drift.
@@ -216,7 +223,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         // per-cycle active/quiet split), EXCEPT when a `D{cmt}`/`R{cmt}` slot is absent —
         // mirror `ode_iov_subject_supported`'s screen so this attribution can't drift.
         if !subject.all_doses_fixed() {
-            let attr_map = model.active_dose_attr_map();
+            let attr_map = eff.active_dose_attr_map();
             let all_slots_present = subject.doses.iter().all(|d| {
                 matches!(d.rate_mode, crate::types::RateMode::Fixed)
                     || crate::sens::ode_provider::modeled_slot_for(attr_map, d).is_some()
@@ -231,7 +238,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         // steady-state rate-defined infusion under `F ≠ 1`, and steady-state combined
         // with an estimated lagtime, are both analytic now (#486).
         if has_ss
-            && model
+            && eff
                 .ode_spec
                 .as_ref()
                 .and_then(|o| o.rhs_program.as_ref())
@@ -240,12 +247,12 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
             return "steady-state dose + time-dependent ODE RHS";
         }
         // #486: a steady-state dose combined with a built-in absorption input-rate forcing
-        // (`zero_order`/`first_order`) declines to FD — the dual SS equilibration does not
-        // spread a periodic zero-order window / first-order tail over the cycle. Mirror
-        // `ode_iov_subject_supported`'s bail, in the same order, so this attribution can't
-        // drift.
+        // (`zero_order`/`first_order`, or a transit/IG twin's `transit()`/`igd()` forcing)
+        // declines to FD — the dual SS equilibration does not spread a periodic zero-order
+        // window / first-order tail over the cycle. Mirror `ode_iov_subject_supported`'s bail,
+        // in the same order, so this attribution can't drift.
         if has_ss
-            && model
+            && eff
                 .ode_spec
                 .as_ref()
                 .is_some_and(|o| !o.input_rate.is_empty())
@@ -256,8 +263,8 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         if occ_groups.is_empty() {
             return "no observation occasions";
         }
-        let n_stacked = model.n_eta + occ_groups.len() * model.n_kappa;
-        let m_dim = model.n_theta + n_stacked;
+        let n_stacked = eff.n_eta + occ_groups.len() * eff.n_kappa;
+        let m_dim = eff.n_theta + n_stacked;
         if m_dim > crate::sens::ode_provider::MAX_ODE_IOV_AXES {
             return "ODE IOV stacked axis cap";
         }
@@ -4178,6 +4185,51 @@ mod iov_tests {
         assert_eq!(
             iov_fd_reason(&model, &subject),
             "steady-state dose + built-in absorption forcing"
+        );
+    }
+
+    /// #814: `iov_fd_reason` must attribute against the *effective* (ODE-twin) model. A
+    /// closed-form `one_cpt_transit` + IOV subject with a steady-state dose declines to FD for a
+    /// twin-specific reason — the twin's built-in `transit()` absorption forcing under an SS dose
+    /// — the analytic-primary analogue of `iov_fd_reason_attributes_ss_input_rate`'s hand-written
+    /// `zero_order` twin. Before the effective-model switch, `iov_fd_reason` read the analytic
+    /// primary's `ode_spec` (`None`), skipped the whole ODE attribution block, and mislabeled this
+    /// the generic "subject outside IOV analytic scope".
+    #[test]
+    fn iov_fd_reason_attributes_transit_twin_ss_forcing() {
+        let model = crate::parser::model_parser::parse_model_string(TRANSIT_IOV_MODEL)
+            .expect("parse transit IOV");
+        assert!(
+            model.ode_spec.is_none(),
+            "the closed-form transit primary is analytic"
+        );
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        assert!(
+            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
+            "SS + transit-twin absorption forcing must route to FD under IOV"
+        );
+        assert_eq!(
+            iov_fd_reason(&model, &subject),
+            "steady-state dose + built-in absorption forcing",
+            "#814: attribution must read the effective (twin) model, not the analytic primary"
         );
     }
 
