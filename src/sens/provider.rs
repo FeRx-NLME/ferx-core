@@ -2377,7 +2377,10 @@ fn moving_bounds_separable(
 ) -> bool {
     let attr_map = model.active_dose_attr_map();
     let has_lag = model.has_lagtime();
-    let mut moving: Vec<(f64, BoundJet)> = Vec::new();
+    // `(time, jet, is_arrival)`. Arrivals and infusion ends are treated differently against a
+    // *fixed* break below: an observation on a moving **end** is corrected by the walk, but one
+    // on a moving **arrival** cannot be (see (2)).
+    let mut moving: Vec<(f64, BoundJet, bool)> = Vec::new();
     for (k, d) in subject.doses.iter().enumerate() {
         let modeled_slot =
             crate::sens::ode_provider::modeled_slot_for(attr_map, d).map(|(_mode, slot)| slot);
@@ -2385,7 +2388,7 @@ fn moving_bounds_separable(
         let t_start = eff[k].time + dose_lagtimes.get(k).copied().unwrap_or(0.0);
         // Dose arrival: moves only under a lagtime.
         if has_lag {
-            moving.push((t_start, BoundJet::Lag));
+            moving.push((t_start, BoundJet::Lag, true));
         }
         // Infusion end: moves under a lagtime (riding the arrival) and/or when modeled.
         if eff[k].rate > 0.0 && eff[k].duration > 0.0 {
@@ -2395,7 +2398,7 @@ fn moving_bounds_separable(
                 None => None,
             };
             if let Some(jet) = jet {
-                moving.push((t_start + eff[k].duration, jet));
+                moving.push((t_start + eff[k].duration, jet, false));
             }
         }
     }
@@ -2403,10 +2406,10 @@ fn moving_bounds_separable(
         return true;
     }
     // (1) Moving-vs-moving: coincident breaks must agree on their jet.
-    for (i, &(t, jet)) in moving.iter().enumerate() {
+    for (i, &(t, jet, _)) in moving.iter().enumerate() {
         if moving[..i]
             .iter()
-            .any(|&(u, j)| j != jet && (u - t).abs() < 1e-9)
+            .any(|&(u, j, _)| j != jet && (u - t).abs() < 1e-9)
         {
             return false;
         }
@@ -2415,29 +2418,35 @@ fn moving_bounds_separable(
     // moving break. (A dose arrival is itself a moving break here, so dose-vs-dose
     // coincidences are covered by (1), not by this check.)
     //
-    // This applies to a **modeled infusion end** as much as to a lagged arrival, and closes a
-    // pre-#486 hole. An observation sampled exactly at `t + D` (a modeled `RATE=-1/-2` window
-    // end) used to be admitted, and the walk then read that observation's state at the *moving*
-    // boundary — differentiating `x(end(D))` along the boundary instead of taking `∂x/∂D` at
-    // the observation's own fixed time. The prediction is genuinely **non-differentiable** in
-    // `D` there: for `D` above the coincidence the infusion is still running at the sample (only
-    // the rate `amt/D` matters), while below it the dose has finished and a decay term appears,
-    // so the one-sided slopes differ (measured on a 1-cpt modeled-duration fixture: `+2.3` vs
-    // `−8.6`, with central FD returning their average `−3.2`). The walk returned `−1.9` — not
-    // either one-sided derivative, and not the average.
+    // **Observations on a moving infusion end are exempt** — the walk corrects them rather than
+    // declining (`event_driven_sens_with_doses_g` steps the read-out state back across the
+    // zero-length sliver `end(D) − t_obs`, recovering the one-sided derivative the ODE engine's
+    // jump sensitivities also return). Everything else still declines:
     //
-    // There is no correct jet to hand back at a kink, so decline to FD, exactly as for the
-    // other degenerate coincidences. The FD fallback differentiates the same objective the
-    // optimizer sees and lands on the two-sided average. Measure-zero (`D` is estimated, so it
-    // sweeps through the sample time at most transiently), and per-subject, so a subject only
-    // takes the FD path on the iterations where the coincidence actually holds.
-    let fixed = subject
-        .obs_times
+    // * an observation on a moving **arrival**. A bolus arrival makes the prediction
+    //   *discontinuous* in the arrival time — the sample lands on one side or the other of an
+    //   instantaneous jump in amount — so there is no derivative to recover, one-sided or
+    //   otherwise. (An infusion *start* is continuous, but the walk reads the state before the
+    //   dose event is applied, so it is not correctable by the same sliver; it declines too,
+    //   conservatively.)
+    // * a **reset** or **covariate-change** (`PkOnly`) time on any moving break. Those events are
+    //   not read-outs, so there is no state to correct — the walk would simply apply them at the
+    //   moving clock position instead of their own fixed one.
+    for &f in &subject.obs_times {
+        // Only a moving *arrival* disqualifies an observation; a moving end is corrected.
+        if moving
+            .iter()
+            .any(|&(t, _, is_arrival)| is_arrival && (t - f).abs() < 1e-9)
+        {
+            return false;
+        }
+    }
+    for &f in subject
+        .pk_only_times
         .iter()
-        .chain(subject.pk_only_times.iter())
-        .chain(subject.reset_times.iter());
-    for &f in fixed {
-        if moving.iter().any(|&(t, _)| (t - f).abs() < 1e-9) {
+        .chain(subject.reset_times.iter())
+    {
+        if moving.iter().any(|&(t, _, _)| (t - f).abs() < 1e-9) {
             return false;
         }
     }
@@ -7096,27 +7105,56 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
 
-    /// An observation sampled **exactly at a modeled infusion end** declines to FD (#486).
+    /// An observation sampled **exactly at a moving infusion end** gets the *one-sided* analytic
+    /// derivative — the same value the ODE engine's jump/saltation sensitivities return (#486).
     ///
-    /// This closes a pre-existing hole. The walk reads each observation's state at the interval
-    /// boundary, and a modeled `RATE=-1/-2` window end is a *moving* boundary — so when a sample
-    /// time coincides with it, the walk differentiated `x(end(D))` **along the boundary** rather
-    /// than taking `∂x/∂D` at the sample's own fixed time. The prediction is genuinely
-    /// non-differentiable in `D` at that point (above the coincidence the infusion is still
-    /// running at the sample, so only the rate `amt/D` matters; below it the dose has finished
-    /// and a decay term appears), so no single jet is right: on this fixture the one-sided slopes
-    /// are `+2.26` and `−8.57`, central FD gives their average `−3.15`, and the walk returned
-    /// `−1.92` — neither. Declining hands the subject to FD, which differentiates the same
-    /// objective the optimizer sees.
+    /// The walk propagates through the moving boundary, so its state at that instant is
+    /// `x(end(D))`. That is what later events need, but an observation's clock time does **not**
+    /// move with `D`: reading it there differentiates along the boundary and adds a spurious
+    /// `ẋ·∂end/∂D`. On this fixture that produced `−1.92`, which is not even a subgradient in
+    /// general. The walk now steps the read-out state back across the zero-length sliver
+    /// `Δ = end(D) − t_obs` (value 0, live jet) with the infusion still running, recovering
+    /// `∂x/∂D` at the sample's own fixed time.
     ///
-    /// The coincidence is measure-zero (`D` is estimated, so it sweeps past a fixed sample time
-    /// at most transiently) and the decline is **per-subject**, so an ordinary modeled-dose
-    /// subject — sampled anywhere else — stays analytic. Both are asserted here.
+    /// The prediction is genuinely **kinked** in `D` here — above the coincidence the infusion is
+    /// still running at the sample (only the rate `amt/D` matters), below it the dose has finished
+    /// and a decay term appears — so no two-sided derivative exists (one-sided slopes `−8.57` and
+    /// `+2.26`; central FD returns their average `−3.15`). The strongest correct answer available
+    /// is a one-sided derivative, and the **ODE twin is the oracle**: it reaches the identical
+    /// value by an entirely independent route (RK45 + an explicit saltation injection, versus a
+    /// dual sliver on a closed form), so agreeing with it pins the convention *and* the value.
+    /// Central-FD parity is deliberately **not** asserted at the kink — it cannot hold.
     #[test]
-    fn obs_on_modeled_infusion_end_declines_to_fd() {
-        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+    fn obs_on_modeled_infusion_end_matches_ode_twin() {
+        const ODE_TWIN: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let cf = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse cf");
+        let ode = parse_model_string(ODE_TWIN).expect("parse ode twin");
         let theta = [10.0, 50.0, 2.0];
-        // η_D1 = 0 ⇒ D1 = TVD1 = 2.0 exactly, so an observation at t = 2.0 sits on the window end.
+        // η_D1 = 0 ⇒ D1 = TVD1 = 2.0 exactly, so the t = 2.0 sample sits ON the window end.
         let eta = [0.12, -0.08, 0.0];
         let dose = || {
             DoseEvent::modeled(
@@ -7130,18 +7168,49 @@ mod tests {
         };
 
         let on_end = subject_with_dose(dose(), &[1.0, 2.0, 3.0]);
-        assert!(
-            subject_sensitivities(&model, &on_end, &theta, &eta).is_none(),
-            "an observation on the moving infusion end must decline to FD (no correct jet at the kink)"
-        );
-        assert!(
-            subject_eta_grad(&model, &on_end, &theta, &eta).is_none(),
-            "inner must decline in lockstep with the outer (no split scope)"
-        );
+        let cf_sens = subject_sensitivities(&cf, &on_end, &theta, &eta)
+            .expect("closed form must stay analytic on the kink (corrected read-out)");
+        let ode_sens = subject_sensitivities(&ode, &on_end, &theta, &eta)
+            .expect("ODE twin serves it via jump sensitivities");
 
-        // Sampled away from the window end: still analytic, and still exact.
+        for (j, (c, o)) in cf_sens.obs.iter().zip(ode_sens.obs.iter()).enumerate() {
+            approx::assert_relative_eq!(c.f, o.f, max_relative = 1e-6, epsilon = 1e-9);
+            for m in 0..theta.len() {
+                approx::assert_relative_eq!(
+                    c.df_dtheta[m],
+                    o.df_dtheta[m],
+                    max_relative = 1e-5,
+                    epsilon = 1e-7
+                );
+            }
+            for k in 0..cf.n_eta {
+                approx::assert_relative_eq!(
+                    c.df_deta[k],
+                    o.df_deta[k],
+                    max_relative = 1e-5,
+                    epsilon = 1e-7
+                );
+            }
+            let _ = j;
+        }
+
+        // The inner (Dual1) walk must carry the same correction as the outer (Dual2) one — a
+        // correction applied to one and not the other would silently split inner/outer scope.
+        let inner = subject_eta_grad(&cf, &on_end, &theta, &eta).expect("inner analytic");
+        for (o, i) in cf_sens.obs.iter().zip(inner.iter()) {
+            for k in 0..cf.n_eta {
+                approx::assert_relative_eq!(
+                    o.df_deta[k],
+                    i.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-12
+                );
+            }
+        }
+
+        // Away from the boundary the correction must be inert: still exact vs central FD.
         let off_end = subject_with_dose(dose(), &[1.0, 2.5, 3.0]);
-        check_full_provider_vs_fd(&model, &off_end, &theta, &eta);
+        check_full_provider_vs_fd(&cf, &off_end, &theta, &eta);
     }
 
     /// A modeled-duration `RATE=-2` subject must now route to the event-driven walk
@@ -7676,9 +7745,9 @@ mod tests {
         // distinct backing slots ⇒ not separable ⇒ decline to FD.
         //
         // Sample times deliberately avoid every window end (2.0 / 3.0 below): an observation
-        // *on* a moving infusion end declines for its own reason (the prediction has a kink in
-        // `D` there — `obs_on_modeled_infusion_end_declines_to_fd`), which would mask the
-        // distinct-slot separability this test is actually about.
+        // *on* a moving infusion end takes the corrected one-sided read-out
+        // (`obs_on_modeled_infusion_end_matches_ode_twin`), which would muddy the distinct-slot
+        // separability this test is actually about.
         let coincident = subject_with_doses_and_resets(doses.clone(), &[0.5, 1.5, 3.5], Vec::new());
         assert!(
             subject_sensitivities(

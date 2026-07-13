@@ -849,45 +849,86 @@ fn propagate_bounds_g<T: PkNum>(
         }
         let dt = dual_pos(w[1]) - dual_pos(w[0]);
         let mid = 0.5 * (w[0] + w[1]);
-        // Active infusion rates (F·rate) summed per the production model→cmt arms:
-        // central / peripheral-1 / peripheral-2 for the disposition compartments,
-        // plus `rate_depot` for a zero-order input into the oral depot (cmt 1, #400).
-        let mut rate_central = T::from_f64(0.0);
-        let mut rate_periph1 = T::from_f64(0.0);
-        let mut rate_periph2 = T::from_f64(0.0);
-        let mut rate_depot = T::from_f64(0.0);
-        for (k, d) in doses.iter().enumerate() {
-            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
-            let t_start = d.time + lag;
-            let t_end = t_start + d.duration;
-            if t_start < reset_floor {
-                continue;
-            }
-            if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
-                // Modeled infusion: the dual rate (`amt/D` or `R`) carries the PK-param
-                // jet; a fixed infusion keeps its concrete `d.rate`. `pk.f` applies `F`
-                // (duration-defined) exactly as the fixed path does.
-                let r = match dose_inf_dual.get(k).copied().flatten() {
-                    Some((rate_bare, _)) => pk.f * rate_bare,
-                    None => pk.f * T::from_f64(d.rate),
-                };
-                match (pk_model, d.cmt) {
-                    (PkModel::OneCptIv, 1) => rate_central = rate_central + r,
-                    (PkModel::OneCptOral, 1) => rate_depot = rate_depot + r,
-                    (PkModel::OneCptOral, 2) => rate_central = rate_central + r,
-                    (PkModel::TwoCptIv, 1) => rate_central = rate_central + r,
-                    (PkModel::TwoCptIv, 2) => rate_periph1 = rate_periph1 + r,
-                    (PkModel::TwoCptOral, 1) => rate_depot = rate_depot + r,
-                    (PkModel::TwoCptOral, 2) => rate_central = rate_central + r,
-                    (PkModel::ThreeCptIv, 1) => rate_central = rate_central + r,
-                    (PkModel::ThreeCptIv, 2) => rate_periph1 = rate_periph1 + r,
-                    (PkModel::ThreeCptIv, 3) => rate_periph2 = rate_periph2 + r,
-                    (PkModel::ThreeCptOral, 1) => rate_depot = rate_depot + r,
-                    (PkModel::ThreeCptOral, 2) => rate_central = rate_central + r,
-                    _ => {}
-                }
+        let rates = active_rates_g(
+            doses,
+            dose_lagtimes,
+            dose_inf_dual,
+            pk,
+            pk_model,
+            reset_floor,
+            mid,
+        );
+        apply_step_g(state, dt, pk, pk_model, rates);
+    }
+}
+
+/// The infusion rates (`F·rate`, already summed per compartment) active at clock time `mid`,
+/// laid out as `(central, peripheral-1, peripheral-2, depot)` per the production model→cmt map.
+/// A **modeled** dose contributes its dual rate (`amt/D` or `R`), so the injected magnitude
+/// carries the PK-param jet; a fixed dose contributes its concrete `d.rate`.
+///
+/// Shared by the interval walk ([`propagate_bounds_g`]) and the observation-on-a-moving-boundary
+/// correction in [`event_driven_sens_with_doses_g`], so the two cannot drift apart on which
+/// infusions are considered active at a given instant. The window test is inclusive at both
+/// ends (`t_start <= mid && t_end >= mid`), matching production.
+#[allow(clippy::too_many_arguments)]
+fn active_rates_g<T: PkNum>(
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+    dose_inf_dual: &[Option<(T, T)>],
+    pk: &PkDual<T>,
+    pk_model: PkModel,
+    reset_floor: f64,
+    mid: f64,
+) -> (T, T, T, T) {
+    let mut rate_central = T::from_f64(0.0);
+    let mut rate_periph1 = T::from_f64(0.0);
+    let mut rate_periph2 = T::from_f64(0.0);
+    let mut rate_depot = T::from_f64(0.0);
+    for (k, d) in doses.iter().enumerate() {
+        let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+        let t_start = d.time + lag;
+        let t_end = t_start + d.duration;
+        if t_start < reset_floor {
+            continue;
+        }
+        if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
+            let r = match dose_inf_dual.get(k).copied().flatten() {
+                Some((rate_bare, _)) => pk.f * rate_bare,
+                None => pk.f * T::from_f64(d.rate),
+            };
+            match (pk_model, d.cmt) {
+                (PkModel::OneCptIv, 1) => rate_central = rate_central + r,
+                (PkModel::OneCptOral, 1) => rate_depot = rate_depot + r,
+                (PkModel::OneCptOral, 2) => rate_central = rate_central + r,
+                (PkModel::TwoCptIv, 1) => rate_central = rate_central + r,
+                (PkModel::TwoCptIv, 2) => rate_periph1 = rate_periph1 + r,
+                (PkModel::TwoCptOral, 1) => rate_depot = rate_depot + r,
+                (PkModel::TwoCptOral, 2) => rate_central = rate_central + r,
+                (PkModel::ThreeCptIv, 1) => rate_central = rate_central + r,
+                (PkModel::ThreeCptIv, 2) => rate_periph1 = rate_periph1 + r,
+                (PkModel::ThreeCptIv, 3) => rate_periph2 = rate_periph2 + r,
+                (PkModel::ThreeCptOral, 1) => rate_depot = rate_depot + r,
+                (PkModel::ThreeCptOral, 2) => rate_central = rate_central + r,
+                _ => {}
             }
         }
+    }
+    (rate_central, rate_periph1, rate_periph2, rate_depot)
+}
+
+/// Advance the dual state by one (possibly dual-length) step under a constant rate vector.
+/// `dt` may carry a jet — that is how a moving boundary's sensitivity enters — and its **value**
+/// may be zero, which is exactly the zero-length sliver the observation correction uses.
+fn apply_step_g<T: PkNum>(
+    state: &mut [T],
+    dt: T,
+    pk: &PkDual<T>,
+    pk_model: PkModel,
+    rates: (T, T, T, T),
+) {
+    let (rate_central, rate_periph1, rate_periph2, rate_depot) = rates;
+    {
         match pk_model {
             // See event_driven::propagate — transit / IG cannot be state-propagated; the
             // Dual2 superposition path serves their sensitivities instead (#386/#790).
@@ -956,6 +997,55 @@ fn propagate_bounds_g<T: PkNum>(
             ),
         }
     }
+}
+
+/// `Δ = end(p) − t` for an observation time `t` that lands exactly on a **moving infusion end**,
+/// or `None` when it doesn't (the overwhelmingly common case).
+///
+/// `Δ` has **value zero** — the boundary and the sample coincide at the current parameters — but
+/// a non-zero *jet*, because the window end `t_start + D` moves with the estimated `D{cmt}`/`R{cmt}`
+/// (and, under a lagtime, with the arrival it rides on). That jet is exactly what the correction in
+/// [`event_driven_sens_with_doses_g`] needs.
+///
+/// Only **infusion ends** qualify. A dose *arrival* landing on an observation is a different animal:
+/// a bolus arrival makes the prediction **discontinuous** in the arrival time (the sample lands
+/// before or after an instantaneous jump in amount), so no derivative exists at all and the provider
+/// declines such a subject to FD upstream rather than correcting anything.
+fn moving_infusion_end_delta<T: PkNum>(
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+    dose_lag_dual: &[T],
+    dose_inf_dual: &[Option<(T, T)>],
+    reset_floor: f64,
+    t: f64,
+) -> Option<T> {
+    let has_lag = !dose_lag_dual.is_empty();
+    for (k, d) in doses.iter().enumerate() {
+        if !(d.rate > 0.0 && d.duration > 0.0) {
+            continue;
+        }
+        let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+        let t_start = d.time + lag;
+        if t_start < reset_floor {
+            continue;
+        }
+        let end = t_start + d.duration;
+        if (end - t).abs() >= 1e-9 {
+            continue;
+        }
+        let dual_start = match dose_lag_dual.get(k) {
+            Some(&lag_d) => T::from_f64(d.time) + lag_d,
+            None => T::from_f64(t_start),
+        };
+        let dual_end = match dose_inf_dual.get(k).copied().flatten() {
+            Some((_, dur_bare)) => dual_start + dur_bare,
+            None if has_lag => dual_start + T::from_f64(d.duration),
+            // A fixed window with no lagtime: the end does not move, so there is nothing to correct.
+            None => continue,
+        };
+        return Some(dual_end - T::from_f64(t));
+    }
+    None
 }
 
 /// Shared early-stop driver for the **dual** SS-equilibration loops (#519; #532 review #9/#10):
@@ -1194,9 +1284,60 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 }
             }
             EventKind::Obs => {
+                // **Observation sitting exactly on a moving infusion end** (#486).
+                //
+                // The walk propagates *through* the moving boundary, so `state` here is
+                // `x(end(D))` — the state at the boundary, which is what every *later* event
+                // needs. But an observation's time does not move with `D`: we want `x(t_obs)`
+                // at the sample's own fixed clock time. Differentiating `x(end(D))` instead
+                // adds a spurious `ẋ·∂end/∂D` and yields a value that is not even a subgradient.
+                //
+                // Correct it by stepping a copy of the state **back** across the zero-length
+                // sliver `Δ = end(D) − t_obs` with the infusion still running. `Δ` has value 0
+                // (boundary and sample coincide) but a live jet, so the step leaves the
+                // prediction's *value* untouched and removes exactly the along-the-boundary
+                // term from its derivatives — to second order, since the dual carries it.
+                //
+                // What comes out is the **one-sided** (pre-jump) derivative: the branch where
+                // the infusion is still running at the sample. That is the same convention the
+                // ODE engine's jump/saltation sensitivities already use, so the two engines now
+                // agree here (pinned by `provider_obs_on_modeled_infusion_end_matches_ode_twin`).
+                // The prediction is genuinely kinked in `D` at this point, so no two-sided
+                // derivative exists — a one-sided one is the strongest correct answer available.
+                let mut obs_state;
+                let read = match moving_infusion_end_delta(
+                    eff_doses,
+                    &schedule.dose_lagtimes,
+                    dose_lag_dual,
+                    dose_inf_dual,
+                    reset_floor,
+                    ev.time,
+                ) {
+                    Some(delta) => {
+                        obs_state = state.clone();
+                        let rates = active_rates_g(
+                            eff_doses,
+                            &schedule.dose_lagtimes,
+                            dose_inf_dual,
+                            &pk_now,
+                            pk_model,
+                            reset_floor,
+                            ev.time,
+                        );
+                        apply_step_g(
+                            &mut obs_state,
+                            T::from_f64(0.0) - delta,
+                            &pk_now,
+                            pk_model,
+                            rates,
+                        );
+                        &obs_state[..]
+                    }
+                    None => &state[..],
+                };
                 let v = pk_now.v;
                 let conc = if v.val() > 0.0 {
-                    state[central_slot] / v
+                    read[central_slot] / v
                 } else {
                     T::from_f64(0.0)
                 };

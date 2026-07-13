@@ -376,18 +376,24 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 - **Wrong analytic gradient for an observation sampled exactly at a modeled infusion
-  end** (#486). With a modeled `RATE=-1`/`-2` dose, the infusion window end moves with the
+  end** (#486). With a modeled `RATE=-1`/`-2` dose the infusion window end moves with the
   estimated `D{cmt}`/`R{cmt}`. An observation whose time coincided with that end had its
-  gradient taken *along the moving boundary* rather than at the sample's own fixed time,
-  giving a `∂f/∂D` that was simply wrong (on a 1-cpt fixture: `−1.9` where the true
-  one-sided slopes are `+2.3` and `−8.6`, and the finite-difference reference gives their
-  average `−3.2`). The prediction is genuinely non-differentiable in `D` at that point —
-  above the coincidence the infusion is still running at the sample, below it the dose has
-  finished — so there is no correct jet to return, and such a subject now falls back to
-  finite differences (which differentiates the same objective the optimizer sees). The
-  coincidence is transient in practice, since `D` is estimated and only sweeps past a fixed
-  sample time momentarily, and the fallback is per-subject: an ordinary modeled-dose subject
-  sampled anywhere else stays analytic.
+  gradient taken *along the moving boundary* rather than at the sample's own fixed clock
+  time, adding a spurious term: on a 1-cpt fixture it returned `−1.9`, which is not even a
+  valid subgradient in general. The closed-form walk now steps the read-out state back across
+  the zero-length window `end(D) − t_obs` with the infusion still running, recovering the
+  derivative at the sample's own time. Sampling at the end of an infusion is a normal design,
+  so this is worth knowing about even though the exact coincidence is transient (`D` is
+  estimated, so it only sweeps past a fixed sample time momentarily).
+
+  The prediction is genuinely **kinked** in `D` at that point — just above the coincidence the
+  infusion is still running at the sample, just below it the dose has finished and a decay term
+  appears — so no two-sided derivative exists there (the one-sided slopes are `−8.6` and
+  `+2.3`, and a central finite difference returns their average, `−3.2`). ferx returns the
+  **one-sided** derivative, which is the same convention its ODE engine's jump/saltation
+  sensitivities already used; the two engines now agree on this case, which is what pins the
+  value. A finite-difference gradient will still disagree with the analytic one *at exactly*
+  that point, and that is expected rather than a defect.
 - **`run_covariance` now reproduces the inline covariance step exactly.** A standalone
   covariance step (`run_covariance`, `ferx` covariance on a saved fit) returned a covariance
   matrix and standard errors that differed from the same fit run with `covariance = true`
