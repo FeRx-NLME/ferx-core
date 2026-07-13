@@ -151,9 +151,14 @@ fn n_agq_is_validated() {
 ///
 /// AGQ(1) is therefore Laplace **with the exact Hessian** — NONMEM's `LAPLACIAN`. It is not
 /// expected to equal ferx's FOCEI bit-for-bit, because FOCEI is Laplace with the
-/// *Gauss-Newton* Hessian `C'C + Ω⁻¹`, which drops `∂²f/∂η²`. That is a real, documented
-/// difference between the two estimators, not implementation drift — so what this test pins
-/// is that AGQ(1) lands in the Laplace family at all:
+/// *Gauss-Newton* Hessian `C'C + Ω⁻¹`, which drops `∂²f/∂η²`.
+///
+/// That difference is real and externally confirmed, not implementation drift: on this very
+/// model NONMEM `$EST METHOD=1 LAPLACIAN INTER` returns 7.8994 (matching AGQ(1) to five
+/// significant figures) while NONMEM `METHOD=1 INTER` returns 7.4967 (matching ferx FOCEI)
+/// — the reference implementation shows the same 0.40-unit gap. See `docs/estimation/agq.qmd`.
+///
+/// So what this test pins is that AGQ(1) lands in the Laplace family at all:
 ///
 /// * it sits within ~1 OFV unit of FOCEI (same family, differing only in `½log|H|`), and
 /// * it is nowhere near FOCE, which uses the Sheiner–Beal *linearised* marginal — a

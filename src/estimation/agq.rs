@@ -54,6 +54,15 @@
 //! finite n* — AGQ is consistent under any invertible scaling — but at `n_agq = 1` it enters
 //! the objective directly through `½·log|H|`, so a blind `H` would silently not be Laplace.
 //!
+//! This is confirmed externally. On warfarin, AGQ at one node reproduces NONMEM
+//! `$EST METHOD=1 LAPLACIAN INTER` to five significant figures (7.8994 both), while ferx
+//! FOCEI and NONMEM `METHOD=1 INTER` agree with each other on a *different* value (7.4967)
+//! — so the 0.40-unit AGQ(1)-vs-FOCEI gap is FOCEI's Gauss-Newton Hessian, reproduced by
+//! the reference implementation, not drift here. NONMEM's LAPLACIAN **without** `INTER`
+//! misses by 9.3 units, which is the same point from the other side: the exact Hessian has
+//! to carry the curvature of the η-dependent residual variance (`ln V(f(η))`), and the
+//! Gauss-Newton form would have silently dropped it. See `docs/estimation/agq.qmd`.
+//!
 //! # Grid pruning: why there isn't any
 //!
 //! Dropping low-weight nodes looks free and is not. The *corrected* weight

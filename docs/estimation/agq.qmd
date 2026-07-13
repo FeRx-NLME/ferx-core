@@ -91,9 +91,61 @@ exactly that term, and no more.
 
 ## Validation
 
-Warfarin (32 subjects, 1-cpt oral, 3 random effects, proportional error), OFV
-evaluated at identical initial parameters and identical EBEs — so the *only*
-thing varying across rows is the marginal approximation.
+### Against NONMEM
+
+NONMEM has no AGQ. But `n_agq = 1` *is* Laplace with the exact Hessian, and that
+is precisely what `$EST METHOD=1 LAPLACIAN` computes — so LAPLACIAN is the exact
+external anchor for the one-node identity.
+
+Warfarin, OFV evaluated at identical initial parameters (`MAXEVAL=0`):
+
+| Objective | ferx | NONMEM |
+|-----------|------|--------|
+| FOCEI — Laplace, Gauss-Newton Hessian (`METHOD=1 INTER`) | 7.496684 | **7.4967** |
+| **AGQ `n_agq = 1`** — Laplace, exact Hessian (`METHOD=1 LAPLACIAN INTER`) | 7.899403 | **7.8994** |
+| `METHOD=1 LAPLACIAN` *without* `INTER` | — | 17.2049 |
+
+AGQ(1) reproduces NONMEM's LAPLACIAN to **5 significant figures**. Three things
+follow, and together they are the strongest statement available about this
+implementation:
+
+1. **The one-node/Laplace identity holds against an independent engine**, not
+   just against ferx's own arithmetic.
+2. **NONMEM shows the same 0.40-unit gap between LAPLACIAN and FOCEI that ferx
+   does.** So that gap is FOCEI's Gauss-Newton Hessian — a real property of the
+   estimator, reproduced by the reference implementation — and not a defect here.
+3. **`INTER` is required.** Plain `LAPLACIAN` misses by 9.3 OFV units, because
+   the exact Hessian of the conditional NLL must carry the curvature of the
+   η-dependent residual variance (`ln V(f(η))` under a proportional error model).
+   ferx's `individual_nll` includes that term, which is exactly why the Hessian is
+   finite-differenced from the true NLL rather than taken from the Gauss-Newton
+   form — the latter would have silently dropped it.
+
+Converged fit (`MAXEVAL=9999` / `maxiter = 500`):
+
+| Parameter | ferx AGQ `n_agq = 1` | NONMEM `LAPLACIAN INTER` | Δ |
+|-----------|----------------------|--------------------------|---|
+| OFV       | −285.956 | −285.970 | 0.014 |
+| TVCL      | 0.132597 | 0.132687 | 0.07% |
+| TVV       | 7.751891 | 7.737460 | 0.19% |
+| TVKA      | 0.810412 | 0.810924 | 0.06% |
+| PROP_ERR  | 0.010545 | 0.010565 | 0.19% |
+| ω²(ETA_CL)| 0.028500 | 0.028592 | 0.3%  |
+| ω²(ETA_V) | 0.009251 | 0.009592 | 3.6%  |
+| ω²(ETA_KA)| 0.345032 | 0.336006 | 2.7%  |
+
+Thetas agree to <0.2%, variance components to <3.6% — the same order as ferx's
+established FOCEI-vs-NONMEM anchor.
+
+### Against ferx's importance sampler
+
+The NONMEM check validates `n_agq = 1`. To validate the *node sweep* — the part
+NONMEM cannot anchor, because it has no AGQ — the reference is ferx's own
+importance sampler, which estimates the same integral by a completely different
+route.
+
+Warfarin, OFV evaluated at identical initial parameters and identical EBEs — so
+the *only* thing varying across rows is the marginal approximation.
 
 | Method | OFV | What it approximates |
 |--------|-----|----------------------|
@@ -115,12 +167,13 @@ certifies both the marginal and the likelihood's constant convention (an error
 in either would show as tens of OFV units, not hundredths).
 
 Note that FOCEI's 7.497 is *closer* to the truth than AGQ(1)'s 7.899 here. That
-is not a defect: both are one-term approximations, and on this model FOCEI's
-Gauss-Newton Hessian error happens to partially cancel the Laplace error. The
-point of AGQ is that you do not have to rely on that cancellation — you add nodes
-and watch the number stop moving.
+is not a defect — and NONMEM reproduces exactly the same ordering. Both are
+one-term approximations, and on this model FOCEI's Gauss-Newton Hessian error
+happens to partially cancel the Laplace error. The point of AGQ is that you do
+not have to rely on that cancellation: you add nodes and watch the number stop
+moving.
 
-### Converged fit
+### Converged fit vs FOCEI
 
 Full fit of the same model, `maxiter = 500`, covariance step on:
 
@@ -138,6 +191,12 @@ On a well-behaved Gaussian PK model Laplace is already accurate, so AGQ
 reproduces the FOCEI estimates to ~0.2% — which is the expected and desired
 result. AGQ earns its cost on models where that assumption *fails*: non-Gaussian
 endpoints, sparse data, and large `ω²`.
+
+> **Reproducing the NONMEM anchor.** The runner is
+> `C:\package\ferx\nm_agq_laplace_warfarin.R` (klebsiella, `nmfe75`). It submits
+> the four control streams above and prints the comparison table. Note the
+> warfarin data has `CMT = 1` on observation rows, so the `$ERROR` block must use
+> `IPRED = A(2)/V`, not `IPRED = F`.
 
 ## What runs under the hood
 
