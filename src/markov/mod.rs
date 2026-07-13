@@ -374,11 +374,36 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
 ///
 /// # Panics (debug builds only)
 /// Debug-asserts that `q_at(0)` is `n_states × n_states`.
+///
+/// Integrates to near machine precision (`reltol 1e-10`) — the default for the
+/// Tier-1 closed-form anchors. The **fit path** instead uses
+/// [`ctmm_inhomogeneous_transition_with_opts`] with the model's own ODE tolerance
+/// (the same `reltol` the PK/TTE solves use), since integrating the whole
+/// likelihood to `1e-10` on every EBE/FD evaluation is needlessly slow.
 #[must_use]
 pub fn ctmm_inhomogeneous_transition(
     q_at: impl Fn(f64) -> DMatrix<f64>,
     delta_t: f64,
     n_states: usize,
+) -> DMatrix<f64> {
+    let opts = crate::ode::OdeSolverOptions {
+        abstol: 1e-12,
+        reltol: 1e-10,
+        ..Default::default()
+    };
+    ctmm_inhomogeneous_transition_with_opts(q_at, delta_t, n_states, &opts)
+}
+
+/// [`ctmm_inhomogeneous_transition`] with explicit solver options — the fit path
+/// passes the model's ODE `solver_opts` so the occupancy integration uses the same
+/// accuracy as the PK solve that drives it (the user's `TOL`), keeping the
+/// per-evaluation cost in line with the rest of the ODE machinery.
+#[must_use]
+pub fn ctmm_inhomogeneous_transition_with_opts(
+    q_at: impl Fn(f64) -> DMatrix<f64>,
+    delta_t: f64,
+    n_states: usize,
+    opts: &crate::ode::OdeSolverOptions,
 ) -> DMatrix<f64> {
     let s = n_states;
     if delta_t <= 0.0 || delta_t.is_nan() {
@@ -409,16 +434,7 @@ pub fn ctmm_inhomogeneous_transition(
         u0[i * s + i] = 1.0;
     }
 
-    // Tighter than the PK default (reltol 1e-4): a transition probability feeds a
-    // log-likelihood, and the Tier-1 anchors compare against exact closed forms, so
-    // integrate to near machine precision. Cost is trivial (one small S²-state solve
-    // per observation gap).
-    let opts = crate::ode::OdeSolverOptions {
-        abstol: 1e-12,
-        reltol: 1e-10,
-        ..Default::default()
-    };
-    let sol = crate::ode::solve_ode(&rhs, &u0, (0.0, delta_t), &[], &[delta_t], &opts);
+    let sol = crate::ode::solve_ode(&rhs, &u0, (0.0, delta_t), &[], &[delta_t], opts);
 
     match sol.last() {
         Some(pt) => DMatrix::from_row_slice(s, s, &pt.u),

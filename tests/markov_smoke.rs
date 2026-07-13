@@ -562,19 +562,173 @@ mod ctmm_smoke {
         assert!((q_low[(1, 0)] - q_high[(1, 0)]).abs() < 1e-12);
     }
 
-    /// The drug-driven CTMM fit path is not wired yet (Slice 3): a model whose intensity
-    /// references a model state is rejected fail-loud at fit setup rather than scored with a
-    /// frozen/zero state.
+    /// Degenerate anchor for the Slice-3 integration (#817): with `SLOPE = 0` the generator
+    /// is state-**independent** (constant `Q`), so the inhomogeneous occupancy-ODE path must
+    /// reduce to the time-homogeneous `expm(Q·Δt)` result. The drug-driven model at `SLOPE = 0`
+    /// and the plain homogeneous model share `LQ01 = -0.7`, `LQ10 = -1.2`, so their per-subject
+    /// CTMM NLLs must agree — this validates the whole occupancy-integration wiring against the
+    /// exact closed form, independently of any dataset.
     #[test]
-    fn ctmm_drug_driven_fit_rejected_until_slice3() {
-        let model = parse_model_string(DRUG_DRIVEN_MODEL).unwrap();
-        let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
-        let err = fit(&model, &pop, &model.default_params, &smoke_opts())
-            .expect_err("drug-driven CTMM must be rejected until Slice 3");
+    fn ctmm_drug_driven_reduces_to_homogeneous_when_flat() {
+        use ferx_core::markov::endpoint::ctmm_subject_nll;
+        use ferx_core::types::ObsRecord;
+
+        let mut subj = common::subject("1", vec![], vec![], vec![], vec![]);
+        subj.obs_records = [(0.0, 0), (0.7, 1), (1.9, 0), (3.1, 1)]
+            .iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                state,
+                cmt: 5,
+            })
+            .collect();
+
+        // Drug-driven model, but with SLOPE forced to 0 (index 5: [TVCL,TVV,TVKA,LQ01,LQ10,SLOPE]).
+        let drug = parse_model_string(DRUG_DRIVEN_MODEL).unwrap();
+        let mut theta_flat = drug.default_params.theta.clone();
+        theta_flat[5] = 0.0;
+        let nll_inhom = ctmm_subject_nll(&drug, &subj, &theta_flat, &[]);
+
+        // Homogeneous model with the same intensities exp(LQ01), exp(LQ10).
+        let homog = parse_model_string(FIXED_MODEL).unwrap();
+        let nll_homog = ctmm_subject_nll(&homog, &subj, &homog.default_params.theta, &[]);
+
+        assert!(nll_inhom.is_finite() && nll_homog.is_finite());
+        // The inhomogeneous path integrates the occupancy ODE at the model's ODE tolerance
+        // (reltol 1e-4 here) while the homogeneous path uses the exact `expm`, so they agree
+        // to that tolerance — far tighter than any wiring bug (wrong state indexing / matrix
+        // convention would differ by O(1), not ~1e-4).
         assert!(
-            err.contains("cmt = 5") && err.contains("central") && err.contains("#817"),
-            "message should name the CMT, the state, and the tracking issue, got: {err}"
+            (nll_inhom - nll_homog).abs() < 5e-3,
+            "SLOPE=0 inhomogeneous NLL {nll_inhom} must match homogeneous {nll_homog}"
         );
+    }
+
+    /// The evolving model state genuinely drives the likelihood: with a dose raising the
+    /// central concentration and `SLOPE ≠ 0`, the per-subject CTMM NLL differs from the flat
+    /// (`SLOPE = 0`) case — the occupancy integration reads the concentration trajectory.
+    #[test]
+    fn ctmm_drug_driven_state_changes_likelihood() {
+        use ferx_core::markov::endpoint::ctmm_subject_nll;
+        use ferx_core::types::{DoseEvent, ObsRecord};
+
+        // Bolus of 100 into the depot (cmt 1) at t=0 → central rises then falls.
+        let mut subj = common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![],
+            vec![],
+            vec![],
+        );
+        subj.obs_records = [(0.5, 0), (1.0, 1), (2.0, 1), (4.0, 0)]
+            .iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                state,
+                cmt: 5,
+            })
+            .collect();
+
+        let drug = parse_model_string(DRUG_DRIVEN_MODEL).unwrap();
+        let mut theta_flat = drug.default_params.theta.clone();
+        theta_flat[5] = 0.0; // SLOPE = 0
+        let mut theta_drug = drug.default_params.theta.clone();
+        theta_drug[5] = 0.8; // SLOPE = 0.8 (strong concentration effect)
+
+        let nll_flat = ctmm_subject_nll(&drug, &subj, &theta_flat, &[]);
+        let nll_drug = ctmm_subject_nll(&drug, &subj, &theta_drug, &[]);
+
+        assert!(nll_flat.is_finite() && nll_drug.is_finite());
+        assert!(
+            (nll_flat - nll_drug).abs() > 1e-3,
+            "a concentration-driven intensity must change the NLL: flat {nll_flat}, drug {nll_drug}"
+        );
+    }
+
+    /// End-to-end: a **mixed-effects** drug-driven CTMM (a random effect on `CL` flows through
+    /// the concentration into `Q`) fits a few FOCEI iterations and returns a finite OFV —
+    /// exercising the full inhomogeneous dispatch, including the FD-Hessian interaction site at
+    /// perturbed η (which re-solves the ODE and re-integrates the occupancy per perturbation).
+    #[test]
+    fn ctmm_drug_driven_mixed_effects_fit_runs() {
+        use ferx_core::types::{DoseEvent, ObsRecord, Population};
+
+        const M: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta SLOPE(0.3, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + SLOPE * (central / V))
+  transition asleep -> awake  = exp(LQ10)
+";
+        let model = parse_model_string(M).expect("mixed-effects drug-driven CTMM must parse");
+
+        // Four subjects: a bolus into depot at t=0 and a handful of state observations on CMT 5.
+        let obs_sets = [
+            [(0.5, 0), (1.5, 1), (3.0, 1), (5.0, 0)],
+            [(0.5, 1), (1.5, 0), (3.0, 0), (5.0, 1)],
+            [(0.5, 0), (1.5, 0), (3.0, 1), (5.0, 1)],
+            [(0.5, 1), (1.5, 1), (3.0, 0), (5.0, 0)],
+        ];
+        let subjects = obs_sets
+            .iter()
+            .enumerate()
+            .map(|(i, obs)| {
+                let mut s = common::subject(
+                    &format!("{}", i + 1),
+                    vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                    vec![],
+                    vec![],
+                    vec![],
+                );
+                s.obs_records = obs
+                    .iter()
+                    .map(|&(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        state,
+                        cmt: 5,
+                    })
+                    .collect();
+                s
+            })
+            .collect();
+        let pop = Population {
+            covariate_names: vec![],
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+            subjects,
+        };
+
+        let res = fit(&model, &pop, &model.default_params, &smoke_opts())
+            .expect("mixed-effects drug-driven CTMM fit must return Ok");
+        assert!(res.ofv.is_finite(), "OFV must be finite, got {}", res.ofv);
     }
 
     /// A model state reached only *transitively* through an `[individual_parameters]` value is

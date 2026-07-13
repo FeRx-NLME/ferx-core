@@ -2727,9 +2727,16 @@ Gate: `#[cfg(feature = "markov")]` initially.
   state reached only transitively through an `[individual_parameters]` value is rejected
   (no state channel there). Interim: the fit path rejects an inhomogeneous CTMM fail-loud
   until Slice 3 supplies the state trajectory.
-- **Slice 3 — endpoint wiring.** Solve PK once, build the per-gap `q_at(τ)` closure that
-  samples `Q(C(t_m+τ))`, integrate via the Slice-1 leaf, dispatch through the existing FD
-  inner/outer path (CTMM already routes to FD — no new analytic gradient).
+- ✅ **Slice 3 — endpoint wiring.** `ctmm_endpoint_nll_inhomogeneous` (dispatched from
+  `ctmm_subject_nll` when `generator_states` is non-empty): solve the model ODE once at
+  `(θ, η)` via `ode_dense_solve_states` (dose-aware), sample the state on a per-gap sub-grid,
+  and integrate the occupancy ODE per gap with the Slice-1 leaf (`_with_opts`, at the model's
+  ODE tolerance — not the anchor-grade `1e-10`, which timed the fit out), the state linearly
+  interpolated between sub-nodes. Dispatches through the existing FD inner/outer path (each
+  perturbed η re-solves + re-integrates — no new analytic gradient). Interim guard lifted.
+  Validated by a **degenerate anchor** (`SLOPE=0` ⇒ constant `Q` ⇒ matches the homogeneous
+  `expm` path within ODE tolerance), a state-coupling test (concentration changes the NLL),
+  and an end-to-end mixed-effects fit to a finite OFV.
 - **Slice 4 — joint PK-CTMM + NONMEM anchor + docs.** Drug-driven anchor via `F_FLAG=1` with
   `P(Δt)` from the model's own ODEs in `$DES` (mirrors `tests/nonmem/ctmm_2state.ctl`).
 
