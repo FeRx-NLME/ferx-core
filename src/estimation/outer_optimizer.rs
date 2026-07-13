@@ -2347,11 +2347,39 @@ fn population_gradient(
     // one), so every analytic and fixed-EBE gradient below — all of them closed forms of
     // the FOCE marginal — is simply the gradient of the wrong function. Feeding one to the
     // outer optimizer would not fail loudly; it would converge, smoothly, to the FOCE
-    // optimum while reporting AGQ OFVs. Central-difference the real objective instead:
-    // `reconverged_fd_gradient` re-solves the inner loop at each perturbed point, so it
-    // also captures the response of η̂ to the population parameters, which AGQ's objective
-    // depends on through the grid centre.
-    if options.agq_nodes().is_some() {
+    // optimum while reporting AGQ OFVs. AGQ has its own gradient.
+    if let Some(n_nodes) = options.agq_nodes() {
+        // Preferred: AGQ's own exact gradient — the analytic posterior-weighted score over
+        // the nodes (Fisher identity) plus the grid-response term — which needs no inner
+        // re-solve, against the FD path's `2·n_free` *full population objective*
+        // re-evaluations. Exact at every `n_agq`. See `estimation::agq`.
+        // `reconverge_gradient_interval` is honoured here too: it is the documented escape
+        // hatch onto the numeric path, so it must override the analytic gradient for AGQ
+        // exactly as it does for FOCE/FOCEI below.
+        if !reconverge && crate::estimation::agq::analytic_gradient_available(model) {
+            let params = unpack_params(x, init_params);
+            if let Some(mut g) = crate::estimation::agq::agq_population_gradient(
+                model,
+                population,
+                &params,
+                init_params,
+                x,
+                ehs,
+                n_nodes,
+            ) {
+                // Fixed coordinates carry no gradient, matching the analytic FOCE path.
+                let fixed = packed_fixed_mask(init_params);
+                for (i, gi) in g.iter_mut().enumerate() {
+                    if fixed[i] {
+                        *gi = 0.0;
+                    }
+                }
+                return g;
+            }
+        }
+        // Fallback (always correct, just slower): central-difference the real objective,
+        // re-solving the inner loop at each perturbed point so the response of η̂ to the
+        // population parameters is captured too.
         return reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options);
     }
     // M3-censored models now have an exact analytic censored gradient on both the

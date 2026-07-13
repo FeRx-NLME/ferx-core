@@ -121,21 +121,48 @@ implementation:
    finite-differenced from the true NLL rather than taken from the Gauss-Newton
    form — the latter would have silently dropped it.
 
-Converged fit (`MAXEVAL=9999` / `maxiter = 500`):
+Converged fit (`MAXEVAL=9999` / `maxiter = 500`, `optimizer = auto` → L-BFGS on
+the analytic gradient). `n_agq = 1` is the like-for-like comparison — both are
+Laplace with the exact Hessian:
 
-| Parameter | ferx AGQ `n_agq = 1` | NONMEM `LAPLACIAN INTER` | Δ |
-|-----------|----------------------|--------------------------|---|
-| OFV       | −285.956 | −285.970 | 0.014 |
-| TVCL      | 0.132597 | 0.132687 | 0.07% |
-| TVV       | 7.751891 | 7.737460 | 0.19% |
-| TVKA      | 0.810412 | 0.810924 | 0.06% |
-| PROP_ERR  | 0.010545 | 0.010565 | 0.19% |
-| ω²(ETA_CL)| 0.028500 | 0.028592 | 0.3%  |
-| ω²(ETA_V) | 0.009251 | 0.009592 | 3.6%  |
-| ω²(ETA_KA)| 0.345032 | 0.336006 | 2.7%  |
+| Parameter | NONMEM `LAPLACIAN INTER` | ferx AGQ `n_agq = 1` | Δ |
+|-----------|--------------------------|----------------------|---|
+| OFV       | −285.9703 | −285.9702 | 0.0001 |
+| TVCL      | 0.132687 | 0.132688 | +0.001% |
+| TVV       | 7.737460 | 7.737470 | +0.000% |
+| TVKA      | 0.810924 | 0.810898 | −0.003% |
+| PROP_ERR  | 0.0105646 | 0.010565 | +0.004% |
+| ω²(ETA_CL)| 0.0285916 | 0.028592 | +0.001% |
+| ω²(ETA_V) | 0.00959221 | 0.009592 | −0.002% |
+| ω²(ETA_KA)| 0.336006 | 0.336021 | +0.004% |
 
-Thetas agree to <0.2%, variance components to <3.6% — the same order as ferx's
-established FOCEI-vs-NONMEM anchor.
+**Every parameter agrees with NONMEM to within 0.004%.** Raising to `n_agq = 3`
+moves the OFV to −285.9739 (a strictly better marginal) and barely moves the
+estimates — on warfarin the Laplace approximation is already near-exact, so the two
+share a minimum. That is the *point*: where Laplace is good, AGQ confirms it; where
+it is not, AGQ moves away from it and you can watch it happen by raising `n_agq`.
+
+### Speed
+
+Same fit, wall-clock:
+
+| | evaluations | wall |
+|---|---|---|
+| ferx FOCEI (analytic gradient) | 42 | 0.60 s |
+| **ferx AGQ `n_agq = 1`** | 31 | **0.23 s** |
+| **ferx AGQ `n_agq = 3`** | 32 | **0.30 s** |
+| NONMEM `LAPLACIAN INTER` | 220 | 1.21 s |
+| ferx AGQ, naive finite-difference gradient | 38 | 6.5 s |
+
+AGQ is **faster than ferx's own FOCEI** and ~4–5× faster than NONMEM's LAPLACIAN,
+while integrating a strictly better marginal. The last row is what the analytic
+gradient bought: a ~20× speedup over differencing the objective numerically, because
+that route re-solves every subject's inner loop at every perturbed parameter and
+this one never does.
+
+(NONMEM's 1.21 s is its reported *estimation* time and excludes the gfortran
+compile of the control stream, which dominates a real NONMEM run. Different
+hardware, so read the ratio, not the absolute.)
 
 ### Against ferx's importance sampler
 
@@ -210,16 +237,120 @@ AGQ reuses the FOCE/Laplace machinery almost entirely:
 3. **Grid.** Gauss–Hermite nodes/weights are computed by Golub–Welsch, then
    transformed to `η_j = η̂ + √2·Σ^{1/2}·z_j` with `Σ = H⁻¹`.
 4. **Objective.** The exact conditional likelihood is evaluated at each node.
-5. **Outer loop.** The quadrature marginal has no analytic gradient, so the outer
-   optimizer central-differences it, and `optimizer = auto` resolves to
-   derivative-free **BOBYQA** (the same policy every finite-difference-only fit
-   in ferx follows). The covariance step differences the AGQ objective too, so
-   the reported standard errors belong to the likelihood that was actually
-   optimised.
+5. **Outer loop.** AGQ has an **analytic outer gradient** (below), so
+   `optimizer = auto` resolves to gradient-based **L-BFGS**. The covariance step
+   differences the AGQ objective too, so the reported standard errors belong to
+   the likelihood that was actually optimised.
 
 Subjects are evaluated in parallel (rayon); the node sweep is serial within a
 subject. The population sum is reduced in a fixed subject order, so the OFV does
 not depend on the thread count.
+
+## The analytic outer gradient
+
+The quadrature has no closed form, but its *gradient* does — and it costs almost
+nothing extra.
+
+The node terms `t_j = log w_j + ‖z_j‖² − nll(η_j)` normalise to `ŵ_j = softmax(t)_j`,
+which are exactly the **posterior weights at the nodes**. By the Fisher (Louis)
+identity,
+
+$$
+\frac{\partial(-\log G_i)}{\partial\theta}
+= \mathbb{E}_{p(\eta\mid y)}\!\left[\frac{\partial\,\mathrm{nll}(\eta;\theta)}{\partial\theta}\right]
+\;\approx\; \sum_j \hat w_j\, \frac{\partial\,\mathrm{nll}(\eta_j;\theta)}{\partial\theta},
+$$
+
+so the outer gradient is a **posterior-weighted average of fixed-η scores**. Each
+`∂nll(η_j)/∂θ` is available exactly from the `Dual2` sensitivity provider (the
+same `∂f/∂θ` FOCE/FOCEI use — it makes no mode assumption, so it evaluates at any
+η). The Ω block is closed-form from the η-prior, the σ block closed-form from the
+variance model.
+
+### The grid moves too, and that term is not optional
+
+The nodes are built from `(η̂(θ), H(θ))`, so the total derivative also carries
+`∂F/∂η̂ · dη̂/dθ` and `∂F/∂H · dH/dθ`. Both *vanish in the exact-quadrature limit*
+— an exactly-integrated marginal does not care where you centre or scale the grid,
+it is a change of variables — but at finite `n_agq` they do not vanish, and they
+are **not small**. Measured against a finite-difference of the real objective on
+warfarin, the fixed-η score *alone* is **26% wrong at `n_agq = 1`** (where the rule
+*is* Laplace and the cancellation fails completely) and 0.8% wrong at `n_agq = 3`.
+
+ferx therefore computes the grid-response term rather than dropping it, and the
+gradient is the exact total derivative at **every** node count:
+
+| `n_agq` | fixed-η score alone | with grid response |
+|---------|---------------------|--------------------|
+| 1       | 26%                 | **0.16%**          |
+| 3       | 0.79%               | **0.008%**         |
+| 5       | 0.51%               | **0.001%**         |
+| 7       | 0.055%              | **0.001%**         |
+
+(Relative error against a finite-difference of the objective, which re-solves the
+inner loop at each perturbed point. The remaining error is that reference's own
+noise floor.)
+
+Two traps, both of which look like details and are not:
+
+**1. `H` depends on the parameters twice.** `H = ∂²nll/∂η²|_{η̂(θ)}` varies with `θ`
+explicitly (through θ/Ω/σ) *and* implicitly through the mode `η̂(θ)`. Differencing
+only the explicit half is not a partial improvement — it is **worse than omitting
+the term entirely** (26% → 62%), because the two halves substantially cancel. The
+mode has to move too, along `dη̂/dθ` (the implicit-function derivative
+`−H⁻¹·∂²nll/∂η∂θ`, which ferx already computes for EBE warm-start prediction). That
+is also what keeps the whole correction **free of any inner re-solve**.
+
+**2. The step is truncation-dominated, not noise-dominated.** The instinct — "`H` is
+itself finite-differenced, so use a *large* step and stay off its noise floor" — is
+exactly backwards here. `log|H|` curves sharply in the packed coordinates, so a large
+step is catastrophic: at `1e-2` the θ gradient comes out **5× wrong**, at `1e-3` still
+4% wrong. `H`'s own error floor sits well below where truncation bites. The answer is
+converged by `1e-4` and unchanged at `1e-5`.
+
+Cost: the score is one provider call per node; the correction adds `2 × n_free`
+Hessian rebuilds and grid sweeps — no inner re-solve. The finite-difference
+alternative costs `2 × n_free` *full population objective* evaluations, each
+re-solving every subject's inner loop. On warfarin that is the difference between
+6.5 s and 0.4 s.
+
+A fully analytic `dH/dθ` would need third derivatives (`∂³nll/∂η²∂θ`); the provider
+stops at `∂²f/∂η∂θ`, so that one order is finite-differenced.
+
+### Every model gets this gradient — including TTE and categorical
+
+There is no scope gate. Both ingredients work for any likelihood ferx can evaluate:
+
+- the **score** `∂nll(η_j;θ)/∂θ` is taken analytically from the `Dual2` provider
+  where it reaches, and finite-differenced *at fixed η* otherwise;
+- **`dη̂/dθ`** comes from the implicit function theorem (`−H⁻¹·∂²nll/∂η∂θ`), again
+  analytic where the provider reaches and finite-differenced otherwise.
+
+Crucially **neither route re-solves the inner loop** — that is the cost that makes
+the naive finite-difference gradient expensive, and it is what both avoid. So the
+sensitivity provider only decides whether the θ/σ score is analytic (a little
+faster) or finite-differenced; it does *not* decide whether AGQ has a usable
+gradient at all.
+
+That distinction matters here more than anywhere: TTE and categorical endpoints sit
+outside the `Dual2` provider, and they are precisely the models AGQ exists to serve.
+Letting them fall back to the inner-re-solving gradient would have made the headline
+use case the slow one. The test `fd_score_path_agrees_with_the_analytic_one` pins
+that the two routes return the same gradient.
+
+Models that take the finite-differenced score: TTE, categorical, ODE models, M3
+censoring, correlated residuals (`block_sigma`), FREM, IIV-on-RUV, custom residual
+magnitude, and LTBS — each adds a term the plain Gaussian chain rule does not carry.
+The fit output reports which route ran.
+
+### Don't use BOBYQA
+
+`optimizer = bobyqa` **false-converges** on the AGQ objective. On warfarin it stops
+0.015 OFV units above the optimum at the default `inner_tol` — and gets *worse*, to
+0.18, as `inner_tol` is tightened, because a smoother objective merely lets its
+trust-region stopping rule trip sooner (63 → 34 evaluations, still reporting
+"converged"). Its ω estimates land ~3% off NONMEM. This is the failure mode ferx
+records in #317. `auto` picks L-BFGS for AGQ precisely to avoid it.
 
 ## Limitations
 
@@ -228,9 +359,10 @@ not depend on the thread count.
   dimension. AGQ rejects `[iov]` models rather than silently integrating the
   η-only marginal. Use [FOCEI](foce.qmd), [SAEM](saem.qmd) or
   [IMP](importance-sampling.qmd).
-- **Exponential in `n_eta`** — see the cost table above.
-- No analytic outer gradient, so each outer iteration is more expensive than an
-  analytic-gradient FOCEI iteration on the same model.
+- **Exponential in `n_eta`** — see the cost table above. This is the real limit.
+- Models outside the `Dual2` provider take a finite-differenced θ/σ score rather than
+  an analytic one (see above). Same gradient, no inner re-solve, just a little slower
+  per iteration.
 
 ## References
 

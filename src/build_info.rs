@@ -108,10 +108,18 @@ pub fn gradient_method_outer(
         | EstimationMethod::Imp
         | EstimationMethod::Impmap
         | EstimationMethod::Bayes => GradientMethodKind::NotApplicable,
-        // AGQ's objective is the quadrature marginal, which has no analytic gradient here —
-        // `population_gradient` central-differences it. Reported truthfully so this can't
-        // disagree with the live dispatch (the #490 invariant).
-        EstimationMethod::Agq => GradientMethodKind::FiniteDifferences,
+        // AGQ always differentiates the quadrature marginal itself — the posterior-weighted
+        // score over the nodes plus the grid-response term, neither of which re-solves the
+        // inner loop. What varies is only the θ/σ score: analytic from the `Dual2` provider
+        // where it reaches, finite-differenced at fixed η otherwise (TTE, categorical, ODE,
+        // M3, LTBS…). Report that distinction, not a scope gate — there isn't one.
+        EstimationMethod::Agq => {
+            if crate::estimation::agq::analytic_score_supported(model) {
+                GradientMethodKind::Analytic
+            } else {
+                GradientMethodKind::FiniteDifferences
+            }
+        }
         EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
             GradientMethodKind::FiniteDifferences
         }

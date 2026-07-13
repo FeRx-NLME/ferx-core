@@ -98,6 +98,19 @@ pub const MAX_AGQ_GRID: usize = 100_000;
 /// convention so a diverged node sorts as "impossible" rather than poisoning the sum.
 const NLL_SENTINEL: f64 = 1e20;
 
+/// Relative step for central-differencing the grid-response term (and the mixed
+/// `∂²nll/∂η∂x` in [`eta_dx`]).
+///
+/// **Truncation-dominated, not noise-dominated** — the opposite of the intuition. It
+/// differences `log|H|`, which curves sharply in the packed coordinates, so a "safe" large
+/// step is catastrophic: `1e-2` puts the θ gradient 5× off, `1e-3` still 4%. The `H` inside
+/// is itself finite-differenced, but its error floor turns out to sit well below where
+/// truncation bites, so the step wants to be *small*. Measured on warfarin, the answer is
+/// converged by `1e-4` and unchanged at `1e-5`. Calibrated by
+/// `analytic_gradient_matches_fd_at_every_node_count`, which would catch a regression here
+/// immediately.
+const AGQ_GRID_FD_STEP: f64 = 1e-5;
+
 /// Number of nodes in the tensor grid, saturating at [`usize::MAX`] rather than
 /// overflowing — callers compare against [`MAX_AGQ_GRID`] and reject long before that.
 pub fn grid_size(n_nodes: usize, n_eta: usize) -> usize {
@@ -263,12 +276,54 @@ pub(crate) fn agq_subject_nll(
         return NLL_SENTINEL;
     };
 
+    let (_etas, terms) = agq_nodes_and_terms(
+        model,
+        subject,
+        params,
+        eta_hat,
+        nodes,
+        log_weights,
+        &proposal,
+        &mut scratch,
+        schedule.as_ref(),
+    );
+
+    let nll = 0.5 * d as f64 * PI.ln() + 0.5 * proposal.log_det_inv_scale - logsumexp(&terms);
+    if nll.is_finite() {
+        nll
+    } else {
+        NLL_SENTINEL
+    }
+}
+
+/// Sweep the tensor grid once, returning each node's `η_j` and its log-term
+/// `t_j = Σ_k log w_{j,k} + ‖z_j‖² − nll(η_j)`.
+///
+/// The single place the grid is materialised. The objective ([`agq_subject_nll`]) reduces
+/// the terms with `logsumexp`; the gradient ([`agq_subject_packed_gradient`]) additionally
+/// needs the `η_j` themselves and turns the same terms into softmax weights. Sharing one
+/// sweep is what guarantees the gradient is differentiating the objective that was actually
+/// evaluated, rather than a grid that drifted from it.
+#[allow(clippy::too_many_arguments)]
+fn agq_nodes_and_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+    nodes: &[f64],
+    log_weights: &[f64],
+    proposal: &crate::estimation::importance_sampling::Proposal,
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> (Vec<Vec<f64>>, Vec<f64>) {
+    let d = eta_hat.len();
     let n = nodes.len();
-    let mut terms = Vec::with_capacity(grid_size(n, d));
+    let cap = grid_size(n, d);
+    let mut etas = Vec::with_capacity(cap);
+    let mut terms = Vec::with_capacity(cap);
     let mut idx = vec![0usize; d];
     let mut z = vec![0.0f64; d];
     let mut step = vec![0.0f64; d];
-    let mut eta = vec![0.0f64; d];
 
     loop {
         let mut log_w = 0.0;
@@ -281,9 +336,8 @@ pub(crate) fn agq_subject_nll(
         }
         // η_j = η̂ + √2 · Σ^{1/2} · z_j — the adaptive transform.
         proposal.apply_l_sigma(&z, &mut step, std::f64::consts::SQRT_2);
-        for k in 0..d {
-            eta[k] = eta_hat[k] + step[k];
-        }
+        let eta: Vec<f64> = (0..d).map(|k| eta_hat[k] + step[k]).collect();
+
         let nll = individual_nll_into_with_schedule(
             model,
             subject,
@@ -291,13 +345,14 @@ pub(crate) fn agq_subject_nll(
             &eta,
             &params.omega,
             &params.sigma.values,
-            &mut scratch,
-            schedule.as_ref(),
+            scratch,
+            schedule,
         );
         // A diverged node returns `individual_nll`'s 1e20 sentinel, which lands here as a
         // ~−1e20 log-term — negligible under logsumexp unless *every* node diverged, in
         // which case the subject correctly reports the sentinel back.
         terms.push(log_w + z_sq - nll);
+        etas.push(eta);
 
         // Mixed-radix increment over the d-dimensional tensor grid.
         let mut k = 0;
@@ -313,13 +368,7 @@ pub(crate) fn agq_subject_nll(
             break;
         }
     }
-
-    let nll = 0.5 * d as f64 * PI.ln() + 0.5 * proposal.log_det_inv_scale - logsumexp(&terms);
-    if nll.is_finite() {
-        nll
-    } else {
-        NLL_SENTINEL
-    }
+    (etas, terms)
 }
 
 /// Population AGQ objective: `Σ_i agq_subject_nll_i`. The outer loop doubles this into an
@@ -329,7 +378,7 @@ pub(crate) fn agq_subject_nll(
 /// importance sampling), then reduced **serially in subject order** — a rayon `.sum()`
 /// folds along thread-count-dependent split boundaries and f64 addition is not associative,
 /// which would make the OFV depend on the thread count (#703).
-pub(crate) fn agq_population_nll(
+pub fn agq_population_nll(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -355,6 +404,696 @@ pub(crate) fn agq_population_nll(
         })
         .collect();
     per_subject.iter().sum()
+}
+
+// ---------------------------------------------------------------------------
+// Analytic outer gradient
+// ---------------------------------------------------------------------------
+//
+// # The identity
+//
+// AGQ's per-subject objective is `F = (d/2)·logπ + ½·log|H| − LSE`, and the node
+// log-terms are `t_j = log w_j + ‖z_j‖² − nll(η_j)`. Differentiating w.r.t. the packed
+// population parameters `x` with the **nodes held fixed** (η̂ and H constant), the first
+// two terms drop out and the third is a softmax:
+//
+// ```text
+//   ∂F/∂x  =  −∂LSE/∂x  =  Σ_j ŵ_j · ∂nll(η_j; x)/∂x ,     ŵ_j = exp(t_j) / Σ_k exp(t_k)
+// ```
+//
+// The `ŵ_j` are exactly the posterior weights at the nodes, so this is the **Fisher /
+// Louis identity**: `∂(−log ∫e^{−nll})/∂x = E_{p(η|y)}[∂nll/∂x]`, with the quadrature
+// supplying the expectation. Each `∂nll(η_j)/∂x` is a *fixed-η* gradient — no EBE re-solve,
+// no `log|H̃|` term, no EBE-response — which the `Dual2` provider already gives us exactly.
+//
+// # The grid also moves, and that term is not optional
+//
+// The nodes are built from `(η̂(x), H(x))`, so the total derivative also carries
+// `∂F/∂η̂ · dη̂/dx` and `∂F/∂H · dH/dx`. Both **vanish in the exact-quadrature limit** — an
+// exactly-integrated `∫exp(−nll)` does not care where you centre or how you scale the grid;
+// it is a change of variables — so they are identically the quadrature error's sensitivity,
+// and the explicit `½·log|H|` term cancels against the nodes' `H`-dependence rather than
+// either vanishing alone.
+//
+// At finite `n` they do not vanish, and they are **not** small. The fixed-node score alone,
+// measured against a finite-difference of the real objective on warfarin, is **26% wrong at
+// n = 1** (where the rule *is* Laplace and the cancellation fails completely), 0.8% at n = 3.
+// So [`grid_response_correction`] supplies the term, and the gradient is the exact total
+// derivative at every `n_agq`, n = 1 included: 0.17% / 0.16% / 0.002% / 0.0006% at
+// n = 1/3/5/7, i.e. at the FD reference's own noise floor.
+//
+// The subtlety that makes or breaks it: `H = ∂²nll/∂η²|_{η̂(x)}` depends on `x` **twice** —
+// explicitly through θ/Ω/σ, and implicitly through the mode. Differencing only the explicit
+// half is not a partial improvement, it is *worse than omitting the term* (26% → 62%). The
+// mode must be moved along `dη̂/dx` too. See [`grid_response_correction`].
+//
+// # Cost
+//
+// The score is one `subject_sensitivities` call per node — the same order as one objective
+// evaluation. The correction adds `2·n_free` Hessian rebuilds and grid sweeps, with **no**
+// inner re-solve (that is what `dη̂/dx` buys). The `reconverged_fd_gradient` it replaces
+// costs `2·n_free` *full population objective* evaluations, each re-solving every subject's
+// inner loop.
+
+/// Whether the **θ/σ score** can be taken analytically from the `Dual2` provider, or must be
+/// finite-differenced at fixed η.
+///
+/// This is a *speed* switch, not a scope gate: both paths compute the same quantity, and
+/// neither re-solves the inner loop. The analytic form chains the provider's exact `∂f/∂θ`
+/// through `∂nll/∂f`, which is only valid for the plain Gaussian residual term — every
+/// variant listed below adds a term it does not carry (M3's normal-tail, LTBS's `ln f`
+/// wrap, FREM's pseudo-observations, a dense residual covariance, an η-scaled or custom
+/// residual variance), and TTE / categorical endpoints are outside the provider entirely.
+/// Those all take [`accumulate_fixed_eta_packed_gradient_fd`] instead.
+pub fn analytic_score_supported(model: &CompiledModel) -> bool {
+    crate::sens::provider::analytic_outer_gradient_available(model)
+        && !matches!(model.bloq_method, crate::types::BloqMethod::M3)
+        && model.residual_correlations.is_empty()
+        && model.frem_config.is_none()
+        && model.residual_error_eta.is_none()
+        && !model.has_custom_ruv_magnitude()
+        && !model.log_transform
+}
+
+/// AGQ always drives the outer loop with its **own** gradient — for every model, and at every
+/// `n_agq`.
+///
+/// There is deliberately no scope gate here. The two ingredients both work universally:
+///
+/// * the fixed-η score is analytic where the provider reaches
+///   ([`analytic_score_supported`]) and finite-differenced *at fixed η* otherwise
+///   ([`accumulate_fixed_eta_packed_gradient_fd`]) — the latter is correct for any likelihood
+///   ferx can evaluate, including TTE and categorical; and
+/// * `dη̂/dx` comes from the implicit-function theorem (`−H⁻¹·∂²nll/∂η∂x`), analytic where the
+///   provider reaches and finite-differenced otherwise ([`eta_dx`]).
+///
+/// Crucially **neither path re-solves the inner loop**, which is the cost that makes
+/// `reconverged_fd_gradient` expensive. Letting the models AGQ exists for — non-Gaussian
+/// endpoints, which are precisely the ones outside the `Dual2` provider — fall back to that
+/// gradient would have made the headline use case the slow one.
+///
+/// **Node-count independent.** With [`grid_response_correction`] supplying the `∂Φ/∂H·dH/dx`
+/// term, the gradient is the exact total derivative at every `n_agq`, `n_agq = 1` included
+/// (where that term is exactly `½·d log|H|/dx`, the Laplace log-determinant).
+pub fn analytic_gradient_available(model: &CompiledModel) -> bool {
+    // Kept as a predicate (rather than inlining `true`) so a future model class that genuinely
+    // cannot supply `∂nll/∂x` at fixed η has one place to opt out; `population_gradient`'s
+    // `reconverged_fd_gradient` fallback stays wired up behind it.
+    let _ = model;
+    true
+}
+
+/// Finite-differenced θ/σ score at a **fixed η** — the universal fallback when the analytic
+/// chain rule does not apply (TTE, categorical, M3, LTBS, FREM, `block_sigma`, ODE models).
+///
+/// Central-differences `individual_nll(η; θ, σ)` in the *packed* coordinates, so the log-θ and
+/// log-σ chain rules come out automatically. The Ω block is **not** redone here: it is closed
+/// form from the η-prior and the caller has already accumulated it exactly.
+///
+/// Predictions are σ-independent, so the σ perturbations reuse nothing extra — each is one
+/// likelihood evaluation. No inner re-solve, which is the whole point.
+#[allow(clippy::too_many_arguments)]
+fn accumulate_fixed_eta_packed_gradient_fd(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    eta: &[f64],
+    weight: f64,
+    n_theta: usize,
+    sigma_start: usize,
+    out: &mut [f64],
+) -> Option<()> {
+    use crate::estimation::parameterization::{pack_params, packed_fixed_mask, unpack_params};
+
+    let x = pack_params(params);
+    let fixed = packed_fixed_mask(template);
+    let n_sigma = params.sigma.values.len();
+    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+    let schedule = cacheable_schedule(model, subject);
+
+    let mut nll_at = |p: &ModelParameters| -> f64 {
+        individual_nll_into_with_schedule(
+            model,
+            subject,
+            &p.theta,
+            eta,
+            &p.omega,
+            &p.sigma.values,
+            &mut scratch,
+            schedule.as_ref(),
+        )
+    };
+
+    // θ and σ coordinates only — the Ω block is exact in closed form and already added.
+    let coords = (0..n_theta).chain(sigma_start..sigma_start + n_sigma);
+    for k in coords {
+        if fixed[k] {
+            continue;
+        }
+        let h = 1e-6 * (1.0 + x[k].abs());
+        let mut xp = x.clone();
+        let mut xm = x.clone();
+        xp[k] += h;
+        xm[k] -= h;
+        let d = (nll_at(&unpack_params(&xp, template)) - nll_at(&unpack_params(&xm, template)))
+            / (2.0 * h);
+        if d.is_finite() {
+            out[k] += weight * d;
+        }
+    }
+    Some(())
+}
+
+/// Packed gradient of `individual_nll` at a **fixed** `eta`, accumulated as
+/// `out += weight · ∂nll(η)/∂x`.
+///
+/// This is the fixed-η score: the θ block via the provider's exact `∂f/∂θ` chained through
+/// `∂nll/∂f`, the σ block in closed form, and the Ω block from the η-prior alone
+/// (`½(−zzᵀ + Ω⁻¹)`, mapped to Cholesky-packed space by the shared
+/// [`crate::estimation::sens_outer_gradient::chol_pack`]). Deliberately carries **no**
+/// `log|H̃|` and **no** EBE-response term — those belong to the Laplace marginal, not to
+/// `nll(η)` at a fixed η.
+///
+/// Returns `None` when the subject is outside the provider's scope, which drops the whole
+/// population to the FD gradient (all-or-nothing, like `population_gradient_sens`).
+fn accumulate_fixed_eta_packed_gradient(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    eta: &[f64],
+    weight: f64,
+    out: &mut [f64],
+) -> Option<()> {
+    use crate::estimation::parameterization::theta_packs_log;
+
+    let n_obs = subject.observations.len();
+    let n_theta = params.theta.len();
+    let n_sigma = params.sigma.values.len();
+    let n_eta = eta.len();
+
+    // Ω block — from the η-prior `½(ηᵀΩ⁻¹η + log|Ω|)`, which is the *only* place Ω enters
+    // `nll` at a fixed η:
+    //   ∂/∂Ω [½ ηᵀΩ⁻¹η] = −½·zzᵀ   and   ∂/∂Ω [½ log|Ω|] = ½·Ω⁻¹,   z = Ω⁻¹η.
+    // Independent of the data, so it is accumulated even for a subject with no observations.
+    let z = &params.omega.inv * nalgebra::DVector::from_column_slice(eta);
+    let mut m_omega = DMatrix::zeros(n_eta, n_eta);
+    for r in 0..n_eta {
+        for c in 0..n_eta {
+            m_omega[(r, c)] = 0.5 * (-z[r] * z[c] + params.omega.inv[(r, c)]);
+        }
+    }
+    let omega_start = n_theta;
+    let og = crate::estimation::sens_outer_gradient::chol_pack(
+        &m_omega,
+        &params.omega.chol,
+        params.omega.diagonal,
+    );
+    for (k, &v) in og.iter().enumerate() {
+        out[omega_start + k] += weight * v;
+    }
+    let sigma_start = omega_start + og.len();
+
+    if n_obs == 0 {
+        return Some(());
+    }
+
+    // Off the analytic score's scope (a non-Gaussian endpoint, M3, LTBS, an ODE model, …):
+    // finite-difference the θ and σ blocks of `nll` at this **fixed η** instead. Still no
+    // inner re-solve — that is the expensive thing, and neither path does one — so AGQ keeps
+    // its own gradient for *every* model rather than dropping to `reconverged_fd_gradient`.
+    // This matters most for exactly the endpoints AGQ exists to serve: TTE and categorical
+    // are outside the `Dual2` provider, and it would be perverse for them to be the slow case.
+    if !analytic_score_supported(model) {
+        return accumulate_fixed_eta_packed_gradient_fd(
+            model,
+            subject,
+            params,
+            template,
+            eta,
+            weight,
+            n_theta,
+            sigma_start,
+            out,
+        );
+    }
+
+    // Exact ∂f/∂θ at *this* η. `subject_sensitivities` makes no mode assumption — the
+    // η = η̂ requirement in `sens_outer_gradient` lives in its `theta_block`, not here.
+    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
+
+    let err_keys = model.error_spec.obs_keys(subject);
+    let mut d_nll_d_f = vec![0.0f64; n_obs];
+    let mut variances = vec![0.0f64; n_obs];
+    let mut residuals = vec![0.0f64; n_obs];
+
+    for j in 0..n_obs {
+        let f = sens.obs[j].f.max(1e-12);
+        let v = model
+            .residual_variance_at(err_keys[j], f, &params.sigma.values)
+            .max(1e-12);
+        let resid = subject.observations[j] - sens.obs[j].f;
+        residuals[j] = resid;
+        variances[j] = v;
+        // ∂nll_j/∂f = −r/V + ½·(∂V/∂f)·(1/V − r²/V²)  — the halved convention of
+        // `individual_nll` (0.5·Σ[r²/V + ln V]); identical to SAEM's `d_nll_d_f`.
+        let dv_df = model
+            .error_spec
+            .dvar_df(err_keys[j], f, &params.sigma.values);
+        d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
+    }
+
+    // θ block: chain the exact ∂f/∂θ through ∂nll/∂f, then the log-θ packing chain rule.
+    for m in 0..n_theta {
+        let d: f64 = (0..n_obs)
+            .map(|j| d_nll_d_f[j] * sens.obs[j].df_dtheta[m])
+            .sum();
+        let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
+            params.theta[m]
+        } else {
+            1.0
+        };
+        out[m] += weight * d * dtheta_dx;
+    }
+
+    // σ block: closed form. ∂nll/∂(log σ_k) = Σ_j ½·(∂V_j/∂log σ_k)·(1/V_j − r_j²/V_j²).
+    for k in 0..n_sigma {
+        let d: f64 = (0..n_obs)
+            .map(|j| {
+                let f = sens.obs[j].f.max(1e-12);
+                let v = variances[j];
+                let r = residuals[j];
+                let ratio =
+                    model
+                        .error_spec
+                        .dvar_dlogsigma(err_keys[j], k, f, &params.sigma.values);
+                0.5 * ratio * (1.0 / v - r * r / (v * v))
+            })
+            .sum();
+        out[sigma_start + k] += weight * d;
+    }
+
+    Some(())
+}
+
+/// The **grid-response** term `∂Φ/∂H · dH/dx`, the one piece the fixed-node score omits.
+///
+/// Writing `F = Φ(x, H(x))` with the nodes built from `H`, the exact total derivative is
+///
+/// ```text
+///   dF/dx = ∂Φ/∂x|_H          ← the fixed-node score (analytic; see above)
+///         + ∂Φ/∂H · dH/dx     ← this function
+///         + ∂Φ/∂η̂ · dη̂/dx     ← = Σ_j ŵ_j ∇_η nll(η_j), the posterior-mean score = 0
+/// ```
+///
+/// The `∂Φ/∂η̂` factor is the posterior-mean score, which is zero by the Bartlett identity —
+/// exactly so at `n_agq = 1`, where η̂ *is* the mode. So the `H`-response is all that stands
+/// between the fixed-node score and the exact gradient. It is not a small correction: without
+/// it the gradient is 26% wrong at `n_agq = 1`.
+///
+/// It is computed by central-differencing `Φ` in `x` **through the grid alone**: the grid
+/// (`η̂`, `H`) is rebuilt at the perturbed parameters while `nll` stays at the original ones,
+/// which isolates the response term from the direct dependence already covered analytically.
+///
+/// **`H` depends on `x` twice, and both halves matter.** `H = ∂²nll/∂η²|_{η̂(x)}` varies with
+/// `x` explicitly (through θ/Ω/σ) *and* implicitly through the mode `η̂(x)`. Differencing only
+/// the explicit half is not a partial improvement — it is **worse than omitting the term
+/// entirely** (26% → 62% on warfarin at n = 1), because the two halves substantially cancel.
+/// So the mode is moved too, along the exact analytic `dη̂/dx` from
+/// [`crate::estimation::sens_outer_gradient::subject_eta_dx`] (the implicit-function
+/// derivative `−H⁻¹·∂²nll/∂η∂x`, which the EBE predictor already relies on). That is what
+/// keeps this **free of any inner re-solve**: it costs `2·n_free` Hessian rebuilds and grid
+/// sweeps, not the `2·n_free` *full population objective* evaluations `reconverged_fd_gradient`
+/// pays.
+///
+/// A fully analytic `dH/dx` would need `∂³nll/∂η²∂θ`; the provider stops at `∂²f/∂η∂θ`, so
+/// this third order is finite-differenced. `analytic_gradient_matches_fd_at_every_node_count`
+/// measures the result against a finite-difference of the real objective: 0.17% at n = 1,
+/// 0.0006% at n = 7 — the FD reference's own noise floor.
+///
+/// At `n_agq = 1` the grid objective collapses to `½·log|H|` (the single node sits at η̂), so
+/// this reduces to `½·d log|H|/dx` — precisely the Laplace log-determinant term FOCE/FOCEI
+/// carry analytically.
+#[allow(clippy::too_many_arguments)]
+fn grid_response_correction(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    nodes: &[f64],
+    log_weights: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    out: &mut [f64],
+) -> Option<()> {
+    use crate::estimation::parameterization::{packed_fixed_mask, unpack_params};
+
+    let fixed = packed_fixed_mask(template);
+
+    // `H = ∂²nll/∂η²|_{η̂(x)}` depends on `x` **twice**: explicitly through θ/Ω/σ, and
+    // implicitly through the mode `η̂(x)`. Differencing only the explicit half is not a
+    // partial improvement — it is *wrong*, and measurably worse than omitting the term
+    // (26% → 62% on warfarin at n = 1). So the mode is moved too, along the exact analytic
+    // `dη̂/dx` (the implicit-function-theorem derivative `−H⁻¹·∂²nll/∂η∂x`, which the
+    // sensitivity provider already supplies and the EBE predictor already relies on). No
+    // inner re-solve is needed.
+    let deta_dx = eta_dx(
+        model, subject, params, template, x, eta_hat, scratch, schedule,
+    )?;
+
+    for k in 0..x.len() {
+        if fixed[k] {
+            continue;
+        }
+        // `H` is itself a finite-difference quantity, so its own error floor is amplified by
+        // 1/step here. The step must stay well above sqrt(that floor); 1e-3 is calibrated by
+        // `analytic_gradient_matches_fd_at_every_node_count`.
+        let step = AGQ_GRID_FD_STEP * (1.0 + x[k].abs());
+        let mut xp = x.to_vec();
+        let mut xm = x.to_vec();
+        xp[k] += step;
+        xm[k] -= step;
+
+        // The mode moves with the parameters: η̂(x ± h) ≈ η̂ ± h · dη̂/dx_k.
+        let ep: Vec<f64> = (0..eta_hat.len())
+            .map(|i| eta_hat[i] + step * deta_dx[k][i])
+            .collect();
+        let em: Vec<f64> = (0..eta_hat.len())
+            .map(|i| eta_hat[i] - step * deta_dx[k][i])
+            .collect();
+
+        let pp = unpack_params(&xp, template);
+        let pm = unpack_params(&xm, template);
+        let hp = fd_posterior_hessian(model, subject, &pp, &ep, scratch, schedule);
+        let hm = fd_posterior_hessian(model, subject, &pm, &em, scratch, schedule);
+
+        // `nll` stays at the ORIGINAL params — the direct x-dependence is already covered
+        // analytically by the fixed-η score — but the grid (centre and scale) is the
+        // perturbed one, which is exactly the response term we are after.
+        let phip = phi_grid(
+            model,
+            subject,
+            params,
+            &ep,
+            nodes,
+            log_weights,
+            &hp,
+            &pp.omega.inv,
+            scratch,
+            schedule,
+        );
+        let phim = phi_grid(
+            model,
+            subject,
+            params,
+            &em,
+            nodes,
+            log_weights,
+            &hm,
+            &pm.omega.inv,
+            scratch,
+            schedule,
+        );
+        let (Some(phip), Some(phim)) = (phip, phim) else {
+            continue; // a degenerate perturbed Hessian contributes no correction
+        };
+        let r = (phip - phim) / (2.0 * step);
+        if r.is_finite() {
+            out[k] += r;
+        }
+    }
+    Some(())
+}
+
+/// `dη̂/dx` — how the EBE mode moves with the population parameters, per packed coordinate.
+///
+/// From the implicit function theorem: η̂ solves `∇_η nll(η̂; x) = 0`, so
+///
+/// ```text
+///   dη̂/dx = −H⁻¹ · ∂²nll/∂η∂x ,     H = ∂²nll/∂η²|_{η̂}
+/// ```
+///
+/// Uses the provider's exact version
+/// ([`crate::estimation::sens_outer_gradient::subject_eta_dx`]) where it applies, and
+/// otherwise finite-differences the mixed term `∂²nll/∂η∂x` directly — perturb `x`, take the
+/// η-gradient at the *same* η̂, solve against `H`. That costs `2·n_free · 2·d` likelihood
+/// evaluations and, critically, **no inner re-solve**: it is the derivative of the mode, not a
+/// re-computation of it. So models outside the provider (TTE, categorical, ODE) still get the
+/// cheap gradient rather than dropping to `reconverged_fd_gradient`.
+#[allow(clippy::too_many_arguments)]
+fn eta_dx(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> Option<Vec<nalgebra::DVector<f64>>> {
+    use crate::estimation::parameterization::{packed_fixed_mask, unpack_params};
+
+    if analytic_score_supported(model) {
+        if let Some(v) = crate::estimation::sens_outer_gradient::subject_eta_dx(
+            model, subject, template, x, eta_hat,
+        ) {
+            return Some(v);
+        }
+    }
+
+    let d = eta_hat.len();
+    let h_mat = fd_posterior_hessian(model, subject, params, eta_hat, scratch, schedule);
+    let h_inv = h_mat.clone().try_inverse()?;
+    let fixed = packed_fixed_mask(template);
+
+    // ∇_η nll(η̂; p) — central differences in η, at the given parameters.
+    let mut eta_grad = |p: &ModelParameters, out: &mut [f64]| {
+        let mut e = eta_hat.to_vec();
+        for i in 0..d {
+            let step = (f64::EPSILON.powf(0.25) * p.omega.matrix[(i, i)].max(0.0).sqrt()).max(1e-5);
+            e[i] = eta_hat[i] + step;
+            let fp = individual_nll_into_with_schedule(
+                model,
+                subject,
+                &p.theta,
+                &e,
+                &p.omega,
+                &p.sigma.values,
+                scratch,
+                schedule,
+            );
+            e[i] = eta_hat[i] - step;
+            let fm = individual_nll_into_with_schedule(
+                model,
+                subject,
+                &p.theta,
+                &e,
+                &p.omega,
+                &p.sigma.values,
+                scratch,
+                schedule,
+            );
+            e[i] = eta_hat[i];
+            out[i] = (fp - fm) / (2.0 * step);
+        }
+    };
+
+    let mut out = vec![nalgebra::DVector::zeros(d); x.len()];
+    let (mut gp, mut gm) = (vec![0.0f64; d], vec![0.0f64; d]);
+    for k in 0..x.len() {
+        if fixed[k] {
+            continue;
+        }
+        let step = AGQ_GRID_FD_STEP * (1.0 + x[k].abs());
+        let mut xp = x.to_vec();
+        let mut xm = x.to_vec();
+        xp[k] += step;
+        xm[k] -= step;
+        eta_grad(&unpack_params(&xp, template), &mut gp);
+        eta_grad(&unpack_params(&xm, template), &mut gm);
+        // ∂²nll/∂η∂x_k, then dη̂/dx_k = −H⁻¹ · that.
+        let mixed =
+            nalgebra::DVector::from_iterator(d, (0..d).map(|i| (gp[i] - gm[i]) / (2.0 * step)));
+        out[k] = -(&h_inv * mixed);
+    }
+    Some(out)
+}
+
+/// `Φ_grid(H)` — the part of the AGQ objective that depends on `x` *only* through `H`:
+/// `½·log|H| − logΣexp_j[ log w_j + ‖z_j‖² − nll(η̂ + √2·Σ^{1/2}(H)·z_j ; x₀) ]`.
+///
+/// `nll` is evaluated at the **original** `params`, so differencing this in `x` isolates the
+/// grid's response to `H` from the direct `x`-dependence that
+/// [`accumulate_fixed_eta_packed_gradient`] already covers analytically. The `(d/2)·logπ`
+/// constant cancels in the difference and is omitted.
+#[allow(clippy::too_many_arguments)]
+fn phi_grid(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+    nodes: &[f64],
+    log_weights: &[f64],
+    h_mat: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> Option<f64> {
+    let d = eta_hat.len();
+    let proposal = build_proposal(h_mat, omega_inv, d)?;
+    let (_etas, terms) = agq_nodes_and_terms(
+        model,
+        subject,
+        params,
+        eta_hat,
+        nodes,
+        log_weights,
+        &proposal,
+        scratch,
+        schedule,
+    );
+    let lse = logsumexp(&terms);
+    lse.is_finite()
+        .then(|| 0.5 * proposal.log_det_inv_scale - lse)
+}
+
+/// Analytic packed gradient of the AGQ objective for one subject: the posterior-weighted
+/// average of fixed-η scores over the quadrature nodes, **plus** the grid-response term
+/// [`grid_response_correction`] that makes it the exact total derivative at every `n_agq`
+/// (see the module note above).
+///
+/// `out` is the population accumulator; this adds `∂F_i/∂x` into it.
+#[allow(clippy::too_many_arguments)]
+fn agq_subject_packed_gradient(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    nodes: &[f64],
+    log_weights: &[f64],
+    out: &mut [f64],
+) -> Option<()> {
+    let d = eta_hat.len();
+    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+    let schedule = cacheable_schedule(model, subject);
+
+    if d == 0 {
+        return accumulate_fixed_eta_packed_gradient(
+            model, subject, params, template, eta_hat, 1.0, out,
+        );
+    }
+
+    let h = fd_posterior_hessian(
+        model,
+        subject,
+        params,
+        eta_hat,
+        &mut scratch,
+        schedule.as_ref(),
+    );
+    let proposal = build_proposal(&h, &params.omega.inv, d)?;
+
+    // Sweep the grid once, keeping each node's η and its log-term, so the softmax weights
+    // and the scores are computed on exactly the same nodes the objective used.
+    let (etas, terms) = agq_nodes_and_terms(
+        model,
+        subject,
+        params,
+        eta_hat,
+        nodes,
+        log_weights,
+        &proposal,
+        &mut scratch,
+        schedule.as_ref(),
+    );
+    let lse = logsumexp(&terms);
+    if !lse.is_finite() {
+        return None;
+    }
+
+    for (eta_j, &t) in etas.iter().zip(terms.iter()) {
+        let w = (t - lse).exp();
+        if w == 0.0 {
+            continue; // exp underflow — contributes nothing to the average
+        }
+        accumulate_fixed_eta_packed_gradient(model, subject, params, template, eta_j, w, out)?;
+    }
+
+    // …plus the grid's response to H — the only term the fixed-node score omits, and the
+    // whole of the gap at n_agq = 1 (where it is exactly ½·d log|H|/dx).
+    grid_response_correction(
+        model,
+        subject,
+        params,
+        template,
+        x,
+        eta_hat,
+        nodes,
+        log_weights,
+        &mut scratch,
+        schedule.as_ref(),
+        out,
+    )?;
+    Some(())
+}
+
+/// Analytic packed gradient of the AGQ **OFV** (`2 · Σᵢ Fᵢ`), or `None` if any subject is
+/// outside the provider's scope (all-or-nothing, matching `population_gradient_sens`).
+///
+/// Parallel over subjects; the per-subject gradients are reduced **serially in subject
+/// order** so the result cannot depend on the thread count (#703), exactly as
+/// [`agq_population_nll`] does for the objective.
+pub fn agq_population_gradient(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[nalgebra::DVector<f64>],
+    n_nodes: usize,
+) -> Option<Vec<f64>> {
+    let n_packed = x.len();
+    let (nodes, weights) = gauss_hermite(n_nodes);
+    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+
+    let per_subject: Vec<Option<Vec<f64>>> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let mut g = vec![0.0f64; n_packed];
+            agq_subject_packed_gradient(
+                model,
+                subject,
+                params,
+                template,
+                x,
+                eta_hats[i].as_slice(),
+                &nodes,
+                &log_weights,
+                &mut g,
+            )
+            .map(|()| g)
+        })
+        .collect();
+
+    let mut out = vec![0.0f64; n_packed];
+    for g in per_subject {
+        let g = g?;
+        for (o, v) in out.iter_mut().zip(g.iter()) {
+            *o += 2.0 * v; // OFV = 2 · Σᵢ Fᵢ
+        }
+    }
+    if out.iter().all(|v| v.is_finite()) {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

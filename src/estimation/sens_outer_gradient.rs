@@ -1580,7 +1580,10 @@ fn natural_omega_grad_matrix(prep: &Prep, eta_hat: &[f64]) -> DMatrix<f64> {
 /// triangular), with the diagonal log-chain (`x_ii = ln L_ii ⇒ ×L_ii`) and raw
 /// off-diagonals — the same convention/order as [`omega_packed_block`] /
 /// `pack_params`.
-fn chol_pack(m_sub: &DMatrix<f64>, l: &DMatrix<f64>, diagonal: bool) -> Vec<f64> {
+///
+/// Shared with [`crate::estimation::agq`], whose fixed-η natural Ω gradient is the
+/// same `M_sub` shape (just without the Laplace `log|H̃|` and EBE-response terms).
+pub(crate) fn chol_pack(m_sub: &DMatrix<f64>, l: &DMatrix<f64>, diagonal: bool) -> Vec<f64> {
     let n = l.nrows();
     let gl = (m_sub * l).scale(2.0);
     let mut out = Vec::new();

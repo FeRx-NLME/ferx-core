@@ -5198,15 +5198,20 @@ fn fit_inner(
             EstimationMethod::Foce => stage_opts.interaction = false,
             _ => {}
         }
-        // AGQ minimises the quadrature marginal, which has no analytic gradient — so
-        // `auto` must not resolve to the gradient-based optimizer it picks for in-scope
-        // FOCE/FOCEI models. That choice is conditioned on an exact gradient existing
-        // (#490); with only finite differences available, `auto`'s documented answer is
-        // the derivative-free one, and `build_info::gradient_method_outer` already reports
-        // AGQ as FD. Pinning it here keeps the two in agreement. An explicit
-        // `optimizer = ...` is still honoured.
+        // AGQ resolves `auto` to L-BFGS, because it *has* a gradient: the analytic
+        // posterior-weighted score over the quadrature nodes (`estimation::agq`), with the
+        // reconverged-FD gradient as the always-correct fallback.
+        //
+        // BOBYQA — what `resolve_auto` hands every other FD-only fit — **false-converges**
+        // on this objective (the #317 failure mode): on warfarin it stops 0.015 OFV units
+        // above the optimum at the default `inner_tol`, and *worsens* to 0.18 as `inner_tol`
+        // is tightened, because a smoother objective merely lets its trust-region stopping
+        // rule trip sooner (63 -> 34 evaluations, still reporting "converged"). Its ω
+        // estimates land ~3% off NONMEM LAPLACIAN. L-BFGS on the analytic gradient matches
+        // NONMEM to 4-5 significant figures on every parameter, in 0.39 s against FOCEI's
+        // 0.29 s. See docs/estimation/agq.qmd. An explicit `optimizer = ...` is honoured.
         if matches!(method, EstimationMethod::Agq) && stage_opts.optimizer == Optimizer::Auto {
-            stage_opts.optimizer = Optimizer::Bobyqa;
+            stage_opts.optimizer = Optimizer::NloptLbfgs;
         }
         // Run the covariance step (and SIR) only on the last *estimating* stage,
         // so a chain doesn't recompute the expensive FD covariance after every
