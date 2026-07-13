@@ -751,3 +751,86 @@ fn iov_m3_ode_matches_closed_form_estimates() {
         );
     }
 }
+
+/// Estimate-level validation for **lagtime × IOV** (#486). An oral model with an estimated
+/// `ALAG` and inter-occasion variability is bread-and-butter popPK, and until #486 it dropped
+/// the *whole fit* to finite differences: the closed-form IOV walk declined any lagtime,
+/// because it carried no jet for the dose arrival `t + ALAG`. The walk now threads that arrival
+/// as a moving dual boundary, so the fit takes the exact analytic gradient on both loops.
+///
+/// The FD path is the reference — it is NONMEM-anchored on `warfarin_iov` (see the module
+/// header) — and the analytic path must land on the *same* optimum, since both differentiate
+/// the identical marginal. Agreement therefore shows the FD→analytic swap changed the gradient's
+/// *route*, not the objective or the estimates. (Per-point gradient exactness is pinned
+/// separately by the `lagtime_*_matches_fd_*` unit tests.)
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn iov_lagtime_analytic_matches_fd_estimates() {
+    let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVLAG(0.4, 0.01, 3.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  LAGTIME = TVLAG
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  covariance = false
+"#;
+    let model = ferx_core::parser::model_parser::parse_model_string(src)
+        .expect("IOV + lagtime model parses");
+    assert!(model.has_lagtime());
+    assert_eq!(model.n_kappa, 1);
+    // The cell this test exists for: the model must be in analytic IOV scope now.
+    assert!(
+        ferx_core::sens::provider::iov_sens_supported(&model),
+        "lagtime + IOV must take the analytic gradient (#486)"
+    );
+
+    let pop = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
+        .expect("warfarin_iov data loads");
+
+    let run = |gm: ferx_core::GradientMethod| -> FitResult {
+        let mut opts = FitOptions::default();
+        opts.method = EstimationMethod::FoceI;
+        opts.interaction = true;
+        opts.optimizer = Optimizer::Slsqp;
+        opts.gradient_method = gm;
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        fit(&model, &pop, &model.default_params, &opts).expect("IOV + lagtime fit runs")
+    };
+    let analytic = run(ferx_core::GradientMethod::Auto);
+    let fd = run(ferx_core::GradientMethod::Fd);
+
+    assert!(
+        (analytic.ofv - fd.ofv).abs() < 1.0,
+        "analytic OFV {:.4} vs FD OFV {:.4} should agree (same marginal)",
+        analytic.ofv,
+        fd.ofv
+    );
+    for k in 0..analytic.theta.len() {
+        let (a, f) = (analytic.theta[k], fd.theta[k]);
+        assert!(
+            (a - f).abs() <= 0.03 * f.abs().max(1e-3),
+            "theta[{k}]: analytic {a:.5} vs FD {f:.5} diverge beyond 3%"
+        );
+    }
+}

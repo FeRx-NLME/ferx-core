@@ -1320,6 +1320,9 @@ fn run_mcem(
 
     Ok(OuterResult {
         params: final_params,
+        // No packed optimizer vector at the converged point on this path; a later
+        // `run_covariance` reconstructs one from the reported estimates.
+        packed_estimates: None,
         ofv,
         // IMPMAP runs a fixed iteration schedule (no parameter-stabilization
         // stopping test yet), so the only convergence signal we can honestly

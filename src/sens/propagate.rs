@@ -776,41 +776,69 @@ fn propagate_bounds_g<T: PkNum>(
     pk_model: PkModel,
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
+    dose_lag_dual: &[T],
     dose_inf_dual: &[Option<(T, T)>],
     reset_floor: f64,
 ) {
-    // Moving infusion-end boundaries, precomputed once rather than re-scanned per
-    // sub-interval (#486 review #7): each post-reset modeled dose contributes
-    // `(end_time, dual_end)` with `dual_end = t_start + D` carrying `D`'s jet. Doses
-    // starting before a reset are skipped here exactly as the rate-accumulation loop
-    // below skips them (`t_start < reset_floor`), so a modeled infusion whose end
-    // coincides with a reset break does not thread a spurious `∂D` into the
-    // post-reset window (#486 review #3). The provider declines *distinct-slot*
-    // coincident ends to FD (`modeled_ends_separable`), so at most one entry matches a
-    // given break and same-slot coincidences share an identical `dual_end` — the
-    // first match below is therefore exact (#486 review #2).
-    let modeled_ends: Vec<(f64, T)> = doses
-        .iter()
-        .enumerate()
-        .filter_map(|(k, d)| {
-            let (_, dur_bare) = dose_inf_dual.get(k).copied().flatten()?;
-            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
-            let t_start = d.time + lag;
-            if t_start < reset_floor {
-                return None;
+    // Dual clock position of dose `k`'s arrival, `τ_k = t_k + ALAG`. With an estimated
+    // lagtime this boundary **moves**: `dose_lag_dual[k]` carries `∂ALAG/∂(θ,η)`, so the
+    // sub-intervals on either side of the arrival pick up `±∂ALAG` in their dual lengths
+    // and the closed-form flow yields the exact bolus saltation `−A·Φ(t−τ)·b` — the same
+    // dual-boundary mechanism the modeled infusion *end* already uses, needing no explicit
+    // saltation injection (#486). Empty `dose_lag_dual` ⇒ no lagtime in scope ⇒ a constant.
+    let dose_start = |k: usize, d: &DoseEvent| -> (f64, T) {
+        let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+        let t_start = d.time + lag;
+        let dual = match dose_lag_dual.get(k) {
+            Some(&lag_d) => T::from_f64(d.time) + lag_d,
+            None => T::from_f64(t_start),
+        };
+        (t_start, dual)
+    };
+    // Every break whose dual position is not simply its f64 value: each post-reset dose
+    // contributes its arrival `τ_k`, and an infusing dose additionally contributes its
+    // window end `τ_k + D` (the modeled `D`'s jet on top of the arrival's). Doses starting
+    // before a reset are skipped exactly as the rate-accumulation loop below skips them
+    // (`t_start < reset_floor`), so a boundary coinciding with a reset break does not thread
+    // a spurious jet into the post-reset window (#486 review #3).
+    //
+    // The provider declines to FD any subject whose moving boundaries are not *separable* —
+    // two breaks coinciding in `f64` while carrying different jets (`moving_bounds_separable`)
+    // — so at most one entry matches a given break and coincidences that survive share an
+    // identical dual. The first match below is therefore exact (#486 review #2).
+    //
+    // Only boundaries that genuinely *move* are recorded: with no lagtime and no modeled
+    // window nothing does, so this stays empty and `dual_pos` below is the same no-op scan it
+    // was pre-#486 — the ordinary fixed-dose subject (the hot path) pays nothing.
+    let has_lag = !dose_lag_dual.is_empty();
+    let mut moving_bounds: Vec<(f64, T)> = Vec::new();
+    for (k, d) in doses.iter().enumerate() {
+        let (t_start, dual_start) = dose_start(k, d);
+        if t_start < reset_floor {
+            continue;
+        }
+        // The arrival moves only under a lagtime.
+        if has_lag {
+            moving_bounds.push((t_start, dual_start));
+        }
+        if d.rate > 0.0 && d.duration > 0.0 {
+            // The window end moves with the arrival *and* (for a modeled `RATE=-1/-2` dose)
+            // with the estimated duration. A fixed infusion under a lagtime still has a moving
+            // end — it rides the arrival's jet — but a fixed infusion with no lag does not.
+            let dual_end = match dose_inf_dual.get(k).copied().flatten() {
+                Some((_, dur_bare)) => Some(dual_start + dur_bare),
+                None if has_lag => Some(dual_start + T::from_f64(d.duration)),
+                None => None,
+            };
+            if let Some(dual_end) = dual_end {
+                moving_bounds.push((t_start + d.duration, dual_end));
             }
-            Some((t_start + d.duration, T::from_f64(t_start) + dur_bare))
-        })
-        .collect();
-    // Dual clock position of a sub-interval boundary `w`. For a fixed break time it
-    // is just `w`; for the moving *end* of a modeled infusion (`t_start + D`) it
-    // carries `D`'s jet, so adjacent active/quiet windows get `±∂D` in their dual
-    // lengths and the moving-boundary sensitivity is exact (#486). The dose *start*
-    // never moves here (no lagtime in walk scope), so only the end is threaded.
+        }
+    }
     let dual_pos = |w: f64| -> T {
-        for &(end_val, dual_end) in &modeled_ends {
-            if (w - end_val).abs() < 1e-9 {
-                return dual_end;
+        for &(val, dual) in &moving_bounds {
+            if (w - val).abs() < 1e-9 {
+                return dual;
             }
         }
         T::from_f64(w)
@@ -1032,6 +1060,10 @@ fn equilibrate_ss_g<T: PkNum>(
             pk_model,
             &synthetic_dose,
             &synthetic_lag,
+            // The SS equilibration runs in the dose's own periodic frame (the synthetic pulse
+            // sits at t = 0), so its arrival is not a moving boundary: no lag duals. A subject
+            // that pairs SS with a lagtime declines to FD upstream (`ss_lagtime_walk_unsupported`).
+            &[],
             &synthetic_inf,
             f64::NEG_INFINITY,
         );
@@ -1076,6 +1108,7 @@ pub fn event_driven_sens_g<T: PkNum>(
         schedule,
         &subject.doses,
         &[],
+        &[],
         pk_at_dose,
         pk_at_obs,
         pk_at_pk_only,
@@ -1088,14 +1121,20 @@ pub fn event_driven_sens_g<T: PkNum>(
 /// resolves each dose to `f64` (so the schedule's break times and the active-window
 /// checks are correct) and supplies `Some((rate_bare, dur_bare))` per modeled dose
 /// so the rate magnitude and the moving infusion-end boundary carry their PK-param
-/// jets. `eff_doses` / `dose_inf_dual` are parallel to `subject.doses`
+/// jets. `eff_doses` / `dose_inf_dual` / `dose_lag_dual` are parallel to `subject.doses`
 /// (`dose_inf_dual` may be empty, treated as all-`None`).
+///
+/// `dose_lag_dual[k]` is dose `k`'s lagtime as a dual (#486). A model with an estimated
+/// `ALAG` makes each dose *arrival* a moving boundary, exactly as `D`/`R` makes the
+/// infusion *end* one; the walk threads both through the dual sub-interval lengths.
+/// Empty ⇒ the model carries no lagtime and every arrival is a fixed break.
 #[allow(clippy::too_many_arguments)]
 pub fn event_driven_sens_with_doses_g<T: PkNum>(
     pk_model: PkModel,
     subject: &Subject,
     schedule: &EventSchedule,
     eff_doses: &[DoseEvent],
+    dose_lag_dual: &[T],
     dose_inf_dual: &[Option<(T, T)>],
     pk_at_dose: &[PkDual<T>],
     pk_at_obs: &[PkDual<T>],
@@ -1130,6 +1169,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 pk_model,
                 eff_doses,
                 &schedule.dose_lagtimes,
+                dose_lag_dual,
                 dose_inf_dual,
                 reset_floor,
             );

@@ -2128,6 +2128,7 @@ mod tests {
         let sigma_types = error_model.sigma_types();
         let n = sigma.len();
         FitResult {
+            packed_estimates: None,
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],
             method_wall_times_secs: vec![0.0],
@@ -2695,6 +2696,7 @@ mod tests {
     fn minimal_sdtab_result(subjects: Vec<SubjectResult>) -> FitResult {
         let sigma_types = ErrorModel::Proportional.sigma_types();
         FitResult {
+            packed_estimates: None,
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],
             method_wall_times_secs: vec![0.0],

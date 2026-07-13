@@ -16,7 +16,7 @@
 
 use crate::api::{cov_diagnostics, extract_standard_errors, resolve_covariance_status};
 use crate::estimation::outer_optimizer::{compute_covariance, CovarianceStepResult};
-use crate::estimation::parameterization::{compute_mu_k, pack_params};
+use crate::estimation::parameterization::{compute_mu_k, pack_params, unpack_params};
 use crate::estimation::uncertainty_samples::fitted_params_from_result;
 use crate::io::hash::sha256_file;
 use crate::types::*;
@@ -191,8 +191,29 @@ pub fn run_covariance(
     // slightly different EBE than the cold path — enough to make the covariance
     // matrix diverge from the inline result by ~1e-4 on some platforms. Matching
     // the inline start point keeps the two numerics bit-for-bit comparable.
-    let params = fitted_params_from_result(fit, model_ref);
-    let x_hat = pack_params(&params);
+    // Use the **exact** packed vector the fit's own covariance step would have run at, when
+    // the fit carries one. Reconstructing it from the reported θ/Ω/σ (`pack_params` below)
+    // re-derives ω's Cholesky factor from the reported *matrix*, which shifts the packed
+    // values by ~1 ULP. That looks negligible — but the covariance step differentiates the
+    // OFV by second differences, and the OFV itself is only reproducible to ~1e-10 (the inner
+    // EBE loop is iterative, so a 1-ULP move in θ/Ω/σ moves its iterates). The `1/h²` of the
+    // FD Hessian, plus the matrix inverse, turns that into an O(1e-4) difference in the
+    // covariance matrix and the SEs. Carrying the vector makes this wrapper reproduce the
+    // inline step bit-for-bit rather than approximately.
+    //
+    // Fitted results without one (older `.fitrx` bundles, optimizer paths that hold no packed
+    // vector) fall back to reconstruction — correct, just not bit-identical to an inline run.
+    let template = fitted_params_from_result(fit, model_ref);
+    let reconstructed = pack_params(&template);
+    let x_hat = match fit.packed_estimates.as_ref() {
+        Some(x) if x.len() == reconstructed.len() => x.clone(),
+        _ => reconstructed,
+    };
+    // Derive the parameters from that same vector, so the EBE warm-start below is computed at
+    // exactly the point the covariance step differentiates around (the inline path's
+    // `final_params` is likewise `unpack_params(x0, …)`). `template` supplies only structure —
+    // bounds, fixed masks, names — whose values are identical either way.
+    let params = unpack_params(&x_hat, &template);
     let mu_k = compute_mu_k(model_ref, &params.theta, options.mu_referencing);
     let (eta_hats, h_matrices, _stats, kappas) =
         crate::estimation::inner_optimizer::run_inner_loop_warm(
@@ -362,16 +383,17 @@ mod tests {
             .zip(cov_new.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
-        // `run_covariance` reconstructs the packed parameter vector via a
-        // Cholesky round-trip (FitResult.omega → Chol(FitResult.omega) → L),
-        // which introduces O(ε_machine · cond(L)) error relative to the inline
-        // path's exact L (stored from the optimizer, never re-decomposed).
-        // The resulting FD-Hessian perturbations differ by the same amount,
-        // so strict sub-1e-6 parity is not achievable through this path.
-        // 1e-4 is tight enough to catch any real regression while being
-        // realistic about the precision limit of the round-trip.
+        // **Exact** parity. `run_covariance` now differentiates around the very packed vector
+        // the inline step used (`FitResult::packed_estimates`) rather than reconstructing one
+        // from the reported θ/Ω/σ. That reconstruction re-derived ω's Cholesky factor from the
+        // reported *matrix*, moving the packed values by ~1 ULP; because the covariance step
+        // takes second differences of an OFV that is itself only reproducible to ~1e-10 (the
+        // inner EBE loop is iterative), the `1/h²` of the FD Hessian plus the matrix inverse
+        // amplified that into a ~6e-4 divergence. With the exact vector the two paths run the
+        // identical arithmetic, so they agree to the last bits — anything above round-off here
+        // means a real regression, not "FD noise".
         assert!(
-            max_abs_diff < 1e-4,
+            max_abs_diff < 1e-12,
             "run_covariance matrix diverged from inline cov (max abs diff {max_abs_diff})"
         );
 

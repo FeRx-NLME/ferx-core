@@ -5027,6 +5027,9 @@ fn fit_inner(
                 );
                 result = Some(crate::estimation::outer_optimizer::OuterResult {
                     params: stage_params.clone(),
+                    // No packed optimizer vector at the converged point on this path; a later
+                    // `run_covariance` reconstructs one from the reported estimates.
+                    packed_estimates: None,
                     ofv: 2.0 * nll,
                     converged: true,
                     n_iterations: 0,
@@ -5677,6 +5680,7 @@ fn fit_inner(
         ofv,
         aic,
         bic,
+        packed_estimates: result.packed_estimates.clone(),
         theta: result.params.theta.clone(),
         theta_names: result.params.theta_names.clone(),
         eta_names: result.params.omega.eta_names.clone(),
@@ -12865,6 +12869,7 @@ mod simulate_with_uncertainty_tests {
         let n_packed = crate::estimation::parameterization::packed_len(template);
         let cov = DMatrix::identity(n_packed, n_packed) * 0.01;
         FitResult {
+            packed_estimates: None,
             method: EstimationMethod::FoceI,
             method_chain: vec![EstimationMethod::FoceI],
             method_wall_times_secs: vec![0.0],

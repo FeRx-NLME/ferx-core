@@ -11,6 +11,21 @@ use std::sync::{Arc, Mutex};
 /// Result of outer optimization
 pub struct OuterResult {
     pub params: ModelParameters,
+    /// The **exact** packed optimizer vector at the converged point (log-θ /
+    /// Cholesky-ω / log-σ space) — the very vector the inline covariance step was
+    /// evaluated at.
+    ///
+    /// This cannot be recovered from `params` after the fact: `params.omega` is
+    /// reported as a *matrix*, and re-deriving its Cholesky factor rounds the packed
+    /// values by ~1 ULP. The FD-of-OFV covariance Hessian amplifies that by `1/h²`
+    /// (and the matrix inverse again), turning a 1-ULP input shift into an O(1e-4)
+    /// difference in the covariance matrix — so a standalone `run_covariance` that
+    /// rebuilt the vector from the reported θ/Ω/σ did **not** reproduce the inline
+    /// step. Carrying the exact vector makes the two bit-identical.
+    ///
+    /// `None` for optimizer paths that don't hold a packed vector at the converged
+    /// point; `run_covariance` then falls back to reconstructing it.
+    pub packed_estimates: Option<Vec<f64>>,
     pub ofv: f64,
     pub converged: bool,
     pub n_iterations: usize,
@@ -207,6 +222,9 @@ fn evaluate_at_initial_params(
 
     OuterResult {
         params,
+        // The covariance step above was evaluated at `x`; carry it so a later
+        // `run_covariance` reproduces this step bit-for-bit.
+        packed_estimates: Some(x.clone()),
         ofv,
         converged: false,
         n_iterations: 0,
@@ -1394,6 +1412,9 @@ fn optimize_nlopt(
     let ebe_final = ebe_accum.lock().unwrap();
     OuterResult {
         params: final_params,
+        // The exact converged vector the covariance step above ran at — see
+        // `OuterResult::packed_estimates`.
+        packed_estimates: Some(x0.to_vec()),
         ofv: final_ofv,
         converged,
         // NLopt doesn't expose an "iteration" count (BOBYQA/SLSQP don't have
@@ -1843,6 +1864,9 @@ fn optimize_bfgs(
 
     OuterResult {
         params: final_params,
+        // The exact converged vector the covariance step above ran at — see
+        // `OuterResult::packed_estimates`.
+        packed_estimates: Some(x_final.to_vec()),
         ofv: final_ofv,
         converged,
         n_iterations,

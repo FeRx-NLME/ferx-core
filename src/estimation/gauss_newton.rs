@@ -439,6 +439,9 @@ pub fn run_foce_gn(
 
         return OuterResult {
             params: gn_params,
+            // No packed optimizer vector at the converged point on this path; a later
+            // `run_covariance` reconstructs one from the reported estimates.
+            packed_estimates: None,
             ofv,
             converged,
             n_iterations: maxiter,
@@ -559,6 +562,9 @@ pub fn run_foce_gn(
 
     OuterResult {
         params: final_params,
+        // No packed optimizer vector at the converged point on this path; a later
+        // `run_covariance` reconstructs one from the reported estimates.
+        packed_estimates: None,
         ofv: final_ofv,
         converged,
         n_iterations: maxiter,

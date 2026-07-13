@@ -4394,6 +4394,21 @@ pub struct FitResult {
     pub bic: f64,
     pub theta: Vec<f64>,
     pub theta_names: Vec<String>,
+    /// The exact packed optimizer vector at the converged point (log-θ / Cholesky-ω /
+    /// log-σ space), as handed to the inline covariance step.
+    ///
+    /// Persisted because it is **not recoverable** from `theta`/`omega`/`sigma`: `omega` is
+    /// reported as a matrix, so re-deriving its Cholesky factor shifts the packed values by
+    /// ~1 ULP — which the FD-of-OFV covariance Hessian amplifies by `1/h²` (and the matrix
+    /// inverse again) into an O(1e-4) difference in the covariance matrix. Carrying the
+    /// vector lets [`run_covariance`](crate::estimation::run_covariance::run_covariance)
+    /// reproduce the inline covariance step bit-for-bit instead of merely approximately.
+    ///
+    /// `None` for optimizer paths that hold no packed vector, and for fits deserialized from
+    /// a `.fitrx` bundle written before this field existed; the covariance step then falls
+    /// back to reconstructing the vector from the reported estimates.
+    #[serde(default)]
+    pub packed_estimates: Option<Vec<f64>>,
     /// Names of the random effects (etas), parallel to the omega diagonal.
     pub eta_names: Vec<String>,
     #[serde(with = "crate::serde_nalgebra::dmatrix")]

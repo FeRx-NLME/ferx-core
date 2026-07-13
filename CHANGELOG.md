@@ -20,6 +20,26 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Exact (analytic) FOCE/FOCEI gradients for lagtime models with IOV, time-varying
+  covariates, or `TIME`** (#486): a closed-form model carrying an `ALAG`/`LAGTIME` used to
+  fall back to finite differences the moment the subject also had IOV, a time-varying
+  covariate, or a `TIME`-dependent parameter — which covers a large share of everyday oral
+  popPK models. Those fits now use the exact analytic gradient on both loops: they are
+  faster (FD costs one extra objective evaluation per parameter) and no longer inherit the
+  finite-difference step's accuracy loss. Estimates are unchanged within convergence
+  tolerance. Steady-state doses combined with a lagtime still use finite differences.
+- **Exact (analytic) gradients for steady-state dosing combined with an EVID 3/4 reset**
+  (#486) on the closed-form engine — previously finite differences (the ODE engine already
+  had it).
+- **Analytic gradients for `[scaling] y = <expr>` readouts that reference many parameters**
+  (#486): a Form-C readout whose individual parameters spilled past the eight structural PK
+  slots (e.g. a sigmoid-Emax readout on a 3-compartment oral model) fell back to finite
+  differences on the time-varying-covariate path; it is now analytic.
+- **Wider models keep the analytic gradient** (#486): the monomorphisation caps that decide
+  when a model is too wide for the exact gradient were raised — `θ + η` from 16 to 24 (ODE
+  and output-scaling paths) and from 24 to 32 on the closed-form event walk. A mid-sized
+  covariate model (5 structural θ + 6 covariate-effect θ + 5 η) sat at exactly the old
+  limit, so adding one more covariate silently dropped the whole fit to finite differences.
 - **Restart of an interrupted run from a checkpoint** (#755): a fit now
   periodically saves a small `{model}.tmp` resume point (throttled to
   `[fit_options] checkpoint_interval_secs`, default 300 s, so short runs write
@@ -355,6 +375,20 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **`run_covariance` now reproduces the inline covariance step exactly.** A standalone
+  covariance step (`run_covariance`, `ferx` covariance on a saved fit) returned a covariance
+  matrix and standard errors that differed from the same fit run with `covariance = true`
+  inline — by up to ~6e-4 on the warfarin example, enough to be visible in reported SEs. The
+  cause was that `run_covariance` rebuilt the optimizer's packed parameter vector from the
+  *reported* θ/Ω/σ, which re-derives Ω's Cholesky factor from the reported matrix and shifts
+  the packed values by ~1 ULP. That looks negligible, but the covariance step takes **second
+  differences** of an objective that is itself only reproducible to ~1e-10 (the inner EBE loop
+  is iterative), so the FD Hessian's `1/h²` — and then the matrix inverse — amplified a
+  last-bit input difference into the fourth decimal of the covariance. The exact converged
+  vector is now carried on `FitResult` (`packed_estimates`, also persisted in `.fitrx`), so
+  the standalone step differentiates around precisely the point the inline step used and the
+  two agree to the last bits. Fits saved before this change still work — they fall back to the
+  old reconstruction.
 - **Inner EBE line search no longer aborts on a non-finite objective** (#719
   follow-up): the FOCEI inner-loop backtracking line search
   (`estimation/inner_optimizer.rs`) could panic with `clamp(NaN, NaN)` (a process

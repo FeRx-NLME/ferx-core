@@ -438,6 +438,9 @@ pub fn optimize_trust_region(
 
     OuterResult {
         params: final_params,
+        // No packed optimizer vector at the converged point on this path; a later
+        // `run_covariance` reconstructs one from the reported estimates.
+        packed_estimates: None,
         ofv: final_ofv,
         converged,
         n_iterations: 0,
