@@ -562,6 +562,64 @@ mod ctmm_smoke {
         assert!((q_low[(1, 0)] - q_high[(1, 0)]).abs() < 1e-12);
     }
 
+    /// A transition-intensity identifier that names **both** an ODE state and a declared
+    /// `[covariates]` column is ambiguous — the fit would silently use the model state and
+    /// ignore the data column. The parser must reject it fail-loud (#825 review, finding #3).
+    #[test]
+    fn ctmm_rejects_state_covariate_name_collision() {
+        // Baseline: identical model but with a differently-named covariate parses fine.
+        const OK: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta SLOPE(0.1, -5.0, 5.0)
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+  KA = TVKA
+
+[covariates]
+  continuous: WT
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + SLOPE * (central / V))
+  transition asleep -> awake  = exp(LQ10)
+";
+        assert!(
+            parse_model_string(OK).is_ok(),
+            "baseline (no name collision) must parse"
+        );
+
+        // Declaring a covariate named `central` — the same name as an ODE state the
+        // intensity references — must be rejected.
+        let collide = OK.replace("continuous: WT", "continuous: central");
+        let err = parse_model_string(&collide)
+            .expect_err("a state/covariate name collision must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("central") && msg.to_lowercase().contains("ambiguous"),
+            "error should name the colliding identifier and flag the ambiguity; got: {msg}"
+        );
+    }
+
     /// Degenerate anchor for the Slice-3 integration (#817): with `SLOPE = 0` the generator
     /// is state-**independent** (constant `Q`), so the inhomogeneous occupancy-ODE path must
     /// reduce to the time-homogeneous `expm(Q·Δt)` result. The drug-driven model at `SLOPE = 0`
@@ -741,6 +799,93 @@ mod ctmm_smoke {
             (got - expected).abs() < 1e-4,
             "drug-driven CTMM NLL {got} must match the closed form {expected} (Δ = {})",
             (got - expected).abs()
+        );
+    }
+
+    /// The inhomogeneous (drug-driven) path must reproduce the homogeneous path's hard-repel
+    /// guards rather than silently scoring a bogus likelihood (#825 review, findings #6/#7):
+    ///   • an out-of-order (decreasing-time) record pair, and
+    ///   • a diverged (enormous-but-finite) transition intensity
+    /// must both collapse the subject to the sentinel NLL so the optimizer is repelled.
+    #[test]
+    fn ctmm_drug_driven_repels_bad_time_and_diverged_intensity() {
+        use ferx_core::markov::endpoint::ctmm_subject_nll;
+        use ferx_core::types::{DoseEvent, ObsRecord};
+
+        const M: &str = r"
+[parameters]
+  theta CL(1.0, 0.01, 100.0)
+  theta V(10.0, 0.1, 500.0)
+  theta A(0.5, 1e-4, 100.0)
+  theta B(0.3, 1e-4, 100.0)
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CLi = CL
+  Vi  = V
+  Ai  = A
+  Bi  = B
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CLi/Vi) * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [s0=0, s1=1]
+  transition s0 -> s1 = Ai * (central / Vi)
+  transition s1 -> s0 = Bi * (central / Vi)
+";
+        let model = parse_model_string(M).expect("commuting drug-driven CTMM must parse");
+        let theta = &model.default_params.theta;
+        const SENTINEL: f64 = 1e20;
+
+        // Sanity: a well-ordered, moderate-dose subject scores a finite (non-sentinel) NLL.
+        let ok_obs = [(0.5_f64, 0usize), (1.3, 1), (2.6, 0)];
+        let mk = |dose: f64, obs: &[(f64, usize)]| {
+            let mut s = common::subject(
+                "1",
+                vec![DoseEvent::new(0.0, dose, 1, 0.0, false, 0.0)],
+                vec![],
+                vec![],
+                vec![],
+            );
+            s.obs_records = obs
+                .iter()
+                .map(|&(time, state)| ObsRecord::DiscreteState {
+                    time,
+                    state,
+                    cmt: 5,
+                })
+                .collect();
+            s
+        };
+        let good = ctmm_subject_nll(&model, &mk(100.0, &ok_obs), theta, &[]);
+        assert!(
+            good.is_finite() && good < SENTINEL,
+            "baseline NLL {good} must be finite"
+        );
+
+        // #6: decreasing time between two same-state records → repel.
+        let dec_obs = [(2.6_f64, 0usize), (1.3, 0)];
+        let dec = ctmm_subject_nll(&model, &mk(100.0, &dec_obs), theta, &[]);
+        assert!(
+            dec >= SENTINEL,
+            "decreasing-time pair must repel (got {dec})"
+        );
+
+        // #7: an enormous bolus drives C(t)=central/V huge, so the intensity Ai·C diverges
+        // (|q·dt| ≫ MAX_EXP_ARG_ABS) → repel rather than integrate a hung/overflowed solve.
+        let huge = ctmm_subject_nll(&model, &mk(1e20, &ok_obs), theta, &[]);
+        assert!(
+            huge >= SENTINEL,
+            "diverged intensity must repel (got {huge})"
         );
     }
 

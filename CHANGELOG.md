@@ -31,8 +31,9 @@ section of the SDLC for the versioning policy).
   random effects. An intensity may also depend on a **model state** — a drug
   concentration (`central / V`) or a PD response — making the generator
   time-inhomogeneous `Q(t) = f(state(t))` (#817); ferx then integrates the
-  occupancy ODE `dP/dτ = Q(state(t))·P` over each observation gap instead of the
-  closed-form matrix exponential (requires an ODE model). Requires the `markov`
+  occupancy ODE `dP/dτ = P·Q(state(t))` (forward Kolmogorov) over each
+  observation gap instead of the closed-form matrix exponential (requires an ODE
+  model). Requires the `markov`
   cargo feature. See the
   [Markov models](https://ferx-nlme.github.io/ferx-core/model-file/markov-model.html)
   and [CTMM estimation](https://ferx-nlme.github.io/ferx-core/estimation/ctmm.html)

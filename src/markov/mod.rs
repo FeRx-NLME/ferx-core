@@ -340,11 +340,16 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
 /// that varies within the interval — the drug-driven CTMM (`Q(t) = f(C(t))`),
 /// Phase 6, Track D (#817).
 ///
-/// Solves the matrix occupancy ODE
+/// Solves the matrix occupancy ODE (forward Kolmogorov, right multiplication)
 ///
 /// ```text
-///   dP/dτ = Q(τ)·P,   P(0) = I,   τ ∈ [0, Δt]
+///   dP/dτ = P·Q(τ),   P(0) = I,   τ ∈ [0, Δt]
 /// ```
+///
+/// so `P(Δt)[from, to] = Pr(state = to at Δt | state = from at 0)`, matching the
+/// homogeneous `matrix_exp(Q·Δt)` indexing. (The backward form `Q(τ)·P` gives the
+/// transpose-ordered result and is only equal for a generator that commutes across
+/// time — constant `Q`, or `Q(τ)=g(τ)·Q₀`.)
 ///
 /// on the shared Dormand–Prince RK45 engine ([`crate::ode::solve_ode`]) and
 /// returns `P(Δt)`. `q_at(τ)` supplies the `n_states × n_states` generator at
@@ -367,7 +372,7 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
 /// `P(Δt_m)` from this function instead of `matrix_exp`.
 ///
 /// The occupancy matrix is flattened **row-major** into the ODE state vector
-/// (length `n_states²`); the RHS reshapes it, forms `Q(τ)·P`, and flattens back.
+/// (length `n_states²`); the RHS reshapes it, forms `P·Q(τ)`, and flattens back.
 /// A non-positive `delta_t` returns the identity (`P(0) = I`; a zero-length gap
 /// between identical states contributes `log 1 = 0`, exactly as the homogeneous
 /// kernel treats it).
@@ -417,10 +422,15 @@ pub fn ctmm_inhomogeneous_transition_with_opts(
     );
 
     // Flattened matrix ODE: u ↔ P row-major (u[i*s + j] = P[i, j]).
-    // `du = Q(t)·P`. `params` is unused — `q_at` captures everything it needs.
+    // Forward Kolmogorov `dP/dt = P·Q(t)` (right multiplication), so
+    // `P[from, to] = Pr(state=to at Δt | state=from at 0)` — the same indexing the
+    // homogeneous `matrix_exp(Q·dt)` path yields. Using the backward form `Q·P`
+    // would only coincide for a generator that commutes across time (constant Q,
+    // or a scalar-scaled Q(τ)=g(τ)·Q₀); it is wrong for a genuinely non-commuting
+    // time-varying generator. `params` is unused — `q_at` captures what it needs.
     let rhs = |u: &[f64], _params: &[f64], t: f64, du: &mut [f64]| {
         let p = DMatrix::from_row_slice(s, s, u);
-        let dp = q_at(t) * p;
+        let dp = p * q_at(t);
         for i in 0..s {
             for j in 0..s {
                 du[i * s + j] = dp[(i, j)];
@@ -1176,6 +1186,58 @@ mod tests {
             "scalar-time-varying Q must match expm(Q₀·∫g); got {p}, want {expected}"
         );
         for i in 0..2 {
+            assert!((p.row(i).sum() - 1.0).abs() < 1e-8, "row {i} sums to 1");
+        }
+    }
+
+    /// A genuinely **non-commuting** time-varying generator: piecewise-constant
+    /// `Q(τ) = Q₁` on `[0, h)`, `Q₂` on `[h, 2h)`, with `Q₁·Q₂ ≠ Q₂·Q₁`. The
+    /// forward Kolmogorov solution `dP/dτ = P·Q(τ)`, `P(0)=I` is the *time-ordered*
+    /// product `P(2h) = expm(Q₁·h) · expm(Q₂·h)` (left-to-right in time). This is the
+    /// anchor the two commuting tests above cannot supply: the backward form
+    /// `dP/dτ = Q(τ)·P` would instead give `expm(Q₂·h)·expm(Q₁·h)` (reversed order),
+    /// which differs precisely because `Q₁,Q₂` do not commute — so this test fails
+    /// unless the integrator uses the correct right-multiplication.
+    #[test]
+    fn ctmm_inhomogeneous_matches_time_ordered_product_for_noncommuting_q() {
+        let h = 1.3_f64;
+        let q1 = generator_3();
+        // A second, structurally different generator that does not commute with q1.
+        let q2 = {
+            let mut q =
+                DMatrix::from_row_slice(3, 3, &[0.0, 0.1, 0.7, 0.6, 0.0, 0.2, 0.4, 0.3, 0.0]);
+            for i in 0..3 {
+                let rs: f64 = q.row(i).sum();
+                q[(i, i)] = -rs;
+            }
+            q
+        };
+        // Sanity: the generators genuinely do not commute, so forward vs backward
+        // integration give different answers — the test has teeth.
+        assert!(
+            max_abs_diff(&(&q1 * &q2), &(&q2 * &q1)) > 1e-3,
+            "test generators must not commute"
+        );
+
+        let e1 = matrix_exp(&(&q1 * h));
+        let e2 = matrix_exp(&(&q2 * h));
+        let expected = &e1 * &e2; // forward/right-multiplication time order
+        let wrong = &e2 * &e1; // backward/left-multiplication order (must NOT match)
+
+        let p = ctmm_inhomogeneous_transition(
+            |t| if t < h { q1.clone() } else { q2.clone() },
+            2.0 * h,
+            3,
+        );
+        assert!(
+            max_abs_diff(&p, &expected) < 1e-6,
+            "non-commuting Q must match the time-ordered product expm(Q₁h)·expm(Q₂h); got {p}, want {expected}"
+        );
+        assert!(
+            max_abs_diff(&p, &wrong) > 1e-3,
+            "must NOT match the reversed (backward-Kolmogorov) product"
+        );
+        for i in 0..3 {
             assert!((p.row(i).sum() - 1.0).abs() < 1e-8, "row {i} sums to 1");
         }
     }

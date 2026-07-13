@@ -2755,6 +2755,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 .map(|s| s.state_names.as_slice())
                 .unwrap_or(&[]);
             for lines in markov_blocks {
+                let declared_cov_names: Vec<String> = covariate_decls
+                    .as_ref()
+                    .map(|d| d.iter().map(|c| c.name.clone()).collect())
+                    .unwrap_or_default();
                 let (cmt, endpoint, ctmm_covs, blk_thetas, blk_etas) = parse_markov_model_block(
                     lines,
                     &theta_names,
@@ -2763,6 +2767,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     &model.kappa_names,
                     &model.error_spec,
                     ode_state_names,
+                    &declared_cov_names,
                 )?;
                 if model.endpoints.contains_key(&cmt) {
                     return Err(format!(
@@ -4505,6 +4510,7 @@ fn is_matrix_rate_key(key: &str) -> bool {
 /// rejected with a "not yet supported" message so the surface stays honest.
 #[cfg(feature = "markov")]
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn parse_markov_model_block(
     lines: &[String],
     theta_names: &[String],
@@ -4516,6 +4522,10 @@ fn parse_markov_model_block(
     // An intensity that references one of these is time-inhomogeneous (drug/PD-driven
     // Q(t), Phase 6 #817): the referenced state is threaded into the generator.
     ode_state_names: &[String],
+    // Names declared in the optional `[covariates]` block (empty when absent). Used to
+    // reject a name that is *both* an ODE state and a declared data covariate — that
+    // collision would otherwise silently reinterpret the covariate column as the state.
+    declared_covariates: &[String],
 ) -> Result<
     (
         usize,
@@ -4914,6 +4924,25 @@ fn parse_markov_model_block(
             .map(|(idx, name)| (name.clone(), idx))
             .collect()
     };
+
+    // Reject a name that is simultaneously an ODE state and a declared data covariate:
+    // the intensity would resolve it to the model state (below), silently overwriting the
+    // covariate column and stripping it from the required-column / TV-covariate checks —
+    // a wrong driver with no error. Fail loud and ask the user to disambiguate.
+    if !declared_covariates.is_empty() {
+        let cov_set_decl: HashSet<&String> = declared_covariates.iter().collect();
+        if let Some((name, _)) = generator_states
+            .iter()
+            .find(|(n, _)| cov_set_decl.contains(n))
+        {
+            return Err(format!(
+                "[markov_model]: the transition-intensity identifier `{name}` names both an ODE \
+                 model state and a declared [covariates] column. This is ambiguous — the fit \
+                 would use the model state and ignore the data column. Rename one of them so the \
+                 intended driver is unambiguous."
+            ));
+        }
+    }
 
     // A referenced ODE state parsed as a `Covariate` leaf, so it was pooled into `cov_set`
     // by the covariate scan above. It is a model **state**, not a data covariate — drop it

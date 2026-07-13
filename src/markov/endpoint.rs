@@ -212,7 +212,7 @@ const INHOMOGENEOUS_SUBNODES_PER_GAP: usize = 16;
 /// The generator depends on the model's ODE state (a concentration `central/V`, a PD
 /// response compartment, …), so `P(Δt_m)` has no closed form. The subject's ODE
 /// system is solved once for `(θ, η)`; per observation gap the state is sampled on a
-/// sub-grid and the occupancy ODE `dP/dτ = Q(state(t_m+τ))·P`, `P(0)=I` is integrated
+/// sub-grid and the occupancy ODE `dP/dτ = P·Q(state(t_m+τ))`, `P(0)=I` is integrated
 /// with [`crate::markov::ctmm_inhomogeneous_transition`], the state linearly
 /// interpolated between sub-nodes. The likelihood is the same
 /// `−Σ_m log P(Δt_m)[s_m, s_{m+1}]`. Evaluated fresh at each `η` (including the
@@ -270,33 +270,62 @@ fn ctmm_endpoint_nll_inhomogeneous(
         let dt = t1 - t0;
         let base = m * (n_sub + 1); // this gap's block start in `grid`/`states`
 
+        // Out-of-order records (t_{m+1} < t_m): the homogeneous `ctmm_data_term`
+        // rejects this with `MarkovError::TimeDecreased`; the inhomogeneous path would
+        // instead return the identity `P(0)` and silently score a same-state pair as
+        // `log 1 = 0`, understating the objective. Repel to match. (`dt == 0` with an
+        // identical state is the legitimate zero-length gap and falls through.)
+        if dt < 0.0 {
+            return SUBJECT_SENTINEL_NLL;
+        }
+
         // State at elapsed time τ ∈ [0, dt] within the gap, linearly interpolated
-        // between the two bracketing sub-nodes. `Q` off-diagonals are guarded inside
+        // between the two bracketing sub-nodes, written into a reused scratch buffer so
+        // the occupancy-ODE RHS (called at every RK45 stage of every gap) does not
+        // allocate a fresh `Vec` per evaluation. `Q` off-diagonals are guarded inside
         // the generator's downstream use, but a negative off-diagonal from an
         // unconstrained intensity must still repel — checked at the sub-nodes below.
-        let interp_state = |tau: f64| -> Vec<f64> {
+        let n_ode = states[base].len();
+        let interp_scratch = std::cell::RefCell::new(vec![0.0_f64; n_ode]);
+        let interp_into = |tau: f64, out: &mut [f64]| {
             if dt <= 0.0 {
-                return states[base].clone();
+                out.copy_from_slice(&states[base]);
+                return;
             }
             let frac = (tau / dt).clamp(0.0, 1.0) * (n_sub as f64);
             let lo = (frac.floor() as usize).min(n_sub);
             let hi = (lo + 1).min(n_sub);
             let w_hi = frac - lo as f64;
             let (a, b) = (&states[base + lo], &states[base + hi]);
-            a.iter()
-                .zip(b.iter())
-                .map(|(x, y)| x + (y - x) * w_hi)
-                .collect()
+            for (o, (x, y)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+                *o = x + (y - x) * w_hi;
+            }
         };
 
-        // Repel a negative off-diagonal (an unconstrained intensity driven negative by
-        // the state) at any sub-node — the inhomogeneous analogue of the homogeneous
-        // guard; `Q` is smooth, so the dense sub-nodes catch it.
+        // Guard the generator at each sub-node — the inhomogeneous analogue of the
+        // homogeneous `ctmm_data_term` up-front checks; `Q` is smooth in the state, so
+        // the dense sub-nodes catch these (a driver that is non-monotone *strictly
+        // between* two same-sign sub-nodes is the residual gap, not covered here):
+        //   • a non-finite ODE state — e.g. a grid node the solve never reached and
+        //     left as `NaN` — would poison the occupancy integration silently;
+        //   • a non-finite or enormous rate (`|q·dt| > MAX_EXP_ARG_ABS`), a diverged
+        //     intensity that would hang/overflow the stiff occupancy solve rather than
+        //     return a usable `P` (mirrors the homogeneous `expm`-argument guard); and
+        //   • a negative off-diagonal, an unconstrained intensity driven negative.
+        // All repel the optimizer (sentinel) rather than scoring a bogus likelihood.
         for i in 0..=n_sub {
-            let q = generator_fn(theta, eta, cov, &states[base + i]);
+            let st = &states[base + i];
+            if st.iter().any(|x| !x.is_finite()) {
+                return SUBJECT_SENTINEL_NLL;
+            }
+            let q = generator_fn(theta, eta, cov, st);
             for j in 0..q.nrows() {
                 for k in 0..q.ncols() {
-                    if j != k && q[(j, k)] < -1e-12 {
+                    let qjk = q[(j, k)];
+                    if !qjk.is_finite() || qjk.abs() * dt > super::MAX_EXP_ARG_ABS {
+                        return SUBJECT_SENTINEL_NLL;
+                    }
+                    if j != k && qjk < -1e-12 {
                         return SUBJECT_SENTINEL_NLL;
                     }
                 }
@@ -304,7 +333,11 @@ fn ctmm_endpoint_nll_inhomogeneous(
         }
 
         let p = crate::markov::ctmm_inhomogeneous_transition_with_opts(
-            |tau| generator_fn(theta, eta, cov, &interp_state(tau)),
+            |tau| {
+                let mut st = interp_scratch.borrow_mut();
+                interp_into(tau, &mut st);
+                generator_fn(theta, eta, cov, &st)
+            },
             dt,
             n_states,
             &ode.solver_opts,
