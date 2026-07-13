@@ -4585,9 +4585,18 @@ fn parse_markov_model_block(
                 }
             },
             "cmt" => {
-                cmt_opt = Some(value.parse::<usize>().map_err(|_| {
+                let c = value.parse::<usize>().map_err(|_| {
                     format!("[markov_model]: invalid cmt `{value}` — expected a positive integer")
-                })?);
+                })?;
+                // CMT is 1-based everywhere in ferx (CMT=0 has special meaning), so reject
+                // 0 here rather than silently route data to compartment index 0.
+                if c == 0 {
+                    return Err(
+                        "[markov_model]: cmt = 0 is invalid — compartment indices are 1-based"
+                            .to_string(),
+                    );
+                }
+                cmt_opt = Some(c);
             }
             "states" => {
                 states_seen = true;
@@ -4610,6 +4619,15 @@ fn parse_markov_model_block(
                         Some((l, c)) => (l.trim().to_string(), c.trim()),
                         None => (tok.to_string(), tok),
                     };
+                    // Reject an empty label (`states = [=0, ...]`): a transition can never
+                    // reference it (transition state names must be non-empty), so it would
+                    // be an unreferenceable state. Point the user at the bare-numeric form.
+                    if label.is_empty() {
+                        return Err(format!(
+                            "[markov_model]: state code `{code_str}` has an empty label — use \
+                             `label={code_str}` or the bare numeric form (e.g. `states = [0, 1]`)"
+                        ));
+                    }
                     let code = code_str.parse::<usize>().map_err(|_| {
                         format!(
                             "[markov_model]: state code `{code_str}` must be a non-negative \
@@ -4812,6 +4830,38 @@ fn parse_markov_model_block(
                 "[markov_model]: a transition intensity references an [individual_parameters] value \
                  whose definition uses a [covariate_nn] output. Neural-network-driven individual \
                  parameters are not available to CTMM intensities — reference an NN-free parameter."
+                    .to_string(),
+            );
+        }
+    }
+
+    // Reject a literal `TIME` reference in an intensity (or in an
+    // `[individual_parameters]` value an intensity reaches). The CTMM is
+    // time-homogeneous: the generator is built once per subject, *outside* any
+    // model-time scope (unlike the binary logit, which is wrapped per record), so
+    // `Expression::Time` would resolve to the thread-local default 0.0 and the fit
+    // would silently drop the time term. The TV-covariate guard does not catch this —
+    // `TIME` is not a covariate. A drug/time-driven Q(t) is Phase 6.
+    {
+        let mut time_hit = false;
+        {
+            let mut mark = |e: &Expression| {
+                if matches!(e, Expression::Time) {
+                    time_hit = true;
+                }
+            };
+            for (_, _, expr) in &transitions {
+                visit_expr_nodes(expr, &mut mark);
+            }
+            visit_stmt_nodes(&needed_indiv_stmts, &mut mark);
+        }
+        if time_hit {
+            return Err(
+                "[markov_model]: a transition intensity references TIME. The CTMM is \
+                 time-homogeneous — the generator is built once per subject and evaluated \
+                 outside any model-time scope, so TIME would silently resolve to 0. Write the \
+                 intensity in terms of θ/η/covariates only; a time-varying (drug-driven) \
+                 generator Q(t) is Phase 6."
                     .to_string(),
             );
         }

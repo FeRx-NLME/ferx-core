@@ -113,6 +113,21 @@ fn ctmm_endpoint_nll(
         n_states,
         "generator_fn must return an n_states×n_states matrix"
     );
+    // A transition intensity is an unconstrained user expression, so a covariate /
+    // parameter regime (e.g. a linear covariate model, or a diverged η) can drive an
+    // off-diagonal rate negative. A negative off-diagonal makes `q` a non-generator:
+    // `expm(Q·Δt)` is no longer stochastic and an observed transition can score P > 1,
+    // which `ctmm_data_term` clamps to a 0 penalty — the *minimum*, silently rewarding
+    // the optimizer toward the unphysical region. Treat it as the degenerate case and
+    // repel, exactly as the kernel does for an underflowed transition. The tiny
+    // tolerance absorbs floating round-off on a rate that is physically zero.
+    for j in 0..q.nrows() {
+        for k in 0..q.ncols() {
+            if j != k && q[(j, k)] < -1e-12 {
+                return SUBJECT_SENTINEL_NLL;
+            }
+        }
+    }
     match ctmm_data_term(&q, &obs) {
         Ok(nll) => nll,
         // Structural/data MarkovError — ruled out by validate_ctmm_states + the
@@ -189,6 +204,40 @@ pub fn validate_ctmm_states(
     Ok(())
 }
 
+/// Fail-loud check that a subject's CTMM observations on `cmt` are **non-decreasing
+/// in time**, in record order. Run once at fit setup.
+///
+/// The datareader sorts a subject's *doses* by time but leaves its observation rows
+/// in file order (the NONMEM convention is time-ordered input, but nothing enforces
+/// it). An out-of-order pair would make [`ctmm_data_term`] return
+/// [`MarkovError::TimeDecreased`](crate::markov::MarkovError::TimeDecreased), which
+/// [`ctmm_endpoint_nll`] maps to the [`SUBJECT_SENTINEL_NLL`] backstop — silently
+/// collapsing that subject's entire likelihood to `1e20` and biasing the population
+/// fit with no diagnostic. Rejecting up front converts that silent corruption into a
+/// clear error, mirroring [`validate_ctmm_states`]. Only `DiscreteState` rows on
+/// `cmt` are inspected.
+pub fn validate_ctmm_times(cmt: usize, records: &[ObsRecord]) -> Result<(), String> {
+    let mut prev: Option<f64> = None;
+    for r in records {
+        if let ObsRecord::DiscreteState { time, cmt: c, .. } = r {
+            if *c != cmt {
+                continue;
+            }
+            if let Some(p) = prev {
+                if *time < p {
+                    return Err(format!(
+                        "[markov_model] cmt = {cmt}: observation times must be non-decreasing \
+                         within a subject, but {p} is followed by {time}. Sort each subject's \
+                         CTMM rows by TIME (the datareader does not reorder observations)."
+                    ));
+                }
+            }
+            prev = Some(*time);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +308,45 @@ mod tests {
             &[disc(0.0, 0, 5), disc(1.0, 9, 5)],
         );
         assert_eq!(got, SUBJECT_SENTINEL_NLL);
+    }
+
+    /// A negative off-diagonal intensity (an unconstrained user expression driven
+    /// negative) makes `Q` a non-generator; the endpoint repels with the sentinel
+    /// rather than let `expm` produce a super-stochastic entry the kernel clamps to a
+    /// 0 (minimum) penalty. `const_gen(a, b)` with `a < 0` puts `-a` at the `0→1`
+    /// off-diagonal.
+    #[test]
+    fn ctmm_endpoint_negative_offdiagonal_sentinels() {
+        let got = nll(
+            &[0, 1],
+            &const_gen(-0.4, 0.6), // q[0,1] = -0.4 < 0 ⇒ invalid generator
+            &[disc(0.0, 0, 5), disc(1.0, 1, 5)],
+        );
+        assert_eq!(got, SUBJECT_SENTINEL_NLL);
+        // A valid (non-negative off-diagonal) generator on the same data does not.
+        let ok = nll(
+            &[0, 1],
+            &const_gen(0.4, 0.6),
+            &[disc(0.0, 0, 5), disc(1.0, 1, 5)],
+        );
+        assert!(ok.is_finite() && ok < SUBJECT_SENTINEL_NLL, "got {ok}");
+    }
+
+    /// `validate_ctmm_times` rejects out-of-order observation times (which would
+    /// otherwise collapse the subject to the silent sentinel) and passes sorted rows.
+    #[test]
+    fn validate_ctmm_times_rejects_out_of_order() {
+        // Decreasing 2.0 → 1.0 on CMT 5.
+        let recs = [disc(0.0, 0, 5), disc(2.0, 1, 5), disc(1.0, 0, 5)];
+        let err = validate_ctmm_times(5, &recs).unwrap_err();
+        assert!(err.contains("cmt = 5"), "msg: {err}");
+        assert!(err.contains("non-decreasing"), "msg: {err}");
+        // Sorted rows pass; equal times (Δt = 0) are allowed (non-decreasing).
+        assert!(
+            validate_ctmm_times(5, &[disc(0.0, 0, 5), disc(1.0, 1, 5), disc(1.0, 1, 5)]).is_ok()
+        );
+        // Out-of-order rows on a *different* CMT are ignored for this endpoint.
+        assert!(validate_ctmm_times(5, &[disc(2.0, 0, 5), disc(1.0, 1, 6)]).is_ok());
     }
 
     /// `validate_ctmm_states` names the CMT, the offending DV, and the declared set.

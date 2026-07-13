@@ -293,6 +293,16 @@ mod ctmm_smoke {
             "[markov_model]\n  type = ctmm\n  cmt = xx\n  states = [a=0, b=1]\n  transition a -> b = exp(LQ01)\n"
         ))
         .is_err());
+        // cmt = 0 (compartment indices are 1-based).
+        assert!(parse_model_string(&wrap(
+            "[markov_model]\n  type = ctmm\n  cmt = 0\n  states = [a=0, b=1]\n  transition a -> b = exp(LQ01)\n"
+        ))
+        .is_err());
+        // Empty state label (`=0`): an unreferenceable state.
+        assert!(parse_model_string(&wrap(
+            "[markov_model]\n  type = ctmm\n  cmt = 5\n  states = [=0, b=1]\n  transition a -> b = exp(LQ01)\n"
+        ))
+        .is_err());
         // states not bracketed.
         assert!(parse_model_string(&wrap(
             "[markov_model]\n  type = ctmm\n  cmt = 5\n  states = a=0, b=1\n  transition a -> b = exp(LQ01)\n"
@@ -315,6 +325,79 @@ mod ctmm_smoke {
             full("  transition a -> b = exp(LQ01)\n")
         )))
         .is_err());
+    }
+
+    /// A transition intensity that references `TIME` is rejected at parse: the CTMM is
+    /// time-homogeneous (the generator is built outside any model-time scope), so `TIME`
+    /// would silently resolve to 0 and drop the time term.
+    #[test]
+    fn ctmm_intensity_references_time_rejected() {
+        // Direct TIME in an intensity.
+        const DIRECT: &str = r"
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta BT(0.1, -5.0, 5.0)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [a=0, b=1]
+  transition a -> b = exp(LQ01 + BT * TIME)
+  transition b -> a = exp(LQ10)
+";
+        let err = parse_model_string(DIRECT)
+            .expect_err("a direct TIME reference in a CTMM intensity must be rejected");
+        assert!(err.contains("TIME"), "message should name TIME, got: {err}");
+
+        // TIME reached transitively through an [individual_parameters] value.
+        const VIA_INDIV: &str = r"
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta BT(0.1, -5.0, 5.0)
+
+[individual_parameters]
+  LQ = LQ01 + BT * TIME
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [a=0, b=1]
+  transition a -> b = exp(LQ)
+  transition b -> a = exp(LQ10)
+";
+        assert!(
+            parse_model_string(VIA_INDIV).is_err(),
+            "TIME reached through an [individual_parameters] value must be rejected"
+        );
+    }
+
+    /// A CTMM endpoint has no simulation path yet: `simulate()` fails loud (panics at the
+    /// single simulate chokepoint) rather than emit meaningless all-zero discrete rows.
+    #[test]
+    #[should_panic(expected = "CTMM")]
+    fn ctmm_simulate_panics() {
+        use ferx_core::simulate;
+        let model = parse_model_string(FIXED_MODEL).unwrap();
+        let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
+        let _ = simulate(&model, &pop, &model.default_params, 1);
+    }
+
+    /// Out-of-order CTMM observation times are rejected at fit setup (the datareader sorts
+    /// doses, not observations), rather than silently collapsing the subject to the 1e20
+    /// sentinel and biasing the population OFV.
+    #[test]
+    fn ctmm_out_of_order_times_rejected() {
+        let model = parse_model_string(FIXED_MODEL).unwrap();
+        // Times 2.0 then 1.0 on CMT 5 — decreasing.
+        let pop = common::binary_pop(&[(0.0, vec![(2.0, 0), (1.0, 1)])], 5);
+        let err = fit(&model, &pop, &model.default_params, &smoke_opts())
+            .expect_err("out-of-order CTMM times must be rejected");
+        assert!(
+            err.contains("cmt = 5") && err.contains("non-decreasing"),
+            "message should name the CMT and the constraint, got: {err}"
+        );
     }
 
     /// A transition intensity that references an IOV κ directly is rejected at parse (the

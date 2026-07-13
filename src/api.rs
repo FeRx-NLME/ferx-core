@@ -431,6 +431,19 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // observations": it is the only thing that allocates sigma, and every model
     // otherwise carries a default `pk_model`, so the structural model alone can't
     // distinguish intent.
+    // CTMM (#759) cannot be simulated yet — sampling a discrete-state trajectory from
+    // the generator is a later slice. Return a clear Err here rather than fall through
+    // to the "nothing to simulate" message (CTMM-only) or the all-zero Gaussian emitter
+    // (with `times`); the library `simulate()` chokepoint panics on the same case.
+    #[cfg(feature = "markov")]
+    if parsed.model.has_ctmm() {
+        return Err(
+            "[simulation]: a [markov_model] (CTMM) endpoint cannot be simulated yet — \
+             sampling a discrete-state trajectory from the generator is a later slice. \
+             fit() supports CTMM; --simulate does not."
+                .to_string(),
+        );
+    }
     let model_has_continuous = !parsed.model.default_params.sigma.values.is_empty();
     let model_has_tte = parsed.model.has_tte();
     if sim_spec.obs_times.is_empty() {
@@ -3156,6 +3169,9 @@ pub fn fit(
                     state_codes,
                     &subject.obs_records,
                 )?;
+                // Out-of-order observation times would otherwise silently collapse the
+                // subject to the 1e20 sentinel (datareader sorts doses, not obs).
+                crate::markov::endpoint::validate_ctmm_times(*cmt, &subject.obs_records)?;
             }
         }
     }
@@ -8532,6 +8548,18 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     #[cfg(feature = "survival")]
     assert_survival_tv_covariates(model, population);
     assert_absorption_dosing_supported(model, population);
+    // CTMM (#759) has no simulation path yet: the Gaussian/PK emitter below would write
+    // meaningless all-zero DV rows for a discrete-state endpoint (the generator is never
+    // sampled). Fail loud rather than return garbage — fit() supports CTMM, simulate()
+    // does not. Mirrors the survival guards above; the CLI `--simulate` path returns this
+    // as a clean Err in `run_model_simulate`. This is the single simulate chokepoint.
+    #[cfg(feature = "markov")]
+    assert!(
+        !model.has_ctmm(),
+        "simulate()/predict() does not support a [markov_model] (CTMM) endpoint yet — its \
+         discrete-state trajectory has no simulation path, so the Gaussian emitter would \
+         produce meaningless all-zero observations. CTMM simulation is a later slice."
+    );
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
     // no resets / left truncation). `simulate_with_options` checks them first and

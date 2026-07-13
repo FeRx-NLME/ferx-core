@@ -74,7 +74,9 @@ ID,TIME,DV,CMT,EVID,MDV
 ```
 
 An observed `DV` that is not one of the declared `states` codes is rejected fail-loud at
-fit setup (naming the CMT and the offending value).
+fit setup (naming the CMT and the offending value). Each subject's CTMM rows must be
+**non-decreasing in `TIME`** — the reader does not reorder observations, so an out-of-order
+subject is rejected at fit setup rather than silently dropped.
 
 ## Random effects and covariates
 
@@ -101,8 +103,15 @@ An intensity may carry between-subject variability and covariates:
 The generator is built once per subject from a **baseline** covariate snapshot (the CTMM
 is *time-homogeneous*). A covariate that is time-varying in the data is therefore
 rejected at fit setup rather than silently frozen; a genuinely drug-driven `Q(t)` is a
-planned extension. Intensities are evaluated with per-subject (BSV) η only, so an
-inter-occasion (`[iov]` / κ) reference is rejected.
+planned extension. For the same reason a bare `TIME` in an intensity is rejected at parse
+(it would silently resolve to 0). Intensities are evaluated with per-subject (BSV) η only,
+so an inter-occasion (`[iov]` / κ) reference is rejected.
+
+An intensity is a **rate** and must evaluate non-negative for every subject: a
+parameter/covariate regime that drives an off-diagonal negative makes the generator
+non-stochastic, and that subject's contribution is treated as degenerate (it repels the
+optimizer) rather than silently scored. Write intensities on a scale that stays positive
+— e.g. `exp(...)` — rather than an unconstrained linear form.
 
 ## Current limitations
 
