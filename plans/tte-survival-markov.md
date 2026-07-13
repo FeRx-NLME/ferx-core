@@ -2737,8 +2737,14 @@ Gate: `#[cfg(feature = "markov")]` initially.
   Validated by a **degenerate anchor** (`SLOPE=0` ⇒ constant `Q` ⇒ matches the homogeneous
   `expm` path within ODE tolerance), a state-coupling test (concentration changes the NLL),
   and an end-to-end mixed-effects fit to a finite OFV.
-- **Slice 4 — joint PK-CTMM + NONMEM anchor + docs.** Drug-driven anchor via `F_FLAG=1` with
-  `P(Δt)` from the model's own ODEs in `$DES` (mirrors `tests/nonmem/ctmm_2state.ctl`).
+- ✅ **Slice 4 — validation + example + docs.** A fresh NONMEM `$DES` anchor is impractical
+  for a PK-coupled CTMM (continuous PK but per-observation occupancy reset; NONMEM's only
+  per-record reset, EVID=3, zeros the PK too — §3.4). Validated instead per the CLAUDE.md
+  exception pattern: (a) an **exact closed-form anchor** — a commuting generator `Q(t)=C(t)·Q₀`
+  matches `expm(Q₀·∫C)` to ~1e-5; (b) **reduction** — `SLOPE=0` reduces to the homogeneous CTMM,
+  which is NONMEM-anchored (Phase 5); (c) a slow-gated **simulate→fit recovery** on the bundled
+  `examples/ctmm_pd_2state.ferx` (+ `data/`, `tools/sim_ctmm_pd.py`) — LQ01/LQ10/SLOPE recovered.
+  Docs: drug/PD-driven section on the Markov page. **Draft PR #825.**
 
 ### Phase 7 — HMM (Hidden Markov Models) · Track D (tail)
 

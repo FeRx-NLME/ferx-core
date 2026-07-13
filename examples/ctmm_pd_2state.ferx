@@ -1,0 +1,64 @@
+# Drug-driven (time-inhomogeneous) continuous-time Markov model — Phase 6, Track D (#817).
+#
+# A two-state process (s0 = 0, s1 = 1) observed via the integer DV column on CMT 5, whose
+# s0 -> s1 transition intensity depends on the drug concentration: as central concentration
+# rises after a dose, the subject is more likely to switch into state 1. This is the
+# time-INHOMOGENEOUS CTMM — the generator Q(t) = f(C(t)) varies over each observation gap, so
+# ferx integrates the occupancy ODE dP/dτ = Q(state(t))·P per gap (no closed-form matrix
+# exponential once Q varies within the gap).
+#
+# Concentration is written `central / V` (there is no `Cc` builtin — an intensity may
+# reference any ODE state by name, exactly as a drug-driven survival hazard does). The PK is a
+# 1-compartment IV model (a bolus into `central`); a between-subject random effect on CL flows
+# through the concentration into the transition intensity.
+#
+# Data: data/ctmm_pd_2state.csv — 60 subjects, an IV bolus at t=0 (CMT 1) plus 10 state
+# observations each on CMT 5, Gillespie-simulated from these same parameters
+# (LQ01 = -1.2, LQ10 = -0.7, SLOPE = 0.15, CL = 1, V = 10, ω²_CL = 0.09;
+# tools/sim_ctmm_pd.py, seed 20817 — balanced ~50/50 states, ~230 observed transitions).
+#
+# ferx recovers the transition structure well: LQ01 = -1.20, LQ10 = -0.60, SLOPE = 0.145
+# (OFV 712.23). Clearance and its IIV are only weakly identified (high η-shrinkage) because
+# the concentration is never *observed* here — it is inferred purely from the state
+# transitions; a real study would also observe the PK to pin CL down.
+#
+# Requires the `markov` cargo feature. Run:
+#   cargo run --release --features markov -- examples/ctmm_pd_2state.ferx --data data/ctmm_pd_2state.csv
+
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)      # clearance (drives the concentration decay)
+  theta TVV(10.0, 0.1, 500.0)       # central volume
+  theta LQ01(-1.2, -6.0, 3.0)       # baseline log intensity s0 -> s1
+  theta LQ10(-0.7, -6.0, 3.0)       # log intensity s1 -> s0 (concentration-independent)
+  theta SLOPE(0.15, -5.0, 5.0)      # concentration effect on the s0 -> s1 log intensity
+
+  omega ETA_CL ~ 0.09
+
+  # No Gaussian PK observations here (only discrete states are observed), so the residual
+  # error is unidentified — declare it FIXed, purely to satisfy the ODE model's error block.
+  # A joint PK + drug-driven CTMM fit would instead observe the concentration and estimate it.
+  sigma PROP ~ 0.05 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL / V) * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [s0=0, s1=1]
+  transition s0 -> s1 = exp(LQ01 + SLOPE * (central / V))
+  transition s1 -> s0 = exp(LQ10)
+
+[fit_options]
+  method  = focei
+  maxiter = 300

@@ -645,6 +645,105 @@ mod ctmm_smoke {
         );
     }
 
+    /// **Exact end-to-end anchor** for the drug-driven pipeline (#817). A NONMEM `$DES` anchor
+    /// is impractical for a PK-coupled CTMM (continuous PK but the occupancy must reset to the
+    /// observed state each observation, which NONMEM's only per-record reset — EVID=3 — cannot
+    /// do without zeroing the PK too; see plan §3.4). Instead we anchor the whole path — PK
+    /// solve → state sampling → occupancy integration → likelihood — against a *closed form*.
+    ///
+    /// Both intensities are scaled by the **same** concentration `C(t) = central/V`, so the
+    /// generator is `Q(t) = C(t)·Q₀` with `Q₀ = [[-A, A], [B, -B]]` fixed. A scalar-times-fixed
+    /// generator commutes across time, so the time-ordered occupancy solution collapses to
+    /// `P(Δt) = expm(Q₀ · ∫C)`. For a 1-cpt IV bolus `C(t) = (D/V)e^{-kt}` (`k = CL/V`), the gap
+    /// integral is exact: `∫_{t0}^{t1} C = (D/CL)(e^{-k t0} − e^{-k t1})`. So the per-subject NLL
+    /// has a closed form independent of ferx's integrator, and the two must agree.
+    #[test]
+    fn ctmm_drug_driven_matches_closed_form_commuting_generator() {
+        use ferx_core::markov::endpoint::ctmm_subject_nll;
+        use ferx_core::types::{DoseEvent, ObsRecord};
+
+        // Q(t) = C(t)·[[-A,A],[B,-B]]; both intensities scale with central/V.
+        const M: &str = r"
+[parameters]
+  theta CL(1.0, 0.01, 100.0)
+  theta V(10.0, 0.1, 500.0)
+  theta A(0.5, 1e-4, 100.0)
+  theta B(0.3, 1e-4, 100.0)
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CLi = CL
+  Vi  = V
+  Ai  = A
+  Bi  = B
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CLi/Vi) * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [s0=0, s1=1]
+  transition s0 -> s1 = Ai * (central / Vi)
+  transition s1 -> s0 = Bi * (central / Vi)
+";
+        let model = parse_model_string(M).expect("commuting drug-driven CTMM must parse");
+        let (cl, v, a, b) = (1.0_f64, 10.0, 0.5, 0.3);
+        let k = cl / v;
+        let dose = 100.0_f64;
+
+        // IV bolus of `dose` into central (cmt 1) at t=0.
+        let mut subj = common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, dose, 1, 0.0, false, 0.0)],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let obs = [(0.5_f64, 0usize), (1.3, 1), (2.6, 0), (5.0, 1)];
+        subj.obs_records = obs
+            .iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                state,
+                cmt: 5,
+            })
+            .collect();
+
+        // Closed-form 2-state transition matrix expm(Q₀·G) for Q₀=[[-a,a],[b,-b]].
+        let exact_2state = |a: f64, b: f64, g: f64| -> [[f64; 2]; 2] {
+            let lam = a + b;
+            let e = (-lam * g).exp();
+            [
+                [(b + a * e) / lam, (a - a * e) / lam],
+                [(b - b * e) / lam, (a + b * e) / lam],
+            ]
+        };
+        let mut expected = 0.0_f64;
+        for w in obs.windows(2) {
+            let (t0, t1) = (w[0].0, w[1].0);
+            // G = ∫_{t0}^{t1} C(t) dt = (D/CL)(e^{-k t0} − e^{-k t1}).
+            let g = (dose / cl) * ((-k * t0).exp() - (-k * t1).exp());
+            let p = exact_2state(a, b, g);
+            expected -= p[w[0].1][w[1].1].ln();
+        }
+
+        let got = ctmm_subject_nll(&model, &subj, &model.default_params.theta, &[]);
+        // Measured Δ ≈ 1.4e-5 (16 sub-nodes + reltol 1e-4 linear interp on a smooth C(t)); the
+        // 1e-4 bound leaves margin while staying far tighter than any wiring/convention bug.
+        assert!(
+            (got - expected).abs() < 1e-4,
+            "drug-driven CTMM NLL {got} must match the closed form {expected} (Δ = {})",
+            (got - expected).abs()
+        );
+    }
+
     /// End-to-end: a **mixed-effects** drug-driven CTMM (a random effect on `CL` flows through
     /// the concentration into `Q`) fits a few FOCEI iterations and returns a finite OFV —
     /// exercising the full inhomogeneous dispatch, including the FD-Hessian interaction site at

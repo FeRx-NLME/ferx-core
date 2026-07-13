@@ -148,6 +148,10 @@ no closed form once `Q` varies within the gap), scoring the same
 `transition` line. This requires an ODE (`[odes]`) model; the occupancy integration uses the
 model's ODE tolerance (`TOL`).
 
+A complete runnable model is `examples/ctmm_pd_2state.ferx` (with `data/ctmm_pd_2state.csv`):
+a concentration-driven 2-state process where ferx recovers the transition intensities and the
+drug effect from the Gillespie-simulated data.
+
 ## Current limitations
 
 - `type = mctmm` / `type = dtmm` (minimal-CTMM and discrete-time Markov) — planned.
