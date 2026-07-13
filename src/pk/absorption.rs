@@ -683,6 +683,87 @@ impl<T: PkNum> PreparedInputRate<T> {
         }
     }
 
+    /// The absorbed-fraction CDF `G(s) = ∫₀ˢ g(u) du` of this kernel's normalized density `g`
+    /// (`∫₀^∞ g = 1`): the fraction of a bolus dose that has *appeared downstream* by age `s`.
+    /// `G(s) = 0` for `s ≤ 0`, `G(∞) = 1`. Used to convolve the kernel with a zero-order
+    /// (infusion) input in [`Self::rate_infused`] (#719 gap 2). Every kind's CDF is a `PkNum`
+    /// closed form — transit → the regularized lower incomplete gamma `P(n+1, KTR·s)`;
+    /// inverse-Gaussian → the two-`Φ` IG CDF (the stable exp-tilt form, matching the closed-form
+    /// provider); Weibull / first-order → elementary — so it carries exact `Dual2` sensitivities.
+    #[inline]
+    pub fn cdf(&self, s: T) -> T {
+        if s.val() <= 0.0 {
+            return T::from_f64(0.0);
+        }
+        match *self {
+            PreparedInputRate::Transit { ktr, n, .. } => {
+                crate::stats::special::regularized_gamma_p(n + T::from_f64(1.0), ktr * s)
+            }
+            PreparedInputRate::InverseGaussian {
+                mat, inv_2cv2mat, ..
+            } => {
+                // Standard IG(μ = MAT, λ) CDF, λ = MAT/CV² = 2·MAT²·inv_2cv2mat:
+                //   F(s) = Φ(z₁) + exp(2λ/μ)·Φ(z₂),
+                //   z₁ = √(λ/s)·(s/μ − 1),  z₂ = −√(λ/s)·(s/μ + 1).
+                // `exp(2λ/μ)` overflows for small CV², so fold it through `log Φ`
+                // (`log_normal_cdf_g`), exactly as the analytic IG closed form does.
+                let lambda = T::from_f64(2.0) * mat * mat * inv_2cv2mat;
+                let sqrt_lam_over_s = (lambda / s).sqrt();
+                let s_over_mu = s / mat;
+                let z1 = sqrt_lam_over_s * (s_over_mu - T::from_f64(1.0));
+                let z2 = -sqrt_lam_over_s * (s_over_mu + T::from_f64(1.0));
+                let two_lambda_over_mu = T::from_f64(2.0) * lambda / mat;
+                crate::stats::special::normal_cdf_g(z1)
+                    + (two_lambda_over_mu + crate::stats::special::log_normal_cdf_g(z2)).exp()
+            }
+            PreparedInputRate::Weibull { beta, ln_td, .. } => {
+                // 1 − exp(−(s/Td)^β), with (s/Td)^β = exp(β·(ln s − ln Td)).
+                let p = (beta * (s.ln() - ln_td)).exp();
+                T::from_f64(1.0) - (-p).exp()
+            }
+            PreparedInputRate::ZeroOrder { inv_dur, .. } => {
+                // Ramp CDF `min(s/dur, 1)`. Zero-order-into-zero-order (infusing a zero-order
+                // window) is rejected upstream (a spanning-window convolution, a follow-up), so
+                // this arm is defined only for completeness / a well-typed match.
+                let frac = s * inv_dur;
+                if frac.val() >= 1.0 {
+                    T::from_f64(1.0)
+                } else {
+                    frac
+                }
+            }
+            PreparedInputRate::FirstOrder { ka } => T::from_f64(1.0) - (-(ka * s)).exp(),
+        }
+    }
+
+    /// Appearance rate for a dose delivered as a **zero-order infusion** of duration `t_inf`
+    /// (constant input rate `dose/t_inf` over `[0, t_inf]`) into this kernel, rather than an
+    /// instantaneous bolus (#719 gap 2). The input is smeared over the window, so `R_in` is the
+    /// convolution of the kernel density with the rectangle:
+    ///
+    /// ```text
+    ///   R_in_inf(tad) = (dose/t_inf)·[G(tad) − G(max(tad − t_inf, 0))],
+    /// ```
+    ///
+    /// which is mass-exact (`∫₀^∞ R_in_inf dt = dose`) and reduces to the bolus [`Self::rate`] as
+    /// `t_inf → 0`. `tad ≤ 0` / `dose ≤ 0` / `t_inf ≤ 0 ⇒ 0`. Carries exact `Dual2` sensitivities
+    /// via [`Self::cdf`]; the kink at `tad = t_inf` is a *fixed* boundary (the data-`RATE` window
+    /// does not move with the PK params), placed as a break on the ODE timeline by the caller.
+    #[inline]
+    pub fn rate_infused(&self, tad: T, dose: T, t_inf: T) -> T {
+        if tad.val() <= 0.0 || dose.val() <= 0.0 || t_inf.val() <= 0.0 {
+            return T::from_f64(0.0);
+        }
+        let g_hi = self.cdf(tad);
+        let lower = tad - t_inf;
+        let g_lo = if lower.val() > 0.0 {
+            self.cdf(lower)
+        } else {
+            T::from_f64(0.0)
+        };
+        (g_hi - g_lo) * dose / t_inf
+    }
+
     /// The right-hand limit `lim_{tad→0⁺} R_in(tad, dose)` — the forcing's onset
     /// value, needed by the event-driven ODE sensitivity walk to inject an exact
     /// rate-on **saltation** when a dose's own arrival is a moving boundary (an
@@ -741,6 +822,59 @@ impl<T: PkNum> PreparedInputRate<T> {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// The infused appearance rate (`rate_infused`, #719 gap 2) must equal the superposition of
+    /// many tiny bolus sub-doses spread over the infusion window — the definition of a
+    /// zero-order input feeding the kernel. An infusion of dose `D` over `[0, T]` is the N→∞
+    /// limit of `N` boluses of `D/N` at the sub-interval midpoints; the midpoint Riemann sum of
+    /// `∫₀^T (D/T)·g(tad − τ) dτ` is exactly that superposition, and it must match the closed
+    /// form `(D/T)·[G(tad) − G(tad − T)]` for every density kind (transit / IG / Weibull /
+    /// first-order), on both sides of the window edge `tad = T`.
+    #[test]
+    fn rate_infused_matches_bolus_subdose_superposition() {
+        let d = 100.0_f64;
+        let t_inf = 3.0_f64;
+        let n = 40_000usize;
+        let cases: Vec<PreparedInputRate<f64>> = vec![
+            PreparedInputRate::first_order(0.7),
+            PreparedInputRate::transit(3.0, 1.5),
+            PreparedInputRate::weibull(2.0, 1.8),
+            PreparedInputRate::inverse_gaussian(2.0, 0.3),
+        ];
+        for prep in cases {
+            for &tad in &[0.5, 1.0, 2.5, 3.0, 4.0, 7.0] {
+                let infused = prep.rate_infused(tad, d, t_inf);
+                let mut superposed = 0.0;
+                for k in 0..n {
+                    let tk = (k as f64 + 0.5) * t_inf / n as f64; // sub-dose midpoints
+                    superposed += prep.rate(tad - tk, d / n as f64);
+                }
+                let rel = (infused - superposed).abs() / superposed.abs().max(1e-9);
+                assert!(
+                    rel < 2e-3,
+                    "kind {prep:?} at tad={tad}: infused {infused:.6} vs superposition \
+                     {superposed:.6} (rel {rel:.2e})"
+                );
+            }
+        }
+    }
+
+    /// `∫₀^∞ R_in_inf dt = dose` — the infusion delivers the full (bioavailable) mass, exactly
+    /// like a bolus, regardless of the window `T`. Trapezoidal over a long horizon.
+    #[test]
+    fn rate_infused_is_mass_exact() {
+        let prep = PreparedInputRate::<f64>::first_order(0.8);
+        let (d, t_inf, dt, upper) = (100.0_f64, 4.0_f64, 1e-3_f64, 200.0_f64);
+        let steps = (upper / dt) as usize;
+        let mut sum = 0.0;
+        let mut prev = prep.rate_infused(0.0, d, t_inf);
+        for i in 1..=steps {
+            let cur = prep.rate_infused(i as f64 * dt, d, t_inf);
+            sum += 0.5 * (prev + cur) * dt;
+            prev = cur;
+        }
+        assert_relative_eq!(sum, d, max_relative = 1e-4);
+    }
 
     /// Coarse trapezoidal `∫₀^upper R_in dt` — enough to check normalisation.
     fn integrate(n: f64, mtt: f64, dose: f64, upper: f64, dt: f64) -> f64 {

@@ -520,15 +520,15 @@ fn transit_steady_state_matches_ode() {
     assert_equiv("ss", false, false, &pop, ACCUM_RTOL);
 }
 
+/// An infusion (RATE>0) on a closed-form transit model now reroutes to its ODE twin (#719 gap
+/// 2) instead of being rejected: the twin delivers the dose as a zero-order source feeding the
+/// kernel (the convolved `R_in_inf`). The rerouted analytic path must match the hand-written
+/// `transit()` ODE with the same infusion, at eta = 0.
 #[test]
-fn transit_infusion_dose_rejected() {
-    // rate > 0 → infusion.
-    let inf = DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0);
-    let e = transit_fit_err(&population(vec![inf], vec![1.0, 4.0, 8.0]));
-    assert!(
-        e.contains("infusion"),
-        "expected an infusion-rejection message, got: {e}"
-    );
+fn transit_infusion_matches_ode() {
+    let inf = DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0); // rate 25 → 4 h window
+    let pop = population(vec![inf], vec![1.0, 2.0, 4.0, 6.0, 10.0]);
+    assert_equiv("infusion", false, false, &pop, ACCUM_RTOL);
 }
 
 /// Build the (analytic, ODE) `.ferx` pair for a transit model carrying **IOV on CL**
@@ -1867,20 +1867,13 @@ fn two_cpt_transit_iov_matches_hand_written_ode_forcing() {
     }
 }
 
-/// The infusion guard also covers the 2-cpt model, naming it (shared `check_transit_support`,
-/// the 2-cpt counterpart of `transit_infusion_dose_rejected`).
+/// Two-compartment closed-form transit with an infusion reroutes to its 2-cpt ODE twin (#719
+/// gap 2) and matches it — the 2-cpt counterpart of `transit_infusion_matches_ode`.
 #[test]
-fn two_cpt_transit_infusion_dose_rejected() {
-    let (an_src, _) = build_pair_2cpt(false, false);
-    let model = parse_full_model(&an_src).expect("parses").model;
-    let inf = DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0); // rate > 0 → infusion
-    let pop = population(vec![inf], vec![1.0, 4.0, 8.0]);
-    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("2cpt transit + infusion should be rejected");
-    assert!(
-        e.contains("two_cpt_transit") && e.contains("infusion"),
-        "expected a two_cpt_transit infusion-rejection message, got: {e}"
-    );
+fn two_cpt_transit_infusion_matches_ode() {
+    let inf = DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0); // rate 25 → 4 h window
+    let pop = population(vec![inf], vec![1.0, 2.0, 4.0, 6.0, 10.0]);
+    assert_equiv_2cpt("2cpt infusion", false, false, &pop, ACCUM_RTOL);
 }
 
 /// A plain `two_cpt_transit` model with time-varying covariates now **works**: the runtime

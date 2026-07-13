@@ -125,6 +125,21 @@ section of the SDLC for the versioning policy).
   `2·n_free`-inner-resolve `reconverged_fd_gradient` fallback.
 
 ### Added
+- **Infusion (`RATE>0`) into a built-in absorption compartment** (#719): an
+  infusion into a `transit()` / `igd()` / `weibull()` / `first_order()` absorption
+  input-rate compartment is now supported on the ODE path — previously rejected
+  with `E_ABSORPTION_RATE`. The dose is treated as a **zero-order source feeding
+  the kernel**: its mass is released at a constant rate over the infusion window
+  `T`, so `R_in` becomes the convolution `(F·amt/T)·[G(t) − G(t − T)]` of the
+  kernel with the rectangle (`G` = the kernel's absorbed-fraction CDF), and the
+  dose's plain `+rate` injection is suppressed. Predictions match NONMEM's native
+  `ADVAN2` zero-order-into-depot behaviour and an explicit sub-dose train.
+  Closed-form `pk *_transit` / `*_ig` models with an infusion reroute to their ODE
+  twin automatically. Sensitivities use a finite-difference fallback (at normal
+  FOCEI speed — an infusion prediction needs no equilibration). Still rejected,
+  with clear codes: an infusion into a `zero_order()` window
+  (`E_ABSORPTION_RATE_ZERO_ORDER`) and a steady-state infusion
+  (`E_ABSORPTION_SS_INFUSION`).
 - **Steady-state (`SS=1`) dosing into a built-in absorption compartment** (#719):
   an `SS=1` dose into a `transit()` / `igd()` / `weibull()` / `first_order()`
   absorption input-rate compartment is now supported on the ODE path — previously

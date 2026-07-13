@@ -672,6 +672,7 @@ fn ss_state_at_phase(
 /// list must split at the same `F`-scaled infusion ends so each segment is fully
 /// active or inactive.
 pub(crate) fn active_infusions(
+    input_rate: &[crate::pk::absorption::InputRateForcing],
     doses: &[DoseEvent],
     t_start: f64,
     t_end: f64,
@@ -684,6 +685,14 @@ pub(crate) fn active_infusions(
         .enumerate()
         .filter_map(|(k, d)| {
             if !is_real_infusion(d) {
+                return None;
+            }
+            // Infusion into a built-in absorption compartment (#719 gap 2): the dose is a
+            // zero-order source *feeding the kernel*, delivered through the convolved input rate
+            // `R_in_inf` (`add_prepared_input_rate_forcing`), NOT injected directly. Suppress the
+            // plain `+rate` here so the mass is not double-counted. (`input_rate` is empty on the
+            // EKF path and on models with no built-in absorption, so this is then a no-op.)
+            if input_rate.iter().any(|f| f.cmt == d.cmt.saturating_sub(1)) {
                 return None;
             }
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
@@ -1059,6 +1068,19 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
                 dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
             if d.ss && d.ii > 0.0 {
                 acc = acc + ss_periodic_forcing(prep, tad, T::from_f64(d.ii), dose_mass);
+            } else if d.is_infusion() {
+                // Infusion (RATE>0) into a built-in absorption compartment (#719 gap 2): the
+                // dose is a *zero-order source* feeding the kernel — its mass is delivered at a
+                // constant rate over the infusion window, so `R_in` is the convolution of the
+                // kernel with that rectangle, `(dose/T)·[G(tad) − G(tad − T)]` (mass-exact).
+                // The bioavailable window `T` (#419: rate-defined → `F·amt/rate`, duration-defined
+                // → the duration) is a *fixed* boundary here — the analytic sensitivity of the
+                // window under an estimated `F` (rate-defined case) is gated to FD upstream. The
+                // dose's plain `+rate` injection is suppressed for this compartment
+                // (`active_infusions` skips input-rate cmts), so there is no double count.
+                let f_bio_k = dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0));
+                let window = d.bioavailable_infusion(f_bio_k.val()).1;
+                acc = acc + prep.rate_infused(tad, dose_mass, T::from_f64(window));
             } else {
                 if tad.val() <= 0.0 {
                     continue;
@@ -1556,6 +1578,7 @@ fn integrate_segment(
     // the dispatcher routes those to `ode_predictions_event_driven` — so
     // no reset floor applies here.
     let active = active_infusions(
+        &ode.input_rate,
         &subject.doses,
         t_start,
         t_end,
@@ -3696,6 +3719,7 @@ pub fn ode_predictions_event_driven(
             // Wrap the user RHS so any infusion fully spanning
             // [cur_t, t_event] contributes `+rate` to its compartment.
             let active = active_infusions(
+                &ode.input_rate,
                 &subject.doses,
                 cur_t,
                 t_event,
@@ -8305,6 +8329,112 @@ mod tests {
                 rel < 1e-6,
                 "offset {}: SS {ss:.8} vs explicit run-in {ri:.8} (rel {rel:.2e})",
                 obs_offsets[i]
+            );
+        }
+    }
+
+    /// An **infusion** (RATE>0) into a built-in `first_order()` absorption compartment must equal
+    /// a train of many tiny bolus sub-doses spread over the infusion window — the zero-order-
+    /// source-feeding-the-kernel semantics (#719 gap 2), integrated through the full ODE engine.
+    /// This validates `rate_infused` *and* the `+rate` double-count suppression end-to-end: the
+    /// infused dose is delivered only through the convolved `R_in_inf`, exactly as the sub-dose
+    /// train is delivered through the superposed bolus kernel.
+    #[test]
+    fn infusion_into_first_order_absorption_matches_subdose_train() {
+        let mut ode = first_order_one_cpt_spec();
+        ode.solver_opts.reltol = 1e-11;
+        ode.solver_opts.abstol = 1e-11;
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 2.0;
+        pk.values[crate::types::PK_IDX_V] = 20.0;
+        pk.values[4] = 0.6; // ka
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+
+        let (d, t_inf) = (100.0_f64, 3.0_f64);
+        let obs = vec![0.5, 1.5, 3.0, 5.0, 9.0];
+
+        // Infusion: RATE = D/T (rate-defined → window = amt/rate = T).
+        let inf_subj = make_subject(
+            vec![DoseEvent::new(0.0, d, 1, d / t_inf, false, 0.0)],
+            obs.clone(),
+        );
+        assert!(is_real_infusion(&inf_subj.doses[0]));
+        let inf_preds = ode_predictions(&ode, &pk.values, &[], &[], &inf_subj);
+
+        // Sub-dose train: N boluses of D/N at the sub-interval midpoints of [0, T].
+        let n = 300usize;
+        let subdoses: Vec<DoseEvent> = (0..n)
+            .map(|k| {
+                let tk = (k as f64 + 0.5) * t_inf / n as f64;
+                DoseEvent::new(tk, d / n as f64, 1, 0.0, false, 0.0)
+            })
+            .collect();
+        let train_preds = ode_predictions(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &make_subject(subdoses, obs.clone()),
+        );
+
+        assert_eq!(inf_preds.len(), train_preds.len());
+        for (i, (&a, &b)) in inf_preds.iter().zip(&train_preds).enumerate() {
+            assert!(a.is_finite() && b > 0.0);
+            let rel = (a - b).abs() / b;
+            assert!(
+                rel < 1e-3,
+                "obs {i} (t={}): infusion {a:.6} vs sub-dose train {b:.6} (rel {rel:.2e})",
+                obs[i]
+            );
+        }
+    }
+
+    /// An infusion into a **transit** depot (the incomplete-gamma density feeding a real depot
+    /// state, then `KA` to central) must also equal a sub-dose train (#719 gap 2) — covering the
+    /// gamma-CDF `rate_infused` branch and the depot-state carryover through the ODE engine.
+    #[test]
+    fn infusion_into_transit_depot_absorption_matches_subdose_train() {
+        let mut ode = transit_one_cpt_oral_spec();
+        ode.solver_opts.reltol = 1e-11;
+        ode.solver_opts.abstol = 1e-11;
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 3.0;
+        pk.values[crate::types::PK_IDX_V] = 30.0;
+        pk.values[4] = 1.2; // KA
+        pk.values[6] = 3.0; // n transit compartments
+        pk.values[7] = 1.5; // MTT
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+
+        let (d, t_inf) = (50.0_f64, 2.5_f64);
+        let obs = vec![0.5, 1.5, 2.5, 4.0, 8.0];
+        let inf_subj = make_subject(
+            vec![DoseEvent::new(0.0, d, 1, d / t_inf, false, 0.0)],
+            obs.clone(),
+        );
+        let inf_preds = ode_predictions(&ode, &pk.values, &[], &[], &inf_subj);
+
+        let n = 300usize;
+        let subdoses: Vec<DoseEvent> = (0..n)
+            .map(|k| {
+                let tk = (k as f64 + 0.5) * t_inf / n as f64;
+                DoseEvent::new(tk, d / n as f64, 1, 0.0, false, 0.0)
+            })
+            .collect();
+        let train_preds = ode_predictions(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &make_subject(subdoses, obs.clone()),
+        );
+
+        for (i, (&a, &b)) in inf_preds.iter().zip(&train_preds).enumerate() {
+            assert!(a.is_finite() && b > 0.0);
+            let rel = (a - b).abs() / b;
+            assert!(
+                rel < 1e-3,
+                "obs {i} (t={}): infusion {a:.6} vs sub-dose train {b:.6} (rel {rel:.2e})",
+                obs[i]
             );
         }
     }
