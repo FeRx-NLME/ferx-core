@@ -391,8 +391,24 @@ fn frem_rao_blackwell_marginal_drops_covariate_2pi_constant() {
 
     assert!(rb.is_finite(), "RB marginal must be finite, got {rb}");
     // Fixed seed and fast-but-stable K=6000. Tolerance is comfortably below the
-    // ~36.8 bug offset and above the observed MC/platform noise.
-    let expected = 19781.127590682896_f64;
+    // ~36.8 bug offset (10 subjects × 2 covariate etas × log 2π) and above the observed
+    // MC/platform noise.
+    //
+    // #251: this reference was 19781.127590682896, which was enshrining a bug. Importance
+    // sampling is unbiased in expectation, but its proposal is centred on the inner-loop
+    // EBEs — and those were being driven to the mode of the WRONG likelihood, because the
+    // inner analytic gradient scored FREM covariate pseudo-observations against the PK
+    // model instead of `θ[i] + η[j]` with `EPSCOV`. The proposal therefore had almost no
+    // overlap with the true posterior, the weights collapsed, and the estimate was
+    // meaningless. (`importance_sampling` already applied the FREM residual override when
+    // *scoring*; it inherited the broken proposal.)
+    //
+    // The corrected value cross-checks against a completely independent estimator: the
+    // converged FOCEI Laplace OFV on this model is 210.99
+    // (`frem_covariate_omega_matches_sample_variance_under_focei`), and this 6000-sample
+    // IS marginal is 211.65. Two different approximations of the same quantity now agree
+    // to <1 unit, where before they differed by ~19 570.
+    let expected = 211.64831787274125_f64;
     assert!(
         (rb - expected).abs() < 12.0,
         "RB marginal {rb} should stay near the seeded no-constant reference \
@@ -500,21 +516,33 @@ fn frem_covariate_omega_matches_sample_variance() {
     );
 }
 
-/// The same ground truth under **FOCEI** — the gradient-based twin of
-/// `frem_covariate_omega_matches_sample_variance` (#251).
+/// The gradient-based twin of `frem_covariate_omega_matches_sample_variance` (#251).
 ///
-/// REGRESSION TEST. The FREM-aware residual override was applied to SAEM (see the test
-/// below), to importance sampling, and to the CWRES path — but never to the analytic
-/// gradients. So `subject_sensitivities` handed the gradient the ordinary **PK** jet for
-/// covariate pseudo-observation rows and the assembly read the ordinary residual variance,
-/// while the objective scored those same rows against `theta[i] + eta[j]` with `EPSCOV`.
-/// FOCEI was therefore minimising one objective and differentiating another (and the inner
-/// loop drove the EBEs to the mode of the wrong likelihood).
+/// Two independent checks, and it matters which one does the regression work.
 ///
-/// Because the only "data" for a covariate row is the subject's own covariate value, the
-/// covariate eta variance has an exact ground truth: it must recover the covariate's
-/// **sample variance**. That makes this a real oracle rather than a smoke test — and it is
-/// what a gradient-based FREM fit could not do before the fix.
+/// **The covariate ω is the weak check.** It has an exact ground truth — the only "data"
+/// for a covariate row is the subject's own covariate value, so `Ω_cov` must recover the
+/// covariate's sample variance — but it turns out to be *insensitive to the gradient bug*:
+/// the pseudo-observations pin `η_cov ≈ y_cov − θ_cov` almost regardless of how the
+/// optimizer got there, so the recovered ω was already ~right (118.7 vs 111.56) even with
+/// the analytic gradient differentiating the wrong likelihood. Keep it as a correctness
+/// oracle, but do not mistake it for the regression.
+///
+/// **The OFV is the real check.** The FREM-aware residual override reached SAEM (see the
+/// test below), importance sampling and the CWRES path, but never the analytic gradients:
+/// the provider handed them the ordinary **PK** jet for `FREMTYPE > 0` rows and the
+/// assemblies read the ordinary residual variance, while the objective scores those rows
+/// against `θ[i] + η[j]` with `EPSCOV`. The inner loop therefore drove the EBEs to the mode
+/// of the wrong likelihood, and the FOCEI objective — evaluated *at* those EBEs — landed
+/// ~4700 units worse:
+///
+/// ```text
+///   before fix:  OFV = 4900.6      (ω_WT = 118.71, ω_AGE = 104.30)
+///   after fix:   OFV =  211.0      (ω_WT = 118.67, ω_AGE = 104.27)
+/// ```
+///
+/// This PR does not touch the objective, only the gradients — so the entire OFV gap is the
+/// fit landing somewhere else. That is what the `ofv < 1000.0` bound below pins.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -528,13 +556,32 @@ fn frem_covariate_omega_matches_sample_variance_under_focei() {
     let pop = read_nonmem_csv(&result.data_path, None, None).unwrap();
 
     let mut opts = FitOptions::default();
-    opts.method = ferx_core::EstimationMethod::Focei;
+    opts.method = ferx_core::EstimationMethod::FoceI;
     opts.run_covariance_step = false;
     opts.verbose = false;
 
     let fit_result =
         fit(&model, &pop, &model.default_params, &opts).expect("FREM FOCEI fit should succeed");
+    println!(
+        "FOCEI FREM: OFV={:.1}  omega_WT={:.2} (want 111.56)  omega_AGE={:.2} (want 99.38)",
+        fit_result.ofv,
+        fit_result.omega[(3, 3)],
+        fit_result.omega[(4, 4)],
+    );
     assert!(fit_result.ofv.is_finite(), "OFV should be finite");
+
+    // THE regression assertion. With the analytic gradients corrected the fit converges to
+    // OFV ≈ 211; with the PK jet / PK variance on the pseudo-obs rows it settles at ≈ 4901,
+    // because the inner loop drives the EBEs to the mode of a likelihood that is not the one
+    // being minimised. The bound sits far from both, so it discriminates without being
+    // brittle. (The covariate-ω assertions below pass either way — see the doc comment.)
+    assert!(
+        fit_result.ofv < 1000.0,
+        "FOCEI FREM OFV = {:.1}; expected ≈ 211. A value near 4900 means the analytic \
+         gradient is differentiating the PK likelihood on covariate pseudo-observation rows \
+         while the objective scores them against theta[i] + eta[j] with EPSCOV.",
+        fit_result.ofv
+    );
 
     let omega = &fit_result.omega;
     for (idx, expected, name) in [(3usize, 111.56f64, "WT"), (4, 99.38, "AGE")] {
@@ -543,8 +590,7 @@ fn frem_covariate_omega_matches_sample_variance_under_focei() {
         assert!(
             pct < 15.0,
             "{name} omega diag ({got:.2}) should be within 15% of the sample variance \
-             ({expected:.2}), got {pct:.1}% — the analytic gradient is differentiating a \
-             different likelihood than the objective on covariate pseudo-obs rows"
+             ({expected:.2}), got {pct:.1}%"
         );
     }
 }

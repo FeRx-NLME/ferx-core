@@ -35,9 +35,26 @@ section of the SDLC for the versioning policy).
   The provider now rewrites both jets for pseudo-observation rows (`f = theta[i] +
   eta[j]`, unit first derivatives, zero second derivatives — the same `{0, 1}` Jacobian
   the FOCE H-matrix already stamped in), and both gradient assemblies use the `EPSCOV`
-  variance. This was latent because FREM models are conventionally fit with `method =
-  saem`, which uses neither gradient; a FREM fit under `focei` (or now `agq` / `laplace`)
-  was affected. **SAEM fits are unchanged.**
+  variance.
+
+  On the warfarin FREM example the effect is large. A converged FOCEI fit goes from
+  **OFV 4900.6 to 211.0**, and the importance-sampling marginal (`method = imp`) from
+  **19781.1 to 211.6** — `imp` scores FREM rows correctly but centres its proposal on the
+  inner-loop EBEs, so it inherited the wrong mode, the weights collapsed, and its estimate
+  was meaningless. This release changes no objective function, only gradients, so the
+  entire gap is the fit previously landing in the wrong place. That the corrected FOCEI
+  Laplace OFV (211.0) and the corrected 6000-sample IS marginal (211.6) — two independent
+  approximations — now agree to under one unit is the strongest check that the new values
+  are the right ones.
+
+  Note the recovered covariate omegas barely move (118.71 → 118.67 for WT), because they
+  are pinned by the pseudo-observations themselves. **A FREM fit could therefore look
+  entirely plausible on the one diagnostic a user would naturally check, and still be badly
+  wrong.**
+
+  Latent because FREM models are conventionally fit with `method = saem`, which uses
+  neither gradient — and the covariate-omega regression test runs SAEM. Fits under `focei`,
+  `imp` (or now `agq` / `laplace`) were affected. **SAEM fits are unchanged.**
 
 - **AGQ / `laplace`: the analytic outer gradient now covers the same models as
   FOCE/FOCEI** (#251). Its score previously carried a Gaussian-only residual chain,
