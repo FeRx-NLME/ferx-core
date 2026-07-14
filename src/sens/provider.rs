@@ -2700,6 +2700,8 @@ pub fn subject_sensitivities_tvcov(
     // scale-then-log order matches production `ln(f/s)` (#486). The inner EBE gradient stays
     // on FD for LTBS (covariance stability), so there is no inner counterpart.
     apply_ltbs_transform_outer(&mut sens, model.log_transform);
+    // FREM covariate pseudo-observations are not PK rows at all — overwrite their jet.
+    apply_frem_pseudo_obs_jet(&mut sens, model, subject, theta, eta);
     Some(sens)
 }
 
@@ -3455,17 +3457,62 @@ pub(crate) fn subject_eta_grad_with_schedule(
     eta: &[f64],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
-    if !sens_profile_enabled() {
-        return subject_eta_grad_impl(model, subject, theta, eta, cached_schedule);
+    let mut r = if !sens_profile_enabled() {
+        subject_eta_grad_impl(model, subject, theta, eta, cached_schedule)
+    } else {
+        let t0 = std::time::Instant::now();
+        let r = subject_eta_grad_impl(model, subject, theta, eta, cached_schedule);
+        PROFILE_ETA_NANOS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        PROFILE_ETA_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        r
+    };
+    // FREM covariate pseudo-observations, inner (η-gradient) counterpart of
+    // `apply_frem_pseudo_obs_jet`. Applied here rather than inside `subject_eta_grad_impl`
+    // so it covers every inner route at one choke point — closed-form, TV-cov event-driven
+    // and the light `Dual1` ODE walk — none of which knows the row is not a PK row.
+    if let Some(g) = r.as_mut() {
+        apply_frem_pseudo_obs_grad(g, model, subject, theta, eta);
     }
-    let t0 = std::time::Instant::now();
-    let r = subject_eta_grad_impl(model, subject, theta, eta, cached_schedule);
-    PROFILE_ETA_NANOS.fetch_add(
-        t0.elapsed().as_nanos() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    PROFILE_ETA_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     r
+}
+
+/// Inner (η-gradient) counterpart of [`apply_frem_pseudo_obs_jet`]: a FREM covariate
+/// pseudo-observation's prediction is `θ[ti] + η[ei]`, so `∂f/∂η = e_ei` exactly — the
+/// same `{0, 1}` Jacobian `inner_optimizer::overwrite_frem_pseudo_obs_rows` already
+/// stamps into the FOCE H-matrix. Without it the inner EBE gradient differentiates the PK
+/// model on a row the objective scores against a covariate, so the EBEs themselves are
+/// wrong. A no-op for a non-FREM model or a subject with no pseudo-observations.
+fn apply_frem_pseudo_obs_grad(
+    sens: &mut [ObsGrad],
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) {
+    let Some(fc) = model.frem_config.as_ref() else {
+        return;
+    };
+    if subject.fremtype.is_empty() {
+        return;
+    }
+    for (j, obs) in sens.iter_mut().enumerate() {
+        let ft = subject.fremtype.get(j).copied().unwrap_or(0);
+        if ft == 0 {
+            continue;
+        }
+        let Some(&(ti, ei)) = fc.fremtype_to_indices.get(&ft) else {
+            continue;
+        };
+        obs.f = theta.get(ti).copied().unwrap_or(0.0) + eta.get(ei).copied().unwrap_or(0.0);
+        let n_eta = obs.df_deta.len();
+        obs.df_deta.iter_mut().for_each(|v| *v = 0.0);
+        if ei < n_eta {
+            obs.df_deta[ei] = 1.0;
+        }
+    }
 }
 
 fn subject_eta_grad_impl(
@@ -4815,7 +4862,68 @@ fn subject_sensitivities_impl(
     // that the TV-cov event-driven outer (`subject_sensitivities_tvcov`) also uses. Applied
     // last, matching production's scale-then-log order.
     apply_ltbs_transform_outer(&mut sens, model.log_transform);
+    // FREM covariate pseudo-observations are not PK rows at all — overwrite their jet.
+    apply_frem_pseudo_obs_jet(&mut sens, model, subject, theta, eta);
     Some(sens)
+}
+
+/// Replace the jet of every FREM **covariate pseudo-observation** row (`fremtype > 0`).
+///
+/// `individual_nll` does not score such a row against the PK model at all: its prediction
+/// is `θ[theta_idx] + η[eta_idx]` and its variance is the dedicated covariate σ (`EPSCOV`),
+/// not `error_spec.variance_at(f)`. The sensitivity walk knows nothing about that — it
+/// returns the ordinary PK jet for every observation — so without this pass the analytic
+/// outer gradient differentiates a likelihood the objective never evaluates on those rows.
+///
+/// The corrected row is trivially linear-Gaussian:
+///
+/// ```text
+///   f = θ[ti] + η[ei] ,   ∂f/∂η = e_ei ,   ∂f/∂θ = e_ti ,   every 2nd derivative = 0
+/// ```
+///
+/// The *variance* half is handled by the consumers, which read the FREM σ override rather
+/// than `variance_at` for these rows (`sens_outer_gradient::score_core`); `d = ∂R/∂f` and
+/// `d2` are then zero because `R` does not depend on `f` here.
+///
+/// Applied **after** [`apply_ltbs_transform_outer`], because a FREM row's prediction is not
+/// log-transformed by the objective either (`individual_nll` takes the `fremtype` branch
+/// before it ever touches `preds`), so the LTBS jet for that row must be overwritten, not
+/// composed with. A no-op for a non-FREM model or a subject with no pseudo-observations.
+fn apply_frem_pseudo_obs_jet(
+    sens: &mut SubjectSens,
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) {
+    let Some(fc) = model.frem_config.as_ref() else {
+        return;
+    };
+    if subject.fremtype.is_empty() {
+        return;
+    }
+    for (j, obs) in sens.obs.iter_mut().enumerate() {
+        let ft = subject.fremtype.get(j).copied().unwrap_or(0);
+        if ft == 0 {
+            continue;
+        }
+        let Some(&(ti, ei)) = fc.fremtype_to_indices.get(&ft) else {
+            continue;
+        };
+        let n_eta = obs.df_deta.len();
+        let n_theta = obs.df_dtheta.len();
+        obs.f = theta.get(ti).copied().unwrap_or(0.0) + eta.get(ei).copied().unwrap_or(0.0);
+        obs.df_deta.iter_mut().for_each(|v| *v = 0.0);
+        if ei < n_eta {
+            obs.df_deta[ei] = 1.0;
+        }
+        obs.df_dtheta.iter_mut().for_each(|v| *v = 0.0);
+        if ti < n_theta {
+            obs.df_dtheta[ti] = 1.0;
+        }
+        obs.d2f_deta2.iter_mut().for_each(|v| *v = 0.0);
+        obs.d2f_deta_dtheta.iter_mut().for_each(|v| *v = 0.0);
+    }
 }
 
 /// Apply the log-transform-both-sides (LTBS) `g = ln(f)` output transform to an outer

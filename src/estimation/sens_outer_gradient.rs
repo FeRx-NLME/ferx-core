@@ -42,14 +42,14 @@ use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
 /// Per-observation error-model scalars used throughout the assembly.
-struct ErrTerms {
-    r: f64,       // Rⱼ
-    d: f64,       // dⱼ = ∂R/∂f
-    eps: f64,     // εⱼ = y − f
-    alpha: f64,   // αⱼ
-    alpha_p: f64, // α'ⱼ = dαⱼ/df
-    p: f64,       // pⱼ
-    beta: f64,    // βⱼ = dpⱼ/df
+pub(crate) struct ErrTerms {
+    pub(crate) r: f64,       // Rⱼ
+    pub(crate) d: f64,       // dⱼ = ∂R/∂f
+    pub(crate) eps: f64,     // εⱼ = y − f
+    pub(crate) alpha: f64,   // αⱼ
+    pub(crate) alpha_p: f64, // α'ⱼ = dαⱼ/df
+    pub(crate) p: f64,       // pⱼ
+    pub(crate) beta: f64,    // βⱼ = dpⱼ/df
     // M3-censored × residual-eta (`iiv_on_ruv`) cross-term coefficients (#4c).
     // Zero on quantified rows and on non-`iiv_on_ruv` censored rows. With
     // `z = (y−f)/√v`, `h = φ(z)/Φ(z)`, `m = 1/√v + (y−f)·R'/(2 v^{3/2})` and
@@ -59,24 +59,24 @@ struct ErrTerms {
     // inner Hessian's residual-eta row/col reads `ruv_cz`/`ruv_cm` instead of the
     // Gaussian `2ε²/R`/`ruv_kappa`. Since #486 these `ruv_cz`/`ruv_cm` terms also enter
     // `H̃`/`log|H̃|` (with their θ/σ/η derivatives), consistently with quantified rows.
-    ruv_cz: f64, // C·z  (residual-eta diagonal of the true inner Hessian)
-    ruv_cm: f64, // C·m  (residual-eta × structural-η / θ / σ coupling)
+    pub(crate) ruv_cz: f64, // C·z  (residual-eta diagonal of the true inner Hessian)
+    pub(crate) ruv_cm: f64, // C·m  (residual-eta × structural-η / θ / σ coupling)
     /// True for an M3-censored row. The residual-eta blocks read the censored
     /// `ruv_cz`/`ruv_cm` coefficients instead of the Gaussian `2ε²/R`/`ruv_kappa`.
-    censored: bool,
+    pub(crate) censored: bool,
     /// Raw NONMEM `CENS` sign for this row (`0` quantified, `>0` below-LLOQ /
     /// lower tail, `<0` above-ULOQ / upper tail). The σ-block's FD of the
     /// censored df-coefficient must re-evaluate the kernel on the same tail, so
     /// the sign is carried here rather than re-read from the subject.
-    cens_sign: i8,
+    pub(crate) cens_sign: i8,
     /// `∂Rⱼ/∂θₘ` from the custom residual-error magnitude's *direct* θ-dependence
     /// (#484/#576/#486) — `mult(θ)` enters `R` independent of the prediction `f`,
     /// so this is a channel `theta_block` would otherwise miss entirely. Empty
     /// when no magnitude is active (the common case; zero-cost).
-    dr_dtheta: Vec<f64>,
+    pub(crate) dr_dtheta: Vec<f64>,
     /// `∂dⱼ/∂θₘ = ∂²Rⱼ/∂f∂θₘ`, the `f`-derivative of `dr_dtheta` — the magnitude
     /// analog of the σ-block's `d_sig`. Empty when no magnitude is active.
-    dd_dtheta: Vec<f64>,
+    pub(crate) dd_dtheta: Vec<f64>,
 }
 
 /// `(g1, g2) = (∂L/∂f, ∂²L/∂f²)` only — used by the reconverge test oracles
@@ -678,17 +678,149 @@ fn mag_alpha_dtheta(et: &ErrTerms, m: usize) -> f64 {
 /// and the **IOV** path, where the random effects are the stacked
 /// `[η_bsv, κ₁..κ_K]` and `omega_inv` is the inverse of the block-diagonal
 /// `Ω_bsv ⊕ K·Ω_iov`. Everything else (error model, σ, censoring) is shared.
+/// The per-observation scalar likelihood chain (`ErrTerms`) plus the two Hessians, for
+/// an **arbitrary** `eta` — the mode is never assumed.
+///
+/// This is the half of [`prepare_stacked`] that does not depend on the FOCEI `log|H̃|`
+/// machinery, split out so callers that only need the *score* of the conditional NLL can
+/// have it without paying for two Cholesky inverses per call (#251 AGQ/Laplace, which
+/// evaluates it once per quadrature node).
+///
+/// Two things here are exactly what an AGQ/Laplace node needs, for the FULL analytic
+/// scope (M3-censored, `iiv_on_ruv`, custom σ magnitude, correlated residual, LTBS):
+///
+/// * `et[j].alpha = 2·∂L_j/∂f_j` — the residual chain, per endpoint family; and
+/// * `h_inner = Ω⁻¹ + Σⱼ (∂²L_j/∂f² aⱼaⱼᵀ + ∂L_j/∂f Aⱼ)`, which **is** the exact
+///   conditional Hessian `∂²nll/∂b²` (`L_j = ½(εⱼ²/Rⱼ + ln Rⱼ)`, so `½α` and `½α'`
+///   recover `∂L/∂f` and `∂²L/∂f²`).
+pub(crate) struct ScoreCore {
+    pub(crate) et: Vec<ErrTerms>,
+    /// `H̃ = Σ pⱼ aⱼaⱼᵀ + Ω⁻¹` — the first-order (Almquist) FOCEI Hessian.
+    pub(crate) htilde: DMatrix<f64>,
+    /// `H = ∂²nll/∂b²` — the **exact** conditional Hessian at `eta`.
+    pub(crate) h_inner: DMatrix<f64>,
+    pub(crate) g_ruv: Vec<f64>,
+    pub(crate) gp_ruv: Vec<f64>,
+    pub(crate) cens_dcz_df: Vec<f64>,
+    pub(crate) cens_dcm_df: Vec<f64>,
+    pub(crate) mult: Option<Vec<Vec<f64>>>,
+    pub(crate) ruv_scale: f64,
+    pub(crate) ruv: Option<usize>,
+}
+
+/// `∂(Σⱼ Lⱼ)/∂σ_k` at **fixed** predictions — the data term's σ-gradient, in natural σ.
+///
+/// σ enters `nll` only through the residual variance, so this is a closed-form scalar
+/// computation at fixed `f`: no model evaluation, no inner solve, no Hessian. It is the
+/// *data half* of [`sigma_block`], which additionally carries the FOCEI `log|H̃|` and
+/// EBE-response terms that a fixed-`b` score must NOT have (#251 AGQ/Laplace).
+///
+/// Quantified rows use `∂L/∂R · ∂R/∂σ`. `R` is a quadratic form in σ
+/// (`R = Σ_s (coeff_s(f)·mult_s·σ_s)²`), so the central difference of `R` is **exact** up
+/// to rounding — there is no truncation error to trade against noise — and it inherits the
+/// custom-magnitude, `iiv_on_ruv` and correlated-residual scalings for free rather than
+/// re-deriving `∂R/∂σ` once per family. Censored rows use the `−logΦ(z)` kernel's own
+/// σ-derivative through the shared [`censored_sigma_m_terms`], the same convention and FD
+/// step `sigma_block` uses.
+pub(crate) fn data_sigma_gradient(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    core: &ScoreCore,
+) -> Vec<f64> {
+    let sigma = &params.sigma.values;
+    let n_sigma = sigma.len();
+    let err_keys = model.error_spec.obs_keys(subject);
+    let correlated = !model.residual_correlations.is_empty();
+    let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
+    let mut out = vec![0.0f64; n_sigma];
+
+    for k in 0..n_sigma {
+        let h = sigma_fd_step(sigma[k]);
+        let mut sp = sigma.clone();
+        sp[k] += h;
+        let mut sm = sigma.clone();
+        sm[k] -= h;
+        let (corr_sp, corr_sm) = if correlated {
+            (
+                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sp)),
+                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sm)),
+            )
+        } else {
+            (None, None)
+        };
+
+        let mut acc = 0.0;
+        for (j, obs) in sens.obs.iter().enumerate() {
+            let cmt = err_keys[j];
+            let f = obs.f;
+            let et = &core.et[j];
+            if et.censored {
+                let (_dg1, _ruv_sig, l_sig) = censored_sigma_m_terms(
+                    model,
+                    cmt,
+                    subject.observations[j],
+                    f,
+                    &sp,
+                    &sm,
+                    h,
+                    core.ruv_scale,
+                    et.ruv_cz,
+                    et.r,
+                    core.ruv.is_some(),
+                    et.cens_sign,
+                );
+                acc += l_sig;
+                continue;
+            }
+            // `R` at σ±h, built exactly as `score_core` builds it: a FREM covariate
+            // pseudo-observation takes the dedicated `EPSCOV` σ; otherwise the
+            // correlation-aware diagonal, else the magnitude-scaled or legacy variance,
+            // times the `iiv_on_ruv` scale.
+            let r_at = |sa: &[f64], corr: &Option<(Vec<f64>, Vec<f64>)>| -> f64 {
+                if let Some(v) = crate::stats::likelihood::build_frem_r_override(
+                    model.frem_config.as_ref(),
+                    &subject.fremtype,
+                    sa,
+                )
+                .as_ref()
+                .and_then(|o| o.get(j))
+                .and_then(|x| *x)
+                {
+                    return v;
+                }
+                match corr {
+                    Some((rv, _)) => rv[j],
+                    None => match core.mult.as_ref().and_then(|m| m.get(j)) {
+                        Some(m) => {
+                            model.error_spec.variance_at_scaled(cmt, f, sa, &[], m) * core.ruv_scale
+                        }
+                        None => model.error_spec.variance_at(cmt, f, sa) * core.ruv_scale,
+                    },
+                }
+            };
+            let dr_dsig = (r_at(&sp, &corr_sp) - r_at(&sm, &corr_sm)) / (2.0 * h);
+            // `∂L/∂R = (R − ε²)/(2R²)` for `L = ½(ε²/R + ln R)`.
+            let (r, eps) = (et.r, et.eps);
+            acc += 0.5 * (r - eps * eps) / (r * r) * dr_dsig;
+        }
+        out[k] = acc;
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
-fn prepare_stacked(
+pub(crate) fn score_core(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
     sens: &SubjectSens,
     n_eta: usize,
-    omega_inv: DMatrix<f64>,
-    eta_hat: &[f64],
+    omega_inv: &DMatrix<f64>,
+    eta: &[f64],
     ruv: Option<usize>,
-) -> Option<Prep> {
+) -> Option<ScoreCore> {
     let n_obs = subject.observations.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
@@ -717,7 +849,7 @@ fn prepare_stacked(
     // to keep its residual variance unscaled, so gate on the local `ruv`, not on
     // `model.residual_error_eta`).
     let ruv_scale = if ruv.is_some() {
-        model.residual_var_scale(eta_hat)
+        model.residual_var_scale(eta)
     } else {
         1.0
     };
@@ -774,11 +906,23 @@ fn prepare_stacked(
     } else {
         None
     };
+    // FREM covariate pseudo-observations (`fremtype > 0`): the objective scores these rows
+    // against the dedicated covariate σ (`EPSCOV`), not `error_spec.variance_at(f)`. The
+    // provider has already rewritten their *jet* (`apply_frem_pseudo_obs_jet` — prediction
+    // `θ[ti] + η[ei]`, unit first derivatives, zero second); this is the matching *variance*
+    // half. `R` is constant in `f` on such a row, hence `d = d2 = 0`. `None` for a non-FREM
+    // model, so the common path allocates nothing.
+    let frem_r = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma,
+    );
     for obs in sens.obs.iter() {
         let f = obs.f;
         // obs index → cmt: provider obs are parallel to subject.obs_times.
         let j = et.len();
         let cmt = err_keys[j];
+        let frem_var = frem_r.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
         // `mult_row` is `None` for every observation on a non-magnitude model, so
         // that path keeps the exact legacy `variance_at`/`dvar_df`/`d2var_df2`
         // association bit-for-bit (the `_scaled` variants reassociate the
@@ -788,9 +932,11 @@ fn prepare_stacked(
         // diagonals; otherwise fall back to the per-obs (magnitude-scaled or legacy)
         // variance/derivatives. `block_sigma` and custom magnitude are mutually exclusive
         // (a `block_sigma` model has `mult == None`), so the two branches never mix.
-        let (r, d, d2) = match &corr_diag {
-            Some((rv, dv, d2v)) => (rv[j], dv[j], d2v[j]),
-            None => {
+        let (r, d, d2) = match (frem_var, &corr_diag) {
+            // FREM pseudo-obs: `R = EPSCOV²`, independent of `f`.
+            (Some(v), _) => (v, 0.0, 0.0),
+            (None, Some((rv, dv, d2v))) => (rv[j], dv[j], d2v[j]),
+            (None, None) => {
                 let r = match mult_row {
                     Some(m) => {
                         model.error_spec.variance_at_scaled(cmt, f, sigma, &[], m) * ruv_scale
@@ -942,6 +1088,49 @@ fn prepare_stacked(
         }
         et.push(t);
     }
+
+    Some(ScoreCore {
+        et,
+        htilde,
+        h_inner,
+        g_ruv,
+        gp_ruv,
+        cens_dcz_df,
+        cens_dcm_df,
+        mult,
+        ruv_scale,
+        ruv,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_stacked(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    n_eta: usize,
+    omega_inv: DMatrix<f64>,
+    eta_hat: &[f64],
+    ruv: Option<usize>,
+) -> Option<Prep> {
+    let n_obs = subject.observations.len();
+    let err_keys = model.error_spec.obs_keys(subject);
+    let sigma = &params.sigma.values;
+    let ScoreCore {
+        et,
+        htilde,
+        h_inner,
+        g_ruv,
+        gp_ruv,
+        cens_dcz_df,
+        cens_dcm_df,
+        mult,
+        ruv_scale,
+        ruv: _,
+    } = score_core(
+        model, subject, params, sens, n_eta, &omega_inv, eta_hat, ruv,
+    )?;
 
     let htilde_inv = htilde.cholesky()?.inverse();
     let h_inner_inv = h_inner.cholesky()?.inverse();

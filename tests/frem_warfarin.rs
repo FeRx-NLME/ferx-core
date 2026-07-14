@@ -500,6 +500,55 @@ fn frem_covariate_omega_matches_sample_variance() {
     );
 }
 
+/// The same ground truth under **FOCEI** — the gradient-based twin of
+/// `frem_covariate_omega_matches_sample_variance` (#251).
+///
+/// REGRESSION TEST. The FREM-aware residual override was applied to SAEM (see the test
+/// below), to importance sampling, and to the CWRES path — but never to the analytic
+/// gradients. So `subject_sensitivities` handed the gradient the ordinary **PK** jet for
+/// covariate pseudo-observation rows and the assembly read the ordinary residual variance,
+/// while the objective scored those same rows against `theta[i] + eta[j]` with `EPSCOV`.
+/// FOCEI was therefore minimising one objective and differentiating another (and the inner
+/// loop drove the EBEs to the mode of the wrong likelihood).
+///
+/// Because the only "data" for a covariate row is the subject's own covariate value, the
+/// covariate eta variance has an exact ground truth: it must recover the covariate's
+/// **sample variance**. That makes this a real oracle rather than a smoke test — and it is
+/// what a gradient-based FREM fit could not do before the fix.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn frem_covariate_omega_matches_sample_variance_under_focei() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = setup_frem(tmp.path());
+
+    let model = parse_model_file(&result.model_path).unwrap();
+    let pop = read_nonmem_csv(&result.data_path, None, None).unwrap();
+
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Focei;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+
+    let fit_result =
+        fit(&model, &pop, &model.default_params, &opts).expect("FREM FOCEI fit should succeed");
+    assert!(fit_result.ofv.is_finite(), "OFV should be finite");
+
+    let omega = &fit_result.omega;
+    for (idx, expected, name) in [(3usize, 111.56f64, "WT"), (4, 99.38, "AGE")] {
+        let got = omega[(idx, idx)];
+        let pct = ((got - expected) / expected * 100.0).abs();
+        assert!(
+            pct < 15.0,
+            "{name} omega diag ({got:.2}) should be within 15% of the sample variance \
+             ({expected:.2}), got {pct:.1}% — the analytic gradient is differentiating a \
+             different likelihood than the objective on covariate pseudo-obs rows"
+        );
+    }
+}
+
 /// Regression test: under SAEM, adding FREM covariates must NOT shrink the PK
 /// residual error. Before the FREM-aware residual override, SAEM scored the
 /// covariate pseudo-observations with the PK error model; their near-zero

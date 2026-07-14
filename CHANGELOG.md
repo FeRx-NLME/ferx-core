@@ -19,6 +19,39 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+- **FREM: the analytic gradients differentiated the wrong likelihood on covariate
+  pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against
+  the prediction `theta[i] + eta[j]` with the dedicated covariate error `EPSCOV` — but the
+  sensitivity provider returned the ordinary **PK** jet for those rows, and the gradient
+  assemblies read the ordinary residual variance rather than the `EPSCOV` override that
+  SAEM, importance sampling and the CWRES path all already applied. Both loops were
+  affected:
+  - the **outer** (population) gradient, so FOCE/FOCEI were minimising one objective while
+    differentiating another; and
+  - the **inner** (EBE) gradient, so the empirical Bayes estimates themselves converged to
+    the mode of the wrong likelihood.
+
+  The provider now rewrites both jets for pseudo-observation rows (`f = theta[i] +
+  eta[j]`, unit first derivatives, zero second derivatives — the same `{0, 1}` Jacobian
+  the FOCE H-matrix already stamped in), and both gradient assemblies use the `EPSCOV`
+  variance. This was latent because FREM models are conventionally fit with `method =
+  saem`, which uses neither gradient; a FREM fit under `focei` (or now `agq` / `laplace`)
+  was affected. **SAEM fits are unchanged.**
+
+- **AGQ / `laplace`: the analytic outer gradient now covers the same models as
+  FOCE/FOCEI** (#251). Its score previously carried a Gaussian-only residual chain,
+  so five endpoint families that FOCE/FOCEI already handled analytically — **M3
+  censoring, IIV-on-RUV, a custom or time-varying residual magnitude, LTBS, and
+  correlated residuals (`block_sigma`)** — silently fell back to a finite-differenced
+  score. They now share the same per-observation chain as FOCE/FOCEI and take the
+  analytic route, so scope parity holds by construction rather than by a list that
+  can drift. Under a custom residual magnitude this also **corrects** the θ gradient:
+  `mult(θ)` makes the residual variance depend on θ directly, and that channel was
+  not approximated before — it was missing entirely. FREM, TTE and categorical
+  endpoints continue to use the finite-differenced score (neither re-solves the inner
+  loop, so they remain fast).
+
 ### Added
 - **AGQ and `laplace` now support inter-occasion variability (`[iov]`)** (#251).
   Under IOV the integral runs over the **stacked** random-effect vector
