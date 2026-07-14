@@ -1555,6 +1555,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],

@@ -665,7 +665,7 @@ impl PkParams {
 }
 
 /// A single subject with dosing and observation data
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Subject {
     pub id: String,
     pub doses: Vec<DoseEvent>,
@@ -720,6 +720,15 @@ pub struct Subject {
     /// Occasion index per observation row (parallel to `obs_times`).
     /// Empty when no IOV column is present in the data.
     pub occasions: Vec<u32>,
+    /// `L2` grouping id per observation row (parallel to `obs_times`), the
+    /// NONMEM data item that ties several records into one correlated
+    /// observation unit. Rows sharing an `L2` value (within a subject) are
+    /// correlated together by `block_sigma`; a `0` (or empty vector when the
+    /// data has no `L2` column) means "ungrouped", and those rows fall back to
+    /// the `(time, occasion)` pairing rule. This is what lets a user pair, e.g.,
+    /// the total and unbound rows of one blood draw explicitly rather than
+    /// relying on co-temporal row order (#827).
+    pub obs_l2: Vec<i64>,
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
@@ -6447,6 +6456,7 @@ pub(crate) mod test_helpers {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6611,6 +6621,7 @@ mod tests {
             reset_times: vec![],
             cens: vec![0, 0],
             occasions: vec![],
+            obs_l2: Vec::new(),
             dose_occasions: vec![],
             // Row 0 = PK observation, row 1 = covariate pseudo-observation.
             fremtype: vec![0, 100],
@@ -6661,6 +6672,7 @@ mod tests {
             reset_times: vec![],
             cens: vec![0],
             occasions: vec![],
+            obs_l2: Vec::new(),
             dose_occasions: vec![],
             fremtype: vec![0],
             obs_records: vec![],
@@ -7967,6 +7979,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: Vec::new(),
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),

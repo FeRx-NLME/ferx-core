@@ -22889,6 +22889,7 @@ if (WT > 70) {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -22909,6 +22910,7 @@ if (WT > 70) {
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             &sigma,
             &model.residual_correlations,
         );
@@ -22956,6 +22958,7 @@ if (WT > 70) {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],

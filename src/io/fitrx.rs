@@ -1999,6 +1999,7 @@ mod tests {
                 reset_times: vec![],
                 cens: vec![0; n_obs_each],
                 occasions: vec![],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![],
                 fremtype: Vec::new(),
                 obs_records: vec![],
