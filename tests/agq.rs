@@ -1087,3 +1087,45 @@ fn analytic_gradient_matches_fd_under_iov() {
         );
     }
 }
+
+/// **AGQ must be able to *declare* convergence, not just reach it.**
+///
+/// AGQ's gradient is exact but **finite-difference-limited** — the grid-response term and the
+/// posterior Hessian are both central differences, so it carries a noise floor around 1e-4
+/// relative. The gradient-optimizer path historically set NLopt's stops to `1e-12`, which is
+/// *unreachable* for such a gradient: L-BFGS keeps stepping until the true gradient drops
+/// under the floor, at which point the search direction is noise, the line search cannot find
+/// a decrease, and NLopt returns a bare `NLOPT_FAILURE`.
+///
+/// The fit was fine (the engine restores the best-seen point) but was reported as **not
+/// converged** — a lie about a result that had been flat to 8 significant figures for a dozen
+/// evaluations, and one paid for with ~40% wasted wall-clock grinding past the plateau.
+///
+/// So AGQ stops on the reachable objective-change criterion instead. This pins that a plain,
+/// well-behaved AGQ fit actually reports `converged`.
+#[test]
+fn agq_reports_convergence_rather_than_grinding_into_nlopt_failure() {
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+    let pop = warfarin();
+
+    for (method, n) in [
+        (EstimationMethod::Laplace, 1usize),
+        (EstimationMethod::Agq, 3),
+    ] {
+        let opts = FitOptions {
+            method,
+            methods: vec![],
+            n_agq: n,
+            outer_maxiter: 500,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let r = fit(&model, &pop, &model.default_params, &opts).expect("fit must succeed");
+        assert!(
+            r.converged,
+            "{method:?} (n_agq={n}) must report convergence, not grind into NLOPT_FAILURE \
+             against an unreachable 1e-12 gradient stop. OFV = {}",
+            r.ofv
+        );
+    }
+}

@@ -1267,10 +1267,34 @@ fn optimize_nlopt(
     } else {
         opt.set_maxeval(options.outer_maxiter as u32 * (n as u32 + 1))
             .unwrap();
-        // Use very loose tolerances — FOCE objective is noisy from EBE re-estimation.
-        // Let maxeval be the primary stopping criterion.
-        opt.set_xtol_rel(1e-12).unwrap();
-        opt.set_ftol_rel(1e-12).unwrap();
+        if options.agq_nodes().is_some() {
+            // AGQ's gradient is exact but **finite-difference-limited**: the grid-response
+            // term and the posterior Hessian are both central differences, so the gradient
+            // carries a noise floor (~1e-4 relative). The 1e-12 stops below are therefore
+            // *unreachable* for it — and unreachable stops are not harmless. L-BFGS keeps
+            // stepping until the true gradient drops under that floor, at which point the
+            // search direction is noise, the line search cannot find a decrease, and NLopt
+            // returns a bare `NLOPT_FAILURE`. The fit is fine (the engine restores the
+            // best-seen point) but it is reported as *not converged*, which is a lie about a
+            // result that has been flat to 8 significant figures for 15 evaluations.
+            //
+            // So stop AGQ where its objective actually settles — the same reachable
+            // objective-change / step-size criteria BOBYQA gets — rather than chasing a
+            // gradient norm the gradient cannot deliver. FOCE/FOCEI keep the 1e-12 stops:
+            // their gradient is analytic to ~1e-11 and they *do* reach `XtolReached`.
+            opt.set_xtol_rel(options.outer_xtol).unwrap();
+            let ftol = resolve_outer_ftol(
+                model.has_non_gaussian(),
+                model.is_ode_based(),
+                options.outer_ftol,
+            );
+            opt.set_ftol_rel(ftol).unwrap();
+        } else {
+            // FOCE objective is noisy from EBE re-estimation; let maxeval be the primary
+            // stopping criterion and rely on the analytic gradient to drive |g| down.
+            opt.set_xtol_rel(1e-12).unwrap();
+            opt.set_ftol_rel(1e-12).unwrap();
+        }
     }
 
     if options.verbose {
