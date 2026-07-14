@@ -3248,6 +3248,33 @@ fn perturb_init(
     p
 }
 
+/// Multi-start ranking: should the candidate `(c_ofv, c_conv)` replace the
+/// current best `(b_ofv, b_conv)`?
+///
+/// **Validity is the primary key.** A run whose OFV is non-finite or
+/// sentinel-large (block_sigma `R` gone indefinite, a divergent peripheral
+/// compartment, …) is a failed fit even if it reports `converged = true` — the
+/// inner objective returns the ~1e20 sentinel and the outer optimizer can
+/// "converge" on it. Such a run must never beat a valid but unconverged start
+/// (e.g. the exact-inits start 0), which the old "converged-first" rule allowed,
+/// so multi-start could return a divergence with a huge OFV. Within the same
+/// validity class: prefer converged, then lower OFV.
+///
+/// The validity cutoff sits well below the ~1e20 inner-objective sentinel but
+/// far above any legitimate population OFV, so a real fit never trips it; a NaN
+/// OFV is non-finite and therefore also invalid, so it can never block a finite
+/// valid candidate.
+fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: bool) -> bool {
+    /// OFVs at or above this are treated as diverged/invalid (see above).
+    const DIVERGENCE_OFV: f64 = 1e14;
+    let valid = |o: f64| o.is_finite() && o < DIVERGENCE_OFV;
+    match (valid(b_ofv), valid(c_ofv)) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => (!b_conv && c_conv) || (b_conv == c_conv && c_ofv < b_ofv),
+    }
+}
+
 /// Main fit entry point: CompiledModel + Population → FitResult.
 ///
 /// When `options.threads` is `Some(n)`, the fit runs inside a scoped rayon
@@ -3654,7 +3681,7 @@ pub fn fit(
         None => par_starts(),
     };
 
-    // Pick best converged result; fall back to best unconverged if none converged.
+    // Pick the best start (see `multistart_prefers` for the ranking).
     let mut best: Option<(usize, FitResult)> = None;
     let mut failed_starts: Vec<String> = Vec::new();
     for (k, res) in results {
@@ -3662,11 +3689,7 @@ pub fn fit(
             Ok(r) => {
                 let better = match &best {
                     None => true,
-                    Some((_, b)) => {
-                        // Prefer converged over unconverged; then lower OFV
-                        (!b.converged && r.converged)
-                            || (b.converged == r.converged && r.ofv < b.ofv)
-                    }
+                    Some((_, b)) => multistart_prefers(b.ofv, b.converged, r.ofv, r.converged),
                 };
                 if better {
                     best = Some((k, r));
@@ -4041,6 +4064,42 @@ fn build_indiv_map(pk: &PkParams, names: &[String], pk_indices: &[usize]) -> Has
         .filter(|(name, _)| !crate::parser::model_parser::is_synthetic_readout_param(name))
         .map(|(name, &idx)| (name.clone(), pk.values[idx]))
         .collect()
+}
+
+#[cfg(test)]
+mod multistart_prefers_tests {
+    use super::multistart_prefers;
+
+    const SENTINEL: f64 = 2.3e16; // block_sigma-indefinite divergence OFV
+
+    #[test]
+    fn valid_unconverged_beats_invalid_converged() {
+        // The regression: a diverged start reporting `converged = true` with a
+        // sentinel OFV must NOT beat the valid, unconverged exact-inits start.
+        assert!(multistart_prefers(SENTINEL, true, 867.0, false));
+        assert!(!multistart_prefers(867.0, false, SENTINEL, true));
+    }
+
+    #[test]
+    fn non_finite_is_invalid() {
+        assert!(multistart_prefers(f64::INFINITY, true, 900.0, false));
+        assert!(multistart_prefers(f64::NAN, true, 900.0, false));
+    }
+
+    #[test]
+    fn among_valid_prefers_converged_then_lower_ofv() {
+        // converged beats unconverged even at a (slightly) higher OFV.
+        assert!(multistart_prefers(730.0, false, 735.0, true));
+        // same convergence: lower OFV wins.
+        assert!(multistart_prefers(740.0, true, 734.0, true));
+        assert!(!multistart_prefers(734.0, true, 740.0, true));
+    }
+
+    #[test]
+    fn both_invalid_prefers_lower() {
+        assert!(multistart_prefers(3e16, false, 2e16, false));
+        assert!(!multistart_prefers(2e16, false, 3e16, false));
+    }
 }
 
 #[cfg(test)]
