@@ -20,6 +20,28 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Exact (analytic) FOCE/FOCEI gradients for lagtime models with IOV, time-varying
+  covariates, or `TIME`** (#486): a closed-form model carrying an `ALAG`/`LAGTIME` used to
+  fall back to finite differences the moment the subject also had IOV, a time-varying
+  covariate, or a `TIME`-dependent parameter — which covers a large share of everyday oral
+  popPK models. Those fits now use the exact analytic gradient on both loops: they are
+  faster (FD costs one extra objective evaluation per parameter) and no longer inherit the
+  finite-difference step's accuracy loss. Estimates are unchanged within convergence
+  tolerance. Steady-state doses combined with a lagtime still use finite differences.
+- **Exact (analytic) gradients for steady-state dosing combined with an EVID 3/4 reset**
+  (#486) on the closed-form engine — previously finite differences (the ODE engine already
+  had it).
+- **Analytic gradients for `[scaling] y = <expr>` readouts that reference many parameters**
+  (#486): a Form-C readout whose individual parameters spilled past the eight structural PK
+  slots (e.g. a sigmoid-Emax readout on a 3-compartment oral model) fell back to finite
+  differences on the time-varying-covariate path; it is now analytic.
+- **Wider models keep the analytic gradient** (#486): the monomorphisation caps that decide
+  when a model is too wide for the exact gradient were raised from 16 to 24 `θ + η` (the ODE
+  and output-scaling paths). A mid-sized covariate model (5 structural θ + 6 covariate-effect
+  θ + 5 η) sat at exactly the old limit, so adding one more covariate silently dropped the
+  whole fit to finite differences. The closed-form event walk's cap is now coupled to the ODE
+  one, closing a pre-existing gap where a 17–24-axis model took an analytic *outer* gradient
+  against a finite-difference *inner* one.
 - **`L2` data column for correlated observation units** (#827): the reader now
   recognizes NONMEM's level-2 grouping item. Observation rows sharing an `L2`
   value within a subject are paired into one correlated unit for a `block_sigma`
@@ -399,6 +421,35 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **Wrong analytic gradient for an observation sampled exactly on a moving dose boundary**
+  (#486) — a modeled infusion end, or a lagged dose arrival. With a modeled `RATE=-1`/`-2` dose the infusion window end moves with the
+  estimated `D{cmt}`/`R{cmt}`. An observation whose time coincided with that end had its
+  gradient taken *along the moving boundary* rather than at the sample's own fixed clock
+  time, adding a spurious term: on a 1-cpt fixture it returned `−1.9`, which is not even a
+  valid subgradient in general. The closed-form walk now steps the read-out state back across
+  the zero-length window `end(D) − t_obs` with the infusion still running, recovering the
+  derivative at the sample's own time. Sampling at the end of an infusion is a normal design,
+  so this is worth knowing about even though the exact coincidence is transient (`D` is
+  estimated, so it only sweeps past a fixed sample time momentarily).
+
+  The prediction is genuinely **kinked** in `D` at that point — just above the coincidence the
+  infusion is still running at the sample, just below it the dose has finished and a decay term
+  appears — so no two-sided derivative exists there (the one-sided slopes are `−8.6` and
+  `+2.3`, and a central finite difference returns their average, `−3.2`). ferx returns the
+  **one-sided** derivative — specifically, the derivative of the branch ferx's own event
+  ordering already uses to define the *value* there (an infusion at its end is still
+  contributing; a dose at its arrival has landed). That is the same convention its ODE engine's
+  jump/saltation sensitivities already used, and the two engines now return the same number.
+
+  The same correction applies to an observation landing on a **lagged dose arrival**, where it
+  matters more than it looks: on an oral model the prediction's *value* at that instant is zero
+  (the depot bolus has only just landed, so the central compartment is still empty) while its
+  derivative is not — the closed form previously reported a derivative of zero, which looks
+  innocuous and is wrong.
+
+  Note the deliberate consequence: at *exactly* such a coincidence an analytic gradient and a
+  finite-difference gradient legitimately disagree — FD averages across a branch switch the
+  model does not make there. That is a property of a kinked model, not a defect.
 - **`block_sigma` correlated residuals no longer collapse the objective when a
   subject has two samples at the same time** (#827): with a `block_sigma` +
   covariate-selected / per-CMT error model (the free-vs-total assay pattern),

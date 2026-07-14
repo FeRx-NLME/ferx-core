@@ -4840,6 +4840,29 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
 
+    /// As [`ONECPT_IV_RESET`] but with a bioavailability `F`. A **rate-defined** infusion
+    /// (`RATE > 0`) under `F ≠ 1` is a deliberate FD cell — `F` reshapes the infusion window
+    /// (#419) in a way the closed-form dual kernels can't represent — so an infusion subject on
+    /// this model is per-subject out of analytic scope, while a bolus subject stays in scope.
+    /// Used as the mixed analytic/FD population fixture.
+    const ONECPT_IV_RESET_F: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVF(0.8, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  F  = TVF
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
     /// Two IV-infusion occasions separated by an EVID=4 reset at t=120: occasion-2
     /// observations must rebuild from zero (no carryover across the reset). The
     /// observations are synthesised from the production predictor at a reference η
@@ -5091,12 +5114,99 @@ mod tests {
         }
     }
 
-    /// Out-of-scope sibling of [`reset_subject_outer`]: same two IV-infusion
-    /// occasions split by an EVID=4 reset, but the doses are **steady-state**.
-    /// SS + reset is outside the analytic provider's scope (SS assumes an infinite
-    /// periodic history a mid-record reset contradicts), so it returns `None` from
-    /// `subject_sensitivities` while production still predicts it via the
-    /// event-driven `f64` walk.
+    /// **SS + EVID 3/4 reset is analytic since #486.** The pair used to decline to FD on the
+    /// closed-form engine (it is genuinely inexpressible by dose superposition, which folds in
+    /// the SS dose's infinite periodic history that the reset truncates), while the ODE engine
+    /// served it via #550. Routing these subjects to the event walk — which production already
+    /// uses for every reset subject — closes the cell: the walk equilibrates each SS dose at
+    /// its own event and zeros the dual state at the reset.
+    ///
+    /// Anchored against reconverged FD of the FOCEI **and** FOCE OFV across every packed
+    /// coordinate (θ, Ω, σ), the same oracle `population_packed_gradient_reset_matches_fd` uses.
+    #[test]
+    fn ss_reset_subject_is_analytic_and_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+
+        let model = parse_model_string(ONECPT_IV_RESET).expect("parse");
+        let theta = [0.22, 11.0];
+        let eta_ref = [0.12, -0.08];
+
+        let s_ss_reset = ss_reset_subject_outer(&model, &theta, &eta_ref, "ss_reset");
+        let s_plain = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+
+        // The cell this test exists for: the SS+reset subject is in analytic scope now.
+        let zeros = vec![0.0; model.n_eta];
+        assert!(
+            crate::sens::provider::subject_sensitivities(&model, &s_ss_reset, &theta, &zeros)
+                .is_some(),
+            "SS+reset subject must be served analytically by the event walk (#486)"
+        );
+
+        let pop = Population {
+            subjects: vec![s_ss_reset, s_plain],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+
+        for interaction in [true, false] {
+            let analytic = if interaction {
+                population_gradient_sens(&model, &pop, &template, &x, &ehs)
+            } else {
+                population_gradient_sens_foce(&model, &pop, &template, &x, &ehs)
+            }
+            .expect("SS+reset population must take the all-or-nothing analytic path");
+
+            let ofv = |xv: &[f64]| -> f64 {
+                let p = unpack_params(xv, &template);
+                2.0 * pop
+                    .subjects
+                    .iter()
+                    .map(|s| {
+                        if interaction {
+                            marginal_nll(&model, s, &p)
+                        } else {
+                            marginal_nll_foce(&model, s, &p)
+                        }
+                    })
+                    .sum::<f64>()
+            };
+            let fd_at = |k: usize, h: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[k] += h;
+                let mut xm = x.clone();
+                xm[k] -= h;
+                (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+            };
+            for k in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[k].abs());
+                let f1 = fd_at(k, h);
+                let f2 = fd_at(k, h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0;
+                approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
+            }
+        }
+    }
+
+    /// Sibling of [`reset_subject_outer`]: same two IV-infusion occasions split by an EVID=4
+    /// reset, but the doses are **steady-state**. Served analytically since #486 — the event
+    /// walk equilibrates each SS dose per event and zeros the state at the reset, mirroring the
+    /// `f64` instance of the same walk that production already uses for reset subjects. (Only
+    /// the *static* dose-superposition path cannot express it, since an SS dose folds in an
+    /// infinite periodic history the reset truncates.)
     fn ss_reset_subject_outer(
         model: &CompiledModel,
         theta: &[f64],
@@ -5132,13 +5242,17 @@ mod tests {
         use crate::estimation::parameterization::{compute_bounds, pack_params};
         use crate::types::{FitOptions, Population};
 
-        let model = parse_model_string(ONECPT_IV_RESET).expect("parse");
-        let theta = [0.22, 11.0];
+        // The out-of-scope subject used to be SS+reset; since #486 the event walk serves that
+        // combination analytically (see `ss_reset_subject_is_analytic_and_matches_fd`), so this
+        // fixture now takes its out-of-scope subject from a cell that is *deliberately* FD: a
+        // rate-defined infusion under `F ≠ 1` (#419).
+        let model = parse_model_string(ONECPT_IV_RESET_F).expect("parse");
+        let theta = [0.22, 11.0, 0.8];
         let eta_ref = [0.12, -0.08];
 
-        // In-scope plain subject + an out-of-scope SS+reset subject.
+        // In-scope plain (bolus) subject + an out-of-scope rate-defined-infusion subject.
         let s_plain = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-        let s_oos = ss_reset_subject_outer(&model, &theta, &eta_ref, "ss_reset");
+        let s_oos = reset_subject_outer(&model, &theta, &eta_ref, "rate_inf_f");
         let pop = Population {
             subjects: vec![s_plain, s_oos],
             covariate_names: vec![],
@@ -5154,7 +5268,7 @@ mod tests {
         let params = unpack_params(&x, &template);
 
         // EBE per subject: in-scope subjects use the analytic Newton polish
-        // (`precise_ebe`); the out-of-scope SS+reset subject uses the production
+        // (`precise_ebe`); the out-of-scope infusion subject uses the production
         // inner solver (`find_ebe`), which `precise_ebe` can't because it unwraps
         // the analytic provider.
         let zeros = vec![0.0; model.n_eta];
@@ -5177,7 +5291,7 @@ mod tests {
         // whole population because subject 1 (SS+reset) is out of scope.
         assert!(
             population_gradient_sens(&model, &pop, &template, &x, &ehs).is_none(),
-            "SS+reset subject must take the whole population out of the all-or-nothing path"
+            "out-of-scope subject must take the whole population out of the all-or-nothing path"
         );
         // The per-subject view keeps the in-scope subject analytic, only the
         // out-of-scope one `None`.
@@ -5185,7 +5299,7 @@ mod tests {
         assert!(per_sub[0].is_some(), "plain subject is in analytic scope");
         assert!(
             per_sub[1].is_none(),
-            "SS+reset subject is out of analytic scope"
+            "rate-defined infusion under F is out of analytic scope"
         );
 
         // The assembled mixed gradient (analytic in-scope + per-subject FD for the

@@ -14045,15 +14045,6 @@ impl OdeOutputProgram {
                 .any(|op| matches!(op, Op::PushVar(i) if *i as usize == idx))
     }
 
-    /// The highest PK slot any individual parameter of this readout maps to
-    /// (`indiv_to_pk`), or `None` if the readout references no individual
-    /// parameters. The tv-covariate event-walk provider (#650) seeds only the
-    /// eight `PkDual` structural slots (`CL..V3`, 0..=7), so it serves the readout
-    /// analytically only when every referenced parameter slot fits there.
-    pub(crate) fn max_indiv_pk_slot(&self) -> Option<usize> {
-        self.indiv_to_pk.iter().copied().max()
-    }
-
     /// Evaluate the output expression over a dual type, generic over [`PkNum`]
     /// (`Dual1` light inner / `Dual2` full outer; #410) — the Form-C readout.
     /// `state` is the integrated dual state; `params` is the flat PK-parameter
