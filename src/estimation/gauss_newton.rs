@@ -94,6 +94,7 @@ pub fn run_foce_gn(
         None,
         Some(&init_mu_k),
         options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
     );
 
     let mut ofv = 2.0
@@ -237,6 +238,7 @@ pub fn run_foce_gn(
             Some(&eta_hats),
             Some(&try_mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
         let ofv_try = 2.0
             * pop_nll(
@@ -3422,7 +3424,7 @@ mod tests {
 
         use crate::estimation::inner_optimizer::run_inner_loop_warm;
         let (eta_hats, h_mats, _, kappas_all) =
-            run_inner_loop_warm(&model, &population, template, 200, 1e-5, None, None, 0);
+            run_inner_loop_warm(&model, &population, template, 200, 1e-5, None, None, 0, 0);
 
         let (nll_an, grad_an) = subject_nll_pop_grad(
             &x,

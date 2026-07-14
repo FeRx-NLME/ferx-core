@@ -234,6 +234,7 @@ pub fn run_sir_core(
                 Some(eta_hats),
                 Some(&sir_mu_k),
                 0, // SIR: no EBE convergence tracking
+                0, // SIR: warm-started; no inner multi-start
             );
 
             // Compute OFV

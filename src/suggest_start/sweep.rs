@@ -190,7 +190,7 @@ fn rrmse_ebe(
     // enough for a grid sweep — full inner-loop precision is not needed here,
     // and warm-starting means convergence is typically 3–5 iterations.
     let (eta_hats, _h, _stats, _kappas) =
-        run_inner_loop_warm(model, population, params, 20, 1e-3, prev_etas, None, 0);
+        run_inner_loop_warm(model, population, params, 20, 1e-3, prev_etas, None, 0, 0);
 
     // Compute predictions using the per-subject EBEs.
     let mut sum_sq = 0.0_f64;

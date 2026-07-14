@@ -5007,6 +5007,20 @@ pub struct FitOptions {
     pub outer_ftol: Option<f64>,
     pub inner_maxiter: usize,
     pub inner_tol: f64,
+    /// Guarded multi-start count for the inner EBE search (`[fit_options]
+    /// inner_restarts`, default `1`; set `0` to disable). A multimodal individual objective —
+    /// e.g. saturable protein binding, which admits a high-V/low-conc and a
+    /// low-V/high-conc basin for the same data — can trap a single warm-started
+    /// BFGS in the wrong basin, inflating that subject's objective. When `> 0`,
+    /// subjects on the event-driven path (system resets / time-varying
+    /// covariates, where this shows up) re-solve the EBE **on a cold start** from
+    /// `inner_restarts` Ω-scaled alternate seeds per random effect and keep the
+    /// lowest-objective mode; the outer loop's warm start then carries the chosen
+    /// basin forward, so the scan runs once per subject per fit (≈0 overhead).
+    /// Unimodal subjects are unaffected — an alternate seed that reconverges to
+    /// the same mode is not accepted — so `0` and the untriggered subjects stay
+    /// bit-identical.
+    pub inner_restarts: usize,
     /// Inner EBE-reconvergence tolerance used **only by the covariance step**
     /// (`[fit_options] cov_inner_tol`), decoupled from the fit's `inner_tol`. The
     /// covariance R-matrix is a second-difference of the reconverged OFV, and that
@@ -5515,6 +5529,12 @@ impl Default for FitOptions {
             // only held for well-conditioned fits. Override via `inner_tol = ...`
             // in `[fit_options]` (loosen for speed; tighten with care).
             inner_tol: 1e-5,
+            // On by default (one Ω-scaled restart pass): guards against inner-EBE
+            // local minima on multimodal individual objectives at ≈0 cost, since
+            // it fires only for reset / TV-cov subjects on a cold start and only
+            // *accepts* a strictly-lower mode. Unimodal subjects stay bit-identical;
+            // set `inner_restarts = 0` to disable. See `FitOptions::inner_restarts`.
+            inner_restarts: 1,
             cov_inner_tol: None,
             // ODE solver tolerances: match OdeSolverOptions::default() so the
             // engine default is unchanged. Opt into tighter accuracy per model

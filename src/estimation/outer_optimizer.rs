@@ -164,6 +164,7 @@ fn evaluate_at_initial_params(
         Some(&cold_etas),
         Some(&mu_k),
         options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
     );
     let ofv = 2.0
         * pop_nll(
@@ -562,6 +563,7 @@ fn run_global_presearch(
             Some(&cached_zero),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
         let nll = pop_nll(
             model,
@@ -609,6 +611,7 @@ fn run_global_presearch(
             Some(&state.cached_etas),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
 
         let nll = pop_nll(
@@ -1005,6 +1008,7 @@ fn optimize_nlopt(
             Some(&state.cached_etas),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
 
         // Compute OFV with fixed EBEs
@@ -1350,6 +1354,7 @@ fn optimize_nlopt(
         None,
         Some(&final_mu_k),
         options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
     );
 
     let final_nll = pop_nll(
@@ -1497,6 +1502,7 @@ fn optimize_bfgs(
             Some(prev_etas),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
         let ofv = 2.0
             * pop_nll(
@@ -1530,6 +1536,7 @@ fn optimize_bfgs(
             Some(prev_etas),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
         let ofv = ofv_at_fixed(x, &ehs, &hms, &kappas);
         // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x).
@@ -1821,6 +1828,7 @@ fn optimize_bfgs(
         Some(&cached_etas),
         Some(&bfgs_final_mu_k),
         options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
     );
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
@@ -1941,6 +1949,7 @@ fn reconverged_fd_gradient(
             Some(warm_etas),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
         let raw = 2.0
             * pop_nll(
@@ -2038,6 +2047,7 @@ fn subject_reconverged_fd_gradient(
             options.inner_tol,
             Some(warm_eta.as_slice()),
             Some(&mu_k),
+            0,
         );
         crate::stats::likelihood::foce_subject_nll(
             model,
@@ -2079,6 +2089,7 @@ fn subject_reconverged_fd_gradient_iov(
             options.inner_tol,
             Some(warm_eta.as_slice()),
             Some(&mu_k),
+            0,
         );
         crate::stats::likelihood::foce_subject_nll_iov(
             model,
@@ -3162,6 +3173,7 @@ pub(crate) fn compute_covariance(
                 cov_inner_tol,
                 Some(eta_hats[i].as_slice()),
                 Some(&mu_k),
+                0,
             );
             ehs.push(ebe.eta);
             hms.push(ebe.h_matrix);
@@ -5190,6 +5202,7 @@ mod tests {
                 Some(&eta_hats),
                 Some(&mu_k),
                 options.min_obs_for_convergence_check as usize,
+                options.inner_restarts,
             );
             2.0 * pop_nll(&model, &population, &params, &ehs, &hms, &kaps, true)
         };
@@ -6136,6 +6149,7 @@ mod tests {
             1e-6,
             Some(&cold),
             Some(&mu_k),
+            0,
             0,
         );
         let init_ofv = 2.0 * pop_nll(&model, &population, &init_params, &ehs, &hms, &kappas, true);

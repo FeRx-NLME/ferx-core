@@ -5787,6 +5787,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "maxiter" => opts.outer_maxiter = parse_usize("maxiter")?,
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
+        "inner_restarts" => opts.inner_restarts = parse_usize("inner_restarts")?,
         "cov_inner_tol" => opts.cov_inner_tol = Some(parse_f64("cov_inner_tol")?),
         "outer_xtol" => {
             let v = parse_f64("outer_xtol")?;
@@ -21039,6 +21040,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_inner_restarts() {
+        // Default is 1 (guarded multi-start on); the key overrides the count.
+        let default = parse_full_model(&minimal_model_with_fit_options("  method = focei"))
+            .unwrap()
+            .fit_options
+            .inner_restarts;
+        assert_eq!(default, 1);
+        let parsed =
+            parse_full_model(&minimal_model_with_fit_options("  inner_restarts = 2")).unwrap();
+        assert_eq!(parsed.fit_options.inner_restarts, 2);
+        // `0` disables it.
+        let off =
+            parse_full_model(&minimal_model_with_fit_options("  inner_restarts = 0")).unwrap();
+        assert_eq!(off.fit_options.inner_restarts, 0);
+    }
+
+    #[test]
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
         //   optimizer = auto, inner_maxiter = 200, inner_tol = 1e-5,
@@ -21047,6 +21065,7 @@ mod tests {
         assert_eq!(opts.optimizer, Optimizer::Auto);
         assert_eq!(opts.inner_maxiter, 200);
         assert!((opts.inner_tol - 1e-5).abs() < 1e-20);
+        assert_eq!(opts.inner_restarts, 1);
         assert_eq!(opts.steihaug_max_iters, None);
     }
 
