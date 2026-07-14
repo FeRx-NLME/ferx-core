@@ -4925,6 +4925,41 @@ fn parse_markov_model_block(
             .collect()
     };
 
+    // Reject a name that is simultaneously an ODE state and a referenced θ/η parameter:
+    // such an identifier resolves to the *parameter* leaf (`Expression::Theta/Eta`,
+    // indices assigned at parse), so it is invisible to the state-reference scan above
+    // and the endpoint would silently score on the time-**homogeneous** path with the
+    // constant parameter value instead of the evolving model state the user intended as
+    // the driver. The covariate-collision guard below catches the [covariates] case; this
+    // catches the parameter case symmetrically. `Theta/Eta` leaves carry only an index,
+    // so map it back to a name via `theta_names`/`eta_names`.
+    if !ode_state_names.is_empty() {
+        let state_name_set: HashSet<&String> = ode_state_names.iter().collect();
+        let mut collide: Option<String> = None;
+        for (_, _, expr) in &transitions {
+            visit_expr_nodes(expr, &mut |e: &Expression| {
+                let nm = match e {
+                    Expression::Theta(i) => theta_names.get(*i),
+                    Expression::Eta(i) => eta_names.get(*i),
+                    _ => None,
+                };
+                if let Some(name) = nm {
+                    if state_name_set.contains(name) {
+                        collide = Some(name.clone());
+                    }
+                }
+            });
+        }
+        if let Some(name) = collide {
+            return Err(format!(
+                "[markov_model]: the transition-intensity identifier `{name}` names both an ODE \
+                 model state and a θ/η parameter. This is ambiguous — the fit would use the \
+                 constant parameter and ignore the (time-inhomogeneous) model state. Rename one \
+                 of them so the intended driver is unambiguous."
+            ));
+        }
+    }
+
     // Reject a name that is simultaneously an ODE state and a declared data covariate:
     // the intensity would resolve it to the model state (below), silently overwriting the
     // covariate column and stripping it from the required-column / TV-covariate checks —
