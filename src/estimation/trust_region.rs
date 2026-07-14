@@ -52,6 +52,7 @@ impl FoceiProblem<'_> {
             warm_ref,
             Some(&mu_k),
             self.options.min_obs_for_convergence_check as usize,
+            self.options.inner_restarts,
         );
         *self.cached_etas.lock().unwrap() = etas.clone();
         (etas, h_mats)
@@ -380,6 +381,7 @@ pub fn optimize_trust_region(
         None,
         Some(&final_mu_k),
         options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
     );
 
     let final_ofv = 2.0

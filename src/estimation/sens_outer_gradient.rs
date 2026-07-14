@@ -3221,7 +3221,7 @@ mod tests {
     /// would be meaningless (the Eq. 46 EBE-response identity only holds at the
     /// actual stationary point).
     fn precise_ebe(model: &CompiledModel, subject: &Subject, params: &ModelParameters) -> Vec<f64> {
-        let warm = find_ebe(model, subject, params, 80, 1e-10, None, None);
+        let warm = find_ebe(model, subject, params, 80, 1e-10, None, None, 0);
         let mut eta: Vec<f64> = warm.eta.iter().copied().collect();
         let n_eta = model.n_eta;
         let sigma = &params.sigma.values;
@@ -3617,7 +3617,7 @@ mod tests {
         subject: &Subject,
         params: &ModelParameters,
     ) -> Vec<f64> {
-        let warm = find_ebe(model, subject, params, 80, 1e-10, None, None);
+        let warm = find_ebe(model, subject, params, 80, 1e-10, None, None, 0);
         let mut eta: Vec<f64> = warm.eta.iter().copied().collect();
         let n_eta = model.n_eta;
         let rr = model.residual_error_eta.expect("ruv model");
@@ -3860,7 +3860,7 @@ mod tests {
         subject: &Subject,
         params: &ModelParameters,
     ) -> Vec<f64> {
-        let warm = find_ebe(model, subject, params, 80, 1e-12, None, None);
+        let warm = find_ebe(model, subject, params, 80, 1e-12, None, None, 0);
         let mut eta: Vec<f64> = warm.eta.iter().copied().collect();
         let n_eta = model.n_eta;
         let sigma = &params.sigma.values;
@@ -5282,7 +5282,7 @@ mod tests {
                 if in_scope(s) {
                     DVector::from_vec(precise_ebe(&model, s, &params))
                 } else {
-                    find_ebe(&model, s, &params, 200, 1e-12, None, None).eta
+                    find_ebe(&model, s, &params, 200, 1e-12, None, None, 0).eta
                 }
             })
             .collect();
@@ -5320,7 +5320,7 @@ mod tests {
             if in_scope(s) {
                 marginal_nll(&model, s, p)
             } else {
-                let ebe = find_ebe(&model, s, p, 200, 1e-12, None, None);
+                let ebe = find_ebe(&model, s, p, 200, 1e-12, None, None, 0);
                 foce_subject_nll(
                     &model,
                     s,
@@ -6495,7 +6495,7 @@ mod tests {
         let n_eta = model.n_eta;
         let n_kappa = model.n_kappa;
         let n_st = n_eta + k * n_kappa;
-        let warm = find_ebe(model, subject, params, 80, 1e-10, None, None);
+        let warm = find_ebe(model, subject, params, 80, 1e-10, None, None, 0);
         let mut stacked = vec![0.0; n_st];
         for i in 0..n_eta {
             stacked[i] = warm.eta[i];

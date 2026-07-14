@@ -42,6 +42,21 @@ section of the SDLC for the versioning policy).
   whole fit to finite differences. The closed-form event walk's cap is now coupled to the ODE
   one, closing a pre-existing gap where a 17–24-axis model took an analytic *outer* gradient
   against a finite-difference *inner* one.
+- **Guarded multi-start inner EBE, on by default** (#830, `inner_restarts`,
+  default `1`): escapes a multimodal individual objective, where a single
+  warm-started inner optimizer can settle in the wrong basin and inflate a
+  subject's objective. The classic case is saturable protein binding (a
+  high-volume/low-concentration and a low-volume/high-concentration fit both
+  explain a total-concentration profile). Subjects on the event-driven path
+  (system resets or time-varying covariates) now re-solve the EBE on a cold start
+  from Ω-scaled seeds per random effect and keep the lowest-objective mode; the
+  outer warm start carries it forward, so the scan runs once per subject per fit
+  (≈0 % overhead). A seed that reconverges to the same mode is not accepted, so
+  unimodal subjects are unchanged; only a genuinely trapped subject moves — to
+  the deeper, correct basin. On the fluconazole free/total binding model this
+  recovers the NONMEM fit (OFV 734.67 vs NONMEM 734.64, versus 749.3 before). Set
+  `inner_restarts = 0` to restore the previous single-start behaviour. See
+  [Fit options](https://ferx-nlme.github.io/ferx-core/model-file/fit-options.html).
 - **`L2` data column for correlated observation units** (#827): the reader now
   recognizes NONMEM's level-2 grouping item. Observation rows sharing an `L2`
   value within a subject are paired into one correlated unit for a `block_sigma`

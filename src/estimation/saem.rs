@@ -2225,6 +2225,7 @@ pub fn run_saem(
         Some(&warm_etas),
         Some(&saem_final_mu_k),
         0, // SAEM: no EBE convergence tracking
+        0, // SAEM final EBE is warm-started; no inner multi-start
     );
 
     // ---- Final OFV via FOCE approximation (for AIC/BIC comparability) ----

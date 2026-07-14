@@ -638,6 +638,7 @@ pub fn find_ebe(
     tol: f64,
     eta_init: Option<&[f64]>,
     mu_k: Option<&[f64]>,
+    restarts: usize,
 ) -> EbeResult {
     let n_eta = model.n_eta;
 
@@ -847,8 +848,57 @@ pub fn find_ebe(
         (false, false)
     };
 
-    let ebe_converged = bfgs_converged || nm_converged;
-    let nll = obj(&eta);
+    let mut ebe_converged = bfgs_converged || nm_converged;
+    let mut nll = obj(&eta);
+
+    // ── Guarded multi-start inner EBE (`[fit_options] inner_restarts`) ──────
+    // A multimodal individual objective (e.g. saturable binding: a high-V/low-
+    // conc basin vs a low-V/high-conc basin) traps a single warm-started BFGS in
+    // whichever basin the start point sits in. When `inner_restarts > 0`, subjects
+    // on the event-driven path (system resets / time-varying covariates — where
+    // this shows up) re-solve from `inner_restarts` Ω-scaled alternate seeds per
+    // random effect (`±2·sd`, `±3·sd`, …) and keep the lowest-objective mode.
+    // Gated on a COLD start (`eta_init.is_none()`): the outer loop warm-starts the
+    // inner EBE from the previous iteration's mode, so once the basin is picked at
+    // iteration 0 the warm start carries it forward — no need to re-scan every
+    // outer eval (that is ~12× slower). One multi-start per subject per fit.
+    // A seed that reconverges to the same mode is not accepted (`+ 1e-9` guard),
+    // so unimodal subjects stay bit-identical to `inner_restarts = 0`.
+    if restarts > 0 && eta_init.is_none() && (subject.has_resets() || subject.has_tv_covariates()) {
+        let base = eta.clone();
+        for i in 0..n_eta {
+            let sd = params.omega.matrix[(i, i)].max(0.0).sqrt();
+            if sd == 0.0 {
+                continue;
+            }
+            for m in 1..=restarts {
+                let step = (m as f64 + 1.0) * sd;
+                for &k in &[-step, step] {
+                    let mut cand = base.clone();
+                    cand[i] = k;
+                    let ok = inner_minimize_with_grad(
+                        &obj,
+                        &agrad,
+                        &mut cand,
+                        n_eta,
+                        max_iter,
+                        tol,
+                        precond.as_deref(),
+                        stop_precond,
+                        enable_stall,
+                    );
+                    if cand.iter().all(|v| v.is_finite()) {
+                        let cand_nll = obj(&cand);
+                        if cand_nll + 1e-9 < nll {
+                            nll = cand_nll;
+                            eta = cand;
+                            ebe_converged = ebe_converged || ok;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // The optimiser variable already is eta_true (mean-zero, NONMEM-compatible).
     let eta_true: Vec<f64> = eta;
@@ -2785,7 +2835,7 @@ pub fn run_inner_loop(
     InnerLoopStats,
     Vec<Vec<DVector<f64>>>,
 ) {
-    run_inner_loop_warm(model, population, params, max_iter, tol, None, None, 0)
+    run_inner_loop_warm(model, population, params, max_iter, tol, None, None, 0, 0)
 }
 
 /// Run inner loop with optional warm-start EBEs and optional mu-referencing shift.
@@ -2799,6 +2849,7 @@ pub fn run_inner_loop(
 /// Returns `(eta_hats, h_matrices, stats, kappas_per_subject)`.
 /// `kappas_per_subject[i]` contains per-occasion kappa EBEs for subject i; it is
 /// empty for non-IOV subjects or when `model.n_kappa == 0`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_inner_loop_warm(
     model: &CompiledModel,
     population: &Population,
@@ -2808,6 +2859,7 @@ pub fn run_inner_loop_warm(
     prev_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
     min_obs: usize,
+    restarts: usize,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -2822,7 +2874,7 @@ pub fn run_inner_loop_warm(
         .enumerate()
         .map(|(i, subject)| {
             let init = prev_etas.map(|pe| pe[i].as_slice());
-            find_ebe(model, subject, params, max_iter, tol, init, mu_k)
+            find_ebe(model, subject, params, max_iter, tol, init, mu_k, restarts)
         })
         .collect();
 
@@ -2960,6 +3012,7 @@ mod tests {
             1e-5,
             None,
             None,
+            0,
         );
 
         assert!(
@@ -4387,7 +4440,7 @@ mod iov_tests {
         let model = make_iov_model();
         let subject = make_iov_subject();
         let params = model.default_params.clone();
-        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None);
+        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None, 0);
         assert_eq!(result.kappas.len(), 2, "Expected 2 kappas for 2 occasions");
         assert_eq!(result.kappas[0].len(), 1);
         assert_eq!(result.kappas[1].len(), 1);
@@ -4399,7 +4452,7 @@ mod iov_tests {
         let model = make_iov_model();
         let subject = make_iov_subject();
         let params = model.default_params.clone();
-        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None);
+        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None, 0);
         // H-matrix: n_obs × n_eta (BSV only, kappas fixed)
         assert_eq!(result.h_matrix.nrows(), subject.obs_times.len());
         assert_eq!(result.h_matrix.ncols(), model.n_eta);
@@ -4706,13 +4759,22 @@ mod iov_tests {
             individual_nll(m, &subject, &p.theta, e, &p.omega, &p.sigma.values)
         };
 
-        let e_an = find_ebe(&an, &subject, &an.default_params, 300, 1e-7, None, None);
+        let e_an = find_ebe(&an, &subject, &an.default_params, 300, 1e-7, None, None, 0);
         let eta_an: Vec<f64> = e_an.eta.iter().copied().collect();
         let ref_nll = nll(&an, &eta_an);
 
         // The ODE form must reach the same global minimum (objectives are identical), and
         // must report it as a converged EBE (not a fallback that left it non-stationary).
-        let e_od = find_ebe(&ode, &subject, &ode.default_params, 300, 1e-7, None, None);
+        let e_od = find_ebe(
+            &ode,
+            &subject,
+            &ode.default_params,
+            300,
+            1e-7,
+            None,
+            None,
+            0,
+        );
         let eta_od: Vec<f64> = e_od.eta.iter().copied().collect();
         let ode_nll = nll(&ode, &eta_od);
 
@@ -5701,9 +5763,9 @@ mod iov_tests {
         let params = model.default_params.clone();
 
         set_inner_optimizer(InnerOptimizer::Bfgs);
-        let bfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None);
+        let bfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None, 0);
         set_inner_optimizer(InnerOptimizer::Lbfgs);
-        let lbfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None);
+        let lbfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None, 0);
         set_inner_optimizer(InnerOptimizer::Auto);
 
         assert!(bfgs.converged && lbfgs.converged, "both must converge");
@@ -6057,11 +6119,11 @@ mod iov_tests {
             analytic_inner_grad_supported(&model, &subject),
             "ODE-LTBS subject should now take the analytic inner gradient"
         );
-        let analytic = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+        let analytic = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
 
         model.gradient_method = GradientMethod::Fd; // force FD inner
         assert!(!analytic_inner_grad_supported(&model, &subject));
-        let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+        let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
 
         assert!(
             analytic.converged && fd.converged,
@@ -6285,11 +6347,11 @@ mod iov_tests {
             analytic_inner_grad_supported(&model, &subject),
             "plain ODE-LTBS subject should take the analytic inner gradient"
         );
-        let analytic = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+        let analytic = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
 
         model.gradient_method = GradientMethod::Fd; // force FD inner
         assert!(!analytic_inner_grad_supported(&model, &subject));
-        let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+        let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
 
         assert!(
             analytic.converged && fd.converged,
@@ -6392,9 +6454,9 @@ mod iov_tests {
         assert!(!ebe_warm_start_enabled());
     }
 
-    #[test]
-    fn test_find_ebe_no_iov_kappas_empty() {
-        // A model without IOV should return empty kappas
+    /// A minimal non-IOV 1-cpt IV model (`CL = TVCL·exp(η)`, `V = TVV`) shared by
+    /// the plain-EBE and inner-restart tests.
+    fn no_iov_1cpt_model() -> CompiledModel {
         let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
         let default_params = crate::types::ModelParameters {
             theta: vec![5.0, 50.0],
@@ -6412,7 +6474,7 @@ mod iov_tests {
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
-        let model = CompiledModel {
+        CompiledModel {
             name: "no_iov".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
@@ -6472,8 +6534,11 @@ mod iov_tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
-        };
-        let subject = Subject {
+        }
+    }
+
+    fn no_iov_subject(reset_times: Vec<f64>) -> Subject {
+        Subject {
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
@@ -6485,17 +6550,48 @@ mod iov_tests {
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
+            reset_times,
             cens: vec![0; 3],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn test_find_ebe_no_iov_kappas_empty() {
+        // A model without IOV should return empty kappas.
+        let model = no_iov_1cpt_model();
+        let subject = no_iov_subject(Vec::new());
         let params = model.default_params.clone();
-        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None);
+        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None, 0);
         assert!(result.kappas.is_empty());
+    }
+
+    /// The guarded inner multi-start (`inner_restarts > 0`) fires on a
+    /// reset-bearing subject (cold start), exercises the Ω-scaled seed scan, and
+    /// — because this 1-cpt objective is unimodal — reconverges to the SAME EBE
+    /// as `inner_restarts = 0`. This pins the "unimodal subjects stay
+    /// bit-identical" guarantee while covering the restart loop.
+    #[test]
+    fn test_inner_restart_unimodal_is_bit_identical() {
+        let model = no_iov_1cpt_model();
+        // reset_times non-empty ⇒ `has_resets()` ⇒ the restart trigger is armed.
+        let subject = no_iov_subject(vec![0.0]);
+        assert!(subject.has_resets());
+        let params = model.default_params.clone();
+        // Cold start (`eta_init = None`) is required for the restart to fire.
+        let base = find_ebe(&model, &subject, &params, 200, 1e-6, None, None, 0);
+        let restarted = find_ebe(&model, &subject, &params, 200, 1e-6, None, None, 2);
+        assert!(restarted.eta[0].is_finite());
+        assert!(
+            (restarted.eta[0] - base.eta[0]).abs() < 1e-7,
+            "unimodal EBE must be unchanged by the restart: base={} restarted={}",
+            base.eta[0],
+            restarted.eta[0]
+        );
     }
 
     /// Regression guard for #302: the non-IOV inner EBE must be invariant to the
@@ -6605,10 +6701,10 @@ mod iov_tests {
             obs_records: vec![],
         };
         let params = model.default_params.clone();
-        let r_none = find_ebe(&model, &subject, &params, 200, 1e-6, None, None);
+        let r_none = find_ebe(&model, &subject, &params, 200, 1e-6, None, None, 0);
         // A large mu (e.g. an additive mu-ref's typical value) is the case that
         // mis-converged in psi-space; the EBE must be unchanged.
-        let r_mu = find_ebe(&model, &subject, &params, 200, 1e-6, None, Some(&[8.0]));
+        let r_mu = find_ebe(&model, &subject, &params, 200, 1e-6, None, Some(&[8.0]), 0);
         assert!(
             (r_none.eta[0] - r_mu.eta[0]).abs() < 1e-9,
             "non-IOV EBE must be mu-shift invariant: none={}, mu=8 -> {}",
@@ -6629,12 +6725,12 @@ mod iov_tests {
         let params = model.default_params.clone();
 
         // Fit without mu_k.
-        let r1 = find_ebe(&model, &subject, &params, 200, 1e-5, None, None);
+        let r1 = find_ebe(&model, &subject, &params, 200, 1e-5, None, None, 0);
 
         // Fit with a non-zero mu_k. If mu were dropped, BSV eta would shift by
         // -mu; with the fix, BSV eta is recovered as psi - mu and matches r1.
         let mu = vec![0.1];
-        let r2 = find_ebe(&model, &subject, &params, 200, 1e-5, None, Some(&mu));
+        let r2 = find_ebe(&model, &subject, &params, 200, 1e-5, None, Some(&mu), 0);
 
         assert!(r1.converged && r2.converged);
         // This fixture's BSV mode sits far out (η̂ ≈ −7.6) where the FD-gradient
