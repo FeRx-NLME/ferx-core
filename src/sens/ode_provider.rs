@@ -9533,11 +9533,12 @@ mod tests {
     }
 
     /// A model whose individual-parameter program carries more than `MAX_ODE_AXES`
-    /// (16) axes must make `param_derivatives_at_cov` return `None` gracefully (its
-    /// dispatch only specializes `1..=16`, hitting the `_ => None` arm) rather than
+    /// axes must make `param_derivatives_at_cov` return `None` gracefully (its dispatch
+    /// only specializes `1..=MAX_ODE_AXES`, hitting the `_ => None` arm) rather than
     /// panic — the seeders propagate that `None` via `?`, so the caller falls back to
-    /// FD. (The gate caps `n_theta + n_eta ≤ 16`, so this `_ => None` is otherwise
-    /// reachable only through intermediate-axis inflation — see #455.) (#451 re-review #10)
+    /// FD. (The gate caps `n_theta + n_eta ≤ MAX_ODE_AXES`, so this `_ => None` is
+    /// otherwise reachable only through intermediate-axis inflation — see #455.)
+    /// (#451 re-review #10)
     #[test]
     fn param_derivatives_at_cov_declines_over_max_axes_gracefully() {
         // 16 thetas + 1 eta = 17 axes (> MAX_ODE_AXES). All thetas feed CL so the
@@ -9573,6 +9574,25 @@ mod tests {
             pd.is_none(),
             "> MAX_ODE_AXES axes must decline to FD, not panic"
         );
+
+        // The decline is a property of the **program's axis count**, never of the covariate
+        // snapshot: `param_derivatives_at_cov` reads `cov` only to *evaluate* the program, and
+        // decides `Some`/`None` before that, on `prog.n_axes()` alone. `run_obs_grad_tvcov`
+        // relies on exactly this — it hoists one `ParamDerivs` per event behind a single `?`,
+        // which is only equivalent to the old per-consumer checks because a program that
+        // resolves at one event's covariates resolves at all of them. If a future change ever
+        // made the decline cov-dependent, the hoist would silently serve the *first* event's
+        // answer to every other event, so pin the invariant here rather than in a comment.
+        for cov in [
+            HashMap::new(),
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 1.0e6), ("AGE".to_string(), -3.0)]),
+        ] {
+            assert!(
+                param_derivatives_at_cov(prog, &model, &cov, &theta, &[0.1]).is_none(),
+                "the > MAX_ODE_AXES decline must not depend on the covariate snapshot"
+            );
+        }
     }
 
     // ---- #430 slice 1: built-in inverse-Gaussian absorption forcing over Dual2 ----
