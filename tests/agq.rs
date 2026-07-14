@@ -334,7 +334,7 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
     let ofv = |x: &[f64], n: usize| -> f64 {
         let params = unpack_params(x, template);
         let (ehs, _hms, _stats, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
-            &model, &pop, &params, 300, 1e-10, None, None, 0,
+            &model, &pop, &params, 500, 1e-12, None, None, 0,
         );
         2.0 * agq::agq_population_nll(&model, &pop, &params, &ehs, &[], n)
     };
@@ -344,15 +344,18 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
         // Analytic gradient at x0.
         let params = unpack_params(&x0, template);
         let (ehs, _h, _s, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
-            &model, &pop, &params, 300, 1e-10, None, None, 0,
+            &model, &pop, &params, 500, 1e-12, None, None, 0,
         );
         let g = agq::agq_population_gradient(&model, &pop, &params, template, &x0, &ehs, &[], n)
             .expect("analytic gradient must be available in scope");
 
-        // Central FD of the true objective.
+        // Central FD of the true objective. Step 1e-4, not 1e-5: this references a
+        // **reconverged** objective, so a step below the inner solver's noise floor amplifies
+        // that noise rather than cutting truncation, and the reference — not the gradient —
+        // becomes the inaccurate side. See the IOV twin of this test.
         let mut fd = vec![0.0f64; np];
         for i in 0..np {
-            let h = 1e-5 * (1.0 + x0[i].abs());
+            let h = 1e-4 * (1.0 + x0[i].abs());
             let (mut xp, mut xm) = (x0.clone(), x0.clone());
             xp[i] += h;
             xm[i] -= h;
@@ -374,15 +377,17 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
     // gate: `grid_response_correction` supplies the `∂Φ/∂H·dH/dx` term that the fixed-node
     // score omits, and at n = 1 that term is the entire difference (a 26% error without it).
     //
-    // Measured: 1.6e-3 at n = 1, 7.8e-5 at n = 3, ~1e-5 beyond. The 5e-3 bound leaves headroom
-    // for the FD reference's own noise (it central-differences a *reconverged* objective, so
-    // the inner solver's tolerance leaks in) while still failing loudly on a real regression —
-    // a wrong gradient misses by tens of percent here, not tenths of a percent. It also pins
-    // `AGQ_GRID_FD_STEP`: at 1e-2 this test fails outright (the grid-response term is
-    // truncation-dominated, and a "safe" large step puts the θ gradient 5× off).
+    // Measured: 2.0e-5 at n = 1, 1.5e-6 at n = 3, 2.1e-7 at n = 7 — the gradient is exact to
+    // the reference's own precision. (An earlier revision of this test used a 1e-5 FD step and
+    // read 1.6e-3; that was the *reference's* noise, not the gradient's error — see the step
+    // comment above. Do not "restore" the smaller step.)
+    //
+    // The 1e-4 bound also pins `AGQ_GRID_FD_STEP`: at 1e-2 this test fails outright, because
+    // the grid-response term is truncation-dominated and a "safe" large step puts the θ
+    // gradient 5x off.
     for (k, &n) in [1usize, 3, 5, 7].iter().enumerate() {
         assert!(
-            rel_errs[k] < 5e-3,
+            rel_errs[k] < 1e-4,
             "n_agq={n}: analytic gradient must match FD of the objective, got {:.3e} \
              relative error (all: {rel_errs:?})",
             rel_errs[k]
@@ -1023,10 +1028,14 @@ fn analytic_gradient_matches_fd_under_iov() {
     let np = x0.len();
 
     // Objective at a packed point: re-solve the joint (η, κ) EBEs, then the AGQ OFV.
+    //
+    // The inner solve must be *tightly* converged (1e-12, not the 1e-10 default). This is the
+    // FD reference, and its noise floor is set by how precisely the joint (η, κ) mode is found
+    // — a loosely-solved mode makes the reference, not the gradient, the inaccurate side.
     let ofv = |x: &[f64], n: usize| -> f64 {
         let params = unpack_params(x, template);
         let (ehs, _h, _s, kaps) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
-            model, &pop, &params, 300, 1e-10, None, None, 0,
+            model, &pop, &params, 500, 1e-12, None, None, 0,
         );
         2.0 * agq::agq_population_nll(model, &pop, &params, &ehs, &kaps, n)
     };
@@ -1034,7 +1043,7 @@ fn analytic_gradient_matches_fd_under_iov() {
     for n in [1usize, 3] {
         let params = unpack_params(&x0, template);
         let (ehs, _h, _s, kaps) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
-            model, &pop, &params, 300, 1e-10, None, None, 0,
+            model, &pop, &params, 500, 1e-12, None, None, 0,
         );
         assert!(
             kaps.iter().any(|k| !k.is_empty()),
@@ -1044,9 +1053,15 @@ fn analytic_gradient_matches_fd_under_iov() {
         let g = agq::agq_population_gradient(model, &pop, &params, template, &x0, &ehs, &kaps, n)
             .expect("IOV gradient must be available");
 
+        // FD step 1e-4, NOT the 1e-5 that *looks* more accurate. The reference differences a
+        // **reconverged** objective, so shrinking the step past the inner solver's own noise
+        // floor amplifies that noise instead of reducing truncation. Measured on this model:
+        // 1.4e-3 at h = 1e-5, settling to 2.4e-4 at 1e-4 and staying there through 1e-3 — i.e.
+        // the *reference* was the inaccurate side, not the gradient. Mistaking one for the
+        // other made this gradient look 10x worse than it is; hence this comment.
         let mut fd = vec![0.0f64; np];
         for i in 0..np {
-            let h = 1e-5 * (1.0 + x0[i].abs());
+            let h = 1e-4 * (1.0 + x0[i].abs());
             let (mut xp, mut xm) = (x0.clone(), x0.clone());
             xp[i] += h;
             xm[i] -= h;
@@ -1061,16 +1076,11 @@ fn analytic_gradient_matches_fd_under_iov() {
             .iter()
             .zip(fd.iter())
             .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
-        // 2.5e-2, against 1.6e-3 for the non-IOV case — and honestly so. The FD reference
-        // re-solves the **joint** (η, κ) mode at every perturbed point, and that inner solve is
-        // the noisier half of the comparison (a 5-dimensional mode over 2 occasions of sparse
-        // data). The residual sits on ω_CL / ω_KA — the flat directions — *not* on Ω_iov, whose
-        // block is the genuinely new algebra here and lands at 0.4%. It is comfortably inside
-        // what L-BFGS needs: the IOV fits converge and reproduce FOCEI-IOV's estimates to <1%,
-        // κ included. A wrong Ω_iov block (a dropped `K·Ω_iov⁻¹`, a mis-summed occasion axis)
-        // misses by tens of percent, which this bound still catches.
+        // Measured: 2.4e-4 — the same order as the non-IOV case, not a degraded one. The Ω_iov
+        // block (the genuinely new algebra here) is exact; a wrong one — a dropped
+        // `K·Ω_iov⁻¹`, a mis-summed occasion axis — misses by tens of percent.
         assert!(
-            max_diff / scale < 2.5e-2,
+            max_diff / scale < 1e-3,
             "n_agq={n} (IOV): analytic gradient must match FD of the objective, got {:.3e} \
              relative error\n  analytic: {g:?}\n  fd:       {fd:?}",
             max_diff / scale

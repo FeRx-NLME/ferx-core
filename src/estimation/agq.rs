@@ -1055,19 +1055,22 @@ fn eta_dx(
 ) -> Option<Vec<nalgebra::DVector<f64>>> {
     use crate::estimation::parameterization::{packed_fixed_mask, unpack_params};
 
-    // `dη̂/dx` from the provider, non-IOV only.
-    //
-    // Deliberately NOT `subject_eta_dx_iov` for IOV, even though it exists. Both provider
-    // entry points solve `db̂/dx = −H_inner⁻¹ · ∂²nll/∂b∂x` against the *Gauss-Newton* inner
-    // Hessian, whereas AGQ's grid is scaled by the **exact** FD Hessian. Non-IOV that
-    // mismatch is immaterial (it leaves the gradient at 0.16% of FD), but with the stacked
-    // (η, κ) Hessian it is not: it puts the ω gradients ~8% out. The implicit-function finite
-    // difference below uses the same exact `H` the grid does, and brings IOV back in line.
-    // Still no inner re-solve — this is the derivative of the mode, not a recomputation of it.
-    if !stack.is_iov() && analytic_score_supported(model, stack) {
-        if let Some(v) = crate::estimation::sens_outer_gradient::subject_eta_dx(
-            model, subject, template, x, b_hat,
-        ) {
+    // `db̂/dx` from the provider — the stacked (η, κ) entry point under IOV, the η-only one
+    // otherwise. Both are the exact implicit-function derivative `−H_inner⁻¹·∂²nll/∂b∂x`, and
+    // neither re-solves the inner loop: this is the *derivative* of the mode, not a
+    // recomputation of it. The finite difference below is the fallback for models outside the
+    // provider's scope, and uses the same exact `H` the grid is scaled by.
+    if analytic_score_supported(model, stack) {
+        let exact = if stack.is_iov() {
+            crate::estimation::sens_outer_gradient::subject_eta_dx_iov(
+                model, subject, template, x, b_hat,
+            )
+        } else {
+            crate::estimation::sens_outer_gradient::subject_eta_dx(
+                model, subject, template, x, b_hat,
+            )
+        };
+        if let Some(v) = exact {
             return Some(v);
         }
     }
