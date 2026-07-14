@@ -1521,7 +1521,7 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
 would be dead code and a coverage hole behind the same flag):
 
 ```rust
-/// Phase 6 — time-inhomogeneous transition: solve dP/dt = Q(C(t))·P, P(0)=I (RK45).
+/// Phase 6 — time-inhomogeneous transition: solve dP/dt = P·Q(C(t)), P(0)=I (RK45).
 pub fn ctmm_inhomogeneous_transition(q_at_c: impl Fn(f64) -> DMatrix<f64>, delta_t: f64, n_states: usize) -> DMatrix<f64>;
 
 /// Phase 7 — HMM forward algorithm: O(T×S²), log-sum-exp stable.
@@ -2713,7 +2713,8 @@ Gate: `#[cfg(feature = "markov")]` initially.
 
 **Slicing (leaf-first, mirroring Phase 5):**
 - ✅ **Slice 1 — numerical leaf.** `ctmm_inhomogeneous_transition(q_at, Δt, n_states)` in
-  `src/markov/mod.rs`: integrates `dP/dτ = Q(τ)·P`, `P(0)=I` on the shared Dormand–Prince
+  `src/markov/mod.rs`: integrates `dP/dτ = P·Q(τ)`, `P(0)=I` (forward Kolmogorov,
+  right-multiplication) on the shared Dormand–Prince
   RK45 (`crate::ode::solve_ode`), occupancy matrix flattened row-major into the ODE state.
   Tier-1 anchors: constant-`Q` ⇒ `expm(Q·Δt)` (agrees with the homogeneous path); scalar
   `Q(τ)=g(τ)·Q₀` ⇒ `expm(Q₀·∫g)` (closed form independent of `expm`); zero-Δt ⇒ `I`.

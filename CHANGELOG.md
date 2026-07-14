@@ -74,8 +74,6 @@ section of the SDLC for the versioning policy).
   [Markov models](https://ferx-nlme.github.io/ferx-core/model-file/markov-model.html)
   and [CTMM estimation](https://ferx-nlme.github.io/ferx-core/estimation/ctmm.html)
   pages. (mCTMM/DTMM and CTMM simulation are planned follow-ups.)
-  pages. (mCTMM/DTMM, drug-driven `Q(t)`, and CTMM simulation are planned
-  follow-ups.)
 - **Adaptive Gaussian quadrature (`method = agq`)** (#251): a new estimation
   method that generalises Laplace. Instead of approximating each subject's
   marginal likelihood with a single Gaussian at the empirical-Bayes mode, it
