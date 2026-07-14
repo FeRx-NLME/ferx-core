@@ -334,7 +334,7 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
     let ofv = |x: &[f64], n: usize| -> f64 {
         let params = unpack_params(x, template);
         let (ehs, _hms, _stats, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
-            &model, &pop, &params, 500, 1e-12, None, None, 0,
+            &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
         );
         2.0 * agq::agq_population_nll(&model, &pop, &params, &ehs, &[], n)
     };
@@ -344,7 +344,7 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
         // Analytic gradient at x0.
         let params = unpack_params(&x0, template);
         let (ehs, _h, _s, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
-            &model, &pop, &params, 500, 1e-12, None, None, 0,
+            &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
         );
         let g = agq::agq_population_gradient(&model, &pop, &params, template, &x0, &ehs, &[], n)
             .expect("analytic gradient must be available in scope");
@@ -441,6 +441,7 @@ fn fd_score_path_agrees_with_the_analytic_one() {
         1e-10,
         None,
         None,
+        0,
         0,
     );
 
@@ -1035,7 +1036,7 @@ fn analytic_gradient_matches_fd_under_iov() {
     let ofv = |x: &[f64], n: usize| -> f64 {
         let params = unpack_params(x, template);
         let (ehs, _h, _s, kaps) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
-            model, &pop, &params, 500, 1e-12, None, None, 0,
+            model, &pop, &params, 500, 1e-12, None, None, 0, 0,
         );
         2.0 * agq::agq_population_nll(model, &pop, &params, &ehs, &kaps, n)
     };
@@ -1043,7 +1044,7 @@ fn analytic_gradient_matches_fd_under_iov() {
     for n in [1usize, 3] {
         let params = unpack_params(&x0, template);
         let (ehs, _h, _s, kaps) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
-            model, &pop, &params, 500, 1e-12, None, None, 0,
+            model, &pop, &params, 500, 1e-12, None, None, 0, 0,
         );
         assert!(
             kaps.iter().any(|k| !k.is_empty()),

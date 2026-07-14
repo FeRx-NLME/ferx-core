@@ -249,6 +249,9 @@ pub fn run_covariance(
             None,
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            // Cold reconvergence: match the fit's inner multi-start so the EBEs
+            // land in the same basin (else SEs would differ from the inline path).
+            options.inner_restarts,
         );
 
     // --- Run the covariance step (identical to the inline path in fit()) ---

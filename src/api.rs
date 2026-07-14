@@ -5345,6 +5345,7 @@ fn fit_inner(
                         None,
                         Some(&mu_k),
                         stage_opts.min_obs_for_convergence_check as usize,
+                        stage_opts.inner_restarts,
                     );
                 let nll = crate::estimation::outer_optimizer::pop_nll(
                     model,
@@ -8442,7 +8443,7 @@ pub fn simulate_with_options_diag(
     // tolerances only need to localize each EBE well enough to match on, not to
     // reproduce a specific fit's inner settings.
     let (eta_hats, _h, _stats, _kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
-        model, population, params, 100, 1e-6, None, None, 1,
+        model, population, params, 100, 1e-6, None, None, 1, 0,
     );
 
     // A divergent EBE can come back non-finite (`find_ebe` only gates its

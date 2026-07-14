@@ -1212,6 +1212,7 @@ pub fn run_bayes(
             Some(&warm_etas),
             None,
             0,
+            0,
         );
 
     // OFV at the posterior mean (2·Σ individual_nll, IOV-aware). NOTE: this is

@@ -251,7 +251,16 @@ fn run_map_multistart(
             let mu = Some(mu_k);
 
             // Baseline: warm-start (or cold-start from η = 0).
-            let mut best = find_ebe(model, subject, params, inner_maxiter, inner_tol, warm, mu);
+            let mut best = find_ebe(
+                model,
+                subject,
+                params,
+                inner_maxiter,
+                inner_tol,
+                warm,
+                mu,
+                0,
+            );
 
             if let Some(ref l_omega) = omega_chol {
                 // Deterministic per-subject, per-iteration seed, separated from IS draws.
@@ -278,6 +287,7 @@ fn run_map_multistart(
                         inner_tol,
                         Some(&eta_slice),
                         mu,
+                        0,
                     );
                     if candidate.nll < best.nll {
                         best = candidate;
