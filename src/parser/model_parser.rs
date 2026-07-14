@@ -5623,6 +5623,16 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         Ok(EstimationMethod::Imp)
     } else if val.contains("hybrid") || val == "gn_hybrid" || val == "gn-hybrid" {
         Ok(EstimationMethod::FoceGnHybrid)
+    } else if val == "agq"
+        || val == "aghq"
+        || val == "gauss_hermite"
+        || val == "gauss-hermite"
+        || val == "adaptive_gaussian_quadrature"
+        || val == "adaptive-gaussian-quadrature"
+    {
+        // MUST stay above the `contains("gauss")` arm below, which would otherwise
+        // swallow `gauss_hermite` / `adaptive_gaussian_quadrature` into Gauss-*Newton*.
+        Ok(EstimationMethod::Agq)
     } else if val == "gn" || val.contains("gauss") {
         Ok(EstimationMethod::FoceGn)
     } else if val == "focei" || val == "foce-i" || val == "foce_i" || val.contains("interaction") {
@@ -6068,6 +6078,19 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 return Err(format!("sir_df must be >= 1.0, got {v}"));
             }
             opts.sir_df = v;
+        }
+        "n_agq" => {
+            let v = parse_usize("n_agq")?;
+            if v < 1 {
+                return Err("n_agq must be >= 1 (1 = the Laplace approximation)".to_string());
+            }
+            if v > crate::estimation::agq::MAX_AGQ_NODES {
+                return Err(format!(
+                    "n_agq must be <= {}, got {v}",
+                    crate::estimation::agq::MAX_AGQ_NODES
+                ));
+            }
+            opts.n_agq = v;
         }
         "imp_samples" => {
             let v = parse_usize("imp_samples")?;
@@ -14147,15 +14170,6 @@ impl OdeOutputProgram {
                 .ops
                 .iter()
                 .any(|op| matches!(op, Op::PushVar(i) if *i as usize == idx))
-    }
-
-    /// The highest PK slot any individual parameter of this readout maps to
-    /// (`indiv_to_pk`), or `None` if the readout references no individual
-    /// parameters. The tv-covariate event-walk provider (#650) seeds only the
-    /// eight `PkDual` structural slots (`CL..V3`, 0..=7), so it serves the readout
-    /// analytically only when every referenced parameter slot fits there.
-    pub(crate) fn max_indiv_pk_slot(&self) -> Option<usize> {
-        self.indiv_to_pk.iter().copied().max()
     }
 
     /// Evaluate the output expression over a dual type, generic over [`PkNum`]
@@ -23025,6 +23039,7 @@ if (WT > 70) {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -23045,6 +23060,7 @@ if (WT > 70) {
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             &sigma,
             &model.residual_correlations,
         );
@@ -23092,6 +23108,7 @@ if (WT > 70) {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],

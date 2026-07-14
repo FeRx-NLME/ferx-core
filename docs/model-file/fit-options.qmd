@@ -13,7 +13,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `method` | `foce`, `focei`, `saem`, `gn`, `gn_hybrid`, `impmap`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](#chained-fits). When neither this key nor a wrapper's `method` argument is set, the engine falls back to `focei` and emits a warning so the implicit choice is visible — set `method` here to silence it. |
+| `method` | `foce`, `focei`, `agq`, `saem`, `gn`, `gn_hybrid`, `impmap`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](#chained-fits). When neither this key nor a wrapper's `method` argument is set, the engine falls back to `focei` and emits a warning so the implicit choice is visible — set `method` here to silence it. |
 | `threads` | positive integer, `0`, `auto` | `auto` | Number of Rayon worker threads for per-subject parallelism. A positive integer pins the count. `0`/`auto` (or omitting the key) uses the engine's default: available cores − 1 (floored at 1), capped at 8 — most fits gain little from spreading across every core, and not all cores are equal on asymmetric platforms (e.g. Apple Silicon E-cores). The CLI's `--threads` flag mirrors this key (see `ferx --help`). |
 | `maxiter` | integer | `500` | Maximum outer loop iterations. `maxiter = 0` is *evaluation only* (NONMEM `MAXEVAL=0`): the engine runs one inner EBE solve at the initial parameters and reports the objective there with no outer optimisation — useful for scoring a fixed parameter set or computing standard errors at known estimates (with `covariance = true`). The reported fit is marked not-converged, and the parameters are returned unchanged. |
 | `covariance` | `true`, `false` | `true` | Compute covariance matrix and standard errors |
@@ -171,11 +171,24 @@ method = foce
 ```
 First-Order Conditional Estimation. Linearizes the model around the empirical Bayes estimates. Fast and reliable for most models.
 
+### AGQ
+```
+method = agq
+n_agq  = 3
+```
+Adaptive Gaussian Quadrature. Generalizes Laplace: instead of one Gaussian at the empirical-Bayes mode, it evaluates the **exact** conditional likelihood on a Gauss-Hermite grid around that mode. `n_agq = 1` is Laplace identically; more nodes refine the marginal. Makes no Gaussian-residual assumption, so it is the deterministic option for non-Gaussian endpoints (TTE, categorical). Cost is `n_agq ^ n_eta` per subject per iteration, so it suits models with few random effects (`n_eta ≤ 4`). See the [AGQ page](../estimation/agq.qmd).
+
 ### SAEM
 ```
 method = saem
 ```
 Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP optimization for random effects. More robust to local minima; recommended for complex models with many random effects.
+
+## AGQ-Specific Options
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `n_agq` | `3` | Gauss-Hermite nodes **per random effect**. `1` reproduces the Laplace approximation exactly; odd values are conventional (they keep a node at the mode). Max `21`. The tensor grid costs `n_agq ^ n_eta` likelihood evaluations per subject per outer iteration, and a fit whose grid exceeds 100 000 nodes is rejected at check time — lower `n_agq`, use fewer random effects, or switch to `saem` / `imp`. |
 
 ## SAEM-Specific Options
 

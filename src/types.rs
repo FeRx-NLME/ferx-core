@@ -665,7 +665,7 @@ impl PkParams {
 }
 
 /// A single subject with dosing and observation data
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Subject {
     pub id: String,
     pub doses: Vec<DoseEvent>,
@@ -720,6 +720,15 @@ pub struct Subject {
     /// Occasion index per observation row (parallel to `obs_times`).
     /// Empty when no IOV column is present in the data.
     pub occasions: Vec<u32>,
+    /// `L2` grouping id per observation row (parallel to `obs_times`), the
+    /// NONMEM data item that ties several records into one correlated
+    /// observation unit. Rows sharing an `L2` value (within a subject) are
+    /// correlated together by `block_sigma`; a `0` (or empty vector when the
+    /// data has no `L2` column) means "ungrouped", and those rows fall back to
+    /// the `(time, occasion)` pairing rule. This is what lets a user pair, e.g.,
+    /// the total and unbound rows of one blood draw explicitly rather than
+    /// relying on co-temporal row order (#827).
+    pub obs_l2: Vec<i64>,
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
@@ -4860,6 +4869,26 @@ pub struct FitResult {
     /// were active during the fit (or the caller supplied `ignore`/`accept`
     /// expressions).  `None` means no filtering was requested.
     pub exclusions: Option<ExclusionSummary>,
+    /// The optimizer's **exact** final packed parameter vector (log-theta,
+    /// Cholesky-omega lower triangle, log-sigma, over the free parameters), lifted
+    /// from [`OuterResult::packed_estimate`]. Lets [`run_covariance`] reproduce the
+    /// inline covariance step's FD-Hessian bit-for-bit by reusing this exact
+    /// Cholesky factor instead of re-decomposing `omega` (which is not the
+    /// round-trip inverse of the stored `L·Lᵀ`; the FD Hessian amplifies the
+    /// difference on ill-conditioned ω directions — the divergence #816 review
+    /// surfaced). `Some` for every packed-Cholesky-space optimizer — the NLopt and
+    /// BFGS outer loops, the trust region, and Gauss-Newton (pure and hybrid). `None`
+    /// for SAEM and importance-sampling (which rebuild `omega` from the reported
+    /// matrix, so both paths re-decompose identically and already agree), for Bayes
+    /// (no Hessian covariance step), and for hand-built results.
+    ///
+    /// **Transient (`#[serde(skip)]`):** it is an in-process optimisation for a
+    /// `run_covariance` called right after a fit; a fit reloaded from `.fitrx`
+    /// carries `None` and `run_covariance` falls back to re-packing from `omega`
+    /// (the documented "~1e-5, platform dependent" path). Never serialized, so no
+    /// `.fitrx` / ferx-r format change.
+    #[serde(skip)]
+    pub packed_estimate: Option<Vec<f64>>,
 }
 
 impl FitResult {
@@ -5155,6 +5184,16 @@ pub struct FitOptions {
     // `imp_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
     // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` at the fixed input parameters
     // without updating them.
+    /// Gauss–Hermite nodes **per random effect** for `method = agq` (#251). Default 3.
+    ///
+    /// `n_agq = 1` is the Laplace approximation exactly (see
+    /// [`crate::estimation::agq`]); larger values refine the marginal and are what make
+    /// AGQ unbiased on strongly non-Gaussian integrands. The tensor grid costs
+    /// `n_agq^n_eta` likelihood evaluations per subject per outer iteration, so raise it
+    /// deliberately — odd values are conventional (they keep a node exactly at the mode).
+    /// Capped by [`crate::estimation::agq::MAX_AGQ_NODES`], with the *grid* additionally
+    /// capped by [`crate::estimation::agq::MAX_AGQ_GRID`].
+    pub n_agq: usize,
     /// Number of importance samples per subject. Default 1000. Recommended
     /// 2000–5000 for publication-quality MC SE (cost scales linearly).
     pub imp_samples: usize,
@@ -5556,6 +5595,7 @@ impl Default for FitOptions {
             sir_seed: None,
             sir_keep_samples: false,
             sir_df: 5.0,
+            n_agq: 3,
             imp_samples: 1000,
             imp_proposal_df: 5.0,
             imp_seed: None,
@@ -5829,6 +5869,17 @@ pub enum EstimationMethod {
     /// σ²: inverse-gamma, mu-referenced θ: normal). Reports posterior summaries +
     /// convergence diagnostics on `FitResult.bayes`, not a point estimate.
     Bayes,
+    /// Adaptive Gauss–Hermite quadrature (#251) — the Laplace approximation generalised.
+    /// Reuses the FOCE/Laplace inner loop to find each subject's EBE mode, then evaluates
+    /// the **exact** conditional likelihood on a Gauss–Hermite grid laid around that mode
+    /// (`n_agq` nodes per random effect). At `n_agq = 1` it is Laplace identically; above
+    /// that the marginal improves and — because it integrates the model's real likelihood
+    /// rather than a Gaussian-residual surrogate — it is the only method here that handles
+    /// non-Gaussian endpoints (TTE, categorical) without approximation. Deterministic, so
+    /// unlike [`Saem`](Self::Saem) / [`Imp`](Self::Imp) its OFV carries no Monte-Carlo noise.
+    /// Cost is `n_agq^n_eta` likelihood evaluations per subject per iteration; see
+    /// [`crate::estimation::agq::MAX_AGQ_GRID`].
+    Agq,
 }
 
 impl EstimationMethod {
@@ -5842,6 +5893,7 @@ impl EstimationMethod {
             EstimationMethod::Imp => "IMP",
             EstimationMethod::Impmap => "IMPMAP",
             EstimationMethod::Bayes => "BAYES",
+            EstimationMethod::Agq => "AGQ",
         }
     }
 }
@@ -5855,6 +5907,21 @@ impl FitOptions {
         } else {
             self.methods.clone()
         }
+    }
+
+    /// The AGQ node count when this (stage's) method is AGQ, else `None`.
+    ///
+    /// The **single predicate** every AGQ-aware branch consults — the population objective
+    /// ([`crate::estimation::outer_optimizer::pop_nll_opts`]), the outer-gradient dispatch,
+    /// and the optimizer/report classification. Keeping it in one place is what stops the
+    /// objective and the gradient from disagreeing about which method is running: an
+    /// outer loop minimising the AGQ objective while fed the analytic *FOCE* gradient
+    /// would converge, silently, to the wrong parameters.
+    ///
+    /// Reads `self.method` (the per-stage method — `api::fit_inner` rewrites it for each
+    /// stage of a chain), so it is correct inside a chained fit too.
+    pub fn agq_nodes(&self) -> Option<usize> {
+        (self.method == EstimationMethod::Agq).then(|| self.n_agq.max(1))
     }
 
     /// Covariance-step inner EBE-reconvergence tolerance that **closed-form,
@@ -6061,6 +6128,27 @@ pub fn framework_keys() -> &'static [&'static str] {
 pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
     match m {
         EstimationMethod::Foce | EstimationMethod::FoceI => &[
+            "maxiter",
+            "inner_maxiter",
+            "inner_tol",
+            "inner_optimizer",
+            "optimizer",
+            "outer_xtol",
+            "outer_ftol",
+            "steihaug_max_iters",
+            "global_search",
+            "global_maxeval",
+            "stagnation_guard",
+            "reconverge_gradient_interval",
+        ],
+        // AGQ drives the same outer loop and the same inner EBE solve as FOCE/FOCEI —
+        // it only swaps the population objective — so it accepts that method's keys,
+        // plus the node count. AGQ *does* have an exact analytic outer gradient, and
+        // `reconverge_gradient_interval` is its escape hatch onto the numeric path
+        // (honoured in `population_gradient`), so the key applies here exactly as it
+        // does for FOCE/FOCEI.
+        EstimationMethod::Agq => &[
+            "n_agq",
             "maxiter",
             "inner_maxiter",
             "inner_tol",
@@ -6447,6 +6535,7 @@ pub(crate) mod test_helpers {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6611,6 +6700,7 @@ mod tests {
             reset_times: vec![],
             cens: vec![0, 0],
             occasions: vec![],
+            obs_l2: Vec::new(),
             dose_occasions: vec![],
             // Row 0 = PK observation, row 1 = covariate pseudo-observation.
             fremtype: vec![0, 100],
@@ -6661,6 +6751,7 @@ mod tests {
             reset_times: vec![],
             cens: vec![0],
             occasions: vec![],
+            obs_l2: Vec::new(),
             dose_occasions: vec![],
             fremtype: vec![0],
             obs_records: vec![],
@@ -7967,6 +8058,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: Vec::new(),
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),

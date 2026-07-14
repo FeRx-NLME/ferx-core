@@ -16,7 +16,7 @@
 
 use crate::api::{cov_diagnostics, extract_standard_errors, resolve_covariance_status};
 use crate::estimation::outer_optimizer::{compute_covariance, CovarianceStepResult};
-use crate::estimation::parameterization::{compute_mu_k, pack_params};
+use crate::estimation::parameterization::{compute_mu_k, pack_params, packed_len, unpack_params};
 use crate::estimation::uncertainty_samples::fitted_params_from_result;
 use crate::io::hash::sha256_file;
 use crate::types::*;
@@ -32,10 +32,21 @@ use std::path::Path;
 /// calls the same `compute_covariance` at the same converged point rather than
 /// duplicating the FD-Hessian logic, so a fit produced with `covariance = false`
 /// followed by `run_covariance` yields the same covariance matrix and SEs as a
-/// single fit produced with `covariance = true`, up to finite-difference noise
-/// (~1e-5, platform dependent): the inline path passes the optimizer's exact
-/// Cholesky factor, while this wrapper reconstructs it from `fit.omega` via a
-/// re-decomposition, which the FD Hessian amplifies.
+/// single fit produced with `covariance = true`.
+///
+/// When the fit carries the optimizer's exact packed vector
+/// ([`FitResult::packed_estimate`] — the in-memory FOCE/FOCEI path), the match is
+/// **bit-for-bit**: the parameters are rebuilt by *unpacking* that vector, so the
+/// `OmegaMatrix`'s `Ω⁻¹` / `log|Ω|` come from the same Cholesky factor `L` the
+/// inline step used. Reconstructing them from `fit.omega` instead re-decomposes
+/// `chol(L·Lᵀ) ≠ L` to machine-ε; that tiny `Ω⁻¹` difference feeds the inner NLL
+/// penalty, shifts the reconverged EBEs, and the FD Hessian amplifies it — up to
+/// ~1e-1 on an ill-conditioned ω direction (the divergence #816's review surfaced).
+/// A fit reloaded from `.fitrx` (no packed vector), or from SAEM /
+/// importance-sampling / Bayes (whose inline step re-packs `omega` the same way
+/// and so already agrees), takes that re-decomposition fallback. Every in-memory
+/// packed-Cholesky-space fit — NLopt, BFGS, trust region, Gauss-Newton — carries
+/// the vector and reproduces bit-for-bit.
 ///
 /// # Failure semantics
 ///
@@ -191,8 +202,42 @@ pub fn run_covariance(
     // slightly different EBE than the cold path — enough to make the covariance
     // matrix diverge from the inline result by ~1e-4 on some platforms. Matching
     // the inline start point keeps the two numerics bit-for-bit comparable.
-    let params = fitted_params_from_result(fit, model_ref);
-    let x_hat = pack_params(&params);
+    // Reconstruct the model parameters for the covariance step. The `omega` a fit
+    // reports is `L·Lᵀ`; rebuilding an `OmegaMatrix` from that matrix re-decomposes
+    // it (`chol(omega)`), and the resulting `Ω⁻¹` / `log|Ω|` differ from the ones the
+    // inline covariance step used (built directly from the optimizer's exact Cholesky
+    // factor `L`) by ~machine-epsilon. That difference feeds the inner NLL penalty
+    // `½ηᵀΩ⁻¹η`, shifts the reconverged EBEs at each FD point, and the FD Hessian
+    // amplifies it — badly on ill-conditioned ω directions (the #816-review
+    // divergence: ~0.1 on a warfarin ω²(KA) with ~115% RSE).
+    //
+    // So when the fit carries the optimizer's exact packed vector (`packed_estimate`,
+    // the in-memory packed-Cholesky-space path), **unpack it** to rebuild the
+    // parameters — the `OmegaMatrix` is then built from that same `L`
+    // (`from_chol_factor`), bit-for-bit identical to the inline path, and the
+    // covariance reproduces exactly. The fallback re-decomposes from `omega`
+    // (reloaded `.fitrx` fits, or SAEM/importance-sampling/Bayes, whose inline step
+    // re-packs `omega` the same way and so already agrees). The length guard falls
+    // back on any model/dimension mismatch.
+    //
+    // Note: on the reuse arm `packed_estimate` is the source of truth for the
+    // numeric center — `base_params` supplies only the structural template
+    // (names/masks/bounds/diagonal), and `compute_covariance` reads all θ/Ω/σ
+    // values from `x_hat`. A `FitResult` whose `theta`/`omega`/`sigma` were mutated
+    // in-process *after* the fit is therefore evaluated at the original packed
+    // point; recompute the fit rather than editing its estimates in place.
+    let base_params = fitted_params_from_result(fit, model_ref);
+    let (params, x_hat) = match &fit.packed_estimate {
+        // Alloc-free length guard (`packed_len`, not `pack_params(..).len()`);
+        // `pack_params` is only needed on the fallback arm, as the actual `x_hat`.
+        Some(v) if v.len() == packed_len(&base_params) => {
+            (unpack_params(v, &base_params), v.clone())
+        }
+        _ => {
+            let repacked = pack_params(&base_params);
+            (base_params, repacked)
+        }
+    };
     let mu_k = compute_mu_k(model_ref, &params.theta, options.mu_referencing);
     let (eta_hats, h_matrices, _stats, kappas) =
         crate::estimation::inner_optimizer::run_inner_loop_warm(
@@ -313,6 +358,137 @@ mod tests {
         Some(fit)
     }
 
+    /// IOV analogue of `run_covariance_matches_inline_covariance` (#823). The
+    /// reuse path packs/unpacks the `omega_iov` Cholesky block too, and the
+    /// **diagonal-IOV branch of `unpack_params` reconstructs it through
+    /// `OmegaMatrix::from_diagonal` (square-then-re-decompose)** rather than the
+    /// `from_chol_factor` route the BSV `omega` takes — a distinct construction
+    /// with no prior parity coverage.
+    ///
+    /// It is nonetheless **bit-for-bit**: both the inline covariance step
+    /// (`compute_covariance(&x0, …)`) and this standalone step run the entire
+    /// numeric path — the base OFV, every FD-Hessian perturbation, and
+    /// `se_kappa`'s `iov.matrix[(i,i)]` factor — through the *same*
+    /// `unpack_params(x0, template)` on the *same* packed vector
+    /// `fit.packed_estimate`. So the `from_diagonal` construction is applied
+    /// identically on both sides and cannot introduce a divergence; the
+    /// asymmetry the issue flags lives inside `unpack_params`, not between the
+    /// two callers. Observed `max_abs_diff == 0.0`, with `se_kappa` matching to
+    /// the last bit.
+    ///
+    /// `fit_from_files` can't thread `iov_column` from `[fit_options]` (it
+    /// passes `None`), so — like every other IOV test — this drives the direct
+    /// `fit()` API with `read_nonmem_csv(.., Some("OCC"))` and hands both
+    /// `Some(model)` and `Some(pop)` to `run_covariance` (the documented IOV
+    /// workaround; a bare `Some(model)` for an IOV model is an error).
+    #[test]
+    fn run_covariance_matches_inline_covariance_iov() {
+        use crate::api::fit;
+
+        let model = crate::parser::model_parser::parse_full_model_file(std::path::Path::new(
+            "examples/warfarin_iov.ferx",
+        ))
+        .expect("parse warfarin_iov.ferx")
+        .model;
+        assert!(model.n_kappa > 0, "warfarin_iov.ferx must declare kappa");
+        let pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("data/warfarin_iov.csv"),
+            None,
+            Some("OCC"),
+        )
+        .expect("read warfarin_iov.csv");
+
+        // FOCEI (the IOV case the issue calls for) on the deterministic BOBYQA
+        // outer optimizer, so fit A and fit B converge to the same packed point.
+        let opts = FitOptions {
+            method: crate::types::EstimationMethod::FoceI,
+            interaction: true,
+            ..quick_opts()
+        };
+
+        // Fit A: inline covariance step. Skip (like the non-IOV sibling) if the
+        // FD cov step didn't produce a matrix — the parity assertions need a
+        // non-None reference, and FD conditioning is out of scope here.
+        let fit_a = fit(&model, &pop, &model.default_params, &opts).expect("iov fit A converges");
+        if fit_a.covariance_matrix.is_none() {
+            eprintln!(
+                "[skip] inline IOV covariance step produced no matrix (FD instability); \
+                 skipping run_covariance IOV parity assertions"
+            );
+            return;
+        }
+        // The whole point of the IOV variant: se_kappa must actually be exercised.
+        assert!(
+            fit_a.se_kappa.is_some(),
+            "inline IOV cov step must populate se_kappa"
+        );
+
+        // Fit B: identical settings, no inline covariance step.
+        let fit_b = fit(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                run_covariance_step: false,
+                ..opts.clone()
+            },
+        )
+        .expect("iov fit B converges");
+        assert!(
+            fit_b.covariance_matrix.is_none(),
+            "fit B should carry no covariance (run_covariance_step = false)"
+        );
+        // The bit-exact reuse relies on the FOCEI fit carrying the packed vector;
+        // guard it so a regression that stops populating it can't silently drop
+        // run_covariance onto the divergent re-decomposition fallback.
+        assert!(
+            fit_b.packed_estimate.is_some(),
+            "an IOV FOCEI fit must carry packed_estimate for run_covariance to reuse"
+        );
+
+        let out = run_covariance(&fit_b, Some(&model), Some(&pop), &opts)
+            .expect("run_covariance succeeds for the IOV model");
+
+        assert_eq!(out.covariance_status, CovarianceStatus::Computed);
+        let cov_ref = fit_a.covariance_matrix.as_ref().unwrap();
+        let cov_new = out
+            .covariance_matrix
+            .as_ref()
+            .expect("run_covariance populated covariance_matrix");
+        assert_eq!(cov_ref.shape(), cov_new.shape());
+        let max_abs_diff = cov_ref
+            .iter()
+            .zip(cov_new.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs_diff < 1e-12,
+            "IOV run_covariance matrix diverged from inline cov (max abs diff {max_abs_diff})"
+        );
+
+        // Every SE vector must agree bit-for-bit — se_kappa is the one the IOV
+        // reuse path (`from_diagonal` round-trip) newly covers.
+        let se_eq = |label: &str, a: &Option<Vec<f64>>, b: &Option<Vec<f64>>| {
+            assert_eq!(a.is_some(), b.is_some(), "{label}: presence differs");
+            if let (Some(a), Some(b)) = (a, b) {
+                assert_eq!(a.len(), b.len(), "{label}: length differs");
+                for (x, y) in a.iter().zip(b) {
+                    assert!((x - y).abs() < 1e-12, "{label} diverged: {x} vs {y}");
+                }
+            }
+        };
+        se_eq("se_theta", &fit_a.se_theta, &out.se_theta);
+        se_eq("se_omega", &fit_a.se_omega, &out.se_omega);
+        se_eq("se_sigma", &fit_a.se_sigma, &out.se_sigma);
+        se_eq("se_kappa", &fit_a.se_kappa, &out.se_kappa);
+
+        // Non-covariance fields round-trip unchanged — including omega_iov.
+        assert_eq!(out.theta, fit_b.theta);
+        assert_eq!(out.omega, fit_b.omega);
+        assert_eq!(out.omega_iov, fit_b.omega_iov);
+        assert_eq!(out.ofv, fit_b.ofv);
+    }
+
     #[test]
     fn run_covariance_matches_inline_covariance() {
         // The wrapper must reproduce the inline `fit()` covariance step exactly:
@@ -362,25 +538,34 @@ mod tests {
             .zip(cov_new.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
-        // `run_covariance` reconstructs the packed parameter vector via a
-        // Cholesky round-trip (FitResult.omega → Chol(FitResult.omega) → L),
-        // which introduces O(ε_machine · cond(L)) error relative to the inline
-        // path's exact L (stored from the optimizer, never re-decomposed).
-        // The resulting FD-Hessian perturbations differ by the same amount,
-        // so strict sub-1e-6 parity is not achievable through this path.
-        // 1e-4 is tight enough to catch any real regression while being
-        // realistic about the precision limit of the round-trip.
+        // `run_covariance` reuses the optimizer's exact packed vector
+        // (`fit.packed_estimate`) to rebuild the parameters, so its `OmegaMatrix`
+        // `Ω⁻¹` / `log|Ω|` are built from the same Cholesky factor `L` the inline
+        // step used — the covariance is now reproduced **bit-for-bit** (observed
+        // `max_abs_diff == 0.0`). Before this fix the two diverged by re-decomposing
+        // `omega` (`chol(L·Lᵀ) ≠ L` to machine-ε), amplified by the FD Hessian to
+        // ~0.1 on the warfarin ω²(KA) direction (~115% RSE). The bound is far below
+        // any real regression while tolerating theoretical last-ULP parallelism noise.
         assert!(
-            max_abs_diff < 1e-4,
+            max_abs_diff < 1e-12,
             "run_covariance matrix diverged from inline cov (max abs diff {max_abs_diff})"
         );
 
-        // SEs are derived from the covariance, so they must agree too.
+        // Guard the propagation: the bit-exact reproduction relies on the FOCEI fit
+        // carrying the optimizer's packed vector. If that stops being populated, the
+        // covariance silently falls back to the ~1e-1-divergent re-decomposition path
+        // — so assert it is present rather than let the fix rot.
+        assert!(
+            fit_b.packed_estimate.is_some(),
+            "a FOCEI fit must carry packed_estimate for run_covariance to reuse"
+        );
+
+        // SEs are derived from the covariance, so they must agree bit-for-bit too.
         assert_eq!(out.se_theta.is_some(), fit_a.se_theta.is_some());
         if let (Some(a), Some(b)) = (&fit_a.se_theta, &out.se_theta) {
             assert_eq!(a.len(), b.len());
             for (x, y) in a.iter().zip(b) {
-                assert!((x - y).abs() < 1e-4, "se_theta diverged: {x} vs {y}");
+                assert!((x - y).abs() < 1e-12, "se_theta diverged: {x} vs {y}");
             }
         }
 
@@ -388,6 +573,78 @@ mod tests {
         assert_eq!(out.theta, fit_b.theta);
         assert_eq!(out.omega, fit_b.omega);
         assert_eq!(out.ofv, fit_b.ofv);
+    }
+
+    /// Cover the re-decomposition **fallback** arm (`fit.packed_estimate == None`) —
+    /// the path taken by `.fitrx`-reloaded fits and by SAEM / importance-sampling /
+    /// Bayes. The bit-exact reuse test above only exercises the `Some` arm (every
+    /// in-memory packed-space fit now carries the vector), so null it here to force
+    /// the fallback and keep it from silently rotting. This path is *not* bit-exact:
+    /// it re-decomposes `chol(fit.omega)` instead of reusing the exact `L`, so it
+    /// matches the inline step only up to the FD-amplified re-decomposition
+    /// divergence this PR documents (~0.1 on the ill-conditioned warfarin ω²(KA)
+    /// direction). The assertions therefore check a *valid* covariance and guard
+    /// against gross regressions, not exactness.
+    #[test]
+    fn run_covariance_fallback_without_packed_estimate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (model_path, data_path) = copy_example_to_tempdir(dir.path());
+
+        let opts = quick_opts();
+        let Some(fit_a) = fit_with_cov_or_skip(
+            model_path.to_str().unwrap(),
+            data_path.to_str().unwrap(),
+            opts.clone(),
+        ) else {
+            return;
+        };
+
+        let mut fit_b = fit_from_files(
+            model_path.to_str().unwrap(),
+            Some(data_path.to_str().unwrap()),
+            None,
+            Some(FitOptions {
+                run_covariance_step: false,
+                ..opts.clone()
+            }),
+        )
+        .expect("fit must converge");
+
+        // Force the fallback: drop the packed vector so run_covariance rebuilds the
+        // parameters by re-decomposing `fit.omega` (exactly the reloaded-fit path).
+        fit_b.packed_estimate = None;
+        let out = run_covariance(&fit_b, None, None, &opts).expect("run_covariance succeeds");
+
+        assert_eq!(out.covariance_status, CovarianceStatus::Computed);
+        let cov_ref = fit_a.covariance_matrix.as_ref().unwrap();
+        let cov_new = out
+            .covariance_matrix
+            .as_ref()
+            .expect("fallback run_covariance populated covariance_matrix");
+        assert_eq!(cov_ref.shape(), cov_new.shape());
+
+        // Valid variances → real SEs: catches a fallback that panics, returns the
+        // wrong converged point, or yields a garbage/indefinite matrix.
+        for i in 0..cov_new.nrows() {
+            let var = cov_new[(i, i)];
+            assert!(
+                var.is_finite() && var > 0.0,
+                "fallback covariance diagonal {i} is not a valid variance: {var}"
+            );
+        }
+
+        // Loose agreement with the inline step: the re-decomposition divergence is
+        // ~0.1 here, so this only guards against gross regressions, not the
+        // bit-for-bit exactness the reuse arm provides.
+        let max_abs_diff = cov_ref
+            .iter()
+            .zip(cov_new.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs_diff < 0.5,
+            "fallback run_covariance grossly diverged from inline cov (max abs diff {max_abs_diff})"
+        );
     }
 
     /// Regression (#730 interaction): when `run_covariance` re-reads the dataset

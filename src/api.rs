@@ -489,6 +489,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             reset_times: Vec::new(),
             cens: vec![0; sim_spec.obs_times.len()],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             // One right-censored template row per cause CMT, at the administrative
@@ -2222,6 +2223,70 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // ── AGQ (#251) ────────────────────────────────────────────────────────────
+    if chain.iter().any(|&m| m == EstimationMethod::Agq) {
+        // The quadrature integrates over the BSV random effects η only. With IOV the
+        // marginal is a joint integral over (η, κ₁..κ_K), whose tensor grid is
+        // `n_agq^(n_eta + n_occ·n_iov)` — combinatorially hopeless even at 2 nodes, quite
+        // apart from the joint-Hessian work. Reject rather than quietly integrating the
+        // wrong (η-only) marginal and reporting a confidently wrong OFV.
+        if model.n_kappa > 0 {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_IOV_UNSUPPORTED",
+                    "method = agq does not support inter-occasion variability (κ / [iov]): the \
+                     marginal would be a joint integral over η and every occasion's κ, and the \
+                     tensor grid is intractable at that dimension. Use method = focei, saem, or \
+                     imp for IOV models.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        // The tensor rule costs `n_agq^n_eta` full likelihood evaluations per subject per
+        // outer iteration. Past the cap that is not "slow", it is a fit that will never
+        // finish — so it is worth failing at check time, with the two levers spelled out.
+        let n_nodes = options.n_agq.max(1);
+        // Per-dimension node cap. The parser (`apply_fit_option`) enforces this for
+        // file-driven fits, but a `FitOptions` built directly against the Rust API
+        // bypasses that path — so re-check here, alongside the grid cap, or an
+        // out-of-range `n_agq` (e.g. 100 with a single η, which slips under the grid
+        // cap) would reach `gauss_hermite` past the point Golub–Welsch stays accurate.
+        if n_nodes > crate::estimation::agq::MAX_AGQ_NODES {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_NODES_TOO_LARGE",
+                    format!(
+                        "method = agq with n_agq = {n_nodes} exceeds the {}-node per-dimension \
+                         limit: beyond ~20 nodes the Golub–Welsch rule loses its extreme nodes to \
+                         round-off and the marginal gains nothing. Lower n_agq (n_agq = 1 is the \
+                         Laplace approximation, i.e. FOCEI-equivalent cost).",
+                        crate::estimation::agq::MAX_AGQ_NODES,
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+        let grid = crate::estimation::agq::grid_size(n_nodes, model.n_eta);
+        if grid > crate::estimation::agq::MAX_AGQ_GRID {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_GRID_TOO_LARGE",
+                    format!(
+                        "method = agq with n_agq = {n_nodes} and {} random effects needs a \
+                         {n_nodes}^{} = {grid}-node tensor grid per subject per iteration, over \
+                         the {} limit. Lower n_agq (n_agq = 1 is the Laplace approximation, i.e. \
+                         FOCEI-equivalent cost), reduce the number of random effects, or use \
+                         method = saem / imp, whose cost does not grow with the η dimension.",
+                        model.n_eta,
+                        model.n_eta,
+                        crate::estimation::agq::MAX_AGQ_GRID,
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
     // Explicit `gradient_method = ad`: the Enzyme autodiff path was retired in
     // favour of the hand-rolled `Dual2` analytic sensitivities. Reject it rather
     // than silently running a different method. `auto` (analytic where in scope,
@@ -2769,6 +2834,92 @@ pub fn check_model_data_warnings(
             );
             diags.push(Diagnostic::warning(code, msg));
             break;
+        }
+    }
+
+    // An `L2` column that nothing consumes (#830). `L2` is a reserved level-2
+    // grouping data item, so the reader always treats it as the block_sigma
+    // pairing id and never as a covariate. If the model declares no block_sigma
+    // correlated residual, an `L2` column is inert — and if the user actually
+    // meant it as a covariate it has silently vanished. Surface that.
+    if model.residual_correlations.is_empty()
+        && population.subjects.iter().any(|s| !s.obs_l2.is_empty())
+    {
+        diags.push(Diagnostic::warning(
+            "W_L2_UNUSED",
+            "The dataset has an `L2` column but the model declares no block_sigma \
+             correlated residual, so `L2` is read as the reserved level-2 grouping \
+             id and is not available as a covariate. Rename the column if you \
+             intended it as a covariate."
+                .to_string(),
+        ));
+    }
+
+    // block_sigma cross correlations with an ambiguous (time, occasion) fallback
+    // pairing (#830). Without an `L2` grouping column the reader pairs co-temporal
+    // correlated rows one-to-one in file row order. That is unambiguous for the
+    // standard two-row layout (one total + one unbound per draw), but when a
+    // (time, occasion) group holds a row that could correlate with two or more
+    // others — e.g. replicate assays written as total1, unbound1, total2, unbound2
+    // — the resulting cross covariances depend on the physical CSV row order.
+    // Point the user at an explicit `L2` column, which makes the grouping
+    // order-independent.
+    if !model.residual_correlations.is_empty() {
+        use crate::stats::residual_error::loadings_share_correlation;
+        let n_sigma = init_params.sigma.values.len();
+        let corrs = &model.residual_correlations;
+        let n_ambiguous = population
+            .subjects
+            .iter()
+            // A subject that already carries any L2 id is explicitly grouped —
+            // its pairing does not depend on row order.
+            .filter(|s| !s.obs_l2.iter().any(|&id| id != 0))
+            .filter(|s| {
+                let loads: Vec<Vec<(usize, f64)>> = s
+                    .obs_cmts
+                    .iter()
+                    .map(|&cmt| model.error_spec.sigma_loadings(cmt, 1.0, n_sigma))
+                    .collect();
+                // Group observation indices by (time, occasion) and flag any group
+                // where a row structurally shares a correlation with ≥2 others —
+                // the case where greedy row-order pairing is ambiguous.
+                let n = s.obs_times.len();
+                let key = |j: usize| {
+                    (
+                        s.obs_times.get(j).copied().unwrap_or(0.0).to_bits(),
+                        s.occasions.get(j).copied().unwrap_or(0),
+                    )
+                };
+                (0..n).any(|j| {
+                    if loads.get(j).is_none_or(|l| l.is_empty()) {
+                        return false;
+                    }
+                    let degree = (0..n)
+                        .filter(|&k| k != j && key(k) == key(j))
+                        .filter(|&k| {
+                            loads
+                                .get(k)
+                                .zip(loads.get(j))
+                                .is_some_and(|(lk, lj)| loadings_share_correlation(lj, lk, corrs))
+                        })
+                        .count();
+                    degree >= 2
+                })
+            })
+            .count();
+        if n_ambiguous > 0 {
+            diags.push(Diagnostic::warning(
+                "W_BLOCK_SIGMA_L2_ORDER",
+                format!(
+                    "{} subject(s) have a block_sigma correlated residual whose \
+                     co-temporal rows can pair more than one way, and the dataset \
+                     has no L2 grouping column — the cross covariances are paired \
+                     one-to-one in CSV row order, so reordering rows would change \
+                     the fit. Add an explicit `L2` column giving each correlated \
+                     unit its own id to make the pairing order-independent.",
+                    n_ambiguous
+                ),
+            ));
         }
     }
 
@@ -4769,6 +4920,9 @@ fn fit_inner(
         // (FOCE/FOCEI/GN) are driven by the inner-loop gradient; IMP consumes
         // the EBE Hessian built via that same route. SAEM is sampling-based, so
         // it reports its E-step kernel (MH/HMC) instead of a gradient route.
+        // AGQ included: it runs the same inner EBE solve as FOCE/FOCEI (it only replaces
+        // the *population* objective), so the inner analytic-vs-FD η-gradient route this
+        // reports is exactly as relevant to it.
         let uses_gradient_route = chain.iter().any(|m| {
             matches!(
                 m,
@@ -4778,6 +4932,7 @@ fn fit_inner(
                     | EstimationMethod::FoceGnHybrid
                     | EstimationMethod::Imp
                     | EstimationMethod::Impmap
+                    | EstimationMethod::Agq
             )
         });
         if uses_gradient_route {
@@ -4873,6 +5028,7 @@ fn fit_inner(
                 | EstimationMethod::FoceGnHybrid
                 | EstimationMethod::Imp
                 | EstimationMethod::Impmap
+                | EstimationMethod::Agq
         )
     }) {
         if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning(
@@ -5078,6 +5234,21 @@ fn fit_inner(
             EstimationMethod::Foce => stage_opts.interaction = false,
             _ => {}
         }
+        // AGQ resolves `auto` to L-BFGS, because it *has* a gradient: the analytic
+        // posterior-weighted score over the quadrature nodes (`estimation::agq`), with the
+        // reconverged-FD gradient as the always-correct fallback.
+        //
+        // BOBYQA — what `resolve_auto` hands every other FD-only fit — **false-converges**
+        // on this objective (the #317 failure mode): on warfarin it stops 0.015 OFV units
+        // above the optimum at the default `inner_tol`, and *worsens* to 0.18 as `inner_tol`
+        // is tightened, because a smoother objective merely lets its trust-region stopping
+        // rule trip sooner (63 -> 34 evaluations, still reporting "converged"). Its ω
+        // estimates land ~3% off NONMEM LAPLACIAN. L-BFGS on the analytic gradient matches
+        // NONMEM to 4-5 significant figures on every parameter, in 0.39 s against FOCEI's
+        // 0.29 s. See docs/estimation/agq.qmd. An explicit `optimizer = ...` is honoured.
+        if matches!(method, EstimationMethod::Agq) && stage_opts.optimizer == Optimizer::Auto {
+            stage_opts.optimizer = Optimizer::NloptLbfgs;
+        }
         // Run the covariance step (and SIR) only on the last *estimating* stage,
         // so a chain doesn't recompute the expensive FD covariance after every
         // method (#615). See `is_last_estimating_stage` for the eval-only-IMP rule.
@@ -5161,6 +5332,7 @@ fn fit_inner(
                     impmap_trace: None,
                     bayes: None,
                     cond_dist: None,
+                    packed_estimate: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -5800,6 +5972,10 @@ fn fit_inner(
         sigma_names: result.params.sigma.names.clone(),
         error_model: model.error_model,
         covariance_matrix: result.covariance_matrix,
+        // The optimizer's exact packed vector (FOCE/FOCEI paths), so a later
+        // `run_covariance` reproduces this fit's covariance step bit-for-bit (#816
+        // follow-up). `None` for estimators that don't pack in Cholesky space.
+        packed_estimate: result.packed_estimate,
         se_theta,
         se_omega,
         se_sigma,
@@ -7171,6 +7347,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -8470,6 +8647,7 @@ fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             &params.sigma.values,
             &model.residual_correlations,
             mult,
@@ -8481,6 +8659,7 @@ fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             &params.sigma.values,
             &model.residual_correlations,
         ),
@@ -10227,6 +10406,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 6],
                 occasions: occasions.clone(),
+                obs_l2: Vec::new(),
                 dose_occasions: dose_occ.clone(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11104,6 +11284,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 4],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11192,6 +11373,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 4],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11278,6 +11460,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 3],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11372,6 +11555,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 3],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11467,6 +11651,7 @@ mod iov_integration {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -11814,6 +11999,7 @@ mod iov_integration {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -12802,6 +12988,7 @@ mod simulate_with_uncertainty_tests {
             reset_times: Vec::new(),
             cens: vec![0; n],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),
@@ -12969,6 +13156,7 @@ mod simulate_with_uncertainty_tests {
                 reset_times: Vec::new(),
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -13098,6 +13286,7 @@ mod simulate_with_uncertainty_tests {
             neural_networks: Vec::new(),
             covariate_table: None,
             exclusions: None,
+            packed_estimate: None,
         }
     }
 
@@ -14026,6 +14215,7 @@ mod sde_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 3],
                 occasions: vec![1u32; 3],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1u32],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -14156,6 +14346,7 @@ mod sde_integration {
                 reset_times: Vec::new(),
                 cens: vec![0],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -14480,6 +14671,7 @@ mod tests_sdtab_tv_cov {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -14649,6 +14841,7 @@ mod tests_sdtab_tv_cov {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -14804,6 +14997,7 @@ mod tests_sdtab_tv_cov {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -14965,6 +15159,7 @@ mod tests_derived_session_clock {
             reset_times: vec![5.0], // boundary at shifted t=5
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -15203,6 +15398,7 @@ mod tests_derived_session_clock {
             reset_times: Vec::new(),
             cens: vec![0; 3],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -15346,6 +15542,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             obs_records: vec![],
         }
@@ -15526,6 +15723,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             obs_records: vec![],
         };
@@ -15617,6 +15815,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -15687,6 +15886,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -15747,6 +15947,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -15768,6 +15969,159 @@ mod tests_derived_iov_kappa {
             !diags.iter().any(|d| d.message.contains("ALAG")),
             "no compartment-indexed ALAGn warning for an analytical (non-ODE) model"
         );
+    }
+
+    // ── #830: block_sigma L2 pairing warnings ───────────────────────────────
+
+    /// A two-endpoint block_sigma model correlating cmt-1 (slot 0) with cmt-2
+    /// (slot 1) via ρ.
+    fn block_sigma_two_endpoint_model() -> CompiledModel {
+        let mut m = minimal_iov_model(vec![]);
+        m.error_spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                crate::types::EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+            (
+                2,
+                crate::types::EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+        ]));
+        m.error_model = ErrorModel::Proportional;
+        m.n_epsilon = 2;
+        m.default_params.sigma = SigmaVector {
+            values: vec![0.3, 0.4],
+            names: vec!["S1".into(), "S2".into()],
+        };
+        m.default_params.sigma_fixed = vec![false, false];
+        m.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        m
+    }
+
+    fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject {
+        let n = cmts.len();
+        Subject {
+            fremtype: Vec::new(),
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: times.clone(),
+            obs_raw_times: times,
+            observations: vec![1.0; n],
+            obs_cmts: cmts,
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            obs_l2: l2,
+            dose_occasions: vec![1],
+            obs_records: vec![],
+        }
+    }
+
+    fn population_of(subject: Subject) -> Population {
+        Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Four co-temporal rows (total1, unbound1, total2, unbound2) with a
+    /// block_sigma correlation and NO L2 column: a total row can pair with either
+    /// unbound row, so the greedy row-order pairing is ambiguous and must warn.
+    #[test]
+    fn block_sigma_ambiguous_pairing_without_l2_warns() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(
+            vec![1, 2, 1, 2],
+            vec![1.0, 1.0, 1.0, 1.0],
+            Vec::new(),
+        ));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
+            "ambiguous co-temporal pairing with no L2 must warn"
+        );
+    }
+
+    /// The same four rows grouped by an explicit L2 id are unambiguous — no warning.
+    #[test]
+    fn block_sigma_l2_grouped_pairing_does_not_warn() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(
+            vec![1, 2, 1, 2],
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![1, 1, 2, 2],
+        ));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            !diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
+            "explicit L2 grouping is order-independent — must not warn"
+        );
+    }
+
+    /// A clean two-row draw (one total + one unbound) has only one possible
+    /// pairing even without L2 — no warning.
+    #[test]
+    fn block_sigma_two_row_layout_does_not_warn() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(vec![1, 2], vec![1.0, 1.0], Vec::new()));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            !diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
+            "an unambiguous two-row draw must not warn"
+        );
+    }
+
+    /// An L2 column present while the model declares no block_sigma correlation
+    /// means L2 is inert (and a covariate of that name was silently reserved) —
+    /// warn W_L2_UNUSED.
+    #[test]
+    fn l2_column_without_block_sigma_warns_unused() {
+        let model = minimal_iov_model(vec![]); // no residual_correlations
+        let pop = population_of(obs_only_subject(vec![1], vec![1.0], vec![0]));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_L2_UNUSED"),
+            "an L2 column unused by any block_sigma model must warn"
+        );
+    }
+
+    /// No L2 column and no block_sigma: nothing to warn about.
+    #[test]
+    fn no_l2_column_no_block_sigma_is_quiet() {
+        let model = minimal_iov_model(vec![]);
+        let pop = population_of(obs_only_subject(vec![1], vec![1.0], Vec::new()));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(!diags.iter().any(|d| d.code == "W_L2_UNUSED"));
+        assert!(!diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"));
+    }
+
+    /// A block_sigma model whose data DOES carry an L2 column must not raise
+    /// W_L2_UNUSED — the column is consumed.
+    #[test]
+    fn block_sigma_with_l2_is_not_flagged_unused() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(vec![1, 2], vec![1.0, 1.0], vec![1, 1]));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(!diags.iter().any(|d| d.code == "W_L2_UNUSED"));
     }
 
     /// An SS=1 dose combined with an [initial_conditions] baseline double-counts
@@ -15818,6 +16172,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             obs_records: vec![],
         };
@@ -15880,6 +16235,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             obs_records: vec![],
         };
@@ -15938,6 +16294,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -16075,6 +16432,7 @@ mod adaptive_sim_tests {
             reset_times: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1u32; n],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1u32; n_dose],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -18068,6 +18426,7 @@ mod adaptive_snapshot_verify_tests {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -18395,6 +18754,7 @@ mod adaptive_snapshot_verify_tests {
             reset_times: Vec::new(),
             cens: vec![0; decisions.len()],
             occasions: vec![1; decisions.len()],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],

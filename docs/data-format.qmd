@@ -32,6 +32,7 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 | `II` | numeric | 0 | Interdose interval for repeated dosing |
 | `SS` | integer | 0 | Steady-state flag. 1 = assume steady state |
 | `CENS` | integer | 0 | Censoring flag. `1` = below LLOQ and `DV` carries the LLOQ; `-1` = above ULOQ and `DV` carries the ULOQ; `0` = quantified. Paired with `bloq_method = m3` in `[fit_options]` to enable likelihood-based handling — see [BLOQ example](examples/bloq.qmd). |
+| `L2` | integer | 0 (ungrouped) | Level-2 grouping id (NONMEM data item). Observation rows sharing an `L2` value within a subject form one **correlated observation unit** and pick up the `block_sigma` cross covariance — e.g. the total and unbound rows of one blood draw. `0` / absent = ungrouped. Only affects models with a [`block_sigma`](model-file/error-model.qmd) correlated residual; see [Covariate-selected error models](model-file/error-model.qmd). |
 
 > **Missing DV on observation rows.** An `EVID=0` row contributes to the
 > likelihood only when its `DV` is present. If the `DV` is missing

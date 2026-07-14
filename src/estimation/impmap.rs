@@ -1349,6 +1349,7 @@ fn run_mcem(
         impmap_trace,
         bayes: None,
         cond_dist: None,
+        packed_estimate: None,
     })
 }
 

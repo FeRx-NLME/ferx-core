@@ -438,6 +438,7 @@ fn method_to_str(m: EstimationMethod) -> &'static str {
         EstimationMethod::Imp => "imp",
         EstimationMethod::Impmap => "impmap",
         EstimationMethod::Bayes => "bayes",
+        EstimationMethod::Agq => "agq",
     }
 }
 
@@ -451,6 +452,7 @@ fn method_from_str(s: &str) -> Result<EstimationMethod, FitrxError> {
         "saem" => EstimationMethod::Saem,
         "imp" => EstimationMethod::Imp,
         "bayes" => EstimationMethod::Bayes,
+        "agq" => EstimationMethod::Agq,
         _ => return Err(FitrxError::Corrupt(format!("unknown method {:?}", s))),
     })
 }
@@ -1919,6 +1921,9 @@ fn wire_to_fit_result(
         // round-tripped result therefore has no covariate table.
         covariate_table: None,
         exclusions: None,
+        // Transient (`#[serde(skip)]`) and not persisted: a reloaded fit has no
+        // optimizer packed vector, so `run_covariance` re-packs from omega (#816).
+        packed_estimate: None,
     })
 }
 
@@ -1996,6 +2001,7 @@ mod tests {
                 reset_times: vec![],
                 cens: vec![0; n_obs_each],
                 occasions: vec![],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -2137,6 +2143,7 @@ mod tests {
             neural_networks: Vec::new(),
             covariate_table: None,
             exclusions: None,
+            packed_estimate: None,
         }
     }
 

@@ -71,7 +71,14 @@ const _: () = assert!(
 
 /// Largest (θ + η) axis count for which the analytical η/θ chain (the
 /// individual-parameter program over `Dual2<M>`) is monomorphised.
-pub(crate) const MAX_ODE_AXES: usize = 16;
+///
+/// Raised 16 → 24 (#486). This const is the most load-bearing in `sens/`: besides
+/// gating the ODE walk it also bounds `param_derivatives_at_cov`, which the
+/// **closed-form** provider calls for its exact θ-chain — past the cap the CF path
+/// silently fell back to `lognormal_param_derivatives`, whose `∂p/∂θ` is a central
+/// *finite difference* of `tv_fn`, while still reporting "analytic". A 5-structural-θ
+/// + 6-covariate-θ + 5-η model sits at exactly 16, i.e. right on the old edge.
+pub(crate) const MAX_ODE_AXES: usize = 24;
 
 /// Largest stacked `(θ, η_bsv, κ_1..κ_K)` axis count for ODE IOV subjects.
 /// Kept separate from [`MAX_ODE_AXES`] because high-occasion IOV subjects are wide
@@ -91,8 +98,8 @@ pub(crate) const MAX_ODE_IOV_AXES: usize = 96;
 // back to FD with no error. This compile-time tripwire forces an edit here — and a look at
 // all four tables — before the const can change (#438 / #466 review round 1 #13 + round 2).
 const _: () = assert!(
-    MAX_ODE_AXES == 16,
-    "MAX_ODE_AXES changed: widen the disp!(1..=16) / dispatch_tv!(1..=16) tables in \
+    MAX_ODE_AXES == 24,
+    "MAX_ODE_AXES changed: widen the disp!(1..=24) / dispatch_tv!(1..=24) tables in \
      ode_subject_sensitivities, ode_subject_eta_grad, param_eta_derivatives, \
      and param_derivatives_at_cov to match, then update this assert"
 );
@@ -863,7 +870,9 @@ pub fn ode_subject_sensitivities(
                 }
             };
         }
-        return dispatch_tv!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+        return dispatch_tv!(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+        );
     }
     if !ode_subject_supported(model, subject) {
         return None;
@@ -1030,7 +1039,9 @@ pub fn ode_subject_eta_grad(
         }
         // Up to MAX_ODE_AXES (matches the outer `run_subject_tvcov` M-dispatch and
         // the `ode_tvcov_supported` axis bound), so inner/outer stay matched (#449 #4).
-        return dispatch_tv!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+        return dispatch_tv!(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+        );
     }
     if !ode_subject_supported(model, subject) {
         return None;
@@ -1161,7 +1172,7 @@ pub(crate) fn param_eta_derivatives_from_prog(
             }
         };
     }
-    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
 }
 
 /// Analytical `∂p/∂(θ,η)` (+ second order) from an explicit individual-parameter
@@ -3072,7 +3083,7 @@ pub(crate) fn param_derivatives_at_cov(
             }
         };
     }
-    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
 }
 
 /// Per-event flat PK-slot duals seeded on **η only** (`Dual1<N>`, `N = n_eta`) at a
@@ -5432,6 +5443,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1; n],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],

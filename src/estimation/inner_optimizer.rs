@@ -588,6 +588,48 @@ fn inner_stall_enabled(model: &CompiledModel, subject: &Subject) -> bool {
 ///
 /// When `mu_k` is None every shift is zero and the behaviour is identical to
 /// the original (eta-space) implementation.
+/// The per-subject [`pk::event_driven::EventSchedule`] that may be built **once** and
+/// reused across many evaluations at differing `eta`, or `None` when no such reuse is
+/// sound. The schedule pre-computes the merged event timeline and the per-interval
+/// infusion bounds; those are subject-static — and so cacheable — only when nothing
+/// eta-dependent can move a baked-in break time:
+///
+/// - **lagtime** can be eta-dependent and the schedule bakes per-dose times in, so a
+///   cached schedule goes stale as eta varies. The non-cached path
+///   (`event_driven_predictions`) rebuilds it per call from the current per-dose
+///   `PkParams` (which carry lagtime).
+/// - **bioavailability `F`** scales a *rate*-defined infusion's duration (#419), which
+///   likewise moves the baked-in window as eta varies. Duration-defined infusions keep
+///   the cache (`F` scales their rate, not the window).
+///
+/// Only subjects that actually take the event-driven analytical path (TV covariates or
+/// EVID-3/4 resets, closed-form PK) can use a schedule at all; the no-TV fast path never
+/// calls `event_driven_predictions`, so `None` costs it nothing.
+///
+/// Shared by the inner EBE loop ([`find_ebe`]) and the AGQ node sweep
+/// ([`crate::estimation::agq`]), which both hold `eta` variable over one subject — so the
+/// staleness rules above cannot drift between them.
+pub(crate) fn cacheable_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> Option<pk::event_driven::EventSchedule> {
+    if (subject.has_tv_covariates() || subject.has_resets())
+        && model.ode_spec.is_none()
+        && pk::event_driven::supports_event_driven(model.pk_model)
+        && !model.has_lagtime()
+        && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
+    {
+        Some(pk::event_driven::EventSchedule::for_subject(
+            subject,
+            model.pk_model,
+            &subject.doses,
+            &[],
+        ))
+    } else {
+        None
+    }
+}
+
 pub fn find_ebe(
     model: &CompiledModel,
     subject: &Subject,
@@ -691,35 +733,7 @@ pub fn find_ebe(
     // analytical path — for the no-TV fast path the schedule is None and
     // event_driven_predictions is never called.
     let pk_scratch_cell = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
-    // Skip the schedule cache when the model declares lagtime: lagtime can
-    // be eta-dependent and the schedule bakes per-dose times in, so a
-    // cached schedule would go stale as the inner BFGS varies eta. The
-    // non-cached path (`event_driven_predictions`) rebuilds the schedule
-    // per call using the current per-dose PkParams (which carry lagtime).
-    // Reset-bearing subjects (EVID=3/4) also take the event-driven analytical
-    // path, so they benefit from a cached schedule too — the schedule now
-    // includes reset events.
-    // Also skip the cache when bioavailability `F` could reshape a rate-defined
-    // infusion window: `F` scales such an infusion's *duration* (#419), which
-    // moves the baked-in break times as the inner BFGS varies eta (the same
-    // staleness reason as `has_lagtime`). The non-cached path rebuilds per call
-    // with the current `F`. Duration-defined infusions keep the cache (`F` scales
-    // their rate, not the window).
-    let schedule = if (subject.has_tv_covariates() || subject.has_resets())
-        && model.ode_spec.is_none()
-        && pk::event_driven::supports_event_driven(model.pk_model)
-        && !model.has_lagtime()
-        && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
-    {
-        Some(pk::event_driven::EventSchedule::for_subject(
-            subject,
-            model.pk_model,
-            &subject.doses,
-            &[],
-        ))
-    } else {
-        None
-    };
+    let schedule = cacheable_schedule(model, subject);
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here — not inside `agrad`, which BFGS calls on
     // every inner step (and every line-search trial) — instead of re-walking
@@ -1844,6 +1858,7 @@ fn dense_residual_inner_gradient(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             sigma,
             corr,
             mult,
@@ -1855,6 +1870,7 @@ fn dense_residual_inner_gradient(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             sigma,
             corr,
         ),
@@ -1877,6 +1893,7 @@ fn dense_residual_inner_gradient(
         &subject.obs_times,
         &subject.obs_raw_times,
         &subject.occasions,
+        &subject.obs_l2,
         sigma,
         corr,
         ruv_mult.as_deref(),
@@ -2929,6 +2946,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -3032,6 +3050,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0, 0, 1, 1],
             occasions: vec![1; 6],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -3154,6 +3173,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0, 0, 1, 1],
             occasions: vec![1; 6],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -3627,6 +3647,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 0, 100], // last obs is FREM
             obs_records: vec![],
@@ -3749,6 +3770,7 @@ mod iov_tests {
                 reset_times: Vec::new(),
                 cens: vec![0; 4],
                 occasions: vec![1, 1, 2, 2],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1, 2],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -3876,6 +3898,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: vec![1; 5],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -3942,6 +3965,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -3965,6 +3989,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; n_wide],
             occasions: (1..=n_wide as u32).collect(),
+            obs_l2: Vec::new(),
             dose_occasions: (1..=n_wide as u32).collect(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4010,6 +4035,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4059,6 +4085,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4101,6 +4128,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4143,6 +4171,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4181,6 +4210,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4225,6 +4255,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4344,6 +4375,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4403,6 +4435,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4491,6 +4524,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4590,6 +4624,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; n],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4819,6 +4854,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 2],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4883,6 +4919,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4983,6 +5020,7 @@ mod iov_tests {
             // term differentiates them.
             cens: vec![0, 0, 0, 0, 1, 1],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5095,6 +5133,7 @@ mod iov_tests {
             // Occasion-2 tail is M3 *right*-censored (above ULOQ): upper tail.
             cens: vec![0, 0, 0, 0, -1, -1],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5211,6 +5250,7 @@ mod iov_tests {
                 reset_times: Vec::new(),
                 cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
                 occasions: vec![1, 1, 1, 2, 2, 2],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1, 2],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -5323,6 +5363,7 @@ mod iov_tests {
                 reset_times: Vec::new(),
                 cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
                 occasions: vec![1, 1, 1, 2, 2, 2],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1, 2],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -5434,6 +5475,7 @@ mod iov_tests {
             // Occasion-2 tail rows M3 left-censored, co-occurring with iiv_on_ruv.
             cens: vec![0, 0, 0, 0, 1, 1],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5651,6 +5693,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1; 6],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5718,6 +5761,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5754,6 +5798,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5836,6 +5881,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: vec![1; 5],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5879,6 +5925,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: vec![1; 5],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5929,6 +5976,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: vec![1; 5],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5970,6 +6018,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6052,6 +6101,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: vec![1; 5],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6113,6 +6163,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6204,6 +6255,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6279,6 +6331,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6435,6 +6488,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6546,6 +6600,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             obs_records: vec![],
         };

@@ -55,6 +55,22 @@ pub struct OuterResult {
     /// `method = saem` and `saem_conddist = true`; `None` for every other
     /// estimator and for SAEM runs that did not request the pass (#257).
     pub cond_dist: Option<CondDist>,
+    /// The optimizer's **exact** final packed parameter vector (log-theta,
+    /// Cholesky-omega lower triangle, log-sigma, over the free parameters) — the
+    /// same vector this stage's inline covariance step used. `Some` for every
+    /// packed-Cholesky-space optimizer — BOBYQA/SLSQP/MMA (NLopt), the hand-rolled
+    /// BFGS, the trust region, and Gauss-Newton (pure and hybrid) — including
+    /// `outer_maxiter = 0` evaluation. `None` for SAEM and importance-sampling,
+    /// whose covariance step rebuilds `omega` from the reported matrix (so its
+    /// Cholesky factor re-decomposes identically on both the inline and
+    /// `run_covariance` paths and already agrees), and for Bayes (no Hessian
+    /// covariance step).
+    ///
+    /// Carried so `run_covariance` can reproduce the inline FD-Hessian bit-for-bit
+    /// by reusing this exact Cholesky factor instead of re-decomposing `omega`
+    /// (`omega → chol` is not the round-trip inverse of the stored `L·Lᵀ`, and the
+    /// FD Hessian amplifies the difference on ill-conditioned ω directions).
+    pub packed_estimate: Option<Vec<f64>>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -150,14 +166,14 @@ fn evaluate_at_initial_params(
         options.min_obs_for_convergence_check as usize,
     );
     let ofv = 2.0
-        * pop_nll(
+        * pop_nll_opts(
             model,
             population,
             &params,
             &eta_hats,
             &h_matrices,
             &kappas,
-            options.interaction,
+            options,
         );
 
     if options.verbose {
@@ -206,6 +222,13 @@ fn evaluate_at_initial_params(
         };
 
     OuterResult {
+        // Evaluation-only (`outer_maxiter = 0`): no optimizer ran, but the eval
+        // still packs the init in Cholesky space and the inline covariance step
+        // above used `&x` as its FD center. Carry that exact vector so a later
+        // `run_covariance` reproduces this step bit-for-bit — the re-decomposition
+        // fallback (`chol(L·Lᵀ) ≠ L`) would otherwise diverge on an ill-conditioned
+        // init omega just as it does for a converged fit (#816 follow-up).
+        packed_estimate: Some(x.clone()),
         params,
         ofv,
         converged: false,
@@ -298,6 +321,46 @@ pub(crate) fn cap_slsqp_gradient(g: &mut [f64], lower_s: &[f64], upper_s: &[f64]
     } else {
         false
     }
+}
+
+/// The population objective the outer loop actually minimises: [`pop_nll`] (FOCE/FOCEI),
+/// or the AGQ marginal when the stage's method is `agq`.
+///
+/// **Every** production site that needs "the objective for *this* fit" must call this, not
+/// `pop_nll` — the objective closures, the reconverged-FD gradient, and the covariance
+/// stencil alike. An AGQ fit whose covariance step differenced the *FOCE* objective would
+/// report standard errors for a likelihood it never optimised.
+///
+/// Non-AGQ fits forward to `pop_nll` with identical arguments, so their OFV is unchanged
+/// bit for bit.
+pub(crate) fn pop_nll_opts(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> f64 {
+    if let Some(n_nodes) = options.agq_nodes() {
+        // AGQ + IOV is rejected in `check_model_options`, so `kappas` is empty here and the
+        // integral is over η alone. The EBE modes are the same ones FOCE/FOCEI use — AGQ
+        // does not re-optimise them, it lays its grid around them — and `h_matrices` (the
+        // ∂f/∂η Jacobian) is a FOCE artefact AGQ has no use for: it finite-differences the
+        // true posterior Hessian instead. See `crate::estimation::agq`.
+        return crate::estimation::agq::agq_population_nll(
+            model, population, params, eta_hats, n_nodes,
+        );
+    }
+    pop_nll(
+        model,
+        population,
+        params,
+        eta_hats,
+        h_matrices,
+        kappas,
+        options.interaction,
+    )
 }
 
 /// Dispatch to the IOV-aware or standard population NLL based on model.n_kappa.
@@ -540,15 +603,7 @@ fn run_global_presearch(
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
         );
-        let nll = pop_nll(
-            model,
-            population,
-            &params,
-            &ehs,
-            &hms,
-            &kappas,
-            options.interaction,
-        );
+        let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         let raw = 2.0 * nll;
         let guarded = ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac);
         if !raw.is_finite() || guarded {
@@ -588,15 +643,7 @@ fn run_global_presearch(
             options.min_obs_for_convergence_check as usize,
         );
 
-        let nll = pop_nll(
-            model,
-            population,
-            &params,
-            &ehs,
-            &hms,
-            &kappas,
-            options.interaction,
-        );
+        let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         let raw_ofv = 2.0 * nll;
 
         let ebe_guard =
@@ -985,15 +1032,7 @@ fn optimize_nlopt(
         );
 
         // Compute OFV with fixed EBEs
-        let nll = pop_nll(
-            model,
-            population,
-            &params,
-            &ehs,
-            &hms,
-            &kappas,
-            options.interaction,
-        );
+        let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         let raw_ofv = 2.0 * nll;
 
         // EBE convergence guard: reject step when too many subjects unconverged or any
@@ -1329,14 +1368,14 @@ fn optimize_nlopt(
         options.min_obs_for_convergence_check as usize,
     );
 
-    let final_nll = pop_nll(
+    let final_nll = pop_nll_opts(
         model,
         population,
         &final_params,
         &final_ehs,
         &final_hms,
         &final_kappas,
-        options.interaction,
+        options,
     );
     let final_ofv = 2.0 * final_nll;
 
@@ -1418,6 +1457,9 @@ fn optimize_nlopt(
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
+        // The exact packed vector this stage's inline covariance step used (#816
+        // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
+        packed_estimate: Some(x0.clone()),
     }
 }
 
@@ -1448,14 +1490,8 @@ fn optimize_bfgs(
                         kappas: &[Vec<DVector<f64>>]|
      -> f64 {
         let params = unpack_params(x, init_params);
-        2.0 * pop_nll(
-            model,
-            population,
-            &params,
-            eta_hats,
-            h_matrices,
-            kappas,
-            options.interaction,
+        2.0 * pop_nll_opts(
+            model, population, &params, eta_hats, h_matrices, kappas, options,
         )
     };
 
@@ -1472,16 +1508,7 @@ fn optimize_bfgs(
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
         );
-        let ofv = 2.0
-            * pop_nll(
-                model,
-                population,
-                &params,
-                &ehs,
-                &hms,
-                &kappas,
-                options.interaction,
-            );
+        let ofv = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         if ofv.is_finite() {
             ofv
         } else {
@@ -1842,6 +1869,9 @@ fn optimize_bfgs(
     }
 
     OuterResult {
+        // The exact packed vector this stage's inline covariance step used (#816
+        // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
+        packed_estimate: Some(x_final.clone()),
         params: final_params,
         ofv: final_ofv,
         converged,
@@ -1913,16 +1943,7 @@ fn reconverged_fd_gradient(
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
         );
-        let raw = 2.0
-            * pop_nll(
-                model,
-                population,
-                &params,
-                &ehs,
-                &hms,
-                &kappas,
-                options.interaction,
-            );
+        let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         if !raw.is_finite()
             || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
         {
@@ -2322,6 +2343,45 @@ fn population_gradient(
 ) -> Vec<f64> {
     let reconverge = reconverge_this_eval(options, *grad_eval_idx);
     *grad_eval_idx += 1;
+    // AGQ minimises a *different* objective (the quadrature marginal, not the FOCE/Laplace
+    // one), so every analytic and fixed-EBE gradient below — all of them closed forms of
+    // the FOCE marginal — is simply the gradient of the wrong function. Feeding one to the
+    // outer optimizer would not fail loudly; it would converge, smoothly, to the FOCE
+    // optimum while reporting AGQ OFVs. AGQ has its own gradient.
+    if let Some(n_nodes) = options.agq_nodes() {
+        // Preferred: AGQ's own exact gradient — the analytic posterior-weighted score over
+        // the nodes (Fisher identity) plus the grid-response term — which needs no inner
+        // re-solve, against the FD path's `2·n_free` *full population objective*
+        // re-evaluations. Exact at every `n_agq`. See `estimation::agq`.
+        // `reconverge_gradient_interval` is honoured here too: it is the documented escape
+        // hatch onto the numeric path, so it must override the analytic gradient for AGQ
+        // exactly as it does for FOCE/FOCEI below.
+        if !reconverge && crate::estimation::agq::analytic_gradient_available(model) {
+            let params = unpack_params(x, init_params);
+            if let Some(mut g) = crate::estimation::agq::agq_population_gradient(
+                model,
+                population,
+                &params,
+                init_params,
+                x,
+                ehs,
+                n_nodes,
+            ) {
+                // Fixed coordinates carry no gradient, matching the analytic FOCE path.
+                let fixed = packed_fixed_mask(init_params);
+                for (i, gi) in g.iter_mut().enumerate() {
+                    if fixed[i] {
+                        *gi = 0.0;
+                    }
+                }
+                return g;
+            }
+        }
+        // Fallback (always correct, just slower): central-difference the real objective,
+        // re-solving the inner loop at each perturbed point so the response of η̂ to the
+        // population parameters is captured too.
+        return reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options);
+    }
     // M3-censored models now have an exact analytic censored gradient on both the
     // FOCEI (`subject_packed_gradient` + `prepare`'s M3 branch) and the FOCE
     // (`subject_packed_gradient_foce`, censored rows excluded from R̃ and added as
@@ -3145,15 +3205,7 @@ pub(crate) fn compute_covariance(
     // marginal already carries ηᵀΩ⁻¹η + log|Ω|; for FOCE we add that prior here.
     let ofv = |xv: &[f64]| -> f64 {
         let (params, ehs, hms, kaps) = reconverge_point(xv);
-        let foce_nll = pop_nll(
-            model,
-            population,
-            &params,
-            &ehs,
-            &hms,
-            &kaps,
-            options.interaction,
-        );
+        let foce_nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kaps, options);
         // Covariance OFV = −2·logL = 2·pop_nll for both FOCE and FOCEI.
         //
         // FOCE uses the Sheiner–Beal linearised marginal `(y−f₀)ᵀR̃⁻¹(y−f₀) +
@@ -3264,15 +3316,7 @@ pub(crate) fn compute_covariance(
         let f0 = base_ofv;
         let serial_ofv = |xv: &[f64]| -> f64 {
             let (params, ehs, hms, kaps) = reconverge_point(xv);
-            2.0 * pop_nll(
-                model,
-                population,
-                &params,
-                &ehs,
-                &hms,
-                &kaps,
-                options.interaction,
-            )
+            2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kaps, options)
         };
 
         let nf = free_idx.len();
@@ -4651,6 +4695,7 @@ mod tests {
                 reset_times: Vec::new(),
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -5331,6 +5376,7 @@ mod tests {
                 reset_times: Vec::new(),
                 cens: vec![0; 6],
                 occasions: vec![1, 1, 1, 2, 2, 2],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1],
                 obs_records: vec![],
             })

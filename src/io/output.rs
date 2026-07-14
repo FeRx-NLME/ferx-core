@@ -2234,6 +2234,7 @@ mod tests {
             neural_networks: Vec::new(),
             covariate_table: None,
             exclusions: None,
+            packed_estimate: None,
         }
     }
 
@@ -2686,6 +2687,7 @@ mod tests {
             reset_times: vec![],
             cens: vec![0; n_obs],
             occasions: vec![],
+            obs_l2: Vec::new(),
             dose_occasions: vec![],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -2801,6 +2803,7 @@ mod tests {
             neural_networks: Vec::new(),
             covariate_table: None,
             exclusions: None,
+            packed_estimate: None,
         }
     }
 

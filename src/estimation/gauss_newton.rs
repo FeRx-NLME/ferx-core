@@ -458,6 +458,11 @@ pub fn run_foce_gn(
             impmap_trace: None,
             bayes: None,
             cond_dist: None,
+            // Exact packed vector this cov step used (`compute_covariance(&x, …)`).
+            // Pure GN optimizes in packed Cholesky space, so `x`'s omega block is
+            // the exact factor `L`; reused by `run_covariance` for a bit-for-bit
+            // covariance instead of re-decomposing `omega` (#816 follow-up).
+            packed_estimate: Some(x.clone()),
         };
     }
 
@@ -512,6 +517,13 @@ pub fn run_foce_gn(
         final_kappas = kappas;
     }
 
+    // The exact packed vector the covariance step below uses as its FD center.
+    // GN (and its FOCEI polish) optimizes in packed Cholesky space, so
+    // `final_params.omega.chol` is the optimizer's exact factor `L` — not a
+    // re-decomposition — and carrying it lets a later `run_covariance` reproduce
+    // this step bit-for-bit rather than re-decomposing `omega` (#816 follow-up).
+    let final_packed = pack_params(&final_params);
+
     // ---- Covariance step ----
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     let (covariance_matrix, covariance_wall_time_secs) =
@@ -520,9 +532,8 @@ pub fn run_foce_gn(
                 eprintln!("Running covariance step...");
             }
             let cov_timer = std::time::Instant::now();
-            let packed = pack_params(&final_params);
             let cm = match compute_covariance(
-                &packed,
+                &final_packed,
                 &final_params,
                 model,
                 population,
@@ -578,6 +589,9 @@ pub fn run_foce_gn(
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
+        // Exact packed vector this stage's covariance step used (see above);
+        // reused by `run_covariance` for a bit-for-bit covariance (#816 follow-up).
+        packed_estimate: Some(final_packed),
     }
 }
 
@@ -2079,6 +2093,7 @@ mod tests {
                 reset_times: Vec::new(),
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -2091,6 +2106,42 @@ mod tests {
             input_columns: vec![],
             exclusions: None,
             warnings: vec![],
+        }
+    }
+
+    /// #816 follow-up regression: GN and its FOCEI hybrid both optimize in packed
+    /// Cholesky space, so their covariance step uses the optimizer's exact factor
+    /// `L`. Both return sites must carry `packed_estimate` so a standalone
+    /// `run_covariance` reproduces the inline covariance bit-for-bit (without it the
+    /// standalone step re-decomposes `chol(L·Lᵀ) ≠ L` and diverges on an
+    /// ill-conditioned ω). Fails if either return regresses to `None`.
+    #[test]
+    fn gn_and_hybrid_carry_packed_estimate() {
+        use crate::estimation::parameterization::packed_len;
+        let model = make_model();
+        let pop = make_population();
+        for (method, name) in [
+            (crate::types::EstimationMethod::FoceGn, "gn"),
+            (crate::types::EstimationMethod::FoceGnHybrid, "gn_hybrid"),
+        ] {
+            // One outer step, no covariance step: we only assert the packed vector
+            // is propagated, so this stays fast (no convergence needed).
+            let opts = FitOptions {
+                method,
+                outer_maxiter: 1,
+                run_covariance_step: false,
+                verbose: false,
+                ..FitOptions::default()
+            };
+            let res = run_foce_gn(&model, &pop, &model.default_params, &opts);
+            let packed = res
+                .packed_estimate
+                .unwrap_or_else(|| panic!("{name} must carry packed_estimate"));
+            assert_eq!(
+                packed.len(),
+                packed_len(&model.default_params),
+                "{name} packed_estimate has the wrong length"
+            );
         }
     }
 
@@ -3336,6 +3387,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
