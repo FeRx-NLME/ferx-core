@@ -35,17 +35,35 @@ section of the SDLC for the versioning policy).
   The provider now rewrites both jets for pseudo-observation rows (`f = theta[i] +
   eta[j]`, unit first derivatives, zero second derivatives — the same `{0, 1}` Jacobian
   the FOCE H-matrix already stamped in), and both gradient assemblies use the `EPSCOV`
-  variance.
+  variance — consistently at every consumer, not only the two that motivated the fix:
+  the outer jet override now also covers the ODE sensitivity provider (previously only
+  the closed-form/TV-cov routes got it, so an ODE FREM subject still combined the raw
+  PK jet with the `EPSCOV` variance); `method = foce`'s Sheiner–Beal `R⁰` and its σ-FD
+  now take the `EPSCOV` override (previously only FOCEI's `score_core` did); the FOCEI
+  `sigma_block` and `subject_eta_dx` σ-FD loops now use it too (previously they FD'd the
+  *PK* variance's — zero — dependence on `EPSCOV`, so `grad[EPSCOV]` was identically zero
+  under `focei` and a spurious term leaked into the other residual-error σ instead); and
+  the `iiv_on_ruv` residual-eta block and the custom-magnitude direct-θ channel now both
+  skip FREM rows (a pseudo-observation's likelihood has no η_ruv or magnitude dependence
+  at all).
 
   On the warfarin FREM example the effect is large. A converged FOCEI fit goes from
   **OFV 4900.6 to 211.0**, and the importance-sampling marginal (`method = imp`) from
   **19781.1 to 211.6** — `imp` scores FREM rows correctly but centres its proposal on the
   inner-loop EBEs, so it inherited the wrong mode, the weights collapsed, and its estimate
-  was meaningless. This release changes no objective function, only gradients, so the
-  entire gap is the fit previously landing in the wrong place. That the corrected FOCEI
-  Laplace OFV (211.0) and the corrected 6000-sample IS marginal (211.6) — two independent
-  approximations — now agree to under one unit is the strongest check that the new values
-  are the right ones.
+  was meaningless.
+
+  This is primarily a gradient fix, and most of the OFV gap is simply the fit landing
+  somewhere else because the gradient that drove it there was wrong. One piece is not
+  gradient-only, though: `find_ebe`'s non-IOV `h_matrix` — the Jacobian `foce_subject_nll`
+  uses to build the `log|H̃|` Laplace curvature term, which **is** part of the reported
+  OFV — reuses the same provider choke point this fix corrects, and that Jacobian never
+  received the FREM `{0, 1}` override before (only the IOV path and the FD-Jacobian
+  fallback already had it). So a non-IOV FREM subject's own curvature term was also wrong
+  pre-fix, independently of the outer-gradient bug above. That the corrected FOCEI Laplace
+  OFV (211.0) and the corrected 6000-sample IS marginal (211.6) — two independent
+  approximations, and IS's data term does not go through `h_matrix` at all — now agree to
+  under one unit is nonetheless a strong check that the new values are the right ones.
 
   Note the recovered covariate omegas barely move (118.71 → 118.67 for WT), because they
   are pinned by the pseudo-observations themselves. **A FREM fit could therefore look
@@ -65,9 +83,20 @@ section of the SDLC for the versioning policy).
   analytic route, so scope parity holds by construction rather than by a list that
   can drift. Under a custom residual magnitude this also **corrects** the θ gradient:
   `mult(θ)` makes the residual variance depend on θ directly, and that channel was
-  not approximated before — it was missing entirely. FREM, TTE and categorical
-  endpoints continue to use the finite-differenced score (neither re-solves the inner
-  loop, so they remain fast).
+  not approximated before — it was missing entirely. FREM is included too — its
+  pseudo-observation rows now ride the same analytic score as FOCE/FOCEI via the FREM
+  fix above. TTE and categorical endpoints still take the finite-differenced score
+  (neither re-solves the inner loop, so they remain fast) — they have no analytic
+  chain in the `Dual2` provider at all, not merely an AGQ-side gate. `block_sigma` is
+  now accepted for `method = agq` / `laplace` (previously rejected at `fit()` even
+  though the analytic score already carried a `corr_diag` branch for it). Under IOV,
+  the scope check now excludes non-Gaussian endpoints and bounds the custom-magnitude
+  axis count the same way the non-IOV gate does — previously an IOV + TTE/categorical
+  subject could pass the gate and silently score only the Ω prior, dropping the hazard
+  term. A per-subject runtime decline inside the analytic score (an off-diagonal
+  `block_sigma` subject, or magnitude × M3-censored) now falls back to the fixed-η FD
+  score for just that subject, rather than dropping the whole population onto the
+  `2·n_free`-inner-resolve `reconverged_fd_gradient` fallback.
 
 ### Added
 - **AGQ and `laplace` now support inter-occasion variability (`[iov]`)** (#251).

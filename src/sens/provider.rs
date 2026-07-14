@@ -3879,16 +3879,29 @@ pub fn subject_sensitivities(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
-    if !sens_profile_enabled() {
-        return subject_sensitivities_impl(model, subject, theta, eta);
+    let mut r = if !sens_profile_enabled() {
+        subject_sensitivities_impl(model, subject, theta, eta)
+    } else {
+        let t0 = std::time::Instant::now();
+        let r = subject_sensitivities_impl(model, subject, theta, eta);
+        PROFILE_SENS_NANOS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        PROFILE_SENS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        r
+    };
+    // FREM covariate pseudo-observations, at the one choke point that covers every
+    // route `subject_sensitivities_impl` can take — the no-TV closed form, the TV-cov
+    // event-driven walk (which also applies this internally so its own direct callers
+    // stay correct), and the ODE provider (`ode_subject_sensitivities`), which returns
+    // early from `subject_sensitivities_impl` and previously never saw this pass at all
+    // (#251 review #1): an ODE FREM subject took the analytic outer gradient with the raw
+    // PK jet on pseudo-obs rows while `score_core` still overrode their variance to
+    // `EPSCOV²`, mismatching jet and variance by orders of magnitude.
+    if let Some(sens) = r.as_mut() {
+        apply_frem_pseudo_obs_jet(sens, model, subject, theta, eta);
     }
-    let t0 = std::time::Instant::now();
-    let r = subject_sensitivities_impl(model, subject, theta, eta);
-    PROFILE_SENS_NANOS.fetch_add(
-        t0.elapsed().as_nanos() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    PROFILE_SENS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     r
 }
 
@@ -4862,8 +4875,6 @@ fn subject_sensitivities_impl(
     // that the TV-cov event-driven outer (`subject_sensitivities_tvcov`) also uses. Applied
     // last, matching production's scale-then-log order.
     apply_ltbs_transform_outer(&mut sens, model.log_transform);
-    // FREM covariate pseudo-observations are not PK rows at all — overwrite their jet.
-    apply_frem_pseudo_obs_jet(&mut sens, model, subject, theta, eta);
     Some(sens)
 }
 

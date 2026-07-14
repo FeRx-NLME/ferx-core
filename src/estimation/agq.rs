@@ -585,16 +585,6 @@ fn stack_mode(eta_hat: &[f64], kappas: &[nalgebra::DVector<f64>]) -> Vec<f64> {
 // costs `2·n_free` *full population objective* evaluations, each re-solving every subject's
 // inner loop.
 
-/// Whether the **θ/σ score** can be taken analytically from the `Dual2` provider, or must be
-/// finite-differenced at fixed η.
-///
-/// This is a *speed* switch, not a scope gate: both paths compute the same quantity, and
-/// neither re-solves the inner loop. The analytic form chains the provider's exact `∂f/∂θ`
-/// through `∂nll/∂f`, which is only valid for the plain Gaussian residual term — every
-/// variant listed below adds a term it does not carry (M3's normal-tail, LTBS's `ln f`
-/// wrap, FREM's pseudo-observations, a dense residual covariance, an η-scaled or custom
-/// residual variance), and TTE / categorical endpoints are outside the provider entirely.
-/// Those all take [`accumulate_fixed_eta_packed_gradient_fd`] instead.
 /// Model-level mirror of [`analytic_score_supported`], for reporting
 /// (`build_info::gradient_method_outer`) which has no per-subject [`Stack`]. Uses the model's
 /// own `n_kappa` to pick the IOV or non-IOV provider scope, which is the same answer every
@@ -615,10 +605,19 @@ pub fn analytic_score_supported(model: &CompiledModel, stack: &Stack) -> bool {
     // (θ, η, κ) dual walk, gated by `iov_sens_supported`, while the non-IOV entry point is
     // gated by `analytic_outer_gradient_available`. `analytic_outer_gradient_available`
     // already folds in `iov_sens_supported`, but it also carries the `gradient_method = fd`
-    // opt-out and the non-Gaussian/magnitude bails, which apply to both.
+    // opt-out and the non-Gaussian/magnitude bails, which apply to both — so the IOV arm
+    // must repeat them explicitly rather than only calling `iov_sens_supported`, or an IOV
+    // + TTE/categorical model (or IOV + an over-wide custom magnitude) would silently pass
+    // this gate: `score_core` would then build `et` from `subject.observations` alone, and
+    // a pure-TTE subject (`n_obs == 0`) would score only the Ω prior with no hazard
+    // contribution at all (#251 review #9).
     let provider = if stack.is_iov() {
         crate::sens::provider::iov_sens_supported(model)
             && !matches!(model.gradient_method, crate::types::GradientMethod::Fd)
+            && !model.has_non_gaussian()
+            && (!model.has_custom_ruv_magnitude()
+                || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
+                    && model.residual_correlations.is_empty()))
     } else {
         crate::sens::provider::analytic_outer_gradient_available(model)
     };
@@ -638,9 +637,11 @@ pub fn analytic_score_supported(model: &CompiledModel, stack: &Stack) -> bool {
     // pseudo-observations. It went unnoticed because FREM models are conventionally fit
     // with SAEM, which never asks for that gradient.)
     //
-    // Two runtime declines still land on FD, both inside `score_core` (returning `None`,
-    // which propagates through this function's `?`): a genuinely off-diagonal correlated
-    // subject, and magnitude × M3-censored.
+    // Two runtime (per-subject, not caught by this model-level predicate) declines still
+    // land on FD: a genuinely off-diagonal correlated subject, and magnitude ×
+    // M3-censored — both inside `score_core`, returning `None`. `accumulate_fixed_eta_
+    // packed_gradient` falls back to `accumulate_fixed_b_packed_gradient_fd` for just
+    // that subject when this happens, not the whole population (#251 review #8).
     provider
 }
 
@@ -651,7 +652,7 @@ pub fn analytic_score_supported(model: &CompiledModel, stack: &Stack) -> bool {
 ///
 /// * the fixed-η score is analytic where the provider reaches
 ///   ([`analytic_score_supported`]) and finite-differenced *at fixed η* otherwise
-///   ([`accumulate_fixed_eta_packed_gradient_fd`]) — the latter is correct for any likelihood
+///   ([`accumulate_fixed_b_packed_gradient_fd`]) — the latter is correct for any likelihood
 ///   ferx can evaluate, including TTE and categorical; and
 /// * `dη̂/dx` comes from the implicit-function theorem (`−H⁻¹·∂²nll/∂η∂x`), analytic where the
 ///   provider reaches and finite-differenced otherwise ([`eta_dx`]).
@@ -842,10 +843,39 @@ fn accumulate_fixed_eta_packed_gradient(
     // requirement in `sens_outer_gradient` lives in its `theta_block`, not here. The IOV
     // entry point takes the *stacked* (η, κ) vector and returns the same `ObsSens`, so
     // everything below is identical for both.
+    //
+    // `analytic_score_supported` is a *model*-level scope check; `score_core` (and, more
+    // rarely, the sensitivity provider itself) can still decline a specific *subject* at
+    // runtime — a genuinely off-diagonal correlated residual, or magnitude × an
+    // M3-censored row. Falling through those `?`s used to propagate `None` out of this
+    // whole function, which `agq_population_gradient` treats as "any subject declined" and
+    // answers by dropping the **entire population** onto `reconverged_fd_gradient` — the
+    // `2·n_free` full-objective, every-subject-inner-resolve fallback this module exists to
+    // avoid. FOCE/FOCEI stopped doing that population-wide bail for exactly this cost
+    // (`population_gradient_sens_mixed`'s per-subject `subject_reconverged_fd_gradient`
+    // salvage); AGQ's fixed-b FD score is this function's own equivalent per-subject
+    // salvage, and it is already right here — the Ω/Ω_iov block above is unaffected by
+    // which θ/σ path runs, so falling back for just this subject is exactly the state
+    // `accumulate_fixed_b_packed_gradient_fd`'s own docs assume it's called in (#251
+    // review #8).
     let sens = if stack.is_iov() {
-        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b)?
+        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b)
     } else {
-        crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b)?
+        crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b)
+    };
+    let Some(sens) = sens else {
+        return accumulate_fixed_b_packed_gradient_fd(
+            model,
+            subject,
+            params,
+            template,
+            stack,
+            b,
+            weight,
+            n_theta,
+            sigma_start,
+            out,
+        );
     };
 
     // The per-observation scalar likelihood chain. `score_core` is the half of
@@ -869,7 +899,21 @@ fn accumulate_fixed_eta_packed_gradient(
         &stack.omega_joint_inv,
         b,
         model.residual_error_eta,
-    )?;
+    );
+    let Some(core) = core else {
+        return accumulate_fixed_b_packed_gradient_fd(
+            model,
+            subject,
+            params,
+            template,
+            stack,
+            b,
+            weight,
+            n_theta,
+            sigma_start,
+            out,
+        );
+    };
     let et = &core.et;
 
     // θ block. Two channels:

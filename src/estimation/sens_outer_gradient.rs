@@ -1019,8 +1019,14 @@ pub(crate) fn score_core(
         // `∂d_j/∂θₘ` are a sum over the observation's sigma loadings of
         // `2·coeff²·mult·σ²·∂mult/∂θₘ` and `4·coeff·coeff'·mult·σ²·∂mult/∂θₘ` — the
         // same bilinear shape `residual_error::diag_self_deriv` uses for the
-        // `f`-derivative, just chain-ruled through `mult(θ)` instead of `f`.
-        if let (Some(m), Some(mg_row)) = (mult_row, mult_grad.as_ref().and_then(|mg| mg.get(j))) {
+        // `f`-derivative, just chain-ruled through `mult(θ)` instead of `f`. Never on a
+        // FREM row: its `R` is the dedicated `EPSCOV²` override, independent of the PK
+        // error-spec magnitude entirely, so `dr_dtheta`/`dd_dtheta` must stay empty
+        // there exactly as for a censored or correlated row (#251 review #6).
+        if let (Some(m), Some(mg_row)) = (
+            mult_row.filter(|_| frem_var.is_none()),
+            mult_grad.as_ref().and_then(|mg| mg.get(j)),
+        ) {
             let mut dd_dtheta = vec![0.0f64; n_theta];
             let dr_dtheta = mag_variance_dtheta(
                 &model.error_spec,
@@ -1048,8 +1054,13 @@ pub(crate) fn score_core(
         // Residual-eta rows/cols (`a_{j,ruv} = 0`, so the loop above left them at
         // their `Ω⁻¹` value). `c̃_{j,ruv} = 2` ⇒ `½ c̃ c̃ᵀ` gives `H̃[ruv,ruv] += 2`
         // and `H̃[ruv,l] += gⱼ a_{jl}` (`gⱼ = dⱼ/Rⱼ`); the true Hessian gets
-        // `H[ruv,ruv] += 2ε²/R` and `H[ruv,l] += κⱼ a_{jl}`.
-        if let Some(rr) = ruv {
+        // `H[ruv,ruv] += 2ε²/R` and `H[ruv,l] += κⱼ a_{jl}`. Skipped entirely for a
+        // FREM row: `individual_nll`'s FREM dispatch never applies `ruv_scale`, so such
+        // a row's likelihood has zero η_ruv dependence and must leave `g_ruv`/`gp_ruv`
+        // at their default `0.0` and the `(rr, ·)` block untouched (#251 review #5) —
+        // otherwise the row's huge `1/R` (`R = EPSCOV²`) leaks a spurious O(1e8) term
+        // into the `eta_ruv` Hessian/gradient.
+        if let Some(rr) = ruv.filter(|_| frem_var.is_none()) {
             if t.censored {
                 // Censored row's residual-eta second derivatives enter BOTH the true inner
                 // Hessian AND `H̃`/`log|H̃|` (consistent inclusion): `[ruv,ruv] += C·z`,
@@ -1630,6 +1641,30 @@ fn sigma_block(
                 continue;
             }
             let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
+            // FREM covariate pseudo-observation (`fremtype > 0`): `R = EPSCOV²`,
+            // independent of `f` (`d ≡ 0`), and — matching `individual_nll`'s FREM
+            // dispatch — NOT scaled by `ruv_scale`/magnitude, so `r_sig` is the bare FD
+            // of the covariate-σ variance, not lifted by `prep.ruv_scale` (#251 review
+            // #2). A `None` `frem_row` (the common case) falls through to the ordinary
+            // correlation/magnitude/legacy variance chain below.
+            let frem_row = crate::stats::likelihood::build_frem_r_override(
+                model.frem_config.as_ref(),
+                &subject.fremtype,
+                &sp,
+            )
+            .as_ref()
+            .and_then(|o| o.get(j))
+            .and_then(|x| *x)
+            .zip(
+                crate::stats::likelihood::build_frem_r_override(
+                    model.frem_config.as_ref(),
+                    &subject.fremtype,
+                    &sm,
+                )
+                .as_ref()
+                .and_then(|o| o.get(j))
+                .and_then(|x| *x),
+            );
             // Evaluate the four closed-form error functions once at σ±h and reuse
             // them for `r_sig`/`d_sig` and the residual-eta `g_sig` below. For a
             // correlated model (`block_sigma`) these are the correlation-aware variance
@@ -1637,27 +1672,43 @@ fn sigma_block(
             // - it doesn't depend on σ.
             let mult_row: Option<&[f64]> =
                 mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
-            let (vp, vm, dp_var, dm_var) = match (&corr_sp, &corr_sm) {
-                (Some((rvp, dvp)), Some((rvm, dvm))) => (rvp[j], rvm[j], dvp[j], dvm[j]),
-                _ => match mult_row {
-                    Some(m) => (
-                        model.error_spec.variance_at_scaled(cmt, f, &sp, &[], m),
-                        model.error_spec.variance_at_scaled(cmt, f, &sm, &[], m),
-                        model.error_spec.dvar_df_scaled(cmt, f, &sp, m),
-                        model.error_spec.dvar_df_scaled(cmt, f, &sm, m),
-                    ),
-                    None => (
-                        model.error_spec.variance_at(cmt, f, &sp),
-                        model.error_spec.variance_at(cmt, f, &sm),
-                        model.error_spec.dvar_df(cmt, f, &sp),
-                        model.error_spec.dvar_df(cmt, f, &sm),
-                    ),
-                },
+            let (r_sig, d_sig) = if let Some((vp_frem, vm_frem)) = frem_row {
+                ((vp_frem - vm_frem) / (2.0 * h), 0.0)
+            } else {
+                let (vp, vm, dp_var, dm_var) = match (&corr_sp, &corr_sm) {
+                    (Some((rvp, dvp)), Some((rvm, dvm))) => (rvp[j], rvm[j], dvp[j], dvm[j]),
+                    _ => match mult_row {
+                        Some(m) => (
+                            model.error_spec.variance_at_scaled(cmt, f, &sp, &[], m),
+                            model.error_spec.variance_at_scaled(cmt, f, &sm, &[], m),
+                            model.error_spec.dvar_df_scaled(cmt, f, &sp, m),
+                            model.error_spec.dvar_df_scaled(cmt, f, &sm, m),
+                        ),
+                        None => (
+                            model.error_spec.variance_at(cmt, f, &sp),
+                            model.error_spec.variance_at(cmt, f, &sm),
+                            model.error_spec.dvar_df(cmt, f, &sp),
+                            model.error_spec.dvar_df(cmt, f, &sm),
+                        ),
+                    },
+                };
+                // ∂R/∂σ_k, ∂d/∂σ_k by central FD. `et.r`/`et.d` carry the `exp(2·η_ruv)`
+                // scale, so lift these too.
+                let r_sig = prep.ruv_scale * (vp - vm) / (2.0 * h);
+                let d_sig = prep.ruv_scale * (dp_var - dm_var) / (2.0 * h);
+                // Residual-eta terms (#474). `∂R/∂σ` scales `R`, so:
+                //   M[ruv] = ∂(1−ε²/R)/∂σ = ε²/R² · Rσ   (the residual-eta row of M)
+                //   ∂log|H̃|/∂σ gains  (∂gⱼ/∂σ)·wⱼ[ruv]  with `gⱼ = d/R` (scale-free,
+                //     so FD the unscaled quotient directly). Skipped for a FREM row
+                //     above — its likelihood has no η_ruv dependence at all (#251
+                //     review #5's principle, applied to σ).
+                if let Some(rr) = prep.ruv {
+                    m_vec[rr] += eps * eps / (r * r) * r_sig;
+                    let g_sig = (dp_var / vp - dm_var / vm) / (2.0 * h);
+                    fixed += g_sig * prep.w[j][rr];
+                }
+                (r_sig, d_sig)
             };
-            // ∂R/∂σ_k, ∂d/∂σ_k by central FD. `et.r`/`et.d` carry the `exp(2·η_ruv)`
-            // scale, so lift these too.
-            let r_sig = prep.ruv_scale * (vp - vm) / (2.0 * h);
-            let d_sig = prep.ruv_scale * (dp_var - dm_var) / (2.0 * h);
 
             let inv_r = 1.0 / r;
             let inv_r2 = inv_r * inv_r;
@@ -1674,16 +1725,6 @@ fn sigma_block(
                 + ((r - eps * eps) * inv_r2) * d_sig;
             for m in 0..n_eta {
                 m_vec[m] += 0.5 * dalpha * obs.df_deta[m];
-            }
-            // Residual-eta terms (#474). `∂R/∂σ` scales `R`, so:
-            //   M[ruv] = ∂(1−ε²/R)/∂σ = ε²/R² · Rσ   (the residual-eta row of M)
-            //   ∂log|H̃|/∂σ gains  (∂gⱼ/∂σ)·wⱼ[ruv]  with `gⱼ = d/R` (scale-free,
-            //     so FD the unscaled quotient directly).
-            if let Some(rr) = prep.ruv {
-                m_vec[rr] += eps * eps * inv_r2 * r_sig;
-                // `gⱼ = d/R` is scale-free, so FD the unscaled quotient directly.
-                let g_sig = (dp_var / vp - dm_var / vm) / (2.0 * h);
-                fixed += g_sig * prep.w[j][rr];
             }
         }
 
@@ -2175,12 +2216,27 @@ pub fn subject_packed_gradient_foce(
         let cmt = err_keys[j];
         let f0act = sens0.obs[j].f;
         let mult_row: Option<&[f64]> = mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
+        // FREM covariate pseudo-observation (`fremtype > 0`): the Sheiner–Beal marginal
+        // still needs an `R⁰ⱼ` for this row, but the objective scores it against the
+        // dedicated `EPSCOV` variance, not `error_spec.variance_at`. `R⁰ = EPSCOV²` is
+        // constant in `f`, hence `d⁰ = 0`, and it takes neither the correlation-aware
+        // nor the magnitude-scaled branch below (#251 review #3 — `method = foce` had
+        // no FREM branch at all, unlike FOCEI's `score_core`).
+        let frem_r0 = crate::stats::likelihood::build_frem_r_override(
+            model.frem_config.as_ref(),
+            &subject.fremtype,
+            sigma,
+        )
+        .as_ref()
+        .and_then(|o| o.get(j))
+        .and_then(|x| *x);
         // Correlated residual (`block_sigma`, #627): correlation-aware `(R⁰, ∂R⁰/∂f)`.
         // block_sigma is mutually exclusive with custom magnitude and M3, so `mult_row`
         // and the censored (`cg`) path are inactive whenever `corr_rd0` is set.
-        let (r, dd) = match &corr_rd0 {
-            Some((rv, dv, _)) => (rv[j], dv[j]),
-            None => {
+        let (r, dd) = match (frem_r0, &corr_rd0) {
+            (Some(v), _) => (v, 0.0),
+            (None, Some((rv, dv, _))) => (rv[j], dv[j]),
+            (None, None) => {
                 let r = match mult_row {
                     Some(mm) => model
                         .error_spec
@@ -2199,21 +2255,29 @@ pub fn subject_packed_gradient_foce(
         }
         r0[i] = r;
         d0[i] = dd;
-        if let (Some(mm), Some(mg_row)) = (mult_row, mult_grad.as_ref().and_then(|mg| mg.get(j))) {
-            // `R⁰` at f(η=0), so `ruv_scale = 1` (no `iiv_on_ruv` on this path); the
-            // Sheiner–Beal marginal only needs `∂R/∂θ`, so skip the `∂d/∂θ` accumulation.
-            let dr = mag_variance_dtheta(
-                &model.error_spec,
-                cmt,
-                f0act,
-                sigma,
-                mm,
-                mg_row,
-                n_theta,
-                1.0,
-                None,
-            );
-            dr0_dtheta[i] = dr;
+        // The magnitude direct-θ channel is a PK-error-spec derivative and does not
+        // apply to a FREM row's dedicated `EPSCOV` variance (#251 review #6's
+        // principle): `dr0_dtheta[i]` stays empty there, exactly as for a censored or
+        // correlated row.
+        if frem_r0.is_none() {
+            if let (Some(mm), Some(mg_row)) =
+                (mult_row, mult_grad.as_ref().and_then(|mg| mg.get(j)))
+            {
+                // `R⁰` at f(η=0), so `ruv_scale = 1` (no `iiv_on_ruv` on this path); the
+                // Sheiner–Beal marginal only needs `∂R/∂θ`, so skip the `∂d/∂θ` accumulation.
+                let dr = mag_variance_dtheta(
+                    &model.error_spec,
+                    cmt,
+                    f0act,
+                    sigma,
+                    mm,
+                    mg_row,
+                    n_theta,
+                    1.0,
+                    None,
+                );
+                dr0_dtheta[i] = dr;
+            }
         }
     }
 
@@ -2312,6 +2376,31 @@ pub fn subject_packed_gradient_foce(
         for (i, &j) in quant.iter().enumerate() {
             let cmt = err_keys[j];
             let f0act = sens0.obs[j].f;
+            // FREM covariate pseudo-observation: `R⁰ = EPSCOV²`, so `∂R⁰/∂σ` comes from
+            // the dedicated covariate σ, not the PK error model (#251 review #3). Without
+            // this branch `dr0` FD's the PK variance's (zero) dependence on `EPSCOV`,
+            // leaving `grad[EPSCOV] ≡ 0` under `method = foce` too.
+            let frem_vp = crate::stats::likelihood::build_frem_r_override(
+                model.frem_config.as_ref(),
+                &subject.fremtype,
+                &sp,
+            )
+            .as_ref()
+            .and_then(|o| o.get(j))
+            .and_then(|x| *x);
+            let frem_vm = crate::stats::likelihood::build_frem_r_override(
+                model.frem_config.as_ref(),
+                &subject.fremtype,
+                &sm,
+            )
+            .as_ref()
+            .and_then(|o| o.get(j))
+            .and_then(|x| *x);
+            if let (Some(vp), Some(vm)) = (frem_vp, frem_vm) {
+                let dr0 = (vp - vm) / (2.0 * hsig);
+                nat += 0.5 * dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
+                continue;
+            }
             // Correlation-aware `∂R⁰/∂σ` when block_sigma present (within-obs cross
             // term); otherwise ∂R⁰/∂σ carries the magnitude multiplier (`mult` scales
             // the σ loading), so FD the *scaled* variance when a magnitude is active
@@ -3090,6 +3179,29 @@ pub fn subject_eta_dx(
                 continue;
             }
             let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
+            // FREM covariate pseudo-observation: `R = EPSCOV²`, independent of `f`
+            // (`d ≡ 0`) and — matching `individual_nll` — not scaled by `ruv_scale`, so
+            // `r_sig` is the bare FD of the covariate-σ variance (#251 review #4). It
+            // also skips the residual-eta row below: a FREM row's likelihood has no
+            // η_ruv dependence (#251 review #5's principle, applied here too).
+            let frem_row = crate::stats::likelihood::build_frem_r_override(
+                model.frem_config.as_ref(),
+                &subject.fremtype,
+                &sp,
+            )
+            .as_ref()
+            .and_then(|o| o.get(j))
+            .and_then(|x| *x)
+            .zip(
+                crate::stats::likelihood::build_frem_r_override(
+                    model.frem_config.as_ref(),
+                    &subject.fremtype,
+                    &sm,
+                )
+                .as_ref()
+                .and_then(|o| o.get(j))
+                .and_then(|x| *x),
+            );
             // `et.r`/`et.d` carry the `exp(2·η_ruv)` scale *and* any custom-magnitude
             // `mult`, so lift `∂R/∂σ`,`∂d/∂σ` the same way (mirrors `sigma_block`);
             // `ruv_scale == 1` when there is no ruv, `mult_row = None` for bare sigma.
@@ -3097,25 +3209,35 @@ pub fn subject_eta_dx(
             // variance / `∂R/∂f` (mutually exclusive with custom magnitude).
             let mult_row: Option<&[f64]> =
                 mult.as_ref().and_then(|mm| mm.get(j)).map(|v| v.as_slice());
-            let (var_p, var_m, dvar_p, dvar_m) = match (&corr_sp, &corr_sm) {
-                (Some((rvp, dvp)), Some((rvm, dvm))) => (rvp[j], rvm[j], dvp[j], dvm[j]),
-                _ => match mult_row {
-                    Some(mm) => (
-                        model.error_spec.variance_at_scaled(cmt, f, &sp, &[], mm),
-                        model.error_spec.variance_at_scaled(cmt, f, &sm, &[], mm),
-                        model.error_spec.dvar_df_scaled(cmt, f, &sp, mm),
-                        model.error_spec.dvar_df_scaled(cmt, f, &sm, mm),
-                    ),
-                    None => (
-                        model.error_spec.variance_at(cmt, f, &sp),
-                        model.error_spec.variance_at(cmt, f, &sm),
-                        model.error_spec.dvar_df(cmt, f, &sp),
-                        model.error_spec.dvar_df(cmt, f, &sm),
-                    ),
-                },
+            let (r_sig, d_sig) = if let Some((vp_frem, vm_frem)) = frem_row {
+                ((vp_frem - vm_frem) / (2.0 * h), 0.0)
+            } else {
+                let (var_p, var_m, dvar_p, dvar_m) = match (&corr_sp, &corr_sm) {
+                    (Some((rvp, dvp)), Some((rvm, dvm))) => (rvp[j], rvm[j], dvp[j], dvm[j]),
+                    _ => match mult_row {
+                        Some(mm) => (
+                            model.error_spec.variance_at_scaled(cmt, f, &sp, &[], mm),
+                            model.error_spec.variance_at_scaled(cmt, f, &sm, &[], mm),
+                            model.error_spec.dvar_df_scaled(cmt, f, &sp, mm),
+                            model.error_spec.dvar_df_scaled(cmt, f, &sm, mm),
+                        ),
+                        None => (
+                            model.error_spec.variance_at(cmt, f, &sp),
+                            model.error_spec.variance_at(cmt, f, &sm),
+                            model.error_spec.dvar_df(cmt, f, &sp),
+                            model.error_spec.dvar_df(cmt, f, &sm),
+                        ),
+                    },
+                };
+                let r_sig = prep.ruv_scale * (var_p - var_m) / (2.0 * h);
+                let d_sig = prep.ruv_scale * (dvar_p - dvar_m) / (2.0 * h);
+                // Residual-eta row of M (#474): `M[ruv] = ∂(1−ε²/R)/∂σ = ε²/R²·Rσ`.
+                // Skipped for a FREM row (handled above).
+                if let Some(rr) = prep.ruv {
+                    mvec[rr] += eps * eps / (r * r) * r_sig;
+                }
+                (r_sig, d_sig)
             };
-            let r_sig = prep.ruv_scale * (var_p - var_m) / (2.0 * h);
-            let d_sig = prep.ruv_scale * (dvar_p - dvar_m) / (2.0 * h);
             let inv_r = 1.0 / r;
             let inv_r2 = inv_r * inv_r;
             let inv_r3 = inv_r2 * inv_r;
@@ -3123,10 +3245,6 @@ pub fn subject_eta_dx(
                 + ((r - eps * eps) * inv_r2) * d_sig;
             for m in 0..n_eta {
                 mvec[m] += 0.5 * dalpha * obs.df_deta[m];
-            }
-            // Residual-eta row of M (#474): `M[ruv] = ∂(1−ε²/R)/∂σ = ε²/R²·Rσ`.
-            if let Some(rr) = prep.ruv {
-                mvec[rr] += eps * eps * inv_r2 * r_sig;
             }
         }
         out[sigma_start + k] = -(&prep.h_inner_inv * mvec) * sigma[k];
@@ -3416,6 +3534,11 @@ mod tests {
         let sigma = &params.sigma.values;
         let omega_inv = &params.omega.inv;
         let mult = model.ruv_obs_mult(subject, &params.theta);
+        let frem_r = crate::stats::likelihood::build_frem_r_override(
+            model.frem_config.as_ref(),
+            &subject.fremtype,
+            sigma,
+        );
         for _ in 0..50 {
             let sens =
                 crate::sens::provider::subject_sensitivities(model, subject, &params.theta, &eta)
@@ -3433,13 +3556,15 @@ mod tests {
                 let cmt = subject.obs_cmts[j];
                 let mult_row: Option<&[f64]> =
                     mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
-                let (r, d, d2) = match mult_row {
-                    Some(m) => (
+                let frem_var = frem_r.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+                let (r, d, d2) = match (frem_var, mult_row) {
+                    (Some(v), _) => (v, 0.0, 0.0),
+                    (None, Some(m)) => (
                         model.error_spec.variance_at_scaled(cmt, f, sigma, &[], m),
                         model.error_spec.dvar_df_scaled(cmt, f, sigma, m),
                         model.error_spec.d2var_df2_scaled(cmt, sigma, m),
                     ),
-                    None => (
+                    (None, None) => (
                         model.error_spec.variance_at(cmt, f, sigma),
                         model.error_spec.dvar_df(cmt, f, sigma),
                         model.error_spec.d2var_df2(cmt, sigma),
@@ -3508,6 +3633,11 @@ mod tests {
         let jac = eta_jacobian_any(model, subject, &params.theta, eta);
         let h_matrix =
             nalgebra::DMatrix::from_row_slice(subject.obs_times.len(), model.n_eta, &jac);
+        let frem_r_override = crate::stats::likelihood::build_frem_r_override(
+            model.frem_config.as_ref(),
+            &subject.fremtype,
+            &params.sigma.values,
+        );
         foce_subject_nll_interaction(
             subject,
             &ipreds,
@@ -3518,7 +3648,7 @@ mod tests {
             &model.error_spec,
             model.bloq_method,
             &[],
-            None,
+            frem_r_override.as_deref(),
             model.residual_error_eta,
             model.ruv_obs_mult(subject, &params.theta).as_deref(),
         )
@@ -6066,6 +6196,156 @@ mod tests {
                 (analytic[k] - fd).abs() / fd.abs().max(1e-12)
             );
             approx::assert_relative_eq!(analytic[k], fd, max_relative = 5e-3, epsilon = 1e-5);
+        }
+    }
+
+    const FREM_OUTER_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TV_WT(72.0, 1.0, 500.0)
+
+  block_omega (ETA_CL, ETA_V, ETA_KA, ETA_WT_FREM) = [
+    0.09,
+    0.0, 0.04,
+    0.0, 0.0, 0.30,
+    0.0, 0.0, 0.0, 111.56
+  ]
+
+  sigma PROP_ERR ~ 0.02
+  sigma EPSCOV   ~ 0.30
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  frem_predictions = TV_WT/ETA_WT_FREM:100
+  frem_sigma       = EPSCOV
+"#;
+
+    /// A subject with 3 PK observation rows plus one FREM covariate pseudo-observation
+    /// (FREMTYPE 100), built without going through the data reader (mirrors
+    /// `agq::tests::frem_pseudo_obs_rows_get_the_right_analytic_score`'s fixture).
+    fn frem_outer_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
+        use std::collections::HashMap;
+        let fc = model.frem_config.as_ref().expect("fixture must be FREM");
+        let pk_times = [1.0, 6.0, 24.0];
+        let n = pk_times.len() + 1;
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: pk_times
+                .iter()
+                .copied()
+                .chain(std::iter::once(0.0))
+                .collect(),
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: pk_times
+                .iter()
+                .map(|_| 0u16)
+                .chain(std::iter::once(100u16))
+                .collect(),
+            obs_records: vec![],
+        };
+        let eta_ref = [0.1, -0.05, 0.15, 0.0];
+        let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, &eta_ref);
+        for j in 0..pk_times.len() {
+            subject.observations[j] = preds[j] * 0.85;
+        }
+        let (ti, _ei) = fc.fremtype_to_indices[&100u16];
+        subject.observations[pk_times.len()] = theta[ti] * 1.10;
+        subject
+    }
+
+    /// FREM covariate pseudo-observations, at the **FOCEI outer** (`population_gradient_sens`
+    /// / `theta_block` / `sigma_block`) level — not AGQ's `score_core` consumer, which
+    /// `agq::tests::frem_pseudo_obs_rows_get_the_right_analytic_score` already covers.
+    ///
+    /// That AGQ test alone missed a real bug (#251 review #2): `sigma_block`'s σ-FD ran the
+    /// *plain PK* variance at σ±h on a FREM row instead of the `EPSCOV`-aware one, so
+    /// `grad[EPSCOV]` came out identically zero under FOCE/FOCEI while a spurious term leaked
+    /// into `PROP_ERR`'s gradient — invisible to any test that never differentiates through
+    /// `theta_block`/`sigma_block` on a FREM model. This test does, against FD of the true
+    /// FOCEI marginal (`marginal_nll`, which is itself now FREM-aware via
+    /// `foce_subject_nll_interaction`'s `frem_r_override`), covering every packed coordinate
+    /// (θ, Ω, and — critically — σ including `EPSCOV`).
+    #[test]
+    fn population_packed_gradient_frem_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+
+        let model = parse_model_string(FREM_OUTER_MODEL).expect("parse");
+        assert_eq!(model.n_eta, 4, "3 PK etas + 1 covariate eta");
+        let theta = model.default_params.theta.clone();
+        let subject = frem_outer_subject(&model, &theta);
+
+        let pop = Population {
+            subjects: vec![subject],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta;
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+
+        let analytic =
+            population_gradient_sens(&model, &pop, &template, &x, &ehs).expect("FREM supported");
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| marginal_nll(&model, s, &p))
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            let scale = fd.abs().max(analytic[k].abs()).max(1.0);
+            assert!(
+                (analytic[k] - fd).abs() / scale < 5e-3,
+                "coord {k}: analytic {} vs FD {} (rel {:.2e})",
+                analytic[k],
+                fd,
+                (analytic[k] - fd).abs() / scale
+            );
         }
     }
 

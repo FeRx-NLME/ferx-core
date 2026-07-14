@@ -2342,13 +2342,16 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     | EstimationMethod::FoceI
                     | EstimationMethod::Saem
                     | EstimationMethod::Imp
+                    | EstimationMethod::Agq
+                    | EstimationMethod::Laplace
             ) {
                 diags.push(
                     Diagnostic::error(
                         "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
                         "block_sigma correlated residual errors are currently supported for \
-                         method = foce, focei, saem, and imp only. The gn / gn_hybrid \
-                         Gauss-Newton paths still use diagonal residual-error derivatives.",
+                         method = foce, focei, saem, imp, agq, and laplace only. The gn / \
+                         gn_hybrid Gauss-Newton paths still use diagonal residual-error \
+                         derivatives.",
                     )
                     .with_block("fit_options"),
                 );
@@ -11157,7 +11160,8 @@ mod iov_integration {
     }
 
     // block_sigma correlated residual errors are wired into the Gaussian FOCE,
-    // FOCEI, SAEM, and IMP paths; the Gauss-Newton (gn / gn_hybrid) methods still
+    // FOCEI, SAEM, IMP, AGQ, and Laplace paths (AGQ/Laplace via `score_core`'s
+    // `corr_diag` branch, #251); the Gauss-Newton (gn / gn_hybrid) methods still
     // use diagonal residual-error derivatives and must be rejected up front.
     #[test]
     fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
@@ -11184,12 +11188,14 @@ mod iov_integration {
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
 
-        // FOCE, FOCEI, SAEM, and IMP are all accepted (no method diagnostic).
+        // FOCE, FOCEI, SAEM, IMP, AGQ, and Laplace are all accepted (no method diagnostic).
         for method in [
             EstimationMethod::Foce,
             EstimationMethod::FoceI,
             EstimationMethod::Saem,
             EstimationMethod::Imp,
+            EstimationMethod::Agq,
+            EstimationMethod::Laplace,
         ] {
             let opts = fast_opts(method, Optimizer::Bobyqa, false);
             assert!(
