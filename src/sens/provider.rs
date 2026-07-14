@@ -2870,7 +2870,13 @@ fn run_obs_tvcov<const M: usize>(
     // always none — and then there is nothing to materialize, so skip the per-observation pass
     // entirely rather than running a full second-order `pd_from_program` per observation and
     // discarding it (#822 review #8). The readout never reads those slots in that case, so the
-    // `_` arm's `constant(0.0)` is unobservable.
+    // `_` arm's `constant(0.0)` is unobservable: `allocate_readout_extra_slots` /
+    // `pk_assignment_mapping` (`parser::model_parser`) slot *every* readout-referenced
+    // individual parameter, constant or not, so a parameter's own slot is always a member of
+    // `ro_slots` whenever the readout actually reads it — `ro_slots` cannot be empty while a
+    // live high-slot read exists (#822 review #1, refuted: see
+    // `form_c_tvcov_readout_constant_param_matches_fd`, which forces a constant parameter past
+    // `V3` and confirms `ro_slots` is non-empty there).
     let ro_slots: Vec<usize> = if readout.is_some() {
         (PK_IDX_V3 + 1..N_PK)
             .filter(|&s| slot_row[s].is_some())
@@ -3152,8 +3158,8 @@ fn run_obs_grad_tvcov<const N: usize>(
               cov: &std::collections::HashMap<String, f64>|
      -> Option<PkDual<Dual1<N>>> {
         let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
-        // `None` above the param-derivative dispatch cap (n_axes > 16): decline so
-        // the inner loop falls back to FD rather than panicking (#449 review #1).
+        // `None` above the param-derivative dispatch cap (n_axes > MAX_ODE_AXES): decline
+        // so the inner loop falls back to FD rather than panicking (#449 review #1).
         let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
         let pk = (model.pk_param_fn)(theta, eta, cov, time);
         let seed_row = |i: usize, val: f64| -> Dual1<N> {
@@ -3258,7 +3264,18 @@ fn run_obs_grad_tvcov<const N: usize>(
 
     // Analytic Form C readout (#650): per-observation dual eval scratch (Dual1).
     // Readout params past the eight structural slots — the inner (`Dual1`, η-only) mirror of
-    // `run_obs_tvcov`'s `ro_extra` (#486).
+    // `run_obs_tvcov`'s `ro_extra` (#486). `ro_slots` is hoisted the same way as the outer's,
+    // so a readout with nothing to differentiate above `PK_IDX_V3` skips the per-observation
+    // `param_derivatives_at_cov` pass instead of paying it every inner BFGS step and
+    // discarding the result (#822 review #2 — the outer already had this guard, #822 review
+    // #8, but the inner's copy of the same prologue was missing it).
+    let ro_slots: Vec<usize> = if readout.is_some() {
+        (PK_IDX_V3 + 1..N_PK)
+            .filter(|&s| slot_row[s].is_some())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let ro_extra: Vec<(crate::types::PkParams, Vec<(usize, Dual1<N>)>)> = if readout.is_some() {
         (0..subject.obs_times.len())
             .map(|j| {
@@ -3266,18 +3283,22 @@ fn run_obs_grad_tvcov<const N: usize>(
                 let t = subject.obs_times[j];
                 let _guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, t);
                 let pk = (model.pk_param_fn)(theta, eta, cov, t);
-                let extras = match param_derivatives_at_cov(prog, model, cov, theta, eta) {
-                    Some(pd) => (PK_IDX_V3 + 1..N_PK)
-                        .filter(|&s| slot_row[s].is_some())
-                        .map(|s| {
-                            let val = pk.values.get(s).copied().unwrap_or(0.0);
-                            (
-                                s,
-                                pk_slot_dual_inner::<N>(s, val, &pd.dp_deta, slots, n_eta),
-                            )
-                        })
-                        .collect(),
-                    None => Vec::new(),
+                let extras = if ro_slots.is_empty() {
+                    Vec::new()
+                } else {
+                    match param_derivatives_at_cov(prog, model, cov, theta, eta) {
+                        Some(pd) => ro_slots
+                            .iter()
+                            .map(|&s| {
+                                let val = pk.values.get(s).copied().unwrap_or(0.0);
+                                (
+                                    s,
+                                    pk_slot_dual_inner::<N>(s, val, &pd.dp_deta, slots, n_eta),
+                                )
+                            })
+                            .collect(),
+                        None => Vec::new(),
+                    }
                 };
                 (pk, extras)
             })
@@ -3479,9 +3500,9 @@ fn subject_eta_grad_impl(
     if !analytical_supported(model) {
         return None;
     }
-    if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
-        return None;
-    }
+    // SS + EVID 3/4 reset is handled above: `subject_routes_to_event_walk` already
+    // returns `true` for it (its own `has_resets() && any ss` clause), so that case
+    // always exits through the walk branch and never reaches here (#822 review #3).
     // Modeled-duration doses (`RATE=-2` → `D{cmt}`) resolve `rate`/`duration` from
     // the PK params in the prediction path; the provider iterates `subject.doses`
     // directly, so the unresolved dose would be a bolus/zero-input surrogate. Route
@@ -4606,12 +4627,11 @@ fn subject_sensitivities_impl(
     // current reset segment (see `reset_floor` in the obs loop): for linear PK a
     // reset zeros the compartments, so the prediction at an observation is the
     // superposition of only the doses since the most recent reset — which carries
-    // the exact `∂f/∂pk` through the same closed forms. Steady-state doses assume
-    // an infinite periodic history that a mid-record reset contradicts, so a
-    // subject mixing SS with resets falls back to FD.
-    if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
-        return None;
-    }
+    // the exact `∂f/∂pk` through the same closed forms. A subject mixing SS with
+    // resets is handled above instead: `subject_routes_to_event_walk` already
+    // returns `true` for it (its own `has_resets() && any ss` clause), so it
+    // always exits through the walk branch and never reaches this dose-
+    // superposition path (#822 review #3).
 
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
@@ -8409,6 +8429,83 @@ mod tests {
         assert!(s.has_tv_covariates(), "fixture must be a TV-cov subject");
         assert!(readout_tvcov_supported(&m), "BMAX/KD fit the PkDual slots");
         check_full_provider_vs_fd(&m, &s, &[0.2, 10.0, 3.0, 2.0], &[0.12, -0.08]);
+    }
+
+    /// #822 review #1 (outer): a readout that references a non-structural individual
+    /// parameter which is itself a `(θ, η)`-*constant* (`HILL = 2.0`, no theta/eta on
+    /// its RHS) — forced past `PK_IDX_V3` into a genuinely non-structural slot by
+    /// referencing enough other non-structural params first to exhaust the low free
+    /// slots (`allocate_readout_extra_slots` hands out the free `one_cpt_iv` slots
+    /// `[Q, V2, KA, Q3, V3]` before spilling to slot 9) — must still read HILL's real
+    /// *value* on the TV-cov walk, not substitute zero.
+    ///
+    /// This pins the invariant review finding #822-#1 hinged on: the parser slots
+    /// *every* readout-referenced individual parameter into `pk_assignment_mapping`
+    /// regardless of whether its value is differentiated (`slot_row[s]` is set purely
+    /// by name resolution, not by whether the row's gradient is nonzero), so a
+    /// parameter's own slot is always a member of `ro_slots` whenever the readout
+    /// actually reads it — `ro_slots` cannot be empty while a live high-slot read
+    /// exists — confirmed by instrumenting `ro_slots` under this exact fixture: it is
+    /// `[9]` (HILL's spilled slot), never empty, so `ro_extra` always takes the branch
+    /// with the correct `pk.values[9] = 2.0` fallback — the finding's premise (a
+    /// constant param read while `ro_slots` is empty) does not occur.
+    #[test]
+    fn form_c_tvcov_readout_constant_param_matches_fd() {
+        const SRC: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVP1(1.0, 0.01, 100.0)
+  theta TVP2(1.0, 0.01, 100.0)
+  theta TVP3(1.0, 0.01, 100.0)
+  theta TVP4(1.0, 0.01, 100.0)
+  theta TVP5(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  P1   = TVP1
+  P2   = TVP2
+  P3   = TVP3
+  P4   = TVP4
+  P5   = TVP5
+  HILL = 2.0
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = (P1 + P2 + P3 + P4 + P5) * 0.0 + HILL * (central / V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(SRC).expect("parse tv-cov constant readout param");
+        let mut s = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0],
+        );
+        // A per-row covariate (unreferenced by any individual parameter) is enough to
+        // route the subject onto the event-driven TV-cov walk (`has_tv_covariates` is a
+        // subject-level property); it need not be the thing that makes HILL constant.
+        s.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 60.0)]),
+            HashMap::from([("WT".to_string(), 80.0)]),
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 95.0)]),
+        ];
+        assert!(s.has_tv_covariates(), "fixture must be a TV-cov subject");
+        assert!(
+            readout_tvcov_supported(&m),
+            "P1..P5/HILL fit the PkDual overflow slots"
+        );
+        let theta = [0.2, 10.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let eta = [0.12, -0.08];
+        let sens = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+        assert!(
+            sens.obs.iter().all(|o| o.f != 0.0),
+            "HILL must not be silently zeroed by the outer readout substitution"
+        );
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
     }
 
     /// #650 review: a readout that references the oral **depot** amount is rejected
