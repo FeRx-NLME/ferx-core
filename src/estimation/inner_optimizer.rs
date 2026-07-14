@@ -862,8 +862,12 @@ pub fn find_ebe(
     // inner EBE from the previous iteration's mode, so once the basin is picked at
     // iteration 0 the warm start carries it forward — no need to re-scan every
     // outer eval (that is ~12× slower). One multi-start per subject per fit.
-    // A seed that reconverges to the same mode is not accepted (`+ 1e-9` guard),
-    // so unimodal subjects stay bit-identical to `inner_restarts = 0`.
+    // An alternate seed replaces the warm-start mode only when it reaches a
+    // meaningfully lower objective (`cand_nll + 1e-9 < nll`); a seed that merely
+    // reconverges to the same basin is rejected by that guard. So a scanned
+    // subject's EBE is unchanged from `inner_restarts = 0` unless a seed finds a
+    // strictly better mode — and subjects without resets / TV-covariates are
+    // never scanned at all, staying bit-identical.
     if restarts > 0 && eta_init.is_none() && (subject.has_resets() || subject.has_tv_covariates()) {
         let base = eta.clone();
         for i in 0..n_eta {
