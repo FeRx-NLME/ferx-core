@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use crate::estimation::gauss_newton::subject_nll_pop_grad;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{
-    compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
+    compute_covariance, pop_nll_opts, CovarianceStepResult, OuterResult,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params, PackedBounds,
@@ -59,14 +59,14 @@ impl FoceiProblem<'_> {
 
     fn ofv_fixed(&self, x: &[f64], etas: &[DVector<f64>], h_mats: &[DMatrix<f64>]) -> f64 {
         let params = unpack_params(x, self.init_params);
-        let nll = pop_nll(
+        let nll = pop_nll_opts(
             self.model,
             self.population,
             &params,
             etas,
             h_mats,
             &[], // trust_region doesn't support IOV yet; kappas empty
-            self.options.interaction,
+            self.options,
         );
         let raw = 2.0 * nll;
         if raw.is_finite() {
@@ -383,14 +383,14 @@ pub fn optimize_trust_region(
     );
 
     let final_ofv = 2.0
-        * pop_nll(
+        * pop_nll_opts(
             model,
             population,
             &final_params,
             &final_ehs,
             &final_hms,
             &final_kappas,
-            options.interaction,
+            options,
         );
 
     if options.verbose {

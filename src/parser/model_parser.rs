@@ -5496,6 +5496,16 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         Ok(EstimationMethod::Imp)
     } else if val.contains("hybrid") || val == "gn_hybrid" || val == "gn-hybrid" {
         Ok(EstimationMethod::FoceGnHybrid)
+    } else if val == "agq"
+        || val == "aghq"
+        || val == "gauss_hermite"
+        || val == "gauss-hermite"
+        || val == "adaptive_gaussian_quadrature"
+        || val == "adaptive-gaussian-quadrature"
+    {
+        // MUST stay above the `contains("gauss")` arm below, which would otherwise
+        // swallow `gauss_hermite` / `adaptive_gaussian_quadrature` into Gauss-*Newton*.
+        Ok(EstimationMethod::Agq)
     } else if val == "gn" || val.contains("gauss") {
         Ok(EstimationMethod::FoceGn)
     } else if val == "focei" || val == "foce-i" || val == "foce_i" || val.contains("interaction") {
@@ -5941,6 +5951,19 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 return Err(format!("sir_df must be >= 1.0, got {v}"));
             }
             opts.sir_df = v;
+        }
+        "n_agq" => {
+            let v = parse_usize("n_agq")?;
+            if v < 1 {
+                return Err("n_agq must be >= 1 (1 = the Laplace approximation)".to_string());
+            }
+            if v > crate::estimation::agq::MAX_AGQ_NODES {
+                return Err(format!(
+                    "n_agq must be <= {}, got {v}",
+                    crate::estimation::agq::MAX_AGQ_NODES
+                ));
+            }
+            opts.n_agq = v;
         }
         "imp_samples" => {
             let v = parse_usize("imp_samples")?;

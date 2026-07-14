@@ -1766,14 +1766,20 @@ fn subject_is_estimate_joint(
 // Proposal construction (regularised Hessian, Cholesky factors)
 // ---------------------------------------------------------------------------
 
-struct Proposal {
+/// A regularised, Cholesky-factored posterior scale for one subject.
+///
+/// Shared by importance sampling (which draws `η = η̂ + s·Σ^{1/2}·z` for random `z`) and
+/// by AGQ ([`crate::estimation::agq`], which lays *deterministic* Gauss–Hermite nodes on
+/// the same transform) — the two differ only in where `z` comes from, so they must not
+/// carry separate copies of the jitter / fallback / back-substitution logic.
+pub(crate) struct Proposal {
     /// Lower-triangular L such that L L' = H_reg = Σ⁻¹.
     /// Used both to apply Σ^{1/2} when sampling (L'⁻¹ z) and to evaluate the
     /// Mahalanobis term (‖L'·diff‖²) when scoring q(η).
     chol_h: DMatrix<f64>,
     /// log|H_reg| = 2 · Σ log L_ii — used for the log|Σ| = −log|H_reg| piece
-    /// of the Student-t log-density.
-    log_det_inv_scale: f64,
+    /// of the Student-t log-density, and for AGQ's `½·log|H|` normaliser.
+    pub(crate) log_det_inv_scale: f64,
     d: usize,
 }
 
@@ -1781,7 +1787,7 @@ impl Proposal {
     /// Apply `scale · L_Σ z` into `out`, where `L_Σ` is the Cholesky factor of
     /// Σ = H⁻¹. Implementation: `L_Σ = L^{-T}` for the L from `H = L L^T`, so
     /// `L_Σ z = L^{-T} z` — one back-substitution.
-    fn apply_l_sigma(&self, z: &[f64], out: &mut [f64], scale: f64) {
+    pub(crate) fn apply_l_sigma(&self, z: &[f64], out: &mut [f64], scale: f64) {
         // Back-solve L^T x = z for x (i.e. `out`).
         // L is lower-triangular; L^T is upper-triangular.
         let l = &self.chol_h;
@@ -1829,7 +1835,11 @@ impl Proposal {
 /// proposal that won't give a sharp likelihood estimate but stays well-defined.
 ///
 /// Returns `None` only when `d == 0`.
-fn build_proposal(h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize) -> Option<Proposal> {
+pub(crate) fn build_proposal(
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    d: usize,
+) -> Option<Proposal> {
     if d == 0 {
         return None;
     }
