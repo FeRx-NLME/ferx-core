@@ -560,6 +560,12 @@ const _: () = assert!(
 /// analytic **outer** gradient while the inner declined via `?` — an analytic outer against a
 /// fixed-EBE FD inner, exactly the split `subject_eta_grad_tvcov_with_schedule` forbids
 /// (#449 re-review #2). Raise the two together, never this one alone.
+///
+/// That decline is now the *only* consequence of a cap divergence: `run_obs_grad_tvcov` hoists
+/// the program derivatives, so every consumer inside it is total and a miss can no longer be
+/// papered over with a zero jet (it used to be, in the modeled-dose slot dual and the readout's
+/// high slots — a wrong gradient reported as analytic). The assert still stands, because an
+/// inner-FD / outer-analytic *scope split* remains wrong on its own.
 const MAX_TVCOV_AXES: usize = 24;
 
 const _: () = assert!(
@@ -3154,13 +3160,42 @@ fn run_obs_grad_tvcov<const N: usize>(
     // the `Dual1` η-derivative walk (gated on `uses_time`, like the f64 closure;
     // #486 / #610).
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
-    let mk = |time: f64,
-              cov: &std::collections::HashMap<String, f64>|
-     -> Option<PkDual<Dual1<N>>> {
+
+    // Per-event program derivatives (`∂p/∂η`), evaluated **once per event** and shared by every
+    // consumer below: the event `PkDual`s, the modeled-dose / lagtime slot duals, and the Form-C
+    // readout's high slots.
+    //
+    // `param_derivatives_at_cov` declines (`None`) purely on the *program's* axis count —
+    // `n_theta + n_eta` above the `disp!` cap (#449 review #1) — which is a property of `prog`,
+    // never of `cov` (`ode_provider::param_derivatives_at_cov`). Its `None` is therefore uniform
+    // across a subject's events, so hoisting it collapses the decline into the single `?` below
+    // that drops the whole subject to FD. The consumers then take a `&ParamDerivs` and are
+    // *total*: there is no longer a site that can substitute a **zero jet** for a missing
+    // derivative and report the result as analytic. Two such fallbacks used to exist (the
+    // modeled-dose slot dual and the readout's high slots); both were unreachable only by
+    // coincidence, and a `MAX_TVCOV_AXES > MAX_ODE_AXES` cap divergence would have made them a
+    // silently-wrong gradient rather than an FD fallback (#822 follow-up).
+    let pd_at = |time: f64,
+                 cov: &std::collections::HashMap<String, f64>|
+     -> Option<crate::sens::ode_provider::ParamDerivs> {
         let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
-        // `None` above the param-derivative dispatch cap (n_axes > MAX_ODE_AXES): decline
-        // so the inner loop falls back to FD rather than panicking (#449 review #1).
-        let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
+        param_derivatives_at_cov(prog, model, cov, theta, eta)
+    };
+    let pd_dose: Vec<crate::sens::ode_provider::ParamDerivs> = (0..subject.doses.len())
+        .map(|k| pd_at(subject.doses[k].time, subject.dose_cov(k)))
+        .collect::<Option<Vec<_>>>()?;
+    let pd_obs: Vec<crate::sens::ode_provider::ParamDerivs> = (0..subject.obs_times.len())
+        .map(|j| pd_at(subject.obs_times[j], subject.obs_cov(j)))
+        .collect::<Option<Vec<_>>>()?;
+    let pd_pk_only: Vec<crate::sens::ode_provider::ParamDerivs> = (0..subject.pk_only_times.len())
+        .map(|m| pd_at(subject.pk_only_times[m], subject.pk_only_cov(m)))
+        .collect::<Option<Vec<_>>>()?;
+
+    let mk = |pd: &crate::sens::ode_provider::ParamDerivs,
+              time: f64,
+              cov: &std::collections::HashMap<String, f64>|
+     -> PkDual<Dual1<N>> {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         let pk = (model.pk_param_fn)(theta, eta, cov, time);
         let seed_row = |i: usize, val: f64| -> Dual1<N> {
             let mut grad = [0.0; N];
@@ -3175,7 +3210,7 @@ fn run_obs_grad_tvcov<const N: usize>(
                 None => Dual1::<N>::constant(val),
             }
         };
-        Some(PkDual {
+        PkDual {
             cl: dv(PK_IDX_CL, pk.cl()),
             v: dv(PK_IDX_V, pk.v()),
             q: dv(PK_IDX_Q, pk.q()),
@@ -3184,18 +3219,24 @@ fn run_obs_grad_tvcov<const N: usize>(
             q3: dv(PK_IDX_Q3, pk.q3()),
             v3: dv(PK_IDX_V3, pk.v3()),
             f: dv(PK_IDX_F, pk.f_bio()),
-        })
+        }
     };
 
     let pk_at_dose: Vec<PkDual<Dual1<N>>> = (0..subject.doses.len())
-        .map(|k| mk(subject.doses[k].time, subject.dose_cov(k)))
-        .collect::<Option<Vec<_>>>()?;
+        .map(|k| mk(&pd_dose[k], subject.doses[k].time, subject.dose_cov(k)))
+        .collect();
     let pk_at_obs: Vec<PkDual<Dual1<N>>> = (0..subject.obs_times.len())
-        .map(|j| mk(subject.obs_times[j], subject.obs_cov(j)))
-        .collect::<Option<Vec<_>>>()?;
+        .map(|j| mk(&pd_obs[j], subject.obs_times[j], subject.obs_cov(j)))
+        .collect();
     let pk_at_pk_only: Vec<PkDual<Dual1<N>>> = (0..subject.pk_only_times.len())
-        .map(|m| mk(subject.pk_only_times[m], subject.pk_only_cov(m)))
-        .collect::<Option<Vec<_>>>()?;
+        .map(|m| {
+            mk(
+                &pd_pk_only[m],
+                subject.pk_only_times[m],
+                subject.pk_only_cov(m),
+            )
+        })
+        .collect();
 
     // Modeled-`RATE=-1/-2` doses (#486): resolve to concrete rate/duration and build
     // the per-dose duals (dual rate + moving infusion-end boundary). A modeled dose's
@@ -3222,15 +3263,11 @@ fn run_obs_grad_tvcov<const N: usize>(
     if !moving_bounds_separable(model, subject, &eff_doses, &dose_lagtimes) {
         return None;
     }
+    // Reads the dose's already-computed `∂p/∂η` — no program re-evaluation, and no `None` arm
+    // to swallow (see the `pd_dose` hoist above).
     let slot_dual = |k: usize, slot: usize| -> Dual1<N> {
-        let cov = subject.dose_cov(k);
-        let _guard =
-            crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, subject.doses[k].time);
         let val = dose_pk[k].values.get(slot).copied().unwrap_or(0.0);
-        match param_derivatives_at_cov(prog, model, cov, theta, eta) {
-            Some(pd) => pk_slot_dual_inner::<N>(slot, val, &pd.dp_deta, slots, n_eta),
-            None => Dual1::constant(val),
-        }
+        pk_slot_dual_inner::<N>(slot, val, &pd_dose[k].dp_deta, slots, n_eta)
     };
     let dose_inf_dual = modeled_dose_inf_duals::<Dual1<N>>(model, subject, &slot_dual);
     let dose_lag_dual = dose_lag_duals::<Dual1<N>>(model, subject, &slot_dual);
@@ -3264,11 +3301,9 @@ fn run_obs_grad_tvcov<const N: usize>(
 
     // Analytic Form C readout (#650): per-observation dual eval scratch (Dual1).
     // Readout params past the eight structural slots — the inner (`Dual1`, η-only) mirror of
-    // `run_obs_tvcov`'s `ro_extra` (#486). `ro_slots` is hoisted the same way as the outer's,
-    // so a readout with nothing to differentiate above `PK_IDX_V3` skips the per-observation
-    // `param_derivatives_at_cov` pass instead of paying it every inner BFGS step and
-    // discarding the result (#822 review #2 — the outer already had this guard, #822 review
-    // #8, but the inner's copy of the same prologue was missing it).
+    // `run_obs_tvcov`'s `ro_extra` (#486). `ro_slots` is empty when the readout differentiates
+    // nothing above `PK_IDX_V3`, in which case the per-observation seeding below is a no-op;
+    // the derivatives it seeds from are `pd_obs[j]`, already computed once for the walk.
     let ro_slots: Vec<usize> = if readout.is_some() {
         (PK_IDX_V3 + 1..N_PK)
             .filter(|&s| slot_row[s].is_some())
@@ -3283,23 +3318,16 @@ fn run_obs_grad_tvcov<const N: usize>(
                 let t = subject.obs_times[j];
                 let _guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, t);
                 let pk = (model.pk_param_fn)(theta, eta, cov, t);
-                let extras = if ro_slots.is_empty() {
-                    Vec::new()
-                } else {
-                    match param_derivatives_at_cov(prog, model, cov, theta, eta) {
-                        Some(pd) => ro_slots
-                            .iter()
-                            .map(|&s| {
-                                let val = pk.values.get(s).copied().unwrap_or(0.0);
-                                (
-                                    s,
-                                    pk_slot_dual_inner::<N>(s, val, &pd.dp_deta, slots, n_eta),
-                                )
-                            })
-                            .collect(),
-                        None => Vec::new(),
-                    }
-                };
+                let extras: Vec<(usize, Dual1<N>)> = ro_slots
+                    .iter()
+                    .map(|&s| {
+                        let val = pk.values.get(s).copied().unwrap_or(0.0);
+                        (
+                            s,
+                            pk_slot_dual_inner::<N>(s, val, &pd_obs[j].dp_deta, slots, n_eta),
+                        )
+                    })
+                    .collect();
                 (pk, extras)
             })
             .collect()
