@@ -365,6 +365,26 @@ censoring, correlated residuals (`block_sigma`), FREM, IIV-on-RUV, custom residu
 magnitude, and LTBS — each adds a term the plain Gaussian chain rule does not carry.
 The fit output reports which route ran.
 
+### Where AGQ stops
+
+AGQ's gradient is exact but **finite-difference-limited**: the grid-response term
+and the posterior Hessian are both central differences, so it carries a noise floor
+(~1e-4 relative). It therefore cannot drive `|g|` arbitrarily low the way an
+analytic-to-machine-precision gradient can.
+
+So AGQ stops on the **objective-change** criterion (`outer_ftol`, default 1e-6) and
+the step-size criterion (`outer_xtol`), not on a gradient norm. That is where its
+objective actually settles.
+
+This matters more than it sounds. FOCE/FOCEI are given a `1e-12` stop, which they can
+reach; giving the same to AGQ makes it *unreachable*, and an unreachable stop is not
+harmless — the optimizer keeps stepping until the true gradient drops under its own
+noise floor, at which point the search direction is noise, the line search fails, and
+the run is reported as **not converged** despite sitting on an OFV that has been flat
+for a dozen evaluations. Stopping AGQ where it actually settles both fixes that and
+makes it *faster* (on warfarin + IOV: 14.5 s → 8.2 s), because the grinding past the
+plateau was pure waste.
+
 ### Don't use BOBYQA
 
 `optimizer = bobyqa` **false-converges** on the AGQ objective. On warfarin it stops

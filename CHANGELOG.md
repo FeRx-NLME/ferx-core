@@ -449,6 +449,17 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **AGQ / `laplace` fits no longer report "did not converge" while sitting on a settled
+  OFV** (#251). The gradient-based outer optimizer set NLopt's stopping tolerances to
+  `1e-12`, which FOCE/FOCEI can reach (their analytic gradient is exact to ~1e-11) but
+  AGQ cannot: AGQ's gradient is exact yet *finite-difference-limited* (the grid-response
+  term and the posterior Hessian are central differences), so it carries a noise floor.
+  L-BFGS ground on past the point where the objective had settled, until its line search
+  failed on a noise-dominated direction and NLopt returned a bare failure — reporting
+  "not converged" for a result that had been flat to eight significant figures. AGQ now
+  stops on the reachable objective-change criterion (`outer_ftol` / `outer_xtol`), which
+  both fixes the flag and makes the fits **faster** (AGQ+IOV on warfarin: 14.5 s → 8.2 s;
+  Laplace+IOV: 2.2 s → 1.3 s), with identical estimates. FOCE/FOCEI are unchanged.
 - **Wrong analytic gradient for an observation sampled exactly on a moving dose boundary**
   (#486) — a modeled infusion end, or a lagged dose arrival. With a modeled `RATE=-1`/`-2` dose the infusion window end moves with the
   estimated `D{cmt}`/`R{cmt}`. An observation whose time coincided with that end had its
