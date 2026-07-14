@@ -128,6 +128,18 @@ pub enum MarkovError {
         from: usize,
         to: usize,
     },
+
+    /// A generator *derivative* `∂Q/∂p` passed to [`ctmm_data_term_grad`] does not match
+    /// the generator's shape. Checked at runtime, not just in debug: the gradient
+    /// contracts `⟨G, ∂Q/∂p⟩` with a zipped iterator, which on a short `∂Q/∂p` would
+    /// silently *truncate* and return a confidently wrong gradient.
+    #[error("∂Q/∂p at axis {axis} is {rows}×{cols}, but the generator is {n_states}×{n_states}")]
+    DerivativeShapeMismatch {
+        axis: usize,
+        rows: usize,
+        cols: usize,
+        n_states: usize,
+    },
 }
 
 /// Transition-probability matrix `P(Δt) = expm(A)` for `A = Q·Δt`.
@@ -269,10 +281,19 @@ pub fn ctmm_data_term_grad(
     if s < 2 {
         return Err(MarkovError::TooFewStates { n: s });
     }
-    debug_assert!(
-        dq.iter().all(|d| d.shape() == (s, s)),
-        "every ∂Q/∂p must match Q's shape"
-    );
+    // Validated at runtime, not merely debug-asserted: the contraction below zips `G` with
+    // `∂Q/∂p`, so a short derivative matrix would silently truncate and yield a wrong
+    // gradient rather than an error — and this is a `pub` entry point.
+    for (axis, d) in dq.iter().enumerate() {
+        if d.shape() != (s, s) {
+            return Err(MarkovError::DerivativeShapeMismatch {
+                axis,
+                rows: d.nrows(),
+                cols: d.ncols(),
+                n_states: s,
+            });
+        }
+    }
 
     for (i, o) in obs.iter().enumerate() {
         if o.state >= s {
@@ -1034,6 +1055,30 @@ mod tests {
         ];
         assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SENTINEL_NLL);
         assert!(ctmm_data_term_grad(&q, &dq, &obs).unwrap().is_none());
+    }
+
+    /// A misshapen `∂Q/∂p` must be an error, not a truncated contraction. The gradient zips
+    /// `G` with `∂Q/∂p`, so a short derivative would silently drop entries and return a
+    /// confidently wrong gradient — the exact failure mode a `debug_assert!` alone would let
+    /// through in release.
+    #[test]
+    fn data_term_grad_rejects_a_misshapen_derivative() {
+        let q = DMatrix::from_row_slice(2, 2, &[-0.5, 0.5, 0.3, -0.3]);
+        let dq = vec![DMatrix::<f64>::zeros(3, 3)];
+        let obs = vec![
+            StateObs {
+                time: 0.0,
+                state: 0,
+            },
+            StateObs {
+                time: 1.0,
+                state: 1,
+            },
+        ];
+        assert!(matches!(
+            ctmm_data_term_grad(&q, &dq, &obs),
+            Err(MarkovError::DerivativeShapeMismatch { axis: 0, .. })
+        ));
     }
 
     #[test]

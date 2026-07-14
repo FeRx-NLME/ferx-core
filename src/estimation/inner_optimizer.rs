@@ -1542,37 +1542,36 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     if analytic_inner_common_bail(model) {
         return false;
     }
-    // Endpoint-only CTMM (#759): a `[markov_model]` with no `[structural_model]` has no
-    // Gaussian data term and no PK model, so `analytical_supported` rejects it on the
-    // absence of a closed form — yet its inner gradient (prior + the exact CTMM η-term) is
-    // fully analytic. Report that here, because `build_info::gradient_method_inner` reads
-    // this predicate and would otherwise say "fd" while `find_ebe` runs the analytic route.
+    // CTMM (#759): a subject's CTMM term is analytic only when its generator carries a
+    // dual-evaluable program. Without one — a drug-driven `Q(t)`, a `(θ, η)` width past the
+    // dual dispatch cap, an intensity we could not resolve — *every* subject declines at the
+    // survival-record guard in `analytic_inner_grad_supported`, so reporting "analytic" here
+    // would be a pure misreport.
+    //
+    // `analytical_supported` below does **not** catch this, which is the trap: an
+    // endpoint-only model (a `[markov_model]` with no `[structural_model]`) is *still* given
+    // a default `pk_model` and a vacuous `tv_fn` (`model_parser.rs`, `tv_fn = Some(..)` for
+    // any non-ODE model), and its `pk_indices` are empty so the per-slot check passes
+    // trivially — so the closed-form scope check waves it straight through despite there
+    // being no closed form at all.
     #[cfg(feature = "markov")]
-    if endpoint_only_analytic_ctmm(model) {
-        return true;
+    if model.has_ctmm() && !all_ctmm_endpoints_analytic(model) {
+        return false;
     }
     crate::sens::provider::analytical_supported(model)
 }
 
-/// A fit whose *only* data term is a CTMM we can differentiate exactly: no structural PK
-/// model (so no Gaussian observations at all) and every endpoint a time-homogeneous CTMM
-/// with a dual-evaluable generator program. The model-level counterpart of the
-/// `subject.obs_times.is_empty()` branch in [`analytic_inner_grad_supported`].
+/// Every `Ctmm` endpoint on the model carries a dual-evaluable generator program, i.e. its
+/// transition term can be differentiated exactly rather than finite-differenced. The
+/// model-level counterpart of [`ctmm_records_fully_analytic`]'s per-subject check.
 #[cfg(feature = "markov")]
-fn endpoint_only_analytic_ctmm(model: &CompiledModel) -> bool {
+fn all_ctmm_endpoints_analytic(model: &CompiledModel) -> bool {
     use crate::types::EndpointLikelihood;
-    // No `[structural_model]`: neither a closed form (`tv_fn`) nor an `[odes]` block.
-    if model.tv_fn.is_some() || model.ode_spec.is_some() || model.endpoints.is_empty() {
-        return false;
-    }
-    model.endpoints.iter().all(|(_, ep)| {
-        matches!(
-            ep,
-            EndpointLikelihood::Ctmm {
-                generator_program: Some(_),
-                ..
-            }
-        )
+    model.endpoints.iter().all(|(_, ep)| match ep {
+        EndpointLikelihood::Ctmm {
+            generator_program, ..
+        } => generator_program.is_some(),
+        _ => true,
     })
 }
 
@@ -1605,6 +1604,14 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // non-Gaussian term, both of which we have exactly, so only the global escape hatches
     // apply. (`analytic_eta_nll_gradient_with_schedule` mirrors this by skipping the
     // provider for such a subject.)
+    //
+    // **Ordering is load-bearing:** this branch is only sound *after* the guard above. A
+    // CTMM subject always carries `DiscreteState` records, so an endpoint-only CTMM whose
+    // generator has no dual-evaluable program (past the axis cap, or an intensity we could
+    // not resolve) is already rejected there — it can never fall through to here and claim
+    // an analytic route the gradient cannot supply. Reaching this line therefore means the
+    // subject's non-Gaussian term is either absent or exactly served, and the only thing
+    // left is the prior. (Pinned by `program_less_endpoint_only_ctmm_stays_fd`.)
     if subject.obs_times.is_empty() {
         return !analytic_inner_common_bail(model);
     }
@@ -3038,6 +3045,46 @@ mod tests {
             assert!(
                 super::super::analytic_inner_grad_supported(&model, &subject()),
                 "a CTMM subject must now take the analytic inner route"
+            );
+        }
+
+        /// An endpoint-only CTMM whose generator has **no** dual-evaluable program — here by
+        /// pushing the `(θ, η)` width past `MAX_CTMM_AXES` — must stay on FD, on *both* the
+        /// model-level predicate `build_info` reports and the per-subject gate `find_ebe`
+        /// runs. The two must agree, or the fit reports a gradient method it does not use.
+        ///
+        /// This pins the ordering inside `analytic_inner_grad_supported`: the survival-record
+        /// guard runs first and rejects a program-less CTMM subject, so it never reaches the
+        /// `obs_times.is_empty()` branch (which would otherwise wave it through on the
+        /// strength of having no Gaussian block). Swap those two and this test fails.
+        #[test]
+        fn program_less_endpoint_only_ctmm_stays_fd() {
+            let n_th = 25; // + 1 η = 26 axes > MAX_CTMM_AXES (24)
+            let mut src = String::from("[parameters]\n");
+            for i in 1..=n_th {
+                src += &format!("  theta T{i}(0.1, -6.0, 3.0)\n");
+            }
+            src += "  omega ETA_Q ~ 0.1\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
+                    states = [awake=0, asleep=1]\n  transition awake  -> asleep = exp(ETA_Q + ";
+            src += &(1..=n_th)
+                .map(|i| format!("T{i}"))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            src += ")\n  transition asleep -> awake  = exp(T1)\n";
+
+            let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+            assert_eq!(
+                model.n_theta + model.n_eta,
+                26,
+                "fixture must exceed the cap"
+            );
+            assert!(
+                !super::super::analytic_inner_grad_supported_model(&model),
+                "a CTMM past the dual dispatch cap must report FD"
+            );
+            assert!(
+                !super::super::analytic_inner_grad_supported(&model, &subject()),
+                "…and must actually take FD, not fall through the no-Gaussian-block branch"
             );
         }
 

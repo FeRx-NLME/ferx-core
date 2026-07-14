@@ -205,16 +205,18 @@ pub fn ctmm_subject_eta_grad(
             }
         }
 
-        // Project the (θ, η)-seeded jets onto the η axes: axis `n_theta_axis() + k` is η_k.
-        let eta_axes: Vec<nalgebra::DMatrix<f64>> = (0..n_eta)
-            .map(|k| {
-                dq.get(prog.n_theta_axis() + k)
-                    .cloned()
-                    .unwrap_or_else(|| nalgebra::DMatrix::zeros(*n_states, *n_states))
-            })
-            .collect();
-
-        let (v, g) = crate::markov::ctmm_data_term_grad(&q, &eta_axes, &obs).ok()??;
+        // Project the (θ, η)-seeded jets onto the η axes. `dq` is laid out θ₀..θ_{T−1},
+        // η₀..η_{E−1}, so the η block is exactly the tail — borrow it, no clones.
+        //
+        // A length mismatch would mean the program's axis layout disagrees with the model's
+        // η count. Decline (→ FD) rather than zero-fill the missing axes: a zero jet is a
+        // *wrong* gradient reported as analytic, which is the failure mode this whole
+        // change set exists to remove.
+        let n_theta = prog.n_theta_axis();
+        if dq.len() != n_theta + n_eta {
+            return None;
+        }
+        let (v, g) = crate::markov::ctmm_data_term_grad(&q, &dq[n_theta..], &obs).ok()??;
         nll += v;
         for (acc, gi) in grad.iter_mut().zip(g.iter()) {
             *acc += gi;
