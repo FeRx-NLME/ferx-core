@@ -17,8 +17,12 @@
 //! `docs/estimation/agq.qmd`.
 
 use ferx_core::parser::model_parser::{parse_full_model, parse_model_string};
-use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, FitResult, Population};
+use ferx_core::{
+    fit, read_nonmem_csv, CompiledModel, EstimationMethod, FitOptions, FitResult, Population,
+};
 use std::path::Path;
+
+mod common;
 
 /// Warfarin oral 1-cpt, 3 random effects, proportional error. With `n_agq = 3` this is a
 /// 3³ = 27-node grid per subject — small enough to stay a Tier-2 test.
@@ -53,9 +57,13 @@ fn warfarin() -> Population {
     read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data must load")
 }
 
-/// OFV at the initial parameters (no outer minimisation) under `method`.
-fn eval_only_ofv(population: &Population, method: EstimationMethod, n_agq: usize) -> f64 {
-    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+/// OFV at the initial parameters (no outer minimisation) of an already-parsed `model`.
+fn eval_only_ofv_model(
+    model: &CompiledModel,
+    population: &Population,
+    method: EstimationMethod,
+    n_agq: usize,
+) -> f64 {
     let opts = FitOptions {
         method,
         methods: vec![],
@@ -66,9 +74,15 @@ fn eval_only_ofv(population: &Population, method: EstimationMethod, n_agq: usize
         ..FitOptions::default()
     };
     let result =
-        fit(&model, population, &model.default_params, &opts).expect("eval-only fit must succeed");
+        fit(model, population, &model.default_params, &opts).expect("eval-only fit must succeed");
     assert!(result.ofv.is_finite(), "OFV must be finite");
     result.ofv
+}
+
+/// OFV at the initial parameters (no outer minimisation) of `WARFARIN_SRC` under `method`.
+fn eval_only_ofv(population: &Population, method: EstimationMethod, n_agq: usize) -> f64 {
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+    eval_only_ofv_model(&model, population, method, n_agq)
 }
 
 /// Parse `src` (model + its `[fit_options]`) and fit it eval-only, honouring the file's
@@ -521,4 +535,284 @@ fn agq_rejects_an_intractable_grid() {
         err.contains("n_agq") && err.contains("grid"),
         "the grid-cap rejection must name the lever to turn: {err}"
     );
+}
+
+/// `n_agq` past the per-dimension node cap is rejected at model-check time even when the
+/// resulting *grid* fits under `MAX_AGQ_GRID` — the case a direct-Rust-API caller can reach,
+/// since the parser guard that protects file/FFI fits is bypassed (review #821, point 2).
+/// With a single random effect, `n_agq = 100` is a 100-node grid (well under the grid cap)
+/// yet drives `gauss_hermite(100)` past where Golub–Welsch stays accurate.
+#[test]
+fn agq_rejects_out_of_range_node_count_built_via_the_rust_api() {
+    use ferx_core::api::check_model_options;
+
+    // One random effect: grid = n_agq^1 = n_agq, so the grid cap cannot catch this — only the
+    // per-dimension node cap can.
+    let src = WARFARIN_SRC
+        .replace("  omega ETA_V  ~ 0.04\n", "")
+        .replace("  omega ETA_KA ~ 0.30\n", "")
+        .replace("  V  = TVV  * exp(ETA_V)", "  V  = TVV")
+        .replace("  KA = TVKA * exp(ETA_KA)", "  KA = TVKA");
+    let model = parse_model_string(&src).expect("single-eta warfarin must parse");
+    assert_eq!(
+        model.n_eta, 1,
+        "fixture must have exactly one random effect"
+    );
+
+    let n = ferx_core::estimation::agq::MAX_AGQ_NODES + 79; // 100, safely under MAX_AGQ_GRID at n_eta = 1
+    assert!(
+        ferx_core::estimation::agq::grid_size(n, model.n_eta)
+            < ferx_core::estimation::agq::MAX_AGQ_GRID,
+        "the grid must stay under MAX_AGQ_GRID so only the node cap can reject this"
+    );
+    let opts = FitOptions {
+        method: EstimationMethod::Agq,
+        n_agq: n,
+        ..FitOptions::default()
+    };
+    let diags = check_model_options(&model, &opts);
+    assert!(
+        diags.iter().any(|d| d.code == "E_AGQ_NODES_TOO_LARGE"),
+        "an out-of-range n_agq must be rejected by check_model_options even under the grid cap; \
+         got {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+    // The in-range boundary (exactly MAX_AGQ_NODES) must NOT be rejected.
+    let ok_opts = FitOptions {
+        method: EstimationMethod::Agq,
+        n_agq: ferx_core::estimation::agq::MAX_AGQ_NODES,
+        ..FitOptions::default()
+    };
+    assert!(
+        !check_model_options(&model, &ok_opts)
+            .iter()
+            .any(|d| d.code == "E_AGQ_NODES_TOO_LARGE"),
+        "n_agq = MAX_AGQ_NODES is in range and must be accepted"
+    );
+}
+
+/// **The AGQ covariance stencil.** Every other AGQ test sets `run_covariance_step = false`,
+/// so the AGQ-marginal FD covariance (differenced through the `pop_nll_opts` seam in
+/// `compute_covariance`, so the standard errors difference the objective AGQ actually
+/// optimised) has no regression test. Run a short AGQ fit *with* covariance on and assert it
+/// produces finite, positive standard errors (review #821, point 4).
+#[test]
+fn agq_covariance_step_produces_finite_standard_errors() {
+    let pop = warfarin();
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+    let opts = FitOptions {
+        method: EstimationMethod::Agq,
+        n_agq: 1,
+        // A handful of outer iterations so covariance is evaluated near the optimum where the
+        // marginal Hessian is PD, while keeping this a Tier-2 (fast, no convergence loop) test.
+        outer_maxiter: 8,
+        run_covariance_step: true,
+        ..FitOptions::default()
+    };
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("AGQ fit with covariance");
+    let se = res
+        .se_theta
+        .expect("AGQ must report theta standard errors when covariance is on");
+    assert_eq!(se.len(), 3, "one SE per theta");
+    assert!(
+        se.iter().all(|s| s.is_finite() && *s > 0.0),
+        "AGQ theta standard errors must be finite and positive: {se:?}"
+    );
+    assert!(
+        res.covariance_matrix.is_some(),
+        "AGQ covariance matrix must be reported"
+    );
+}
+
+/// AGQ over a **non-Gaussian endpoint** — the capability the method exists for and which every
+/// other test in this file (all Gaussian warfarin PK) leaves unexercised (review #821, point 3).
+///
+/// The likelihood integrated here is a mixed-effects **binary / logistic** model, which sits
+/// entirely outside the `Dual2` sensitivity provider — so it drives AGQ's fixed-η FD score path
+/// (the one that also serves TTE, categorical, ODE, M3), not the analytic-provider path the
+/// Gaussian tests take. The independent truth is ferx's importance sampler evaluating the same
+/// marginal by a completely different route (Student-t / prior proposal, self-normalised
+/// weights — no quadrature, no Hessian), exactly as `agq_converges_to_the_importance_sampling_marginal`
+/// anchors the Gaussian node sweep.
+#[cfg(feature = "survival")]
+mod non_gaussian {
+    use ferx_core::estimation::agq;
+    use ferx_core::parser::model_parser::parse_model_string;
+    use ferx_core::{fit, CompiledModel, EstimationMethod, FitOptions, Population};
+
+    /// Mixed-effects logistic: population intercept + slope on `X`, plus a per-subject random
+    /// intercept `ETA_I`. One binary observation per row; the logit reads the per-record `TIME`
+    /// via the covariate `X` only, so the marginal is a genuine 1-D integral over `ETA_I`.
+    const BINARY_MIXED: &str = r"
+[parameters]
+  theta TH0(0.2, -10.0, 10.0)
+  theta THX(0.8, -10.0, 10.0)
+  omega ETA_I ~ 0.4
+
+[binary_model]
+  cmt   = 3
+  logit = TH0 + THX * X + ETA_I
+";
+
+    /// The same model with the random intercept removed — ordinary (fixed-effects) logistic
+    /// regression, `n_eta = 0`. Exercises AGQ's `d == 0` short-circuits.
+    const BINARY_FIXED: &str = r"
+[parameters]
+  theta TH0(0.2, -10.0, 10.0)
+  theta THX(0.8, -10.0, 10.0)
+
+[binary_model]
+  cmt   = 3
+  logit = TH0 + THX * X
+";
+
+    /// A deterministic binary dataset: 16 subjects, 4 observations each, `X` spread across a
+    /// range and the 0/1 states loosely tracking `TH0 + THX·X` so the model is identifiable.
+    fn binary_population() -> Population {
+        let subjects: Vec<(f64, Vec<(f64, u8)>)> = vec![
+            (-2.0, vec![(0.0, 0), (1.0, 0), (2.0, 0), (3.0, 0)]),
+            (-1.5, vec![(0.0, 0), (1.0, 0), (2.0, 1), (3.0, 0)]),
+            (-1.0, vec![(0.0, 0), (1.0, 1), (2.0, 0), (3.0, 0)]),
+            (-0.8, vec![(0.0, 1), (1.0, 0), (2.0, 0), (3.0, 0)]),
+            (-0.5, vec![(0.0, 0), (1.0, 1), (2.0, 0), (3.0, 1)]),
+            (-0.3, vec![(0.0, 1), (1.0, 0), (2.0, 1), (3.0, 0)]),
+            (-0.1, vec![(0.0, 0), (1.0, 1), (2.0, 1), (3.0, 0)]),
+            (0.1, vec![(0.0, 1), (1.0, 0), (2.0, 1), (3.0, 1)]),
+            (0.3, vec![(0.0, 1), (1.0, 1), (2.0, 0), (3.0, 1)]),
+            (0.5, vec![(0.0, 0), (1.0, 1), (2.0, 1), (3.0, 1)]),
+            (0.8, vec![(0.0, 1), (1.0, 1), (2.0, 1), (3.0, 0)]),
+            (1.0, vec![(0.0, 1), (1.0, 0), (2.0, 1), (3.0, 1)]),
+            (1.3, vec![(0.0, 1), (1.0, 1), (2.0, 1), (3.0, 1)]),
+            (1.6, vec![(0.0, 1), (1.0, 1), (2.0, 0), (3.0, 1)]),
+            (2.0, vec![(0.0, 1), (1.0, 1), (2.0, 1), (3.0, 1)]),
+            (2.5, vec![(0.0, 0), (1.0, 1), (2.0, 1), (3.0, 1)]),
+        ];
+        crate::common::binary_pop(&subjects, 3)
+    }
+
+    /// Eval-only AGQ OFV of `model` on the binary population at the initial parameters.
+    fn agq_ofv(model: &CompiledModel, pop: &Population, n_agq: usize) -> f64 {
+        crate::eval_only_ofv_model(model, pop, EstimationMethod::Agq, n_agq)
+    }
+
+    /// **Point 3: the binary marginal is integrated correctly, cross-checked against IS.**
+    #[test]
+    fn agq_integrates_a_binary_endpoint_and_agrees_with_importance_sampling() {
+        let model = parse_model_string(BINARY_MIXED).expect("mixed binary model must parse");
+        assert_eq!(
+            model.n_eta, 1,
+            "fixture must have exactly one random effect"
+        );
+        assert!(
+            agq::analytic_gradient_available(&model),
+            "AGQ supplies its own gradient for the binary endpoint too (no scope gate)"
+        );
+        let pop = binary_population();
+
+        // AGQ node sweep at the initial parameters — every OFV must be finite.
+        let agq: Vec<f64> = [1usize, 3, 7, 15]
+            .iter()
+            .map(|&n| agq_ofv(&model, &pop, n))
+            .collect();
+        assert!(
+            agq.iter().all(|o| o.is_finite()),
+            "AGQ binary OFVs must be finite: {agq:?}"
+        );
+
+        // Independent truth: the IS marginal at the same parameters. IS estimates the same
+        // integral by sampling η and averaging the exact conditional likelihood (which includes
+        // the logit term via `accumulate_non_gaussian_nll`), so it shares no code path with the
+        // quadrature. Deterministic under a fixed seed.
+        let is_opts = FitOptions {
+            method: EstimationMethod::Imp,
+            interaction: true,
+            imp_eval_only: true,
+            imp_samples: 100_000,
+            imp_seed: Some(11),
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let truth = fit(&model, &pop, &model.default_params, &is_opts)
+            .expect("IS evaluation must succeed on the binary model")
+            .importance_sampling
+            .expect("IMP eval-only must report a marginal")
+            .minus2_log_likelihood;
+
+        let refined = (agq.last().unwrap() - truth).abs();
+        assert!(
+            refined < 0.5,
+            "the refined AGQ grid must agree with the IS marginal on the binary endpoint: \
+             truth={truth:.6}, AGQ OFVs={agq:?} (final gap {refined:.4})"
+        );
+    }
+
+    /// Point 3 (gradient side): a short *optimising* AGQ fit over the binary endpoint drives the
+    /// fixed-η FD score path end-to-end (the analytic-provider path never fires here), returning
+    /// a finite OFV. This is the headline capability — a non-Gaussian likelihood optimised by
+    /// AGQ — exercised through the public `fit()` boundary rather than only the eval-only OFV.
+    #[test]
+    fn agq_optimises_a_binary_endpoint() {
+        let model = parse_model_string(BINARY_MIXED).expect("mixed binary model must parse");
+        let pop = binary_population();
+        let opts = FitOptions {
+            method: EstimationMethod::Agq,
+            n_agq: 3,
+            outer_maxiter: 3, // Tier-2: a few steps, no convergence loop
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let res = fit(&model, &pop, &model.default_params, &opts)
+            .expect("a short AGQ fit over a binary endpoint must return Ok");
+        assert!(
+            res.ofv.is_finite(),
+            "AGQ binary fit OFV must be finite: {}",
+            res.ofv
+        );
+    }
+
+    /// **Point 4: the `d == 0` short-circuit** (`agq_subject_nll`, `agq_subject_packed_gradient`).
+    /// A fixed-effects binary model has no random effect, so the marginal is a point mass and AGQ
+    /// degenerates to the conditional likelihood — the node count cannot matter, and the OFV must
+    /// equal FOCEI's exactly. The short optimising fit then drives the gradient's own `d == 0`
+    /// branch (`accumulate_fixed_eta_packed_gradient`).
+    #[test]
+    fn agq_with_no_random_effects_is_the_conditional_likelihood() {
+        let model =
+            parse_model_string(BINARY_FIXED).expect("fixed-effects binary model must parse");
+        assert_eq!(model.n_eta, 0, "fixture must have no random effects");
+        let pop = binary_population();
+
+        let agq1 = agq_ofv(&model, &pop, 1);
+        let agq7 = agq_ofv(&model, &pop, 7);
+        let focei = crate::eval_only_ofv_model(&model, &pop, EstimationMethod::FoceI, 1);
+
+        // Nothing to integrate over ⇒ the node count cannot move the OFV, bit-for-bit.
+        assert_eq!(
+            agq1.to_bits(),
+            agq7.to_bits(),
+            "with n_eta = 0 the node count is irrelevant: n=1 {agq1} vs n=7 {agq7}"
+        );
+        // …and the marginal *is* the conditional likelihood, so AGQ = FOCEI exactly.
+        assert!(
+            (agq1 - focei).abs() < 1e-9,
+            "with no random effects AGQ must equal FOCEI exactly: agq={agq1}, focei={focei}"
+        );
+
+        // Drive the gradient's d == 0 branch through a short optimising fit.
+        let opts = FitOptions {
+            method: EstimationMethod::Agq,
+            n_agq: 3,
+            outer_maxiter: 3,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let res = fit(&model, &pop, &model.default_params, &opts)
+            .expect("a fixed-effects AGQ fit must return Ok");
+        assert!(
+            res.ofv.is_finite(),
+            "fixed-effects AGQ OFV must be finite: {}",
+            res.ofv
+        );
+    }
 }

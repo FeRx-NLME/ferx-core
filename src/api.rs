@@ -2246,6 +2246,26 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         // outer iteration. Past the cap that is not "slow", it is a fit that will never
         // finish — so it is worth failing at check time, with the two levers spelled out.
         let n_nodes = options.n_agq.max(1);
+        // Per-dimension node cap. The parser (`apply_fit_option`) enforces this for
+        // file-driven fits, but a `FitOptions` built directly against the Rust API
+        // bypasses that path — so re-check here, alongside the grid cap, or an
+        // out-of-range `n_agq` (e.g. 100 with a single η, which slips under the grid
+        // cap) would reach `gauss_hermite` past the point Golub–Welsch stays accurate.
+        if n_nodes > crate::estimation::agq::MAX_AGQ_NODES {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_NODES_TOO_LARGE",
+                    format!(
+                        "method = agq with n_agq = {n_nodes} exceeds the {}-node per-dimension \
+                         limit: beyond ~20 nodes the Golub–Welsch rule loses its extreme nodes to \
+                         round-off and the marginal gains nothing. Lower n_agq (n_agq = 1 is the \
+                         Laplace approximation, i.e. FOCEI-equivalent cost).",
+                        crate::estimation::agq::MAX_AGQ_NODES,
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
         let grid = crate::estimation::agq::grid_size(n_nodes, model.n_eta);
         if grid > crate::estimation::agq::MAX_AGQ_GRID {
             diags.push(

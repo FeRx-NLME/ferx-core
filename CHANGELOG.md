@@ -61,8 +61,8 @@ section of the SDLC for the versioning policy).
   nodes), so a converged `n_agq = 3` warfarin fit takes 0.39 s against FOCEI's
   0.29 s and NONMEM LAPLACIAN's 1.21 s, and reproduces NONMEM's estimates to 4–5
   significant figures on every parameter. Cost is `n_agq ^ n_eta` per subject per
-  iteration, so it suits models with few random effects; grids over 100 000 nodes
-  and IOV models are rejected at check time. See the
+  iteration, so it suits models with few random effects; grids over 100 000 nodes,
+  out-of-range node counts, and IOV models are rejected at check time. See the
   [AGQ docs page](https://ferx-nlme.github.io/ferx-core/estimation/agq.html).
 - **Restart of an interrupted run from a checkpoint** (#755): a fit now
   periodically saves a small `{model}.tmp` resume point (throttled to

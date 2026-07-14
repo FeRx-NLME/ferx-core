@@ -6123,8 +6123,10 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
         ],
         // AGQ drives the same outer loop and the same inner EBE solve as FOCE/FOCEI —
         // it only swaps the population objective — so it accepts that method's keys,
-        // plus the node count. It has no analytic outer gradient, so
-        // `reconverge_gradient_interval` (an analytic-path escape hatch) does not apply.
+        // plus the node count. AGQ *does* have an exact analytic outer gradient, and
+        // `reconverge_gradient_interval` is its escape hatch onto the numeric path
+        // (honoured in `population_gradient`), so the key applies here exactly as it
+        // does for FOCE/FOCEI.
         EstimationMethod::Agq => &[
             "n_agq",
             "maxiter",
@@ -6138,6 +6140,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "global_search",
             "global_maxeval",
             "stagnation_guard",
+            "reconverge_gradient_interval",
         ],
         EstimationMethod::FoceGn => &[
             "maxiter",
