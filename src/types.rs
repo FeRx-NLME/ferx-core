@@ -2851,6 +2851,17 @@ pub enum EndpointLikelihood {
         state_codes: Vec<usize>,
         /// Builds the generator `Q(θ,η,cov,state)` — see [`GeneratorFn`].
         generator_fn: GeneratorFn,
+        /// Resolved, dual-evaluable form of the same intensities, for the **analytic**
+        /// gradient: it yields `∂Q/∂(θ,η)` exactly, which the endpoint chains through the
+        /// Van Loan Fréchet derivative of `expm` instead of finite-differencing the whole
+        /// matrix-exponential likelihood (#759).
+        ///
+        /// `None` — and the endpoint keeps its FD gradient — when the intensities are
+        /// time-**inhomogeneous** (an intensity reads an ODE state, so `Q` is a functional
+        /// of the PK trajectory and the likelihood is an occupancy ODE rather than an
+        /// `expm`), or when the program cannot be represented exactly (see
+        /// `build_ctmm_generator_program`).
+        generator_program: Option<crate::parser::model_parser::CtmmGeneratorProgram>,
         /// Covariate names referenced by any transition intensity (including any
         /// reached transitively through `[individual_parameters]`). Evaluated at a
         /// baseline snapshot, so a covariate listed here that is time-varying in

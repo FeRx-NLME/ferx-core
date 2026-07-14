@@ -115,6 +115,48 @@ mod ctmm_smoke {
         assert!(res.ofv.is_finite(), "OFV must be finite, got {}", res.ofv);
     }
 
+    /// The analytic inner EBE gradient (#759 — exact `∂Q/∂η` chained through the Van Loan
+    /// Fréchet derivative of `expm`) must land the *fit* in the same place the finite-
+    /// difference inner gradient does. They optimize the same objective, so the OFV and the
+    /// estimates must agree to well inside the FD gradient's own noise; a sign error, a
+    /// dropped prior, or a factor-of-2 in the wiring would move the EBEs and show up here
+    /// even though the term-level gradient tests pass.
+    #[test]
+    fn ctmm_analytic_inner_gradient_matches_the_fd_route() {
+        let subjects: Vec<(f64, Vec<(f64, u8)>)> = vec![
+            (0.0, vec![(0.0, 0), (1.0, 0), (2.0, 1), (3.5, 1)]),
+            (0.0, vec![(0.0, 1), (1.0, 0), (2.0, 0), (3.5, 1)]),
+            (0.0, vec![(0.0, 0), (1.0, 1), (2.0, 1), (3.5, 0)]),
+            (0.0, vec![(0.0, 1), (1.0, 1), (2.0, 0), (3.5, 0)]),
+            (0.0, vec![(0.0, 0), (1.0, 0), (2.0, 0), (3.5, 1)]),
+            (0.0, vec![(0.0, 1), (1.0, 0), (2.0, 1), (3.5, 1)]),
+        ];
+        let pop = common::binary_pop(&subjects, 5);
+
+        let analytic = parse_model_string(MIXED_MODEL).unwrap();
+        // `gradient = fd` trips `analytic_inner_common_bail`, restoring the pre-#759 route:
+        // the EBE search finite-differences the whole objective.
+        let fd = parse_model_string(&format!("{MIXED_MODEL}\n[fit_options]\n  gradient = fd\n"))
+            .unwrap();
+
+        let opts = FitOptions {
+            outer_maxiter: 12,
+            ..Default::default()
+        };
+        let ra = fit(&analytic, &pop, &analytic.default_params, &opts).expect("analytic fit");
+        let rf = fit(&fd, &pop, &fd.default_params, &opts).expect("fd fit");
+
+        assert!(
+            (ra.ofv - rf.ofv).abs() < 1e-4,
+            "analytic-inner OFV {} vs FD-inner OFV {}",
+            ra.ofv,
+            rf.ofv
+        );
+        for (i, (a, f)) in ra.theta.iter().zip(rf.theta.iter()).enumerate() {
+            assert!((a - f).abs() < 1e-3, "theta[{i}]: analytic {a} vs FD {f}");
+        }
+    }
+
     /// SAEM runs a short CTMM fit and returns a finite OFV — exercises the SAEM dispatch
     /// site the FOCEI tests do not reach.
     #[test]

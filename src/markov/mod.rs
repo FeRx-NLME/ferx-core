@@ -222,6 +222,144 @@ pub fn generator_rate_direction(s: usize, j: usize, k: usize, dt: f64) -> DMatri
     e
 }
 
+/// Exact gradient of [`ctmm_data_term`] w.r.t. an arbitrary parameter vector, given the
+/// generator `q` and its derivatives `dq[a] = ∂Q/∂p_a` (#759).
+///
+/// This is the analytic replacement for finite-differencing the whole matrix-exponential
+/// likelihood. The chain is
+///
+/// ```text
+///   ∂/∂p_a [ −log P(Δt)[u,v] ]  =  − L(QΔt, (∂Q/∂p_a)·Δt)[u,v] / P(Δt)[u,v]
+/// ```
+///
+/// with `L` the Fréchet derivative ([`matrix_exp_frechet`]). Evaluating that literally
+/// would cost one `2S×2S` `expm` **per axis per gap** — which for a handful of axes is
+/// *slower* than the `S×S` FD it replaces. Instead we use the adjoint identity
+///
+/// ```text
+///   ⟨C, L(A, E)⟩  =  ⟨L(Aᵀ, C), E⟩          (trace inner product)
+/// ```
+///
+/// Only one *entry* `[u,v]` of `P` is ever read, so seeding `C = e_u e_vᵀ` gives a single
+/// matrix `G = L((QΔt)ᵀ, e_u e_vᵀ)` with `∂P[u,v]/∂p_a = ⟨G, (∂Q/∂p_a)·Δt⟩` for **every**
+/// `a`. That is **one** Fréchet solve per observation gap regardless of the parameter count
+/// — cheaper than the FD path (`2·n_axes` `S×S` `expm`s per gap) as soon as there are a few
+/// axes, and it scales to the full `(θ, η)` width for free. `adjoint_frechet_matches_direct`
+/// pins the identity against the direct per-direction form.
+///
+/// `dq[a]` must be a valid generator *direction* (zero row sums). The caller gets that for
+/// free by differentiating the intensities — see `CtmmGeneratorProgram::eval_generator_duals`.
+///
+/// Returns `Ok(None)` where [`ctmm_data_term`] returns [`SENTINEL_NLL`]: at a degenerate
+/// generator the value is a flat repellent constant with no meaningful derivative, so the
+/// caller falls back to FD for that point rather than being handed a zero (or garbage)
+/// gradient. Errors mirror [`ctmm_data_term`] exactly.
+pub fn ctmm_data_term_grad(
+    q: &DMatrix<f64>,
+    dq: &[DMatrix<f64>],
+    obs: &[StateObs],
+) -> Result<Option<(f64, Vec<f64>)>, MarkovError> {
+    if !q.is_square() {
+        return Err(MarkovError::NonSquareGenerator {
+            rows: q.nrows(),
+            cols: q.ncols(),
+        });
+    }
+    let s = q.nrows();
+    if s < 2 {
+        return Err(MarkovError::TooFewStates { n: s });
+    }
+    debug_assert!(
+        dq.iter().all(|d| d.shape() == (s, s)),
+        "every ∂Q/∂p must match Q's shape"
+    );
+
+    for (i, o) in obs.iter().enumerate() {
+        if o.state >= s {
+            return Err(MarkovError::StateOutOfRange {
+                state: o.state,
+                n_states: s,
+            });
+        }
+        if !o.time.is_finite() {
+            return Err(MarkovError::NonFiniteTime {
+                index: i,
+                time: o.time,
+            });
+        }
+    }
+
+    let n_axes = dq.len();
+    let mut grad = vec![0.0_f64; n_axes];
+    if obs.len() < 2 {
+        return Ok(Some((0.0, grad)));
+    }
+
+    let mut nll = 0.0;
+    for (i, pair) in obs.windows(2).enumerate() {
+        let (a, b) = (pair[0], pair[1]);
+        let dt = b.time - a.time;
+
+        if dt < 0.0 {
+            return Err(MarkovError::TimeDecreased {
+                index: i + 1,
+                prev: a.time,
+                next: b.time,
+            });
+        }
+        if dt == 0.0 {
+            if a.state != b.state {
+                return Err(MarkovError::ZeroDtStateChange {
+                    index: i + 1,
+                    time: b.time,
+                    from: a.state,
+                    to: b.state,
+                });
+            }
+            // P(0) = I: the term is identically 0 in both value and derivative.
+            continue;
+        }
+
+        let arg = q * dt;
+        if arg
+            .iter()
+            .any(|x| !x.is_finite() || x.abs() > MAX_EXP_ARG_ABS)
+        {
+            return Ok(None);
+        }
+        let p_mat = matrix_exp(&arg);
+        let p = p_mat[(a.state, b.state)];
+        if !p.is_finite() || p <= 0.0 {
+            return Ok(None);
+        }
+        // Mirror `ctmm_data_term`'s `p.min(1.0)` clamp in the *derivative* too: where the
+        // clamp binds, the implemented value is the constant `ln(1) = 0`, so its exact
+        // derivative is 0 — not `−(∂P/∂p)/p`. Differentiating through a clamp the value
+        // path applies is the classic way an "analytic" gradient stops matching the
+        // function it claims to differentiate.
+        if p > 1.0 {
+            continue;
+        }
+        nll -= p.ln();
+
+        // One adjoint Fréchet solve, reused across every axis (see the doc comment).
+        let mut seed = DMatrix::<f64>::zeros(s, s);
+        seed[(a.state, b.state)] = 1.0;
+        let g = matrix_exp_frechet(&arg.transpose(), &seed);
+        for (ax, dq_a) in dq.iter().enumerate() {
+            // ∂P[u,v]/∂p_a = ⟨G, (∂Q/∂p_a)·Δt⟩; the NLL term is −log P.
+            let dp: f64 = g
+                .iter()
+                .zip(dq_a.iter())
+                .map(|(gi, di)| gi * di)
+                .sum::<f64>()
+                * dt;
+            grad[ax] -= dp / p;
+        }
+    }
+    Ok(Some((nll, grad)))
+}
+
 /// Individual CTMM negative log-likelihood for a **prebuilt** generator `q`:
 /// `−Σ_m log P(Δt_m)[s_m, s_{m+1}]` over consecutive observation pairs.
 ///
@@ -784,6 +922,118 @@ mod tests {
         let qm = DMatrix::from_row_slice(2, 2, &[-(a - ha), a - ha, b, -b]) * dt;
         let grad_fd = (matrix_exp(&qp) - matrix_exp(&qm)) / (2.0 * ha);
         assert!(max_abs_diff(&grad_vl, &grad_fd) < 1e-8);
+    }
+
+    // ---- ctmm_data_term_grad: the adjoint Van Loan chain (#759) -----------------
+
+    /// The identity `ctmm_data_term_grad` is built on: `⟨C, L(A,E)⟩ = ⟨L(Aᵀ,C), E⟩`.
+    ///
+    /// This is what lets one Fréchet solve per observation gap serve *every* parameter
+    /// axis, instead of one solve per (axis, gap). If it ever stopped holding, the
+    /// gradient would be silently wrong — and plausibly so, since it would still have the
+    /// right sparsity and rough magnitude — so pin it directly rather than only through
+    /// the FD comparisons below.
+    #[test]
+    fn adjoint_frechet_matches_direct() {
+        let (a, b, dt) = (0.7, 0.3, 2.0);
+        let q = DMatrix::from_row_slice(2, 2, &[-a, a, b, -b]);
+        let arg = &q * dt;
+        // Direction: raise the 0→1 rate (constrained, row-sum-zero).
+        let e = generator_rate_direction(2, 0, 1, dt);
+        // Direct: the (0,1) entry of L(A, E).
+        let direct = matrix_exp_frechet(&arg, &e)[(0, 1)];
+        // Adjoint: one solve with Aᵀ seeded at the entry we read, contracted with E.
+        let mut seed = DMatrix::<f64>::zeros(2, 2);
+        seed[(0, 1)] = 1.0;
+        let g = matrix_exp_frechet(&arg.transpose(), &seed);
+        let adjoint: f64 = g.iter().zip(e.iter()).map(|(gi, ei)| gi * ei).sum();
+        assert!(
+            (direct - adjoint).abs() < 1e-12,
+            "adjoint Fréchet identity broken: direct {direct}, adjoint {adjoint}"
+        );
+    }
+
+    #[test]
+    fn data_term_grad_matches_fd() {
+        // Q(θ) = [[-e^{t0}, e^{t0}], [e^{t1}, -e^{t1}]] — the shipped 2-state CTMM shape,
+        // parameterized on the log scale so ∂Q/∂θ is not the trivial rate direction.
+        let theta = [(-0.7_f64), -1.2];
+        let build = |t: &[f64; 2]| {
+            let (r01, r10) = (t[0].exp(), t[1].exp());
+            DMatrix::from_row_slice(2, 2, &[-r01, r01, r10, -r10])
+        };
+        // ∂Q/∂θ_0 = r01·(E_01 − E_00); likewise for θ_1.
+        let dq: Vec<DMatrix<f64>> = (0..2)
+            .map(|a| {
+                let r = theta[a].exp();
+                let (j, k) = if a == 0 { (0, 1) } else { (1, 0) };
+                let mut m = DMatrix::<f64>::zeros(2, 2);
+                m[(j, k)] = r;
+                m[(j, j)] = -r;
+                m
+            })
+            .collect();
+        let obs = vec![
+            StateObs {
+                time: 0.0,
+                state: 0,
+            },
+            StateObs {
+                time: 1.3,
+                state: 1,
+            },
+            StateObs {
+                time: 2.1,
+                state: 1,
+            },
+            StateObs {
+                time: 4.0,
+                state: 0,
+            },
+        ];
+        let q = build(&theta);
+        let (v, g) = ctmm_data_term_grad(&q, &dq, &obs)
+            .expect("well-posed generator")
+            .expect("not degenerate");
+        // Value agrees with the plain kernel — the gradient path must not drift from it.
+        assert!((v - ctmm_data_term(&q, &obs).unwrap()).abs() < 1e-14);
+
+        for a in 0..2 {
+            let h = 1e-6;
+            let (mut tp, mut tm) = (theta, theta);
+            tp[a] += h;
+            tm[a] -= h;
+            let fd = (ctmm_data_term(&build(&tp), &obs).unwrap()
+                - ctmm_data_term(&build(&tm), &obs).unwrap())
+                / (2.0 * h);
+            assert!(
+                (g[a] - fd).abs() < 1e-6,
+                "axis {a}: analytic {}, FD {fd}",
+                g[a]
+            );
+        }
+    }
+
+    /// A degenerate generator returns a flat `SENTINEL_NLL` with no meaningful derivative;
+    /// the gradient path must say so (`Ok(None)`) rather than hand back a zero gradient,
+    /// which the optimizer would read as "already at a stationary point".
+    #[test]
+    fn data_term_grad_declines_at_the_degeneracy_sentinel() {
+        let big = MAX_EXP_ARG_ABS;
+        let q = DMatrix::from_row_slice(2, 2, &[-big, big, big, -big]);
+        let dq = vec![DMatrix::<f64>::zeros(2, 2)];
+        let obs = vec![
+            StateObs {
+                time: 0.0,
+                state: 0,
+            },
+            StateObs {
+                time: 10.0,
+                state: 1,
+            },
+        ];
+        assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SENTINEL_NLL);
+        assert!(ctmm_data_term_grad(&q, &dq, &obs).unwrap().is_none());
     }
 
     #[test]

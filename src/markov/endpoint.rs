@@ -140,6 +140,89 @@ fn ctmm_endpoint_nll(
     }
 }
 
+/// Exact `∂/∂η` of [`ctmm_subject_nll`] — the analytic counterpart of finite-differencing
+/// the whole matrix-exponential likelihood (#759).
+///
+/// `Q` is rebuilt over `Dual1` with θ and η seeded
+/// ([`CtmmGeneratorProgram::eval_generator_duals`]), giving an exact `∂Q/∂(θ,η)`; the η
+/// columns are then chained through the Van Loan Fréchet derivative of `expm` by
+/// [`ctmm_data_term_grad`]. Returns `(value, ∂/∂η)` with the gradient at the **same 1×
+/// scale as the value** — the caller applies the objective's factor.
+///
+/// `None` — caller falls back to FD for this point — when *any* CTMM endpoint on the
+/// subject cannot be served exactly:
+///   * a time-**inhomogeneous** generator (no program: the likelihood is an occupancy ODE,
+///     not an `expm`, so Van Loan does not apply);
+///   * a `(θ, η)` width past the dual dispatch cap, or intensities we could not resolve;
+///   * the degenerate regime — a negative off-diagonal rate, or the `expm`/underflow
+///     guards — where the value is a flat `SUBJECT_SENTINEL_NLL` repellent with no
+///     meaningful derivative.
+///
+/// Only the **η** block is returned today (the inner EBE loop is the consumer). The
+/// program seeds the θ axes too, so an outer θ-gradient is a projection away — see the
+/// non-Gaussian outer-gradient split (#486).
+pub fn ctmm_subject_eta_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>)> {
+    let n_eta = model.n_eta;
+    let mut nll = 0.0;
+    let mut grad = vec![0.0_f64; n_eta];
+    if subject.obs_records.is_empty() {
+        return Some((nll, grad));
+    }
+    for (cmt, endpoint) in &model.endpoints {
+        let EndpointLikelihood::Ctmm {
+            n_states,
+            state_codes,
+            generator_program,
+            ..
+        } = endpoint
+        else {
+            continue;
+        };
+        // No program ⇒ inhomogeneous, or not exactly representable. Decline the whole
+        // subject rather than serve a partial gradient.
+        let prog = generator_program.as_ref()?;
+
+        let obs = collect_state_obs(*cmt, state_codes, &subject.obs_records).ok()?;
+        if obs.len() < 2 {
+            continue;
+        }
+        let (q, dq) = prog.eval_generator_duals(theta, eta, &subject.covariates)?;
+        debug_assert_eq!(q.nrows(), *n_states);
+
+        // Same degeneracy guard as the value path (`ctmm_endpoint_nll`): a negative
+        // off-diagonal makes `Q` a non-generator and the value collapses to the flat
+        // sentinel, which has no derivative.
+        for j in 0..q.nrows() {
+            for k in 0..q.ncols() {
+                if j != k && q[(j, k)] < -1e-12 {
+                    return None;
+                }
+            }
+        }
+
+        // Project the (θ, η)-seeded jets onto the η axes: axis `n_theta_axis() + k` is η_k.
+        let eta_axes: Vec<nalgebra::DMatrix<f64>> = (0..n_eta)
+            .map(|k| {
+                dq.get(prog.n_theta_axis() + k)
+                    .cloned()
+                    .unwrap_or_else(|| nalgebra::DMatrix::zeros(*n_states, *n_states))
+            })
+            .collect();
+
+        let (v, g) = crate::markov::ctmm_data_term_grad(&q, &eta_axes, &obs).ok()??;
+        nll += v;
+        for (acc, gi) in grad.iter_mut().zip(g.iter()) {
+            *acc += gi;
+        }
+    }
+    Some((nll, grad))
+}
+
 /// Sum the CTMM-endpoint NLL over every `Ctmm` CMT for one subject, mirroring the
 /// per-endpoint TTE / binary dispatch. Returns `0.0` when the model has no CTMM
 /// endpoint or the subject has no discrete-state records for it.
@@ -467,6 +550,113 @@ mod tests {
             &[disc(0.0, 1, 5), disc(dt, 2, 5)],
         );
         assert!((got - (-p01.ln())).abs() < 1e-12, "got {got}");
+    }
+
+    // ---- analytic η-gradient: dual generator + Van Loan chain (#759) ------------
+
+    /// The mixed-effects CTMM of `tests/markov_smoke.rs`: a per-subject random effect on
+    /// the awake→asleep intensity, no `[structural_model]` (an endpoint-only fit).
+    const MIXED_CTMM: &str = r"
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  omega ETA_Q ~ 0.1
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + ETA_Q)
+  transition asleep -> awake  = exp(LQ10)
+";
+
+    fn ctmm_subject(states: &[(f64, usize)]) -> Subject {
+        Subject {
+            id: "1".into(),
+            obs_records: states
+                .iter()
+                .map(|&(t, s)| disc(t, s, 5))
+                .collect::<Vec<_>>(),
+            ..Default::default()
+        }
+    }
+
+    /// The load-bearing end-to-end check: the exact η-gradient — `∂Q/∂η` from replaying the
+    /// parsed intensities over `Dual1`, chained through the adjoint Van Loan derivative of
+    /// `expm` — must equal a central finite difference of the *same* subject NLL the fit
+    /// minimizes. This is what pins the whole chain (parser → program → generator jets →
+    /// Fréchet) to the function it claims to differentiate.
+    #[test]
+    fn ctmm_subject_eta_grad_matches_fd() {
+        let model = crate::parser::model_parser::parse_model_string(MIXED_CTMM).expect("parse");
+        assert_eq!(model.n_eta, 1);
+        let subject = ctmm_subject(&[(0.0, 0), (1.0, 0), (2.3, 1), (3.1, 1), (5.0, 0)]);
+        let theta = [-0.7_f64, -1.2];
+
+        // Away from η = 0, so a sign error or a dropped term cannot hide.
+        for &eta0 in &[-0.45_f64, 0.0, 0.6] {
+            let eta = [eta0];
+            let (v, g) = ctmm_subject_eta_grad(&model, &subject, &theta, &eta)
+                .expect("homogeneous CTMM with a dual-evaluable program is analytic");
+            // The gradient path's value must not drift from the value path's.
+            let v_ref = ctmm_subject_nll(&model, &subject, &theta, &eta);
+            assert!((v - v_ref).abs() < 1e-12, "value drift: {v} vs {v_ref}");
+
+            let h = 1e-6;
+            let fd = (ctmm_subject_nll(&model, &subject, &theta, &[eta0 + h])
+                - ctmm_subject_nll(&model, &subject, &theta, &[eta0 - h]))
+                / (2.0 * h);
+            assert!(
+                (g[0] - fd).abs() < 1e-6,
+                "η = {eta0}: analytic {}, FD {fd}",
+                g[0]
+            );
+            // A real gradient, not an accidental zero.
+            assert!(g[0].abs() > 1e-3, "η = {eta0}: gradient suspiciously flat");
+        }
+    }
+
+    /// A time-**inhomogeneous** (drug-driven) generator gets no program — its likelihood is
+    /// an occupancy ODE, not an `expm`, so the Van Loan identity does not apply. It must
+    /// decline to FD rather than silently return the homogeneous answer.
+    #[test]
+    fn inhomogeneous_ctmm_declines_the_analytic_grad() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta SLOPE(0.1, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [s0=0, s1=1]
+  transition s0 -> s1 = exp(LQ01 + SLOPE * (central / V))
+  transition s1 -> s0 = exp(LQ10)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        let subject = ctmm_subject(&[(0.0, 0), (1.0, 1)]);
+        assert!(
+            ctmm_subject_eta_grad(&model, &subject, &model.default_params.theta, &[0.1]).is_none(),
+            "a state-driven generator must decline the expm-based analytic gradient"
+        );
     }
 
     /// A subject with a single observation carries no transition ⇒ 0 contribution.

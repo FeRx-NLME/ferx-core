@@ -1482,6 +1482,50 @@ pub(crate) fn subject_has_survival_records(subject: &Subject) -> bool {
     }
 }
 
+/// Whether **every** non-Gaussian record on this subject is a CTMM state observation that
+/// the analytic path can serve exactly (#759) — i.e. the subject's whole non-Gaussian data
+/// term is `−Σ log P(Δt)[s,s']` on a time-homogeneous generator with a dual-evaluable
+/// program ([`ctmm_subject_eta_grad`](crate::markov::endpoint::ctmm_subject_eta_grad)).
+///
+/// Strict on purpose. The inner gradient is a *sum* of term gradients, so admitting a
+/// subject that also carries a TTE / binary / count record would silently drop that term's
+/// contribution — a wrong gradient, not a slow one. TTE and binary have no analytic η-channel
+/// at all (their `LinearPredictorFn` / `HazardParamFn` are `f64` closures outside `sens/`),
+/// so such a subject keeps FD for the whole objective.
+///
+/// Always `false` without the `markov` feature (there are no CTMM records to serve).
+fn ctmm_records_fully_analytic(model: &CompiledModel, subject: &Subject) -> bool {
+    #[cfg(feature = "markov")]
+    {
+        use crate::types::{EndpointLikelihood, ObsRecord};
+        if !model.has_ctmm() {
+            return false;
+        }
+        // The CMTs whose endpoint is a CTMM we can differentiate exactly. An endpoint with
+        // no `generator_program` — a time-inhomogeneous (drug-driven) generator, whose
+        // likelihood is an occupancy ODE rather than an `expm` — is not one of them.
+        let analytic_cmts: Vec<usize> = model
+            .endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| match ep {
+                EndpointLikelihood::Ctmm {
+                    generator_program, ..
+                } if generator_program.is_some() => Some(*cmt),
+                _ => None,
+            })
+            .collect();
+        subject.obs_records.iter().all(|r| match r {
+            ObsRecord::DiscreteState { cmt, .. } => analytic_cmts.contains(cmt),
+            _ => false,
+        })
+    }
+    #[cfg(not(feature = "markov"))]
+    {
+        let _ = (model, subject);
+        false
+    }
+}
+
 /// Model-level half of [`analytic_inner_grad_supported`]: every gate that does
 /// not depend on the subject. `build_info::gradient_method_inner` reports the
 /// inner route off **this same** predicate, so the reported `gradient_method_inner`
@@ -1498,7 +1542,38 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     if analytic_inner_common_bail(model) {
         return false;
     }
+    // Endpoint-only CTMM (#759): a `[markov_model]` with no `[structural_model]` has no
+    // Gaussian data term and no PK model, so `analytical_supported` rejects it on the
+    // absence of a closed form — yet its inner gradient (prior + the exact CTMM η-term) is
+    // fully analytic. Report that here, because `build_info::gradient_method_inner` reads
+    // this predicate and would otherwise say "fd" while `find_ebe` runs the analytic route.
+    #[cfg(feature = "markov")]
+    if endpoint_only_analytic_ctmm(model) {
+        return true;
+    }
     crate::sens::provider::analytical_supported(model)
+}
+
+/// A fit whose *only* data term is a CTMM we can differentiate exactly: no structural PK
+/// model (so no Gaussian observations at all) and every endpoint a time-homogeneous CTMM
+/// with a dual-evaluable generator program. The model-level counterpart of the
+/// `subject.obs_times.is_empty()` branch in [`analytic_inner_grad_supported`].
+#[cfg(feature = "markov")]
+fn endpoint_only_analytic_ctmm(model: &CompiledModel) -> bool {
+    use crate::types::EndpointLikelihood;
+    // No `[structural_model]`: neither a closed form (`tv_fn`) nor an `[odes]` block.
+    if model.tv_fn.is_some() || model.ode_spec.is_some() || model.endpoints.is_empty() {
+        return false;
+    }
+    model.endpoints.iter().all(|(_, ep)| {
+        matches!(
+            ep,
+            EndpointLikelihood::Ctmm {
+                generator_program: Some(_),
+                ..
+            }
+        )
+    })
 }
 
 /// Whether the exact analytic η-gradient of the individual NLL
@@ -1512,8 +1587,26 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // provider models — the analytical path declines below, and the light ODE walk
     // (`run_subject_eta`) iterates only `subject.obs_times`, so it would silently
     // omit the survival term. Guard both routes up front.
-    if subject_has_survival_records(subject) {
+    //
+    // CTMM is the exception since #759: its transition likelihood *does* have an exact
+    // η-gradient now (`Q` rebuilt over `Dual1` for `∂Q/∂η`, chained through the Van Loan
+    // Fréchet derivative of `expm`), and `analytic_eta_nll_gradient_with_schedule` adds it
+    // to the Gaussian block. `ctmm_records_fully_analytic` is deliberately strict — it
+    // demands that *every* record on the subject be a CTMM state observation the program
+    // can serve, so a subject that also carries a TTE / binary / count record (whose terms
+    // remain FD-only) still declines the whole gradient rather than silently omitting them.
+    if subject_has_survival_records(subject) && !ctmm_records_fully_analytic(model, subject) {
         return false;
+    }
+    // No Gaussian observations ⇒ no Gaussian data term, hence nothing for the PK provider
+    // to serve: an **endpoint-only** fit (a `[markov_model]` with no `[structural_model]`,
+    // which the parser admits) has no PK model at all, and `analytical_supported` below
+    // would reject it on that basis alone. Its inner gradient is the prior plus the
+    // non-Gaussian term, both of which we have exactly, so only the global escape hatches
+    // apply. (`analytic_eta_nll_gradient_with_schedule` mirrors this by skipping the
+    // provider for such a subject.)
+    if subject.obs_times.is_empty() {
+        return !analytic_inner_common_bail(model);
     }
     // ODE models use the light `Dual1` inner provider (#410) with their own
     // per-subject scope ([`ode_inner_grad_supported`]). The global escape hatches
@@ -1740,6 +1833,39 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
     mult: Option<&[Vec<f64>]>,
 ) -> Option<Vec<f64>> {
+    // The inner NLL is `½(η'Ω⁻¹η + log|Ω| + data_gauss + 2·data_nonGaussian)`, so its
+    // η-gradient is a plain **sum** of term gradients. Assemble the non-Gaussian block
+    // first, because it is the one that decides whether this subject can be served at all
+    // (the Gaussian provider's own `None` is handled below, as before).
+    //
+    // CTMM (#759): exact, via `∂Q/∂(θ,η)` over `Dual1` chained through the Van Loan Fréchet
+    // derivative of `expm`. The objective's `2×` on the data term and the outer `½` cancel,
+    // so this enters at 1× — the same scale `ctmm_subject_eta_grad` returns.
+    // TTE / binary / count records have no analytic η-channel and are refused upstream by
+    // `analytic_inner_grad_supported` → `ctmm_records_fully_analytic`, so a subject reaching
+    // here carries no other non-Gaussian term to omit.
+    #[cfg(feature = "markov")]
+    let ctmm_grad: Option<Vec<f64>> = if model.has_ctmm() {
+        Some(crate::markov::endpoint::ctmm_subject_eta_grad(model, subject, theta, eta)?.1)
+    } else {
+        None
+    };
+
+    // No Gaussian observations ⇒ no Gaussian data term and (for an endpoint-only fit) no PK
+    // model for the provider to evaluate. The gradient is prior + non-Gaussian; return it
+    // directly rather than asking a provider that has nothing to compute.
+    if subject.obs_times.is_empty() {
+        let eta_v = nalgebra::DVector::from_column_slice(eta);
+        let mut grad: Vec<f64> = (&omega.inv * &eta_v).as_slice().to_vec();
+        #[cfg(feature = "markov")]
+        if let Some(g) = &ctmm_grad {
+            for (acc, gi) in grad.iter_mut().zip(g.iter()) {
+                *acc += gi;
+            }
+        }
+        return Some(grad);
+    }
+
     // Light first-order provider (value + ∂f/∂η only); the inner gradient never
     // needs the second-order / θ blocks the full `subject_sensitivities` carries.
     let sens = crate::sens::provider::subject_eta_grad_with_schedule(
@@ -1749,11 +1875,24 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         eta,
         cached_schedule,
     )?;
+    // Fold the non-Gaussian block into whichever Gaussian branch runs below.
+    #[cfg(feature = "markov")]
+    let add_nongaussian = |mut g: Vec<f64>| -> Vec<f64> {
+        if let Some(c) = &ctmm_grad {
+            for (acc, gi) in g.iter_mut().zip(c.iter()) {
+                *acc += gi;
+            }
+        }
+        g
+    };
+    #[cfg(not(feature = "markov"))]
+    let add_nongaussian = |g: Vec<f64>| -> Vec<f64> { g };
     // Correlated residual (`block_sigma`, #627): the per-obs `coef·∂f/∂η` loop below
     // assumes a diagonal R. Route the dense-R generalisation here — it serves both the
     // analytical and the ODE (`Dual1`) inner path, since `sens` carries `∂f/∂η` for both.
     if !model.residual_correlations.is_empty() {
-        return dense_residual_inner_gradient(model, subject, theta, eta, omega, sigma, &sens);
+        return dense_residual_inner_gradient(model, subject, theta, eta, omega, sigma, &sens)
+            .map(add_nongaussian);
     }
     let n_eta = model.n_eta;
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
@@ -1806,7 +1945,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     for (k, g) in grad.iter_mut().enumerate() {
         *g += prior[k];
     }
-    Some(grad)
+    Some(add_nongaussian(grad))
 }
 
 /// Dense-`R` (`block_sigma`, #627) analytic inner η-gradient — the correlated-residual
@@ -2848,6 +2987,104 @@ pub fn run_inner_loop_warm(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// An endpoint-only mixed-effects CTMM (#759): no `[structural_model]`, so no Gaussian
+    /// data term and no PK provider — the inner objective is `½(η'Ω⁻¹η + log|Ω|) + D_ctmm(η)`.
+    #[cfg(feature = "markov")]
+    mod ctmm_inner {
+        use crate::types::{ObsRecord, Subject};
+
+        const MIXED_CTMM: &str = r"
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  omega ETA_Q ~ 0.1
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + ETA_Q)
+  transition asleep -> awake  = exp(LQ10)
+";
+
+        fn subject() -> Subject {
+            Subject {
+                id: "1".into(),
+                obs_records: [(0.0, 0), (1.0, 0), (2.3, 1), (3.1, 1), (5.0, 0)]
+                    .iter()
+                    .map(|&(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        state,
+                        cmt: 5,
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        }
+
+        /// The route must actually change. Before #759 every subject with `obs_records`
+        /// declined the analytic inner gradient outright, so this predicate was `false` and
+        /// the EBE search finite-differenced the whole objective.
+        #[test]
+        fn endpoint_only_ctmm_reports_and_takes_the_analytic_inner_route() {
+            let model = crate::parser::model_parser::parse_model_string(MIXED_CTMM).unwrap();
+            // Model-level: what `build_info::gradient_method_inner` reports.
+            assert!(
+                super::super::analytic_inner_grad_supported_model(&model),
+                "an endpoint-only CTMM must report an analytic inner gradient"
+            );
+            // Subject-level: what `find_ebe` actually runs.
+            assert!(
+                super::super::analytic_inner_grad_supported(&model, &subject()),
+                "a CTMM subject must now take the analytic inner route"
+            );
+        }
+
+        /// The whole inner gradient — prior + CTMM data term — against a central difference
+        /// of `individual_nll`, the exact objective the EBE search minimizes. This is the
+        /// contract that matters: the two must agree, or BFGS converges on one function
+        /// while descending another.
+        #[test]
+        fn analytic_inner_gradient_matches_fd_of_individual_nll() {
+            let model = crate::parser::model_parser::parse_model_string(MIXED_CTMM).unwrap();
+            let subject = subject();
+            let params = &model.default_params;
+            let theta = &params.theta;
+
+            for &eta0 in &[-0.4_f64, 0.0, 0.55] {
+                let g = super::super::analytic_eta_nll_gradient_with_schedule(
+                    &model,
+                    &subject,
+                    theta,
+                    &[eta0],
+                    &params.omega,
+                    &params.sigma.values,
+                    None,
+                    None,
+                )
+                .expect("endpoint-only CTMM is in analytic scope");
+
+                let nll = |e: f64| {
+                    crate::stats::likelihood::individual_nll(
+                        &model,
+                        &subject,
+                        theta,
+                        &[e],
+                        &params.omega,
+                        &params.sigma.values,
+                    )
+                };
+                let h = 1e-6;
+                let fd = (nll(eta0 + h) - nll(eta0 - h)) / (2.0 * h);
+                assert!(
+                    (g[0] - fd).abs() < 1e-6,
+                    "η = {eta0}: analytic {}, FD {fd}",
+                    g[0]
+                );
+            }
+        }
+    }
 
     /// The M3 censored coefficient `∂/∂f[−logΦ((y−f)/√v)]` must equal a central
     /// finite difference of that data term — across additive (`dv_df = 0`) and

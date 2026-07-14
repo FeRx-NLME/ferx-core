@@ -22,10 +22,29 @@ are the declared `transition` intensities and the diagonal is fixed row-sum-zero
 A CTMM's state-occupancy probabilities obey `dP/dt = Qᵀ P`. For a **time-homogeneous**
 generator this has the exact closed-form solution `P(Δt) = expm(Q·Δt)`, so ferx forms the
 transition matrix directly with a matrix exponential (nalgebra's Higham scaling-and-
-squaring Padé) rather than integrating the ODE. The parameter gradients are the exact
-Van Loan (1978) Fréchet derivatives of the exponential — cleaner and exactly
-differentiable, with no ODE solver in the loop. (A genuinely drug-driven, time-varying
-`Q(t)` would need the occupancy ODE and is a planned extension.)
+squaring Padé) rather than integrating the ODE — no ODE solver in the loop, and exactly
+differentiable. A genuinely drug-driven, time-varying `Q(t)` *does* need the occupancy
+ODE, and takes that path instead (see [current scope](#current-scope)).
+
+### The η-gradient is exact
+
+The EBE search differentiates the transition likelihood **analytically** (#759). The
+intensities are replayed over dual numbers with θ and η seeded, giving an exact `∂Q/∂η`;
+that is chained to `∂P/∂Q` through the Van Loan (1978) Fréchet derivative of the matrix
+exponential, `L(A,E) = d/dt expm(A + tE)|₀`. The row-sum-zero constraint
+(`q_jj = −Σ_{k≠j} q_jk`) is inherited for free — differentiation is linear, so the
+derivative of a valid generator is a valid direction.
+
+Only one *entry* of `P` is ever read per observation gap, so ferx uses the adjoint form
+`⟨C, L(A,E)⟩ = ⟨L(Aᵀ,C), E⟩`: a single Fréchet solve per gap serves every parameter at
+once, instead of one solve per (parameter, gap). That makes the exact gradient *cheaper*
+than the finite differences it replaces, not merely more accurate.
+
+Two things are still finite-differenced: the FOCEI Laplace `½log|H̃|` term needs the
+**second** derivative of the data term w.r.t. η (Van Loan gives first derivatives), and
+the **outer** (θ) gradient is still FD for any model with a non-Gaussian endpoint. A
+drug-driven `Q(t)` keeps FD throughout — its likelihood is an occupancy ODE, not an
+`expm`, so the Fréchet identity does not apply.
 
 ferx does **not** use the NONMEM `EVID=3` / occupancy-flag CTMM dataset mechanism: it
 reads ordinary `(ID, TIME, STATE)` rows and conditions on each subject's first observed
@@ -35,7 +54,7 @@ state (see the [data format](../model-file/markov-model.qmd#data-format)).
 
 | Method | CTMM | Notes |
 |--------|:----:|-------|
-| **FOCEI** (Laplace) | ✓ | Default. A finite-difference Hessian of the data term w.r.t. η plus the `½ log\|H̃\|` correction (the transition likelihood has no closed-form analytic η-Hessian, so the inner gradient and outer Laplace are FD, as for TTE / binary). |
+| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (exact `∂Q/∂η` × Van Loan, above); the `½ log\|H̃\|` correction still uses a finite-difference Hessian of the data term w.r.t. η, and the outer θ-gradient is FD, as for TTE / binary. |
 | **SAEM** | ✓ | Preferred for sparse state data — no Laplace approximation. |
 | **IMP** (importance sampling) | ✓ | Unbiased marginal likelihood. |
 | **FOCE** (no interaction) | — | Drops the log-det correction and is biased for a non-Gaussian data term; use `focei`. |
@@ -81,6 +100,12 @@ closed-form `P(Δt)_{00} = (b + a·e^{-(a+b)Δt})/(a+b)` for `Q = [[-a,a],[b,-b]
 
 ## Current scope
 
-The first CTMM slice ships the **fit path** for a time-homogeneous generator (parse →
-datareader routing → FOCEI/SAEM/IMP). Minimal-CTMM (`mctmm`), discrete-time Markov
-(`dtmm`), drug-driven `Q(t)`, and CTMM simulation/prediction are planned follow-ups.
+The **fit path** ships for both a time-homogeneous generator and a **drug-driven** one
+(an intensity may reference an ODE state, e.g.
+`transition s0 -> s1 = exp(LQ01 + SLOPE * (central / V))` — see
+`examples/ctmm_pd_2state.ferx`). The drug-driven case integrates the occupancy ODE
+`dP/dτ = P·Q(τ)` over each gap rather than forming `expm(Q·Δt)`, so it does not get the
+analytic η-gradient above.
+
+Minimal-CTMM (`mctmm`), discrete-time Markov (`dtmm`), and CTMM simulation/prediction are
+planned follow-ups.

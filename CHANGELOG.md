@@ -20,6 +20,19 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Exact (analytic) inner EBE gradient for CTMM (`[markov_model]`) fits** (#759). The
+  transition likelihood `−Σ log P(Δt)[s,s']`, `P = expm(Q·Δt)`, was finite-differenced
+  end-to-end: every EBE step perturbed η, rebuilt `Q`, and redid a matrix exponential per
+  observation gap. The intensities are now replayed over dual numbers with θ and η seeded,
+  giving an exact `∂Q/∂η`, which is chained to `∂P/∂Q` through the Van Loan (1978) Fréchet
+  derivative of the matrix exponential. The generator's row-sum-zero constraint is inherited
+  for free (differentiation is linear, so the derivative of a valid generator is a valid
+  direction). Because only one *entry* of `P` is read per gap, the adjoint form
+  `⟨C, L(A,E)⟩ = ⟨L(Aᵀ,C), E⟩` lets a **single** Fréchet solve per gap serve every parameter
+  at once — so the exact gradient is *cheaper* than the finite differences it replaces, not
+  just more accurate. A drug-driven (time-inhomogeneous) `Q(t)` keeps the FD path: its
+  likelihood is an occupancy ODE, not an `expm`, so the identity does not apply. The FOCEI
+  Laplace `½log|H̃|` term and the outer θ-gradient are still FD.
 - **AGQ and `laplace` now support inter-occasion variability (`[iov]`)** (#251).
   Under IOV the integral runs over the **stacked** random-effect vector
   `b = [η, κ₁ … κ_K]`, whose prior is the block-diagonal `Ω ⊕ Ω_iov^⊕K` — which is

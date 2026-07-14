@@ -5024,6 +5024,30 @@ fn parse_markov_model_block(
     // injected into the variable map so `eval_expression` resolves it. On the homogeneous
     // path `generator_states` is empty and `state` is ignored.
     let n_states = states.len();
+
+    // Snapshot a resolved, **dual-evaluable** form of the intensities before they move into
+    // the f64 closure below — the CTMM analogue of `IndivParamProgram` (#759). This is what
+    // lets `markov::endpoint` produce an exact `∂Q/∂(θ,η)` (and, chained through the Van Loan
+    // Fréchet derivative of `expm`, an exact likelihood gradient) instead of finite-
+    // differencing the whole matrix-exponential likelihood.
+    //
+    // Built only for the **time-homogeneous** endpoint: an intensity that reads an ODE state
+    // makes `Q` a functional of the PK trajectory, whose derivative needs the state's own
+    // sensitivities (and whose likelihood is an occupancy ODE, not an `expm` — so Van Loan
+    // does not apply). Those keep the FD path, so the program is `None` there.
+    let generator_program = if generator_states.is_empty() {
+        build_ctmm_generator_program(
+            &transitions,
+            &needed_indiv_stmts,
+            &generator_covariates,
+            n_states,
+            theta_names.len(),
+            eta_names.len(),
+        )
+    } else {
+        None
+    };
+
     let indiv = needed_indiv_stmts;
     let gen_states = generator_states.clone();
     let generator_fn: crate::types::GeneratorFn = Box::new(
@@ -5060,6 +5084,7 @@ fn parse_markov_model_block(
             n_states,
             state_codes,
             generator_fn,
+            generator_program,
             generator_covariates: generator_covariates.clone(),
             generator_states,
         },
@@ -13919,6 +13944,245 @@ fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
         }
     }
     dyn_vars.iter().map(|&d| !d).collect()
+}
+
+/// Widest `(θ, η)` axis count the CTMM generator's dual dispatch specializes.
+/// Above this, [`CtmmGeneratorProgram::eval_generator_duals`] returns `None` and the
+/// endpoint keeps its finite-difference gradient — a fallback, never a wrong answer.
+#[cfg(feature = "markov")]
+pub(crate) const MAX_CTMM_AXES: usize = 24;
+
+/// Compiled, **dual-evaluable** `[markov_model]` transition intensities — the CTMM
+/// analogue of [`IndivParamProgram`] (#759).
+///
+/// The f64 [`GeneratorFn`](crate::types::GeneratorFn) tree-walks `Expression`s and can
+/// only ever produce `Q` itself, which is why the CTMM likelihood has been finite-
+/// differenced end-to-end (perturb η, rebuild `Q`, redo an `expm` per observation gap).
+/// This snapshot carries the same intensities in *resolved* form — the shared
+/// `Bytecode` the rest of the analytic-sensitivity path uses — so they can be replayed
+/// over `Dual1<M>` with θ and η seeded, yielding an exact `∂Q/∂(θ,η)`.
+///
+/// Chained through the Van Loan Fréchet derivative of `expm`
+/// ([`markov::matrix_exp_frechet`](crate::markov::matrix_exp_frechet)) this gives the exact
+/// likelihood gradient. Note `∂Q/∂p` inherits the generator's **row-sum-zero constraint**
+/// for free: every intensity is added at its off-diagonal entry and subtracted from the
+/// diagonal, and differentiation is linear, so the derivative of a valid generator is a
+/// valid *direction*. That is the constraint `generator_rate_direction` hand-builds for the
+/// one-rate-at-a-time case, and the reason a naive "one gradient per `Q` entry" API is wrong
+/// (see the `markov` module docs).
+///
+/// Time-**inhomogeneous** endpoints (an intensity reading an ODE state) get no program:
+/// their likelihood is an occupancy ODE, not an `expm`, so Van Loan does not apply.
+#[cfg(feature = "markov")]
+#[derive(Debug, Clone)]
+pub struct CtmmGeneratorProgram {
+    /// Resolved `[individual_parameters]` statements the intensities read, in
+    /// dependency order (already restricted to the transitively-referenced subset).
+    stmts: Vec<Statement>,
+    /// Var-slot count the statements above write into.
+    n_vars: usize,
+    /// `(from, to, intensity)` — one compiled off-diagonal rate per `transition` line.
+    rates: Vec<(usize, usize, Bytecode)>,
+    n_states: usize,
+    /// Covariate names in the generator's own (sorted) order, for the cov slice.
+    cov_names: Vec<String>,
+    n_theta: usize,
+    /// BSV η count. IOV kappas are rejected in an intensity at parse, so this is the
+    /// full η width the intensities can read.
+    n_eta: usize,
+}
+
+#[cfg(feature = "markov")]
+impl CtmmGeneratorProgram {
+    /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
+    pub(crate) fn n_axes(&self) -> usize {
+        self.n_theta + self.n_eta
+    }
+    pub(crate) fn n_theta_axis(&self) -> usize {
+        self.n_theta
+    }
+
+    /// `Q` and `∂Q/∂(θ, η)` at a covariate snapshot, evaluated over `Dual1<M>` with
+    /// θ_m on axis `m` and η_k on axis `n_theta + k` (the same axis convention
+    /// [`IndivParamProgram::eval_param_duals`] uses).
+    ///
+    /// Returns `(q, dq)` where `q` is the `S×S` generator and `dq[a]` is `∂Q/∂(axis a)`,
+    /// length `n_axes()`. Both are built by placing each intensity — value and jet — at
+    /// its off-diagonal entry and subtracting it from the diagonal, so each `dq[a]` has
+    /// zero row sums by construction.
+    ///
+    /// `None` above the dispatch cap ([`MAX_CTMM_AXES`]): the endpoint then keeps its FD
+    /// gradient rather than a wrong one.
+    pub(crate) fn eval_generator_duals(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<(nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>)> {
+        macro_rules! disp {
+            ($($m:literal),+) => {
+                match self.n_axes() {
+                    $($m => Some(self.eval_generator_duals_n::<$m>(theta, eta, covariates)),)+
+                    _ => None,
+                }
+            };
+        }
+        disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+    }
+
+    fn eval_generator_duals_n<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> (nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>) {
+        use crate::sens::dual1::Dual1;
+        debug_assert_eq!(M, self.n_axes());
+        let theta_d: Vec<Dual1<M>> = theta
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                if m < M {
+                    Dual1::var(v, m)
+                } else {
+                    // A θ the intensities cannot reference anyway (the program is sized by
+                    // the model's declared θ count, so this is unreachable in practice).
+                    Dual1::constant(v)
+                }
+            })
+            .collect();
+        let eta_d: Vec<Dual1<M>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                let dim = self.n_theta + k;
+                if dim < M {
+                    Dual1::var(v, dim)
+                } else {
+                    // IOV kappas are appended past the BSV η block and are rejected in an
+                    // intensity at parse, so they are correctly seeded as constants here.
+                    Dual1::constant(v)
+                }
+            })
+            .collect();
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+
+        let mut vars = vec![Dual1::<M>::constant(0.0); self.n_vars];
+        let mut stack: Vec<Dual1<M>> = Vec::new();
+        eval_statements_g::<Dual1<M>>(
+            &self.stmts,
+            &theta_d,
+            &eta_d,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            &[],
+        );
+
+        let s = self.n_states;
+        let n_axes = self.n_axes();
+        let mut q = nalgebra::DMatrix::<f64>::zeros(s, s);
+        let mut dq = vec![nalgebra::DMatrix::<f64>::zeros(s, s); n_axes];
+        let empty_nn: Vec<Vec<f64>> = Vec::new();
+        for (j, k, bc) in &self.rates {
+            let rate = eval_bytecode_g::<Dual1<M>>(
+                bc, &theta_d, &eta_d, &cov_vec, &vars, &empty_nn, &mut stack,
+            );
+            q[(*j, *k)] += rate.value;
+            q[(*j, *j)] -= rate.value;
+            for (a, dq_a) in dq.iter_mut().enumerate().take(n_axes) {
+                let g = rate.grad[a];
+                dq_a[(*j, *k)] += g;
+                dq_a[(*j, *j)] -= g;
+            }
+        }
+        (q, dq)
+    }
+}
+
+/// Resolve + compile a `[markov_model]`'s intensities into a [`CtmmGeneratorProgram`].
+/// `None` when the program cannot be represented exactly, in which case the endpoint keeps
+/// its FD gradient: an intensity or an `[individual_parameters]` value that reads an
+/// identifier we cannot bind (which would silently lower to a constant `0.0` push and thus
+/// a silently-wrong derivative), or a `(θ, η)` width past the dual dispatch cap.
+#[cfg(feature = "markov")]
+fn build_ctmm_generator_program(
+    transitions: &[(usize, usize, Expression)],
+    needed_indiv_stmts: &[Statement],
+    generator_covariates: &[String],
+    n_states: usize,
+    n_theta: usize,
+    n_eta: usize,
+) -> Option<CtmmGeneratorProgram> {
+    if n_theta + n_eta == 0 || n_theta + n_eta > MAX_CTMM_AXES {
+        return None;
+    }
+
+    // Var slots for the `[individual_parameters]` values the intensities read, in the
+    // order they are assigned (so a later value may read an earlier one).
+    let var_names = assigned_vars_in_order(needed_indiv_stmts);
+    let var_idx: HashMap<String, usize> = var_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    let n_vars = var_names.len();
+    let cov_idx: HashMap<String, usize> = generator_covariates
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+
+    // An unresolved `Variable`/`Covariate` leaf lowers to a constant `0.0` in
+    // `compile_bytecode` (its documented fall-through). That is survivable for a *value*
+    // path that never sees one, but here it would hand back a confidently wrong gradient,
+    // so refuse the program instead and let FD serve the endpoint.
+    let resolvable = |e: &Expression| -> bool {
+        let mut ok = true;
+        visit_expr_nodes(e, &mut |node: &Expression| match node {
+            Expression::Variable(name) => ok &= var_idx.contains_key(name),
+            Expression::Covariate(name) => ok &= cov_idx.contains_key(name),
+            _ => {}
+        });
+        ok
+    };
+    if !transitions.iter().all(|(_, _, e)| resolvable(e)) {
+        return None;
+    }
+    let mut indiv_ok = true;
+    visit_stmt_nodes(needed_indiv_stmts, &mut |e: &Expression| {
+        indiv_ok &= resolvable(e);
+    });
+    if !indiv_ok {
+        return None;
+    }
+
+    let mut stmts: Vec<Statement> = needed_indiv_stmts.to_vec();
+    resolve_variable_indices(&mut stmts, &var_idx, &cov_idx, None);
+
+    let rates: Vec<(usize, usize, Bytecode)> = transitions
+        .iter()
+        .map(|(j, k, expr)| {
+            let mut e = expr.clone();
+            resolve_expr_indices(&mut e, &var_idx, &cov_idx);
+            (*j, *k, compile_bytecode(&e))
+        })
+        .collect();
+
+    Some(CtmmGeneratorProgram {
+        stmts,
+        n_vars,
+        rates,
+        n_states,
+        cov_names: generator_covariates.to_vec(),
+        n_theta,
+        n_eta,
+    })
 }
 
 /// Compiled `[individual_parameters]` block + var layout, exposed so the
