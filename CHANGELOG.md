@@ -397,6 +397,15 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **Multi-start (`n_starts`) no longer returns a diverged run as the "best" fit**
+  (#830): the start selection preferred any `converged` run over an unconverged
+  one *before* comparing OFVs, so a start that diverged — driving the residual
+  covariance indefinite and reporting a ~1e20 sentinel OFV while still flagged
+  `converged` — outranked a valid but unconverged start (including the exact-inits
+  start 0). Multi-start could therefore return a worthless fit with an enormous
+  OFV. Validity (finite, non-sentinel OFV) is now the primary ranking key, so a
+  valid run always wins; converged-vs-OFV ordering is unchanged within a validity
+  class.
 - **`block_sigma` correlated residuals no longer collapse the objective when a
   subject has two samples at the same time** (#827): with a `block_sigma` +
   covariate-selected / per-CMT error model (the free-vs-total assay pattern),
