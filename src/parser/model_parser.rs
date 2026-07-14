@@ -5658,6 +5658,9 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         Ok(EstimationMethod::Imp)
     } else if val.contains("hybrid") || val == "gn_hybrid" || val == "gn-hybrid" {
         Ok(EstimationMethod::FoceGnHybrid)
+    } else if val == "laplace" || val == "laplacian" {
+        // NONMEM `$EST METHOD=1 LAPLACIAN`. Routes to the AGQ objective with one node.
+        Ok(EstimationMethod::Laplace)
     } else if val == "agq"
         || val == "aghq"
         || val == "gauss_hermite"

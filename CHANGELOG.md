@@ -20,6 +20,29 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **AGQ and `laplace` now support inter-occasion variability (`[iov]`)** (#251).
+  Under IOV the integral runs over the **stacked** random-effect vector
+  `b = [η, κ₁ … κ_K]`, whose prior is the block-diagonal `Ω ⊕ Ω_iov^⊕K` — which is
+  exactly what ferx's IOV likelihood already scores, so every AGQ formula carries
+  over with `d` the stacked dimension. IOV is a change of *dimension*, not of
+  method. The tensor grid is therefore `n_agq^(n_eta + K·n_kappa)` and grows with
+  the occasion count `K`, so the 100 000-node cap is now enforced against the
+  stacked dimension once the data is read (the error names `K`). **`method =
+  laplace` is always tractable under IOV** — its grid is a single point regardless
+  of `d`. Previously both methods rejected `[iov]` models outright.
+- **`method = laplace` — the Laplace approximation as a first-class estimator** (#251).
+  Alias `laplacian`. This is NONMEM's `$EST METHOD=1 LAPLACIAN`: the Laplace
+  approximation built from the **exact** Hessian of the conditional likelihood.
+  It is *not* the same estimator as `focei`, which builds its Gaussian from the
+  Gauss-Newton Hessian `CᵀC + Ω⁻¹` (dropping `∂²f/∂η²`) and therefore reports a
+  different OFV; `laplace` carries the curvature of the η-dependent residual
+  variance that the Gauss-Newton form discards, which is why it reproduces NONMEM's
+  LAPLACIAN to six significant figures on warfarin. Internally it *is* `agq` with the
+  node count pinned to 1 — same objective, same analytic gradient, same covariance
+  step, bit-identical OFV — so it is the cheapest member of the AGQ family (one node,
+  no grid) and on warfarin converges *faster than FOCEI* (0.23 s vs 0.60 s). `n_agq`
+  is not one of its options; use `method = agq` to vary the node count. See the
+  [AGQ docs page](https://ferx-nlme.github.io/ferx-core/estimation/agq.html).
 - **Exact (analytic) FOCE/FOCEI gradients for lagtime models with IOV, time-varying
   covariates, or `TIME`** (#486): a closed-form model carrying an `ALAG`/`LAGTIME` used to
   fall back to finite differences the moment the subject also had IOV, a time-varying
@@ -426,6 +449,17 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **AGQ / `laplace` fits no longer report "did not converge" while sitting on a settled
+  OFV** (#251). The gradient-based outer optimizer set NLopt's stopping tolerances to
+  `1e-12`, which FOCE/FOCEI can reach (their analytic gradient is exact to ~1e-11) but
+  AGQ cannot: AGQ's gradient is exact yet *finite-difference-limited* (the grid-response
+  term and the posterior Hessian are central differences), so it carries a noise floor.
+  L-BFGS ground on past the point where the objective had settled, until its line search
+  failed on a noise-dominated direction and NLopt returned a bare failure — reporting
+  "not converged" for a result that had been flat to eight significant figures. AGQ now
+  stops on the reachable objective-change criterion (`outer_ftol` / `outer_xtol`), which
+  both fixes the flag and makes the fits **faster** (AGQ+IOV on warfarin: 14.5 s → 8.2 s;
+  Laplace+IOV: 2.2 s → 1.3 s), with identical estimates. FOCE/FOCEI are unchanged.
 - **Wrong analytic gradient for an observation sampled exactly on a moving dose boundary**
   (#486) — a modeled infusion end, or a lagged dose arrival. With a modeled `RATE=-1`/`-2` dose the infusion window end moves with the
   estimated `D{cmt}`/`R{cmt}`. An observation whose time coincided with that end had its

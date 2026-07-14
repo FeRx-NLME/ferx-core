@@ -334,9 +334,9 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
     let ofv = |x: &[f64], n: usize| -> f64 {
         let params = unpack_params(x, template);
         let (ehs, _hms, _stats, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
-            &model, &pop, &params, 300, 1e-10, None, None, 0,
+            &model, &pop, &params, 500, 1e-12, None, None, 0,
         );
-        2.0 * agq::agq_population_nll(&model, &pop, &params, &ehs, n)
+        2.0 * agq::agq_population_nll(&model, &pop, &params, &ehs, &[], n)
     };
 
     let mut rel_errs = Vec::new();
@@ -344,15 +344,18 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
         // Analytic gradient at x0.
         let params = unpack_params(&x0, template);
         let (ehs, _h, _s, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
-            &model, &pop, &params, 300, 1e-10, None, None, 0,
+            &model, &pop, &params, 500, 1e-12, None, None, 0,
         );
-        let g = agq::agq_population_gradient(&model, &pop, &params, template, &x0, &ehs, n)
+        let g = agq::agq_population_gradient(&model, &pop, &params, template, &x0, &ehs, &[], n)
             .expect("analytic gradient must be available in scope");
 
-        // Central FD of the true objective.
+        // Central FD of the true objective. Step 1e-4, not 1e-5: this references a
+        // **reconverged** objective, so a step below the inner solver's noise floor amplifies
+        // that noise rather than cutting truncation, and the reference — not the gradient —
+        // becomes the inaccurate side. See the IOV twin of this test.
         let mut fd = vec![0.0f64; np];
         for i in 0..np {
-            let h = 1e-5 * (1.0 + x0[i].abs());
+            let h = 1e-4 * (1.0 + x0[i].abs());
             let (mut xp, mut xm) = (x0.clone(), x0.clone());
             xp[i] += h;
             xm[i] -= h;
@@ -374,15 +377,17 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
     // gate: `grid_response_correction` supplies the `∂Φ/∂H·dH/dx` term that the fixed-node
     // score omits, and at n = 1 that term is the entire difference (a 26% error without it).
     //
-    // Measured: 1.6e-3 at n = 1, 7.8e-5 at n = 3, ~1e-5 beyond. The 5e-3 bound leaves headroom
-    // for the FD reference's own noise (it central-differences a *reconverged* objective, so
-    // the inner solver's tolerance leaks in) while still failing loudly on a real regression —
-    // a wrong gradient misses by tens of percent here, not tenths of a percent. It also pins
-    // `AGQ_GRID_FD_STEP`: at 1e-2 this test fails outright (the grid-response term is
-    // truncation-dominated, and a "safe" large step puts the θ gradient 5× off).
+    // Measured: 2.0e-5 at n = 1, 1.5e-6 at n = 3, 2.1e-7 at n = 7 — the gradient is exact to
+    // the reference's own precision. (An earlier revision of this test used a 1e-5 FD step and
+    // read 1.6e-3; that was the *reference's* noise, not the gradient's error — see the step
+    // comment above. Do not "restore" the smaller step.)
+    //
+    // The 1e-4 bound also pins `AGQ_GRID_FD_STEP`: at 1e-2 this test fails outright, because
+    // the grid-response term is truncation-dominated and a "safe" large step puts the θ
+    // gradient 5x off.
     for (k, &n) in [1usize, 3, 5, 7].iter().enumerate() {
         assert!(
-            rel_errs[k] < 5e-3,
+            rel_errs[k] < 1e-4,
             "n_agq={n}: analytic gradient must match FD of the objective, got {:.3e} \
              relative error (all: {rel_errs:?})",
             rel_errs[k]
@@ -440,11 +445,20 @@ fn fd_score_path_agrees_with_the_analytic_one() {
     );
 
     for n in [1usize, 3] {
-        let g_an =
-            agq::agq_population_gradient(&analytic_model, &pop, &params, template, &x, &ehs, n)
-                .expect("analytic-score gradient");
-        let g_fd = agq::agq_population_gradient(&fd_model, &pop, &params, template, &x, &ehs, n)
-            .expect("FD-score gradient");
+        let g_an = agq::agq_population_gradient(
+            &analytic_model,
+            &pop,
+            &params,
+            template,
+            &x,
+            &ehs,
+            &[],
+            n,
+        )
+        .expect("analytic-score gradient");
+        let g_fd =
+            agq::agq_population_gradient(&fd_model, &pop, &params, template, &x, &ehs, &[], n)
+                .expect("FD-score gradient");
 
         let scale = g_an
             .iter()
@@ -461,34 +475,6 @@ fn fd_score_path_agrees_with_the_analytic_one() {
             max_diff / scale
         );
     }
-}
-
-/// The quadrature integrates over the BSV η only. Under IOV the marginal is a joint
-/// integral over η *and* every occasion's κ; silently integrating the η-only marginal
-/// would report a confidently wrong OFV, so the fit must be rejected instead.
-#[test]
-fn agq_rejects_iov() {
-    let src = WARFARIN_SRC
-        .replace("  method = focei", "  method = agq")
-        .replace(
-            "  sigma PROP_ERR ~ 0.1 (sd)",
-            "  sigma PROP_ERR ~ 0.1 (sd)\n  kappa KAPPA_CL ~ 0.05",
-        )
-        .replace(
-            "  CL = TVCL * exp(ETA_CL)",
-            "  CL = TVCL * exp(ETA_CL + KAPPA_CL)",
-        );
-    // If the IOV DSL spelling drifts, fail loudly rather than let a parse error make this
-    // test vacuously "pass" without ever reaching the guard.
-    let err = fit_from_src(&src).expect_err("AGQ + IOV must be rejected");
-    assert!(
-        !err.contains("parse") && !err.contains("unknown"),
-        "IOV warfarin model must parse (test needs updating): {err}"
-    );
-    assert!(
-        err.contains("iov") || err.contains("IOV") || err.contains("occasion"),
-        "the AGQ+IOV rejection must say why: {err}"
-    );
 }
 
 /// The tensor grid is `n_agq^n_eta`. With 3 random effects, `n_agq = 21` is 9261 nodes
@@ -813,6 +799,333 @@ mod non_gaussian {
             res.ofv.is_finite(),
             "fixed-effects AGQ OFV must be finite: {}",
             res.ofv
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `method = laplace` — AGQ at one node, exposed as a first-class method (#251)
+// ---------------------------------------------------------------------------
+
+/// **The identity, at the API boundary.** `method = laplace` is not a re-implementation of
+/// Laplace; it is `method = agq` with the node count pinned to 1, routed through the same
+/// objective, the same analytic gradient and the same covariance stencil.
+///
+/// So the OFV must be **bit-identical** — not "close". Anything less means the two are
+/// taking different code paths, which is precisely what this variant exists not to do.
+#[test]
+fn laplace_is_bit_identical_to_agq_with_one_node() {
+    let pop = warfarin();
+    let laplace = eval_only_ofv(&pop, EstimationMethod::Laplace, 1);
+    let agq1 = eval_only_ofv(&pop, EstimationMethod::Agq, 1);
+    assert_eq!(
+        laplace.to_bits(),
+        agq1.to_bits(),
+        "method = laplace must BE agq(n_agq = 1), not merely agree with it: \
+         laplace={laplace}, agq1={agq1}"
+    );
+
+    // And it is genuinely a different estimator from FOCEI — Laplace with the exact Hessian
+    // vs FOCEI's Gauss-Newton one. If these ever coincide, the exact Hessian has been lost.
+    let focei = eval_only_ofv(&pop, EstimationMethod::FoceI, 1);
+    assert!(
+        (laplace - focei).abs() > 1e-6,
+        "LAPLACE (exact Hessian) must not collapse onto FOCEI (Gauss-Newton Hessian): \
+         both {laplace}"
+    );
+}
+
+/// `n_agq` is pinned for Laplace and cannot be varied — the node count is what *defines* the
+/// method. Setting it must not change the answer (and it is not one of the method's keys, so
+/// the engine also warns it is unsupported).
+#[test]
+fn laplace_ignores_n_agq() {
+    let pop = warfarin();
+    let a = eval_only_ofv(&pop, EstimationMethod::Laplace, 1);
+    let b = eval_only_ofv(&pop, EstimationMethod::Laplace, 7);
+    assert_eq!(
+        a.to_bits(),
+        b.to_bits(),
+        "method = laplace must pin the node count to 1 regardless of n_agq: {a} vs {b}"
+    );
+    assert!(
+        !ferx_core::types::method_specific_keys(EstimationMethod::Laplace).contains(&"n_agq"),
+        "`n_agq` must not be an option of method = laplace — it is fixed at 1"
+    );
+}
+
+#[test]
+fn laplace_method_parses() {
+    for token in ["laplace", "LAPLACE", "laplacian"] {
+        let opts = options_of(&with_fit_options(&format!("  method = {token}")));
+        assert_eq!(
+            opts.method,
+            EstimationMethod::Laplace,
+            "`{token}` must select LAPLACE"
+        );
+    }
+    assert_eq!(EstimationMethod::Laplace.label(), "LAPLACE");
+}
+
+// ---------------------------------------------------------------------------
+// IOV — AGQ and Laplace integrate the joint (η, κ) marginal (#251)
+// ---------------------------------------------------------------------------
+
+/// Warfarin with a per-occasion κ on CL. 3 η + 1 κ; the dataset has 2 occasions, so the
+/// stacked integration variable is `b = [η_CL, η_V, η_KA, κ¹, κ²]` — dimension 5.
+const WARFARIN_IOV_SRC: &str = r"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = agq
+  iov_column = OCC
+  covariance = false
+";
+
+fn warfarin_iov() -> Population {
+    read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
+        .expect("warfarin_iov data must load")
+}
+
+/// Eval-only OFV on the IOV model under `method`.
+fn iov_ofv(method: EstimationMethod, n_agq: usize) -> f64 {
+    let parsed = parse_full_model(WARFARIN_IOV_SRC).expect("IOV model must parse");
+    let opts = FitOptions {
+        method,
+        methods: vec![],
+        interaction: method == EstimationMethod::FoceI,
+        n_agq,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..parsed.fit_options
+    };
+    let r = fit(
+        &parsed.model,
+        &warfarin_iov(),
+        &parsed.model.default_params,
+        &opts,
+    )
+    .expect("IOV eval-only fit must succeed");
+    assert!(r.ofv.is_finite(), "IOV OFV must be finite, got {}", r.ofv);
+    r.ofv
+}
+
+/// **AGQ integrates the *joint* (η, κ) marginal under IOV — it does not silently drop κ.**
+///
+/// The integration variable becomes the stacked `b = [η, κ₁ … κ_K]`, whose prior is the
+/// block-diagonal `Ω ⊕ Ω_iov^⊕K`. That is exactly what `individual_nll_iov` already scores,
+/// so every AGQ formula carries over with `d` the stacked dimension.
+///
+/// The check that this is really happening: the κ prior contributes `K·log|Ω_iov|` and the
+/// κ's own quadratic form to the integrand, so an η-only marginal would give a *different*
+/// number. Ω_iov here is 0.01 (a tight prior), so `log|Ω_iov|` is large and negative — an
+/// implementation that ignored κ could not land anywhere near the IOV-aware objective.
+#[test]
+fn agq_and_laplace_integrate_the_joint_iov_marginal() {
+    let laplace = iov_ofv(EstimationMethod::Laplace, 1);
+    let agq1 = iov_ofv(EstimationMethod::Agq, 1);
+    let agq3 = iov_ofv(EstimationMethod::Agq, 3);
+    let focei = iov_ofv(EstimationMethod::FoceI, 1);
+
+    // The identity survives the stacking: laplace IS agq at one node, over the joint vector.
+    assert_eq!(
+        laplace.to_bits(),
+        agq1.to_bits(),
+        "under IOV too, method = laplace must BE agq(n_agq = 1): {laplace} vs {agq1}"
+    );
+
+    // Laplace-family: within a Hessian approximation of FOCEI-IOV, which uses the same joint
+    // mode but the Gauss-Newton curvature. Nowhere near it would mean κ was mishandled.
+    assert!(
+        (agq1 - focei).abs() < 5.0,
+        "AGQ-IOV must be in the same Laplace family as FOCEI-IOV: agq1={agq1}, focei={focei}"
+    );
+
+    // Refining the grid over the *stacked* vector must move the answer (the joint posterior
+    // is not exactly Gaussian) but stay in the same basin.
+    assert!(
+        agq3.is_finite() && (agq3 - agq1).abs() < 5.0,
+        "AGQ-IOV n=3 must refine, not diverge: agq1={agq1}, agq3={agq3}"
+    );
+}
+
+/// The grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` lives in the *data* — so the
+/// cap has to be enforced where the population is visible, not at model-check time. A node
+/// count that is fine without IOV can be intractable with it.
+///
+/// `method = laplace` is exempt by construction: one node, whatever `d` is.
+#[test]
+fn agq_iov_grid_cap_counts_the_stacked_dimension() {
+    // 3 η + 1 κ × 2 occasions = d 5. At n_agq = 21 that is 21^5 ≈ 4.1M nodes — over the cap.
+    let parsed = parse_full_model(WARFARIN_IOV_SRC).expect("parses");
+    let opts = FitOptions {
+        method: EstimationMethod::Agq,
+        n_agq: 21,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..parsed.fit_options.clone()
+    };
+    let err = fit(
+        &parsed.model,
+        &warfarin_iov(),
+        &parsed.model.default_params,
+        &opts,
+    )
+    .expect_err("an intractable IOV grid must be rejected");
+    assert!(
+        err.contains("stacked") || err.contains("occasions"),
+        "the rejection must explain that IOV raised the dimension: {err}"
+    );
+
+    // …and Laplace sails through the same model: one node regardless of the dimension.
+    assert!(
+        iov_ofv(EstimationMethod::Laplace, 1).is_finite(),
+        "method = laplace must always be tractable under IOV — its grid is a single point"
+    );
+}
+
+/// **The analytic gradient must be exact under IOV too.**
+///
+/// Under IOV the θ/σ score comes from the *stacked* sensitivity provider
+/// (`subject_sensitivities_iov`, which walks (θ, η, κ) duals), the Ω block from the η-prior,
+/// and — the only genuinely new piece — the **Ω_iov block** from the κ prior
+/// `½(Σ_k κ_kᵀΩ_iov⁻¹κ_k + K·log|Ω_iov|)`, whose derivative is
+/// `½(−Σ_k z_k z_kᵀ + K·Ω_iov⁻¹)` summed over the K occasions that *share* one Ω_iov.
+///
+/// That shared-block sum is easy to get wrong (forget the `K·Ω_iov⁻¹`, or sum over the wrong
+/// axis, and the ω_iov gradient is silently off). Differencing the real objective catches it.
+#[test]
+fn analytic_gradient_matches_fd_under_iov() {
+    use ferx_core::estimation::agq;
+    use ferx_core::estimation::parameterization::{pack_params, unpack_params};
+
+    let parsed = parse_full_model(WARFARIN_IOV_SRC).expect("IOV model must parse");
+    let model = &parsed.model;
+    let pop = warfarin_iov();
+    assert!(model.n_kappa > 0, "test model must carry kappa");
+
+    let template = &model.default_params;
+    let x0 = pack_params(template);
+    let np = x0.len();
+
+    // Objective at a packed point: re-solve the joint (η, κ) EBEs, then the AGQ OFV.
+    //
+    // The inner solve must be *tightly* converged (1e-12, not the 1e-10 default). This is the
+    // FD reference, and its noise floor is set by how precisely the joint (η, κ) mode is found
+    // — a loosely-solved mode makes the reference, not the gradient, the inaccurate side.
+    let ofv = |x: &[f64], n: usize| -> f64 {
+        let params = unpack_params(x, template);
+        let (ehs, _h, _s, kaps) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
+            model, &pop, &params, 500, 1e-12, None, None, 0,
+        );
+        2.0 * agq::agq_population_nll(model, &pop, &params, &ehs, &kaps, n)
+    };
+
+    for n in [1usize, 3] {
+        let params = unpack_params(&x0, template);
+        let (ehs, _h, _s, kaps) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
+            model, &pop, &params, 500, 1e-12, None, None, 0,
+        );
+        assert!(
+            kaps.iter().any(|k| !k.is_empty()),
+            "the inner loop must return per-occasion kappas, else this proves nothing"
+        );
+
+        let g = agq::agq_population_gradient(model, &pop, &params, template, &x0, &ehs, &kaps, n)
+            .expect("IOV gradient must be available");
+
+        // FD step 1e-4, NOT the 1e-5 that *looks* more accurate. The reference differences a
+        // **reconverged** objective, so shrinking the step past the inner solver's own noise
+        // floor amplifies that noise instead of reducing truncation. Measured on this model:
+        // 1.4e-3 at h = 1e-5, settling to 2.4e-4 at 1e-4 and staying there through 1e-3 — i.e.
+        // the *reference* was the inaccurate side, not the gradient. Mistaking one for the
+        // other made this gradient look 10x worse than it is; hence this comment.
+        let mut fd = vec![0.0f64; np];
+        for i in 0..np {
+            let h = 1e-4 * (1.0 + x0[i].abs());
+            let (mut xp, mut xm) = (x0.clone(), x0.clone());
+            xp[i] += h;
+            xm[i] -= h;
+            fd[i] = (ofv(&xp, n) - ofv(&xm, n)) / (2.0 * h);
+        }
+
+        let scale = fd
+            .iter()
+            .chain(g.iter())
+            .fold(1e-6f64, |m, v| m.max(v.abs()));
+        let max_diff = g
+            .iter()
+            .zip(fd.iter())
+            .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+        // Measured: 2.4e-4 — the same order as the non-IOV case, not a degraded one. The Ω_iov
+        // block (the genuinely new algebra here) is exact; a wrong one — a dropped
+        // `K·Ω_iov⁻¹`, a mis-summed occasion axis — misses by tens of percent.
+        assert!(
+            max_diff / scale < 1e-3,
+            "n_agq={n} (IOV): analytic gradient must match FD of the objective, got {:.3e} \
+             relative error\n  analytic: {g:?}\n  fd:       {fd:?}",
+            max_diff / scale
+        );
+    }
+}
+
+/// **AGQ must be able to *declare* convergence, not just reach it.**
+///
+/// AGQ's gradient is exact but **finite-difference-limited** — the grid-response term and the
+/// posterior Hessian are both central differences, so it carries a noise floor around 1e-4
+/// relative. The gradient-optimizer path historically set NLopt's stops to `1e-12`, which is
+/// *unreachable* for such a gradient: L-BFGS keeps stepping until the true gradient drops
+/// under the floor, at which point the search direction is noise, the line search cannot find
+/// a decrease, and NLopt returns a bare `NLOPT_FAILURE`.
+///
+/// The fit was fine (the engine restores the best-seen point) but was reported as **not
+/// converged** — a lie about a result that had been flat to 8 significant figures for a dozen
+/// evaluations, and one paid for with ~40% wasted wall-clock grinding past the plateau.
+///
+/// So AGQ stops on the reachable objective-change criterion instead. This pins that a plain,
+/// well-behaved AGQ fit actually reports `converged`.
+#[test]
+fn agq_reports_convergence_rather_than_grinding_into_nlopt_failure() {
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+    let pop = warfarin();
+
+    for (method, n) in [
+        (EstimationMethod::Laplace, 1usize),
+        (EstimationMethod::Agq, 3),
+    ] {
+        let opts = FitOptions {
+            method,
+            methods: vec![],
+            n_agq: n,
+            outer_maxiter: 500,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let r = fit(&model, &pop, &model.default_params, &opts).expect("fit must succeed");
+        assert!(
+            r.converged,
+            "{method:?} (n_agq={n}) must report convergence, not grind into NLOPT_FAILURE \
+             against an unreachable 1e-12 gradient stop. OFV = {}",
+            r.ofv
         );
     }
 }
