@@ -3252,8 +3252,15 @@ fn perturb_init(
 /// (e.g. the exact-inits start 0), which the old "converged-first" rule allowed,
 /// so multi-start could return a divergence with a huge OFV. Within the same
 /// validity class: prefer converged, then lower OFV.
+///
+/// The validity cutoff sits well below the ~1e20 inner-objective sentinel but
+/// far above any legitimate population OFV, so a real fit never trips it; a NaN
+/// OFV is non-finite and therefore also invalid, so it can never block a finite
+/// valid candidate.
 fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: bool) -> bool {
-    let valid = |o: f64| o.is_finite() && o < 1e14;
+    /// OFVs at or above this are treated as diverged/invalid (see above).
+    const DIVERGENCE_OFV: f64 = 1e14;
+    let valid = |o: f64| o.is_finite() && o < DIVERGENCE_OFV;
     match (valid(b_ofv), valid(c_ofv)) {
         (false, true) => true,
         (true, false) => false,
