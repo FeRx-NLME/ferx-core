@@ -4230,6 +4230,22 @@ pub fn ode_dense_solve_states(
 
     let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();
 
+    // Saveat nodes earlier than the first integrated segment (e.g. a discrete-state
+    // CTMM observation recorded before the first dose, whose times the segment
+    // timeline — built from doses/obs_times/pk-only/resets, not `obs_records` — does
+    // not cover). Nothing has acted on the system before the first event, so the state
+    // there is the seeded initial state `u`; fill it so these nodes are not left as
+    // `NaN`, which a downstream finiteness guard (the inhomogeneous CTMM scorer) would
+    // otherwise read as a diverged solve and use to wrongly repel a valid subject. No-op
+    // for the usual case where every saveat is at or after the first event.
+    if let Some(&first_start) = break_times.first() {
+        for (i, &t) in saveat.iter().enumerate() {
+            if t < first_start - 1e-12 {
+                result[i] = u.clone();
+            }
+        }
+    }
+
     for w in break_times.windows(2) {
         let (t_start, t_end) = (w[0], w[1]);
         if (t_end - t_start).abs() < 1e-15 {

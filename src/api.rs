@@ -2224,28 +2224,35 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     }
 
     // ── AGQ (#251) ────────────────────────────────────────────────────────────
-    if chain.iter().any(|&m| m == EstimationMethod::Agq) {
-        // The quadrature integrates over the BSV random effects η only. With IOV the
-        // marginal is a joint integral over (η, κ₁..κ_K), whose tensor grid is
-        // `n_agq^(n_eta + n_occ·n_iov)` — combinatorially hopeless even at 2 nodes, quite
-        // apart from the joint-Hessian work. Reject rather than quietly integrating the
-        // wrong (η-only) marginal and reporting a confidently wrong OFV.
-        if model.n_kappa > 0 {
-            diags.push(
-                Diagnostic::error(
-                    "E_AGQ_IOV_UNSUPPORTED",
-                    "method = agq does not support inter-occasion variability (κ / [iov]): the \
-                     marginal would be a joint integral over η and every occasion's κ, and the \
-                     tensor grid is intractable at that dimension. Use method = focei, saem, or \
-                     imp for IOV models.",
-                )
-                .with_block("fit_options"),
-            );
-        }
-        // The tensor rule costs `n_agq^n_eta` full likelihood evaluations per subject per
+    // Laplace routes through the same AGQ objective (one node), so it inherits the same
+    // compatibility guards. Its grid is a single point no matter how many random effects
+    // there are, so the caps below never fire for it — including under IOV.
+    if chain
+        .iter()
+        .any(|&m| matches!(m, EstimationMethod::Agq | EstimationMethod::Laplace))
+    {
+        // IOV is **supported**: AGQ integrates over the stacked (η, κ₁..κ_K), which is exactly
+        // what `individual_nll_iov` already scores. What IOV changes is the *dimension* — and
+        // hence the tensor grid — not the method. The grid cap below is what decides whether a
+        // given IOV model is tractable, and it is checked against the stacked dimension in
+        // `fit_inner` (which, unlike this function, can see the occasion count in the data).
+        //
+        // Name the method the user actually wrote, so a `method = laplace` fit is never told
+        // about "method = agq".
+        let label = if chain.contains(&EstimationMethod::Laplace) {
+            "laplace"
+        } else {
+            "agq"
+        };
+        // The tensor rule costs `n_agq^d` full likelihood evaluations per subject per
         // outer iteration. Past the cap that is not "slow", it is a fit that will never
         // finish — so it is worth failing at check time, with the two levers spelled out.
-        let n_nodes = options.n_agq.max(1);
+        //
+        // Read the node count from `agq_nodes()`, NOT `options.n_agq`: `method = laplace`
+        // pins it to 1 regardless of what `n_agq` holds (the key is not one of its options),
+        // so reading the raw field would let a stray `n_agq = 100` trip these caps on a fit
+        // that only ever builds a single node.
+        let n_nodes = options.agq_nodes().unwrap_or(1);
         // Per-dimension node cap. The parser (`apply_fit_option`) enforces this for
         // file-driven fits, but a `FitOptions` built directly against the Rust API
         // bypasses that path — so re-check here, alongside the grid cap, or an
@@ -2256,7 +2263,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 Diagnostic::error(
                     "E_AGQ_NODES_TOO_LARGE",
                     format!(
-                        "method = agq with n_agq = {n_nodes} exceeds the {}-node per-dimension \
+                        "method = {label} with n_agq = {n_nodes} exceeds the {}-node per-dimension \
                          limit: beyond ~20 nodes the Golub–Welsch rule loses its extreme nodes to \
                          round-off and the marginal gains nothing. Lower n_agq (n_agq = 1 is the \
                          Laplace approximation, i.e. FOCEI-equivalent cost).",
@@ -2272,7 +2279,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 Diagnostic::error(
                     "E_AGQ_GRID_TOO_LARGE",
                     format!(
-                        "method = agq with n_agq = {n_nodes} and {} random effects needs a \
+                        "method = {label} with n_agq = {n_nodes} and {} random effects needs a \
                          {n_nodes}^{} = {grid}-node tensor grid per subject per iteration, over \
                          the {} limit. Lower n_agq (n_agq = 1 is the Laplace approximation, i.e. \
                          FOCEI-equivalent cost), reduce the number of random effects, or use \
@@ -3313,7 +3320,23 @@ pub fn fit(
     // CMT). Otherwise the code→index map would miss and fold into a silent sentinel.
     #[cfg(feature = "markov")]
     for (cmt, endpoint) in &model.endpoints {
-        if let EndpointLikelihood::Ctmm { state_codes, .. } = endpoint {
+        if let EndpointLikelihood::Ctmm {
+            state_codes,
+            generator_states,
+            ..
+        } = endpoint
+        {
+            // Time-inhomogeneous (drug/PD-driven Q(t), #817): an intensity references a
+            // model ODE state, scored by the per-gap occupancy integration in
+            // `ctmm_endpoint_nll_inhomogeneous`. That requires an ODE model — guaranteed at
+            // parse (`generator_states` indices point into `ode_spec`), asserted here for a
+            // hand-built `CompiledModel`.
+            if !generator_states.is_empty() && model.ode_spec.is_none() {
+                return Err(format!(
+                    "[markov_model] cmt = {cmt}: a transition intensity references a model state \
+                     (time-inhomogeneous Q(t)), but the model has no ODE system to supply it."
+                ));
+            }
             for subject in &population.subjects {
                 crate::markov::endpoint::validate_ctmm_states(
                     *cmt,
@@ -3404,6 +3427,39 @@ pub fn fit(
         population,
         &options.iov_occasion,
     ))?;
+    // AGQ + IOV: the tensor grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` (the
+    // occasion count) is a property of the *data*, not the model — so this cap cannot be
+    // checked in `check_model_options`, which never sees the population. Check it here, once
+    // the occasions are known, against the worst subject.
+    //
+    // `method = laplace` is a single node regardless of `d`, so it always passes: Laplace +
+    // IOV is tractable at any occasion count.
+    if let Some(n_nodes) = options.agq_nodes() {
+        if model.n_kappa > 0 {
+            let max_occ = population
+                .subjects
+                .iter()
+                .map(|s| crate::stats::likelihood::iov_occasion_groups(s).len())
+                .max()
+                .unwrap_or(0);
+            let d = model.n_eta + max_occ * model.n_kappa;
+            let grid = crate::estimation::agq::grid_size(n_nodes, d);
+            if grid > crate::estimation::agq::MAX_AGQ_GRID {
+                return Err(format!(
+                    "method = agq with n_agq = {n_nodes} needs a {n_nodes}^{d} = {grid}-node \
+                     tensor grid per subject per iteration — over the {} limit. Under IOV the \
+                     integral is over the stacked (η, κ₁..κ_{max_occ}), so the dimension is \
+                     n_eta ({}) + occasions ({max_occ}) × n_kappa ({}) = {d}. Lower n_agq, or \
+                     use method = laplace (one node — always tractable, and the exact-Hessian \
+                     Laplace approximation), or saem / imp, whose cost does not grow with the \
+                     random-effect dimension.",
+                    crate::estimation::agq::MAX_AGQ_GRID,
+                    model.n_eta,
+                    model.n_kappa,
+                ));
+            }
+        }
+    }
     // If any subject has per-event covariate snapshots that don't carry
     // a variation in covariates the model actually references (e.g.
     // DAY / STIME columns in NONMEM-format datasets), clear those
@@ -4917,6 +4973,7 @@ fn fit_inner(
                     | EstimationMethod::Imp
                     | EstimationMethod::Impmap
                     | EstimationMethod::Agq
+                    | EstimationMethod::Laplace
             )
         });
         if uses_gradient_route {
@@ -5013,6 +5070,7 @@ fn fit_inner(
                 | EstimationMethod::Imp
                 | EstimationMethod::Impmap
                 | EstimationMethod::Agq
+                | EstimationMethod::Laplace
         )
     }) {
         if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning(
@@ -5230,7 +5288,9 @@ fn fit_inner(
         // estimates land ~3% off NONMEM LAPLACIAN. L-BFGS on the analytic gradient matches
         // NONMEM to 4-5 significant figures on every parameter, in 0.39 s against FOCEI's
         // 0.29 s. See docs/estimation/agq.qmd. An explicit `optimizer = ...` is honoured.
-        if matches!(method, EstimationMethod::Agq) && stage_opts.optimizer == Optimizer::Auto {
+        if matches!(method, EstimationMethod::Agq | EstimationMethod::Laplace)
+            && stage_opts.optimizer == Optimizer::Auto
+        {
             stage_opts.optimizer = Optimizer::NloptLbfgs;
         }
         // Run the covariance step (and SIR) only on the last *estimating* stage,

@@ -1590,7 +1590,7 @@ fn compute_joint_posterior_hessian(
 }
 
 /// Build the joint prior precision matrix (block-diagonal: Omega_bsv^{-1} + K copies of Omega_iov^{-1}).
-fn build_joint_omega_inv(
+pub(crate) fn build_joint_omega_inv(
     omega_inv: &DMatrix<f64>,
     omega_iov_inv: &DMatrix<f64>,
     n_eta: usize,

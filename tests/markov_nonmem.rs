@@ -93,3 +93,56 @@ fn ferx_ctmm_matches_nonmem_2state() {
         res.ofv
     );
 }
+
+/// Drug-driven (time-inhomogeneous) CTMM recovery test (#817).
+///
+/// A NONMEM `$DES` anchor is impractical for a PK-coupled CTMM: the PK must integrate
+/// continuously across the subject while the occupancy resets to the observed state at
+/// every observation, and NONMEM's only per-record reset (EVID=3) zeros *all*
+/// compartments — the PK included (plan §3.4 already deems NONMEM's CTMM mechanism not
+/// feasible). The drug-driven path is instead validated by (a) an **exact closed-form
+/// anchor** — a commuting generator `Q(t)=C(t)·Q₀` matches `expm(Q₀·∫C)`
+/// (`tests/markov_smoke.rs::ctmm_drug_driven_matches_closed_form_commuting_generator`),
+/// and (b) **reduction** — `SLOPE=0` reduces to the homogeneous CTMM, which *is*
+/// NONMEM-anchored above. This test adds a **simulate → fit self-consistency** check:
+/// fitting the Gillespie-simulated example recovers the data-generating transition
+/// structure (the drug effect `SLOPE`, and both baseline log-intensities).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn ferx_drug_driven_ctmm_recovers_simulated_params() {
+    let opts = FitOptions {
+        outer_maxiter: 300,
+        ..Default::default()
+    };
+    let res = fit_from_files(
+        "examples/ctmm_pd_2state.ferx",
+        Some("data/ctmm_pd_2state.csv"),
+        None,
+        Some(opts),
+    )
+    .expect("drug-driven CTMM fit must converge");
+
+    // theta = [TVCL, TVV, LQ01, LQ10, SLOPE]. Data-generating: LQ01=-1.2, LQ10=-0.7,
+    // SLOPE=0.15. The transition structure (baseline intensities + concentration effect) is
+    // well identified from 60 subjects; CL and its IIV are only weakly informed (no PK is
+    // observed), so they are not asserted here.
+    let (lq01, lq10, slope) = (res.theta[2], res.theta[3], res.theta[4]);
+    assert!((lq01 - (-1.2)).abs() < 0.12, "LQ01 {lq01} vs truth -1.2");
+    assert!((lq10 - (-0.7)).abs() < 0.15, "LQ10 {lq10} vs truth -0.7");
+    assert!((slope - 0.15).abs() < 0.06, "SLOPE {slope} vs truth 0.15");
+    // The concentration effect is resolved as clearly positive (not merely near 0).
+    assert!(
+        slope > 0.05,
+        "SLOPE {slope} must be a clear positive drug effect"
+    );
+
+    // Regression pin on the objective (catches numerical drift in the occupancy integration).
+    assert!(
+        (res.ofv - 712.226).abs() < 0.5,
+        "OFV {} vs recorded 712.226",
+        res.ofv
+    );
+}

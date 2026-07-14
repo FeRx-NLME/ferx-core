@@ -13,7 +13,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `method` | `foce`, `focei`, `agq`, `saem`, `gn`, `gn_hybrid`, `impmap`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](#chained-fits). When neither this key nor a wrapper's `method` argument is set, the engine falls back to `focei` and emits a warning so the implicit choice is visible — set `method` here to silence it. |
+| `method` | `foce`, `focei`, `laplace`, `agq`, `saem`, `gn`, `gn_hybrid`, `impmap`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](#chained-fits). When neither this key nor a wrapper's `method` argument is set, the engine falls back to `focei` and emits a warning so the implicit choice is visible — set `method` here to silence it. |
 | `threads` | positive integer, `0`, `auto` | `auto` | Number of Rayon worker threads for per-subject parallelism. A positive integer pins the count. `0`/`auto` (or omitting the key) uses the engine's default: available cores − 1 (floored at 1), capped at 8 — most fits gain little from spreading across every core, and not all cores are equal on asymmetric platforms (e.g. Apple Silicon E-cores). The CLI's `--threads` flag mirrors this key (see `ferx --help`). |
 | `maxiter` | integer | `500` | Maximum outer loop iterations. `maxiter = 0` is *evaluation only* (NONMEM `MAXEVAL=0`): the engine runs one inner EBE solve at the initial parameters and reports the objective there with no outer optimisation — useful for scoring a fixed parameter set or computing standard errors at known estimates (with `covariance = true`). The reported fit is marked not-converged, and the parameters are returned unchanged. |
 | `covariance` | `true`, `false` | `true` | Compute covariance matrix and standard errors |
@@ -171,6 +171,18 @@ FOCE with Interaction. Includes the dependence of the residual error on random e
 method = foce
 ```
 First-Order Conditional Estimation. Linearizes the model around the empirical Bayes estimates. Fast and reliable for most models.
+
+### Laplace
+```
+method = laplace
+```
+The **Laplace approximation with the exact Hessian** — NONMEM `$EST METHOD=1 LAPLACIAN` (alias `laplacian`).
+
+This is *not* the same estimator as `focei`. Both approximate the marginal likelihood with a single Gaussian at the empirical-Bayes mode, but FOCEI builds that Gaussian from the **Gauss-Newton** Hessian `CᵀC + Ω⁻¹` (which drops `∂²f/∂η²`), while `laplace` differentiates the true conditional likelihood. It therefore carries the curvature of the η-dependent residual variance that the Gauss-Newton form discards — which is why it reproduces NONMEM's LAPLACIAN to six significant figures where FOCEI lands on a different value.
+
+Internally it *is* [`agq`](#agq) with the node count pinned to 1 — the one-point Gauss-Hermite rule sits at the mode, and the quadrature sum collapses to the Laplace formula exactly. Same objective, same analytic gradient, same covariance step; `n_agq` is not one of its options. It is the cheapest member of the family (one node, no grid) and on warfarin it is *faster* than FOCEI.
+
+Use it when you want a NONMEM-`LAPLACIAN`-comparable fit, or a Laplace baseline to raise `n_agq` from. See the [AGQ page](../estimation/agq.qmd).
 
 ### AGQ
 ```
@@ -467,7 +479,7 @@ When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.c
 | Column | Populated by | Description |
 |--------|-------------|-------------|
 | `iter` | all | Iteration number |
-| `method` | all | `foce`, `focei`, `gn`, `gn_hybrid`, `saem` |
+| `method` | all | `foce`, `focei`, `laplace`, `agq`, `gn`, `gn_hybrid`, `saem` |
 | `phase` | gn_hybrid, saem | `focei` (polish) or `explore`/`converge` |
 | `ofv` | all | Objective function value |
 | `wall_ms` | all | Wall time for this iteration (ms) |

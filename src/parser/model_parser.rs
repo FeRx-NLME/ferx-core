@@ -2744,7 +2744,21 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     markov_blocks.push(lines);
                 }
             }
+            // ODE state names (in state-vector order) let an intensity reference a model
+            // state for the time-inhomogeneous path (#817). `build_ode_spec` has already
+            // run, so `model.ode_spec` is populated for an ODE model; analytic/no-ODE
+            // models pass an empty slice (no state to drive Q, so any such reference stays
+            // an unresolved identifier as before).
+            let ode_state_names: &[String] = model
+                .ode_spec
+                .as_ref()
+                .map(|s| s.state_names.as_slice())
+                .unwrap_or(&[]);
             for lines in markov_blocks {
+                let declared_cov_names: Vec<String> = covariate_decls
+                    .as_ref()
+                    .map(|d| d.iter().map(|c| c.name.clone()).collect())
+                    .unwrap_or_default();
                 let (cmt, endpoint, ctmm_covs, blk_thetas, blk_etas) = parse_markov_model_block(
                     lines,
                     &theta_names,
@@ -2752,6 +2766,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     &indiv_stmts,
                     &model.kappa_names,
                     &model.error_spec,
+                    ode_state_names,
+                    &declared_cov_names,
                 )?;
                 if model.endpoints.contains_key(&cmt) {
                     return Err(format!(
@@ -4494,6 +4510,7 @@ fn is_matrix_rate_key(key: &str) -> bool {
 /// rejected with a "not yet supported" message so the surface stays honest.
 #[cfg(feature = "markov")]
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn parse_markov_model_block(
     lines: &[String],
     theta_names: &[String],
@@ -4501,6 +4518,14 @@ fn parse_markov_model_block(
     indiv_stmts: &[Statement],
     kappa_names: &[String],
     error_spec: &ErrorSpec,
+    // ODE state names in state-vector order (empty for a non-ODE / analytic model).
+    // An intensity that references one of these is time-inhomogeneous (drug/PD-driven
+    // Q(t), Phase 6 #817): the referenced state is threaded into the generator.
+    ode_state_names: &[String],
+    // Names declared in the optional `[covariates]` block (empty when absent). Used to
+    // reject a name that is *both* an ODE state and a declared data covariate — that
+    // collision would otherwise silently reinterpret the covariate column as the state.
+    declared_covariates: &[String],
 ) -> Result<
     (
         usize,
@@ -4872,20 +4897,156 @@ fn parse_markov_model_block(
         }
     }
 
+    // ── Time-inhomogeneous (drug/PD-driven Q(t), Phase 6 #817) detection ──────────
+    // An intensity may reference a model **ODE state** by name (e.g. a concentration
+    // `central/V` or a PD response compartment), evaluated at the current time as the
+    // state evolves. An identifier that is neither θ/η nor an `[individual_parameters]`
+    // name parses as an `Expression::Covariate` leaf (resolved from the covariates map at
+    // eval); a state name lands there too. Collect every Variable **and** Covariate leaf
+    // used directly in the transitions, and keep the ones that name an ODE state (and are
+    // not shadowed by an individual-parameter name — those resolve to the parameter).
+    // `generator_states` pairs each with its ODE-state-vector index; non-empty ⇒ the
+    // endpoint is inhomogeneous.
+    let generator_states: Vec<(String, usize)> = {
+        let mut referenced: HashSet<String> = HashSet::new();
+        for (_, _, expr) in &transitions {
+            visit_expr_nodes(expr, &mut |e: &Expression| {
+                if let Expression::Variable(name) | Expression::Covariate(name) = e {
+                    referenced.insert(name.clone());
+                }
+            });
+        }
+        let indiv_set: HashSet<&String> = indiv_param_names.iter().collect();
+        ode_state_names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| referenced.contains(*name) && !indiv_set.contains(name))
+            .map(|(idx, name)| (name.clone(), idx))
+            .collect()
+    };
+
+    // Reject a name that is simultaneously an ODE state and a referenced θ/η parameter:
+    // such an identifier resolves to the *parameter* leaf (`Expression::Theta/Eta`,
+    // indices assigned at parse), so it is invisible to the state-reference scan above
+    // and the endpoint would silently score on the time-**homogeneous** path with the
+    // constant parameter value instead of the evolving model state the user intended as
+    // the driver. The covariate-collision guard below catches the [covariates] case; this
+    // catches the parameter case symmetrically. `Theta/Eta` leaves carry only an index,
+    // so map it back to a name via `theta_names`/`eta_names`.
+    if !ode_state_names.is_empty() {
+        let state_name_set: HashSet<&String> = ode_state_names.iter().collect();
+        let mut collide: Option<String> = None;
+        for (_, _, expr) in &transitions {
+            visit_expr_nodes(expr, &mut |e: &Expression| {
+                let nm = match e {
+                    Expression::Theta(i) => theta_names.get(*i),
+                    Expression::Eta(i) => eta_names.get(*i),
+                    _ => None,
+                };
+                if let Some(name) = nm {
+                    if state_name_set.contains(name) {
+                        collide = Some(name.clone());
+                    }
+                }
+            });
+        }
+        if let Some(name) = collide {
+            return Err(format!(
+                "[markov_model]: the transition-intensity identifier `{name}` names both an ODE \
+                 model state and a θ/η parameter. This is ambiguous — the fit would use the \
+                 constant parameter and ignore the (time-inhomogeneous) model state. Rename one \
+                 of them so the intended driver is unambiguous."
+            ));
+        }
+    }
+
+    // Reject a name that is simultaneously an ODE state and a declared data covariate:
+    // the intensity would resolve it to the model state (below), silently overwriting the
+    // covariate column and stripping it from the required-column / TV-covariate checks —
+    // a wrong driver with no error. Fail loud and ask the user to disambiguate.
+    if !declared_covariates.is_empty() {
+        let cov_set_decl: HashSet<&String> = declared_covariates.iter().collect();
+        if let Some((name, _)) = generator_states
+            .iter()
+            .find(|(n, _)| cov_set_decl.contains(n))
+        {
+            return Err(format!(
+                "[markov_model]: the transition-intensity identifier `{name}` names both an ODE \
+                 model state and a declared [covariates] column. This is ambiguous — the fit \
+                 would use the model state and ignore the data column. Rename one of them so the \
+                 intended driver is unambiguous."
+            ));
+        }
+    }
+
+    // A referenced ODE state parsed as a `Covariate` leaf, so it was pooled into `cov_set`
+    // by the covariate scan above. It is a model **state**, not a data covariate — drop it
+    // so it is neither registered as a required data column nor caught by the TV-covariate
+    // guard (its time variation is intrinsic and handled by the occupancy integration).
+    let state_name_set: HashSet<&String> = generator_states.iter().map(|(n, _)| n).collect();
+    cov_set.retain(|c| !state_name_set.contains(c));
     let mut generator_covariates: Vec<String> = cov_set.into_iter().collect();
     generator_covariates.sort();
 
-    // Build the generator closure over (θ, η, covariates): place each intensity at
-    // its off-diagonal entry and subtract it from the diagonal so every row sums to
-    // zero — the caller always receives a valid generator.
+    // A state reached only *transitively* through an `[individual_parameters]` value is
+    // not supported yet: `eval_indiv_param_vars` evaluates those with no state channel,
+    // so the state would silently resolve to 0. Reject fail-loud, pointing the user to
+    // reference the state directly in the transition intensity.
+    if !ode_state_names.is_empty() {
+        let mut indiv_refs: HashSet<String> = HashSet::new();
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut indiv_refs); // covariate leaves
+        for s in &needed_indiv_stmts {
+            visit_stmt_nodes(std::slice::from_ref(s), &mut |e: &Expression| {
+                if let Expression::Variable(name) = e {
+                    indiv_refs.insert(name.clone());
+                }
+            });
+        }
+        let indiv_set: HashSet<&String> = indiv_param_names.iter().collect();
+        if let Some(name) = ode_state_names
+            .iter()
+            .find(|n| indiv_refs.contains(*n) && !indiv_set.contains(n))
+        {
+            return Err(format!(
+                "[markov_model]: an [individual_parameters] value referenced by a transition \
+                 intensity reads the model state `{name}`. A state-driven (time-inhomogeneous) \
+                 intensity must reference the state directly in the `transition` line (e.g. \
+                 `transition A -> B = exp(LQ + SLOPE * ({name} / V))`), not through an \
+                 [individual_parameters] value."
+            ));
+        }
+    }
+
+    // Build the generator closure over (θ, η, covariates, state): place each intensity
+    // at its off-diagonal entry and subtract it from the diagonal so every row sums to
+    // zero — the caller always receives a valid generator. On the inhomogeneous path the
+    // caller passes the ODE `state` at the current time; each referenced state name is
+    // injected into the variable map so `eval_expression` resolves it. On the homogeneous
+    // path `generator_states` is empty and `state` is ignored.
     let n_states = states.len();
     let indiv = needed_indiv_stmts;
+    let gen_states = generator_states.clone();
     let generator_fn: crate::types::GeneratorFn = Box::new(
-        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-            let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, state: &[f64]| {
+            // A referenced ODE state parses as a `Covariate` leaf, so `eval_expression`
+            // resolves it from the covariates map. On the inhomogeneous path overlay the
+            // current state values there; the homogeneous path leaves `gen_states` empty and
+            // uses the caller's map unchanged (no clone).
+            let cov_owned;
+            let cov: &HashMap<String, f64> = if gen_states.is_empty() {
+                covariates
+            } else {
+                let mut c = covariates.clone();
+                for (name, idx) in &gen_states {
+                    c.insert(name.clone(), state.get(*idx).copied().unwrap_or(0.0));
+                }
+                cov_owned = c;
+                &cov_owned
+            };
+            let vars = eval_indiv_param_vars(&indiv, theta, eta, cov);
             let mut q = nalgebra::DMatrix::<f64>::zeros(n_states, n_states);
             for (j, k, expr) in &transitions {
-                let rate = eval_expression(expr, theta, eta, covariates, &vars, &[]);
+                let rate = eval_expression(expr, theta, eta, cov, &vars, &[]);
                 q[(*j, *k)] += rate;
                 q[(*j, *j)] -= rate;
             }
@@ -4900,6 +5061,7 @@ fn parse_markov_model_block(
             state_codes,
             generator_fn,
             generator_covariates: generator_covariates.clone(),
+            generator_states,
         },
         generator_covariates,
         theta_set,
@@ -5496,6 +5658,9 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         Ok(EstimationMethod::Imp)
     } else if val.contains("hybrid") || val == "gn_hybrid" || val == "gn-hybrid" {
         Ok(EstimationMethod::FoceGnHybrid)
+    } else if val == "laplace" || val == "laplacian" {
+        // NONMEM `$EST METHOD=1 LAPLACIAN`. Routes to the AGQ objective with one node.
+        Ok(EstimationMethod::Laplace)
     } else if val == "agq"
         || val == "aghq"
         || val == "gauss_hermite"
