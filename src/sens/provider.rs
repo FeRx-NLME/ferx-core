@@ -3500,9 +3500,13 @@ fn subject_eta_grad_impl(
     if !analytical_supported(model) {
         return None;
     }
-    // SS + EVID 3/4 reset is handled above: `subject_routes_to_event_walk` already
-    // returns `true` for it (its own `has_resets() && any ss` clause), so that case
-    // always exits through the walk branch and never reaches here (#822 review #3).
+    // SS + EVID 3/4 reset on a model the walk CANNOT propagate (transit/IG: `supports_event_
+    // driven` is false, so `subject_routes_to_event_walk` returns false before its own
+    // `has_resets() && any ss` clause is ever consulted) still reaches the static superposition
+    // path here — which cannot express it. Decline. This guard is NOT dead code.
+    if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
+        return None;
+    }
     // Modeled-duration doses (`RATE=-2` → `D{cmt}`) resolve `rate`/`duration` from
     // the PK params in the prediction path; the provider iterates `subject.doses`
     // directly, so the unresolved dose would be a bolus/zero-input surrogate. Route
@@ -4627,11 +4631,15 @@ fn subject_sensitivities_impl(
     // current reset segment (see `reset_floor` in the obs loop): for linear PK a
     // reset zeros the compartments, so the prediction at an observation is the
     // superposition of only the doses since the most recent reset — which carries
-    // the exact `∂f/∂pk` through the same closed forms. A subject mixing SS with
-    // resets is handled above instead: `subject_routes_to_event_walk` already
-    // returns `true` for it (its own `has_resets() && any ss` clause), so it
-    // always exits through the walk branch and never reaches this dose-
-    // superposition path (#822 review #3).
+    // the exact `∂f/∂pk` through the same closed forms. Steady-state doses assume an infinite
+    // periodic history that a mid-record reset contradicts, so a subject mixing SS with resets
+    // falls back to FD **here**. This is not dead code: `subject_routes_to_event_walk` bails to
+    // `false` for a model the walk cannot state-propagate (transit/IG — `supports_event_driven`)
+    // *before* it ever consults its own `has_resets() && any ss` clause, so such a subject lands
+    // on this dose-superposition path, which cannot express SS + reset.
+    if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
+        return None;
+    }
 
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
