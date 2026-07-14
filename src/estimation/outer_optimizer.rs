@@ -343,13 +343,14 @@ pub(crate) fn pop_nll_opts(
     options: &FitOptions,
 ) -> f64 {
     if let Some(n_nodes) = options.agq_nodes() {
-        // AGQ + IOV is rejected in `check_model_options`, so `kappas` is empty here and the
-        // integral is over η alone. The EBE modes are the same ones FOCE/FOCEI use — AGQ
-        // does not re-optimise them, it lays its grid around them — and `h_matrices` (the
-        // ∂f/∂η Jacobian) is a FOCE artefact AGQ has no use for: it finite-differences the
-        // true posterior Hessian instead. See `crate::estimation::agq`.
+        // AGQ integrates over whatever random effects the subject has: η alone, or the
+        // stacked (η, κ₁..κ_K) under IOV — the joint marginal, not the η-only one. The modes
+        // are the ones the shared inner loop already converged (`find_ebe_iov` returns the
+        // joint mode); AGQ does not re-optimise them, it lays its grid around them.
+        // `h_matrices` (the ∂f/∂η Jacobian) is a FOCE artefact AGQ has no use for — it
+        // finite-differences the true posterior Hessian instead. See `crate::estimation::agq`.
         return crate::estimation::agq::agq_population_nll(
-            model, population, params, eta_hats, n_nodes,
+            model, population, params, eta_hats, kappas, n_nodes,
         );
     }
     pop_nll(
@@ -2365,6 +2366,7 @@ fn population_gradient(
                 init_params,
                 x,
                 ehs,
+                kappas,
                 n_nodes,
             ) {
                 // Fixed coordinates carry no gradient, matching the analytic FOCE path.

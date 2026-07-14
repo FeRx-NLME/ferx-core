@@ -5880,6 +5880,22 @@ pub enum EstimationMethod {
     /// Cost is `n_agq^n_eta` likelihood evaluations per subject per iteration; see
     /// [`crate::estimation::agq::MAX_AGQ_GRID`].
     Agq,
+    /// The **Laplace approximation** with the *exact* Hessian — NONMEM `$EST METHOD=1
+    /// LAPLACIAN` (#251).
+    ///
+    /// Identical to [`Agq`](Self::Agq) at one node: the one-point Gauss–Hermite rule sits at
+    /// the mode with weight `√π`, and the quadrature sum collapses, term for term, to
+    /// `(2π)^(d/2)·|H|^(−½)·exp(l(η̂))`. So this variant routes through the AGQ objective with
+    /// the node count pinned to 1 — it is not a separate implementation, and `n_agq` is not
+    /// one of its options.
+    ///
+    /// **Distinct from [`FoceI`](Self::FoceI)**, which is Laplace with the *Gauss-Newton*
+    /// Hessian `CᵀC + Ω⁻¹` (that form drops `∂²f/∂η²`). This one differentiates the true
+    /// conditional NLL, so it carries the curvature of the η-dependent residual variance that
+    /// the Gauss-Newton form discards — which is exactly why it reproduces NONMEM's LAPLACIAN
+    /// (to six significant figures on warfarin) where FOCEI lands on a different value. It is
+    /// also the cheapest member of the AGQ family: one node, no grid.
+    Laplace,
 }
 
 impl EstimationMethod {
@@ -5894,6 +5910,7 @@ impl EstimationMethod {
             EstimationMethod::Impmap => "IMPMAP",
             EstimationMethod::Bayes => "BAYES",
             EstimationMethod::Agq => "AGQ",
+            EstimationMethod::Laplace => "LAPLACE",
         }
     }
 }
@@ -5921,7 +5938,16 @@ impl FitOptions {
     /// Reads `self.method` (the per-stage method — `api::fit_inner` rewrites it for each
     /// stage of a chain), so it is correct inside a chained fit too.
     pub fn agq_nodes(&self) -> Option<usize> {
-        (self.method == EstimationMethod::Agq).then(|| self.n_agq.max(1))
+        match self.method {
+            EstimationMethod::Agq => Some(self.n_agq.max(1)),
+            // Laplace *is* AGQ at one node — not an approximation of it, an identity (the
+            // one-point Gauss-Hermite rule sits at the mode with weight √π, and the sum
+            // collapses to `(2π)^(d/2)·|H|^(−½)·exp(l(η̂))`). So it routes through the same
+            // objective, the same analytic gradient, and the same covariance stencil, with
+            // the node count pinned. `n_agq` is not one of its keys; it cannot be varied.
+            EstimationMethod::Laplace => Some(1),
+            _ => None,
+        }
     }
 
     /// Covariance-step inner EBE-reconvergence tolerance that **closed-form,
@@ -6149,6 +6175,24 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
         // does for FOCE/FOCEI.
         EstimationMethod::Agq => &[
             "n_agq",
+            "maxiter",
+            "inner_maxiter",
+            "inner_tol",
+            "inner_optimizer",
+            "optimizer",
+            "outer_xtol",
+            "outer_ftol",
+            "steihaug_max_iters",
+            "global_search",
+            "global_maxeval",
+            "stagnation_guard",
+            "reconverge_gradient_interval",
+        ],
+        // Laplace is AGQ with the node count pinned to 1, so it takes AGQ's keys **minus
+        // `n_agq`** — that key is not a knob here, and offering it would invite
+        // `method = laplace, n_agq = 5`, which is a contradiction. Users who want to vary the
+        // node count already have `method = agq`.
+        EstimationMethod::Laplace => &[
             "maxiter",
             "inner_maxiter",
             "inner_tol",

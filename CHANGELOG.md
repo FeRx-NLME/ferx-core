@@ -20,6 +20,29 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **AGQ and `laplace` now support inter-occasion variability (`[iov]`)** (#251).
+  Under IOV the integral runs over the **stacked** random-effect vector
+  `b = [η, κ₁ … κ_K]`, whose prior is the block-diagonal `Ω ⊕ Ω_iov^⊕K` — which is
+  exactly what ferx's IOV likelihood already scores, so every AGQ formula carries
+  over with `d` the stacked dimension. IOV is a change of *dimension*, not of
+  method. The tensor grid is therefore `n_agq^(n_eta + K·n_kappa)` and grows with
+  the occasion count `K`, so the 100 000-node cap is now enforced against the
+  stacked dimension once the data is read (the error names `K`). **`method =
+  laplace` is always tractable under IOV** — its grid is a single point regardless
+  of `d`. Previously both methods rejected `[iov]` models outright.
+- **`method = laplace` — the Laplace approximation as a first-class estimator** (#251).
+  Alias `laplacian`. This is NONMEM's `$EST METHOD=1 LAPLACIAN`: the Laplace
+  approximation built from the **exact** Hessian of the conditional likelihood.
+  It is *not* the same estimator as `focei`, which builds its Gaussian from the
+  Gauss-Newton Hessian `CᵀC + Ω⁻¹` (dropping `∂²f/∂η²`) and therefore reports a
+  different OFV; `laplace` carries the curvature of the η-dependent residual
+  variance that the Gauss-Newton form discards, which is why it reproduces NONMEM's
+  LAPLACIAN to six significant figures on warfarin. Internally it *is* `agq` with the
+  node count pinned to 1 — same objective, same analytic gradient, same covariance
+  step, bit-identical OFV — so it is the cheapest member of the AGQ family (one node,
+  no grid) and on warfarin converges *faster than FOCEI* (0.23 s vs 0.60 s). `n_agq`
+  is not one of its options; use `method = agq` to vary the node count. See the
+  [AGQ docs page](https://ferx-nlme.github.io/ferx-core/estimation/agq.html).
 - **Exact (analytic) FOCE/FOCEI gradients for lagtime models with IOV, time-varying
   covariates, or `TIME`** (#486): a closed-form model carrying an `ALAG`/`LAGTIME` used to
   fall back to finite differences the moment the subject also had IOV, a time-varying

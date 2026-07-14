@@ -65,7 +65,29 @@ best at **n_eta ≤ 4**.
 > perfectly ordinary share of the integral. Sparse (Smolyak) grids are the real
 > answer for `n_eta = 5..8` and are tracked as future work.
 
-## `n_agq = 1` is exactly Laplace
+## `n_agq = 1` is exactly Laplace — and has its own method name
+
+Because the one-node case is a genuinely useful estimator in its own right (it is
+NONMEM's `$EST METHOD=1 LAPLACIAN`), it is exposed directly:
+
+```ini
+[fit_options]
+  method = laplace     # alias: laplacian
+```
+
+`method = laplace` **is** `method = agq` with the node count pinned to 1 — the same
+objective, the same analytic gradient, the same covariance step, routed through the
+same code. The OFVs are bit-identical, and `n_agq` is not one of its options (the
+node count is what *defines* the method). Prefer it when you want a
+NONMEM-`LAPLACIAN`-comparable fit, or a Laplace baseline to raise `n_agq` from.
+
+It is also the cheapest member of the family — one node, no grid — and on warfarin
+it converges *faster than FOCEI* (0.23 s vs 0.60 s), because AGQ's analytic gradient
+needs fewer outer iterations.
+
+> **`laplace` is not `focei`.** Both place a single Gaussian at the empirical-Bayes
+> mode, but they build it from different Hessians — see below. They are different
+> estimators and will report different OFVs.
 
 With one node the rule is `z = 0` with weight `√π`, and the quadrature sum
 collapses, term for term, to
@@ -352,14 +374,44 @@ trust-region stopping rule trip sooner (63 → 34 evaluations, still reporting
 "converged"). Its ω estimates land ~3% off NONMEM. This is the failure mode ferx
 records in #317. `auto` picks L-BFGS for AGQ precisely to avoid it.
 
+## Inter-occasion variability (IOV)
+
+AGQ and `laplace` both support `[iov]`. Under IOV the integral is over the
+**stacked** random-effect vector
+
+$$
+b = [\eta,\ \kappa_1,\ \dots,\ \kappa_K],
+\qquad d = n_\eta + K \cdot n_\kappa
+$$
+
+whose prior is the block-diagonal `Ω_joint = Ω ⊕ Ω_iov ⊕ … ⊕ Ω_iov` (one block per
+occasion). That is not a new model — it is exactly what ferx's IOV likelihood already
+scores, since
+
+```text
+nll_iov = ½·(ηᵀΩ⁻¹η + log|Ω| + Σ_k κ_kᵀΩ_iov⁻¹κ_k + K·log|Ω_iov| + data)
+        = ½·(bᵀΩ_joint⁻¹b + log|Ω_joint| + data)
+```
+
+So **every formula on this page carries over verbatim** with `d` the stacked
+dimension: the marginal, the `½log|H|` normaliser, the node transform, the
+Fisher-identity gradient. IOV is a change of *dimension*, not of method. The mode is
+the joint `(η̂, κ̂)` one the inner loop already converges.
+
+**The catch is the dimension.** The tensor grid is `n_agq^d`, and `K` — the number
+of occasions — comes from the *data*. Three η, one κ, two occasions gives `d = 5`
+and `3⁵ = 243` nodes (fine); ten occasions gives `d = 13` and `3¹³ ≈ 1.6 M` (not).
+ferx enforces the 100 000-node cap against the stacked dimension once the data is
+read, and the error names the occasion count so the cause is obvious.
+
+> **`method = laplace` is always tractable under IOV.** Its grid is a *single point*
+> no matter how large `d` grows — only the Hessian gets bigger. So Laplace + IOV
+> works at any occasion count, and is the natural choice when the AGQ grid blows up.
+
 ## Limitations
 
-- **No IOV.** Under inter-occasion variability the marginal is a joint integral
-  over `η` *and* every occasion's `κ`; the tensor grid is intractable at that
-  dimension. AGQ rejects `[iov]` models rather than silently integrating the
-  η-only marginal. Use [FOCEI](foce.qmd), [SAEM](saem.qmd) or
-  [IMP](importance-sampling.qmd).
-- **Exponential in `n_eta`** — see the cost table above. This is the real limit.
+- **Exponential in the random-effect dimension** — see the cost table above, and
+  the IOV section below. This is the real limit.
 - Models outside the `Dual2` provider take a finite-differenced θ/σ score rather than
   an analytic one (see above). Same gradient, no inner re-solve, just a little slower
   per iteration.

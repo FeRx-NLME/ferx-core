@@ -156,52 +156,179 @@ fn logsumexp(xs: &[f64]) -> f64 {
     max + xs.iter().map(|x| (x - max).exp()).sum::<f64>().ln()
 }
 
-/// Central-difference Hessian of the exact conditional NLL w.r.t. η at `eta_hat`.
+/// The per-subject **integration variable** and its prior.
 ///
-/// Step `hᵢ = max(ε^¼ · √Ωᵢᵢ, 1e-4)`: `ε^¼` is the standard second-difference step (it
-/// balances truncation against the `ε/h²` round-off blow-up), scaled by the prior SD
-/// because that is η's natural unit. The `1e-4` floor keeps a near-zero (or FIXed-small)
-/// Ωᵢᵢ from driving `h` so small that `ε/h²` swamps the curvature.
-fn fd_posterior_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    eta_hat: &[f64],
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-) -> DMatrix<f64> {
-    let d = eta_hat.len();
-    let mut nll_at = |eta: &[f64]| -> f64 {
-        individual_nll_into_with_schedule(
+/// AGQ integrates over whatever random effects the subject has. Without IOV that is `b = η`
+/// with prior `Ω`. With IOV it is the **stacked** vector
+///
+/// ```text
+///   b = [η, κ₁, …, κ_K]        (dimension d = n_eta + K·n_kappa)
+/// ```
+///
+/// whose prior is the block-diagonal `Ω_joint = Ω ⊕ Ω_iov ⊕ … ⊕ Ω_iov` (K copies). That is
+/// not a new model — it is exactly what
+/// [`crate::stats::likelihood::individual_nll_iov`] already scores, since
+///
+/// ```text
+///   nll_iov = ½·(ηᵀΩ⁻¹η + log|Ω| + Σ_k κ_kᵀΩ_iov⁻¹κ_k + K·log|Ω_iov| + data)
+///           = ½·(bᵀΩ_joint⁻¹b + log|Ω_joint| + data)
+/// ```
+///
+/// So **every AGQ formula in this module carries over verbatim** with `d` the stacked
+/// dimension: the marginal, the `(d/2)·logπ + ½log|H|` normaliser, the node transform, the
+/// Fisher-identity gradient. IOV is a change of dimension, not of method.
+///
+/// The cost is that `d` grows with the number of occasions, and the tensor grid is
+/// `n_agq^d` — see [`MAX_AGQ_GRID`]. `method = laplace` (one node) is unaffected: its grid is
+/// a single point no matter how large `d` gets, so Laplace + IOV is always tractable.
+pub(crate) struct Stack {
+    n_eta: usize,
+    n_kappa: usize,
+    /// Occasions for *this* subject (0 when the model or subject has no IOV).
+    n_occ: usize,
+    /// `Ω_joint⁻¹`, the prior precision over `b`. Feeds `build_proposal`'s fallback.
+    omega_joint_inv: DMatrix<f64>,
+    /// `√diag(Ω_joint)` — each coordinate's natural scale, for finite-difference steps.
+    prior_sd: Vec<f64>,
+}
+
+impl Stack {
+    /// Build the stack for a subject with `n_occ` occasions (`0` ⇒ no IOV).
+    fn new(model: &CompiledModel, params: &ModelParameters, n_occ: usize) -> Self {
+        let n_eta = model.n_eta;
+        let n_kappa = if n_occ == 0 { 0 } else { model.n_kappa };
+        let d = n_eta + n_occ * n_kappa;
+
+        let (omega_joint_inv, prior_sd) = match (&params.omega_iov, n_kappa) {
+            (Some(iov), k) if k > 0 => {
+                let inv = crate::estimation::importance_sampling::build_joint_omega_inv(
+                    &params.omega.inv,
+                    &iov.inv,
+                    n_eta,
+                    k,
+                    n_occ,
+                );
+                let mut sd = Vec::with_capacity(d);
+                for i in 0..n_eta {
+                    sd.push(params.omega.matrix[(i, i)].max(0.0).sqrt());
+                }
+                for _ in 0..n_occ {
+                    for i in 0..k {
+                        sd.push(iov.matrix[(i, i)].max(0.0).sqrt());
+                    }
+                }
+                (inv, sd)
+            }
+            _ => {
+                let sd = (0..n_eta)
+                    .map(|i| params.omega.matrix[(i, i)].max(0.0).sqrt())
+                    .collect();
+                (params.omega.inv.clone(), sd)
+            }
+        };
+        Self {
+            n_eta,
+            n_kappa,
+            n_occ,
+            omega_joint_inv,
+            prior_sd,
+        }
+    }
+
+    /// Dimension of the integration variable.
+    fn d(&self) -> usize {
+        self.n_eta + self.n_occ * self.n_kappa
+    }
+
+    fn is_iov(&self) -> bool {
+        self.n_occ > 0 && self.n_kappa > 0
+    }
+
+    /// Split `b` back into `(η, [κ₁ … κ_K])`.
+    fn split<'a>(&self, b: &'a [f64]) -> (&'a [f64], Vec<Vec<f64>>) {
+        let eta = &b[..self.n_eta];
+        let kappas = (0..self.n_occ)
+            .map(|k| {
+                let s = self.n_eta + k * self.n_kappa;
+                b[s..s + self.n_kappa].to_vec()
+            })
+            .collect();
+        (eta, kappas)
+    }
+
+    /// The exact conditional NLL at an arbitrary `b` — the AGQ integrand. Dispatches to the
+    /// IOV-aware likelihood when the subject has occasions; both are the model's *real*
+    /// likelihood, not a surrogate.
+    fn nll_at(
+        &self,
+        model: &CompiledModel,
+        subject: &Subject,
+        params: &ModelParameters,
+        b: &[f64],
+        scratch: &mut pk::EventPkParams,
+        schedule: Option<&pk::event_driven::EventSchedule>,
+    ) -> f64 {
+        if !self.is_iov() {
+            return individual_nll_into_with_schedule(
+                model,
+                subject,
+                &params.theta,
+                b,
+                &params.omega,
+                &params.sigma.values,
+                scratch,
+                schedule,
+            );
+        }
+        let (eta, kappas) = self.split(b);
+        crate::stats::likelihood::individual_nll_iov(
             model,
             subject,
             &params.theta,
             eta,
+            &kappas,
             &params.omega,
+            params.omega_iov.as_ref(),
             &params.sigma.values,
-            scratch,
-            schedule,
         )
-    };
+    }
+}
+
+/// Central-difference Hessian of the exact conditional NLL w.r.t. the integration variable
+/// `b` at `b_hat` (see [`Stack`] — `b = η`, or `[η, κ₁..κ_K]` under IOV).
+///
+/// Step `hᵢ = max(ε^¼ · √Ω_joint,ᵢᵢ, 1e-4)`: `ε^¼` is the standard second-difference step (it
+/// balances truncation against the `ε/h²` round-off blow-up), scaled by the prior SD because
+/// that is each coordinate's natural unit. The `1e-4` floor keeps a near-zero (or FIXed-small)
+/// prior variance from driving `h` so small that `ε/h²` swamps the curvature.
+fn fd_posterior_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    stack: &Stack,
+    b_hat: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> DMatrix<f64> {
+    let d = stack.d();
+    let mut nll_at =
+        |b: &[f64]| -> f64 { stack.nll_at(model, subject, params, b, scratch, schedule) };
 
     let steps: Vec<f64> = (0..d)
-        .map(|i| {
-            let sd = params.omega.matrix[(i, i)].max(0.0).sqrt();
-            (f64::EPSILON.powf(0.25) * sd).max(1e-4)
-        })
+        .map(|i| (f64::EPSILON.powf(0.25) * stack.prior_sd[i]).max(1e-4))
         .collect();
 
-    let f0 = nll_at(eta_hat);
+    let f0 = nll_at(b_hat);
     let mut h = DMatrix::<f64>::zeros(d, d);
-    let mut eta = eta_hat.to_vec();
+    let mut b = b_hat.to_vec();
 
     for i in 0..d {
         let hi = steps[i];
-        eta[i] = eta_hat[i] + hi;
-        let f_plus = nll_at(&eta);
-        eta[i] = eta_hat[i] - hi;
-        let f_minus = nll_at(&eta);
-        eta[i] = eta_hat[i];
+        b[i] = b_hat[i] + hi;
+        let f_plus = nll_at(&b);
+        b[i] = b_hat[i] - hi;
+        let f_minus = nll_at(&b);
+        b[i] = b_hat[i];
         h[(i, i)] = (f_plus - 2.0 * f0 + f_minus) / (hi * hi);
     }
 
@@ -209,11 +336,11 @@ fn fd_posterior_hessian(
         for j in (i + 1)..d {
             let (hi, hj) = (steps[i], steps[j]);
             let mut at = |si: f64, sj: f64| -> f64 {
-                eta[i] = eta_hat[i] + si * hi;
-                eta[j] = eta_hat[j] + sj * hj;
-                let v = nll_at(&eta);
-                eta[i] = eta_hat[i];
-                eta[j] = eta_hat[j];
+                b[i] = b_hat[i] + si * hi;
+                b[j] = b_hat[j] + sj * hj;
+                let v = nll_at(&b);
+                b[i] = b_hat[i];
+                b[j] = b_hat[j];
                 v
             };
             let mixed =
@@ -236,11 +363,12 @@ pub(crate) fn agq_subject_nll(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
-    eta_hat: &[f64],
+    stack: &Stack,
+    b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
 ) -> f64 {
-    let d = eta_hat.len();
+    let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
     let schedule = cacheable_schedule(model, subject);
 
@@ -248,13 +376,11 @@ pub(crate) fn agq_subject_nll(
     // conditional likelihood itself. (The formula below would agree — an empty tensor
     // product is the single empty node — but there is no Σ to factor, so short-circuit.)
     if d == 0 {
-        return individual_nll_into_with_schedule(
+        return stack.nll_at(
             model,
             subject,
-            &params.theta,
-            eta_hat,
-            &params.omega,
-            &params.sigma.values,
+            params,
+            b_hat,
             &mut scratch,
             schedule.as_ref(),
         );
@@ -264,23 +390,26 @@ pub(crate) fn agq_subject_nll(
         model,
         subject,
         params,
-        eta_hat,
+        stack,
+        b_hat,
         &mut scratch,
         schedule.as_ref(),
     );
     // `build_proposal` applies the relative jitter and — if the FD Hessian came back
-    // indefinite (a loosely-converged mode, a flat direction) — falls back to the Ω-scale
-    // factor. That fallback keeps AGQ *consistent* (any invertible scale integrates to the
-    // same limit); it only costs nodes-worth of efficiency, which is the right failure mode.
-    let Some(proposal) = build_proposal(&h, &params.omega.inv, d) else {
+    // indefinite (a loosely-converged mode, a flat direction) — falls back to the prior-scale
+    // factor (`Ω`, or the block-diagonal `Ω_joint` under IOV). That fallback keeps AGQ
+    // *consistent* (any invertible scale integrates to the same limit); it only costs
+    // nodes-worth of efficiency, which is the right failure mode.
+    let Some(proposal) = build_proposal(&h, &stack.omega_joint_inv, d) else {
         return NLL_SENTINEL;
     };
 
-    let (_etas, terms) = agq_nodes_and_terms(
+    let (_bs, terms) = agq_nodes_and_terms(
         model,
         subject,
         params,
-        eta_hat,
+        stack,
+        b_hat,
         nodes,
         log_weights,
         &proposal,
@@ -309,17 +438,18 @@ fn agq_nodes_and_terms(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
-    eta_hat: &[f64],
+    stack: &Stack,
+    b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
     proposal: &crate::estimation::importance_sampling::Proposal,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> (Vec<Vec<f64>>, Vec<f64>) {
-    let d = eta_hat.len();
+    let d = stack.d();
     let n = nodes.len();
     let cap = grid_size(n, d);
-    let mut etas = Vec::with_capacity(cap);
+    let mut bs = Vec::with_capacity(cap);
     let mut terms = Vec::with_capacity(cap);
     let mut idx = vec![0usize; d];
     let mut z = vec![0.0f64; d];
@@ -334,25 +464,17 @@ fn agq_nodes_and_terms(
             z_sq += zk * zk;
             log_w += log_weights[idx[k]];
         }
-        // η_j = η̂ + √2 · Σ^{1/2} · z_j — the adaptive transform.
+        // b_j = b̂ + √2 · Σ^{1/2} · z_j — the adaptive transform, over the whole stacked
+        // vector (η, and every occasion's κ under IOV).
         proposal.apply_l_sigma(&z, &mut step, std::f64::consts::SQRT_2);
-        let eta: Vec<f64> = (0..d).map(|k| eta_hat[k] + step[k]).collect();
+        let b: Vec<f64> = (0..d).map(|k| b_hat[k] + step[k]).collect();
 
-        let nll = individual_nll_into_with_schedule(
-            model,
-            subject,
-            &params.theta,
-            &eta,
-            &params.omega,
-            &params.sigma.values,
-            scratch,
-            schedule,
-        );
+        let nll = stack.nll_at(model, subject, params, &b, scratch, schedule);
         // A diverged node returns `individual_nll`'s 1e20 sentinel, which lands here as a
         // ~−1e20 log-term — negligible under logsumexp unless *every* node diverged, in
         // which case the subject correctly reports the sentinel back.
         terms.push(log_w + z_sq - nll);
-        etas.push(eta);
+        bs.push(b);
 
         // Mixed-radix increment over the d-dimensional tensor grid.
         let mut k = 0;
@@ -368,7 +490,7 @@ fn agq_nodes_and_terms(
             break;
         }
     }
-    (etas, terms)
+    (bs, terms)
 }
 
 /// Population AGQ objective: `Σ_i agq_subject_nll_i`. The outer loop doubles this into an
@@ -383,6 +505,7 @@ pub fn agq_population_nll(
     population: &Population,
     params: &ModelParameters,
     eta_hats: &[nalgebra::DVector<f64>],
+    kappas: &[Vec<nalgebra::DVector<f64>>],
     n_nodes: usize,
 ) -> f64 {
     let (nodes, weights) = gauss_hermite(n_nodes);
@@ -393,17 +516,24 @@ pub fn agq_population_nll(
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            agq_subject_nll(
-                model,
-                subject,
-                params,
-                eta_hats[i].as_slice(),
-                &nodes,
-                &log_weights,
-            )
+            let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            let stack = Stack::new(model, params, subj_kappas.len());
+            let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
+            agq_subject_nll(model, subject, params, &stack, &b_hat, &nodes, &log_weights)
         })
         .collect();
     per_subject.iter().sum()
+}
+
+/// Assemble the stacked mode `b̂ = [η̂, κ̂₁ … κ̂_K]` from what the shared inner loop already
+/// returns. AGQ does not re-optimise either piece — `find_ebe_iov` converges the joint
+/// (η, κ) mode, which is exactly the point the grid is centred on.
+fn stack_mode(eta_hat: &[f64], kappas: &[nalgebra::DVector<f64>]) -> Vec<f64> {
+    let mut b = eta_hat.to_vec();
+    for k in kappas {
+        b.extend_from_slice(k.as_slice());
+    }
+    b
 }
 
 // ---------------------------------------------------------------------------
@@ -465,8 +595,34 @@ pub fn agq_population_nll(
 /// wrap, FREM's pseudo-observations, a dense residual covariance, an η-scaled or custom
 /// residual variance), and TTE / categorical endpoints are outside the provider entirely.
 /// Those all take [`accumulate_fixed_eta_packed_gradient_fd`] instead.
-pub fn analytic_score_supported(model: &CompiledModel) -> bool {
-    crate::sens::provider::analytic_outer_gradient_available(model)
+/// Model-level mirror of [`analytic_score_supported`], for reporting
+/// (`build_info::gradient_method_outer`) which has no per-subject [`Stack`]. Uses the model's
+/// own `n_kappa` to pick the IOV or non-IOV provider scope, which is the same answer every
+/// subject of an IOV model gets.
+pub fn analytic_score_supported_model(model: &CompiledModel) -> bool {
+    let stack = Stack {
+        n_eta: model.n_eta,
+        n_kappa: model.n_kappa,
+        n_occ: usize::from(model.n_kappa > 0),
+        omega_joint_inv: DMatrix::zeros(0, 0),
+        prior_sd: Vec::new(),
+    };
+    analytic_score_supported(model, &stack)
+}
+
+pub fn analytic_score_supported(model: &CompiledModel, stack: &Stack) -> bool {
+    // The provider's scope differs for IOV: `subject_sensitivities_iov` runs the stacked
+    // (θ, η, κ) dual walk, gated by `iov_sens_supported`, while the non-IOV entry point is
+    // gated by `analytic_outer_gradient_available`. `analytic_outer_gradient_available`
+    // already folds in `iov_sens_supported`, but it also carries the `gradient_method = fd`
+    // opt-out and the non-Gaussian/magnitude bails, which apply to both.
+    let provider = if stack.is_iov() {
+        crate::sens::provider::iov_sens_supported(model)
+            && !matches!(model.gradient_method, crate::types::GradientMethod::Fd)
+    } else {
+        crate::sens::provider::analytic_outer_gradient_available(model)
+    };
+    provider
         && !matches!(model.bloq_method, crate::types::BloqMethod::M3)
         && model.residual_correlations.is_empty()
         && model.frem_config.is_none()
@@ -513,12 +669,13 @@ pub fn analytic_gradient_available(model: &CompiledModel) -> bool {
 /// Predictions are σ-independent, so the σ perturbations reuse nothing extra — each is one
 /// likelihood evaluation. No inner re-solve, which is the whole point.
 #[allow(clippy::too_many_arguments)]
-fn accumulate_fixed_eta_packed_gradient_fd(
+fn accumulate_fixed_b_packed_gradient_fd(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
     template: &ModelParameters,
-    eta: &[f64],
+    stack: &Stack,
+    b: &[f64],
     weight: f64,
     n_theta: usize,
     sigma_start: usize,
@@ -533,16 +690,7 @@ fn accumulate_fixed_eta_packed_gradient_fd(
     let schedule = cacheable_schedule(model, subject);
 
     let mut nll_at = |p: &ModelParameters| -> f64 {
-        individual_nll_into_with_schedule(
-            model,
-            subject,
-            &p.theta,
-            eta,
-            &p.omega,
-            &p.sigma.values,
-            &mut scratch,
-            schedule.as_ref(),
-        )
+        stack.nll_at(model, subject, p, b, &mut scratch, schedule.as_ref())
     };
 
     // θ and σ coordinates only — the Ω block is exact in closed form and already added.
@@ -582,22 +730,25 @@ fn accumulate_fixed_eta_packed_gradient(
     subject: &Subject,
     params: &ModelParameters,
     template: &ModelParameters,
+    stack: &Stack,
     eta: &[f64],
     weight: f64,
     out: &mut [f64],
 ) -> Option<()> {
     use crate::estimation::parameterization::theta_packs_log;
 
+    let b = eta; // the integration variable: η, or the stacked [η, κ₁..κ_K] under IOV
     let n_obs = subject.observations.len();
     let n_theta = params.theta.len();
     let n_sigma = params.sigma.values.len();
-    let n_eta = eta.len();
+    let n_eta = stack.n_eta;
+    let (eta_part, kappas) = stack.split(b);
 
-    // Ω block — from the η-prior `½(ηᵀΩ⁻¹η + log|Ω|)`, which is the *only* place Ω enters
-    // `nll` at a fixed η:
+    // ── Ω block ──────────────────────────────────────────────────────────────────────
+    // From the η-prior `½(ηᵀΩ⁻¹η + log|Ω|)`, the only place Ω enters `nll` at a fixed b:
     //   ∂/∂Ω [½ ηᵀΩ⁻¹η] = −½·zzᵀ   and   ∂/∂Ω [½ log|Ω|] = ½·Ω⁻¹,   z = Ω⁻¹η.
-    // Independent of the data, so it is accumulated even for a subject with no observations.
-    let z = &params.omega.inv * nalgebra::DVector::from_column_slice(eta);
+    // Data-independent, so it is accumulated even for a subject with no observations.
+    let z = &params.omega.inv * nalgebra::DVector::from_column_slice(eta_part);
     let mut m_omega = DMatrix::zeros(n_eta, n_eta);
     for r in 0..n_eta {
         for c in 0..n_eta {
@@ -615,23 +766,58 @@ fn accumulate_fixed_eta_packed_gradient(
     }
     let sigma_start = omega_start + og.len();
 
+    // ── Ω_iov block ──────────────────────────────────────────────────────────────────
+    // The κ prior is `½(Σ_k κ_kᵀΩ_iov⁻¹κ_k + K·log|Ω_iov|)` — the *same* shape as the η
+    // prior, but summed over the K occasions, which share one Ω_iov:
+    //   ∂/∂Ω_iov = ½·(−Σ_k z_k z_kᵀ + K·Ω_iov⁻¹),   z_k = Ω_iov⁻¹κ_k.
+    // Mapped to Cholesky-packed space by the same `chol_pack`. This is the only block that
+    // is genuinely new under IOV; θ and σ are unchanged (see below).
+    let iov_start = sigma_start + n_sigma;
+    if stack.is_iov() {
+        let iov = params
+            .omega_iov
+            .as_ref()
+            .expect("stack.is_iov() ⟹ omega_iov present");
+        let k_occ = kappas.len();
+        let n_iov = stack.n_kappa;
+        let mut m_iov = DMatrix::zeros(n_iov, n_iov);
+        for kap in &kappas {
+            let zk = &iov.inv * nalgebra::DVector::from_column_slice(kap);
+            for r in 0..n_iov {
+                for c in 0..n_iov {
+                    m_iov[(r, c)] -= 0.5 * zk[r] * zk[c];
+                }
+            }
+        }
+        for r in 0..n_iov {
+            for c in 0..n_iov {
+                m_iov[(r, c)] += 0.5 * (k_occ as f64) * iov.inv[(r, c)];
+            }
+        }
+        let ig = crate::estimation::sens_outer_gradient::chol_pack(&m_iov, &iov.chol, iov.diagonal);
+        for (k, &v) in ig.iter().enumerate() {
+            out[iov_start + k] += weight * v;
+        }
+    }
+
     if n_obs == 0 {
         return Some(());
     }
 
     // Off the analytic score's scope (a non-Gaussian endpoint, M3, LTBS, an ODE model, …):
-    // finite-difference the θ and σ blocks of `nll` at this **fixed η** instead. Still no
+    // finite-difference the θ and σ blocks of `nll` at this **fixed b** instead. Still no
     // inner re-solve — that is the expensive thing, and neither path does one — so AGQ keeps
     // its own gradient for *every* model rather than dropping to `reconverged_fd_gradient`.
     // This matters most for exactly the endpoints AGQ exists to serve: TTE and categorical
     // are outside the `Dual2` provider, and it would be perverse for them to be the slow case.
-    if !analytic_score_supported(model) {
-        return accumulate_fixed_eta_packed_gradient_fd(
+    if !analytic_score_supported(model, stack) {
+        return accumulate_fixed_b_packed_gradient_fd(
             model,
             subject,
             params,
             template,
-            eta,
+            stack,
+            b,
             weight,
             n_theta,
             sigma_start,
@@ -639,9 +825,15 @@ fn accumulate_fixed_eta_packed_gradient(
         );
     }
 
-    // Exact ∂f/∂θ at *this* η. `subject_sensitivities` makes no mode assumption — the
-    // η = η̂ requirement in `sens_outer_gradient` lives in its `theta_block`, not here.
-    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
+    // Exact ∂f/∂θ at *this* b. Neither provider entry point assumes the mode — the η = η̂
+    // requirement in `sens_outer_gradient` lives in its `theta_block`, not here. The IOV
+    // entry point takes the *stacked* (η, κ) vector and returns the same `ObsSens`, so
+    // everything below is identical for both.
+    let sens = if stack.is_iov() {
+        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b)?
+    } else {
+        crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b)?
+    };
 
     let err_keys = model.error_spec.obs_keys(subject);
     let mut d_nll_d_f = vec![0.0f64; n_obs];
@@ -741,8 +933,9 @@ fn grid_response_correction(
     subject: &Subject,
     params: &ModelParameters,
     template: &ModelParameters,
+    stack: &Stack,
     x: &[f64],
-    eta_hat: &[f64],
+    b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
     scratch: &mut pk::EventPkParams,
@@ -760,8 +953,8 @@ fn grid_response_correction(
     // `dη̂/dx` (the implicit-function-theorem derivative `−H⁻¹·∂²nll/∂η∂x`, which the
     // sensitivity provider already supplies and the EBE predictor already relies on). No
     // inner re-solve is needed.
-    let deta_dx = eta_dx(
-        model, subject, params, template, x, eta_hat, scratch, schedule,
+    let db_dx = eta_dx(
+        model, subject, params, template, stack, x, b_hat, scratch, schedule,
     )?;
 
     for k in 0..x.len() {
@@ -777,18 +970,21 @@ fn grid_response_correction(
         xp[k] += step;
         xm[k] -= step;
 
-        // The mode moves with the parameters: η̂(x ± h) ≈ η̂ ± h · dη̂/dx_k.
-        let ep: Vec<f64> = (0..eta_hat.len())
-            .map(|i| eta_hat[i] + step * deta_dx[k][i])
+        // The mode moves with the parameters: b̂(x ± h) ≈ b̂ ± h · db̂/dx_k.
+        let ep: Vec<f64> = (0..b_hat.len())
+            .map(|i| b_hat[i] + step * db_dx[k][i])
             .collect();
-        let em: Vec<f64> = (0..eta_hat.len())
-            .map(|i| eta_hat[i] - step * deta_dx[k][i])
+        let em: Vec<f64> = (0..b_hat.len())
+            .map(|i| b_hat[i] - step * db_dx[k][i])
             .collect();
 
         let pp = unpack_params(&xp, template);
         let pm = unpack_params(&xm, template);
-        let hp = fd_posterior_hessian(model, subject, &pp, &ep, scratch, schedule);
-        let hm = fd_posterior_hessian(model, subject, &pm, &em, scratch, schedule);
+        // Ω_joint moves with the parameters too, so rebuild the stack at each perturbed point.
+        let sp = Stack::new(model, &pp, stack.n_occ);
+        let sm = Stack::new(model, &pm, stack.n_occ);
+        let hp = fd_posterior_hessian(model, subject, &pp, &sp, &ep, scratch, schedule);
+        let hm = fd_posterior_hessian(model, subject, &pm, &sm, &em, scratch, schedule);
 
         // `nll` stays at the ORIGINAL params — the direct x-dependence is already covered
         // analytically by the fixed-η score — but the grid (centre and scale) is the
@@ -797,11 +993,12 @@ fn grid_response_correction(
             model,
             subject,
             params,
+            stack,
             &ep,
             nodes,
             log_weights,
             &hp,
-            &pp.omega.inv,
+            &sp.omega_joint_inv,
             scratch,
             schedule,
         );
@@ -809,11 +1006,12 @@ fn grid_response_correction(
             model,
             subject,
             params,
+            stack,
             &em,
             nodes,
             log_weights,
             &hm,
-            &pm.omega.inv,
+            &sm.omega_joint_inv,
             scratch,
             schedule,
         );
@@ -849,54 +1047,46 @@ fn eta_dx(
     subject: &Subject,
     params: &ModelParameters,
     template: &ModelParameters,
+    stack: &Stack,
     x: &[f64],
-    eta_hat: &[f64],
+    b_hat: &[f64],
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> Option<Vec<nalgebra::DVector<f64>>> {
     use crate::estimation::parameterization::{packed_fixed_mask, unpack_params};
 
-    if analytic_score_supported(model) {
+    // `dη̂/dx` from the provider, non-IOV only.
+    //
+    // Deliberately NOT `subject_eta_dx_iov` for IOV, even though it exists. Both provider
+    // entry points solve `db̂/dx = −H_inner⁻¹ · ∂²nll/∂b∂x` against the *Gauss-Newton* inner
+    // Hessian, whereas AGQ's grid is scaled by the **exact** FD Hessian. Non-IOV that
+    // mismatch is immaterial (it leaves the gradient at 0.16% of FD), but with the stacked
+    // (η, κ) Hessian it is not: it puts the ω gradients ~8% out. The implicit-function finite
+    // difference below uses the same exact `H` the grid does, and brings IOV back in line.
+    // Still no inner re-solve — this is the derivative of the mode, not a recomputation of it.
+    if !stack.is_iov() && analytic_score_supported(model, stack) {
         if let Some(v) = crate::estimation::sens_outer_gradient::subject_eta_dx(
-            model, subject, template, x, eta_hat,
+            model, subject, template, x, b_hat,
         ) {
             return Some(v);
         }
     }
 
-    let d = eta_hat.len();
-    let h_mat = fd_posterior_hessian(model, subject, params, eta_hat, scratch, schedule);
+    let d = stack.d();
+    let h_mat = fd_posterior_hessian(model, subject, params, stack, b_hat, scratch, schedule);
     let h_inv = h_mat.clone().try_inverse()?;
     let fixed = packed_fixed_mask(template);
 
-    // ∇_η nll(η̂; p) — central differences in η, at the given parameters.
+    // ∇_b nll(b̂; p) — central differences in the stacked variable, at the given parameters.
     let mut eta_grad = |p: &ModelParameters, out: &mut [f64]| {
-        let mut e = eta_hat.to_vec();
+        let mut e = b_hat.to_vec();
         for i in 0..d {
-            let step = (f64::EPSILON.powf(0.25) * p.omega.matrix[(i, i)].max(0.0).sqrt()).max(1e-5);
-            e[i] = eta_hat[i] + step;
-            let fp = individual_nll_into_with_schedule(
-                model,
-                subject,
-                &p.theta,
-                &e,
-                &p.omega,
-                &p.sigma.values,
-                scratch,
-                schedule,
-            );
-            e[i] = eta_hat[i] - step;
-            let fm = individual_nll_into_with_schedule(
-                model,
-                subject,
-                &p.theta,
-                &e,
-                &p.omega,
-                &p.sigma.values,
-                scratch,
-                schedule,
-            );
-            e[i] = eta_hat[i];
+            let step = (f64::EPSILON.powf(0.25) * stack.prior_sd[i]).max(1e-5);
+            e[i] = b_hat[i] + step;
+            let fp = stack.nll_at(model, subject, p, &e, scratch, schedule);
+            e[i] = b_hat[i] - step;
+            let fm = stack.nll_at(model, subject, p, &e, scratch, schedule);
+            e[i] = b_hat[i];
             out[i] = (fp - fm) / (2.0 * step);
         }
     };
@@ -934,7 +1124,8 @@ fn phi_grid(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
-    eta_hat: &[f64],
+    stack: &Stack,
+    b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
     h_mat: &DMatrix<f64>,
@@ -942,13 +1133,14 @@ fn phi_grid(
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> Option<f64> {
-    let d = eta_hat.len();
+    let d = stack.d();
     let proposal = build_proposal(h_mat, omega_inv, d)?;
-    let (_etas, terms) = agq_nodes_and_terms(
+    let (_bs, terms) = agq_nodes_and_terms(
         model,
         subject,
         params,
-        eta_hat,
+        stack,
+        b_hat,
         nodes,
         log_weights,
         &proposal,
@@ -972,19 +1164,20 @@ fn agq_subject_packed_gradient(
     subject: &Subject,
     params: &ModelParameters,
     template: &ModelParameters,
+    stack: &Stack,
     x: &[f64],
-    eta_hat: &[f64],
+    b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
     out: &mut [f64],
 ) -> Option<()> {
-    let d = eta_hat.len();
+    let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
     let schedule = cacheable_schedule(model, subject);
 
     if d == 0 {
         return accumulate_fixed_eta_packed_gradient(
-            model, subject, params, template, eta_hat, 1.0, out,
+            model, subject, params, template, stack, b_hat, 1.0, out,
         );
     }
 
@@ -992,19 +1185,21 @@ fn agq_subject_packed_gradient(
         model,
         subject,
         params,
-        eta_hat,
+        stack,
+        b_hat,
         &mut scratch,
         schedule.as_ref(),
     );
-    let proposal = build_proposal(&h, &params.omega.inv, d)?;
+    let proposal = build_proposal(&h, &stack.omega_joint_inv, d)?;
 
-    // Sweep the grid once, keeping each node's η and its log-term, so the softmax weights
+    // Sweep the grid once, keeping each node's b and its log-term, so the softmax weights
     // and the scores are computed on exactly the same nodes the objective used.
-    let (etas, terms) = agq_nodes_and_terms(
+    let (bs, terms) = agq_nodes_and_terms(
         model,
         subject,
         params,
-        eta_hat,
+        stack,
+        b_hat,
         nodes,
         log_weights,
         &proposal,
@@ -1016,12 +1211,12 @@ fn agq_subject_packed_gradient(
         return None;
     }
 
-    for (eta_j, &t) in etas.iter().zip(terms.iter()) {
+    for (b_j, &t) in bs.iter().zip(terms.iter()) {
         let w = (t - lse).exp();
         if w == 0.0 {
             continue; // exp underflow — contributes nothing to the average
         }
-        accumulate_fixed_eta_packed_gradient(model, subject, params, template, eta_j, w, out)?;
+        accumulate_fixed_eta_packed_gradient(model, subject, params, template, stack, b_j, w, out)?;
     }
 
     // …plus the grid's response to H — the only term the fixed-node score omits, and the
@@ -1031,8 +1226,9 @@ fn agq_subject_packed_gradient(
         subject,
         params,
         template,
+        stack,
         x,
-        eta_hat,
+        b_hat,
         nodes,
         log_weights,
         &mut scratch,
@@ -1055,6 +1251,7 @@ pub fn agq_population_gradient(
     template: &ModelParameters,
     x: &[f64],
     eta_hats: &[nalgebra::DVector<f64>],
+    kappas: &[Vec<nalgebra::DVector<f64>>],
     n_nodes: usize,
 ) -> Option<Vec<f64>> {
     let n_packed = x.len();
@@ -1066,14 +1263,18 @@ pub fn agq_population_gradient(
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
+            let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            let stack = Stack::new(model, params, subj_kappas.len());
+            let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
             let mut g = vec![0.0f64; n_packed];
             agq_subject_packed_gradient(
                 model,
                 subject,
                 params,
                 template,
+                &stack,
                 x,
-                eta_hats[i].as_slice(),
+                &b_hat,
                 &nodes,
                 &log_weights,
                 &mut g,
