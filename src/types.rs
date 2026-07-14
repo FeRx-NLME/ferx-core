@@ -2772,18 +2772,28 @@ pub type LinearPredictorFn =
     Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
 
 #[cfg(feature = "markov")]
-/// Closure building a CTMM generator matrix `Q(θ, η, covariates)` — the S×S
-/// transition-intensity (generator) matrix for a continuous-time Markov endpoint.
+/// Closure building a CTMM generator matrix `Q(θ, η, covariates, state)` — the
+/// S×S transition-intensity (generator) matrix for a continuous-time Markov
+/// endpoint.
 ///
 /// The off-diagonals `q_jk ≥ 0` (`j ≠ k`) are the `[markov_model] transition`
 /// intensities; the builder fills the diagonal row-sum-zero
 /// (`q_jj = −Σ_{k≠j} q_jk`) so the caller always receives a valid generator.
-/// Mirrors [`LinearPredictorFn`]: evaluated once per subject from a *baseline*
-/// covariate snapshot (time-homogeneous — a drug-driven `Q(t)` is Phase 6), so a
-/// time-varying covariate on an intensity would be silently frozen and is
-/// guarded at parse/fit-setup.
-pub type GeneratorFn =
-    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> nalgebra::DMatrix<f64> + Send + Sync>;
+///
+/// The `state` slice is the model's **ODE state vector at the current time**,
+/// supplied only on the **time-inhomogeneous** (drug/PD-driven `Q(t)`, Phase 6,
+/// #817) path so an intensity may reference an ODE state by name (e.g. a
+/// concentration `central/V` or a PD response compartment). The builder resolves
+/// those names against `state` via the endpoint's
+/// [`generator_states`](EndpointLikelihood::Ctmm::generator_states) index map.
+/// On the **time-homogeneous** (Phase 5) path no intensity references a state, so
+/// callers pass an empty slice and the argument is ignored — the generator is
+/// then a pure function of a *baseline* `(θ, η, covariates)` snapshot, and a
+/// time-varying covariate on an intensity would be silently frozen (guarded at
+/// parse/fit-setup).
+pub type GeneratorFn = Box<
+    dyn Fn(&[f64], &[f64], &HashMap<String, f64>, &[f64]) -> nalgebra::DMatrix<f64> + Send + Sync,
+>;
 
 #[cfg(feature = "survival")]
 /// Per-CMT endpoint likelihood specification.
@@ -2839,7 +2849,7 @@ pub enum EndpointLikelihood {
         /// be coded with any non-negative integers (e.g. `1`/`2`), not only
         /// `0..S−1`. Length `== n_states`; codes are unique (checked at parse).
         state_codes: Vec<usize>,
-        /// Builds the generator `Q(θ,η,cov)` — see [`GeneratorFn`].
+        /// Builds the generator `Q(θ,η,cov,state)` — see [`GeneratorFn`].
         generator_fn: GeneratorFn,
         /// Covariate names referenced by any transition intensity (including any
         /// reached transitively through `[individual_parameters]`). Evaluated at a
@@ -2849,6 +2859,16 @@ pub enum EndpointLikelihood {
         /// [`Self::Tte`]'s `hazard_covariates` and [`Self::Binary`]'s
         /// `lp_covariates` (#741).
         generator_covariates: Vec<String>,
+        /// ODE **state** names referenced by any transition intensity, paired with
+        /// their index in the model's ODE state vector: `(state_name, ode_index)`.
+        /// Non-empty **iff** the endpoint is time-**inhomogeneous** (drug/PD-driven
+        /// `Q(t)`, Phase 6 #817) — an intensity references a model state, so the
+        /// generator must be re-evaluated as the state evolves over each observation
+        /// gap (occupancy ODE, [`crate::markov::ctmm_inhomogeneous_transition`])
+        /// rather than built once per subject. **Empty** ⇒ time-homogeneous (Phase 5,
+        /// `expm(Q·Δt)`). [`generator_fn`](Self::Ctmm::generator_fn) reads its `state`
+        /// argument through this map.
+        generator_states: Vec<(String, usize)>,
     },
     // Ordinal, Poisson, NegBin, Dtmm deferred to Phase 4/4b
 }

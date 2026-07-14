@@ -107,7 +107,10 @@ fn ctmm_endpoint_nll(
     if obs.len() < 2 {
         return 0.0;
     }
-    let q = generator_fn(theta, eta, covariates);
+    // Time-homogeneous path: no ODE state drives Q, so the state slice is empty.
+    // The time-inhomogeneous (drug/PD-driven) path is scored by a separate integrator
+    // (Phase 6, #817) that supplies the evolving state per gap — see `ctmm_subject_nll`.
+    let q = generator_fn(theta, eta, covariates, &[]);
     debug_assert_eq!(
         q.nrows(),
         n_states,
@@ -159,20 +162,192 @@ pub fn ctmm_subject_nll(
             n_states,
             state_codes,
             generator_fn,
+            generator_states,
             ..
         } = endpoint
         {
-            nll += ctmm_endpoint_nll(
-                *cmt,
-                *n_states,
-                state_codes,
-                generator_fn,
-                &subject.obs_records,
-                &subject.covariates,
-                theta,
-                eta,
-            );
+            nll += if generator_states.is_empty() {
+                // Time-homogeneous (Phase 5): one constant Q per subject, P = expm(Q·Δt).
+                ctmm_endpoint_nll(
+                    *cmt,
+                    *n_states,
+                    state_codes,
+                    generator_fn,
+                    &subject.obs_records,
+                    &subject.covariates,
+                    theta,
+                    eta,
+                )
+            } else {
+                // Time-inhomogeneous (Phase 6, #817): Q depends on the evolving model
+                // state, so each interval transition is integrated (occupancy ODE).
+                ctmm_endpoint_nll_inhomogeneous(
+                    model,
+                    subject,
+                    *cmt,
+                    *n_states,
+                    state_codes,
+                    generator_fn,
+                    theta,
+                    eta,
+                )
+            };
         }
+    }
+    nll
+}
+
+/// Number of interior sub-nodes per observation gap at which the model state is
+/// sampled to drive `Q(state(t))` across the interval. The occupancy ODE is then
+/// integrated (adaptively) with the state linearly interpolated between sub-nodes;
+/// concentration/PD states are smooth within a gap, so a modest grid is accurate,
+/// and it is refined for free by the adaptive occupancy stepper on top. The
+/// degenerate `SLOPE = 0` case (state-independent `Q`) is exact regardless.
+#[cfg(feature = "markov")]
+const INHOMOGENEOUS_SUBNODES_PER_GAP: usize = 16;
+
+/// Negative CTMM log-likelihood for one subject on a **time-inhomogeneous** (drug/
+/// PD-driven `Q(t)`) endpoint (Phase 6, #817).
+///
+/// The generator depends on the model's ODE state (a concentration `central/V`, a PD
+/// response compartment, …), so `P(Δt_m)` has no closed form. The subject's ODE
+/// system is solved once for `(θ, η)`; per observation gap the state is sampled on a
+/// sub-grid and the occupancy ODE `dP/dτ = P·Q(state(t_m+τ))`, `P(0)=I` is integrated
+/// with [`crate::markov::ctmm_inhomogeneous_transition`], the state linearly
+/// interpolated between sub-nodes. The likelihood is the same
+/// `−Σ_m log P(Δt_m)[s_m, s_{m+1}]`. Evaluated fresh at each `η` (including the
+/// perturbed `η` of the FD paths), so the full `η`-dependence — through both the
+/// generator and the PK/PD state trajectory — is captured without new gradient
+/// plumbing.
+#[cfg(feature = "markov")]
+#[allow(clippy::too_many_arguments)]
+fn ctmm_endpoint_nll_inhomogeneous(
+    model: &CompiledModel,
+    subject: &Subject,
+    cmt: usize,
+    n_states: usize,
+    state_codes: &[usize],
+    generator_fn: &GeneratorFn,
+    theta: &[f64],
+    eta: &[f64],
+) -> f64 {
+    let obs = match collect_state_obs(cmt, state_codes, &subject.obs_records) {
+        Ok(o) => o,
+        Err(_bad_code) => return SUBJECT_SENTINEL_NLL, // validated pre-fit; defensive
+    };
+    if obs.len() < 2 {
+        return 0.0;
+    }
+    // An inhomogeneous intensity references an ODE state, so the model must be an ODE
+    // model (guaranteed at parse: `generator_states` indices point into `ode_spec`).
+    let Some(ode) = model.ode_spec.as_ref() else {
+        return SUBJECT_SENTINEL_NLL;
+    };
+
+    // PK/PD parameter snapshot at (θ, η) — the ODE solve reads it (baseline covariate
+    // snapshot; a time-varying covariate on the generator is rejected at fit setup).
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+
+    // One sub-grid per gap: `n_sub + 1` uniform nodes spanning [t_m, t_{m+1}] (gap m
+    // occupies a contiguous block, so gaps sharing a boundary time keep independent
+    // blocks). Solve the ODE state at every node in a single pass.
+    let n_sub = INHOMOGENEOUS_SUBNODES_PER_GAP;
+    let n_gaps = obs.len() - 1;
+    let mut grid: Vec<f64> = Vec::with_capacity(n_gaps * (n_sub + 1));
+    for w in obs.windows(2) {
+        let (t0, t1) = (w[0].time, w[1].time);
+        for i in 0..=n_sub {
+            grid.push(t0 + (t1 - t0) * (i as f64) / (n_sub as f64));
+        }
+    }
+    let states = crate::ode::ode_dense_solve_states(ode, &pk.values, theta, eta, subject, &grid);
+    debug_assert_eq!(states.len(), grid.len());
+
+    let cov = &subject.covariates;
+    let mut nll = 0.0;
+    for (m, w) in obs.windows(2).enumerate() {
+        let (t0, t1) = (w[0].time, w[1].time);
+        let dt = t1 - t0;
+        let base = m * (n_sub + 1); // this gap's block start in `grid`/`states`
+
+        // Out-of-order records (t_{m+1} < t_m): the homogeneous `ctmm_data_term`
+        // rejects this with `MarkovError::TimeDecreased`; the inhomogeneous path would
+        // instead return the identity `P(0)` and silently score a same-state pair as
+        // `log 1 = 0`, understating the objective. Repel to match. (`dt == 0` with an
+        // identical state is the legitimate zero-length gap and falls through.)
+        if dt < 0.0 {
+            return SUBJECT_SENTINEL_NLL;
+        }
+
+        // State at elapsed time τ ∈ [0, dt] within the gap, linearly interpolated
+        // between the two bracketing sub-nodes, written into a reused scratch buffer so
+        // the occupancy-ODE RHS (called at every RK45 stage of every gap) does not
+        // allocate a fresh `Vec` per evaluation. `Q` off-diagonals are guarded inside
+        // the generator's downstream use, but a negative off-diagonal from an
+        // unconstrained intensity must still repel — checked at the sub-nodes below.
+        let n_ode = states[base].len();
+        let interp_scratch = std::cell::RefCell::new(vec![0.0_f64; n_ode]);
+        let interp_into = |tau: f64, out: &mut [f64]| {
+            if dt <= 0.0 {
+                out.copy_from_slice(&states[base]);
+                return;
+            }
+            let frac = (tau / dt).clamp(0.0, 1.0) * (n_sub as f64);
+            let lo = (frac.floor() as usize).min(n_sub);
+            let hi = (lo + 1).min(n_sub);
+            let w_hi = frac - lo as f64;
+            let (a, b) = (&states[base + lo], &states[base + hi]);
+            for (o, (x, y)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+                *o = x + (y - x) * w_hi;
+            }
+        };
+
+        // Guard the generator at each sub-node — the inhomogeneous analogue of the
+        // homogeneous `ctmm_data_term` up-front checks; `Q` is smooth in the state, so
+        // the dense sub-nodes catch these (a driver that is non-monotone *strictly
+        // between* two same-sign sub-nodes is the residual gap, not covered here):
+        //   • a non-finite ODE state — e.g. a grid node the solve never reached and
+        //     left as `NaN` — would poison the occupancy integration silently;
+        //   • a non-finite or enormous rate (`|q·dt| > MAX_EXP_ARG_ABS`), a diverged
+        //     intensity that would hang/overflow the stiff occupancy solve rather than
+        //     return a usable `P` (mirrors the homogeneous `expm`-argument guard); and
+        //   • a negative off-diagonal, an unconstrained intensity driven negative.
+        // All repel the optimizer (sentinel) rather than scoring a bogus likelihood.
+        for i in 0..=n_sub {
+            let st = &states[base + i];
+            if st.iter().any(|x| !x.is_finite()) {
+                return SUBJECT_SENTINEL_NLL;
+            }
+            let q = generator_fn(theta, eta, cov, st);
+            for j in 0..q.nrows() {
+                for k in 0..q.ncols() {
+                    let qjk = q[(j, k)];
+                    if !qjk.is_finite() || qjk.abs() * dt > super::MAX_EXP_ARG_ABS {
+                        return SUBJECT_SENTINEL_NLL;
+                    }
+                    if j != k && qjk < -1e-12 {
+                        return SUBJECT_SENTINEL_NLL;
+                    }
+                }
+            }
+        }
+
+        let p = crate::markov::ctmm_inhomogeneous_transition_with_opts(
+            |tau| {
+                let mut st = interp_scratch.borrow_mut();
+                interp_into(tau, &mut st);
+                generator_fn(theta, eta, cov, &st)
+            },
+            dt,
+            n_states,
+            &ode.solver_opts,
+        );
+        let prob = p[(obs[m].state, obs[m + 1].state)];
+        // Underflowed / non-positive probability for an observed transition → repel.
+        if !prob.is_finite() || prob <= 0.0 {
+            return SUBJECT_SENTINEL_NLL;
+        }
+        nll -= prob.min(1.0).ln();
     }
     nll
 }
@@ -244,11 +419,13 @@ mod tests {
     use crate::types::GeneratorFn;
     use nalgebra::DMatrix;
 
-    /// A constant 2-state generator `Q = [[-a, a], [b, -b]]`, ignoring θ/η/cov.
+    /// A constant 2-state generator `Q = [[-a, a], [b, -b]]`, ignoring θ/η/cov/state.
     fn const_gen(a: f64, b: f64) -> GeneratorFn {
-        Box::new(move |_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| {
-            DMatrix::from_row_slice(2, 2, &[-a, a, b, -b])
-        })
+        Box::new(
+            move |_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>, _s: &[f64]| {
+                DMatrix::from_row_slice(2, 2, &[-a, a, b, -b])
+            },
+        )
     }
 
     fn disc(time: f64, state: usize, cmt: usize) -> ObsRecord {

@@ -3313,7 +3313,23 @@ pub fn fit(
     // CMT). Otherwise the code→index map would miss and fold into a silent sentinel.
     #[cfg(feature = "markov")]
     for (cmt, endpoint) in &model.endpoints {
-        if let EndpointLikelihood::Ctmm { state_codes, .. } = endpoint {
+        if let EndpointLikelihood::Ctmm {
+            state_codes,
+            generator_states,
+            ..
+        } = endpoint
+        {
+            // Time-inhomogeneous (drug/PD-driven Q(t), #817): an intensity references a
+            // model ODE state, scored by the per-gap occupancy integration in
+            // `ctmm_endpoint_nll_inhomogeneous`. That requires an ODE model — guaranteed at
+            // parse (`generator_states` indices point into `ode_spec`), asserted here for a
+            // hand-built `CompiledModel`.
+            if !generator_states.is_empty() && model.ode_spec.is_none() {
+                return Err(format!(
+                    "[markov_model] cmt = {cmt}: a transition intensity references a model state \
+                     (time-inhomogeneous Q(t)), but the model has no ODE system to supply it."
+                ));
+            }
             for subject in &population.subjects {
                 crate::markov::endpoint::validate_ctmm_states(
                     *cmt,

@@ -64,11 +64,16 @@ section of the SDLC for the versioning policy).
   and scores each consecutive observation pair with the exact transition
   matrix `P(Δt) = expm(Q·Δt)`. Time-homogeneous generators fit with FOCEI
   (default), SAEM, or IMP; intensities may carry covariates and between-subject
-  random effects. Requires the `markov` cargo feature. See the
+  random effects. An intensity may also depend on a **model state** — a drug
+  concentration (`central / V`) or a PD response — making the generator
+  time-inhomogeneous `Q(t) = f(state(t))` (#817); ferx then integrates the
+  occupancy ODE `dP/dτ = P·Q(state(t))` (forward Kolmogorov) over each
+  observation gap instead of the closed-form matrix exponential (requires an ODE
+  model). Requires the `markov`
+  cargo feature. See the
   [Markov models](https://ferx-nlme.github.io/ferx-core/model-file/markov-model.html)
   and [CTMM estimation](https://ferx-nlme.github.io/ferx-core/estimation/ctmm.html)
-  pages. (mCTMM/DTMM, drug-driven `Q(t)`, and CTMM simulation are planned
-  follow-ups.)
+  pages. (mCTMM/DTMM and CTMM simulation are planned follow-ups.)
 - **Adaptive Gaussian quadrature (`method = agq`)** (#251): a new estimation
   method that generalises Laplace. Instead of approximating each subject's
   marginal likelihood with a single Gaussian at the empirical-Bayes mode, it
