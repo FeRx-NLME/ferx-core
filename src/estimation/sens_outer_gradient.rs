@@ -4837,6 +4837,37 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
 
+    /// 1-cpt IV with bioavailability `F` — the fixture the mixed-gradient test uses
+    /// for a genuinely out-of-analytic-scope subject. An IV *bolus* is a magnitude
+    /// scale (`F` post-multiply, analytic), but a rate-defined *infusion* under
+    /// `F ≠ 1` reshapes the window (`rate` held, duration `F·dur`), which the
+    /// superposition kernels can't express — so the analytic provider declines to FD
+    /// (#419) while production's `event_driven_predictions` predicts it correctly.
+    /// That is the exact "analytic-declines / f64-correct" pairing the mixed assembly
+    /// needs, and — unlike a modeled-duration `D`-slot fixture — `F` is a *shared*
+    /// structural parameter that also drives the in-scope subject, so no packed
+    /// coordinate is exercised only through the FD-filled subject. (Steady-state +
+    /// reset is now analytic on the event-driven walk (#830), so it no longer serves
+    /// as an out-of-scope case.)
+    const ONECPT_IV_F_INFUSION: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVF(0.7, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_F  ~ 0.05
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  F  = TVF  * exp(ETA_F)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
     /// Two IV-infusion occasions separated by an EVID=4 reset at t=120: occasion-2
     /// observations must rebuild from zero (no carryover across the reset). The
     /// observations are synthesised from the production predictor at a reference η
@@ -5115,7 +5146,7 @@ mod tests {
     }
 
     /// Regression for focei-slsqp-fixed-ebe-gradient-bias: a population mixing
-    /// in-scope subjects with a single out-of-scope (SS+reset) subject must still
+    /// in-scope subjects with a single out-of-scope (distinct-slot modeled-duration) subject must still
     /// yield the exact analytic gradient for the in-scope subjects, filling only
     /// the out-of-scope one with a reconverged per-subject FD. Before the fix one
     /// such subject forced `population_gradient_sens` to `None`, dropping the
@@ -5129,13 +5160,33 @@ mod tests {
         use crate::estimation::parameterization::{compute_bounds, pack_params};
         use crate::types::{FitOptions, Population};
 
-        let model = parse_model_string(ONECPT_IV_RESET).expect("parse");
-        let theta = [0.22, 11.0];
-        let eta_ref = [0.12, -0.08];
+        let model = parse_model_string(ONECPT_IV_F_INFUSION).expect("parse");
+        let theta = [10.0, 50.0, 0.7];
 
-        // In-scope plain subject + an out-of-scope SS+reset subject.
-        let s_plain = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-        let s_oos = ss_reset_subject_outer(&model, &theta, &eta_ref, "ss_reset");
+        // In-scope plain (bolus) subject — F is a magnitude scale, so it is served
+        // analytically — plus an out-of-scope subject whose rate-defined infusion
+        // under F ≠ 1 reshapes the window and declines to FD (#419).
+        let s_plain = subject_with_obs(&model, &theta, &[0.25, 1.0, 2.0, 4.0, 8.0]);
+        let mut s_oos = subject_with_obs(
+            &model,
+            &theta,
+            &[0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0],
+        );
+        s_oos.id = "f_infusion_oos".into();
+        s_oos.doses = vec![crate::types::DoseEvent::new(
+            0.0, 1000.0, 1, 500.0, false, 0.0,
+        )];
+        assert!(
+            s_oos.has_rate_defined_infusion() && model.has_bioavailability(),
+            "OOS fixture must be a rate-defined infusion under F ≠ 1"
+        );
+        // Re-synthesise realistic nonzero-residual observations from production for
+        // the replaced dose schedule.
+        {
+            let preds =
+                crate::pk::compute_predictions_with_tv(&model, &s_oos, &theta, &[0.1, -0.05, 0.15]);
+            s_oos.observations = preds.iter().map(|p| p * 0.85).collect();
+        }
         let pop = Population {
             subjects: vec![s_plain, s_oos],
             covariate_names: vec![],
@@ -5151,7 +5202,7 @@ mod tests {
         let params = unpack_params(&x, &template);
 
         // EBE per subject: in-scope subjects use the analytic Newton polish
-        // (`precise_ebe`); the out-of-scope SS+reset subject uses the production
+        // (`precise_ebe`); the out-of-scope F≠1-infusion subject uses the production
         // inner solver (`find_ebe`), which `precise_ebe` can't because it unwraps
         // the analytic provider.
         let zeros = vec![0.0; model.n_eta];
@@ -5171,10 +5222,10 @@ mod tests {
             .collect();
 
         // Pre-fix behaviour: the all-or-nothing analytic gradient declines the
-        // whole population because subject 1 (SS+reset) is out of scope.
+        // whole population because subject 1 (distinct-slot modeled-duration) is out of scope.
         assert!(
             population_gradient_sens(&model, &pop, &template, &x, &ehs).is_none(),
-            "SS+reset subject must take the whole population out of the all-or-nothing path"
+            "out-of-scope subject must take the whole population out of the all-or-nothing path"
         );
         // The per-subject view keeps the in-scope subject analytic, only the
         // out-of-scope one `None`.
@@ -5182,7 +5233,7 @@ mod tests {
         assert!(per_sub[0].is_some(), "plain subject is in analytic scope");
         assert!(
             per_sub[1].is_none(),
-            "SS+reset subject is out of analytic scope"
+            "distinct-slot modeled-duration subject is out of analytic scope"
         );
 
         // The assembled mixed gradient (analytic in-scope + per-subject FD for the
@@ -5236,7 +5287,12 @@ mod tests {
             let f1 = fd_at(k, h);
             let f2 = fd_at(k, h / 2.0);
             let fd = (4.0 * f2 - f1) / 3.0;
-            approx::assert_relative_eq!(mixed[k], fd, max_relative = 3e-3, epsilon = 1e-5);
+            // 5e-3 (vs the 3e-3 elsewhere): the `F`-theta coordinate drives the
+            // out-of-scope subject's infusion-window reshape, so its reconverged-EBE
+            // FOCEI FD is the noisiest coordinate here. Still tight enough to catch an
+            // assembly bug — a misfilled OOS coordinate lands orders of magnitude off,
+            // not at the 3rd decimal.
+            approx::assert_relative_eq!(mixed[k], fd, max_relative = 5e-3, epsilon = 1e-5);
         }
     }
 

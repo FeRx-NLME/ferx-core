@@ -2469,12 +2469,11 @@ pub fn subject_sensitivities_tvcov(
     }
     // Steady-state doses equilibrate per-event in the walk (`equilibrate_ss_g`,
     // at each dose's covariate snapshot), exactly as production's event-driven
-    // predictor does. A steady-state dose assumes an infinite periodic history,
-    // which a mid-record reset contradicts, so a subject mixing SS with resets
-    // falls back to FD — mirroring the non-IOV / IOV providers.
-    if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
-        return None;
-    }
+    // predictor does. SS combined with an EVID 3/4 reset is served here (#830): the
+    // walk zeros the dual state at the reset and re-equilibrates the next SS dose
+    // fresh, so there is no truncated-history problem (unlike dose superposition,
+    // which still gates the pair in `subject_sensitivities_impl`). `subject_routes_
+    // to_event_walk` routes such subjects here for exactly this reason.
     // Modeled-`RATE=-1/-2` doses — including combined with steady state (#486:
     // `equilibrate_ss_g` threads the modeled-window jet into its per-cycle active/quiet
     // split) — are served analytically below via the per-dose duals; only the
@@ -2820,9 +2819,10 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     if model.analytic_readout.is_some() && !readout_tvcov_supported(model) {
         return None;
     }
-    if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
-        return None;
-    }
+    // SS + EVID 3/4 reset is served on the event-driven walk (#830): resets zero the
+    // dual state, the next SS dose re-equilibrates fresh — the inner twin of the outer
+    // `subject_sensitivities_tvcov` handling. Dose superposition still gates the pair
+    // in `subject_eta_grad_impl`; the router sends these subjects here instead.
     // Modeled-`RATE=-1/-2` doses are served analytically by the walk now (#486): the
     // dual rate + moving infusion-end boundary (`run_obs_grad_tvcov` builds the
     // per-dose duals). The steady-state combination is analytic too (#486:
@@ -3207,6 +3207,11 @@ fn subject_eta_grad_impl(
     if !analytical_supported(model) {
         return None;
     }
+    // Dose superposition cannot express SS + reset (an SS dose folds in an infinite
+    // periodic history a reset truncates), so decline to FD. A `supports_event_driven`
+    // model with this pair has already been routed to the state-propagating walk above
+    // (`subject_routes_to_event_walk`, #830), which *can* express it; only transit/IG
+    // (no finite linear state) reach here and correctly fall back.
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
@@ -4267,6 +4272,18 @@ pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subj
         // `ode_tvcov_supported`'s `has_modeled_dose` clause. An oral modeled infusion
         // is already covered by `subject_has_oral_infusion`; this adds the IV route.
         || !subject.all_doses_fixed()
+        // Steady-state dosing combined with an EVID 3/4 reset (#830). Dose
+        // superposition genuinely cannot express this pair (an SS dose folds in an
+        // infinite periodic history that a reset truncates), so it declines to FD in
+        // `subject_{eta_grad,sensitivities}_impl`. The state-propagating walk *can*:
+        // `event_driven_sens_with_doses_g` zeros the dual state at each reset and
+        // re-equilibrates the next SS dose per-event (`equilibrate_ss_g`) — the exact
+        // dual twin of production's `event_driven_predictions`, which serves the same
+        // combination on the f64 path. `supports_event_driven` is already required
+        // above, so transit/IG (whose Gamma absorption is not a finite linear state)
+        // stay on the superposition path and correctly decline to FD. Mirrors the ODE
+        // walk's `ode_tvcov_supported`, which admits SS + reset for the same reason.
+        || (subject.has_resets() && subject.doses.iter().any(|d| d.ss))
 }
 
 fn subject_sensitivities_impl(
@@ -4328,7 +4345,11 @@ fn subject_sensitivities_impl(
     // superposition of only the doses since the most recent reset — which carries
     // the exact `∂f/∂pk` through the same closed forms. Steady-state doses assume
     // an infinite periodic history that a mid-record reset contradicts, so a
-    // subject mixing SS with resets falls back to FD.
+    // subject mixing SS with resets cannot be expressed by superposition. A
+    // `supports_event_driven` model with this pair routes to the state-propagating
+    // walk above (`subject_routes_to_event_walk`, #830), which zeros state at the
+    // reset and re-equilibrates the next SS dose; only transit/IG (no finite linear
+    // state) reach here and correctly fall back to FD.
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
@@ -7408,6 +7429,74 @@ mod tests {
             &[1.0, 4.0, 6.0, 8.0, 11.0],
         );
         check_provider_vs_production(&iv, &ss_inf, &[10.0, 50.0, 15.0, 100.0], &[0.1, -0.05]);
+    }
+
+    /// **Steady-state dosing combined with an EVID 3/4 reset on the closed-form
+    /// path (#830).** The fluconazole shape: two SS-infusion occasions with distinct
+    /// `II`, separated by an EVID=4 reset (reset + re-dose to steady state). Dose
+    /// superposition gates this pair (an SS dose folds in an infinite periodic history
+    /// a reset truncates), so before #830 every such subject fell back to FD. Now the
+    /// subject routes to the state-propagating event-driven walk — which zeros the dual
+    /// state at the reset and re-equilibrates the next SS dose fresh — so both the outer
+    /// sensitivities and the inner η-gradient are served analytically and must match FD
+    /// of the production predictor (`compute_predictions_with_tv`, which takes the same
+    /// `event_driven_predictions` walk on the f64 side). This is the closed-form twin of
+    /// `population_packed_gradient_ode_ss_reset_matches_fd` (the ODE-path anchor).
+    #[test]
+    fn provider_2cpt_ss_plus_reset_matches_fd() {
+        let iv = parse_model_string(TWOCPT_IV).expect("parse");
+        // OCC 1: SS infusion at t=0 (II=24, rate=500, amt=6000 → dur=12 < II).
+        // OCC 2: EVID=4 reset + SS infusion at t=48 (II=8, rate=1000, amt=2000 → dur=2).
+        let doses = vec![
+            DoseEvent::new(0.0, 6000.0, 1, 500.0, true, 24.0),
+            DoseEvent::new(48.0, 2000.0, 1, 1000.0, true, 8.0),
+        ];
+        // Observations straddle both occasions (pre- and post-reset).
+        let subject =
+            subject_with_doses_and_resets(doses, &[6.0, 18.0, 23.5, 49.0, 51.0, 55.0], vec![48.0]);
+        assert!(
+            subject.has_resets() && subject.doses.iter().any(|d| d.ss),
+            "fixture must be SS + reset"
+        );
+        // Routes to the event-driven walk (superposition declines the pair), the
+        // precondition for the analytic gradient below.
+        assert!(
+            subject_routes_to_event_walk(&iv, &subject),
+            "SS + reset on a walk-supported model must route to the event-driven walk"
+        );
+        // Both providers must serve it (no FD fallback), and match FD of production.
+        assert!(
+            subject_sensitivities(&iv, &subject, &[10.0, 50.0, 15.0, 100.0], &[0.1, -0.05])
+                .is_some(),
+            "outer sensitivities must be analytic for SS + reset"
+        );
+        assert!(
+            subject_eta_grad(&iv, &subject, &[10.0, 50.0, 15.0, 100.0], &[0.1, -0.05]).is_some(),
+            "inner η-gradient must be analytic for SS + reset"
+        );
+        check_full_provider_vs_fd(&iv, &subject, &[10.0, 50.0, 15.0, 100.0], &[0.1, -0.05]);
+    }
+
+    /// Transit absorption (no finite linear state → not `supports_event_driven`)
+    /// combined with SS + reset must STILL decline to FD: the router keeps it on the
+    /// dose-superposition path, whose SS+reset guard is live (#830 keeps the guard for
+    /// exactly this class — see #822's restore of the static-path guards).
+    #[test]
+    fn transit_ss_plus_reset_still_declines_to_fd() {
+        let m = parse_model_string(ONECPT_TRANSIT_MODEL).expect("parse");
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, true, 24.0),
+            DoseEvent::new(48.0, 1000.0, 1, 0.0, true, 24.0),
+        ];
+        let subject = subject_with_doses_and_resets(doses, &[6.0, 18.0, 52.0], vec![48.0]);
+        assert!(
+            !subject_routes_to_event_walk(&m, &subject),
+            "transit must not route to the event-driven walk"
+        );
+        assert!(
+            subject_sensitivities(&m, &subject, &[10.0, 50.0, 1.0, 0.5], &[0.1, -0.05]).is_none(),
+            "transit SS + reset must decline to FD (superposition guard live)"
+        );
     }
 
     #[test]

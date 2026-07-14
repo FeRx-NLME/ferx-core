@@ -676,6 +676,21 @@ section of the SDLC for the versioning policy).
   than being run with kappas held at zero, covariates frozen at their baseline value,
   process noise dropped, or the reset ignored.
 
+### Performance
+- **Analytic (exact) gradients for steady-state dosing combined with an EVID 3/4
+  reset** on the closed-form PK path (#830): a subject that mixes a steady-state
+  dose (`SS=1`) with a system reset — e.g. per-occasion steady-state infusions
+  separated by an `EVID=4` reset, as in the fluconazole free/total binding model —
+  previously fell back to finite-difference inner and outer gradients (correct but
+  ~`2·n_eta+1`× more prediction evaluations per step). These subjects now route to
+  the state-propagating event-driven sensitivity walk, which zeros the state at the
+  reset and re-equilibrates the next steady-state dose exactly as the production
+  predictor does, so both the FOCE/FOCEI outer gradient and the inner EBE gradient
+  are served analytically. On the fluconazole model this moves all 31 subjects onto
+  analytic gradients (12 were on FD) with the objective unchanged. Transit / IG
+  absorption models (no finite linear state) correctly remain on FD for this
+  combination.
+
 ## [0.2.0] - 2026-07-03
 
 ### Added
