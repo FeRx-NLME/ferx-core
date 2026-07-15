@@ -2247,26 +2247,31 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // Laplace is the exact-anchor quadrature. At `n_agq = 1` its grid is a single point no
     // matter how many random effects there are, so the caps below never fire; at `n_agq > 1`
     // they bound the tensor grid.
-    if chain
+    // Both quadrature methods hit these caps: `laplace` at any `n_agq`, and `focei` at
+    // `n_agq > 1` (the Gauss-Newton-anchored quadrature — same `n_agq^d` tensor grid). The
+    // block must fire for either, or a non-IOV FOCEI quadrature would skip the check-time
+    // caps entirely (the runtime cap in `fit_inner` only fires under IOV) and build a
+    // 100k+-node grid unchecked (#251 review #1).
+    let laplace_stage = chain
         .iter()
-        .any(|&m| matches!(m, EstimationMethod::Laplace))
-    {
-        // IOV is **supported**: AGQ integrates over the stacked (η, κ₁..κ_K), which is exactly
-        // what `individual_nll_iov` already scores. What IOV changes is the *dimension* — and
-        // hence the tensor grid — not the method. The grid cap below is what decides whether a
-        // given IOV model is tractable, and it is checked against the stacked dimension in
-        // `fit_inner` (which, unlike this function, can see the occasion count in the data).
+        .any(|&m| matches!(m, EstimationMethod::Laplace));
+    let focei_quadrature =
+        chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI)) && options.n_agq > 1;
+    if laplace_stage || focei_quadrature {
+        // IOV is **supported**: the quadrature integrates over the stacked (η, κ₁..κ_K),
+        // which is exactly what `individual_nll_iov` already scores. What IOV changes is the
+        // *dimension* — and hence the tensor grid — not the method. The grid cap below is
+        // what decides whether a given IOV model is tractable, and it is checked against the
+        // stacked dimension in `fit_inner` (which, unlike this function, can see the
+        // occasion count in the data).
         //
-        let label = "laplace";
+        // Name the quadrature method the user actually wrote.
+        let label = if laplace_stage { "laplace" } else { "focei" };
         // The tensor rule costs `n_agq^d` full likelihood evaluations per subject per
         // outer iteration. Past the cap that is not "slow", it is a fit that will never
         // finish — so it is worth failing at check time, with the two levers spelled out.
-        //
-        // Read the node count from `agq_nodes()`, NOT `options.n_agq`: `method = laplace`
-        // pins it to 1 regardless of what `n_agq` holds (the key is not one of its options),
-        // so reading the raw field would let a stray `n_agq = 100` trip these caps on a fit
-        // that only ever builds a single node.
-        let n_nodes = options.agq_nodes().unwrap_or(1);
+        // Both quadrature methods use `n_agq` as the node count.
+        let n_nodes = options.n_agq.max(1);
         // Per-dimension node cap. The parser (`apply_fit_option`) enforces this for
         // file-driven fits, but a `FitOptions` built directly against the Rust API
         // bypasses that path — so re-check here, alongside the grid cap, or an
@@ -3475,8 +3480,10 @@ pub fn fit(
     // checked in `check_model_options`, which never sees the population. Check it here, once
     // the occasions are known, against the worst subject.
     //
-    // `method = laplace` is a single node regardless of `d`, so it always passes: Laplace +
-    // IOV is tractable at any occasion count.
+    // `method = laplace` / `focei` at `n_agq = 1` is a single node regardless of `d`, so it
+    // always passes; only `n_agq > 1` (adaptive quadrature) can trip this. `agq_nodes()`
+    // fires for both quadrature methods, so name whichever the user actually wrote (#251
+    // review #4) rather than hardcoding "laplace".
     if let Some(n_nodes) = options.agq_nodes() {
         if model.n_kappa > 0 {
             let max_occ = population
@@ -3488,13 +3495,18 @@ pub fn fit(
             let d = model.n_eta + max_occ * model.n_kappa;
             let grid = crate::estimation::agq::grid_size(n_nodes, d);
             if grid > crate::estimation::agq::MAX_AGQ_GRID {
+                let label = if matches!(options.method, EstimationMethod::Laplace) {
+                    "laplace"
+                } else {
+                    "focei"
+                };
                 return Err(format!(
-                    "method = laplace with n_agq = {n_nodes} needs a {n_nodes}^{d} = {grid}-node \
+                    "method = {label} with n_agq = {n_nodes} needs a {n_nodes}^{d} = {grid}-node \
                      tensor grid per subject per iteration — over the {} limit. Under IOV the \
                      integral is over the stacked (η, κ₁..κ_{max_occ}), so the dimension is \
                      n_eta ({}) + occasions ({max_occ}) × n_kappa ({}) = {d}. Lower n_agq \
-                     (n_agq = 1 is Laplace — one node, always tractable), or use saem / imp, \
-                     whose cost does not grow with the random-effect dimension.",
+                     (n_agq = 1 is the single-node method — always tractable), or use \
+                     saem / imp, whose cost does not grow with the random-effect dimension.",
                     crate::estimation::agq::MAX_AGQ_GRID,
                     model.n_eta,
                     model.n_kappa,
@@ -5363,15 +5375,17 @@ fn fit_inner(
         if matches!(method, EstimationMethod::Laplace) && stage_opts.optimizer == Optimizer::Auto {
             stage_opts.optimizer = Optimizer::NloptLbfgs;
         }
-        // The exact-anchor quadrature (Laplace / adaptive GH) needs a tighter EBE than
-        // FOCE/FOCEI: its analytic gradient assumes b̂ is exactly the mode (Bartlett), so a
-        // loose b̂ from a poor start yields a non-descent direction that stalls the outer
-        // optimizer. Measured on warfarin (#251): the shared default 1e-5 fails to converge
-        // from a 1.3× start, while 1e-8 is robust across realistic starts at negligible cost
-        // near the optimum (the OFV is insensitive to inner_tol there). FOCEI's Gauss-Newton
-        // log|H̃| is forgiving of a loose b̂, so it keeps the looser default. `.min` so an
-        // explicit tighter `inner_tol` is preserved.
-        if matches!(method, EstimationMethod::Laplace) {
+        // The **quadrature** methods need a tighter EBE than plain FOCE/FOCEI: their analytic
+        // grid gradient assumes b̂ is exactly the mode (Bartlett identity), so a loose b̂ from
+        // a poor start yields a non-descent direction that stalls the outer optimizer.
+        // Measured on warfarin (#251): the shared default 1e-5 fails to converge from a 1.3×
+        // start, while 1e-8 is robust across realistic starts at negligible cost near the
+        // optimum (the OFV is insensitive to inner_tol there). This is anchor-independent —
+        // `focei` with `n_agq > 1` reuses the same mode-dependent gradient (#251 review #3),
+        // so it needs the tighter EBE too; only plain FOCE/FOCEI (`agq_nodes() == None`, whose
+        // Gauss-Newton `log|H̃|` is forgiving of a loose b̂) keeps the looser default. `.min`
+        // so an explicit tighter `inner_tol` is preserved.
+        if stage_opts.agq_nodes().is_some() {
             stage_opts.inner_tol = stage_opts.inner_tol.min(1e-8);
         }
         // Run the covariance step (and SIR) only on the last *estimating* stage,

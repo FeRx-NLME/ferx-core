@@ -35,10 +35,9 @@ section of the SDLC for the versioning policy).
   node placement and, at one node, in whether `½log|H|` carries the exact curvature or the
   Gauss-Newton approximation. The old `method = agq` (and its `gauss_hermite` /
   `adaptive_gaussian_quadrature` aliases) is rejected by the parser with a message pointing
-  to `method = laplace` + `n_agq`. `.fitrx` bundles written by older versions still load
-  (their `agq` method reads back as `laplace`). **This is a breaking change to the model
-  file's `[fit_options]`; `method = agq` was unreleased, so no released version is
-  affected.**
+  to `method = laplace` + `n_agq`. **This is a breaking change to the model file's
+  `[fit_options]`; `method = agq` was unreleased, so no released version — and no persisted
+  `.fitrx` bundle — is affected.**
 - **Laplace / adaptive-GH quadrature uses a tighter default `inner_tol` (`1e-8`, was the
   shared `1e-5`)** (#251). Its analytic gradient assumes the EBE is exactly the posterior
   mode; a loose inner tolerance left `b̂` off-mode from a poor start and could stall the

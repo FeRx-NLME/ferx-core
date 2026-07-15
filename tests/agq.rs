@@ -760,6 +760,108 @@ fn agq_rejects_out_of_range_node_count_built_via_the_rust_api() {
     );
 }
 
+/// The `n_agq` caps must fire for the **FOCEI** quadrature too, not only Laplace (#251
+/// review #1). A non-IOV closed-form model with `method = focei, n_agq` over the cap would
+/// otherwise skip every check-time guard (the runtime cap only fires under IOV) and build a
+/// 100k+-node grid unchecked — a hang / OOM. Plain FOCEI (`n_agq = 1`) must stay uncapped.
+#[test]
+fn focei_quadrature_hits_the_node_cap_like_laplace() {
+    use ferx_core::api::check_model_options;
+
+    let model = parse_model_string(WARFARIN_SRC).expect("warfarin must parse");
+    let over = ferx_core::estimation::agq::MAX_AGQ_NODES + 79; // 100
+
+    // focei + n_agq > MAX_AGQ_NODES → rejected, exactly as laplace is.
+    let focei = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: over,
+        ..FitOptions::default()
+    };
+    assert!(
+        check_model_options(&model, &focei)
+            .iter()
+            .any(|d| d.code == "E_AGQ_NODES_TOO_LARGE" || d.code == "E_AGQ_GRID_TOO_LARGE"),
+        "focei with an over-cap n_agq must be rejected at check time, not left to hang"
+    );
+
+    // Plain FOCEI (n_agq = 1) is not a quadrature — the caps must NOT fire.
+    let plain = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: 1,
+        ..FitOptions::default()
+    };
+    assert!(
+        !check_model_options(&model, &plain)
+            .iter()
+            .any(|d| d.code.starts_with("E_AGQ_")),
+        "plain FOCEI (n_agq = 1) must not trip the quadrature caps"
+    );
+}
+
+/// `focei` + `n_agq > 1` is rejected outside the analytic sensitivity scope (the GN anchor's
+/// `H̃` comes from the provider). Forcing `gradient_method = fd` takes the model out of scope,
+/// which must surface `E_FOCEI_NAGQ_UNSUPPORTED` rather than a deep runtime failure. `laplace`
+/// (exact anchor, no provider dependency) has no such restriction.
+#[test]
+fn focei_quadrature_out_of_analytic_scope_is_rejected() {
+    use ferx_core::api::check_model_options;
+    use ferx_core::types::GradientMethod;
+
+    let mut model = parse_model_string(WARFARIN_SRC).expect("warfarin must parse");
+    model.gradient_method = GradientMethod::Fd; // forces analytic_score_supported == false
+
+    let focei = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: 3,
+        ..FitOptions::default()
+    };
+    assert!(
+        check_model_options(&model, &focei)
+            .iter()
+            .any(|d| d.code == "E_FOCEI_NAGQ_UNSUPPORTED"),
+        "focei + n_agq > 1 out of analytic scope must be rejected"
+    );
+    // Laplace is unaffected — the exact anchor needs no provider.
+    let laplace = FitOptions {
+        method: EstimationMethod::Laplace,
+        n_agq: 3,
+        ..FitOptions::default()
+    };
+    assert!(
+        !check_model_options(&model, &laplace)
+            .iter()
+            .any(|d| d.code == "E_FOCEI_NAGQ_UNSUPPORTED"),
+        "laplace + n_agq > 1 must not be gated on analytic scope"
+    );
+}
+
+/// The runtime IOV grid cap fires for the FOCEI quadrature too, and names `focei` (not
+/// `laplace`) in the message (#251 review #4). `21^5` over the stacked (η, κ) dimension is
+/// far past `MAX_AGQ_GRID`.
+#[test]
+fn focei_iov_grid_cap_reports_focei() {
+    let parsed = parse_full_model(WARFARIN_IOV_SRC).expect("IOV model must parse");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        n_agq: 21,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..parsed.fit_options
+    };
+    let err = fit(
+        &parsed.model,
+        &warfarin_iov(),
+        &parsed.model.default_params,
+        &opts,
+    )
+    .expect_err("an intractable FOCEI-IOV grid must be rejected");
+    assert!(
+        err.contains("method = focei") && err.contains("n_agq"),
+        "the FOCEI-IOV grid-cap error must name focei and the lever: {err}"
+    );
+}
+
 /// **The AGQ covariance stencil.** Every other AGQ test sets `run_covariance_step = false`,
 /// so the AGQ-marginal FD covariance (differenced through the `pop_nll_opts` seam in
 /// `compute_covariance`, so the standard errors difference the objective AGQ actually
@@ -1116,6 +1218,9 @@ fn agq_and_laplace_integrate_the_joint_iov_marginal() {
     let laplace = iov_ofv(EstimationMethod::Laplace, 1);
     let agq3 = iov_ofv(EstimationMethod::Laplace, 3);
     let focei = iov_ofv(EstimationMethod::FoceI, 1);
+    // The Gauss-Newton-anchored quadrature under IOV: exercises `anchor_hessian`'s stacked
+    // (η, κ) `subject_sensitivities_iov` branch.
+    let focei3 = iov_ofv(EstimationMethod::FoceI, 3);
 
     // Laplace-family: within a Hessian approximation of FOCEI-IOV, which uses the same joint
     // mode but the Gauss-Newton curvature. Nowhere near it would mean κ was mishandled.
@@ -1125,10 +1230,14 @@ fn agq_and_laplace_integrate_the_joint_iov_marginal() {
     );
 
     // Refining the grid over the *stacked* vector must move the answer (the joint posterior
-    // is not exactly Gaussian) but stay in the same basin.
+    // is not exactly Gaussian) but stay in the same basin — for both anchors.
     assert!(
         agq3.is_finite() && (agq3 - laplace).abs() < 5.0,
         "Laplace-IOV n=3 must refine, not diverge: n1={laplace}, n3={agq3}"
+    );
+    assert!(
+        focei3.is_finite() && (focei3 - focei).abs() < 5.0,
+        "FOCEI-IOV n=3 (GN-anchored quadrature) must refine, not diverge: n1={focei}, n3={focei3}"
     );
 }
 

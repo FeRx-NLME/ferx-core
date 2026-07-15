@@ -6002,10 +6002,10 @@ impl FitOptions {
             // adaptive Gauss–Hermite quadrature. Both route through the same objective, the
             // same analytic gradient, and the same covariance stencil.
             EstimationMethod::Laplace => Some(self.n_agq.max(1)),
-            // FOCEI with `n_agq > 1` is the Gauss-Newton-anchored quadrature refinement;
-            // `n_agq = 1` (the default) is plain FOCEI and takes its own path (`None`).
-            // (Enabled in the GN-anchor step; until then `check_model_options` rejects
-            // `focei` with `n_agq > 1`, so this arm never fires.)
+            // FOCEI with `n_agq > 1` is the Gauss-Newton-anchored quadrature refinement, live
+            // for every in-analytic-scope model; `n_agq = 1` (the default) is plain FOCEI and
+            // takes its own path (`None`). `check_model_options` rejects `focei, n_agq > 1`
+            // only *outside* the analytic sensitivity scope (`E_FOCEI_NAGQ_UNSUPPORTED`).
             EstimationMethod::FoceI if self.n_agq > 1 => Some(self.n_agq),
             _ => None,
         }
