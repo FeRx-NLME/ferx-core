@@ -702,6 +702,31 @@ fn dense_r_and_derivatives(
     sigma: &[f64],
     correlations: &[crate::types::ResidualCorrelation],
 ) -> (DMatrix<f64>, Vec<DMatrix<f64>>, Vec<Vec<DMatrix<f64>>>) {
+    let (r, dr) = dense_r_and_dr(model, subject, sens, sigma, correlations);
+    let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
+    let err_keys = model.error_spec.obs_keys(subject);
+    let d2 = crate::stats::residual_error::compute_d2r_df2_matrices(
+        &model.error_spec,
+        &ipreds,
+        err_keys.as_ref(),
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        &subject.obs_l2,
+        sigma,
+        correlations,
+        None,
+    );
+    (r, dr, d2)
+}
+
+fn dense_r_and_dr(
+    model: &CompiledModel,
+    subject: &Subject,
+    sens: &SubjectSens,
+    sigma: &[f64],
+    correlations: &[crate::types::ResidualCorrelation],
+) -> (DMatrix<f64>, Vec<DMatrix<f64>>) {
     let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     let err_keys = model.error_spec.obs_keys(subject);
     let r = crate::stats::residual_error::r_matrix_maybe_scaled(
@@ -725,19 +750,7 @@ fn dense_r_and_derivatives(
         correlations,
         None,
     );
-    let d2 = crate::stats::residual_error::compute_d2r_df2_matrices(
-        &model.error_spec,
-        &ipreds,
-        err_keys.as_ref(),
-        &subject.obs_times,
-        &subject.obs_raw_times,
-        &subject.occasions,
-        &subject.obs_l2,
-        sigma,
-        correlations,
-        None,
-    );
-    (r, dr, d2)
+    (r, dr)
 }
 
 fn dense_direct_r_sigma(
@@ -753,10 +766,8 @@ fn dense_direct_r_sigma(
     sp[k] += h;
     let mut sm = sigma.clone();
     sm[k] -= h;
-    let (rp, drp, _) =
-        dense_r_and_derivatives(model, subject, sens, &sp, &params.residual_correlations);
-    let (rm, drm, _) =
-        dense_r_and_derivatives(model, subject, sens, &sm, &params.residual_correlations);
+    let (rp, drp) = dense_r_and_dr(model, subject, sens, &sp, &params.residual_correlations);
+    let (rm, drm) = dense_r_and_dr(model, subject, sens, &sm, &params.residual_correlations);
     let r_z = (rp - rm).scale(1.0 / (2.0 * h));
     let dr_z = drp
         .iter()
@@ -779,8 +790,8 @@ fn dense_direct_r_rho(
     cp[k].rho += h;
     let mut cm = params.residual_correlations.clone();
     cm[k].rho -= h;
-    let (rp, drp, _) = dense_r_and_derivatives(model, subject, sens, &params.sigma.values, &cp);
-    let (rm, drm, _) = dense_r_and_derivatives(model, subject, sens, &params.sigma.values, &cm);
+    let (rp, drp) = dense_r_and_dr(model, subject, sens, &params.sigma.values, &cp);
+    let (rm, drm) = dense_r_and_dr(model, subject, sens, &params.sigma.values, &cm);
     let r_z = (rp - rm).scale(1.0 / (2.0 * h));
     let dr_z = drp
         .iter()
@@ -953,9 +964,23 @@ fn dense_prepare_focei(
     let htilde = jmat.transpose() * &r_inv * &jmat + bmat.scale(0.5) + &params.omega.inv;
     let htilde_inv = htilde.cholesky()?.inverse();
 
+    let mut prep = DenseRPrep {
+        n_eta,
+        residuals,
+        jmat,
+        r_inv,
+        htilde_inv,
+        h_inner_inv: DMatrix::zeros(n_eta, n_eta),
+        g_eta: DVector::zeros(n_eta),
+        dr_df,
+        d2r_df2,
+        k_eta,
+        m_eta,
+    };
+
     let mut h_inner = DMatrix::<f64>::zeros(n_eta, n_eta);
     for z in 0..n_eta {
-        let b = jmat.column(z).into_owned();
+        let b = prep.jmat.column(z).into_owned();
         let mut e = DMatrix::<f64>::zeros(n_obs, n_eta);
         for i in 0..n_obs {
             for a in 0..n_eta {
@@ -963,45 +988,13 @@ fn dense_prepare_focei(
             }
         }
         let direct_dr_z = vec![DMatrix::<f64>::zeros(n_obs, n_obs); n_obs];
-        let col = dense_inner_mixed(
-            &DenseRPrep {
-                n_eta,
-                residuals: residuals.clone(),
-                jmat: jmat.clone(),
-                r_inv: r_inv.clone(),
-                htilde_inv: htilde_inv.clone(),
-                h_inner_inv: DMatrix::zeros(n_eta, n_eta),
-                g_eta: DVector::zeros(n_eta),
-                dr_df: dr_df.clone(),
-                d2r_df2: d2r_df2.clone(),
-                k_eta: k_eta.clone(),
-                m_eta: m_eta.clone(),
-            },
-            &k_eta[z],
-            &e,
-            &b,
-            &direct_dr_z,
-        );
+        let col = dense_inner_mixed(&prep, &prep.k_eta[z], &e, &b, &direct_dr_z);
         for a in 0..n_eta {
             h_inner[(a, z)] = col[a] + params.omega.inv[(a, z)];
         }
     }
     let h_inner = (&h_inner + h_inner.transpose()).scale(0.5);
-    let h_inner_inv = h_inner.cholesky()?.inverse();
-
-    let mut prep = DenseRPrep {
-        n_eta,
-        residuals,
-        jmat,
-        r_inv,
-        htilde_inv,
-        h_inner_inv,
-        g_eta: DVector::zeros(n_eta),
-        dr_df,
-        d2r_df2,
-        k_eta,
-        m_eta,
-    };
+    prep.h_inner_inv = h_inner.cholesky()?.inverse();
     for z in 0..n_eta {
         let b = prep.jmat.column(z).into_owned();
         let mut e = DMatrix::<f64>::zeros(n_obs, n_eta);

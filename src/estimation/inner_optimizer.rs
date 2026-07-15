@@ -569,13 +569,19 @@ fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> 
 /// rerouted subject, so one that dropped to the FD inner gradient could run to `MAX_INNER` and
 /// return an under-converged EBE.
 ///
-/// The reroute considered here is subject-static (TV-cov / `TIME` / IOV via `effective_for`), so
-/// a non-rerouted subject — including a constant-parameter, in-domain subject of a twin-carrying
-/// model, or a purely analytic model — keeps the exact `gnorm < tol` behaviour and stays
-/// bit-identical to prior releases. (`effective_for` returns `self` without building the twin for
-/// those, so this adds no cost on the common path.)
+/// Dense correlated-residual (`block_sigma`) objectives also enable the stall stop. They are
+/// exact, but empirically the low-dimensional BFGS inner loop can keep making tiny objective
+/// changes while the raw gradient norm sits above `tol`; accepting a flat, non-improving point
+/// avoids burning the full inner-iteration budget on every outer line-search trial.
+///
+/// The ODE reroute considered here is subject-static (TV-cov / `TIME` / IOV via
+/// `effective_for`), so a non-rerouted, non-correlated subject — including a constant-parameter,
+/// in-domain subject of a twin-carrying model, or a purely analytic diagonal-R model — keeps the
+/// exact `gnorm < tol` behaviour and stays bit-identical to prior releases.
+/// (`effective_for` returns `self` without building the twin for those, so this adds no cost on
+/// the common path.)
 fn inner_stall_enabled(model: &CompiledModel, subject: &Subject) -> bool {
-    model.effective_for(subject).ode_spec.is_some()
+    model.effective_for(subject).ode_spec.is_some() || !model.residual_correlations.is_empty()
 }
 
 /// Find Empirical Bayes Estimates (EBEs) for a single subject via BFGS.
@@ -697,31 +703,6 @@ pub fn find_ebe(
         }
     }
 
-    // Diagonal preconditioner for the inner BFGS. FREM posteriors are extremely
-    // multi-scale: PK etas have curvature ~1e2 and scale ~0.1, covariate
-    // pseudo-obs etas have curvature ~1e6 (EPSCOV variance) and scale ~±40, and
-    // near-fixed etas reach ~1e10. With the default H0 = I the search direction
-    // is mis-scaled by up to ~1e8 per dimension and BFGS never reaches the true
-    // joint mode — the returned η̂ then has an absurd obs-NLL, which makes the
-    // IMP/IMPMAP importance proposal (centred on that mode) collapse to ~0 ESS
-    // and diverge (issue #406). The preconditioner sets H0 = diag(precondᵢ) with
-    // precondᵢ ≈ posterior variance of etaᵢ = 1/(Ω⁻¹ᵢᵢ + dataᵢ), where dataᵢ is
-    // the analytic FREM pseudo-obs precision (J=1, R=EPSCOV²); covariate dims
-    // get a near-Newton step in one iteration, PK dims fall back to the prior
-    // conditional scale. `None` for non-FREM models → identity H0 (unchanged).
-    let precond: Option<Vec<f64>> = build_inner_preconditioner(model, subject, params, n_eta);
-    // The preconditioner accelerates the inner search (it is the BFGS H0), but it
-    // drives the convergence *test* only for FREM, where the raw L2 gradient norm
-    // is dominated by the sharp covariate pseudo-obs dims and never reaches `tol`
-    // (issue #406). For general FOCE/FOCEI fits the stop test stays raw L2, so the
-    // converged EBE — and the estimates — are independent of H0: preconditioning
-    // changes only the path to the mode, not the mode itself.
-    let stop_precond: Option<&[f64]> = if model.frem_config.is_some() {
-        precond.as_deref()
-    } else {
-        None
-    };
-
     // Per-subject scratch buffers, built once and reused across every
     // BFGS line-search obj call and every Jacobian perturbation. The
     // EventSchedule pre-computes the merged event timeline + per-interval
@@ -740,6 +721,21 @@ pub fn find_ebe(
     // every inner step (and every line-search trial) — instead of re-walking
     // every magnitude expression on each of those calls (#486 review).
     let mult = model.ruv_obs_mult(subject, &params.theta);
+
+    // Diagonal preconditioner for the inner BFGS. FREM uses pseudo-observation
+    // precision (#406); correlated residual models use a one-time dense-R
+    // Gauss-Newton diagonal at the warm start; other models fall back to the
+    // Ω⁻¹ diagonal scale. The convergence test is preconditioned only for FREM,
+    // where raw gradient units are dominated by sharp covariate pseudo-obs
+    // dimensions; dense `block_sigma` keeps raw gradient units for this norm
+    // and relies on the objective-stall gate for flat, non-improving tails.
+    let precond: Option<Vec<f64>> =
+        build_inner_preconditioner(model, subject, params, n_eta, &eta, schedule.as_ref());
+    let stop_precond: Option<&[f64]> = if model.frem_config.is_some() {
+        precond.as_deref()
+    } else {
+        None
+    };
 
     // Objective evaluated directly at eta_true (the optimiser variable).
     let obj = |e: &[f64]| -> f64 {
@@ -2261,9 +2257,11 @@ fn analytic_eta_nll_gradient_iov(
 /// so the Jacobian is 1 and the row contributes `1/R` with `R = EPSCOV²`); PK /
 /// non-covariate dims have `dataᵢ = 0` and fall back to `1/Ω⁻¹ᵢᵢ`.
 ///
-/// General FOCE/FOCEI models: `Some(1/Ω⁻¹ᵢᵢ)` — the prior conditional scale per η,
-/// so a correlated or multi-scale Ω does not mis-scale the search. `None` only when
-/// Ω⁻¹ has no usable diagonal (→ identity `H0`).
+/// General FOCE/FOCEI models: `Some(1/(Ω⁻¹ᵢᵢ + dataᵢ))`, where dense
+/// `block_sigma` models get a one-time Gauss-Newton data diagonal
+/// `diag(JᵀR⁻¹J)` at the warm start and other models use only the prior
+/// conditional scale. `None` only when no usable diagonal is available
+/// (→ identity `H0`).
 ///
 /// This preconditioner is the BFGS `H0` only. Whether it also drives the
 /// convergence *test* is decided by the caller (`find_ebe`): FREM uses it for both
@@ -2274,6 +2272,8 @@ fn build_inner_preconditioner(
     subject: &Subject,
     params: &ModelParameters,
     n_eta: usize,
+    eta: &[f64],
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<f64>> {
     if let Some(fc) = model.frem_config.as_ref() {
         return preconditioner_from_parts(
@@ -2292,7 +2292,66 @@ fn build_inner_preconditioner(
     // uses, minus the covariate pseudo-obs precision (not cheaply available per-η
     // here). `find_ebe` keeps the raw-L2 stop test for this path, so the H0 only
     // changes the path to the mode — the converged EBE is unchanged.
+    if let Some(p) =
+        dense_residual_inner_preconditioner(model, subject, params, n_eta, eta, cached_schedule)
+    {
+        return Some(p);
+    }
     inner_preconditioner_from_omega(&params.omega.inv, n_eta)
+}
+
+fn dense_residual_inner_preconditioner(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    n_eta: usize,
+    eta: &[f64],
+    cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
+) -> Option<Vec<f64>> {
+    if n_eta == 0
+        || model.residual_correlations.is_empty()
+        || model.is_sde()
+        || model.frem_config.is_some()
+        || matches!(model.bloq_method, crate::types::BloqMethod::M3)
+    {
+        return None;
+    }
+    let sens = crate::sens::provider::subject_eta_grad_with_schedule(
+        model,
+        subject,
+        &params.theta,
+        eta,
+        cached_schedule,
+    )?;
+    let ipreds: Vec<f64> = sens.iter().map(|o| o.f).collect();
+    let err_keys = model.error_spec.obs_keys(subject);
+    let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+    let r = crate::stats::residual_error::r_matrix_maybe_scaled(
+        &model.error_spec,
+        &ipreds,
+        err_keys.as_ref(),
+        subject,
+        &params.sigma.values,
+        &params.residual_correlations,
+        ruv_mult.as_deref(),
+    );
+    let chol = r.cholesky()?;
+    let mut out = vec![1.0_f64; n_eta];
+    let mut usable = false;
+    for k in 0..n_eta {
+        let mut j = DVector::<f64>::zeros(sens.len());
+        for (m, obs) in sens.iter().enumerate() {
+            j[m] = obs.df_deta[k];
+        }
+        let data_prec = j.dot(&chol.solve(&j)).max(0.0);
+        let prior_prec = params.omega.inv[(k, k)].max(0.0);
+        let prec = prior_prec + data_prec;
+        if prec.is_finite() && prec > 0.0 {
+            out[k] = 1.0 / prec;
+            usable = true;
+        }
+    }
+    usable.then_some(out)
 }
 
 /// Diagonal inner-BFGS preconditioner `precondᵢ = 1/Ω⁻¹ᵢᵢ` for general
@@ -5241,6 +5300,16 @@ mod iov_tests {
             inner_stall_enabled(&transit_iov, &subject),
             "#814: the twin reroute must enable the inner stall for transit+IOV"
         );
+
+        // Dense correlated residuals are exact, but their inner BFGS gradients can
+        // plateau well above the raw tolerance after the objective has stopped
+        // moving. Enable the same objective-stall escape hatch so paired
+        // block_sigma fits do not burn the full inner iteration budget.
+        let corr = parse_model_string(
+            "[parameters]\n  theta TVCL(1.0)\n  theta TVV(10.0)\n  omega ETA_CL ~ 0.09\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse correlated residual model");
+        assert!(inner_stall_enabled(&corr, &subject));
     }
 
     /// Closed-form IOV + `iiv_on_ruv` (#4b): the analytic stacked-η inner gradient
