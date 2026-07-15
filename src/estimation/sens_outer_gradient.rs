@@ -6692,6 +6692,7 @@ mod tests {
             &hm,
             &params.omega,
             &params.sigma.values,
+            &params.residual_correlations,
             interaction,
             &kappas,
             params.omega_iov.as_ref().expect("IOV model has omega_iov"),

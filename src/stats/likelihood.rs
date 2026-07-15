@@ -74,16 +74,37 @@ pub fn individual_nll(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
 ) -> f64 {
-    // Allocate-on-each-call wrapper — see `individual_nll_into` for
-    // the scratch-aware version used by SAEM's MH loop.
-    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-    individual_nll_into(
+    individual_nll_with_correlations(
         model,
         subject,
         theta,
         eta,
         omega,
         sigma_values,
+        &model.residual_correlations,
+    )
+}
+
+pub fn individual_nll_with_correlations(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
+) -> f64 {
+    // Allocate-on-each-call wrapper — see `individual_nll_into` for
+    // the scratch-aware version used by SAEM's MH loop.
+    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+    individual_nll_into_with_correlations(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        residual_correlations,
         &mut scratch,
     )
 }
@@ -102,7 +123,29 @@ pub fn individual_nll_into(
     sigma_values: &[f64],
     scratch: &mut pk::EventPkParams,
 ) -> f64 {
-    individual_nll_into_with_schedule(
+    individual_nll_into_with_correlations(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        &model.residual_correlations,
+        scratch,
+    )
+}
+
+pub fn individual_nll_into_with_correlations(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
+    scratch: &mut pk::EventPkParams,
+) -> f64 {
+    individual_nll_into_with_schedule_and_correlations(
         model,
         subject,
         theta,
@@ -111,6 +154,7 @@ pub fn individual_nll_into(
         sigma_values,
         scratch,
         None,
+        residual_correlations,
     )
 }
 
@@ -472,6 +516,30 @@ pub fn individual_nll_into_with_schedule(
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
+    individual_nll_into_with_schedule_and_correlations(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        scratch,
+        schedule,
+        &model.residual_correlations,
+    )
+}
+
+pub fn individual_nll_into_with_schedule_and_correlations(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    residual_correlations: &[ResidualCorrelation],
+) -> f64 {
     // Ω⁻¹ and log|Ω| are pre-computed in `OmegaMatrix::from_matrix_*`.
     // Hot-path users (FOCE inner BFGS, SAEM MH) call this 100s–1000s of
     // times per subject per outer iter — recomputing Cholesky+inverse
@@ -525,12 +593,13 @@ pub fn individual_nll_into_with_schedule(
     let has_censored_m3 =
         matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    if !model.residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
+    if !residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
         match dense_residual_data_term(
             model,
             subject,
             &preds,
             sigma_values,
+            residual_correlations,
             ruv_scale,
             &p_obs,
             ruv_mult.as_deref(),
@@ -621,6 +690,7 @@ fn dense_residual_data_term(
     subject: &Subject,
     preds: &[f64],
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     ruv_scale: f64,
     p_obs: &[f64],
     ruv_mult: Option<&[Vec<f64>]>,
@@ -633,7 +703,7 @@ fn dense_residual_data_term(
         err_keys.as_ref(),
         subject,
         sigma_values,
-        &model.residual_correlations,
+        residual_correlations,
         ruv_mult,
     );
     if ruv_scale != 1.0 {
@@ -712,6 +782,7 @@ pub(crate) fn obs_nll_subject_from_preds(
             subject,
             preds,
             sigma_values,
+            &model.residual_correlations,
             ruv_scale,
             &[],
             ruv_mult.as_deref(),
@@ -870,6 +941,31 @@ pub fn foce_subject_nll(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
     interaction: bool,
+) -> f64 {
+    foce_subject_nll_with_correlations(
+        model,
+        subject,
+        theta,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        interaction,
+        &model.residual_correlations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn foce_subject_nll_with_correlations(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    interaction: bool,
+    residual_correlations: &[ResidualCorrelation],
 ) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
     // #570: at the EBE mode the Gaussian `ipreds` solve and the at-mode TTE-term solve
@@ -1051,7 +1147,7 @@ pub fn foce_subject_nll(
     // off-diagonal covariance. The non-interaction (Sheiner–Beal) branch carries
     // the dense R for both cases via `compute_r_matrix_with_correlations`.
     if interaction {
-        if model.residual_correlations.is_empty() {
+        if residual_correlations.is_empty() {
             foce_subject_nll_interaction(
                 subject,
                 &ipreds,
@@ -1075,7 +1171,7 @@ pub fn foce_subject_nll(
                 omega,
                 sigma_values,
                 &model.error_spec,
-                &model.residual_correlations,
+                residual_correlations,
                 &p_obs,
                 ruv_mult.as_deref(),
             )
@@ -1103,7 +1199,7 @@ pub fn foce_subject_nll(
             omega,
             sigma_values,
             &model.error_spec,
-            &model.residual_correlations,
+            residual_correlations,
             model.bloq_method,
             &p_obs,
             frem_r_override.as_deref(),
@@ -1885,12 +1981,13 @@ pub fn foce_subject_nll_iov(
     h_matrix: &DMatrix<f64>,
     omega_bsv: &OmegaMatrix,
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     interaction: bool,
     kappas: &[DVector<f64>],
     omega_iov: &OmegaMatrix,
 ) -> f64 {
     if kappas.is_empty() {
-        return foce_subject_nll(
+        return foce_subject_nll_with_correlations(
             model,
             subject,
             theta,
@@ -1899,6 +1996,7 @@ pub fn foce_subject_nll_iov(
             omega_bsv,
             sigma_values,
             interaction,
+            residual_correlations,
         );
     }
 
@@ -2046,7 +2144,7 @@ pub fn foce_subject_nll_iov(
             &sigma_b,
             sigma_values,
             &model.error_spec,
-            &model.residual_correlations,
+            residual_correlations,
             model.bloq_method,
             &p_obs_iov,
             None,
@@ -2069,6 +2167,7 @@ pub fn foce_population_nll_iov(
     omega_bsv: &OmegaMatrix,
     omega_iov: &OmegaMatrix,
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     interaction: bool,
 ) -> f64 {
     // Compute each subject's NLL in parallel, then reduce in a fixed subject
@@ -2096,6 +2195,7 @@ pub fn foce_population_nll_iov(
                 &h_matrices[i],
                 omega_bsv,
                 sigma_values,
+                residual_correlations,
                 interaction,
                 kappas,
                 omega_iov,
@@ -2114,6 +2214,7 @@ pub fn foce_population_nll(
     h_matrices: &[DMatrix<f64>],
     omega: &OmegaMatrix,
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     interaction: bool,
 ) -> f64 {
     // Deterministic reduction: collect per-subject NLLs in subject order, then
@@ -2125,7 +2226,7 @@ pub fn foce_population_nll(
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            foce_subject_nll(
+            foce_subject_nll_with_correlations(
                 model,
                 subject,
                 theta,
@@ -2134,6 +2235,7 @@ pub fn foce_population_nll(
                 omega,
                 sigma_values,
                 interaction,
+                residual_correlations,
             )
         })
         .collect();
@@ -2498,6 +2600,8 @@ mod tests {
                     names: vec!["PROP_ERR".into()],
                 },
                 sigma_fixed: vec![false],
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
             },
@@ -2819,6 +2923,7 @@ mod tests {
             &h_bsv,
             &omega_bsv,
             &sigma,
+            &[],
             false,
             &zero_kappas,
             &make_omega(1e-12),
@@ -2844,6 +2949,7 @@ mod tests {
                 &h_bsv,
                 &omega_bsv,
                 &sigma,
+                &[],
                 false,
                 &kappas,
                 &make_omega(iov_var),

@@ -1862,7 +1862,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         _ => Vec::new(),
     };
     let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
-    let residual_correlations = build_residual_correlations(&block_sigmas, &sigma_names)?;
+    let (residual_correlations, residual_correlation_fixed) =
+        build_residual_correlations_with_fixed(&block_sigmas, &sigma_names)?;
     validate_residual_correlations(&error_spec, &residual_correlations, &sigma_names)?;
     // Keep a copy of the flat sigma names for the custom residual-magnitude
     // build (#484), which runs after the [covariates] block is parsed.
@@ -1931,6 +1932,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         omega_fixed,
         sigma,
         sigma_fixed,
+        residual_correlations: residual_correlations.clone(),
+        residual_correlation_fixed,
         omega_iov,
         kappa_fixed,
     };
@@ -9978,16 +9981,17 @@ fn build_omega_fixed(
     Ok(fixed)
 }
 
-fn build_residual_correlations(
+fn build_residual_correlations_with_fixed(
     block_sigmas: &[BlockSigmaSpec],
     sigma_names: &[String],
-) -> Result<Vec<ResidualCorrelation>, String> {
+) -> Result<(Vec<ResidualCorrelation>, Vec<bool>), String> {
     let name_to_idx: std::collections::HashMap<&str, usize> = sigma_names
         .iter()
         .enumerate()
         .map(|(i, n)| (n.as_str(), i))
         .collect();
     let mut out = Vec::new();
+    let mut fixed = Vec::new();
     for block in block_sigmas {
         let n = block.names.len();
         let mut variances = vec![0.0; n];
@@ -10037,13 +10041,13 @@ fn build_residual_correlations(
                         sigma_j: j,
                         rho,
                     });
+                    fixed.push(block.fixed);
                 }
                 pos += 1;
             }
         }
-        let _fixed = block.fixed;
     }
-    Ok(out)
+    Ok((out, fixed))
 }
 
 fn validate_block_sigma_single_error_order(
@@ -20071,11 +20075,13 @@ mod tests {
         assert!((sigmas[1].value - 1.0).abs() < 1e-12);
 
         let sigma_names: Vec<String> = sigmas.iter().map(|s| s.name.clone()).collect();
-        let corrs = build_residual_correlations(&block_sigmas, &sigma_names).unwrap();
+        let (corrs, fixed) =
+            build_residual_correlations_with_fixed(&block_sigmas, &sigma_names).unwrap();
         assert_eq!(corrs.len(), 1);
         assert_eq!(corrs[0].sigma_i, 1);
         assert_eq!(corrs[0].sigma_j, 0);
         assert!((corrs[0].rho - 0.5).abs() < 1e-12);
+        assert_eq!(fixed, vec![false]);
     }
 
     #[test]
@@ -20123,7 +20129,7 @@ mod tests {
             fixed: true,
         };
         let names = vec!["A".to_string(), "B".to_string()];
-        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        let err = build_residual_correlations_with_fixed(&[block], &names).unwrap_err();
         assert!(err.contains("positive diagonal variances"), "got: {err}");
     }
 
@@ -20136,7 +20142,7 @@ mod tests {
             fixed: true,
         };
         let names = vec!["A".to_string(), "B".to_string()];
-        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        let err = build_residual_correlations_with_fixed(&[block], &names).unwrap_err();
         assert!(err.contains("invalid correlation"), "got: {err}");
     }
 
@@ -20149,7 +20155,7 @@ mod tests {
             fixed: true,
         };
         let names = vec!["A".to_string(), "B".to_string()];
-        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        let err = build_residual_correlations_with_fixed(&[block], &names).unwrap_err();
         assert!(err.contains("unknown sigma"), "got: {err}");
     }
 
@@ -20162,8 +20168,9 @@ mod tests {
             fixed: true,
         };
         let names = vec!["A".to_string(), "B".to_string()];
-        let corrs = build_residual_correlations(&[block], &names).unwrap();
+        let (corrs, fixed) = build_residual_correlations_with_fixed(&[block], &names).unwrap();
         assert!(corrs.is_empty());
+        assert!(fixed.is_empty());
     }
 
     #[test]
@@ -20886,6 +20893,11 @@ mod tests {
 "#;
         let parsed = parse_full_model(content).expect("cross-endpoint block_sigma should parse");
         assert_eq!(parsed.model.residual_correlations.len(), 1);
+        assert_eq!(parsed.model.default_params.residual_correlations.len(), 1);
+        assert_eq!(
+            parsed.model.default_params.residual_correlation_fixed,
+            vec![true]
+        );
     }
 
     #[test]
@@ -23257,6 +23269,8 @@ if (WT > 70) {
         // rho = cov / (sd_i · sd_j) = 0.005 / sqrt(0.01·0.09).
         let expected_rho = 0.005 / (0.01f64 * 0.09).sqrt();
         assert!((corr.rho - expected_rho).abs() < 1e-12);
+        assert_eq!(model.default_params.residual_correlations.len(), 1);
+        assert_eq!(model.default_params.residual_correlation_fixed, vec![false]);
     }
 
     #[test]

@@ -412,7 +412,7 @@ Correlated combined error:
 `block_sigma` uses NONMEM-style lower-triangle covariance values:
 `[Var(PROP_ERR), Cov(PROP_ERR, ADD_ERR), Var(ADD_ERR)]`. Diagonal entries
 initialize the named sigma SDs (`sqrt(variance)`) and the off-diagonal entries
-define fixed residual correlations. For the example above, `PROP_ERR = 0.2`,
+initialize residual correlations. For the example above, `PROP_ERR = 0.2`,
 `ADD_ERR = 1.0`, and `Corr(PROP_ERR, ADD_ERR) = 0.5`, so the residual variance
 for a combined-error observation is:
 
@@ -421,14 +421,17 @@ V = (f \sigma_\mathrm{prop})^2 + \sigma_\mathrm{add}^2
     + 2 f \rho \sigma_\mathrm{prop}\sigma_\mathrm{add}
 $$
 
-The diagonal sigma SDs are estimated unless marked `FIX`; the off-diagonal
-covariance is always converted to a fixed correlation. A nonzero `block_sigma`
-covariance can connect sigmas that co-load on the same `combined(...)` endpoint,
-or sigmas used by different endpoints measured at the same subject time and
-occasion — whether those endpoints are selected by the CMT column (per-CMT) or
-by a covariate `if/else` selector (#669). In the cross-endpoint case ferx builds
-a subject-level residual covariance matrix, so paired rows such as total/unbound
-assays receive the NONMEM-style covariance term
+The diagonal sigma SDs are estimated unless marked `FIX`. Under `method = foce`
+or `method = focei`, each nonzero off-diagonal is converted to an initial
+correlation and estimated as a bounded correlation coordinate unless the
+`block_sigma` declaration is marked `FIX`; `FIX` preserves the old fixed
+correlation behavior. A nonzero `block_sigma` covariance can connect sigmas that
+co-load on the same `combined(...)` endpoint, or sigmas used by different
+endpoints measured at the same subject time and occasion — whether those
+endpoints are selected by the CMT column (per-CMT) or by a covariate `if/else`
+selector (#669). In the cross-endpoint case ferx builds a subject-level residual
+covariance matrix, so paired rows such as total/unbound assays receive the
+NONMEM-style covariance term
 `f_total * f_unbound * Cov(EPS_total, EPS_unbound)`.
 
 Current scope: `block_sigma` is supported for the Gaussian `method = foce`,

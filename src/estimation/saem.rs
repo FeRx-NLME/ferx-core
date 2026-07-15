@@ -1202,6 +1202,8 @@ fn saem_state_to_params(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
+        residual_correlations: init_params.residual_correlations.clone(),
+        residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
         omega_iov: if n_kappa > 0 {
             // Use from_matrix_with_mask so the structural free_mask is preserved
             // when this snapshot is handed to a chained estimator (e.g.
@@ -2171,6 +2173,7 @@ pub fn run_saem(
                     &state.omega_mat,
                     init_params.omega.diagonal,
                     &state.sigma_vals,
+                    &[],
                     iov,
                 );
                 crate::estimation::trace::write_saem(
@@ -3005,6 +3008,8 @@ mod tests {
                     names: vec!["PROP_ERR".into()],
                 },
                 sigma_fixed: vec![false],
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 omega_iov: Some(OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()])),
                 kappa_fixed: vec![false],
             },

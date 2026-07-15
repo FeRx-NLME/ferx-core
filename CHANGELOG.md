@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **`block_sigma` off-diagonal SIGMA terms are now estimated by FOCE/FOCEI
+  unless the block is marked `FIX`** (#847). Non-`FIX` off-diagonals are packed
+  as bounded residual-correlation coordinates, reported in `FitResult` and the
+  fit YAML, and used by the FOCE/FOCEI inner objective, outer objective, and
+  reconverged finite-difference gradient path.
+
 - **FREM: the analytic gradients differentiated the wrong likelihood on covariate
   pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against
   the prediction `theta[i] + eta[j]` with the dedicated covariate error `EPSCOV` — but the

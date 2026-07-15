@@ -388,6 +388,7 @@ pub(crate) fn pop_nll(
                 &params.omega,
                 iov,
                 &params.sigma.values,
+                &params.residual_correlations,
                 interaction,
             );
         }
@@ -400,6 +401,7 @@ pub(crate) fn pop_nll(
         h_matrices,
         &params.omega,
         &params.sigma.values,
+        &params.residual_correlations,
         interaction,
     )
 }
@@ -2066,7 +2068,7 @@ fn subject_reconverged_fd_gradient(
             Some(&mu_k),
             0,
         );
-        crate::stats::likelihood::foce_subject_nll(
+        crate::stats::likelihood::foce_subject_nll_with_correlations(
             model,
             subject,
             &params.theta,
@@ -2075,6 +2077,7 @@ fn subject_reconverged_fd_gradient(
             &params.omega,
             &params.sigma.values,
             options.interaction,
+            &params.residual_correlations,
         )
     };
     central_diff_packed(x, &fixed, bounds, eval)
@@ -2116,6 +2119,7 @@ fn subject_reconverged_fd_gradient_iov(
             &ebe.h_matrix,
             &params.omega,
             &params.sigma.values,
+            &params.residual_correlations,
             options.interaction,
             &ebe.kappas,
             params
@@ -2455,6 +2459,21 @@ fn population_gradient(
     // `Optimizer::resolve_auto` and `build_info::gradient_method_outer` also use,
     // so the `auto` optimizer cannot pick a gradient-based optimizer while this
     // gate falls through to FD (#490 review).
+    let has_free_residual_correlation =
+        init_params
+            .residual_correlations
+            .iter()
+            .enumerate()
+            .any(|(i, _)| {
+                !init_params
+                    .residual_correlation_fixed
+                    .get(i)
+                    .copied()
+                    .unwrap_or(false)
+            });
+    if has_free_residual_correlation {
+        return reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options);
+    }
     if !force_reconverge && crate::sens::provider::analytic_outer_gradient_available(model) {
         let g = if iov_analytic {
             // Per-subject: exact analytic for in-scope subjects, per-subject reconverged-FD
@@ -4164,6 +4183,8 @@ mod tests {
                 names: vec!["ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -4223,6 +4244,8 @@ mod tests {
                 names: vec!["ADD".into(), "PROP".into()],
             },
             sigma_fixed: vec![false, false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -4248,6 +4271,8 @@ mod tests {
                 names: vec!["ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(crate::types::OmegaMatrix::from_diagonal(
                 &[0.02],
                 vec!["KAPPA_CL".into()],
@@ -4292,6 +4317,8 @@ mod tests {
                 names: vec!["ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
@@ -4650,6 +4677,8 @@ mod tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -4858,6 +4887,8 @@ mod tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -5332,6 +5363,8 @@ mod tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![true],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![true],
         };

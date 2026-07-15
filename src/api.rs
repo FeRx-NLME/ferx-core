@@ -10,9 +10,7 @@ use crate::io::datareader::{
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
-use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
-};
+use crate::stats::likelihood::{build_frem_r_override, compute_cwres, foce_subject_nll_iov};
 use crate::stats::residual_error::{
     compute_iwres_with_correlations, compute_r_matrix_with_correlations,
     compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
@@ -6089,6 +6087,8 @@ fn fit_inner(
         theta_fixed: result.params.theta_fixed.clone(),
         omega_fixed: result.params.omega_fixed.clone(),
         sigma_fixed: result.params.sigma_fixed.clone(),
+        residual_correlations: result.params.residual_correlations.clone(),
+        residual_correlation_fixed: result.params.residual_correlation_fixed.clone(),
         omega_init_as_sd: model.omega_init_as_sd.clone(),
         sigma_init_as_sd: model.sigma_init_as_sd.clone(),
         subjects,
@@ -6632,12 +6632,13 @@ fn compute_subject_results(
                     h,
                     &params.omega,
                     &params.sigma.values,
+                    &params.residual_correlations,
                     interaction,
                     kappas,
                     omega_iov,
                 )
             } else {
-                foce_subject_nll(
+                crate::stats::likelihood::foce_subject_nll_with_correlations(
                     model,
                     subject,
                     &params.theta,
@@ -6646,6 +6647,7 @@ fn compute_subject_results(
                     &params.omega,
                     &params.sigma.values,
                     interaction,
+                    &params.residual_correlations,
                 )
             };
 
@@ -10425,6 +10427,8 @@ mod iov_integration {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
         };
@@ -12189,6 +12193,8 @@ mod extract_se_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov,
             kappa_fixed,
         }
@@ -12221,6 +12227,8 @@ mod extract_se_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
@@ -12283,6 +12291,8 @@ mod extract_se_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
@@ -12321,6 +12331,8 @@ mod extract_se_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
@@ -12357,6 +12369,8 @@ mod extract_se_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
@@ -12944,6 +12958,8 @@ mod simulate_with_uncertainty_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -13326,6 +13342,8 @@ mod simulate_with_uncertainty_tests {
             theta_fixed: template.theta_fixed.clone(),
             omega_fixed: template.omega_fixed.clone(),
             sigma_fixed: template.sigma_fixed.clone(),
+            residual_correlations: template.residual_correlations.clone(),
+            residual_correlation_fixed: template.residual_correlation_fixed.clone(),
             omega_init_as_sd: vec![false; template.omega.matrix.nrows()],
             sigma_init_as_sd: vec![false; template.sigma.values.len()],
             subjects: vec![],
@@ -14556,6 +14574,8 @@ mod multi_start_tests {
                 names: vec!["ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         }
@@ -14693,6 +14713,8 @@ mod tests_sdtab_tv_cov {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -15031,6 +15053,8 @@ mod tests_sdtab_tv_cov {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -15217,6 +15241,8 @@ mod tests_derived_session_clock {
                     names: vec!["ERR".into()],
                 },
                 sigma_fixed: vec![false],
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
             },
@@ -15612,6 +15638,8 @@ mod tests_derived_iov_kappa {
                     names: vec!["ERR".into()],
                 },
                 sigma_fixed: vec![false],
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 omega_iov: Some(OmegaMatrix::from_diagonal(&[1.0], vec!["KAPPA_CL".into()])),
                 kappa_fixed: vec![false],
             },

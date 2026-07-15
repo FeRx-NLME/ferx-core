@@ -1185,6 +1185,8 @@ pub fn run_bayes(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
+        residual_correlations: init_params.residual_correlations.clone(),
+        residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
         omega_iov: omega_iov_mean.clone(),
         kappa_fixed: init_params.kappa_fixed.clone(),
     };

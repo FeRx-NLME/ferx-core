@@ -79,6 +79,8 @@ pub fn fitted_params_from_result(
             names: fit_result.sigma_names.clone(),
         },
         sigma_fixed: fit_result.sigma_fixed.clone(),
+        residual_correlations: fit_result.residual_correlations.clone(),
+        residual_correlation_fixed: fit_result.residual_correlation_fixed.clone(),
         omega_iov,
         kappa_fixed: fit_result.kappa_fixed.clone(),
     }
@@ -318,6 +320,8 @@ mod tests {
                 names: vec!["prop_err".to_string()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         }
@@ -350,6 +354,8 @@ mod tests {
             theta_fixed: template.theta_fixed.clone(),
             omega_fixed: template.omega_fixed.clone(),
             sigma_fixed: template.sigma_fixed.clone(),
+            residual_correlations: template.residual_correlations.clone(),
+            residual_correlation_fixed: template.residual_correlation_fixed.clone(),
             omega_init_as_sd: vec![false; template.omega.matrix.nrows()],
             sigma_init_as_sd: vec![false; template.sigma.values.len()],
             subjects: vec![],

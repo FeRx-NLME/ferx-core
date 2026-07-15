@@ -669,6 +669,8 @@ fn run_mcem(
                 names: init_params.sigma.names.clone(),
             },
             sigma_fixed: init_params.sigma_fixed.clone(),
+            residual_correlations: init_params.residual_correlations.clone(),
+            residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
             omega_iov: None,
             kappa_fixed: init_params.kappa_fixed.clone(),
         };
@@ -1151,6 +1153,8 @@ fn run_mcem(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
+        residual_correlations: init_params.residual_correlations.clone(),
+        residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
         omega_iov: None,
         kappa_fixed: init_params.kappa_fixed.clone(),
     };

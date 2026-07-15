@@ -2486,6 +2486,8 @@ mod tests {
                     names: vec!["EPS".into()],
                 },
                 sigma_fixed: vec![false],
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
             },

@@ -1,6 +1,6 @@
 use crate::pk;
 use crate::stats::likelihood::{
-    individual_nll_into_with_schedule, individual_nll_iov, iov_occasion_groups,
+    individual_nll_into_with_schedule_and_correlations, individual_nll_iov, iov_occasion_groups,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -744,7 +744,7 @@ pub fn find_ebe(
     // Objective evaluated directly at eta_true (the optimiser variable).
     let obj = |e: &[f64]| -> f64 {
         let mut scratch = pk_scratch_cell.borrow_mut();
-        individual_nll_into_with_schedule(
+        individual_nll_into_with_schedule_and_correlations(
             model,
             subject,
             &params.theta,
@@ -753,6 +753,7 @@ pub fn find_ebe(
             &params.sigma.values,
             &mut scratch,
             schedule.as_ref(),
+            &params.residual_correlations,
         )
     };
 
@@ -3054,6 +3055,7 @@ pub fn run_inner_loop_warm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stats::likelihood::individual_nll_into_with_schedule;
     use std::collections::HashMap;
 
     /// An endpoint-only mixed-effects CTMM (#759): no `[structural_model]`, so no Gaussian
@@ -3905,6 +3907,8 @@ mod tests {
                 names: vec!["RUV".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
@@ -4638,6 +4642,8 @@ mod iov_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
         };
@@ -6764,6 +6770,8 @@ mod iov_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -6909,6 +6917,8 @@ mod iov_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };

@@ -282,6 +282,30 @@ pub fn print_results(result: &FitResult) {
             _ => eprintln!("  {:<20} = {:.6}  SE = {}", label, s, se_str),
         }
     }
+    if !result.residual_correlations.is_empty() {
+        eprintln!("\n--- SIGMA Correlations ---");
+        for (i, corr) in result.residual_correlations.iter().enumerate() {
+            let left = result
+                .sigma_names
+                .get(corr.sigma_i)
+                .map(|n| n.as_str())
+                .unwrap_or("EPS");
+            let right = result
+                .sigma_names
+                .get(corr.sigma_j)
+                .map(|n| n.as_str())
+                .unwrap_or("EPS");
+            let name = format!("{left}~{right}");
+            let is_fixed = result
+                .residual_correlation_fixed
+                .get(i)
+                .copied()
+                .unwrap_or(false);
+            let label = if is_fixed { fixed_label(&name) } else { name };
+            let se_str = if is_fixed { "---" } else { "N/A" };
+            eprintln!("  {:<20} = {:.6}  SE = {}", label, corr.rho, se_str);
+        }
+    }
 
     // IOV (KAPPA) estimates
     if let Some(ref iov) = result.omega_iov {
@@ -1814,6 +1838,37 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             }
         }
     }
+    if !result.residual_correlations.is_empty() {
+        writeln!(f, "\nsigma_correlations:").map_err(|e| e.to_string())?;
+        for (i, corr) in result.residual_correlations.iter().enumerate() {
+            let left = result
+                .sigma_names
+                .get(corr.sigma_i)
+                .cloned()
+                .unwrap_or_else(|| format!("sigma_{}", corr.sigma_i + 1));
+            let right = result
+                .sigma_names
+                .get(corr.sigma_j)
+                .cloned()
+                .unwrap_or_else(|| format!("sigma_{}", corr.sigma_j + 1));
+            let key = format!("{left}~{right}");
+            writeln!(f, "  {}:", key).map_err(|e| e.to_string())?;
+            writeln!(f, "    estimate: {:.6}", corr.rho).map_err(|e| e.to_string())?;
+            writeln!(f, "    sigma_i: {}", left).map_err(|e| e.to_string())?;
+            writeln!(f, "    sigma_j: {}", right).map_err(|e| e.to_string())?;
+            if result
+                .residual_correlation_fixed
+                .get(i)
+                .copied()
+                .unwrap_or(false)
+            {
+                writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
+                writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+            } else {
+                writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+            }
+        }
+    }
 
     // IOV (KAPPA) block
     if let Some(ref iov) = result.omega_iov {
@@ -2152,6 +2207,8 @@ mod tests {
             theta_fixed: Vec::new(),
             omega_fixed: Vec::new(),
             sigma_fixed: vec![false; n],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_init_as_sd: Vec::new(),
             sigma_init_as_sd: vec![false; n],
             subjects: Vec::new(),
@@ -2556,6 +2613,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sigma_yaml_emits_residual_correlations() {
+        let mut result = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        result.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        result.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        result.residual_correlation_fixed = vec![true];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&result, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("\nsigma_correlations:"), "yaml=\n{}", yaml);
+        assert!(yaml.contains("  PROP_ERR~ADD_ERR:"), "yaml=\n{}", yaml);
+        assert!(yaml.contains("    estimate: 0.500000"), "yaml=\n{}", yaml);
+        assert!(yaml.contains("    fixed: true"), "yaml=\n{}", yaml);
+    }
+
     // ── sdtab helpers ────────────────────────────────────────────────────────
 
     fn sdtab_subject_result(id: &str, n_obs: usize) -> SubjectResult {
@@ -2721,6 +2800,8 @@ mod tests {
             theta_fixed: Vec::new(),
             omega_fixed: Vec::new(),
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_init_as_sd: Vec::new(),
             sigma_init_as_sd: vec![false],
             subjects,
