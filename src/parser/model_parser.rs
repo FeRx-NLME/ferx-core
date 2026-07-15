@@ -12363,12 +12363,84 @@ fn check_unused_parameters(
     warnings
 }
 
-fn eval_expression(
+// ─── Shared expression / condition evaluators ───────────────────────────────
+//
+// `eval_expression`/`eval_condition` (HashMap-keyed name lookup) and
+// `eval_expression_indexed`/`eval_condition_indexed` (slice-index lookup) were
+// byte-for-byte identical in every arithmetic/unary/power/conditional/literal
+// arm; they differed ONLY in how the four "environment" variants
+// (`Variable`/`Covariate` vs `VariableIdx`/`CovariateIdx`) resolve a name to an
+// `f64`. That name resolution is factored into the `EvalEnv` trait, with a
+// HashMap impl (`MapEnv`) and a slice impl (`SliceEnv`), so the arithmetic lives
+// once in the generic `eval_expr`/`eval_cond`. Monomorphization keeps both call
+// sites zero-cost. Every arithmetic/guard arm is copied verbatim from the
+// originals (the `Div` 1e-30 guard, the unary fn set, the `NnOutput` cache
+// lookup).
+
+/// Name resolution for the four environment expression variants
+/// (`Variable`/`Covariate`/`VariableIdx`/`CovariateIdx`). The generic
+/// evaluator routes exactly those variants here; every other arm is handled
+/// generically.
+trait EvalEnv {
+    fn resolve(&self, expr: &Expression) -> f64;
+}
+
+/// HashMap-keyed environment (the unindexed evaluator).
+struct MapEnv<'a> {
+    covariates: &'a HashMap<String, f64>,
+    vars: &'a HashMap<String, f64>,
+}
+
+impl EvalEnv for MapEnv<'_> {
+    #[inline]
+    fn resolve(&self, expr: &Expression) -> f64 {
+        match expr {
+            Expression::Covariate(name) => self.covariates.get(name).copied().unwrap_or(0.0),
+            Expression::Variable(name) => {
+                if name.eq_ignore_ascii_case("MACHEPS") {
+                    f64::EPSILON
+                } else {
+                    self.vars.get(name).copied().unwrap_or(0.0)
+                }
+            }
+            _ => {
+                debug_assert!(
+                    false,
+                    "indexed expression reached unindexed eval_expression"
+                );
+                0.0
+            }
+        }
+    }
+}
+
+/// Slice-indexed environment (the resolved, hot indexed evaluator).
+struct SliceEnv<'a> {
+    covariates: &'a [f64],
+    vars: &'a [f64],
+}
+
+impl EvalEnv for SliceEnv<'_> {
+    #[inline]
+    fn resolve(&self, expr: &Expression) -> f64 {
+        match expr {
+            Expression::VariableIdx(i) => self.vars.get(*i).copied().unwrap_or(0.0),
+            Expression::CovariateIdx(i) => self.covariates.get(*i).copied().unwrap_or(0.0),
+            _ => {
+                debug_assert!(false, "unresolved name reached eval_expression_indexed");
+                0.0
+            }
+        }
+    }
+}
+
+/// Generic expression evaluator. All arithmetic/unary/power/conditional/literal
+/// arms are shared; the environment variants delegate to `env.resolve`.
+fn eval_expr<E: EvalEnv>(
     expr: &Expression,
     theta: &[f64],
     eta: &[f64],
-    covariates: &HashMap<String, f64>,
-    vars: &HashMap<String, f64>,
+    env: &E,
     nn_outputs: &[Vec<f64>],
 ) -> f64 {
     match expr {
@@ -12376,24 +12448,13 @@ fn eval_expression(
         Expression::Theta(i) => theta[*i],
         Expression::Eta(i) => eta[*i],
         Expression::Time => current_model_time(),
-        Expression::Covariate(name) => covariates.get(name).copied().unwrap_or(0.0),
-        Expression::Variable(name) => {
-            if name.eq_ignore_ascii_case("MACHEPS") {
-                f64::EPSILON
-            } else {
-                vars.get(name).copied().unwrap_or(0.0)
-            }
-        }
-        Expression::VariableIdx(_) | Expression::CovariateIdx(_) => {
-            debug_assert!(
-                false,
-                "indexed expression reached unindexed eval_expression"
-            );
-            0.0
-        }
+        Expression::Variable(_)
+        | Expression::Covariate(_)
+        | Expression::VariableIdx(_)
+        | Expression::CovariateIdx(_) => env.resolve(expr),
         Expression::BinOp(lhs, op, rhs) => {
-            let l = eval_expression(lhs, theta, eta, covariates, vars, nn_outputs);
-            let r = eval_expression(rhs, theta, eta, covariates, vars, nn_outputs);
+            let l = eval_expr(lhs, theta, eta, env, nn_outputs);
+            let r = eval_expr(rhs, theta, eta, env, nn_outputs);
             match op {
                 BinOp::Add => l + r,
                 BinOp::Sub => l - r,
@@ -12409,7 +12470,7 @@ fn eval_expression(
             }
         }
         Expression::UnaryFn(name, arg) => {
-            let v = eval_expression(arg, theta, eta, covariates, vars, nn_outputs);
+            let v = eval_expr(arg, theta, eta, env, nn_outputs);
             match name.as_str() {
                 "exp" => v.exp(),
                 "log" | "ln" => v.max(1e-30).ln(),
@@ -12435,23 +12496,23 @@ fn eval_expression(
             }
         }
         Expression::Power(base, exp) => {
-            let b = eval_expression(base, theta, eta, covariates, vars, nn_outputs);
-            let e = eval_expression(exp, theta, eta, covariates, vars, nn_outputs);
+            let b = eval_expr(base, theta, eta, env, nn_outputs);
+            let e = eval_expr(exp, theta, eta, env, nn_outputs);
             b.powf(e)
         }
         Expression::Conditional(cond, t, e) => {
-            if eval_condition(cond, theta, eta, covariates, vars, nn_outputs) {
-                eval_expression(t, theta, eta, covariates, vars, nn_outputs)
+            if eval_cond(cond, theta, eta, env, nn_outputs) {
+                eval_expr(t, theta, eta, env, nn_outputs)
             } else {
-                eval_expression(e, theta, eta, covariates, vars, nn_outputs)
+                eval_expr(e, theta, eta, env, nn_outputs)
             }
         }
         Expression::NnOutput { nn_idx, output_idx } => {
-            // Same per-call cache as the indexed evaluator. Callers
-            // populate `nn_outputs` from `NamedMlpMapper::forward_raw`
-            // (see the `tv_fn` closure for the eta=0 path). Out-of-bounds
-            // indices return 0.0 with a debug-assert so a logic bug
-            // surfaces in tests but doesn't crash release builds.
+            // Per-call cache populated once per forward via
+            // `NamedMlpMapper::forward_raw`. Multiple references to outputs of
+            // the same NN therefore share a single forward pass. Out-of-bounds
+            // indices return 0.0 with a debug-assert so a logic bug surfaces in
+            // tests but doesn't crash release builds.
             nn_outputs
                 .get(*nn_idx)
                 .and_then(|v| v.get(*output_idx))
@@ -12459,7 +12520,7 @@ fn eval_expression(
                 .unwrap_or_else(|| {
                     debug_assert!(
                         false,
-                        "NnOutput nn_idx={nn_idx} output_idx={output_idx} out of bounds in unindexed eval"
+                        "NnOutput nn_idx={nn_idx} output_idx={output_idx} out of bounds"
                     );
                     0.0
                 })
@@ -12467,18 +12528,18 @@ fn eval_expression(
     }
 }
 
-fn eval_condition(
+/// Generic condition evaluator (shared by the HashMap and slice entry points).
+fn eval_cond<E: EvalEnv>(
     cond: &Condition,
     theta: &[f64],
     eta: &[f64],
-    covariates: &HashMap<String, f64>,
-    vars: &HashMap<String, f64>,
+    env: &E,
     nn_outputs: &[Vec<f64>],
 ) -> bool {
     match cond {
         Condition::Compare(l, op, r) => {
-            let lv = eval_expression(l, theta, eta, covariates, vars, nn_outputs);
-            let rv = eval_expression(r, theta, eta, covariates, vars, nn_outputs);
+            let lv = eval_expr(l, theta, eta, env, nn_outputs);
+            let rv = eval_expr(r, theta, eta, env, nn_outputs);
             match op {
                 CmpOp::Lt => lv < rv,
                 CmpOp::Le => lv <= rv,
@@ -12489,15 +12550,39 @@ fn eval_condition(
             }
         }
         Condition::And(l, r) => {
-            eval_condition(l, theta, eta, covariates, vars, nn_outputs)
-                && eval_condition(r, theta, eta, covariates, vars, nn_outputs)
+            eval_cond(l, theta, eta, env, nn_outputs) && eval_cond(r, theta, eta, env, nn_outputs)
         }
         Condition::Or(l, r) => {
-            eval_condition(l, theta, eta, covariates, vars, nn_outputs)
-                || eval_condition(r, theta, eta, covariates, vars, nn_outputs)
+            eval_cond(l, theta, eta, env, nn_outputs) || eval_cond(r, theta, eta, env, nn_outputs)
         }
-        Condition::Not(c) => !eval_condition(c, theta, eta, covariates, vars, nn_outputs),
+        Condition::Not(c) => !eval_cond(c, theta, eta, env, nn_outputs),
     }
+}
+
+#[inline]
+fn eval_expression(
+    expr: &Expression,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+    vars: &HashMap<String, f64>,
+    nn_outputs: &[Vec<f64>],
+) -> f64 {
+    let env = MapEnv { covariates, vars };
+    eval_expr(expr, theta, eta, &env, nn_outputs)
+}
+
+#[inline]
+fn eval_condition(
+    cond: &Condition,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+    vars: &HashMap<String, f64>,
+    nn_outputs: &[Vec<f64>],
+) -> bool {
+    let env = MapEnv { covariates, vars };
+    eval_cond(cond, theta, eta, &env, nn_outputs)
 }
 
 // ─── Bytecode interpreter ───────────────────────────────────────────────────
@@ -13342,6 +13427,7 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
 /// + probe in the `pk_param_fn` closure. Falls back to 0.0 for the
 /// HashMap-keyed variants (Variable/Covariate) since callers running
 /// the indexed path have already resolved every name.
+#[inline]
 fn eval_expression_indexed(
     expr: &Expression,
     theta: &[f64],
@@ -13350,91 +13436,11 @@ fn eval_expression_indexed(
     vars: &[f64],
     nn_outputs: &[Vec<f64>],
 ) -> f64 {
-    match expr {
-        Expression::Literal(v) => *v,
-        Expression::Theta(i) => theta[*i],
-        Expression::Eta(i) => eta[*i],
-        Expression::Time => current_model_time(),
-        Expression::VariableIdx(i) => vars.get(*i).copied().unwrap_or(0.0),
-        Expression::CovariateIdx(i) => covariates.get(*i).copied().unwrap_or(0.0),
-        Expression::Covariate(_) | Expression::Variable(_) => {
-            debug_assert!(false, "unresolved name reached eval_expression_indexed");
-            0.0
-        }
-        Expression::BinOp(lhs, op, rhs) => {
-            let l = eval_expression_indexed(lhs, theta, eta, covariates, vars, nn_outputs);
-            let r = eval_expression_indexed(rhs, theta, eta, covariates, vars, nn_outputs);
-            match op {
-                BinOp::Add => l + r,
-                BinOp::Sub => l - r,
-                BinOp::Mul => l * r,
-                BinOp::Div => {
-                    if r.abs() < 1e-30 {
-                        0.0
-                    } else {
-                        l / r
-                    }
-                }
-                BinOp::Mod => l.rem_euclid(r),
-            }
-        }
-        Expression::UnaryFn(name, arg) => {
-            let v = eval_expression_indexed(arg, theta, eta, covariates, vars, nn_outputs);
-            match name.as_str() {
-                "exp" => v.exp(),
-                "log" | "ln" => v.max(1e-30).ln(),
-                "sqrt" => v.max(0.0).sqrt(),
-                "abs" => v.abs(),
-                "floor" => v.floor(),
-                "ceil" => v.ceil(),
-                "round" => v.round(),
-                "inv_logit" | "expit" => {
-                    if v >= 0.0 {
-                        1.0 / (1.0 + (-v).exp())
-                    } else {
-                        let e = v.exp();
-                        e / (1.0 + e)
-                    }
-                }
-                "logit" => {
-                    let clamped = v.clamp(1e-15, 1.0 - 1e-15);
-                    (clamped / (1.0 - clamped)).ln()
-                }
-                _ => v,
-            }
-        }
-        Expression::Power(base, exp) => {
-            let b = eval_expression_indexed(base, theta, eta, covariates, vars, nn_outputs);
-            let e = eval_expression_indexed(exp, theta, eta, covariates, vars, nn_outputs);
-            b.powf(e)
-        }
-        Expression::Conditional(cond, t, e) => {
-            if eval_condition_indexed(cond, theta, eta, covariates, vars, nn_outputs) {
-                eval_expression_indexed(t, theta, eta, covariates, vars, nn_outputs)
-            } else {
-                eval_expression_indexed(e, theta, eta, covariates, vars, nn_outputs)
-            }
-        }
-        Expression::NnOutput { nn_idx, output_idx } => {
-            // Reads from the per-call cache that `build_pk_param_fn`
-            // populates once per forward via `NamedMlpMapper::forward_raw`.
-            // Multiple references to outputs of the same NN therefore share
-            // a single forward pass.
-            nn_outputs
-                .get(*nn_idx)
-                .and_then(|v| v.get(*output_idx))
-                .copied()
-                .unwrap_or_else(|| {
-                    debug_assert!(
-                        false,
-                        "NnOutput nn_idx={nn_idx} output_idx={output_idx} out of bounds"
-                    );
-                    0.0
-                })
-        }
-    }
+    let env = SliceEnv { covariates, vars };
+    eval_expr(expr, theta, eta, &env, nn_outputs)
 }
 
+#[inline]
 fn eval_condition_indexed(
     cond: &Condition,
     theta: &[f64],
@@ -13443,29 +13449,8 @@ fn eval_condition_indexed(
     vars: &[f64],
     nn_outputs: &[Vec<f64>],
 ) -> bool {
-    match cond {
-        Condition::Compare(l, op, r) => {
-            let lv = eval_expression_indexed(l, theta, eta, covariates, vars, nn_outputs);
-            let rv = eval_expression_indexed(r, theta, eta, covariates, vars, nn_outputs);
-            match op {
-                CmpOp::Lt => lv < rv,
-                CmpOp::Le => lv <= rv,
-                CmpOp::Gt => lv > rv,
-                CmpOp::Ge => lv >= rv,
-                CmpOp::Eq => lv == rv,
-                CmpOp::Ne => lv != rv,
-            }
-        }
-        Condition::And(l, r) => {
-            eval_condition_indexed(l, theta, eta, covariates, vars, nn_outputs)
-                && eval_condition_indexed(r, theta, eta, covariates, vars, nn_outputs)
-        }
-        Condition::Or(l, r) => {
-            eval_condition_indexed(l, theta, eta, covariates, vars, nn_outputs)
-                || eval_condition_indexed(r, theta, eta, covariates, vars, nn_outputs)
-        }
-        Condition::Not(c) => !eval_condition_indexed(c, theta, eta, covariates, vars, nn_outputs),
-    }
+    let env = SliceEnv { covariates, vars };
+    eval_cond(cond, theta, eta, &env, nn_outputs)
 }
 
 /// Inner statement evaluator threaded with a caller-owned bytecode stack.

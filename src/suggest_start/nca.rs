@@ -22,6 +22,20 @@ pub struct SubjectNca {
     pub mrt: Option<f64>,
 }
 
+/// One linear-up / log-down trapezoid segment of width `dt`: the linear rule
+/// `0.5·(y0 + y1)·dt` when the segment is rising (`y1 >= y0`) or either endpoint
+/// is non-positive, else the log-down (log-mean) rule `(y0 − y1)/(ln y0 − ln y1)·dt`.
+/// Shared by the AUC, AUMC and Wagner-Nelson cumulative-AUC accumulators so the
+/// segment rule lives in one place.
+#[inline]
+fn logdown_trapezoid(y0: f64, y1: f64, dt: f64) -> f64 {
+    if y1 >= y0 || y0 <= 0.0 || y1 <= 0.0 {
+        0.5 * (y0 + y1) * dt
+    } else {
+        (y0 - y1) / (y0.ln() - y1.ln()) * dt
+    }
+}
+
 /// Compute linear-up / log-down trapezoidal AUC for dose-normalised
 /// concentrations on the first-dose interval [t0, t_end).
 ///
@@ -48,12 +62,7 @@ pub fn auc_trapezoid(times: &[f64], concs: &[f64]) -> Option<(f64, f64, f64)> {
             continue;
         }
         // Linear-up / log-down: linear when c1 >= c0, log-down otherwise.
-        let trap = if c1 >= c0 || c0 <= 0.0 || c1 <= 0.0 {
-            0.5 * (c0 + c1) * dt
-        } else {
-            (c0 - c1) / (c0.ln() - c1.ln()) * dt
-        };
-        auc += trap;
+        auc += logdown_trapezoid(c0, c1, dt);
     }
 
     let &(t_last, c_last) = pairs.last().unwrap();
@@ -82,12 +91,7 @@ pub fn aumc_trapezoid(times: &[f64], concs: &[f64]) -> Option<(f64, f64, f64)> {
         if dt <= 0.0 {
             continue;
         }
-        let trap = if tc1 >= tc0 || tc0 <= 0.0 || tc1 <= 0.0 {
-            0.5 * (tc0 + tc1) * dt
-        } else {
-            (tc0 - tc1) / (tc0.ln() - tc1.ln()) * dt
-        };
-        aumc += trap;
+        aumc += logdown_trapezoid(tc0, tc1, dt);
     }
 
     let &(t_last, tc_last) = pairs.last().unwrap();
@@ -233,12 +237,7 @@ pub fn wagner_nelson_ka(times: &[f64], concs: &[f64], cl_f: f64, v_f: f64) -> Op
         let (t0, c0) = pairs[i - 1];
         let (t1, c1) = pairs[i];
         let dt = t1 - t0;
-        let trap = if c1 >= c0 || c0 <= 0.0 || c1 <= 0.0 {
-            0.5 * (c0 + c1) * dt
-        } else {
-            (c0 - c1) / (c0.ln() - c1.ln()) * dt
-        };
-        cum_auc[i] = cum_auc[i - 1] + trap;
+        cum_auc[i] = cum_auc[i - 1] + logdown_trapezoid(c0, c1, dt);
     }
 
     let c_last = pairs.last().unwrap().1;
