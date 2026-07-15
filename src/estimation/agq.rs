@@ -1060,6 +1060,7 @@ fn grid_response_correction(
     params: &ModelParameters,
     template: &ModelParameters,
     stack: &Stack,
+    anchor: HessianAnchor,
     x: &[f64],
     b_hat: &[f64],
     nodes: &[f64],
@@ -1109,8 +1110,12 @@ fn grid_response_correction(
         // Ω_joint moves with the parameters too, so rebuild the stack at each perturbed point.
         let sp = Stack::new(model, &pp, stack.n_occ);
         let sm = Stack::new(model, &pm, stack.n_occ);
-        let hp = fd_posterior_hessian(model, subject, &pp, &sp, &ep, scratch, schedule);
-        let hm = fd_posterior_hessian(model, subject, &pm, &sm, &em, scratch, schedule);
+        let (Some(hp), Some(hm)) = (
+            anchor_hessian(anchor, model, subject, &pp, &sp, &ep, scratch, schedule),
+            anchor_hessian(anchor, model, subject, &pm, &sm, &em, scratch, schedule),
+        ) else {
+            continue; // GN anchor out of scope at this perturbed point — no correction
+        };
 
         // `nll` stays at the ORIGINAL params — the direct x-dependence is already covered
         // analytically by the fixed-η score — but the grid (centre and scale) is the
@@ -1298,6 +1303,7 @@ fn agq_subject_packed_gradient(
     b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
+    anchor: HessianAnchor,
     out: &mut [f64],
 ) -> Option<()> {
     let d = stack.d();
@@ -1310,7 +1316,8 @@ fn agq_subject_packed_gradient(
         );
     }
 
-    let h = fd_posterior_hessian(
+    let h = anchor_hessian(
+        anchor,
         model,
         subject,
         params,
@@ -1318,7 +1325,7 @@ fn agq_subject_packed_gradient(
         b_hat,
         &mut scratch,
         schedule.as_ref(),
-    );
+    )?;
     let proposal = build_proposal(&h, &stack.omega_joint_inv, d)?;
 
     // Sweep the grid once, keeping each node's b and its log-term, so the softmax weights
@@ -1356,6 +1363,7 @@ fn agq_subject_packed_gradient(
         params,
         template,
         stack,
+        anchor,
         x,
         b_hat,
         nodes,
@@ -1382,6 +1390,7 @@ pub fn agq_population_gradient(
     eta_hats: &[nalgebra::DVector<f64>],
     kappas: &[Vec<nalgebra::DVector<f64>>],
     n_nodes: usize,
+    anchor: HessianAnchor,
 ) -> Option<Vec<f64>> {
     let n_packed = x.len();
     let (nodes, weights) = gauss_hermite(n_nodes);
@@ -1406,6 +1415,7 @@ pub fn agq_population_gradient(
                 &b_hat,
                 &nodes,
                 &log_weights,
+                anchor,
                 &mut g,
             )
             .map(|()| g)

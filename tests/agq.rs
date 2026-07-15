@@ -433,8 +433,18 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
         let (ehs, _h, _s, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
             &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
         );
-        let g = agq::agq_population_gradient(&model, &pop, &params, template, &x0, &ehs, &[], n)
-            .expect("analytic gradient must be available in scope");
+        let g = agq::agq_population_gradient(
+            &model,
+            &pop,
+            &params,
+            template,
+            &x0,
+            &ehs,
+            &[],
+            n,
+            ferx_core::types::HessianAnchor::Exact,
+        )
+        .expect("analytic gradient must be available in scope");
 
         // Central FD of the true objective. Step 1e-4, not 1e-5: this references a
         // **reconverged** objective, so a step below the inner solver's noise floor amplifies
@@ -486,6 +496,81 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
         rel_errs[3] < rel_errs[0],
         "accuracy should improve with node count: {rel_errs:?}"
     );
+}
+
+/// The **Gauss-Newton-anchored** quadrature (`focei, n_agq > 1`) has its own analytic
+/// gradient, and it must match a finite difference of its own objective (#251). Same
+/// machinery as the exact-anchor test above — the fixed-node score is anchor-independent, the
+/// grid-response term differences the Gauss-Newton `H̃` instead of the exact Hessian, and the
+/// mode response `dη̂/dx` stays the exact one (η̂ minimises the true conditional NLL regardless
+/// of which Hessian scales the grid).
+#[test]
+fn gauss_newton_anchored_gradient_matches_fd() {
+    use ferx_core::estimation::agq;
+    use ferx_core::estimation::parameterization::{pack_params, unpack_params};
+    use ferx_core::types::HessianAnchor::GaussNewton;
+
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+    let pop = warfarin();
+    let template = &model.default_params;
+    let x0 = pack_params(template);
+    let np = x0.len();
+
+    let ofv = |x: &[f64], n: usize| -> f64 {
+        let params = unpack_params(x, template);
+        let (ehs, _h, _s, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
+        );
+        2.0 * agq::agq_population_nll(&model, &pop, &params, &ehs, &[], n, GaussNewton)
+    };
+
+    let mut rel_errs = Vec::new();
+    for &n in &[1usize, 3, 5] {
+        let params = unpack_params(&x0, template);
+        let (ehs, _h, _s, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
+        );
+        let g = agq::agq_population_gradient(
+            &model,
+            &pop,
+            &params,
+            template,
+            &x0,
+            &ehs,
+            &[],
+            n,
+            GaussNewton,
+        )
+        .expect("GN-anchored analytic gradient must be available in scope");
+
+        let mut fd = vec![0.0f64; np];
+        for i in 0..np {
+            let h = 1e-4 * (1.0 + x0[i].abs());
+            let (mut xp, mut xm) = (x0.clone(), x0.clone());
+            xp[i] += h;
+            xm[i] -= h;
+            fd[i] = (ofv(&xp, n) - ofv(&xm, n)) / (2.0 * h);
+        }
+
+        let scale = fd
+            .iter()
+            .chain(g.iter())
+            .fold(1e-6f64, |m, v| m.max(v.abs()));
+        let max_diff = g
+            .iter()
+            .zip(fd.iter())
+            .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+        rel_errs.push(max_diff / scale);
+    }
+
+    for (k, &n) in [1usize, 3, 5].iter().enumerate() {
+        assert!(
+            rel_errs[k] < 2e-3,
+            "n_agq={n}: GN-anchored analytic gradient must match FD of its objective, got \
+             {:.3e} (all: {rel_errs:?})",
+            rel_errs[k]
+        );
+    }
 }
 
 /// **AGQ has its own gradient for every model — nothing falls back to the inner-re-solving
@@ -542,11 +627,21 @@ fn fd_score_path_agrees_with_the_analytic_one() {
             &ehs,
             &[],
             n,
+            ferx_core::types::HessianAnchor::Exact,
         )
         .expect("analytic-score gradient");
-        let g_fd =
-            agq::agq_population_gradient(&fd_model, &pop, &params, template, &x, &ehs, &[], n)
-                .expect("FD-score gradient");
+        let g_fd = agq::agq_population_gradient(
+            &fd_model,
+            &pop,
+            &params,
+            template,
+            &x,
+            &ehs,
+            &[],
+            n,
+            ferx_core::types::HessianAnchor::Exact,
+        )
+        .expect("FD-score gradient");
 
         let scale = g_an
             .iter()
@@ -1127,8 +1222,18 @@ fn analytic_gradient_matches_fd_under_iov() {
             "the inner loop must return per-occasion kappas, else this proves nothing"
         );
 
-        let g = agq::agq_population_gradient(model, &pop, &params, template, &x0, &ehs, &kaps, n)
-            .expect("IOV gradient must be available");
+        let g = agq::agq_population_gradient(
+            model,
+            &pop,
+            &params,
+            template,
+            &x0,
+            &ehs,
+            &kaps,
+            n,
+            ferx_core::types::HessianAnchor::Exact,
+        )
+        .expect("IOV gradient must be available");
 
         // FD step 1e-4, NOT the 1e-5 that *looks* more accurate. The reference differences a
         // **reconverged** objective, so shrinking the step past the inner solver's own noise

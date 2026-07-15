@@ -2534,14 +2534,11 @@ fn population_gradient(
         // `reconverge_gradient_interval` is honoured here too: it is the documented escape
         // hatch onto the numeric path, so it must override the analytic gradient for AGQ
         // exactly as it does for FOCE/FOCEI below.
-        // `agq_population_gradient` is the analytic gradient of the **exact-anchor** objective
-        // (its grid-response term differences the exact Hessian). The Gauss-Newton anchor
-        // (`focei` with `n_agq > 1`) has a different `½log|H̃|` term, so it must NOT use this
-        // gradient — for now it takes the reconverged-FD path below (always correct; the
-        // analytic GN-anchor gradient is a separate step). Only the exact anchor is analytic.
-        let exact_anchor = options.hessian_anchor() == crate::types::HessianAnchor::Exact;
-        if exact_anchor && !reconverge && crate::estimation::agq::analytic_gradient_available(model)
-        {
+        // `agq_population_gradient` is the analytic gradient of the quadrature objective for
+        // **either** anchor: the fixed-node score is anchor-independent, and the grid-response
+        // term differences whichever Hessian scales the grid (exact for `laplace`,
+        // Gauss-Newton for `focei` — `anchor` selects it, matching the objective).
+        if !reconverge && crate::estimation::agq::analytic_gradient_available(model) {
             let params = unpack_params(x, init_params);
             if let Some(mut g) = crate::estimation::agq::agq_population_gradient(
                 model,
@@ -2552,6 +2549,7 @@ fn population_gradient(
                 ehs,
                 kappas,
                 n_nodes,
+                options.hessian_anchor(),
             ) {
                 // Fixed coordinates carry no gradient, matching the analytic FOCE path.
                 let fixed = packed_fixed_mask(init_params);
