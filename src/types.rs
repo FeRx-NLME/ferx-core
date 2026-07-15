@@ -4615,6 +4615,11 @@ pub struct FitResult {
     /// Per residual-correlation FIX flags, parallel to `residual_correlations`.
     #[serde(default)]
     pub residual_correlation_fixed: Vec<bool>,
+    /// Standard errors for the residual correlations (on the `rho` scale),
+    /// parallel to `residual_correlations`. `None` when no covariance matrix
+    /// was computed.
+    #[serde(default)]
+    pub se_residual_correlation: Option<Vec<f64>>,
     /// Per-eta SD-init flag (parallel to the omega diagonal): `true` when the
     /// initial value was written as `omega NAME ~ X (sd)`. Lets downstream
     /// printers annotate the estimate with `[initial specified as SD]`.

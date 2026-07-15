@@ -118,6 +118,11 @@ struct FitWire {
     theta: ThetaWire,
     omega: OmegaWire,
     sigma: SigmaWire,
+    /// `block_sigma` off-diagonal residual correlations. Absent on bundles
+    /// produced before #847 added correlation estimation; loaders default to
+    /// `None` (no correlations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    residual_correlations: Option<ResidualCorrelationsWire>,
     error_model: String,
     #[serde(with = "crate::io::serde_nan::scalar")]
     shrinkage_eps: f64,
@@ -234,6 +239,18 @@ struct SigmaWire {
     /// for backward compatibility with .fitrx files from before issue #5.
     #[serde(default)]
     init_as_sd: Vec<bool>,
+}
+
+/// `block_sigma` residual correlations carried through a `.fitrx` round-trip.
+/// Optional / defaulted so bundles written before this field existed still load
+/// (they deserialize to `None`, i.e. no correlations).
+#[derive(Serialize, Deserialize)]
+struct ResidualCorrelationsWire {
+    sigma_i: Vec<usize>,
+    sigma_j: Vec<usize>,
+    rho: Vec<f64>,
+    fixed: Vec<bool>,
+    se: Option<Vec<f64>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -593,6 +610,17 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
                 .map(|t| sigma_type_to_str(*t).into())
                 .collect(),
             init_as_sd: r.sigma_init_as_sd.clone(),
+        },
+        residual_correlations: if r.residual_correlations.is_empty() {
+            None
+        } else {
+            Some(ResidualCorrelationsWire {
+                sigma_i: r.residual_correlations.iter().map(|c| c.sigma_i).collect(),
+                sigma_j: r.residual_correlations.iter().map(|c| c.sigma_j).collect(),
+                rho: r.residual_correlations.iter().map(|c| c.rho).collect(),
+                fixed: r.residual_correlation_fixed.clone(),
+                se: r.se_residual_correlation.clone(),
+            })
         },
         error_model: error_model_to_str(r.error_model).into(),
         shrinkage_eps: r.shrinkage_eps,
@@ -1683,8 +1711,33 @@ fn wire_to_fit_result(
         theta_fixed: w.theta.fixed,
         omega_fixed: w.omega.fixed,
         sigma_fixed: w.sigma.fixed,
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
+        residual_correlations: w
+            .residual_correlations
+            .as_ref()
+            .map(|rc| {
+                rc.sigma_i
+                    .iter()
+                    .zip(&rc.sigma_j)
+                    .zip(&rc.rho)
+                    .map(
+                        |((&sigma_i, &sigma_j), &rho)| crate::types::ResidualCorrelation {
+                            sigma_i,
+                            sigma_j,
+                            rho,
+                        },
+                    )
+                    .collect()
+            })
+            .unwrap_or_default(),
+        residual_correlation_fixed: w
+            .residual_correlations
+            .as_ref()
+            .map(|rc| rc.fixed.clone())
+            .unwrap_or_default(),
+        se_residual_correlation: w
+            .residual_correlations
+            .as_ref()
+            .and_then(|rc| rc.se.clone()),
         omega_init_as_sd: omega_init_as_sd_resolved,
         sigma_init_as_sd: sigma_init_as_sd_resolved,
         subjects,
@@ -1902,6 +1955,7 @@ mod tests {
             sigma_fixed: vec![false],
             residual_correlations: Vec::new(),
             residual_correlation_fixed: Vec::new(),
+            se_residual_correlation: None,
             omega_init_as_sd: vec![false, false],
             sigma_init_as_sd: vec![false],
             subjects: vec![dummy_subject("S1", n_eta, 3), dummy_subject("S2", n_eta, 2)],
@@ -2122,6 +2176,56 @@ mod tests {
         assert_eq!(loaded.model_source, "model source\n");
         assert!(loaded.population.is_none());
         assert_eq!(loaded.manifest.format_version, FORMAT_VERSION);
+    }
+
+    /// Regression (#847 review): a `block_sigma` model's residual correlations
+    /// must survive a `.fitrx` round-trip; before the fix `wire_to_fit_result`
+    /// hardcoded them to empty, so a reloaded fit silently lost the estimated
+    /// correlation (and downstream simulate/predict used zero).
+    #[test]
+    fn roundtrip_preserves_residual_correlations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corr.fitrx");
+        let mut r = minimal_fit_result();
+        r.sigma = vec![0.05, 1.0];
+        r.sigma_names = vec!["prop".into(), "add".into()];
+        r.sigma_fixed = vec![false, false];
+        r.se_sigma = Some(vec![0.001, 0.01]);
+        r.sigma_init_as_sd = vec![false, false];
+        r.sigma_types = vec![SigmaType::Proportional, SigmaType::Additive];
+        r.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.42,
+        }];
+        r.residual_correlation_fixed = vec![false];
+        r.se_residual_correlation = Some(vec![0.03]);
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model\n", &path, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit(&path).unwrap();
+        let l = &loaded.fit;
+        assert_eq!(l.residual_correlations.len(), 1);
+        assert_eq!(l.residual_correlations[0].sigma_i, 0);
+        assert_eq!(l.residual_correlations[0].sigma_j, 1);
+        assert!((l.residual_correlations[0].rho - 0.42).abs() < 1e-12);
+        assert_eq!(l.residual_correlation_fixed, vec![false]);
+        assert_eq!(l.se_residual_correlation, Some(vec![0.03]));
+    }
+
+    /// A diagonal-`$SIGMA` fit has no residual correlations; the wire section is
+    /// omitted and the reloaded fit deserializes to empty vectors / `None`.
+    #[test]
+    fn roundtrip_without_residual_correlations_stays_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nocorr.fitrx");
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert!(loaded.fit.residual_correlations.is_empty());
+        assert!(loaded.fit.residual_correlation_fixed.is_empty());
+        assert!(loaded.fit.se_residual_correlation.is_none());
     }
 
     #[test]

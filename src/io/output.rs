@@ -302,7 +302,14 @@ pub fn print_results(result: &FitResult) {
                 .copied()
                 .unwrap_or(false);
             let label = if is_fixed { fixed_label(&name) } else { name };
-            let se_str = if is_fixed { "---" } else { "N/A" };
+            let se_str = if is_fixed {
+                "---".to_string()
+            } else {
+                match &result.se_residual_correlation {
+                    Some(se) if i < se.len() => format!("{:.6}", se[i]),
+                    _ => "N/A".to_string(),
+                }
+            };
             eprintln!("  {:<20} = {:.6}  SE = {}", label, corr.rho, se_str);
         }
     }
@@ -1856,16 +1863,19 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    estimate: {:.6}", corr.rho).map_err(|e| e.to_string())?;
             writeln!(f, "    sigma_i: {}", left).map_err(|e| e.to_string())?;
             writeln!(f, "    sigma_j: {}", right).map_err(|e| e.to_string())?;
-            if result
+            let is_fixed = result
                 .residual_correlation_fixed
                 .get(i)
                 .copied()
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            if is_fixed {
                 writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
-                writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
-            } else {
-                writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+            }
+            match result.se_residual_correlation.as_ref() {
+                Some(se) if !is_fixed && i < se.len() => {
+                    writeln!(f, "    se: {:.6}", se[i]).map_err(|e| e.to_string())?
+                }
+                _ => writeln!(f, "    se: ~").map_err(|e| e.to_string())?,
             }
         }
     }
@@ -2209,6 +2219,7 @@ mod tests {
             sigma_fixed: vec![false; n],
             residual_correlations: Vec::new(),
             residual_correlation_fixed: Vec::new(),
+            se_residual_correlation: None,
             omega_init_as_sd: Vec::new(),
             sigma_init_as_sd: vec![false; n],
             subjects: Vec::new(),
@@ -2635,6 +2646,29 @@ mod tests {
         assert!(yaml.contains("    fixed: true"), "yaml=\n{}", yaml);
     }
 
+    /// A free (estimated) correlation with a computed SE emits it numerically
+    /// instead of the `se: ~` placeholder, and does not emit `fixed:`.
+    #[test]
+    fn sigma_yaml_emits_estimated_residual_correlation_se() {
+        let mut result = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        result.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        result.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        result.residual_correlation_fixed = vec![false];
+        result.se_residual_correlation = Some(vec![0.037]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&result, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("    se: 0.037000"), "yaml=\n{}", yaml);
+        assert!(!yaml.contains("    fixed: true"), "yaml=\n{}", yaml);
+    }
+
     // ── sdtab helpers ────────────────────────────────────────────────────────
 
     fn sdtab_subject_result(id: &str, n_obs: usize) -> SubjectResult {
@@ -2802,6 +2836,7 @@ mod tests {
             sigma_fixed: vec![false],
             residual_correlations: Vec::new(),
             residual_correlation_fixed: Vec::new(),
+            se_residual_correlation: None,
             omega_init_as_sd: Vec::new(),
             sigma_init_as_sd: vec![false],
             subjects,

@@ -24,7 +24,14 @@ section of the SDLC for the versioning policy).
   unless the block is marked `FIX`** (#847). Non-`FIX` off-diagonals are packed
   as bounded residual-correlation coordinates, reported in `FitResult` and the
   fit YAML, and used by the FOCE/FOCEI inner objective, outer objective, and
-  reconverged finite-difference gradient path.
+  reconverged finite-difference gradient path. Standard errors are now reported
+  for estimated correlations (delta method through the Fisher-z transform), and
+  they survive a `.fitrx` save/load round-trip (#847).
+
+- **IOV/kappa standard errors were read from the wrong covariance entries when a
+  model combined a free `block_sigma` correlation with an IOV term** (#847). The
+  packed layout inserts residual correlations before the IOV block, but the
+  kappa SE offset did not skip them; kappa SEs are now indexed correctly.
 
 - **FREM: the analytic gradients differentiated the wrong likelihood on covariate
   pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against

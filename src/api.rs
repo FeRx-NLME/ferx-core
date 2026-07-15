@@ -5706,6 +5706,8 @@ fn fit_inner(
     // Extract SEs from covariance matrix using converged parameter values
     let (se_theta, se_omega, se_sigma, se_kappa) =
         extract_standard_errors(&result.covariance_matrix, &result.params);
+    let se_residual_correlation =
+        extract_residual_correlation_se(&result.covariance_matrix, &result.params);
 
     // Optional SIR step
     let mut warnings = result.warnings;
@@ -6089,6 +6091,7 @@ fn fit_inner(
         sigma_fixed: result.params.sigma_fixed.clone(),
         residual_correlations: result.params.residual_correlations.clone(),
         residual_correlation_fixed: result.params.residual_correlation_fixed.clone(),
+        se_residual_correlation,
         omega_init_as_sd: model.omega_init_as_sd.clone(),
         sigma_init_as_sd: model.sigma_init_as_sd.clone(),
         subjects,
@@ -7968,6 +7971,7 @@ pub(crate) fn extract_standard_errors(
     let n_theta = template.theta.len();
     let n_eta = template.omega.dim();
     let n_sigma = template.sigma.values.len();
+    let n_corr = template.residual_correlations.len();
 
     // SE on packed scale
     let se_packed: Vec<f64> = (0..n)
@@ -8090,7 +8094,13 @@ pub(crate) fn extract_standard_errors(
     // Same delta-method approximation as `se_omega`: SE(var_i) ≈ 2 * var_i * SE(log L_ii),
     // which is exact for diagonal IOV and a first-order approximation for block_kappa.
     // Off-diagonal covariance SEs are not currently reported (matches BSV omega).
-    let kappa_start = sigma_start + n_sigma;
+    //
+    // The packed layout is [theta, Ω, sigma, residual correlations, Ω_IOV], so
+    // the IOV block starts after the `n_corr` residual-correlation slots — see
+    // `parameterization::pack_params`. Omitting `n_corr` here reads kappa SEs
+    // from the wrong covariance diagonals whenever a model has both a free
+    // `block_sigma` correlation and an IOV term (#847 review).
+    let kappa_start = sigma_start + n_sigma + n_corr;
     let se_kappa: Option<Vec<f64>> = template.omega_iov.as_ref().map(|iov| {
         let n_kappa = iov.dim();
         (0..n_kappa)
@@ -8110,6 +8120,49 @@ pub(crate) fn extract_standard_errors(
     });
 
     (Some(se_theta), Some(se_omega), Some(se_sigma), se_kappa)
+}
+
+/// Standard errors for the estimated residual correlations, on the `rho` scale.
+///
+/// The optimizer carries each free correlation as a Fisher-z coordinate
+/// `z = atanh(rho)` in the packed slot between sigma and Ω_IOV (see
+/// `parameterization::pack_params`). The covariance matrix therefore gives
+/// `SE(z)`; the delta method through `rho = tanh(z)` (`d rho/dz = 1 - rho²`)
+/// maps it back to `SE(rho) = SE(z) · (1 - rho²)`. Fixed correlations still
+/// occupy a slot but their SE is reported as `0.0` (the reduced-Hessian
+/// covariance step zeroes them, matching FIX sigma/omega handling).
+pub(crate) fn extract_residual_correlation_se(
+    cov: &Option<DMatrix<f64>>,
+    template: &ModelParameters,
+) -> Option<Vec<f64>> {
+    let cov = cov.as_ref()?;
+    let n_corr = template.residual_correlations.len();
+    if n_corr == 0 {
+        return None;
+    }
+    let n = cov.nrows();
+    let n_theta = template.theta.len();
+    let n_eta = template.omega.dim();
+    let n_omega = if template.omega.diagonal {
+        n_eta
+    } else {
+        n_eta * (n_eta + 1) / 2
+    };
+    let corr_start = n_theta + n_omega + template.sigma.values.len();
+    let se = (0..n_corr)
+        .map(|i| {
+            let idx = corr_start + i;
+            if idx < n {
+                let v = cov[(idx, idx)];
+                let se_z = if v > 0.0 { v.sqrt() } else { 0.0 };
+                let rho = template.residual_correlations[i].rho;
+                se_z * (1.0 - rho * rho)
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    Some(se)
 }
 
 /// Simulate observations from a model with given parameters (random seed).
@@ -12464,6 +12517,66 @@ mod extract_se_tests {
         let (_, _, _, se_kappa) = extract_standard_errors(&None, &template);
         assert!(se_kappa.is_none());
     }
+
+    /// Regression (#847 review): the packed layout is
+    /// `[theta, Ω, sigma, residual correlations, Ω_IOV]`, so kappa SE indexing
+    /// must skip the residual-correlation slots. With one free correlation plus
+    /// one diagonal kappa, the IOV block starts one slot later than
+    /// `sigma_start + n_sigma`; before the fix, se_kappa read the correlation's
+    /// covariance diagonal instead.
+    #[test]
+    fn test_se_kappa_offset_skips_residual_correlations() {
+        let iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
+        let mut template = make_template(Some(iov), vec![false]);
+        template.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 0,
+            rho: 0.3,
+        }];
+        template.residual_correlation_fixed = vec![false];
+        // Packed layout: theta(1) + omega(1) + sigma(1) + corr(1) + kappa(1) = 5.
+        // Distinct diagonal entries so the wrong index is detectable:
+        // idx 3 = correlation slot (se_packed 100), idx 4 = kappa (se_packed 2).
+        let mut cov = DMatrix::<f64>::zeros(5, 5);
+        cov[(3, 3)] = 100.0_f64.powi(2); // correlation slot — must NOT be read for kappa
+        cov[(4, 4)] = 2.0_f64.powi(2); // kappa slot — the correct source
+        let (_, _, _, se_kappa) = extract_standard_errors(&Some(cov), &template);
+        let se = se_kappa.expect("se_kappa should be Some when omega_iov is set");
+        // se_kappa[0] = 2 * var * SE(log L) = 2 * 0.04 * 2 = 0.16 (reads idx 4).
+        assert!(
+            (se[0] - 2.0 * 0.04 * 2.0).abs() < 1e-12,
+            "kappa SE must read the IOV slot (idx 4), got {}",
+            se[0]
+        );
+    }
+
+    /// The residual-correlation SE is the covariance-matrix packed SE mapped
+    /// through the Fisher-z delta method `SE(rho) = SE(z) * (1 - rho^2)`.
+    #[test]
+    fn test_residual_correlation_se_delta_method() {
+        use super::extract_residual_correlation_se;
+        let mut template = make_template(None, vec![]);
+        template.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        template.residual_correlation_fixed = vec![false];
+        // Packed layout: theta(1) + omega(1) + sigma(1) + corr(1) = 4.
+        let mut cov = DMatrix::<f64>::zeros(4, 4);
+        cov[(3, 3)] = 0.2_f64.powi(2); // SE(z) = 0.2
+        let se = extract_residual_correlation_se(&Some(cov), &template).expect("Some");
+        assert_eq!(se.len(), 1);
+        // SE(rho) = 0.2 * (1 - 0.25) = 0.15
+        assert!((se[0] - 0.15).abs() < 1e-12, "got {}", se[0]);
+    }
+
+    #[test]
+    fn test_residual_correlation_se_none_when_no_correlations() {
+        let template = make_template(None, vec![]);
+        let cov = Some(DMatrix::<f64>::identity(3, 3));
+        assert!(super::extract_residual_correlation_se(&cov, &template).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -13344,6 +13457,7 @@ mod simulate_with_uncertainty_tests {
             sigma_fixed: template.sigma_fixed.clone(),
             residual_correlations: template.residual_correlations.clone(),
             residual_correlation_fixed: template.residual_correlation_fixed.clone(),
+            se_residual_correlation: None,
             omega_init_as_sd: vec![false; template.omega.matrix.nrows()],
             sigma_init_as_sd: vec![false; template.sigma.values.len()],
             subjects: vec![],

@@ -356,6 +356,7 @@ mod tests {
             sigma_fixed: template.sigma_fixed.clone(),
             residual_correlations: template.residual_correlations.clone(),
             residual_correlation_fixed: template.residual_correlation_fixed.clone(),
+            se_residual_correlation: None,
             omega_init_as_sd: vec![false; template.omega.matrix.nrows()],
             sigma_init_as_sd: vec![false; template.sigma.values.len()],
             subjects: vec![],
