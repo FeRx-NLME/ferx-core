@@ -671,6 +671,451 @@ fn residual_correlation_block(
     grad
 }
 
+struct DenseRPrep {
+    n_eta: usize,
+    residuals: DVector<f64>,
+    jmat: DMatrix<f64>,
+    r_inv: DMatrix<f64>,
+    htilde_inv: DMatrix<f64>,
+    h_inner_inv: DMatrix<f64>,
+    g_eta: DVector<f64>,
+    dr_df: Vec<DMatrix<f64>>,
+    d2r_df2: Vec<Vec<DMatrix<f64>>>,
+    k_eta: Vec<DMatrix<f64>>,
+    m_eta: Vec<DMatrix<f64>>,
+}
+
+fn trace_product(a: &DMatrix<f64>, b: &DMatrix<f64>) -> f64 {
+    let mut out = 0.0;
+    for i in 0..a.nrows() {
+        for j in 0..a.ncols() {
+            out += a[(i, j)] * b[(j, i)];
+        }
+    }
+    out
+}
+
+fn dense_r_and_derivatives(
+    model: &CompiledModel,
+    subject: &Subject,
+    sens: &SubjectSens,
+    sigma: &[f64],
+    correlations: &[crate::types::ResidualCorrelation],
+) -> (DMatrix<f64>, Vec<DMatrix<f64>>, Vec<Vec<DMatrix<f64>>>) {
+    let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
+    let err_keys = model.error_spec.obs_keys(subject);
+    let r = crate::stats::residual_error::r_matrix_maybe_scaled(
+        &model.error_spec,
+        &ipreds,
+        err_keys.as_ref(),
+        subject,
+        sigma,
+        correlations,
+        None,
+    );
+    let dr = crate::stats::residual_error::compute_dr_df_matrices(
+        &model.error_spec,
+        &ipreds,
+        err_keys.as_ref(),
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        &subject.obs_l2,
+        sigma,
+        correlations,
+        None,
+    );
+    let d2 = crate::stats::residual_error::compute_d2r_df2_matrices(
+        &model.error_spec,
+        &ipreds,
+        err_keys.as_ref(),
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        &subject.obs_l2,
+        sigma,
+        correlations,
+        None,
+    );
+    (r, dr, d2)
+}
+
+fn dense_direct_r_sigma(
+    model: &CompiledModel,
+    subject: &Subject,
+    sens: &SubjectSens,
+    params: &ModelParameters,
+    k: usize,
+) -> (DMatrix<f64>, Vec<DMatrix<f64>>) {
+    let sigma = &params.sigma.values;
+    let h = sigma_fd_step(sigma[k]);
+    let mut sp = sigma.clone();
+    sp[k] += h;
+    let mut sm = sigma.clone();
+    sm[k] -= h;
+    let (rp, drp, _) =
+        dense_r_and_derivatives(model, subject, sens, &sp, &params.residual_correlations);
+    let (rm, drm, _) =
+        dense_r_and_derivatives(model, subject, sens, &sm, &params.residual_correlations);
+    let r_z = (rp - rm).scale(1.0 / (2.0 * h));
+    let dr_z = drp
+        .iter()
+        .zip(drm.iter())
+        .map(|(a, b)| (a - b).scale(1.0 / (2.0 * h)))
+        .collect();
+    (r_z, dr_z)
+}
+
+fn dense_direct_r_rho(
+    model: &CompiledModel,
+    subject: &Subject,
+    sens: &SubjectSens,
+    params: &ModelParameters,
+    k: usize,
+) -> (DMatrix<f64>, Vec<DMatrix<f64>>) {
+    let rho = params.residual_correlations[k].rho;
+    let h = (1e-6 * (1.0 + rho.abs())).min(0.5 * (0.999_999 - rho.abs()).max(1e-8));
+    let mut cp = params.residual_correlations.clone();
+    cp[k].rho += h;
+    let mut cm = params.residual_correlations.clone();
+    cm[k].rho -= h;
+    let (rp, drp, _) = dense_r_and_derivatives(model, subject, sens, &params.sigma.values, &cp);
+    let (rm, drm, _) = dense_r_and_derivatives(model, subject, sens, &params.sigma.values, &cm);
+    let r_z = (rp - rm).scale(1.0 / (2.0 * h));
+    let dr_z = drp
+        .iter()
+        .zip(drm.iter())
+        .map(|(a, b)| (a - b).scale(1.0 / (2.0 * h)))
+        .collect();
+    (r_z, dr_z)
+}
+
+fn dense_k_z(
+    prep: &DenseRPrep,
+    e_mat: &DMatrix<f64>,
+    b: &DVector<f64>,
+    direct_dr_z: &[DMatrix<f64>],
+    eta_col: usize,
+) -> DMatrix<f64> {
+    let n_obs = prep.residuals.len();
+    let mut out = DMatrix::<f64>::zeros(n_obs, n_obs);
+    for i in 0..n_obs {
+        let e = e_mat[(i, eta_col)];
+        if e != 0.0 {
+            out += prep.dr_df[i].clone().scale(e);
+        }
+        let jia = prep.jmat[(i, eta_col)];
+        if jia != 0.0 {
+            let mut ri_z = direct_dr_z[i].clone();
+            for j in 0..n_obs {
+                if b[j] != 0.0 {
+                    ri_z += prep.d2r_df2[i][j].clone().scale(b[j]);
+                }
+            }
+            out += ri_z.scale(jia);
+        }
+    }
+    out
+}
+
+fn dense_htilde_z(
+    prep: &DenseRPrep,
+    r_z: &DMatrix<f64>,
+    e_mat: &DMatrix<f64>,
+    b: &DVector<f64>,
+    direct_dr_z: &[DMatrix<f64>],
+) -> DMatrix<f64> {
+    let n_eta = prep.n_eta;
+    let s_z = -(&prep.r_inv * r_z * &prep.r_inv);
+    let term1 = e_mat.transpose() * &prep.r_inv * &prep.jmat
+        + prep.jmat.transpose() * &prep.r_inv * e_mat
+        + prep.jmat.transpose() * &s_z * &prep.jmat;
+
+    let mut m_z: Vec<DMatrix<f64>> = Vec::with_capacity(n_eta);
+    for a in 0..n_eta {
+        let k_z = dense_k_z(prep, e_mat, b, direct_dr_z, a);
+        m_z.push(&s_z * &prep.k_eta[a] + &prep.r_inv * k_z);
+    }
+
+    let mut b_z = DMatrix::<f64>::zeros(n_eta, n_eta);
+    for a in 0..n_eta {
+        for c in 0..n_eta {
+            b_z[(a, c)] =
+                trace_product(&m_z[a], &prep.m_eta[c]) + trace_product(&prep.m_eta[a], &m_z[c]);
+        }
+    }
+
+    term1 + b_z.scale(0.5)
+}
+
+fn dense_inner_mixed(
+    prep: &DenseRPrep,
+    r_z: &DMatrix<f64>,
+    e_mat: &DMatrix<f64>,
+    b: &DVector<f64>,
+    direct_dr_z: &[DMatrix<f64>],
+) -> DVector<f64> {
+    let n_eta = prep.n_eta;
+    let v = &prep.r_inv * &prep.residuals;
+    let c = &prep.r_inv - &v * v.transpose();
+    let s_z = -(&prep.r_inv * r_z * &prep.r_inv);
+    let v_z = &s_z * &prep.residuals - &prep.r_inv * b;
+    let c_z = &s_z - &v_z * v.transpose() - &v * v_z.transpose();
+
+    let mut out = DVector::<f64>::zeros(n_eta);
+    for a in 0..n_eta {
+        let j_a = prep.jmat.column(a);
+        let e_a = e_mat.column(a);
+        let k_a_z = dense_k_z(prep, e_mat, b, direct_dr_z, a);
+        let fixed = -e_a.dot(&v)
+            + j_a.dot(&(&prep.r_inv * r_z * &v))
+            + j_a.dot(&(&prep.r_inv * b))
+            + 0.5 * (trace_product(&c_z, &prep.k_eta[a]) + trace_product(&c, &k_a_z));
+        out[a] = fixed;
+    }
+    out
+}
+
+fn dense_fixed_gradient(
+    prep: &DenseRPrep,
+    r_z: &DMatrix<f64>,
+    e_mat: &DMatrix<f64>,
+    b: &DVector<f64>,
+    direct_dr_z: &[DMatrix<f64>],
+) -> f64 {
+    let v = &prep.r_inv * &prep.residuals;
+    let c = &prep.r_inv - &v * v.transpose();
+    let data = -b.dot(&v) + 0.5 * trace_product(&c, r_z);
+    let h_z = dense_htilde_z(prep, r_z, e_mat, b, direct_dr_z);
+    data + 0.5 * trace_product(&prep.htilde_inv, &h_z)
+}
+
+fn dense_prepare_focei(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+) -> Option<DenseRPrep> {
+    if subject.observations.is_empty()
+        || model.frem_config.is_some()
+        || model.residual_error_eta.is_some()
+        || matches!(model.bloq_method, crate::types::BloqMethod::M3)
+        || model.has_custom_ruv_magnitude()
+    {
+        return None;
+    }
+    let n_obs = subject.observations.len();
+    let n_eta = params.omega.dim();
+    let (r, dr_df, d2r_df2) = dense_r_and_derivatives(
+        model,
+        subject,
+        sens,
+        &params.sigma.values,
+        &params.residual_correlations,
+    );
+    let chol = r.cholesky()?;
+    let r_inv = chol.inverse();
+    let residuals = DVector::from_iterator(
+        n_obs,
+        subject
+            .observations
+            .iter()
+            .zip(sens.obs.iter())
+            .map(|(&y, obs)| y - obs.f),
+    );
+    let mut jmat = DMatrix::<f64>::zeros(n_obs, n_eta);
+    for (i, obs) in sens.obs.iter().enumerate() {
+        for a in 0..n_eta {
+            jmat[(i, a)] = obs.df_deta[a];
+        }
+    }
+
+    let mut k_eta = Vec::with_capacity(n_eta);
+    let mut m_eta = Vec::with_capacity(n_eta);
+    for a in 0..n_eta {
+        let mut k = DMatrix::<f64>::zeros(n_obs, n_obs);
+        for i in 0..n_obs {
+            let v = jmat[(i, a)];
+            if v != 0.0 {
+                k += dr_df[i].clone().scale(v);
+            }
+        }
+        m_eta.push(&r_inv * &k);
+        k_eta.push(k);
+    }
+
+    let mut bmat = DMatrix::<f64>::zeros(n_eta, n_eta);
+    for a in 0..n_eta {
+        for c in 0..n_eta {
+            bmat[(a, c)] = trace_product(&m_eta[a], &m_eta[c]);
+        }
+    }
+    let htilde = jmat.transpose() * &r_inv * &jmat + bmat.scale(0.5) + &params.omega.inv;
+    let htilde_inv = htilde.cholesky()?.inverse();
+
+    let mut h_inner = DMatrix::<f64>::zeros(n_eta, n_eta);
+    for z in 0..n_eta {
+        let b = jmat.column(z).into_owned();
+        let mut e = DMatrix::<f64>::zeros(n_obs, n_eta);
+        for i in 0..n_obs {
+            for a in 0..n_eta {
+                e[(i, a)] = sens.obs[i].d2f_deta2[a * n_eta + z];
+            }
+        }
+        let direct_dr_z = vec![DMatrix::<f64>::zeros(n_obs, n_obs); n_obs];
+        let col = dense_inner_mixed(
+            &DenseRPrep {
+                n_eta,
+                residuals: residuals.clone(),
+                jmat: jmat.clone(),
+                r_inv: r_inv.clone(),
+                htilde_inv: htilde_inv.clone(),
+                h_inner_inv: DMatrix::zeros(n_eta, n_eta),
+                g_eta: DVector::zeros(n_eta),
+                dr_df: dr_df.clone(),
+                d2r_df2: d2r_df2.clone(),
+                k_eta: k_eta.clone(),
+                m_eta: m_eta.clone(),
+            },
+            &k_eta[z],
+            &e,
+            &b,
+            &direct_dr_z,
+        );
+        for a in 0..n_eta {
+            h_inner[(a, z)] = col[a] + params.omega.inv[(a, z)];
+        }
+    }
+    let h_inner = (&h_inner + h_inner.transpose()).scale(0.5);
+    let h_inner_inv = h_inner.cholesky()?.inverse();
+
+    let mut prep = DenseRPrep {
+        n_eta,
+        residuals,
+        jmat,
+        r_inv,
+        htilde_inv,
+        h_inner_inv,
+        g_eta: DVector::zeros(n_eta),
+        dr_df,
+        d2r_df2,
+        k_eta,
+        m_eta,
+    };
+    for z in 0..n_eta {
+        let b = prep.jmat.column(z).into_owned();
+        let mut e = DMatrix::<f64>::zeros(n_obs, n_eta);
+        for i in 0..n_obs {
+            for a in 0..n_eta {
+                e[(i, a)] = sens.obs[i].d2f_deta2[a * n_eta + z];
+            }
+        }
+        let direct_dr_z = vec![DMatrix::<f64>::zeros(n_obs, n_obs); n_obs];
+        let h_z = dense_htilde_z(&prep, &prep.k_eta[z], &e, &b, &direct_dr_z);
+        prep.g_eta[z] = trace_product(&prep.htilde_inv, &h_z);
+    }
+    Some(prep)
+}
+
+fn omega_packed_block_dense(
+    prep: &DenseRPrep,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+) -> Vec<f64> {
+    let n_eta = prep.n_eta;
+    let l = &params.omega.chol;
+    let z = &params.omega.inv * DVector::from_column_slice(eta_hat);
+    let g_mat = &params.omega.inv * &prep.htilde_inv * &params.omega.inv;
+    let s = &params.omega.inv * (&prep.h_inner_inv * &prep.g_eta);
+    let entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, params.omega.diagonal);
+
+    entries
+        .iter()
+        .map(|&(row, col)| {
+            let v: Vec<f64> = (0..n_eta).map(|r| l[(r, col)]).collect();
+            let vz: f64 = v.iter().zip(z.iter()).map(|(a, b)| a * b).sum();
+            let gv_row: f64 = (0..n_eta).map(|c| g_mat[(row, c)] * v[c]).sum();
+            let sv: f64 = v.iter().zip(s.iter()).map(|(a, b)| a * b).sum();
+            let t = 0.5 * (vz * s[row] + z[row] * sv);
+            if row == col {
+                let l_kk = l[(row, row)];
+                (-l_kk * z[row] * vz + 1.0 - l_kk * gv_row) + l_kk * t
+            } else {
+                (-z[row] * vz - gv_row) + t
+            }
+        })
+        .collect()
+}
+
+fn subject_packed_gradient_dense_focei(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    params: &ModelParameters,
+    sens: &SubjectSens,
+) -> Option<Vec<f64>> {
+    let prep = dense_prepare_focei(model, subject, params, sens)?;
+    let n_theta = params.theta.len();
+    let n_sigma = params.sigma.values.len();
+    let n_corr = params.residual_correlations.len();
+    let n_obs = subject.observations.len();
+    let mut g = vec![0.0f64; x.len()];
+
+    for m in 0..n_theta {
+        let mut b = DVector::<f64>::zeros(n_obs);
+        let mut e = DMatrix::<f64>::zeros(n_obs, prep.n_eta);
+        for i in 0..n_obs {
+            b[i] = sens.obs[i].df_dtheta[m];
+            for a in 0..prep.n_eta {
+                e[(i, a)] = sens.obs[i].d2f_deta_dtheta[a * n_theta + m];
+            }
+        }
+        let direct_dr_z = vec![DMatrix::<f64>::zeros(n_obs, n_obs); n_obs];
+        let mut r_z = DMatrix::<f64>::zeros(n_obs, n_obs);
+        for i in 0..n_obs {
+            if b[i] != 0.0 {
+                r_z += prep.dr_df[i].clone().scale(b[i]);
+            }
+        }
+        let fixed = dense_fixed_gradient(&prep, &r_z, &e, &b, &direct_dr_z);
+        let mvec = dense_inner_mixed(&prep, &r_z, &e, &b, &direct_dr_z);
+        let deta = -(&prep.h_inner_inv * mvec);
+        let dtheta_dx = theta_dx_chain(template, &params.theta, m);
+        g[m] = (fixed + 0.5 * prep.g_eta.dot(&deta)) * dtheta_dx;
+    }
+
+    let omega_start = n_theta;
+    let og = omega_packed_block_dense(&prep, params, eta_hat);
+    for (ko, &val) in og.iter().enumerate() {
+        g[omega_start + ko] = val;
+    }
+    let sigma_start = omega_start + og.len();
+    for k in 0..n_sigma {
+        let b = DVector::<f64>::zeros(n_obs);
+        let e = DMatrix::<f64>::zeros(n_obs, prep.n_eta);
+        let (r_z, direct_dr_z) = dense_direct_r_sigma(model, subject, sens, params, k);
+        let fixed = dense_fixed_gradient(&prep, &r_z, &e, &b, &direct_dr_z);
+        let mvec = dense_inner_mixed(&prep, &r_z, &e, &b, &direct_dr_z);
+        let deta = -(&prep.h_inner_inv * mvec);
+        g[sigma_start + k] = (fixed + 0.5 * prep.g_eta.dot(&deta)) * params.sigma.values[k];
+    }
+    let corr_start = sigma_start + n_sigma;
+    for k in 0..n_corr {
+        let b = DVector::<f64>::zeros(n_obs);
+        let e = DMatrix::<f64>::zeros(n_obs, prep.n_eta);
+        let (r_z, direct_dr_z) = dense_direct_r_rho(model, subject, sens, params, k);
+        let fixed = dense_fixed_gradient(&prep, &r_z, &e, &b, &direct_dr_z);
+        let mvec = dense_inner_mixed(&prep, &r_z, &e, &b, &direct_dr_z);
+        let deta = -(&prep.h_inner_inv * mvec);
+        let rho = params.residual_correlations[k].rho;
+        g[corr_start + k] = (fixed + 0.5 * prep.g_eta.dot(&deta)) * (1.0 - rho * rho);
+    }
+
+    Some(g)
+}
+
 fn prepare(
     model: &CompiledModel,
     subject: &Subject,
@@ -2075,6 +2520,20 @@ pub fn subject_packed_gradient(
     // FD via `iov_analytical_supported`.
     let params = unpack_params(x, template);
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
+    if !params.residual_correlations.is_empty()
+        && corr_residual_diag(
+            model,
+            subject,
+            &sens,
+            &params.sigma.values,
+            &params.residual_correlations,
+        )
+        .is_none()
+    {
+        return subject_packed_gradient_dense_focei(
+            model, subject, template, x, eta_hat, &params, &sens,
+        );
+    }
     let prep = prepare(model, subject, &params, &sens, eta_hat)?;
 
     let n_theta = params.theta.len();
@@ -4379,6 +4838,93 @@ mod tests {
         eta
     }
 
+    /// Test-only EBE refinement for dense cross-observation `block_sigma`: finite-
+    /// difference Newton against the production inner NLL. The diagonal helper above
+    /// uses the scalar `(r,d,d2)` path and intentionally unwraps `corr_residual_diag`,
+    /// so paired selected endpoints need this dense objective oracle.
+    fn precise_ebe_dense_corr(
+        model: &CompiledModel,
+        subject: &Subject,
+        params: &ModelParameters,
+    ) -> Vec<f64> {
+        let warm = find_ebe(model, subject, params, 120, 1e-12, None, None, 0);
+        let mut eta: Vec<f64> = warm.eta.iter().copied().collect();
+        let n_eta = model.n_eta;
+        let nll = |eta: &[f64]| {
+            crate::stats::likelihood::individual_nll_with_correlations(
+                model,
+                subject,
+                &params.theta,
+                eta,
+                &params.omega,
+                &params.sigma.values,
+                &params.residual_correlations,
+            )
+        };
+
+        for _ in 0..20 {
+            let base = nll(&eta);
+            let mut grad = DVector::<f64>::zeros(n_eta);
+            let mut hess = DMatrix::<f64>::zeros(n_eta, n_eta);
+            let steps: Vec<f64> = eta.iter().map(|v| 2e-5_f64 * (1.0 + v.abs())).collect();
+            for a in 0..n_eta {
+                let ha = steps[a];
+                let mut ep = eta.clone();
+                ep[a] += ha;
+                let mut em = eta.clone();
+                em[a] -= ha;
+                let fp = nll(&ep);
+                let fm = nll(&em);
+                grad[a] = (fp - fm) / (2.0 * ha);
+                hess[(a, a)] = (fp - 2.0 * base + fm) / (ha * ha);
+                for b in (a + 1)..n_eta {
+                    let hb = steps[b];
+                    let mut epp = eta.clone();
+                    epp[a] += ha;
+                    epp[b] += hb;
+                    let mut epm = eta.clone();
+                    epm[a] += ha;
+                    epm[b] -= hb;
+                    let mut emp = eta.clone();
+                    emp[a] -= ha;
+                    emp[b] += hb;
+                    let mut emm = eta.clone();
+                    emm[a] -= ha;
+                    emm[b] -= hb;
+                    let hab = (nll(&epp) - nll(&epm) - nll(&emp) + nll(&emm)) / (4.0 * ha * hb);
+                    hess[(a, b)] = hab;
+                    hess[(b, a)] = hab;
+                }
+            }
+            let Some(chol) = hess.cholesky() else {
+                break;
+            };
+            let step = chol.solve(&grad);
+            if step.norm() < 1e-10 || grad.norm() < 1e-8 {
+                break;
+            }
+            let mut scale = 1.0;
+            let mut accepted = false;
+            while scale >= 1.0 / 128.0 {
+                let trial: Vec<f64> = eta
+                    .iter()
+                    .zip(step.iter())
+                    .map(|(e, s)| e - scale * s)
+                    .collect();
+                if nll(&trial) < base {
+                    eta = trial;
+                    accepted = true;
+                    break;
+                }
+                scale *= 0.5;
+            }
+            if !accepted {
+                break;
+            }
+        }
+        eta
+    }
+
     /// Dense (`block_sigma`) FOCEI marginal at a given η̂. The production
     /// `foce_subject_nll(.., interaction=true)` dispatches to
     /// `foce_subject_nll_interaction_dense` for correlated models.
@@ -4540,8 +5086,8 @@ mod tests {
         assert!(matches!(model.error_spec, ErrorSpec::Selected { .. }));
         assert!(!model.residual_correlations.is_empty());
         assert!(
-            !crate::sens::provider::analytic_outer_gradient_available(&model),
-            "production auto must be conservative for selected cross-endpoint block_sigma"
+            crate::sens::provider::analytic_outer_gradient_for_interaction(&model, true),
+            "FOCEI selected cross-endpoint block_sigma should use the analytic gradient route"
         );
 
         // Distinct times → diagonal R (analytic path proceeds); alternating FREE
@@ -4593,6 +5139,87 @@ mod tests {
                 .sum::<f64>()
         };
         assert_grad_matches_richardson_fd(&x, &analytic, ofv, 2e-3, 1e-5);
+    }
+
+    /// #847 fluconazole shape: selected total/free observations can be paired in
+    /// one residual block, making `R` genuinely dense. The FOCEI packed gradient
+    /// should still be analytic, including the free `block_sigma` correlation.
+    #[test]
+    fn population_packed_gradient_selected_paired_block_sigma_dense_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+
+        let model =
+            parse_model_string(SELECTED_BLOCK_SIGMA_1CPT).expect("parse selected block_sigma");
+        assert!(crate::sens::provider::analytic_outer_gradient_for_interaction(&model, true));
+
+        let theta = &[1.1, 11.0];
+        let mut s1 = selected_dense_subject(
+            &model,
+            theta,
+            &[1.0, 1.0, 2.0, 2.0, 4.0, 4.0],
+            &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        );
+        s1.obs_l2 = vec![1, 1, 2, 2, 3, 3];
+        let mut s2 = selected_dense_subject(
+            &model,
+            theta,
+            &[0.5, 0.5, 3.0, 3.0, 8.0, 8.0],
+            &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        );
+        s2.id = "2".into();
+        s2.obs_l2 = vec![1, 1, 2, 2, 3, 3];
+        let pop = Population {
+            subjects: vec![s1, s2],
+            covariate_names: vec!["FREE".into()],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let sens0 = crate::sens::provider::subject_sensitivities(
+            &model,
+            &pop.subjects[0],
+            &params.theta,
+            &[0.0, 0.0],
+        )
+        .expect("subject in analytic scope");
+        assert!(
+            corr_residual_diag(
+                &model,
+                &pop.subjects[0],
+                &sens0,
+                &params.sigma.values,
+                &params.residual_correlations,
+            )
+            .is_none(),
+            "paired total/free rows must exercise the dense-R path"
+        );
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe_dense_corr(&model, s, &params)))
+            .collect();
+
+        let analytic = population_gradient_sens(&model, &pop, &template, &x, &ehs)
+            .expect("paired selected block_sigma is analytic");
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    let eta = precise_ebe_dense_corr(&model, s, &p);
+                    marginal_nll_dense_at(&model, s, &p, &eta)
+                })
+                .sum::<f64>()
+        };
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 5e-3, 5e-5);
     }
 
     /// `block_sigma` + η-dependent `ExpressionScale` `obs_scale` (#627 × #486): the analytic

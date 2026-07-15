@@ -6921,15 +6921,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auto_picks_bobyqa_for_cross_endpoint_residual_correlation() {
+    fn resolve_auto_picks_lbfgs_for_focei_cross_endpoint_residual_correlation() {
         let m = crate::parser::model_parser::parse_model_string(
             "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n[fit_options]\n  method = focei\n",
         )
         .expect("parse cross-endpoint block_sigma");
         assert_eq!(
             Optimizer::Auto.resolve_auto(&m, true),
+            Optimizer::NloptLbfgs,
+            "FOCEI cross-endpoint block_sigma has dense-R analytic gradients, so auto can use L-BFGS"
+        );
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m, false),
             Optimizer::Bobyqa,
-            "cross-endpoint block_sigma needs dense-R gradients, so auto must avoid L-BFGS"
+            "plain FOCE still lacks the dense-R block_sigma gradient, so auto must avoid L-BFGS there"
         );
     }
 

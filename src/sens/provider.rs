@@ -657,6 +657,38 @@ fn residual_correlation_outer_diagonal_supported(model: &CompiledModel) -> bool 
     true
 }
 
+fn residual_correlation_dense_focei_supported(model: &CompiledModel) -> bool {
+    !model.residual_correlations.is_empty()
+        && model.n_kappa == 0
+        && !model.is_sde()
+        && model.frem_config.is_none()
+        && !model.has_custom_ruv_magnitude()
+        && model.residual_error_eta.is_none()
+        && !matches!(model.bloq_method, crate::types::BloqMethod::M3)
+}
+
+fn analytic_outer_gradient_common_available(model: &CompiledModel) -> bool {
+    !matches!(model.gradient_method, GradientMethod::Fd)
+        && !model.has_non_gaussian()
+        // Custom / time-varying residual-error magnitude (#484/#576/#486): `mult(θ)`
+        // makes `R` depend on θ directly, which `sens_outer_gradient::theta_block`
+        // now carries via a `Dual1`-differentiated direct-θ channel — bounded by the
+        // same `Dual1<M>` dispatch table `ScaleDerivProgram`/`ExpressionScale` uses
+        // (`MAX_RUV_MAG_AXES`). Beyond that axis count, or combined with a **correlated**
+        // residual (`block_sigma`, #627 — the dense assembly does not thread the
+        // magnitude's direct-θ channel), still routes to FD. `iiv_on_ruv` is now analytic
+        // combined with the magnitude (the residual-eta `c̃`-column coupling `d/R` gets its
+        // direct-θ terms in `theta_block`). (An M3-censored row's `−logΦ(z)` direct-θ chain
+        // is threaded per-subject too now; where it can't be — a subject with censored rows
+        // under the FOCEI magnitude path — `prepare_stacked` bails at runtime, not here.)
+        && (!model.has_custom_ruv_magnitude()
+            || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
+                && model.residual_correlations.is_empty()))
+        // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
+        // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
+        && (sens_supported(model) || iov_sens_supported(model))
+}
+
 /// Whether the exact analytic **outer** (population) FOCE/FOCEI gradient is
 /// available for `model`: it is in the sensitivity provider's scope (non-IOV
 /// [`sens_supported`] or [`iov_analytical_supported`]) and the user did not
@@ -679,33 +711,8 @@ fn residual_correlation_outer_diagonal_supported(model: &CompiledModel) -> bool 
 /// `resolve_auto` would pick a gradient-based optimizer that then stalls on a meaningless
 /// gradient (these endpoints are FD-only — see `docs/estimation/tte.qmd`).
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
-    !matches!(model.gradient_method, GradientMethod::Fd)
-        // Correlated residual (`block_sigma`, #627) has an analytic outer gradient only
-        // for the diagonal-R scope: within-observation covariance terms (e.g.
-        // `combined(prop, add)`) reduce to the scalar Almquist path fed
-        // correlation-aware `(r,d,d2)`. Cross-observation endpoint covariance (e.g.
-        // paired total/free rows) needs the dense-R Almquist gradient, which is not yet
-        // implemented; do not route `auto` to a gradient optimizer that would then fill
-        // every subject with reconverged FD.
+    analytic_outer_gradient_common_available(model)
         && residual_correlation_outer_diagonal_supported(model)
-        && !model.has_non_gaussian()
-        // Custom / time-varying residual-error magnitude (#484/#576/#486): `mult(θ)`
-        // makes `R` depend on θ directly, which `sens_outer_gradient::theta_block`
-        // now carries via a `Dual1`-differentiated direct-θ channel — bounded by the
-        // same `Dual1<M>` dispatch table `ScaleDerivProgram`/`ExpressionScale` uses
-        // (`MAX_RUV_MAG_AXES`). Beyond that axis count, or combined with a **correlated**
-        // residual (`block_sigma`, #627 — the dense assembly does not thread the
-        // magnitude's direct-θ channel), still routes to FD. `iiv_on_ruv` is now analytic
-        // combined with the magnitude (the residual-eta `c̃`-column coupling `d/R` gets its
-        // direct-θ terms in `theta_block`). (An M3-censored row's `−logΦ(z)` direct-θ chain
-        // is threaded per-subject too now; where it can't be — a subject with censored rows
-        // under the FOCEI magnitude path — `prepare_stacked` bails at runtime, not here.)
-        && (!model.has_custom_ruv_magnitude()
-            || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
-                && model.residual_correlations.is_empty()))
-        // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
-        // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
-        && (sens_supported(model) || iov_sens_supported(model))
     // IIV on residual error (#474) needs no gate here: the analytic gradient (inner η-column +
     // outer θ/Ω/σ variance terms) is provider-agnostic, so it serves every `iiv_on_ruv`
     // combination — closed-form and ODE, plain / IOV / M3-BLOQ including the triples
@@ -717,20 +724,18 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
 /// consult so `auto`'s pick and the reported gradient method can never disagree
 /// with the outer loop's actual dispatch.
 ///
-/// As of the FOCE σ-magnitude work (#486), a custom / time-varying residual-error
-/// magnitude (`σ = expr(TIME, cov, θ)`) is analytic on **both** loops — the
-/// Sheiner–Beal FOCE (non-interaction) assembly (`subject_packed_gradient_foce` /
-/// `subject_packed_gradient_foce_iov`) now threads `mult(θ)` through its marginal
-/// `R⁰` (value + direct-θ derivative), matching the FOCEI direct-θ channel. So the
-/// predicate no longer narrows by `interaction`: every exclusion in
-/// `analytic_outer_gradient_available` is interaction-independent (a magnitude
-/// combined with an M3-censored row is a *per-subject* FD fallback, as under
-/// FOCEI, not a model-level decline). The `interaction` parameter is retained for
-/// call-site stability and in case a future interaction-only channel must
-/// re-narrow here.
+/// Cross-observation residual correlations from paired endpoint `block_sigma`
+/// need the dense-R FOCEI assembly; plain FOCE still uses the diagonal-R
+/// Sheiner–Beal implementation, so the predicate narrows by `interaction` only
+/// for that dense residual-correlation scope.
 pub fn analytic_outer_gradient_for_interaction(model: &CompiledModel, interaction: bool) -> bool {
-    let _ = interaction;
-    analytic_outer_gradient_available(model)
+    if analytic_outer_gradient_available(model) {
+        return true;
+    }
+    interaction
+        && analytic_outer_gradient_common_available(model)
+        && !residual_correlation_outer_diagonal_supported(model)
+        && residual_correlation_dense_focei_supported(model)
 }
 
 /// Whether the light **ODE inner** η-gradient (`Dual1`) serves this model+subject:
@@ -5628,15 +5633,22 @@ mod tests {
         assert!(analytic_outer_gradient_available(&block_sigma));
 
         // Cross-endpoint `block_sigma` (paired total/free rows) needs the dense-R
-        // Almquist gradient. Until that is implemented, do not report an analytic
-        // outer gradient and let `auto` avoid gradient optimizers on fluconazole-like
-        // models.
+        // Almquist gradient. That path is FOCEI-specific, so the interaction-aware
+        // predicate admits it while the interaction-agnostic one remains false.
         let selected_block_sigma = parse_model_string(
             "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n[fit_options]\n  method = focei\n",
         )
         .expect("parse selected block_sigma model");
         assert!(!selected_block_sigma.residual_correlations.is_empty());
         assert!(!analytic_outer_gradient_available(&selected_block_sigma));
+        assert!(analytic_outer_gradient_for_interaction(
+            &selected_block_sigma,
+            true
+        ));
+        assert!(!analytic_outer_gradient_for_interaction(
+            &selected_block_sigma,
+            false
+        ));
     }
 
     /// The `TIME` built-in makes a structural parameter piecewise/time-varying, so

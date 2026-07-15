@@ -2455,11 +2455,16 @@ fn population_gradient(
     // `gradient = fd` forces the numeric path for the outer gradient too (the inner
     // EBE gradient honours it via `analytic_inner_grad_supported`), so the option
     // fully disables the analytic sensitivities rather than only the inner half.
-    // `analytic_outer_gradient_available` is the shared predicate that
+    // `analytic_outer_gradient_for_interaction` is the shared predicate that
     // `Optimizer::resolve_auto` and `build_info::gradient_method_outer` also use,
     // so the `auto` optimizer cannot pick a gradient-based optimizer while this
     // gate falls through to FD (#490 review).
-    if !force_reconverge && crate::sens::provider::analytic_outer_gradient_available(model) {
+    if !force_reconverge
+        && crate::sens::provider::analytic_outer_gradient_for_interaction(
+            model,
+            options.interaction,
+        )
+    {
         let g = if iov_analytic {
             // Per-subject: exact analytic for in-scope subjects, per-subject reconverged-FD
             // for out-of-scope ones — always `Some`, mirroring the non-IOV mixed path. A

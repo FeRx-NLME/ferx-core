@@ -143,8 +143,9 @@ pub fn gradient_method_outer(
                     // admits ODE IOV models too, so the reported method tracks the live outer
                     // dispatch (`outer_optimizer.rs`) for IOV as well (#466 review #4 / #439 IOV).
                     // Shared with `resolve_auto` so the reported method tracks the live outer
-                    // dispatch; a custom-magnitude model is analytic on both FOCE and FOCEI now
-                    // (#486 σ-magnitude FOCE port), so this no longer narrows by interaction.
+                    // dispatch. Most exclusions are interaction-independent; dense
+                    // cross-observation block_sigma is FOCEI-only, so the predicate still gets
+                    // the method-derived interaction flag.
                     if crate::sens::provider::analytic_outer_gradient_for_interaction(
                         model,
                         interaction,
