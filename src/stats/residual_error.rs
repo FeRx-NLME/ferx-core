@@ -1,4 +1,4 @@
-use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SubjectResult};
+use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, Subject, SubjectResult};
 use nalgebra::DMatrix;
 
 const MIN_VARIANCE: f64 = 1e-12;
@@ -391,6 +391,50 @@ pub fn compute_r_matrix_with_correlations_scaled(
     );
     fill_cross_covariances(&mut r, &pairs);
     r
+}
+
+/// Dense residual covariance `R`, dispatching on the optional per-observation
+/// custom-magnitude multiplier: `Some(mult)` routes through the `_scaled`
+/// association ([`compute_r_matrix_with_correlations_scaled`]) and `None` through
+/// the bare ([`compute_r_matrix_with_correlations`]) diagonal form. The two are
+/// equal in exact arithmetic but differ by ~1 ULP under IEEE-754 reassociation,
+/// so the split is preserved (not merged). `obs_times`/`obs_raw_times`/
+/// `occasions`/`obs_l2` are pulled off `subject`. Folds the identical `match`
+/// that the FOCE/FOCEI/data-term/CWRES paths each carried.
+pub(crate) fn r_matrix_maybe_scaled(
+    error_spec: &ErrorSpec,
+    preds: &[f64],
+    err_keys: &[usize],
+    subject: &Subject,
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    ruv_mult: Option<&[Vec<f64>]>,
+) -> DMatrix<f64> {
+    match ruv_mult {
+        Some(mult) => compute_r_matrix_with_correlations_scaled(
+            error_spec,
+            preds,
+            err_keys,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &subject.obs_l2,
+            sigma_values,
+            correlations,
+            mult,
+        ),
+        None => compute_r_matrix_with_correlations(
+            error_spec,
+            preds,
+            err_keys,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &subject.obs_l2,
+            sigma_values,
+            correlations,
+        ),
+    }
 }
 
 /// `∂R/∂f_m` matrices of the dense residual covariance built by

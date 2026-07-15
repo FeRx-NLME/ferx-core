@@ -31,6 +31,7 @@
 
 use super::dual2::Dual2;
 use super::jet::{over_v1, Jet};
+use super::one_cpt_explicit::dual2_tuple;
 use super::three_cpt::{
     three_cpt_infusion_g, three_cpt_infusion_ss_g, three_cpt_iv_bolus_g, three_cpt_iv_bolus_ss_g,
     three_cpt_oral_g, three_cpt_oral_ss_g,
@@ -174,17 +175,12 @@ pub fn iv_bolus_explicit(
     v3: f64,
 ) -> (f64, [f64; 6], [[f64; 6]; 6]) {
     let fallback = || {
-        let d = three_cpt_iv_bolus_g::<Dual2<6>>(
-            amt,
-            Dual2::constant(t),
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q2, 2),
-            Dual2::var(v2, 3),
-            Dual2::var(q3, 4),
-            Dual2::var(v3, 5),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            three_cpt_iv_bolus_g,
+            6,
+            [amt, Dual2::constant(t)],
+            [cl, v1, q2, v2, q3, v3]
+        )
     };
     if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || v3 <= 0.0 || cl <= 0.0 || q2 < 0.0 || q3 < 0.0 {
         return (0.0, [0.0; 6], [[0.0; 6]; 6]);
@@ -239,19 +235,12 @@ pub fn infusion_explicit(
     v3: f64,
 ) -> (f64, [f64; 6], [[f64; 6]; 6]) {
     let fallback = || {
-        let d = three_cpt_infusion_g::<Dual2<6>>(
-            rate,
-            dur,
-            amt,
-            Dual2::constant(t),
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q2, 2),
-            Dual2::var(v2, 3),
-            Dual2::var(q3, 4),
-            Dual2::var(v3, 5),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            three_cpt_infusion_g,
+            6,
+            [rate, dur, amt, Dual2::constant(t)],
+            [cl, v1, q2, v2, q3, v3]
+        )
     };
     if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || v3 <= 0.0 || cl <= 0.0 || q2 < 0.0 || q3 < 0.0 {
         return (0.0, [0.0; 6], [[0.0; 6]; 6]);
@@ -330,19 +319,12 @@ pub fn oral_explicit(
     f_bio: f64,
 ) -> (f64, [f64; 8], [[f64; 8]; 8]) {
     let fallback = || {
-        let d = three_cpt_oral_g::<Dual2<8>>(
-            amt,
-            Dual2::constant(t),
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q2, 2),
-            Dual2::var(v2, 3),
-            Dual2::var(q3, 4),
-            Dual2::var(v3, 5),
-            Dual2::var(ka, 6),
-            Dual2::var(f_bio, 7),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            three_cpt_oral_g,
+            8,
+            [amt, Dual2::constant(t)],
+            [cl, v1, q2, v2, q3, v3, ka, f_bio]
+        )
     };
     if t < 0.0
         || v1 <= 0.0
@@ -410,18 +392,12 @@ pub fn iv_bolus_ss_explicit(
     v3: f64,
 ) -> (f64, [f64; 6], [[f64; 6]; 6]) {
     let fallback = || {
-        let d = three_cpt_iv_bolus_ss_g::<Dual2<6>>(
-            amt,
-            Dual2::constant(t),
-            ii,
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q2, 2),
-            Dual2::var(v2, 3),
-            Dual2::var(q3, 4),
-            Dual2::var(v3, 5),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            three_cpt_iv_bolus_ss_g,
+            6,
+            [amt, Dual2::constant(t), ii],
+            [cl, v1, q2, v2, q3, v3]
+        )
     };
     if t < 0.0
         || v1 <= 0.0
@@ -482,20 +458,12 @@ pub fn oral_ss_explicit(
     f_bio: f64,
 ) -> (f64, [f64; 8], [[f64; 8]; 8]) {
     let fallback = || {
-        let d = three_cpt_oral_ss_g::<Dual2<8>>(
-            amt,
-            Dual2::constant(t),
-            ii,
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q2, 2),
-            Dual2::var(v2, 3),
-            Dual2::var(q3, 4),
-            Dual2::var(v3, 5),
-            Dual2::var(ka, 6),
-            Dual2::var(f_bio, 7),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            three_cpt_oral_ss_g,
+            8,
+            [amt, Dual2::constant(t), ii],
+            [cl, v1, q2, v2, q3, v3, ka, f_bio]
+        )
     };
     if t < 0.0
         || v1 <= 0.0
@@ -573,20 +541,12 @@ pub fn infusion_ss_explicit(
     v3: f64,
 ) -> (f64, [f64; 6], [[f64; 6]; 6]) {
     let fallback = || {
-        let d = three_cpt_infusion_ss_g::<Dual2<6>>(
-            rate,
-            dur,
-            amt,
-            Dual2::constant(t),
-            ii,
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q2, 2),
-            Dual2::var(v2, 3),
-            Dual2::var(q3, 4),
-            Dual2::var(v3, 5),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            three_cpt_infusion_ss_g,
+            6,
+            [rate, dur, amt, Dual2::constant(t), ii],
+            [cl, v1, q2, v2, q3, v3]
+        )
     };
     if t < 0.0
         || v1 <= 0.0

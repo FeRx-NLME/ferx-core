@@ -1493,6 +1493,20 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
     }
 }
 
+/// Shared check→`panic!` wrapper for the non-`fit` entry points (`predict()`/
+/// `simulate()`): if the sibling `check_*` produced a message, fail loudly with
+/// the common template naming `what` the engine received. `fit()` surfaces the
+/// same conditions as an `Err` instead of panicking. Callers holding a
+/// `Result`-returning check pass `first_error(&check).err()`.
+fn panic_if_unsupported(result: Option<String>, what: &str) {
+    if let Some(msg) = result {
+        panic!(
+            "predict()/simulate() received {what}: {msg}\n\
+             (fit() reports this as an error rather than panicking.)"
+        );
+    }
+}
+
 /// Features the analytic closed-form absorption models — transit (`one_cpt_transit`,
 /// `two_cpt_transit`, #386) and inverse-Gaussian (`one_cpt_ig`, `two_cpt_ig`, #790) —
 /// do not support: the exponential-tilting closed form is a constant-parameter
@@ -1917,13 +1931,10 @@ pub(crate) fn check_survival_tv_covariates(
 /// loudly rather than return a subtly wrong result.
 #[cfg(feature = "survival")]
 pub(crate) fn assert_survival_tv_covariates(model: &CompiledModel, population: &Population) {
-    if let Some(msg) = check_survival_tv_covariates(model, population) {
-        panic!(
-            "predict()/simulate() received a survival model / data combination with a \
-             time-varying covariate on a hazard: {msg}\n(fit() reports this as an error rather \
-             than panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_survival_tv_covariates(model, population),
+        "a survival model / data combination with a time-varying covariate on a hazard",
+    );
 }
 
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
@@ -1966,13 +1977,10 @@ pub(crate) fn assert_absorption_closed_form_support(
     model: &CompiledModel,
     population: &Population,
 ) {
-    if let Some(msg) = check_absorption_closed_form_support(model, population) {
-        panic!(
-            "predict()/simulate() received a model/data combination the analytic absorption \
-             closed form cannot honour: {msg}\n(fit() reports this as an error rather than \
-             panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_absorption_closed_form_support(model, population),
+        "a model/data combination the analytic absorption closed form cannot honour",
+    );
 }
 
 /// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
@@ -2043,25 +2051,20 @@ pub(crate) fn assert_absorption_flip_flop_no_twin(
     population: &Population,
     theta: &[f64],
 ) {
-    if let Some(msg) = check_absorption_flip_flop_no_twin(model, population, theta) {
-        panic!(
-            "predict()/simulate() received a model/data combination the absorption closed form \
-             cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_absorption_flip_flop_no_twin(model, population, theta),
+        "a model/data combination the absorption closed form cannot honour",
+    );
 }
 
 /// Panic on a depot-referencing analytic Form C readout + reset subject, for the
 /// `Vec`-returning `predict()`/`simulate()` paths (mirrors
 /// [`assert_absorption_closed_form_support`]). `fit()` returns this as an `Err`.
 pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population: &Population) {
-    if let Some(msg) = check_analytic_readout_support(model, population) {
-        panic!(
-            "predict()/simulate() received a model/data combination the analytic Form C \
-             readout cannot honour: {msg}\n(fit() reports this as an error rather than \
-             panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_analytic_readout_support(model, population),
+        "a model/data combination the analytic Form C readout cannot honour",
+    );
 }
 
 /// Panic on a malformed built-in **absorption input-rate** model/data combination —
@@ -2076,13 +2079,10 @@ pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population:
 /// [`check_absorption_dosing`] for the *value* / domain checks that need data. A
 /// no-op for any model with no built-in input-rate forcing (the common case).
 pub(crate) fn assert_absorption_dosing_supported(model: &CompiledModel, population: &Population) {
-    if let Err(msg) = first_error(&check_absorption_dosing(model, population)) {
-        panic!(
-            "predict()/simulate() received a model/data combination the built-in absorption \
-             input-rate machinery cannot honour: {msg}\n(fit() reports this as an error rather \
-             than panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        first_error(&check_absorption_dosing(model, population)).err(),
+        "a model/data combination the built-in absorption input-rate machinery cannot honour",
+    );
 }
 
 /// Model + estimation-option *compatibility* checks that don't depend on data:
@@ -6941,42 +6941,72 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
     hits
 }
 
-/// Build the human message + native structured entry (with `details`) for
-/// theta estimates pinned to an optimizer bound, or `None` when none are.
-fn boundary_estimate_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
-    let hits = boundary_estimates(params);
+/// Construct a fit-end [`WarningEntry`] with the invariant fields every native
+/// emitter shares (`severity: Warning`, `source_method: None`), varying only
+/// `category`, `message`, and `details`.
+fn warning_entry(
+    category: WarningCode,
+    message: String,
+    details: Option<serde_json::Value>,
+) -> WarningEntry {
+    WarningEntry {
+        severity: WarningSeverity::Warning,
+        category,
+        message,
+        source_method: None,
+        details,
+    }
+}
+
+/// Shared scaffold for the list-style fit-end warnings: given a set of `hits`,
+/// return `None` when empty, otherwise join a human `list` string (`line` per
+/// hit), format the message (`msg` over the joined list), build the structured
+/// `details`, and wrap it in a [`WarningEntry`] as `Some((message, entry))`.
+fn list_warning<H>(
+    hits: Vec<H>,
+    category: WarningCode,
+    line: impl Fn(&H) -> String,
+    msg: impl Fn(&str) -> String,
+    details: impl Fn(&[H]) -> serde_json::Value,
+) -> Option<(String, WarningEntry)> {
     if hits.is_empty() {
         return None;
     }
-    let list = hits
-        .iter()
-        .map(|(name, est, _bound, side)| format!("{name} ({est:.4} at {side} bound)"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let msg = format!(
-        "Parameter estimate(s) pinned to an optimizer bound: {list}. This often \
-         indicates non-identifiability or a too-tight bound; inspect the affected \
-         parameter(s) and consider relaxing the bound or simplifying the model."
-    );
-    let params_json: Vec<serde_json::Value> = hits
-        .iter()
-        .map(|(name, est, bound, side)| {
-            serde_json::json!({
-                "parameter": name,
-                "estimate": est,
-                "bound": bound,
-                "side": side,
-            })
-        })
-        .collect();
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::BoundaryEstimate,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({ "parameters": params_json })),
-    };
+    let list = hits.iter().map(|h| line(h)).collect::<Vec<_>>().join(", ");
+    let msg = msg(&list);
+    let entry = warning_entry(category, msg.clone(), Some(details(&hits)));
     Some((msg, entry))
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// theta estimates pinned to an optimizer bound, or `None` when none are.
+fn boundary_estimate_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
+    list_warning(
+        boundary_estimates(params),
+        WarningCode::BoundaryEstimate,
+        |(name, est, _bound, side)| format!("{name} ({est:.4} at {side} bound)"),
+        |list| {
+            format!(
+                "Parameter estimate(s) pinned to an optimizer bound: {list}. This often \
+                 indicates non-identifiability or a too-tight bound; inspect the affected \
+                 parameter(s) and consider relaxing the bound or simplifying the model."
+            )
+        },
+        |hits| {
+            let params_json: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|(name, est, bound, side)| {
+                    serde_json::json!({
+                        "parameter": name,
+                        "estimate": est,
+                        "bound": bound,
+                        "side": side,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "parameters": params_json })
+        },
+    )
 }
 
 /// Relative-standard-error threshold (percent) above which a free THETA is
@@ -7022,45 +7052,38 @@ fn inflated_rse_warning(
     se_theta: &Option<Vec<f64>>,
     params: &ModelParameters,
 ) -> Option<(String, WarningEntry)> {
-    let hits = inflated_rse_thetas(se_theta, params);
-    if hits.is_empty() {
-        return None;
-    }
-    let list = hits
-        .iter()
+    list_warning(
+        inflated_rse_thetas(se_theta, params),
+        WarningCode::InflatedRse,
         // One decimal so a borderline value (e.g. 50.4%) is not displayed as
         // "50%" — which would read as below the threshold it just tripped.
-        .map(|(name, _est, _se, rse)| format!("{name} ({rse:.1}%)"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let msg = format!(
-        "High relative standard error (RSE > {:.0}%): {list}. These parameter(s) \
-         are imprecisely estimated — often a sign of over-parameterization or \
-         data that do not inform them; consider simplifying the model.",
-        RSE_WARN_THRESHOLD_PCT
-    );
-    let params_json: Vec<serde_json::Value> = hits
-        .iter()
-        .map(|(name, est, se, rse)| {
+        |(name, _est, _se, rse)| format!("{name} ({rse:.1}%)"),
+        |list| {
+            format!(
+                "High relative standard error (RSE > {:.0}%): {list}. These parameter(s) \
+                 are imprecisely estimated — often a sign of over-parameterization or \
+                 data that do not inform them; consider simplifying the model.",
+                RSE_WARN_THRESHOLD_PCT
+            )
+        },
+        |hits| {
+            let params_json: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|(name, est, se, rse)| {
+                    serde_json::json!({
+                        "parameter": name,
+                        "estimate": est,
+                        "se": se,
+                        "rse_pct": rse,
+                    })
+                })
+                .collect();
             serde_json::json!({
-                "parameter": name,
-                "estimate": est,
-                "se": se,
-                "rse_pct": rse,
+                "threshold_pct": RSE_WARN_THRESHOLD_PCT,
+                "parameters": params_json,
             })
-        })
-        .collect();
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::InflatedRse,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({
-            "threshold_pct": RSE_WARN_THRESHOLD_PCT,
-            "parameters": params_json,
-        })),
-    };
-    Some((msg, entry))
+        },
+    )
 }
 
 /// Absolute correlation above which a parameter pair is flagged as
@@ -7109,37 +7132,30 @@ fn high_correlation_pairs(
 /// Build the human message + native structured entry (with `details`) for
 /// highly correlated THETA pairs in the fit's covariance matrix, or `None`.
 fn high_correlation_warning(result: &FitResult) -> Option<(String, WarningEntry)> {
-    let pairs = high_correlation_pairs(result.covariance_matrix.as_ref(), &result.theta_names);
-    if pairs.is_empty() {
-        return None;
-    }
-    let list = pairs
-        .iter()
-        .map(|(a, b, r)| format!("{a} ~ {b} ({r:.2})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let msg = format!(
-        "Highly correlated parameter pair(s) (|r| >= {CORRELATION_WARN_THRESHOLD:.2}): \
-         {list}. Highly correlated estimates indicate over-parameterization or \
-         non-identifiability; consider fixing or removing one of each pair."
-    );
-    let pairs_json: Vec<serde_json::Value> = pairs
-        .iter()
-        .map(
-            |(a, b, r)| serde_json::json!({ "parameter_a": a, "parameter_b": b, "correlation": r }),
-        )
-        .collect();
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::HighCorrelation,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({
-            "threshold": CORRELATION_WARN_THRESHOLD,
-            "pairs": pairs_json,
-        })),
-    };
-    Some((msg, entry))
+    list_warning(
+        high_correlation_pairs(result.covariance_matrix.as_ref(), &result.theta_names),
+        WarningCode::HighCorrelation,
+        |(a, b, r)| format!("{a} ~ {b} ({r:.2})"),
+        |list| {
+            format!(
+                "Highly correlated parameter pair(s) (|r| >= {CORRELATION_WARN_THRESHOLD:.2}): \
+                 {list}. Highly correlated estimates indicate over-parameterization or \
+                 non-identifiability; consider fixing or removing one of each pair."
+            )
+        },
+        |pairs| {
+            let pairs_json: Vec<serde_json::Value> = pairs
+                .iter()
+                .map(|(a, b, r)| {
+                    serde_json::json!({ "parameter_a": a, "parameter_b": b, "correlation": r })
+                })
+                .collect();
+            serde_json::json!({
+                "threshold": CORRELATION_WARN_THRESHOLD,
+                "pairs": pairs_json,
+            })
+        },
+    )
 }
 
 /// Build the human message + native structured entry for a **twin-less** transit /
@@ -7217,17 +7233,15 @@ fn absorption_flip_flop_ebe_warning(
         ode_fn,
         params
     );
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::FlipFlop,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({
+    let entry = warning_entry(
+        WarningCode::FlipFlop,
+        msg.clone(),
+        Some(serde_json::json!({
             "phase": "ebe",
             "model": model.pk_model.canonical_name(),
             "subjects": crossers,
         })),
-    };
+    );
     Some((msg, entry))
 }
 

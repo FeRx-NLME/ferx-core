@@ -114,139 +114,88 @@ impl PkNum for f64 {
     }
 }
 
-impl<const N: usize> PkNum for Dual1<N> {
-    const SECOND_ORDER: bool = false;
-    #[inline]
-    fn from_f64(x: f64) -> Self {
-        Dual1::constant(x)
-    }
-    #[inline]
-    fn var(x: f64, dim: usize) -> Self {
-        Dual1::var(x, dim)
-    }
-    #[inline]
-    fn val(self) -> f64 {
-        self.value
-    }
-    #[inline]
-    fn exp(self) -> Self {
-        Dual1::exp(self)
-    }
-    #[inline]
-    fn ln(self) -> Self {
-        Dual1::ln(self)
-    }
-    #[inline]
-    fn sqrt(self) -> Self {
-        Dual1::sqrt(self)
-    }
-    #[inline]
-    fn pow(self, e: Self) -> Self {
-        Dual1::powd(self, e)
-    }
-    #[inline]
-    fn abs(self) -> Self {
-        Dual1::abs(self)
-    }
-    #[inline]
-    fn inv_logit(self) -> Self {
-        Dual1::inv_logit(self)
-    }
-    #[inline]
-    fn logit(self) -> Self {
-        Dual1::logit(self)
-    }
-    #[inline]
-    fn cos(self) -> Self {
-        Dual1::cos(self)
-    }
-    #[inline]
-    fn acos(self) -> Self {
-        Dual1::acos(self)
-    }
-    #[inline]
-    fn guard_floor(self, lo: f64) -> Self {
-        // `!(value >= lo)` (not `value < lo`) so a `NaN` value floors too, matching
-        // `f64::max(lo)` on the scalar path (`NaN.max(lo) == lo`) — otherwise a
-        // transient `NaN` would give a finite f64 prediction but a `NaN` dual
-        // gradient (the clamped region is flat, so the floored jet is zero) (#430).
-        if !(self.value >= lo) {
-            Dual1::constant(lo)
-        } else {
-            self
+/// Generate the `PkNum` impl for a dual type whose every method is a one-line
+/// delegation to the inherent method of the same name. `Dual1<N>` and
+/// `DualMixed<NA, N>` differ only in their const-generic list, the
+/// `SECOND_ORDER` flag, and (implicitly) which inherent method the delegator
+/// resolves to — everything else is identical, including the `guard_floor`
+/// NaN-flooring body. The scalar `f64` impl stays hand-written (its bodies are
+/// inline formulas, not delegation).
+macro_rules! impl_pknum_delegate {
+    ($ty:ident<$(const $c:ident: usize),+>, second_order = $so:expr) => {
+        impl<$(const $c: usize),+> PkNum for $ty<$($c),+> {
+            const SECOND_ORDER: bool = $so;
+            #[inline]
+            fn from_f64(x: f64) -> Self {
+                $ty::constant(x)
+            }
+            #[inline]
+            fn var(x: f64, dim: usize) -> Self {
+                $ty::var(x, dim)
+            }
+            #[inline]
+            fn val(self) -> f64 {
+                self.value
+            }
+            #[inline]
+            fn exp(self) -> Self {
+                $ty::exp(self)
+            }
+            #[inline]
+            fn ln(self) -> Self {
+                $ty::ln(self)
+            }
+            #[inline]
+            fn sqrt(self) -> Self {
+                $ty::sqrt(self)
+            }
+            #[inline]
+            fn pow(self, e: Self) -> Self {
+                $ty::powd(self, e)
+            }
+            #[inline]
+            fn abs(self) -> Self {
+                $ty::abs(self)
+            }
+            #[inline]
+            fn inv_logit(self) -> Self {
+                $ty::inv_logit(self)
+            }
+            #[inline]
+            fn logit(self) -> Self {
+                $ty::logit(self)
+            }
+            #[inline]
+            fn cos(self) -> Self {
+                $ty::cos(self)
+            }
+            #[inline]
+            fn acos(self) -> Self {
+                $ty::acos(self)
+            }
+            #[inline]
+            fn guard_floor(self, lo: f64) -> Self {
+                // `!(value >= lo)` (not `value < lo`) so a `NaN` value floors too,
+                // matching `f64::max(lo)` on the scalar path (`NaN.max(lo) == lo`) —
+                // otherwise a transient `NaN` would give a finite f64 prediction but a
+                // `NaN` dual gradient (the clamped region is flat, so the floored jet
+                // is zero) (#430).
+                if !(self.value >= lo) {
+                    $ty::constant(lo)
+                } else {
+                    self
+                }
+            }
+            #[inline]
+            fn ln_gamma(self) -> Self {
+                $ty::ln_gamma(self)
+            }
         }
-    }
-    #[inline]
-    fn ln_gamma(self) -> Self {
-        Dual1::ln_gamma(self)
-    }
+    };
 }
 
-impl<const NA: usize, const N: usize> PkNum for DualMixed<NA, N> {
-    const SECOND_ORDER: bool = true;
-    #[inline]
-    fn from_f64(x: f64) -> Self {
-        DualMixed::constant(x)
-    }
-    #[inline]
-    fn var(x: f64, dim: usize) -> Self {
-        DualMixed::var(x, dim)
-    }
-    #[inline]
-    fn val(self) -> f64 {
-        self.value
-    }
-    #[inline]
-    fn exp(self) -> Self {
-        DualMixed::exp(self)
-    }
-    #[inline]
-    fn ln(self) -> Self {
-        DualMixed::ln(self)
-    }
-    #[inline]
-    fn sqrt(self) -> Self {
-        DualMixed::sqrt(self)
-    }
-    #[inline]
-    fn pow(self, e: Self) -> Self {
-        DualMixed::powd(self, e)
-    }
-    #[inline]
-    fn abs(self) -> Self {
-        DualMixed::abs(self)
-    }
-    #[inline]
-    fn inv_logit(self) -> Self {
-        DualMixed::inv_logit(self)
-    }
-    #[inline]
-    fn logit(self) -> Self {
-        DualMixed::logit(self)
-    }
-    #[inline]
-    fn cos(self) -> Self {
-        DualMixed::cos(self)
-    }
-    #[inline]
-    fn acos(self) -> Self {
-        DualMixed::acos(self)
-    }
-    #[inline]
-    fn guard_floor(self, lo: f64) -> Self {
-        // `!(value >= lo)` floors `NaN` too, matching `f64::max(lo)` — see the
-        // `Dual1` impl above (#430).
-        if !(self.value >= lo) {
-            DualMixed::constant(lo)
-        } else {
-            self
-        }
-    }
-    #[inline]
-    fn ln_gamma(self) -> Self {
-        DualMixed::ln_gamma(self)
-    }
-}
+impl_pknum_delegate!(Dual1<const N: usize>, second_order = false);
+impl_pknum_delegate!(DualMixed<const NA: usize, const N: usize>, second_order = true);
 
 #[cfg(test)]
 mod tests {

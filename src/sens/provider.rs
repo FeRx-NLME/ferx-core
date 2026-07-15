@@ -547,6 +547,22 @@ const _: () = assert!(
     "dispatch_init_impulse! enumerates 1..=24; update it when MAX_SCALE_AXES changes",
 );
 
+/// Monomorphize a `const`-generic dispatcher on a runtime dimension: expand
+/// `$dim` against the literal table `$($n),+`, binding the matched literal as a
+/// block-local `const $N: usize` for `$body` to use as its const-generic
+/// argument, with a `_ => None` fallback. Written once and shared by the seven
+/// `run_*::<N>` dispatch ladders below (formerly a per-function `macro_rules!
+/// disp` re-declared at each site). The generated `match` arms are the same
+/// tokens as the hand-written ladders, so the dispatch is bit-identical.
+macro_rules! const_dispatch {
+    ($dim:expr; $($n:literal),+ $(,)?; |$N:ident| $body:expr $(,)?) => {
+        match $dim {
+            $($n => { const $N: usize = $n; $body })+
+            _ => None,
+        }
+    };
+}
+
 /// Maximum `(θ, η)` axis count (`n_theta + n_eta`) for the TV-cov event-driven dual
 /// walk. The outer `run_obs_tvcov` (`m_dim`) and inner `run_obs_grad_tvcov` (`n_eta
 /// ≤ m_dim`) dispatch tables both enumerate `1..=MAX_TVCOV_AXES`, and
@@ -808,6 +824,58 @@ fn lognormal_param_derivatives(
     }
 }
 
+/// Resolve the exact `(∂p/∂(θ,η)` full [`ParamDerivs`], `slots)` pair for a subject:
+/// evaluate the compiled `[individual_parameters]` program over `Dual2` seeded on
+/// `(θ, η)` when it covers the required PK slots, else fall back to the closed-form
+/// log-normal chain (`pk·sel` / `tv_theta_jacobian`) whose rows follow
+/// `pk_indices` order. Returns `None` — the caller falls back to FD — only when the
+/// program path is unavailable AND some PK-param η is not `LogNormal` (the
+/// log-normal chain would then be wrong). Hoisted from the two byte-identical outer
+/// call sites (`apply_tvcov_init_outer`, `subject_sensitivities`) — see F4.
+fn resolve_param_derivs(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    pk: &crate::types::PkParams,
+) -> Option<(crate::sens::ode_provider::ParamDerivs, Vec<usize>)> {
+    match model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .filter(|prog| prog_covers_required_pk_slots(model, prog))
+        .and_then(|prog| {
+            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
+                .map(|pd| (pd, prog.pk_slots()))
+        }) {
+        Some(v) => Some(v),
+        None => {
+            if !model
+                .eta_param_info
+                .iter()
+                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
+            {
+                return None;
+            }
+            let pd = lognormal_param_derivatives(model, subject, theta, pk);
+            Some((pd, model.pk_indices.clone()))
+        }
+    }
+}
+
+/// PK slot → differentiated-row index of a `pd`/`dp_deta` whose rows follow `slots`
+/// order: `out[slots[i]] = Some(i)` for every in-range slot, `None` otherwise.
+/// Hoisted from the five identical `[None; N_PK]` build loops (F4).
+fn seed_dim_from_slots(slots: &[usize]) -> [Option<usize>; N_PK] {
+    let mut seed_dim: [Option<usize>; N_PK] = [None; N_PK];
+    for (i, &slot) in slots.iter().enumerate() {
+        if slot < N_PK {
+            seed_dim[slot] = Some(i);
+        }
+    }
+    seed_dim
+}
+
 // ─── IOV (inter-occasion variability) analytic sensitivities ──────────
 //
 // IOV makes the PK parameters switch mid-decay at occasion boundaries (NONMEM
@@ -862,17 +930,13 @@ pub(crate) fn iov_combined_derivs_dyn(
     theta: &[f64],
     combined: &[f64],
 ) -> Option<CombinedDerivs> {
-    macro_rules! disp {
-        ($($m:literal),+) => {
-            match n_theta + n_eff {
-                $($m => Some(iov_combined_derivs::<$m>(
-                    prog, n_theta, n_eff, n_rows, cov, theta, combined,
-                )),)+
-                _ => None,
-            }
-        };
-    }
-    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+    const_dispatch!(
+        n_theta + n_eff;
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+        |M| Some(iov_combined_derivs::<M>(
+            prog, n_theta, n_eff, n_rows, cov, theta, combined,
+        ))
+    )
 }
 
 /// Evaluate the compiled `[individual_parameters]` program over `Dual2<MP>` seeded
@@ -1153,21 +1217,15 @@ pub fn subject_sensitivities_iov(
     // the *unknowns* (n_eta + K·n_kappa + n_theta), not the PK axes, so it stays
     // narrow for many occasions whenever n_kappa < n_diff (the usual κ-on-CL case).
     let m_dim = s.n_theta + s.n_stacked;
-    macro_rules! disp {
-        ($($m:literal),+) => {
-            match m_dim {
-                $($m => run_obs_iov::<$m>(
-                    model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
-                    &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked,
-                    s.n_theta, s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
-                    readout, s.readout_obs.as_ref(),
-                ),)+
-                _ => None,
-            }
-        };
-    }
-    let mut sens = disp!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    let mut sens = const_dispatch!(
+        m_dim;
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+        |M| run_obs_iov::<M>(
+            model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
+            &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked,
+            s.n_theta, s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
+            readout, s.readout_obs.as_ref(),
+        )
     )?;
     // LTBS (#486): apply the `ln(f)` jet LAST — after the in-walk scale quotient / Form C
     // readout / init impulse — so the outer θ/Ω/σ gradient matches production's scale-then-log
@@ -1289,12 +1347,7 @@ fn build_iov_sources(
     let slots = prog.pk_slots_ref();
     let n_diff = slots.len();
     // PK slot → differentiated-row index (for seeding the dual axis).
-    let mut slot_row: [Option<usize>; N_PK] = [None; N_PK];
-    for (i, &sl) in slots.iter().enumerate() {
-        if sl < N_PK {
-            slot_row[sl] = Some(i);
-        }
-    }
+    let slot_row = seed_dim_from_slots(slots);
 
     // Combined derivatives at `(theta, combined)` evaluated at covariate map `cov`
     // and event time `time`, dispatching the program-eval width `MP = n_theta +
@@ -1512,20 +1565,16 @@ fn subject_eta_grad_iov_analytical(
         .and_then(|ar| ar.program.as_ref());
     let s = build_iov_sources(model, subject, theta, stacked_eta)?;
     let n_dim = s.n_stacked;
-    macro_rules! disp {
-        ($($n:literal),+) => {
-            match n_dim {
-                $($n => run_obs_iov_eta::<$n>(
-                    model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
-                    &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_stacked,
-                    s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
-                    readout, s.readout_obs.as_ref(),
-                ),)+
-                _ => None,
-            }
-        };
-    }
-    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+    const_dispatch!(
+        n_dim;
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+        |N| run_obs_iov_eta::<N>(
+            model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
+            &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_stacked,
+            s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
+            readout, s.readout_obs.as_ref(),
+        )
+    )
 }
 
 /// The dual-width-`M` inner of [`subject_sensitivities_iov`] (`M = n_theta +
@@ -2511,28 +2560,7 @@ fn apply_tvcov_init_outer(
     let n_theta = model.n_theta;
     let n_eta = model.n_eta;
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-    let (pd, slots): (crate::sens::ode_provider::ParamDerivs, Vec<usize>) = match model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .filter(|prog| prog_covers_required_pk_slots(model, prog))
-        .and_then(|prog| {
-            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
-                .map(|pd| (pd, prog.pk_slots()))
-        }) {
-        Some(v) => v,
-        None => {
-            if !model
-                .eta_param_info
-                .iter()
-                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
-            {
-                return None;
-            }
-            let pd = lognormal_param_derivatives(model, subject, theta, &pk);
-            (pd, model.pk_indices.clone())
-        }
-    };
+    let (pd, slots) = resolve_param_derivs(model, subject, theta, eta, &pk)?;
     dispatch_init_impulse!(
         n_theta + n_eta,
         apply_analytical_init_outer,
@@ -2566,28 +2594,11 @@ fn apply_tvcov_init_inner(
     }
     let n_eta = model.n_eta;
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-    let (dp_deta, slots): (Vec<Vec<f64>>, Vec<usize>) = match model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .filter(|prog| prog_covers_required_pk_slots(model, prog))
-        .and_then(|prog| {
-            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
-                .map(|pd| (pd.dp_deta, prog.pk_slots()))
-        }) {
-        Some(v) => v,
-        None => {
-            if !model
-                .eta_param_info
-                .iter()
-                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
-            {
-                return None;
-            }
-            let pd = lognormal_param_derivatives(model, subject, theta, &pk);
-            (pd.dp_deta, model.pk_indices.clone())
-        }
-    };
+    // Full `ParamDerivs` via the shared resolver, then project the η-block (the inner
+    // init impulse consumes `∂p/∂η` only) — bit-identical to the former inline
+    // `param_derivatives_from_prog(...).map(|pd| pd.dp_deta)` + log-normal fallback (F4).
+    let (pd, slots) = resolve_param_derivs(model, subject, theta, eta, &pk)?;
+    let dp_deta = pd.dp_deta;
     dispatch_init_impulse!(
         n_eta,
         apply_analytical_init_inner,
@@ -2657,12 +2668,7 @@ pub fn subject_sensitivities_tvcov(
     let slots = prog.pk_slots_ref();
     // PK slot → differentiated-row index of `pd_from_program` (for seeding the
     // dual axis). `pd` rows follow `pk_slots()` order, so row `i` ↔ slot `slots[i]`.
-    let mut slot_row: [Option<usize>; N_PK] = [None; N_PK];
-    for (i, &s) in slots.iter().enumerate() {
-        if s < N_PK {
-            slot_row[s] = Some(i);
-        }
-    }
+    let slot_row = seed_dim_from_slots(slots);
 
     // Analytic Form C readout program (#650); `readout_tvcov_supported` (checked at
     // the gate) guarantees it fits the eight structural `PkDual` slots here.
@@ -2670,18 +2676,12 @@ pub fn subject_sensitivities_tvcov(
         .analytic_readout
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
-    macro_rules! disp {
-        ($($m:literal),+) => {
-            match m_dim {
-                $($m => run_obs_tvcov::<$m>(
-                    model, subject, theta, eta, prog, &slot_row, n_eta, n_theta, readout,
-                ),)+
-                _ => None,
-            }
-        };
-    }
-    let mut sens = disp!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    let mut sens = const_dispatch!(
+        m_dim;
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+        |M| run_obs_tvcov::<M>(
+            model, subject, theta, eta, prog, &slot_row, n_eta, n_theta, readout,
+        )
     )?;
 
     // Analytic `[initial_conditions]` impulse (#486): layer `A₀·kernel(t, pk)` and its exact
@@ -3081,31 +3081,20 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
         .as_ref()
         .expect("tvcov_analytical_supported guarantees the program");
     let slots = prog.pk_slots_ref();
-    let mut slot_row: [Option<usize>; N_PK] = [None; N_PK];
-    for (i, &s) in slots.iter().enumerate() {
-        if s < N_PK {
-            slot_row[s] = Some(i);
-        }
-    }
+    let slot_row = seed_dim_from_slots(slots);
 
     let readout = model
         .analytic_readout
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
-    macro_rules! disp {
-        ($($n:literal),+) => {
-            match n_eta {
-                $($n => run_obs_grad_tvcov::<$n>(model, subject, theta, eta, prog, &slot_row, n_eta, cached_schedule, readout),)+
-                _ => None,
-            }
-        };
-    }
     // Match the outer `run_obs_tvcov` cap (`m_dim = n_theta + n_eta` over `1..=24`):
     // since `n_eta ≤ m_dim`, bounding the gate at 24 (below) makes both dispatch
     // tables resolve, so the inner and outer analytic scope stay matched rather than
     // splitting to a fixed-EBE FD inner (#449 re-review #2).
-    let mut out = disp!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    let mut out = const_dispatch!(
+        n_eta;
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+        |N| run_obs_grad_tvcov::<N>(model, subject, theta, eta, prog, &slot_row, n_eta, cached_schedule, readout)
     )?;
 
     // Analytic `[initial_conditions]` impulse (#486): η-gradient only, layered BEFORE scaling —
@@ -3612,12 +3601,7 @@ fn subject_eta_grad_impl(
             (pd.dp_deta, model.pk_indices.clone())
         }
     };
-    let mut seed_dim: [Option<usize>; N_PK] = [None; N_PK];
-    for (i, &slot) in slots.iter().enumerate() {
-        if slot < N_PK {
-            seed_dim[slot] = Some(i);
-        }
-    }
+    let seed_dim = seed_dim_from_slots(&slots);
 
     // Analytic Form C readout program (#650); the gate guarantees it is dual-
     // evaluable and depot-free, so the inner `run_obs_grad` serves it exactly.
@@ -3625,18 +3609,14 @@ fn subject_eta_grad_impl(
         .analytic_readout
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
-    macro_rules! disp {
-        ($($n:literal),+) => {
-            match slots.len() {
-                $($n => Some(run_obs_grad::<$n>(
-                    &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit, ig,
-                    two_cpt_ig, subject, &dp_deta, n_eta, readout,
-                )),)+
-                _ => None,
-            }
-        };
-    }
-    let mut out = disp!(1, 2, 3, 4, 5, 6, 7, 8, 9)?;
+    let mut out = const_dispatch!(
+        slots.len();
+        1, 2, 3, 4, 5, 6, 7, 8, 9;
+        |N| Some(run_obs_grad::<N>(
+            &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit, ig,
+            two_cpt_ig, subject, &dp_deta, n_eta, readout,
+        ))
+    )?;
     // Analytic `[initial_conditions]` impulse (#524): η-gradient only, layered on
     // BEFORE scaling — same insertion order as the f64 `pk::add_analytical_init`.
     // The inner path runs on `Dual1<n_eta>`, so it dispatches on `n_eta` (≤ the
@@ -4695,46 +4675,14 @@ fn subject_sensitivities_impl(
     // `tv_theta_jacobian` θ chain (`ρ`) — whose rows ARE in `pk_indices` order —
     // when the program path is unavailable (NN-weight θ / IOV kappa axis mismatch,
     // or a literal-const PK slot the program omits).
-    let (pd, slots): (crate::sens::ode_provider::ParamDerivs, Vec<usize>) = match model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .filter(|prog| prog_covers_required_pk_slots(model, prog))
-        .and_then(|prog| {
-            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
-                .map(|pd| (pd, prog.pk_slots()))
-        }) {
-        Some((pd, slots)) => (pd, slots),
-        None => {
-            // The closed-form fallback assumes `∂p/∂η = pk·sel` (log-normal). It is
-            // only valid when every PK-param eta is LogNormal; for additive / logit
-            // / custom etas the exact `∂p/∂η` must come from the program chain
-            // above, and if that is unavailable (NN-weight θ or IOV kappa axis
-            // mismatch) we fall back to FD rather than mis-apply the log-normal
-            // chain (which would be off by a factor of `pk` vs `1`). PR #381 #4.
-            if !model
-                .eta_param_info
-                .iter()
-                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
-            {
-                return None;
-            }
-            let pd = lognormal_param_derivatives(model, subject, theta, &pk);
-            (pd, model.pk_indices.clone())
-        }
-    };
+    let (pd, slots) = resolve_param_derivs(model, subject, theta, eta, &pk)?;
 
     // Right-size the dual width to the number of differentiated PK parameters
     // (issue #367): seed only those on a compact `0..N`, so a 2-cpt IV model runs
     // `Dual2<4>` (4× fewer Hessian entries per op than the former fixed `Dual2<8>`),
     // 3-cpt `Dual2<6>`, etc. `seed_dim[s]` is the compact dual axis for PK slot `s`
     // (`None` = constant, not differentiated); `pd` row `i` ↔ compact axis `i`.
-    let mut seed_dim: [Option<usize>; N_PK] = [None; N_PK];
-    for (i, &slot) in slots.iter().enumerate() {
-        if slot < N_PK {
-            seed_dim[slot] = Some(i);
-        }
-    }
+    let seed_dim = seed_dim_from_slots(&slots);
 
     // Explicit-kernel fast path (the default): pick the model class, then take it
     // only if a hand-written kernel covers every dose (else the whole subject uses
@@ -4776,20 +4724,16 @@ fn subject_sensitivities_impl(
         .analytic_readout
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
-    macro_rules! disp {
-        ($($n:literal),+) => {
-            match slots.len() {
-                $($n => Some(SubjectSens {
-                    obs: run_obs::<$n>(
-                        &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit, ig,
-                        two_cpt_ig, explicit_kind, subject, &pd, n_eta, n_theta, readout,
-                    ),
-                }),)+
-                _ => None,
-            }
-        };
-    }
-    let mut sens = disp!(1, 2, 3, 4, 5, 6, 7, 8, 9)?;
+    let mut sens = const_dispatch!(
+        slots.len();
+        1, 2, 3, 4, 5, 6, 7, 8, 9;
+        |N| Some(SubjectSens {
+            obs: run_obs::<N>(
+                &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit, ig,
+                two_cpt_ig, explicit_kind, subject, &pd, n_eta, n_theta, readout,
+            ),
+        })
+    )?;
     // Analytic `[initial_conditions]` impulse (#524): layer `A₀ · kernel(t, pk)`
     // and its exact `(θ, η)` jet onto every observation BEFORE scaling — the same
     // insertion order as the f64 `pk::add_analytical_init`. Dispatched on the

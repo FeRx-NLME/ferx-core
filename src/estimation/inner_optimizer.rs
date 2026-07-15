@@ -2954,19 +2954,7 @@ fn compute_jacobian_fd(
     // ∂Y/∂η_j = 1 if j == m, 0 otherwise. The FD values for these rows
     // are noisy (esp. cross-terms that should be exactly 0) and corrupt
     // the posterior Hessian used by the IS proposal.
-    if let Some(ref fc) = model.frem_config {
-        if !subject.fremtype.is_empty() {
-            for (i, &ft) in subject.fremtype.iter().enumerate() {
-                if ft > 0 {
-                    if let Some(&(_theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
-                        for j in 0..n_eta {
-                            h[(i, j)] = if j == eta_idx { 1.0 } else { 0.0 };
-                        }
-                    }
-                }
-            }
-        }
-    }
+    overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
 
     h
 }

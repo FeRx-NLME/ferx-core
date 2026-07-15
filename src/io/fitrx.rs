@@ -27,106 +27,9 @@ use zip::{ZipArchive, ZipWriter};
 
 pub const FORMAT_VERSION: &str = "1";
 
-// ---------------------------------------------------------------------------
-// Serde helpers for non-finite floats
-// ---------------------------------------------------------------------------
-//
-// JSON has no representation for NaN/±Inf. `serde_json` writes them as
-// `null` on serialize, which is correct per the spec but means the default
-// `Deserialize` for `f64` then fails when reading the value back. These
-// helpers make the round-trip lossless: non-finite serializes to `null`,
-// and `null` deserializes back to `NaN`. Use via `#[serde(with = "...")]`
-// on fields that may legitimately carry NaN (shrinkage, cov_condition_number
-// when the Hessian is singular, etc.).
-
-mod f64_nan_as_null {
-    use serde::{de::Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(value: &f64, ser: S) -> Result<S::Ok, S::Error> {
-        if value.is_finite() {
-            ser.serialize_f64(*value)
-        } else {
-            ser.serialize_none()
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<f64, D::Error> {
-        let opt: Option<f64> = Option::deserialize(de)?;
-        Ok(opt.unwrap_or(f64::NAN))
-    }
-}
-
-mod vec_f64_nan_as_null {
-    use serde::{de::Deserialize, ser::SerializeSeq, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(value: &Vec<f64>, ser: S) -> Result<S::Ok, S::Error> {
-        let mut seq = ser.serialize_seq(Some(value.len()))?;
-        for v in value {
-            if v.is_finite() {
-                seq.serialize_element(v)?;
-            } else {
-                seq.serialize_element(&Option::<f64>::None)?;
-            }
-        }
-        seq.end()
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<f64>, D::Error> {
-        let opts: Vec<Option<f64>> = Vec::deserialize(de)?;
-        Ok(opts.into_iter().map(|o| o.unwrap_or(f64::NAN)).collect())
-    }
-}
-
-mod vec_vec_f64_nan_as_null {
-    use serde::{de::Deserialize, ser::SerializeSeq, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(value: &Vec<Vec<f64>>, ser: S) -> Result<S::Ok, S::Error> {
-        let mut outer = ser.serialize_seq(Some(value.len()))?;
-        for inner in value {
-            // Delegate each inner Vec<f64> to the same NaN-as-null logic.
-            struct NanSafeSlice<'a>(&'a [f64]);
-            impl serde::Serialize for NanSafeSlice<'_> {
-                fn serialize<S2: Serializer>(&self, s: S2) -> Result<S2::Ok, S2::Error> {
-                    use serde::ser::SerializeSeq as _;
-                    let mut seq = s.serialize_seq(Some(self.0.len()))?;
-                    for v in self.0 {
-                        if v.is_finite() {
-                            seq.serialize_element(v)?;
-                        } else {
-                            seq.serialize_element(&Option::<f64>::None)?;
-                        }
-                    }
-                    seq.end()
-                }
-            }
-            outer.serialize_element(&NanSafeSlice(inner))?;
-        }
-        outer.end()
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<Vec<f64>>, D::Error> {
-        let outer: Vec<Vec<Option<f64>>> = Vec::deserialize(de)?;
-        Ok(outer
-            .into_iter()
-            .map(|inner| inner.into_iter().map(|o| o.unwrap_or(f64::NAN)).collect())
-            .collect())
-    }
-}
-
-mod opt_f64_nan_as_null {
-    use serde::{de::Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(value: &Option<f64>, ser: S) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(v) if v.is_finite() => ser.serialize_some(v),
-            _ => ser.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<f64>, D::Error> {
-        Option::<f64>::deserialize(de)
-    }
-}
+// Serde helpers for non-finite floats (non-finite -> JSON `null`, `null` ->
+// `NaN`) live in the shared `crate::io::serde_nan` module; fields reference them
+// via `#[serde(with = "crate::io::serde_nan::{scalar,vec,vec_vec,opt}")]`.
 
 /// Errors from `.fitrx` save/load.
 #[derive(Debug, thiserror::Error)]
@@ -216,15 +119,15 @@ struct FitWire {
     omega: OmegaWire,
     sigma: SigmaWire,
     error_model: String,
-    #[serde(with = "f64_nan_as_null")]
+    #[serde(with = "crate::io::serde_nan::scalar")]
     shrinkage_eps: f64,
-    #[serde(default = "default_nan", with = "f64_nan_as_null")]
+    #[serde(default = "default_nan", with = "crate::io::serde_nan::scalar")]
     iwres_lag1_r: f64,
-    #[serde(default = "default_nan", with = "f64_nan_as_null")]
+    #[serde(default = "default_nan", with = "crate::io::serde_nan::scalar")]
     dw_statistic: f64,
     covariance_matrix: Option<MatrixWire>,
     cov_eigenvalues: Option<Vec<f64>>,
-    #[serde(with = "opt_f64_nan_as_null")]
+    #[serde(with = "crate::io::serde_nan::opt")]
     cov_condition_number: Option<f64>,
 
     sir: Option<SirWire>,
@@ -311,7 +214,7 @@ struct OmegaWire {
     fixed: Vec<bool>,
     log_transformed: Vec<bool>,
     param_corr: Option<MatrixWire>,
-    #[serde(with = "vec_f64_nan_as_null")]
+    #[serde(with = "crate::io::serde_nan::vec")]
     shrinkage: Vec<f64>,
     /// Per-eta SD-init flag (see `FitResult.omega_init_as_sd`). Optional /
     /// defaulted so .fitrx files written before issue #5 still load — older
@@ -349,11 +252,11 @@ struct IovWire {
     kappa_names: Vec<String>,
     kappa_fixed: Vec<bool>,
     se_kappa: Option<Vec<f64>>,
-    #[serde(with = "vec_f64_nan_as_null")]
+    #[serde(with = "crate::io::serde_nan::vec")]
     shrinkage_kappa: Vec<f64>,
     /// Per-occasion kappa shrinkage: `[occ_idx][kappa_idx]`.
     /// Defaulted for backward compatibility with older .fitrx files.
-    #[serde(default, with = "vec_vec_f64_nan_as_null")]
+    #[serde(default, with = "crate::io::serde_nan::vec_vec")]
     shrinkage_kappa_by_occ: Vec<Vec<f64>>,
     omega_iov: MatrixWire,
     omega_iov_param_corr: Option<MatrixWire>,
@@ -379,7 +282,7 @@ struct EtaParamInfoWire {
 struct MatrixWire {
     rows: usize,
     cols: usize,
-    #[serde(with = "vec_f64_nan_as_null")]
+    #[serde(with = "crate::io::serde_nan::vec")]
     data: Vec<f64>,
 }
 
@@ -428,142 +331,102 @@ fn default_one() -> usize {
     1
 }
 
-fn method_to_str(m: EstimationMethod) -> &'static str {
-    match m {
-        EstimationMethod::Foce => "foce",
-        EstimationMethod::FoceI => "focei",
-        EstimationMethod::FoceGn => "foce_gn",
-        EstimationMethod::FoceGnHybrid => "foce_gn_hybrid",
-        EstimationMethod::Saem => "saem",
-        EstimationMethod::Imp => "imp",
-        EstimationMethod::Impmap => "impmap",
-        EstimationMethod::Bayes => "bayes",
-        EstimationMethod::Agq => "agq",
-        EstimationMethod::Laplace => "laplace",
-    }
-}
-
-fn method_from_str(s: &str) -> Result<EstimationMethod, FitrxError> {
-    Ok(match s {
-        "foce" => EstimationMethod::Foce,
-        "focei" => EstimationMethod::FoceI,
-        "impmap" => EstimationMethod::Impmap,
-        "foce_gn" => EstimationMethod::FoceGn,
-        "foce_gn_hybrid" => EstimationMethod::FoceGnHybrid,
-        "saem" => EstimationMethod::Saem,
-        "imp" => EstimationMethod::Imp,
-        "bayes" => EstimationMethod::Bayes,
-        "agq" => EstimationMethod::Agq,
-        "laplace" => EstimationMethod::Laplace,
-        _ => return Err(FitrxError::Corrupt(format!("unknown method {:?}", s))),
-    })
-}
-
-fn error_model_to_str(m: ErrorModel) -> &'static str {
-    match m {
-        ErrorModel::Additive => "additive",
-        ErrorModel::Proportional => "proportional",
-        ErrorModel::Combined => "combined",
-    }
-}
-
-fn error_model_from_str(s: &str) -> Result<ErrorModel, FitrxError> {
-    Ok(match s {
-        "additive" => ErrorModel::Additive,
-        "proportional" => ErrorModel::Proportional,
-        "combined" => ErrorModel::Combined,
-        _ => return Err(FitrxError::Corrupt(format!("unknown error_model {:?}", s))),
-    })
-}
-
-fn covariance_status_to_str(s: &CovarianceStatus) -> &'static str {
-    match s {
-        CovarianceStatus::NotRequested => "not_requested",
-        CovarianceStatus::Computed => "computed",
-        CovarianceStatus::Failed => "failed",
-        CovarianceStatus::SirFallback => "sir_fallback",
-    }
-}
-
-fn covariance_status_from_str(s: &str) -> Result<CovarianceStatus, FitrxError> {
-    Ok(match s {
-        "not_requested" => CovarianceStatus::NotRequested,
-        "computed" => CovarianceStatus::Computed,
-        "failed" => CovarianceStatus::Failed,
-        "sir_fallback" => CovarianceStatus::SirFallback,
-        _ => {
-            return Err(FitrxError::Corrupt(format!(
-                "unknown covariance_status {:?}",
-                s
-            )))
+/// Generate the `<enum> <-> &str` wire-format mapping pair for one enum.
+///
+/// Emits `$to_fn(v) -> &'static str` and `$from_fn(&str) -> Result<$enum, _>`
+/// from a single variant/literal table, so the two can never drift apart. The
+/// string literals are the on-disk `.fitrx` wire format, so they must stay
+/// byte-identical; the `$to_arg` type lets a mapping take its enum by reference
+/// (e.g. `&CovarianceStatus`) while `$from_fn` always returns it by value.
+macro_rules! str_enum_map {
+    (
+        $enum:ident, $label:literal,
+        $to_fn:ident($to_arg:ty), $from_fn:ident,
+        { $($variant:ident => $lit:literal),+ $(,)? }
+    ) => {
+        fn $to_fn(v: $to_arg) -> &'static str {
+            match v {
+                $($enum::$variant => $lit,)+
+            }
         }
-    })
-}
 
-fn theta_transform_to_str(t: ThetaTransform) -> &'static str {
-    match t {
-        ThetaTransform::Identity => "identity",
-        ThetaTransform::Log => "log",
-        ThetaTransform::Logit => "logit",
-        ThetaTransform::LogitProbability => "logit_probability",
-    }
-}
-
-fn theta_transform_from_str(s: &str) -> Result<ThetaTransform, FitrxError> {
-    Ok(match s {
-        "identity" => ThetaTransform::Identity,
-        "log" => ThetaTransform::Log,
-        "logit" => ThetaTransform::Logit,
-        "logit_probability" => ThetaTransform::LogitProbability,
-        _ => {
-            return Err(FitrxError::Corrupt(format!(
-                "unknown theta_transform {:?}",
-                s
-            )))
+        fn $from_fn(s: &str) -> Result<$enum, FitrxError> {
+            Ok(match s {
+                $($lit => $enum::$variant,)+
+                _ => {
+                    return Err(FitrxError::Corrupt(format!(
+                        concat!("unknown ", $label, " {:?}"),
+                        s
+                    )))
+                }
+            })
         }
-    })
+    };
 }
 
-fn sigma_type_to_str(t: SigmaType) -> &'static str {
-    match t {
-        SigmaType::Proportional => "proportional",
-        SigmaType::Additive => "additive",
+str_enum_map!(EstimationMethod, "method", method_to_str(EstimationMethod), method_from_str, {
+    Foce => "foce",
+    FoceI => "focei",
+    FoceGn => "foce_gn",
+    FoceGnHybrid => "foce_gn_hybrid",
+    Saem => "saem",
+    Imp => "imp",
+    Impmap => "impmap",
+    Bayes => "bayes",
+    Agq => "agq",
+    Laplace => "laplace",
+});
+
+str_enum_map!(ErrorModel, "error_model", error_model_to_str(ErrorModel), error_model_from_str, {
+    Additive => "additive",
+    Proportional => "proportional",
+    Combined => "combined",
+});
+
+str_enum_map!(
+    CovarianceStatus,
+    "covariance_status",
+    covariance_status_to_str(&CovarianceStatus),
+    covariance_status_from_str,
+    {
+        NotRequested => "not_requested",
+        Computed => "computed",
+        Failed => "failed",
+        SirFallback => "sir_fallback",
     }
-}
+);
 
-fn sigma_type_from_str(s: &str) -> Result<SigmaType, FitrxError> {
-    Ok(match s {
-        "proportional" => SigmaType::Proportional,
-        "additive" => SigmaType::Additive,
-        _ => return Err(FitrxError::Corrupt(format!("unknown sigma_type {:?}", s))),
-    })
-}
-
-fn eta_param_type_to_str(t: EtaParamType) -> &'static str {
-    match t {
-        EtaParamType::LogNormal => "log_normal",
-        EtaParamType::Additive => "additive",
-        EtaParamType::Logit => "logit",
-        EtaParamType::LogitProbability => "logit_probability",
-        EtaParamType::Custom => "custom",
+str_enum_map!(
+    ThetaTransform,
+    "theta_transform",
+    theta_transform_to_str(ThetaTransform),
+    theta_transform_from_str,
+    {
+        Identity => "identity",
+        Log => "log",
+        Logit => "logit",
+        LogitProbability => "logit_probability",
     }
-}
+);
 
-fn eta_param_type_from_str(s: &str) -> Result<EtaParamType, FitrxError> {
-    Ok(match s {
-        "log_normal" => EtaParamType::LogNormal,
-        "additive" => EtaParamType::Additive,
-        "logit" => EtaParamType::Logit,
-        "logit_probability" => EtaParamType::LogitProbability,
-        "custom" => EtaParamType::Custom,
-        _ => {
-            return Err(FitrxError::Corrupt(format!(
-                "unknown eta_param_type {:?}",
-                s
-            )))
-        }
-    })
-}
+str_enum_map!(SigmaType, "sigma_type", sigma_type_to_str(SigmaType), sigma_type_from_str, {
+    Proportional => "proportional",
+    Additive => "additive",
+});
+
+str_enum_map!(
+    EtaParamType,
+    "eta_param_type",
+    eta_param_type_to_str(EtaParamType),
+    eta_param_type_from_str,
+    {
+        LogNormal => "log_normal",
+        Additive => "additive",
+        Logit => "logit",
+        LogitProbability => "logit_probability",
+        Custom => "custom",
+    }
+);
 
 // ---------------------------------------------------------------------------
 // Save
@@ -957,11 +820,9 @@ fn write_predictions_csv<W: Write>(
 }
 
 fn fmt_f64(v: f64) -> String {
-    if v.is_nan() {
-        String::new()
-    } else {
-        format!("{:.6}", v)
-    }
+    // Shared CSV float formatter (NaN → empty, else 6 dp). See
+    // `io::output::fmt_num` for the single source of truth.
+    crate::io::output::fmt_num(v)
 }
 
 fn csv_escape(s: &str) -> String {
@@ -1082,30 +943,6 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
     })
 }
 
-fn read_json<T: serde::de::DeserializeOwned, R: Read + std::io::Seek>(
-    archive: &mut ZipArchive<R>,
-    name: &str,
-) -> Result<T, FitrxError> {
-    let mut file = archive
-        .by_name(name)
-        .map_err(|_| FitrxError::Corrupt(format!("missing entry {}", name)))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
-    Ok(serde_json::from_str(&buf)?)
-}
-
-fn read_text<R: Read + std::io::Seek>(
-    archive: &mut ZipArchive<R>,
-    name: &str,
-) -> Result<String, FitrxError> {
-    let mut file = archive
-        .by_name(name)
-        .map_err(|_| FitrxError::Corrupt(format!("missing entry {}", name)))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
-    Ok(buf)
-}
-
 fn read_bytes<R: Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
     name: &str,
@@ -1116,6 +953,23 @@ fn read_bytes<R: Read + std::io::Seek>(
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+fn read_text<R: Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &str,
+) -> Result<String, FitrxError> {
+    let buf = read_bytes(archive, name)?;
+    String::from_utf8(buf)
+        .map_err(|e| FitrxError::Corrupt(format!("invalid UTF-8 in entry {}: {}", name, e)))
+}
+
+fn read_json<T: serde::de::DeserializeOwned, R: Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &str,
+) -> Result<T, FitrxError> {
+    let buf = read_bytes(archive, name)?;
+    Ok(serde_json::from_slice(&buf)?)
 }
 
 fn parse_subjects(
@@ -2655,7 +2509,7 @@ mod tests {
         assert!(loaded.fit.shrinkage_eta[0].is_nan());
         assert_eq!(loaded.fit.shrinkage_eta[1], 0.15);
         // cov_condition_number was +Inf; round-trips as None (null) under the
-        // current opt_f64_nan_as_null adapter. Either NaN or None is fine —
+        // current serde_nan::opt adapter. Either NaN or None is fine —
         // both mean "could not be computed reliably" downstream.
         assert!(loaded
             .fit

@@ -21,6 +21,7 @@
 
 use super::dual2::Dual2;
 use super::jet::{over_v1, Jet};
+use super::one_cpt_explicit::dual2_tuple;
 use super::two_cpt::{
     two_cpt_infusion_g, two_cpt_infusion_ss_g, two_cpt_iv_bolus_g, two_cpt_iv_bolus_ss_g,
     two_cpt_oral_g, two_cpt_oral_ss_g,
@@ -101,15 +102,12 @@ pub fn iv_bolus_explicit(
     v2: f64,
 ) -> (f64, [f64; 4], [[f64; 4]; 4]) {
     let fallback = || {
-        let d = two_cpt_iv_bolus_g::<Dual2<4>>(
-            amt,
-            Dual2::constant(t),
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q, 2),
-            Dual2::var(v2, 3),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            two_cpt_iv_bolus_g,
+            4,
+            [amt, Dual2::constant(t)],
+            [cl, v1, q, v2]
+        )
     };
     if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 {
         return (0.0, [0.0; 4], [[0.0; 4]; 4]);
@@ -148,17 +146,12 @@ pub fn infusion_explicit(
     v2: f64,
 ) -> (f64, [f64; 4], [[f64; 4]; 4]) {
     let fallback = || {
-        let d = two_cpt_infusion_g::<Dual2<4>>(
-            rate,
-            dur,
-            amt,
-            Dual2::constant(t),
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q, 2),
-            Dual2::var(v2, 3),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            two_cpt_infusion_g,
+            4,
+            [rate, dur, amt, Dual2::constant(t)],
+            [cl, v1, q, v2]
+        )
     };
     if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 {
         return (0.0, [0.0; 4], [[0.0; 4]; 4]);
@@ -221,17 +214,12 @@ pub fn oral_explicit(
     f_bio: f64,
 ) -> (f64, [f64; 6], [[f64; 6]; 6]) {
     let fallback = || {
-        let d = two_cpt_oral_g::<Dual2<6>>(
-            amt,
-            Dual2::constant(t),
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q, 2),
-            Dual2::var(v2, 3),
-            Dual2::var(ka, 4),
-            Dual2::var(f_bio, 5),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            two_cpt_oral_g,
+            6,
+            [amt, Dual2::constant(t)],
+            [cl, v1, q, v2, ka, f_bio]
+        )
     };
     if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 || ka <= 0.0 {
         return (0.0, [0.0; 6], [[0.0; 6]; 6]);
@@ -283,16 +271,12 @@ pub fn iv_bolus_ss_explicit(
     v2: f64,
 ) -> (f64, [f64; 4], [[f64; 4]; 4]) {
     let fallback = || {
-        let d = two_cpt_iv_bolus_ss_g::<Dual2<4>>(
-            amt,
-            Dual2::constant(t),
-            ii,
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q, 2),
-            Dual2::var(v2, 3),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            two_cpt_iv_bolus_ss_g,
+            4,
+            [amt, Dual2::constant(t), ii],
+            [cl, v1, q, v2]
+        )
     };
     if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 || ii <= 0.0 {
         return (0.0, [0.0; 4], [[0.0; 4]; 4]);
@@ -332,18 +316,12 @@ pub fn oral_ss_explicit(
     f_bio: f64,
 ) -> (f64, [f64; 6], [[f64; 6]; 6]) {
     let fallback = || {
-        let d = two_cpt_oral_ss_g::<Dual2<6>>(
-            amt,
-            Dual2::constant(t),
-            ii,
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q, 2),
-            Dual2::var(v2, 3),
-            Dual2::var(ka, 4),
-            Dual2::var(f_bio, 5),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            two_cpt_oral_ss_g,
+            6,
+            [amt, Dual2::constant(t), ii],
+            [cl, v1, q, v2, ka, f_bio]
+        )
     };
     if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 || ka <= 0.0 || ii <= 0.0 {
         return (0.0, [0.0; 6], [[0.0; 6]; 6]);
@@ -399,18 +377,12 @@ pub fn infusion_ss_explicit(
     v2: f64,
 ) -> (f64, [f64; 4], [[f64; 4]; 4]) {
     let fallback = || {
-        let d = two_cpt_infusion_ss_g::<Dual2<4>>(
-            rate,
-            dur,
-            amt,
-            Dual2::constant(t),
-            ii,
-            Dual2::var(cl, 0),
-            Dual2::var(v1, 1),
-            Dual2::var(q, 2),
-            Dual2::var(v2, 3),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            two_cpt_infusion_ss_g,
+            4,
+            [rate, dur, amt, Dual2::constant(t), ii],
+            [cl, v1, q, v2]
+        )
     };
     if t < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 || ii <= 0.0 {
         return (0.0, [0.0; 4], [[0.0; 4]; 4]);

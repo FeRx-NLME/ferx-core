@@ -5979,6 +5979,50 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             .parse::<f64>()
             .map_err(|_| format!("fit option `{name}`: expected number, got `{value}`"))
     };
+    // Parse an f64 that must be strictly positive and finite.
+    let parse_pos_finite = |name: &str| -> Result<f64, String> {
+        let v = parse_f64(name)?;
+        if v <= 0.0 || !v.is_finite() {
+            return Err(format!("{name} must be a positive finite value, got {v}"));
+        }
+        Ok(v)
+    };
+    // Parse an f64 with an inclusive lower bound (`v >= min`). `min` is rendered
+    // with Debug so integral bounds keep their trailing `.0` (e.g. `>= 1.0`).
+    let parse_f64_min = |name: &str, min: f64| -> Result<f64, String> {
+        let v = parse_f64(name)?;
+        if v < min {
+            return Err(format!("{name} must be >= {min:?}, got {v}"));
+        }
+        Ok(v)
+    };
+    // Parse an f64 constrained to the closed unit interval [0.0, 1.0].
+    let parse_unit_interval = |name: &str| -> Result<f64, String> {
+        let v = parse_f64(name)?;
+        if !(0.0..=1.0).contains(&v) {
+            return Err(format!("{name} must be in [0.0, 1.0], got {v}"));
+        }
+        Ok(v)
+    };
+    // Parse a Student-t proposal df: `normal`/`mvn` select a multivariate-normal
+    // proposal (∞ df), otherwise a finite df `>= 1.0`. `strip_quotes` mirrors the
+    // impmap site, which tolerates a quoted `"normal"` token.
+    let parse_proposal_df = |name: &str, strip_quotes: bool| -> Result<f64, String> {
+        let tok = if strip_quotes {
+            value.trim_matches(|c| c == '"' || c == '\'')
+        } else {
+            value
+        };
+        if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
+            Ok(f64::INFINITY)
+        } else {
+            let v = parse_f64(name)?;
+            if v < 1.0 {
+                return Err(format!("{name} must be >= 1.0 or `normal`, got {v}"));
+            }
+            Ok(v)
+        }
+    };
 
     // Dispatch first, then record the key on success so we can later warn
     // when a key is set that the selected method does not consume. Malformed
@@ -5989,42 +6033,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "inner_restarts" => opts.inner_restarts = parse_usize("inner_restarts")?,
         "cov_inner_tol" => opts.cov_inner_tol = Some(parse_f64("cov_inner_tol")?),
-        "outer_xtol" => {
-            let v = parse_f64("outer_xtol")?;
-            if v <= 0.0 || !v.is_finite() {
-                return Err(format!(
-                    "outer_xtol must be a positive finite value, got {v}"
-                ));
-            }
-            opts.outer_xtol = v;
-        }
-        "outer_ftol" => {
-            let v = parse_f64("outer_ftol")?;
-            if v <= 0.0 || !v.is_finite() {
-                return Err(format!(
-                    "outer_ftol must be a positive finite value, got {v}"
-                ));
-            }
-            opts.outer_ftol = Some(v);
-        }
-        "ode_reltol" => {
-            let v = parse_f64("ode_reltol")?;
-            if v <= 0.0 || !v.is_finite() {
-                return Err(format!(
-                    "ode_reltol must be a positive finite value, got {v}"
-                ));
-            }
-            opts.ode_reltol = v;
-        }
-        "ode_abstol" => {
-            let v = parse_f64("ode_abstol")?;
-            if v <= 0.0 || !v.is_finite() {
-                return Err(format!(
-                    "ode_abstol must be a positive finite value, got {v}"
-                ));
-            }
-            opts.ode_abstol = v;
-        }
+        "outer_xtol" => opts.outer_xtol = parse_pos_finite("outer_xtol")?,
+        "outer_ftol" => opts.outer_ftol = Some(parse_pos_finite("outer_ftol")?),
+        "ode_reltol" => opts.ode_reltol = parse_pos_finite("ode_reltol")?,
+        "ode_abstol" => opts.ode_abstol = parse_pos_finite("ode_abstol")?,
         "ode_max_steps" => {
             let v = parse_usize("ode_max_steps")?;
             if v == 0 {
@@ -6058,16 +6070,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             };
         }
-        "fd_hessian_step" => {
-            let v = parse_f64("fd_hessian_step")?;
-            if v <= 0.0 || !v.is_finite() {
-                return Err(format!(
-                    "fd_hessian_step must be a positive finite value, got {}",
-                    v
-                ));
-            }
-            opts.fd_hessian_step = v;
-        }
+        "fd_hessian_step" => opts.fd_hessian_step = parse_pos_finite("fd_hessian_step")?,
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -6136,13 +6139,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "sir_resamples" => opts.sir_resamples = parse_usize("sir_resamples")?,
         "sir_seed" => opts.sir_seed = parse_u64_opt("sir_seed")?,
         "sir_keep_samples" => opts.sir_keep_samples = parse_bool("sir_keep_samples")?,
-        "sir_df" => {
-            let v = parse_f64("sir_df")?;
-            if v < 1.0 {
-                return Err(format!("sir_df must be >= 1.0, got {v}"));
-            }
-            opts.sir_df = v;
-        }
+        "sir_df" => opts.sir_df = parse_f64_min("sir_df", 1.0)?,
         "n_agq" => {
             let v = parse_usize("n_agq")?;
             if v < 1 {
@@ -6163,29 +6160,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.imp_samples = v;
         }
-        "imp_proposal_df" => {
-            let tok = value.trim();
-            if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
-                opts.imp_proposal_df = f64::INFINITY;
-            } else {
-                let v = parse_f64("imp_proposal_df")?;
-                if v < 1.0 {
-                    return Err(format!(
-                        "imp_proposal_df must be >= 1.0 or `normal`, got {v}"
-                    ));
-                }
-                opts.imp_proposal_df = v;
-            }
-        }
+        "imp_proposal_df" => opts.imp_proposal_df = parse_proposal_df("imp_proposal_df", false)?,
         "imp_seed" => opts.imp_seed = parse_u64_opt("imp_seed")?,
         "imp_low_ess_threshold" => {
-            let v = parse_f64("imp_low_ess_threshold")?;
-            if !(0.0..=1.0).contains(&v) {
-                return Err(format!(
-                    "imp_low_ess_threshold must be in [0.0, 1.0], got {v}"
-                ));
-            }
-            opts.imp_low_ess_threshold = v;
+            opts.imp_low_ess_threshold = parse_unit_interval("imp_low_ess_threshold")?
         }
         "imp_iterations" => {
             let v = parse_usize("imp_iterations")?;
@@ -6210,32 +6188,16 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.impmap_samples = v;
         }
+        // `normal` / `mvn` (or a very large df) select a multivariate-normal
+        // proposal — NONMEM's IMPMAP default. A finite value gives Student-t.
+        // `strip_quotes = true` tolerates a quoted `"normal"` token.
         "impmap_proposal_df" => {
-            // `normal` / `mvn` (or a very large df) select a multivariate-normal
-            // proposal — NONMEM's IMPMAP default. A finite value gives Student-t.
-            let tok = value.trim().trim_matches(|c| c == '"' || c == '\'');
-            if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
-                opts.impmap_proposal_df = f64::INFINITY;
-            } else {
-                let v = parse_f64("impmap_proposal_df")?;
-                if v < 1.0 {
-                    return Err(format!(
-                        "impmap_proposal_df must be >= 1.0 or `normal`, got {v}"
-                    ));
-                }
-                opts.impmap_proposal_df = v;
-            }
+            opts.impmap_proposal_df = parse_proposal_df("impmap_proposal_df", true)?
         }
         "impmap_seed" => opts.impmap_seed = parse_u64_opt("impmap_seed")?,
         "impmap_averaging" => opts.impmap_averaging = parse_usize("impmap_averaging")?,
         "impmap_low_ess_threshold" => {
-            let v = parse_f64("impmap_low_ess_threshold")?;
-            if !(0.0..=1.0).contains(&v) {
-                return Err(format!(
-                    "impmap_low_ess_threshold must be in [0.0, 1.0], got {v}"
-                ));
-            }
-            opts.impmap_low_ess_threshold = v;
+            opts.impmap_low_ess_threshold = parse_unit_interval("impmap_low_ess_threshold")?
         }
         "impmap_trace" => opts.impmap_trace = parse_bool("impmap_trace")?,
         "impmap_mceta" => opts.impmap_mceta = parse_usize("impmap_mceta")?,

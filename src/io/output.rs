@@ -4,6 +4,46 @@ fn fixed_label(name: &str) -> String {
     format!("{} [FIX]", name)
 }
 
+/// Relative standard error as a percent: `|se / est| · 100`, or `NaN` when the
+/// estimate is ~0 (guards the divide-by-zero for a parameter pinned at 0).
+fn rse_pct(est: f64, se: f64) -> f64 {
+    if est.abs() > 1e-12 {
+        (se / est.abs()) * 100.0
+    } else {
+        f64::NAN
+    }
+}
+
+/// Coefficient of variation as a percent from a variance: `sqrt(var) · 100`, or
+/// `0` for a non-positive variance.
+fn cv_pct(var: f64) -> f64 {
+    if var > 0.0 {
+        var.sqrt() * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// Parameter correlation for the off-diagonal `(i, j)`: prefer the precomputed
+/// `param_corr` matrix entry when present, else fall back to
+/// `cov / (sqrt(var_i) · sqrt(var_j))` (0 when either variance is non-positive).
+fn param_corr_fallback(
+    m: Option<&nalgebra::DMatrix<f64>>,
+    cov: f64,
+    var_i: f64,
+    var_j: f64,
+    i: usize,
+    j: usize,
+) -> f64 {
+    m.map(|m| m[(i, j)]).unwrap_or_else(|| {
+        if var_i > 0.0 && var_j > 0.0 {
+            cov / (var_i.sqrt() * var_j.sqrt())
+        } else {
+            0.0
+        }
+    })
+}
+
 /// Summary statistics over an NN's flat weight vector for the compact
 /// `neural_networks:` section in the fit YAML / CLI output. Empty input
 /// yields all zeros (defensive — shouldn't happen in practice because
@@ -94,11 +134,7 @@ pub fn print_results(result: &FitResult) {
             match &result.se_theta {
                 Some(se) => {
                     let se_val = se[i];
-                    let rse = if est.abs() > 1e-12 {
-                        (se_val / est.abs()) * 100.0
-                    } else {
-                        f64::NAN
-                    };
+                    let rse = rse_pct(est, se_val);
                     (format!("{:.6}", se_val), format!("{:.1}", rse))
                 }
                 None => ("N/A".to_string(), "N/A".to_string()),
@@ -163,7 +199,7 @@ pub fn print_results(result: &FitResult) {
             }
         };
         if show_cv {
-            let cv = if var > 0.0 { var.sqrt() * 100.0 } else { 0.0 };
+            let cv = cv_pct(var);
             eprintln!(
                 "  {:<20} = {:.6}  (CV% = {:.1})  SE = {}",
                 label, var, cv, se_str
@@ -182,19 +218,14 @@ pub fn print_results(result: &FitResult) {
                 }
                 let name_i = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
                 let name_j = result.eta_names.get(j).map(|s| s.as_str()).unwrap_or("ETA");
-                let param_corr = result
-                    .omega_param_corr
-                    .as_ref()
-                    .map(|m| m[(i, j)])
-                    .unwrap_or_else(|| {
-                        let var_i = result.omega[(i, i)];
-                        let var_j = result.omega[(j, j)];
-                        if var_i > 0.0 && var_j > 0.0 {
-                            cov / (var_i.sqrt() * var_j.sqrt())
-                        } else {
-                            0.0
-                        }
-                    });
+                let param_corr = param_corr_fallback(
+                    result.omega_param_corr.as_ref(),
+                    cov,
+                    result.omega[(i, i)],
+                    result.omega[(j, j)],
+                    i,
+                    j,
+                );
                 let se_cov = crate::types::omega_se_at(&result.se_omega, n_eta, i, j);
                 let se_str = match se_cov {
                     Some(s) => format!("  SE = {:.6}", s),
@@ -278,7 +309,7 @@ pub fn print_results(result: &FitResult) {
                 }
             };
             if show_cv {
-                let cv = if var > 0.0 { var.sqrt() * 100.0 } else { 0.0 };
+                let cv = cv_pct(var);
                 eprintln!(
                     "  {:<20} = {:.6}  (CV% = {:.1})  SE = {}",
                     label, var, cv, se_str
@@ -307,19 +338,14 @@ pub fn print_results(result: &FitResult) {
                         .get(j)
                         .map(|s| s.as_str())
                         .unwrap_or("KAPPA");
-                    let param_corr = result
-                        .omega_iov_param_corr
-                        .as_ref()
-                        .map(|m| m[(i, j)])
-                        .unwrap_or_else(|| {
-                            let var_i = iov[(i, i)];
-                            let var_j = iov[(j, j)];
-                            if var_i > 0.0 && var_j > 0.0 {
-                                cov / (var_i.sqrt() * var_j.sqrt())
-                            } else {
-                                0.0
-                            }
-                        });
+                    let param_corr = param_corr_fallback(
+                        result.omega_iov_param_corr.as_ref(),
+                        cov,
+                        iov[(i, i)],
+                        iov[(j, j)],
+                        i,
+                        j,
+                    );
                     eprintln!(
                         "  {} × {} = {:.6}  (param corr = {:.4})",
                         name_i, name_j, cov, param_corr,
@@ -602,11 +628,7 @@ pub fn format_summary(result: &FitResult) -> String {
             match &result.se_theta {
                 Some(se) => {
                     let se_val = se[i];
-                    let rse = if est.abs() > 1e-12 {
-                        (se_val / est.abs()) * 100.0
-                    } else {
-                        f64::NAN
-                    };
+                    let rse = rse_pct(est, se_val);
                     (format!("{:.6}", se_val), format!("{:.1}", rse))
                 }
                 None => ("N/A".to_string(), "N/A".to_string()),
@@ -641,7 +663,7 @@ pub fn format_summary(result: &FitResult) -> String {
                 }
             };
             if show_cv {
-                let cv = if var > 0.0 { var.sqrt() * 100.0 } else { 0.0 };
+                let cv = cv_pct(var);
                 let _ = writeln!(
                     out,
                     "  {:<16} = {:.6}  (CV% = {:.1})  SE = {}",
@@ -662,19 +684,14 @@ pub fn format_summary(result: &FitResult) -> String {
                     }
                     let ni = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
                     let nj = result.eta_names.get(j).map(|s| s.as_str()).unwrap_or("ETA");
-                    let corr = result
-                        .omega_param_corr
-                        .as_ref()
-                        .map(|m| m[(i, j)])
-                        .unwrap_or_else(|| {
-                            let vi = result.omega[(i, i)];
-                            let vj = result.omega[(j, j)];
-                            if vi > 0.0 && vj > 0.0 {
-                                cov / (vi.sqrt() * vj.sqrt())
-                            } else {
-                                0.0
-                            }
-                        });
+                    let corr = param_corr_fallback(
+                        result.omega_param_corr.as_ref(),
+                        cov,
+                        result.omega[(i, i)],
+                        result.omega[(j, j)],
+                        i,
+                        j,
+                    );
                     let _ = writeln!(out, "  corr({}, {}) = {:.4}", ni, nj, corr);
                 }
             }
@@ -1412,7 +1429,12 @@ pub fn write_conddist_outputs(result: &FitResult, model_name: &str) -> Vec<Strin
 }
 
 /// Format a numeric cell for CSV output: NaN → empty (missing), else 6 dp.
-fn fmt_num(v: f64) -> String {
+///
+/// Shared with `io::fitrx` (via its `fmt_f64` wrapper) so bundle CSVs and sdtab
+/// covariate/conddist CSVs format floats identically. NOTE: `write_sdtab_csv`
+/// deliberately does *not* use this — it blanks on `!is_finite()` (also ±Inf),
+/// a documented divergence.
+pub(crate) fn fmt_num(v: f64) -> String {
     if v.is_nan() {
         String::new()
     } else {
@@ -1628,13 +1650,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         let est = result.theta[i];
         let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
         let se = result.se_theta.as_ref().map(|v| v[i]);
-        let rse = se.map(|s| {
-            if est.abs() > 1e-12 {
-                (s / est.abs()) * 100.0
-            } else {
-                f64::NAN
-            }
-        });
+        let rse = se.map(|s| rse_pct(est, s));
         writeln!(f, "  {}:", name).map_err(|e| e.to_string())?;
         writeln!(f, "    estimate: {:.6}", est).map_err(|e| e.to_string())?;
         if is_fixed {
@@ -1699,7 +1715,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     writeln!(f, "\nomega:").map_err(|e| e.to_string())?;
     for i in 0..n_eta {
         let var = result.omega[(i, i)];
-        let cv_pct = if var > 0.0 { var.sqrt() * 100.0 } else { 0.0 };
+        let cv_pct = cv_pct(var);
         let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
         let se = crate::types::omega_se_at(&result.se_omega, n_eta, i, i);
         let key = result
@@ -1735,19 +1751,14 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(j)
                     .cloned()
                     .unwrap_or_else(|| format!("eta_{}", j + 1));
-                let param_corr = result
-                    .omega_param_corr
-                    .as_ref()
-                    .map(|m| m[(i, j)])
-                    .unwrap_or_else(|| {
-                        let var_i = result.omega[(i, i)];
-                        let var_j = result.omega[(j, j)];
-                        if var_i > 0.0 && var_j > 0.0 {
-                            cov / (var_i.sqrt() * var_j.sqrt())
-                        } else {
-                            0.0
-                        }
-                    });
+                let param_corr = param_corr_fallback(
+                    result.omega_param_corr.as_ref(),
+                    cov,
+                    result.omega[(i, i)],
+                    result.omega[(j, j)],
+                    i,
+                    j,
+                );
                 let se_cov = crate::types::omega_se_at(&result.se_omega, n_eta, i, j);
                 writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
                 writeln!(f, "    covariance: {:.6}", cov).map_err(|e| e.to_string())?;
@@ -1810,7 +1821,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         let n_kappa = iov.nrows();
         for i in 0..n_kappa {
             let var = iov[(i, i)];
-            let cv_pct = if var > 0.0 { var.sqrt() * 100.0 } else { 0.0 };
+            let cv_pct = cv_pct(var);
             let is_fixed = result.kappa_fixed.get(i).copied().unwrap_or(false);
             let se = result.se_kappa.as_ref().and_then(|v| v.get(i).copied());
             let name = result
@@ -1850,19 +1861,14 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(j)
                     .cloned()
                     .unwrap_or_else(|| format!("kappa_{}", j + 1));
-                let param_corr = result
-                    .omega_iov_param_corr
-                    .as_ref()
-                    .map(|m| m[(i, j)])
-                    .unwrap_or_else(|| {
-                        let var_i = iov[(i, i)];
-                        let var_j = iov[(j, j)];
-                        if var_i > 0.0 && var_j > 0.0 {
-                            cov / (var_i.sqrt() * var_j.sqrt())
-                        } else {
-                            0.0
-                        }
-                    });
+                let param_corr = param_corr_fallback(
+                    result.omega_iov_param_corr.as_ref(),
+                    cov,
+                    iov[(i, i)],
+                    iov[(j, j)],
+                    i,
+                    j,
+                );
                 writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
                 writeln!(f, "    covariance: {:.6}", cov).map_err(|e| e.to_string())?;
                 writeln!(f, "    correlation: {:.6}", param_corr).map_err(|e| e.to_string())?;
@@ -2078,11 +2084,7 @@ pub fn parameter_table(result: &FitResult) -> String {
         let (se_str, rse_str) = match &result.se_theta {
             Some(se) => {
                 let se_val = se[i];
-                let rse = if est.abs() > 1e-12 {
-                    (se_val / est.abs()) * 100.0
-                } else {
-                    f64::NAN
-                };
+                let rse = rse_pct(est, se_val);
                 (format!("{:.6}", se_val), format!("{:.1}", rse))
             }
             None => ("---".to_string(), "---".to_string()),
