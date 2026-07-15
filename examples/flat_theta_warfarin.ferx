@@ -1,0 +1,34 @@
+# One-compartment oral PK model (warfarin) with a deliberately unmapped theta.
+# TVFLAT is declared but never referenced in [individual_parameters] or the
+# structural model, so its analytic outer gradient is identically zero. It is a
+# regression fixture for the pre-flight flat-theta guard (#826): the fit must
+# degrade gracefully (warn + freeze TVFLAT) instead of dying on an eval-1 Failure.
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVFLAT(1.0, 0.001, 10.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  optimizer  = nlopt_lbfgs
+  maxiter    = 300
+  covariance = false

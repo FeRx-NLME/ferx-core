@@ -99,6 +99,14 @@ section of the SDLC for the versioning policy).
   `2·n_free`-inner-resolve `reconverged_fd_gradient` fallback.
 
 ### Added
+- **Flat (zero-gradient) thetas are now frozen at start instead of killing the fit** (#826).
+  A pre-flight check computes the outer gradient at the initial estimate; any non-fixed
+  theta whose gradient is ≈ 0 (a parameter that never reaches the objective — typically
+  unmapped, or dropped from the structural / scaling model) is held fixed at its initial
+  value and reported with a `flat_parameter` warning naming it, rather than leaving a zero
+  search direction that made gradient-based NLopt return `Failure` on the first evaluation
+  and pin *every* parameter at its initial value. The remaining parameters now estimate
+  normally.
 - **Exact (analytic) inner EBE gradient for CTMM (`[markov_model]`) fits** (#759). The
   transition likelihood `−Σ log P(Δt)[s,s']`, `P = expm(Q·Δt)`, was finite-differenced
   end-to-end: every EBE step perturbed η, rebuilt `Q`, and redid a matrix exponential per

@@ -110,7 +110,23 @@ pub fn optimize_population(
         };
         &owned_opts
     };
-    match resolved {
+    // Pre-flight flat-theta guard (#826): a non-fixed theta whose outer gradient is
+    // identically ~0 at the initial estimate never reaches the objective (typically
+    // unmapped / dropped from the structural or scaling model). Left in the optimized
+    // vector it gives a zero search direction that makes gradient NLopt return
+    // `Failure` on eval 1, pinning *every* parameter at its initial value. Freeze such
+    // thetas (treat as FIX) and warn, so the remaining parameters optimize normally.
+    let frozen_params;
+    let (init_params, preflight_warnings) =
+        match freeze_flat_thetas(model, population, init_params, options) {
+            Some((fp, w)) => {
+                frozen_params = fp;
+                (&frozen_params, w)
+            }
+            None => (init_params, Vec::new()),
+        };
+
+    let mut result = match resolved {
         // `Auto` is resolved away above; group it with the NLopt path defensively.
         Optimizer::Slsqp
         | Optimizer::NloptLbfgs
@@ -126,7 +142,122 @@ pub fn optimize_population(
             init_params,
             options,
         ),
+    };
+    // Surface the freeze warnings ahead of the optimizer's own (they explain why a
+    // parameter was held fixed, which the reader wants before any convergence notes).
+    if !preflight_warnings.is_empty() {
+        let mut w = preflight_warnings;
+        w.append(&mut result.warnings);
+        result.warnings = w;
     }
+    result
+}
+
+/// Pre-flight flat-theta detection (#826). Computes the outer gradient at the
+/// initial estimate and flags any non-fixed theta whose gradient is negligible
+/// relative to the largest theta gradient — i.e. a parameter that has no effect
+/// on the objective (unmapped, or dropped from the structural / scaling model).
+///
+/// Returns `None` when nothing is flat (the common case; the caller keeps the
+/// borrowed `init_params` untouched), or `Some((frozen, warnings))` with a
+/// modified clone whose `theta_fixed` marks the flat thetas so the rest of the
+/// pipeline treats them as FIX — the graceful-degradation the issue asks for
+/// instead of the whole fit dying on an eval-1 `Failure`.
+fn freeze_flat_thetas(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Option<(ModelParameters, Vec<String>)> {
+    let n_theta = init_params.theta.len();
+    // Nothing to freeze if every theta is already fixed.
+    if (0..n_theta).all(|i| init_params.theta_fixed.get(i).copied().unwrap_or(false)) {
+        return None;
+    }
+
+    let bounds = compute_bounds(init_params);
+    let mut x = pack_params(init_params);
+    clamp_to_bounds(&mut x, &bounds);
+    let params = unpack_params(&x, init_params);
+    let n_subj = population.subjects.len();
+    let n_eta = model.n_eta;
+
+    // One cold inner solve, then one outer-gradient eval — the same pair the first
+    // optimizer iteration would run, so the pre-flight costs roughly one iteration.
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let cold_etas = vec![DVector::zeros(n_eta); n_subj];
+    let (ehs, hms, _stats, kappas) = run_inner_loop_warm(
+        model,
+        population,
+        &params,
+        options.inner_maxiter,
+        options.inner_tol,
+        Some(&cold_etas),
+        Some(&mu_k),
+        options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
+    );
+    let mut grad_eval_idx = 0usize;
+    let grad = population_gradient(
+        &x,
+        n_subj,
+        init_params,
+        model,
+        population,
+        &ehs,
+        &hms,
+        &kappas,
+        &bounds,
+        options,
+        &mut grad_eval_idx,
+    );
+
+    // Thetas are the first `n_theta` packed coordinates (see `pack_params`), so
+    // `grad[i]` is d(OFV)/d(coord_i) for theta `i`. A structurally flat theta has an
+    // *identically* zero analytic sensitivity, so its gradient is ~0 to machine
+    // precision — freeze only that near-zero case, never a merely weakly-identified
+    // param (small-but-nonzero; covariance flags those as high RSE).
+    const FLAT_ABS: f64 = 1e-8;
+    const FLAT_REL: f64 = 1e-6;
+    let is_free = |i: usize| !init_params.theta_fixed.get(i).copied().unwrap_or(false);
+    let g_at = |i: usize| grad.get(i).copied().unwrap_or(0.0).abs();
+    // Reference scale for "negligible". If the whole theta gradient is ~0 the
+    // objective is globally flat (no data reaches it) — a different pathology, so
+    // bail rather than freeze every parameter.
+    let g_max = (0..n_theta)
+        .filter(|&i| is_free(i))
+        .map(g_at)
+        .fold(0.0_f64, f64::max);
+    if g_max <= FLAT_ABS {
+        return None;
+    }
+
+    let flat: Vec<usize> = (0..n_theta)
+        .filter(|&i| is_free(i) && g_at(i) <= FLAT_ABS && g_at(i) <= FLAT_REL * g_max)
+        .collect();
+    if flat.is_empty() {
+        return None;
+    }
+
+    let mut frozen = init_params.clone();
+    let mut warnings = Vec::new();
+    for &i in &flat {
+        frozen.theta_fixed[i] = true;
+        let name = init_params
+            .theta_names
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("<theta>");
+        warnings.push(format!(
+            "[parameters] `{name}` has no effect on the objective (gradient ≈ 0 at the \
+             initial estimate) — it is likely computed but never used (unmapped, or dropped \
+             from the structural / scaling model). Freezing it at its initial value ({val}) \
+             so the remaining parameters can be estimated; map or remove `{name}` to silence \
+             this.",
+            val = init_params.theta[i],
+        ));
+    }
+    Some((frozen, warnings))
 }
 
 /// Evaluate the population objective at the initial parameters without running
@@ -4825,6 +4956,52 @@ mod tests {
     #[test]
     fn test_outer_ad_gradient_iiv() {
         check_gradient(&make_model(), &make_population(3), 1);
+    }
+
+    /// Pre-flight flat-theta guard (#826): a model whose second theta (TVV) is
+    /// structurally flat — V no longer reads it — is detected and frozen, while the
+    /// active TVCL is left free. A single unmapped theta must not kill the fit.
+    #[test]
+    fn preflight_freezes_flat_theta() {
+        let mut model = make_model();
+        // Drop theta[1] from the structural model: V becomes a constant, so TVV
+        // never reaches the objective (identically-zero outer gradient).
+        model.pk_param_fn = Box::new(
+            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp();
+                p.values[1] = 50.0;
+                p
+            },
+        );
+        let pop = make_population(3);
+        let mut options = FitOptions::default();
+        options.interaction = false;
+
+        let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &options)
+            .expect("flat TVV must be detected");
+        assert!(!frozen.theta_fixed[0], "active TVCL stays free");
+        assert!(frozen.theta_fixed[1], "flat TVV is frozen (FIX)");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("TVV") && w.contains("no effect")),
+            "warning must name the flat param: {warnings:?}"
+        );
+    }
+
+    /// Negative case: every theta of the baseline model reaches the objective, so
+    /// the pre-flight freezes nothing (returns `None`, leaving `init_params` alone).
+    #[test]
+    fn preflight_no_freeze_when_all_thetas_active() {
+        let model = make_model();
+        let pop = make_population(3);
+        let mut options = FitOptions::default();
+        options.interaction = false;
+        assert!(
+            freeze_flat_thetas(&model, &pop, &model.default_params, &options).is_none(),
+            "no theta is flat — nothing to freeze"
+        );
     }
 
     /// Block omega (2×2 with off-diagonal): tests Cholesky-param gradient.
