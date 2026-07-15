@@ -111,6 +111,10 @@ section of the SDLC for the versioning policy).
   score for just that subject, rather than dropping the whole population onto the
   `2·n_free`-inner-resolve `reconverged_fd_gradient` fallback.
 
+### Performance
+- **FOCE/FOCEI fits with cross-observation `block_sigma` residual correlations avoid
+  repeated dense `∂R/∂η` matrix assembly in the inner EBE gradient** (#847).
+
 ### Added
 - **Exact (analytic) inner EBE gradient for CTMM (`[markov_model]`) fits** (#759). The
   transition likelihood `−Σ log P(Δt)[s,s']`, `P = expm(Q·Δt)`, was finite-differenced

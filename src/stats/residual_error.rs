@@ -267,6 +267,188 @@ fn fill_cross_covariances(r: &mut DMatrix<f64>, pairs: &[(usize, usize, f64)]) {
     }
 }
 
+/// One independent residual covariance block for a subject.
+///
+/// `indices` are observation indices into the subject vectors. `r` is the local
+/// covariance matrix for those observations. When requested, `dr_df[a]` is the
+/// local `∂R_block/∂f_indices[a]` matrix.
+pub(crate) struct ResidualCovBlock {
+    pub(crate) indices: Vec<usize>,
+    pub(crate) r: DMatrix<f64>,
+    pub(crate) dr_df: Option<Vec<DMatrix<f64>>>,
+}
+
+fn find_parent(parent: &mut [usize], x: usize) -> usize {
+    if parent[x] != x {
+        parent[x] = find_parent(parent, parent[x]);
+    }
+    parent[x]
+}
+
+fn union_parent(parent: &mut [usize], a: usize, b: usize) {
+    let ra = find_parent(parent, a);
+    let rb = find_parent(parent, b);
+    if ra != rb {
+        parent[rb] = ra;
+    }
+}
+
+/// Build residual covariance blocks without materialising the full subject `R`.
+///
+/// This is equivalent to [`compute_r_matrix_with_correlations`] /
+/// [`compute_dr_df_matrices`], but returns connected components of the
+/// cross-observation covariance graph. For NONMEM-style `L2` paired endpoints
+/// this is usually a collection of 1x1/2x2 blocks, which avoids factoring and
+/// multiplying full `n_obs x n_obs` matrices inside every inner-gradient step.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn residual_covariance_blocks(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    mult: Option<&[Vec<f64>]>,
+    with_derivatives: bool,
+) -> Vec<ResidualCovBlock> {
+    let n = ipreds.len();
+    let empty: Vec<f64> = Vec::new();
+    let mrow = |j: usize| -> &[f64] {
+        mult.and_then(|m| m.get(j))
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty)
+    };
+    let m_at = |j: usize, idx: usize| -> f64 { mrow(j).get(idx).copied().unwrap_or(1.0) };
+    let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
+
+    let vload: Vec<Vec<(usize, f64)>> = (0..n)
+        .map(|j| {
+            error_spec
+                .sigma_loadings(cmt_at(j), ipreds[j], sigma_values.len())
+                .into_iter()
+                .map(|(idx, c)| (idx, c * m_at(j, idx)))
+                .collect()
+        })
+        .collect();
+    let sload: Vec<Vec<(usize, f64)>> = if with_derivatives {
+        (0..n)
+            .map(|j| {
+                error_spec
+                    .sigma_loading_slopes(cmt_at(j), sigma_values.len())
+                    .into_iter()
+                    .map(|(idx, s)| (idx, s * m_at(j, idx)))
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let pairs = if correlations.is_empty() {
+        Vec::new()
+    } else {
+        match_partners(
+            &vload,
+            obs_times,
+            obs_raw_times,
+            occasions,
+            obs_l2,
+            sigma_values,
+            correlations,
+        )
+    };
+
+    let mut parent: Vec<usize> = (0..n).collect();
+    for &(j, k, _) in &pairs {
+        union_parent(&mut parent, j, k);
+    }
+
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for j in 0..n {
+        let root = find_parent(&mut parent, j);
+        match roots.iter().position(|&r| r == root) {
+            Some(pos) => groups[pos].push(j),
+            None => {
+                roots.push(root);
+                groups.push(vec![j]);
+            }
+        }
+    }
+
+    let mut blocks = Vec::with_capacity(groups.len());
+    for indices in groups {
+        let b = indices.len();
+        let mut local_pos = vec![usize::MAX; n];
+        for (local, &global) in indices.iter().enumerate() {
+            local_pos[global] = local;
+        }
+
+        let mut r = DMatrix::<f64>::zeros(b, b);
+        for (local, &j) in indices.iter().enumerate() {
+            r[(local, local)] = match mult {
+                Some(_) => error_spec.variance_at_scaled(
+                    cmt_at(j),
+                    ipreds[j],
+                    sigma_values,
+                    correlations,
+                    mrow(j),
+                ),
+                None if correlations.is_empty() => {
+                    error_spec.variance_at(cmt_at(j), ipreds[j], sigma_values)
+                }
+                None => error_spec.variance_at_with_correlations(
+                    cmt_at(j),
+                    ipreds[j],
+                    sigma_values,
+                    correlations,
+                ),
+            };
+        }
+        for &(j, k, cov) in &pairs {
+            let lj = local_pos[j];
+            let lk = local_pos[k];
+            if lj != usize::MAX && lk != usize::MAX {
+                r[(lj, lk)] = cov;
+                r[(lk, lj)] = cov;
+            }
+        }
+
+        let dr_df = if with_derivatives {
+            let mut dr = vec![DMatrix::<f64>::zeros(b, b); b];
+            for (local, &j) in indices.iter().enumerate() {
+                if !vload[j].is_empty() {
+                    dr[local][(local, local)] =
+                        diag_self_deriv(&vload[j], &sload[j], sigma_values, correlations);
+                }
+            }
+            for &(j, k, _) in &pairs {
+                let lj = local_pos[j];
+                let lk = local_pos[k];
+                if lj == usize::MAX || lk == usize::MAX {
+                    continue;
+                }
+                let djk =
+                    cross_observation_covariance(&sload[j], &vload[k], sigma_values, correlations);
+                dr[lj][(lj, lk)] = djk;
+                dr[lj][(lk, lj)] = djk;
+                let dkj =
+                    cross_observation_covariance(&sload[k], &vload[j], sigma_values, correlations);
+                dr[lk][(lk, lj)] = dkj;
+                dr[lk][(lj, lk)] = dkj;
+            }
+            Some(dr)
+        } else {
+            None
+        };
+
+        blocks.push(ResidualCovBlock { indices, r, dr_df });
+    }
+    blocks
+}
+
 /// Build the subject-level residual covariance matrix `R`.
 ///
 /// The diagonal is the existing per-observation residual variance, including
@@ -979,6 +1161,93 @@ mod tests {
         assert_relative_eq!(r[(0, 1)], 50.0 * 5.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
         assert_relative_eq!(r[(1, 0)], r[(0, 1)], epsilon = 1e-12);
         assert_eq!(r[(0, 2)], 0.0);
+    }
+
+    #[test]
+    fn test_residual_covariance_blocks_reconstruct_dense_r_and_dr() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let ipreds = [50.0, 5.0, 40.0, 4.0, 30.0];
+        let cmts = [1usize, 2, 1, 2, 1];
+        let times = [1.0, 1.0, 2.0, 2.0, 3.0];
+        let l2 = [10, 10, 20, 20, 0];
+        let sigma = [0.2, 0.3];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        let dense = compute_r_matrix_with_correlations(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &l2,
+            &sigma,
+            &[corr.clone()],
+        );
+        let dense_dr = compute_dr_df_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &l2,
+            &sigma,
+            &[corr],
+            None,
+        );
+        let blocks = residual_covariance_blocks(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &l2,
+            &sigma,
+            &[corr],
+            None,
+            true,
+        );
+        let mut r_recon = DMatrix::<f64>::zeros(ipreds.len(), ipreds.len());
+        let mut dr_recon = vec![DMatrix::<f64>::zeros(ipreds.len(), ipreds.len()); ipreds.len()];
+        for block in blocks {
+            let dr = block.dr_df.expect("derivatives requested");
+            for (a, &ja) in block.indices.iter().enumerate() {
+                for (b, &jb) in block.indices.iter().enumerate() {
+                    r_recon[(ja, jb)] = block.r[(a, b)];
+                    for (m_local, &jm) in block.indices.iter().enumerate() {
+                        dr_recon[jm][(ja, jb)] = dr[m_local][(a, b)];
+                    }
+                }
+            }
+        }
+        for i in 0..ipreds.len() {
+            for j in 0..ipreds.len() {
+                assert_relative_eq!(r_recon[(i, j)], dense[(i, j)], epsilon = 1e-12);
+                for m in 0..ipreds.len() {
+                    assert_relative_eq!(dr_recon[m][(i, j)], dense_dr[m][(i, j)], epsilon = 1e-12);
+                }
+            }
+        }
     }
 
     // #827: two physical samples at the SAME subject time (replicate assays,

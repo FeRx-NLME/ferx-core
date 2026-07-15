@@ -2050,7 +2050,7 @@ fn dense_residual_inner_gradient(
     sigma: &[f64],
     sens: &[crate::sens::provider::ObsGrad],
 ) -> Option<Vec<f64>> {
-    use nalgebra::{DMatrix, DVector};
+    use nalgebra::DVector;
     let n_eta = model.n_eta;
     let eta_v = DVector::from_column_slice(eta);
     let prior = &omega.inv * &eta_v;
@@ -2064,79 +2064,121 @@ fn dense_residual_inner_gradient(
     let err_keys = model.error_spec.obs_keys(subject);
     // Per-observation custom residual magnitude (#484); η-independent, matches the marginal.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
-    let r = match ruv_mult.as_deref() {
-        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
-            &model.error_spec,
-            &ipreds,
-            err_keys.as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            &subject.obs_l2,
-            sigma,
-            corr,
-            mult,
-        ),
-        None => crate::stats::residual_error::compute_r_matrix_with_correlations(
-            &model.error_spec,
-            &ipreds,
-            err_keys.as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            &subject.obs_l2,
-            sigma,
-            corr,
-        ),
-    };
-    let chol = r.clone().cholesky()?;
-    let r_inv = chol.inverse();
-    let residuals = DVector::from_iterator(
-        n_obs,
-        subject
-            .observations
-            .iter()
-            .zip(ipreds.iter())
-            .map(|(&y, &f)| y - f),
-    );
-    let s = chol.solve(&residuals); // R⁻¹ r
-    let dr = crate::stats::residual_error::compute_dr_df_matrices(
-        &model.error_spec,
-        &ipreds,
-        err_keys.as_ref(),
-        &subject.obs_times,
-        &subject.obs_raw_times,
-        &subject.occasions,
-        &subject.obs_l2,
-        sigma,
-        corr,
-        ruv_mult.as_deref(),
-    );
     let mut grad = vec![0.0f64; n_eta];
+    if n_obs > 16 {
+        let blocks = crate::stats::residual_error::residual_covariance_blocks(
+            &model.error_spec,
+            &ipreds,
+            err_keys.as_ref(),
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &subject.obs_l2,
+            sigma,
+            corr,
+            ruv_mult.as_deref(),
+            true,
+        );
+        for block in blocks {
+            let Some(dr) = block.dr_df else {
+                return None;
+            };
+            let chol = block.r.cholesky()?;
+            let r_inv = chol.inverse();
+            let residuals = DVector::from_iterator(
+                block.indices.len(),
+                block
+                    .indices
+                    .iter()
+                    .map(|&j| subject.observations[j] - ipreds[j]),
+            );
+            let s = chol.solve(&residuals); // R_block⁻¹ r_block
+            let b = block.indices.len();
+            let mut r_coeff = vec![0.0_f64; b];
+            for m in 0..b {
+                let mut tr_m = 0.0;
+                for p in 0..b {
+                    for q in 0..b {
+                        tr_m += r_inv[(p, q)] * dr[m][(q, p)];
+                    }
+                }
+                let quad_m = s.dot(&(&dr[m] * &s));
+                r_coeff[m] = 0.5 * (tr_m - quad_m);
+            }
+            for k in 0..n_eta {
+                for (local, &m) in block.indices.iter().enumerate() {
+                    grad[k] += sens[m].df_deta[k] * (-s[local] + r_coeff[local]);
+                }
+            }
+        }
+    } else {
+        let r = match ruv_mult.as_deref() {
+            Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
+                &model.error_spec,
+                &ipreds,
+                err_keys.as_ref(),
+                &subject.obs_times,
+                &subject.obs_raw_times,
+                &subject.occasions,
+                &subject.obs_l2,
+                sigma,
+                corr,
+                mult,
+            ),
+            None => crate::stats::residual_error::compute_r_matrix_with_correlations(
+                &model.error_spec,
+                &ipreds,
+                err_keys.as_ref(),
+                &subject.obs_times,
+                &subject.obs_raw_times,
+                &subject.occasions,
+                &subject.obs_l2,
+                sigma,
+                corr,
+            ),
+        };
+        let chol = r.clone().cholesky()?;
+        let r_inv = chol.inverse();
+        let residuals = DVector::from_iterator(
+            n_obs,
+            subject
+                .observations
+                .iter()
+                .zip(ipreds.iter())
+                .map(|(&y, &f)| y - f),
+        );
+        let s = chol.solve(&residuals); // R⁻¹ r
+        let dr = crate::stats::residual_error::compute_dr_df_matrices(
+            &model.error_spec,
+            &ipreds,
+            err_keys.as_ref(),
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &subject.obs_l2,
+            sigma,
+            corr,
+            ruv_mult.as_deref(),
+        );
+        let mut r_coeff = vec![0.0_f64; n_obs];
+        for m in 0..n_obs {
+            let mut tr_m = 0.0;
+            for p in 0..n_obs {
+                for q in 0..n_obs {
+                    tr_m += r_inv[(p, q)] * dr[m][(q, p)];
+                }
+            }
+            let quad_m = s.dot(&(&dr[m] * &s));
+            r_coeff[m] = 0.5 * (tr_m - quad_m);
+        }
+        for k in 0..n_eta {
+            for m in 0..n_obs {
+                grad[k] += sens[m].df_deta[k] * (-s[m] + r_coeff[m]);
+            }
+        }
+    }
     for k in 0..n_eta {
-        // −a_kᵀ s, where a_k = (∂f_m/∂η_k)_m is column k of H.
-        let mut term_a = 0.0;
-        for m in 0..n_obs {
-            term_a += sens[m].df_deta[k] * s[m];
-        }
-        // ∂R/∂η_k = Σ_m H[m,k]·∂R/∂f_m.
-        let mut dr_k = DMatrix::<f64>::zeros(n_obs, n_obs);
-        for m in 0..n_obs {
-            let h_mk = sens[m].df_deta[k];
-            if h_mk != 0.0 {
-                dr_k += h_mk * &dr[m];
-            }
-        }
-        // tr(M_k) = tr(R⁻¹ ∂R/∂η_k) = Σ_{p,q} r_inv[p,q]·dr_k[q,p].
-        let mut tr_mk = 0.0;
-        for p in 0..n_obs {
-            for q in 0..n_obs {
-                tr_mk += r_inv[(p, q)] * dr_k[(q, p)];
-            }
-        }
-        // sᵀ ∂R/∂η_k s.
-        let quad = s.dot(&(&dr_k * &s));
-        grad[k] = -term_a + 0.5 * (tr_mk - quad) + prior[k];
+        grad[k] += prior[k];
     }
     Some(grad)
 }
@@ -2326,24 +2368,59 @@ fn dense_residual_inner_preconditioner(
     let ipreds: Vec<f64> = sens.iter().map(|o| o.f).collect();
     let err_keys = model.error_spec.obs_keys(subject);
     let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
-    let r = crate::stats::residual_error::r_matrix_maybe_scaled(
+    let mut out = vec![1.0_f64; n_eta];
+    let mut usable = false;
+    if sens.len() <= 16 {
+        let r = crate::stats::residual_error::r_matrix_maybe_scaled(
+            &model.error_spec,
+            &ipreds,
+            err_keys.as_ref(),
+            subject,
+            &params.sigma.values,
+            &params.residual_correlations,
+            ruv_mult.as_deref(),
+        );
+        let chol = r.cholesky()?;
+        for k in 0..n_eta {
+            let mut j = DVector::<f64>::zeros(sens.len());
+            for (m, obs) in sens.iter().enumerate() {
+                j[m] = obs.df_deta[k];
+            }
+            let data_prec = j.dot(&chol.solve(&j)).max(0.0);
+            let prior_prec = params.omega.inv[(k, k)].max(0.0);
+            let prec = prior_prec + data_prec;
+            if prec.is_finite() && prec > 0.0 {
+                out[k] = 1.0 / prec;
+                usable = true;
+            }
+        }
+        return usable.then_some(out);
+    }
+    let blocks = crate::stats::residual_error::residual_covariance_blocks(
         &model.error_spec,
         &ipreds,
         err_keys.as_ref(),
-        subject,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        &subject.obs_l2,
         &params.sigma.values,
         &params.residual_correlations,
         ruv_mult.as_deref(),
+        false,
     );
-    let chol = r.cholesky()?;
-    let mut out = vec![1.0_f64; n_eta];
-    let mut usable = false;
     for k in 0..n_eta {
-        let mut j = DVector::<f64>::zeros(sens.len());
-        for (m, obs) in sens.iter().enumerate() {
-            j[m] = obs.df_deta[k];
+        let mut data_prec = 0.0_f64;
+        for block in &blocks {
+            let Some(chol) = block.r.clone().cholesky() else {
+                return None;
+            };
+            let mut j = DVector::<f64>::zeros(block.indices.len());
+            for (local, &m) in block.indices.iter().enumerate() {
+                j[local] = sens[m].df_deta[k];
+            }
+            data_prec += j.dot(&chol.solve(&j)).max(0.0);
         }
-        let data_prec = j.dot(&chol.solve(&j)).max(0.0);
         let prior_prec = params.omega.inv[(k, k)].max(0.0);
         let prec = prior_prec + data_prec;
         if prec.is_finite() && prec > 0.0 {

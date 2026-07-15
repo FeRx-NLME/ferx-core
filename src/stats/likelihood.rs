@@ -697,6 +697,44 @@ fn dense_residual_data_term(
 ) -> Option<f64> {
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
+    if !residual_correlations.is_empty() && preds.len() > 16 {
+        let blocks = crate::stats::residual_error::residual_covariance_blocks(
+            &model.error_spec,
+            preds,
+            err_keys.as_ref(),
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &subject.obs_l2,
+            sigma_values,
+            residual_correlations,
+            ruv_mult,
+            false,
+        );
+        let mut out = 0.0;
+        for block in blocks {
+            let mut r = block.r;
+            if ruv_scale != 1.0 {
+                r *= ruv_scale;
+            }
+            for (local, &j) in block.indices.iter().enumerate() {
+                if let Some(v) = p_obs.get(j) {
+                    r[(local, local)] += *v;
+                }
+            }
+            let chol = r.cholesky()?;
+            let residuals = DVector::from_iterator(
+                block.indices.len(),
+                block
+                    .indices
+                    .iter()
+                    .map(|&j| subject.observations[j] - preds[j]),
+            );
+            let solved = chol.solve(&residuals);
+            out += residuals.dot(&solved) + chol_log_det(&chol.l());
+        }
+        return Some(out);
+    }
     let mut r = crate::stats::residual_error::r_matrix_maybe_scaled(
         &model.error_spec,
         preds,

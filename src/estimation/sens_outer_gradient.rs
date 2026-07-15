@@ -1049,12 +1049,28 @@ fn subject_packed_gradient_dense_focei(
     params: &ModelParameters,
     sens: &SubjectSens,
 ) -> Option<Vec<f64>> {
+    subject_packed_gradient_dense_focei_with_eta_dx(
+        model, subject, template, x, eta_hat, params, sens,
+    )
+    .map(|(g, _)| g)
+}
+
+fn subject_packed_gradient_dense_focei_with_eta_dx(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    params: &ModelParameters,
+    sens: &SubjectSens,
+) -> Option<(Vec<f64>, Vec<DVector<f64>>)> {
     let prep = dense_prepare_focei(model, subject, params, sens)?;
     let n_theta = params.theta.len();
     let n_sigma = params.sigma.values.len();
     let n_corr = params.residual_correlations.len();
     let n_obs = subject.observations.len();
     let mut g = vec![0.0f64; x.len()];
+    let mut eta_dx: Vec<DVector<f64>> = vec![DVector::zeros(prep.n_eta); x.len()];
 
     for m in 0..n_theta {
         let mut b = DVector::<f64>::zeros(n_obs);
@@ -1077,12 +1093,25 @@ fn subject_packed_gradient_dense_focei(
         let deta = -(&prep.h_inner_inv * mvec);
         let dtheta_dx = theta_dx_chain(template, &params.theta, m);
         g[m] = (fixed + 0.5 * prep.g_eta.dot(&deta)) * dtheta_dx;
+        eta_dx[m] = deta * dtheta_dx;
     }
 
     let omega_start = n_theta;
     let og = omega_packed_block_dense(&prep, params, eta_hat);
     for (ko, &val) in og.iter().enumerate() {
         g[omega_start + ko] = val;
+    }
+    let z = &params.omega.inv * DVector::from_column_slice(eta_hat);
+    let l = &params.omega.chol;
+    let entries: Vec<(usize, usize)> = lower_tri_entries(prep.n_eta, params.omega.diagonal);
+    for (ko, &(row, col)) in entries.iter().enumerate() {
+        let v = DVector::from_iterator(prep.n_eta, (0..prep.n_eta).map(|r| l[(r, col)]));
+        let vz = v.dot(&z);
+        let oinv_v = &params.omega.inv * &v;
+        let oinv_col_row: DVector<f64> = params.omega.inv.column(row).into_owned();
+        let m_l = -(oinv_col_row * vz + oinv_v * z[row]);
+        let chain = if row == col { l[(row, row)] } else { 1.0 };
+        eta_dx[omega_start + ko] = -(&prep.h_inner_inv * m_l) * chain;
     }
     let sigma_start = omega_start + og.len();
     for k in 0..n_sigma {
@@ -1093,6 +1122,7 @@ fn subject_packed_gradient_dense_focei(
         let mvec = dense_inner_mixed(&prep, &r_z, &e, &b, &direct_dr_z);
         let deta = -(&prep.h_inner_inv * mvec);
         g[sigma_start + k] = (fixed + 0.5 * prep.g_eta.dot(&deta)) * params.sigma.values[k];
+        eta_dx[sigma_start + k] = deta * params.sigma.values[k];
     }
     let corr_start = sigma_start + n_sigma;
     for k in 0..n_corr {
@@ -1104,9 +1134,10 @@ fn subject_packed_gradient_dense_focei(
         let deta = -(&prep.h_inner_inv * mvec);
         let rho = params.residual_correlations[k].rho;
         g[corr_start + k] = (fixed + 0.5 * prep.g_eta.dot(&deta)) * (1.0 - rho * rho);
+        eta_dx[corr_start + k] = deta * (1.0 - rho * rho);
     }
 
-    Some(g)
+    Some((g, eta_dx))
 }
 
 fn prepare(
@@ -2659,6 +2690,58 @@ pub fn per_subject_packed_gradients(
         .collect()
 }
 
+/// Per-subject FOCEI packed gradient plus Eq. 48 EBE-response Jacobian for the
+/// dense cross-observation `block_sigma` path. Returns `None` for subjects that
+/// are not on that dense path; callers can still use [`per_subject_packed_gradients`]
+/// for the gradient and simply skip the predictor.
+pub fn per_subject_packed_gradients_dense_eta_dx(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[DVector<f64>],
+) -> Vec<Option<(Vec<f64>, Vec<DVector<f64>>)>> {
+    population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            if subject.observations.is_empty() {
+                return Some((
+                    vec![0.0; x.len()],
+                    vec![DVector::zeros(model.n_eta); x.len()],
+                ));
+            }
+            let params = unpack_params(x, template);
+            if params.residual_correlations.is_empty() {
+                return None;
+            }
+            let sens =
+                subject_sensitivities(model, subject, &params.theta, eta_hats[i].as_slice())?;
+            if corr_residual_diag(
+                model,
+                subject,
+                &sens,
+                &params.sigma.values,
+                &params.residual_correlations,
+            )
+            .is_some()
+            {
+                return None;
+            }
+            subject_packed_gradient_dense_focei_with_eta_dx(
+                model,
+                subject,
+                template,
+                x,
+                eta_hats[i].as_slice(),
+                &params,
+                &sens,
+            )
+        })
+        .collect()
+}
+
 /// Per-subject analytic packed gradients for an **IOV** model — the IOV analogue of
 /// [`per_subject_packed_gradients`], exposing `None` per out-of-scope subject (rather than
 /// short-circuiting the whole population to FD) so the
@@ -3639,6 +3722,9 @@ pub fn subject_eta_dx(
     }
     let params = unpack_params(x, template);
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
+    if !model.residual_correlations.is_empty() {
+        return subject_eta_dx_dense(model, subject, template, x, eta_hat, &params, &sens);
+    }
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
     let prep = prepare(model, subject, &params, &sens, eta_hat)?;
@@ -3862,6 +3948,21 @@ pub fn subject_eta_dx(
     }
 
     Some(out)
+}
+
+fn subject_eta_dx_dense(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    params: &ModelParameters,
+    sens: &SubjectSens,
+) -> Option<Vec<DVector<f64>>> {
+    subject_packed_gradient_dense_focei_with_eta_dx(
+        model, subject, template, x, eta_hat, params, sens,
+    )
+    .map(|(_, eta_dx)| eta_dx)
 }
 
 /// Per-subject `dη̂/dx` Jacobians for the whole population, or `None` if any
