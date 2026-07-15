@@ -284,6 +284,57 @@ fn agq_converges_to_the_importance_sampling_marginal() {
     );
 }
 
+/// **The unification's mathematical heart** (#251): the exact anchor (`laplace`) and the
+/// Gauss-Newton anchor (`focei`) place their grids differently, so they disagree at one node
+/// — but the quadrature identity holds for *any* positive-definite scaling, so both converge
+/// to the **same** marginal integral as `n_agq` grows. This pins exactly that: the two anchors
+/// differ at n = 1 (FOCEI ≠ Laplace) yet both land on the IS marginal by n = 11.
+#[test]
+fn both_anchors_converge_to_the_same_marginal() {
+    let pop = warfarin();
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+
+    // Independent truth: the IS marginal at the initial parameters.
+    let is_opts = FitOptions {
+        method: EstimationMethod::Imp,
+        interaction: true,
+        imp_eval_only: true,
+        imp_samples: 20_000,
+        imp_seed: Some(7),
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let truth = fit(&model, &pop, &model.default_params, &is_opts)
+        .expect("IS eval must succeed")
+        .importance_sampling
+        .expect("IMP eval-only reports a marginal")
+        .minus2_log_likelihood;
+
+    let laplace1 = eval_only_ofv(&pop, EstimationMethod::Laplace, 1);
+    let focei1 = eval_only_ofv(&pop, EstimationMethod::FoceI, 1);
+    let laplace11 = eval_only_ofv(&pop, EstimationMethod::Laplace, 11);
+    let focei11 = eval_only_ofv(&pop, EstimationMethod::FoceI, 11);
+
+    // Different anchor ⇒ different value at one node.
+    assert!(
+        (laplace1 - focei1).abs() > 1e-6,
+        "the anchors must differ at n = 1: laplace={laplace1}, focei={focei1}"
+    );
+    // Same integral in the limit ⇒ both close on the IS marginal (residual is IS's own MC
+    // error at 20k samples, not quadrature error).
+    assert!(
+        (laplace11 - truth).abs() < 0.15 && (focei11 - truth).abs() < 0.15,
+        "both anchors must converge to the same marginal (IS truth {truth:.4}): \
+         laplace(11)={laplace11:.4}, focei(11)={focei11:.4}"
+    );
+    // And to each other.
+    assert!(
+        (laplace11 - focei11).abs() < 0.1,
+        "the anchors must agree once refined: laplace(11)={laplace11:.4}, focei(11)={focei11:.4}"
+    );
+}
+
 /// Refining the grid must *converge*, not wander: successive refinements move the OFV by
 /// less and less. This is what makes a node count meaningful — if the OFV kept drifting with
 /// `n_agq` there would be no answer to report.

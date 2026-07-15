@@ -5363,6 +5363,17 @@ fn fit_inner(
         if matches!(method, EstimationMethod::Laplace) && stage_opts.optimizer == Optimizer::Auto {
             stage_opts.optimizer = Optimizer::NloptLbfgs;
         }
+        // The exact-anchor quadrature (Laplace / adaptive GH) needs a tighter EBE than
+        // FOCE/FOCEI: its analytic gradient assumes b̂ is exactly the mode (Bartlett), so a
+        // loose b̂ from a poor start yields a non-descent direction that stalls the outer
+        // optimizer. Measured on warfarin (#251): the shared default 1e-5 fails to converge
+        // from a 1.3× start, while 1e-8 is robust across realistic starts at negligible cost
+        // near the optimum (the OFV is insensitive to inner_tol there). FOCEI's Gauss-Newton
+        // log|H̃| is forgiving of a loose b̂, so it keeps the looser default. `.min` so an
+        // explicit tighter `inner_tol` is preserved.
+        if matches!(method, EstimationMethod::Laplace) {
+            stage_opts.inner_tol = stage_opts.inner_tol.min(1e-8);
+        }
         // Run the covariance step (and SIR) only on the last *estimating* stage,
         // so a chain doesn't recompute the expensive FD covariance after every
         // method (#615). See `is_last_estimating_stage` for the eval-only-IMP rule.

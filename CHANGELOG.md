@@ -19,6 +19,33 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **`method = agq` removed; adaptive quadrature is now an *argument*, not a method**
+  (#251). Adaptive Gauss–Hermite quadrature is not a separate estimator — it is the
+  single-point method (Laplace / FOCEI) evaluated on more nodes. So the **method name now
+  selects the Hessian anchor** and **`n_agq` (default 1) is the node count**:
+  - `method = laplace` — the exact-Hessian anchor. `n_agq = 1` is the Laplace approximation
+    (NONMEM `LAPLACIAN`); `n_agq > 1` is adaptive Gauss–Hermite quadrature (what `method =
+    agq` used to be).
+  - `method = focei` — the Gauss-Newton anchor. `n_agq = 1` is plain FOCEI (unchanged,
+    bit-identical); `n_agq > 1` is a **new** Gauss-Newton-anchored quadrature that refines
+    FOCEI toward the exact marginal (requires the analytic sensitivity scope).
+
+  Both anchors converge to the same marginal likelihood as `n_agq → ∞`; they differ only in
+  node placement and, at one node, in whether `½log|H|` carries the exact curvature or the
+  Gauss-Newton approximation. The old `method = agq` (and its `gauss_hermite` /
+  `adaptive_gaussian_quadrature` aliases) is rejected by the parser with a message pointing
+  to `method = laplace` + `n_agq`. `.fitrx` bundles written by older versions still load
+  (their `agq` method reads back as `laplace`). **This is a breaking change to the model
+  file's `[fit_options]`; `method = agq` was unreleased, so no released version is
+  affected.**
+- **Laplace / adaptive-GH quadrature uses a tighter default `inner_tol` (`1e-8`, was the
+  shared `1e-5`)** (#251). Its analytic gradient assumes the EBE is exactly the posterior
+  mode; a loose inner tolerance left `b̂` off-mode from a poor start and could stall the
+  outer optimizer. The tighter default converges robustly from realistic starts at
+  negligible cost near the optimum. FOCE/FOCEI are unchanged (their Gauss-Newton `log|H̃|`
+  is forgiving of a loose mode).
+
 ### Fixed
 - **FREM: the analytic gradients differentiated the wrong likelihood on covariate
   pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against
@@ -88,7 +115,7 @@ section of the SDLC for the versioning policy).
   fix above. TTE and categorical endpoints still take the finite-differenced score
   (neither re-solves the inner loop, so they remain fast) — they have no analytic
   chain in the `Dual2` provider at all, not merely an AGQ-side gate. `block_sigma` is
-  now accepted for `method = agq` / `laplace` (previously rejected at `fit()` even
+  now accepted for `method = laplace` (previously rejected at `fit()` even
   though the analytic score already carried a `corr_diag` branch for it). Under IOV,
   the scope check now excludes non-Gaussian endpoints and bounds the custom-magnitude
   axis count the same way the non-IOV gate does — previously an IOV + TTE/categorical
@@ -137,11 +164,10 @@ section of the SDLC for the versioning policy).
   Gauss-Newton Hessian `CᵀC + Ω⁻¹` (dropping `∂²f/∂η²`) and therefore reports a
   different OFV; `laplace` carries the curvature of the η-dependent residual
   variance that the Gauss-Newton form discards, which is why it reproduces NONMEM's
-  LAPLACIAN to six significant figures on warfarin. Internally it *is* `agq` with the
-  node count pinned to 1 — same objective, same analytic gradient, same covariance
-  step, bit-identical OFV — so it is the cheapest member of the AGQ family (one node,
-  no grid) and on warfarin converges *faster than FOCEI* (0.23 s vs 0.60 s). `n_agq`
-  is not one of its options; use `method = agq` to vary the node count. See the
+  LAPLACIAN to six significant figures on warfarin. At the default `n_agq = 1` it is a
+  single node, no grid — the cheapest configuration, and on warfarin it converges
+  *faster than FOCEI* (0.23 s vs 0.60 s); `n_agq > 1` turns it into adaptive
+  Gauss–Hermite quadrature over the same objective. See the
   [AGQ docs page](https://ferx-nlme.github.io/ferx-core/estimation/agq.html).
 - **Exact (analytic) FOCE/FOCEI gradients for lagtime models with IOV, time-varying
   covariates, or `TIME`** (#486): a closed-form model carrying an `ALAG`/`LAGTIME` used to
@@ -212,11 +238,11 @@ section of the SDLC for the versioning policy).
   [Markov models](https://ferx-nlme.github.io/ferx-core/model-file/markov-model.html)
   and [CTMM estimation](https://ferx-nlme.github.io/ferx-core/estimation/ctmm.html)
   pages. (mCTMM/DTMM and CTMM simulation are planned follow-ups.)
-- **Adaptive Gaussian quadrature (`method = agq`)** (#251): a new estimation
-  method that generalises Laplace. Instead of approximating each subject's
+- **Adaptive Gaussian quadrature (`method = laplace` with `n_agq > 1`)** (#251):
+  generalises Laplace. Instead of approximating each subject's
   marginal likelihood with a single Gaussian at the empirical-Bayes mode, it
   evaluates the *exact* conditional likelihood on a Gauss-Hermite grid laid
-  around that mode (`[fit_options] n_agq`, default 3 nodes per random effect).
+  around that mode (`[fit_options] n_agq`, default 1 node per random effect).
   `n_agq = 1` reproduces the Laplace approximation identically — it matches NONMEM
   `$EST METHOD=1 LAPLACIAN` to five significant figures on warfarin. Because it
   makes no Gaussian-residual assumption it handles non-Gaussian endpoints (TTE,
