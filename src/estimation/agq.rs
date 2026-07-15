@@ -585,42 +585,31 @@ fn stack_mode(eta_hat: &[f64], kappas: &[nalgebra::DVector<f64>]) -> Vec<f64> {
 // costs `2·n_free` *full population objective* evaluations, each re-solving every subject's
 // inner loop.
 
-/// Model-level mirror of [`analytic_score_supported`], for reporting
-/// (`build_info::gradient_method_outer`) which has no per-subject [`Stack`]. Uses the model's
-/// own `n_kappa` to pick the IOV or non-IOV provider scope, which is the same answer every
-/// subject of an IOV model gets.
+/// Alias kept for `build_info::gradient_method_outer`, which reports scope by model.
+/// Identical to [`analytic_score_supported`] — the predicate is purely model-level.
 pub fn analytic_score_supported_model(model: &CompiledModel) -> bool {
-    let stack = Stack {
-        n_eta: model.n_eta,
-        n_kappa: model.n_kappa,
-        n_occ: usize::from(model.n_kappa > 0),
-        omega_joint_inv: DMatrix::zeros(0, 0),
-        prior_sd: Vec::new(),
-    };
-    analytic_score_supported(model, &stack)
+    analytic_score_supported(model)
 }
 
-pub fn analytic_score_supported(model: &CompiledModel, stack: &Stack) -> bool {
-    // The provider's scope differs for IOV: `subject_sensitivities_iov` runs the stacked
-    // (θ, η, κ) dual walk, gated by `iov_sens_supported`, while the non-IOV entry point is
-    // gated by `analytic_outer_gradient_available`. `analytic_outer_gradient_available`
-    // already folds in `iov_sens_supported`, but it also carries the `gradient_method = fd`
-    // opt-out and the non-Gaussian/magnitude bails, which apply to both — so the IOV arm
-    // must repeat them explicitly rather than only calling `iov_sens_supported`, or an IOV
-    // + TTE/categorical model (or IOV + an over-wide custom magnitude) would silently pass
-    // this gate: `score_core` would then build `et` from `subject.observations` alone, and
-    // a pure-TTE subject (`n_obs == 0`) would score only the Ω prior with no hazard
-    // contribution at all (#251 review #9).
-    let provider = if stack.is_iov() {
-        crate::sens::provider::iov_sens_supported(model)
-            && !matches!(model.gradient_method, crate::types::GradientMethod::Fd)
-            && !model.has_non_gaussian()
-            && (!model.has_custom_ruv_magnitude()
-                || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
-                    && model.residual_correlations.is_empty()))
-    } else {
-        crate::sens::provider::analytic_outer_gradient_available(model)
-    };
+/// Whether the AGQ/Laplace analytic score applies to `model`.
+///
+/// This is **the same predicate FOCE/FOCEI gate on** — a single call to
+/// [`analytic_outer_gradient_available`](crate::sens::provider::analytic_outer_gradient_available),
+/// with no separate copy. That is deliberate and load-bearing for scope parity: widening the
+/// analytic scope (a new PK model, a new endpoint family, a relaxed magnitude bound) in that
+/// one function extends FOCE, FOCEI, AGQ and Laplace **together**, with no per-estimator list
+/// here to drift out of step (#251).
+///
+/// It already covers IOV without a separate arm. `analytic_outer_gradient_available`'s final
+/// clause is `sens_supported(model) || iov_sens_supported(model)`, and `sens_supported` is
+/// always false under IOV (both `analytical_supported` and `ode_analytical_supported` bail on
+/// `n_kappa != 0`), so for an IOV model it reduces exactly to `iov_sens_supported` AND the
+/// shared `!fd` / `!has_non_gaussian` / magnitude bails — the whole IOV scope
+/// (`iov_sens_supported` itself folds in the closed-form, ODE-IOV and transit-via-ODE-twin
+/// cases). The earlier hand-replicated IOV arm (#251 review #9) was therefore pure redundancy
+/// and a drift hazard; delegating supersedes it.
+pub fn analytic_score_supported(model: &CompiledModel) -> bool {
+    let provider = crate::sens::provider::analytic_outer_gradient_available(model);
     // Everything the FOCE/FOCEI outer gradient can do analytically, the AGQ/Laplace score
     // can now do too: the per-observation residual chain comes from the SAME
     // `sens_outer_gradient::score_core`, so M3-BLOQ, `iiv_on_ruv`, a custom / time-varying
@@ -824,7 +813,7 @@ fn accumulate_fixed_eta_packed_gradient(
     // its own gradient for *every* model rather than dropping to `reconverged_fd_gradient`.
     // This matters most for exactly the endpoints AGQ exists to serve: TTE and categorical
     // are outside the `Dual2` provider, and it would be perverse for them to be the slow case.
-    if !analytic_score_supported(model, stack) {
+    if !analytic_score_supported(model) {
         return accumulate_fixed_b_packed_gradient_fd(
             model,
             subject,
@@ -1127,7 +1116,7 @@ fn eta_dx(
     // neither re-solves the inner loop: this is the *derivative* of the mode, not a
     // recomputation of it. The finite difference below is the fallback for models outside the
     // provider's scope, and uses the same exact `H` the grid is scaled by.
-    if analytic_score_supported(model, stack) {
+    if analytic_score_supported(model) {
         let exact = if stack.is_iov() {
             crate::estimation::sens_outer_gradient::subject_eta_dx_iov(
                 model, subject, template, x, b_hat,
@@ -1529,7 +1518,7 @@ mod tests {
         let params = unpack_params(&x, template);
         let stack = Stack::new(model, &params, usize::from(model.n_kappa > 0));
         assert!(
-            analytic_score_supported(model, &stack),
+            analytic_score_supported(model),
             "{label}: expected the ANALYTIC score path, got the FD fallback"
         );
 
