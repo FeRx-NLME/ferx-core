@@ -19,6 +19,7 @@
 
 use super::num::PkNum;
 use crate::pk::event_driven::{Event, EventKind, EventSchedule};
+use crate::pk::topology::Channel;
 use crate::types::{DoseEvent, PkModel, Subject};
 
 /// 1-cpt IV/central propagator: evolve `state[0]` (central amount) over `dt` with
@@ -707,18 +708,7 @@ const SS_EQUILIBRATION_CYCLES: usize = 50;
 /// included for the forthcoming extension; the walk currently propagates 1-/2-cpt.
 #[inline]
 fn state_layout_g(pk_model: PkModel) -> (usize, usize) {
-    match pk_model {
-        PkModel::OneCptIv => (1, 0),
-        PkModel::OneCptOral => (2, 1),
-        PkModel::OneCptTransit => (2, 1),
-        PkModel::OneCptIg => (2, 1),
-        PkModel::TwoCptIv => (2, 0),
-        PkModel::TwoCptOral => (3, 1),
-        PkModel::TwoCptTransit => (3, 1),
-        PkModel::TwoCptIg => (3, 1),
-        PkModel::ThreeCptIv => (3, 0),
-        PkModel::ThreeCptOral => (4, 1),
-    }
+    pk_model.topology().state_layout()
 }
 
 /// True when the generic walk implements this model — all six analytical 1-/2-/3-
@@ -726,15 +716,7 @@ fn state_layout_g(pk_model: PkModel) -> (usize, usize) {
 /// defensive backstop.
 #[inline]
 fn walk_supports(pk_model: PkModel) -> bool {
-    matches!(
-        pk_model,
-        PkModel::OneCptIv
-            | PkModel::OneCptOral
-            | PkModel::TwoCptIv
-            | PkModel::TwoCptOral
-            | PkModel::ThreeCptIv
-            | PkModel::ThreeCptOral
-    )
+    pk_model.topology().event_walk_supported
 }
 
 #[inline]
@@ -911,20 +893,12 @@ fn active_rates_g<T: PkNum>(
                 Some((rate_bare, _)) => pk.f * rate_bare,
                 None => pk.f * T::from_f64(d.rate),
             };
-            match (pk_model, d.cmt) {
-                (PkModel::OneCptIv, 1) => rate_central = rate_central + r,
-                (PkModel::OneCptOral, 1) => rate_depot = rate_depot + r,
-                (PkModel::OneCptOral, 2) => rate_central = rate_central + r,
-                (PkModel::TwoCptIv, 1) => rate_central = rate_central + r,
-                (PkModel::TwoCptIv, 2) => rate_periph1 = rate_periph1 + r,
-                (PkModel::TwoCptOral, 1) => rate_depot = rate_depot + r,
-                (PkModel::TwoCptOral, 2) => rate_central = rate_central + r,
-                (PkModel::ThreeCptIv, 1) => rate_central = rate_central + r,
-                (PkModel::ThreeCptIv, 2) => rate_periph1 = rate_periph1 + r,
-                (PkModel::ThreeCptIv, 3) => rate_periph2 = rate_periph2 + r,
-                (PkModel::ThreeCptOral, 1) => rate_depot = rate_depot + r,
-                (PkModel::ThreeCptOral, 2) => rate_central = rate_central + r,
-                _ => {}
+            match pk_model.topology().dose_channel(d.cmt) {
+                Some(Channel::Central) => rate_central = rate_central + r,
+                Some(Channel::Periph1) => rate_periph1 = rate_periph1 + r,
+                Some(Channel::Periph2) => rate_periph2 = rate_periph2 + r,
+                Some(Channel::Depot) => rate_depot = rate_depot + r,
+                None => {}
             }
         }
     }
