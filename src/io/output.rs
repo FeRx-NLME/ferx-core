@@ -1567,6 +1567,22 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
         }
     }
 
+    // Estimated block_sigma off-diagonals (#847): packed last, as Fisher-z
+    // correlation coordinates (`corr_{eps_i}_{eps_j}`).
+    for c in &result.residual_correlations {
+        let ni = result
+            .sigma_names
+            .get(c.sigma_i)
+            .cloned()
+            .unwrap_or_else(|| format!("sigma_{}", c.sigma_i + 1));
+        let nj = result
+            .sigma_names
+            .get(c.sigma_j)
+            .cloned()
+            .unwrap_or_else(|| format!("sigma_{}", c.sigma_j + 1));
+        names.push(format!("corr_{ni}_{nj}"));
+    }
+
     // Pad with generic names if the covariance matrix is larger than expected
     // (shouldn't happen in practice, but prevents index-out-of-bounds).
     while names.len() < n {
@@ -1808,6 +1824,38 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
             writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
         } else {
+            match se {
+                Some(sv) => writeln!(f, "    se: {:.6}", sv).map_err(|e| e.to_string())?,
+                None => writeln!(f, "    se: ~").map_err(|e| e.to_string())?,
+            }
+        }
+    }
+
+    // Estimated block_sigma off-diagonals (#847). Reports the fitted residual
+    // correlation ρ, its SE (on the ρ scale), and the implied covariance
+    // ρ·σ_i·σ_j — the full SIGMA block NONMEM would print. Keyed `{name_i}__{name_j}`.
+    if !result.residual_correlations.is_empty() {
+        writeln!(f, "\nsigma_correlations:").map_err(|e| e.to_string())?;
+        for (k, c) in result.residual_correlations.iter().enumerate() {
+            let name_i = result
+                .sigma_names
+                .get(c.sigma_i)
+                .cloned()
+                .unwrap_or_else(|| format!("sigma_{}", c.sigma_i + 1));
+            let name_j = result
+                .sigma_names
+                .get(c.sigma_j)
+                .cloned()
+                .unwrap_or_else(|| format!("sigma_{}", c.sigma_j + 1));
+            let si = result.sigma.get(c.sigma_i).copied().unwrap_or(0.0);
+            let sj = result.sigma.get(c.sigma_j).copied().unwrap_or(0.0);
+            let se = result
+                .se_residual_correlations
+                .as_ref()
+                .and_then(|v| v.get(k).copied());
+            writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
+            writeln!(f, "    correlation: {:.6}", c.rho).map_err(|e| e.to_string())?;
+            writeln!(f, "    covariance: {:.6}", c.rho * si * sj).map_err(|e| e.to_string())?;
             match se {
                 Some(sv) => writeln!(f, "    se: {:.6}", sv).map_err(|e| e.to_string())?,
                 None => writeln!(f, "    se: ~").map_err(|e| e.to_string())?,
@@ -2144,6 +2192,8 @@ mod tests {
             omega: DMatrix::zeros(0, 0),
             sigma,
             sigma_names: (0..n).map(|i| format!("EPS_{}", i + 1)).collect(),
+            residual_correlations: Vec::new(),
+            se_residual_correlations: None,
             error_model,
             covariance_matrix: None,
             se_theta: None,
@@ -2511,6 +2561,39 @@ mod tests {
         );
     }
 
+    /// #847: an estimated `block_sigma` off-diagonal is rendered in a
+    /// `sigma_correlations:` section with correlation, implied covariance, and SE.
+    #[test]
+    fn sigma_correlations_yaml_reports_estimated_offdiagonal() {
+        let mut result = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        result.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.75,
+        }];
+        result.se_residual_correlations = Some(vec![0.04]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&result, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        assert!(yaml.contains("sigma_correlations:"), "yaml=\n{yaml}");
+        // ρ = 0.75, covariance = 0.75 * 1.0 * 0.2 = 0.15, se = 0.04.
+        assert!(yaml.contains("correlation: 0.750000"), "yaml=\n{yaml}");
+        assert!(yaml.contains("covariance: 0.150000"), "yaml=\n{yaml}");
+        assert!(yaml.contains("se: 0.040000"), "yaml=\n{yaml}");
+    }
+
+    /// No `sigma_correlations:` section when the model has no block_sigma off-diagonals.
+    #[test]
+    fn sigma_correlations_yaml_absent_without_block_sigma() {
+        let result = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&result, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        assert!(!yaml.contains("sigma_correlations:"), "yaml=\n{yaml}");
+    }
+
     #[test]
     fn sigma_yaml_proportional_emits_variance_and_cv_pct() {
         let yaml = yaml_for(ErrorModel::Proportional, vec![0.1]);
@@ -2713,6 +2796,8 @@ mod tests {
             omega: DMatrix::zeros(0, 0),
             sigma: vec![0.1],
             sigma_names: vec!["eps".to_string()],
+            residual_correlations: Vec::new(),
+            se_residual_correlations: None,
             error_model: ErrorModel::Proportional,
             covariance_matrix: None,
             se_theta: None,

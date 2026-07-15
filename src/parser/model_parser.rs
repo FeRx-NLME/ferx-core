@@ -1863,6 +1863,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     };
     let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
     let residual_correlations = build_residual_correlations(&block_sigmas, &sigma_names)?;
+    let residual_correlation_fixed = build_residual_correlation_fixed(&block_sigmas);
     validate_residual_correlations(&error_spec, &residual_correlations, &sigma_names)?;
     // Keep a copy of the flat sigma names for the custom residual-magnitude
     // build (#484), which runs after the [covariates] block is parsed.
@@ -1931,6 +1932,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         omega_fixed,
         sigma,
         sigma_fixed,
+        residual_correlations: residual_correlations.clone(),
+        residual_correlation_fixed,
         omega_iov,
         kappa_fixed,
     };
@@ -10041,9 +10044,32 @@ fn build_residual_correlations(
                 pos += 1;
             }
         }
-        let _fixed = block.fixed;
     }
     Ok(out)
+}
+
+/// Per-off-diagonal FIX flags parallel to [`build_residual_correlations`]'s
+/// output. Walks the same block / lower-triangle order and emits an entry only
+/// where that function emits a [`ResidualCorrelation`] (off-diagonal, non-zero
+/// covariance), carrying the owning block's `FIX` flag. A plain `block_sigma`
+/// yields `false` (the off-diagonal is estimated, NONMEM `$SIGMA BLOCK(n)`
+/// semantics); `block_sigma ... FIX` yields `true` (pins the correlation).
+fn build_residual_correlation_fixed(block_sigmas: &[BlockSigmaSpec]) -> Vec<bool> {
+    let mut out = Vec::new();
+    for block in block_sigmas {
+        let n = block.names.len();
+        let mut pos = 0;
+        for row in 0..n {
+            for col in 0..=row {
+                let value = block.lower_triangle[pos];
+                if row != col && value != 0.0 {
+                    out.push(block.fixed);
+                }
+                pos += 1;
+            }
+        }
+    }
+    out
 }
 
 fn validate_block_sigma_single_error_order(
@@ -20069,6 +20095,44 @@ mod tests {
         let (_, _, _, sigmas, block_sigmas, _, _) = parse_parameters(&lines).unwrap();
         assert!(sigmas.iter().all(|s| s.fixed));
         assert!(block_sigmas[0].fixed);
+    }
+
+    /// #847: a plain `block_sigma` off-diagonal is ESTIMATED (NONMEM BLOCK
+    /// semantics) — `residual_correlation_fixed` is `false`; a `FIX` block pins it.
+    #[test]
+    fn test_block_sigma_offdiag_estimated_unless_fixed() {
+        let free = vec!["block_sigma (PROP, ADD) = [0.04, 0.10, 1.0]".to_string()];
+        let (_, _, _, _, free_blocks, _, _) = parse_parameters(&free).unwrap();
+        assert_eq!(build_residual_correlation_fixed(&free_blocks), vec![false]);
+
+        let fixed = vec!["block_sigma (PROP, ADD) = [0.04, 0.10, 1.0] FIX".to_string()];
+        let (_, _, _, _, fixed_blocks, _, _) = parse_parameters(&fixed).unwrap();
+        assert_eq!(build_residual_correlation_fixed(&fixed_blocks), vec![true]);
+    }
+
+    /// The estimated off-diagonal appears in `default_params` as a live optimizer
+    /// coordinate: `residual_correlations` carries ρ and the packed vector grows by
+    /// one slot (the Fisher-z coordinate), free unless `FIX`.
+    #[test]
+    fn test_block_sigma_default_params_carry_free_rho() {
+        let src = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  omega ETA_CL ~ 0.09\n  \
+                   block_sigma (PROP, ADD) = [0.04, 0.10, 1.0]\n[individual_parameters]\n  \
+                   CL = TVCL * exp(ETA_CL)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=10.0)\n\
+                   [error_model]\n  DV ~ combined(PROP, ADD)\n[fit_options]\n  method = focei\n";
+        let model = parse_model_string(src).expect("parse");
+        let p = &model.default_params;
+        assert_eq!(p.residual_correlations.len(), 1);
+        assert!((p.residual_correlations[0].rho - 0.5).abs() < 1e-12);
+        assert_eq!(p.residual_correlation_fixed, vec![false]);
+        // Packed vector: 1 theta + 1 omega + 2 sigma + 1 rho = 5.
+        let packed = crate::estimation::parameterization::pack_params(p);
+        assert_eq!(packed.len(), 5);
+        // The rho slot is NOT pinned (free) → bounds differ.
+        let bounds = crate::estimation::parameterization::compute_bounds(p);
+        assert!(
+            bounds.lower[4] < bounds.upper[4],
+            "rho coordinate must be free"
+        );
     }
 
     #[test]

@@ -1229,13 +1229,22 @@ pub struct SigmaVector {
     pub names: Vec<String>,
 }
 
-/// Fixed correlation between two named residual-error terms.
+/// Correlation between two named residual-error terms (a `block_sigma`
+/// off-diagonal).
 ///
 /// `sigma_i` and `sigma_j` index [`SigmaVector::values`]. The covariance used
 /// at runtime is `rho * sigma_i * sigma_j`, so the existing positive SD
 /// parameterization remains unchanged while off-diagonal residual covariance is
 /// carried into subject-level R matrices.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// `rho` is an **estimated** parameter for a plain `block_sigma` block (matching
+/// NONMEM `$SIGMA BLOCK(n)`, which estimates the whole lower triangle): it is
+/// carried as an optimizer coordinate on [`ModelParameters::residual_correlations`]
+/// and packed as `atanh(rho)` (Fisher-z) so the optimizer works unconstrained
+/// while `rho` stays in `(-1, 1)`. A `block_sigma ... FIX` block instead pins
+/// every entry — the off-diagonal is then a fixed correlation (see
+/// [`ModelParameters::residual_correlation_fixed`]).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ResidualCorrelation {
     pub sigma_i: usize,
     pub sigma_j: usize,
@@ -1262,6 +1271,18 @@ pub struct ModelParameters {
     pub sigma: SigmaVector,
     /// Per-sigma FIX flags.
     pub sigma_fixed: Vec<bool>,
+    /// Estimated off-diagonal residual correlations (`block_sigma`). Each entry's
+    /// `rho` is a live optimizer coordinate (packed as `atanh(rho)` after the
+    /// sigma / Ω_IOV blocks — see `parameterization::pack_params`), so the outer
+    /// loop moves it just like θ/Ω/σ. Empty for models with no `block_sigma`
+    /// off-diagonals. The pair indices (`sigma_i`, `sigma_j`) never change; only
+    /// `rho` is estimated.
+    pub residual_correlations: Vec<ResidualCorrelation>,
+    /// Per-correlation FIX flags (parallel to `residual_correlations`). `true`
+    /// for a `block_sigma ... FIX` block, which pins the off-diagonal at its
+    /// initial correlation; `false` for a plain `block_sigma`, whose off-diagonal
+    /// is estimated (NONMEM `$SIGMA BLOCK(n)` semantics).
+    pub residual_correlation_fixed: Vec<bool>,
     /// Inter-occasion variability matrix (Omega_IOV). `None` when no `kappa`
     /// declarations appear in the model file.  Always diagonal for Option A.
     pub omega_iov: Option<OmegaMatrix>,
@@ -1275,6 +1296,7 @@ impl ModelParameters {
         self.theta_fixed.iter().any(|&b| b)
             || self.omega_fixed.iter().any(|&b| b)
             || self.sigma_fixed.iter().any(|&b| b)
+            || self.residual_correlation_fixed.iter().any(|&b| b)
             || self.kappa_fixed.iter().any(|&b| b)
     }
 }
@@ -4589,6 +4611,18 @@ pub struct FitResult {
     pub sigma: Vec<f64>,
     /// Names of the sigma parameters, parallel to `sigma`.
     pub sigma_names: Vec<String>,
+    /// Estimated `block_sigma` off-diagonal residual correlations. Each entry's
+    /// `rho` is the fitted correlation between sigma terms `sigma_i`/`sigma_j`;
+    /// the corresponding covariance is `rho * sigma[sigma_i] * sigma[sigma_j]`.
+    /// Empty for models with no `block_sigma` off-diagonals. Rendered as a
+    /// `sigma_correlations:` block in the fit YAML.
+    #[serde(default)]
+    pub residual_correlations: Vec<ResidualCorrelation>,
+    /// Standard errors for each entry of `residual_correlations` (on the ρ
+    /// scale), or `None` when the covariance step did not run. Parallel to
+    /// `residual_correlations`.
+    #[serde(default)]
+    pub se_residual_correlations: Option<Vec<f64>>,
     /// Residual error model (additive, proportional, combined).
     ///
     /// For multi-endpoint (per-CMT) models this is only the *representative*
@@ -6453,6 +6487,8 @@ pub(crate) mod test_helpers {
                     names: vec!["EPS".into()],
                 },
                 sigma_fixed: vec![false],
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
             },
@@ -6539,6 +6575,8 @@ pub(crate) mod test_helpers {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };

@@ -5706,7 +5706,7 @@ fn fit_inner(
     };
 
     // Extract SEs from covariance matrix using converged parameter values
-    let (se_theta, se_omega, se_sigma, se_kappa) =
+    let (se_theta, se_omega, se_sigma, se_kappa, se_residual_correlations) =
         extract_standard_errors(&result.covariance_matrix, &result.params);
 
     // Optional SIR step
@@ -6077,6 +6077,8 @@ fn fit_inner(
         omega: result.params.omega.matrix.clone(),
         sigma: result.params.sigma.values.clone(),
         sigma_names: result.params.sigma.names.clone(),
+        residual_correlations: result.params.residual_correlations.clone(),
+        se_residual_correlations: se_residual_correlations.clone(),
         error_model: model.error_model,
         covariance_matrix: result.covariance_matrix,
         // The optimizer's exact packed vector (FOCE/FOCEI paths), so a later
@@ -6632,6 +6634,7 @@ fn compute_subject_results(
                     h,
                     &params.omega,
                     &params.sigma.values,
+                    &params.residual_correlations,
                     interaction,
                     kappas,
                     omega_iov,
@@ -6645,6 +6648,7 @@ fn compute_subject_results(
                     h,
                     &params.omega,
                     &params.sigma.values,
+                    &params.residual_correlations,
                     interaction,
                 )
             };
@@ -7956,10 +7960,11 @@ pub(crate) fn extract_standard_errors(
     Option<Vec<f64>>,
     Option<Vec<f64>>,
     Option<Vec<f64>>,
+    Option<Vec<f64>>,
 ) {
     let cov = match cov {
         Some(c) => c,
-        None => return (None, None, None, None),
+        None => return (None, None, None, None, None),
     };
 
     let n = cov.nrows();
@@ -8107,7 +8112,45 @@ pub(crate) fn extract_standard_errors(
             .collect()
     });
 
-    (Some(se_theta), Some(se_omega), Some(se_sigma), se_kappa)
+    // Residual correlations (`block_sigma` off-diagonals): SE on the ρ scale via
+    // the Fisher-z delta method. ρ = tanh(z), dρ/dz = 1 − ρ², so
+    // SE(ρ) ≈ (1 − ρ²)·SE(z). The z-coordinates are packed last (after IOV).
+    let iov_packed_len = template.omega_iov.as_ref().map_or(0, |iov| {
+        let d = iov.dim();
+        if iov.diagonal {
+            d
+        } else {
+            d * (d + 1) / 2
+        }
+    });
+    let rho_start = kappa_start + iov_packed_len;
+    let se_residual_correlations: Option<Vec<f64>> = if template.residual_correlations.is_empty() {
+        None
+    } else {
+        Some(
+            template
+                .residual_correlations
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let idx = rho_start + i;
+                    if idx < n {
+                        (1.0 - c.rho * c.rho).abs() * se_packed[idx]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
+        )
+    };
+
+    (
+        Some(se_theta),
+        Some(se_omega),
+        Some(se_sigma),
+        se_kappa,
+        se_residual_correlations,
+    )
 }
 
 /// Simulate observations from a model with given parameters (random seed).
@@ -10425,6 +10468,8 @@ mod iov_integration {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
         };
@@ -12189,6 +12234,8 @@ mod extract_se_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov,
             kappa_fixed,
         }
@@ -12221,6 +12268,8 @@ mod extract_se_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
@@ -12232,7 +12281,7 @@ mod extract_se_tests {
         for i in 0..n {
             cov[(i, i)] = ((i + 1) as f64).powi(2);
         }
-        let (_, se_omega, _, _) = extract_standard_errors(&Some(cov), &template);
+        let (_, se_omega, _, _, _) = extract_standard_errors(&Some(cov), &template);
         let se = se_omega.unwrap();
         // Full LT: [omega(0,0), omega(1,0), omega(2,0), omega(1,1), omega(2,1), omega(2,2)]
         assert_eq!(se.len(), 6);
@@ -12283,12 +12332,14 @@ mod extract_se_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
         // Packed: theta(1) + omega_block(3) + sigma(1) = 5.  Identity cov.
         let cov = Some(DMatrix::<f64>::identity(5, 5));
-        let (_, se_omega, _, _) = extract_standard_errors(&cov, &template);
+        let (_, se_omega, _, _, _) = extract_standard_errors(&cov, &template);
         let se = se_omega.unwrap();
         // Full LT: [omega(0,0), omega(1,0), omega(1,1)]
         assert_eq!(se.len(), 3);
@@ -12302,6 +12353,72 @@ mod extract_se_tests {
         // diagonal-only format returns None for off-diag
         let diag_only = Some(vec![0.1, 0.2]);
         assert!(omega_se_at(&diag_only, 2, 1, 0).is_none());
+    }
+
+    /// #847: `extract_standard_errors` reports an SE for each estimated
+    /// `block_sigma` off-diagonal, delta-method-transformed from the packed
+    /// Fisher-z coordinate: SE(ρ) = (1 − ρ²)·SE(z). The ρ coordinate is packed
+    /// last (after θ / Ω / σ / Ω_IOV).
+    #[test]
+    fn test_se_residual_correlation_delta_method() {
+        use crate::types::ResidualCorrelation;
+        let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["E1".into()]);
+        let template = ModelParameters {
+            theta: vec![5.0],
+            theta_names: vec!["TVCL".into()],
+            theta_lower: vec![0.1],
+            theta_upper: vec![50.0],
+            theta_fixed: vec![false],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.2, 1.0],
+                names: vec!["PROP".into(), "ADD".into()],
+            },
+            sigma_fixed: vec![false; 2],
+            residual_correlations: vec![ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: 0.6,
+            }],
+            residual_correlation_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+        };
+        // Packed: theta(1) + omega(1) + sigma(2) + rho(1) = 5. Identity cov → SE(z)=1.
+        let cov = Some(DMatrix::<f64>::identity(5, 5));
+        let (_, _, _, _, se_rho) = extract_standard_errors(&cov, &template);
+        let se = se_rho.expect("rho SE present");
+        assert_eq!(se.len(), 1);
+        // SE(ρ) = (1 − 0.6²)·1 = 0.64.
+        assert!((se[0] - 0.64).abs() < 1e-9, "got {}", se[0]);
+    }
+
+    /// A `FIX`ed residual correlation is pinned (reduced Hessian → SE 0).
+    #[test]
+    fn test_se_residual_correlation_none_without_block_sigma() {
+        let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["E1".into()]);
+        let template = ModelParameters {
+            theta: vec![5.0],
+            theta_names: vec!["TVCL".into()],
+            theta_lower: vec![0.1],
+            theta_upper: vec![50.0],
+            theta_fixed: vec![false],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.2],
+                names: vec!["PROP".into()],
+            },
+            sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
+            omega_iov: None,
+            kappa_fixed: vec![],
+        };
+        let cov = Some(DMatrix::<f64>::identity(3, 3));
+        let (_, _, _, _, se_rho) = extract_standard_errors(&cov, &template);
+        assert!(se_rho.is_none(), "no block_sigma → no rho SE");
     }
 
     /// Diagonal omega path is unaffected by the fix; this guards the simple case.
@@ -12321,12 +12438,14 @@ mod extract_se_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
         // Packed layout: theta(1) + omega_diag(2) + sigma(1) = 4. Identity cov.
         let cov = Some(DMatrix::<f64>::identity(4, 4));
-        let (_, se_omega, _, _) = extract_standard_errors(&cov, &template);
+        let (_, se_omega, _, _, _) = extract_standard_errors(&cov, &template);
         let se = se_omega.unwrap();
         assert!((se[0] - 2.0 * 0.04).abs() < 1e-12);
         assert!((se[1] - 2.0 * 0.09).abs() < 1e-12);
@@ -12357,6 +12476,8 @@ mod extract_se_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
@@ -12367,7 +12488,7 @@ mod extract_se_tests {
         cov[(1, 1)] = 0.3_f64.powi(2); // se_packed[1] = 0.3
         cov[(2, 2)] = 1.0;
         cov[(3, 3)] = 1.0;
-        let (se_theta, _, _, _) = extract_standard_errors(&Some(cov), &template);
+        let (se_theta, _, _, _, _) = extract_standard_errors(&Some(cov), &template);
         let se = se_theta.unwrap();
         // log-packed: SE = theta * SE(x) = 2.0 * 0.1 = 0.2
         assert!(
@@ -12396,7 +12517,7 @@ mod extract_se_tests {
         // Packed layout: [theta, omega(1), sigma, kappa_1, kappa_2] → 5 entries.
         // Identity cov means se_packed = [1, 1, 1, 1, 1].
         let cov = Some(DMatrix::<f64>::identity(5, 5));
-        let (_, _, _, se_kappa) = extract_standard_errors(&cov, &template);
+        let (_, _, _, se_kappa, _) = extract_standard_errors(&cov, &template);
         let se = se_kappa.expect("se_kappa should be Some when omega_iov is set");
         assert_eq!(se.len(), 2);
         assert!((se[0] - 2.0 * 0.04).abs() < 1e-12);
@@ -12425,7 +12546,7 @@ mod extract_se_tests {
         for i in 0..n {
             cov[(i, i)] = ((i + 1) as f64).powi(2); // se_packed[i] = i + 1
         }
-        let (_, _, _, se_kappa) = extract_standard_errors(&Some(cov), &template);
+        let (_, _, _, se_kappa, _) = extract_standard_errors(&Some(cov), &template);
         let se = se_kappa.unwrap();
         // L[0,0] at idx 3 → se_packed = 4 → se_kappa[0] = 2 * 0.04 * 4 = 0.32
         assert!((se[0] - 2.0 * 0.04 * 4.0).abs() < 1e-12, "got {}", se[0]);
@@ -12439,7 +12560,7 @@ mod extract_se_tests {
     fn test_se_kappa_none_when_no_iov() {
         let template = make_template(None, vec![]);
         let cov = Some(DMatrix::<f64>::identity(3, 3));
-        let (_, _, _, se_kappa) = extract_standard_errors(&cov, &template);
+        let (_, _, _, se_kappa, _) = extract_standard_errors(&cov, &template);
         assert!(se_kappa.is_none());
     }
 
@@ -12447,7 +12568,7 @@ mod extract_se_tests {
     fn test_se_kappa_none_when_no_cov() {
         let iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
         let template = make_template(Some(iov), vec![false]);
-        let (_, _, _, se_kappa) = extract_standard_errors(&None, &template);
+        let (_, _, _, se_kappa, _) = extract_standard_errors(&None, &template);
         assert!(se_kappa.is_none());
     }
 }
@@ -12944,6 +13065,8 @@ mod simulate_with_uncertainty_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -13318,6 +13441,8 @@ mod simulate_with_uncertainty_tests {
             omega: template.omega.matrix.clone(),
             sigma: template.sigma.values.clone(),
             sigma_names: template.sigma.names.clone(),
+            residual_correlations: Vec::new(),
+            se_residual_correlations: None,
             error_model: ErrorModel::Proportional,
             covariance_matrix: Some(cov),
             se_theta: None,
@@ -14556,6 +14681,8 @@ mod multi_start_tests {
                 names: vec!["ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         }
@@ -14693,6 +14820,8 @@ mod tests_sdtab_tv_cov {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -15031,6 +15160,8 @@ mod tests_sdtab_tv_cov {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -15217,6 +15348,8 @@ mod tests_derived_session_clock {
                     names: vec!["ERR".into()],
                 },
                 sigma_fixed: vec![false],
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
             },
@@ -15612,6 +15745,8 @@ mod tests_derived_iov_kappa {
                     names: vec!["ERR".into()],
                 },
                 sigma_fixed: vec![false],
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 omega_iov: Some(OmegaMatrix::from_diagonal(&[1.0], vec!["KAPPA_CL".into()])),
                 kappa_fixed: vec![false],
             },

@@ -524,6 +524,7 @@ pub(crate) fn pop_nll(
                 &params.omega,
                 iov,
                 &params.sigma.values,
+                &params.residual_correlations,
                 interaction,
             );
         }
@@ -536,6 +537,7 @@ pub(crate) fn pop_nll(
         h_matrices,
         &params.omega,
         &params.sigma.values,
+        &params.residual_correlations,
         interaction,
     )
 }
@@ -2210,6 +2212,7 @@ fn subject_reconverged_fd_gradient(
             &ebe.h_matrix,
             &params.omega,
             &params.sigma.values,
+            &params.residual_correlations,
             options.interaction,
         )
     };
@@ -2252,6 +2255,7 @@ fn subject_reconverged_fd_gradient_iov(
             &ebe.h_matrix,
             &params.omega,
             &params.sigma.values,
+            &params.residual_correlations,
             options.interaction,
             &ebe.kappas,
             params
@@ -4300,6 +4304,8 @@ mod tests {
                 names: vec!["ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -4359,6 +4365,8 @@ mod tests {
                 names: vec!["ADD".into(), "PROP".into()],
             },
             sigma_fixed: vec![false, false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -4384,6 +4392,8 @@ mod tests {
                 names: vec!["ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(crate::types::OmegaMatrix::from_diagonal(
                 &[0.02],
                 vec!["KAPPA_CL".into()],
@@ -4428,6 +4438,8 @@ mod tests {
                 names: vec!["ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
@@ -4786,6 +4798,8 @@ mod tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -5080,6 +5094,8 @@ mod tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -5554,6 +5570,8 @@ mod tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![true],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![true],
         };

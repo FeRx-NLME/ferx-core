@@ -19,6 +19,22 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **`block_sigma` off-diagonals are now estimated, not fixed** (#847). A plain
+  `block_sigma (E1, E2) = [...]` block now estimates its off-diagonal residual
+  covariance/correlation as a free parameter (NONMEM `$SIGMA BLOCK(n)`
+  semantics), instead of pinning it at the initial correlation. The correlation
+  is optimized as a Fisher-z (`atanh ρ`) coordinate so it stays in `(-1, 1)` and
+  the 2×2 residual block stays positive-definite, and it rides the **analytic**
+  FOCE/FOCEI outer-gradient path (a closed-form ∂(−2LL)/∂ρ, not a finite-
+  difference fallback). Add `FIX` to the block to keep the previous behaviour
+  (all entries, including the off-diagonal, held fixed). The fitted full SIGMA
+  block — the estimated ρ, its standard error, and the implied covariance — is
+  reported in a `sigma_correlations:` section of the fit YAML. On the Radboudumc
+  fluconazole model this moves the fitted residual correlation and Q toward the
+  NONMEM trace (TVQ ≈ 16.8) instead of stalling at the fixed-ρ optimum. SAEM /
+  IMP / AGQ / Laplace continue to hold the off-diagonal at its initial value.
+
 ### Fixed
 - **FREM: the analytic gradients differentiated the wrong likelihood on covariate
   pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against

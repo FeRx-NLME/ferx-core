@@ -203,7 +203,15 @@ fn subject_nll(
 ) -> f64 {
     if kappas.is_empty() {
         individual_nll_into_with_schedule(
-            model, subject, theta, eta, omega, sigma, scratch, schedule,
+            model,
+            subject,
+            theta,
+            eta,
+            omega,
+            sigma,
+            &model.residual_correlations,
+            scratch,
+            schedule,
         )
     } else {
         individual_nll_iov(model, subject, theta, eta, kappas, omega, omega_iov, sigma)
@@ -1185,6 +1193,10 @@ pub fn run_bayes(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
+        // Bayes holds `block_sigma` off-diagonals at their initial correlation
+        // (the MCMC sampler does not resample residual ρ); carry them through.
+        residual_correlations: init_params.residual_correlations.clone(),
+        residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
         omega_iov: omega_iov_mean.clone(),
         kappa_fixed: init_params.kappa_fixed.clone(),
     };

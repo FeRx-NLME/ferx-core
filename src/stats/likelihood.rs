@@ -109,6 +109,7 @@ pub fn individual_nll_into(
         eta,
         omega,
         sigma_values,
+        &model.residual_correlations,
         scratch,
         None,
     )
@@ -469,6 +470,7 @@ pub fn individual_nll_into_with_schedule(
     eta: &[f64],
     omega: &OmegaMatrix,
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
@@ -525,12 +527,13 @@ pub fn individual_nll_into_with_schedule(
     let has_censored_m3 =
         matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    if !model.residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
+    if !residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
         match dense_residual_data_term(
             model,
             subject,
             &preds,
             sigma_values,
+            residual_correlations,
             ruv_scale,
             &p_obs,
             ruv_mult.as_deref(),
@@ -621,6 +624,7 @@ fn dense_residual_data_term(
     subject: &Subject,
     preds: &[f64],
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     ruv_scale: f64,
     p_obs: &[f64],
     ruv_mult: Option<&[Vec<f64>]>,
@@ -633,7 +637,7 @@ fn dense_residual_data_term(
         err_keys.as_ref(),
         subject,
         sigma_values,
-        &model.residual_correlations,
+        residual_correlations,
         ruv_mult,
     );
     if ruv_scale != 1.0 {
@@ -712,6 +716,7 @@ pub(crate) fn obs_nll_subject_from_preds(
             subject,
             preds,
             sigma_values,
+            &model.residual_correlations,
             ruv_scale,
             &[],
             ruv_mult.as_deref(),
@@ -869,6 +874,7 @@ pub fn foce_subject_nll(
     h_matrix: &DMatrix<f64>,
     omega: &OmegaMatrix,
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     interaction: bool,
 ) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
@@ -1051,7 +1057,7 @@ pub fn foce_subject_nll(
     // off-diagonal covariance. The non-interaction (Sheiner–Beal) branch carries
     // the dense R for both cases via `compute_r_matrix_with_correlations`.
     if interaction {
-        if model.residual_correlations.is_empty() {
+        if residual_correlations.is_empty() {
             foce_subject_nll_interaction(
                 subject,
                 &ipreds,
@@ -1075,7 +1081,7 @@ pub fn foce_subject_nll(
                 omega,
                 sigma_values,
                 &model.error_spec,
-                &model.residual_correlations,
+                residual_correlations,
                 &p_obs,
                 ruv_mult.as_deref(),
             )
@@ -1103,7 +1109,7 @@ pub fn foce_subject_nll(
             omega,
             sigma_values,
             &model.error_spec,
-            &model.residual_correlations,
+            residual_correlations,
             model.bloq_method,
             &p_obs,
             frem_r_override.as_deref(),
@@ -1885,6 +1891,7 @@ pub fn foce_subject_nll_iov(
     h_matrix: &DMatrix<f64>,
     omega_bsv: &OmegaMatrix,
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     interaction: bool,
     kappas: &[DVector<f64>],
     omega_iov: &OmegaMatrix,
@@ -1898,6 +1905,7 @@ pub fn foce_subject_nll_iov(
             h_matrix,
             omega_bsv,
             sigma_values,
+            residual_correlations,
             interaction,
         );
     }
@@ -2046,7 +2054,7 @@ pub fn foce_subject_nll_iov(
             &sigma_b,
             sigma_values,
             &model.error_spec,
-            &model.residual_correlations,
+            residual_correlations,
             model.bloq_method,
             &p_obs_iov,
             None,
@@ -2069,6 +2077,7 @@ pub fn foce_population_nll_iov(
     omega_bsv: &OmegaMatrix,
     omega_iov: &OmegaMatrix,
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     interaction: bool,
 ) -> f64 {
     // Compute each subject's NLL in parallel, then reduce in a fixed subject
@@ -2096,6 +2105,7 @@ pub fn foce_population_nll_iov(
                 &h_matrices[i],
                 omega_bsv,
                 sigma_values,
+                residual_correlations,
                 interaction,
                 kappas,
                 omega_iov,
@@ -2114,6 +2124,7 @@ pub fn foce_population_nll(
     h_matrices: &[DMatrix<f64>],
     omega: &OmegaMatrix,
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     interaction: bool,
 ) -> f64 {
     // Deterministic reduction: collect per-subject NLLs in subject order, then
@@ -2133,6 +2144,7 @@ pub fn foce_population_nll(
                 &h_matrices[i],
                 omega,
                 sigma_values,
+                residual_correlations,
                 interaction,
             )
         })
@@ -2498,6 +2510,8 @@ mod tests {
                     names: vec!["PROP_ERR".into()],
                 },
                 sigma_fixed: vec![false],
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
             },
@@ -2808,7 +2822,15 @@ mod tests {
         //     marginal. The OLD code added 0.5·K·log|Ω_iov| = log(1e-12) ≈ -27.6,
         //     so this assertion fails without the proper-marginal fix.
         let base = foce_subject_nll(
-            &model, &subj, &theta, &eta_hat, &h_bsv, &omega_bsv, &sigma, false,
+            &model,
+            &subj,
+            &theta,
+            &eta_hat,
+            &h_bsv,
+            &omega_bsv,
+            &sigma,
+            &model.residual_correlations,
+            false,
         );
         let zero_kappas = vec![DVector::zeros(1), DVector::zeros(1)];
         let reduced = foce_subject_nll_iov(
@@ -2819,6 +2841,7 @@ mod tests {
             &h_bsv,
             &omega_bsv,
             &sigma,
+            &model.residual_correlations,
             false,
             &zero_kappas,
             &make_omega(1e-12),
@@ -2844,6 +2867,7 @@ mod tests {
                 &h_bsv,
                 &omega_bsv,
                 &sigma,
+                &model.residual_correlations,
                 false,
                 &kappas,
                 &make_omega(iov_var),
@@ -3597,6 +3621,7 @@ mod tests {
             &h_matrix,
             &p.omega,
             &p.sigma.values,
+            &p.residual_correlations,
             true,
         );
         assert!(

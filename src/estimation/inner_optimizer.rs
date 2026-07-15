@@ -751,6 +751,7 @@ pub fn find_ebe(
             e,
             &params.omega,
             &params.sigma.values,
+            &params.residual_correlations,
             &mut scratch,
             schedule.as_ref(),
         )
@@ -3351,7 +3352,17 @@ mod tests {
         let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
         let obj = |e: &[f64]| -> f64 {
             let mut s = scratch.borrow_mut();
-            individual_nll_into_with_schedule(&model, subject, theta, e, omega, sigma, &mut s, None)
+            individual_nll_into_with_schedule(
+                &model,
+                subject,
+                theta,
+                e,
+                omega,
+                sigma,
+                &model.residual_correlations,
+                &mut s,
+                None,
+            )
         };
         let fd = gradient_fd(&obj, &eta, model.n_eta);
 
@@ -3414,7 +3425,15 @@ mod tests {
         let obj = |e: &[f64]| -> f64 {
             let mut s = scratch.borrow_mut();
             individual_nll_into_with_schedule(
-                &model, &subject, theta, e, omega, sigma, &mut s, None,
+                &model,
+                &subject,
+                theta,
+                e,
+                omega,
+                sigma,
+                &model.residual_correlations,
+                &mut s,
+                None,
             )
         };
         let fd = gradient_fd(&obj, &eta, model.n_eta);
@@ -3470,7 +3489,17 @@ mod tests {
         let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
         let obj = |e: &[f64]| -> f64 {
             let mut s = scratch.borrow_mut();
-            individual_nll_into_with_schedule(&model, subject, theta, e, omega, sigma, &mut s, None)
+            individual_nll_into_with_schedule(
+                &model,
+                subject,
+                theta,
+                e,
+                omega,
+                sigma,
+                &model.residual_correlations,
+                &mut s,
+                None,
+            )
         };
         let fd = gradient_fd(&obj, &eta, model.n_eta);
 
@@ -3537,7 +3566,15 @@ mod tests {
         let obj = |e: &[f64]| -> f64 {
             let mut s = scratch.borrow_mut();
             individual_nll_into_with_schedule(
-                &model, &subject, theta, e, omega, sigma, &mut s, None,
+                &model,
+                &subject,
+                theta,
+                e,
+                omega,
+                sigma,
+                &model.residual_correlations,
+                &mut s,
+                None,
             )
         };
         let fd = gradient_fd(&obj, &eta, model.n_eta);
@@ -3905,6 +3942,8 @@ mod tests {
                 names: vec!["RUV".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: vec![],
         };
@@ -4638,6 +4677,8 @@ mod iov_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
         };
@@ -6764,6 +6805,8 @@ mod iov_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -6909,6 +6952,8 @@ mod iov_tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };

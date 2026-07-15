@@ -41,8 +41,26 @@ const MODEL: &str = "\
   method = focei
 ";
 
-fn fit_with(gradient: GradientMethod) -> ferx_core::FitResult {
-    let mut model = parse_model_string(MODEL).expect("block_sigma model must parse");
+// Same model, but the block_sigma off-diagonal is ESTIMATED (no `FIX`) — #847.
+const MODEL_FREE: &str = "\
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.04
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+[fit_options]
+  method = focei
+";
+
+fn fit_model(src: &str, gradient: GradientMethod) -> ferx_core::FitResult {
+    let mut model = parse_model_string(src).expect("block_sigma model must parse");
     assert!(
         !model.residual_correlations.is_empty(),
         "model must carry a residual correlation"
@@ -62,6 +80,10 @@ fn fit_with(gradient: GradientMethod) -> ferx_core::FitResult {
     opts.run_covariance_step = false;
     opts.verbose = false;
     fit(&model, &population, &model.default_params, &opts).expect("block_sigma fit must succeed")
+}
+
+fn fit_with(gradient: GradientMethod) -> ferx_core::FitResult {
+    fit_model(MODEL, gradient)
 }
 
 /// The analytic dense-R FOCEI gradient converges to the same basin as the
@@ -107,4 +129,57 @@ fn dense_residual_analytic_and_fd_fits_agree() {
             fd.theta[k]
         );
     }
+}
+
+/// #847 end-to-end: with the `block_sigma` off-diagonal **estimated** (no `FIX`),
+/// the fit must (a) actually move ρ off its initial 0.5, (b) reach an OFV no worse
+/// than the FIX-ρ fit (an extra free parameter cannot worsen the optimum), and
+/// (c) converge to the same optimum on the analytic and finite-difference gradient
+/// paths — i.e. the closed-form ∂/∂ρ is correct end-to-end, not just per-coordinate.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn block_sigma_offdiag_is_estimated_and_analytic_matches_fd() {
+    let analytic = fit_model(MODEL_FREE, GradientMethod::Auto);
+    let fd = fit_model(MODEL_FREE, GradientMethod::Fd);
+    let fixed = fit_with(GradientMethod::Auto); // FIX-ρ reference (init ρ = 0.5)
+
+    // (a) ρ is a real free parameter: reported, finite, and moved off the init.
+    assert_eq!(analytic.residual_correlations.len(), 1);
+    let rho = analytic.residual_correlations[0].rho;
+    assert!(
+        rho.is_finite() && rho.abs() < 1.0,
+        "ρ must stay in (-1,1): {rho}"
+    );
+    assert!(
+        (rho - 0.5).abs() > 1e-3,
+        "estimated ρ {rho} should move off the initial 0.5"
+    );
+
+    // (b) estimating the off-diagonal cannot worsen the optimum vs holding it fixed.
+    assert!(
+        analytic.ofv <= fixed.ofv + 1e-2,
+        "free-ρ OFV {} should be ≤ fixed-ρ OFV {}",
+        analytic.ofv,
+        fixed.ofv
+    );
+
+    // (c) the analytic ∂/∂ρ path lands in the same OFV basin as reconverged FD.
+    // (Per-coordinate ∂/∂ρ equality is pinned separately by the fast unit test
+    // `population_packed_gradient_block_sigma_matches_fd`; ρ itself is only weakly
+    // identified on this flat 2-subject surface, so the OFV — not ρ — is compared.)
+    assert!(
+        analytic.ofv.is_finite() && fd.ofv.is_finite(),
+        "both OFVs finite: analytic {}, fd {}",
+        analytic.ofv,
+        fd.ofv
+    );
+    assert!(
+        (analytic.ofv - fd.ofv).abs() < 0.1,
+        "analytic OFV {} vs FD OFV {} land in different basins",
+        analytic.ofv,
+        fd.ofv
+    );
 }

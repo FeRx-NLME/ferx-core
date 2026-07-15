@@ -276,6 +276,7 @@ impl Stack {
                 b,
                 &params.omega,
                 &params.sigma.values,
+                &params.residual_correlations,
                 scratch,
                 schedule,
             );
@@ -1751,6 +1752,7 @@ mod tests {
                     e,
                     &params.omega,
                     &params.sigma.values,
+                    &params.residual_correlations,
                     s,
                     None,
                 )

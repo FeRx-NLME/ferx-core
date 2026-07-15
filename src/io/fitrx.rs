@@ -1675,6 +1675,10 @@ fn wire_to_fit_result(
         omega,
         sigma: w.sigma.estimates,
         sigma_names: w.sigma.names,
+        // The fitrx wire format does not yet carry estimated block_sigma
+        // off-diagonals; a round-tripped fit reports none.
+        residual_correlations: Vec::new(),
+        se_residual_correlations: None,
         error_model: error_model_from_str(&w.error_model)?,
         covariance_matrix,
         se_theta: w.theta.se,
@@ -1890,6 +1894,8 @@ mod tests {
             omega: DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]),
             sigma: vec![0.05],
             sigma_names: vec!["prop".into()],
+            residual_correlations: Vec::new(),
+            se_residual_correlations: None,
             error_model: ErrorModel::Proportional,
             covariance_matrix: Some(DMatrix::<f64>::identity(3, 3)),
             se_theta: Some(vec![0.01, 0.02, 0.005]),

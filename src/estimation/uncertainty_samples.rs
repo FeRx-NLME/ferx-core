@@ -79,8 +79,26 @@ pub fn fitted_params_from_result(
             names: fit_result.sigma_names.clone(),
         },
         sigma_fixed: fit_result.sigma_fixed.clone(),
+        // Estimated `block_sigma` off-diagonals (final ρ) come from the fit;
+        // the template supplies the pair structure and FIX flags.
+        residual_correlations: fit_result_residual_correlations(fit_result, template),
+        residual_correlation_fixed: template.residual_correlation_fixed.clone(),
         omega_iov,
         kappa_fixed: fit_result.kappa_fixed.clone(),
+    }
+}
+
+/// Final residual correlations for uncertainty sampling: prefer the fitted ρ
+/// (`FitResult.residual_correlations`) and fall back to the template's initial
+/// pairs when a fit predates the field (keeps the pair structure/indices intact).
+fn fit_result_residual_correlations(
+    fit_result: &crate::types::FitResult,
+    template: &ModelParameters,
+) -> Vec<crate::types::ResidualCorrelation> {
+    if fit_result.residual_correlations.len() == template.residual_correlations.len() {
+        fit_result.residual_correlations.clone()
+    } else {
+        template.residual_correlations.clone()
     }
 }
 
@@ -318,6 +336,8 @@ mod tests {
                 names: vec!["prop_err".to_string()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         }
@@ -342,6 +362,8 @@ mod tests {
             omega: template.omega.matrix.clone(),
             sigma: template.sigma.values.clone(),
             sigma_names: template.sigma.names.clone(),
+            residual_correlations: Vec::new(),
+            se_residual_correlations: None,
             error_model: ErrorModel::Proportional,
             covariance_matrix: Some(cov),
             se_theta: None,

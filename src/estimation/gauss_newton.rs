@@ -1967,6 +1967,7 @@ fn subject_nll_at(
                 h_matrix,
                 &params.omega,
                 &params.sigma.values,
+                &params.residual_correlations,
                 options.interaction,
                 kappas,
                 iov,
@@ -1982,6 +1983,7 @@ fn subject_nll_at(
         h_matrix,
         &params.omega,
         &params.sigma.values,
+        &params.residual_correlations,
         options.interaction,
     )
 }
@@ -2012,6 +2014,8 @@ mod tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -3019,6 +3023,8 @@ mod tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -3306,6 +3312,8 @@ mod tests {
                 names: vec!["PROP_ERR".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
         };
@@ -3458,6 +3466,7 @@ mod tests {
                     &h_mats[0],
                     &p.omega,
                     &p.sigma.values,
+                    &p.residual_correlations,
                     options.interaction,
                     &kappas_all[0],
                     iov,

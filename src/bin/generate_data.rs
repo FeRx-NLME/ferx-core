@@ -174,6 +174,8 @@ fn build_warfarin_model() -> CompiledModel {
         omega_fixed: vec![false; 3],
         sigma,
         sigma_fixed: vec![false; 1],
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         omega_iov: None,
         kappa_fixed: Vec::new(),
     };
@@ -272,6 +274,8 @@ fn build_warfarin_true_params() -> ModelParameters {
             names: vec!["PROP_ERR".into()],
         },
         sigma_fixed: vec![false; 1],
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         omega_iov: None,
         kappa_fixed: Vec::new(),
     }
@@ -303,6 +307,8 @@ fn generate_two_cpt_iv() {
         omega_fixed: vec![false; 4],
         sigma,
         sigma_fixed: vec![false; 1],
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         omega_iov: None,
         kappa_fixed: Vec::new(),
     };
@@ -425,6 +431,8 @@ fn generate_two_cpt_oral_cov() {
         omega_fixed: vec![false; 5],
         sigma,
         sigma_fixed: vec![false; 1],
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         omega_iov: None,
         kappa_fixed: Vec::new(),
     };
@@ -611,6 +619,8 @@ fn generate_mm_oral() {
         omega_fixed: vec![false; 2],
         sigma,
         sigma_fixed: vec![false; 1],
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         omega_iov: None,
         kappa_fixed: Vec::new(),
     };

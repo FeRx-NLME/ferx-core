@@ -287,7 +287,7 @@ pub fn run_covariance(
     let covariance_wall_time_secs = cov_timer.elapsed().as_secs_f64();
 
     // --- Build the refreshed FitResult ------------------------------------
-    let (se_theta, se_omega, se_sigma, se_kappa) =
+    let (se_theta, se_omega, se_sigma, se_kappa, se_residual_correlations) =
         extract_standard_errors(&covariance_matrix, &params);
     let (cov_eigenvalues, cov_condition_number) = cov_diagnostics(covariance_matrix.as_ref());
     // Bayesian fits never run a Hessian covariance step; guard so a covariance
@@ -301,6 +301,7 @@ pub fn run_covariance(
     out.se_omega = se_omega;
     out.se_sigma = se_sigma;
     out.se_kappa = se_kappa;
+    out.se_residual_correlations = se_residual_correlations;
     out.cov_eigenvalues = cov_eigenvalues;
     out.cov_condition_number = cov_condition_number;
     out.covariance_status = covariance_status;

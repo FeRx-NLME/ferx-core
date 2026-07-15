@@ -1,4 +1,4 @@
-use crate::types::{CompiledModel, ModelParameters, OmegaMatrix, SigmaVector};
+use crate::types::{CompiledModel, ModelParameters, OmegaMatrix, ResidualCorrelation, SigmaVector};
 use nalgebra::DMatrix;
 
 /// Bounds for the packed parameter vector
@@ -28,6 +28,28 @@ pub struct PackedBounds {
 #[inline]
 pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
     theta_lower >= 0.0
+}
+
+/// Unconstrained-space bound for a Fisher-z (`atanh`) residual-correlation
+/// coordinate. `tanh(6) ≈ 0.99998`, so a `block_sigma` off-diagonal ρ stays
+/// strictly inside `(-1, 1)` — every 2×2 residual block stays positive-definite
+/// while the optimizer works on an unbounded coordinate.
+pub(crate) const RHO_Z_BOUND: f64 = 6.0;
+
+/// Pack a residual correlation ρ ∈ (-1, 1) as its Fisher-z coordinate
+/// `atanh(ρ)`, clamped to `[-RHO_Z_BOUND, RHO_Z_BOUND]`. The pre-clamp on ρ
+/// keeps `atanh` finite if a parsed init sits exactly at ±1.
+#[inline]
+pub(crate) fn pack_rho(rho: f64) -> f64 {
+    rho.clamp(-0.999_999, 0.999_999)
+        .atanh()
+        .clamp(-RHO_Z_BOUND, RHO_Z_BOUND)
+}
+
+/// Inverse of [`pack_rho`]: map a Fisher-z coordinate back to ρ = `tanh(z)`.
+#[inline]
+pub(crate) fn unpack_rho(z: f64) -> f64 {
+    z.tanh()
 }
 
 /// Pack ModelParameters into a flat unconstrained vector for optimization.
@@ -95,6 +117,13 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
                 }
             }
         }
+    }
+
+    // Residual correlations (`block_sigma` off-diagonals): Fisher-z `atanh(ρ)`,
+    // appended last so the θ/Ω/σ/Ω_IOV layout every other caller relies on is
+    // unchanged. FIX blocks are pinned by `compute_bounds` (lower == upper).
+    for corr in &params.residual_correlations {
+        v.push(pack_rho(corr.rho));
     }
 
     v
@@ -196,6 +225,22 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         None
     };
 
+    // Residual correlations: reconstruct each pair from the template (indices
+    // never change) with ρ = tanh(z) from the packed Fisher-z coordinate.
+    let residual_correlations: Vec<ResidualCorrelation> = template
+        .residual_correlations
+        .iter()
+        .map(|c| {
+            let rho = unpack_rho(v[idx]);
+            idx += 1;
+            ResidualCorrelation {
+                sigma_i: c.sigma_i,
+                sigma_j: c.sigma_j,
+                rho,
+            }
+        })
+        .collect();
+
     ModelParameters {
         theta,
         theta_names: template.theta_names.clone(),
@@ -206,6 +251,8 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         omega_fixed: template.omega_fixed.clone(),
         sigma,
         sigma_fixed: template.sigma_fixed.clone(),
+        residual_correlations,
+        residual_correlation_fixed: template.residual_correlation_fixed.clone(),
         omega_iov,
         kappa_fixed: template.kappa_fixed.clone(),
     }
@@ -265,6 +312,11 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
                 }
             }
         }
+    }
+
+    // Residual correlations: `FIX`-ed `block_sigma` off-diagonals are pinned.
+    for &f in &template.residual_correlation_fixed {
+        mask.push(f);
     }
 
     mask
@@ -334,7 +386,8 @@ pub fn packed_len(template: &ModelParameters) -> usize {
             d * (d + 1) / 2
         }
     });
-    n_theta + n_omega + n_sigma + n_iov
+    let n_corr = template.residual_correlations.len();
+    n_theta + n_omega + n_sigma + n_iov + n_corr
 }
 
 /// Compute box constraints for the packed parameter vector.
@@ -418,6 +471,13 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
         }
     }
 
+    // Residual-correlation (Fisher-z) bounds. `[-RHO_Z_BOUND, RHO_Z_BOUND]` keeps
+    // ρ = tanh(z) strictly inside (-1, 1) so every 2×2 residual block stays PD.
+    for _ in 0..template.residual_correlations.len() {
+        lower.push(-RHO_Z_BOUND);
+        upper.push(RHO_Z_BOUND);
+    }
+
     // Pin any FIX parameters to their packed (log-space) initial value.
     // We pack first, then overwrite lower=upper=packed[i] for fixed indices.
     // Pack-before-overwrite is correct even for block Cholesky off-diagonals,
@@ -456,6 +516,16 @@ pub fn coordinate_names(params: &ModelParameters) -> Vec<String> {
     }
     if let Some(ref iov) = params.omega_iov {
         push_omega_names(&mut names, iov);
+    }
+    // Residual correlations couple two sigma terms: `SIGMA(i,j)` (NONMEM-style),
+    // or `EPS_i~EPS_j` when both sigma names are declared.
+    for c in &params.residual_correlations {
+        let ni = params.sigma.names.get(c.sigma_i).filter(|s| !s.is_empty());
+        let nj = params.sigma.names.get(c.sigma_j).filter(|s| !s.is_empty());
+        match (ni, nj) {
+            (Some(a), Some(b)) => names.push(format!("{}~{}", a, b)),
+            _ => names.push(format!("SIGMA({},{})", c.sigma_i + 1, c.sigma_j + 1)),
+        }
     }
     names
 }
@@ -498,13 +568,19 @@ fn push_omega_names(names: &mut Vec<String>, om: &OmegaMatrix) {
 /// (diagonal) / covariances (off-diagonal), sigma are variances. This is the
 /// back-transformed space the trace's `val:*` columns report.
 pub fn coordinate_values(params: &ModelParameters) -> Vec<f64> {
-    coordinate_values_raw(
+    let mut v = coordinate_values_raw(
         &params.theta,
         &params.omega.matrix,
         params.omega.diagonal,
         &params.sigma.values,
         params.omega_iov.as_ref().map(|m| (&m.matrix, m.diagonal)),
-    )
+    );
+    // Residual correlations report on their natural (ρ) scale, mirroring the
+    // Fisher-z coordinate order appended by `pack_params`.
+    for c in &params.residual_correlations {
+        v.push(c.rho);
+    }
+    v
 }
 
 /// Assemble the natural-scale coordinate vector directly from raw pieces, for
@@ -637,6 +713,8 @@ mod tests {
             omega_fixed: vec![false; 2],
             sigma,
             sigma_fixed: vec![false; 1],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         }
@@ -683,6 +761,71 @@ mod tests {
         }
     }
 
+    /// #847: a residual correlation packs as `atanh(ρ)` and round-trips through
+    /// `tanh`, growing the packed vector by one free slot per off-diagonal.
+    #[test]
+    fn test_pack_unpack_rho_round_trip() {
+        let mut template = make_template();
+        template.sigma = SigmaVector {
+            values: vec![0.3, 1.0],
+            names: vec!["prop".into(), "add".into()],
+        };
+        template.sigma_fixed = vec![false; 2];
+        template.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.62,
+        }];
+        template.residual_correlation_fixed = vec![false];
+
+        // 2 theta + 2 omega + 2 sigma + 1 rho = 7.
+        assert_eq!(packed_len(&template), 7);
+        let packed = pack_params(&template);
+        assert_eq!(packed.len(), 7);
+        // Last coordinate is the Fisher-z transform of ρ.
+        assert_relative_eq!(packed[6], 0.62_f64.atanh(), epsilon = 1e-12);
+
+        let recovered = unpack_params(&packed, &template);
+        assert_eq!(recovered.residual_correlations.len(), 1);
+        assert_eq!(recovered.residual_correlations[0].sigma_i, 1);
+        assert_eq!(recovered.residual_correlations[0].sigma_j, 0);
+        assert_relative_eq!(recovered.residual_correlations[0].rho, 0.62, epsilon = 1e-9);
+        // Free (non-FIX) → bounds are the open Fisher-z interval, not pinned.
+        let bounds = compute_bounds(&template);
+        assert!(bounds.lower[6] < bounds.upper[6]);
+
+        // Trace name / value vectors carry the ρ coordinate last, on its natural scale.
+        let names = coordinate_names(&template);
+        assert_eq!(names.len(), 7);
+        assert_eq!(names[6], "add~prop");
+        let vals = coordinate_values(&template);
+        assert_eq!(vals.len(), 7);
+        assert_relative_eq!(vals[6], 0.62, epsilon = 1e-12);
+    }
+
+    /// A `FIX`ed residual correlation is pinned by `compute_bounds`
+    /// (lower == upper) and flagged in `packed_fixed_mask`.
+    #[test]
+    fn test_fixed_rho_is_pinned() {
+        let mut template = make_template();
+        template.sigma = SigmaVector {
+            values: vec![0.3, 1.0],
+            names: vec!["prop".into(), "add".into()],
+        };
+        template.sigma_fixed = vec![false; 2];
+        template.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        template.residual_correlation_fixed = vec![true];
+
+        let mask = packed_fixed_mask(&template);
+        assert!(mask[6], "fixed rho must be masked");
+        let bounds = compute_bounds(&template);
+        assert_relative_eq!(bounds.lower[6], bounds.upper[6], epsilon = 1e-12);
+    }
+
     #[test]
     fn test_pack_values_are_log_transformed() {
         let template = make_template();
@@ -721,6 +864,8 @@ mod tests {
             omega_fixed: vec![false; 1],
             sigma,
             sigma_fixed: vec![false; 1],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -811,6 +956,8 @@ mod tests {
             omega_fixed: vec![false; 2],
             sigma,
             sigma_fixed: vec![false; 1],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         }
@@ -866,6 +1013,8 @@ mod tests {
                 names: vec!["s".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -921,6 +1070,8 @@ mod tests {
                 names: vec!["s".into()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(make_block_plus_diag_omega()),
             kappa_fixed: vec![false, false, false],
         };
@@ -1041,6 +1192,8 @@ mod tests {
                 names: vec![String::new()],
             },
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -1121,6 +1274,8 @@ mod tests {
             omega_fixed: vec![false; 3],
             sigma,
             sigma_fixed: vec![false; 1],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
@@ -1413,6 +1568,8 @@ mod tests {
             omega_fixed: vec![false],
             sigma,
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
         }
@@ -1566,6 +1723,8 @@ mod tests {
             omega_fixed: vec![false],
             sigma,
             sigma_fixed: vec![false],
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false, false],
         }
