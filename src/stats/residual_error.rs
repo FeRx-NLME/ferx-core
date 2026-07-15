@@ -42,6 +42,84 @@ pub fn compute_r_diag(
         .collect()
 }
 
+/// `true` when no two observations can share a correlated residual block, so the
+/// subject's residual covariance `R` (and `∂R/∂f`, `∂²R/∂f²`) is strictly
+/// diagonal for *any* parameter values. O(n): a repeated `L2` group id, or a
+/// repeated `(time, occasion)` among ungrouped (`L2 == 0`) rows, is the only way
+/// [`same_residual_block`] can pair two rows — so all-distinct keys ⇒ no pairs ⇒
+/// no cross-covariance.
+///
+/// This is a data-static superset of "`R` is diagonal": it may return `false`
+/// for a subject whose rows share a block but no correlation (then the caller
+/// falls back to the dense path — correct, just not the fast path), and never
+/// returns `true` when an off-diagonal could exist. Combined-error `block_sigma`
+/// at distinct observation times is the common `true` case, letting the
+/// objective and gradients skip the dense Cholesky and the O(n³) `∂R` tensors.
+pub fn residual_is_diagonal(obs_times: &[f64], occasions: &[u32], obs_l2: &[i64]) -> bool {
+    use std::collections::HashSet;
+    let n = obs_times.len();
+    let mut l2_seen: HashSet<i64> = HashSet::new();
+    let mut to_seen: HashSet<(u64, u32)> = HashSet::new();
+    for j in 0..n {
+        let l2 = obs_l2.get(j).copied().unwrap_or(0);
+        if l2 != 0 {
+            if !l2_seen.insert(l2) {
+                return false;
+            }
+        } else {
+            let key = (
+                observation_time_key(obs_times, j),
+                observation_occasion_key(occasions, j),
+            );
+            if !to_seen.insert(key) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Diagonal of `∂R/∂f` — only `∂R_mm/∂f_m` per observation, O(n). Bit-identical
+/// to `compute_dr_df_matrices(..)[m][(m,m)]`, but without that function's
+/// `vec![DMatrix::zeros(n,n); n]` O(n³) allocation. Valid to use in place of the
+/// dense builder exactly when [`residual_is_diagonal`] holds (no cross terms).
+pub fn compute_dr_df_diag(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<f64> {
+    let n = ipreds.len();
+    let empty: Vec<f64> = Vec::new();
+    let mrow = |j: usize| -> &[f64] {
+        mult.and_then(|m| m.get(j))
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty)
+    };
+    let m_at = |j: usize, idx: usize| -> f64 { mrow(j).get(idx).copied().unwrap_or(1.0) };
+    let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
+    (0..n)
+        .map(|j| {
+            let vload: Vec<(usize, f64)> = error_spec
+                .sigma_loadings(cmt_at(j), ipreds[j], sigma_values.len())
+                .into_iter()
+                .map(|(idx, c)| (idx, c * m_at(j, idx)))
+                .collect();
+            if vload.is_empty() {
+                return 0.0;
+            }
+            let sload: Vec<(usize, f64)> = error_spec
+                .sigma_loading_slopes(cmt_at(j), sigma_values.len())
+                .into_iter()
+                .map(|(idx, s)| (idx, s * m_at(j, idx)))
+                .collect();
+            diag_self_deriv(&vload, &sload, sigma_values, correlations)
+        })
+        .collect()
+}
+
 /// Compute residual variances including fixed residual correlations from
 /// `block_sigma`.
 pub fn compute_r_diag_with_correlations(
@@ -865,6 +943,51 @@ mod tests {
     fn test_additive_variance() {
         let v = residual_variance(ErrorModel::Additive, 10.0, &[0.5]);
         assert_relative_eq!(v, 0.25, epsilon = 1e-12);
+    }
+
+    /// #847 perf gate: distinct observation times/occasions ⇒ R is diagonal; a
+    /// repeated (time, occasion) or a repeated L2 group ⇒ pairing possible.
+    #[test]
+    fn test_residual_is_diagonal_detects_pairing() {
+        // Distinct times, no L2 → diagonal.
+        assert!(residual_is_diagonal(&[0.5, 1.0, 2.0], &[0, 0, 0], &[]));
+        // Two rows share (time, occasion) → not diagonal (may pair).
+        assert!(!residual_is_diagonal(&[1.0, 1.0, 2.0], &[0, 0, 0], &[]));
+        // Same time but different occasion → distinct blocks → diagonal.
+        assert!(residual_is_diagonal(&[1.0, 1.0], &[0, 1], &[]));
+        // Repeated nonzero L2 id → not diagonal.
+        assert!(!residual_is_diagonal(&[0.5, 2.0], &[0, 0], &[7, 7]));
+        // Distinct L2 ids (singleton groups) → diagonal.
+        assert!(residual_is_diagonal(&[0.5, 2.0], &[0, 0], &[7, 8]));
+    }
+
+    /// [`compute_dr_df_diag`] equals the diagonal of the dense
+    /// [`compute_dr_df_matrices`], bit-for-bit — it is the O(n) drop-in the
+    /// gradient/objective use when [`residual_is_diagonal`].
+    #[test]
+    fn test_compute_dr_df_diag_matches_dense_diagonal() {
+        use crate::types::ResidualCorrelation;
+        let es = ErrorSpec::Single(ErrorModel::Combined); // PROP (slot 0) + ADD (slot 1)
+        let ipreds = [1.5_f64, 4.0, 8.0];
+        let cmts = [0usize, 0, 0];
+        let sigma = [0.2_f64, 1.0];
+        let corr = [ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        let dense =
+            compute_dr_df_matrices(&es, &ipreds, &cmts, &[], &[], &[], &[], &sigma, &corr, None);
+        let diag = compute_dr_df_diag(&es, &ipreds, &cmts, &sigma, &corr, None);
+        assert_eq!(diag.len(), 3);
+        for m in 0..3 {
+            assert!(
+                diag[m].to_bits() == dense[m][(m, m)].to_bits(),
+                "row {m}: diag {} != dense {}",
+                diag[m],
+                dense[m][(m, m)]
+            );
+        }
     }
 
     #[test]

@@ -2068,6 +2068,61 @@ fn dense_residual_inner_gradient(
     let err_keys = model.error_spec.obs_keys(subject);
     // Per-observation custom residual magnitude (#484); η-independent, matches the marginal.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
+
+    // Diagonal-R fast path (#847 perf): the common combined-error `block_sigma`
+    // leaves R diagonal (no cross-observation pairing), so R⁻¹, the Cholesky, and
+    // the per-observation `∂R/∂f` matrices are all diagonal. Computing them densely
+    // was O(n³) per inner step (n = obs/subject) — 2–3 orders of magnitude on
+    // richly-sampled subjects. Here the same assembly collapses to O(n·n_eta):
+    // `M_k = R⁻¹ ∂R/∂η_k` is diagonal, so `tr(M_k)` and `sᵀ∂R/∂η_k s` are scalar
+    // sums. Algebraically identical to the dense branch below (verified against it
+    // and against FD by the inner-gradient tests).
+    if crate::stats::residual_error::residual_is_diagonal(
+        &subject.obs_times,
+        &subject.occasions,
+        &subject.obs_l2,
+    ) {
+        let rv = crate::stats::residual_error::compute_r_diag_with_correlations(
+            &model.error_spec,
+            &ipreds,
+            err_keys.as_ref(),
+            sigma,
+            corr,
+        );
+        let dv = crate::stats::residual_error::compute_dr_df_diag(
+            &model.error_spec,
+            &ipreds,
+            err_keys.as_ref(),
+            sigma,
+            corr,
+            ruv_mult.as_deref(),
+        );
+        let mut s = vec![0.0f64; n_obs]; // R⁻¹ r
+        let mut rinv = vec![0.0f64; n_obs]; // diag(R⁻¹)
+        for m in 0..n_obs {
+            if rv[m] <= 0.0 || rv[m].is_nan() {
+                return None; // non-PD, exactly where the dense Cholesky would fail
+            }
+            rinv[m] = 1.0 / rv[m];
+            s[m] = (subject.observations[m] - ipreds[m]) * rinv[m];
+        }
+        let mut grad = vec![0.0f64; n_eta];
+        for k in 0..n_eta {
+            let mut term_a = 0.0;
+            let mut tr_mk = 0.0;
+            let mut quad = 0.0;
+            for m in 0..n_obs {
+                let h = sens[m].df_deta[k];
+                term_a += h * s[m];
+                let dr_k_mm = h * dv[m]; // (∂R/∂η_k)_mm
+                tr_mk += rinv[m] * dr_k_mm;
+                quad += s[m] * (dr_k_mm * s[m]);
+            }
+            grad[k] = -term_a + 0.5 * (tr_mk - quad) + prior[k];
+        }
+        return Some(grad);
+    }
+
     let r = match ruv_mult.as_deref() {
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             &model.error_spec,

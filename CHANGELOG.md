@@ -35,6 +35,18 @@ section of the SDLC for the versioning policy).
   NONMEM trace (TVQ ≈ 16.8) instead of stalling at the fixed-ρ optimum. SAEM /
   IMP / AGQ / Laplace continue to hold the off-diagonal at its initial value.
 
+### Performance
+- **`block_sigma` fits with a diagonal residual `R` are no longer O(n³) per
+  evaluation** (#847). A `combined`-error `block_sigma` at distinct observation
+  times leaves the subject residual covariance `R` diagonal, but the inner
+  objective, inner gradient, and FOCEI marginal all built and factored a dense
+  `n×n` `R` (and, in the gradient, `n` dense `n×n` `∂R/∂f` matrices) — O(n³) per
+  inner BFGS step, 2–3 orders of magnitude on richly-sampled subjects. These now
+  detect the diagonal case (`residual_is_diagonal`, O(n) and data-static) and use
+  closed-form O(n) diagonal assembly instead of dense Cholesky / inverse / `∂R`
+  tensors. Results are unchanged (bit-for-bit for the data term). Cross-endpoint
+  (paired total/unbound) blocks with genuine off-diagonal `R` keep the dense path.
+
 ### Fixed
 - **FREM: the analytic gradients differentiated the wrong likelihood on covariate
   pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against

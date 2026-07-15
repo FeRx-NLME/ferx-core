@@ -631,6 +631,49 @@ fn dense_residual_data_term(
 ) -> Option<f64> {
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
+
+    // Diagonal-R fast path (#847 perf): when no two observations can pair
+    // (`residual_is_diagonal`), skip building the dense n×n R and its Cholesky
+    // entirely — O(n) instead of O(n²)+O(n³). Only for the unscaled diagonal
+    // builder (`ruv_mult` is None, which holds for every `block_sigma` model —
+    // custom residual magnitude is mutually exclusive). Bit-for-bit identical to
+    // the dense branch: same per-row variance (`variance_at_with_correlations`),
+    // same `× ruv_scale` then `+ p_obs` order, same `√`-based solve as
+    // `quad_form_plus_logdet` performs on a diagonal R.
+    if ruv_mult.is_none()
+        && crate::stats::residual_error::residual_is_diagonal(
+            &subject.obs_times,
+            &subject.occasions,
+            &subject.obs_l2,
+        )
+    {
+        let rv = crate::stats::residual_error::compute_r_diag_with_correlations(
+            &model.error_spec,
+            preds,
+            err_keys.as_ref(),
+            sigma_values,
+            residual_correlations,
+        );
+        let mut quad = 0.0;
+        let mut ld = 0.0;
+        for j in 0..rv.len() {
+            let mut rjj = rv[j];
+            if ruv_scale != 1.0 {
+                rjj *= ruv_scale;
+            }
+            rjj += p_obs.get(j).copied().unwrap_or(0.0);
+            let ljj = rjj.sqrt();
+            if ljj <= 0.0 || ljj.is_nan() {
+                return None;
+            }
+            let resid = subject.observations[j] - preds[j];
+            let solved = (resid / ljj) / ljj;
+            quad += resid * solved;
+            ld += ljj.ln();
+        }
+        return Some(quad + 2.0 * ld);
+    }
+
     let mut r = crate::stats::residual_error::r_matrix_maybe_scaled(
         &model.error_spec,
         preds,
@@ -648,7 +691,6 @@ fn dense_residual_data_term(
             r[(j, j)] += *v;
         }
     }
-    let chol = r.cholesky()?;
     let residuals = DVector::from_iterator(
         subject.observations.len(),
         subject
@@ -657,8 +699,7 @@ fn dense_residual_data_term(
             .zip(preds.iter())
             .map(|(&y, &f)| y - f),
     );
-    let solved = chol.solve(&residuals);
-    Some(residuals.dot(&solved) + chol_log_det(&chol.l()))
+    quad_form_plus_logdet(&r, &residuals)
 }
 
 /// Observation-only NLL for a single subject with ETAs held fixed.
@@ -1450,6 +1491,77 @@ pub fn foce_subject_nll_interaction_dense(
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = error_spec.obs_keys(subject);
 
+    // Diagonal-R fast path (#847 perf): the FOCEI marginal is O(n³) (dense
+    // Cholesky, R⁻¹, per-η ∂R/∂η matrices, tr(M_k M_l)) but collapses to
+    // O(n·n_eta²) when R is diagonal (the common combined-error `block_sigma`).
+    // `R⁻¹`, `∂R/∂η_k`, and `M_k = R⁻¹∂R/∂η_k` are all diagonal, so `term1` and
+    // the interaction `B` become scalar sums. `ruv_mult` is None for every
+    // `block_sigma` model (custom magnitude is mutually exclusive).
+    if ruv_mult.is_none()
+        && crate::stats::residual_error::residual_is_diagonal(
+            &subject.obs_times,
+            &subject.occasions,
+            &subject.obs_l2,
+        )
+    {
+        let rv = crate::stats::residual_error::compute_r_diag_with_correlations(
+            error_spec,
+            ipreds,
+            err_keys.as_ref(),
+            sigma_values,
+            correlations,
+        );
+        let dv = crate::stats::residual_error::compute_dr_df_diag(
+            error_spec,
+            ipreds,
+            err_keys.as_ref(),
+            sigma_values,
+            correlations,
+            None,
+        );
+        let mut rinv = vec![0.0f64; n_obs]; // diag(R⁻¹)
+        let mut data_ll = 0.0;
+        for m in 0..n_obs {
+            let rjj = rv[m] + p_obs.get(m).copied().unwrap_or(0.0);
+            let ljj = rjj.sqrt();
+            if ljj <= 0.0 || ljj.is_nan() {
+                return 1e20;
+            }
+            rinv[m] = 1.0 / rjj;
+            let resid = subject.observations[m] - ipreds[m];
+            data_ll += resid * (resid / rjj);
+            data_ll += 2.0 * ljj.ln();
+        }
+        // M_k[m,m] = R⁻¹_mm · (∂R/∂η_k)_mm = rinv_m · H[m,k]·dv_m.
+        let mk: Vec<Vec<f64>> = (0..n_eta)
+            .map(|k| {
+                (0..n_obs)
+                    .map(|m| rinv[m] * (h_matrix[(m, k)] * dv[m]))
+                    .collect::<Vec<f64>>()
+            })
+            .collect();
+        let mut htilde = omega.inv.clone();
+        for k in 0..n_eta {
+            for l in 0..n_eta {
+                // term1_{kl} = Σ_m H[m,k]·R⁻¹_mm·H[m,l].
+                let mut t1 = 0.0;
+                // B_{kl} = tr(M_k M_l) = Σ_m M_k[m,m]·M_l[m,m] (diagonal).
+                let mut bkl = 0.0;
+                for m in 0..n_obs {
+                    t1 += h_matrix[(m, k)] * rinv[m] * h_matrix[(m, l)];
+                    bkl += mk[k][m] * mk[l][m];
+                }
+                htilde[(k, l)] += t1 + 0.5 * bkl;
+            }
+        }
+        let log_det_htilde = match htilde.cholesky() {
+            Some(c) => chol_log_det(&c.l()),
+            None => return 1e20,
+        };
+        let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+        return 0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde);
+    }
+
     // Dense R at η̂ (+ SDE process noise on the diagonal), assembled exactly as
     // the data term and FOCE-standard path assemble it.
     let mut r = crate::stats::residual_error::r_matrix_maybe_scaled(
@@ -1852,6 +1964,52 @@ pub(crate) fn chol_log_det(l: &DMatrix<f64>) -> f64 {
         }
     }
     2.0 * ld
+}
+
+/// `true` when `r`'s off-diagonal entries are all exactly zero. Cross-observation
+/// residual covariance (`block_sigma` paired total/unbound rows sharing a
+/// time/occasion/L2 block) is the *only* thing that writes a nonzero off-diagonal
+/// (`fill_cross_covariances`); a `combined`-error `block_sigma` at distinct
+/// observation times leaves `R` diagonal, so this is the common case.
+fn r_is_diagonal(r: &DMatrix<f64>) -> bool {
+    let n = r.nrows();
+    for a in 0..n {
+        for b in (a + 1)..n {
+            if r[(a, b)] != 0.0 || r[(b, a)] != 0.0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The dense residual data term `rᵀR⁻¹r + log|R|`, but O(n) instead of O(n³) when
+/// `R` is diagonal — the usual `block_sigma` combined-error case, where the dense
+/// Cholesky was pure waste (2–3 orders of magnitude on subjects with many
+/// observations). The diagonal branch is **bit-for-bit** identical to
+/// `r.cholesky()` on a diagonal `R`: nalgebra factors it as `L = diag(√Rⱼⱼ)` and
+/// solves by two divisions per row, so `solveⱼ = (rⱼ/√Rⱼⱼ)/√Rⱼⱼ` and
+/// `log|R| = 2·Σ ln√Rⱼⱼ` reproduce the exact same rounding. Returns `None`
+/// (non-PD) exactly where `cholesky()` would.
+fn quad_form_plus_logdet(r: &DMatrix<f64>, residuals: &DVector<f64>) -> Option<f64> {
+    if r_is_diagonal(r) {
+        let n = r.nrows();
+        let mut quad = 0.0;
+        let mut ld = 0.0;
+        for j in 0..n {
+            let ljj = r[(j, j)].sqrt();
+            if ljj <= 0.0 || ljj.is_nan() {
+                return None;
+            }
+            let solved = (residuals[j] / ljj) / ljj;
+            quad += residuals[j] * solved;
+            ld += ljj.ln();
+        }
+        return Some(quad + 2.0 * ld);
+    }
+    let chol = r.clone().cholesky()?;
+    let solved = chol.solve(residuals);
+    Some(residuals.dot(&solved) + chol_log_det(&chol.l()))
 }
 
 /// IOV-aware FOCE per-subject NLL — a *proper* linearised marginal over the
@@ -2449,6 +2607,52 @@ mod tests {
     };
     use approx::assert_relative_eq;
     use std::collections::HashMap;
+
+    /// The O(n) diagonal fast path in [`quad_form_plus_logdet`] must be
+    /// **bit-for-bit** identical to the dense Cholesky path for a diagonal `R`
+    /// (that is the whole point — no OFV shift, just no O(n³) work).
+    #[test]
+    fn quad_form_diagonal_fast_path_is_bit_identical_to_cholesky() {
+        let diag = [0.04_f64, 0.25, 1.5, 0.0009, 12.0, 0.7];
+        let mut r = DMatrix::<f64>::zeros(diag.len(), diag.len());
+        for (j, &d) in diag.iter().enumerate() {
+            r[(j, j)] = d;
+        }
+        let residuals = DVector::from_vec(vec![0.3, -1.1, 2.7, -0.05, 4.0, -0.9]);
+
+        // Reference: the exact dense computation the old code did.
+        let chol = r.clone().cholesky().unwrap();
+        let solved = chol.solve(&residuals);
+        let reference = residuals.dot(&solved) + chol_log_det(&chol.l());
+
+        let fast = quad_form_plus_logdet(&r, &residuals).unwrap();
+        assert!(
+            fast.to_bits() == reference.to_bits(),
+            "diagonal fast path {fast} != dense {reference} (bit-for-bit required)"
+        );
+    }
+
+    /// A genuinely dense `R` (cross-observation off-diagonals) still goes through
+    /// the Cholesky branch and matches the reference.
+    #[test]
+    fn quad_form_dense_path_matches_reference() {
+        let mut r = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![1.0, 2.0, 3.0]));
+        r[(0, 1)] = 0.3;
+        r[(1, 0)] = 0.3;
+        let residuals = DVector::from_vec(vec![0.5, -1.0, 0.7]);
+        let chol = r.clone().cholesky().unwrap();
+        let reference = residuals.dot(&chol.solve(&residuals)) + chol_log_det(&chol.l());
+        let got = quad_form_plus_logdet(&r, &residuals).unwrap();
+        assert!((got - reference).abs() < 1e-14);
+    }
+
+    /// Non-PD (zero / negative diagonal) returns `None`, exactly like `cholesky()`.
+    #[test]
+    fn quad_form_non_pd_returns_none() {
+        let r = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![1.0, 0.0, 3.0]));
+        let residuals = DVector::from_vec(vec![0.5, 1.0, 0.7]);
+        assert!(quad_form_plus_logdet(&r, &residuals).is_none());
+    }
 
     fn make_simple_subject() -> Subject {
         Subject {
