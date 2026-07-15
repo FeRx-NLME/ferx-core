@@ -80,6 +80,7 @@ use crate::estimation::importance_sampling::build_proposal;
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
 use crate::stats::likelihood::individual_nll_into_with_schedule;
+use crate::stats::util::log_sum_exp as logsumexp;
 use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Subject};
 
 /// Upper bound on `n_agq`. Beyond ~20 nodes the Golub–Welsch eigenproblem starts to lose
@@ -145,15 +146,6 @@ pub(crate) fn gauss_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
     // independent of whatever order the eigensolver happened to converge in.
     pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("GH nodes are finite"));
     pairs.into_iter().unzip()
-}
-
-/// Numerically stable `log Σ exp(xᵢ)`.
-fn logsumexp(xs: &[f64]) -> f64 {
-    let max = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if !max.is_finite() {
-        return max;
-    }
-    max + xs.iter().map(|x| (x - max).exp()).sum::<f64>().ln()
 }
 
 /// The per-subject **integration variable** and its prior.
