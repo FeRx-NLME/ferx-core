@@ -41,11 +41,11 @@ section of the SDLC for the versioning policy).
   in the same `L2` group or at the same `(time, occasion)`, `R` is block-diagonal
   with small (typically 2×2) blocks. The inner objective, inner gradient, and
   FOCEI marginal now factor each small block independently — O(Σ b³) instead of
-  the full O(n³) Cholesky/inverse and O(n⁴) `∂²R` tensors. Note: under a
-  gradient-based outer optimizer these models still fall back to a per-subject
-  finite-difference *outer* gradient (the analytic outer gradient covers only the
-  diagonal-`R` reduction); `optimizer = bobyqa` (derivative-free) avoids that and
-  benefits fully from the block-diagonal objective.
+  the full O(n³) Cholesky/inverse and O(n⁴) `∂²R` tensors. The **outer** gradient
+  for these models is now analytic too (Almquist Eq. 48 decomposition over the
+  block-fast marginal/inner-gradient, with the EBE response `dη̂/dx` from the
+  implicit function theorem), so a gradient-based outer optimizer no longer falls
+  back to the expensive per-subject reconverged finite-difference gradient.
 - **`block_sigma` fits with a diagonal residual `R` are no longer O(n³) per
   evaluation** (#847). A `combined`-error `block_sigma` at distinct observation
   times leaves the subject residual covariance `R` diagonal, but the inner

@@ -787,6 +787,7 @@ pub fn find_ebe(
             e,
             &params.omega,
             &params.sigma.values,
+            &params.residual_correlations,
             schedule.as_ref(),
             mult.as_deref(),
         ) {
@@ -1870,6 +1871,7 @@ pub(crate) fn analytic_eta_nll_gradient(
         eta,
         omega,
         sigma,
+        &model.residual_correlations,
         None,
         mult.as_deref(),
     )
@@ -1892,6 +1894,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     eta: &[f64],
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
+    corr: &[crate::types::ResidualCorrelation],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
     mult: Option<&[Vec<f64>]>,
 ) -> Option<Vec<f64>> {
@@ -1953,8 +1956,10 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // assumes a diagonal R. Route the dense-R generalisation here — it serves both the
     // analytical and the ODE (`Dual1`) inner path, since `sens` carries `∂f/∂η` for both.
     if !model.residual_correlations.is_empty() {
-        return dense_residual_inner_gradient(model, subject, theta, eta, omega, sigma, &sens)
-            .map(add_nongaussian);
+        return dense_residual_inner_gradient(
+            model, subject, theta, eta, omega, sigma, corr, &sens,
+        )
+        .map(add_nongaussian);
     }
     let n_eta = model.n_eta;
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
@@ -2052,6 +2057,7 @@ fn dense_residual_inner_gradient(
     eta: &[f64],
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
+    corr: &[crate::types::ResidualCorrelation],
     sens: &[crate::sens::provider::ObsGrad],
 ) -> Option<Vec<f64>> {
     use nalgebra::{DMatrix, DVector};
@@ -2063,7 +2069,6 @@ fn dense_residual_inner_gradient(
         return Some(prior.as_slice().to_vec());
     }
     let ipreds: Vec<f64> = sens.iter().map(|o| o.f).collect();
-    let corr = &model.residual_correlations;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
     // Per-observation custom residual magnitude (#484); η-independent, matches the marginal.

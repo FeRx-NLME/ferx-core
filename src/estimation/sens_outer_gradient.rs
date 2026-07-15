@@ -2068,6 +2068,112 @@ pub fn subject_packed_gradient_iov(
     Some(g)
 }
 
+/// Block-diagonal correlated-residual (`block_sigma` L2 / paired cross-endpoint)
+/// FOCEI outer gradient via the Almquist Eq. 48 decomposition
+/// `dFᵢ/dx = ∂Fᵢ/∂x|_η̂ + (∂Fᵢ/∂η̂)·dη̂/dx`, with the EBE response
+/// `dη̂/dx = −H_inner⁻¹ ∂g_inner/∂x` (implicit function theorem on the inner
+/// optimality condition `g_inner(η̂,x)=0`). The partials are central FDs of the
+/// **block-fast** marginal (`foce_subject_nll`) and inner gradient
+/// (`analytic_eta_nll_gradient_with_schedule`), which are O(n) for block-diagonal
+/// R — so this stays off the per-subject *reconverged*-FD fallback (no EBE re-
+/// solve per coordinate). Used only for the block-diagonal-R correlated case; the
+/// diagonal-R and non-correlated cases keep the exact closed-form scalar path.
+/// `None` when a provider can't produce `∂f/∂η` or `H_inner` is singular.
+fn subject_packed_gradient_block(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    interaction: bool,
+) -> Option<Vec<f64>> {
+    use crate::estimation::inner_optimizer::analytic_eta_nll_gradient_with_schedule;
+    use crate::sens::provider::subject_eta_jacobian;
+    use crate::stats::likelihood::foce_subject_nll;
+    let n = x.len();
+    let n_eta = model.n_eta;
+    let n_obs = subject.observations.len();
+    if n_obs == 0 {
+        return Some(vec![0.0; n]);
+    }
+
+    // Marginal F(params, η) — FOCEI (`interaction`) or FOCE. Recomputes ∂f/∂η
+    // (θ-dependent) each call.
+    let marginal = |params: &ModelParameters, eta: &[f64]| -> Option<f64> {
+        let jac = subject_eta_jacobian(model, subject, &params.theta, eta)?;
+        let h = DMatrix::from_row_slice(n_obs, n_eta, &jac);
+        Some(foce_subject_nll(
+            model,
+            subject,
+            &params.theta,
+            &DVector::from_column_slice(eta),
+            &h,
+            &params.omega,
+            &params.sigma.values,
+            &params.residual_correlations,
+            interaction,
+        ))
+    };
+    // Inner (individual-NLL) η-gradient g(params, η).
+    let inner_g = |params: &ModelParameters, eta: &[f64]| -> Option<Vec<f64>> {
+        let mult = model.ruv_obs_mult(subject, &params.theta);
+        analytic_eta_nll_gradient_with_schedule(
+            model,
+            subject,
+            &params.theta,
+            eta,
+            &params.omega,
+            &params.sigma.values,
+            &params.residual_correlations,
+            None,
+            mult.as_deref(),
+        )
+    };
+
+    let params = unpack_params(x, template);
+    // H_inner = ∂g/∂η and g_η = ∂F/∂η, both by central FD at η̂.
+    let heta = 1e-5;
+    let mut h_inner = DMatrix::<f64>::zeros(n_eta, n_eta);
+    let mut g_eta = vec![0.0f64; n_eta];
+    for i in 0..n_eta {
+        let mut ep = eta_hat.to_vec();
+        ep[i] += heta;
+        let mut em = eta_hat.to_vec();
+        em[i] -= heta;
+        let gp = inner_g(&params, &ep)?;
+        let gm = inner_g(&params, &em)?;
+        for r in 0..n_eta {
+            h_inner[(r, i)] = (gp[r] - gm[r]) / (2.0 * heta);
+        }
+        g_eta[i] = (marginal(&params, &ep)? - marginal(&params, &em)?) / (2.0 * heta);
+    }
+    let h_inner_inv = h_inner.try_inverse()?;
+
+    // Per free packed coordinate: ∂F/∂x|_η̂ + g_η·(−H_inner⁻¹ ∂g/∂x).
+    let fixed = packed_fixed_mask(template);
+    let mut grad = vec![0.0f64; n];
+    for j in 0..n {
+        if fixed[j] {
+            continue;
+        }
+        let hj = 1e-6 * (1.0 + x[j].abs());
+        let mut xp = x.to_vec();
+        xp[j] += hj;
+        let mut xm = x.to_vec();
+        xm[j] -= hj;
+        let pp = unpack_params(&xp, template);
+        let pm = unpack_params(&xm, template);
+        let df_partial = (marginal(&pp, eta_hat)? - marginal(&pm, eta_hat)?) / (2.0 * hj);
+        let gp = inner_g(&pp, eta_hat)?;
+        let gm = inner_g(&pm, eta_hat)?;
+        let dg = DVector::from_iterator(n_eta, (0..n_eta).map(|r| (gp[r] - gm[r]) / (2.0 * hj)));
+        let deta = -(&h_inner_inv * dg);
+        let resp: f64 = (0..n_eta).map(|r| g_eta[r] * deta[r]).sum();
+        grad[j] = df_partial + resp;
+    }
+    Some(grad)
+}
+
 /// The exact per-subject FOCEI gradient `dFᵢ/dx` in the **packed** optimizer
 /// space (log-θ / Cholesky-Ω / log-σ), or `None` when unsupported. `eta_hat`
 /// must be the EBE for `unpack_params(x)`.
@@ -2080,6 +2186,19 @@ pub fn subject_packed_gradient(
 ) -> Option<Vec<f64>> {
     if subject.observations.is_empty() {
         return Some(vec![0.0; x.len()]);
+    }
+    // Block-diagonal correlated residual (`block_sigma` L2 / paired cross-endpoint):
+    // R has genuine off-diagonals, so the scalar `corr_residual_diag` reduction
+    // below can't represent it. Use the Almquist FD decomposition over the block-
+    // fast marginal/inner-gradient instead of bailing to reconverged FD.
+    if !model.residual_correlations.is_empty()
+        && !crate::stats::residual_error::residual_is_diagonal(
+            &subject.obs_times,
+            &subject.occasions,
+            &subject.obs_l2,
+        )
+    {
+        return subject_packed_gradient_block(model, subject, template, x, eta_hat, true);
     }
     // M3/BLOQ: censored rows enter through `prepare` (data term `−logΦ`, true
     // inner Hessian, AND `H̃`/`log|H̃|` at FOCEI order — matching `gaussian_foce_accum`).
@@ -2283,13 +2402,26 @@ pub fn subject_packed_gradient_foce(
     x: &[f64],
     eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
+    if subject.observations.is_empty() {
+        return Some(vec![0.0; x.len()]);
+    }
+    // Block-diagonal correlated residual: the Sheiner–Beal `R̃ = JΩJᵀ + R` couples
+    // rows within a residual block, so the diagonal-`R⁰` assembly below can't serve
+    // it. Use the Almquist FD decomposition over the FOCE marginal instead of
+    // bailing to reconverged FD.
+    if !model.residual_correlations.is_empty()
+        && !crate::stats::residual_error::residual_is_diagonal(
+            &subject.obs_times,
+            &subject.occasions,
+            &subject.obs_l2,
+        )
+    {
+        return subject_packed_gradient_block(model, subject, template, x, eta_hat, false);
+    }
     let params = unpack_params(x, template);
     let n_eta = model.n_eta;
     let n_theta = params.theta.len();
     let n_obs = subject.observations.len();
-    if n_obs == 0 {
-        return Some(vec![0.0; x.len()]);
-    }
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
@@ -4558,6 +4690,134 @@ mod tests {
                 .sum::<f64>()
         };
         assert_grad_matches_richardson_fd(&x, &analytic, ofv, 2e-3, 1e-5);
+    }
+
+    /// #847: paired same-time total/unbound rows make `R` genuinely **block-
+    /// diagonal** (not diagonal), so the scalar `corr_residual_diag` reduction
+    /// can't serve it. `subject_packed_gradient` must take the Almquist FD-
+    /// decomposition block path and match Richardson reconverged FD of ferx's own
+    /// FOCEI marginal across every θ/Ω/σ/ρ coordinate — i.e. the block outer
+    /// gradient is correct, replacing the per-subject reconverged-FD fallback.
+    #[test]
+    fn population_packed_gradient_paired_block_sigma_matches_fd() {
+        use crate::estimation::inner_optimizer::find_ebe;
+        use crate::estimation::parameterization::{pack_params, packed_fixed_mask};
+
+        let model =
+            parse_model_string(SELECTED_BLOCK_SIGMA_1CPT).expect("parse selected block_sigma");
+        let theta = &[1.1, 11.0];
+        // Two rows per draw (FREE=0 total, FREE=1 unbound) at the SAME time →
+        // block-diagonal R with 2×2 blocks.
+        let times = [1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 8.0, 8.0];
+        let frees = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        let subj = selected_dense_subject(&model, theta, &times, &frees);
+        assert!(
+            !crate::stats::residual_error::residual_is_diagonal(
+                &subj.obs_times,
+                &subj.occasions,
+                &subj.obs_l2
+            ),
+            "fixture must be block-diagonal (paired same-time rows)"
+        );
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+
+        let ebe = |p: &ModelParameters| -> Vec<f64> {
+            find_ebe(&model, &subj, p, 200, 1e-12, None, None, 0)
+                .eta
+                .iter()
+                .copied()
+                .collect()
+        };
+        let eta_hat = ebe(&params);
+        let analytic = subject_packed_gradient(&model, &subj, &template, &x, &eta_hat)
+            .expect("block-diagonal gradient must be analytic (not None)");
+        // Population OFV is 2·Σᵢ Fᵢ with fixed coords zeroed (see `population_sum`).
+        let fixed = packed_fixed_mask(&template);
+        let analytic2: Vec<f64> = analytic
+            .iter()
+            .enumerate()
+            .map(|(k, &g)| if fixed[k] { 0.0 } else { 2.0 * g })
+            .collect();
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            let e = ebe(&p);
+            let jac =
+                crate::sens::provider::subject_eta_jacobian(&model, &subj, &p.theta, &e).unwrap();
+            let h = DMatrix::from_row_slice(times.len(), model.n_eta, &jac);
+            2.0 * crate::stats::likelihood::foce_subject_nll(
+                &model,
+                &subj,
+                &p.theta,
+                &DVector::from_vec(e),
+                &h,
+                &p.omega,
+                &p.sigma.values,
+                &p.residual_correlations,
+                true,
+            )
+        };
+        assert_grad_matches_richardson_fd(&x, &analytic2, ofv, 5e-3, 1e-5);
+    }
+
+    /// FOCE (non-interaction) analogue of the paired block-diagonal test: the
+    /// `subject_packed_gradient_foce` block path must match Richardson reconverged
+    /// FD of ferx's FOCE (Sheiner–Beal) marginal.
+    #[test]
+    fn population_packed_gradient_paired_block_sigma_foce_matches_fd() {
+        use crate::estimation::inner_optimizer::find_ebe;
+        use crate::estimation::parameterization::{pack_params, packed_fixed_mask};
+
+        let model =
+            parse_model_string(SELECTED_BLOCK_SIGMA_1CPT).expect("parse selected block_sigma");
+        let theta = &[1.1, 11.0];
+        let times = [1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 8.0, 8.0];
+        let frees = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        let subj = selected_dense_subject(&model, theta, &times, &frees);
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ebe = |p: &ModelParameters| -> Vec<f64> {
+            find_ebe(&model, &subj, p, 200, 1e-12, None, None, 0)
+                .eta
+                .iter()
+                .copied()
+                .collect()
+        };
+        let eta_hat = ebe(&params);
+        let analytic = subject_packed_gradient_foce(&model, &subj, &template, &x, &eta_hat)
+            .expect("block-diagonal FOCE gradient must be analytic");
+        let fixed = packed_fixed_mask(&template);
+        let analytic2: Vec<f64> = analytic
+            .iter()
+            .enumerate()
+            .map(|(k, &g)| if fixed[k] { 0.0 } else { 2.0 * g })
+            .collect();
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            let e = ebe(&p);
+            let jac =
+                crate::sens::provider::subject_eta_jacobian(&model, &subj, &p.theta, &e).unwrap();
+            let h = DMatrix::from_row_slice(times.len(), model.n_eta, &jac);
+            2.0 * crate::stats::likelihood::foce_subject_nll(
+                &model,
+                &subj,
+                &p.theta,
+                &DVector::from_vec(e),
+                &h,
+                &p.omega,
+                &p.sigma.values,
+                &p.residual_correlations,
+                false,
+            )
+        };
+        assert_grad_matches_richardson_fd(&x, &analytic2, ofv, 5e-3, 1e-5);
     }
 
     /// `block_sigma` + η-dependent `ExpressionScale` `obs_scale` (#627 × #486): the analytic
