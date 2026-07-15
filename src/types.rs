@@ -4329,6 +4329,12 @@ pub enum WarningCode {
     /// fitted EBE — a silently degenerate likelihood contribution the η = 0
     /// fit-start reject could not catch (#785).
     FlipFlop,
+    /// A non-fixed theta whose outer gradient is ≈ 0 at the initial estimate — it
+    /// has no effect on the objective (unmapped, or dropped from the structural /
+    /// scaling model). The pre-flight guard freezes it at its initial value so the
+    /// remaining parameters can be estimated instead of the whole fit dying on an
+    /// eval-1 optimizer `Failure` (#826).
+    FlatParameter,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -4365,6 +4371,7 @@ impl WarningCode {
             WarningCode::Threads => "threads",
             WarningCode::Simulation => "simulation",
             WarningCode::FlipFlop => "flip_flop",
+            WarningCode::FlatParameter => "flat_parameter",
             WarningCode::General => "general",
         }
     }
@@ -4545,6 +4552,10 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || (lower.contains("parameters") && lower.contains("covariance step:"))
     {
         (WarningSeverity::Info, WarningCode::CovarianceStep)
+    } else if lower.contains("has no effect on the objective") {
+        // Pre-flight flat-theta guard (#826): a theta with an ≈0 outer gradient at
+        // the initial estimate was frozen at its init so the fit could proceed.
+        (WarningSeverity::Warning, WarningCode::FlatParameter)
     } else {
         (WarningSeverity::Warning, WarningCode::General)
     };
@@ -7092,6 +7103,18 @@ mod tests {
         let w = classify_warning("Covariance step failed");
         assert_eq!(w.severity, WarningSeverity::Critical);
         assert_eq!(w.category.as_str(), "covariance_failed");
+    }
+
+    #[test]
+    fn classify_warning_flat_parameter_is_warning() {
+        let w = classify_warning(
+            "[parameters] `TVFLAT` has no effect on the objective (gradient ≈ 0 at the \
+             initial estimate) — it is likely computed but never used. Freezing it at its \
+             initial value (1) so the remaining parameters can be estimated.",
+        );
+        assert_eq!(w.severity, WarningSeverity::Warning);
+        assert_eq!(w.category.as_str(), "flat_parameter");
+        assert_eq!(w.source_method.as_deref(), Some("parameters"));
     }
 
     #[test]
