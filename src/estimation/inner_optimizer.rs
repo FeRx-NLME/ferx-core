@@ -2123,6 +2123,82 @@ fn dense_residual_inner_gradient(
         return Some(grad);
     }
 
+    // Block-diagonal fast path (#847 perf): paired total/unbound `block_sigma`
+    // leaves R block-diagonal with small blocks. R⁻¹, ∂R/∂η_k, and M_k are all
+    // block-diagonal, so the full O(n³) Cholesky / inverse / dense ∂R tensors
+    // collapse to independent per-block dense problems — O(Σ b³). Same assembly
+    // as the dense branch below, summed over disjoint blocks.
+    if ruv_mult.is_none() {
+        let blocks = crate::stats::residual_error::residual_blocks(
+            &subject.obs_times,
+            &subject.occasions,
+            &subject.obs_l2,
+        );
+        if blocks.len() < n_obs {
+            let mut s = vec![0.0f64; n_obs]; // R⁻¹ r, assembled globally
+                                             // Per block (parallel to `blocks`): R_g⁻¹ and its ∂R/∂f matrices.
+            let mut rinvs: Vec<DMatrix<f64>> = Vec::with_capacity(blocks.len());
+            let mut drs: Vec<Vec<DMatrix<f64>>> = Vec::with_capacity(blocks.len());
+            for block in &blocks {
+                let bn = block.len();
+                let (rg, dr) = crate::stats::residual_error::block_r_and_dr(
+                    &model.error_spec,
+                    block,
+                    &ipreds,
+                    err_keys.as_ref(),
+                    &subject.obs_times,
+                    &subject.obs_raw_times,
+                    &subject.occasions,
+                    &subject.obs_l2,
+                    sigma,
+                    corr,
+                );
+                let chol = rg.clone().cholesky()?;
+                let resid_g = DVector::from_iterator(
+                    bn,
+                    block.iter().map(|&j| subject.observations[j] - ipreds[j]),
+                );
+                let sg = chol.solve(&resid_g);
+                for (loc, &j) in block.iter().enumerate() {
+                    s[j] = sg[loc];
+                }
+                rinvs.push(chol.inverse());
+                drs.push(dr);
+            }
+            let mut grad = vec![0.0f64; n_eta];
+            for k in 0..n_eta {
+                let mut term_a = 0.0;
+                for m in 0..n_obs {
+                    term_a += sens[m].df_deta[k] * s[m];
+                }
+                let mut tr_mk = 0.0;
+                let mut quad = 0.0;
+                for (bi, block) in blocks.iter().enumerate() {
+                    let rinv = &rinvs[bi];
+                    let dr = &drs[bi];
+                    let bn = block.len();
+                    // (∂R/∂η_k)_g = Σ_{m∈g} H[m,k]·∂R/∂f_m.
+                    let mut drk = DMatrix::<f64>::zeros(bn, bn);
+                    for (loc, &j) in block.iter().enumerate() {
+                        let h = sens[j].df_deta[k];
+                        if h != 0.0 {
+                            drk += h * &dr[loc];
+                        }
+                    }
+                    for p in 0..bn {
+                        for q in 0..bn {
+                            tr_mk += rinv[(p, q)] * drk[(q, p)];
+                        }
+                    }
+                    let sg = DVector::from_iterator(bn, block.iter().map(|&j| s[j]));
+                    quad += sg.dot(&(&drk * &sg));
+                }
+                grad[k] = -term_a + 0.5 * (tr_mk - quad) + prior[k];
+            }
+            return Some(grad);
+        }
+    }
+
     let r = match ruv_mult.as_deref() {
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             &model.error_spec,

@@ -699,6 +699,39 @@ fn dense_residual_data_term(
             .zip(preds.iter())
             .map(|(&y, &f)| y - f),
     );
+
+    // Block-diagonal fast path (#847 perf): paired total/unbound `block_sigma`
+    // (an L2 group or two co-temporal rows per draw) leaves R block-diagonal with
+    // small blocks. The full data term `rᵀR⁻¹r + log|R|` sums over disjoint
+    // blocks, so factor each small block instead of the whole n×n R — O(Σ b³)
+    // rather than O(n³). Only when nothing scales the diagonal magnitude
+    // (`ruv_mult` None, i.e. every `block_sigma` model).
+    if ruv_mult.is_none() {
+        let blocks = crate::stats::residual_error::residual_blocks(
+            &subject.obs_times,
+            &subject.occasions,
+            &subject.obs_l2,
+        );
+        if blocks.len() < subject.observations.len() {
+            let mut data_ll = 0.0;
+            for block in &blocks {
+                let bn = block.len();
+                let mut rg = DMatrix::<f64>::zeros(bn, bn);
+                for (a, &ja) in block.iter().enumerate() {
+                    for (b, &jb) in block.iter().enumerate() {
+                        rg[(a, b)] = r[(ja, jb)];
+                    }
+                }
+                let resid_g = DVector::from_iterator(
+                    bn,
+                    block.iter().map(|&j| subject.observations[j] - preds[j]),
+                );
+                data_ll += quad_form_plus_logdet(&rg, &resid_g)?;
+            }
+            return Some(data_ll);
+        }
+    }
+
     quad_form_plus_logdet(&r, &residuals)
 }
 
@@ -1560,6 +1593,91 @@ pub fn foce_subject_nll_interaction_dense(
         };
         let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
         return 0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde);
+    }
+
+    // Block-diagonal fast path (#847 perf): paired total/unbound `block_sigma`
+    // leaves R block-diagonal with small blocks. The data term, `term1 = HᵀR⁻¹H`,
+    // and the interaction `B_{kl} = tr(M_k M_l)` all sum over disjoint blocks, so
+    // each is assembled from independent small per-block dense problems — O(Σ b³ +
+    // Σ b²·n_eta²) rather than O(n³ + n_eta·n²).
+    if ruv_mult.is_none() {
+        let blocks = crate::stats::residual_error::residual_blocks(
+            &subject.obs_times,
+            &subject.occasions,
+            &subject.obs_l2,
+        );
+        if blocks.len() < n_obs {
+            let mut data_ll = 0.0;
+            let mut term1 = DMatrix::<f64>::zeros(n_eta, n_eta);
+            let mut bmat = DMatrix::<f64>::zeros(n_eta, n_eta);
+            for block in &blocks {
+                let bn = block.len();
+                let (mut rg, dr) = crate::stats::residual_error::block_r_and_dr(
+                    error_spec,
+                    block,
+                    ipreds,
+                    err_keys.as_ref(),
+                    &subject.obs_times,
+                    &subject.obs_raw_times,
+                    &subject.occasions,
+                    &subject.obs_l2,
+                    sigma_values,
+                    correlations,
+                );
+                for (loc, &j) in block.iter().enumerate() {
+                    rg[(loc, loc)] += p_obs.get(j).copied().unwrap_or(0.0);
+                }
+                let chol = match rg.clone().cholesky() {
+                    Some(c) => c,
+                    None => return 1e20,
+                };
+                let rinv = chol.inverse();
+                let resid_g = DVector::from_iterator(
+                    bn,
+                    block.iter().map(|&j| subject.observations[j] - ipreds[j]),
+                );
+                data_ll += resid_g.dot(&chol.solve(&resid_g)) + chol_log_det(&chol.l());
+                // H_g (b×n_eta) → term1 += H_gᵀ R_g⁻¹ H_g.
+                let mut hg = DMatrix::<f64>::zeros(bn, n_eta);
+                for (loc, &j) in block.iter().enumerate() {
+                    for k in 0..n_eta {
+                        hg[(loc, k)] = h_matrix[(j, k)];
+                    }
+                }
+                term1 += hg.transpose() * &rinv * &hg;
+                // M_k = R_g⁻¹ (∂R/∂η_k)_g, then B_{kl} += tr(M_k M_l).
+                let mk: Vec<DMatrix<f64>> = (0..n_eta)
+                    .map(|k| {
+                        let mut drk = DMatrix::<f64>::zeros(bn, bn);
+                        for (loc, &j) in block.iter().enumerate() {
+                            let h = h_matrix[(j, k)];
+                            if h != 0.0 {
+                                drk += h * &dr[loc];
+                            }
+                        }
+                        &rinv * drk
+                    })
+                    .collect();
+                for k in 0..n_eta {
+                    for l in 0..n_eta {
+                        let mut t = 0.0;
+                        for p in 0..bn {
+                            for q in 0..bn {
+                                t += mk[k][(p, q)] * mk[l][(q, p)];
+                            }
+                        }
+                        bmat[(k, l)] += t;
+                    }
+                }
+            }
+            let htilde = term1 + 0.5 * bmat + &omega.inv;
+            let log_det_htilde = match htilde.cholesky() {
+                Some(c) => chol_log_det(&c.l()),
+                None => return 1e20,
+            };
+            let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+            return 0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde);
+        }
     }
 
     // Dense R at η̂ (+ SDE process noise on the diagonal), assembled exactly as

@@ -79,6 +79,49 @@ pub fn residual_is_diagonal(obs_times: &[f64], occasions: &[u32], obs_l2: &[i64]
     true
 }
 
+/// Partition observation indices into disjoint **residual blocks** — the
+/// equivalence classes of [`same_residual_block`]. `R` (and `∂R/∂f`, `∂²R/∂f²`)
+/// is block-diagonal over this partition (zero cross-block covariance), so the
+/// objective / gradient / FOCEI marginal decompose into independent per-block
+/// dense problems of size `b_g` — O(Σ b_g³) instead of O(n³). For the common
+/// paired total/unbound `block_sigma` (an `L2` group or two co-temporal rows per
+/// draw) the blocks are 2×2, so the factorizations are O(n) overall.
+///
+/// Ungrouped rows (`L2 == 0` at a unique `(time, occasion)`) are singleton
+/// blocks — a subject with all singletons is the diagonal case
+/// ([`residual_is_diagonal`]). Blocks preserve ascending observation-index order,
+/// and are returned in first-appearance order. O(n).
+pub fn residual_blocks(obs_times: &[f64], occasions: &[u32], obs_l2: &[i64]) -> Vec<Vec<usize>> {
+    use std::collections::HashMap;
+    // Key mirrors `same_residual_block`: an explicit L2 id groups by id; an
+    // ungrouped row groups by (time bits, occasion).
+    #[derive(PartialEq, Eq, Hash)]
+    enum Key {
+        L2(i64),
+        TimeOcc(u64, u32),
+    }
+    let n = obs_times.len();
+    let mut index: HashMap<Key, usize> = HashMap::new();
+    let mut blocks: Vec<Vec<usize>> = Vec::new();
+    for j in 0..n {
+        let l2 = obs_l2.get(j).copied().unwrap_or(0);
+        let key = if l2 != 0 {
+            Key::L2(l2)
+        } else {
+            Key::TimeOcc(
+                observation_time_key(obs_times, j),
+                observation_occasion_key(occasions, j),
+            )
+        };
+        let bi = *index.entry(key).or_insert_with(|| {
+            blocks.push(Vec::new());
+            blocks.len() - 1
+        });
+        blocks[bi].push(j);
+    }
+    blocks
+}
+
 /// Diagonal of `∂R/∂f` — only `∂R_mm/∂f_m` per observation, O(n). Bit-identical
 /// to `compute_dr_df_matrices(..)[m][(m,m)]`, but without that function's
 /// `vec![DMatrix::zeros(n,n); n]` O(n³) allocation. Valid to use in place of the
@@ -118,6 +161,68 @@ pub fn compute_dr_df_diag(
             diag_self_deriv(&vload, &sload, sigma_values, correlations)
         })
         .collect()
+}
+
+/// Build one residual block's dense `R_g` and its per-observation `∂R/∂f_m`
+/// matrices (`dr_g[local_m]`, each `b×b`), from the subject's full arrays
+/// restricted to `block` (a set of paired observation indices). Reproduces the
+/// full builders' pairing/cross terms within the block — the block-diagonal
+/// analogue used by the O(Σ b³) gradient/marginal fast paths in place of the full
+/// O(n³) `compute_r_matrix_with_correlations` / `compute_dr_df_matrices`. `mult`
+/// is None for every `block_sigma` model (custom magnitude is mutually exclusive).
+#[allow(clippy::too_many_arguments)]
+pub fn block_r_and_dr(
+    error_spec: &ErrorSpec,
+    block: &[usize],
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+) -> (DMatrix<f64>, Vec<DMatrix<f64>>) {
+    let g = |src: &[f64], j: usize| src.get(j).copied().unwrap_or(0.0);
+    let sub_ipreds: Vec<f64> = block.iter().map(|&j| ipreds[j]).collect();
+    let sub_cmts: Vec<usize> = block
+        .iter()
+        .map(|&j| obs_cmts.get(j).copied().unwrap_or(0))
+        .collect();
+    let sub_times: Vec<f64> = block.iter().map(|&j| g(obs_times, j)).collect();
+    let sub_raw: Vec<f64> = block.iter().map(|&j| g(obs_raw_times, j)).collect();
+    let sub_occ: Vec<u32> = block
+        .iter()
+        .map(|&j| occasions.get(j).copied().unwrap_or(0))
+        .collect();
+    let sub_l2: Vec<i64> = block
+        .iter()
+        .map(|&j| obs_l2.get(j).copied().unwrap_or(0))
+        .collect();
+    let rg = compute_r_matrix_with_correlations(
+        error_spec,
+        &sub_ipreds,
+        &sub_cmts,
+        &sub_times,
+        &sub_raw,
+        &sub_occ,
+        &sub_l2,
+        sigma_values,
+        correlations,
+    );
+    let dr = compute_dr_df_matrices(
+        error_spec,
+        &sub_ipreds,
+        &sub_cmts,
+        &sub_times,
+        &sub_raw,
+        &sub_occ,
+        &sub_l2,
+        sigma_values,
+        correlations,
+        None,
+    );
+    (rg, dr)
 }
 
 /// Compute residual variances including fixed residual correlations from
@@ -959,6 +1064,24 @@ mod tests {
         assert!(!residual_is_diagonal(&[0.5, 2.0], &[0, 0], &[7, 7]));
         // Distinct L2 ids (singleton groups) → diagonal.
         assert!(residual_is_diagonal(&[0.5, 2.0], &[0, 0], &[7, 8]));
+    }
+
+    /// #847 perf: `residual_blocks` partitions observations into the
+    /// same_residual_block equivalence classes (L2 groups; else (time, occasion)).
+    #[test]
+    fn test_residual_blocks_partition() {
+        // Distinct times, no L2 → all singletons.
+        let b = residual_blocks(&[0.5, 1.0, 2.0], &[0, 0, 0], &[]);
+        assert_eq!(b, vec![vec![0], vec![1], vec![2]]);
+        // Two L2 pairs (total+free per draw) → two 2-blocks, index order preserved.
+        let b = residual_blocks(&[1.0, 1.0, 5.0, 5.0], &[0; 4], &[10, 10, 11, 11]);
+        assert_eq!(b, vec![vec![0, 1], vec![2, 3]]);
+        // Co-temporal ungrouped rows → one block by (time, occasion).
+        let b = residual_blocks(&[1.0, 1.0, 2.0], &[0, 0, 0], &[]);
+        assert_eq!(b, vec![vec![0, 1], vec![2]]);
+        // Same time, different occasion → separate blocks.
+        let b = residual_blocks(&[1.0, 1.0], &[0, 1], &[]);
+        assert_eq!(b, vec![vec![0], vec![1]]);
     }
 
     /// [`compute_dr_df_diag`] equals the diagonal of the dense

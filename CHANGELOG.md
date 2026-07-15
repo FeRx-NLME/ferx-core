@@ -36,6 +36,16 @@ section of the SDLC for the versioning policy).
   IMP / AGQ / Laplace continue to hold the off-diagonal at its initial value.
 
 ### Performance
+- **Paired-endpoint `block_sigma` (`L2` / cross-endpoint total-unbound) fits use a
+  block-diagonal fast path** (#847). When correlated residuals pair observations
+  in the same `L2` group or at the same `(time, occasion)`, `R` is block-diagonal
+  with small (typically 2×2) blocks. The inner objective, inner gradient, and
+  FOCEI marginal now factor each small block independently — O(Σ b³) instead of
+  the full O(n³) Cholesky/inverse and O(n⁴) `∂²R` tensors. Note: under a
+  gradient-based outer optimizer these models still fall back to a per-subject
+  finite-difference *outer* gradient (the analytic outer gradient covers only the
+  diagonal-`R` reduction); `optimizer = bobyqa` (derivative-free) avoids that and
+  benefits fully from the block-diagonal objective.
 - **`block_sigma` fits with a diagonal residual `R` are no longer O(n³) per
   evaluation** (#847). A `combined`-error `block_sigma` at distinct observation
   times leaves the subject residual covariance `R` diagonal, but the inner
