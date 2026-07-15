@@ -6902,18 +6902,14 @@ mod tests {
 
     #[test]
     fn resolve_auto_uses_gradient_route_for_free_residual_correlation() {
-        let mut m = test_helpers::analytical_model(GradientMethod::Auto);
-        m.residual_correlations = vec![ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 0,
-            rho: 0.2,
-        }];
-        m.default_params.residual_correlations = m.residual_correlations.clone();
-        m.default_params.residual_correlation_fixed = vec![false];
+        let mut m = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse diagonal block_sigma");
         assert_eq!(
             Optimizer::Auto.resolve_auto(&m, true),
             Optimizer::NloptLbfgs,
-            "free residual-correlation coordinates have analytic gradients, so auto can use L-BFGS"
+            "within-observation residual-correlation coordinates have analytic gradients, so auto can use L-BFGS"
         );
 
         m.default_params.residual_correlation_fixed = vec![true];
@@ -6921,6 +6917,19 @@ mod tests {
             Optimizer::Auto.resolve_auto(&m, true),
             Optimizer::NloptLbfgs,
             "FIX block_sigma correlations keep the analytic optimizer route"
+        );
+    }
+
+    #[test]
+    fn resolve_auto_picks_bobyqa_for_cross_endpoint_residual_correlation() {
+        let m = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse cross-endpoint block_sigma");
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m, true),
+            Optimizer::Bobyqa,
+            "cross-endpoint block_sigma needs dense-R gradients, so auto must avoid L-BFGS"
         );
     }
 

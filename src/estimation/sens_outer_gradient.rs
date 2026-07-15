@@ -4539,9 +4539,10 @@ mod tests {
             parse_model_string(SELECTED_BLOCK_SIGMA_1CPT).expect("parse selected block_sigma");
         assert!(matches!(model.error_spec, ErrorSpec::Selected { .. }));
         assert!(!model.residual_correlations.is_empty());
-        assert!(crate::sens::provider::analytic_outer_gradient_available(
-            &model
-        ));
+        assert!(
+            !crate::sens::provider::analytic_outer_gradient_available(&model),
+            "production auto must be conservative for selected cross-endpoint block_sigma"
+        );
 
         // Distinct times → diagonal R (analytic path proceeds); alternating FREE
         // flags route rows to both branches within one subject.

@@ -38,9 +38,9 @@ use super::one_cpt::{one_cpt_conc_g, one_cpt_ig_conc_g, one_cpt_transit_conc_g};
 use super::three_cpt::three_cpt_conc_g;
 use super::two_cpt::{two_cpt_conc_g, two_cpt_ig_conc_g, two_cpt_transit_conc_g};
 use crate::types::{
-    CompiledModel, DoseEvent, GradientMethod, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_CV2,
-    PK_IDX_F, PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_MAT, PK_IDX_MTT, PK_IDX_N, PK_IDX_Q, PK_IDX_Q3,
-    PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
+    CompiledModel, DoseEvent, ErrorSpec, GradientMethod, PkModel, ScalingSpec, Subject, PK_IDX_CL,
+    PK_IDX_CV2, PK_IDX_F, PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_MAT, PK_IDX_MTT, PK_IDX_N, PK_IDX_Q,
+    PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
 };
 
 /// Exact sensitivities of one observation w.r.t. η and θ. Hessian-shaped fields
@@ -629,6 +629,34 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model))
 }
 
+fn residual_correlation_outer_diagonal_supported(model: &CompiledModel) -> bool {
+    if model.residual_correlations.is_empty() {
+        return true;
+    }
+
+    let n_sigma = model.default_params.sigma.values.len();
+    let loadings: Vec<Vec<(usize, f64)>> = match &model.error_spec {
+        ErrorSpec::Single(_) => vec![model.error_spec.sigma_loadings(0, 1.0, n_sigma)],
+        ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => map
+            .keys()
+            .map(|&cmt| model.error_spec.sigma_loadings(cmt, 1.0, n_sigma))
+            .collect(),
+    };
+
+    for j in 0..loadings.len() {
+        for k in (j + 1)..loadings.len() {
+            if crate::stats::residual_error::loadings_share_correlation(
+                &loadings[j],
+                &loadings[k],
+                &model.residual_correlations,
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Whether the exact analytic **outer** (population) FOCE/FOCEI gradient is
 /// available for `model`: it is in the sensitivity provider's scope (non-IOV
 /// [`sens_supported`] or [`iov_analytical_supported`]) and the user did not
@@ -652,10 +680,14 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 /// gradient (these endpoints are FD-only — see `docs/estimation/tte.qmd`).
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
-        // Correlated residual (`block_sigma`, #627) now has an analytic outer gradient
-        // for the analytical (diagonal-R) scope: the dense Almquist assembly reduces to
-        // the scalar path fed correlation-aware `(r,d,d2)` (`corr_residual_diag`). A rare
-        // off-diagonal-R subject bails per-subject to FD via `corr_residual_diag` → `None`.
+        // Correlated residual (`block_sigma`, #627) has an analytic outer gradient only
+        // for the diagonal-R scope: within-observation covariance terms (e.g.
+        // `combined(prop, add)`) reduce to the scalar Almquist path fed
+        // correlation-aware `(r,d,d2)`. Cross-observation endpoint covariance (e.g.
+        // paired total/free rows) needs the dense-R Almquist gradient, which is not yet
+        // implemented; do not route `auto` to a gradient optimizer that would then fill
+        // every subject with reconverged FD.
+        && residual_correlation_outer_diagonal_supported(model)
         && !model.has_non_gaussian()
         // Custom / time-varying residual-error magnitude (#484/#576/#486): `mult(θ)`
         // makes `R` depend on θ directly, which `sens_outer_gradient::theta_block`
@@ -5585,15 +5617,26 @@ mod tests {
         ruv_m3.residual_error_eta = Some(0);
         ruv_m3.bloq_method = crate::types::BloqMethod::M3;
         assert!(analytic_outer_gradient_available(&ruv_m3));
-        // Correlated residual (`block_sigma`) is now analytic on the outer loop (#627):
-        // the dense assembly reduces to the scalar path fed correlation-aware `(r,d,d2)`.
-        // (Previously this predicate short-circuited to FD on any residual correlation.)
+        // Within-observation correlated residual (`block_sigma`) is analytic on the
+        // outer loop (#627): the dense assembly reduces to the scalar path fed
+        // correlation-aware `(r,d,d2)`.
         let block_sigma = parse_model_string(
             "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.05, 1.00]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n",
         )
         .expect("parse block_sigma model");
         assert!(!block_sigma.residual_correlations.is_empty());
         assert!(analytic_outer_gradient_available(&block_sigma));
+
+        // Cross-endpoint `block_sigma` (paired total/free rows) needs the dense-R
+        // Almquist gradient. Until that is implemented, do not report an analytic
+        // outer gradient and let `auto` avoid gradient optimizers on fluconazole-like
+        // models.
+        let selected_block_sigma = parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse selected block_sigma model");
+        assert!(!selected_block_sigma.residual_correlations.is_empty());
+        assert!(!analytic_outer_gradient_available(&selected_block_sigma));
     }
 
     /// The `TIME` built-in makes a structural parameter piecewise/time-varying, so
