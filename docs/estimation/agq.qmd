@@ -1,0 +1,469 @@
+# AGQ — Adaptive Gaussian Quadrature
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+`agq` (aliases `aghq`, `gauss_hermite`, `adaptive_gaussian_quadrature`)
+generalises the Laplace approximation. Where [FOCE/FOCEI](foce.qmd) approximate
+each subject's marginal likelihood with a *single* Gaussian centred at the
+empirical-Bayes mode, AGQ keeps that centring but evaluates the integrand on a
+Gauss–Hermite grid laid around the mode. One node reproduces Laplace exactly;
+more nodes refine the marginal.
+
+Its two defining properties:
+
+- **It integrates the model's real likelihood.** Nothing is linearised and no
+  Gaussian-residual assumption is made, so count, categorical and
+  time-to-event endpoints are handled by the same engine, without the
+  approximation FOCE/FOCEI structurally depend on.
+- **It is deterministic.** The grid is fixed, so the objective carries no
+  Monte-Carlo noise — unlike [SAEM](saem.qmd) or [IMP](importance-sampling.qmd),
+  it needs no common random numbers, no step-size schedule, and returns a
+  bit-identical OFV run to run.
+
+## Usage
+
+```ini
+[fit_options]
+  method = agq
+  n_agq  = 3      # Gauss-Hermite nodes per random effect (default 3)
+```
+
+From R:
+
+```r
+fit <- ferx_fit(model, data, method = "agq", settings = list(n_agq = 5))
+```
+
+`n_agq` is the number of nodes **per random effect**. Odd values are
+conventional — they keep a node exactly at the mode. `n_agq = 1` *is* the
+Laplace approximation (see below).
+
+## Cost, and the dimensionality limit
+
+The grid is a tensor product: `n_agq ^ n_eta` likelihood evaluations per subject
+per outer iteration. That is the whole cost model, and it is exponential in the
+number of random effects.
+
+| n_eta | `n_agq = 1` | `n_agq = 3` | `n_agq = 5` | `n_agq = 7` |
+|-------|-------------|-------------|-------------|-------------|
+| 2     | 1           | 9           | 25          | 49          |
+| 3     | 1           | 27          | 125         | 343         |
+| 5     | 1           | 243         | 3 125       | 16 807      |
+| 8     | 1           | 6 561       | 390 625     | 5.7 M       |
+
+ferx rejects a fit whose grid exceeds **100 000 nodes** rather than start work
+that will not finish. If you hit that, lower `n_agq`, reduce the number of
+random effects, or use [SAEM](saem.qmd) / [IMP](importance-sampling.qmd) —
+Monte-Carlo methods whose cost does not grow with the η dimension. AGQ is at its
+best at **n_eta ≤ 4**.
+
+> **Note on grid pruning.** A natural-looking optimisation — dropping nodes whose
+> Gauss–Hermite weight is negligible — is *unsound* here and ferx does not do it.
+> The adaptive rule multiplies each weight by `exp(‖z‖²)`, which exactly cancels
+> the `e^{−z²}` decay the Hermite weights carry, so the corrected weights are
+> `Θ(1)` right across the grid. A node with a tiny raw weight can carry a
+> perfectly ordinary share of the integral. Sparse (Smolyak) grids are the real
+> answer for `n_eta = 5..8` and are tracked as future work.
+
+## `n_agq = 1` is exactly Laplace — and has its own method name
+
+Because the one-node case is a genuinely useful estimator in its own right (it is
+NONMEM's `$EST METHOD=1 LAPLACIAN`), it is exposed directly:
+
+```ini
+[fit_options]
+  method = laplace     # alias: laplacian
+```
+
+`method = laplace` **is** `method = agq` with the node count pinned to 1 — the same
+objective, the same analytic gradient, the same covariance step, routed through the
+same code. The OFVs are bit-identical, and `n_agq` is not one of its options (the
+node count is what *defines* the method). Prefer it when you want a
+NONMEM-`LAPLACIAN`-comparable fit, or a Laplace baseline to raise `n_agq` from.
+
+It is also the cheapest member of the family — one node, no grid — and on warfarin
+it converges *faster than FOCEI* (0.23 s vs 0.60 s), because AGQ's analytic gradient
+needs fewer outer iterations.
+
+> **`laplace` is not `focei`.** Both place a single Gaussian at the empirical-Bayes
+> mode, but they build it from different Hessians — see below. They are different
+> estimators and will report different OFVs.
+
+With one node the rule is `z = 0` with weight `√π`, and the quadrature sum
+collapses, term for term, to
+
+$$
+L_i \approx (2\pi)^{d/2}\,|H|^{-1/2}\,\exp\!\big(l_i(\hat\eta)\big),
+$$
+
+which is the Laplace approximation. This is an identity, not a numerical
+coincidence.
+
+**AGQ(1) is Laplace with the *exact* Hessian — NONMEM's `$EST METHOD=1
+LAPLACIAN`.** It is deliberately *not* identical to ferx's FOCEI, which is
+Laplace with the **Gauss-Newton** Hessian `CᵀC + Ω⁻¹` (that form drops
+`∂²f/∂η²`). ferx computes `H` by central differences of the true conditional
+NLL, because the Gauss-Newton form carries *no curvature at all* from TTE or
+categorical endpoints — it is blind on precisely the models AGQ exists to serve.
+
+The grid scaling only affects accuracy at finite `n` (AGQ converges to the same
+marginal under any invertible scaling), but at `n_agq = 1` it enters the
+objective directly through `½·log|H|`. So the two Laplace variants differ by
+exactly that term, and no more.
+
+## Validation
+
+### Against NONMEM
+
+NONMEM has no AGQ. But `n_agq = 1` *is* Laplace with the exact Hessian, and that
+is precisely what `$EST METHOD=1 LAPLACIAN` computes — so LAPLACIAN is the exact
+external anchor for the one-node identity.
+
+Warfarin, OFV evaluated at identical initial parameters (`MAXEVAL=0`):
+
+| Objective | ferx | NONMEM |
+|-----------|------|--------|
+| FOCEI — Laplace, Gauss-Newton Hessian (`METHOD=1 INTER`) | 7.496684 | **7.4967** |
+| **AGQ `n_agq = 1`** — Laplace, exact Hessian (`METHOD=1 LAPLACIAN INTER`) | 7.899403 | **7.8994** |
+| `METHOD=1 LAPLACIAN` *without* `INTER` | — | 17.2049 |
+
+AGQ(1) reproduces NONMEM's LAPLACIAN to **5 significant figures**. Three things
+follow, and together they are the strongest statement available about this
+implementation:
+
+1. **The one-node/Laplace identity holds against an independent engine**, not
+   just against ferx's own arithmetic.
+2. **NONMEM shows the same 0.40-unit gap between LAPLACIAN and FOCEI that ferx
+   does.** So that gap is FOCEI's Gauss-Newton Hessian — a real property of the
+   estimator, reproduced by the reference implementation — and not a defect here.
+3. **`INTER` is required.** Plain `LAPLACIAN` misses by 9.3 OFV units, because
+   the exact Hessian of the conditional NLL must carry the curvature of the
+   η-dependent residual variance (`ln V(f(η))` under a proportional error model).
+   ferx's `individual_nll` includes that term, which is exactly why the Hessian is
+   finite-differenced from the true NLL rather than taken from the Gauss-Newton
+   form — the latter would have silently dropped it.
+
+Converged fit (`MAXEVAL=9999` / `maxiter = 500`, `optimizer = auto` → L-BFGS on
+the analytic gradient). `n_agq = 1` is the like-for-like comparison — both are
+Laplace with the exact Hessian:
+
+| Parameter | NONMEM `LAPLACIAN INTER` | ferx AGQ `n_agq = 1` | Δ |
+|-----------|--------------------------|----------------------|---|
+| OFV       | −285.9703 | −285.9702 | 0.0001 |
+| TVCL      | 0.132687 | 0.132688 | +0.001% |
+| TVV       | 7.737460 | 7.737470 | +0.000% |
+| TVKA      | 0.810924 | 0.810898 | −0.003% |
+| PROP_ERR  | 0.0105646 | 0.010565 | +0.004% |
+| ω²(ETA_CL)| 0.0285916 | 0.028592 | +0.001% |
+| ω²(ETA_V) | 0.00959221 | 0.009592 | −0.002% |
+| ω²(ETA_KA)| 0.336006 | 0.336021 | +0.004% |
+
+**Every parameter agrees with NONMEM to within 0.004%.** Raising to `n_agq = 3`
+moves the OFV to −285.9739 (a strictly better marginal) and barely moves the
+estimates — on warfarin the Laplace approximation is already near-exact, so the two
+share a minimum. That is the *point*: where Laplace is good, AGQ confirms it; where
+it is not, AGQ moves away from it and you can watch it happen by raising `n_agq`.
+
+### Speed
+
+Same fit, wall-clock:
+
+| | evaluations | wall |
+|---|---|---|
+| ferx FOCEI (analytic gradient) | 42 | 0.60 s |
+| **ferx AGQ `n_agq = 1`** | 31 | **0.23 s** |
+| **ferx AGQ `n_agq = 3`** | 32 | **0.30 s** |
+| NONMEM `LAPLACIAN INTER` | 220 | 1.21 s |
+| ferx AGQ, naive finite-difference gradient | 38 | 6.5 s |
+
+AGQ is **faster than ferx's own FOCEI** and ~4–5× faster than NONMEM's LAPLACIAN,
+while integrating a strictly better marginal. The last row is what the analytic
+gradient bought: a ~20× speedup over differencing the objective numerically, because
+that route re-solves every subject's inner loop at every perturbed parameter and
+this one never does.
+
+(NONMEM's 1.21 s is its reported *estimation* time and excludes the gfortran
+compile of the control stream, which dominates a real NONMEM run. Different
+hardware, so read the ratio, not the absolute.)
+
+### Against ferx's importance sampler
+
+The NONMEM check validates `n_agq = 1`. To validate the *node sweep* — the part
+NONMEM cannot anchor, because it has no AGQ — the reference is ferx's own
+importance sampler, which estimates the same integral by a completely different
+route.
+
+Warfarin, OFV evaluated at identical initial parameters and identical EBEs — so
+the *only* thing varying across rows is the marginal approximation.
+
+| Method | OFV | What it approximates |
+|--------|-----|----------------------|
+| FOCE   | 16.475 | Sheiner–Beal *linearised* marginal |
+| FOCEI  |  7.497 | Laplace, Gauss-Newton Hessian |
+| **AGQ `n_agq = 1`** | **7.899** | **Laplace, exact Hessian** |
+| AGQ `n_agq = 3` |  7.697 | |
+| AGQ `n_agq = 5` |  7.501 | |
+| AGQ `n_agq = 7` |  7.483 | |
+| AGQ `n_agq = 11` | **7.480** | ← converged |
+| **IMP** (20 000 samples) | **7.457** | Monte-Carlo marginal (independent) |
+
+The last row is the check that matters. Importance sampling estimates the *same
+integral* by a completely different route — a Student-t proposal with
+self-normalised weights: no quadrature, no Hessian, no Laplace. AGQ's refined
+grid lands within **0.02 OFV units** of it, which is inside IS's own Monte-Carlo
+error at 20 000 samples. Two estimators sharing no code path agree, which
+certifies both the marginal and the likelihood's constant convention (an error
+in either would show as tens of OFV units, not hundredths).
+
+Note that FOCEI's 7.497 is *closer* to the truth than AGQ(1)'s 7.899 here. That
+is not a defect — and NONMEM reproduces exactly the same ordering. Both are
+one-term approximations, and on this model FOCEI's Gauss-Newton Hessian error
+happens to partially cancel the Laplace error. The point of AGQ is that you do
+not have to rely on that cancellation: you add nodes and watch the number stop
+moving.
+
+### Converged fit vs FOCEI
+
+Full fit of the same model, `maxiter = 500`, covariance step on:
+
+| Parameter | FOCEI | AGQ (`n_agq = 3`) |
+|-----------|-------|-------------------|
+| OFV       | −286.004 | −285.973 |
+| TVCL      | 0.132673 | 0.132684 |
+| TVV       | 7.73806  | 7.73881  |
+| TVKA      | 0.809975 | 0.811433 |
+| ω²(ETA_V) | 0.009593 | 0.009589 |
+| ω²(ETA_KA)| 0.336241 | 0.337807 |
+| PROP_ERR  | 0.010565 | 0.010561 |
+
+On a well-behaved Gaussian PK model Laplace is already accurate, so AGQ
+reproduces the FOCEI estimates to ~0.2% — which is the expected and desired
+result. AGQ earns its cost on models where that assumption *fails*: non-Gaussian
+endpoints, sparse data, and large `ω²`.
+
+> **Reproducing the NONMEM anchor.** The runner is
+> `C:\package\ferx\nm_agq_laplace_warfarin.R` (klebsiella, `nmfe75`). It submits
+> the four control streams above and prints the comparison table. Note the
+> warfarin data has `CMT = 1` on observation rows, so the `$ERROR` block must use
+> `IPRED = A(2)/V`, not `IPRED = F`.
+
+## What runs under the hood
+
+AGQ reuses the FOCE/Laplace machinery almost entirely:
+
+1. **Inner loop — unchanged.** The per-subject EBE mode `η̂` comes from the same
+   solver FOCE/FOCEI use, including the analytic `Dual2` η-gradient where the
+   model is in the sensitivity provider's scope. AGQ does **not** re-optimise the
+   mode; it only lays the grid around it.
+2. **Hessian.** `H` is central-differenced from the true conditional NLL at `η̂`.
+3. **Grid.** Gauss–Hermite nodes/weights are computed by Golub–Welsch, then
+   transformed to `η_j = η̂ + √2·Σ^{1/2}·z_j` with `Σ = H⁻¹`.
+4. **Objective.** The exact conditional likelihood is evaluated at each node.
+5. **Outer loop.** AGQ has an **analytic outer gradient** (below), so
+   `optimizer = auto` resolves to gradient-based **L-BFGS**. The covariance step
+   differences the AGQ objective too, so the reported standard errors belong to
+   the likelihood that was actually optimised.
+
+Subjects are evaluated in parallel (rayon); the node sweep is serial within a
+subject. The population sum is reduced in a fixed subject order, so the OFV does
+not depend on the thread count.
+
+## The analytic outer gradient
+
+The quadrature has no closed form, but its *gradient* does — and it costs almost
+nothing extra.
+
+The node terms `t_j = log w_j + ‖z_j‖² − nll(η_j)` normalise to `ŵ_j = softmax(t)_j`,
+which are exactly the **posterior weights at the nodes**. By the Fisher (Louis)
+identity,
+
+$$
+\frac{\partial(-\log G_i)}{\partial\theta}
+= \mathbb{E}_{p(\eta\mid y)}\!\left[\frac{\partial\,\mathrm{nll}(\eta;\theta)}{\partial\theta}\right]
+\;\approx\; \sum_j \hat w_j\, \frac{\partial\,\mathrm{nll}(\eta_j;\theta)}{\partial\theta},
+$$
+
+so the outer gradient is a **posterior-weighted average of fixed-η scores**. Each
+`∂nll(η_j)/∂θ` is available exactly from the `Dual2` sensitivity provider (the
+same `∂f/∂θ` FOCE/FOCEI use — it makes no mode assumption, so it evaluates at any
+η). The Ω block is closed-form from the η-prior, the σ block closed-form from the
+variance model.
+
+### The grid moves too, and that term is not optional
+
+The nodes are built from `(η̂(θ), H(θ))`, so the total derivative also carries
+`∂F/∂η̂ · dη̂/dθ` and `∂F/∂H · dH/dθ`. Both *vanish in the exact-quadrature limit*
+— an exactly-integrated marginal does not care where you centre or scale the grid,
+it is a change of variables — but at finite `n_agq` they do not vanish, and they
+are **not small**. Measured against a finite-difference of the real objective on
+warfarin, the fixed-η score *alone* is **26% wrong at `n_agq = 1`** (where the rule
+*is* Laplace and the cancellation fails completely) and 0.8% wrong at `n_agq = 3`.
+
+ferx therefore computes the grid-response term rather than dropping it, and the
+gradient is the exact total derivative at **every** node count:
+
+| `n_agq` | fixed-η score alone | with grid response |
+|---------|---------------------|--------------------|
+| 1       | 26%                 | **0.16%**          |
+| 3       | 0.79%               | **0.008%**         |
+| 5       | 0.51%               | **0.001%**         |
+| 7       | 0.055%              | **0.001%**         |
+
+(Relative error against a finite-difference of the objective, which re-solves the
+inner loop at each perturbed point. The remaining error is that reference's own
+noise floor.)
+
+Two traps, both of which look like details and are not:
+
+**1. `H` depends on the parameters twice.** `H = ∂²nll/∂η²|_{η̂(θ)}` varies with `θ`
+explicitly (through θ/Ω/σ) *and* implicitly through the mode `η̂(θ)`. Differencing
+only the explicit half is not a partial improvement — it is **worse than omitting
+the term entirely** (26% → 62%), because the two halves substantially cancel. The
+mode has to move too, along `dη̂/dθ` (the implicit-function derivative
+`−H⁻¹·∂²nll/∂η∂θ`, which ferx already computes for EBE warm-start prediction). That
+is also what keeps the whole correction **free of any inner re-solve**.
+
+**2. The step is truncation-dominated, not noise-dominated.** The instinct — "`H` is
+itself finite-differenced, so use a *large* step and stay off its noise floor" — is
+exactly backwards here. `log|H|` curves sharply in the packed coordinates, so a large
+step is catastrophic: at `1e-2` the θ gradient comes out **5× wrong**, at `1e-3` still
+4% wrong. `H`'s own error floor sits well below where truncation bites. The answer is
+converged by `1e-4` and unchanged at `1e-5`.
+
+Cost: the score is one provider call per node; the correction adds `2 × n_free`
+Hessian rebuilds and grid sweeps — no inner re-solve. The finite-difference
+alternative costs `2 × n_free` *full population objective* evaluations, each
+re-solving every subject's inner loop. On warfarin that is the difference between
+6.5 s and 0.4 s.
+
+A fully analytic `dH/dθ` would need third derivatives (`∂³nll/∂η²∂θ`); the provider
+stops at `∂²f/∂η∂θ`, so that one order is finite-differenced.
+
+### Every model gets this gradient — including TTE and categorical
+
+There is no scope gate. Both ingredients work for any likelihood ferx can evaluate:
+
+- the **score** `∂nll(η_j;θ)/∂θ` is taken analytically from the `Dual2` provider
+  where it reaches, and finite-differenced *at fixed η* otherwise;
+- **`dη̂/dθ`** comes from the implicit function theorem (`−H⁻¹·∂²nll/∂η∂θ`), again
+  analytic where the provider reaches and finite-differenced otherwise.
+
+Crucially **neither route re-solves the inner loop** — that is the cost that makes
+the naive finite-difference gradient expensive, and it is what both avoid. So the
+sensitivity provider only decides whether the θ/σ score is analytic (a little
+faster) or finite-differenced; it does *not* decide whether AGQ has a usable
+gradient at all.
+
+That distinction matters here more than anywhere: TTE and categorical endpoints sit
+outside the `Dual2` provider, and they are precisely the models AGQ exists to serve.
+Letting them fall back to the inner-re-solving gradient would have made the headline
+use case the slow one. The test `fd_score_path_agrees_with_the_analytic_one` pins
+that the two routes return the same gradient.
+
+#### Scope parity with FOCE/FOCEI
+
+The analytic score reaches **exactly as far as the FOCE/FOCEI analytic outer
+gradient does** — no further, and no less. It is the same per-observation residual
+chain (`sens_outer_gradient::score_core`), so M3 censoring, IIV-on-RUV, a custom or
+time-varying residual magnitude, LTBS, correlated residuals (`block_sigma`) and ODE
+models all take the analytic route, exactly as they do under FOCE/FOCEI.
+
+That parity holds *by construction*: AGQ does not keep its own list of supported
+families, so there is nothing to drift out of step with the FOCE/FOCEI gate.
+
+FREM is included too: a covariate pseudo-observation row (`FREMTYPE > 0`) is scored
+against `θ[i] + η[j]` with the dedicated `EPSCOV` error rather than against the PK
+model, and both halves of that — the jet and the variance — now flow through the
+shared machinery.
+
+Models that still take the finite-differenced score:
+
+- **TTE and categorical endpoints**, which have no analytic outer gradient at all —
+  the sensitivity provider covers the structural PK/PD model, not the event or
+  category likelihood. These are also the models AGQ exists to serve, which is why
+  the FD route must (and does) avoid re-solving the inner loop.
+- `gradient_method = fd`, the explicit opt-out.
+
+Two cases decline per *subject* rather than per model, and fall back for that
+population: a genuinely off-diagonal correlated residual, and a custom magnitude
+combined with an M3-censored row.
+
+The fit output reports which route ran.
+
+### Where AGQ stops
+
+AGQ's gradient is exact but **finite-difference-limited**: the grid-response term
+and the posterior Hessian are both central differences, so it carries a noise floor
+(~1e-4 relative). It therefore cannot drive `|g|` arbitrarily low the way an
+analytic-to-machine-precision gradient can.
+
+So AGQ stops on the **objective-change** criterion (`outer_ftol`, default 1e-6) and
+the step-size criterion (`outer_xtol`), not on a gradient norm. That is where its
+objective actually settles.
+
+This matters more than it sounds. FOCE/FOCEI are given a `1e-12` stop, which they can
+reach; giving the same to AGQ makes it *unreachable*, and an unreachable stop is not
+harmless — the optimizer keeps stepping until the true gradient drops under its own
+noise floor, at which point the search direction is noise, the line search fails, and
+the run is reported as **not converged** despite sitting on an OFV that has been flat
+for a dozen evaluations. Stopping AGQ where it actually settles both fixes that and
+makes it *faster* (on warfarin + IOV: 14.5 s → 8.2 s), because the grinding past the
+plateau was pure waste.
+
+### Don't use BOBYQA
+
+`optimizer = bobyqa` **false-converges** on the AGQ objective. On warfarin it stops
+0.015 OFV units above the optimum at the default `inner_tol` — and gets *worse*, to
+0.18, as `inner_tol` is tightened, because a smoother objective merely lets its
+trust-region stopping rule trip sooner (63 → 34 evaluations, still reporting
+"converged"). Its ω estimates land ~3% off NONMEM. This is the failure mode ferx
+records in #317. `auto` picks L-BFGS for AGQ precisely to avoid it.
+
+## Inter-occasion variability (IOV)
+
+AGQ and `laplace` both support `[iov]`. Under IOV the integral is over the
+**stacked** random-effect vector
+
+$$
+b = [\eta,\ \kappa_1,\ \dots,\ \kappa_K],
+\qquad d = n_\eta + K \cdot n_\kappa
+$$
+
+whose prior is the block-diagonal `Ω_joint = Ω ⊕ Ω_iov ⊕ … ⊕ Ω_iov` (one block per
+occasion). That is not a new model — it is exactly what ferx's IOV likelihood already
+scores, since
+
+```text
+nll_iov = ½·(ηᵀΩ⁻¹η + log|Ω| + Σ_k κ_kᵀΩ_iov⁻¹κ_k + K·log|Ω_iov| + data)
+        = ½·(bᵀΩ_joint⁻¹b + log|Ω_joint| + data)
+```
+
+So **every formula on this page carries over verbatim** with `d` the stacked
+dimension: the marginal, the `½log|H|` normaliser, the node transform, the
+Fisher-identity gradient. IOV is a change of *dimension*, not of method. The mode is
+the joint `(η̂, κ̂)` one the inner loop already converges.
+
+**The catch is the dimension.** The tensor grid is `n_agq^d`, and `K` — the number
+of occasions — comes from the *data*. Three η, one κ, two occasions gives `d = 5`
+and `3⁵ = 243` nodes (fine); ten occasions gives `d = 13` and `3¹³ ≈ 1.6 M` (not).
+ferx enforces the 100 000-node cap against the stacked dimension once the data is
+read, and the error names the occasion count so the cause is obvious.
+
+> **`method = laplace` is always tractable under IOV.** Its grid is a *single point*
+> no matter how large `d` grows — only the Hessian gets bigger. So Laplace + IOV
+> works at any occasion count, and is the natural choice when the AGQ grid blows up.
+
+## Limitations
+
+- **Exponential in the random-effect dimension** — see the cost table above, and
+  the IOV section below. This is the real limit.
+- Models outside the `Dual2` provider take a finite-differenced θ/σ score rather than
+  an analytic one (see above). Same gradient, no inner re-solve, just a little slower
+  per iteration.
+
+## References
+
+- Pinheiro & Bates (1995), *Approximations to the log-likelihood function in the
+  nonlinear mixed-effects model*, J Comput Graph Stat 4(1):12–35.
+- Adaptive Gaussian quadrature as a generalisation of the Laplacian method, as
+  implemented in Phoenix NLME (ADPO), J Pharmacokinet Pharmacodyn (2025).

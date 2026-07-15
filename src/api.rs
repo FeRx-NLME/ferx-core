@@ -1493,6 +1493,20 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
     }
 }
 
+/// Shared check→`panic!` wrapper for the non-`fit` entry points (`predict()`/
+/// `simulate()`): if the sibling `check_*` produced a message, fail loudly with
+/// the common template naming `what` the engine received. `fit()` surfaces the
+/// same conditions as an `Err` instead of panicking. Callers holding a
+/// `Result`-returning check pass `first_error(&check).err()`.
+fn panic_if_unsupported(result: Option<String>, what: &str) {
+    if let Some(msg) = result {
+        panic!(
+            "predict()/simulate() received {what}: {msg}\n\
+             (fit() reports this as an error rather than panicking.)"
+        );
+    }
+}
+
 /// Features the analytic closed-form absorption models — transit (`one_cpt_transit`,
 /// `two_cpt_transit`, #386) and inverse-Gaussian (`one_cpt_ig`, `two_cpt_ig`, #790) —
 /// do not support: the exponential-tilting closed form is a constant-parameter
@@ -1917,13 +1931,10 @@ pub(crate) fn check_survival_tv_covariates(
 /// loudly rather than return a subtly wrong result.
 #[cfg(feature = "survival")]
 pub(crate) fn assert_survival_tv_covariates(model: &CompiledModel, population: &Population) {
-    if let Some(msg) = check_survival_tv_covariates(model, population) {
-        panic!(
-            "predict()/simulate() received a survival model / data combination with a \
-             time-varying covariate on a hazard: {msg}\n(fit() reports this as an error rather \
-             than panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_survival_tv_covariates(model, population),
+        "a survival model / data combination with a time-varying covariate on a hazard",
+    );
 }
 
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
@@ -1966,13 +1977,10 @@ pub(crate) fn assert_absorption_closed_form_support(
     model: &CompiledModel,
     population: &Population,
 ) {
-    if let Some(msg) = check_absorption_closed_form_support(model, population) {
-        panic!(
-            "predict()/simulate() received a model/data combination the analytic absorption \
-             closed form cannot honour: {msg}\n(fit() reports this as an error rather than \
-             panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_absorption_closed_form_support(model, population),
+        "a model/data combination the analytic absorption closed form cannot honour",
+    );
 }
 
 /// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
@@ -2043,25 +2051,20 @@ pub(crate) fn assert_absorption_flip_flop_no_twin(
     population: &Population,
     theta: &[f64],
 ) {
-    if let Some(msg) = check_absorption_flip_flop_no_twin(model, population, theta) {
-        panic!(
-            "predict()/simulate() received a model/data combination the absorption closed form \
-             cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_absorption_flip_flop_no_twin(model, population, theta),
+        "a model/data combination the absorption closed form cannot honour",
+    );
 }
 
 /// Panic on a depot-referencing analytic Form C readout + reset subject, for the
 /// `Vec`-returning `predict()`/`simulate()` paths (mirrors
 /// [`assert_absorption_closed_form_support`]). `fit()` returns this as an `Err`.
 pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population: &Population) {
-    if let Some(msg) = check_analytic_readout_support(model, population) {
-        panic!(
-            "predict()/simulate() received a model/data combination the analytic Form C \
-             readout cannot honour: {msg}\n(fit() reports this as an error rather than \
-             panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_analytic_readout_support(model, population),
+        "a model/data combination the analytic Form C readout cannot honour",
+    );
 }
 
 /// Panic on a malformed built-in **absorption input-rate** model/data combination —
@@ -2076,13 +2079,10 @@ pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population:
 /// [`check_absorption_dosing`] for the *value* / domain checks that need data. A
 /// no-op for any model with no built-in input-rate forcing (the common case).
 pub(crate) fn assert_absorption_dosing_supported(model: &CompiledModel, population: &Population) {
-    if let Err(msg) = first_error(&check_absorption_dosing(model, population)) {
-        panic!(
-            "predict()/simulate() received a model/data combination the built-in absorption \
-             input-rate machinery cannot honour: {msg}\n(fit() reports this as an error rather \
-             than panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        first_error(&check_absorption_dosing(model, population)).err(),
+        "a model/data combination the built-in absorption input-rate machinery cannot honour",
+    );
 }
 
 /// Model + estimation-option *compatibility* checks that don't depend on data:
@@ -2223,6 +2223,77 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // ── AGQ (#251) ────────────────────────────────────────────────────────────
+    // Laplace routes through the same AGQ objective (one node), so it inherits the same
+    // compatibility guards. Its grid is a single point no matter how many random effects
+    // there are, so the caps below never fire for it — including under IOV.
+    if chain
+        .iter()
+        .any(|&m| matches!(m, EstimationMethod::Agq | EstimationMethod::Laplace))
+    {
+        // IOV is **supported**: AGQ integrates over the stacked (η, κ₁..κ_K), which is exactly
+        // what `individual_nll_iov` already scores. What IOV changes is the *dimension* — and
+        // hence the tensor grid — not the method. The grid cap below is what decides whether a
+        // given IOV model is tractable, and it is checked against the stacked dimension in
+        // `fit_inner` (which, unlike this function, can see the occasion count in the data).
+        //
+        // Name the method the user actually wrote, so a `method = laplace` fit is never told
+        // about "method = agq".
+        let label = if chain.contains(&EstimationMethod::Laplace) {
+            "laplace"
+        } else {
+            "agq"
+        };
+        // The tensor rule costs `n_agq^d` full likelihood evaluations per subject per
+        // outer iteration. Past the cap that is not "slow", it is a fit that will never
+        // finish — so it is worth failing at check time, with the two levers spelled out.
+        //
+        // Read the node count from `agq_nodes()`, NOT `options.n_agq`: `method = laplace`
+        // pins it to 1 regardless of what `n_agq` holds (the key is not one of its options),
+        // so reading the raw field would let a stray `n_agq = 100` trip these caps on a fit
+        // that only ever builds a single node.
+        let n_nodes = options.agq_nodes().unwrap_or(1);
+        // Per-dimension node cap. The parser (`apply_fit_option`) enforces this for
+        // file-driven fits, but a `FitOptions` built directly against the Rust API
+        // bypasses that path — so re-check here, alongside the grid cap, or an
+        // out-of-range `n_agq` (e.g. 100 with a single η, which slips under the grid
+        // cap) would reach `gauss_hermite` past the point Golub–Welsch stays accurate.
+        if n_nodes > crate::estimation::agq::MAX_AGQ_NODES {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_NODES_TOO_LARGE",
+                    format!(
+                        "method = {label} with n_agq = {n_nodes} exceeds the {}-node per-dimension \
+                         limit: beyond ~20 nodes the Golub–Welsch rule loses its extreme nodes to \
+                         round-off and the marginal gains nothing. Lower n_agq (n_agq = 1 is the \
+                         Laplace approximation, i.e. FOCEI-equivalent cost).",
+                        crate::estimation::agq::MAX_AGQ_NODES,
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+        let grid = crate::estimation::agq::grid_size(n_nodes, model.n_eta);
+        if grid > crate::estimation::agq::MAX_AGQ_GRID {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_GRID_TOO_LARGE",
+                    format!(
+                        "method = {label} with n_agq = {n_nodes} and {} random effects needs a \
+                         {n_nodes}^{} = {grid}-node tensor grid per subject per iteration, over \
+                         the {} limit. Lower n_agq (n_agq = 1 is the Laplace approximation, i.e. \
+                         FOCEI-equivalent cost), reduce the number of random effects, or use \
+                         method = saem / imp, whose cost does not grow with the η dimension.",
+                        model.n_eta,
+                        model.n_eta,
+                        crate::estimation::agq::MAX_AGQ_GRID,
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
     // Explicit `gradient_method = ad`: the Enzyme autodiff path was retired in
     // favour of the hand-rolled `Dual2` analytic sensitivities. Reject it rather
     // than silently running a different method. `auto` (analytic where in scope,
@@ -2271,13 +2342,16 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     | EstimationMethod::FoceI
                     | EstimationMethod::Saem
                     | EstimationMethod::Imp
+                    | EstimationMethod::Agq
+                    | EstimationMethod::Laplace
             ) {
                 diags.push(
                     Diagnostic::error(
                         "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
                         "block_sigma correlated residual errors are currently supported for \
-                         method = foce, focei, saem, and imp only. The gn / gn_hybrid \
-                         Gauss-Newton paths still use diagonal residual-error derivatives.",
+                         method = foce, focei, saem, imp, agq, and laplace only. The gn / \
+                         gn_hybrid Gauss-Newton paths still use diagonal residual-error \
+                         derivatives.",
                     )
                     .with_block("fit_options"),
                 );
@@ -3188,8 +3262,15 @@ fn perturb_init(
 /// (e.g. the exact-inits start 0), which the old "converged-first" rule allowed,
 /// so multi-start could return a divergence with a huge OFV. Within the same
 /// validity class: prefer converged, then lower OFV.
+///
+/// The validity cutoff sits well below the ~1e20 inner-objective sentinel but
+/// far above any legitimate population OFV, so a real fit never trips it; a NaN
+/// OFV is non-finite and therefore also invalid, so it can never block a finite
+/// valid candidate.
 fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: bool) -> bool {
-    let valid = |o: f64| o.is_finite() && o < 1e14;
+    /// OFVs at or above this are treated as diverged/invalid (see above).
+    const DIVERGENCE_OFV: f64 = 1e14;
+    let valid = |o: f64| o.is_finite() && o < DIVERGENCE_OFV;
     match (valid(b_ofv), valid(c_ofv)) {
         (false, true) => true,
         (true, false) => false,
@@ -3269,7 +3350,23 @@ pub fn fit(
     // CMT). Otherwise the code→index map would miss and fold into a silent sentinel.
     #[cfg(feature = "markov")]
     for (cmt, endpoint) in &model.endpoints {
-        if let EndpointLikelihood::Ctmm { state_codes, .. } = endpoint {
+        if let EndpointLikelihood::Ctmm {
+            state_codes,
+            generator_states,
+            ..
+        } = endpoint
+        {
+            // Time-inhomogeneous (drug/PD-driven Q(t), #817): an intensity references a
+            // model ODE state, scored by the per-gap occupancy integration in
+            // `ctmm_endpoint_nll_inhomogeneous`. That requires an ODE model — guaranteed at
+            // parse (`generator_states` indices point into `ode_spec`), asserted here for a
+            // hand-built `CompiledModel`.
+            if !generator_states.is_empty() && model.ode_spec.is_none() {
+                return Err(format!(
+                    "[markov_model] cmt = {cmt}: a transition intensity references a model state \
+                     (time-inhomogeneous Q(t)), but the model has no ODE system to supply it."
+                ));
+            }
             for subject in &population.subjects {
                 crate::markov::endpoint::validate_ctmm_states(
                     *cmt,
@@ -3360,6 +3457,39 @@ pub fn fit(
         population,
         &options.iov_occasion,
     ))?;
+    // AGQ + IOV: the tensor grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` (the
+    // occasion count) is a property of the *data*, not the model — so this cap cannot be
+    // checked in `check_model_options`, which never sees the population. Check it here, once
+    // the occasions are known, against the worst subject.
+    //
+    // `method = laplace` is a single node regardless of `d`, so it always passes: Laplace +
+    // IOV is tractable at any occasion count.
+    if let Some(n_nodes) = options.agq_nodes() {
+        if model.n_kappa > 0 {
+            let max_occ = population
+                .subjects
+                .iter()
+                .map(|s| crate::stats::likelihood::iov_occasion_groups(s).len())
+                .max()
+                .unwrap_or(0);
+            let d = model.n_eta + max_occ * model.n_kappa;
+            let grid = crate::estimation::agq::grid_size(n_nodes, d);
+            if grid > crate::estimation::agq::MAX_AGQ_GRID {
+                return Err(format!(
+                    "method = agq with n_agq = {n_nodes} needs a {n_nodes}^{d} = {grid}-node \
+                     tensor grid per subject per iteration — over the {} limit. Under IOV the \
+                     integral is over the stacked (η, κ₁..κ_{max_occ}), so the dimension is \
+                     n_eta ({}) + occasions ({max_occ}) × n_kappa ({}) = {d}. Lower n_agq, or \
+                     use method = laplace (one node — always tractable, and the exact-Hessian \
+                     Laplace approximation), or saem / imp, whose cost does not grow with the \
+                     random-effect dimension.",
+                    crate::estimation::agq::MAX_AGQ_GRID,
+                    model.n_eta,
+                    model.n_kappa,
+                ));
+            }
+        }
+    }
     // If any subject has per-event covariate snapshots that don't carry
     // a variation in covariates the model actually references (e.g.
     // DAY / STIME columns in NONMEM-format datasets), clear those
@@ -4892,6 +5022,9 @@ fn fit_inner(
         // (FOCE/FOCEI/GN) are driven by the inner-loop gradient; IMP consumes
         // the EBE Hessian built via that same route. SAEM is sampling-based, so
         // it reports its E-step kernel (MH/HMC) instead of a gradient route.
+        // AGQ included: it runs the same inner EBE solve as FOCE/FOCEI (it only replaces
+        // the *population* objective), so the inner analytic-vs-FD η-gradient route this
+        // reports is exactly as relevant to it.
         let uses_gradient_route = chain.iter().any(|m| {
             matches!(
                 m,
@@ -4901,6 +5034,8 @@ fn fit_inner(
                     | EstimationMethod::FoceGnHybrid
                     | EstimationMethod::Imp
                     | EstimationMethod::Impmap
+                    | EstimationMethod::Agq
+                    | EstimationMethod::Laplace
             )
         });
         if uses_gradient_route {
@@ -4996,6 +5131,8 @@ fn fit_inner(
                 | EstimationMethod::FoceGnHybrid
                 | EstimationMethod::Imp
                 | EstimationMethod::Impmap
+                | EstimationMethod::Agq
+                | EstimationMethod::Laplace
         )
     }) {
         if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning(
@@ -5200,6 +5337,23 @@ fn fit_inner(
             EstimationMethod::FoceI => stage_opts.interaction = true,
             EstimationMethod::Foce => stage_opts.interaction = false,
             _ => {}
+        }
+        // AGQ resolves `auto` to L-BFGS, because it *has* a gradient: the analytic
+        // posterior-weighted score over the quadrature nodes (`estimation::agq`), with the
+        // reconverged-FD gradient as the always-correct fallback.
+        //
+        // BOBYQA — what `resolve_auto` hands every other FD-only fit — **false-converges**
+        // on this objective (the #317 failure mode): on warfarin it stops 0.015 OFV units
+        // above the optimum at the default `inner_tol`, and *worsens* to 0.18 as `inner_tol`
+        // is tightened, because a smoother objective merely lets its trust-region stopping
+        // rule trip sooner (63 -> 34 evaluations, still reporting "converged"). Its ω
+        // estimates land ~3% off NONMEM LAPLACIAN. L-BFGS on the analytic gradient matches
+        // NONMEM to 4-5 significant figures on every parameter, in 0.39 s against FOCEI's
+        // 0.29 s. See docs/estimation/agq.qmd. An explicit `optimizer = ...` is honoured.
+        if matches!(method, EstimationMethod::Agq | EstimationMethod::Laplace)
+            && stage_opts.optimizer == Optimizer::Auto
+        {
+            stage_opts.optimizer = Optimizer::NloptLbfgs;
         }
         // Run the covariance step (and SIR) only on the last *estimating* stage,
         // so a chain doesn't recompute the expensive FD covariance after every
@@ -6790,42 +6944,72 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
     hits
 }
 
-/// Build the human message + native structured entry (with `details`) for
-/// theta estimates pinned to an optimizer bound, or `None` when none are.
-fn boundary_estimate_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
-    let hits = boundary_estimates(params);
+/// Construct a fit-end [`WarningEntry`] with the invariant fields every native
+/// emitter shares (`severity: Warning`, `source_method: None`), varying only
+/// `category`, `message`, and `details`.
+fn warning_entry(
+    category: WarningCode,
+    message: String,
+    details: Option<serde_json::Value>,
+) -> WarningEntry {
+    WarningEntry {
+        severity: WarningSeverity::Warning,
+        category,
+        message,
+        source_method: None,
+        details,
+    }
+}
+
+/// Shared scaffold for the list-style fit-end warnings: given a set of `hits`,
+/// return `None` when empty, otherwise join a human `list` string (`line` per
+/// hit), format the message (`msg` over the joined list), build the structured
+/// `details`, and wrap it in a [`WarningEntry`] as `Some((message, entry))`.
+fn list_warning<H>(
+    hits: Vec<H>,
+    category: WarningCode,
+    line: impl Fn(&H) -> String,
+    msg: impl Fn(&str) -> String,
+    details: impl Fn(&[H]) -> serde_json::Value,
+) -> Option<(String, WarningEntry)> {
     if hits.is_empty() {
         return None;
     }
-    let list = hits
-        .iter()
-        .map(|(name, est, _bound, side)| format!("{name} ({est:.4} at {side} bound)"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let msg = format!(
-        "Parameter estimate(s) pinned to an optimizer bound: {list}. This often \
-         indicates non-identifiability or a too-tight bound; inspect the affected \
-         parameter(s) and consider relaxing the bound or simplifying the model."
-    );
-    let params_json: Vec<serde_json::Value> = hits
-        .iter()
-        .map(|(name, est, bound, side)| {
-            serde_json::json!({
-                "parameter": name,
-                "estimate": est,
-                "bound": bound,
-                "side": side,
-            })
-        })
-        .collect();
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::BoundaryEstimate,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({ "parameters": params_json })),
-    };
+    let list = hits.iter().map(|h| line(h)).collect::<Vec<_>>().join(", ");
+    let msg = msg(&list);
+    let entry = warning_entry(category, msg.clone(), Some(details(&hits)));
     Some((msg, entry))
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// theta estimates pinned to an optimizer bound, or `None` when none are.
+fn boundary_estimate_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
+    list_warning(
+        boundary_estimates(params),
+        WarningCode::BoundaryEstimate,
+        |(name, est, _bound, side)| format!("{name} ({est:.4} at {side} bound)"),
+        |list| {
+            format!(
+                "Parameter estimate(s) pinned to an optimizer bound: {list}. This often \
+                 indicates non-identifiability or a too-tight bound; inspect the affected \
+                 parameter(s) and consider relaxing the bound or simplifying the model."
+            )
+        },
+        |hits| {
+            let params_json: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|(name, est, bound, side)| {
+                    serde_json::json!({
+                        "parameter": name,
+                        "estimate": est,
+                        "bound": bound,
+                        "side": side,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "parameters": params_json })
+        },
+    )
 }
 
 /// Relative-standard-error threshold (percent) above which a free THETA is
@@ -6871,45 +7055,38 @@ fn inflated_rse_warning(
     se_theta: &Option<Vec<f64>>,
     params: &ModelParameters,
 ) -> Option<(String, WarningEntry)> {
-    let hits = inflated_rse_thetas(se_theta, params);
-    if hits.is_empty() {
-        return None;
-    }
-    let list = hits
-        .iter()
+    list_warning(
+        inflated_rse_thetas(se_theta, params),
+        WarningCode::InflatedRse,
         // One decimal so a borderline value (e.g. 50.4%) is not displayed as
         // "50%" — which would read as below the threshold it just tripped.
-        .map(|(name, _est, _se, rse)| format!("{name} ({rse:.1}%)"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let msg = format!(
-        "High relative standard error (RSE > {:.0}%): {list}. These parameter(s) \
-         are imprecisely estimated — often a sign of over-parameterization or \
-         data that do not inform them; consider simplifying the model.",
-        RSE_WARN_THRESHOLD_PCT
-    );
-    let params_json: Vec<serde_json::Value> = hits
-        .iter()
-        .map(|(name, est, se, rse)| {
+        |(name, _est, _se, rse)| format!("{name} ({rse:.1}%)"),
+        |list| {
+            format!(
+                "High relative standard error (RSE > {:.0}%): {list}. These parameter(s) \
+                 are imprecisely estimated — often a sign of over-parameterization or \
+                 data that do not inform them; consider simplifying the model.",
+                RSE_WARN_THRESHOLD_PCT
+            )
+        },
+        |hits| {
+            let params_json: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|(name, est, se, rse)| {
+                    serde_json::json!({
+                        "parameter": name,
+                        "estimate": est,
+                        "se": se,
+                        "rse_pct": rse,
+                    })
+                })
+                .collect();
             serde_json::json!({
-                "parameter": name,
-                "estimate": est,
-                "se": se,
-                "rse_pct": rse,
+                "threshold_pct": RSE_WARN_THRESHOLD_PCT,
+                "parameters": params_json,
             })
-        })
-        .collect();
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::InflatedRse,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({
-            "threshold_pct": RSE_WARN_THRESHOLD_PCT,
-            "parameters": params_json,
-        })),
-    };
-    Some((msg, entry))
+        },
+    )
 }
 
 /// Absolute correlation above which a parameter pair is flagged as
@@ -6958,37 +7135,30 @@ fn high_correlation_pairs(
 /// Build the human message + native structured entry (with `details`) for
 /// highly correlated THETA pairs in the fit's covariance matrix, or `None`.
 fn high_correlation_warning(result: &FitResult) -> Option<(String, WarningEntry)> {
-    let pairs = high_correlation_pairs(result.covariance_matrix.as_ref(), &result.theta_names);
-    if pairs.is_empty() {
-        return None;
-    }
-    let list = pairs
-        .iter()
-        .map(|(a, b, r)| format!("{a} ~ {b} ({r:.2})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let msg = format!(
-        "Highly correlated parameter pair(s) (|r| >= {CORRELATION_WARN_THRESHOLD:.2}): \
-         {list}. Highly correlated estimates indicate over-parameterization or \
-         non-identifiability; consider fixing or removing one of each pair."
-    );
-    let pairs_json: Vec<serde_json::Value> = pairs
-        .iter()
-        .map(
-            |(a, b, r)| serde_json::json!({ "parameter_a": a, "parameter_b": b, "correlation": r }),
-        )
-        .collect();
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::HighCorrelation,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({
-            "threshold": CORRELATION_WARN_THRESHOLD,
-            "pairs": pairs_json,
-        })),
-    };
-    Some((msg, entry))
+    list_warning(
+        high_correlation_pairs(result.covariance_matrix.as_ref(), &result.theta_names),
+        WarningCode::HighCorrelation,
+        |(a, b, r)| format!("{a} ~ {b} ({r:.2})"),
+        |list| {
+            format!(
+                "Highly correlated parameter pair(s) (|r| >= {CORRELATION_WARN_THRESHOLD:.2}): \
+                 {list}. Highly correlated estimates indicate over-parameterization or \
+                 non-identifiability; consider fixing or removing one of each pair."
+            )
+        },
+        |pairs| {
+            let pairs_json: Vec<serde_json::Value> = pairs
+                .iter()
+                .map(|(a, b, r)| {
+                    serde_json::json!({ "parameter_a": a, "parameter_b": b, "correlation": r })
+                })
+                .collect();
+            serde_json::json!({
+                "threshold": CORRELATION_WARN_THRESHOLD,
+                "pairs": pairs_json,
+            })
+        },
+    )
 }
 
 /// Build the human message + native structured entry for a **twin-less** transit /
@@ -7066,17 +7236,15 @@ fn absorption_flip_flop_ebe_warning(
         ode_fn,
         params
     );
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::FlipFlop,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({
+    let entry = warning_entry(
+        WarningCode::FlipFlop,
+        msg.clone(),
+        Some(serde_json::json!({
             "phase": "ebe",
             "model": model.pk_model.canonical_name(),
             "subjects": crossers,
         })),
-    };
+    );
     Some((msg, entry))
 }
 
@@ -11066,7 +11234,8 @@ mod iov_integration {
     }
 
     // block_sigma correlated residual errors are wired into the Gaussian FOCE,
-    // FOCEI, SAEM, and IMP paths; the Gauss-Newton (gn / gn_hybrid) methods still
+    // FOCEI, SAEM, IMP, AGQ, and Laplace paths (AGQ/Laplace via `score_core`'s
+    // `corr_diag` branch, #251); the Gauss-Newton (gn / gn_hybrid) methods still
     // use diagonal residual-error derivatives and must be rejected up front.
     #[test]
     fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
@@ -11093,12 +11262,14 @@ mod iov_integration {
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
 
-        // FOCE, FOCEI, SAEM, and IMP are all accepted (no method diagnostic).
+        // FOCE, FOCEI, SAEM, IMP, AGQ, and Laplace are all accepted (no method diagnostic).
         for method in [
             EstimationMethod::Foce,
             EstimationMethod::FoceI,
             EstimationMethod::Saem,
             EstimationMethod::Imp,
+            EstimationMethod::Agq,
+            EstimationMethod::Laplace,
         ] {
             let opts = fast_opts(method, Optimizer::Bobyqa, false);
             assert!(

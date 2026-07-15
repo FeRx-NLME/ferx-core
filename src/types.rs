@@ -2772,18 +2772,28 @@ pub type LinearPredictorFn =
     Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
 
 #[cfg(feature = "markov")]
-/// Closure building a CTMM generator matrix `Q(θ, η, covariates)` — the S×S
-/// transition-intensity (generator) matrix for a continuous-time Markov endpoint.
+/// Closure building a CTMM generator matrix `Q(θ, η, covariates, state)` — the
+/// S×S transition-intensity (generator) matrix for a continuous-time Markov
+/// endpoint.
 ///
 /// The off-diagonals `q_jk ≥ 0` (`j ≠ k`) are the `[markov_model] transition`
 /// intensities; the builder fills the diagonal row-sum-zero
 /// (`q_jj = −Σ_{k≠j} q_jk`) so the caller always receives a valid generator.
-/// Mirrors [`LinearPredictorFn`]: evaluated once per subject from a *baseline*
-/// covariate snapshot (time-homogeneous — a drug-driven `Q(t)` is Phase 6), so a
-/// time-varying covariate on an intensity would be silently frozen and is
-/// guarded at parse/fit-setup.
-pub type GeneratorFn =
-    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> nalgebra::DMatrix<f64> + Send + Sync>;
+///
+/// The `state` slice is the model's **ODE state vector at the current time**,
+/// supplied only on the **time-inhomogeneous** (drug/PD-driven `Q(t)`, Phase 6,
+/// #817) path so an intensity may reference an ODE state by name (e.g. a
+/// concentration `central/V` or a PD response compartment). The builder resolves
+/// those names against `state` via the endpoint's
+/// [`generator_states`](EndpointLikelihood::Ctmm::generator_states) index map.
+/// On the **time-homogeneous** (Phase 5) path no intensity references a state, so
+/// callers pass an empty slice and the argument is ignored — the generator is
+/// then a pure function of a *baseline* `(θ, η, covariates)` snapshot, and a
+/// time-varying covariate on an intensity would be silently frozen (guarded at
+/// parse/fit-setup).
+pub type GeneratorFn = Box<
+    dyn Fn(&[f64], &[f64], &HashMap<String, f64>, &[f64]) -> nalgebra::DMatrix<f64> + Send + Sync,
+>;
 
 #[cfg(feature = "survival")]
 /// Per-CMT endpoint likelihood specification.
@@ -2839,8 +2849,19 @@ pub enum EndpointLikelihood {
         /// be coded with any non-negative integers (e.g. `1`/`2`), not only
         /// `0..S−1`. Length `== n_states`; codes are unique (checked at parse).
         state_codes: Vec<usize>,
-        /// Builds the generator `Q(θ,η,cov)` — see [`GeneratorFn`].
+        /// Builds the generator `Q(θ,η,cov,state)` — see [`GeneratorFn`].
         generator_fn: GeneratorFn,
+        /// Resolved, dual-evaluable form of the same intensities, for the **analytic**
+        /// gradient: it yields `∂Q/∂(θ,η)` exactly, which the endpoint chains through the
+        /// Van Loan Fréchet derivative of `expm` instead of finite-differencing the whole
+        /// matrix-exponential likelihood (#759).
+        ///
+        /// `None` — and the endpoint keeps its FD gradient — when the intensities are
+        /// time-**inhomogeneous** (an intensity reads an ODE state, so `Q` is a functional
+        /// of the PK trajectory and the likelihood is an occupancy ODE rather than an
+        /// `expm`), or when the program cannot be represented exactly (see
+        /// `build_ctmm_generator_program`).
+        generator_program: Option<crate::parser::model_parser::CtmmGeneratorProgram>,
         /// Covariate names referenced by any transition intensity (including any
         /// reached transitively through `[individual_parameters]`). Evaluated at a
         /// baseline snapshot, so a covariate listed here that is time-varying in
@@ -2849,6 +2870,16 @@ pub enum EndpointLikelihood {
         /// [`Self::Tte`]'s `hazard_covariates` and [`Self::Binary`]'s
         /// `lp_covariates` (#741).
         generator_covariates: Vec<String>,
+        /// ODE **state** names referenced by any transition intensity, paired with
+        /// their index in the model's ODE state vector: `(state_name, ode_index)`.
+        /// Non-empty **iff** the endpoint is time-**inhomogeneous** (drug/PD-driven
+        /// `Q(t)`, Phase 6 #817) — an intensity references a model state, so the
+        /// generator must be re-evaluated as the state evolves over each observation
+        /// gap (occupancy ODE, [`crate::markov::ctmm_inhomogeneous_transition`])
+        /// rather than built once per subject. **Empty** ⇒ time-homogeneous (Phase 5,
+        /// `expm(Q·Δt)`). [`generator_fn`](Self::Ctmm::generator_fn) reads its `state`
+        /// argument through this map.
+        generator_states: Vec<(String, usize)>,
     },
     // Ordinal, Poisson, NegBin, Dtmm deferred to Phase 4/4b
 }
@@ -5178,6 +5209,16 @@ pub struct FitOptions {
     // `imp_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
     // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` at the fixed input parameters
     // without updating them.
+    /// Gauss–Hermite nodes **per random effect** for `method = agq` (#251). Default 3.
+    ///
+    /// `n_agq = 1` is the Laplace approximation exactly (see
+    /// [`crate::estimation::agq`]); larger values refine the marginal and are what make
+    /// AGQ unbiased on strongly non-Gaussian integrands. The tensor grid costs
+    /// `n_agq^n_eta` likelihood evaluations per subject per outer iteration, so raise it
+    /// deliberately — odd values are conventional (they keep a node exactly at the mode).
+    /// Capped by [`crate::estimation::agq::MAX_AGQ_NODES`], with the *grid* additionally
+    /// capped by [`crate::estimation::agq::MAX_AGQ_GRID`].
+    pub n_agq: usize,
     /// Number of importance samples per subject. Default 1000. Recommended
     /// 2000–5000 for publication-quality MC SE (cost scales linearly).
     pub imp_samples: usize,
@@ -5585,6 +5626,7 @@ impl Default for FitOptions {
             sir_seed: None,
             sir_keep_samples: false,
             sir_df: 5.0,
+            n_agq: 3,
             imp_samples: 1000,
             imp_proposal_df: 5.0,
             imp_seed: None,
@@ -5858,6 +5900,33 @@ pub enum EstimationMethod {
     /// σ²: inverse-gamma, mu-referenced θ: normal). Reports posterior summaries +
     /// convergence diagnostics on `FitResult.bayes`, not a point estimate.
     Bayes,
+    /// Adaptive Gauss–Hermite quadrature (#251) — the Laplace approximation generalised.
+    /// Reuses the FOCE/Laplace inner loop to find each subject's EBE mode, then evaluates
+    /// the **exact** conditional likelihood on a Gauss–Hermite grid laid around that mode
+    /// (`n_agq` nodes per random effect). At `n_agq = 1` it is Laplace identically; above
+    /// that the marginal improves and — because it integrates the model's real likelihood
+    /// rather than a Gaussian-residual surrogate — it is the only method here that handles
+    /// non-Gaussian endpoints (TTE, categorical) without approximation. Deterministic, so
+    /// unlike [`Saem`](Self::Saem) / [`Imp`](Self::Imp) its OFV carries no Monte-Carlo noise.
+    /// Cost is `n_agq^n_eta` likelihood evaluations per subject per iteration; see
+    /// [`crate::estimation::agq::MAX_AGQ_GRID`].
+    Agq,
+    /// The **Laplace approximation** with the *exact* Hessian — NONMEM `$EST METHOD=1
+    /// LAPLACIAN` (#251).
+    ///
+    /// Identical to [`Agq`](Self::Agq) at one node: the one-point Gauss–Hermite rule sits at
+    /// the mode with weight `√π`, and the quadrature sum collapses, term for term, to
+    /// `(2π)^(d/2)·|H|^(−½)·exp(l(η̂))`. So this variant routes through the AGQ objective with
+    /// the node count pinned to 1 — it is not a separate implementation, and `n_agq` is not
+    /// one of its options.
+    ///
+    /// **Distinct from [`FoceI`](Self::FoceI)**, which is Laplace with the *Gauss-Newton*
+    /// Hessian `CᵀC + Ω⁻¹` (that form drops `∂²f/∂η²`). This one differentiates the true
+    /// conditional NLL, so it carries the curvature of the η-dependent residual variance that
+    /// the Gauss-Newton form discards — which is exactly why it reproduces NONMEM's LAPLACIAN
+    /// (to six significant figures on warfarin) where FOCEI lands on a different value. It is
+    /// also the cheapest member of the AGQ family: one node, no grid.
+    Laplace,
 }
 
 impl EstimationMethod {
@@ -5871,6 +5940,8 @@ impl EstimationMethod {
             EstimationMethod::Imp => "IMP",
             EstimationMethod::Impmap => "IMPMAP",
             EstimationMethod::Bayes => "BAYES",
+            EstimationMethod::Agq => "AGQ",
+            EstimationMethod::Laplace => "LAPLACE",
         }
     }
 }
@@ -5883,6 +5954,30 @@ impl FitOptions {
             vec![self.method]
         } else {
             self.methods.clone()
+        }
+    }
+
+    /// The AGQ node count when this (stage's) method is AGQ, else `None`.
+    ///
+    /// The **single predicate** every AGQ-aware branch consults — the population objective
+    /// ([`crate::estimation::outer_optimizer::pop_nll_opts`]), the outer-gradient dispatch,
+    /// and the optimizer/report classification. Keeping it in one place is what stops the
+    /// objective and the gradient from disagreeing about which method is running: an
+    /// outer loop minimising the AGQ objective while fed the analytic *FOCE* gradient
+    /// would converge, silently, to the wrong parameters.
+    ///
+    /// Reads `self.method` (the per-stage method — `api::fit_inner` rewrites it for each
+    /// stage of a chain), so it is correct inside a chained fit too.
+    pub fn agq_nodes(&self) -> Option<usize> {
+        match self.method {
+            EstimationMethod::Agq => Some(self.n_agq.max(1)),
+            // Laplace *is* AGQ at one node — not an approximation of it, an identity (the
+            // one-point Gauss-Hermite rule sits at the mode with weight √π, and the sum
+            // collapses to `(2π)^(d/2)·|H|^(−½)·exp(l(η̂))`). So it routes through the same
+            // objective, the same analytic gradient, and the same covariance stencil, with
+            // the node count pinned. `n_agq` is not one of its keys; it cannot be varied.
+            EstimationMethod::Laplace => Some(1),
+            _ => None,
         }
     }
 
@@ -6090,6 +6185,47 @@ pub fn framework_keys() -> &'static [&'static str] {
 pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
     match m {
         EstimationMethod::Foce | EstimationMethod::FoceI => &[
+            "maxiter",
+            "inner_maxiter",
+            "inner_tol",
+            "inner_restarts",
+            "inner_optimizer",
+            "optimizer",
+            "outer_xtol",
+            "outer_ftol",
+            "steihaug_max_iters",
+            "global_search",
+            "global_maxeval",
+            "stagnation_guard",
+            "reconverge_gradient_interval",
+        ],
+        // AGQ drives the same outer loop and the same inner EBE solve as FOCE/FOCEI —
+        // it only swaps the population objective — so it accepts that method's keys,
+        // plus the node count. AGQ *does* have an exact analytic outer gradient, and
+        // `reconverge_gradient_interval` is its escape hatch onto the numeric path
+        // (honoured in `population_gradient`), so the key applies here exactly as it
+        // does for FOCE/FOCEI.
+        EstimationMethod::Agq => &[
+            "n_agq",
+            "maxiter",
+            "inner_maxiter",
+            "inner_tol",
+            "inner_restarts",
+            "inner_optimizer",
+            "optimizer",
+            "outer_xtol",
+            "outer_ftol",
+            "steihaug_max_iters",
+            "global_search",
+            "global_maxeval",
+            "stagnation_guard",
+            "reconverge_gradient_interval",
+        ],
+        // Laplace is AGQ with the node count pinned to 1, so it takes AGQ's keys **minus
+        // `n_agq`** — that key is not a knob here, and offering it would invite
+        // `method = laplace, n_agq = 5`, which is a contradiction. Users who want to vary the
+        // node count already have `method = agq`.
+        EstimationMethod::Laplace => &[
             "maxiter",
             "inner_maxiter",
             "inner_tol",

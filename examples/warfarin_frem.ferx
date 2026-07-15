@@ -22,12 +22,11 @@
   theta TV_WT(72.0) FIX
   theta TV_AGE(37.6) FIX
 
-  omega ETA_CL  ~ 0.09
-  omega ETA_V   ~ 0.04
-  omega ETA_KA  ~ 0.30
-  omega ETA_WT_FREM  ~ 111.56
-  omega ETA_AGE_FREM ~ 99.38
-
+  # The five random effects are declared by `block_omega` alone. Declaring them a
+  # second time with `omega NAME ~ v` lines does NOT merge — it appends a further
+  # five random effects with the same names, giving a 10-eta model with a 10x10
+  # omega. (`prepare_frem()` emits the block form only; this file used to carry
+  # both.)
   block_omega (ETA_CL, ETA_V, ETA_KA, ETA_WT_FREM, ETA_AGE_FREM) = [
     0.09,
     0.0, 0.04,

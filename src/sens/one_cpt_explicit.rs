@@ -27,6 +27,35 @@ use super::dual2::Dual2;
 use super::jet::Jet;
 use super::one_cpt::{one_cpt_infusion_ss_g, one_cpt_oral_g, one_cpt_oral_ss_g};
 
+/// Seed a generic dual PK kernel and collapse it to a `(value, grad, hess)`
+/// tuple — the `_explicit` fallback boilerplate written once.
+///
+/// `$f` is the generic `*_g` kernel, `$n` its `Dual2` width. `[$pre…]` are the
+/// leading arguments forwarded verbatim (raw scalars plus `Dual2::constant(t)`
+/// and any `ii`); `[$var…]` are the parameter values seeded as successive
+/// `Dual2::var` axes `0, 1, 2, …` in the order written. Expansion forwards the
+/// same seeds as the hand-written fallbacks, so it is bit-identical.
+///
+/// Shared across the three `*_cpt_explicit` modules via `pub(crate) use`.
+macro_rules! dual2_tuple {
+    ($f:ident, $n:literal, [$($pre:expr),* $(,)?], [$($var:expr),* $(,)?]) => {
+        dual2_tuple!(@seed $f, $n, [$($pre,)*], 0usize, [$($var,)*])
+    };
+    (@seed $f:ident, $n:literal, [$($acc:expr,)*], $idx:expr, [$head:expr, $($rest:expr,)*]) => {
+        dual2_tuple!(
+            @seed $f, $n,
+            [$($acc,)* $crate::sens::dual2::Dual2::var($head, $idx),],
+            $idx + 1usize,
+            [$($rest,)*]
+        )
+    };
+    (@seed $f:ident, $n:literal, [$($acc:expr,)*], $idx:expr, []) => {{
+        let d = $f::<Dual2<$n>>($($acc),*);
+        (d.value, d.grad, d.hess)
+    }};
+}
+pub(crate) use dual2_tuple;
+
 /// Chain a prefactor `A(CL,V)` and a shape `G(k)` (given as value/`G'`/`G''`,
 /// `k = CL/V`) into `(f, ∂f/∂[CL,V], ∂²f/∂[CL,V]²)` for `f = A·G(k)`. `A` is
 /// supplied by its own partials `(a, a_CL, a_V, a_CLCL, a_CLV, a_VV)`; the
@@ -131,15 +160,12 @@ pub fn oral_explicit(
     let k = cl / v;
     if (ka - k).abs() < 1e-6 {
         // L'Hôpital limit — rare; let the dual path handle it exactly.
-        let d = one_cpt_oral_g::<Dual2<4>>(
-            amt,
-            Dual2::constant(t),
-            Dual2::var(cl, 0),
-            Dual2::var(v, 1),
-            Dual2::var(ka, 2),
-            Dual2::var(f_bio, 3),
+        return dual2_tuple!(
+            one_cpt_oral_g,
+            4,
+            [amt, Dual2::constant(t)],
+            [cl, v, ka, f_bio]
         );
-        return (d.value, d.grad, d.hess);
     }
 
     // Non-SS Bateman: S = e^{−kt} − e^{−ka·t}; ∂S/∂k∂ka = 0 (separates).
@@ -241,16 +267,12 @@ pub fn oral_ss_explicit(
     }
     let k = cl / v;
     let fallback = || {
-        let d = one_cpt_oral_ss_g::<Dual2<4>>(
-            amt,
-            Dual2::constant(t),
-            ii,
-            Dual2::var(cl, 0),
-            Dual2::var(v, 1),
-            Dual2::var(ka, 2),
-            Dual2::var(f_bio, 3),
-        );
-        (d.value, d.grad, d.hess)
+        dual2_tuple!(
+            one_cpt_oral_ss_g,
+            4,
+            [amt, Dual2::constant(t), ii],
+            [cl, v, ka, f_bio]
+        )
     };
     if (ka - k).abs() < 1e-6 {
         return fallback();
@@ -380,16 +402,12 @@ pub fn infusion_ss_explicit(
         // Overlapping SS infusion: delegate to the generic dual kernel, which
         // superposes the past pulse train (#379). Rare enough not to warrant a
         // hand-written explicit variant.
-        let d = one_cpt_infusion_ss_g::<Dual2<2>>(
-            rate,
-            dur,
-            amt,
-            Dual2::constant(t),
-            ii,
-            Dual2::var(cl, 0),
-            Dual2::var(v, 1),
+        return dual2_tuple!(
+            one_cpt_infusion_ss_g,
+            2,
+            [rate, dur, amt, Dual2::constant(t), ii],
+            [cl, v]
         );
-        return (d.value, d.grad, d.hess);
     }
     let k = cl / v;
     let kj = Jet::<1>::var(k, 0);

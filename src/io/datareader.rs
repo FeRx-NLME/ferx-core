@@ -198,6 +198,33 @@ pub fn read_nonmem_csv_with_covariates(
     read_nonmem_csv_with_covariates_mapped(path, decls, extra_columns, iov_column, &[])
 }
 
+/// Build the covariate-column read set: declared names first (so the covariate
+/// table's column order matches the declaration), then each `extra` column not
+/// already present. Dedup is case-sensitive, matching the declared spelling.
+fn declared_union(decls: &[CovariateDecl], extra: &[String]) -> Vec<String> {
+    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
+    for c in extra {
+        if !union.iter().any(|n| n == c) {
+            union.push(c.clone());
+        }
+    }
+    union
+}
+
+/// Ensure every covariate column referenced by a `[data_selection]` filter is
+/// present in `cols`, so a filter on an otherwise-unread column still fires.
+/// Case-insensitive dedup: referenced names are lowercased, declared names may
+/// not be. No-op when `filter` is `None`.
+fn augment_with_filter(cols: &mut Vec<String>, filter: Option<&SelectionFilter>) {
+    if let Some(f) = filter {
+        for c in f.referenced_covariate_columns() {
+            if !cols.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
+                cols.push(c);
+            }
+        }
+    }
+}
+
 /// Like [`read_nonmem_csv_with_covariates`] but with a `[data]` column
 /// remapping (#730). See [`read_nonmem_csv_mapped`].
 pub(crate) fn read_nonmem_csv_with_covariates_mapped(
@@ -209,12 +236,7 @@ pub(crate) fn read_nonmem_csv_with_covariates_mapped(
 ) -> Result<(Population, CovariateTable), String> {
     // Population reads the union of declared + referenced-but-undeclared columns,
     // declared first so the table's column order matches the declaration.
-    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
-    for c in extra_columns {
-        if !union.iter().any(|n| n == c) {
-            union.push(c.clone());
-        }
-    }
+    let union = declared_union(decls, extra_columns);
     let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
     let (pop, table) = read_nonmem_csv_impl(
         path,
@@ -258,11 +280,7 @@ pub(crate) fn read_nonmem_csv_filtered_mapped(
     // augmentation is needed.) Symmetric with the `[covariates]` reader.
     let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
         let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
-        for c in filter.referenced_covariate_columns() {
-            if !v.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
-                v.push(c);
-            }
-        }
+        augment_with_filter(&mut v, Some(filter));
         v
     });
     let cols_ref: Option<Vec<&str>> = augmented
@@ -308,23 +326,14 @@ pub(crate) fn read_nonmem_csv_with_covariates_filtered_mapped(
     filter: &SelectionFilter,
     column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
-    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
-    for c in extra_columns {
-        if !union.iter().any(|n| n == c) {
-            union.push(c.clone());
-        }
-    }
+    let mut union = declared_union(decls, extra_columns);
     // Ensure any covariate column referenced by an ignore/accept clause is read
     // into each subject's covariate map, even if the model never declared it.
     // Without this, a filter on an undeclared column would silently never fire
     // on the declared-`[covariates]` read path (`union` would lack the column,
     // so it would be absent from `locf_state`). Case-insensitive dedup: the
     // referenced names are lowercased, declared names may not be.
-    for c in filter.referenced_covariate_columns() {
-        if !union.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
-            union.push(c);
-        }
-    }
+    augment_with_filter(&mut union, Some(filter));
     let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
     let (pop, table) = read_nonmem_csv_impl(
         path,
@@ -527,13 +536,7 @@ pub(crate) fn read_nonmem_csv_filtered_tte(
 ) -> Result<Population, String> {
     let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
         let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
-        if let Some(f) = filter {
-            for c in f.referenced_covariate_columns() {
-                if !v.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
-                    v.push(c);
-                }
-            }
-        }
+        augment_with_filter(&mut v, filter);
         v
     });
     let cols_ref: Option<Vec<&str>> = augmented
@@ -563,19 +566,8 @@ pub(crate) fn read_nonmem_csv_with_covariates_tte(
     discrete_cmts: &HashSet<usize>,
     column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
-    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
-    for c in extra_columns {
-        if !union.iter().any(|n| n == c) {
-            union.push(c.clone());
-        }
-    }
-    if let Some(f) = filter {
-        for c in f.referenced_covariate_columns() {
-            if !union.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
-                union.push(c);
-            }
-        }
-    }
+    let mut union = declared_union(decls, extra_columns);
+    augment_with_filter(&mut union, filter);
     let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
     let (pop, table) = read_nonmem_csv_impl(
         path,

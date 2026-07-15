@@ -8,7 +8,7 @@
 //! more robust than the asymptotic covariance matrix.
 
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
-use crate::estimation::outer_optimizer::pop_nll;
+use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
     compute_bounds, compute_mu_k, pack_params, packed_fixed_mask, unpack_params,
 };
@@ -185,7 +185,6 @@ pub fn run_sir_core(
     // Step 2: Evaluate importance weights in parallel (warm-started inner loop)
     let inner_maxiter = options.inner_maxiter;
     let inner_tol = options.inner_tol;
-    let interaction = options.interaction;
     let bounds = compute_bounds(params);
 
     let log_weights: Vec<f64> = samples
@@ -237,16 +236,9 @@ pub fn run_sir_core(
                 0, // SIR: warm-started; no inner multi-start
             );
 
-            // Compute OFV
-            let nll_k = pop_nll(
-                model,
-                population,
-                &params_k,
-                &ehs,
-                &hms,
-                &_kappas,
-                interaction,
-            );
+            // Compute OFV — through the method-aware seam, so an AGQ fit's SIR weights come
+            // from the AGQ marginal it was actually optimised against, not the FOCE one.
+            let nll_k = pop_nll_opts(model, population, &params_k, &ehs, &hms, &_kappas, options);
             let ofv_k = 2.0 * nll_k;
             if !ofv_k.is_finite() {
                 return f64::NEG_INFINITY;

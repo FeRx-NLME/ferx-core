@@ -13,7 +13,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `method` | `foce`, `focei`, `saem`, `gn`, `gn_hybrid`, `impmap`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](#chained-fits). When neither this key nor a wrapper's `method` argument is set, the engine falls back to `focei` and emits a warning so the implicit choice is visible — set `method` here to silence it. |
+| `method` | `foce`, `focei`, `laplace`, `agq`, `saem`, `gn`, `gn_hybrid`, `impmap`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](#chained-fits). When neither this key nor a wrapper's `method` argument is set, the engine falls back to `focei` and emits a warning so the implicit choice is visible — set `method` here to silence it. |
 | `threads` | positive integer, `0`, `auto` | `auto` | Number of Rayon worker threads for per-subject parallelism. A positive integer pins the count. `0`/`auto` (or omitting the key) uses the engine's default: available cores − 1 (floored at 1), capped at 8 — most fits gain little from spreading across every core, and not all cores are equal on asymmetric platforms (e.g. Apple Silicon E-cores). The CLI's `--threads` flag mirrors this key (see `ferx --help`). |
 | `maxiter` | integer | `500` | Maximum outer loop iterations. `maxiter = 0` is *evaluation only* (NONMEM `MAXEVAL=0`): the engine runs one inner EBE solve at the initial parameters and reports the objective there with no outer optimisation — useful for scoring a fixed parameter set or computing standard errors at known estimates (with `covariance = true`). The reported fit is marked not-converged, and the parameters are returned unchanged. |
 | `covariance` | `true`, `false` | `true` | Compute covariance matrix and standard errors |
@@ -27,7 +27,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 | `inner_optimizer` | `auto`, `bfgs`, `lbfgs`, `nelder_mead` | `auto` | Inner-loop (per-subject EBE) optimisation algorithm. `auto` uses dense BFGS, switching to limited-memory L-BFGS above 32 random effects. The explicit values pin a single algorithm with **no** automatic switching: `bfgs` (dense), `lbfgs` (limited-memory two-loop recursion — cheaper per step at high random-effect dimension), `nelder_mead` (derivative-free, for diagnosing gradient issues). All gradient-based variants converge to the same EBE; the choice trades per-step cost against memory. Applies to every method with an inner loop (`foce`/`focei`/`gn`/`gn_hybrid`/`saem`/`impmap`). |
 | `inner_tol` | float | `1e-5` | Gradient-norm convergence tolerance for the inner (per-subject EBE) optimizer. A looser tolerance leaves residual noise in each subject's EBE solution, which propagates into the marginal objective the outer optimizer sees; on models with a noisy or flat marginal surface (FD-inner FOCE such as log-transform-both-sides) that noise can make the derivative-free BOBYQA outer optimizer false-converge above the true minimum. `1e-5` removes enough of that noise to match NONMEM's minimum, at roughly 1.5× the per-fit cost of the older `1e-4` default. (For reference, NONMEM runs its inner conditional optimization far tighter than its outer convergence: the inner precision `SIGL` defaults to ~10 significant digits, versus the outer `NSIG`/SIGDIGITS default of 3.) Tighter is not uniformly better: at `1e-6` some ill-conditioned fits over-converge the inner Hessian and the outer optimizer can land in a worse basin. Loosen it (e.g. `1e-4`) to speed up well-conditioned fits where it makes no difference; change it further only with validation against a reference fit. |
 | `cov_inner_tol` | float | `inner_tol` (LTBS: `min(inner_tol, 1e-8)`) | Inner EBE-reconvergence tolerance used **only by the covariance step**, decoupled from `inner_tol`. The covariance R-matrix is a second-difference of the reconverged OFV and is more sensitive to EBE precision than the fit itself, so on a flat or weakly-identified surface an EBE converged only to the fit's `inner_tol` can leave enough residual noise to perturb the standard errors (e.g. the heavily-censored M3 + IOV case in #654 — set `cov_inner_tol = 1e-11`). This lets the covariance step reconverge tighter without slowing every outer iteration. Unset (default) uses `inner_tol` for ordinary models (SEs unchanged) and `min(inner_tol, 1e-8)` for **LTBS** models, whose `g = ln(f)` covariance Hessian needs the tighter reconvergence. The default is deliberately *not* tightened for every model — over-converging some ill-conditioned inner Hessians (e.g. IOV block-Ω) drives the covariance indefinite — so opt in per model with this key. |
-| `inner_restarts` | integer | `1` | Guarded multi-start count for the inner (per-subject EBE) optimizer, to escape a **multimodal individual objective**. Saturable protein binding is the classic case: a high-volume/low-concentration fit and a low-volume/high-concentration fit can both explain a subject's total-concentration data, so a single warm-started inner BFGS can settle in the wrong (shallower) basin, inflating that subject's objective and biasing its EBE. With `inner_restarts = N > 0` (default `1`), subjects on the event-driven path (system resets `EVID=3/4` or time-varying covariates — where this shows up) re-solve the EBE **on a cold start** from `N` Ω-scaled alternate seeds per random effect (`±2·sd`, `±3·sd`, …) and keep the lowest-objective mode; the outer loop's warm start then carries the chosen basin through the rest of the fit, so the extra scan runs once per subject per fit (≈0 % overhead). An alternate seed that reconverges to the same mode is not accepted, so unimodal subjects are bit-identical to `inner_restarts = 0`; only a genuinely trapped subject changes (it moves to the deeper, correct basin). Applies to the gradient-based methods (`focei`, `foce`, `gn`, `gn_hybrid`, `trust_region`); the covariance step reconverges with the same setting so standard errors stay consistent with the fit. Set `inner_restarts = 0` to disable; raise it above `1` only if a wider seed ladder is needed. |
+| `inner_restarts` | integer | `1` | Guarded multi-start count for the inner (per-subject EBE) optimizer, to escape a **multimodal individual objective**. Saturable protein binding is the classic case: a high-volume/low-concentration fit and a low-volume/high-concentration fit can both explain a subject's total-concentration data, so a single warm-started inner BFGS can settle in the wrong (shallower) basin, inflating that subject's objective and biasing its EBE. With `inner_restarts = N > 0` (default `1`), subjects on the event-driven path (system resets `EVID=3/4` or time-varying covariates — where this shows up) re-solve the EBE **on a cold start** from `N` Ω-scaled alternate seeds per random effect (`±2·sd`, `±3·sd`, …) and keep the lowest-objective mode; the outer loop's warm start then carries the chosen basin through the rest of the fit, so the extra scan runs once per subject per fit (≈0 % overhead). An alternate seed that reconverges to the same mode is not accepted, so unimodal subjects are bit-identical to `inner_restarts = 0`; only a genuinely trapped subject changes (it moves to the deeper, correct basin). Applies to the gradient-based methods that share this inner EBE solve (`focei`, `foce`, `agq`, `laplace`, `gn`, `gn_hybrid`, `trust_region`); the covariance step reconverges with the same setting so standard errors stay consistent with the fit. Set `inner_restarts = 0` to disable; raise it above `1` only if a wider seed ladder is needed. |
 | `steihaug_max_iters` | integer | adaptive | Max CG iterations for the Steihaug subproblem (only used when `optimizer = trust_region`). Default (unset) uses `ceil(sqrt(n_params)).clamp(5, n_params)` — typically 5 for standard NLME models. Set explicitly (e.g. `steihaug_max_iters = 50`) to pin the budget. |
 | `ode_reltol` | float | `1e-4` | RK45 ODE solver **relative** tolerance. Applies to ODE models, and to the auto-generated ODE **twin** that closed-form transit / inverse-Gaussian absorption models (`one_cpt_transit`, `two_cpt_transit`, `one_cpt_ig`, `two_cpt_ig`) use to serve IOV, time-varying-covariate, and `TIME`-switch subjects (#719/#814) — so a call-time override reaches those rerouted fits too; otherwise ignored for analytical PK. The default reproduces analytical closed forms in PRED to ~`1e-4`, but the FOCE objective amplifies solver error, so the OFV of an ODE-form model can differ from its analytical equivalent by several units. Set a tighter value (e.g. `1e-10`) when the ODE-form **OFV** must match an analytical reference; expect slower fits. |
 | `ode_abstol` | float | `1e-6` | RK45 ODE solver **absolute** tolerance (companion to `ode_reltol`). ODE models and the closed-form absorption ODE twin (as for `ode_reltol`). |
@@ -172,11 +172,36 @@ method = foce
 ```
 First-Order Conditional Estimation. Linearizes the model around the empirical Bayes estimates. Fast and reliable for most models.
 
+### Laplace
+```
+method = laplace
+```
+The **Laplace approximation with the exact Hessian** — NONMEM `$EST METHOD=1 LAPLACIAN` (alias `laplacian`).
+
+This is *not* the same estimator as `focei`. Both approximate the marginal likelihood with a single Gaussian at the empirical-Bayes mode, but FOCEI builds that Gaussian from the **Gauss-Newton** Hessian `CᵀC + Ω⁻¹` (which drops `∂²f/∂η²`), while `laplace` differentiates the true conditional likelihood. It therefore carries the curvature of the η-dependent residual variance that the Gauss-Newton form discards — which is why it reproduces NONMEM's LAPLACIAN to six significant figures where FOCEI lands on a different value.
+
+Internally it *is* [`agq`](#agq) with the node count pinned to 1 — the one-point Gauss-Hermite rule sits at the mode, and the quadrature sum collapses to the Laplace formula exactly. Same objective, same analytic gradient, same covariance step; `n_agq` is not one of its options. It is the cheapest member of the family (one node, no grid) and on warfarin it is *faster* than FOCEI.
+
+Use it when you want a NONMEM-`LAPLACIAN`-comparable fit, or a Laplace baseline to raise `n_agq` from. See the [AGQ page](../estimation/agq.qmd).
+
+### AGQ
+```
+method = agq
+n_agq  = 3
+```
+Adaptive Gaussian Quadrature. Generalizes Laplace: instead of one Gaussian at the empirical-Bayes mode, it evaluates the **exact** conditional likelihood on a Gauss-Hermite grid around that mode. `n_agq = 1` is Laplace identically; more nodes refine the marginal. Makes no Gaussian-residual assumption, so it is the deterministic option for non-Gaussian endpoints (TTE, categorical). Cost is `n_agq ^ n_eta` per subject per iteration, so it suits models with few random effects (`n_eta ≤ 4`). See the [AGQ page](../estimation/agq.qmd).
+
 ### SAEM
 ```
 method = saem
 ```
 Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP optimization for random effects. More robust to local minima; recommended for complex models with many random effects.
+
+## AGQ-Specific Options
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `n_agq` | `3` | Gauss-Hermite nodes **per random effect**. `1` reproduces the Laplace approximation exactly; odd values are conventional (they keep a node at the mode). Max `21`. The tensor grid costs `n_agq ^ n_eta` likelihood evaluations per subject per outer iteration, and a fit whose grid exceeds 100 000 nodes is rejected at check time — lower `n_agq`, use fewer random effects, or switch to `saem` / `imp`. |
 
 ## SAEM-Specific Options
 
@@ -454,7 +479,7 @@ When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.c
 | Column | Populated by | Description |
 |--------|-------------|-------------|
 | `iter` | all | Iteration number |
-| `method` | all | `foce`, `focei`, `gn`, `gn_hybrid`, `saem` |
+| `method` | all | `foce`, `focei`, `laplace`, `agq`, `gn`, `gn_hybrid`, `saem` |
 | `phase` | gn_hybrid, saem | `focei` (polish) or `explore`/`converge` |
 | `ofv` | all | Objective function value |
 | `wall_ms` | all | Wall time for this iteration (ms) |
