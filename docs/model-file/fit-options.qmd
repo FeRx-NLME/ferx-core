@@ -180,16 +180,20 @@ The **Laplace approximation with the exact Hessian** — NONMEM `$EST METHOD=1 L
 
 This is *not* the same estimator as `focei`. Both approximate the marginal likelihood with a single Gaussian at the empirical-Bayes mode, but FOCEI builds that Gaussian from the **Gauss-Newton** Hessian `CᵀC + Ω⁻¹` (which drops `∂²f/∂η²`), while `laplace` differentiates the true conditional likelihood. It therefore carries the curvature of the η-dependent residual variance that the Gauss-Newton form discards — which is why it reproduces NONMEM's LAPLACIAN to six significant figures where FOCEI lands on a different value.
 
-Internally it *is* [`agq`](#agq) with the node count pinned to 1 — the one-point Gauss-Hermite rule sits at the mode, and the quadrature sum collapses to the Laplace formula exactly. Same objective, same analytic gradient, same covariance step; `n_agq` is not one of its options. It is the cheapest member of the family (one node, no grid) and on warfarin it is *faster* than FOCEI.
+At the default `n_agq = 1` it is a single Gaussian at the mode; the `n_agq` argument
+generalizes it to adaptive Gauss-Hermite quadrature (below). Same objective, same analytic
+gradient, same covariance step. It is the cheapest configuration (one node, no grid) and on warfarin it is *faster* than FOCEI.
 
-Use it when you want a NONMEM-`LAPLACIAN`-comparable fit, or a Laplace baseline to raise `n_agq` from. See the [AGQ page](../estimation/agq.qmd).
+Use `n_agq = 1` when you want a NONMEM-`LAPLACIAN`-comparable fit, or a Laplace baseline to raise `n_agq` from. See the [AGQ page](../estimation/agq.qmd).
 
-### AGQ
+### `n_agq` — adaptive Gauss-Hermite quadrature
 ```
-method = agq
+method = laplace
 n_agq  = 3
 ```
-Adaptive Gaussian Quadrature. Generalizes Laplace: instead of one Gaussian at the empirical-Bayes mode, it evaluates the **exact** conditional likelihood on a Gauss-Hermite grid around that mode. `n_agq = 1` is Laplace identically; more nodes refine the marginal. Makes no Gaussian-residual assumption, so it is the deterministic option for non-Gaussian endpoints (TTE, categorical). Cost is `n_agq ^ n_eta` per subject per iteration, so it suits models with few random effects (`n_eta ≤ 4`). See the [AGQ page](../estimation/agq.qmd).
+`n_agq` is an **argument**, not a separate method (there is no `method = agq`). It sets the Gauss-Hermite nodes per random effect. `n_agq = 1` (default) is the classical single-point method; `n_agq > 1` evaluates the **exact** conditional likelihood on a grid around the empirical-Bayes mode, refining the marginal toward the exact integral. It makes no Gaussian-residual assumption, so it is the deterministic option for non-Gaussian endpoints (TTE, categorical). Cost is `n_agq ^ n_eta` per subject per iteration, so it suits models with few random effects (`n_eta ≤ 4`).
+
+The **method name selects the Hessian anchor**: `method = laplace` places the grid with the exact Hessian, `method = focei` with the Gauss-Newton `H̃`. So `method = focei` with `n_agq > 1` is the Gauss-Newton-anchored quadrature — FOCEI refined toward the exact marginal. See the [AGQ page](../estimation/agq.qmd).
 
 ### SAEM
 ```

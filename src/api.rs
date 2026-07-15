@@ -2223,13 +2223,28 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // ── AGQ (#251) ────────────────────────────────────────────────────────────
-    // Laplace routes through the same AGQ objective (one node), so it inherits the same
-    // compatibility guards. Its grid is a single point no matter how many random effects
-    // there are, so the caps below never fire for it — including under IOV.
+    // ── Quadrature: FOCEI + n_agq > 1 is the Gauss-Newton-anchored refinement (#251) ──────
+    // Not yet available (Phase B lands the GN-anchored objective + gradient); reject it
+    // rather than silently running plain FOCEI. Remove this guard when GN quadrature ships.
+    if chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI)) && options.n_agq > 1 {
+        diags.push(
+            Diagnostic::error(
+                "E_FOCEI_NAGQ_UNSUPPORTED",
+                "method = focei with n_agq > 1 (the Gauss-Newton-anchored quadrature) is not \
+                 yet available; use method = laplace with n_agq > 1 for adaptive Gauss–Hermite \
+                 quadrature.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
+    // ── AGQ / Laplace (#251) ──────────────────────────────────────────────────────────────
+    // Laplace is the exact-anchor quadrature. At `n_agq = 1` its grid is a single point no
+    // matter how many random effects there are, so the caps below never fire; at `n_agq > 1`
+    // they bound the tensor grid.
     if chain
         .iter()
-        .any(|&m| matches!(m, EstimationMethod::Agq | EstimationMethod::Laplace))
+        .any(|&m| matches!(m, EstimationMethod::Laplace))
     {
         // IOV is **supported**: AGQ integrates over the stacked (η, κ₁..κ_K), which is exactly
         // what `individual_nll_iov` already scores. What IOV changes is the *dimension* — and
@@ -2237,13 +2252,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         // given IOV model is tractable, and it is checked against the stacked dimension in
         // `fit_inner` (which, unlike this function, can see the occasion count in the data).
         //
-        // Name the method the user actually wrote, so a `method = laplace` fit is never told
-        // about "method = agq".
-        let label = if chain.contains(&EstimationMethod::Laplace) {
-            "laplace"
-        } else {
-            "agq"
-        };
+        let label = "laplace";
         // The tensor rule costs `n_agq^d` full likelihood evaluations per subject per
         // outer iteration. Past the cap that is not "slow", it is a fit that will never
         // finish — so it is worth failing at check time, with the two levers spelled out.
@@ -2342,7 +2351,6 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     | EstimationMethod::FoceI
                     | EstimationMethod::Saem
                     | EstimationMethod::Imp
-                    | EstimationMethod::Agq
                     | EstimationMethod::Laplace
             ) {
                 diags.push(
@@ -3476,13 +3484,12 @@ pub fn fit(
             let grid = crate::estimation::agq::grid_size(n_nodes, d);
             if grid > crate::estimation::agq::MAX_AGQ_GRID {
                 return Err(format!(
-                    "method = agq with n_agq = {n_nodes} needs a {n_nodes}^{d} = {grid}-node \
+                    "method = laplace with n_agq = {n_nodes} needs a {n_nodes}^{d} = {grid}-node \
                      tensor grid per subject per iteration — over the {} limit. Under IOV the \
                      integral is over the stacked (η, κ₁..κ_{max_occ}), so the dimension is \
-                     n_eta ({}) + occasions ({max_occ}) × n_kappa ({}) = {d}. Lower n_agq, or \
-                     use method = laplace (one node — always tractable, and the exact-Hessian \
-                     Laplace approximation), or saem / imp, whose cost does not grow with the \
-                     random-effect dimension.",
+                     n_eta ({}) + occasions ({max_occ}) × n_kappa ({}) = {d}. Lower n_agq \
+                     (n_agq = 1 is Laplace — one node, always tractable), or use saem / imp, \
+                     whose cost does not grow with the random-effect dimension.",
                     crate::estimation::agq::MAX_AGQ_GRID,
                     model.n_eta,
                     model.n_kappa,
@@ -5034,7 +5041,6 @@ fn fit_inner(
                     | EstimationMethod::FoceGnHybrid
                     | EstimationMethod::Imp
                     | EstimationMethod::Impmap
-                    | EstimationMethod::Agq
                     | EstimationMethod::Laplace
             )
         });
@@ -5131,7 +5137,6 @@ fn fit_inner(
                 | EstimationMethod::FoceGnHybrid
                 | EstimationMethod::Imp
                 | EstimationMethod::Impmap
-                | EstimationMethod::Agq
                 | EstimationMethod::Laplace
         )
     }) {
@@ -5350,9 +5355,7 @@ fn fit_inner(
         // estimates land ~3% off NONMEM LAPLACIAN. L-BFGS on the analytic gradient matches
         // NONMEM to 4-5 significant figures on every parameter, in 0.39 s against FOCEI's
         // 0.29 s. See docs/estimation/agq.qmd. An explicit `optimizer = ...` is honoured.
-        if matches!(method, EstimationMethod::Agq | EstimationMethod::Laplace)
-            && stage_opts.optimizer == Optimizer::Auto
-        {
+        if matches!(method, EstimationMethod::Laplace) && stage_opts.optimizer == Optimizer::Auto {
             stage_opts.optimizer = Optimizer::NloptLbfgs;
         }
         // Run the covariance step (and SIR) only on the last *estimating* stage,
@@ -11268,7 +11271,6 @@ mod iov_integration {
             EstimationMethod::FoceI,
             EstimationMethod::Saem,
             EstimationMethod::Imp,
-            EstimationMethod::Agq,
             EstimationMethod::Laplace,
         ] {
             let opts = fast_opts(method, Optimizer::Bobyqa, false);

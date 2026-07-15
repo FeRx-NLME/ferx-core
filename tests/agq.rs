@@ -113,24 +113,25 @@ fn with_fit_options(body: &str) -> String {
 }
 
 #[test]
-fn agq_method_parses_with_aliases() {
+fn agq_method_token_is_rejected_with_migration_note() {
+    // `method = agq` was removed (#251): adaptive quadrature is `method = laplace` with
+    // `n_agq > 1`. The old tokens must error, and the message must name the replacement.
     for token in [
         "agq",
         "aghq",
         "gauss_hermite",
         "adaptive_gaussian_quadrature",
     ] {
-        let opts = options_of(&with_fit_options(&format!("  method = {token}")));
-        assert_eq!(
-            opts.method,
-            EstimationMethod::Agq,
-            "`{token}` must select AGQ — note `gauss_hermite` is a near-miss for the \
-             Gauss-*Newton* alias, which matches on `contains(\"gauss\")`, so the AGQ arm \
-             has to sit above it in the parser"
-        );
+        match parse_full_model(&with_fit_options(&format!("  method = {token}"))) {
+            Ok(_) => panic!("`{token}` must be rejected now that agq is removed"),
+            Err(err) => assert!(
+                err.contains("laplace") && err.contains("n_agq"),
+                "`{token}` error must point to `method = laplace` + `n_agq`: {err}"
+            ),
+        }
     }
-    // …and the Gauss-Newton aliases must still resolve to Gauss-Newton, i.e. the AGQ arm
-    // sitting above them did not over-capture.
+    // The Gauss-Newton aliases must still resolve to Gauss-Newton (the removed `agq` arm
+    // sat above them and must not have taken `gn` / `gauss_newton` down with it).
     for token in ["gn", "gauss_newton"] {
         assert_eq!(
             options_of(&with_fit_options(&format!("  method = {token}"))).method,
@@ -145,16 +146,16 @@ fn n_agq_is_validated() {
     // Rejected at parse time (the `[fit_options]` grammar), so `parse_full_model` errors.
     // `ParsedModel` isn't `Debug`, so unwrap the Result by hand rather than `expect_err`.
     for bad in [
-        "  method = agq\n  n_agq = 0",
-        "  method = agq\n  n_agq = 99",
+        "  method = laplace\n  n_agq = 0",
+        "  method = laplace\n  n_agq = 99",
     ] {
         match parse_full_model(&with_fit_options(bad)) {
             Ok(_) => panic!("out-of-range n_agq must be rejected: {bad:?}"),
             Err(err) => assert!(err.contains("n_agq"), "unhelpful error: {err}"),
         }
     }
-    // The default (3) applies when the key is omitted.
-    assert_eq!(options_of(&with_fit_options("  method = agq")).n_agq, 3);
+    // The default (1 = Laplace) applies when the key is omitted.
+    assert_eq!(options_of(&with_fit_options("  method = laplace")).n_agq, 1);
 }
 
 /// **The identity.** One Gauss–Hermite node sits at the mode with weight `√π`, so the
@@ -185,7 +186,7 @@ fn one_node_agq_is_the_laplace_approximation() {
     let pop = warfarin();
     let foce = eval_only_ofv(&pop, EstimationMethod::Foce, 1);
     let focei = eval_only_ofv(&pop, EstimationMethod::FoceI, 1);
-    let agq1 = eval_only_ofv(&pop, EstimationMethod::Agq, 1);
+    let agq1 = eval_only_ofv(&pop, EstimationMethod::Laplace, 1);
 
     let to_focei = (agq1 - focei).abs();
     let to_foce = (agq1 - foce).abs();
@@ -235,7 +236,7 @@ fn agq_converges_to_the_importance_sampling_marginal() {
 
     let ofvs: Vec<f64> = [1usize, 3, 5, 7, 9, 11]
         .iter()
-        .map(|&n| eval_only_ofv(&pop, EstimationMethod::Agq, n))
+        .map(|&n| eval_only_ofv(&pop, EstimationMethod::Laplace, n))
         .collect();
     let errs: Vec<f64> = ofvs.iter().map(|o| (o - truth).abs()).collect();
 
@@ -264,7 +265,7 @@ fn ofv_settles_as_nodes_are_added() {
     let pop = warfarin();
     let ofvs: Vec<f64> = [1usize, 3, 5, 7]
         .iter()
-        .map(|&n| eval_only_ofv(&pop, EstimationMethod::Agq, n))
+        .map(|&n| eval_only_ofv(&pop, EstimationMethod::Laplace, n))
         .collect();
 
     let steps: Vec<f64> = ofvs.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
@@ -286,8 +287,8 @@ fn ofv_settles_as_nodes_are_added() {
 #[test]
 fn ofv_is_bit_identical_across_runs() {
     let pop = warfarin();
-    let a = eval_only_ofv(&pop, EstimationMethod::Agq, 3);
-    let b = eval_only_ofv(&pop, EstimationMethod::Agq, 3);
+    let a = eval_only_ofv(&pop, EstimationMethod::Laplace, 3);
+    let b = eval_only_ofv(&pop, EstimationMethod::Laplace, 3);
     assert_eq!(
         a.to_bits(),
         b.to_bits(),
@@ -513,7 +514,7 @@ fn agq_rejects_an_intractable_grid() {
   DV ~ proportional(PROP_ERR)
 
 [fit_options]
-  method = agq
+  method = laplace
   n_agq = 21
 "
     );
@@ -553,7 +554,7 @@ fn agq_rejects_out_of_range_node_count_built_via_the_rust_api() {
         "the grid must stay under MAX_AGQ_GRID so only the node cap can reject this"
     );
     let opts = FitOptions {
-        method: EstimationMethod::Agq,
+        method: EstimationMethod::Laplace,
         n_agq: n,
         ..FitOptions::default()
     };
@@ -566,7 +567,7 @@ fn agq_rejects_out_of_range_node_count_built_via_the_rust_api() {
     );
     // The in-range boundary (exactly MAX_AGQ_NODES) must NOT be rejected.
     let ok_opts = FitOptions {
-        method: EstimationMethod::Agq,
+        method: EstimationMethod::Laplace,
         n_agq: ferx_core::estimation::agq::MAX_AGQ_NODES,
         ..FitOptions::default()
     };
@@ -588,7 +589,7 @@ fn agq_covariance_step_produces_finite_standard_errors() {
     let pop = warfarin();
     let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
     let opts = FitOptions {
-        method: EstimationMethod::Agq,
+        method: EstimationMethod::Laplace,
         n_agq: 1,
         // A handful of outer iterations so covariance is evaluated near the optimum where the
         // marginal Hessian is PD, while keeping this a Tier-2 (fast, no convergence loop) test.
@@ -679,7 +680,7 @@ mod non_gaussian {
 
     /// Eval-only AGQ OFV of `model` on the binary population at the initial parameters.
     fn agq_ofv(model: &CompiledModel, pop: &Population, n_agq: usize) -> f64 {
-        crate::eval_only_ofv_model(model, pop, EstimationMethod::Agq, n_agq)
+        crate::eval_only_ofv_model(model, pop, EstimationMethod::Laplace, n_agq)
     }
 
     /// **Point 3: the binary marginal is integrated correctly, cross-checked against IS.**
@@ -743,7 +744,7 @@ mod non_gaussian {
         let model = parse_model_string(BINARY_MIXED).expect("mixed binary model must parse");
         let pop = binary_population();
         let opts = FitOptions {
-            method: EstimationMethod::Agq,
+            method: EstimationMethod::Laplace,
             n_agq: 3,
             outer_maxiter: 3, // Tier-2: a few steps, no convergence loop
             run_covariance_step: false,
@@ -788,7 +789,7 @@ mod non_gaussian {
 
         // Drive the gradient's d == 0 branch through a short optimising fit.
         let opts = FitOptions {
-            method: EstimationMethod::Agq,
+            method: EstimationMethod::Laplace,
             n_agq: 3,
             outer_maxiter: 3,
             run_covariance_step: false,
@@ -808,50 +809,39 @@ mod non_gaussian {
 // `method = laplace` — AGQ at one node, exposed as a first-class method (#251)
 // ---------------------------------------------------------------------------
 
-/// **The identity, at the API boundary.** `method = laplace` is not a re-implementation of
-/// Laplace; it is `method = agq` with the node count pinned to 1, routed through the same
-/// objective, the same analytic gradient and the same covariance stencil.
-///
-/// So the OFV must be **bit-identical** — not "close". Anything less means the two are
-/// taking different code paths, which is precisely what this variant exists not to do.
+/// **Laplace is the exact-anchor quadrature at one node, and a genuinely different estimator
+/// from FOCEI.** `method = laplace` with `n_agq = 1` uses the exact Hessian; FOCEI uses the
+/// Gauss-Newton one. If they ever coincide, the exact Hessian has been lost.
 #[test]
-fn laplace_is_bit_identical_to_agq_with_one_node() {
+fn laplace_one_node_is_not_focei() {
     let pop = warfarin();
     let laplace = eval_only_ofv(&pop, EstimationMethod::Laplace, 1);
-    let agq1 = eval_only_ofv(&pop, EstimationMethod::Agq, 1);
-    assert_eq!(
-        laplace.to_bits(),
-        agq1.to_bits(),
-        "method = laplace must BE agq(n_agq = 1), not merely agree with it: \
-         laplace={laplace}, agq1={agq1}"
-    );
-
-    // And it is genuinely a different estimator from FOCEI — Laplace with the exact Hessian
-    // vs FOCEI's Gauss-Newton one. If these ever coincide, the exact Hessian has been lost.
     let focei = eval_only_ofv(&pop, EstimationMethod::FoceI, 1);
     assert!(
         (laplace - focei).abs() > 1e-6,
         "LAPLACE (exact Hessian) must not collapse onto FOCEI (Gauss-Newton Hessian): \
-         both {laplace}"
+         laplace={laplace}, focei={focei}"
     );
 }
 
-/// `n_agq` is pinned for Laplace and cannot be varied — the node count is what *defines* the
-/// method. Setting it must not change the answer (and it is not one of the method's keys, so
-/// the engine also warns it is unsupported).
+/// `n_agq` is now an **argument** to Laplace, not pinned (#251): `n_agq = 1` is Laplace,
+/// `n_agq > 1` is adaptive Gauss–Hermite quadrature over the same integral. So varying it must
+/// change the OFV (the quadrature refines the marginal the one-point rule approximates), and
+/// `n_agq` must be one of the method's keys.
 #[test]
-fn laplace_ignores_n_agq() {
+fn laplace_respects_n_agq() {
     let pop = warfarin();
     let a = eval_only_ofv(&pop, EstimationMethod::Laplace, 1);
     let b = eval_only_ofv(&pop, EstimationMethod::Laplace, 7);
-    assert_eq!(
+    assert_ne!(
         a.to_bits(),
         b.to_bits(),
-        "method = laplace must pin the node count to 1 regardless of n_agq: {a} vs {b}"
+        "method = laplace must now vary with n_agq (1 = Laplace, 7 = a 7-node quadrature of \
+         the same marginal): {a} vs {b}"
     );
     assert!(
-        !ferx_core::types::method_specific_keys(EstimationMethod::Laplace).contains(&"n_agq"),
-        "`n_agq` must not be an option of method = laplace — it is fixed at 1"
+        ferx_core::types::method_specific_keys(EstimationMethod::Laplace).contains(&"n_agq"),
+        "`n_agq` must be an option of method = laplace"
     );
 }
 
@@ -897,7 +887,7 @@ const WARFARIN_IOV_SRC: &str = r"
   DV ~ proportional(PROP_ERR)
 
 [fit_options]
-  method     = agq
+  method     = laplace
   iov_column = OCC
   covariance = false
 ";
@@ -943,29 +933,21 @@ fn iov_ofv(method: EstimationMethod, n_agq: usize) -> f64 {
 #[test]
 fn agq_and_laplace_integrate_the_joint_iov_marginal() {
     let laplace = iov_ofv(EstimationMethod::Laplace, 1);
-    let agq1 = iov_ofv(EstimationMethod::Agq, 1);
-    let agq3 = iov_ofv(EstimationMethod::Agq, 3);
+    let agq3 = iov_ofv(EstimationMethod::Laplace, 3);
     let focei = iov_ofv(EstimationMethod::FoceI, 1);
-
-    // The identity survives the stacking: laplace IS agq at one node, over the joint vector.
-    assert_eq!(
-        laplace.to_bits(),
-        agq1.to_bits(),
-        "under IOV too, method = laplace must BE agq(n_agq = 1): {laplace} vs {agq1}"
-    );
 
     // Laplace-family: within a Hessian approximation of FOCEI-IOV, which uses the same joint
     // mode but the Gauss-Newton curvature. Nowhere near it would mean κ was mishandled.
     assert!(
-        (agq1 - focei).abs() < 5.0,
-        "AGQ-IOV must be in the same Laplace family as FOCEI-IOV: agq1={agq1}, focei={focei}"
+        (laplace - focei).abs() < 5.0,
+        "Laplace-IOV must be in the same family as FOCEI-IOV: laplace={laplace}, focei={focei}"
     );
 
     // Refining the grid over the *stacked* vector must move the answer (the joint posterior
     // is not exactly Gaussian) but stay in the same basin.
     assert!(
-        agq3.is_finite() && (agq3 - agq1).abs() < 5.0,
-        "AGQ-IOV n=3 must refine, not diverge: agq1={agq1}, agq3={agq3}"
+        agq3.is_finite() && (agq3 - laplace).abs() < 5.0,
+        "Laplace-IOV n=3 must refine, not diverge: n1={laplace}, n3={agq3}"
     );
 }
 
@@ -979,7 +961,7 @@ fn agq_iov_grid_cap_counts_the_stacked_dimension() {
     // 3 η + 1 κ × 2 occasions = d 5. At n_agq = 21 that is 21^5 ≈ 4.1M nodes — over the cap.
     let parsed = parse_full_model(WARFARIN_IOV_SRC).expect("parses");
     let opts = FitOptions {
-        method: EstimationMethod::Agq,
+        method: EstimationMethod::Laplace,
         n_agq: 21,
         outer_maxiter: 0,
         run_covariance_step: false,
@@ -1111,7 +1093,7 @@ fn agq_reports_convergence_rather_than_grinding_into_nlopt_failure() {
 
     for (method, n) in [
         (EstimationMethod::Laplace, 1usize),
-        (EstimationMethod::Agq, 3),
+        (EstimationMethod::Laplace, 3),
     ] {
         let opts = FitOptions {
             method,

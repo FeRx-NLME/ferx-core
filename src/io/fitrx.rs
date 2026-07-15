@@ -373,7 +373,7 @@ str_enum_map!(EstimationMethod, "method", method_to_str(EstimationMethod), metho
     Imp => "imp",
     Impmap => "impmap",
     Bayes => "bayes",
-    Agq => "agq",
+    // `agq` was removed (#251); it was unreleased, so no persisted bundle carries it.
     Laplace => "laplace",
 });
 
