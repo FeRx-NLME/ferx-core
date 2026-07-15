@@ -80,7 +80,7 @@ use crate::estimation::importance_sampling::build_proposal;
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
 use crate::stats::likelihood::individual_nll_into_with_schedule;
-use crate::types::{CompiledModel, ModelParameters, Population, Subject};
+use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Subject};
 
 /// Upper bound on `n_agq`. Beyond ~20 nodes the Golub–Welsch eigenproblem starts to lose
 /// the extreme nodes to round-off, and the marginal accuracy gain is nil for any realistic
@@ -352,6 +352,60 @@ fn fd_posterior_hessian(
     h
 }
 
+/// The Hessian that scales the quadrature grid and enters `½log|H|`, per the anchor.
+///
+/// * [`HessianAnchor::Exact`] → the exact conditional Hessian `∂²nll/∂b²`
+///   ([`fd_posterior_hessian`]). This is Laplace / adaptive GH quadrature.
+/// * [`HessianAnchor::GaussNewton`] → the Almquist `H̃ = Ω⁻¹ + Σ pⱼaⱼaⱼᵀ`, taken directly
+///   from [`sens_outer_gradient::score_core`] — the *same* Hessian FOCEI's own objective and
+///   gradient use, so `focei` with `n_agq > 1` is a genuine quadrature refinement of FOCEI.
+///
+/// Returns `None` when the anchor Hessian cannot be formed: an indefinite exact FD Hessian, or
+/// a Gauss-Newton anchor on a model outside the sensitivity provider's scope (the caller then
+/// yields the NLL sentinel, and `api::check_model_options` rejects `focei, n_agq > 1` outside
+/// that scope up front so this does not surprise a fit at runtime).
+fn anchor_hessian(
+    anchor: HessianAnchor,
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    stack: &Stack,
+    b_hat: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> Option<DMatrix<f64>> {
+    match anchor {
+        HessianAnchor::Exact => Some(fd_posterior_hessian(
+            model, subject, params, stack, b_hat, scratch, schedule,
+        )),
+        HessianAnchor::GaussNewton => {
+            // `H̃ = Ω⁻¹ + Σ pⱼ aⱼaⱼᵀ`, exactly what `score_core` assembles for FOCEI. The jet
+            // is the stacked (η, κ) one under IOV, so this serves both regimes.
+            let sens = if stack.is_iov() {
+                crate::sens::provider::subject_sensitivities_iov(
+                    model,
+                    subject,
+                    &params.theta,
+                    b_hat,
+                )?
+            } else {
+                crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b_hat)?
+            };
+            let core = crate::estimation::sens_outer_gradient::score_core(
+                model,
+                subject,
+                params,
+                &sens,
+                stack.d(),
+                &stack.omega_joint_inv,
+                b_hat,
+                model.residual_error_eta,
+            )?;
+            Some(core.htilde)
+        }
+    }
+}
+
 /// AGQ marginal NLL for one subject, in the same "without constant" units as
 /// [`crate::stats::likelihood::foce_subject_nll`] — see the module docs for the derivation.
 ///
@@ -367,6 +421,7 @@ pub(crate) fn agq_subject_nll(
     b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
+    anchor: HessianAnchor,
 ) -> f64 {
     let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
@@ -386,7 +441,8 @@ pub(crate) fn agq_subject_nll(
         );
     }
 
-    let h = fd_posterior_hessian(
+    let Some(h) = anchor_hessian(
+        anchor,
         model,
         subject,
         params,
@@ -394,7 +450,11 @@ pub(crate) fn agq_subject_nll(
         b_hat,
         &mut scratch,
         schedule.as_ref(),
-    );
+    ) else {
+        // Gauss-Newton anchor out of the provider's scope (guarded up front by
+        // `check_model_options`, so this is only reachable if that guard is bypassed).
+        return NLL_SENTINEL;
+    };
     // `build_proposal` applies the relative jitter and — if the FD Hessian came back
     // indefinite (a loosely-converged mode, a flat direction) — falls back to the prior-scale
     // factor (`Ω`, or the block-diagonal `Ω_joint` under IOV). That fallback keeps AGQ
@@ -507,6 +567,7 @@ pub fn agq_population_nll(
     eta_hats: &[nalgebra::DVector<f64>],
     kappas: &[Vec<nalgebra::DVector<f64>>],
     n_nodes: usize,
+    anchor: HessianAnchor,
 ) -> f64 {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
@@ -519,7 +580,16 @@ pub fn agq_population_nll(
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
-            agq_subject_nll(model, subject, params, &stack, &b_hat, &nodes, &log_weights)
+            agq_subject_nll(
+                model,
+                subject,
+                params,
+                &stack,
+                &b_hat,
+                &nodes,
+                &log_weights,
+                anchor,
+            )
         })
         .collect();
     per_subject.iter().sum()

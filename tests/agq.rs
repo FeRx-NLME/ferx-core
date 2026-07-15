@@ -181,6 +181,33 @@ fn n_agq_is_validated() {
 ///
 /// A wrong likelihood constant (a dropped `log|Ω|`, a stray `log(2π)`) would show up here as
 /// tens of OFV units, not tenths.
+/// **`focei` with `n_agq > 1` is the Gauss-Newton-anchored quadrature** (#251): the same
+/// adaptive-GH machinery as `laplace`, but scaling the grid with FOCEI's Gauss-Newton `H̃`
+/// instead of the exact Hessian. So `focei, n_agq = 3` must
+///
+/// * be finite and in FOCEI's basin (a few OFV units of `focei, n_agq = 1`), and
+/// * differ from `laplace, n_agq = 3` — same nodes-count, *different anchor* — which is the
+///   whole point of exposing the anchor through the method name.
+#[test]
+fn focei_n_agq_gt_1_is_the_gauss_newton_anchored_quadrature() {
+    let pop = warfarin();
+    let focei1 = eval_only_ofv(&pop, EstimationMethod::FoceI, 1);
+    let focei3 = eval_only_ofv(&pop, EstimationMethod::FoceI, 3);
+    let laplace3 = eval_only_ofv(&pop, EstimationMethod::Laplace, 3);
+
+    assert!(
+        focei3.is_finite() && (focei3 - focei1).abs() < 5.0,
+        "focei n=3 (GN-anchored quadrature) must refine FOCEI, not diverge: \
+         focei1={focei1}, focei3={focei3}"
+    );
+    assert_ne!(
+        focei3.to_bits(),
+        laplace3.to_bits(),
+        "the anchor must matter: focei (Gauss-Newton) and laplace (exact) at the same n_agq = 3 \
+         must differ — focei3={focei3}, laplace3={laplace3}"
+    );
+}
+
 #[test]
 fn one_node_agq_is_the_laplace_approximation() {
     let pop = warfarin();
@@ -337,7 +364,15 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
         let (ehs, _hms, _stats, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
             &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
         );
-        2.0 * agq::agq_population_nll(&model, &pop, &params, &ehs, &[], n)
+        2.0 * agq::agq_population_nll(
+            &model,
+            &pop,
+            &params,
+            &ehs,
+            &[],
+            n,
+            ferx_core::types::HessianAnchor::Exact,
+        )
     };
 
     let mut rel_errs = Vec::new();
@@ -1020,7 +1055,15 @@ fn analytic_gradient_matches_fd_under_iov() {
         let (ehs, _h, _s, kaps) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
             model, &pop, &params, 500, 1e-12, None, None, 0, 0,
         );
-        2.0 * agq::agq_population_nll(model, &pop, &params, &ehs, &kaps, n)
+        2.0 * agq::agq_population_nll(
+            model,
+            &pop,
+            &params,
+            &ehs,
+            &kaps,
+            n,
+            ferx_core::types::HessianAnchor::Exact,
+        )
     };
 
     for n in [1usize, 3] {

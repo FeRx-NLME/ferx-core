@@ -2224,15 +2224,20 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     }
 
     // ── Quadrature: FOCEI + n_agq > 1 is the Gauss-Newton-anchored refinement (#251) ──────
-    // Not yet available (Phase B lands the GN-anchored objective + gradient); reject it
-    // rather than silently running plain FOCEI. Remove this guard when GN quadrature ships.
-    if chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI)) && options.n_agq > 1 {
+    // The GN anchor's `H̃` comes from the sensitivity provider (`score_core`), so the
+    // refinement is available only where that provider reaches — the same analytic scope
+    // FOCEI's own outer gradient needs. Outside it (e.g. an ODE model without sensitivities,
+    // or a pure-TTE endpoint), reject up front rather than fail deep in the objective.
+    if chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI))
+        && options.n_agq > 1
+        && !crate::estimation::agq::analytic_score_supported(model)
+    {
         diags.push(
             Diagnostic::error(
                 "E_FOCEI_NAGQ_UNSUPPORTED",
-                "method = focei with n_agq > 1 (the Gauss-Newton-anchored quadrature) is not \
-                 yet available; use method = laplace with n_agq > 1 for adaptive Gauss–Hermite \
-                 quadrature.",
+                "method = focei with n_agq > 1 (the Gauss-Newton-anchored quadrature) needs a \
+                 model in the analytic sensitivity scope. Use method = laplace with n_agq > 1 \
+                 for the exact-anchor quadrature, which has no such restriction.",
             )
             .with_block("fit_options"),
         );
