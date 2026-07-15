@@ -113,24 +113,25 @@ fn with_fit_options(body: &str) -> String {
 }
 
 #[test]
-fn agq_method_parses_with_aliases() {
+fn agq_method_token_is_rejected_with_migration_note() {
+    // `method = agq` was removed (#251): adaptive quadrature is `method = laplace` with
+    // `n_agq > 1`. The old tokens must error, and the message must name the replacement.
     for token in [
         "agq",
         "aghq",
         "gauss_hermite",
         "adaptive_gaussian_quadrature",
     ] {
-        let opts = options_of(&with_fit_options(&format!("  method = {token}")));
-        assert_eq!(
-            opts.method,
-            EstimationMethod::Agq,
-            "`{token}` must select AGQ — note `gauss_hermite` is a near-miss for the \
-             Gauss-*Newton* alias, which matches on `contains(\"gauss\")`, so the AGQ arm \
-             has to sit above it in the parser"
-        );
+        match parse_full_model(&with_fit_options(&format!("  method = {token}"))) {
+            Ok(_) => panic!("`{token}` must be rejected now that agq is removed"),
+            Err(err) => assert!(
+                err.contains("laplace") && err.contains("n_agq"),
+                "`{token}` error must point to `method = laplace` + `n_agq`: {err}"
+            ),
+        }
     }
-    // …and the Gauss-Newton aliases must still resolve to Gauss-Newton, i.e. the AGQ arm
-    // sitting above them did not over-capture.
+    // The Gauss-Newton aliases must still resolve to Gauss-Newton (the removed `agq` arm
+    // sat above them and must not have taken `gn` / `gauss_newton` down with it).
     for token in ["gn", "gauss_newton"] {
         assert_eq!(
             options_of(&with_fit_options(&format!("  method = {token}"))).method,
@@ -145,16 +146,16 @@ fn n_agq_is_validated() {
     // Rejected at parse time (the `[fit_options]` grammar), so `parse_full_model` errors.
     // `ParsedModel` isn't `Debug`, so unwrap the Result by hand rather than `expect_err`.
     for bad in [
-        "  method = agq\n  n_agq = 0",
-        "  method = agq\n  n_agq = 99",
+        "  method = laplace\n  n_agq = 0",
+        "  method = laplace\n  n_agq = 99",
     ] {
         match parse_full_model(&with_fit_options(bad)) {
             Ok(_) => panic!("out-of-range n_agq must be rejected: {bad:?}"),
             Err(err) => assert!(err.contains("n_agq"), "unhelpful error: {err}"),
         }
     }
-    // The default (3) applies when the key is omitted.
-    assert_eq!(options_of(&with_fit_options("  method = agq")).n_agq, 3);
+    // The default (1 = Laplace) applies when the key is omitted.
+    assert_eq!(options_of(&with_fit_options("  method = laplace")).n_agq, 1);
 }
 
 /// **The identity.** One Gauss–Hermite node sits at the mode with weight `√π`, so the
@@ -180,12 +181,39 @@ fn n_agq_is_validated() {
 ///
 /// A wrong likelihood constant (a dropped `log|Ω|`, a stray `log(2π)`) would show up here as
 /// tens of OFV units, not tenths.
+/// **`focei` with `n_agq > 1` is the Gauss-Newton-anchored quadrature** (#251): the same
+/// adaptive-GH machinery as `laplace`, but scaling the grid with FOCEI's Gauss-Newton `H̃`
+/// instead of the exact Hessian. So `focei, n_agq = 3` must
+///
+/// * be finite and in FOCEI's basin (a few OFV units of `focei, n_agq = 1`), and
+/// * differ from `laplace, n_agq = 3` — same nodes-count, *different anchor* — which is the
+///   whole point of exposing the anchor through the method name.
+#[test]
+fn focei_n_agq_gt_1_is_the_gauss_newton_anchored_quadrature() {
+    let pop = warfarin();
+    let focei1 = eval_only_ofv(&pop, EstimationMethod::FoceI, 1);
+    let focei3 = eval_only_ofv(&pop, EstimationMethod::FoceI, 3);
+    let laplace3 = eval_only_ofv(&pop, EstimationMethod::Laplace, 3);
+
+    assert!(
+        focei3.is_finite() && (focei3 - focei1).abs() < 5.0,
+        "focei n=3 (GN-anchored quadrature) must refine FOCEI, not diverge: \
+         focei1={focei1}, focei3={focei3}"
+    );
+    assert_ne!(
+        focei3.to_bits(),
+        laplace3.to_bits(),
+        "the anchor must matter: focei (Gauss-Newton) and laplace (exact) at the same n_agq = 3 \
+         must differ — focei3={focei3}, laplace3={laplace3}"
+    );
+}
+
 #[test]
 fn one_node_agq_is_the_laplace_approximation() {
     let pop = warfarin();
     let foce = eval_only_ofv(&pop, EstimationMethod::Foce, 1);
     let focei = eval_only_ofv(&pop, EstimationMethod::FoceI, 1);
-    let agq1 = eval_only_ofv(&pop, EstimationMethod::Agq, 1);
+    let agq1 = eval_only_ofv(&pop, EstimationMethod::Laplace, 1);
 
     let to_focei = (agq1 - focei).abs();
     let to_foce = (agq1 - foce).abs();
@@ -235,7 +263,7 @@ fn agq_converges_to_the_importance_sampling_marginal() {
 
     let ofvs: Vec<f64> = [1usize, 3, 5, 7, 9, 11]
         .iter()
-        .map(|&n| eval_only_ofv(&pop, EstimationMethod::Agq, n))
+        .map(|&n| eval_only_ofv(&pop, EstimationMethod::Laplace, n))
         .collect();
     let errs: Vec<f64> = ofvs.iter().map(|o| (o - truth).abs()).collect();
 
@@ -256,6 +284,57 @@ fn agq_converges_to_the_importance_sampling_marginal() {
     );
 }
 
+/// **The unification's mathematical heart** (#251): the exact anchor (`laplace`) and the
+/// Gauss-Newton anchor (`focei`) place their grids differently, so they disagree at one node
+/// — but the quadrature identity holds for *any* positive-definite scaling, so both converge
+/// to the **same** marginal integral as `n_agq` grows. This pins exactly that: the two anchors
+/// differ at n = 1 (FOCEI ≠ Laplace) yet both land on the IS marginal by n = 11.
+#[test]
+fn both_anchors_converge_to_the_same_marginal() {
+    let pop = warfarin();
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+
+    // Independent truth: the IS marginal at the initial parameters.
+    let is_opts = FitOptions {
+        method: EstimationMethod::Imp,
+        interaction: true,
+        imp_eval_only: true,
+        imp_samples: 20_000,
+        imp_seed: Some(7),
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let truth = fit(&model, &pop, &model.default_params, &is_opts)
+        .expect("IS eval must succeed")
+        .importance_sampling
+        .expect("IMP eval-only reports a marginal")
+        .minus2_log_likelihood;
+
+    let laplace1 = eval_only_ofv(&pop, EstimationMethod::Laplace, 1);
+    let focei1 = eval_only_ofv(&pop, EstimationMethod::FoceI, 1);
+    let laplace11 = eval_only_ofv(&pop, EstimationMethod::Laplace, 11);
+    let focei11 = eval_only_ofv(&pop, EstimationMethod::FoceI, 11);
+
+    // Different anchor ⇒ different value at one node.
+    assert!(
+        (laplace1 - focei1).abs() > 1e-6,
+        "the anchors must differ at n = 1: laplace={laplace1}, focei={focei1}"
+    );
+    // Same integral in the limit ⇒ both close on the IS marginal (residual is IS's own MC
+    // error at 20k samples, not quadrature error).
+    assert!(
+        (laplace11 - truth).abs() < 0.15 && (focei11 - truth).abs() < 0.15,
+        "both anchors must converge to the same marginal (IS truth {truth:.4}): \
+         laplace(11)={laplace11:.4}, focei(11)={focei11:.4}"
+    );
+    // And to each other.
+    assert!(
+        (laplace11 - focei11).abs() < 0.1,
+        "the anchors must agree once refined: laplace(11)={laplace11:.4}, focei(11)={focei11:.4}"
+    );
+}
+
 /// Refining the grid must *converge*, not wander: successive refinements move the OFV by
 /// less and less. This is what makes a node count meaningful — if the OFV kept drifting with
 /// `n_agq` there would be no answer to report.
@@ -264,7 +343,7 @@ fn ofv_settles_as_nodes_are_added() {
     let pop = warfarin();
     let ofvs: Vec<f64> = [1usize, 3, 5, 7]
         .iter()
-        .map(|&n| eval_only_ofv(&pop, EstimationMethod::Agq, n))
+        .map(|&n| eval_only_ofv(&pop, EstimationMethod::Laplace, n))
         .collect();
 
     let steps: Vec<f64> = ofvs.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
@@ -286,8 +365,8 @@ fn ofv_settles_as_nodes_are_added() {
 #[test]
 fn ofv_is_bit_identical_across_runs() {
     let pop = warfarin();
-    let a = eval_only_ofv(&pop, EstimationMethod::Agq, 3);
-    let b = eval_only_ofv(&pop, EstimationMethod::Agq, 3);
+    let a = eval_only_ofv(&pop, EstimationMethod::Laplace, 3);
+    let b = eval_only_ofv(&pop, EstimationMethod::Laplace, 3);
     assert_eq!(
         a.to_bits(),
         b.to_bits(),
@@ -336,7 +415,15 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
         let (ehs, _hms, _stats, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
             &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
         );
-        2.0 * agq::agq_population_nll(&model, &pop, &params, &ehs, &[], n)
+        2.0 * agq::agq_population_nll(
+            &model,
+            &pop,
+            &params,
+            &ehs,
+            &[],
+            n,
+            ferx_core::types::HessianAnchor::Exact,
+        )
     };
 
     let mut rel_errs = Vec::new();
@@ -346,8 +433,18 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
         let (ehs, _h, _s, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
             &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
         );
-        let g = agq::agq_population_gradient(&model, &pop, &params, template, &x0, &ehs, &[], n)
-            .expect("analytic gradient must be available in scope");
+        let g = agq::agq_population_gradient(
+            &model,
+            &pop,
+            &params,
+            template,
+            &x0,
+            &ehs,
+            &[],
+            n,
+            ferx_core::types::HessianAnchor::Exact,
+        )
+        .expect("analytic gradient must be available in scope");
 
         // Central FD of the true objective. Step 1e-4, not 1e-5: this references a
         // **reconverged** objective, so a step below the inner solver's noise floor amplifies
@@ -399,6 +496,81 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
         rel_errs[3] < rel_errs[0],
         "accuracy should improve with node count: {rel_errs:?}"
     );
+}
+
+/// The **Gauss-Newton-anchored** quadrature (`focei, n_agq > 1`) has its own analytic
+/// gradient, and it must match a finite difference of its own objective (#251). Same
+/// machinery as the exact-anchor test above — the fixed-node score is anchor-independent, the
+/// grid-response term differences the Gauss-Newton `H̃` instead of the exact Hessian, and the
+/// mode response `dη̂/dx` stays the exact one (η̂ minimises the true conditional NLL regardless
+/// of which Hessian scales the grid).
+#[test]
+fn gauss_newton_anchored_gradient_matches_fd() {
+    use ferx_core::estimation::agq;
+    use ferx_core::estimation::parameterization::{pack_params, unpack_params};
+    use ferx_core::types::HessianAnchor::GaussNewton;
+
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+    let pop = warfarin();
+    let template = &model.default_params;
+    let x0 = pack_params(template);
+    let np = x0.len();
+
+    let ofv = |x: &[f64], n: usize| -> f64 {
+        let params = unpack_params(x, template);
+        let (ehs, _h, _s, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
+        );
+        2.0 * agq::agq_population_nll(&model, &pop, &params, &ehs, &[], n, GaussNewton)
+    };
+
+    let mut rel_errs = Vec::new();
+    for &n in &[1usize, 3, 5] {
+        let params = unpack_params(&x0, template);
+        let (ehs, _h, _s, _k) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, &params, 500, 1e-12, None, None, 0, 0,
+        );
+        let g = agq::agq_population_gradient(
+            &model,
+            &pop,
+            &params,
+            template,
+            &x0,
+            &ehs,
+            &[],
+            n,
+            GaussNewton,
+        )
+        .expect("GN-anchored analytic gradient must be available in scope");
+
+        let mut fd = vec![0.0f64; np];
+        for i in 0..np {
+            let h = 1e-4 * (1.0 + x0[i].abs());
+            let (mut xp, mut xm) = (x0.clone(), x0.clone());
+            xp[i] += h;
+            xm[i] -= h;
+            fd[i] = (ofv(&xp, n) - ofv(&xm, n)) / (2.0 * h);
+        }
+
+        let scale = fd
+            .iter()
+            .chain(g.iter())
+            .fold(1e-6f64, |m, v| m.max(v.abs()));
+        let max_diff = g
+            .iter()
+            .zip(fd.iter())
+            .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+        rel_errs.push(max_diff / scale);
+    }
+
+    for (k, &n) in [1usize, 3, 5].iter().enumerate() {
+        assert!(
+            rel_errs[k] < 2e-3,
+            "n_agq={n}: GN-anchored analytic gradient must match FD of its objective, got \
+             {:.3e} (all: {rel_errs:?})",
+            rel_errs[k]
+        );
+    }
 }
 
 /// **AGQ has its own gradient for every model — nothing falls back to the inner-re-solving
@@ -455,11 +627,21 @@ fn fd_score_path_agrees_with_the_analytic_one() {
             &ehs,
             &[],
             n,
+            ferx_core::types::HessianAnchor::Exact,
         )
         .expect("analytic-score gradient");
-        let g_fd =
-            agq::agq_population_gradient(&fd_model, &pop, &params, template, &x, &ehs, &[], n)
-                .expect("FD-score gradient");
+        let g_fd = agq::agq_population_gradient(
+            &fd_model,
+            &pop,
+            &params,
+            template,
+            &x,
+            &ehs,
+            &[],
+            n,
+            ferx_core::types::HessianAnchor::Exact,
+        )
+        .expect("FD-score gradient");
 
         let scale = g_an
             .iter()
@@ -513,7 +695,7 @@ fn agq_rejects_an_intractable_grid() {
   DV ~ proportional(PROP_ERR)
 
 [fit_options]
-  method = agq
+  method = laplace
   n_agq = 21
 "
     );
@@ -553,7 +735,7 @@ fn agq_rejects_out_of_range_node_count_built_via_the_rust_api() {
         "the grid must stay under MAX_AGQ_GRID so only the node cap can reject this"
     );
     let opts = FitOptions {
-        method: EstimationMethod::Agq,
+        method: EstimationMethod::Laplace,
         n_agq: n,
         ..FitOptions::default()
     };
@@ -566,7 +748,7 @@ fn agq_rejects_out_of_range_node_count_built_via_the_rust_api() {
     );
     // The in-range boundary (exactly MAX_AGQ_NODES) must NOT be rejected.
     let ok_opts = FitOptions {
-        method: EstimationMethod::Agq,
+        method: EstimationMethod::Laplace,
         n_agq: ferx_core::estimation::agq::MAX_AGQ_NODES,
         ..FitOptions::default()
     };
@@ -575,6 +757,108 @@ fn agq_rejects_out_of_range_node_count_built_via_the_rust_api() {
             .iter()
             .any(|d| d.code == "E_AGQ_NODES_TOO_LARGE"),
         "n_agq = MAX_AGQ_NODES is in range and must be accepted"
+    );
+}
+
+/// The `n_agq` caps must fire for the **FOCEI** quadrature too, not only Laplace (#251
+/// review #1). A non-IOV closed-form model with `method = focei, n_agq` over the cap would
+/// otherwise skip every check-time guard (the runtime cap only fires under IOV) and build a
+/// 100k+-node grid unchecked — a hang / OOM. Plain FOCEI (`n_agq = 1`) must stay uncapped.
+#[test]
+fn focei_quadrature_hits_the_node_cap_like_laplace() {
+    use ferx_core::api::check_model_options;
+
+    let model = parse_model_string(WARFARIN_SRC).expect("warfarin must parse");
+    let over = ferx_core::estimation::agq::MAX_AGQ_NODES + 79; // 100
+
+    // focei + n_agq > MAX_AGQ_NODES → rejected, exactly as laplace is.
+    let focei = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: over,
+        ..FitOptions::default()
+    };
+    assert!(
+        check_model_options(&model, &focei)
+            .iter()
+            .any(|d| d.code == "E_AGQ_NODES_TOO_LARGE" || d.code == "E_AGQ_GRID_TOO_LARGE"),
+        "focei with an over-cap n_agq must be rejected at check time, not left to hang"
+    );
+
+    // Plain FOCEI (n_agq = 1) is not a quadrature — the caps must NOT fire.
+    let plain = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: 1,
+        ..FitOptions::default()
+    };
+    assert!(
+        !check_model_options(&model, &plain)
+            .iter()
+            .any(|d| d.code.starts_with("E_AGQ_")),
+        "plain FOCEI (n_agq = 1) must not trip the quadrature caps"
+    );
+}
+
+/// `focei` + `n_agq > 1` is rejected outside the analytic sensitivity scope (the GN anchor's
+/// `H̃` comes from the provider). Forcing `gradient_method = fd` takes the model out of scope,
+/// which must surface `E_FOCEI_NAGQ_UNSUPPORTED` rather than a deep runtime failure. `laplace`
+/// (exact anchor, no provider dependency) has no such restriction.
+#[test]
+fn focei_quadrature_out_of_analytic_scope_is_rejected() {
+    use ferx_core::api::check_model_options;
+    use ferx_core::types::GradientMethod;
+
+    let mut model = parse_model_string(WARFARIN_SRC).expect("warfarin must parse");
+    model.gradient_method = GradientMethod::Fd; // forces analytic_score_supported == false
+
+    let focei = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: 3,
+        ..FitOptions::default()
+    };
+    assert!(
+        check_model_options(&model, &focei)
+            .iter()
+            .any(|d| d.code == "E_FOCEI_NAGQ_UNSUPPORTED"),
+        "focei + n_agq > 1 out of analytic scope must be rejected"
+    );
+    // Laplace is unaffected — the exact anchor needs no provider.
+    let laplace = FitOptions {
+        method: EstimationMethod::Laplace,
+        n_agq: 3,
+        ..FitOptions::default()
+    };
+    assert!(
+        !check_model_options(&model, &laplace)
+            .iter()
+            .any(|d| d.code == "E_FOCEI_NAGQ_UNSUPPORTED"),
+        "laplace + n_agq > 1 must not be gated on analytic scope"
+    );
+}
+
+/// The runtime IOV grid cap fires for the FOCEI quadrature too, and names `focei` (not
+/// `laplace`) in the message (#251 review #4). `21^5` over the stacked (η, κ) dimension is
+/// far past `MAX_AGQ_GRID`.
+#[test]
+fn focei_iov_grid_cap_reports_focei() {
+    let parsed = parse_full_model(WARFARIN_IOV_SRC).expect("IOV model must parse");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        n_agq: 21,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..parsed.fit_options
+    };
+    let err = fit(
+        &parsed.model,
+        &warfarin_iov(),
+        &parsed.model.default_params,
+        &opts,
+    )
+    .expect_err("an intractable FOCEI-IOV grid must be rejected");
+    assert!(
+        err.contains("method = focei") && err.contains("n_agq"),
+        "the FOCEI-IOV grid-cap error must name focei and the lever: {err}"
     );
 }
 
@@ -588,7 +872,7 @@ fn agq_covariance_step_produces_finite_standard_errors() {
     let pop = warfarin();
     let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
     let opts = FitOptions {
-        method: EstimationMethod::Agq,
+        method: EstimationMethod::Laplace,
         n_agq: 1,
         // A handful of outer iterations so covariance is evaluated near the optimum where the
         // marginal Hessian is PD, while keeping this a Tier-2 (fast, no convergence loop) test.
@@ -679,7 +963,7 @@ mod non_gaussian {
 
     /// Eval-only AGQ OFV of `model` on the binary population at the initial parameters.
     fn agq_ofv(model: &CompiledModel, pop: &Population, n_agq: usize) -> f64 {
-        crate::eval_only_ofv_model(model, pop, EstimationMethod::Agq, n_agq)
+        crate::eval_only_ofv_model(model, pop, EstimationMethod::Laplace, n_agq)
     }
 
     /// **Point 3: the binary marginal is integrated correctly, cross-checked against IS.**
@@ -743,7 +1027,7 @@ mod non_gaussian {
         let model = parse_model_string(BINARY_MIXED).expect("mixed binary model must parse");
         let pop = binary_population();
         let opts = FitOptions {
-            method: EstimationMethod::Agq,
+            method: EstimationMethod::Laplace,
             n_agq: 3,
             outer_maxiter: 3, // Tier-2: a few steps, no convergence loop
             run_covariance_step: false,
@@ -788,7 +1072,7 @@ mod non_gaussian {
 
         // Drive the gradient's d == 0 branch through a short optimising fit.
         let opts = FitOptions {
-            method: EstimationMethod::Agq,
+            method: EstimationMethod::Laplace,
             n_agq: 3,
             outer_maxiter: 3,
             run_covariance_step: false,
@@ -808,50 +1092,39 @@ mod non_gaussian {
 // `method = laplace` — AGQ at one node, exposed as a first-class method (#251)
 // ---------------------------------------------------------------------------
 
-/// **The identity, at the API boundary.** `method = laplace` is not a re-implementation of
-/// Laplace; it is `method = agq` with the node count pinned to 1, routed through the same
-/// objective, the same analytic gradient and the same covariance stencil.
-///
-/// So the OFV must be **bit-identical** — not "close". Anything less means the two are
-/// taking different code paths, which is precisely what this variant exists not to do.
+/// **Laplace is the exact-anchor quadrature at one node, and a genuinely different estimator
+/// from FOCEI.** `method = laplace` with `n_agq = 1` uses the exact Hessian; FOCEI uses the
+/// Gauss-Newton one. If they ever coincide, the exact Hessian has been lost.
 #[test]
-fn laplace_is_bit_identical_to_agq_with_one_node() {
+fn laplace_one_node_is_not_focei() {
     let pop = warfarin();
     let laplace = eval_only_ofv(&pop, EstimationMethod::Laplace, 1);
-    let agq1 = eval_only_ofv(&pop, EstimationMethod::Agq, 1);
-    assert_eq!(
-        laplace.to_bits(),
-        agq1.to_bits(),
-        "method = laplace must BE agq(n_agq = 1), not merely agree with it: \
-         laplace={laplace}, agq1={agq1}"
-    );
-
-    // And it is genuinely a different estimator from FOCEI — Laplace with the exact Hessian
-    // vs FOCEI's Gauss-Newton one. If these ever coincide, the exact Hessian has been lost.
     let focei = eval_only_ofv(&pop, EstimationMethod::FoceI, 1);
     assert!(
         (laplace - focei).abs() > 1e-6,
         "LAPLACE (exact Hessian) must not collapse onto FOCEI (Gauss-Newton Hessian): \
-         both {laplace}"
+         laplace={laplace}, focei={focei}"
     );
 }
 
-/// `n_agq` is pinned for Laplace and cannot be varied — the node count is what *defines* the
-/// method. Setting it must not change the answer (and it is not one of the method's keys, so
-/// the engine also warns it is unsupported).
+/// `n_agq` is now an **argument** to Laplace, not pinned (#251): `n_agq = 1` is Laplace,
+/// `n_agq > 1` is adaptive Gauss–Hermite quadrature over the same integral. So varying it must
+/// change the OFV (the quadrature refines the marginal the one-point rule approximates), and
+/// `n_agq` must be one of the method's keys.
 #[test]
-fn laplace_ignores_n_agq() {
+fn laplace_respects_n_agq() {
     let pop = warfarin();
     let a = eval_only_ofv(&pop, EstimationMethod::Laplace, 1);
     let b = eval_only_ofv(&pop, EstimationMethod::Laplace, 7);
-    assert_eq!(
+    assert_ne!(
         a.to_bits(),
         b.to_bits(),
-        "method = laplace must pin the node count to 1 regardless of n_agq: {a} vs {b}"
+        "method = laplace must now vary with n_agq (1 = Laplace, 7 = a 7-node quadrature of \
+         the same marginal): {a} vs {b}"
     );
     assert!(
-        !ferx_core::types::method_specific_keys(EstimationMethod::Laplace).contains(&"n_agq"),
-        "`n_agq` must not be an option of method = laplace — it is fixed at 1"
+        ferx_core::types::method_specific_keys(EstimationMethod::Laplace).contains(&"n_agq"),
+        "`n_agq` must be an option of method = laplace"
     );
 }
 
@@ -897,7 +1170,7 @@ const WARFARIN_IOV_SRC: &str = r"
   DV ~ proportional(PROP_ERR)
 
 [fit_options]
-  method     = agq
+  method     = laplace
   iov_column = OCC
   covariance = false
 ";
@@ -943,29 +1216,28 @@ fn iov_ofv(method: EstimationMethod, n_agq: usize) -> f64 {
 #[test]
 fn agq_and_laplace_integrate_the_joint_iov_marginal() {
     let laplace = iov_ofv(EstimationMethod::Laplace, 1);
-    let agq1 = iov_ofv(EstimationMethod::Agq, 1);
-    let agq3 = iov_ofv(EstimationMethod::Agq, 3);
+    let agq3 = iov_ofv(EstimationMethod::Laplace, 3);
     let focei = iov_ofv(EstimationMethod::FoceI, 1);
-
-    // The identity survives the stacking: laplace IS agq at one node, over the joint vector.
-    assert_eq!(
-        laplace.to_bits(),
-        agq1.to_bits(),
-        "under IOV too, method = laplace must BE agq(n_agq = 1): {laplace} vs {agq1}"
-    );
+    // The Gauss-Newton-anchored quadrature under IOV: exercises `anchor_hessian`'s stacked
+    // (η, κ) `subject_sensitivities_iov` branch.
+    let focei3 = iov_ofv(EstimationMethod::FoceI, 3);
 
     // Laplace-family: within a Hessian approximation of FOCEI-IOV, which uses the same joint
     // mode but the Gauss-Newton curvature. Nowhere near it would mean κ was mishandled.
     assert!(
-        (agq1 - focei).abs() < 5.0,
-        "AGQ-IOV must be in the same Laplace family as FOCEI-IOV: agq1={agq1}, focei={focei}"
+        (laplace - focei).abs() < 5.0,
+        "Laplace-IOV must be in the same family as FOCEI-IOV: laplace={laplace}, focei={focei}"
     );
 
     // Refining the grid over the *stacked* vector must move the answer (the joint posterior
-    // is not exactly Gaussian) but stay in the same basin.
+    // is not exactly Gaussian) but stay in the same basin — for both anchors.
     assert!(
-        agq3.is_finite() && (agq3 - agq1).abs() < 5.0,
-        "AGQ-IOV n=3 must refine, not diverge: agq1={agq1}, agq3={agq3}"
+        agq3.is_finite() && (agq3 - laplace).abs() < 5.0,
+        "Laplace-IOV n=3 must refine, not diverge: n1={laplace}, n3={agq3}"
+    );
+    assert!(
+        focei3.is_finite() && (focei3 - focei).abs() < 5.0,
+        "FOCEI-IOV n=3 (GN-anchored quadrature) must refine, not diverge: n1={focei}, n3={focei3}"
     );
 }
 
@@ -979,7 +1251,7 @@ fn agq_iov_grid_cap_counts_the_stacked_dimension() {
     // 3 η + 1 κ × 2 occasions = d 5. At n_agq = 21 that is 21^5 ≈ 4.1M nodes — over the cap.
     let parsed = parse_full_model(WARFARIN_IOV_SRC).expect("parses");
     let opts = FitOptions {
-        method: EstimationMethod::Agq,
+        method: EstimationMethod::Laplace,
         n_agq: 21,
         outer_maxiter: 0,
         run_covariance_step: false,
@@ -1038,7 +1310,15 @@ fn analytic_gradient_matches_fd_under_iov() {
         let (ehs, _h, _s, kaps) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
             model, &pop, &params, 500, 1e-12, None, None, 0, 0,
         );
-        2.0 * agq::agq_population_nll(model, &pop, &params, &ehs, &kaps, n)
+        2.0 * agq::agq_population_nll(
+            model,
+            &pop,
+            &params,
+            &ehs,
+            &kaps,
+            n,
+            ferx_core::types::HessianAnchor::Exact,
+        )
     };
 
     for n in [1usize, 3] {
@@ -1051,8 +1331,18 @@ fn analytic_gradient_matches_fd_under_iov() {
             "the inner loop must return per-occasion kappas, else this proves nothing"
         );
 
-        let g = agq::agq_population_gradient(model, &pop, &params, template, &x0, &ehs, &kaps, n)
-            .expect("IOV gradient must be available");
+        let g = agq::agq_population_gradient(
+            model,
+            &pop,
+            &params,
+            template,
+            &x0,
+            &ehs,
+            &kaps,
+            n,
+            ferx_core::types::HessianAnchor::Exact,
+        )
+        .expect("IOV gradient must be available");
 
         // FD step 1e-4, NOT the 1e-5 that *looks* more accurate. The reference differences a
         // **reconverged** objective, so shrinking the step past the inner solver's own noise
@@ -1111,7 +1401,7 @@ fn agq_reports_convergence_rather_than_grinding_into_nlopt_failure() {
 
     for (method, n) in [
         (EstimationMethod::Laplace, 1usize),
-        (EstimationMethod::Agq, 3),
+        (EstimationMethod::Laplace, 3),
     ] {
         let opts = FitOptions {
             method,

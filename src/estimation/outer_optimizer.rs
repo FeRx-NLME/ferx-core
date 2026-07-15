@@ -487,7 +487,13 @@ pub(crate) fn pop_nll_opts(
         // `h_matrices` (the ∂f/∂η Jacobian) is a FOCE artefact AGQ has no use for — it
         // finite-differences the true posterior Hessian instead. See `crate::estimation::agq`.
         return crate::estimation::agq::agq_population_nll(
-            model, population, params, eta_hats, kappas, n_nodes,
+            model,
+            population,
+            params,
+            eta_hats,
+            kappas,
+            n_nodes,
+            options.hessian_anchor(),
         );
     }
     pop_nll(
@@ -2528,6 +2534,10 @@ fn population_gradient(
         // `reconverge_gradient_interval` is honoured here too: it is the documented escape
         // hatch onto the numeric path, so it must override the analytic gradient for AGQ
         // exactly as it does for FOCE/FOCEI below.
+        // `agq_population_gradient` is the analytic gradient of the quadrature objective for
+        // **either** anchor: the fixed-node score is anchor-independent, and the grid-response
+        // term differences whichever Hessian scales the grid (exact for `laplace`,
+        // Gauss-Newton for `focei` — `anchor` selects it, matching the objective).
         if !reconverge && crate::estimation::agq::analytic_gradient_available(model) {
             let params = unpack_params(x, init_params);
             if let Some(mut g) = crate::estimation::agq::agq_population_gradient(
@@ -2539,6 +2549,7 @@ fn population_gradient(
                 ehs,
                 kappas,
                 n_nodes,
+                options.hessian_anchor(),
             ) {
                 // Fixed coordinates carry no gradient, matching the analytic FOCE path.
                 let fixed = packed_fixed_mask(init_params);

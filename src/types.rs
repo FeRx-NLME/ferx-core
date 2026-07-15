@@ -5220,11 +5220,13 @@ pub struct FitOptions {
     // `imp_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
     // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` at the fixed input parameters
     // without updating them.
-    /// Gauss–Hermite nodes **per random effect** for `method = agq` (#251). Default 3.
+    /// Gauss–Hermite nodes **per random effect** for `method = laplace` and
+    /// `method = focei` (#251). **Default 1.**
     ///
-    /// `n_agq = 1` is the Laplace approximation exactly (see
-    /// [`crate::estimation::agq`]); larger values refine the marginal and are what make
-    /// AGQ unbiased on strongly non-Gaussian integrands. The tensor grid costs
+    /// `n_agq = 1` is the classical single-point method (Laplace under the exact anchor,
+    /// FOCEI under the Gauss-Newton anchor). `n_agq > 1` is adaptive Gauss–Hermite
+    /// quadrature: it refines the marginal toward the exact integral and is what makes the
+    /// exact-anchor path unbiased on strongly non-Gaussian integrands. The tensor grid costs
     /// `n_agq^n_eta` likelihood evaluations per subject per outer iteration, so raise it
     /// deliberately — odd values are conventional (they keep a node exactly at the mode).
     /// Capped by [`crate::estimation::agq::MAX_AGQ_NODES`], with the *grid* additionally
@@ -5637,7 +5639,7 @@ impl Default for FitOptions {
             sir_seed: None,
             sir_keep_samples: false,
             sir_df: 5.0,
-            n_agq: 3,
+            n_agq: 1,
             imp_samples: 1000,
             imp_proposal_df: 5.0,
             imp_seed: None,
@@ -5911,33 +5913,49 @@ pub enum EstimationMethod {
     /// σ²: inverse-gamma, mu-referenced θ: normal). Reports posterior summaries +
     /// convergence diagnostics on `FitResult.bayes`, not a point estimate.
     Bayes,
-    /// Adaptive Gauss–Hermite quadrature (#251) — the Laplace approximation generalised.
-    /// Reuses the FOCE/Laplace inner loop to find each subject's EBE mode, then evaluates
-    /// the **exact** conditional likelihood on a Gauss–Hermite grid laid around that mode
-    /// (`n_agq` nodes per random effect). At `n_agq = 1` it is Laplace identically; above
-    /// that the marginal improves and — because it integrates the model's real likelihood
-    /// rather than a Gaussian-residual surrogate — it is the only method here that handles
-    /// non-Gaussian endpoints (TTE, categorical) without approximation. Deterministic, so
-    /// unlike [`Saem`](Self::Saem) / [`Imp`](Self::Imp) its OFV carries no Monte-Carlo noise.
-    /// Cost is `n_agq^n_eta` likelihood evaluations per subject per iteration; see
-    /// [`crate::estimation::agq::MAX_AGQ_GRID`].
-    Agq,
     /// The **Laplace approximation** with the *exact* Hessian — NONMEM `$EST METHOD=1
-    /// LAPLACIAN` (#251).
+    /// LAPLACIAN` — generalised to adaptive Gauss–Hermite quadrature by the `n_agq` argument
+    /// (#251).
     ///
-    /// Identical to [`Agq`](Self::Agq) at one node: the one-point Gauss–Hermite rule sits at
-    /// the mode with weight `√π`, and the quadrature sum collapses, term for term, to
-    /// `(2π)^(d/2)·|H|^(−½)·exp(l(η̂))`. So this variant routes through the AGQ objective with
-    /// the node count pinned to 1 — it is not a separate implementation, and `n_agq` is not
-    /// one of its options.
+    /// The estimator evaluates the **exact** conditional likelihood on a Gauss–Hermite grid
+    /// of `n_agq` nodes per random effect, laid around each subject's EBE mode with the exact
+    /// posterior Hessian as the scaling. At **`n_agq = 1`** the one-point rule sits at the
+    /// mode with weight `√π` and the sum collapses, term for term, to
+    /// `(2π)^(d/2)·|H|^(−½)·exp(l(η̂))` — Laplace exactly. At **`n_agq > 1`** it is adaptive
+    /// Gauss–Hermite quadrature: the marginal improves toward the exact integral, and because
+    /// it integrates the model's real likelihood rather than a Gaussian-residual surrogate it
+    /// is the only method here that handles non-Gaussian endpoints (TTE, categorical) without
+    /// approximation. Deterministic, so unlike [`Saem`](Self::Saem) / [`Imp`](Self::Imp) its
+    /// OFV carries no Monte-Carlo noise. Cost is `n_agq^n_eta` likelihood evaluations per
+    /// subject per iteration; see [`crate::estimation::agq::MAX_AGQ_GRID`].
     ///
-    /// **Distinct from [`FoceI`](Self::FoceI)**, which is Laplace with the *Gauss-Newton*
-    /// Hessian `CᵀC + Ω⁻¹` (that form drops `∂²f/∂η²`). This one differentiates the true
-    /// conditional NLL, so it carries the curvature of the η-dependent residual variance that
-    /// the Gauss-Newton form discards — which is exactly why it reproduces NONMEM's LAPLACIAN
-    /// (to six significant figures on warfarin) where FOCEI lands on a different value. It is
-    /// also the cheapest member of the AGQ family: one node, no grid.
+    /// **The Hessian anchor is what distinguishes it from [`FoceI`](Self::FoceI)** — which is
+    /// the *same* quadrature machinery with the *Gauss-Newton* Hessian `CᵀC + Ω⁻¹` (dropping
+    /// `∂²f/∂η²`) as the scaling. `Laplace` uses the exact Hessian, so at one node it carries
+    /// the curvature of the η-dependent residual variance the Gauss-Newton form discards —
+    /// which is why it reproduces NONMEM's LAPLACIAN (six significant figures on warfarin)
+    /// where FOCEI lands on a different value. See [`FitOptions::hessian_anchor`].
+    ///
+    /// (There is no separate `Agq` method: adaptive quadrature *is* `Laplace` with
+    /// `n_agq > 1`. The old `method = agq` token is rejected by the parser with a note.)
     Laplace,
+}
+
+/// Which Hessian scales the Gauss–Hermite grid (and enters the `½log|H|` term).
+///
+/// The quadrature identity holds for any positive-definite scaling: the anchor changes the
+/// proposal — and, at one node, the whole objective — but not the `n → ∞` limit. So a single
+/// machinery serves both estimator families, parameterised by this choice:
+/// [`Laplace`](EstimationMethod::Laplace) → [`Exact`](Self::Exact),
+/// [`FoceI`](EstimationMethod::FoceI) → [`GaussNewton`](Self::GaussNewton).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HessianAnchor {
+    /// Exact conditional Hessian `∂²nll/∂b²`. `Laplace` / adaptive GH quadrature.
+    Exact,
+    /// Gauss-Newton (Almquist) Hessian `H̃ = Ω⁻¹ + Σ pⱼaⱼaⱼᵀ`. FOCEI and its quadrature
+    /// refinement. Always positive-definite and needs only first `f`-derivatives, so its
+    /// `½log|H̃|` gradient is fully analytic.
+    GaussNewton,
 }
 
 impl EstimationMethod {
@@ -5951,7 +5969,6 @@ impl EstimationMethod {
             EstimationMethod::Imp => "IMP",
             EstimationMethod::Impmap => "IMPMAP",
             EstimationMethod::Bayes => "BAYES",
-            EstimationMethod::Agq => "AGQ",
             EstimationMethod::Laplace => "LAPLACE",
         }
     }
@@ -5981,14 +5998,26 @@ impl FitOptions {
     /// stage of a chain), so it is correct inside a chained fit too.
     pub fn agq_nodes(&self) -> Option<usize> {
         match self.method {
-            EstimationMethod::Agq => Some(self.n_agq.max(1)),
-            // Laplace *is* AGQ at one node — not an approximation of it, an identity (the
-            // one-point Gauss-Hermite rule sits at the mode with weight √π, and the sum
-            // collapses to `(2π)^(d/2)·|H|^(−½)·exp(l(η̂))`). So it routes through the same
-            // objective, the same analytic gradient, and the same covariance stencil, with
-            // the node count pinned. `n_agq` is not one of its keys; it cannot be varied.
-            EstimationMethod::Laplace => Some(1),
+            // Laplace is the exact-anchor quadrature: `n_agq = 1` is Laplace, `> 1` is
+            // adaptive Gauss–Hermite quadrature. Both route through the same objective, the
+            // same analytic gradient, and the same covariance stencil.
+            EstimationMethod::Laplace => Some(self.n_agq.max(1)),
+            // FOCEI with `n_agq > 1` is the Gauss-Newton-anchored quadrature refinement, live
+            // for every in-analytic-scope model; `n_agq = 1` (the default) is plain FOCEI and
+            // takes its own path (`None`). `check_model_options` rejects `focei, n_agq > 1`
+            // only *outside* the analytic sensitivity scope (`E_FOCEI_NAGQ_UNSUPPORTED`).
+            EstimationMethod::FoceI if self.n_agq > 1 => Some(self.n_agq),
             _ => None,
+        }
+    }
+
+    /// Which Hessian scales the quadrature grid for this (stage's) method. Only meaningful
+    /// when [`agq_nodes`](Self::agq_nodes) is `Some`: `Laplace` anchors on the exact
+    /// conditional Hessian, `FoceI` on the Gauss-Newton `H̃`. See [`HessianAnchor`].
+    pub fn hessian_anchor(&self) -> HessianAnchor {
+        match self.method {
+            EstimationMethod::FoceI => HessianAnchor::GaussNewton,
+            _ => HessianAnchor::Exact,
         }
     }
 
@@ -6195,7 +6224,7 @@ pub fn framework_keys() -> &'static [&'static str] {
 /// wide keys live in `framework_keys`.
 pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
     match m {
-        EstimationMethod::Foce | EstimationMethod::FoceI => &[
+        EstimationMethod::Foce => &[
             "maxiter",
             "inner_maxiter",
             "inner_tol",
@@ -6210,13 +6239,9 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "stagnation_guard",
             "reconverge_gradient_interval",
         ],
-        // AGQ drives the same outer loop and the same inner EBE solve as FOCE/FOCEI —
-        // it only swaps the population objective — so it accepts that method's keys,
-        // plus the node count. AGQ *does* have an exact analytic outer gradient, and
-        // `reconverge_gradient_interval` is its escape hatch onto the numeric path
-        // (honoured in `population_gradient`), so the key applies here exactly as it
-        // does for FOCE/FOCEI.
-        EstimationMethod::Agq => &[
+        // FOCEI accepts `n_agq`: `= 1` (default) is plain FOCEI, `> 1` is the Gauss-Newton-
+        // anchored quadrature refinement.
+        EstimationMethod::FoceI => &[
             "n_agq",
             "maxiter",
             "inner_maxiter",
@@ -6232,11 +6257,10 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "stagnation_guard",
             "reconverge_gradient_interval",
         ],
-        // Laplace is AGQ with the node count pinned to 1, so it takes AGQ's keys **minus
-        // `n_agq`** — that key is not a knob here, and offering it would invite
-        // `method = laplace, n_agq = 5`, which is a contradiction. Users who want to vary the
-        // node count already have `method = agq`.
+        // Laplace is the exact-anchor quadrature; `n_agq` (default 1) is its node count.
+        // `n_agq = 1` is Laplace, `> 1` is adaptive Gauss–Hermite quadrature.
         EstimationMethod::Laplace => &[
+            "n_agq",
             "maxiter",
             "inner_maxiter",
             "inner_tol",

@@ -24,9 +24,13 @@ Its two defining properties:
 
 ```ini
 [fit_options]
-  method = agq
-  n_agq  = 3      # Gauss-Hermite nodes per random effect (default 3)
+  method = laplace
+  n_agq  = 3      # Gauss-Hermite nodes per random effect (default 1 = Laplace)
 ```
+
+There is no separate `method = agq`: adaptive Gauss–Hermite quadrature is
+`method = laplace` with `n_agq > 1` (the exact Hessian anchor). `n_agq = 1` (the
+default) is the Laplace approximation.
 
 From R:
 
@@ -75,15 +79,23 @@ NONMEM's `$EST METHOD=1 LAPLACIAN`), it is exposed directly:
   method = laplace     # alias: laplacian
 ```
 
-`method = laplace` **is** `method = agq` with the node count pinned to 1 — the same
-objective, the same analytic gradient, the same covariance step, routed through the
-same code. The OFVs are bit-identical, and `n_agq` is not one of its options (the
-node count is what *defines* the method). Prefer it when you want a
-NONMEM-`LAPLACIAN`-comparable fit, or a Laplace baseline to raise `n_agq` from.
+`method = laplace` with the default `n_agq = 1` **is** the Laplace approximation:
+one node, no grid, the exact-Hessian anchor. Raising `n_agq` turns the same
+objective — same analytic gradient, same covariance step, same code — into adaptive
+Gauss–Hermite quadrature. Prefer `n_agq = 1` when you want a
+NONMEM-`LAPLACIAN`-comparable fit or a baseline to raise `n_agq` from.
 
-It is also the cheapest member of the family — one node, no grid — and on warfarin
-it converges *faster than FOCEI* (0.23 s vs 0.60 s), because AGQ's analytic gradient
-needs fewer outer iterations.
+It is the cheapest configuration — one node, no grid — and on warfarin it converges
+*faster than FOCEI* (0.23 s vs 0.60 s), because the analytic gradient needs fewer
+outer iterations.
+
+The **Hessian anchor** is what the method name selects: `method = laplace` anchors
+the grid on the exact conditional Hessian, `method = focei` on the Gauss-Newton
+`H̃`. So `method = focei` with `n_agq > 1` is the Gauss-Newton-anchored quadrature —
+FOCEI refined toward the exact marginal. Both anchors converge to the same integral
+as `n_agq → ∞`; they differ only in where the nodes are placed (and, at one node, in
+whether the `½log|H|` term carries the exact curvature or the Gauss-Newton
+approximation).
 
 > **`laplace` is not `focei`.** Both place a single Gaussian at the empirical-Bayes
 > mode, but they build it from different Hessians — see below. They are different

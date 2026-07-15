@@ -114,7 +114,7 @@ pub fn gradient_method_outer(
         // where it reaches, finite-differenced at fixed η otherwise (TTE, categorical, ODE,
         // M3, LTBS…). Report that distinction, not a scope gate — there isn't one.
         // Laplace is AGQ at one node — same objective, same gradient, so same report.
-        EstimationMethod::Agq | EstimationMethod::Laplace => {
+        EstimationMethod::Laplace => {
             if crate::estimation::agq::analytic_score_supported_model(model) {
                 GradientMethodKind::Analytic
             } else {

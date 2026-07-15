@@ -5684,7 +5684,8 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
     } else if val.contains("hybrid") || val == "gn_hybrid" || val == "gn-hybrid" {
         Ok(EstimationMethod::FoceGnHybrid)
     } else if val == "laplace" || val == "laplacian" {
-        // NONMEM `$EST METHOD=1 LAPLACIAN`. Routes to the AGQ objective with one node.
+        // NONMEM `$EST METHOD=1 LAPLACIAN` — the exact-anchor quadrature. `n_agq = 1`
+        // (default) is Laplace; `n_agq > 1` is adaptive Gauss–Hermite quadrature.
         Ok(EstimationMethod::Laplace)
     } else if val == "agq"
         || val == "aghq"
@@ -5693,9 +5694,18 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         || val == "adaptive_gaussian_quadrature"
         || val == "adaptive-gaussian-quadrature"
     {
-        // MUST stay above the `contains("gauss")` arm below, which would otherwise
-        // swallow `gauss_hermite` / `adaptive_gaussian_quadrature` into Gauss-*Newton*.
-        Ok(EstimationMethod::Agq)
+        // `method = agq` was removed (#251): adaptive quadrature is not a separate estimator,
+        // it is `method = laplace` with `n_agq > 1` (exact Hessian anchor) — or
+        // `method = focei` with `n_agq > 1` for the Gauss-Newton anchor. This arm MUST stay
+        // above the `contains("gauss")` arm below, which would otherwise route
+        // `gauss_hermite` into Gauss-*Newton*.
+        Err(
+            "method = agq has been removed: use method = laplace with n_agq = N \
+             (n_agq = 1 is the Laplace approximation, n_agq > 1 is adaptive Gauss–Hermite \
+             quadrature). For the Gauss-Newton-anchored quadrature use method = focei with \
+             n_agq > 1."
+                .to_string(),
+        )
     } else if val == "gn" || val.contains("gauss") {
         Ok(EstimationMethod::FoceGn)
     } else if val == "focei" || val == "foce-i" || val == "foce_i" || val.contains("interaction") {

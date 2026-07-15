@@ -80,7 +80,7 @@ use crate::estimation::importance_sampling::build_proposal;
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
 use crate::stats::likelihood::individual_nll_into_with_schedule;
-use crate::types::{CompiledModel, ModelParameters, Population, Subject};
+use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Subject};
 
 /// Upper bound on `n_agq`. Beyond ~20 nodes the Golub–Welsch eigenproblem starts to lose
 /// the extreme nodes to round-off, and the marginal accuracy gain is nil for any realistic
@@ -352,6 +352,60 @@ fn fd_posterior_hessian(
     h
 }
 
+/// The Hessian that scales the quadrature grid and enters `½log|H|`, per the anchor.
+///
+/// * [`HessianAnchor::Exact`] → the exact conditional Hessian `∂²nll/∂b²`
+///   ([`fd_posterior_hessian`]). This is Laplace / adaptive GH quadrature.
+/// * [`HessianAnchor::GaussNewton`] → the Almquist `H̃ = Ω⁻¹ + Σ pⱼaⱼaⱼᵀ`, taken directly
+///   from [`sens_outer_gradient::score_core`] — the *same* Hessian FOCEI's own objective and
+///   gradient use, so `focei` with `n_agq > 1` is a genuine quadrature refinement of FOCEI.
+///
+/// Returns `None` when the anchor Hessian cannot be formed: an indefinite exact FD Hessian, or
+/// a Gauss-Newton anchor on a model outside the sensitivity provider's scope (the caller then
+/// yields the NLL sentinel, and `api::check_model_options` rejects `focei, n_agq > 1` outside
+/// that scope up front so this does not surprise a fit at runtime).
+fn anchor_hessian(
+    anchor: HessianAnchor,
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    stack: &Stack,
+    b_hat: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> Option<DMatrix<f64>> {
+    match anchor {
+        HessianAnchor::Exact => Some(fd_posterior_hessian(
+            model, subject, params, stack, b_hat, scratch, schedule,
+        )),
+        HessianAnchor::GaussNewton => {
+            // `H̃ = Ω⁻¹ + Σ pⱼ aⱼaⱼᵀ`, exactly what `score_core` assembles for FOCEI. The jet
+            // is the stacked (η, κ) one under IOV, so this serves both regimes.
+            let sens = if stack.is_iov() {
+                crate::sens::provider::subject_sensitivities_iov(
+                    model,
+                    subject,
+                    &params.theta,
+                    b_hat,
+                )?
+            } else {
+                crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b_hat)?
+            };
+            let core = crate::estimation::sens_outer_gradient::score_core(
+                model,
+                subject,
+                params,
+                &sens,
+                stack.d(),
+                &stack.omega_joint_inv,
+                b_hat,
+                model.residual_error_eta,
+            )?;
+            Some(core.htilde)
+        }
+    }
+}
+
 /// AGQ marginal NLL for one subject, in the same "without constant" units as
 /// [`crate::stats::likelihood::foce_subject_nll`] — see the module docs for the derivation.
 ///
@@ -367,6 +421,7 @@ pub(crate) fn agq_subject_nll(
     b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
+    anchor: HessianAnchor,
 ) -> f64 {
     let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
@@ -386,7 +441,8 @@ pub(crate) fn agq_subject_nll(
         );
     }
 
-    let h = fd_posterior_hessian(
+    let Some(h) = anchor_hessian(
+        anchor,
         model,
         subject,
         params,
@@ -394,7 +450,11 @@ pub(crate) fn agq_subject_nll(
         b_hat,
         &mut scratch,
         schedule.as_ref(),
-    );
+    ) else {
+        // Gauss-Newton anchor out of the provider's scope (guarded up front by
+        // `check_model_options`, so this is only reachable if that guard is bypassed).
+        return NLL_SENTINEL;
+    };
     // `build_proposal` applies the relative jitter and — if the FD Hessian came back
     // indefinite (a loosely-converged mode, a flat direction) — falls back to the prior-scale
     // factor (`Ω`, or the block-diagonal `Ω_joint` under IOV). That fallback keeps AGQ
@@ -507,6 +567,7 @@ pub fn agq_population_nll(
     eta_hats: &[nalgebra::DVector<f64>],
     kappas: &[Vec<nalgebra::DVector<f64>>],
     n_nodes: usize,
+    anchor: HessianAnchor,
 ) -> f64 {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
@@ -519,7 +580,16 @@ pub fn agq_population_nll(
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
-            agq_subject_nll(model, subject, params, &stack, &b_hat, &nodes, &log_weights)
+            agq_subject_nll(
+                model,
+                subject,
+                params,
+                &stack,
+                &b_hat,
+                &nodes,
+                &log_weights,
+                anchor,
+            )
         })
         .collect();
     per_subject.iter().sum()
@@ -585,42 +655,31 @@ fn stack_mode(eta_hat: &[f64], kappas: &[nalgebra::DVector<f64>]) -> Vec<f64> {
 // costs `2·n_free` *full population objective* evaluations, each re-solving every subject's
 // inner loop.
 
-/// Model-level mirror of [`analytic_score_supported`], for reporting
-/// (`build_info::gradient_method_outer`) which has no per-subject [`Stack`]. Uses the model's
-/// own `n_kappa` to pick the IOV or non-IOV provider scope, which is the same answer every
-/// subject of an IOV model gets.
+/// Alias kept for `build_info::gradient_method_outer`, which reports scope by model.
+/// Identical to [`analytic_score_supported`] — the predicate is purely model-level.
 pub fn analytic_score_supported_model(model: &CompiledModel) -> bool {
-    let stack = Stack {
-        n_eta: model.n_eta,
-        n_kappa: model.n_kappa,
-        n_occ: usize::from(model.n_kappa > 0),
-        omega_joint_inv: DMatrix::zeros(0, 0),
-        prior_sd: Vec::new(),
-    };
-    analytic_score_supported(model, &stack)
+    analytic_score_supported(model)
 }
 
-pub fn analytic_score_supported(model: &CompiledModel, stack: &Stack) -> bool {
-    // The provider's scope differs for IOV: `subject_sensitivities_iov` runs the stacked
-    // (θ, η, κ) dual walk, gated by `iov_sens_supported`, while the non-IOV entry point is
-    // gated by `analytic_outer_gradient_available`. `analytic_outer_gradient_available`
-    // already folds in `iov_sens_supported`, but it also carries the `gradient_method = fd`
-    // opt-out and the non-Gaussian/magnitude bails, which apply to both — so the IOV arm
-    // must repeat them explicitly rather than only calling `iov_sens_supported`, or an IOV
-    // + TTE/categorical model (or IOV + an over-wide custom magnitude) would silently pass
-    // this gate: `score_core` would then build `et` from `subject.observations` alone, and
-    // a pure-TTE subject (`n_obs == 0`) would score only the Ω prior with no hazard
-    // contribution at all (#251 review #9).
-    let provider = if stack.is_iov() {
-        crate::sens::provider::iov_sens_supported(model)
-            && !matches!(model.gradient_method, crate::types::GradientMethod::Fd)
-            && !model.has_non_gaussian()
-            && (!model.has_custom_ruv_magnitude()
-                || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
-                    && model.residual_correlations.is_empty()))
-    } else {
-        crate::sens::provider::analytic_outer_gradient_available(model)
-    };
+/// Whether the AGQ/Laplace analytic score applies to `model`.
+///
+/// This is **the same predicate FOCE/FOCEI gate on** — a single call to
+/// [`analytic_outer_gradient_available`](crate::sens::provider::analytic_outer_gradient_available),
+/// with no separate copy. That is deliberate and load-bearing for scope parity: widening the
+/// analytic scope (a new PK model, a new endpoint family, a relaxed magnitude bound) in that
+/// one function extends FOCE, FOCEI, AGQ and Laplace **together**, with no per-estimator list
+/// here to drift out of step (#251).
+///
+/// It already covers IOV without a separate arm. `analytic_outer_gradient_available`'s final
+/// clause is `sens_supported(model) || iov_sens_supported(model)`, and `sens_supported` is
+/// always false under IOV (both `analytical_supported` and `ode_analytical_supported` bail on
+/// `n_kappa != 0`), so for an IOV model it reduces exactly to `iov_sens_supported` AND the
+/// shared `!fd` / `!has_non_gaussian` / magnitude bails — the whole IOV scope
+/// (`iov_sens_supported` itself folds in the closed-form, ODE-IOV and transit-via-ODE-twin
+/// cases). The earlier hand-replicated IOV arm (#251 review #9) was therefore pure redundancy
+/// and a drift hazard; delegating supersedes it.
+pub fn analytic_score_supported(model: &CompiledModel) -> bool {
+    let provider = crate::sens::provider::analytic_outer_gradient_available(model);
     // Everything the FOCE/FOCEI outer gradient can do analytically, the AGQ/Laplace score
     // can now do too: the per-observation residual chain comes from the SAME
     // `sens_outer_gradient::score_core`, so M3-BLOQ, `iiv_on_ruv`, a custom / time-varying
@@ -824,7 +883,7 @@ fn accumulate_fixed_eta_packed_gradient(
     // its own gradient for *every* model rather than dropping to `reconverged_fd_gradient`.
     // This matters most for exactly the endpoints AGQ exists to serve: TTE and categorical
     // are outside the `Dual2` provider, and it would be perverse for them to be the slow case.
-    if !analytic_score_supported(model, stack) {
+    if !analytic_score_supported(model) {
         return accumulate_fixed_b_packed_gradient_fd(
             model,
             subject,
@@ -1001,6 +1060,7 @@ fn grid_response_correction(
     params: &ModelParameters,
     template: &ModelParameters,
     stack: &Stack,
+    anchor: HessianAnchor,
     x: &[f64],
     b_hat: &[f64],
     nodes: &[f64],
@@ -1050,8 +1110,12 @@ fn grid_response_correction(
         // Ω_joint moves with the parameters too, so rebuild the stack at each perturbed point.
         let sp = Stack::new(model, &pp, stack.n_occ);
         let sm = Stack::new(model, &pm, stack.n_occ);
-        let hp = fd_posterior_hessian(model, subject, &pp, &sp, &ep, scratch, schedule);
-        let hm = fd_posterior_hessian(model, subject, &pm, &sm, &em, scratch, schedule);
+        let (Some(hp), Some(hm)) = (
+            anchor_hessian(anchor, model, subject, &pp, &sp, &ep, scratch, schedule),
+            anchor_hessian(anchor, model, subject, &pm, &sm, &em, scratch, schedule),
+        ) else {
+            continue; // GN anchor out of scope at this perturbed point — no correction
+        };
 
         // `nll` stays at the ORIGINAL params — the direct x-dependence is already covered
         // analytically by the fixed-η score — but the grid (centre and scale) is the
@@ -1127,7 +1191,7 @@ fn eta_dx(
     // neither re-solves the inner loop: this is the *derivative* of the mode, not a
     // recomputation of it. The finite difference below is the fallback for models outside the
     // provider's scope, and uses the same exact `H` the grid is scaled by.
-    if analytic_score_supported(model, stack) {
+    if analytic_score_supported(model) {
         let exact = if stack.is_iov() {
             crate::estimation::sens_outer_gradient::subject_eta_dx_iov(
                 model, subject, template, x, b_hat,
@@ -1239,6 +1303,7 @@ fn agq_subject_packed_gradient(
     b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
+    anchor: HessianAnchor,
     out: &mut [f64],
 ) -> Option<()> {
     let d = stack.d();
@@ -1251,7 +1316,8 @@ fn agq_subject_packed_gradient(
         );
     }
 
-    let h = fd_posterior_hessian(
+    let h = anchor_hessian(
+        anchor,
         model,
         subject,
         params,
@@ -1259,7 +1325,7 @@ fn agq_subject_packed_gradient(
         b_hat,
         &mut scratch,
         schedule.as_ref(),
-    );
+    )?;
     let proposal = build_proposal(&h, &stack.omega_joint_inv, d)?;
 
     // Sweep the grid once, keeping each node's b and its log-term, so the softmax weights
@@ -1297,6 +1363,7 @@ fn agq_subject_packed_gradient(
         params,
         template,
         stack,
+        anchor,
         x,
         b_hat,
         nodes,
@@ -1323,6 +1390,7 @@ pub fn agq_population_gradient(
     eta_hats: &[nalgebra::DVector<f64>],
     kappas: &[Vec<nalgebra::DVector<f64>>],
     n_nodes: usize,
+    anchor: HessianAnchor,
 ) -> Option<Vec<f64>> {
     let n_packed = x.len();
     let (nodes, weights) = gauss_hermite(n_nodes);
@@ -1347,6 +1415,7 @@ pub fn agq_population_gradient(
                 &b_hat,
                 &nodes,
                 &log_weights,
+                anchor,
                 &mut g,
             )
             .map(|()| g)
@@ -1529,7 +1598,7 @@ mod tests {
         let params = unpack_params(&x, template);
         let stack = Stack::new(model, &params, usize::from(model.n_kappa > 0));
         assert!(
-            analytic_score_supported(model, &stack),
+            analytic_score_supported(model),
             "{label}: expected the ANALYTIC score path, got the FD fallback"
         );
 
