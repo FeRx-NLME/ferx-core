@@ -5867,6 +5867,22 @@ impl Optimizer {
         if self != Optimizer::Auto {
             return self;
         }
+        let has_free_residual_correlation = model
+            .default_params
+            .residual_correlations
+            .iter()
+            .enumerate()
+            .any(|(i, _)| {
+                !model
+                    .default_params
+                    .residual_correlation_fixed
+                    .get(i)
+                    .copied()
+                    .unwrap_or(false)
+            });
+        if has_free_residual_correlation {
+            return Optimizer::Bobyqa;
+        }
         // Use the single shared predicate so `auto` can never disagree with the
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
@@ -6898,6 +6914,30 @@ mod tests {
                 "FD-only model should resolve auto → bobyqa"
             );
         }
+    }
+
+    #[test]
+    fn resolve_auto_picks_bobyqa_for_free_residual_correlation() {
+        let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+        m.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 0,
+            rho: 0.2,
+        }];
+        m.default_params.residual_correlations = m.residual_correlations.clone();
+        m.default_params.residual_correlation_fixed = vec![false];
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m, true),
+            Optimizer::Bobyqa,
+            "free residual-correlation coordinates use reconverged FD gradients, so auto must avoid L-BFGS"
+        );
+
+        m.default_params.residual_correlation_fixed = vec![true];
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m, true),
+            Optimizer::NloptLbfgs,
+            "FIX block_sigma correlations keep the analytic optimizer route"
+        );
     }
 
     /// #486 σ-magnitude FOCE port: a custom residual-magnitude model is analytic on

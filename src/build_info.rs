@@ -145,10 +145,25 @@ pub fn gradient_method_outer(
                     // Shared with `resolve_auto` so the reported method tracks the live outer
                     // dispatch; a custom-magnitude model is analytic on both FOCE and FOCEI now
                     // (#486 σ-magnitude FOCE port), so this no longer narrows by interaction.
-                    if crate::sens::provider::analytic_outer_gradient_for_interaction(
-                        model,
-                        interaction,
-                    ) {
+                    let has_free_residual_correlation = model
+                        .default_params
+                        .residual_correlations
+                        .iter()
+                        .enumerate()
+                        .any(|(i, _)| {
+                            !model
+                                .default_params
+                                .residual_correlation_fixed
+                                .get(i)
+                                .copied()
+                                .unwrap_or(false)
+                        });
+                    if !has_free_residual_correlation
+                        && crate::sens::provider::analytic_outer_gradient_for_interaction(
+                            model,
+                            interaction,
+                        )
+                    {
                         GradientMethodKind::Analytic
                     } else {
                         GradientMethodKind::FiniteDifferences
