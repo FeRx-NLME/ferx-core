@@ -585,16 +585,6 @@ fn stack_mode(eta_hat: &[f64], kappas: &[nalgebra::DVector<f64>]) -> Vec<f64> {
 // costs `2·n_free` *full population objective* evaluations, each re-solving every subject's
 // inner loop.
 
-/// Whether the **θ/σ score** can be taken analytically from the `Dual2` provider, or must be
-/// finite-differenced at fixed η.
-///
-/// This is a *speed* switch, not a scope gate: both paths compute the same quantity, and
-/// neither re-solves the inner loop. The analytic form chains the provider's exact `∂f/∂θ`
-/// through `∂nll/∂f`, which is only valid for the plain Gaussian residual term — every
-/// variant listed below adds a term it does not carry (M3's normal-tail, LTBS's `ln f`
-/// wrap, FREM's pseudo-observations, a dense residual covariance, an η-scaled or custom
-/// residual variance), and TTE / categorical endpoints are outside the provider entirely.
-/// Those all take [`accumulate_fixed_eta_packed_gradient_fd`] instead.
 /// Model-level mirror of [`analytic_score_supported`], for reporting
 /// (`build_info::gradient_method_outer`) which has no per-subject [`Stack`]. Uses the model's
 /// own `n_kappa` to pick the IOV or non-IOV provider scope, which is the same answer every
@@ -615,20 +605,44 @@ pub fn analytic_score_supported(model: &CompiledModel, stack: &Stack) -> bool {
     // (θ, η, κ) dual walk, gated by `iov_sens_supported`, while the non-IOV entry point is
     // gated by `analytic_outer_gradient_available`. `analytic_outer_gradient_available`
     // already folds in `iov_sens_supported`, but it also carries the `gradient_method = fd`
-    // opt-out and the non-Gaussian/magnitude bails, which apply to both.
+    // opt-out and the non-Gaussian/magnitude bails, which apply to both — so the IOV arm
+    // must repeat them explicitly rather than only calling `iov_sens_supported`, or an IOV
+    // + TTE/categorical model (or IOV + an over-wide custom magnitude) would silently pass
+    // this gate: `score_core` would then build `et` from `subject.observations` alone, and
+    // a pure-TTE subject (`n_obs == 0`) would score only the Ω prior with no hazard
+    // contribution at all (#251 review #9).
     let provider = if stack.is_iov() {
         crate::sens::provider::iov_sens_supported(model)
             && !matches!(model.gradient_method, crate::types::GradientMethod::Fd)
+            && !model.has_non_gaussian()
+            && (!model.has_custom_ruv_magnitude()
+                || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
+                    && model.residual_correlations.is_empty()))
     } else {
         crate::sens::provider::analytic_outer_gradient_available(model)
     };
+    // Everything the FOCE/FOCEI outer gradient can do analytically, the AGQ/Laplace score
+    // can now do too: the per-observation residual chain comes from the SAME
+    // `sens_outer_gradient::score_core`, so M3-BLOQ, `iiv_on_ruv`, a custom / time-varying
+    // σ magnitude, LTBS and a correlated residual all ride the analytic path rather than
+    // falling back to the fixed-b FD score. Scope parity holds by construction — there is
+    // no per-family list here to drift out of step with `analytic_outer_gradient_available`.
+    //
+    // FREM included: a covariate pseudo-observation row is scored against `θ[ti] + η[ei]`
+    // with the dedicated `EPSCOV` variance, and BOTH halves are now threaded through the
+    // shared machinery — the jet by `provider::apply_frem_pseudo_obs_jet`, the variance by
+    // `score_core`'s FREM override. (This was a live defect in the FOCE/FOCEI outer
+    // gradient too, not only a missing AGQ capability: the analytic gradient was
+    // differentiating the PK likelihood on rows the objective scores as covariate
+    // pseudo-observations. It went unnoticed because FREM models are conventionally fit
+    // with SAEM, which never asks for that gradient.)
+    //
+    // Two runtime (per-subject, not caught by this model-level predicate) declines still
+    // land on FD: a genuinely off-diagonal correlated subject, and magnitude ×
+    // M3-censored — both inside `score_core`, returning `None`. `accumulate_fixed_eta_
+    // packed_gradient` falls back to `accumulate_fixed_b_packed_gradient_fd` for just
+    // that subject when this happens, not the whole population (#251 review #8).
     provider
-        && !matches!(model.bloq_method, crate::types::BloqMethod::M3)
-        && model.residual_correlations.is_empty()
-        && model.frem_config.is_none()
-        && model.residual_error_eta.is_none()
-        && !model.has_custom_ruv_magnitude()
-        && !model.log_transform
 }
 
 /// AGQ always drives the outer loop with its **own** gradient — for every model, and at every
@@ -638,7 +652,7 @@ pub fn analytic_score_supported(model: &CompiledModel, stack: &Stack) -> bool {
 ///
 /// * the fixed-η score is analytic where the provider reaches
 ///   ([`analytic_score_supported`]) and finite-differenced *at fixed η* otherwise
-///   ([`accumulate_fixed_eta_packed_gradient_fd`]) — the latter is correct for any likelihood
+///   ([`accumulate_fixed_b_packed_gradient_fd`]) — the latter is correct for any likelihood
 ///   ferx can evaluate, including TTE and categorical; and
 /// * `dη̂/dx` comes from the implicit-function theorem (`−H⁻¹·∂²nll/∂η∂x`), analytic where the
 ///   provider reaches and finite-differenced otherwise ([`eta_dx`]).
@@ -829,38 +843,99 @@ fn accumulate_fixed_eta_packed_gradient(
     // requirement in `sens_outer_gradient` lives in its `theta_block`, not here. The IOV
     // entry point takes the *stacked* (η, κ) vector and returns the same `ObsSens`, so
     // everything below is identical for both.
+    //
+    // `analytic_score_supported` is a *model*-level scope check; `score_core` (and, more
+    // rarely, the sensitivity provider itself) can still decline a specific *subject* at
+    // runtime — a genuinely off-diagonal correlated residual, or magnitude × an
+    // M3-censored row. Falling through those `?`s used to propagate `None` out of this
+    // whole function, which `agq_population_gradient` treats as "any subject declined" and
+    // answers by dropping the **entire population** onto `reconverged_fd_gradient` — the
+    // `2·n_free` full-objective, every-subject-inner-resolve fallback this module exists to
+    // avoid. FOCE/FOCEI stopped doing that population-wide bail for exactly this cost
+    // (`population_gradient_sens_mixed`'s per-subject `subject_reconverged_fd_gradient`
+    // salvage); AGQ's fixed-b FD score is this function's own equivalent per-subject
+    // salvage, and it is already right here — the Ω/Ω_iov block above is unaffected by
+    // which θ/σ path runs, so falling back for just this subject is exactly the state
+    // `accumulate_fixed_b_packed_gradient_fd`'s own docs assume it's called in (#251
+    // review #8).
     let sens = if stack.is_iov() {
-        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b)?
+        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b)
     } else {
-        crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b)?
+        crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b)
+    };
+    let Some(sens) = sens else {
+        return accumulate_fixed_b_packed_gradient_fd(
+            model,
+            subject,
+            params,
+            template,
+            stack,
+            b,
+            weight,
+            n_theta,
+            sigma_start,
+            out,
+        );
     };
 
-    let err_keys = model.error_spec.obs_keys(subject);
-    let mut d_nll_d_f = vec![0.0f64; n_obs];
-    let mut variances = vec![0.0f64; n_obs];
-    let mut residuals = vec![0.0f64; n_obs];
+    // The per-observation scalar likelihood chain. `score_core` is the half of
+    // `sens_outer_gradient::prepare_stacked` that does NOT build the FOCEI `log|H̃|`
+    // machinery, so a node pays no Cholesky inverse — and it already carries the
+    // M3-censored (`−logΦ(z)`), `iiv_on_ruv`, custom-σ-magnitude, LTBS and
+    // correlated-residual chains that this function used to hand-roll for the plain
+    // Gaussian case alone. That hand-rolled chain is why AGQ used to gate those five
+    // families onto the fixed-b FD score even though FOCE/FOCEI had them analytic.
+    //
+    // `n_eta` is the STACKED dimension and `Ω⁻¹` the stacked prior precision, so IOV needs
+    // no special case: `ObsSens` is already stacked, and `η_ruv` lives in the BSV block, so
+    // `residual_error_eta` stays a valid stacked index (the same argument the IOV caller of
+    // `prepare_stacked` makes).
+    let core = crate::estimation::sens_outer_gradient::score_core(
+        model,
+        subject,
+        params,
+        &sens,
+        stack.d(),
+        &stack.omega_joint_inv,
+        b,
+        model.residual_error_eta,
+    );
+    let Some(core) = core else {
+        return accumulate_fixed_b_packed_gradient_fd(
+            model,
+            subject,
+            params,
+            template,
+            stack,
+            b,
+            weight,
+            n_theta,
+            sigma_start,
+            out,
+        );
+    };
+    let et = &core.et;
 
-    for j in 0..n_obs {
-        let f = sens.obs[j].f.max(1e-12);
-        let v = model
-            .residual_variance_at(err_keys[j], f, &params.sigma.values)
-            .max(1e-12);
-        let resid = subject.observations[j] - sens.obs[j].f;
-        residuals[j] = resid;
-        variances[j] = v;
-        // ∂nll_j/∂f = −r/V + ½·(∂V/∂f)·(1/V − r²/V²)  — the halved convention of
-        // `individual_nll` (0.5·Σ[r²/V + ln V]); identical to SAEM's `d_nll_d_f`.
-        let dv_df = model
-            .error_spec
-            .dvar_df(err_keys[j], f, &params.sigma.values);
-        d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
-    }
-
-    // θ block: chain the exact ∂f/∂θ through ∂nll/∂f, then the log-θ packing chain rule.
+    // θ block. Two channels:
+    //
+    //  (a) through the prediction — `∂L/∂f · ∂f/∂θ`. `ErrTerms` defines `α = 2·∂L/∂f` for
+    //      EVERY endpoint family (for a censored row it is `2·g1` off the `−logΦ` kernel),
+    //      so `½α` is the residual chain the old code spelled out for Gaussian only.
+    //
+    //  (b) DIRECT — a custom / time-varying σ magnitude `mult(θ)` makes `R` depend on θ
+    //      without passing through `f`, contributing `∂L/∂R · ∂R/∂θ`. This term was not
+    //      approximated before, it was ABSENT: the θ gradient of a magnitude model was
+    //      simply missing a channel. `score_core` declines magnitude × M3 upstream, so the
+    //      quantified `∂L/∂R` below is the only form needed here.
     for m in 0..n_theta {
-        let d: f64 = (0..n_obs)
-            .map(|j| d_nll_d_f[j] * sens.obs[j].df_dtheta[m])
-            .sum();
+        let mut d = 0.0;
+        for j in 0..n_obs {
+            d += 0.5 * et[j].alpha * sens.obs[j].df_dtheta[m];
+            if !et[j].dr_dtheta.is_empty() {
+                let (r, eps) = (et[j].r, et[j].eps);
+                d += 0.5 * (r - eps * eps) / (r * r) * et[j].dr_dtheta[m];
+            }
+        }
         let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
             params.theta[m]
         } else {
@@ -869,21 +944,13 @@ fn accumulate_fixed_eta_packed_gradient(
         out[m] += weight * d * dtheta_dx;
     }
 
-    // σ block: closed form. ∂nll/∂(log σ_k) = Σ_j ½·(∂V_j/∂log σ_k)·(1/V_j − r_j²/V_j²).
+    // σ block, log-packed. σ reaches `nll` only through the residual variance, so this is a
+    // closed-form scalar computation at fixed `f` — no model evaluation, no inner solve.
+    let g_sigma = crate::estimation::sens_outer_gradient::data_sigma_gradient(
+        model, subject, params, &sens, &core,
+    );
     for k in 0..n_sigma {
-        let d: f64 = (0..n_obs)
-            .map(|j| {
-                let f = sens.obs[j].f.max(1e-12);
-                let v = variances[j];
-                let r = residuals[j];
-                let ratio =
-                    model
-                        .error_spec
-                        .dvar_dlogsigma(err_keys[j], k, f, &params.sigma.values);
-                0.5 * ratio * (1.0 / v - r * r / (v * v))
-            })
-            .sum();
-        out[sigma_start + k] += weight * d;
+        out[sigma_start + k] += weight * g_sigma[k] * params.sigma.values[k];
     }
 
     Some(())
@@ -1303,6 +1370,419 @@ pub fn agq_population_gradient(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::model_parser::parse_model_string;
+
+    // --- Phase 0 (#251): the analytic fixed-b score reaches full FOCE/FOCEI scope -------
+    //
+    // AGQ's score used to hand-roll a *Gaussian-only* residual chain, so five endpoint
+    // families that FOCE/FOCEI already handled analytically (M3-BLOQ, `iiv_on_ruv`, a
+    // custom sigma magnitude, LTBS, correlated residual) fell back to the fixed-b FD score.
+    // It now shares `sens_outer_gradient::score_core`, so the chain is the SAME one
+    // FOCE/FOCEI uses and the per-family gates are gone.
+    //
+    // The reference below is a central difference of `Stack::nll_at` at a **fixed, non-mode
+    // b**. That matters: it differences the exact conditional NLL the AGQ objective
+    // integrates, with NO inner re-solve, so -- unlike the outer-gradient tests -- the
+    // reference carries no inner-solver noise floor and the step can be chosen for
+    // truncation alone.
+
+    const M3_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    const RUV_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.10
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+"#;
+
+    const LTBS_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma ADD_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ log_additive(ADD_ERR)
+"#;
+
+    /// FREM: 3 PK etas + 2 covariate etas under one block Ω, with the covariate θs and the
+    /// `EPSCOV` σ left **free** so the gradient test actually exercises those channels (the
+    /// shipped `examples/warfarin_frem.ferx` fixes them, which would mask the very terms
+    /// under test). `EPSCOV` is also given a sane magnitude rather than the near-zero value
+    /// a production FREM model uses to pin `η_cov` to the observed covariate.
+    const FREM_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TV_WT(72.0, 1.0, 500.0)
+  theta TV_AGE(37.6, 1.0, 200.0)
+
+  block_omega (ETA_CL, ETA_V, ETA_KA, ETA_WT_FREM, ETA_AGE_FREM) = [
+    0.09,
+    0.0, 0.04,
+    0.0, 0.0, 0.30,
+    0.0, 0.0, 0.0, 111.56,
+    0.0, 0.0, 0.0, 0.0, 99.38
+  ]
+
+  sigma PROP_ERR ~ 0.02
+  sigma EPSCOV   ~ 0.30
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  frem_predictions = TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200
+  frem_sigma       = EPSCOV
+"#;
+
+    /// A subject with realistic nonzero residuals, built from the model at a reference eta.
+    fn score_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
+        use crate::types::DoseEvent;
+        use std::collections::HashMap;
+        let n = times.len();
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: times.to_vec(),
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        let eta_ref = [0.12, -0.08, 0.2];
+        let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, &eta_ref);
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        subject
+    }
+
+    /// The analytic fixed-b score vs a central difference of `Stack::nll_at` -- at a `b`
+    /// that is deliberately NOT the mode, since the score is a property of `nll(b; x)`
+    /// alone and must hold everywhere, not only at the EBE.
+    fn assert_fixed_b_score_matches_fd(
+        model: &CompiledModel,
+        subject: &Subject,
+        template: &ModelParameters,
+        b: &[f64],
+        tol: f64,
+        label: &str,
+    ) {
+        use crate::estimation::parameterization::{pack_params, packed_fixed_mask, unpack_params};
+
+        let x = pack_params(template);
+        let params = unpack_params(&x, template);
+        let stack = Stack::new(model, &params, usize::from(model.n_kappa > 0));
+        assert!(
+            analytic_score_supported(model, &stack),
+            "{label}: expected the ANALYTIC score path, got the FD fallback"
+        );
+
+        let mut analytic = vec![0.0f64; x.len()];
+        accumulate_fixed_eta_packed_gradient(
+            model,
+            subject,
+            &params,
+            template,
+            &stack,
+            b,
+            1.0,
+            &mut analytic,
+        )
+        .unwrap_or_else(|| panic!("{label}: analytic score declined"));
+
+        let fixed = packed_fixed_mask(template);
+        let mut scratch = crate::pk::EventPkParams::default();
+        let mut nll_at_x = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, template);
+            let st = Stack::new(model, &p, stack.n_occ);
+            st.nll_at(model, subject, &p, b, &mut scratch, None)
+        };
+
+        for k in 0..x.len() {
+            if fixed[k] {
+                continue;
+            }
+            let h = 1e-6 * (1.0 + x[k].abs());
+            let (mut xp, mut xm) = (x.clone(), x.clone());
+            xp[k] += h;
+            xm[k] -= h;
+            let fd = (nll_at_x(&xp) - nll_at_x(&xm)) / (2.0 * h);
+            let scale = fd.abs().max(analytic[k].abs()).max(1.0);
+            assert!(
+                (analytic[k] - fd).abs() / scale < tol,
+                "{label}: coord {k}: analytic {} vs FD {} (rel {:.2e})",
+                analytic[k],
+                fd,
+                (analytic[k] - fd).abs() / scale
+            );
+        }
+    }
+
+    /// M3-BLOQ. Was gated to the FD score; FOCE/FOCEI have had it analytic since #486.
+    #[test]
+    fn fixed_b_score_is_analytic_and_exact_under_m3() {
+        use crate::types::BloqMethod;
+        let mut model = parse_model_string(M3_MODEL).expect("parse");
+        model.bloq_method = BloqMethod::M3;
+        let theta = [0.22, 11.0, 1.4];
+        let mut subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let n = subject.observations.len();
+        subject.cens[n - 1] = 1;
+        subject.cens[n - 2] = 1;
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        assert_fixed_b_score_matches_fd(
+            &model,
+            &subject,
+            &template,
+            &[0.05, -0.03, 0.08],
+            1e-6,
+            "M3",
+        );
+    }
+
+    /// `iiv_on_ruv` -- eta enters the residual VARIANCE directly (`df/deta_ruv = 0`), a
+    /// channel the old Gaussian chain had no term for at all.
+    #[test]
+    fn fixed_b_score_is_analytic_and_exact_under_iiv_on_ruv() {
+        let model = parse_model_string(RUV_MODEL).expect("parse");
+        assert!(
+            model.residual_error_eta.is_some(),
+            "fixture must set iiv_on_ruv"
+        );
+        let theta = [0.22, 11.0, 1.4];
+        let subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        assert_fixed_b_score_matches_fd(
+            &model,
+            &subject,
+            &template,
+            &[0.05, -0.03, 0.08, 0.06],
+            1e-6,
+            "iiv_on_ruv",
+        );
+    }
+
+    /// LTBS. The provider already returns the log-transformed jet
+    /// (`apply_ltbs_transform_outer`), so the shared chain needs no LTBS special case --
+    /// this pins that.
+    #[test]
+    fn fixed_b_score_is_analytic_and_exact_under_ltbs() {
+        let model = parse_model_string(LTBS_MODEL).expect("parse");
+        assert!(model.log_transform, "log_additive must set LTBS");
+        let theta = [0.22, 11.0, 1.4];
+        let subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        assert_fixed_b_score_matches_fd(
+            &model,
+            &subject,
+            &template,
+            &[0.05, -0.03, 0.08],
+            1e-6,
+            "LTBS",
+        );
+    }
+
+    /// FREM covariate pseudo-observations. REGRESSION TEST — this fails without the jet +
+    /// variance fix, and it fails for FOCE/FOCEI too, not just AGQ.
+    ///
+    /// `individual_nll` scores a `fremtype > 0` row against a completely different model:
+    /// prediction `θ[ti] + η[ei]` (not the PK model's `f`) and variance `EPSCOV²` (not
+    /// `error_spec.variance_at(f)`). The sensitivity provider returned the ordinary PK jet
+    /// for those rows and `prepare_stacked` read the ordinary variance, so the analytic
+    /// outer gradient was differentiating a likelihood the objective never evaluates.
+    /// Latent because FREM is conventionally fit with SAEM, which never asks for it.
+    ///
+    /// The FD reference here is a central difference of the real conditional NLL at a fixed
+    /// `b`, so it exercises exactly the likelihood the objective uses — including the
+    /// pseudo-observation rows.
+    #[test]
+    fn frem_pseudo_obs_rows_get_the_right_analytic_score() {
+        use crate::types::DoseEvent;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(FREM_MODEL).expect("parse");
+        let fc = model.frem_config.as_ref().expect("fixture must be FREM");
+        assert_eq!(model.n_eta, 5, "3 PK etas + 2 covariate etas");
+        assert!(
+            analytic_score_supported_model(&model),
+            "FREM must now take the ANALYTIC score path"
+        );
+
+        // Two PK rows plus one pseudo-observation per covariate (FREMTYPE 100 / 200).
+        let mut fts: Vec<u16> = fc.fremtype_to_indices.keys().copied().collect();
+        fts.sort_unstable();
+        assert_eq!(fts.len(), 2, "fixture has WT and AGE pseudo-obs");
+
+        let theta = &model.default_params.theta;
+        let pk_times = [1.0, 6.0, 24.0];
+        let n = pk_times.len() + fts.len();
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: pk_times
+                .iter()
+                .copied()
+                .chain(fts.iter().map(|_| 0.0))
+                .collect(),
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: pk_times
+                .iter()
+                .map(|_| 0u16)
+                .chain(fts.iter().copied())
+                .collect(),
+            obs_records: vec![],
+        };
+        // PK rows: realistic residuals off the model. Pseudo-obs rows: the covariate value,
+        // offset from θ so the residual is nonzero.
+        let eta_ref = vec![0.1, -0.05, 0.15, 0.0, 0.0];
+        let preds = crate::pk::compute_predictions_with_tv(&model, &subject, theta, &eta_ref);
+        for j in 0..pk_times.len() {
+            subject.observations[j] = preds[j] * 0.85;
+        }
+        for (k, &ft) in fts.iter().enumerate() {
+            let (ti, _ei) = fc.fremtype_to_indices[&ft];
+            subject.observations[pk_times.len() + k] = theta[ti] * 1.10;
+        }
+
+        let template = model.default_params.clone();
+        let b = [0.05, -0.03, 0.08, 1.5, -2.0];
+        assert_fixed_b_score_matches_fd(&model, &subject, &template, &b, 1e-6, "FREM");
+
+        // The INNER η-gradient has the same root cause and is the more damaging half: it
+        // sets the EBEs. `analytic_eta_nll_gradient` fed `residual_inner_obs` the PK
+        // prediction and the PK variance on pseudo-observation rows, so the mode it drove
+        // to was not the mode of the likelihood being integrated.
+        let params = model.default_params.clone();
+        let analytic = crate::estimation::inner_optimizer::analytic_eta_nll_gradient(
+            &model,
+            &subject,
+            &params.theta,
+            &b,
+            &params.omega,
+            &params.sigma.values,
+        )
+        .expect("FREM inner gradient must be analytic");
+
+        let mut scratch = crate::pk::EventPkParams::default();
+        for k in 0..b.len() {
+            let h = 1e-6 * (1.0 + b[k].abs());
+            let (mut bp, mut bm) = (b.to_vec(), b.to_vec());
+            bp[k] += h;
+            bm[k] -= h;
+            let nll = |e: &[f64], s: &mut crate::pk::EventPkParams| {
+                crate::stats::likelihood::individual_nll_into_with_schedule(
+                    &model,
+                    &subject,
+                    &params.theta,
+                    e,
+                    &params.omega,
+                    &params.sigma.values,
+                    s,
+                    None,
+                )
+            };
+            let fd = (nll(&bp, &mut scratch) - nll(&bm, &mut scratch)) / (2.0 * h);
+            let scale = fd.abs().max(analytic[k].abs()).max(1.0);
+            assert!(
+                (analytic[k] - fd).abs() / scale < 1e-6,
+                "FREM inner grad η{k}: analytic {} vs FD {}",
+                analytic[k],
+                fd
+            );
+        }
+    }
+
+    /// The gate itself: none of these families may route to the FD score any more.
+    #[test]
+    fn analytic_score_no_longer_gates_the_focei_scope() {
+        use crate::types::BloqMethod;
+        let mut m3 = parse_model_string(M3_MODEL).expect("parse");
+        m3.bloq_method = BloqMethod::M3;
+        for (model, label) in [
+            (m3, "M3"),
+            (parse_model_string(RUV_MODEL).expect("parse"), "iiv_on_ruv"),
+            (parse_model_string(LTBS_MODEL).expect("parse"), "LTBS"),
+        ] {
+            assert!(
+                analytic_score_supported_model(&model),
+                "{label} must take the analytic score path"
+            );
+        }
+    }
 
     /// Golub–Welsch must reproduce the textbook physicists' Hermite rule.
     #[test]

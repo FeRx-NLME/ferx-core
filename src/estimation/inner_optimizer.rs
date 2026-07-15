@@ -1975,7 +1975,24 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     let mut ruv_grad = 0.0_f64;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
+    // FREM covariate pseudo-observations: the objective scores these rows against the
+    // dedicated `EPSCOV` variance, not `error_spec.variance_at(f)`. The provider has
+    // already corrected their `f` and `∂f/∂η` (`apply_frem_pseudo_obs_grad`); this is the
+    // variance half. `R` is η-independent on such a row, so `∂R/∂f = 0` and the whole
+    // residual chain collapses to `∂L/∂η_k = (−ε/R)·δ_{k,ei}`. `None` on a non-FREM model.
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma,
+    );
     for (j, obs) in sens.iter().enumerate() {
+        if let Some(v) = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
+            let coef = -(subject.observations[j] - obs.f) / v;
+            for k in 0..n_eta {
+                grad[k] += coef * obs.df_deta[k];
+            }
+            continue;
+        }
         let cens = if m3 {
             subject.cens.get(j).copied().unwrap_or(0)
         } else {

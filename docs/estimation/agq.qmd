@@ -360,9 +360,34 @@ Letting them fall back to the inner-re-solving gradient would have made the head
 use case the slow one. The test `fd_score_path_agrees_with_the_analytic_one` pins
 that the two routes return the same gradient.
 
-Models that take the finite-differenced score: TTE, categorical, ODE models, M3
-censoring, correlated residuals (`block_sigma`), FREM, IIV-on-RUV, custom residual
-magnitude, and LTBS — each adds a term the plain Gaussian chain rule does not carry.
+#### Scope parity with FOCE/FOCEI
+
+The analytic score reaches **exactly as far as the FOCE/FOCEI analytic outer
+gradient does** — no further, and no less. It is the same per-observation residual
+chain (`sens_outer_gradient::score_core`), so M3 censoring, IIV-on-RUV, a custom or
+time-varying residual magnitude, LTBS, correlated residuals (`block_sigma`) and ODE
+models all take the analytic route, exactly as they do under FOCE/FOCEI.
+
+That parity holds *by construction*: AGQ does not keep its own list of supported
+families, so there is nothing to drift out of step with the FOCE/FOCEI gate.
+
+FREM is included too: a covariate pseudo-observation row (`FREMTYPE > 0`) is scored
+against `θ[i] + η[j]` with the dedicated `EPSCOV` error rather than against the PK
+model, and both halves of that — the jet and the variance — now flow through the
+shared machinery.
+
+Models that still take the finite-differenced score:
+
+- **TTE and categorical endpoints**, which have no analytic outer gradient at all —
+  the sensitivity provider covers the structural PK/PD model, not the event or
+  category likelihood. These are also the models AGQ exists to serve, which is why
+  the FD route must (and does) avoid re-solving the inner loop.
+- `gradient_method = fd`, the explicit opt-out.
+
+Two cases decline per *subject* rather than per model, and fall back for that
+population: a genuinely off-diagonal correlated residual, and a custom magnitude
+combined with an M3-censored row.
+
 The fit output reports which route ran.
 
 ### Where AGQ stops
