@@ -2459,21 +2459,6 @@ fn population_gradient(
     // `Optimizer::resolve_auto` and `build_info::gradient_method_outer` also use,
     // so the `auto` optimizer cannot pick a gradient-based optimizer while this
     // gate falls through to FD (#490 review).
-    let has_free_residual_correlation =
-        init_params
-            .residual_correlations
-            .iter()
-            .enumerate()
-            .any(|(i, _)| {
-                !init_params
-                    .residual_correlation_fixed
-                    .get(i)
-                    .copied()
-                    .unwrap_or(false)
-            });
-    if has_free_residual_correlation {
-        return reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options);
-    }
     if !force_reconverge && crate::sens::provider::analytic_outer_gradient_available(model) {
         let g = if iov_analytic {
             // Per-subject: exact analytic for in-scope subjects, per-subject reconverged-FD

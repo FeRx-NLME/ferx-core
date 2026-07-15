@@ -457,11 +457,11 @@ fn corr_residual_diag(
     subject: &Subject,
     sens: &SubjectSens,
     sigma: &[f64],
+    residual_correlations: &[crate::types::ResidualCorrelation],
 ) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>)> {
     use crate::stats::residual_error::{
         compute_d2r_df2_matrices, compute_dr_df_matrices, compute_r_matrix_with_correlations,
     };
-    let corr = &model.residual_correlations;
     let es = &model.error_spec;
     // #669: per-observation endpoint keys must come from the covariate selector
     // (`obs_keys`), not the raw CMT column — a `Selected` spec keys endpoints by
@@ -481,7 +481,7 @@ fn corr_residual_diag(
         &subject.occasions,
         &subject.obs_l2,
         sigma,
-        corr,
+        residual_correlations,
     );
     // Guard: only diagonal R is served by the scalar reduction (see the doc above).
     for a in 0..n {
@@ -500,7 +500,7 @@ fn corr_residual_diag(
         &subject.occasions,
         &subject.obs_l2,
         sigma,
-        corr,
+        residual_correlations,
         None,
     );
     let d2 = compute_d2r_df2_matrices(
@@ -512,7 +512,7 @@ fn corr_residual_diag(
         &subject.occasions,
         &subject.obs_l2,
         sigma,
-        corr,
+        residual_correlations,
         None,
     );
     let mut rv = vec![0.0; n];
@@ -535,9 +535,9 @@ fn corr_residual_rd_at_sigma(
     subject: &Subject,
     ipreds: &[f64],
     sigma: &[f64],
+    residual_correlations: &[crate::types::ResidualCorrelation],
 ) -> (Vec<f64>, Vec<f64>) {
     use crate::stats::residual_error::compute_dr_df_matrices;
-    let corr = &model.residual_correlations;
     let es = &model.error_spec;
     let n = ipreds.len();
     // #669: selector-resolved endpoint keys, not the raw CMT column (see
@@ -552,16 +552,123 @@ fn corr_residual_rd_at_sigma(
         &subject.occasions,
         &subject.obs_l2,
         sigma,
-        corr,
+        residual_correlations,
         None,
     );
     let mut rv = vec![0.0; n];
     let mut dv = vec![0.0; n];
     for j in 0..n {
-        rv[j] = es.variance_at_with_correlations(err_keys[j], ipreds[j], sigma, corr);
+        rv[j] =
+            es.variance_at_with_correlations(err_keys[j], ipreds[j], sigma, residual_correlations);
         dv[j] = dr[j][(j, j)];
     }
     (rv, dv)
+}
+
+/// Per-observation derivatives of the diagonal residual variance with respect to
+/// each free/fixed `block_sigma` correlation `rho`: `(∂R/∂rho, ∂d/∂rho, ∂d2/∂rho)`.
+fn residual_correlation_diag_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    sens: &SubjectSens,
+    sigma: &[f64],
+    residual_correlations: &[crate::types::ResidualCorrelation],
+) -> Vec<Vec<(f64, f64, f64)>> {
+    let n_corr = residual_correlations.len();
+    let n_obs = sens.obs.len();
+    let n_sigma = sigma.len();
+    let err_keys = model.error_spec.obs_keys(subject);
+    let mut out = vec![vec![(0.0, 0.0, 0.0); n_obs]; n_corr];
+
+    let coeff = |loads: &[(usize, f64)], slot: usize| -> f64 {
+        loads
+            .iter()
+            .find(|(idx, _)| *idx == slot)
+            .map(|(_, c)| *c)
+            .unwrap_or(0.0)
+    };
+
+    for (j, obs) in sens.obs.iter().enumerate() {
+        let cmt = err_keys[j];
+        let load = model.error_spec.sigma_loadings(cmt, obs.f, n_sigma);
+        let slope = model.error_spec.sigma_loading_slopes(cmt, n_sigma);
+        for (ci, corr) in residual_correlations.iter().enumerate() {
+            let si = sigma.get(corr.sigma_i).copied().unwrap_or(0.0);
+            let sj = sigma.get(corr.sigma_j).copied().unwrap_or(0.0);
+            let li = coeff(&load, corr.sigma_i);
+            let lj = coeff(&load, corr.sigma_j);
+            let di = coeff(&slope, corr.sigma_i);
+            let dj = coeff(&slope, corr.sigma_j);
+            let ss = si * sj;
+            out[ci][j] = (
+                2.0 * ss * li * lj,
+                2.0 * ss * (di * lj + li * dj),
+                4.0 * ss * di * dj,
+            );
+        }
+    }
+
+    out
+}
+
+fn residual_correlation_block(
+    prep: &Prep,
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+) -> Vec<f64> {
+    let n_eta = prep.n_eta;
+    let corr_terms = residual_correlation_diag_terms(
+        model,
+        subject,
+        sens,
+        &params.sigma.values,
+        &params.residual_correlations,
+    );
+    let mut grad = vec![0.0f64; params.residual_correlations.len()];
+
+    for (kc, obs_terms) in corr_terms.iter().enumerate() {
+        let mut fixed = 0.0;
+        let mut m_vec = DVector::<f64>::zeros(n_eta);
+        for (j, obs) in sens.obs.iter().enumerate() {
+            if prep.et[j].censored {
+                continue;
+            }
+            let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
+            let (r_rho0, d_rho0, _) = obs_terms[j];
+            let r_rho = prep.ruv_scale * r_rho0;
+            let d_rho = prep.ruv_scale * d_rho0;
+
+            if let Some(rr) = prep.ruv {
+                m_vec[rr] += eps * eps / (r * r) * r_rho;
+                fixed += (d_rho * r - d * r_rho) / (r * r) * prep.w[j][rr];
+            }
+
+            let inv_r = 1.0 / r;
+            let inv_r2 = inv_r * inv_r;
+            let inv_r3 = inv_r2 * inv_r;
+
+            fixed += 0.5 * r_rho * (r - eps * eps) * inv_r2;
+            let dp = -r_rho * inv_r2 + d * d_rho * inv_r2 - d * d * r_rho * inv_r3;
+            fixed += 0.5 * dp * prep.q[j];
+
+            let dalpha = (2.0 * eps * inv_r2 + d * (2.0 * eps * eps - r) * inv_r3) * r_rho
+                + ((r - eps * eps) * inv_r2) * d_rho;
+            for m in 0..n_eta {
+                m_vec[m] += 0.5 * dalpha * obs.df_deta[m];
+            }
+        }
+
+        let deta = -(&prep.h_inner_inv * m_vec);
+        let mut resp = 0.0;
+        for l in 0..n_eta {
+            resp += prep.g_eta[l] * deta[l];
+        }
+        grad[kc] = fixed + 0.5 * resp;
+    }
+
+    grad
 }
 
 fn prepare(
@@ -744,8 +851,20 @@ pub(crate) fn data_sigma_gradient(
         sm[k] -= h;
         let (corr_sp, corr_sm) = if correlated {
             (
-                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sp)),
-                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sm)),
+                Some(corr_residual_rd_at_sigma(
+                    model,
+                    subject,
+                    &ipreds,
+                    &sp,
+                    &params.residual_correlations,
+                )),
+                Some(corr_residual_rd_at_sigma(
+                    model,
+                    subject,
+                    &ipreds,
+                    &sm,
+                    &params.residual_correlations,
+                )),
             )
         } else {
             (None, None)
@@ -902,7 +1021,13 @@ pub(crate) fn score_core(
     // `ruv_scale = 1`). `None` bails to FD (a rare off-diagonal R). Everything else in
     // the assembly is unchanged — see `corr_residual_diag`.
     let corr_diag = if !model.residual_correlations.is_empty() {
-        Some(corr_residual_diag(model, subject, sens, sigma)?)
+        Some(corr_residual_diag(
+            model,
+            subject,
+            sens,
+            sigma,
+            &params.residual_correlations,
+        )?)
     } else {
         None
     };
@@ -1569,8 +1694,20 @@ fn sigma_block(
         // Correlation-aware `(R_jj, ∂R_jj/∂f_j)` at σ±h, built once per σ_k.
         let (corr_sp, corr_sm) = if correlated {
             (
-                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sp)),
-                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sm)),
+                Some(corr_residual_rd_at_sigma(
+                    model,
+                    subject,
+                    &ipreds,
+                    &sp,
+                    &params.residual_correlations,
+                )),
+                Some(corr_residual_rd_at_sigma(
+                    model,
+                    subject,
+                    &ipreds,
+                    &sm,
+                    &params.residual_correlations,
+                )),
             )
         } else {
             (None, None)
@@ -1895,7 +2032,7 @@ pub fn subject_packed_gradient_iov(
     // σ (log-σ chain).
     let g_sigma = sigma_block(&prep, model, subject, &params, &sens);
 
-    // Place in pack_params order: θ, Ω_bsv, σ, Ω_iov.
+    // Place in pack_params order: θ, Ω_bsv, σ, residual correlations, Ω_iov.
     let omega_start = n_theta;
     for (i, &val) in bsv_packed.iter().enumerate() {
         g[omega_start + i] = val;
@@ -1904,7 +2041,12 @@ pub fn subject_packed_gradient_iov(
     for kk in 0..n_sigma {
         g[sigma_start + kk] = g_sigma[kk] * params.sigma.values[kk];
     }
-    let iov_start = sigma_start + n_sigma;
+    let corr_start = sigma_start + n_sigma;
+    let g_corr = residual_correlation_block(&prep, model, subject, &params, &sens);
+    for (kc, corr) in params.residual_correlations.iter().enumerate() {
+        g[corr_start + kc] = g_corr[kc] * (1.0 - corr.rho * corr.rho);
+    }
+    let iov_start = corr_start + params.residual_correlations.len();
     for (i, &val) in iov_packed.iter().enumerate() {
         g[iov_start + i] = val;
     }
@@ -1959,6 +2101,11 @@ pub fn subject_packed_gradient(
     let g_sigma = sigma_block(&prep, model, subject, &params, &sens);
     for k in 0..n_sigma {
         g[sigma_start + k] = g_sigma[k] * params.sigma.values[k];
+    }
+    let corr_start = sigma_start + n_sigma;
+    let g_corr = residual_correlation_block(&prep, model, subject, &params, &sens);
+    for (kc, corr) in params.residual_correlations.iter().enumerate() {
+        g[corr_start + kc] = g_corr[kc] * (1.0 - corr.rho * corr.rho);
     }
 
     Some(g)
@@ -2157,9 +2304,25 @@ pub fn subject_packed_gradient_foce(
     // correlation-aware `(r0,d0)`; a rare off-diagonal bails per-subject to FD via
     // `corr_residual_diag` → `None`. (FOCE is first-order in R — no `∂²R/∂f²`.)
     let correlated = !model.residual_correlations.is_empty();
-    let corr = &model.residual_correlations;
     let corr_rd0 = if correlated {
-        Some(corr_residual_diag(model, subject, &sens0, sigma)?)
+        Some(corr_residual_diag(
+            model,
+            subject,
+            &sens0,
+            sigma,
+            &params.residual_correlations,
+        )?)
+    } else {
+        None
+    };
+    let corr_terms0 = if correlated {
+        Some(residual_correlation_diag_terms(
+            model,
+            subject,
+            &sens0,
+            sigma,
+            &params.residual_correlations,
+        ))
     } else {
         None
     };
@@ -2381,12 +2544,18 @@ pub fn subject_packed_gradient_foce(
                 mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
             let (vp, vm) = if correlated {
                 (
-                    model
-                        .error_spec
-                        .variance_at_with_correlations(cmt, f0act, &sp, corr),
-                    model
-                        .error_spec
-                        .variance_at_with_correlations(cmt, f0act, &sm, corr),
+                    model.error_spec.variance_at_with_correlations(
+                        cmt,
+                        f0act,
+                        &sp,
+                        &params.residual_correlations,
+                    ),
+                    model.error_spec.variance_at_with_correlations(
+                        cmt,
+                        f0act,
+                        &sm,
+                        &params.residual_correlations,
+                    ),
                 )
             } else {
                 match mult_row {
@@ -2409,6 +2578,18 @@ pub fn subject_packed_gradient_foce(
         }
         nat += cg.sigma[k];
         fixed[sigma_start + k] = nat * sigma[k];
+    }
+    let corr_start = sigma_start + n_sigma;
+    if let Some(corr_terms) = &corr_terms0 {
+        for (kc, obs_terms) in corr_terms.iter().enumerate() {
+            let mut nat = 0.0;
+            for (i, &j) in quant.iter().enumerate() {
+                let dr0 = obs_terms[j].0;
+                nat += 0.5 * dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
+            }
+            let rho = params.residual_correlations[kc].rho;
+            fixed[corr_start + kc] = nat * (1.0 - rho * rho);
+        }
     }
 
     // Coupling c = ∂F/∂η̂: SB part over quant rows + the marginal censored coupling
@@ -2607,7 +2788,7 @@ pub fn subject_eta_dx_iov(
         out[omega_start + e] = m_l_response(row, col) * chain;
     }
     let sigma_start = omega_start + bsv_entries.len();
-    let iov_start = sigma_start + n_sigma;
+    let iov_start = sigma_start + n_sigma + params.residual_correlations.len();
     let iov_entries = lower_tri_entries(n_iov, omega_iov.diagonal);
     for (e, &(i, j)) in iov_entries.iter().enumerate() {
         let mut resp = DVector::zeros(n_st);
@@ -2946,7 +3127,7 @@ pub fn subject_packed_gradient_foce_iov(
         nat += cg.sigma[kk];
         fixed[sigma_start + kk] = nat * sigma[kk];
     }
-    let iov_start = sigma_start + n_sigma;
+    let iov_start = sigma_start + n_sigma + params.residual_correlations.len();
     let iov_entries = lower_tri_entries(n_iov, omega_iov.diagonal);
     for (e, &(i, j)) in iov_entries.iter().enumerate() {
         let mut raw = 0.0;
@@ -3077,12 +3258,14 @@ pub fn subject_eta_dx(
                     subject,
                     &eta_dx_ipreds,
                     &sp,
+                    &params.residual_correlations,
                 )),
                 Some(corr_residual_rd_at_sigma(
                     model,
                     subject,
                     &eta_dx_ipreds,
                     &sm,
+                    &params.residual_correlations,
                 )),
             )
         } else {
@@ -3189,6 +3372,41 @@ pub fn subject_eta_dx(
             }
         }
         out[sigma_start + k] = -(&prep.h_inner_inv * mvec) * sigma[k];
+    }
+    let corr_start = sigma_start + n_sigma;
+    if correlated {
+        let corr_terms = residual_correlation_diag_terms(
+            model,
+            subject,
+            &sens,
+            sigma,
+            &params.residual_correlations,
+        );
+        for (kc, obs_terms) in corr_terms.iter().enumerate() {
+            let mut mvec = DVector::<f64>::zeros(n_eta);
+            for (j, obs) in sens.obs.iter().enumerate() {
+                if prep.et[j].censored {
+                    continue;
+                }
+                let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
+                let (r_rho0, d_rho0, _) = obs_terms[j];
+                let r_rho = prep.ruv_scale * r_rho0;
+                let d_rho = prep.ruv_scale * d_rho0;
+                if let Some(rr) = prep.ruv {
+                    mvec[rr] += eps * eps / (r * r) * r_rho;
+                }
+                let inv_r = 1.0 / r;
+                let inv_r2 = inv_r * inv_r;
+                let inv_r3 = inv_r2 * inv_r;
+                let dalpha = (2.0 * eps * inv_r2 + d * (2.0 * eps * eps - r) * inv_r3) * r_rho
+                    + ((r - eps * eps) * inv_r2) * d_rho;
+                for m in 0..n_eta {
+                    mvec[m] += 0.5 * dalpha * obs.df_deta[m];
+                }
+            }
+            let rho = params.residual_correlations[kc].rho;
+            out[corr_start + kc] = -(&prep.h_inner_inv * mvec) * (1.0 - rho * rho);
+        }
     }
 
     Some(out)
@@ -3666,7 +3884,7 @@ mod tests {
         let jac = eta_jacobian_any(model, subject, &params.theta, eta);
         let h_matrix =
             nalgebra::DMatrix::from_row_slice(subject.obs_times.len(), model.n_eta, &jac);
-        foce_subject_nll(
+        crate::stats::likelihood::foce_subject_nll_with_correlations(
             model,
             subject,
             &params.theta,
@@ -3675,6 +3893,7 @@ mod tests {
             &params.omega,
             &params.sigma.values,
             false,
+            &params.residual_correlations,
         )
     }
 
@@ -4128,7 +4347,9 @@ mod tests {
             let sens =
                 crate::sens::provider::subject_sensitivities(model, subject, &params.theta, &eta)
                     .unwrap();
-            let (rv, dv, d2v) = corr_residual_diag(model, subject, &sens, sigma).unwrap();
+            let (rv, dv, d2v) =
+                corr_residual_diag(model, subject, &sens, sigma, &params.residual_correlations)
+                    .unwrap();
             let mut grad = DVector::<f64>::from_column_slice(
                 &(omega_inv * DVector::from_column_slice(&eta))
                     .iter()
@@ -4170,7 +4391,7 @@ mod tests {
         let eta_v = DVector::from_column_slice(eta);
         let jac = eta_jacobian_any(model, subject, &params.theta, eta);
         let h = DMatrix::from_row_slice(subject.obs_times.len(), model.n_eta, &jac);
-        crate::stats::likelihood::foce_subject_nll(
+        crate::stats::likelihood::foce_subject_nll_with_correlations(
             model,
             subject,
             &params.theta,
@@ -4179,6 +4400,7 @@ mod tests {
             &params.omega,
             &params.sigma.values,
             true,
+            &params.residual_correlations,
         )
     }
 

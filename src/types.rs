@@ -5867,22 +5867,6 @@ impl Optimizer {
         if self != Optimizer::Auto {
             return self;
         }
-        let has_free_residual_correlation = model
-            .default_params
-            .residual_correlations
-            .iter()
-            .enumerate()
-            .any(|(i, _)| {
-                !model
-                    .default_params
-                    .residual_correlation_fixed
-                    .get(i)
-                    .copied()
-                    .unwrap_or(false)
-            });
-        if has_free_residual_correlation {
-            return Optimizer::Bobyqa;
-        }
         // Use the single shared predicate so `auto` can never disagree with the
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
@@ -6917,7 +6901,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auto_picks_bobyqa_for_free_residual_correlation() {
+    fn resolve_auto_uses_gradient_route_for_free_residual_correlation() {
         let mut m = test_helpers::analytical_model(GradientMethod::Auto);
         m.residual_correlations = vec![ResidualCorrelation {
             sigma_i: 0,
@@ -6928,8 +6912,8 @@ mod tests {
         m.default_params.residual_correlation_fixed = vec![false];
         assert_eq!(
             Optimizer::Auto.resolve_auto(&m, true),
-            Optimizer::Bobyqa,
-            "free residual-correlation coordinates use reconverged FD gradients, so auto must avoid L-BFGS"
+            Optimizer::NloptLbfgs,
+            "free residual-correlation coordinates have analytic gradients, so auto can use L-BFGS"
         );
 
         m.default_params.residual_correlation_fixed = vec![true];

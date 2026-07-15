@@ -283,8 +283,14 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
         mask.push(f);
     }
 
-    for &f in &template.residual_correlation_fixed {
-        mask.push(f);
+    for i in 0..template.residual_correlations.len() {
+        mask.push(
+            template
+                .residual_correlation_fixed
+                .get(i)
+                .copied()
+                .unwrap_or(false),
+        );
     }
 
     // IOV: mirrors BSV omega mask logic, checking the diagonal flag.
