@@ -242,6 +242,11 @@ fn freeze_flat_thetas(
     let mut frozen = init_params.clone();
     let mut warnings = Vec::new();
     for &i in &flat {
+        // Pin the FIX at the *clamped* value the gradient was actually evaluated at
+        // (`params.theta`, not the raw `init_params.theta`): an out-of-bounds initial
+        // theta must not be frozen — nor reported — outside its declared bounds, and
+        // the printed value must match the point the flatness was decided at.
+        frozen.theta[i] = params.theta[i];
         frozen.theta_fixed[i] = true;
         let name = init_params
             .theta_names
@@ -254,7 +259,7 @@ fn freeze_flat_thetas(
              from the structural / scaling model). Freezing it at its initial value ({val}) \
              so the remaining parameters can be estimated; map or remove `{name}` to silence \
              this.",
-            val = init_params.theta[i],
+            val = params.theta[i],
         ));
     }
     Some((frozen, warnings))
@@ -5001,6 +5006,46 @@ mod tests {
         assert!(
             freeze_flat_thetas(&model, &pop, &model.default_params, &options).is_none(),
             "no theta is flat — nothing to freeze"
+        );
+    }
+
+    /// An out-of-bounds initial value for a flat theta must be frozen (and reported)
+    /// at the *clamped* value the gradient was evaluated at — never pinned outside its
+    /// declared bounds, and never reported as the raw out-of-bounds init.
+    #[test]
+    fn preflight_freezes_out_of_bounds_flat_theta_at_clamped_value() {
+        let mut model = make_model();
+        model.pk_param_fn = Box::new(
+            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp();
+                p.values[1] = 50.0; // TVV (theta[1]) is flat
+                p
+            },
+        );
+        // Push TVV's initial well above its declared upper bound (500).
+        model.default_params.theta[1] = 1000.0;
+        let upper = model.default_params.theta_upper[1];
+        let pop = make_population(3);
+        let mut options = FitOptions::default();
+        options.interaction = false;
+
+        let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &options)
+            .expect("flat TVV must be detected");
+        assert!(frozen.theta_fixed[1], "flat TVV is frozen");
+        assert!(
+            frozen.theta[1].is_finite() && frozen.theta[1] <= upper + 1e-6,
+            "frozen value {} must sit within the declared upper bound {upper}",
+            frozen.theta[1]
+        );
+        assert!(
+            frozen.theta[1] < 1000.0,
+            "must not pin at the out-of-bounds init (1000): {}",
+            frozen.theta[1]
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("1000")),
+            "warning must report the clamped value, not the out-of-bounds init: {warnings:?}"
         );
     }
 
