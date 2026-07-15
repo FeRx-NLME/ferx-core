@@ -38,27 +38,29 @@ impl<const N: usize> Dual1<N> {
         Dual1 { value, grad }
     }
 
+    /// Unary chain rule: given the output `value` and the scalar first derivative
+    /// `d1 = ∂u/∂x`, scale the incoming gradient `src = x'` by it (`u' = d1·x'`).
+    /// Factors out the `grad[i] = d1 * self.grad[i]` scale-loop shared verbatim by
+    /// every unary transcendental op.
+    #[inline]
+    fn chain1(value: f64, d1: f64, src: &[f64; N]) -> Self {
+        let mut grad = [0.0; N];
+        for i in 0..N {
+            grad[i] = d1 * src[i];
+        }
+        Dual1 { value, grad }
+    }
+
     /// `exp(self)`: `u = e^x`, `u' = u·x'`.
     pub fn exp(self) -> Self {
         let v = self.value.exp();
-        let mut grad = [0.0; N];
-        for i in 0..N {
-            grad[i] = v * self.grad[i];
-        }
-        Dual1 { value: v, grad }
+        Dual1::chain1(v, v, &self.grad)
     }
 
     /// `ln(self)`: `u' = x'/x`.
     pub fn ln(self) -> Self {
         let inv = 1.0 / self.value;
-        let mut grad = [0.0; N];
-        for i in 0..N {
-            grad[i] = self.grad[i] * inv;
-        }
-        Dual1 {
-            value: self.value.ln(),
-            grad,
-        }
+        Dual1::chain1(self.value.ln(), inv, &self.grad)
     }
 
     /// `ln Γ(self)`: `u' = ψ(x)·x'`, where ψ is the digamma function. The
@@ -66,14 +68,7 @@ impl<const N: usize> Dual1<N> {
     /// analytic ODE sensitivity path (#430).
     pub fn ln_gamma(self) -> Self {
         let d1 = crate::stats::special::digamma(self.value);
-        let mut grad = [0.0; N];
-        for i in 0..N {
-            grad[i] = d1 * self.grad[i];
-        }
-        Dual1 {
-            value: crate::stats::special::ln_gamma(self.value),
-            grad,
-        }
+        Dual1::chain1(crate::stats::special::ln_gamma(self.value), d1, &self.grad)
     }
 
     /// `sqrt(self)`: `u' = x'/(2√x)`.
@@ -95,21 +90,13 @@ impl<const N: usize> Dual1<N> {
         }
         let v = self.value.sqrt();
         let inv2u = 0.5 / v;
-        let mut grad = [0.0; N];
-        for i in 0..N {
-            grad[i] = inv2u * self.grad[i];
-        }
-        Dual1 { value: v, grad }
+        Dual1::chain1(v, inv2u, &self.grad)
     }
 
     /// `cos(self)`: `u' = −sin(x)·x'`.
     pub fn cos(self) -> Self {
         let (s, c) = self.value.sin_cos();
-        let mut grad = [0.0; N];
-        for i in 0..N {
-            grad[i] = -s * self.grad[i];
-        }
-        Dual1 { value: c, grad }
+        Dual1::chain1(c, -s, &self.grad)
     }
 
     /// `acos(self)`: `u' = g₁·x'`, `g₁ = −1/√(1−x²)`. Same `|x|→1` self-defence as
@@ -127,14 +114,7 @@ impl<const N: usize> Dual1<N> {
             }
         };
         let g1 = -1.0 / one_minus.sqrt();
-        let mut grad = [0.0; N];
-        for i in 0..N {
-            grad[i] = g1 * self.grad[i];
-        }
-        Dual1 {
-            value: v_clamped.acos(),
-            grad,
-        }
+        Dual1::chain1(v_clamped.acos(), g1, &self.grad)
     }
 
     /// `self^e`. Constant exponent uses the power rule `c₁ = n·aⁿ⁻¹` (exact for any
@@ -149,11 +129,7 @@ impl<const N: usize> Dual1<N> {
                 return Dual1::constant(an);
             }
             let c1 = n * a.powf(n - 1.0);
-            let mut grad = [0.0; N];
-            for i in 0..N {
-                grad[i] = c1 * self.grad[i];
-            }
-            return Dual1 { value: an, grad };
+            return Dual1::chain1(an, c1, &self.grad);
         }
         (e * self.ln()).exp()
     }
@@ -171,36 +147,21 @@ impl<const N: usize> Dual1<N> {
     pub fn inv_logit(self) -> Self {
         let u = 1.0 / (1.0 + (-self.value).exp());
         let d = u * (1.0 - u);
-        let mut grad = [0.0; N];
-        for i in 0..N {
-            grad[i] = d * self.grad[i];
-        }
-        Dual1 { value: u, grad }
+        Dual1::chain1(u, d, &self.grad)
     }
 
     /// `logit(self) = ln(x/(1−x))`: `u' = x'/(x(1−x))`.
     pub fn logit(self) -> Self {
         let x = self.value;
         let d = 1.0 / (x * (1.0 - x));
-        let mut grad = [0.0; N];
-        for i in 0..N {
-            grad[i] = d * self.grad[i];
-        }
-        Dual1 {
-            value: (x / (1.0 - x)).ln(),
-            grad,
-        }
+        Dual1::chain1((x / (1.0 - x)).ln(), d, &self.grad)
     }
 
     /// `1/self`: `u' = −x'/x²`.
     pub fn recip(self) -> Self {
         let inv = 1.0 / self.value;
         let inv2 = inv * inv;
-        let mut grad = [0.0; N];
-        for i in 0..N {
-            grad[i] = -self.grad[i] * inv2;
-        }
-        Dual1 { value: inv, grad }
+        Dual1::chain1(inv, -inv2, &self.grad)
     }
 }
 

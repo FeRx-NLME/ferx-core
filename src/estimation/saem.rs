@@ -64,7 +64,10 @@ const OMEGA_SA_MAX_STEP: f64 = 0.1;
 /// Raise every *free* diagonal entry of the BSV Ω that has fallen below `floor`
 /// up to `floor`. FIX-ed diagonals (`omega_fixed[i] == true`) are left untouched
 /// — they carry the user's declared variance and must not be perturbed.
-fn floor_omega_diagonal(omega_mat: &mut DMatrix<f64>, omega_fixed: &[bool], floor: f64) {
+///
+/// Shared source of truth for the SAEM and IMPMAP estimators (`impmap.rs` calls
+/// this instead of carrying its own byte-identical copy).
+pub(crate) fn floor_omega_diagonal(omega_mat: &mut DMatrix<f64>, omega_fixed: &[bool], floor: f64) {
     for i in 0..omega_mat.nrows() {
         let fixed = omega_fixed.get(i).copied().unwrap_or(false);
         if !fixed && omega_mat[(i, i)] < floor {
@@ -1123,7 +1126,7 @@ fn combined_additive_sigma_at_floor(model: &CompiledModel, params: &ModelParamet
 /// `log_transformed = false`) require the extra factor of `theta` from the
 /// log-space chain rule and are deliberately excluded — they fall through to
 /// the regular NLopt M-step.
-fn get_mu_ref_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
+pub(crate) fn get_mu_ref_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
     let mut pairs = Vec::new();
     for (eta_idx, eta_name) in model.eta_names.iter().enumerate() {
         if let Some(mu_ref) = model.mu_refs.get(eta_name) {

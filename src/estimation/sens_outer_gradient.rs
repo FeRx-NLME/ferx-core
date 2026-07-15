@@ -1468,17 +1468,7 @@ fn omega_block(prep: &Prep, params: &ModelParameters, eta_hat: &[f64]) -> Vec<f6
     let u = &prep.h_inner_inv * DVector::from_column_slice(&prep.g_eta);
     let v = &prep.omega_inv * u;
 
-    let entries: Vec<(usize, usize)> = if params.omega.diagonal {
-        (0..n_eta).map(|i| (i, i)).collect()
-    } else {
-        let mut e = Vec::new();
-        for c in 0..n_eta {
-            for r in c..n_eta {
-                e.push((r, c));
-            }
-        }
-        e
-    };
+    let entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, params.omega.diagonal);
 
     entries
         .iter()
@@ -1752,17 +1742,7 @@ fn omega_packed_block(prep: &Prep, params: &ModelParameters, eta_hat: &[f64]) ->
     let g_mat = &prep.omega_inv * &prep.htilde_inv * &prep.omega_inv;
     let s = &prep.omega_inv * (&prep.h_inner_inv * DVector::from_column_slice(&prep.g_eta));
 
-    let entries: Vec<(usize, usize)> = if params.omega.diagonal {
-        (0..n_eta).map(|i| (i, i)).collect()
-    } else {
-        let mut e = Vec::new();
-        for c in 0..n_eta {
-            for r in c..n_eta {
-                e.push((r, c));
-            }
-        }
-        e
-    };
+    let entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, params.omega.diagonal);
 
     entries
         .iter()
@@ -1896,11 +1876,7 @@ pub fn subject_packed_gradient_iov(
     // θ (log/identity chain).
     let g_theta = theta_block(&prep, &sens, n_theta);
     for m in 0..n_theta {
-        let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
-            params.theta[m]
-        } else {
-            1.0
-        };
+        let dtheta_dx = theta_dx_chain(template, &params.theta, m);
         g[m] = g_theta[m] * dtheta_dx;
     }
 
@@ -1966,11 +1942,7 @@ pub fn subject_packed_gradient(
     // θ: ∂F/∂x = ∂F/∂θ · ∂θ/∂x, ∂θ/∂x = θ (log) or 1 (identity).
     let g_theta = theta_block(&prep, &sens, n_theta);
     for m in 0..n_theta {
-        let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
-            params.theta[m]
-        } else {
-            1.0
-        };
+        let dtheta_dx = theta_dx_chain(template, &params.theta, m);
         g[m] = g_theta[m] * dtheta_dx;
     }
 
@@ -1992,6 +1964,43 @@ pub fn subject_packed_gradient(
     Some(g)
 }
 
+/// Shared all-or-nothing population sum `d(OFV)/dx = 2·Σᵢ per_subject(i)` in
+/// packed space, short-circuiting to `None` if any subject is unsupported and
+/// zeroing fixed coordinates. The per-subject closure is the only difference
+/// between the FOCEI ([`population_gradient_sens`]) and FOCE
+/// ([`population_gradient_sens_foce`]) forms.
+///
+/// Subject-parallel (the FD path this replaces was already subject-parallel;
+/// PR #381 review #7). `collect::<Option<_>>` short-circuits to `None` if any
+/// subject is out of analytic scope, and preserves subject order so the
+/// accumulation below is bit-reproducible across runs.
+fn population_sum(
+    population: &Population,
+    template: &ModelParameters,
+    n: usize,
+    per_subject: impl Fn(usize, &Subject) -> Option<Vec<f64>> + Sync,
+) -> Option<Vec<f64>> {
+    let grads: Vec<Vec<f64>> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| per_subject(i, subject))
+        .collect::<Option<Vec<_>>>()?;
+    let mut grad = vec![0.0f64; n];
+    for gi in &grads {
+        for k in 0..n {
+            grad[k] += 2.0 * gi[k];
+        }
+    }
+    let fixed = packed_fixed_mask(template);
+    for k in 0..n {
+        if fixed[k] {
+            grad[k] = 0.0;
+        }
+    }
+    Some(grad)
+}
+
 /// The exact analytic population gradient `d(OFV)/dx = 2·Σᵢ dFᵢ/dx` in packed
 /// space, or **`None` if any single subject is unsupported** (all-or-nothing).
 /// Fixed coordinates are zeroed. `eta_hats[i]` must be subject `i`'s EBE at `x`.
@@ -2011,32 +2020,9 @@ pub fn population_gradient_sens(
     x: &[f64],
     eta_hats: &[DVector<f64>],
 ) -> Option<Vec<f64>> {
-    let n = x.len();
-    // Per-subject gradients in parallel (the FD path this replaces was already
-    // subject-parallel; PR #381 review #7). `collect::<Option<_>>` short-circuits
-    // to `None` if any subject is out of analytic scope, and preserves subject
-    // order so the accumulation below is bit-reproducible across runs.
-    let per_subject: Vec<Vec<f64>> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            subject_packed_gradient(model, subject, template, x, eta_hats[i].as_slice())
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let mut grad = vec![0.0f64; n];
-    for gi in &per_subject {
-        for k in 0..n {
-            grad[k] += 2.0 * gi[k];
-        }
-    }
-    let fixed = packed_fixed_mask(template);
-    for k in 0..n {
-        if fixed[k] {
-            grad[k] = 0.0;
-        }
-    }
-    Some(grad)
+    population_sum(population, template, x.len(), |i, subject| {
+        subject_packed_gradient(model, subject, template, x, eta_hats[i].as_slice())
+    })
 }
 
 /// Per-subject analytic packed gradients `dᵢ = d(nllᵢ)/dx` (FOCEI when
@@ -2327,11 +2313,7 @@ pub fn subject_packed_gradient_foce(
         let tr = (&rtilde_inv * &emojt).trace();
         let uemu = u.dot(&(&emojt * &u));
         let nat = u.dot(&qm) + tr - uemu + 0.5 * dvar + cg.theta[m];
-        let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
-            params.theta[m]
-        } else {
-            1.0
-        };
+        let dtheta_dx = theta_dx_chain(template, &params.theta, m);
         fixed[m] = nat * dtheta_dx;
     }
 
@@ -2341,17 +2323,7 @@ pub fn subject_packed_gradient_foce(
     let l = &params.omega.chol;
     let jl = &jmat * l;
     let cjl = cg.prep_jl(l); // (Jⱼ L) per censored row, once
-    let entries: Vec<(usize, usize)> = if params.omega.diagonal {
-        (0..n_eta).map(|i| (i, i)).collect()
-    } else {
-        let mut e = Vec::new();
-        for col in 0..n_eta {
-            for r in col..n_eta {
-                e.push((r, col));
-            }
-        }
-        e
-    };
+    let entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, params.omega.diagonal);
     let omega_start = n_theta;
     for (ko, &(row, col)) in entries.iter().enumerate() {
         let jr = jmat.column(row);
@@ -2482,29 +2454,9 @@ pub fn population_gradient_sens_foce(
     x: &[f64],
     eta_hats: &[DVector<f64>],
 ) -> Option<Vec<f64>> {
-    let n = x.len();
-    // Subject-parallel; see `population_gradient_sens` (PR #381 review #7).
-    let per_subject: Vec<Vec<f64>> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            subject_packed_gradient_foce(model, subject, template, x, eta_hats[i].as_slice())
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let mut grad = vec![0.0f64; n];
-    for gi in &per_subject {
-        for k in 0..n {
-            grad[k] += 2.0 * gi[k];
-        }
-    }
-    let fixed = packed_fixed_mask(template);
-    for k in 0..n {
-        if fixed[k] {
-            grad[k] = 0.0;
-        }
-    }
-    Some(grad)
+    population_sum(population, template, x.len(), |i, subject| {
+        subject_packed_gradient_foce(model, subject, template, x, eta_hats[i].as_slice())
+    })
 }
 
 /// Lower-triangle packed-entry list for an Ω of dimension `n` (diagonal: `(i,i)`;
@@ -2520,6 +2472,17 @@ fn lower_tri_entries(n: usize, diagonal: bool) -> Vec<(usize, usize)> {
             }
         }
         e
+    }
+}
+
+/// θ→packed chain rule `∂θ/∂x`: `θ` when the parameter packs in log-space,
+/// else `1.0`. Shared by every θ-loop of the packed-gradient / eta-dx functions.
+#[inline]
+fn theta_dx_chain(template: &ModelParameters, theta: &[f64], m: usize) -> f64 {
+    if theta_packs_log(template.theta_lower[m]) {
+        theta[m]
+    } else {
+        1.0
     }
 }
 
@@ -2611,11 +2574,7 @@ pub fn subject_eta_dx_iov(
 
     // θ coords.
     for m in 0..n_theta {
-        let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
-            params.theta[m]
-        } else {
-            1.0
-        };
+        let dtheta_dx = theta_dx_chain(template, &params.theta, m);
         let mut mvec = mixed_eta_theta(&sens.obs, &prep.et, n_st, prep.n_obs, m, prep.ruv);
         for (j, et) in prep.et.iter().enumerate() {
             let dalpha = mag_alpha_dtheta(et, m);
@@ -2924,11 +2883,7 @@ pub fn subject_packed_gradient_foce_iov(
         let tr = (&rtilde_inv * &emojt).trace();
         let uemu = u.dot(&(&emojt * &u));
         let nat = u.dot(&qm) + tr - uemu + 0.5 * dvar + cg.theta[m];
-        let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
-            params.theta[m]
-        } else {
-            1.0
-        };
+        let dtheta_dx = theta_dx_chain(template, &params.theta, m);
         fixed[m] = nat * dtheta_dx;
     }
 
@@ -3061,11 +3016,7 @@ pub fn subject_eta_dx(
 
     // θ coords: dη̂/dx = −H⁻¹ (∂²l/∂η∂θ · ∂θ/∂x).
     for m in 0..n_theta {
-        let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
-            params.theta[m]
-        } else {
-            1.0
-        };
+        let dtheta_dx = theta_dx_chain(template, &params.theta, m);
         let mut mvec = mixed_eta_theta(&sens.obs, &prep.et, n_eta, prep.n_obs, m, prep.ruv);
         // Custom / time-varying σ magnitude (#576/#486): `mult(θ)` makes the inner
         // variance depend on θ directly, adding `½ ∂α/∂θ · a` to `∂²l/∂η∂θ` — the
@@ -3094,17 +3045,7 @@ pub fn subject_eta_dx(
     // Ω coords: M_L = −Ω⁻¹(e_row·(v·z) + v·z_row), v = L[:,col]; ×L_kk for diag-log.
     let z = &prep.omega_inv * DVector::from_column_slice(eta_hat);
     let l = &params.omega.chol;
-    let entries: Vec<(usize, usize)> = if params.omega.diagonal {
-        (0..n_eta).map(|i| (i, i)).collect()
-    } else {
-        let mut e = Vec::new();
-        for c in 0..n_eta {
-            for r in c..n_eta {
-                e.push((r, c));
-            }
-        }
-        e
-    };
+    let entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, params.omega.diagonal);
     let omega_start = n_theta;
     for (ko, &(row, col)) in entries.iter().enumerate() {
         let v = DVector::from_iterator(n_eta, (0..n_eta).map(|r| l[(r, col)]));
@@ -3405,6 +3346,59 @@ mod tests {
         p
     }
 
+    /// The byte-identical no-covariate `Population` wrapper used across the FD
+    /// comparison tests (empty covariates/inputs, `DV` column, no exclusions).
+    fn pop_of(subjects: Vec<Subject>) -> Population {
+        Population {
+            subjects,
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    /// Per-coordinate Richardson-FD gradient check shared by the packed-gradient
+    /// comparison tests. For each coordinate `k`, forms the Richardson combination
+    /// of two central differences of `ofv` (steps `h` and `h/2`, with
+    /// `h = 1e-4·(1+|x[k]|)`) and asserts `analytic[k]` matches it to the caller's
+    /// `max_relative` / `epsilon`. Moves the harness arithmetic verbatim — each
+    /// test supplies only its own `ofv` closure and tolerances.
+    fn assert_grad_matches_richardson_fd(
+        x: &[f64],
+        analytic: &[f64],
+        ofv: impl Fn(&[f64]) -> f64,
+        max_relative: f64,
+        epsilon: f64,
+    ) {
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.to_vec();
+            xp[k] += h;
+            let mut xm = x.to_vec();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[k],
+                fd,
+                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(
+                analytic[k],
+                fd,
+                max_relative = max_relative,
+                epsilon = epsilon
+            );
+        }
+    }
+
     const WARFARIN: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -3698,18 +3692,10 @@ mod tests {
     /// packed gradient must match the reconverged-FD of ferx's FOCE OFV.
     fn run_packed_check_foce(model: &CompiledModel, theta: &[f64]) {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let s1 = subject_with_obs(model, theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         let s2 = subject_with_obs(model, theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0, 72.0]);
-        let pop = Population {
-            subjects: vec![s1, s2],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s1, s2]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -3732,26 +3718,7 @@ mod tests {
                 .map(|s| marginal_nll_foce(model, s, &p))
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            eprintln!(
-                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
-                analytic[k],
-                fd,
-                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
-            );
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 3e-3, 1e-5);
     }
 
     #[test]
@@ -4073,18 +4040,10 @@ mod tests {
     /// independently NONMEM-validated (#413).
     fn run_ruv_packed_check(model: &CompiledModel, theta: &[f64]) {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let s1 = ruv_subject(model, theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         let s2 = ruv_subject(model, theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0, 72.0]);
-        let pop = Population {
-            subjects: vec![s1, s2],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s1, s2]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -4111,26 +4070,7 @@ mod tests {
                 })
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
-            eprintln!(
-                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
-                analytic[k],
-                fd,
-                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
-            );
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 2e-3, 1e-5);
     }
 
     #[test]
@@ -4250,7 +4190,6 @@ mod tests {
     #[test]
     fn population_packed_gradient_block_sigma_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let model = parse_model_string(BLOCK_SIGMA_1CPT).expect("parse block_sigma");
         assert!(
@@ -4264,14 +4203,7 @@ mod tests {
         let theta = &[1.1, 11.0];
         let s1 = dense_subject(&model, theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         let s2 = dense_subject(&model, theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0]);
-        let pop = Population {
-            subjects: vec![s1, s2],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s1, s2]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -4297,26 +4229,7 @@ mod tests {
                 })
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
-            eprintln!(
-                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
-                analytic[k],
-                fd,
-                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
-            );
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 2e-3, 1e-5);
     }
 
     /// FOCE (non-interaction) analog of `population_packed_gradient_block_sigma_matches_fd`.
@@ -4326,7 +4239,6 @@ mod tests {
     #[test]
     fn population_packed_gradient_block_sigma_foce_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let src = BLOCK_SIGMA_1CPT.replace("method = focei", "method = foce");
         let model = parse_model_string(&src).expect("parse block_sigma foce");
@@ -4335,14 +4247,7 @@ mod tests {
         let theta = &[1.1, 11.0];
         let s1 = dense_subject(&model, theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         let s2 = dense_subject(&model, theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0]);
-        let pop = Population {
-            subjects: vec![s1, s2],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s1, s2]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -4368,20 +4273,7 @@ mod tests {
                 })
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 2e-3, 1e-5);
     }
 
     /// Covariate-selected (`if/else`) `block_sigma` fixture: each row's residual
@@ -4420,7 +4312,6 @@ mod tests {
     #[test]
     fn population_packed_gradient_selected_block_sigma_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let model =
             parse_model_string(SELECTED_BLOCK_SIGMA_1CPT).expect("parse selected block_sigma");
@@ -4478,20 +4369,7 @@ mod tests {
                 })
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 2e-3, 1e-5);
     }
 
     /// `block_sigma` + η-dependent `ExpressionScale` `obs_scale` (#627 × #486): the analytic
@@ -4501,7 +4379,6 @@ mod tests {
     #[test]
     fn population_packed_gradient_block_sigma_expression_scale_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let src = BLOCK_SIGMA_1CPT.replace(
             "[structural_model]",
@@ -4519,14 +4396,7 @@ mod tests {
         let theta = &[1.1, 11.0];
         let s1 = dense_subject(&model, theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         let s2 = dense_subject(&model, theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0]);
-        let pop = Population {
-            subjects: vec![s1, s2],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s1, s2]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -4552,20 +4422,7 @@ mod tests {
                 })
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 2e-3, 1e-5);
     }
 
     /// Closed-form `iiv_on_ruv` + **M3 BLOQ** (#4c): the analytic FOCEI packed
@@ -4577,7 +4434,6 @@ mod tests {
     #[test]
     fn population_packed_gradient_iiv_on_ruv_m3_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let mut model = parse_model_string(WARFARIN_RUV).expect("parse");
         model.bloq_method = crate::types::BloqMethod::M3;
@@ -4599,17 +4455,10 @@ mod tests {
             }
             s
         };
-        let pop = Population {
-            subjects: vec![
-                mk(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
-                mk(&[0.25, 1.5, 3.0, 6.0, 12.0, 36.0, 72.0]),
-            ],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![
+            mk(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
+            mk(&[0.25, 1.5, 3.0, 6.0, 12.0, 36.0, 72.0]),
+        ]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.clone();
@@ -4826,7 +4675,6 @@ mod tests {
     #[test]
     fn iiv_on_ruv_m3_2cpt_combined_packed_gradient_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
         let mut model = parse_model_string(RUV_2CPT_COMBINED).expect("parse 2cpt ruv combined");
         model.bloq_method = crate::types::BloqMethod::M3;
         assert_eq!(model.residual_error_eta, Some(2));
@@ -4843,17 +4691,10 @@ mod tests {
             }
             s
         };
-        let pop = Population {
-            subjects: vec![
-                mk(&[0.5, 2.0, 6.0, 12.0, 24.0, 48.0]),
-                mk(&[1.0, 3.0, 8.0, 16.0, 36.0, 72.0]),
-            ],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![
+            mk(&[0.5, 2.0, 6.0, 12.0, 24.0, 48.0]),
+            mk(&[1.0, 3.0, 8.0, 16.0, 36.0, 72.0]),
+        ]);
         let mut template = model.default_params.clone();
         template.theta = theta.clone();
         let x = pack_params(&template);
@@ -5020,18 +4861,10 @@ mod tests {
 
     fn run_population_packed_gradient_check(model: &CompiledModel, theta: &[f64]) {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let s1 = subject_with_obs(model, theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         let s2 = subject_with_obs(model, theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0, 72.0]);
-        let pop = Population {
-            subjects: vec![s1, s2],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s1, s2]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -5055,26 +4888,7 @@ mod tests {
                 .map(|s| marginal_nll(model, s, &p))
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            eprintln!(
-                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
-                analytic[k],
-                fd,
-                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
-            );
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 3e-3, 1e-5);
     }
 
     #[test]
@@ -5257,7 +5071,7 @@ mod tests {
     #[test]
     fn population_packed_gradient_ode_ss_reset_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::{DoseEvent, Population};
+        use crate::types::DoseEvent;
 
         let model = parse_model_string(ONECPT_IV_ODE_SS_RESET).expect("parse ODE SS+reset");
         assert!(model.is_ode_based(), "must be on the ODE path");
@@ -5306,14 +5120,7 @@ mod tests {
         let preds = crate::pk::compute_predictions_with_tv(&model, &s, &theta, &eta_ref);
         s.observations = preds.iter().map(|p| p * 0.85).collect();
 
-        let pop = Population {
-            subjects: vec![s],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s]);
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
         let x = pack_params(&template);
@@ -5359,7 +5166,6 @@ mod tests {
     #[test]
     fn population_packed_gradient_reset_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let model = parse_model_string(ONECPT_IV_RESET).expect("parse");
         let theta = [0.22, 11.0];
@@ -5368,14 +5174,7 @@ mod tests {
         // One reset subject + one ordinary subject, so the population mixes both.
         let s_reset = reset_subject_outer(&model, &theta, &eta_ref, "reset");
         let s_plain = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
-        let pop = Population {
-            subjects: vec![s_reset, s_plain],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s_reset, s_plain]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -5410,26 +5209,7 @@ mod tests {
                     })
                     .sum::<f64>()
             };
-            let fd_at = |k: usize, h: f64| -> f64 {
-                let mut xp = x.clone();
-                xp[k] += h;
-                let mut xm = x.clone();
-                xm[k] -= h;
-                (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-            };
-            for k in 0..x.len() {
-                let h = 1e-4 * (1.0 + x[k].abs());
-                let f1 = fd_at(k, h);
-                let f2 = fd_at(k, h / 2.0);
-                let fd = (4.0 * f2 - f1) / 3.0;
-                eprintln!(
-                    "interaction={interaction} x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
-                    analytic[k],
-                    fd,
-                    (analytic[k] - fd).abs() / fd.abs().max(1e-12)
-                );
-                approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
-            }
+            assert_grad_matches_richardson_fd(&x, &analytic, ofv, 3e-3, 1e-5);
         }
     }
 
@@ -5445,7 +5225,6 @@ mod tests {
     #[test]
     fn ss_reset_subject_is_analytic_and_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let model = parse_model_string(ONECPT_IV_RESET).expect("parse");
         let theta = [0.22, 11.0];
@@ -5462,14 +5241,7 @@ mod tests {
             "SS+reset subject must be served analytically by the event walk (#486)"
         );
 
-        let pop = Population {
-            subjects: vec![s_ss_reset, s_plain],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s_ss_reset, s_plain]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -5503,20 +5275,7 @@ mod tests {
                     })
                     .sum::<f64>()
             };
-            let fd_at = |k: usize, h: f64| -> f64 {
-                let mut xp = x.clone();
-                xp[k] += h;
-                let mut xm = x.clone();
-                xm[k] -= h;
-                (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-            };
-            for k in 0..x.len() {
-                let h = 1e-4 * (1.0 + x[k].abs());
-                let f1 = fd_at(k, h);
-                let f2 = fd_at(k, h / 2.0);
-                let fd = (4.0 * f2 - f1) / 3.0;
-                approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
-            }
+            assert_grad_matches_richardson_fd(&x, &analytic, ofv, 3e-3, 1e-5);
         }
     }
 
@@ -5559,7 +5318,7 @@ mod tests {
     fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
         use crate::estimation::outer_optimizer::population_gradient_sens_mixed;
         use crate::estimation::parameterization::{compute_bounds, pack_params};
-        use crate::types::{FitOptions, Population};
+        use crate::types::FitOptions;
 
         // The out-of-scope subject used to be SS+reset; since #486 the event walk serves that
         // combination analytically (see `ss_reset_subject_is_analytic_and_matches_fd`), so this
@@ -5572,14 +5331,7 @@ mod tests {
         // In-scope plain (bolus) subject + an out-of-scope rate-defined-infusion subject.
         let s_plain = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         let s_oos = reset_subject_outer(&model, &theta, &eta_ref, "rate_inf_f");
-        let pop = Population {
-            subjects: vec![s_plain, s_oos],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s_plain, s_oos]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -5660,20 +5412,7 @@ mod tests {
                 .map(|s| subj_marginal(s, &p))
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            approx::assert_relative_eq!(mixed[k], fd, max_relative = 3e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &mixed, ofv, 3e-3, 1e-5);
     }
 
     // 1-cpt oral with allometric WT-on-CL — the canonical time-varying covariate.
@@ -5765,7 +5504,6 @@ mod tests {
     #[test]
     fn population_packed_gradient_tvcov_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let model = parse_model_string(ONECPT_ORAL_TVCOV_OUTER).expect("parse tvcov");
         let theta = [0.22, 11.0, 1.4, 0.7];
@@ -5852,26 +5590,7 @@ mod tests {
                     })
                     .sum::<f64>()
             };
-            let fd_at = |k: usize, h: f64| -> f64 {
-                let mut xp = x.clone();
-                xp[k] += h;
-                let mut xm = x.clone();
-                xm[k] -= h;
-                (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-            };
-            for k in 0..x.len() {
-                let h = 1e-4 * (1.0 + x[k].abs());
-                let f1 = fd_at(k, h);
-                let f2 = fd_at(k, h / 2.0);
-                let fd = (4.0 * f2 - f1) / 3.0;
-                eprintln!(
-                    "interaction={interaction} x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
-                    analytic[k],
-                    fd,
-                    (analytic[k] - fd).abs() / fd.abs().max(1e-12)
-                );
-                approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
-            }
+            assert_grad_matches_richardson_fd(&x, &analytic, ofv, 3e-3, 1e-5);
         }
     }
 
@@ -5905,7 +5624,6 @@ mod tests {
     #[test]
     fn population_packed_gradient_init_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
 
         let model = parse_model_string(ONECPT_ORAL_INIT_OUTER).expect("parse init outer");
         assert_eq!(model.analytical_init.len(), 1);
@@ -5944,17 +5662,10 @@ mod tests {
             s.observations = preds.iter().map(|p| p * 0.85).collect();
             s
         };
-        let pop = Population {
-            subjects: vec![
-                make("init_a", &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
-                make("init_b", &[1.0, 3.0, 6.0, 12.0]),
-            ],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![
+            make("init_a", &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
+            make("init_b", &[1.0, 3.0, 6.0, 12.0]),
+        ]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -5988,20 +5699,7 @@ mod tests {
                     })
                     .sum::<f64>()
             };
-            let fd_at = |k: usize, h: f64| -> f64 {
-                let mut xp = x.clone();
-                xp[k] += h;
-                let mut xm = x.clone();
-                xm[k] -= h;
-                (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-            };
-            for k in 0..x.len() {
-                let h = 1e-4 * (1.0 + x[k].abs());
-                let f1 = fd_at(k, h);
-                let f2 = fd_at(k, h / 2.0);
-                let fd = (4.0 * f2 - f1) / 3.0;
-                approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
-            }
+            assert_grad_matches_richardson_fd(&x, &analytic, ofv, 3e-3, 1e-5);
         }
     }
 
@@ -6036,7 +5734,6 @@ mod tests {
     #[test]
     fn population_packed_gradient_lagtime_matches_fd() {
         use crate::estimation::parameterization::{pack_params, unpack_params};
-        use crate::types::Population;
         use std::collections::HashMap;
 
         let model = parse_model_string(WARFARIN_LAG).expect("parse lag");
@@ -6071,17 +5768,10 @@ mod tests {
             s.observations = preds.iter().map(|p| p * 0.85).collect();
             s
         };
-        let pop = Population {
-            subjects: vec![
-                build(&[1.0, 2.0, 4.0, 8.0, 24.0]),
-                build(&[1.5, 3.0, 6.0, 12.0, 36.0]),
-            ],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![
+            build(&[1.0, 2.0, 4.0, 8.0, 24.0]),
+            build(&[1.5, 3.0, 6.0, 12.0, 36.0]),
+        ]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -6103,20 +5793,7 @@ mod tests {
                 .map(|s| marginal_nll(&model, s, &p))
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 3e-3, 1e-5);
     }
 
     /// The analytic FOCEI **M3** packed gradient (censored rows enter `prepare`'s
@@ -6127,7 +5804,7 @@ mod tests {
     #[test]
     fn population_packed_gradient_m3_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::{BloqMethod, Population};
+        use crate::types::BloqMethod;
 
         let mut model = parse_model_string(WARFARIN).expect("parse");
         model.bloq_method = BloqMethod::M3;
@@ -6145,14 +5822,7 @@ mod tests {
         }
         assert!(s1.cens.iter().any(|&c| c != 0) && s2.cens.iter().any(|&c| c != 0));
 
-        let pop = Population {
-            subjects: vec![s1, s2],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s1, s2]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -6177,26 +5847,7 @@ mod tests {
                 .map(|s| marginal_nll(&model, s, &p))
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            eprintln!(
-                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
-                analytic[k],
-                fd,
-                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
-            );
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 5e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 5e-3, 1e-5);
     }
 
     const FREM_OUTER_MODEL: &str = r#"
@@ -6389,7 +6040,7 @@ mod tests {
     #[test]
     fn population_packed_gradient_ode_m3_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::{BloqMethod, Population};
+        use crate::types::BloqMethod;
 
         let model = parse_model_string(ONECPT_ODE_M3_OUTER).expect("parse ODE M3");
         assert!(matches!(model.bloq_method, BloqMethod::M3), "must be M3");
@@ -6405,14 +6056,7 @@ mod tests {
         }
         assert!(s1.cens.iter().any(|&c| c != 0) && s2.cens.iter().any(|&c| c != 0));
 
-        let pop = Population {
-            subjects: vec![s1, s2],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s1, s2]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -6435,26 +6079,7 @@ mod tests {
                 .map(|s| marginal_nll(&model, s, &p))
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            eprintln!(
-                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
-                analytic[k],
-                fd,
-                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
-            );
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 5e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 5e-3, 1e-5);
     }
 
     /// Non-IOV 1-cpt oral **user-ODE** model with M3 BLOQ **and** `iiv_on_ruv`
@@ -6502,7 +6127,7 @@ mod tests {
     #[test]
     fn population_packed_gradient_ode_m3_iiv_on_ruv_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::{BloqMethod, Population};
+        use crate::types::BloqMethod;
 
         let model = parse_model_string(ONECPT_ODE_M3_RUV_OUTER).expect("parse ODE M3 + iiv_on_ruv");
         assert!(matches!(model.bloq_method, BloqMethod::M3), "must be M3");
@@ -6525,14 +6150,7 @@ mod tests {
             }
             assert!(s1.cens.iter().any(|&c| c != 0) && s2.cens.iter().any(|&c| c != 0));
 
-            let pop = Population {
-                subjects: vec![s1, s2],
-                covariate_names: vec![],
-                dv_column: "DV".into(),
-                input_columns: vec![],
-                exclusions: None,
-                warnings: vec![],
-            };
+            let pop = pop_of(vec![s1, s2]);
 
             let mut template = model.default_params.clone();
             template.theta = theta.to_vec();
@@ -6560,26 +6178,7 @@ mod tests {
                     })
                     .sum::<f64>()
             };
-            let fd_at = |k: usize, h: f64| -> f64 {
-                let mut xp = x.clone();
-                xp[k] += h;
-                let mut xm = x.clone();
-                xm[k] -= h;
-                (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-            };
-            for k in 0..x.len() {
-                let h = 1e-4 * (1.0 + x[k].abs());
-                let f1 = fd_at(k, h);
-                let f2 = fd_at(k, h / 2.0);
-                let fd = (4.0 * f2 - f1) / 3.0; // Richardson
-                eprintln!(
-                    "ode m3+ruv (right={right}) x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
-                    analytic[k],
-                    fd,
-                    (analytic[k] - fd).abs() / fd.abs().max(1e-9)
-                );
-                approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 2e-5);
-            }
+            assert_grad_matches_richardson_fd(&x, &analytic, ofv, 3e-3, 2e-5);
         }
     }
 
@@ -6590,7 +6189,7 @@ mod tests {
     #[test]
     fn population_packed_gradient_m3_foce_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::{BloqMethod, Population};
+        use crate::types::BloqMethod;
 
         let mut model = parse_model_string(WARFARIN).expect("parse");
         model.bloq_method = BloqMethod::M3;
@@ -6604,14 +6203,7 @@ mod tests {
             s.cens[n - 2] = 1;
         }
 
-        let pop = Population {
-            subjects: vec![s1, s2],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![s1, s2]);
 
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
@@ -6634,26 +6226,7 @@ mod tests {
                 .map(|s| marginal_nll_foce(&model, s, &p))
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            eprintln!(
-                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
-                analytic[k],
-                fd,
-                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
-            );
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 5e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 5e-3, 1e-5);
     }
 
     #[test]
@@ -6716,7 +6289,6 @@ mod tests {
     #[test]
     fn population_packed_gradient_foce_init_infusion_matches_fd() {
         use crate::estimation::parameterization::pack_params;
-        use crate::types::Population;
         let model = parse_model_string(IV_INIT_INFUSION).expect("parse init+infusion");
         let theta = vec![1.0, 20.0, 300.0];
         // Two subjects, each dosed by a finite IV infusion (rate 25 → 4 h window) on top of the
@@ -6730,17 +6302,10 @@ mod tests {
             s.observations = preds.iter().map(|p| p * 0.85).collect();
             s
         };
-        let pop = Population {
-            subjects: vec![
-                mk(&[1.0, 2.0, 4.0, 6.0, 10.0]),
-                mk(&[0.5, 3.0, 5.0, 8.0, 24.0]),
-            ],
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = pop_of(vec![
+            mk(&[1.0, 2.0, 4.0, 6.0, 10.0]),
+            mk(&[0.5, 3.0, 5.0, 8.0, 24.0]),
+        ]);
         let mut template = model.default_params.clone();
         template.theta = theta.clone();
         let x = pack_params(&template);
@@ -6760,20 +6325,7 @@ mod tests {
                 .map(|s| marginal_nll_foce(&model, s, &p))
                 .sum::<f64>()
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0;
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 3e-3, 1e-5);
     }
 
     // --- Eq. 48 EBE warm-start predictor: is it correct & better than plain warm? ---
@@ -9086,26 +8638,7 @@ mod tests {
             let p = unpack_params(xv, &template);
             marginal_nll_foce(model, subject, &p)
         };
-        let fd_at = |k: usize, h: f64| -> f64 {
-            let mut xp = x.clone();
-            xp[k] += h;
-            let mut xm = x.clone();
-            xm[k] -= h;
-            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
-        };
-        for k in 0..x.len() {
-            let h = 1e-4 * (1.0 + x[k].abs());
-            let f1 = fd_at(k, h);
-            let f2 = fd_at(k, h / 2.0);
-            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
-            eprintln!(
-                "foce magnitude x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
-                analytic[k],
-                fd,
-                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
-            );
-            approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
-        }
+        assert_grad_matches_richardson_fd(&x, &analytic, ofv, 3e-3, 1e-5);
     }
 
     #[test]
