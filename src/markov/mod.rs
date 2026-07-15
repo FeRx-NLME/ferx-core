@@ -234,6 +234,151 @@ pub fn generator_rate_direction(s: usize, j: usize, k: usize, dt: f64) -> DMatri
     e
 }
 
+/// Structural validation of the generator itself: square with at least two states.
+/// Returns the state count `s`. A failure is a parameter-independent [`MarkovError`]
+/// (fail loud), not the degenerate sentinel.
+fn validate_generator(q: &DMatrix<f64>) -> Result<usize, MarkovError> {
+    if !q.is_square() {
+        return Err(MarkovError::NonSquareGenerator {
+            rows: q.nrows(),
+            cols: q.ncols(),
+        });
+    }
+    let s = q.nrows();
+    if s < 2 {
+        return Err(MarkovError::TooFewStates { n: s });
+    }
+    Ok(s)
+}
+
+/// Validate every observation's state index (`< s`) and finite time up front, so a
+/// malformed record fails loud regardless of where it sits (not only if the loop
+/// reaches it).
+fn validate_obs(obs: &[StateObs], s: usize) -> Result<(), MarkovError> {
+    for (i, o) in obs.iter().enumerate() {
+        if o.state >= s {
+            return Err(MarkovError::StateOutOfRange {
+                state: o.state,
+                n_states: s,
+            });
+        }
+        if !o.time.is_finite() {
+            return Err(MarkovError::NonFiniteTime {
+                index: i,
+                time: o.time,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Shared structural / data validation preamble for the value kernel
+/// ([`ctmm_data_term`]): the generator is square with ≥2 states, and every
+/// observation is in range with a finite time. Returns the state count `s`.
+/// [`ctmm_data_term_grad`] composes [`validate_generator`] and [`validate_obs`]
+/// directly so its `∂Q/∂p` shape check stays interposed between them, exactly as
+/// before.
+fn validate_generator_and_obs(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<usize, MarkovError> {
+    let s = validate_generator(q)?;
+    validate_obs(obs, s)?;
+    Ok(s)
+}
+
+/// Outcome of one consecutive-observation gap, shared by the value and gradient
+/// kernels so the per-gap dt guards, the `expm`-argument finiteness / magnitude
+/// guard, the matrix exponential, and the `P ≤ 0` degeneracy handling live in one
+/// place. The two callers diverge only *after* a valid [`GapOutcome::Prob`].
+enum GapOutcome {
+    /// A zero-length gap between identical states (`P(0) = I`): contributes nothing.
+    Skip,
+    /// A parameter-driven degeneracy (non-finite / enormous argument, or a
+    /// non-positive observed transition probability): the caller returns its own
+    /// sentinel ([`SENTINEL_NLL`]) / `Ok(None)`.
+    Degenerate,
+    /// A valid transition probability `p = P(Δt)[from, to]` over the gap, carrying
+    /// the scaled argument `arg = Q·Δt` and `dt` (both needed by the gradient's
+    /// adjoint Fréchet solve).
+    Prob { p: f64, arg: DMatrix<f64>, dt: f64 },
+}
+
+/// Score one consecutive-observation gap `(a → b)` at zero-based window index `i`.
+///
+/// Fails loud on a structural gap error (times decrease, or a zero-length gap
+/// between *different* states); otherwise classifies the gap as [`GapOutcome`].
+/// The `expm` argument is guarded for both non-finiteness and magnitude before it
+/// reaches nalgebra (a non-finite entry can panic its internal LU solve; a
+/// finite-but-enormous one hangs its scaling-and-squaring loop) — see
+/// [`MAX_EXP_ARG_ABS`].
+fn gap_transition(
+    q: &DMatrix<f64>,
+    a: StateObs,
+    b: StateObs,
+    i: usize,
+) -> Result<GapOutcome, MarkovError> {
+    let dt = b.time - a.time;
+
+    if dt < 0.0 {
+        return Err(MarkovError::TimeDecreased {
+            index: i + 1,
+            prev: a.time,
+            next: b.time,
+        });
+    }
+    if dt == 0.0 {
+        if a.state != b.state {
+            return Err(MarkovError::ZeroDtStateChange {
+                index: i + 1,
+                time: b.time,
+                from: a.state,
+                to: b.state,
+            });
+        }
+        // Δt = 0, same state: P(0) = I ⇒ log P[s,s] = log 1 = 0.
+        return Ok(GapOutcome::Skip);
+    }
+
+    let arg = q * dt;
+    if arg
+        .iter()
+        .any(|x| !x.is_finite() || x.abs() > MAX_EXP_ARG_ABS)
+    {
+        return Ok(GapOutcome::Degenerate);
+    }
+    let p_mat = matrix_exp(&arg);
+    let p = p_mat[(a.state, b.state)];
+    // Underflow / non-positive probability for an *observed* transition:
+    // this is the degenerate case, not a hard error — repel the optimizer.
+    if !p.is_finite() || p <= 0.0 {
+        return Ok(GapOutcome::Degenerate);
+    }
+    Ok(GapOutcome::Prob { p, arg, dt })
+}
+
+/// Whether any off-diagonal entry of a generator is (past round-off) negative.
+///
+/// A transition intensity is an unconstrained user expression, so a covariate /
+/// parameter regime (or a diverged η) can drive an off-diagonal rate negative,
+/// which makes `Q` a non-generator (`expm(Q·Δt)` is no longer stochastic and an
+/// observed transition can score `P > 1`). Callers treat that as the degenerate
+/// case and repel the optimizer with their own sentinel / `None`. The `1e-12`
+/// tolerance absorbs floating round-off on a rate that is physically zero.
+///
+/// Used by the two homogeneous endpoint sites in `markov/endpoint.rs`
+/// (`ctmm_endpoint_nll`, `ctmm_subject_eta_grad`). The inhomogeneous per-sub-node
+/// guard stays inline there because it shares a single pass with the
+/// finite/`MAX_EXP_ARG_ABS` magnitude check.
+#[inline]
+pub(crate) fn has_negative_offdiagonal(q: &DMatrix<f64>) -> bool {
+    for j in 0..q.nrows() {
+        for k in 0..q.ncols() {
+            if j != k && q[(j, k)] < -1e-12 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Exact gradient of [`ctmm_data_term`] w.r.t. an arbitrary parameter vector, given the
 /// generator `q` and its derivatives `dq[a] = ∂Q/∂p_a` (#759).
 ///
@@ -271,19 +416,11 @@ pub fn ctmm_data_term_grad(
     dq: &[DMatrix<f64>],
     obs: &[StateObs],
 ) -> Result<Option<(f64, Vec<f64>)>, MarkovError> {
-    if !q.is_square() {
-        return Err(MarkovError::NonSquareGenerator {
-            rows: q.nrows(),
-            cols: q.ncols(),
-        });
-    }
-    let s = q.nrows();
-    if s < 2 {
-        return Err(MarkovError::TooFewStates { n: s });
-    }
+    let s = validate_generator(q)?;
     // Validated at runtime, not merely debug-asserted: the contraction below zips `G` with
     // `∂Q/∂p`, so a short derivative matrix would silently truncate and yield a wrong
-    // gradient rather than an error — and this is a `pub` entry point.
+    // gradient rather than an error — and this is a `pub` entry point. Checked between the
+    // generator and observation validation to preserve the original error precedence.
     for (axis, d) in dq.iter().enumerate() {
         if d.shape() != (s, s) {
             return Err(MarkovError::DerivativeShapeMismatch {
@@ -294,21 +431,7 @@ pub fn ctmm_data_term_grad(
             });
         }
     }
-
-    for (i, o) in obs.iter().enumerate() {
-        if o.state >= s {
-            return Err(MarkovError::StateOutOfRange {
-                state: o.state,
-                n_states: s,
-            });
-        }
-        if !o.time.is_finite() {
-            return Err(MarkovError::NonFiniteTime {
-                index: i,
-                time: o.time,
-            });
-        }
-    }
+    validate_obs(obs, s)?;
 
     let n_axes = dq.len();
     let mut grad = vec![0.0_f64; n_axes];
@@ -319,40 +442,12 @@ pub fn ctmm_data_term_grad(
     let mut nll = 0.0;
     for (i, pair) in obs.windows(2).enumerate() {
         let (a, b) = (pair[0], pair[1]);
-        let dt = b.time - a.time;
-
-        if dt < 0.0 {
-            return Err(MarkovError::TimeDecreased {
-                index: i + 1,
-                prev: a.time,
-                next: b.time,
-            });
-        }
-        if dt == 0.0 {
-            if a.state != b.state {
-                return Err(MarkovError::ZeroDtStateChange {
-                    index: i + 1,
-                    time: b.time,
-                    from: a.state,
-                    to: b.state,
-                });
-            }
+        let (p, arg, dt) = match gap_transition(q, a, b, i)? {
             // P(0) = I: the term is identically 0 in both value and derivative.
-            continue;
-        }
-
-        let arg = q * dt;
-        if arg
-            .iter()
-            .any(|x| !x.is_finite() || x.abs() > MAX_EXP_ARG_ABS)
-        {
-            return Ok(None);
-        }
-        let p_mat = matrix_exp(&arg);
-        let p = p_mat[(a.state, b.state)];
-        if !p.is_finite() || p <= 0.0 {
-            return Ok(None);
-        }
+            GapOutcome::Skip => continue,
+            GapOutcome::Degenerate => return Ok(None),
+            GapOutcome::Prob { p, arg, dt } => (p, arg, dt),
+        };
         // Mirror `ctmm_data_term`'s `p.min(1.0)` clamp in the *derivative* too: where the
         // clamp binds, the implemented value is the constant `ln(1) = 0`, so its exact
         // derivative is 0 — not `−(∂P/∂p)/p`. Differentiating through a clamp the value
@@ -404,33 +499,7 @@ pub fn ctmm_data_term_grad(
 /// `≥ 0`, rows summing to `0`) is the model builder's responsibility and is not
 /// re-checked per-evaluation here.
 pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovError> {
-    if !q.is_square() {
-        return Err(MarkovError::NonSquareGenerator {
-            rows: q.nrows(),
-            cols: q.ncols(),
-        });
-    }
-    let s = q.nrows();
-    if s < 2 {
-        return Err(MarkovError::TooFewStates { n: s });
-    }
-
-    // Validate every state index and every time up front, so a malformed record
-    // fails loud regardless of where it sits (not only if the loop reaches it).
-    for (i, o) in obs.iter().enumerate() {
-        if o.state >= s {
-            return Err(MarkovError::StateOutOfRange {
-                state: o.state,
-                n_states: s,
-            });
-        }
-        if !o.time.is_finite() {
-            return Err(MarkovError::NonFiniteTime {
-                index: i,
-                time: o.time,
-            });
-        }
-    }
+    validate_generator_and_obs(q, obs)?;
 
     if obs.len() < 2 {
         return Ok(0.0);
@@ -439,52 +508,14 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
     let mut nll = 0.0;
     for (i, pair) in obs.windows(2).enumerate() {
         let (a, b) = (pair[0], pair[1]);
-        let dt = b.time - a.time;
-
-        if dt < 0.0 {
-            return Err(MarkovError::TimeDecreased {
-                index: i + 1,
-                prev: a.time,
-                next: b.time,
-            });
-        }
-        if dt == 0.0 {
-            if a.state != b.state {
-                return Err(MarkovError::ZeroDtStateChange {
-                    index: i + 1,
-                    time: b.time,
-                    from: a.state,
-                    to: b.state,
-                });
-            }
+        let p = match gap_transition(q, a, b, i)? {
             // Δt = 0, same state: P(0) = I ⇒ log P[s,s] = log 1 = 0.
-            continue;
-        }
-
-        // Guard the exponential's argument before it reaches nalgebra's `expm`.
-        // Two failure modes, both from a rate that diverged during optimization:
-        //   • a non-finite entry (∞/NaN, e.g. an infinite rate from a bad η) —
-        //     `expm`'s internal LU solve `.unwrap()` can *panic* on it; and
-        //   • a finite-but-enormous entry (|q·dt| ≳ 1e38) — `expm` forms internal
-        //     matrix powers that overflow to ∞, driving its scaling count to
-        //     `u64::MAX` so it *hangs* in an unbounded squaring loop.
-        // A hang survives neither the post-`expm` finiteness check nor
-        // `catch_unwind`, so both are rejected here up front. Either is the
-        // degenerate case (repel the optimizer), not a crash or a frozen fit.
-        let arg = q * dt;
-        if arg
-            .iter()
-            .any(|x| !x.is_finite() || x.abs() > MAX_EXP_ARG_ABS)
-        {
-            return Ok(SENTINEL_NLL);
-        }
-        let p_mat = matrix_exp(&arg);
-        let p = p_mat[(a.state, b.state)];
-        // Underflow / non-positive probability for an *observed* transition:
-        // this is the degenerate case, not a hard error — repel the optimizer.
-        if !p.is_finite() || p <= 0.0 {
-            return Ok(SENTINEL_NLL);
-        }
+            GapOutcome::Skip => continue,
+            // Underflow / non-positive probability, or a non-finite / enormous
+            // `expm` argument from a diverged rate — repel the optimizer.
+            GapOutcome::Degenerate => return Ok(SENTINEL_NLL),
+            GapOutcome::Prob { p, .. } => p,
+        };
         // A valid generator gives P ∈ [0, 1]; clamp to 1 so floating round-off on
         // a near-certain transition (p = 1 + ε) contributes ~0 rather than a
         // spurious *negative* NLL, and a malformed generator (a P entry > 1)

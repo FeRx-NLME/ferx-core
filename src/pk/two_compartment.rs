@@ -1,4 +1,6 @@
-use crate::pk::analytical_absorption::{convolve_2cpt_peripheral, IgAbsorption, TransitAbsorption};
+use crate::pk::analytical_absorption::{
+    convolve_2cpt_peripheral, IgAbsorption, TiltedAbsorption, TransitAbsorption,
+};
 use crate::pk::one_compartment::{one_cpt_ig_depot, one_cpt_transit_depot};
 use crate::sens::two_cpt::{
     ig_2cpt_domain_ok, transit_2cpt_domain_ok, two_cpt_ig_g, two_cpt_infusion_g,
@@ -75,6 +77,48 @@ pub fn two_cpt_transit_f(
     two_cpt_transit_g::<f64>(dose.amt, t, cl, v1, q, v2, n, mtt, f_bio)
 }
 
+/// Shared depot-side wrapper for a tilted-absorption 2-cpt model: return the
+/// 1-cpt depot delegate's value when the disposition-domain guard holds, else 0.
+/// `domain_ok` is the model's `*_2cpt_domain_ok(...)` result (evaluated eagerly,
+/// as in each original); `f` builds the disposition-independent 1-cpt depot mass.
+#[inline]
+fn guard_then<T>(domain_ok: Option<T>, f: impl FnOnce() -> f64) -> f64 {
+    if domain_ok.is_some() {
+        f()
+    } else {
+        0.0
+    }
+}
+
+/// Peripheral-compartment concentration `A2/V2` for a single tilted-absorption
+/// 2-cpt bolus at elapsed time `tau`, generic over the [`TiltedAbsorption`] kernel
+/// `abs` and its model's `domain_ok` guard. Shared body of
+/// [`two_cpt_transit_peripheral`] / [`two_cpt_ig_peripheral`]: the absorption
+/// density convolved with the peripheral IV-bolus impulse response
+/// ([`convolve_2cpt_peripheral`]) with `k12 = q/v1` and `(f_bio·amt)/v2`. Returns 0
+/// for `tau < 0`, infusion doses, or when the disposition-domain guard collapses
+/// (confluent `α = β` / flip-flop) — mirrors the central guards.
+#[allow(clippy::too_many_arguments)]
+fn two_cpt_absorption_peripheral<A: TiltedAbsorption<f64>>(
+    abs: &A,
+    domain_ok: Option<(f64, f64, f64)>,
+    dose: &DoseEvent,
+    tau: f64,
+    q: f64,
+    v1: f64,
+    v2: f64,
+    f_bio: f64,
+) -> f64 {
+    if tau < 0.0 || dose.is_infusion() {
+        return 0.0;
+    }
+    let Some((alpha, beta, _k21)) = domain_ok else {
+        return 0.0;
+    };
+    let k12 = q / v1;
+    convolve_2cpt_peripheral(abs, tau, alpha, beta, k12, (f_bio * dose.amt) / v2)
+}
+
 /// Unabsorbed amount still in the transit chain for a single bolus at elapsed time
 /// `tau`: `F·Dose·(1 − P(n+1, KTR·tau))`, `KTR = (n+1)/mtt`. The lumped depot-side
 /// state of the analytic 2-cpt transit model. The unabsorbed-chain mass is
@@ -96,10 +140,9 @@ pub(crate) fn two_cpt_transit_depot(
     mtt: f64,
     f_bio: f64,
 ) -> f64 {
-    if transit_2cpt_domain_ok(cl, v1, q, v2, n, mtt).is_none() {
-        return 0.0;
-    }
-    one_cpt_transit_depot(dose, tau, n, mtt, f_bio)
+    guard_then(transit_2cpt_domain_ok(cl, v1, q, v2, n, mtt), || {
+        one_cpt_transit_depot(dose, tau, n, mtt, f_bio)
+    })
 }
 
 /// Peripheral-compartment concentration `A2/V2` for a single 2-cpt transit bolus at
@@ -120,16 +163,17 @@ pub(crate) fn two_cpt_transit_peripheral(
     mtt: f64,
     f_bio: f64,
 ) -> f64 {
-    if tau < 0.0 || dose.is_infusion() {
-        return 0.0;
-    }
     // Same shared disposition-domain guard as the central path (#634 finding 7).
-    let Some((alpha, beta, _k21)) = transit_2cpt_domain_ok(cl, v1, q, v2, n, mtt) else {
-        return 0.0;
-    };
-    let abs = TransitAbsorption { n, mtt };
-    let k12 = q / v1;
-    convolve_2cpt_peripheral(&abs, tau, alpha, beta, k12, (f_bio * dose.amt) / v2)
+    two_cpt_absorption_peripheral(
+        &TransitAbsorption { n, mtt },
+        transit_2cpt_domain_ok(cl, v1, q, v2, n, mtt),
+        dose,
+        tau,
+        q,
+        v1,
+        v2,
+        f_bio,
+    )
 }
 
 /// 2-cpt inverse-Gaussian absorption central concentration (#790). `F` is baked into
@@ -170,10 +214,9 @@ pub(crate) fn two_cpt_ig_depot(
     cv2: f64,
     f_bio: f64,
 ) -> f64 {
-    if ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2).is_none() {
-        return 0.0;
-    }
-    one_cpt_ig_depot(dose, tau, mat, cv2, f_bio)
+    guard_then(ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2), || {
+        one_cpt_ig_depot(dose, tau, mat, cv2, f_bio)
+    })
 }
 
 /// Peripheral-compartment concentration `A2/V2` for a single 2-cpt IG bolus at elapsed
@@ -194,18 +237,19 @@ pub(crate) fn two_cpt_ig_peripheral(
     cv2: f64,
     f_bio: f64,
 ) -> f64 {
-    if tau < 0.0 || dose.is_infusion() {
-        return 0.0;
-    }
-    let Some((alpha, beta, _k21)) = ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2) else {
-        return 0.0;
-    };
-    let abs = IgAbsorption {
-        mat,
-        lambda: mat / cv2,
-    };
-    let k12 = q / v1;
-    convolve_2cpt_peripheral(&abs, tau, alpha, beta, k12, (f_bio * dose.amt) / v2)
+    two_cpt_absorption_peripheral(
+        &IgAbsorption {
+            mat,
+            lambda: mat / cv2,
+        },
+        ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2),
+        dose,
+        tau,
+        q,
+        v1,
+        v2,
+        f_bio,
+    )
 }
 
 /// Predict concentration from a single dose at elapsed time t using 2-cmt model.

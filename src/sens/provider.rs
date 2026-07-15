@@ -65,60 +65,65 @@ pub struct SubjectSens {
     pub obs: Vec<ObsSens>,
 }
 
-/// Constant `ScalarScale` output divisor `f_scaled = f/k` on the **full** `(θ, η)` jet:
-/// every derivative is linear in `f` and `k` is constant (`∂k/∂η = ∂k/∂θ = 0`), so value,
-/// gradient, and both Hessian blocks divide by the same `k`. Matches `pk::apply_scaling`
-/// (`pred /= s`). No-op at `k == 1.0` (identity scale — skip the per-observation multiply,
-/// as the ODE and closed-form twins do). Shared by the closed-form, TV-cov, and IOV outer
-/// walks so the field set stays in sync across paths (#486).
-#[inline]
-fn scale_obs_sens_full(obs: &mut [ObsSens], k: f64) {
-    if k == 1.0 {
-        return;
+/// Shared accessor letting the constant-`ScalarScale` divide run once over both the
+/// outer full-jet ([`ObsSens`]) and the inner η-grad ([`ObsGrad`]) observation types.
+/// `for_each_scaled_axis` visits every derivative the scale multiplies by `1/k`, in the
+/// same order the two hand-written copies did: the outer visits `∂f/∂η`, `∂²f/∂η²`,
+/// `∂f/∂θ`, `∂²f/∂η∂θ`; the inner only `∂f/∂η` (that width carries no θ / Hessian block).
+trait ScalableObs {
+    fn scale_f_mut(&mut self) -> &mut f64;
+    fn for_each_scaled_axis(&mut self, f: impl FnMut(&mut f64));
+}
+
+impl ScalableObs for ObsSens {
+    #[inline]
+    fn scale_f_mut(&mut self) -> &mut f64 {
+        &mut self.f
     }
-    // Match `pk::apply_scaling` / `ScalingSpec::build_obs_scale_array`: a non-positive or
-    // non-finite scale is invalid and NaN-outs the prediction (loud-failure semantics).
-    // Multiplying by a NaN reciprocal NaNs out the whole jet (value + every derivative),
-    // keeping the analytic path in lock-step with the production predictor the FD oracle
-    // differentiates — rather than emitting an `inf`/sign-flipped jet for `k <= 0`.
-    let inv = if k.is_finite() && k > 0.0 {
-        1.0 / k
-    } else {
-        f64::NAN
-    };
-    for o in obs.iter_mut() {
-        o.f *= inv;
-        for v in o
-            .df_deta
+    #[inline]
+    fn for_each_scaled_axis(&mut self, f: impl FnMut(&mut f64)) {
+        self.df_deta
             .iter_mut()
-            .chain(o.d2f_deta2.iter_mut())
-            .chain(o.df_dtheta.iter_mut())
-            .chain(o.d2f_deta_dtheta.iter_mut())
-        {
-            *v *= inv;
-        }
+            .chain(self.d2f_deta2.iter_mut())
+            .chain(self.df_dtheta.iter_mut())
+            .chain(self.d2f_deta_dtheta.iter_mut())
+            .for_each(f);
     }
 }
 
-/// Constant `ScalarScale` divisor on the **η-only** first-order jet (inner EBE walks):
-/// `f` and each `∂f/∂η` divide by the η-independent `k`; there is no θ / Hessian block to
-/// scale here (these walks emit [`ObsGrad`], not [`ObsSens`]). The grad-only counterpart of
-/// [`scale_obs_sens_full`]; same `k == 1.0` no-op and same `pk::apply_scaling` parity (#486).
+impl ScalableObs for ObsGrad {
+    #[inline]
+    fn scale_f_mut(&mut self) -> &mut f64 {
+        &mut self.f
+    }
+    #[inline]
+    fn for_each_scaled_axis(&mut self, f: impl FnMut(&mut f64)) {
+        self.df_deta.iter_mut().for_each(f);
+    }
+}
+
+/// Divide a subject's jet by a constant `ScalarScale` output divisor `k` (`f_scaled = f/k`)
+/// in place, on either observation width. Every derivative is linear in `f` and `k` is
+/// constant (`∂k/∂η = ∂k/∂θ = 0`), so value, gradient, and (for the outer width) both
+/// Hessian blocks divide by the same `k`. Matches `pk::apply_scaling` (`pred /= s`); no-op
+/// at `k == 1.0`. Per `pk::apply_scaling` / `ScalingSpec::build_obs_scale_array`, a
+/// non-positive or non-finite scale is invalid and NaN-outs the whole jet (loud-failure
+/// semantics) rather than emitting an `inf`/sign-flipped jet, keeping the analytic path in
+/// lock-step with the production predictor the FD oracle differentiates. Shared by the
+/// closed-form, TV-cov, and IOV outer/inner walks so the field set stays in sync (#486).
 #[inline]
-fn scale_obs_sens_grad(obs: &mut [ObsGrad], k: f64) {
+fn scale_obs_sens<J: ScalableObs>(obs: &mut [J], k: f64) {
     if k == 1.0 {
         return;
     }
-    // Invalid (`k <= 0` / non-finite) scale NaN-outs the jet, matching `pk::apply_scaling`
-    // (see `scale_obs_sens_full`).
     let inv = if k.is_finite() && k > 0.0 {
         1.0 / k
     } else {
         f64::NAN
     };
     for o in obs.iter_mut() {
-        o.f *= inv;
-        o.df_deta.iter_mut().for_each(|x| *x *= inv);
+        *o.scale_f_mut() *= inv;
+        o.for_each_scaled_axis(|v| *v *= inv);
     }
 }
 
@@ -216,6 +221,159 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
     } else {
         None
     }
+}
+
+/// The seven PK-class booleans that select which closed-form concentration kernel a dose
+/// superposition dispatches to. Bundled into one `Copy` argument so [`superpose_doses`]
+/// takes it in place of seven flags, and the outer ([`run_obs`]) and inner
+/// ([`run_obs_grad`]) walkers build it from the same field set.
+#[derive(Clone, Copy)]
+struct PkClassFlags {
+    oral: bool,
+    two_cpt: bool,
+    three_cpt: bool,
+    transit: bool,
+    two_cpt_transit: bool,
+    ig: bool,
+    two_cpt_ig: bool,
+}
+
+/// The 14 PK-parameter duals a dose superposition reads, seeded once from `seed_dim`
+/// (which slot maps to which compact dual axis; `None` = constant). Generic over the
+/// seeded number type so the outer walker instantiates it at `Dual2<N>` (full `(θ,η)`
+/// jet + Hessian) and the inner at `Dual1<N>` (η-gradient only) from identical code.
+/// `lag_val` is kept alongside `lag_d` so the lagged-arrival reset test can branch on the
+/// plain value without a borrow.
+struct SeededPkDuals<T: PkNum> {
+    cl_d: T,
+    v1_d: T,
+    q_d: T,
+    v2_d: T,
+    ka_d: T,
+    f_d: T,
+    q3_d: T,
+    v3_d: T,
+    lag_d: T,
+    lag_val: f64,
+    n_d: T,
+    mtt_d: T,
+    mat_d: T,
+    cv2_d: T,
+}
+
+impl<T: PkNum> SeededPkDuals<T> {
+    /// Seed each PK slot as an independent dual axis (`seed_dim[slot] = Some(k)`) or a
+    /// constant (`None`), reading the values off `pk`. Mirrors the per-slot `dv` closure
+    /// the two walkers previously inlined verbatim.
+    fn seed(seed_dim: &[Option<usize>; N_PK], pk: &crate::types::PkParams) -> Self {
+        let dv = |slot: usize, value: f64| -> T {
+            match seed_dim[slot] {
+                Some(k) => T::var(value, k),
+                None => T::from_f64(value),
+            }
+        };
+        let lag_val = pk.lagtime();
+        Self {
+            cl_d: dv(PK_IDX_CL, pk.cl()),
+            v1_d: dv(PK_IDX_V, pk.v()),
+            q_d: dv(PK_IDX_Q, pk.q()),
+            v2_d: dv(PK_IDX_V2, pk.v2()),
+            ka_d: dv(PK_IDX_KA, pk.ka()),
+            f_d: dv(PK_IDX_F, pk.f_bio()),
+            q3_d: dv(PK_IDX_Q3, pk.q3()),
+            v3_d: dv(PK_IDX_V3, pk.v3()),
+            lag_d: dv(PK_IDX_LAGTIME, lag_val),
+            lag_val,
+            n_d: dv(PK_IDX_N, pk.n_transit()),
+            mtt_d: dv(PK_IDX_MTT, pk.mtt()),
+            mat_d: dv(PK_IDX_MAT, pk.mat()),
+            cv2_d: dv(PK_IDX_CV2, pk.cv2()),
+        }
+    }
+}
+
+/// Seed the full `N_PK`-slot PK-parameter dual array the analytic Form-C readout reads
+/// (indexed by PK slot, so `eval_output_g` can pull `V`, binding constants, … via its
+/// `indiv_to_pk` plan). Same per-slot var/constant seeding as [`SeededPkDuals::seed`],
+/// over every slot. Generic so the outer/inner walkers build it at `Dual2<N>`/`Dual1<N>`.
+fn ro_pk_dual_array<T: PkNum>(
+    seed_dim: &[Option<usize>; N_PK],
+    pk: &crate::types::PkParams,
+) -> [T; N_PK] {
+    std::array::from_fn(|s| {
+        let val = pk.values.get(s).copied().unwrap_or(0.0);
+        match seed_dim[s] {
+            Some(k) => T::var(val, k),
+            None => T::from_f64(val),
+        }
+    })
+}
+
+/// The reset segment floor at `t_obs`: the most recent EVID=3/4 reset at or before this
+/// observation (`−∞` when the subject has no resets). Doses before it were zeroed out of
+/// the compartments, so the superposition excludes them — mirroring the event-driven
+/// walker's `event_reset_floor`.
+#[inline]
+fn reset_floor_at(subject: &Subject, t_obs: f64) -> f64 {
+    subject
+        .reset_times
+        .iter()
+        .copied()
+        .filter(|&r| r <= t_obs)
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// Superpose one observation's dose contributions through the closed-form PK kernel the
+/// `flags` select: `f = Σ conc(dose, elapsed)`, restricted to the current reset segment
+/// (`dose.time + lag < reset_floor` excludes washed-out doses, keyed on the *lagged
+/// arrival* — a dose recorded before a reset but arriving after it via lagtime still
+/// contributes, exactly as the event-driven walk applies it, PR #381 #2). `elapsed`
+/// carries the lagtime shift and the SS pre-arrival tail wrap ([`lagged_elapsed`]).
+/// Generic over the seeded dual type, so the `Dual2` outer ([`run_obs`]) and `Dual1`
+/// inner ([`run_obs_grad`]) walkers share the byte-identical dispatch ladder.
+#[inline]
+fn superpose_doses<T: PkNum>(
+    d: &SeededPkDuals<T>,
+    flags: PkClassFlags,
+    subject: &Subject,
+    t_obs: f64,
+    reset_floor: f64,
+) -> T {
+    let mut fd = T::from_f64(0.0);
+    for dose in &subject.doses {
+        if dose.time + d.lag_val < reset_floor {
+            continue;
+        }
+        let Some(elapsed) = lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) else {
+            continue;
+        };
+        let c = if flags.transit {
+            one_cpt_transit_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.n_d, d.mtt_d, d.f_d)
+        } else if flags.two_cpt_transit {
+            two_cpt_transit_conc_g(
+                dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.n_d, d.mtt_d, d.f_d,
+            )
+        } else if flags.ig {
+            one_cpt_ig_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.mat_d, d.cv2_d, d.f_d)
+        } else if flags.two_cpt_ig {
+            two_cpt_ig_conc_g(
+                dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.mat_d, d.cv2_d, d.f_d,
+            )
+        } else if flags.three_cpt {
+            three_cpt_conc_g(
+                dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.q3_d, d.v3_d, d.ka_d, d.f_d,
+                flags.oral,
+            )
+        } else if flags.two_cpt {
+            two_cpt_conc_g(
+                dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.ka_d, d.f_d, flags.oral,
+            )
+        } else {
+            one_cpt_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.ka_d, d.f_d, flags.oral)
+        };
+        fd = fd + c;
+    }
+    fd
 }
 
 /// Master switch for the user-ODE sensitivity path (issue #367, Option A). The
@@ -410,6 +568,48 @@ fn eval_readout_jet<T: crate::sens::num::PkNum>(
     ro_state.resize(n_states, T::from_f64(0.0));
     ro_state[central_slot] = conc * params[PK_IDX_V];
     prog.eval_output_g::<T>(ro_state, params, cov, ro_vars, ro_stack)
+}
+
+/// Apply the analytic Form-C readout (#650) to one observation's (already clamped)
+/// concentration jet: replace `conc` with `y = <expr>` over the seeded dual (central
+/// amount = conc × V), under this observation's `ModelTimeGuard` so a `TIME`-referencing
+/// readout resolves `Op::PushTime` to `t_obs` (matching production's
+/// `apply_analytic_readout` guard; a no-op for a `TIME`-free readout). Returns `conc`
+/// unchanged with no readout, touching the covariate/time snapshots only on the readout
+/// path. Generic over the dual width, so the `Dual2` outer ([`run_obs`]) and `Dual1` inner
+/// ([`run_obs_grad`]) walkers share the guard/eval wiring (#637); the resulting `∂y/∂pk`
+/// (and `∂²y/∂pk²` on the outer width) then rides the same `pd`/`dp_deta` chain.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn apply_readout_jet<T: PkNum>(
+    conc: T,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
+    ro_pk_duals: Option<&[T; N_PK]>,
+    subject: &Subject,
+    obs_i: usize,
+    ro_state: &mut Vec<T>,
+    ro_vars: &mut Vec<T>,
+    ro_stack: &mut Vec<T>,
+) -> T {
+    if let (Some(prog), Some(pkd)) = (readout, ro_pk_duals) {
+        // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
+        // thread-local; enter this observation's time to match production's
+        // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(
+            subject.obs_times.get(obs_i).copied().unwrap_or(0.0),
+        );
+        eval_readout_jet::<T>(
+            prog,
+            conc,
+            pkd,
+            subject.obs_cov(obs_i),
+            ro_state,
+            ro_vars,
+            ro_stack,
+        )
+    } else {
+        conc
+    }
 }
 
 /// κ = 0 (BSV-only) readout-parameter snapshots for the analytic IOV walk (#655).
@@ -1926,7 +2126,7 @@ fn run_obs_iov<const M: usize>(
     // entry (value, gradient, Hessian) divides by the same `k` — the IOV twin of the non-IOV
     // `f_scaled = f/k` and production `apply_scaling` (#486 IOV-scope parity).
     if let ScalingSpec::ScalarScale(k) = model.scaling {
-        scale_obs_sens_full(&mut obs_out, k);
+        scale_obs_sens(&mut obs_out, k);
     }
 
     Some(SubjectSens { obs: obs_out })
@@ -2199,7 +2399,7 @@ fn run_obs_iov_eta<const N: usize>(
     // Constant `ScalarScale` output divisor `f/k` (first-order): `f` and each `∂f/∂stacked-η`
     // divide by `k` (#486 IOV-scope parity — the inner twin of the `run_obs_iov` step).
     if let ScalingSpec::ScalarScale(k) = model.scaling {
-        scale_obs_sens_grad(&mut out, k);
+        scale_obs_sens(&mut out, k);
     }
 
     Some(out)
@@ -2693,7 +2893,7 @@ pub fn subject_sensitivities_tvcov(
     // linear in `f` and `k` is constant, so the whole jet divides by `k` — matches
     // `pk::apply_scaling` (`pred /= s`) on the production TV-cov path.
     if let ScalingSpec::ScalarScale(k) = model.scaling {
-        scale_obs_sens_full(&mut sens.obs, k);
+        scale_obs_sens(&mut sens.obs, k);
     }
     // η-dependent `ExpressionScale` divisor `s(θ, η)`: apply the subject-static quotient
     // `scaled_f = f/s` on the walked jet — the SAME shared quotient the dose-superposition
@@ -3108,7 +3308,7 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     // matching the outer TV-cov path and `pk::apply_scaling`. (LTBS keeps the FD inner —
     // gated upstream; `ExpressionScale` is applied below.)
     if let ScalingSpec::ScalarScale(k) = model.scaling {
-        scale_obs_sens_grad(&mut out, k);
+        scale_obs_sens(&mut out, k);
     }
     // η-dependent `ExpressionScale` divisor: the η-only quotient — the light counterpart
     // of the outer path, matching the static inner path (#486). Subject-static scale from
@@ -3689,7 +3889,7 @@ fn subject_eta_grad_impl(
     // linear in `f` so it divides by the same `k` (η-independent). Matches
     // `pk::apply_scaling` (`pred /= s`). Other scaling variants are gated out.
     if let ScalingSpec::ScalarScale(k) = model.scaling {
-        scale_obs_sens_grad(&mut out, k);
+        scale_obs_sens(&mut out, k);
     }
     // η-dependent `ExpressionScale` output divisor `s(θ, η)`: `f_scaled = f/s`, with the
     // η-only quotient rule `∂(f/s)/∂η_k = (∂f/∂η_k)/s − f·(∂s/∂η_k)/s²`. The light
@@ -3740,95 +3940,28 @@ fn run_obs_grad<const N: usize>(
     n_eta: usize,
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Vec<ObsGrad> {
-    let (cl, v1, q, v2, ka, f_bio, q3, v3) = (
-        pk.cl(),
-        pk.v(),
-        pk.q(),
-        pk.v2(),
-        pk.ka(),
-        pk.f_bio(),
-        pk.q3(),
-        pk.v3(),
-    );
-    let dv = |slot: usize, value: f64| -> Dual1<N> {
-        match seed_dim[slot] {
-            Some(k) => Dual1::<N>::var(value, k),
-            None => Dual1::<N>::constant(value),
-        }
+    let seeded = SeededPkDuals::<Dual1<N>>::seed(seed_dim, pk);
+    let flags = PkClassFlags {
+        oral,
+        two_cpt,
+        three_cpt,
+        transit,
+        two_cpt_transit,
+        ig,
+        two_cpt_ig,
     };
-    let cl_d = dv(PK_IDX_CL, cl);
-    let v1_d = dv(PK_IDX_V, v1);
-    let q_d = dv(PK_IDX_Q, q);
-    let v2_d = dv(PK_IDX_V2, v2);
-    let ka_d = dv(PK_IDX_KA, ka);
-    let f_d = dv(PK_IDX_F, f_bio);
-    let q3_d = dv(PK_IDX_Q3, q3);
-    let v3_d = dv(PK_IDX_V3, v3);
-    // Lagtime enters each dose's concentration through the elapsed-time argument
-    // (`elapsed = (t_obs − dose.time) − lagtime`), so seed it as its own dual axis.
-    let lag_val = pk.lagtime();
-    let lag_d = dv(PK_IDX_LAGTIME, lag_val);
-    // Transit `n`/`mtt` (#386) and IG `mat`/`cv2` (#790), seeded like the other
-    // structural params.
-    let n_d = dv(PK_IDX_N, pk.n_transit());
-    let mtt_d = dv(PK_IDX_MTT, pk.mtt());
-    let mat_d = dv(PK_IDX_MAT, pk.mat());
-    let cv2_d = dv(PK_IDX_CV2, pk.cv2());
 
     // Analytic Form C readout (#650): PK-slot dual vector + scratch, built once
     // (subject-static). Mirrors the outer `run_obs`, on `Dual1<N>` (η-grad only).
-    let ro_pk_duals: Option<[Dual1<N>; N_PK]> = readout.map(|_| {
-        std::array::from_fn(|s| {
-            let val = pk.values.get(s).copied().unwrap_or(0.0);
-            match seed_dim[s] {
-                Some(k) => Dual1::<N>::var(val, k),
-                None => Dual1::<N>::constant(val),
-            }
-        })
-    });
+    let ro_pk_duals: Option<[Dual1<N>; N_PK]> =
+        readout.map(|_| ro_pk_dual_array::<Dual1<N>>(seed_dim, pk));
     let mut ro_state: Vec<Dual1<N>> = Vec::new();
     let mut ro_vars: Vec<Dual1<N>> = Vec::new();
     let mut ro_stack: Vec<Dual1<N>> = Vec::new();
     let mut out = Vec::with_capacity(subject.obs_times.len());
     for (obs_i, &t_obs) in subject.obs_times.iter().enumerate() {
-        let reset_floor = subject
-            .reset_times
-            .iter()
-            .copied()
-            .filter(|&r| r <= t_obs)
-            .fold(f64::NEG_INFINITY, f64::max);
-
-        let mut fd = Dual1::<N>::constant(0.0);
-        for dose in &subject.doses {
-            // Exclude doses washed out by a reset — keyed on the *lagged arrival*
-            // `dose.time + lag`, not the record time: a dose recorded before a
-            // reset but arriving after it (via lagtime) contributes to the new
-            // segment, exactly as the event-driven walk applies it (PR #381 #2).
-            if dose.time + lag_val < reset_floor {
-                continue;
-            }
-            let Some(elapsed) = lagged_elapsed(dose, t_obs, lag_val, lag_d) else {
-                continue;
-            };
-            let c = if transit {
-                one_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, n_d, mtt_d, f_d)
-            } else if two_cpt_transit {
-                two_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, n_d, mtt_d, f_d)
-            } else if ig {
-                one_cpt_ig_conc_g(dose, elapsed, cl_d, v1_d, mat_d, cv2_d, f_d)
-            } else if two_cpt_ig {
-                two_cpt_ig_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, mat_d, cv2_d, f_d)
-            } else if three_cpt {
-                three_cpt_conc_g(
-                    dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
-                )
-            } else if two_cpt {
-                two_cpt_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, ka_d, f_d, oral)
-            } else {
-                one_cpt_conc_g(dose, elapsed, cl_d, v1_d, ka_d, f_d, oral)
-            };
-            fd = fd + c;
-        }
+        let reset_floor = reset_floor_at(subject, t_obs);
+        let fd = superpose_doses(&seeded, flags, subject, t_obs, reset_floor);
 
         // Mirror production's `conc.max(0.0)`: a negative closed-form value clamps
         // to 0, so its η-gradient is 0 there too (consistency with the objective).
@@ -3839,32 +3972,23 @@ fn run_obs_grad<const N: usize>(
         };
 
         // Analytic Form C readout (#650): replace the central concentration with
-        // `y = <expr>` over `Dual1<N>` (central amount = conc × V), mirroring the
-        // outer `run_obs`. Its `∂y/∂pk` then rides the `dp_deta` chain below.
-        let (fval, g) = if let (Some(prog), Some(pkd)) = (readout, ro_pk_duals.as_ref()) {
-            let conc = Dual1::<N> {
-                value: fval,
-                grad: g,
-            };
-            // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
-            // thread-local; enter this observation's time to match production's
-            // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
-            let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(
-                subject.obs_times.get(obs_i).copied().unwrap_or(0.0),
-            );
-            let y = eval_readout_jet::<Dual1<N>>(
-                prog,
-                conc,
-                pkd,
-                subject.obs_cov(obs_i),
-                &mut ro_state,
-                &mut ro_vars,
-                &mut ro_stack,
-            );
-            (y.value, y.grad)
-        } else {
-            (fval, g)
+        // `y = <expr>` over `Dual1<N>` (central amount = conc × V), mirroring the outer
+        // `run_obs`. Its `∂y/∂pk` then rides the `dp_deta` chain below.
+        let conc = Dual1::<N> {
+            value: fval,
+            grad: g,
         };
+        let y = apply_readout_jet(
+            conc,
+            readout,
+            ro_pk_duals.as_ref(),
+            subject,
+            obs_i,
+            &mut ro_state,
+            &mut ro_vars,
+            &mut ro_stack,
+        );
+        let (fval, g) = (y.value, y.grad);
 
         let mut df_deta = vec![0.0; n_eta];
         for i in 0..N {
@@ -4820,7 +4944,7 @@ fn subject_sensitivities_impl(
     // linear in `f` and `k` is constant (`∂k/∂η = ∂k/∂θ = 0`), so the whole jet
     // divides by `k`. Matches `pk::apply_scaling` (`pred /= s`).
     if let ScalingSpec::ScalarScale(k) = model.scaling {
-        scale_obs_sens_full(&mut sens.obs, k);
+        scale_obs_sens(&mut sens.obs, k);
     }
     // ExpressionScale: divide by a per-subject scale `s(θ, η)` whose own jet is
     // computed exactly from the differentiable scale program; quotient-combine
@@ -5032,18 +5156,20 @@ fn run_obs<const N: usize>(
         pk.q3(),
         pk.v3(),
     );
+    let flags = PkClassFlags {
+        oral,
+        two_cpt,
+        three_cpt,
+        transit,
+        two_cpt_transit,
+        ig,
+        two_cpt_ig,
+    };
     // Analytic Form C readout (#650): the PK-parameter dual vector (indexed by PK
     // slot, so `eval_output_g` can pull `V`, binding constants, … via its
     // `indiv_to_pk` plan) and reusable scratch. Subject-static, so built once.
-    let ro_pk_duals: Option<[Dual2<N>; N_PK]> = readout.map(|_| {
-        std::array::from_fn(|s| {
-            let val = pk.values.get(s).copied().unwrap_or(0.0);
-            match seed_dim[s] {
-                Some(k) => Dual2::<N>::var(val, k),
-                None => Dual2::<N>::constant(val),
-            }
-        })
-    });
+    let ro_pk_duals: Option<[Dual2<N>; N_PK]> =
+        readout.map(|_| ro_pk_dual_array::<Dual2<N>>(seed_dim, pk));
     let mut ro_state: Vec<Dual2<N>> = Vec::new();
     let mut ro_vars: Vec<Dual2<N>> = Vec::new();
     let mut ro_stack: Vec<Dual2<N>> = Vec::new();
@@ -5055,12 +5181,7 @@ fn run_obs<const N: usize>(
         // superposition below — mirroring the event-driven walker's
         // `event_reset_floor`. A reset+dose record (EVID=4) sits exactly at the
         // floor and is kept (`dose.time >= reset_floor`).
-        let reset_floor = subject
-            .reset_times
-            .iter()
-            .copied()
-            .filter(|&r| r <= t_obs)
-            .fold(f64::NEG_INFINITY, f64::max);
+        let reset_floor = reset_floor_at(subject, t_obs);
 
         // `(f, ∂f/∂pk, ∂²f/∂pk²)` in the compact `0..N` layout — from the explicit
         // kernels when applicable, else the generic `Dual2<N>` path.
@@ -5080,64 +5201,11 @@ fn run_obs<const N: usize>(
             }
             (val, gv, hv)
         } else {
-            // Seed only the differentiated PK params as `Dual2<N>` on their compact
-            // axes; everything else is a constant. `dv(slot, value)` does the lookup.
-            let dv = |slot: usize, value: f64| -> Dual2<N> {
-                match seed_dim[slot] {
-                    Some(k) => Dual2::<N>::var(value, k),
-                    None => Dual2::<N>::constant(value),
-                }
-            };
-            let cl_d = dv(PK_IDX_CL, cl);
-            let v1_d = dv(PK_IDX_V, v1);
-            let q_d = dv(PK_IDX_Q, q);
-            let v2_d = dv(PK_IDX_V2, v2);
-            let ka_d = dv(PK_IDX_KA, ka);
-            let f_d = dv(PK_IDX_F, f_bio);
-            let q3_d = dv(PK_IDX_Q3, q3);
-            let v3_d = dv(PK_IDX_V3, v3);
-            // Lagtime enters each dose's concentration through the elapsed-time
-            // argument; seed it as its own dual axis (`∂elapsed/∂lagtime = −1`).
-            let lag_val = pk.lagtime();
-            let lag_d = dv(PK_IDX_LAGTIME, lag_val);
-            // Transit `n`/`mtt` (#386) and IG `mat`/`cv2` (#790), seeded like the
-            // other structural params.
-            let n_d = dv(PK_IDX_N, pk.n_transit());
-            let mtt_d = dv(PK_IDX_MTT, pk.mtt());
-            let mat_d = dv(PK_IDX_MAT, pk.mat());
-            let cv2_d = dv(PK_IDX_CV2, pk.cv2());
-
-            // Superpose dose contributions: f = Σ conc(dose, elapsed), restricted
-            // to the current reset segment (`dose.time >= reset_floor`); `elapsed`
+            // Seed only the differentiated PK params as `Dual2<N>` and superpose the
+            // dose contributions restricted to the current reset segment; `elapsed`
             // carries the lagtime shift and the SS pre-arrival tail wrap.
-            let mut fd = Dual2::<N>::constant(0.0);
-            for dose in &subject.doses {
-                // Lagged-arrival reset exclusion — see the value path above (#2).
-                if dose.time + lag_val < reset_floor {
-                    continue;
-                }
-                let Some(elapsed) = lagged_elapsed(dose, t_obs, lag_val, lag_d) else {
-                    continue;
-                };
-                let c = if transit {
-                    one_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, n_d, mtt_d, f_d)
-                } else if two_cpt_transit {
-                    two_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, n_d, mtt_d, f_d)
-                } else if ig {
-                    one_cpt_ig_conc_g(dose, elapsed, cl_d, v1_d, mat_d, cv2_d, f_d)
-                } else if two_cpt_ig {
-                    two_cpt_ig_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, mat_d, cv2_d, f_d)
-                } else if three_cpt {
-                    three_cpt_conc_g(
-                        dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
-                    )
-                } else if two_cpt {
-                    two_cpt_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, ka_d, f_d, oral)
-                } else {
-                    one_cpt_conc_g(dose, elapsed, cl_d, v1_d, ka_d, f_d, oral)
-                };
-                fd = fd + c;
-            }
+            let seeded = SeededPkDuals::<Dual2<N>>::seed(seed_dim, pk);
+            let fd = superpose_doses(&seeded, flags, subject, t_obs, reset_floor);
             (fd.value, fd.grad, fd.hess)
         };
 
@@ -5153,37 +5221,28 @@ fn run_obs<const N: usize>(
             (fval, g, h)
         };
 
-        // Analytic Form C readout (#650): replace the central concentration jet
-        // with `y = <expr>` over `Dual2<N>`. The central compartment **amount** is
-        // `concentration × V` (so a `central / V` readout recovers the
-        // concentration and an additive term layers on); the readout's `∂y/∂pk` /
-        // `∂²y/∂pk²` then ride the same `pd` chain to `(θ, η)` below. Covariates
-        // come from the per-observation snapshot (a per-row `FREE`-style flag).
-        let (fval, g, h) = if let (Some(prog), Some(pkd)) = (readout, ro_pk_duals.as_ref()) {
-            let conc = Dual2::<N> {
-                value: fval,
-                grad: g,
-                hess: h,
-            };
-            // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
-            // thread-local; enter this observation's time to match production's
-            // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
-            let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(
-                subject.obs_times.get(obs_i).copied().unwrap_or(0.0),
-            );
-            let y = eval_readout_jet::<Dual2<N>>(
-                prog,
-                conc,
-                pkd,
-                subject.obs_cov(obs_i),
-                &mut ro_state,
-                &mut ro_vars,
-                &mut ro_stack,
-            );
-            (y.value, y.grad, y.hess)
-        } else {
-            (fval, g, h)
+        // Analytic Form C readout (#650): replace the central concentration jet with
+        // `y = <expr>` over `Dual2<N>`. The central compartment **amount** is
+        // `concentration × V` (so a `central / V` readout recovers the concentration and
+        // an additive term layers on); the readout's `∂y/∂pk` / `∂²y/∂pk²` then ride the
+        // same `pd` chain to `(θ, η)` below. Covariates come from the per-observation
+        // snapshot (a per-row `FREE`-style flag).
+        let conc = Dual2::<N> {
+            value: fval,
+            grad: g,
+            hess: h,
         };
+        let y = apply_readout_jet(
+            conc,
+            readout,
+            ro_pk_duals.as_ref(),
+            subject,
+            obs_i,
+            &mut ro_state,
+            &mut ro_vars,
+            &mut ro_stack,
+        );
+        let (fval, g, h) = (y.value, y.grad, y.hess);
 
         let mut df_deta = vec![0.0; n_eta];
         let mut d2f_deta2 = vec![0.0; n_eta * n_eta];

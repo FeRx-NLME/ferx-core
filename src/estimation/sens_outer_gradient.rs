@@ -673,6 +673,66 @@ fn mag_alpha_dtheta(et: &ErrTerms, m: usize) -> f64 {
         + ((r - eps * eps) * inv_r2) * d_th
 }
 
+/// Residual variance `R` and its `f`-derivative `d = ∂R/∂f` for one observation,
+/// dispatching on whether a custom σ-magnitude is active (`mult_row = Some`): the
+/// scaled closed forms when it is, the legacy ones when it is not (`None` keeps
+/// the exact `variance_at`/`dvar_df` association bit-for-bit — the `_scaled`
+/// variants reassociate the `f`-dependent term by ~1 ULP). Callers apply
+/// `ruv_scale` (and any FD combination) at the call site so float association is
+/// unchanged. Diagonal-`R` only (`block_sigma` correlations force FD upstream).
+#[inline]
+fn variance_rd(
+    es: &crate::types::ErrorSpec,
+    cmt: usize,
+    f: f64,
+    sigma: &[f64],
+    mult_row: Option<&[f64]>,
+) -> (f64, f64) {
+    match mult_row {
+        Some(m) => (
+            es.variance_at_scaled(cmt, f, sigma, &[], m),
+            es.dvar_df_scaled(cmt, f, sigma, m),
+        ),
+        None => (es.variance_at(cmt, f, sigma), es.dvar_df(cmt, f, sigma)),
+    }
+}
+
+/// [`variance_rd`] plus the second `f`-derivative `d2 = ∂²R/∂f²`.
+#[inline]
+fn variance_rd2(
+    es: &crate::types::ErrorSpec,
+    cmt: usize,
+    f: f64,
+    sigma: &[f64],
+    mult_row: Option<&[f64]>,
+) -> (f64, f64, f64) {
+    match mult_row {
+        Some(m) => (
+            es.variance_at_scaled(cmt, f, sigma, &[], m),
+            es.dvar_df_scaled(cmt, f, sigma, m),
+            es.d2var_df2_scaled(cmt, sigma, m),
+        ),
+        None => (
+            es.variance_at(cmt, f, sigma),
+            es.dvar_df(cmt, f, sigma),
+            es.d2var_df2(cmt, sigma),
+        ),
+    }
+}
+
+/// The σ-EBE-response data-term coefficient derivative for one observation:
+/// `∂α/∂σ = [2ε/R² + d(2ε²−R)/R³]·Rσ + [(R−ε²)/R²]·dσ`, given `(r, d, eps)` and the
+/// σ-FD slopes `r_sig = ∂R/∂σ`, `d_sig = ∂d/∂σ`. The σ mirror of [`mag_alpha_dtheta`],
+/// shared by the three σ-blocks (`sigma_block`, `subject_eta_dx{,_iov}`).
+#[inline]
+fn dalpha_dsigma(r: f64, d: f64, eps: f64, r_sig: f64, d_sig: f64) -> f64 {
+    let inv_r = 1.0 / r;
+    let inv_r2 = inv_r * inv_r;
+    let inv_r3 = inv_r2 * inv_r;
+    (2.0 * eps * inv_r2 + d * (2.0 * eps * eps - r) * inv_r3) * r_sig
+        + ((r - eps * eps) * inv_r2) * d_sig
+}
+
 /// [`prepare`] generalized over the random-effect dimension and prior precision,
 /// so it serves both the non-IOV path (`n_eta = model.n_eta`, `Ω⁻¹ = params.omega.inv`)
 /// and the **IOV** path, where the random effects are the stacked
@@ -937,21 +997,8 @@ pub(crate) fn score_core(
             (Some(v), _) => (v, 0.0, 0.0),
             (None, Some((rv, dv, d2v))) => (rv[j], dv[j], d2v[j]),
             (None, None) => {
-                let r = match mult_row {
-                    Some(m) => {
-                        model.error_spec.variance_at_scaled(cmt, f, sigma, &[], m) * ruv_scale
-                    }
-                    None => model.error_spec.variance_at(cmt, f, sigma) * ruv_scale,
-                };
-                let d = match mult_row {
-                    Some(m) => model.error_spec.dvar_df_scaled(cmt, f, sigma, m) * ruv_scale,
-                    None => model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale,
-                };
-                let d2 = match mult_row {
-                    Some(m) => model.error_spec.d2var_df2_scaled(cmt, sigma, m) * ruv_scale,
-                    None => model.error_spec.d2var_df2(cmt, sigma) * ruv_scale,
-                };
-                (r, d, d2)
+                let (r, d, d2) = variance_rd2(&model.error_spec, cmt, f, sigma, mult_row);
+                (r * ruv_scale, d * ruv_scale, d2 * ruv_scale)
             }
         };
         if !(r.is_finite() && r > 0.0) {
@@ -1667,20 +1714,11 @@ fn sigma_block(
             } else {
                 let (vp, vm, dp_var, dm_var) = match (&corr_sp, &corr_sm) {
                     (Some((rvp, dvp)), Some((rvm, dvm))) => (rvp[j], rvm[j], dvp[j], dvm[j]),
-                    _ => match mult_row {
-                        Some(m) => (
-                            model.error_spec.variance_at_scaled(cmt, f, &sp, &[], m),
-                            model.error_spec.variance_at_scaled(cmt, f, &sm, &[], m),
-                            model.error_spec.dvar_df_scaled(cmt, f, &sp, m),
-                            model.error_spec.dvar_df_scaled(cmt, f, &sm, m),
-                        ),
-                        None => (
-                            model.error_spec.variance_at(cmt, f, &sp),
-                            model.error_spec.variance_at(cmt, f, &sm),
-                            model.error_spec.dvar_df(cmt, f, &sp),
-                            model.error_spec.dvar_df(cmt, f, &sm),
-                        ),
-                    },
+                    _ => {
+                        let (vp, dp_var) = variance_rd(&model.error_spec, cmt, f, &sp, mult_row);
+                        let (vm, dm_var) = variance_rd(&model.error_spec, cmt, f, &sm, mult_row);
+                        (vp, vm, dp_var, dm_var)
+                    }
                 };
                 // ∂R/∂σ_k, ∂d/∂σ_k by central FD. `et.r`/`et.d` carry the `exp(2·η_ruv)`
                 // scale, so lift these too.
@@ -1711,8 +1749,7 @@ fn sigma_block(
             fixed += 0.5 * dp * prep.q[j];
 
             // ∂α/∂σ = [2ε/R² + d(2ε²−R)/R³] Rσ + [(R−ε²)/R²] dσ
-            let dalpha = (2.0 * eps * inv_r2 + d * (2.0 * eps * eps - r) * inv_r3) * r_sig
-                + ((r - eps * eps) * inv_r2) * d_sig;
+            let dalpha = dalpha_dsigma(r, d, eps, r_sig, d_sig);
             for m in 0..n_eta {
                 m_vec[m] += 0.5 * dalpha * obs.df_deta[m];
             }
@@ -2222,19 +2259,7 @@ pub fn subject_packed_gradient_foce(
         let (r, dd) = match (frem_r0, &corr_rd0) {
             (Some(v), _) => (v, 0.0),
             (None, Some((rv, dv, _))) => (rv[j], dv[j]),
-            (None, None) => {
-                let r = match mult_row {
-                    Some(mm) => model
-                        .error_spec
-                        .variance_at_scaled(cmt, f0act, sigma, &[], mm),
-                    None => model.error_spec.variance_at(cmt, f0act, sigma),
-                };
-                let d = match mult_row {
-                    Some(mm) => model.error_spec.dvar_df_scaled(cmt, f0act, sigma, mm),
-                    None => model.error_spec.dvar_df(cmt, f0act, sigma),
-                };
-                (r, d)
-            }
+            (None, None) => variance_rd(&model.error_spec, cmt, f0act, sigma, mult_row),
         };
         if !(r.is_finite() && r > 0.0) {
             return None;
@@ -2661,27 +2686,11 @@ pub fn subject_eta_dx_iov(
             // Magnitude-scaled `∂R/∂σ`,`∂d/∂σ` (consistent with the scaled `et.r`/`et.d`).
             let mult_row: Option<&[f64]> =
                 mult.as_ref().and_then(|mm| mm.get(j)).map(|v| v.as_slice());
-            let (var_p, var_m, dvar_p, dvar_m) = match mult_row {
-                Some(mm) => (
-                    model.error_spec.variance_at_scaled(cmt, f, &sp, &[], mm),
-                    model.error_spec.variance_at_scaled(cmt, f, &sm, &[], mm),
-                    model.error_spec.dvar_df_scaled(cmt, f, &sp, mm),
-                    model.error_spec.dvar_df_scaled(cmt, f, &sm, mm),
-                ),
-                None => (
-                    model.error_spec.variance_at(cmt, f, &sp),
-                    model.error_spec.variance_at(cmt, f, &sm),
-                    model.error_spec.dvar_df(cmt, f, &sp),
-                    model.error_spec.dvar_df(cmt, f, &sm),
-                ),
-            };
+            let (var_p, dvar_p) = variance_rd(&model.error_spec, cmt, f, &sp, mult_row);
+            let (var_m, dvar_m) = variance_rd(&model.error_spec, cmt, f, &sm, mult_row);
             let r_sig = (var_p - var_m) / (2.0 * h);
             let d_sig = (dvar_p - dvar_m) / (2.0 * h);
-            let inv_r = 1.0 / r;
-            let inv_r2 = inv_r * inv_r;
-            let inv_r3 = inv_r2 * inv_r;
-            let dalpha = (2.0 * eps * inv_r2 + d * (2.0 * eps * eps - r) * inv_r3) * r_sig
-                + ((r - eps * eps) * inv_r2) * d_sig;
+            let dalpha = dalpha_dsigma(r, d, eps, r_sig, d_sig);
             for m in 0..n_st {
                 mvec[m] += 0.5 * dalpha * obs.df_deta[m];
             }
@@ -2799,20 +2808,12 @@ pub fn subject_packed_gradient_foce_iov(
         let cmt = err_keys[j];
         let f0act = sens0.obs[j].f;
         let mult_row: Option<&[f64]> = mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
-        let r = match mult_row {
-            Some(mm) => model
-                .error_spec
-                .variance_at_scaled(cmt, f0act, sigma, &[], mm),
-            None => model.error_spec.variance_at(cmt, f0act, sigma),
-        };
+        let (r, d) = variance_rd(&model.error_spec, cmt, f0act, sigma, mult_row);
         if !(r.is_finite() && r > 0.0) {
             return None;
         }
         r0[i] = r;
-        d0[i] = match mult_row {
-            Some(mm) => model.error_spec.dvar_df_scaled(cmt, f0act, sigma, mm),
-            None => model.error_spec.dvar_df(cmt, f0act, sigma),
-        };
+        d0[i] = d;
         if let (Some(mm), Some(mg_row)) = (mult_row, mult_grad.as_ref().and_then(|mg| mg.get(j))) {
             // Sheiner–Beal marginal only needs `∂R/∂θ` → skip the `∂d/∂θ` accumulation.
             let dr = mag_variance_dtheta(
@@ -3155,20 +3156,11 @@ pub fn subject_eta_dx(
             } else {
                 let (var_p, var_m, dvar_p, dvar_m) = match (&corr_sp, &corr_sm) {
                     (Some((rvp, dvp)), Some((rvm, dvm))) => (rvp[j], rvm[j], dvp[j], dvm[j]),
-                    _ => match mult_row {
-                        Some(mm) => (
-                            model.error_spec.variance_at_scaled(cmt, f, &sp, &[], mm),
-                            model.error_spec.variance_at_scaled(cmt, f, &sm, &[], mm),
-                            model.error_spec.dvar_df_scaled(cmt, f, &sp, mm),
-                            model.error_spec.dvar_df_scaled(cmt, f, &sm, mm),
-                        ),
-                        None => (
-                            model.error_spec.variance_at(cmt, f, &sp),
-                            model.error_spec.variance_at(cmt, f, &sm),
-                            model.error_spec.dvar_df(cmt, f, &sp),
-                            model.error_spec.dvar_df(cmt, f, &sm),
-                        ),
-                    },
+                    _ => {
+                        let (var_p, dvar_p) = variance_rd(&model.error_spec, cmt, f, &sp, mult_row);
+                        let (var_m, dvar_m) = variance_rd(&model.error_spec, cmt, f, &sm, mult_row);
+                        (var_p, var_m, dvar_p, dvar_m)
+                    }
                 };
                 let r_sig = prep.ruv_scale * (var_p - var_m) / (2.0 * h);
                 let d_sig = prep.ruv_scale * (dvar_p - dvar_m) / (2.0 * h);
@@ -3179,11 +3171,7 @@ pub fn subject_eta_dx(
                 }
                 (r_sig, d_sig)
             };
-            let inv_r = 1.0 / r;
-            let inv_r2 = inv_r * inv_r;
-            let inv_r3 = inv_r2 * inv_r;
-            let dalpha = (2.0 * eps * inv_r2 + d * (2.0 * eps * eps - r) * inv_r3) * r_sig
-                + ((r - eps * eps) * inv_r2) * d_sig;
+            let dalpha = dalpha_dsigma(r, d, eps, r_sig, d_sig);
             for m in 0..n_eta {
                 mvec[m] += 0.5 * dalpha * obs.df_deta[m];
             }

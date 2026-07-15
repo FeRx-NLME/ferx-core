@@ -124,12 +124,8 @@ fn ctmm_endpoint_nll(
     // the optimizer toward the unphysical region. Treat it as the degenerate case and
     // repel, exactly as the kernel does for an underflowed transition. The tiny
     // tolerance absorbs floating round-off on a rate that is physically zero.
-    for j in 0..q.nrows() {
-        for k in 0..q.ncols() {
-            if j != k && q[(j, k)] < -1e-12 {
-                return SUBJECT_SENTINEL_NLL;
-            }
-        }
+    if super::has_negative_offdiagonal(&q) {
+        return SUBJECT_SENTINEL_NLL;
     }
     match ctmm_data_term(&q, &obs) {
         Ok(nll) => nll,
@@ -197,12 +193,8 @@ pub fn ctmm_subject_eta_grad(
         // Same degeneracy guard as the value path (`ctmm_endpoint_nll`): a negative
         // off-diagonal makes `Q` a non-generator and the value collapses to the flat
         // sentinel, which has no derivative.
-        for j in 0..q.nrows() {
-            for k in 0..q.ncols() {
-                if j != k && q[(j, k)] < -1e-12 {
-                    return None;
-                }
-            }
+        if super::has_negative_offdiagonal(&q) {
+            return None;
         }
 
         // Project the (θ, η)-seeded jets onto the η axes. `dq` is laid out θ₀..θ_{T−1},
