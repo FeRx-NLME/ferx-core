@@ -5306,7 +5306,7 @@ mod tests {
     }
 
     /// Regression for focei-slsqp-fixed-ebe-gradient-bias: a population mixing
-    /// in-scope subjects with a single out-of-scope (distinct-slot modeled-duration) subject must still
+    /// in-scope subjects with a single out-of-scope (rate-defined infusion under F ≠ 1) subject must still
     /// yield the exact analytic gradient for the in-scope subjects, filling only
     /// the out-of-scope one with a reconverged per-subject FD. Before the fix one
     /// such subject forced `population_gradient_sens` to `None`, dropping the
@@ -5359,7 +5359,7 @@ mod tests {
             .collect();
 
         // Pre-fix behaviour: the all-or-nothing analytic gradient declines the
-        // whole population because subject 1 (distinct-slot modeled-duration) is out of scope.
+        // whole population because subject 1 (rate-defined infusion under F ≠ 1) is out of scope.
         assert!(
             population_gradient_sens(&model, &pop, &template, &x, &ehs).is_none(),
             "out-of-scope subject must take the whole population out of the all-or-nothing path"
