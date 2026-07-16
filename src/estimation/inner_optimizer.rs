@@ -1917,6 +1917,8 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // directly rather than asking a provider that has nothing to compute.
     if subject.obs_times.is_empty() {
         let eta_v = nalgebra::DVector::from_column_slice(eta);
+        // `mut` is only exercised by the markov CTMM fold below.
+        #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
         let mut grad: Vec<f64> = (&omega.inv * &eta_v).as_slice().to_vec();
         #[cfg(feature = "markov")]
         if let Some(g) = &ctmm_grad {

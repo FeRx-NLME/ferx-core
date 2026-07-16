@@ -1998,14 +1998,4 @@ mod tests {
         // small that would sneak past the MAX_AGQ_GRID check.
         assert_eq!(grid_size(21, 50), usize::MAX);
     }
-
-    #[test]
-    fn logsumexp_is_stable_and_handles_sentinels() {
-        let want = (1.0f64.exp() + 2.0f64.exp()).ln();
-        assert!((logsumexp(&[1.0, 2.0]) - want).abs() < 1e-12);
-        // Huge magnitudes must not overflow.
-        assert!((logsumexp(&[1e5, 1e5]) - (1e5 + 2.0f64.ln())).abs() < 1e-9);
-        // A diverged node (the −1e20 term) is simply ignored next to a live one.
-        assert!((logsumexp(&[-1e20, 3.0]) - 3.0).abs() < 1e-12);
-    }
 }

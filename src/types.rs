@@ -3841,19 +3841,38 @@ impl CompiledModel {
             "analytical_compartment_names called on an ODE model — use ode_spec.state_names instead"
         );
         use std::sync::OnceLock;
-        // Discriminant-indexed cache: the compartment name literals are the
-        // single source of truth in `pk::topology`; here we lazily materialise
-        // the owned `Vec<String>` the public `&'static [String]` API returns.
-        static NAMES: [OnceLock<Vec<String>>; 10] = [const { OnceLock::new() }; 10];
-        let topo = self.pk_model.topology();
-        NAMES[self.pk_model as usize]
-            .get_or_init(|| {
-                topo.compartment_names
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .as_slice()
+        // Exhaustive `match` on `pk_model` so adding an 11th `PkModel` variant is a
+        // COMPILE error here (a missing arm), not a runtime index-out-of-bounds on a
+        // fixed-size array. Each arm lazily materialises its own owned `Vec<String>`
+        // from the compartment-name literals in `pk::topology` — the single source of
+        // truth — that the public `&'static [String]` API returns.
+        macro_rules! cached_names {
+            ($lock:ident) => {{
+                static $lock: OnceLock<Vec<String>> = OnceLock::new();
+                $lock
+                    .get_or_init(|| {
+                        self.pk_model
+                            .topology()
+                            .compartment_names
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .as_slice()
+            }};
+        }
+        match self.pk_model {
+            PkModel::OneCptIv => cached_names!(ONE_CPT_IV),
+            PkModel::OneCptOral => cached_names!(ONE_CPT_ORAL),
+            PkModel::OneCptTransit => cached_names!(ONE_CPT_TRANSIT),
+            PkModel::OneCptIg => cached_names!(ONE_CPT_IG),
+            PkModel::TwoCptIv => cached_names!(TWO_CPT_IV),
+            PkModel::TwoCptOral => cached_names!(TWO_CPT_ORAL),
+            PkModel::TwoCptTransit => cached_names!(TWO_CPT_TRANSIT),
+            PkModel::TwoCptIg => cached_names!(TWO_CPT_IG),
+            PkModel::ThreeCptIv => cached_names!(THREE_CPT_IV),
+            PkModel::ThreeCptOral => cached_names!(THREE_CPT_ORAL),
+        }
     }
 }
 

@@ -45,8 +45,6 @@ pub(crate) struct PkTopology {
     /// Invariant: `== {i+1 | channels[i] == Some(_)}` (asserted by the
     /// consistency test).
     pub infusable: &'static [usize],
-    /// Absorption model (dose enters an input/depot cmt), incl. transit/IG.
-    pub is_oral: bool,
     /// Has an event-driven closed-form walk implementation (the six
     /// non-transit/IG analytical models).
     pub event_walk_supported: bool,
@@ -104,7 +102,6 @@ static ONE_CPT_IV: PkTopology = PkTopology {
     compartment_names: &["central"],
     channels: &[Some(Central)],
     infusable: &[1],
-    is_oral: false,
     event_walk_supported: true,
 };
 static ONE_CPT_ORAL: PkTopology = PkTopology {
@@ -113,25 +110,29 @@ static ONE_CPT_ORAL: PkTopology = PkTopology {
     compartment_names: &["depot", "central"],
     channels: &[Some(Depot), Some(Central)],
     infusable: &[1, 2],
-    is_oral: true,
     event_walk_supported: true,
 };
+// Transit models a bolus absorbed through the Gamma transit chain; modeled-duration
+// infusions are unsupported in v1, so a `D{cmt}` on a transit model is rejected at parse
+// (#386) — hence `infusable: &[]`. There is no event walk, so `channels: &[]` too. Do NOT
+// populate these to "fix an oversight": routing would accept a `D1` that #386 rejects.
 static ONE_CPT_TRANSIT: PkTopology = PkTopology {
     n_states: 2,
     central_slot: 1,
     compartment_names: &["depot", "central"],
     channels: &[],
     infusable: &[],
-    is_oral: true,
     event_walk_supported: false,
 };
+// Inverse-Gaussian, like transit: absorbs an instantaneous bolus through the IG
+// absorption-time density; modeled-duration infusions are unsupported, so a `D{cmt}` on an
+// IG model is rejected at parse (#790) — hence `infusable: &[]` and no walk (`channels: &[]`).
 static ONE_CPT_IG: PkTopology = PkTopology {
     n_states: 2,
     central_slot: 1,
     compartment_names: &["depot", "central"],
     channels: &[],
     infusable: &[],
-    is_oral: true,
     event_walk_supported: false,
 };
 static TWO_CPT_IV: PkTopology = PkTopology {
@@ -140,7 +141,6 @@ static TWO_CPT_IV: PkTopology = PkTopology {
     compartment_names: &["central", "peripheral"],
     channels: &[Some(Central), Some(Periph1)],
     infusable: &[1, 2],
-    is_oral: false,
     event_walk_supported: true,
 };
 static TWO_CPT_ORAL: PkTopology = PkTopology {
@@ -149,25 +149,25 @@ static TWO_CPT_ORAL: PkTopology = PkTopology {
     compartment_names: &["depot", "central", "peripheral"],
     channels: &[Some(Depot), Some(Central)],
     infusable: &[1, 2],
-    is_oral: true,
     event_walk_supported: true,
 };
+// 2-cpt transit: same as the 1-cpt transit — modeled-duration infusion rejected at parse
+// (#386), no event walk. `channels`/`infusable` intentionally empty.
 static TWO_CPT_TRANSIT: PkTopology = PkTopology {
     n_states: 3,
     central_slot: 1,
     compartment_names: &["depot", "central", "peripheral"],
     channels: &[],
     infusable: &[],
-    is_oral: true,
     event_walk_supported: false,
 };
+// 2-cpt inverse-Gaussian: same as the 1-cpt IG (#790). `channels`/`infusable` empty.
 static TWO_CPT_IG: PkTopology = PkTopology {
     n_states: 3,
     central_slot: 1,
     compartment_names: &["depot", "central", "peripheral"],
     channels: &[],
     infusable: &[],
-    is_oral: true,
     event_walk_supported: false,
 };
 static THREE_CPT_IV: PkTopology = PkTopology {
@@ -176,7 +176,6 @@ static THREE_CPT_IV: PkTopology = PkTopology {
     compartment_names: &["central", "peripheral1", "peripheral2"],
     channels: &[Some(Central), Some(Periph1), Some(Periph2)],
     infusable: &[1, 2, 3],
-    is_oral: false,
     event_walk_supported: true,
 };
 static THREE_CPT_ORAL: PkTopology = PkTopology {
@@ -185,7 +184,6 @@ static THREE_CPT_ORAL: PkTopology = PkTopology {
     compartment_names: &["depot", "central", "peripheral1", "peripheral2"],
     channels: &[Some(Depot), Some(Central)],
     infusable: &[1, 2],
-    is_oral: true,
     event_walk_supported: true,
 };
 
@@ -206,9 +204,17 @@ mod tests {
         PkModel::ThreeCptOral,
     ];
 
-    /// The three stored-but-derivable fields must agree with their canonical
-    /// derivation for every variant. This is the drift guard that lets the
-    /// descriptor be a flat literal.
+    /// Drift guard for the stored-but-derivable geometry fields.
+    ///
+    /// `n_states`/`central_slot` are pinned to their canonical derivation from
+    /// `compartment_names`. For `infusable` vs `channels` we assert only the
+    /// genuinely-invariant DIRECTION — every routable compartment must be a
+    /// parse-accepted infusion target (`channels[i].is_some() ⇒ infusable ∋ i+1`) —
+    /// NOT full equality. The two fields answer different questions (`infusable` is
+    /// the parse-time gate for `D{cmt}`/`R{cmt}`; `channels` is the walk's rate-accumulator
+    /// routing), and enforcing equality would force a future PR that legitimately accepts an
+    /// infusion into a no-walk model to invent a fake routing arm. So `infusable` may be a
+    /// superset of the channel set; it may not contain a compartment the walk can't route.
     #[test]
     fn topology_fields_are_internally_consistent() {
         for m in ALL {
@@ -222,13 +228,16 @@ mod tests {
                     .unwrap(),
                 "{m:?} central_slot"
             );
-            let derived: Vec<usize> = t
-                .channels
-                .iter()
-                .enumerate()
-                .filter_map(|(i, c)| c.map(|_| i + 1))
-                .collect();
-            assert_eq!(t.infusable, derived.as_slice(), "{m:?} infusable");
+            for (i, c) in t.channels.iter().enumerate() {
+                if c.is_some() {
+                    assert!(
+                        t.infusable.contains(&(i + 1)),
+                        "{m:?}: cmt {} is routable (channels[{i}]=Some) but not in infusable {:?}",
+                        i + 1,
+                        t.infusable
+                    );
+                }
+            }
         }
     }
 

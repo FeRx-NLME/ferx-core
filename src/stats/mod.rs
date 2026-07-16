@@ -3,4 +3,4 @@ pub mod likelihood;
 pub mod npde;
 pub mod residual_error;
 pub mod special;
-pub mod util;
+pub(crate) mod util;
