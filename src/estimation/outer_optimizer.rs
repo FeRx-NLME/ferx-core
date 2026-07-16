@@ -166,8 +166,12 @@ pub fn optimize_population(
 
 /// Pre-flight flat-theta detection (#826). Computes the outer gradient at the
 /// initial estimate and flags any non-fixed theta whose gradient is negligible
-/// relative to the largest theta gradient — i.e. a parameter that has no effect
-/// on the objective (unmapped, or dropped from the structural / scaling model).
+/// relative to the largest theta gradient, then **confirms** each candidate with a
+/// perturbation probe — only a theta that leaves the reconverged objective exactly
+/// unchanged when moved is truly unmapped and gets frozen. (A near-zero *initial*
+/// gradient alone is not sufficient: an identifiable theta can have a
+/// coincidentally-tiny gradient at the start point, and freezing it there biases
+/// the whole fit — see the probe comment below.)
 ///
 /// Returns `None` when nothing is flat (the common case; the caller keeps the
 /// borrowed `init_params` untouched), or `Some((frozen, warnings))` with a
@@ -243,8 +247,64 @@ fn freeze_flat_thetas(
         return None;
     }
 
-    let flat: Vec<usize> = (0..n_theta)
+    let candidates: Vec<usize> = (0..n_theta)
         .filter(|&i| is_free(i) && g_at(i) <= FLAT_ABS && g_at(i) <= FLAT_REL * g_max)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Confirm structural flatness with a perturbation probe before freezing. A
+    // near-zero gradient at the *initial* estimate is necessary but not sufficient
+    // for "unmapped": a genuinely-identifiable theta can have a coincidentally-tiny
+    // gradient there — e.g. an event-model hazard baseline `H0` evaluated at
+    // `BETA = 0`, where `hazard = H0·exp(0)` is momentarily flat in the coupling
+    // term, and whose ODE-path outer gradient is finite-differenced (#826 froze
+    // such an `H0` at its wrong initial value and biased the whole joint PK-TTE
+    // fit). A truly unmapped theta leaves the reconverged objective *exactly*
+    // unchanged when moved; an identifiable one moves it. Only freeze the former —
+    // freezing an identifiable theta pins it at its initial value and biases every
+    // other estimate. The probe costs one inner solve per candidate (candidates
+    // are rare), on top of the pre-flight gradient eval.
+    let base_ofv = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
+    let reconverged_ofv = |theta_i: usize, value: f64| -> f64 {
+        let mut p = params.clone();
+        p.theta[theta_i] = value;
+        let mu = compute_mu_k(model, &p.theta, options.mu_referencing);
+        let (e, h, _s, k) = run_inner_loop_warm(
+            model,
+            population,
+            &p,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&cold_etas),
+            Some(&mu),
+            options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
+        );
+        2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options)
+    };
+    // True ⇒ moving this theta changes the objective ⇒ it is identifiable, not flat.
+    let moves_objective = |i: usize| -> bool {
+        let ti = params.theta[i];
+        let (lo, hi) = (init_params.theta_lower[i], init_params.theta_upper[i]);
+        let delta = (ti.abs() * 0.5).max((hi - lo).abs() * 0.1).max(1e-2);
+        let mut probe = ti + delta;
+        if !(probe < hi) {
+            probe = ti - delta;
+        }
+        if !(probe > lo) {
+            probe = 0.5 * (lo + hi);
+        }
+        // Could not build a distinct in-bounds probe — do not freeze (safe side).
+        if (probe - ti).abs() <= 1e-12 {
+            return true;
+        }
+        (reconverged_ofv(i, probe) - base_ofv).abs() > 1e-6 * (1.0 + base_ofv.abs())
+    };
+    let flat: Vec<usize> = candidates
+        .into_iter()
+        .filter(|&i| !moves_objective(i))
         .collect();
     if flat.is_empty() {
         return None;
@@ -2893,6 +2953,53 @@ mod tests {
         assert_eq!(cov_progress_eta(100, 0, 5.0), 0.0); // no item done yet
         assert_eq!(cov_progress_eta(100, 10, 0.0), 0.0); // no wall-clock yet
         assert_eq!(cov_progress_eta(40, 40, 8.0), 0.0); // done → 0 remaining
+    }
+
+    /// `freeze_flat_thetas` freezes a genuinely-unmapped theta (`TVFLAT`, declared
+    /// but never used) — the perturbation probe confirms moving it leaves the
+    /// objective unchanged — while leaving the mapped, identifiable thetas free.
+    /// This exercises the probe machinery (#826 follow-up) at the lib level; the
+    /// complementary "identifiable-but-flat-at-init is NOT frozen" case is pinned
+    /// end-to-end by the nightly `joint_pktte_sse_recovers_pk_and_omega`.
+    #[test]
+    fn freeze_flat_thetas_freezes_only_the_unmapped_theta() {
+        use crate::parser::model_parser::parse_model_file;
+        use crate::{read_nonmem_csv, EstimationMethod, FitOptions};
+        use std::path::Path;
+
+        let model = parse_model_file(Path::new("examples/flat_theta_warfarin.ferx"))
+            .expect("flat_theta_warfarin parses");
+        let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+
+        let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &opts)
+            .expect("the unmapped TVFLAT must be detected and frozen");
+        let idx = |name: &str| {
+            model
+                .default_params
+                .theta_names
+                .iter()
+                .position(|n| n == name)
+                .unwrap_or_else(|| panic!("theta {name} not found"))
+        };
+        assert!(frozen.theta_fixed[idx("TVFLAT")], "TVFLAT must be frozen");
+        for name in ["TVCL", "TVV", "TVKA"] {
+            assert!(
+                !frozen.theta_fixed[idx(name)],
+                "identifiable {name} must stay free"
+            );
+        }
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("TVFLAT") && w.contains("no effect")),
+            "a flat-theta warning must name TVFLAT: {warnings:?}"
+        );
     }
 
     /// `resolve_scaling` maps `Auto` to `Abs` (magnitude scaling) for the
