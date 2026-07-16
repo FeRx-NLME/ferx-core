@@ -38,8 +38,10 @@
 //! `weibull()` **combined with an estimated lagtime** (its `β < 1` onset has no
 //! closed-form rate-on saltation), an **expression `obs_scale` combined with LTBS**, and
 //! a few narrow compositions — **steady-state combined with a time-dependent
-//! (`TIME`/`TAD`) RHS**, and **IOV combined with FREM, LTBS, or a steady-state
-//! input-rate forcing**.
+//! (`TIME`/`TAD`) RHS**, and **IOV combined with FREM or LTBS**. (A steady-state dose into a
+//! built-in absorption compartment is analytic since #835, including under IOV; only SS into a
+//! `zero_order` window or SS + an absorption lagtime remain out of scope, and both are rejected
+//! upstream rather than routed here.)
 #![allow(clippy::needless_range_loop)]
 
 use super::dual1::Dual1;
@@ -617,24 +619,17 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };
-    // Steady-state dosing *into* a built-in absorption input-rate compartment (#719) stays on
-    // the FD fallback: the dual SS equilibration (`equilibrate_ss_state_g`) still seeds a
-    // bolus/infusion trough and does not spread the periodic absorption `R_in` over the cycle,
-    // so its (θ,η) sensitivity is not yet validated against the corrected f64 SS prediction.
-    // The f64 predictor *is* correct for this case (the pulse-train equilibration trough plus
-    // the periodic forward `R_in` in `ode::predictions`), so FD differences the right
-    // prediction — this mirrors the IOV gate (`ode_iov_subject_supported`) declining the same
-    // combination, and the analytic dual SS-equilibration through the kernel is a follow-up.
-    // Scoped to the SS-dosed compartment, not "the model declares any input-rate forcing":
-    // a subject whose SS dose targets a plain (non-absorption) compartment — e.g. an IV
-    // loading dose into central on a model that separately declares `transit()`/`igd()`
-    // absorption for a different route — has `R_in` inert for that dose and stays on the
-    // exact event-driven walk.
-    let ss_into_absorption = subject
-        .doses
-        .iter()
-        .any(|d| d.ss && d.ii > 0.0 && ode.input_rate.iter().any(|f| f.cmt + 1 == d.cmt));
-    if ss_into_absorption {
+    // Steady-state dosing into a built-in absorption input-rate compartment is analytic (#835):
+    // the dual walk equilibrates the trough through the closed-form fixed point
+    // (`equilibrate_ss_input_rate_state_g`), carrying `∂u_ss/∂(θ,η)` through `u_ss = (I − M)⁻¹·b`
+    // (linear) or the pulse-train fallback (nonlinear) — bit-identical in value to the f64
+    // predictor, so the forward periodic `R_in` superposition composes on top exactly as on
+    // production. SS into a `zero_order` window and SS + an absorption lagtime stay out of scope
+    // and are hard-rejected upstream (`E_ABSORPTION_SS_ZERO_ORDER` / `E_ABSORPTION_SS_LAG`,
+    // `api::check_absorption_dosing`); the belt-and-suspenders decline below keeps this gate
+    // self-consistent with those scope limits if either upstream check is relaxed. Shared
+    // single source of truth: `CompiledModel::ss_absorption_out_of_scope`.
+    if model.ss_absorption_out_of_scope(subject) {
         return false;
     }
     // Built-in absorption input-rate forcing (transit/igd/weibull/first_order, #486):
@@ -2471,24 +2466,13 @@ fn ode_iov_subject_supported(
     if has_infusion_into_input_rate(model, subject) {
         return None;
     }
-    // #486: a steady-state dose combined with a built-in absorption input-rate forcing
-    // (`zero_order`/`first_order`, admitted under IOV by `ode_iov_supported`) is declined —
-    // the dual SS equilibration (`equilibrate_ss_state_g`) seeds a bolus/infusion trough and
-    // does not spread a periodic zero-order window (or a first-order R_in tail) over the
-    // cycle, so its κ-coupled sensitivity is not yet validated. Non-SS input-rate + IOV is
-    // the analytic scope this PR opens; SS × input-rate stays FD (as it effectively is on the
-    // non-IOV walk for the same equilibration reason). Scoped to the SS-dosed compartment
-    // (mirrors `ode_tvcov_supported`, #719 review): a subject whose SS dose targets a plain
-    // compartment on a model that separately declares absorption forcing elsewhere is
-    // unaffected and stays on this analytic walk.
-    if has_ss
-        && model.ode_spec.as_ref().is_some_and(|o| {
-            subject
-                .doses
-                .iter()
-                .any(|d| d.ss && d.ii > 0.0 && o.input_rate.iter().any(|f| f.cmt + 1 == d.cmt))
-        })
-    {
+    // #835: a steady-state dose into a built-in absorption input-rate compartment is analytic
+    // under IOV too — the shared `integrate_tvcov_g` walk equilibrates the trough via
+    // `equilibrate_ss_input_rate_state_g`, whose fixed-point / pulse-train carries κ's jet through
+    // `params` exactly as it does η/θ. Only SS into a `zero_order` window and SS + an absorption
+    // lagtime stay out of scope; the decline below is the same belt-and-suspenders guard as the
+    // non-IOV gate (`ode_tvcov_supported`), sharing `CompiledModel::ss_absorption_out_of_scope`.
+    if model.ss_absorption_out_of_scope(subject) {
         return None;
     }
     // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are
@@ -3643,6 +3627,156 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     u
 }
 
+/// Dual steady-state trough for an `SS=1` **bolus** dose into a built-in absorption input-rate
+/// compartment (#835) — the analytic-sensitivity counterpart of production's
+/// `equilibrate_ss_state` input-rate branch, and the input-rate sibling of
+/// [`equilibrate_ss_state_g`] (which serves the bolus/infusion-into-a-plain-compartment case).
+///
+/// The dose does not enter as an instantaneous bolus; it drives the compartment through the
+/// absorption kernel `R_in(tad)` (transit/igd/weibull/first_order). On a **linear** disposition
+/// the periodic steady state is the closed-form fixed point `u_ss = (I − M)⁻¹·b`, carried over `T`
+/// by [`equilibrate_ss_input_rate_fixed_point_g`](crate::ode::predictions::equilibrate_ss_input_rate_fixed_point_g)
+/// so `∂u_ss/∂(θ,η[,κ])` (and the 2nd order) fall out of the linear solve — exact analytic parity
+/// with production's fast path, and bit-identical in value. A **nonlinear** disposition fails the
+/// fixed point's self-check, so this falls back to the explicit pulse-train iteration (mirroring
+/// production's fallback), carrying the same jets through its finite loop.
+///
+/// Either way the returned trough is the pre-pulse SS carryover; the forward walk's
+/// `add_prepared_input_rate_forcing` superposes the current + prior pulses' still-arriving tails
+/// on top (disjoint from this trough), exactly as on the f64 path. Bolus-record SS only — SS
+/// infusion into absorption is #719 gap-2 out of scope (`has_infusion_into_input_rate` gates it to
+/// FD before the walk), and the caller's `!is_inf(d)` guard mirrors that. `dose.ii > 0` and
+/// `dose.cmt` valid are caller-guaranteed; a stray out-of-range dose returns the zero trough.
+fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
+    program: &crate::parser::model_parser::OdeRhsProgram,
+    ode: &OdeSpec,
+    n_states: usize,
+    dose: &crate::types::DoseEvent,
+    f_bio: T,
+    params: &[T],
+    opts: &crate::ode::solver::OdeSolverOptions,
+) -> Vec<T> {
+    let n = n_states;
+    let ii = dose.ii;
+    // `dose.cmt > n` (not `dose.cmt - 1 >= n`) — clippy-clean, and the `dose.cmt == 0` guard keeps
+    // the 1-based → 0-based conversion below from underflowing. Mirrors `equilibrate_ss_state_g`.
+    if ii <= 0.0 || dose.cmt == 0 || dose.cmt > n {
+        return vec![T::from_f64(0.0); n];
+    }
+    // Built-in absorption forcings prepared from THIS SS dose's snapshot (`params`), mirroring the
+    // f64 `prepare_input_rates`. The gate's `supported_over_dual()` allowlist guarantees success.
+    let prepared: Vec<PreparedInputRate<T>> = ode
+        .input_rate
+        .iter()
+        .map(|f| {
+            f.prepare_dual::<T>(params)
+                .expect("gate's supported_over_dual() allowlist guarantees prepare_dual succeeds")
+        })
+        .collect();
+
+    let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
+    let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
+    // Disposition alone, cycle-relative time (anchor 0). An SS-admissible RHS is autonomous
+    // (a time/TAD-reading RHS is gated to FD upstream), so the anchor is immaterial — matching
+    // `equilibrate_ss_state_g`'s `eval_rhs_anchored(.., 0.0, 0.0, ..)`.
+    let disposition = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+        eval_rhs_anchored::<T>(
+            program,
+            us,
+            ps,
+            t,
+            0.0,
+            0.0,
+            du,
+            &mut vars_cell.borrow_mut(),
+            &mut stack_cell.borrow_mut(),
+        );
+    };
+
+    // ---- Fast path: closed-form fixed point (linear disposition). ----
+    // A single local SS pulse at t = 0 drives the periodic `R_in` (its SS branch superposes the
+    // infinite-past pulse tails) — the dual mirror of the f64 `wrap_rhs_with_forcings(local_ss)`.
+    let local_ss = [crate::types::DoseEvent::new(
+        0.0, dose.amt, dose.cmt, 0.0, true, ii,
+    )];
+    let lag0 = [T::from_f64(0.0)];
+    let fbio1 = [f_bio];
+    let forced = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+        disposition(us, ps, t, du);
+        crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
+            ode,
+            &prepared,
+            ps,
+            &local_ss,
+            &lag0,
+            &fbio1,
+            f64::NEG_INFINITY,
+            t,
+            du,
+        );
+    };
+    let advance = |rhs: &dyn Fn(&[T], &[T], f64, &mut [T]), u0: &[T]| -> Option<Vec<T>> {
+        solve_ode_g(rhs, u0, (0.0, ii), params, &[ii], opts)
+            .last()
+            .map(|p| p.u.clone())
+    };
+    if let Some(u_ss) = crate::ode::predictions::equilibrate_ss_input_rate_fixed_point_g::<T, _, _>(
+        n,
+        ii,
+        opts.reltol,
+        opts.abstol,
+        |u0| advance(&disposition, u0),
+        |u0| advance(&forced, u0),
+    ) {
+        crate::dosing::record_ss_equilibration_cycles(1);
+        return u_ss;
+    }
+
+    // ---- Fallback: explicit pulse-train iteration (nonlinear disposition). ----
+    // Lay out `SS_EQUILIBRATION_CYCLES` past **non-SS** pulses at 0, II, 2II, … and integrate
+    // segment-by-segment from a zero state; `R_in` is re-evaluated by absolute pulse age so an
+    // absorption tail longer than `II` keeps contributing across cycle boundaries (mirrors the
+    // f64 `equilibrate_ss_state` input-rate fallback). The dual jets ride the finite loop.
+    let n_pulses = crate::dosing::SS_EQUILIBRATION_CYCLES;
+    let local_doses: Vec<crate::types::DoseEvent> = (0..n_pulses)
+        .map(|m| crate::types::DoseEvent::new(m as f64 * ii, dose.amt, dose.cmt, 0.0, false, 0.0))
+        .collect();
+    let lags = vec![T::from_f64(0.0); n_pulses];
+    let fbios = vec![f_bio; n_pulses];
+    let train = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+        disposition(us, ps, t, du);
+        crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
+            ode,
+            &prepared,
+            ps,
+            &local_doses,
+            &lags,
+            &fbios,
+            f64::NEG_INFINITY,
+            t,
+            du,
+        );
+    };
+    let mut u = vec![T::from_f64(0.0); n];
+    let mut prev = vec![0.0_f64; n];
+    let mut cur = vec![0.0_f64; n];
+    let mut cycles_run = 0usize;
+    for m in 0..n_pulses {
+        let seg_start = m as f64 * ii;
+        let seg_end = seg_start + ii;
+        let sol = solve_ode_g(&train, &u, (seg_start, seg_end), params, &[seg_end], opts);
+        if let Some(last) = sol.last() {
+            u.copy_from_slice(&last.u);
+        }
+        cycles_run = m + 1;
+        if crate::sens::propagate::ss_dual_cycle_should_stop(m, &u, &mut cur, &mut prev) {
+            break;
+        }
+    }
+    crate::dosing::record_ss_equilibration_cycles(cycles_run);
+    u
+}
+
 /// Taylor-extend a state `u` — already integrated to the fixed nominal bound `t_val` under
 /// `rhs` — by a further **dual-valued, zero-value** duration `dt`: the value `u` would have
 /// from continuing to flow under the SAME `rhs` for `dt` more time, to 2nd order in `dt`
@@ -4454,6 +4588,26 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 // avoids the second up-to-50-cycle dual SS loop (#642 review #4).
                 u = match ss_trough_cache[idx].take() {
                     Some(trough) => trough,
+                    // SS into a built-in absorption compartment (#835): the dose drives the
+                    // kernel `R_in`, not an instantaneous bolus, so equilibrate through the dual
+                    // fixed point (linear) / pulse-train (nonlinear), carrying `∂u_ss/∂(θ,η[,κ])`.
+                    // `input_rate_consumes_cmt` is the same predicate the forward bolus-skip below
+                    // uses; `!is_inf(d)` mirrors the upstream FD gate on SS infusion into
+                    // absorption (#719 gap-2), so this arm is bolus-record only. The cache is
+                    // populated only by the `K_SS_SEED` (SS+lagtime) branch, which is out of scope
+                    // here (rejected upstream), so a non-lagged SS-absorption dose always lands in
+                    // one of these `None` arms.
+                    None if has_input_rate && input_rate_consumes_cmt(ode, d.cmt) && !is_inf(d) => {
+                        equilibrate_ss_input_rate_state_g::<T>(
+                            program,
+                            ode,
+                            n_states,
+                            d,
+                            f_bio_at_dose[idx],
+                            &pk_at_dose[idx],
+                            opts,
+                        )
+                    }
                     None => equilibrate_ss_state_g::<T>(
                         program,
                         n_states,
@@ -6050,6 +6204,440 @@ mod tests {
         }
     }
 
+    // ---- #835: steady-state dosing into a built-in absorption compartment ----
+    // Gap 1 (#719/#834) made these SS predictions closed-form (`u_ss = (I − M)⁻¹·b`) but left
+    // their sensitivities on FD. The dual walk now carries that fixed point over `Dual1`/`Dual2`
+    // (`equilibrate_ss_input_rate_state_g`), so the analytic gradient/Hessian must match the
+    // production predictor + FD, exactly as every other analytic ODE variant does.
+
+    const ONECPT_SS_FIRST_ORDER: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVKA(0.15, 0.005, 20.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-10
+"#;
+
+    const ONECPT_SS_TRANSIT: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVN(5.0, 1.0, 30.0)
+  theta TVMTT(2.0, 0.1, 20.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = transit(n=N, mtt=MTT) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    const ONECPT_SS_IGD: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVMAT(2.0, 0.1, 20.0)
+  theta TVCV2(0.5, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  MAT = TVMAT
+  CV2 = TVCV2
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    // first_order absorption into a 2-cpt disposition: exercises the multi-state fixed point
+    // (the `I − M` solve is genuinely 2×2, not scalar), with η on both CL and V1.
+    const TWOCPT_SS_FIRST_ORDER: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV1(20.0, 0.5, 200.0)
+  theta TVQ(2.0, 0.01, 100.0)
+  theta TVV2(30.0, 1.0, 500.0)
+  theta TVKA(0.2, 0.005, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+[structural_model]
+  ode(obs_cmt=central, states=[central, peripheral])
+[odes]
+  d/dt(central)    = first_order(ka=KA) - (CL/V1)*central - (Q/V1)*central + (Q/V2)*peripheral
+  d/dt(peripheral) =  (Q/V1)*central - (Q/V2)*peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    // weibull() is the fourth admitted kernel (gate + CHANGELOG) and rides the same generic SS
+    // fixed point / periodic forcing; its log-domain (`ln`/`exp`) Dual2 forcing under an SS pulse
+    // is otherwise unexercised (#835 review). β = 1.5 (> 1) so the density is smooth at the dose
+    // and analytic ≡ central-FD is clean.
+    const ONECPT_SS_WEIBULL: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVTD(2.0, 0.05, 24.0)
+  theta TVBETA(1.5, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  TD   = TVTD
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    // Estimated bioavailability F on an SS-absorption dose: every other SS fixture defaults F = 1,
+    // so the `f_bio: T` jet threaded into `equilibrate_ss_input_rate_state_g` is never
+    // differentiated. Here F rides both a θ (THETA_F) and an η (ETA_F) via `inv_logit`, so
+    // `∂u_ss/∂F` (through the SS trough) must match production FD (#835 review).
+    const ONECPT_SS_FIRST_ORDER_F: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVKA(0.15, 0.005, 20.0)
+  theta THETA_F(0.7, 0.001, 0.999)
+  omega ETA_CL ~ 0.09
+  omega ETA_F ~ 0.04
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = inv_logit(logit(THETA_F) + ETA_F)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    // first_order absorption into a **Michaelis–Menten** (nonlinear) disposition: the closed-form
+    // fixed point self-declines, so the dual walk falls back to the pulse-train iteration — its
+    // gradient must still match production's (which uses the same fallback). η on Vmax.
+    const MM_SS_FIRST_ORDER: &str = r#"
+[parameters]
+  theta TVVM(5.0, 0.1, 100.0)
+  theta TVKM(8.0, 0.1, 200.0)
+  theta TVKA(0.5, 0.005, 20.0)
+  omega ETA_VM ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+[individual_parameters]
+  VM = TVVM * exp(ETA_VM)
+  KM = TVKM
+  KA = TVKA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - VM*central/(KM+central)
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    // SS bolus into compartment 1 with interval `ii`; slow KA (t½,abs ≈ II) so the absorption
+    // tail spills across the interval — the carryover the SS trough must capture.
+    fn ss_absorption_subject(times: &[f64], ii: f64) -> Subject {
+        let mut s = bolus_subject(times);
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, ii)];
+        s
+    }
+
+    #[test]
+    fn ode_provider_ss_first_order_1cpt_matches_production() {
+        let model = parse_model_string(ONECPT_SS_FIRST_ORDER).expect("parse SS first_order");
+        let theta = vec![1.0, 20.0, 0.15];
+        let eta = vec![0.15];
+        let subj = ss_absorption_subject(&[0.5, 1.0, 2.0, 4.0, 6.0, 7.9], 8.0);
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "#835: SS into a first_order absorption compartment must now be analytic"
+        );
+        // Value + ∂/∂η + ∂/∂θ vs the production predictor, analytic Hessian two ways, and
+        // inner(Dual1)/outer(Dual2) parity.
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subj, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subj, &theta, &eta);
+        // The linear disposition takes the closed-form fixed point (one recorded "cycle"), not
+        // the up-to-50-cycle iteration — the fast path #835 restores for sensitivities.
+        let _ = ode_subject_sensitivities(&model, &subj, &theta, &eta).expect("supported");
+        assert_eq!(
+            crate::dosing::last_ss_equilibration_cycles(),
+            1,
+            "a linear disposition must equilibrate via the closed-form fixed point"
+        );
+    }
+
+    #[test]
+    fn ode_provider_ss_transit_1cpt_matches_production() {
+        let model = parse_model_string(ONECPT_SS_TRANSIT).expect("parse SS transit");
+        let theta = vec![1.0, 20.0, 5.0, 2.0];
+        let eta = vec![0.12];
+        let subj = ss_absorption_subject(&[0.5, 1.0, 2.0, 4.0, 6.0, 7.9], 8.0);
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "#835: SS + transit analytic"
+        );
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
+    #[test]
+    fn ode_provider_ss_igd_1cpt_matches_production() {
+        let model = parse_model_string(ONECPT_SS_IGD).expect("parse SS igd");
+        let theta = vec![1.0, 20.0, 2.0, 0.5];
+        let eta = vec![0.12];
+        let subj = ss_absorption_subject(&[0.5, 1.0, 2.0, 4.0, 6.0, 7.9], 8.0);
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "#835: SS + igd analytic"
+        );
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
+    #[test]
+    fn ode_provider_ss_first_order_2cpt_matches_production() {
+        let model = parse_model_string(TWOCPT_SS_FIRST_ORDER).expect("parse SS 2-cpt first_order");
+        let theta = vec![1.0, 20.0, 2.0, 30.0, 0.2];
+        let eta = vec![0.15, -0.1];
+        let subj = ss_absorption_subject(&[0.5, 1.0, 2.0, 4.0, 6.0, 7.9], 8.0);
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "#835: SS + first_order into a 2-cpt disposition analytic"
+        );
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
+    #[test]
+    fn ode_provider_ss_weibull_1cpt_matches_production() {
+        let model = parse_model_string(ONECPT_SS_WEIBULL).expect("parse SS weibull");
+        let theta = vec![1.0, 20.0, 2.0, 1.5];
+        let eta = vec![0.12];
+        let subj = ss_absorption_subject(&[0.5, 1.0, 2.0, 4.0, 6.0, 7.9], 8.0);
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "#835: SS + weibull analytic"
+        );
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
+    #[test]
+    fn ode_provider_ss_first_order_bioavailability_matches_production() {
+        let model =
+            parse_model_string(ONECPT_SS_FIRST_ORDER_F).expect("parse SS first_order under F");
+        assert!(model.has_bioavailability());
+        let theta = vec![1.0, 20.0, 0.15, 0.7];
+        let eta = vec![0.12, 0.1]; // [ETA_CL, ETA_F] — F on IIV exercises ∂u_ss/∂F through the trough
+        let subj = ss_absorption_subject(&[0.5, 1.0, 2.0, 4.0, 6.0, 7.9], 8.0);
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "#835: SS + first_order under an estimated F stays analytic"
+        );
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
+    #[test]
+    fn ode_provider_ss_absorption_nonlinear_disposition_matches_production() {
+        // Nonlinear (MM) disposition: the fixed point self-declines and the dual walk falls back
+        // to the pulse-train iteration — value + gradient must still match production (same
+        // fallback). This is the analytic-parity teeth on the `equilibrate_ss_input_rate_state_g`
+        // fallback branch.
+        let model = parse_model_string(MM_SS_FIRST_ORDER).expect("parse MM SS first_order");
+        let theta = vec![5.0, 8.0, 0.5];
+        let eta = vec![0.1];
+        let subj = ss_absorption_subject(&[0.5, 1.0, 2.0, 4.0, 6.0, 7.9], 8.0);
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "#835: the gate admits SS + smooth kernel regardless of disposition linearity"
+        );
+        check_vs_production(&model, &subj, &theta, &eta);
+        // Prove the fallback fired: a nonlinear disposition runs the iteration (> 1 cycle), not the
+        // single-cycle closed-form fixed point.
+        let _ = ode_subject_sensitivities(&model, &subj, &theta, &eta).expect("supported");
+        assert!(
+            crate::dosing::last_ss_equilibration_cycles() > 1,
+            "a nonlinear disposition must fall back to the pulse-train iteration"
+        );
+    }
+
+    // SS + first_order under IOV: the SS-dosed occasion's κ enters the equilibrated trough, and
+    // later occasions' κ enter the forward walk — the whole stacked `[η, κ_g0, κ_g1]` gradient
+    // must match FD of the production `predict_iov`. κ is just another param axis to
+    // `equilibrate_ss_input_rate_state_g`, so this is the IOV teeth on the same helper.
+    const ONECPT_SS_FIRST_ORDER_IOV: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVKA(0.15, 0.005, 20.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+  KA = TVKA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    #[test]
+    fn ode_provider_ss_first_order_iov_matches_predict_iov() {
+        let model =
+            parse_model_string(ONECPT_SS_FIRST_ORDER_IOV).expect("parse SS first_order IOV");
+        assert_eq!(model.n_kappa, 1);
+        let theta = vec![1.0, 20.0, 0.15];
+        // One SS dose in occasion 1; observations span occasions 1 and 2, so there are two
+        // κ groups and the stacked vector is [η_CL, κ_g0, κ_g1].
+        let mut subj = ss_absorption_subject(&[1.0, 3.0, 5.0, 7.0], 8.0);
+        subj.occasions = vec![1, 1, 2, 2];
+        subj.dose_occasions = vec![1];
+        let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
+        assert_eq!(groups.len(), 2, "fixture must have two κ occasion groups");
+        let stacked = vec![0.12, 0.05, -0.08];
+        assert_eq!(stacked.len(), model.n_eta + groups.len() * model.n_kappa);
+
+        let sens = ode_subject_sensitivities_iov(&model, &subj, &theta, &stacked)
+            .expect("#835: SS + first_order under IOV must be analytic");
+
+        // FD reference: production `predict_iov`, unpacking stacked → (η_bsv, per-group κ).
+        let pred = |th: &[f64], st: &[f64], j: usize| -> f64 {
+            let eta_bsv = st[..model.n_eta].to_vec();
+            let kappas: Vec<Vec<f64>> = (0..groups.len())
+                .map(|g| {
+                    st[model.n_eta + g * model.n_kappa..model.n_eta + (g + 1) * model.n_kappa]
+                        .to_vec()
+                })
+                .collect();
+            crate::pk::predict_iov(&model, &subj, th, &eta_bsv, &kappas)[j]
+        };
+
+        let he = 1e-6;
+        for (j, obs) in sens.obs.iter().enumerate() {
+            approx::assert_relative_eq!(
+                obs.f,
+                pred(&theta, &stacked, j),
+                max_relative = 1e-6,
+                epsilon = 1e-9
+            );
+            for k in 0..stacked.len() {
+                let mut sp = stacked.clone();
+                sp[k] += he;
+                let mut sm = stacked.clone();
+                sm[k] -= he;
+                let g = (pred(&theta, &sp, j) - pred(&theta, &sm, j)) / (2.0 * he);
+                approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 2e-3, epsilon = 1e-6);
+            }
+            for m in 0..model.n_theta {
+                let s = he * (1.0 + theta[m].abs());
+                let mut tp = theta.clone();
+                tp[m] += s;
+                let mut tm = theta.clone();
+                tm[m] -= s;
+                let g = (pred(&tp, &stacked, j) - pred(&tm, &stacked, j)) / (2.0 * s);
+                approx::assert_relative_eq!(
+                    obs.df_dtheta[m],
+                    g,
+                    max_relative = 2e-3,
+                    epsilon = 1e-6
+                );
+            }
+        }
+    }
+
     /// 2nd-order saltation validation (#472 review round 2 #3/#4): the δlag² coefficients
     /// for the **rate-boundary** (infusion) and **bolus `jg_cross`** (multi-dose) cases are
     /// FD-checked against the analytic gradient. All use `ETA_LAG` (lag-on-IIV) so the
@@ -7614,15 +8202,15 @@ mod tests {
   ode_abstol = 1e-12
 "#;
 
-    /// Steady-state × a built-in absorption **input-rate forcing** is declined by both non-IOV
-    /// analytic gates — the static `ode_subject_supported` (all SS) and the event-driven
-    /// `ode_tvcov_supported` (SS × input-rate specifically) — so such a subject routes to the
-    /// finite-difference sensitivity fallback rather than the dual SS-equilibration, which is
-    /// still bolus-only for an input-rate compartment. The f64 prediction FD differences is
-    /// exact (the closed-form fixed-point trough + periodic `R_in`), so the fit is correct; a
-    /// full-speed analytic dual SS-equilibration through the kernel is a follow-up (#719).
+    /// Steady-state × a built-in absorption **input-rate forcing** (smooth density kernel) is now
+    /// **analytic** on the event-driven `ode_tvcov_supported` walk (#835 — the dual carries the
+    /// closed-form SS trough `u_ss = (I − M)⁻¹·b`). It still declines the *static* superposition
+    /// walk (`ode_subject_supported`): any SS dose needs the event-driven equilibration, so the
+    /// routing (event-driven, never static) is unchanged — only the event-driven walk flipped from
+    /// the FD fallback to analytic. (SS into a `zero_order` window, or combined with an absorption
+    /// lagtime, stays on FD and is rejected upstream.)
     #[test]
-    fn ode_gates_decline_ss_into_input_rate_forcing() {
+    fn ode_gates_ss_into_smooth_kernel_analytic_on_event_driven_walk() {
         const M: &str = r#"
 [parameters]
   theta TVCL(1.0, 0.1, 100.0)
@@ -7652,12 +8240,49 @@ mod tests {
         subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0)]; // SS=1, II=8
         assert!(subject.has_periodic_ss_dose());
         assert!(
-            !ode_tvcov_supported(&model, &subject),
-            "SS × input-rate must decline the event-driven analytic walk (→ FD fallback, #719)"
+            ode_tvcov_supported(&model, &subject),
+            "#835: SS × a smooth absorption kernel is analytic on the event-driven walk"
         );
         assert!(
             !ode_subject_supported(&model, &subject),
-            "SS also declines the static analytic walk"
+            "SS still declines the static superposition walk (needs event-driven equilibration)"
+        );
+    }
+
+    /// #835 belt-and-suspenders: SS into a `zero_order` window is hard-rejected upstream
+    /// (`E_ABSORPTION_SS_ZERO_ORDER`), so it never reaches a real fit's gate — but the non-IOV
+    /// `ode_tvcov_supported` gate must *independently* decline it too, so the analytic walk can't
+    /// silently serve the (unbuilt) periodic-window trough if that upstream check is ever relaxed.
+    /// (The IOV twin is covered by `ode_iov_zero_order_ss_falls_back_to_fd`.)
+    #[test]
+    fn ode_gates_ss_into_zero_order_window_declines_dual_walk() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVDUR(2.0, 0.05, 12.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - (CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(M).expect("parse SS zero_order");
+        let mut subject = bolus_subject(&[1.0, 4.0, 7.9]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0)]; // SS=1, II=8
+        assert!(subject.has_periodic_ss_dose());
+        assert!(
+            !ode_tvcov_supported(&model, &subject),
+            "#835: SS into a zero_order window must decline the dual walk (no periodic-window trough)"
         );
     }
 

@@ -104,20 +104,19 @@ fn predict_matches_nonmem_ss_first_order_absorption() {
         );
     }
 }
-/// End-to-end `fit()` on an SS-into-absorption model: the finite-difference sensitivity path
-/// (SS × input-rate is declined by the analytic dual gates, #719) must converge to a sensible
-/// objective rather than stall or diverge. The linear fixed-point equilibration makes each
-/// prediction cheap enough for this to complete, and smooth enough that the FD inner gradient
-/// converges. Slow-gated (the FD FOCEI predict count is inherently large; a full-speed
-/// analytic dual SS-equilibration is the parity follow-up).
+/// End-to-end `fit()` on an SS-into-absorption model. Since #835 the sensitivity path is the
+/// **analytic dual** SS-equilibration — the closed-form fixed point `u_ss = (I − M)⁻¹·b` carried
+/// over `Dual2` (the parity follow-up this test's predecessor flagged), not finite differences.
+/// The fit must converge to a sensible objective rather than stall or diverge. Slow-gated only
+/// because it runs a full FOCEI fit to convergence (Tier 3).
 ///
 /// The dataset's `DV` column is the deterministic NONMEM PRED, so the population minimum sits
 /// at the fixed thetas; starting there, a bounded fit must keep the objective finite and near
-/// that minimum (the FD gradient at the optimum is well-behaved).
+/// that minimum.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "slow: FD FOCEI on an SS-absorption model; opt in with --features slow-tests"
+    ignore = "slow: analytic FOCEI to convergence on an SS-absorption model; opt in with --features slow-tests"
 )]
 fn fit_on_ss_absorption_converges() {
     let src = SS_FIRST_ORDER_MODEL.replace("omega ETA_CL ~ 0.0", "omega ETA_CL ~ 0.05");
