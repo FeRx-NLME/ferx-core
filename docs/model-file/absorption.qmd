@@ -808,6 +808,13 @@ individual parameter (like the `FR*` fraction), and must be finite; a negative v
 is warned (`W_NEGATIVE_LAGTIME`), not clamped. `lag=0` (or no `lag`) is bit-identical
 to an unlagged route, so the argument is a strict superset.
 
+A plain **infusion** (`RATE>0`) into a per-route-lagged compartment composes as expected
+(the whole infused-kernel appearance is delayed by `lag`). **Steady-state** dosing
+(`SS=1`) into a per-route-lagged compartment is *rejected* (`E_ABSORPTION_SS_LAG`) — the
+same limitation as a compartment `lagtime`/`ALAG` under `SS` ([#719](https://github.com/FeRx-NLME/ferx-core/issues/719)):
+the steady-state pre-arrival seed does not yet route the dose through the absorption
+kernel over a lagged onset.
+
 ::: {.callout-note}
 ## Gradients (FD for now)
 

@@ -1268,13 +1268,28 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             .iter()
             .any(|d| d.ss && d.ii > 0.0 && zero_order_cmts.contains(&d.cmt))
     });
+    // A per-route lag (`fn(..., lag=L)`, #856) lives on the forcing's `lag_slot`, NOT the
+    // compartment-lag machinery, so `has_lagtime_on_cmt` does not see it — but the SS
+    // equilibration seed is just as unable to route the dose through a per-route-lagged
+    // onset over the previous interval as through a compartment `lagtime`/`ALAG`. Reject
+    // the combination the same way, compartment-scoped so a per-route lag on a *different*
+    // pathway does not block an SS dose into an un-lagged compartment.
+    let route_lag_cmts: BTreeSet<usize> = ode
+        .input_rate
+        .iter()
+        .filter(|f| f.lag_slot.is_some())
+        .map(|f| f.cmt + 1)
+        .collect();
     // Compartment-scoped, not model-wide (`model.has_lagtime()`): a lag declared on a
     // *different* absorption pathway (e.g. `ALAG2`) must not block an SS dose into an
-    // un-lagged compartment (e.g. `CMT=1`).
+    // un-lagged compartment (e.g. `CMT=1`). Covers both a compartment `lagtime`/`ALAG`
+    // and a per-route `lag=` on a forcing feeding the SS-dosed compartment.
     let has_ss_lag = population.subjects.iter().any(|s| {
-        s.doses
-            .iter()
-            .any(|d| d.ss && d.ii > 0.0 && cmts.contains(&d.cmt) && model.has_lagtime_on_cmt(d.cmt))
+        s.doses.iter().any(|d| {
+            d.ss && d.ii > 0.0
+                && cmts.contains(&d.cmt)
+                && (model.has_lagtime_on_cmt(d.cmt) || route_lag_cmts.contains(&d.cmt))
+        })
     });
     if has_ss_zero_order {
         diags.push(
@@ -1294,10 +1309,11 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             Diagnostic::error(
                 "E_ABSORPTION_SS_LAG",
                 "Steady-state dosing (SS=1) into a built-in absorption compartment combined \
-                 with an absorption lagtime is not yet supported: the SS+lagtime pre-arrival \
-                 seed does not yet route the dose through the absorption kernel over the \
-                 previous interval. Remove the lagtime, expand the run-in with explicit dosing \
-                 records, or dose without SS.",
+                 with an absorption lagtime (a compartment `lagtime`/`ALAG` or a per-route \
+                 `lag=`) is not yet supported: the SS+lagtime pre-arrival seed does not yet \
+                 route the dose through the absorption kernel over the previous interval. \
+                 Remove the lagtime, expand the run-in with explicit dosing records, or dose \
+                 without SS.",
             )
             .with_block("odes"),
         );

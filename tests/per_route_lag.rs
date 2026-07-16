@@ -19,7 +19,7 @@
 mod common;
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::{predict, DoseEvent, Population};
+use ferx_core::{check_model_data, predict, DoseEvent, Population};
 
 // ── Per-route-lag models under test ──────────────────────────────────────────
 
@@ -837,5 +837,92 @@ fn route_lag_multi_dose_equals_compartment_lag_transit() {
         &obs,
         1e-5,
         "transit multi-dose route vs comp",
+    );
+}
+
+// ── Composition with SS (#834) and infusion (#836) into an absorption compartment ──
+//
+// Both landed on `main` after this branch forked, editing the same forcing machinery.
+// A per-route lag lives on the forcing (`lag_slot`), NOT `has_lagtime()`, so these guard
+// the two combinations: SS must be *rejected* (the SS trough seed cannot route a lagged
+// onset — the same limitation that rejects SS + compartment lag, `E_ABSORPTION_SS_LAG`),
+// while a plain infusion must *compose* (a single infusion whose whole appearance is
+// simply delayed by the route lag).
+
+/// SS=1 into `first_order(ka, lag=L)` must raise `E_ABSORPTION_SS_LAG` — the per-route
+/// lag is invisible to `has_lagtime_on_cmt`, so without the forcing-`lag_slot` arm of the
+/// gate this SS dose would slip through and be silently mis-served by the (lag-unaware)
+/// steady-state equilibration seed.
+#[test]
+fn ss_into_per_route_lag_is_rejected() {
+    let model = parse_full_model(ROUTE_LAG_SINGLE).expect("parses").model;
+    let obs: Vec<f64> = (0..=24).map(|i| i as f64 * 0.5).collect();
+    let n = obs.len();
+    let population = Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)], // SS=1, II=12
+            obs,
+            vec![0.0; n],
+            vec![1; n],
+        )],
+    };
+    // `check_model_data` is the entry `fit()` runs (and aborts on the first error);
+    // the SS/absorption gates live there, not in `check_model_data_warnings`.
+    let diags = check_model_data(&model, &population);
+    assert!(
+        diags.iter().any(|d| d.code == "E_ABSORPTION_SS_LAG"),
+        "SS into a per-route-lagged absorption compartment must be rejected with \
+         E_ABSORPTION_SS_LAG (per-route lag is not seen by has_lagtime_on_cmt); got: {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+/// A plain infusion (`RATE>0`) into `first_order(ka, lag=L)` composes correctly: it equals
+/// the same infusion into `first_order(ka)` + compartment lagtime L (both delay the whole
+/// infused-kernel appearance by L). No SS seed involved, so `tad` carries the route lag.
+#[test]
+fn infusion_into_per_route_lag_equals_compartment_lag() {
+    let obs: Vec<f64> = (0..=60).map(|i| i as f64 * 0.5).collect();
+    let inf = |src: &str| {
+        let m = parse_full_model(src).expect("parses").model;
+        let n = obs.len();
+        let pop = Population {
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+            subjects: vec![common::subject(
+                "1",
+                vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)], // rate 50 → 2 h infusion
+                obs.clone(),
+                vec![0.0; n],
+                vec![1; n],
+            )],
+        };
+        predict(&m, &pop, &m.default_params)
+            .iter()
+            .map(|p| p.pred)
+            .collect::<Vec<_>>()
+    };
+    let route = inf(ROUTE_LAG_SINGLE);
+    let comp = inf(COMP_LAG_SINGLE);
+    assert_close(&route, &comp, &obs, 1e-5, "infusion route-lag vs comp-lag");
+    // Genuinely delayed: ~0 before the lag.
+    let before = obs
+        .iter()
+        .zip(&route)
+        .filter(|(&t, _)| t < 2.0)
+        .map(|(_, &c)| c.abs())
+        .fold(0.0, f64::max);
+    assert!(
+        before < 1e-6,
+        "infused conc must be ~0 before the lag; got {before}"
     );
 }

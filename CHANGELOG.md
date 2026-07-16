@@ -133,7 +133,9 @@ section of the SDLC for the versioning policy).
   `dose + lag_cmt + lag_route`); `lag=0` (or no `lag`) is bit-identical to an unlagged
   route. A model carrying a per-route lag is fit over finite differences (the analytic
   per-route onset saltation is a planned follow-up), like `weibull()` + lagtime; a
-  negative lag warns (`W_NEGATIVE_LAGTIME`), a non-finite one is rejected. New example
+  negative lag warns (`W_NEGATIVE_LAGTIME`), a non-finite one is rejected. Steady-state
+  (`SS=1`) dosing into a per-route-lagged absorption compartment is rejected
+  (`E_ABSORPTION_SS_LAG`), consistent with a compartment `lagtime`/`ALAG` (#719). New example
   `examples/per_route_lag_absorption.ferx`; validated by reduction to the NONMEM-anchored
   compartment lag (`tests/per_route_lag.rs`) and by a direct NONMEM `ADVAN13 $DES` anchor
   — ferx's objective at NONMEM's optimum matches `#OBJV = −882.357` to ~1e-6
