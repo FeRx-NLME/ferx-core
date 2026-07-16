@@ -1490,13 +1490,10 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
     let n_kappa = result.kappa_names.len();
 
     let n_omega_diag = n_eta;
-    let n_omega_full = n_eta * (n_eta + 1) / 2;
+    let n_omega_full = crate::estimation::parameterization::omega_packed_len(n_eta, false);
     let n_kappa_diag = n_kappa;
-    let n_kappa_full = if n_kappa > 0 {
-        n_kappa * (n_kappa + 1) / 2
-    } else {
-        0
-    };
+    // `omega_packed_len(0, false) == 0`, so this covers the no-IOV case too.
+    let n_kappa_full = crate::estimation::parameterization::omega_packed_len(n_kappa, false);
     let n_remaining = n.saturating_sub(n_theta + n_sigma);
 
     // Try all four diagonal/block combinations; take the first match.

@@ -47,20 +47,12 @@ pub(crate) enum CovarianceStepResult {
 pub(crate) fn packed_param_label(packed_idx: usize, template: &ModelParameters) -> String {
     let n_theta = template.theta.len();
     let n_eta = template.omega.dim();
-    let n_omega = if template.omega.diagonal {
-        n_eta
-    } else {
-        n_eta * (n_eta + 1) / 2
-    };
+    let n_omega = omega_packed_len(n_eta, template.omega.diagonal);
     let n_sigma = template.sigma.values.len();
-    let n_iov = template.omega_iov.as_ref().map_or(0, |m| {
-        let d = m.dim();
-        if m.diagonal {
-            d
-        } else {
-            d * (d + 1) / 2
-        }
-    });
+    let n_iov = template
+        .omega_iov
+        .as_ref()
+        .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
 
     if packed_idx < n_theta {
         let name = template

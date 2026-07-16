@@ -1,6 +1,8 @@
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
-use crate::estimation::parameterization::{chol_lt_idx, lower_tri_iter, theta_packs_log};
+use crate::estimation::parameterization::{
+    chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
+};
 use crate::estimation::saem;
 use crate::io::datareader::{
     read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
@@ -8197,7 +8199,7 @@ pub(crate) fn extract_standard_errors(
             })
             .collect()
     } else {
-        let n_lt = n_eta * (n_eta + 1) / 2;
+        let n_lt = omega_packed_len(n_eta, false);
         let l = &template.omega.chol;
 
         // Extract omega sub-block of the full covariance matrix.
@@ -8242,12 +8244,7 @@ pub(crate) fn extract_standard_errors(
     };
 
     // Sigma: SE via delta method (log-transformed)
-    let sigma_start = omega_start
-        + if template.omega.diagonal {
-            n_eta
-        } else {
-            n_eta * (n_eta + 1) / 2
-        };
+    let sigma_start = omega_start + omega_packed_len(n_eta, template.omega.diagonal);
     let se_sigma: Vec<f64> = (0..n_sigma)
         .map(|i| {
             let idx = sigma_start + i;

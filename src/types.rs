@@ -5003,7 +5003,7 @@ impl FitResult {
 pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize) -> Option<f64> {
     let se = se_omega.as_ref()?;
     let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
-    let n_lt = n_eta * (n_eta + 1) / 2;
+    let n_lt = crate::estimation::parameterization::omega_packed_len(n_eta, false);
     if se.len() == n_lt && n_lt != n_eta {
         // Full lower-triangle format (block omega). The packed index is the
         // shared column-major `chol_lt_idx` (same convention as `pack_params`).
