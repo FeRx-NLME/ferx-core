@@ -45,14 +45,30 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
     d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
 }
 
-// Dose resolution + SS-equilibration primitives moved to `crate::dosing` (a
-// neutral leaf module) so pk/sens/api don't depend upward on ode/. Re-exported
-// here (permanent) so the ode-internal callers + `crate::ode::*` paths still resolve.
-pub(crate) use crate::dosing::{
+// Dose resolution + SS-equilibration primitives moved to `crate::dosing` (a neutral
+// leaf module) so pk/sens/api don't depend upward on ode/. A PRIVATE import (NOT a
+// `pub(crate) use` re-export) so these do not leak back out as `crate::ode::…` — the
+// upward dependency this move removed stays removed. The ode-internal resolve callers
+// + `equilibrate_ss_state` use the bare names; the `#[cfg(test)] mod tests` picks them
+// up via `use super::*`. Test-only symbols (`ss_cycle_converged`, `SS_EQUILIBRATION_TOL`,
+// `last_ss_equilibration_cycles`, `with_full_ss_equilibration`) are referenced directly
+// as `crate::dosing::…` by the tests, so they are not imported here.
+use crate::dosing::{
     record_ss_equilibration_cycles, resolve_subject_doses, resolve_subject_doses_with,
-    ss_cycle_converged, SsStopTracker, SS_EQUILIBRATION_CYCLES, SS_EQUILIBRATION_TOL,
-    SS_TAIL_REL_FLOOR,
+    SsStopTracker, SS_EQUILIBRATION_CYCLES,
 };
+
+/// Relative floor for truncating the steady-state **input-rate periodic sum** (#719). An
+/// `SS=1` dose into a built-in absorption compartment stands for an infinite past pulse
+/// train, so its appearance rate at time `t` is `Σ_{j≥0} R_in(tad + j·II)` — the tail of
+/// every prior pulse still arriving (see [`add_prepared_input_rate_forcing`]). The absorption
+/// density is eventually monotone-decreasing, so once a term falls below this fraction of the
+/// running sum the remaining tail is spent and the sum stops (hard-capped at
+/// [`crate::dosing::SS_EQUILIBRATION_CYCLES`] so a pathologically slow absorption — mode ≫ II
+/// — still terminates, matching the trough's own cycle budget). Conservative (`1e-10`): the
+/// dropped tail is far below the provider-vs-production parity tolerance. (Kept in
+/// `ode/predictions` — its only consumers — rather than in the neutral `dosing` module.)
+const SS_TAIL_REL_FLOOR: f64 = 1e-10;
 
 /// The time at which a subject's integration begins: the earliest event on the
 /// subject's timeline (first dose, observation, PK-only sample, or reset).
@@ -9621,6 +9637,9 @@ mod tests {
 
     #[test]
     fn ss_cycle_converged_is_mixed_atol_rtol_on_increment() {
+        // Referenced directly from `crate::dosing` (test-only here — not re-exported by
+        // the private facade above).
+        use crate::dosing::{ss_cycle_converged, SS_EQUILIBRATION_TOL};
         // Increment below tol: a 1e-13 move on a magnitude-100 state is ≪ tol·(|a| + max) →
         // converged.
         assert!(ss_cycle_converged(

@@ -2,9 +2,10 @@
 //!
 //! These were extracted from `ode/predictions.rs` so that `pk/`, `sens/`, and
 //! `api` no longer depend *upward* on `ode/` merely to resolve modeled-`RATE`
-//! doses or to share the SS-equilibration convergence tracker. Pure code motion:
-//! `ode::predictions` re-exports every symbol below, so all historical
-//! `crate::ode::{resolve_subject_doses, predictions::*}` paths keep resolving.
+//! doses or to share the SS-equilibration convergence tracker. Pure code motion.
+//! `ode::predictions` *privately* imports the symbols it still uses (it does NOT
+//! re-export them as `crate::ode::…`, so the upward dependency stays removed);
+//! every other consumer reaches these through `crate::dosing::…`.
 //!
 //! - Dose resolution (`resolve_subject_doses{,_with}`): the #324 single source of
 //!   truth for turning modeled-`RATE` (`RATE=-2` → modeled duration `D{cmt}`)
@@ -89,17 +90,6 @@ pub(crate) const SS_EQUILIBRATION_CYCLES: usize = 50;
 /// PK. Fast disposition (`λ·II ≈ 2`) converges in ~14 cycles; slow PK (`λ·II ≈ 0.1`) never
 /// trips it and runs the full [`SS_EQUILIBRATION_CYCLES`] — identical to the old behaviour.
 pub(crate) const SS_EQUILIBRATION_TOL: f64 = 1e-12;
-
-/// Relative floor for truncating the steady-state **input-rate periodic sum** (#719). An
-/// `SS=1` dose into a built-in absorption compartment stands for an infinite past pulse
-/// train, so its appearance rate at time `t` is `Σ_{j≥0} R_in(tad + j·II)` — the tail of
-/// every prior pulse still arriving (see [`add_prepared_input_rate_forcing`]). The absorption
-/// density is eventually monotone-decreasing, so once a term falls below this fraction of the
-/// running sum the remaining tail is spent and the sum stops (hard-capped at
-/// [`SS_EQUILIBRATION_CYCLES`] so a pathologically slow absorption — mode ≫ II — still
-/// terminates, matching the trough's own cycle budget). Conservative (`1e-10`): the dropped
-/// tail is far below the provider-vs-production parity tolerance.
-pub(crate) const SS_TAIL_REL_FLOOR: f64 = 1e-10;
 
 /// Whether the SS-equilibration trough has converged between two successive cycles. Shared
 /// by the f64 predictor, the event-driven f64 loop, and the dual gradient path so every path
@@ -196,14 +186,16 @@ pub(crate) fn last_ss_equilibration_cycles() -> usize {
 /// test sharing the harness thread.
 #[cfg(test)]
 pub(crate) fn with_full_ss_equilibration<R>(f: impl FnOnce() -> R) -> R {
-    struct Reset;
+    // Re-entrant: the guard restores the PRIOR value, not an unconditional `false`, so a
+    // nested call leaves the outer body running with full equilibration still forced.
+    struct Reset(bool);
     impl Drop for Reset {
         fn drop(&mut self) {
-            FORCE_FULL_SS_EQUILIBRATION.with(|c| c.set(false));
+            FORCE_FULL_SS_EQUILIBRATION.with(|c| c.set(self.0));
         }
     }
-    FORCE_FULL_SS_EQUILIBRATION.with(|c| c.set(true));
-    let _reset = Reset;
+    let prev = FORCE_FULL_SS_EQUILIBRATION.with(|c| c.replace(true));
+    let _reset = Reset(prev);
     f()
 }
 

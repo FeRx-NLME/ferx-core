@@ -177,9 +177,9 @@ slow PK (`λ·II = 0.1`, ~14 half-lives total over the 50 cycles),
 bound is conservative and (b) skipping the convergence check keeps
 the hot path branch-free.
 
-If you need tighter accuracy for an unusually slow PK, the constant
-lives at `SS_EQUILIBRATION_CYCLES` in `src/ode/predictions.rs` and
-`EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES` in `src/pk/event_driven.rs`.
+If you need tighter accuracy for an unusually slow PK, the constant has a single
+definition: `SS_EQUILIBRATION_CYCLES` in `src/dosing.rs` (the analytical
+event-driven and ODE paths both use it).
 
 ### Cost comparison
 

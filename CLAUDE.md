@@ -144,6 +144,7 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | `pk/` | Analytical 1-cpt and 2-cpt PK solutions (IV, oral, infusion) with superposition |
 | `ode/solver.rs` | Dormand-Prince RK45 adaptive ODE solver |
 | `ode/predictions.rs` | ODE-based predictions with dose event handling |
+| `dosing.rs` | Neutral dose-resolution (`resolve_subject_doses`, #324) + SS-equilibration policy (`SS_EQUILIBRATION_CYCLES`, `SsStopTracker`) — the single home shared by pk/ode/sens |
 | `estimation/gauss_newton.rs` | Gauss-Newton (BHHH) optimizer with LM damping; pure GN and GN+FOCEI hybrid |
 | `estimation/trust_region.rs` | Newton trust-region outer optimizer (argmin + Steihaug CG); FD gradient & Hessian with fixed EBEs |
 | `estimation/parameterization.rs` | Pack/unpack optimizer vector (log-theta, Cholesky-omega, log-sigma) |
