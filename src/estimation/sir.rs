@@ -276,9 +276,10 @@ pub fn run_sir_core(
     let sum_w: f64 = weights.iter().sum();
     let normalized_weights: Vec<f64> = weights.iter().map(|w| w / sum_w).collect();
 
-    // Effective sample size
-    let sum_w2: f64 = normalized_weights.iter().map(|w| w * w).sum();
-    let ess = if sum_w2 > 0.0 { 1.0 / sum_w2 } else { 0.0 };
+    // Effective sample size — shared Kish ESS (`1/Σw̃²` with zero-guard). SIR's
+    // log-sum-exp normalisation above stays local (its `Err`-on-all-invalid +
+    // no-non-finite-filter contract differs from `stats::util::log_sum_exp_normalised`).
+    let ess = crate::stats::util::ess_from_weights(&normalized_weights);
 
     if options.verbose {
         eprintln!("  SIR: effective sample size = {:.1}", ess);
