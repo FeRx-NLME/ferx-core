@@ -39,6 +39,7 @@ use crate::estimation::outer_optimizer::{
     compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
 };
 use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs_log};
+use crate::estimation::saem::{floor_omega_diagonal, get_mu_ref_pairs};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::obs_nll_subject_into;
 use crate::types::*;
@@ -47,19 +48,6 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
-
-/// Floor the free Ω diagonal to keep the proposal/prior positive-definite.
-/// Mirrors SAEM's `floor_omega_diagonal`: FIX-ed diagonals are left untouched.
-fn floor_omega_diagonal(omega_mat: &mut DMatrix<f64>, omega_fixed: &[bool], floor: f64) {
-    for i in 0..omega_mat.nrows() {
-        if omega_fixed.get(i).copied().unwrap_or(false) {
-            continue;
-        }
-        if omega_mat[(i, i)] < floor {
-            omega_mat[(i, i)] = floor;
-        }
-    }
-}
 
 /// Positive-definite floor for free Ω diagonals (matches the SAEM constant).
 const OMEGA_DIAG_FLOOR: f64 = 1e-6;
@@ -159,30 +147,6 @@ fn covariance_to_proposal_hessian(
     }
 }
 
-/// Log-transformed mu-referencing pairs `(theta_idx, eta_idx)`. For these the
-/// typical value satisfies `log(P_i) = log(θ) + η_i`, so the EM M-step shifts
-/// `log(θ) += mean(η)` in closed form — without it θ and the η mean are
-/// confounded and the variance Ω absorbs the misfit instead. Mirrors SAEM's
-/// `get_mu_ref_pairs`.
-fn mu_ref_log_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::new();
-    for (eta_idx, eta_name) in model.eta_names.iter().enumerate() {
-        if let Some(mu_ref) = model.mu_refs.get(eta_name) {
-            if !mu_ref.log_transformed {
-                continue;
-            }
-            if let Some(theta_idx) = model
-                .theta_names
-                .iter()
-                .position(|n| n == &mu_ref.theta_name)
-            {
-                pairs.push((theta_idx, eta_idx));
-            }
-        }
-    }
-    pairs
-}
-
 /// Names of non-fixed thetas that have **no associated ETA** (are not the target
 /// of any mu-reference). Under IMP/IMPMAP such fixed-effect-only parameters are
 /// estimated solely through the importance-weighted θ M-step, which carries an
@@ -251,7 +215,16 @@ fn run_map_multistart(
             let mu = Some(mu_k);
 
             // Baseline: warm-start (or cold-start from η = 0).
-            let mut best = find_ebe(model, subject, params, inner_maxiter, inner_tol, warm, mu);
+            let mut best = find_ebe(
+                model,
+                subject,
+                params,
+                inner_maxiter,
+                inner_tol,
+                warm,
+                mu,
+                0,
+            );
 
             if let Some(ref l_omega) = omega_chol {
                 // Deterministic per-subject, per-iteration seed, separated from IS draws.
@@ -278,6 +251,7 @@ fn run_map_multistart(
                         inner_tol,
                         Some(&eta_slice),
                         mu,
+                        0,
                     );
                     if candidate.nll < best.nll {
                         best = candidate;
@@ -575,7 +549,7 @@ fn run_mcem(
         ));
     }
 
-    let mu_ref_pairs = mu_ref_log_pairs(model);
+    let mu_ref_pairs = get_mu_ref_pairs(model);
     // A log-mu-referenced typical value is updated only through the closed-form
     // `log θ += mean(η)` shift. When its paired η carries negligible IIV (a tiny,
     // often `FIX`ed ω — e.g. a structural parameter given a dummy random effect

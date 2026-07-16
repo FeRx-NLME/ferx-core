@@ -2744,7 +2744,21 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     markov_blocks.push(lines);
                 }
             }
+            // ODE state names (in state-vector order) let an intensity reference a model
+            // state for the time-inhomogeneous path (#817). `build_ode_spec` has already
+            // run, so `model.ode_spec` is populated for an ODE model; analytic/no-ODE
+            // models pass an empty slice (no state to drive Q, so any such reference stays
+            // an unresolved identifier as before).
+            let ode_state_names: &[String] = model
+                .ode_spec
+                .as_ref()
+                .map(|s| s.state_names.as_slice())
+                .unwrap_or(&[]);
             for lines in markov_blocks {
+                let declared_cov_names: Vec<String> = covariate_decls
+                    .as_ref()
+                    .map(|d| d.iter().map(|c| c.name.clone()).collect())
+                    .unwrap_or_default();
                 let (cmt, endpoint, ctmm_covs, blk_thetas, blk_etas) = parse_markov_model_block(
                     lines,
                     &theta_names,
@@ -2752,6 +2766,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     &indiv_stmts,
                     &model.kappa_names,
                     &model.error_spec,
+                    ode_state_names,
+                    &declared_cov_names,
                 )?;
                 if model.endpoints.contains_key(&cmt) {
                     return Err(format!(
@@ -4494,6 +4510,7 @@ fn is_matrix_rate_key(key: &str) -> bool {
 /// rejected with a "not yet supported" message so the surface stays honest.
 #[cfg(feature = "markov")]
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn parse_markov_model_block(
     lines: &[String],
     theta_names: &[String],
@@ -4501,6 +4518,14 @@ fn parse_markov_model_block(
     indiv_stmts: &[Statement],
     kappa_names: &[String],
     error_spec: &ErrorSpec,
+    // ODE state names in state-vector order (empty for a non-ODE / analytic model).
+    // An intensity that references one of these is time-inhomogeneous (drug/PD-driven
+    // Q(t), Phase 6 #817): the referenced state is threaded into the generator.
+    ode_state_names: &[String],
+    // Names declared in the optional `[covariates]` block (empty when absent). Used to
+    // reject a name that is *both* an ODE state and a declared data covariate — that
+    // collision would otherwise silently reinterpret the covariate column as the state.
+    declared_covariates: &[String],
 ) -> Result<
     (
         usize,
@@ -4872,20 +4897,180 @@ fn parse_markov_model_block(
         }
     }
 
+    // ── Time-inhomogeneous (drug/PD-driven Q(t), Phase 6 #817) detection ──────────
+    // An intensity may reference a model **ODE state** by name (e.g. a concentration
+    // `central/V` or a PD response compartment), evaluated at the current time as the
+    // state evolves. An identifier that is neither θ/η nor an `[individual_parameters]`
+    // name parses as an `Expression::Covariate` leaf (resolved from the covariates map at
+    // eval); a state name lands there too. Collect every Variable **and** Covariate leaf
+    // used directly in the transitions, and keep the ones that name an ODE state (and are
+    // not shadowed by an individual-parameter name — those resolve to the parameter).
+    // `generator_states` pairs each with its ODE-state-vector index; non-empty ⇒ the
+    // endpoint is inhomogeneous.
+    let generator_states: Vec<(String, usize)> = {
+        let mut referenced: HashSet<String> = HashSet::new();
+        for (_, _, expr) in &transitions {
+            visit_expr_nodes(expr, &mut |e: &Expression| {
+                if let Expression::Variable(name) | Expression::Covariate(name) = e {
+                    referenced.insert(name.clone());
+                }
+            });
+        }
+        let indiv_set: HashSet<&String> = indiv_param_names.iter().collect();
+        ode_state_names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| referenced.contains(*name) && !indiv_set.contains(name))
+            .map(|(idx, name)| (name.clone(), idx))
+            .collect()
+    };
+
+    // Reject a name that is simultaneously an ODE state and a referenced θ/η parameter:
+    // such an identifier resolves to the *parameter* leaf (`Expression::Theta/Eta`,
+    // indices assigned at parse), so it is invisible to the state-reference scan above
+    // and the endpoint would silently score on the time-**homogeneous** path with the
+    // constant parameter value instead of the evolving model state the user intended as
+    // the driver. The covariate-collision guard below catches the [covariates] case; this
+    // catches the parameter case symmetrically. `Theta/Eta` leaves carry only an index,
+    // so map it back to a name via `theta_names`/`eta_names`.
+    if !ode_state_names.is_empty() {
+        let state_name_set: HashSet<&String> = ode_state_names.iter().collect();
+        let mut collide: Option<String> = None;
+        for (_, _, expr) in &transitions {
+            visit_expr_nodes(expr, &mut |e: &Expression| {
+                let nm = match e {
+                    Expression::Theta(i) => theta_names.get(*i),
+                    Expression::Eta(i) => eta_names.get(*i),
+                    _ => None,
+                };
+                if let Some(name) = nm {
+                    if state_name_set.contains(name) {
+                        collide = Some(name.clone());
+                    }
+                }
+            });
+        }
+        if let Some(name) = collide {
+            return Err(format!(
+                "[markov_model]: the transition-intensity identifier `{name}` names both an ODE \
+                 model state and a θ/η parameter. This is ambiguous — the fit would use the \
+                 constant parameter and ignore the (time-inhomogeneous) model state. Rename one \
+                 of them so the intended driver is unambiguous."
+            ));
+        }
+    }
+
+    // Reject a name that is simultaneously an ODE state and a declared data covariate:
+    // the intensity would resolve it to the model state (below), silently overwriting the
+    // covariate column and stripping it from the required-column / TV-covariate checks —
+    // a wrong driver with no error. Fail loud and ask the user to disambiguate.
+    if !declared_covariates.is_empty() {
+        let cov_set_decl: HashSet<&String> = declared_covariates.iter().collect();
+        if let Some((name, _)) = generator_states
+            .iter()
+            .find(|(n, _)| cov_set_decl.contains(n))
+        {
+            return Err(format!(
+                "[markov_model]: the transition-intensity identifier `{name}` names both an ODE \
+                 model state and a declared [covariates] column. This is ambiguous — the fit \
+                 would use the model state and ignore the data column. Rename one of them so the \
+                 intended driver is unambiguous."
+            ));
+        }
+    }
+
+    // A referenced ODE state parsed as a `Covariate` leaf, so it was pooled into `cov_set`
+    // by the covariate scan above. It is a model **state**, not a data covariate — drop it
+    // so it is neither registered as a required data column nor caught by the TV-covariate
+    // guard (its time variation is intrinsic and handled by the occupancy integration).
+    let state_name_set: HashSet<&String> = generator_states.iter().map(|(n, _)| n).collect();
+    cov_set.retain(|c| !state_name_set.contains(c));
     let mut generator_covariates: Vec<String> = cov_set.into_iter().collect();
     generator_covariates.sort();
 
-    // Build the generator closure over (θ, η, covariates): place each intensity at
-    // its off-diagonal entry and subtract it from the diagonal so every row sums to
-    // zero — the caller always receives a valid generator.
+    // A state reached only *transitively* through an `[individual_parameters]` value is
+    // not supported yet: `eval_indiv_param_vars` evaluates those with no state channel,
+    // so the state would silently resolve to 0. Reject fail-loud, pointing the user to
+    // reference the state directly in the transition intensity.
+    if !ode_state_names.is_empty() {
+        let mut indiv_refs: HashSet<String> = HashSet::new();
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut indiv_refs); // covariate leaves
+        for s in &needed_indiv_stmts {
+            visit_stmt_nodes(std::slice::from_ref(s), &mut |e: &Expression| {
+                if let Expression::Variable(name) = e {
+                    indiv_refs.insert(name.clone());
+                }
+            });
+        }
+        let indiv_set: HashSet<&String> = indiv_param_names.iter().collect();
+        if let Some(name) = ode_state_names
+            .iter()
+            .find(|n| indiv_refs.contains(*n) && !indiv_set.contains(n))
+        {
+            return Err(format!(
+                "[markov_model]: an [individual_parameters] value referenced by a transition \
+                 intensity reads the model state `{name}`. A state-driven (time-inhomogeneous) \
+                 intensity must reference the state directly in the `transition` line (e.g. \
+                 `transition A -> B = exp(LQ + SLOPE * ({name} / V))`), not through an \
+                 [individual_parameters] value."
+            ));
+        }
+    }
+
+    // Build the generator closure over (θ, η, covariates, state): place each intensity
+    // at its off-diagonal entry and subtract it from the diagonal so every row sums to
+    // zero — the caller always receives a valid generator. On the inhomogeneous path the
+    // caller passes the ODE `state` at the current time; each referenced state name is
+    // injected into the variable map so `eval_expression` resolves it. On the homogeneous
+    // path `generator_states` is empty and `state` is ignored.
     let n_states = states.len();
+
+    // Snapshot a resolved, **dual-evaluable** form of the intensities before they move into
+    // the f64 closure below — the CTMM analogue of `IndivParamProgram` (#759). This is what
+    // lets `markov::endpoint` produce an exact `∂Q/∂(θ,η)` (and, chained through the Van Loan
+    // Fréchet derivative of `expm`, an exact likelihood gradient) instead of finite-
+    // differencing the whole matrix-exponential likelihood.
+    //
+    // Built only for the **time-homogeneous** endpoint: an intensity that reads an ODE state
+    // makes `Q` a functional of the PK trajectory, whose derivative needs the state's own
+    // sensitivities (and whose likelihood is an occupancy ODE, not an `expm` — so Van Loan
+    // does not apply). Those keep the FD path, so the program is `None` there.
+    let generator_program = if generator_states.is_empty() {
+        build_ctmm_generator_program(
+            &transitions,
+            &needed_indiv_stmts,
+            &generator_covariates,
+            n_states,
+            theta_names.len(),
+            eta_names.len(),
+        )
+    } else {
+        None
+    };
+
     let indiv = needed_indiv_stmts;
+    let gen_states = generator_states.clone();
     let generator_fn: crate::types::GeneratorFn = Box::new(
-        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-            let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, state: &[f64]| {
+            // A referenced ODE state parses as a `Covariate` leaf, so `eval_expression`
+            // resolves it from the covariates map. On the inhomogeneous path overlay the
+            // current state values there; the homogeneous path leaves `gen_states` empty and
+            // uses the caller's map unchanged (no clone).
+            let cov_owned;
+            let cov: &HashMap<String, f64> = if gen_states.is_empty() {
+                covariates
+            } else {
+                let mut c = covariates.clone();
+                for (name, idx) in &gen_states {
+                    c.insert(name.clone(), state.get(*idx).copied().unwrap_or(0.0));
+                }
+                cov_owned = c;
+                &cov_owned
+            };
+            let vars = eval_indiv_param_vars(&indiv, theta, eta, cov);
             let mut q = nalgebra::DMatrix::<f64>::zeros(n_states, n_states);
             for (j, k, expr) in &transitions {
-                let rate = eval_expression(expr, theta, eta, covariates, &vars, &[]);
+                let rate = eval_expression(expr, theta, eta, cov, &vars, &[]);
                 q[(*j, *k)] += rate;
                 q[(*j, *j)] -= rate;
             }
@@ -4899,7 +5084,9 @@ fn parse_markov_model_block(
             n_states,
             state_codes,
             generator_fn,
+            generator_program,
             generator_covariates: generator_covariates.clone(),
+            generator_states,
         },
         generator_covariates,
         theta_set,
@@ -5496,6 +5683,29 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         Ok(EstimationMethod::Imp)
     } else if val.contains("hybrid") || val == "gn_hybrid" || val == "gn-hybrid" {
         Ok(EstimationMethod::FoceGnHybrid)
+    } else if val == "laplace" || val == "laplacian" {
+        // NONMEM `$EST METHOD=1 LAPLACIAN` — the exact-anchor quadrature. `n_agq = 1`
+        // (default) is Laplace; `n_agq > 1` is adaptive Gauss–Hermite quadrature.
+        Ok(EstimationMethod::Laplace)
+    } else if val == "agq"
+        || val == "aghq"
+        || val == "gauss_hermite"
+        || val == "gauss-hermite"
+        || val == "adaptive_gaussian_quadrature"
+        || val == "adaptive-gaussian-quadrature"
+    {
+        // `method = agq` was removed (#251): adaptive quadrature is not a separate estimator,
+        // it is `method = laplace` with `n_agq > 1` (exact Hessian anchor) — or
+        // `method = focei` with `n_agq > 1` for the Gauss-Newton anchor. This arm MUST stay
+        // above the `contains("gauss")` arm below, which would otherwise route
+        // `gauss_hermite` into Gauss-*Newton*.
+        Err(
+            "method = agq has been removed: use method = laplace with n_agq = N \
+             (n_agq = 1 is the Laplace approximation, n_agq > 1 is adaptive Gauss–Hermite \
+             quadrature). For the Gauss-Newton-anchored quadrature use method = focei with \
+             n_agq > 1."
+                .to_string(),
+        )
     } else if val == "gn" || val.contains("gauss") {
         Ok(EstimationMethod::FoceGn)
     } else if val == "focei" || val == "foce-i" || val == "foce_i" || val.contains("interaction") {
@@ -5779,6 +5989,50 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             .parse::<f64>()
             .map_err(|_| format!("fit option `{name}`: expected number, got `{value}`"))
     };
+    // Parse an f64 that must be strictly positive and finite.
+    let parse_pos_finite = |name: &str| -> Result<f64, String> {
+        let v = parse_f64(name)?;
+        if v <= 0.0 || !v.is_finite() {
+            return Err(format!("{name} must be a positive finite value, got {v}"));
+        }
+        Ok(v)
+    };
+    // Parse an f64 with an inclusive lower bound (`v >= min`). `min` is rendered
+    // with Debug so integral bounds keep their trailing `.0` (e.g. `>= 1.0`).
+    let parse_f64_min = |name: &str, min: f64| -> Result<f64, String> {
+        let v = parse_f64(name)?;
+        if v < min {
+            return Err(format!("{name} must be >= {min:?}, got {v}"));
+        }
+        Ok(v)
+    };
+    // Parse an f64 constrained to the closed unit interval [0.0, 1.0].
+    let parse_unit_interval = |name: &str| -> Result<f64, String> {
+        let v = parse_f64(name)?;
+        if !(0.0..=1.0).contains(&v) {
+            return Err(format!("{name} must be in [0.0, 1.0], got {v}"));
+        }
+        Ok(v)
+    };
+    // Parse a Student-t proposal df: `normal`/`mvn` select a multivariate-normal
+    // proposal (∞ df), otherwise a finite df `>= 1.0`. `strip_quotes` mirrors the
+    // impmap site, which tolerates a quoted `"normal"` token.
+    let parse_proposal_df = |name: &str, strip_quotes: bool| -> Result<f64, String> {
+        let tok = if strip_quotes {
+            value.trim_matches(|c| c == '"' || c == '\'')
+        } else {
+            value
+        };
+        if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
+            Ok(f64::INFINITY)
+        } else {
+            let v = parse_f64(name)?;
+            if v < 1.0 {
+                return Err(format!("{name} must be >= 1.0 or `normal`, got {v}"));
+            }
+            Ok(v)
+        }
+    };
 
     // Dispatch first, then record the key on success so we can later warn
     // when a key is set that the selected method does not consume. Malformed
@@ -5787,43 +6041,12 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "maxiter" => opts.outer_maxiter = parse_usize("maxiter")?,
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
+        "inner_restarts" => opts.inner_restarts = parse_usize("inner_restarts")?,
         "cov_inner_tol" => opts.cov_inner_tol = Some(parse_f64("cov_inner_tol")?),
-        "outer_xtol" => {
-            let v = parse_f64("outer_xtol")?;
-            if v <= 0.0 || !v.is_finite() {
-                return Err(format!(
-                    "outer_xtol must be a positive finite value, got {v}"
-                ));
-            }
-            opts.outer_xtol = v;
-        }
-        "outer_ftol" => {
-            let v = parse_f64("outer_ftol")?;
-            if v <= 0.0 || !v.is_finite() {
-                return Err(format!(
-                    "outer_ftol must be a positive finite value, got {v}"
-                ));
-            }
-            opts.outer_ftol = Some(v);
-        }
-        "ode_reltol" => {
-            let v = parse_f64("ode_reltol")?;
-            if v <= 0.0 || !v.is_finite() {
-                return Err(format!(
-                    "ode_reltol must be a positive finite value, got {v}"
-                ));
-            }
-            opts.ode_reltol = v;
-        }
-        "ode_abstol" => {
-            let v = parse_f64("ode_abstol")?;
-            if v <= 0.0 || !v.is_finite() {
-                return Err(format!(
-                    "ode_abstol must be a positive finite value, got {v}"
-                ));
-            }
-            opts.ode_abstol = v;
-        }
+        "outer_xtol" => opts.outer_xtol = parse_pos_finite("outer_xtol")?,
+        "outer_ftol" => opts.outer_ftol = Some(parse_pos_finite("outer_ftol")?),
+        "ode_reltol" => opts.ode_reltol = parse_pos_finite("ode_reltol")?,
+        "ode_abstol" => opts.ode_abstol = parse_pos_finite("ode_abstol")?,
         "ode_max_steps" => {
             let v = parse_usize("ode_max_steps")?;
             if v == 0 {
@@ -5857,16 +6080,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             };
         }
-        "fd_hessian_step" => {
-            let v = parse_f64("fd_hessian_step")?;
-            if v <= 0.0 || !v.is_finite() {
-                return Err(format!(
-                    "fd_hessian_step must be a positive finite value, got {}",
-                    v
-                ));
-            }
-            opts.fd_hessian_step = v;
-        }
+        "fd_hessian_step" => opts.fd_hessian_step = parse_pos_finite("fd_hessian_step")?,
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -5935,12 +6149,19 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "sir_resamples" => opts.sir_resamples = parse_usize("sir_resamples")?,
         "sir_seed" => opts.sir_seed = parse_u64_opt("sir_seed")?,
         "sir_keep_samples" => opts.sir_keep_samples = parse_bool("sir_keep_samples")?,
-        "sir_df" => {
-            let v = parse_f64("sir_df")?;
-            if v < 1.0 {
-                return Err(format!("sir_df must be >= 1.0, got {v}"));
+        "sir_df" => opts.sir_df = parse_f64_min("sir_df", 1.0)?,
+        "n_agq" => {
+            let v = parse_usize("n_agq")?;
+            if v < 1 {
+                return Err("n_agq must be >= 1 (1 = the Laplace approximation)".to_string());
             }
-            opts.sir_df = v;
+            if v > crate::estimation::agq::MAX_AGQ_NODES {
+                return Err(format!(
+                    "n_agq must be <= {}, got {v}",
+                    crate::estimation::agq::MAX_AGQ_NODES
+                ));
+            }
+            opts.n_agq = v;
         }
         "imp_samples" => {
             let v = parse_usize("imp_samples")?;
@@ -5949,29 +6170,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.imp_samples = v;
         }
-        "imp_proposal_df" => {
-            let tok = value.trim();
-            if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
-                opts.imp_proposal_df = f64::INFINITY;
-            } else {
-                let v = parse_f64("imp_proposal_df")?;
-                if v < 1.0 {
-                    return Err(format!(
-                        "imp_proposal_df must be >= 1.0 or `normal`, got {v}"
-                    ));
-                }
-                opts.imp_proposal_df = v;
-            }
-        }
+        "imp_proposal_df" => opts.imp_proposal_df = parse_proposal_df("imp_proposal_df", false)?,
         "imp_seed" => opts.imp_seed = parse_u64_opt("imp_seed")?,
         "imp_low_ess_threshold" => {
-            let v = parse_f64("imp_low_ess_threshold")?;
-            if !(0.0..=1.0).contains(&v) {
-                return Err(format!(
-                    "imp_low_ess_threshold must be in [0.0, 1.0], got {v}"
-                ));
-            }
-            opts.imp_low_ess_threshold = v;
+            opts.imp_low_ess_threshold = parse_unit_interval("imp_low_ess_threshold")?
         }
         "imp_iterations" => {
             let v = parse_usize("imp_iterations")?;
@@ -5996,32 +6198,16 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.impmap_samples = v;
         }
+        // `normal` / `mvn` (or a very large df) select a multivariate-normal
+        // proposal — NONMEM's IMPMAP default. A finite value gives Student-t.
+        // `strip_quotes = true` tolerates a quoted `"normal"` token.
         "impmap_proposal_df" => {
-            // `normal` / `mvn` (or a very large df) select a multivariate-normal
-            // proposal — NONMEM's IMPMAP default. A finite value gives Student-t.
-            let tok = value.trim().trim_matches(|c| c == '"' || c == '\'');
-            if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
-                opts.impmap_proposal_df = f64::INFINITY;
-            } else {
-                let v = parse_f64("impmap_proposal_df")?;
-                if v < 1.0 {
-                    return Err(format!(
-                        "impmap_proposal_df must be >= 1.0 or `normal`, got {v}"
-                    ));
-                }
-                opts.impmap_proposal_df = v;
-            }
+            opts.impmap_proposal_df = parse_proposal_df("impmap_proposal_df", true)?
         }
         "impmap_seed" => opts.impmap_seed = parse_u64_opt("impmap_seed")?,
         "impmap_averaging" => opts.impmap_averaging = parse_usize("impmap_averaging")?,
         "impmap_low_ess_threshold" => {
-            let v = parse_f64("impmap_low_ess_threshold")?;
-            if !(0.0..=1.0).contains(&v) {
-                return Err(format!(
-                    "impmap_low_ess_threshold must be in [0.0, 1.0], got {v}"
-                ));
-            }
-            opts.impmap_low_ess_threshold = v;
+            opts.impmap_low_ess_threshold = parse_unit_interval("impmap_low_ess_threshold")?
         }
         "impmap_trace" => opts.impmap_trace = parse_bool("impmap_trace")?,
         "impmap_mceta" => opts.impmap_mceta = parse_usize("impmap_mceta")?,
@@ -12187,12 +12373,84 @@ fn check_unused_parameters(
     warnings
 }
 
-fn eval_expression(
+// ─── Shared expression / condition evaluators ───────────────────────────────
+//
+// `eval_expression`/`eval_condition` (HashMap-keyed name lookup) and
+// `eval_expression_indexed`/`eval_condition_indexed` (slice-index lookup) were
+// byte-for-byte identical in every arithmetic/unary/power/conditional/literal
+// arm; they differed ONLY in how the four "environment" variants
+// (`Variable`/`Covariate` vs `VariableIdx`/`CovariateIdx`) resolve a name to an
+// `f64`. That name resolution is factored into the `EvalEnv` trait, with a
+// HashMap impl (`MapEnv`) and a slice impl (`SliceEnv`), so the arithmetic lives
+// once in the generic `eval_expr`/`eval_cond`. Monomorphization keeps both call
+// sites zero-cost. Every arithmetic/guard arm is copied verbatim from the
+// originals (the `Div` 1e-30 guard, the unary fn set, the `NnOutput` cache
+// lookup).
+
+/// Name resolution for the four environment expression variants
+/// (`Variable`/`Covariate`/`VariableIdx`/`CovariateIdx`). The generic
+/// evaluator routes exactly those variants here; every other arm is handled
+/// generically.
+trait EvalEnv {
+    fn resolve(&self, expr: &Expression) -> f64;
+}
+
+/// HashMap-keyed environment (the unindexed evaluator).
+struct MapEnv<'a> {
+    covariates: &'a HashMap<String, f64>,
+    vars: &'a HashMap<String, f64>,
+}
+
+impl EvalEnv for MapEnv<'_> {
+    #[inline]
+    fn resolve(&self, expr: &Expression) -> f64 {
+        match expr {
+            Expression::Covariate(name) => self.covariates.get(name).copied().unwrap_or(0.0),
+            Expression::Variable(name) => {
+                if name.eq_ignore_ascii_case("MACHEPS") {
+                    f64::EPSILON
+                } else {
+                    self.vars.get(name).copied().unwrap_or(0.0)
+                }
+            }
+            _ => {
+                debug_assert!(
+                    false,
+                    "indexed expression reached unindexed eval_expression"
+                );
+                0.0
+            }
+        }
+    }
+}
+
+/// Slice-indexed environment (the resolved, hot indexed evaluator).
+struct SliceEnv<'a> {
+    covariates: &'a [f64],
+    vars: &'a [f64],
+}
+
+impl EvalEnv for SliceEnv<'_> {
+    #[inline]
+    fn resolve(&self, expr: &Expression) -> f64 {
+        match expr {
+            Expression::VariableIdx(i) => self.vars.get(*i).copied().unwrap_or(0.0),
+            Expression::CovariateIdx(i) => self.covariates.get(*i).copied().unwrap_or(0.0),
+            _ => {
+                debug_assert!(false, "unresolved name reached eval_expression_indexed");
+                0.0
+            }
+        }
+    }
+}
+
+/// Generic expression evaluator. All arithmetic/unary/power/conditional/literal
+/// arms are shared; the environment variants delegate to `env.resolve`.
+fn eval_expr<E: EvalEnv>(
     expr: &Expression,
     theta: &[f64],
     eta: &[f64],
-    covariates: &HashMap<String, f64>,
-    vars: &HashMap<String, f64>,
+    env: &E,
     nn_outputs: &[Vec<f64>],
 ) -> f64 {
     match expr {
@@ -12200,24 +12458,13 @@ fn eval_expression(
         Expression::Theta(i) => theta[*i],
         Expression::Eta(i) => eta[*i],
         Expression::Time => current_model_time(),
-        Expression::Covariate(name) => covariates.get(name).copied().unwrap_or(0.0),
-        Expression::Variable(name) => {
-            if name.eq_ignore_ascii_case("MACHEPS") {
-                f64::EPSILON
-            } else {
-                vars.get(name).copied().unwrap_or(0.0)
-            }
-        }
-        Expression::VariableIdx(_) | Expression::CovariateIdx(_) => {
-            debug_assert!(
-                false,
-                "indexed expression reached unindexed eval_expression"
-            );
-            0.0
-        }
+        Expression::Variable(_)
+        | Expression::Covariate(_)
+        | Expression::VariableIdx(_)
+        | Expression::CovariateIdx(_) => env.resolve(expr),
         Expression::BinOp(lhs, op, rhs) => {
-            let l = eval_expression(lhs, theta, eta, covariates, vars, nn_outputs);
-            let r = eval_expression(rhs, theta, eta, covariates, vars, nn_outputs);
+            let l = eval_expr(lhs, theta, eta, env, nn_outputs);
+            let r = eval_expr(rhs, theta, eta, env, nn_outputs);
             match op {
                 BinOp::Add => l + r,
                 BinOp::Sub => l - r,
@@ -12233,7 +12480,7 @@ fn eval_expression(
             }
         }
         Expression::UnaryFn(name, arg) => {
-            let v = eval_expression(arg, theta, eta, covariates, vars, nn_outputs);
+            let v = eval_expr(arg, theta, eta, env, nn_outputs);
             match name.as_str() {
                 "exp" => v.exp(),
                 "log" | "ln" => v.max(1e-30).ln(),
@@ -12259,23 +12506,23 @@ fn eval_expression(
             }
         }
         Expression::Power(base, exp) => {
-            let b = eval_expression(base, theta, eta, covariates, vars, nn_outputs);
-            let e = eval_expression(exp, theta, eta, covariates, vars, nn_outputs);
+            let b = eval_expr(base, theta, eta, env, nn_outputs);
+            let e = eval_expr(exp, theta, eta, env, nn_outputs);
             b.powf(e)
         }
         Expression::Conditional(cond, t, e) => {
-            if eval_condition(cond, theta, eta, covariates, vars, nn_outputs) {
-                eval_expression(t, theta, eta, covariates, vars, nn_outputs)
+            if eval_cond(cond, theta, eta, env, nn_outputs) {
+                eval_expr(t, theta, eta, env, nn_outputs)
             } else {
-                eval_expression(e, theta, eta, covariates, vars, nn_outputs)
+                eval_expr(e, theta, eta, env, nn_outputs)
             }
         }
         Expression::NnOutput { nn_idx, output_idx } => {
-            // Same per-call cache as the indexed evaluator. Callers
-            // populate `nn_outputs` from `NamedMlpMapper::forward_raw`
-            // (see the `tv_fn` closure for the eta=0 path). Out-of-bounds
-            // indices return 0.0 with a debug-assert so a logic bug
-            // surfaces in tests but doesn't crash release builds.
+            // Per-call cache populated once per forward via
+            // `NamedMlpMapper::forward_raw`. Multiple references to outputs of
+            // the same NN therefore share a single forward pass. Out-of-bounds
+            // indices return 0.0 with a debug-assert so a logic bug surfaces in
+            // tests but doesn't crash release builds.
             nn_outputs
                 .get(*nn_idx)
                 .and_then(|v| v.get(*output_idx))
@@ -12283,7 +12530,7 @@ fn eval_expression(
                 .unwrap_or_else(|| {
                     debug_assert!(
                         false,
-                        "NnOutput nn_idx={nn_idx} output_idx={output_idx} out of bounds in unindexed eval"
+                        "NnOutput nn_idx={nn_idx} output_idx={output_idx} out of bounds"
                     );
                     0.0
                 })
@@ -12291,18 +12538,18 @@ fn eval_expression(
     }
 }
 
-fn eval_condition(
+/// Generic condition evaluator (shared by the HashMap and slice entry points).
+fn eval_cond<E: EvalEnv>(
     cond: &Condition,
     theta: &[f64],
     eta: &[f64],
-    covariates: &HashMap<String, f64>,
-    vars: &HashMap<String, f64>,
+    env: &E,
     nn_outputs: &[Vec<f64>],
 ) -> bool {
     match cond {
         Condition::Compare(l, op, r) => {
-            let lv = eval_expression(l, theta, eta, covariates, vars, nn_outputs);
-            let rv = eval_expression(r, theta, eta, covariates, vars, nn_outputs);
+            let lv = eval_expr(l, theta, eta, env, nn_outputs);
+            let rv = eval_expr(r, theta, eta, env, nn_outputs);
             match op {
                 CmpOp::Lt => lv < rv,
                 CmpOp::Le => lv <= rv,
@@ -12313,15 +12560,39 @@ fn eval_condition(
             }
         }
         Condition::And(l, r) => {
-            eval_condition(l, theta, eta, covariates, vars, nn_outputs)
-                && eval_condition(r, theta, eta, covariates, vars, nn_outputs)
+            eval_cond(l, theta, eta, env, nn_outputs) && eval_cond(r, theta, eta, env, nn_outputs)
         }
         Condition::Or(l, r) => {
-            eval_condition(l, theta, eta, covariates, vars, nn_outputs)
-                || eval_condition(r, theta, eta, covariates, vars, nn_outputs)
+            eval_cond(l, theta, eta, env, nn_outputs) || eval_cond(r, theta, eta, env, nn_outputs)
         }
-        Condition::Not(c) => !eval_condition(c, theta, eta, covariates, vars, nn_outputs),
+        Condition::Not(c) => !eval_cond(c, theta, eta, env, nn_outputs),
     }
+}
+
+#[inline]
+fn eval_expression(
+    expr: &Expression,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+    vars: &HashMap<String, f64>,
+    nn_outputs: &[Vec<f64>],
+) -> f64 {
+    let env = MapEnv { covariates, vars };
+    eval_expr(expr, theta, eta, &env, nn_outputs)
+}
+
+#[inline]
+fn eval_condition(
+    cond: &Condition,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+    vars: &HashMap<String, f64>,
+    nn_outputs: &[Vec<f64>],
+) -> bool {
+    let env = MapEnv { covariates, vars };
+    eval_cond(cond, theta, eta, &env, nn_outputs)
 }
 
 // ─── Bytecode interpreter ───────────────────────────────────────────────────
@@ -13166,6 +13437,7 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
 /// + probe in the `pk_param_fn` closure. Falls back to 0.0 for the
 /// HashMap-keyed variants (Variable/Covariate) since callers running
 /// the indexed path have already resolved every name.
+#[inline]
 fn eval_expression_indexed(
     expr: &Expression,
     theta: &[f64],
@@ -13174,91 +13446,11 @@ fn eval_expression_indexed(
     vars: &[f64],
     nn_outputs: &[Vec<f64>],
 ) -> f64 {
-    match expr {
-        Expression::Literal(v) => *v,
-        Expression::Theta(i) => theta[*i],
-        Expression::Eta(i) => eta[*i],
-        Expression::Time => current_model_time(),
-        Expression::VariableIdx(i) => vars.get(*i).copied().unwrap_or(0.0),
-        Expression::CovariateIdx(i) => covariates.get(*i).copied().unwrap_or(0.0),
-        Expression::Covariate(_) | Expression::Variable(_) => {
-            debug_assert!(false, "unresolved name reached eval_expression_indexed");
-            0.0
-        }
-        Expression::BinOp(lhs, op, rhs) => {
-            let l = eval_expression_indexed(lhs, theta, eta, covariates, vars, nn_outputs);
-            let r = eval_expression_indexed(rhs, theta, eta, covariates, vars, nn_outputs);
-            match op {
-                BinOp::Add => l + r,
-                BinOp::Sub => l - r,
-                BinOp::Mul => l * r,
-                BinOp::Div => {
-                    if r.abs() < 1e-30 {
-                        0.0
-                    } else {
-                        l / r
-                    }
-                }
-                BinOp::Mod => l.rem_euclid(r),
-            }
-        }
-        Expression::UnaryFn(name, arg) => {
-            let v = eval_expression_indexed(arg, theta, eta, covariates, vars, nn_outputs);
-            match name.as_str() {
-                "exp" => v.exp(),
-                "log" | "ln" => v.max(1e-30).ln(),
-                "sqrt" => v.max(0.0).sqrt(),
-                "abs" => v.abs(),
-                "floor" => v.floor(),
-                "ceil" => v.ceil(),
-                "round" => v.round(),
-                "inv_logit" | "expit" => {
-                    if v >= 0.0 {
-                        1.0 / (1.0 + (-v).exp())
-                    } else {
-                        let e = v.exp();
-                        e / (1.0 + e)
-                    }
-                }
-                "logit" => {
-                    let clamped = v.clamp(1e-15, 1.0 - 1e-15);
-                    (clamped / (1.0 - clamped)).ln()
-                }
-                _ => v,
-            }
-        }
-        Expression::Power(base, exp) => {
-            let b = eval_expression_indexed(base, theta, eta, covariates, vars, nn_outputs);
-            let e = eval_expression_indexed(exp, theta, eta, covariates, vars, nn_outputs);
-            b.powf(e)
-        }
-        Expression::Conditional(cond, t, e) => {
-            if eval_condition_indexed(cond, theta, eta, covariates, vars, nn_outputs) {
-                eval_expression_indexed(t, theta, eta, covariates, vars, nn_outputs)
-            } else {
-                eval_expression_indexed(e, theta, eta, covariates, vars, nn_outputs)
-            }
-        }
-        Expression::NnOutput { nn_idx, output_idx } => {
-            // Reads from the per-call cache that `build_pk_param_fn`
-            // populates once per forward via `NamedMlpMapper::forward_raw`.
-            // Multiple references to outputs of the same NN therefore share
-            // a single forward pass.
-            nn_outputs
-                .get(*nn_idx)
-                .and_then(|v| v.get(*output_idx))
-                .copied()
-                .unwrap_or_else(|| {
-                    debug_assert!(
-                        false,
-                        "NnOutput nn_idx={nn_idx} output_idx={output_idx} out of bounds"
-                    );
-                    0.0
-                })
-        }
-    }
+    let env = SliceEnv { covariates, vars };
+    eval_expr(expr, theta, eta, &env, nn_outputs)
 }
 
+#[inline]
 fn eval_condition_indexed(
     cond: &Condition,
     theta: &[f64],
@@ -13267,29 +13459,8 @@ fn eval_condition_indexed(
     vars: &[f64],
     nn_outputs: &[Vec<f64>],
 ) -> bool {
-    match cond {
-        Condition::Compare(l, op, r) => {
-            let lv = eval_expression_indexed(l, theta, eta, covariates, vars, nn_outputs);
-            let rv = eval_expression_indexed(r, theta, eta, covariates, vars, nn_outputs);
-            match op {
-                CmpOp::Lt => lv < rv,
-                CmpOp::Le => lv <= rv,
-                CmpOp::Gt => lv > rv,
-                CmpOp::Ge => lv >= rv,
-                CmpOp::Eq => lv == rv,
-                CmpOp::Ne => lv != rv,
-            }
-        }
-        Condition::And(l, r) => {
-            eval_condition_indexed(l, theta, eta, covariates, vars, nn_outputs)
-                && eval_condition_indexed(r, theta, eta, covariates, vars, nn_outputs)
-        }
-        Condition::Or(l, r) => {
-            eval_condition_indexed(l, theta, eta, covariates, vars, nn_outputs)
-                || eval_condition_indexed(r, theta, eta, covariates, vars, nn_outputs)
-        }
-        Condition::Not(c) => !eval_condition_indexed(c, theta, eta, covariates, vars, nn_outputs),
-    }
+    let env = SliceEnv { covariates, vars };
+    eval_cond(cond, theta, eta, &env, nn_outputs)
 }
 
 /// Inner statement evaluator threaded with a caller-owned bytecode stack.
@@ -13733,6 +13904,245 @@ fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
     dyn_vars.iter().map(|&d| !d).collect()
 }
 
+/// Widest `(θ, η)` axis count the CTMM generator's dual dispatch specializes.
+/// Above this, [`CtmmGeneratorProgram::eval_generator_duals`] returns `None` and the
+/// endpoint keeps its finite-difference gradient — a fallback, never a wrong answer.
+#[cfg(feature = "markov")]
+pub(crate) const MAX_CTMM_AXES: usize = 24;
+
+/// Compiled, **dual-evaluable** `[markov_model]` transition intensities — the CTMM
+/// analogue of [`IndivParamProgram`] (#759).
+///
+/// The f64 [`GeneratorFn`](crate::types::GeneratorFn) tree-walks `Expression`s and can
+/// only ever produce `Q` itself, which is why the CTMM likelihood has been finite-
+/// differenced end-to-end (perturb η, rebuild `Q`, redo an `expm` per observation gap).
+/// This snapshot carries the same intensities in *resolved* form — the shared
+/// `Bytecode` the rest of the analytic-sensitivity path uses — so they can be replayed
+/// over `Dual1<M>` with θ and η seeded, yielding an exact `∂Q/∂(θ,η)`.
+///
+/// Chained through the Van Loan Fréchet derivative of `expm`
+/// ([`markov::matrix_exp_frechet`](crate::markov::matrix_exp_frechet)) this gives the exact
+/// likelihood gradient. Note `∂Q/∂p` inherits the generator's **row-sum-zero constraint**
+/// for free: every intensity is added at its off-diagonal entry and subtracted from the
+/// diagonal, and differentiation is linear, so the derivative of a valid generator is a
+/// valid *direction*. That is the constraint `generator_rate_direction` hand-builds for the
+/// one-rate-at-a-time case, and the reason a naive "one gradient per `Q` entry" API is wrong
+/// (see the `markov` module docs).
+///
+/// Time-**inhomogeneous** endpoints (an intensity reading an ODE state) get no program:
+/// their likelihood is an occupancy ODE, not an `expm`, so Van Loan does not apply.
+#[cfg(feature = "markov")]
+#[derive(Debug, Clone)]
+pub struct CtmmGeneratorProgram {
+    /// Resolved `[individual_parameters]` statements the intensities read, in
+    /// dependency order (already restricted to the transitively-referenced subset).
+    stmts: Vec<Statement>,
+    /// Var-slot count the statements above write into.
+    n_vars: usize,
+    /// `(from, to, intensity)` — one compiled off-diagonal rate per `transition` line.
+    rates: Vec<(usize, usize, Bytecode)>,
+    n_states: usize,
+    /// Covariate names in the generator's own (sorted) order, for the cov slice.
+    cov_names: Vec<String>,
+    n_theta: usize,
+    /// BSV η count. IOV kappas are rejected in an intensity at parse, so this is the
+    /// full η width the intensities can read.
+    n_eta: usize,
+}
+
+#[cfg(feature = "markov")]
+impl CtmmGeneratorProgram {
+    /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
+    pub(crate) fn n_axes(&self) -> usize {
+        self.n_theta + self.n_eta
+    }
+    pub(crate) fn n_theta_axis(&self) -> usize {
+        self.n_theta
+    }
+
+    /// `Q` and `∂Q/∂(θ, η)` at a covariate snapshot, evaluated over `Dual1<M>` with
+    /// θ_m on axis `m` and η_k on axis `n_theta + k` (the same axis convention
+    /// [`IndivParamProgram::eval_param_duals`] uses).
+    ///
+    /// Returns `(q, dq)` where `q` is the `S×S` generator and `dq[a]` is `∂Q/∂(axis a)`,
+    /// length `n_axes()`. Both are built by placing each intensity — value and jet — at
+    /// its off-diagonal entry and subtracting it from the diagonal, so each `dq[a]` has
+    /// zero row sums by construction.
+    ///
+    /// `None` above the dispatch cap ([`MAX_CTMM_AXES`]): the endpoint then keeps its FD
+    /// gradient rather than a wrong one.
+    pub(crate) fn eval_generator_duals(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<(nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>)> {
+        macro_rules! disp {
+            ($($m:literal),+) => {
+                match self.n_axes() {
+                    $($m => Some(self.eval_generator_duals_n::<$m>(theta, eta, covariates)),)+
+                    _ => None,
+                }
+            };
+        }
+        disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+    }
+
+    fn eval_generator_duals_n<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> (nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>) {
+        use crate::sens::dual1::Dual1;
+        debug_assert_eq!(M, self.n_axes());
+        let theta_d: Vec<Dual1<M>> = theta
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                if m < M {
+                    Dual1::var(v, m)
+                } else {
+                    // A θ the intensities cannot reference anyway (the program is sized by
+                    // the model's declared θ count, so this is unreachable in practice).
+                    Dual1::constant(v)
+                }
+            })
+            .collect();
+        let eta_d: Vec<Dual1<M>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                let dim = self.n_theta + k;
+                if dim < M {
+                    Dual1::var(v, dim)
+                } else {
+                    // IOV kappas are appended past the BSV η block and are rejected in an
+                    // intensity at parse, so they are correctly seeded as constants here.
+                    Dual1::constant(v)
+                }
+            })
+            .collect();
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+
+        let mut vars = vec![Dual1::<M>::constant(0.0); self.n_vars];
+        let mut stack: Vec<Dual1<M>> = Vec::new();
+        eval_statements_g::<Dual1<M>>(
+            &self.stmts,
+            &theta_d,
+            &eta_d,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            &[],
+        );
+
+        let s = self.n_states;
+        let n_axes = self.n_axes();
+        let mut q = nalgebra::DMatrix::<f64>::zeros(s, s);
+        let mut dq = vec![nalgebra::DMatrix::<f64>::zeros(s, s); n_axes];
+        let empty_nn: Vec<Vec<f64>> = Vec::new();
+        for (j, k, bc) in &self.rates {
+            let rate = eval_bytecode_g::<Dual1<M>>(
+                bc, &theta_d, &eta_d, &cov_vec, &vars, &empty_nn, &mut stack,
+            );
+            q[(*j, *k)] += rate.value;
+            q[(*j, *j)] -= rate.value;
+            for (a, dq_a) in dq.iter_mut().enumerate().take(n_axes) {
+                let g = rate.grad[a];
+                dq_a[(*j, *k)] += g;
+                dq_a[(*j, *j)] -= g;
+            }
+        }
+        (q, dq)
+    }
+}
+
+/// Resolve + compile a `[markov_model]`'s intensities into a [`CtmmGeneratorProgram`].
+/// `None` when the program cannot be represented exactly, in which case the endpoint keeps
+/// its FD gradient: an intensity or an `[individual_parameters]` value that reads an
+/// identifier we cannot bind (which would silently lower to a constant `0.0` push and thus
+/// a silently-wrong derivative), or a `(θ, η)` width past the dual dispatch cap.
+#[cfg(feature = "markov")]
+fn build_ctmm_generator_program(
+    transitions: &[(usize, usize, Expression)],
+    needed_indiv_stmts: &[Statement],
+    generator_covariates: &[String],
+    n_states: usize,
+    n_theta: usize,
+    n_eta: usize,
+) -> Option<CtmmGeneratorProgram> {
+    if n_theta + n_eta == 0 || n_theta + n_eta > MAX_CTMM_AXES {
+        return None;
+    }
+
+    // Var slots for the `[individual_parameters]` values the intensities read, in the
+    // order they are assigned (so a later value may read an earlier one).
+    let var_names = assigned_vars_in_order(needed_indiv_stmts);
+    let var_idx: HashMap<String, usize> = var_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    let n_vars = var_names.len();
+    let cov_idx: HashMap<String, usize> = generator_covariates
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+
+    // An unresolved `Variable`/`Covariate` leaf lowers to a constant `0.0` in
+    // `compile_bytecode` (its documented fall-through). That is survivable for a *value*
+    // path that never sees one, but here it would hand back a confidently wrong gradient,
+    // so refuse the program instead and let FD serve the endpoint.
+    let resolvable = |e: &Expression| -> bool {
+        let mut ok = true;
+        visit_expr_nodes(e, &mut |node: &Expression| match node {
+            Expression::Variable(name) => ok &= var_idx.contains_key(name),
+            Expression::Covariate(name) => ok &= cov_idx.contains_key(name),
+            _ => {}
+        });
+        ok
+    };
+    if !transitions.iter().all(|(_, _, e)| resolvable(e)) {
+        return None;
+    }
+    let mut indiv_ok = true;
+    visit_stmt_nodes(needed_indiv_stmts, &mut |e: &Expression| {
+        indiv_ok &= resolvable(e);
+    });
+    if !indiv_ok {
+        return None;
+    }
+
+    let mut stmts: Vec<Statement> = needed_indiv_stmts.to_vec();
+    resolve_variable_indices(&mut stmts, &var_idx, &cov_idx, None);
+
+    let rates: Vec<(usize, usize, Bytecode)> = transitions
+        .iter()
+        .map(|(j, k, expr)| {
+            let mut e = expr.clone();
+            resolve_expr_indices(&mut e, &var_idx, &cov_idx);
+            (*j, *k, compile_bytecode(&e))
+        })
+        .collect();
+
+    Some(CtmmGeneratorProgram {
+        stmts,
+        n_vars,
+        rates,
+        n_states,
+        cov_names: generator_covariates.to_vec(),
+        n_theta,
+        n_eta,
+    })
+}
+
 /// Compiled `[individual_parameters]` block + var layout, exposed so the
 /// analytic-sensitivity provider can obtain `∂p/∂η`, `∂p/∂θ` (and second order)
 /// **analytically** — by evaluating the same statements over `Dual2<M>` seeded on
@@ -14020,15 +14430,6 @@ impl OdeOutputProgram {
                 .ops
                 .iter()
                 .any(|op| matches!(op, Op::PushVar(i) if *i as usize == idx))
-    }
-
-    /// The highest PK slot any individual parameter of this readout maps to
-    /// (`indiv_to_pk`), or `None` if the readout references no individual
-    /// parameters. The tv-covariate event-walk provider (#650) seeds only the
-    /// eight `PkDual` structural slots (`CL..V3`, 0..=7), so it serves the readout
-    /// analytically only when every referenced parameter slot fits there.
-    pub(crate) fn max_indiv_pk_slot(&self) -> Option<usize> {
-        self.indiv_to_pk.iter().copied().max()
     }
 
     /// Evaluate the output expression over a dual type, generic over [`PkNum`]
@@ -21039,6 +21440,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_inner_restarts() {
+        // Default is 1 (guarded multi-start on); the key overrides the count.
+        let default = parse_full_model(&minimal_model_with_fit_options("  method = focei"))
+            .unwrap()
+            .fit_options
+            .inner_restarts;
+        assert_eq!(default, 1);
+        let parsed =
+            parse_full_model(&minimal_model_with_fit_options("  inner_restarts = 2")).unwrap();
+        assert_eq!(parsed.fit_options.inner_restarts, 2);
+        // `0` disables it.
+        let off =
+            parse_full_model(&minimal_model_with_fit_options("  inner_restarts = 0")).unwrap();
+        assert_eq!(off.fit_options.inner_restarts, 0);
+    }
+
+    #[test]
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
         //   optimizer = auto, inner_maxiter = 200, inner_tol = 1e-5,
@@ -21047,6 +21465,7 @@ mod tests {
         assert_eq!(opts.optimizer, Optimizer::Auto);
         assert_eq!(opts.inner_maxiter, 200);
         assert!((opts.inner_tol - 1e-5).abs() < 1e-20);
+        assert_eq!(opts.inner_restarts, 1);
         assert_eq!(opts.steihaug_max_iters, None);
     }
 
@@ -22898,6 +23317,7 @@ if (WT > 70) {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -22918,6 +23338,7 @@ if (WT > 70) {
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             &sigma,
             &model.residual_correlations,
         );
@@ -22965,6 +23386,7 @@ if (WT > 70) {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],

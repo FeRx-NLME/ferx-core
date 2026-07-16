@@ -432,11 +432,10 @@ pub fn run_importance_sampling(
                                 defensive_alpha,
                             ) {
                                 let ess_fraction = rb.ess_fraction;
-                                let var_log_marginal = if ess_fraction > 0.0 {
-                                    (1.0 / ess_fraction - 1.0) / (k_samples as f64)
-                                } else {
-                                    1.0
-                                };
+                                let var_log_marginal = var_log_marginal_from_ess_fraction(
+                                    ess_fraction,
+                                    k_samples as f64,
+                                );
                                 return SubjectIsOutput {
                                     log_marginal: rb.log_marginal,
                                     var_log_marginal,
@@ -594,9 +593,7 @@ fn subject_is_estimate(
     let half_d = 0.5 * d as f64;
     let iscale_log_adj = -(d as f64) * iscale.ln();
     let inv_iscale_sq = 1.0 / (iscale * iscale);
-    let log_t_const = ln_gamma(0.5 * (nu + d as f64))
-        - ln_gamma(0.5 * nu)
-        - half_d * (nu * std::f64::consts::PI).ln()
+    let log_t_const = student_t_gamma_ratio(nu, d) - half_d * (nu * std::f64::consts::PI).ln()
         + 0.5 * proposal.log_det_inv_scale
         + iscale_log_adj;
     let log_p_eta_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega;
@@ -670,29 +667,13 @@ fn subject_is_estimate(
     // logsumexp + ESS.
     let (lse, weights_norm) = logsumexp_with_normalised(&log_w);
     let log_marginal = lse - (k_samples as f64).ln();
-    let ess = if weights_norm.is_empty() {
-        0.0
-    } else {
-        let sum_sq: f64 = weights_norm.iter().map(|w| w * w).sum();
-        if sum_sq > 0.0 {
-            1.0 / sum_sq
-        } else {
-            0.0
-        }
-    };
+    let ess = ess_from_weights(&weights_norm);
     let ess_fraction = ess / (k_samples as f64);
 
     // Asymptotic variance of log p̂(yᵢ) for a self-normalised IS estimator:
     //   Var(log p̂) ≈ (K · Σ wₖ² − 1) / K = (1/ESS_fraction − 1) / K
     // (Geweke 1989; equivalent to the standard "1/ESS − 1/K" relation.)
-    let var_log_marginal = if ess_fraction > 0.0 {
-        (1.0 / ess_fraction - 1.0) / (k_samples as f64)
-    } else {
-        // Degenerate — treat the per-subject estimate as having undefined SE.
-        // Inflate by a finite-but-large number so the overall MC SE flags it
-        // without producing a NaN that contaminates the sum.
-        1.0
-    };
+    let var_log_marginal = var_log_marginal_from_ess_fraction(ess_fraction, k_samples as f64);
 
     SubjectIsOutput {
         log_marginal,
@@ -965,9 +946,7 @@ pub(crate) fn subject_is_draws_frem_rb(
     let log_q_const = if mvn {
         -half_np * TWO_PI.ln() + 0.5 * proposal.log_det_inv_scale + iscale_log_adj
     } else {
-        ln_gamma(0.5 * (nu + np as f64)) - ln_gamma(0.5 * nu)
-            + 0.5 * proposal.log_det_inv_scale
-            + iscale_log_adj
+        student_t_gamma_ratio(nu, np) + 0.5 * proposal.log_det_inv_scale + iscale_log_adj
             - half_np * (nu * std::f64::consts::PI).ln()
     };
 
@@ -1064,14 +1043,7 @@ pub(crate) fn subject_is_draws_frem_rb(
 
     let (lse, weights) = logsumexp_with_normalised(&log_w);
     let log_marginal = lse - (k_samples as f64).ln() + log_p_d;
-    let ess = {
-        let sum_sq: f64 = weights.iter().map(|w| w * w).sum();
-        if sum_sq > 0.0 {
-            1.0 / sum_sq
-        } else {
-            0.0
-        }
-    };
+    let ess = ess_from_weights(&weights);
     let ess_fraction = ess / (k_samples as f64);
 
     // Reconstruct full-η weighted moments. η_p moments from the samples; η_c = d
@@ -1208,9 +1180,7 @@ pub(crate) fn subject_is_draws(
     let log_q_const = if mvn {
         -half_d * TWO_PI.ln() + 0.5 * proposal.log_det_inv_scale + iscale_log_adj
     } else {
-        ln_gamma(0.5 * (nu + d as f64)) - ln_gamma(0.5 * nu)
-            + 0.5 * proposal.log_det_inv_scale
-            + iscale_log_adj
+        student_t_gamma_ratio(nu, d) + 0.5 * proposal.log_det_inv_scale + iscale_log_adj
             - half_d * (nu * std::f64::consts::PI).ln()
     };
 
@@ -1297,14 +1267,7 @@ pub(crate) fn subject_is_draws(
 
     let (lse, weights) = logsumexp_with_normalised(&log_w);
     let log_marginal = lse - (k_samples as f64).ln();
-    let ess = {
-        let sum_sq: f64 = weights.iter().map(|w| w * w).sum();
-        if sum_sq > 0.0 {
-            1.0 / sum_sq
-        } else {
-            0.0
-        }
-    };
+    let ess = ess_from_weights(&weights);
     let ess_fraction = ess / (k_samples as f64);
 
     // Weighted first and second moments Σₖ w̃ₖ ηₖ and Σₖ w̃ₖ ηₖ ηₖᵀ.
@@ -1590,7 +1553,7 @@ fn compute_joint_posterior_hessian(
 }
 
 /// Build the joint prior precision matrix (block-diagonal: Omega_bsv^{-1} + K copies of Omega_iov^{-1}).
-fn build_joint_omega_inv(
+pub(crate) fn build_joint_omega_inv(
     omega_inv: &DMatrix<f64>,
     omega_iov_inv: &DMatrix<f64>,
     n_eta: usize,
@@ -1658,9 +1621,7 @@ fn subject_is_estimate_joint(
     let chi_sq = ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller");
 
     let half_d = 0.5 * n_b as f64;
-    let log_t_const = ln_gamma(0.5 * (nu + n_b as f64))
-        - ln_gamma(0.5 * nu)
-        - half_d * (nu * std::f64::consts::PI).ln()
+    let log_t_const = student_t_gamma_ratio(nu, n_b) - half_d * (nu * std::f64::consts::PI).ln()
         + 0.5 * proposal.log_det_inv_scale;
     let log_p_joint_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega_joint;
 
@@ -1737,23 +1698,10 @@ fn subject_is_estimate_joint(
     // logsumexp + ESS
     let (lse, weights_norm) = logsumexp_with_normalised(&log_w);
     let log_marginal = lse - (k_samples as f64).ln();
-    let ess = if weights_norm.is_empty() {
-        0.0
-    } else {
-        let sum_sq: f64 = weights_norm.iter().map(|w| w * w).sum();
-        if sum_sq > 0.0 {
-            1.0 / sum_sq
-        } else {
-            0.0
-        }
-    };
+    let ess = ess_from_weights(&weights_norm);
     let ess_fraction = ess / (k_samples as f64);
 
-    let var_log_marginal = if ess_fraction > 0.0 {
-        (1.0 / ess_fraction - 1.0) / (k_samples as f64)
-    } else {
-        1.0
-    };
+    let var_log_marginal = var_log_marginal_from_ess_fraction(ess_fraction, k_samples as f64);
 
     SubjectIsOutput {
         log_marginal,
@@ -1766,14 +1714,20 @@ fn subject_is_estimate_joint(
 // Proposal construction (regularised Hessian, Cholesky factors)
 // ---------------------------------------------------------------------------
 
-struct Proposal {
+/// A regularised, Cholesky-factored posterior scale for one subject.
+///
+/// Shared by importance sampling (which draws `η = η̂ + s·Σ^{1/2}·z` for random `z`) and
+/// by AGQ ([`crate::estimation::agq`], which lays *deterministic* Gauss–Hermite nodes on
+/// the same transform) — the two differ only in where `z` comes from, so they must not
+/// carry separate copies of the jitter / fallback / back-substitution logic.
+pub(crate) struct Proposal {
     /// Lower-triangular L such that L L' = H_reg = Σ⁻¹.
     /// Used both to apply Σ^{1/2} when sampling (L'⁻¹ z) and to evaluate the
     /// Mahalanobis term (‖L'·diff‖²) when scoring q(η).
     chol_h: DMatrix<f64>,
     /// log|H_reg| = 2 · Σ log L_ii — used for the log|Σ| = −log|H_reg| piece
-    /// of the Student-t log-density.
-    log_det_inv_scale: f64,
+    /// of the Student-t log-density, and for AGQ's `½·log|H|` normaliser.
+    pub(crate) log_det_inv_scale: f64,
     d: usize,
 }
 
@@ -1781,7 +1735,7 @@ impl Proposal {
     /// Apply `scale · L_Σ z` into `out`, where `L_Σ` is the Cholesky factor of
     /// Σ = H⁻¹. Implementation: `L_Σ = L^{-T}` for the L from `H = L L^T`, so
     /// `L_Σ z = L^{-T} z` — one back-substitution.
-    fn apply_l_sigma(&self, z: &[f64], out: &mut [f64], scale: f64) {
+    pub(crate) fn apply_l_sigma(&self, z: &[f64], out: &mut [f64], scale: f64) {
         // Back-solve L^T x = z for x (i.e. `out`).
         // L is lower-triangular; L^T is upper-triangular.
         let l = &self.chol_h;
@@ -1829,7 +1783,11 @@ impl Proposal {
 /// proposal that won't give a sharp likelihood estimate but stays well-defined.
 ///
 /// Returns `None` only when `d == 0`.
-fn build_proposal(h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize) -> Option<Proposal> {
+pub(crate) fn build_proposal(
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    d: usize,
+) -> Option<Proposal> {
     if d == 0 {
         return None;
     }
@@ -1962,6 +1920,45 @@ impl DefensiveMixture {
 // Numerical helpers
 // ---------------------------------------------------------------------------
 
+/// Student-t proposal log-normaliser Γ-ratio: `ln Γ((ν+d)/2) − ln Γ(ν/2)`.
+///
+/// This is the leftmost sub-expression of every Student-t log-q constant in
+/// this module (`subject_is_estimate`, `subject_is_draws`,
+/// `subject_is_draws_frem_rb`, `subject_is_estimate_joint`). Only the Γ-ratio
+/// is shared: the surrounding `−½d·ln(νπ)`, `½·log|Σ⁻¹|` and `−d·ln(iscale)`
+/// terms are summed in site-specific orders, so folding them in here would
+/// reorder the floating-point reduction. Callers append those terms in their
+/// own order, keeping each constant bit-identical to the pre-refactor code.
+#[inline]
+fn student_t_gamma_ratio(nu: f64, d: usize) -> f64 {
+    ln_gamma(0.5 * (nu + d as f64)) - ln_gamma(0.5 * nu)
+}
+
+/// Effective sample size `1 / Σ w̃ₖ²` from normalised weights. Returns `0.0`
+/// when the weights are empty or all-zero (matches the prior inline guards).
+#[inline]
+fn ess_from_weights(weights: &[f64]) -> f64 {
+    let sum_sq: f64 = weights.iter().map(|w| w * w).sum();
+    if sum_sq > 0.0 {
+        1.0 / sum_sq
+    } else {
+        0.0
+    }
+}
+
+/// Asymptotic variance of `log p̂(yᵢ)` for a self-normalised IS estimator:
+/// `(1/ESS_fraction − 1) / K` (Geweke 1989). For the degenerate
+/// `ess_fraction == 0` case it returns a finite-but-large `1.0` so the overall
+/// MC SE flags the subject without producing a NaN that contaminates the sum.
+#[inline]
+fn var_log_marginal_from_ess_fraction(ess_fraction: f64, k: f64) -> f64 {
+    if ess_fraction > 0.0 {
+        (1.0 / ess_fraction - 1.0) / k
+    } else {
+        1.0
+    }
+}
+
 /// Stable `log(eᵃ + eᵇ)` for the two-component defensive-mixture denominator.
 fn logsumexp2(a: f64, b: f64) -> f64 {
     let m = a.max(b);
@@ -2064,6 +2061,7 @@ pub(crate) fn compute_posterior_hessian(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             sigma,
             &model.residual_correlations,
         );
@@ -2183,6 +2181,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0; 3],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             // 3rd row is a FREM covariate pseudo-observation.
             fremtype: vec![0, 0, 5],
@@ -2517,6 +2516,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: Vec::new(),
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype,
             obs_records: Vec::new(),
@@ -2732,6 +2732,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 0, 100],
             obs_records: vec![],

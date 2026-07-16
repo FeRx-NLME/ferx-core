@@ -1521,7 +1521,7 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
 would be dead code and a coverage hole behind the same flag):
 
 ```rust
-/// Phase 6 — time-inhomogeneous transition: solve dP/dt = Q(C(t))·P, P(0)=I (RK45).
+/// Phase 6 — time-inhomogeneous transition: solve dP/dt = P·Q(C(t)), P(0)=I (RK45).
 pub fn ctmm_inhomogeneous_transition(q_at_c: impl Fn(f64) -> DMatrix<f64>, delta_t: f64, n_states: usize) -> DMatrix<f64>;
 
 /// Phase 7 — HMM forward algorithm: O(T×S²), log-sum-exp stable.
@@ -2711,8 +2711,41 @@ Gate: `#[cfg(feature = "markov")]` initially.
 
 **Scope:** Q(t) = f(C(t)); matrix ODE; joint PK-CTMM.
 
-- `ctmm_inhomogeneous_transition` using existing RK45
-- `q12 = f(Cc)` DSL expression
+**Slicing (leaf-first, mirroring Phase 5):**
+- ✅ **Slice 1 — numerical leaf.** `ctmm_inhomogeneous_transition(q_at, Δt, n_states)` in
+  `src/markov/mod.rs`: integrates `dP/dτ = P·Q(τ)`, `P(0)=I` (forward Kolmogorov,
+  right-multiplication) on the shared Dormand–Prince
+  RK45 (`crate::ode::solve_ode`), occupancy matrix flattened row-major into the ODE state.
+  Tier-1 anchors: constant-`Q` ⇒ `expm(Q·Δt)` (agrees with the homogeneous path); scalar
+  `Q(τ)=g(τ)·Q₀` ⇒ `expm(Q₀·∫g)` (closed form independent of `expm`); zero-Δt ⇒ `I`.
+- ✅ **Slice 2 — DSL + detection.** A `[markov_model]` intensity may reference a model ODE
+  state by name (concentration written `central/V`, or any PD/response state — no `Cc`
+  builtin). Parse detects a state reference (a `Variable`/`Covariate` leaf matching an ODE
+  state name), records it in `EndpointLikelihood::Ctmm::generator_states` (non-empty ⇒
+  inhomogeneous), and strips it from `generator_covariates` (it is a state, not a data
+  covariate). `GeneratorFn` gains a `state: &[f64]` argument; the generator overlays the
+  referenced state values into the covariates map so `eval_expression` resolves them. A
+  state reached only transitively through an `[individual_parameters]` value is rejected
+  (no state channel there). Interim: the fit path rejects an inhomogeneous CTMM fail-loud
+  until Slice 3 supplies the state trajectory.
+- ✅ **Slice 3 — endpoint wiring.** `ctmm_endpoint_nll_inhomogeneous` (dispatched from
+  `ctmm_subject_nll` when `generator_states` is non-empty): solve the model ODE once at
+  `(θ, η)` via `ode_dense_solve_states` (dose-aware), sample the state on a per-gap sub-grid,
+  and integrate the occupancy ODE per gap with the Slice-1 leaf (`_with_opts`, at the model's
+  ODE tolerance — not the anchor-grade `1e-10`, which timed the fit out), the state linearly
+  interpolated between sub-nodes. Dispatches through the existing FD inner/outer path (each
+  perturbed η re-solves + re-integrates — no new analytic gradient). Interim guard lifted.
+  Validated by a **degenerate anchor** (`SLOPE=0` ⇒ constant `Q` ⇒ matches the homogeneous
+  `expm` path within ODE tolerance), a state-coupling test (concentration changes the NLL),
+  and an end-to-end mixed-effects fit to a finite OFV.
+- ✅ **Slice 4 — validation + example + docs.** A fresh NONMEM `$DES` anchor is impractical
+  for a PK-coupled CTMM (continuous PK but per-observation occupancy reset; NONMEM's only
+  per-record reset, EVID=3, zeros the PK too — §3.4). Validated instead per the CLAUDE.md
+  exception pattern: (a) an **exact closed-form anchor** — a commuting generator `Q(t)=C(t)·Q₀`
+  matches `expm(Q₀·∫C)` to ~1e-5; (b) **reduction** — `SLOPE=0` reduces to the homogeneous CTMM,
+  which is NONMEM-anchored (Phase 5); (c) a slow-gated **simulate→fit recovery** on the bundled
+  `examples/ctmm_pd_2state.ferx` (+ `data/`, `tools/sim_ctmm_pd.py`) — LQ01/LQ10/SLOPE recovered.
+  Docs: drug/PD-driven section on the Markov page. **Draft PR #825.**
 
 ### Phase 7 — HMM (Hidden Markov Models) · Track D (tail)
 

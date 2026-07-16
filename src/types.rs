@@ -665,7 +665,7 @@ impl PkParams {
 }
 
 /// A single subject with dosing and observation data
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Subject {
     pub id: String,
     pub doses: Vec<DoseEvent>,
@@ -720,6 +720,15 @@ pub struct Subject {
     /// Occasion index per observation row (parallel to `obs_times`).
     /// Empty when no IOV column is present in the data.
     pub occasions: Vec<u32>,
+    /// `L2` grouping id per observation row (parallel to `obs_times`), the
+    /// NONMEM data item that ties several records into one correlated
+    /// observation unit. Rows sharing an `L2` value (within a subject) are
+    /// correlated together by `block_sigma`; a `0` (or empty vector when the
+    /// data has no `L2` column) means "ungrouped", and those rows fall back to
+    /// the `(time, occasion)` pairing rule. This is what lets a user pair, e.g.,
+    /// the total and unbound rows of one blood draw explicitly rather than
+    /// relying on co-temporal row order (#827).
+    pub obs_l2: Vec<i64>,
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
@@ -2763,18 +2772,28 @@ pub type LinearPredictorFn =
     Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
 
 #[cfg(feature = "markov")]
-/// Closure building a CTMM generator matrix `Q(θ, η, covariates)` — the S×S
-/// transition-intensity (generator) matrix for a continuous-time Markov endpoint.
+/// Closure building a CTMM generator matrix `Q(θ, η, covariates, state)` — the
+/// S×S transition-intensity (generator) matrix for a continuous-time Markov
+/// endpoint.
 ///
 /// The off-diagonals `q_jk ≥ 0` (`j ≠ k`) are the `[markov_model] transition`
 /// intensities; the builder fills the diagonal row-sum-zero
 /// (`q_jj = −Σ_{k≠j} q_jk`) so the caller always receives a valid generator.
-/// Mirrors [`LinearPredictorFn`]: evaluated once per subject from a *baseline*
-/// covariate snapshot (time-homogeneous — a drug-driven `Q(t)` is Phase 6), so a
-/// time-varying covariate on an intensity would be silently frozen and is
-/// guarded at parse/fit-setup.
-pub type GeneratorFn =
-    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> nalgebra::DMatrix<f64> + Send + Sync>;
+///
+/// The `state` slice is the model's **ODE state vector at the current time**,
+/// supplied only on the **time-inhomogeneous** (drug/PD-driven `Q(t)`, Phase 6,
+/// #817) path so an intensity may reference an ODE state by name (e.g. a
+/// concentration `central/V` or a PD response compartment). The builder resolves
+/// those names against `state` via the endpoint's
+/// [`generator_states`](EndpointLikelihood::Ctmm::generator_states) index map.
+/// On the **time-homogeneous** (Phase 5) path no intensity references a state, so
+/// callers pass an empty slice and the argument is ignored — the generator is
+/// then a pure function of a *baseline* `(θ, η, covariates)` snapshot, and a
+/// time-varying covariate on an intensity would be silently frozen (guarded at
+/// parse/fit-setup).
+pub type GeneratorFn = Box<
+    dyn Fn(&[f64], &[f64], &HashMap<String, f64>, &[f64]) -> nalgebra::DMatrix<f64> + Send + Sync,
+>;
 
 #[cfg(feature = "survival")]
 /// Per-CMT endpoint likelihood specification.
@@ -2830,8 +2849,19 @@ pub enum EndpointLikelihood {
         /// be coded with any non-negative integers (e.g. `1`/`2`), not only
         /// `0..S−1`. Length `== n_states`; codes are unique (checked at parse).
         state_codes: Vec<usize>,
-        /// Builds the generator `Q(θ,η,cov)` — see [`GeneratorFn`].
+        /// Builds the generator `Q(θ,η,cov,state)` — see [`GeneratorFn`].
         generator_fn: GeneratorFn,
+        /// Resolved, dual-evaluable form of the same intensities, for the **analytic**
+        /// gradient: it yields `∂Q/∂(θ,η)` exactly, which the endpoint chains through the
+        /// Van Loan Fréchet derivative of `expm` instead of finite-differencing the whole
+        /// matrix-exponential likelihood (#759).
+        ///
+        /// `None` — and the endpoint keeps its FD gradient — when the intensities are
+        /// time-**inhomogeneous** (an intensity reads an ODE state, so `Q` is a functional
+        /// of the PK trajectory and the likelihood is an occupancy ODE rather than an
+        /// `expm`), or when the program cannot be represented exactly (see
+        /// `build_ctmm_generator_program`).
+        generator_program: Option<crate::parser::model_parser::CtmmGeneratorProgram>,
         /// Covariate names referenced by any transition intensity (including any
         /// reached transitively through `[individual_parameters]`). Evaluated at a
         /// baseline snapshot, so a covariate listed here that is time-varying in
@@ -2840,6 +2870,16 @@ pub enum EndpointLikelihood {
         /// [`Self::Tte`]'s `hazard_covariates` and [`Self::Binary`]'s
         /// `lp_covariates` (#741).
         generator_covariates: Vec<String>,
+        /// ODE **state** names referenced by any transition intensity, paired with
+        /// their index in the model's ODE state vector: `(state_name, ode_index)`.
+        /// Non-empty **iff** the endpoint is time-**inhomogeneous** (drug/PD-driven
+        /// `Q(t)`, Phase 6 #817) — an intensity references a model state, so the
+        /// generator must be re-evaluated as the state evolves over each observation
+        /// gap (occupancy ODE, [`crate::markov::ctmm_inhomogeneous_transition`])
+        /// rather than built once per subject. **Empty** ⇒ time-homogeneous (Phase 5,
+        /// `expm(Q·Δt)`). [`generator_fn`](Self::Ctmm::generator_fn) reads its `state`
+        /// argument through this map.
+        generator_states: Vec<(String, usize)>,
     },
     // Ordinal, Poisson, NegBin, Dtmm deferred to Phase 4/4b
 }
@@ -4322,6 +4362,12 @@ pub enum WarningCode {
     /// fitted EBE — a silently degenerate likelihood contribution the η = 0
     /// fit-start reject could not catch (#785).
     FlipFlop,
+    /// A non-fixed theta whose outer gradient is ≈ 0 at the initial estimate — it
+    /// has no effect on the objective (unmapped, or dropped from the structural /
+    /// scaling model). The pre-flight guard freezes it at its initial value so the
+    /// remaining parameters can be estimated instead of the whole fit dying on an
+    /// eval-1 optimizer `Failure` (#826).
+    FlatParameter,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -4358,6 +4404,7 @@ impl WarningCode {
             WarningCode::Threads => "threads",
             WarningCode::Simulation => "simulation",
             WarningCode::FlipFlop => "flip_flop",
+            WarningCode::FlatParameter => "flat_parameter",
             WarningCode::General => "general",
         }
     }
@@ -4538,6 +4585,10 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || (lower.contains("parameters") && lower.contains("covariance step:"))
     {
         (WarningSeverity::Info, WarningCode::CovarianceStep)
+    } else if lower.contains("has no effect on the objective") {
+        // Pre-flight flat-theta guard (#826): a theta with an ≈0 outer gradient at
+        // the initial estimate was frozen at its init so the fit could proceed.
+        (WarningSeverity::Warning, WarningCode::FlatParameter)
     } else {
         (WarningSeverity::Warning, WarningCode::General)
     };
@@ -5031,6 +5082,20 @@ pub struct FitOptions {
     pub outer_ftol: Option<f64>,
     pub inner_maxiter: usize,
     pub inner_tol: f64,
+    /// Guarded multi-start count for the inner EBE search (`[fit_options]
+    /// inner_restarts`, default `1`; set `0` to disable). A multimodal individual objective —
+    /// e.g. saturable protein binding, which admits a high-V/low-conc and a
+    /// low-V/high-conc basin for the same data — can trap a single warm-started
+    /// BFGS in the wrong basin, inflating that subject's objective. When `> 0`,
+    /// subjects on the event-driven path (system resets / time-varying
+    /// covariates, where this shows up) re-solve the EBE **on a cold start** from
+    /// `inner_restarts` Ω-scaled alternate seeds per random effect and keep the
+    /// lowest-objective mode; the outer loop's warm start then carries the chosen
+    /// basin forward, so the scan runs once per subject per fit (≈0 overhead).
+    /// Unimodal subjects are unaffected — an alternate seed that reconverges to
+    /// the same mode is not accepted — so `0` and the untriggered subjects stay
+    /// bit-identical.
+    pub inner_restarts: usize,
     /// Inner EBE-reconvergence tolerance used **only by the covariance step**
     /// (`[fit_options] cov_inner_tol`), decoupled from the fit's `inner_tol`. The
     /// covariance R-matrix is a second-difference of the reconverged OFV, and that
@@ -5188,6 +5253,18 @@ pub struct FitOptions {
     // `imp_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
     // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` at the fixed input parameters
     // without updating them.
+    /// Gauss–Hermite nodes **per random effect** for `method = laplace` and
+    /// `method = focei` (#251). **Default 1.**
+    ///
+    /// `n_agq = 1` is the classical single-point method (Laplace under the exact anchor,
+    /// FOCEI under the Gauss-Newton anchor). `n_agq > 1` is adaptive Gauss–Hermite
+    /// quadrature: it refines the marginal toward the exact integral and is what makes the
+    /// exact-anchor path unbiased on strongly non-Gaussian integrands. The tensor grid costs
+    /// `n_agq^n_eta` likelihood evaluations per subject per outer iteration, so raise it
+    /// deliberately — odd values are conventional (they keep a node exactly at the mode).
+    /// Capped by [`crate::estimation::agq::MAX_AGQ_NODES`], with the *grid* additionally
+    /// capped by [`crate::estimation::agq::MAX_AGQ_GRID`].
+    pub n_agq: usize,
     /// Number of importance samples per subject. Default 1000. Recommended
     /// 2000–5000 for publication-quality MC SE (cost scales linearly).
     pub imp_samples: usize,
@@ -5539,6 +5616,12 @@ impl Default for FitOptions {
             // only held for well-conditioned fits. Override via `inner_tol = ...`
             // in `[fit_options]` (loosen for speed; tighten with care).
             inner_tol: 1e-5,
+            // On by default (one Ω-scaled restart pass): guards against inner-EBE
+            // local minima on multimodal individual objectives at ≈0 cost, since
+            // it fires only for reset / TV-cov subjects on a cold start and only
+            // *accepts* a strictly-lower mode. Unimodal subjects stay bit-identical;
+            // set `inner_restarts = 0` to disable. See `FitOptions::inner_restarts`.
+            inner_restarts: 1,
             cov_inner_tol: None,
             // ODE solver tolerances: match OdeSolverOptions::default() so the
             // engine default is unchanged. Opt into tighter accuracy per model
@@ -5589,6 +5672,7 @@ impl Default for FitOptions {
             sir_seed: None,
             sir_keep_samples: false,
             sir_df: 5.0,
+            n_agq: 1,
             imp_samples: 1000,
             imp_proposal_df: 5.0,
             imp_seed: None,
@@ -5862,6 +5946,49 @@ pub enum EstimationMethod {
     /// σ²: inverse-gamma, mu-referenced θ: normal). Reports posterior summaries +
     /// convergence diagnostics on `FitResult.bayes`, not a point estimate.
     Bayes,
+    /// The **Laplace approximation** with the *exact* Hessian — NONMEM `$EST METHOD=1
+    /// LAPLACIAN` — generalised to adaptive Gauss–Hermite quadrature by the `n_agq` argument
+    /// (#251).
+    ///
+    /// The estimator evaluates the **exact** conditional likelihood on a Gauss–Hermite grid
+    /// of `n_agq` nodes per random effect, laid around each subject's EBE mode with the exact
+    /// posterior Hessian as the scaling. At **`n_agq = 1`** the one-point rule sits at the
+    /// mode with weight `√π` and the sum collapses, term for term, to
+    /// `(2π)^(d/2)·|H|^(−½)·exp(l(η̂))` — Laplace exactly. At **`n_agq > 1`** it is adaptive
+    /// Gauss–Hermite quadrature: the marginal improves toward the exact integral, and because
+    /// it integrates the model's real likelihood rather than a Gaussian-residual surrogate it
+    /// is the only method here that handles non-Gaussian endpoints (TTE, categorical) without
+    /// approximation. Deterministic, so unlike [`Saem`](Self::Saem) / [`Imp`](Self::Imp) its
+    /// OFV carries no Monte-Carlo noise. Cost is `n_agq^n_eta` likelihood evaluations per
+    /// subject per iteration; see [`crate::estimation::agq::MAX_AGQ_GRID`].
+    ///
+    /// **The Hessian anchor is what distinguishes it from [`FoceI`](Self::FoceI)** — which is
+    /// the *same* quadrature machinery with the *Gauss-Newton* Hessian `CᵀC + Ω⁻¹` (dropping
+    /// `∂²f/∂η²`) as the scaling. `Laplace` uses the exact Hessian, so at one node it carries
+    /// the curvature of the η-dependent residual variance the Gauss-Newton form discards —
+    /// which is why it reproduces NONMEM's LAPLACIAN (six significant figures on warfarin)
+    /// where FOCEI lands on a different value. See [`FitOptions::hessian_anchor`].
+    ///
+    /// (There is no separate `Agq` method: adaptive quadrature *is* `Laplace` with
+    /// `n_agq > 1`. The old `method = agq` token is rejected by the parser with a note.)
+    Laplace,
+}
+
+/// Which Hessian scales the Gauss–Hermite grid (and enters the `½log|H|` term).
+///
+/// The quadrature identity holds for any positive-definite scaling: the anchor changes the
+/// proposal — and, at one node, the whole objective — but not the `n → ∞` limit. So a single
+/// machinery serves both estimator families, parameterised by this choice:
+/// [`Laplace`](EstimationMethod::Laplace) → [`Exact`](Self::Exact),
+/// [`FoceI`](EstimationMethod::FoceI) → [`GaussNewton`](Self::GaussNewton).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HessianAnchor {
+    /// Exact conditional Hessian `∂²nll/∂b²`. `Laplace` / adaptive GH quadrature.
+    Exact,
+    /// Gauss-Newton (Almquist) Hessian `H̃ = Ω⁻¹ + Σ pⱼaⱼaⱼᵀ`. FOCEI and its quadrature
+    /// refinement. Always positive-definite and needs only first `f`-derivatives, so its
+    /// `½log|H̃|` gradient is fully analytic.
+    GaussNewton,
 }
 
 impl EstimationMethod {
@@ -5875,6 +6002,7 @@ impl EstimationMethod {
             EstimationMethod::Imp => "IMP",
             EstimationMethod::Impmap => "IMPMAP",
             EstimationMethod::Bayes => "BAYES",
+            EstimationMethod::Laplace => "LAPLACE",
         }
     }
 }
@@ -5887,6 +6015,42 @@ impl FitOptions {
             vec![self.method]
         } else {
             self.methods.clone()
+        }
+    }
+
+    /// The AGQ node count when this (stage's) method is AGQ, else `None`.
+    ///
+    /// The **single predicate** every AGQ-aware branch consults — the population objective
+    /// ([`crate::estimation::outer_optimizer::pop_nll_opts`]), the outer-gradient dispatch,
+    /// and the optimizer/report classification. Keeping it in one place is what stops the
+    /// objective and the gradient from disagreeing about which method is running: an
+    /// outer loop minimising the AGQ objective while fed the analytic *FOCE* gradient
+    /// would converge, silently, to the wrong parameters.
+    ///
+    /// Reads `self.method` (the per-stage method — `api::fit_inner` rewrites it for each
+    /// stage of a chain), so it is correct inside a chained fit too.
+    pub fn agq_nodes(&self) -> Option<usize> {
+        match self.method {
+            // Laplace is the exact-anchor quadrature: `n_agq = 1` is Laplace, `> 1` is
+            // adaptive Gauss–Hermite quadrature. Both route through the same objective, the
+            // same analytic gradient, and the same covariance stencil.
+            EstimationMethod::Laplace => Some(self.n_agq.max(1)),
+            // FOCEI with `n_agq > 1` is the Gauss-Newton-anchored quadrature refinement, live
+            // for every in-analytic-scope model; `n_agq = 1` (the default) is plain FOCEI and
+            // takes its own path (`None`). `check_model_options` rejects `focei, n_agq > 1`
+            // only *outside* the analytic sensitivity scope (`E_FOCEI_NAGQ_UNSUPPORTED`).
+            EstimationMethod::FoceI if self.n_agq > 1 => Some(self.n_agq),
+            _ => None,
+        }
+    }
+
+    /// Which Hessian scales the quadrature grid for this (stage's) method. Only meaningful
+    /// when [`agq_nodes`](Self::agq_nodes) is `Some`: `Laplace` anchors on the exact
+    /// conditional Hessian, `FoceI` on the Gauss-Newton `H̃`. See [`HessianAnchor`].
+    pub fn hessian_anchor(&self) -> HessianAnchor {
+        match self.method {
+            EstimationMethod::FoceI => HessianAnchor::GaussNewton,
+            _ => HessianAnchor::Exact,
         }
     }
 
@@ -6093,10 +6257,47 @@ pub fn framework_keys() -> &'static [&'static str] {
 /// wide keys live in `framework_keys`.
 pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
     match m {
-        EstimationMethod::Foce | EstimationMethod::FoceI => &[
+        EstimationMethod::Foce => &[
             "maxiter",
             "inner_maxiter",
             "inner_tol",
+            "inner_restarts",
+            "inner_optimizer",
+            "optimizer",
+            "outer_xtol",
+            "outer_ftol",
+            "steihaug_max_iters",
+            "global_search",
+            "global_maxeval",
+            "stagnation_guard",
+            "reconverge_gradient_interval",
+        ],
+        // FOCEI accepts `n_agq`: `= 1` (default) is plain FOCEI, `> 1` is the Gauss-Newton-
+        // anchored quadrature refinement.
+        EstimationMethod::FoceI => &[
+            "n_agq",
+            "maxiter",
+            "inner_maxiter",
+            "inner_tol",
+            "inner_restarts",
+            "inner_optimizer",
+            "optimizer",
+            "outer_xtol",
+            "outer_ftol",
+            "steihaug_max_iters",
+            "global_search",
+            "global_maxeval",
+            "stagnation_guard",
+            "reconverge_gradient_interval",
+        ],
+        // Laplace is the exact-anchor quadrature; `n_agq` (default 1) is its node count.
+        // `n_agq = 1` is Laplace, `> 1` is adaptive Gauss–Hermite quadrature.
+        EstimationMethod::Laplace => &[
+            "n_agq",
+            "maxiter",
+            "inner_maxiter",
+            "inner_tol",
+            "inner_restarts",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -6111,6 +6312,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "maxiter",
             "inner_maxiter",
             "inner_tol",
+            "inner_restarts",
             "inner_optimizer",
             "gn_lambda",
         ],
@@ -6118,6 +6320,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "maxiter",
             "inner_maxiter",
             "inner_tol",
+            "inner_restarts",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -6480,6 +6683,7 @@ pub(crate) mod test_helpers {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6644,6 +6848,7 @@ mod tests {
             reset_times: vec![],
             cens: vec![0, 0],
             occasions: vec![],
+            obs_l2: Vec::new(),
             dose_occasions: vec![],
             // Row 0 = PK observation, row 1 = covariate pseudo-observation.
             fremtype: vec![0, 100],
@@ -6694,6 +6899,7 @@ mod tests {
             reset_times: vec![],
             cens: vec![0],
             occasions: vec![],
+            obs_l2: Vec::new(),
             dose_occasions: vec![],
             fremtype: vec![0],
             obs_records: vec![],
@@ -6954,6 +7160,18 @@ mod tests {
         let w = classify_warning("Covariance step failed");
         assert_eq!(w.severity, WarningSeverity::Critical);
         assert_eq!(w.category.as_str(), "covariance_failed");
+    }
+
+    #[test]
+    fn classify_warning_flat_parameter_is_warning() {
+        let w = classify_warning(
+            "[parameters] `TVFLAT` has no effect on the objective (gradient ≈ 0 at the \
+             initial estimate) — it is likely computed but never used. Freezing it at its \
+             initial value (1) so the remaining parameters can be estimated.",
+        );
+        assert_eq!(w.severity, WarningSeverity::Warning);
+        assert_eq!(w.category.as_str(), "flat_parameter");
+        assert_eq!(w.source_method.as_deref(), Some("parameters"));
     }
 
     #[test]
@@ -8000,6 +8218,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: Vec::new(),
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),

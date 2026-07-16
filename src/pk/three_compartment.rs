@@ -224,119 +224,81 @@ pub(crate) fn three_cpt_iv_peripherals(
     let c2_scalar = q2 / (v1 * v2); // k12/v2
     let c3_scalar = q3 / (v1 * v3); // k13/v3
     let d = dose.amt;
+    let is_ss = dose.ss && dose.ii > 0.0;
 
-    if dose.ss && dose.ii > 0.0 {
-        let ii = dose.ii;
-        if dose.is_infusion() {
-            let dur = dose.duration;
-            if dur <= 0.0 {
-                // Treat as bolus SS
-                let c2 = c2_scalar
-                    * d
-                    * (-(alpha - k31) / (ab * ag) * (-alpha * tau).exp() * ss_coeff_3(alpha, ii)
-                        + (beta - k31) / (ab * bg) * (-beta * tau).exp() * ss_coeff_3(beta, ii)
-                        - (gamma - k31) / (ag * bg) * (-gamma * tau).exp() * ss_coeff_3(gamma, ii));
-                let c3 = c3_scalar
-                    * d
-                    * (-(alpha - k21) / (ab * ag) * (-alpha * tau).exp() * ss_coeff_3(alpha, ii)
-                        + (beta - k21) / (ab * bg) * (-beta * tau).exp() * ss_coeff_3(beta, ii)
-                        - (gamma - k21) / (ag * bg) * (-gamma * tau).exp() * ss_coeff_3(gamma, ii));
-                return [c2, c3];
-            }
-            if dur > dose.ii {
-                return [0.0; 2];
-            }
-            // Helper for infusion SS peripheral (after-infusion formula with SS coeff)
-            let infusion_periph_ss = |c_scalar: f64, k_far: f64| -> f64 {
-                let r = dose.rate;
-                // After-infusion peripheral formula with SS geometric series:
-                // coeff_X = rate · c_scalar · (X_eigenvalue_residue) / (product · eigenvalue)
-                let coeff_a = -r * c_scalar * (alpha - k_far) / (ab * ag * alpha);
-                let coeff_b = r * c_scalar * (beta - k_far) / (ab * bg * beta);
-                let coeff_g = -r * c_scalar * (gamma - k_far) / (ag * bg * gamma);
-                if tau <= dur {
-                    let cur = coeff_a * (1.0 - (-alpha * tau).exp())
-                        + coeff_b * (1.0 - (-beta * tau).exp())
-                        + coeff_g * (1.0 - (-gamma * tau).exp());
-                    let past = coeff_a
-                        * (1.0 - (-alpha * dur).exp())
-                        * (-alpha * (tau - dur)).exp()
-                        * (-alpha * dose.ii).exp()
-                        * ss_coeff_3(alpha, ii)
-                        + coeff_b
-                            * (1.0 - (-beta * dur).exp())
-                            * (-beta * (tau - dur)).exp()
-                            * (-beta * dose.ii).exp()
-                            * ss_coeff_3(beta, ii)
-                        + coeff_g
-                            * (1.0 - (-gamma * dur).exp())
-                            * (-gamma * (tau - dur)).exp()
-                            * (-gamma * dose.ii).exp()
-                            * ss_coeff_3(gamma, ii);
-                    cur + past
-                } else {
-                    let dt = tau - dur;
-                    coeff_a
-                        * (1.0 - (-alpha * dur).exp())
-                        * (-alpha * dt).exp()
-                        * ss_coeff_3(alpha, ii)
-                        + coeff_b
-                            * (1.0 - (-beta * dur).exp())
-                            * (-beta * dt).exp()
-                            * ss_coeff_3(beta, ii)
-                        + coeff_g
-                            * (1.0 - (-gamma * dur).exp())
-                            * (-gamma * dt).exp()
-                            * ss_coeff_3(gamma, ii)
-                }
-            };
-            [
-                infusion_periph_ss(c2_scalar, k31),
-                infusion_periph_ss(c3_scalar, k21),
-            ]
+    // Per-eigenvalue steady-state geometric factor, folded conditionally exactly as
+    // `three_cpt_oral_peripherals` does: 1/(1−e^{−λ·II}) at SS, else 1. Kept as a
+    // *separate* trailing factor (not multiplied into e^{−λτ}), so the residue
+    // arithmetic is bit-identical to the four hand-written copies this collapses —
+    // `x * 1.0` is the identity, so the non-SS path is unchanged, and the SS path
+    // keeps the original `((coeff · e^{−λτ}) · ss_coeff_3)` association.
+    let term = |lambda: f64| -> f64 {
+        if is_ss {
+            ss_coeff_3(lambda, dose.ii)
         } else {
-            // Bolus SS
-            let c2 = c2_scalar
-                * d
-                * (-(alpha - k31) / (ab * ag) * (-alpha * tau).exp() * ss_coeff_3(alpha, ii)
-                    + (beta - k31) / (ab * bg) * (-beta * tau).exp() * ss_coeff_3(beta, ii)
-                    - (gamma - k31) / (ag * bg) * (-gamma * tau).exp() * ss_coeff_3(gamma, ii));
-            let c3 = c3_scalar
-                * d
-                * (-(alpha - k21) / (ab * ag) * (-alpha * tau).exp() * ss_coeff_3(alpha, ii)
-                    + (beta - k21) / (ab * bg) * (-beta * tau).exp() * ss_coeff_3(beta, ii)
-                    - (gamma - k21) / (ag * bg) * (-gamma * tau).exp() * ss_coeff_3(gamma, ii));
-            [c2, c3]
+            1.0
         }
-    } else if dose.is_infusion() {
+    };
+
+    // Bolus tri-exponential residue — the single closed form for single-dose,
+    // SS, and degenerate (`dur ≤ 0`) infusion. C_periph1 uses (c2_scalar, k31);
+    // C_periph2 swaps k31↔k21 and q2/v2 → q3/v3 (i.e. c3_scalar, k21).
+    let periph_bolus = |c_scalar: f64, k_far: f64| -> f64 {
+        c_scalar
+            * d
+            * (-(alpha - k_far) / (ab * ag) * (-alpha * tau).exp() * term(alpha)
+                + (beta - k_far) / (ab * bg) * (-beta * tau).exp() * term(beta)
+                - (gamma - k_far) / (ag * bg) * (-gamma * tau).exp() * term(gamma))
+    };
+
+    if dose.is_infusion() {
         let dur = dose.duration;
         if dur <= 0.0 {
-            let c2 = c2_scalar
-                * d
-                * (-(alpha - k31) / (ab * ag) * (-alpha * tau).exp()
-                    + (beta - k31) / (ab * bg) * (-beta * tau).exp()
-                    - (gamma - k31) / (ag * bg) * (-gamma * tau).exp());
-            let c3 = c3_scalar
-                * d
-                * (-(alpha - k21) / (ab * ag) * (-alpha * tau).exp()
-                    + (beta - k21) / (ab * bg) * (-beta * tau).exp()
-                    - (gamma - k21) / (ag * bg) * (-gamma * tau).exp());
-            return [c2, c3];
+            // Degenerate infusion → treat as bolus (SS folds through `term`).
+            return [periph_bolus(c2_scalar, k31), periph_bolus(c3_scalar, k21)];
         }
+        if is_ss && dur > dose.ii {
+            return [0.0; 2];
+        }
+        // After-infusion peripheral formula. During the infusion window the SS case
+        // additionally superposes the past-pulse train (each pulse carrying its own
+        // `ss_coeff_3` geometric factor); after the window every term picks up the
+        // conditional `term(λ)` factor (1 for non-SS).
         let infusion_periph = |c_scalar: f64, k_far: f64| -> f64 {
             let r = dose.rate;
+            // coeff_X = rate · c_scalar · (X_eigenvalue_residue) / (product · eigenvalue)
             let coeff_a = -r * c_scalar * (alpha - k_far) / (ab * ag * alpha);
             let coeff_b = r * c_scalar * (beta - k_far) / (ab * bg * beta);
             let coeff_g = -r * c_scalar * (gamma - k_far) / (ag * bg * gamma);
             if tau <= dur {
-                coeff_a * (1.0 - (-alpha * tau).exp())
+                let cur = coeff_a * (1.0 - (-alpha * tau).exp())
                     + coeff_b * (1.0 - (-beta * tau).exp())
-                    + coeff_g * (1.0 - (-gamma * tau).exp())
+                    + coeff_g * (1.0 - (-gamma * tau).exp());
+                if is_ss {
+                    let past = coeff_a
+                        * (1.0 - (-alpha * dur).exp())
+                        * (-alpha * (tau - dur)).exp()
+                        * (-alpha * dose.ii).exp()
+                        * ss_coeff_3(alpha, dose.ii)
+                        + coeff_b
+                            * (1.0 - (-beta * dur).exp())
+                            * (-beta * (tau - dur)).exp()
+                            * (-beta * dose.ii).exp()
+                            * ss_coeff_3(beta, dose.ii)
+                        + coeff_g
+                            * (1.0 - (-gamma * dur).exp())
+                            * (-gamma * (tau - dur)).exp()
+                            * (-gamma * dose.ii).exp()
+                            * ss_coeff_3(gamma, dose.ii);
+                    cur + past
+                } else {
+                    cur
+                }
             } else {
                 let dt = tau - dur;
-                coeff_a * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp()
-                    + coeff_b * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp()
-                    + coeff_g * (1.0 - (-gamma * dur).exp()) * (-gamma * dt).exp()
+                coeff_a * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp() * term(alpha)
+                    + coeff_b * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp() * term(beta)
+                    + coeff_g * (1.0 - (-gamma * dur).exp()) * (-gamma * dt).exp() * term(gamma)
             }
         };
         [
@@ -344,18 +306,7 @@ pub(crate) fn three_cpt_iv_peripherals(
             infusion_periph(c3_scalar, k21),
         ]
     } else {
-        // Single-dose bolus
-        let c2 = c2_scalar
-            * d
-            * (-(alpha - k31) / (ab * ag) * (-alpha * tau).exp()
-                + (beta - k31) / (ab * bg) * (-beta * tau).exp()
-                - (gamma - k31) / (ag * bg) * (-gamma * tau).exp());
-        let c3 = c3_scalar
-            * d
-            * (-(alpha - k21) / (ab * ag) * (-alpha * tau).exp()
-                + (beta - k21) / (ab * bg) * (-beta * tau).exp()
-                - (gamma - k21) / (ag * bg) * (-gamma * tau).exp());
-        [c2, c3]
+        [periph_bolus(c2_scalar, k31), periph_bolus(c3_scalar, k21)]
     }
 }
 

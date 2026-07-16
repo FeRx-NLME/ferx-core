@@ -187,23 +187,11 @@ pub fn tte_nll_from_curves(
         let h_entry = entry_lower_limit(*entry_time, &cumhaz_at);
 
         match event_type {
-            EventType::RightCensored => {
-                let h_t = cumhaz_at(*time);
-                if monotone_violation(h_t, h_entry) {
-                    return 1e20;
+            EventType::RightCensored | EventType::Exact => {
+                match score_event(event_type, *time, h_entry, &cumhaz_at, &hazard_at, tol) {
+                    Some((contrib, _)) => nll += contrib,
+                    None => return 1e20,
                 }
-                nll += h_t - h_entry;
-            }
-            EventType::Exact => {
-                let h_val = hazard_at(*time);
-                if h_val <= 0.0 {
-                    return 1e20;
-                }
-                let h_t = cumhaz_at(*time);
-                if monotone_violation(h_t, h_entry) {
-                    return 1e20;
-                }
-                nll += h_t - h_entry - h_val.ln();
             }
             EventType::IntervalCensored { left, right } => {
                 let h_l = cumhaz_at(*left);
@@ -267,6 +255,56 @@ fn entry_lower_limit(entry_time: f64, cumhaz_at: impl Fn(f64) -> f64) -> f64 {
     }
 }
 
+/// Shared `RightCensored` / `Exact` scoring for one TTE event record, given the
+/// hazard-clock argument `arg` (absolute time or a reset gap) and the lower
+/// cumulative-hazard limit `h_lo` to subtract:
+///   RightCensored: `H(arg) − h_lo`
+///   Exact:         `H(arg) − h_lo − log h(arg)`
+///
+/// Returns `(contribution, H(arg))` where `contribution` is the record's NLL term
+/// and `H(arg) = cumhaz_at(arg)` (used by the clock-forward path to telescope
+/// `h_lo`), or `None` when the record is numerically ill-defined — a non-positive
+/// hazard at an exact event, or a non-monotone cumulative hazard past the
+/// [`MonoTol`] round-off band — which each caller folds into its `1e20` sentinel.
+///
+/// The three survival loops ([`tte_nll_from_curves`], [`rtte_forward_nll_from_curves`],
+/// [`rtte_reset_nll_from_curves`]) share these two arms verbatim and differ only in
+/// their lower-limit bookkeeping, which stays inline in each. `IntervalCensored` is
+/// **not** scored here — single-event TTE handles it inline and the RTTE paths reject
+/// it — so that arm is unreachable (folded to `None` for exhaustiveness).
+#[inline]
+fn score_event(
+    event_type: &EventType,
+    arg: f64,
+    h_lo: f64,
+    cumhaz_at: impl Fn(f64) -> f64,
+    hazard_at: impl Fn(f64) -> f64,
+    tol: MonoTol,
+) -> Option<(f64, f64)> {
+    match event_type {
+        EventType::RightCensored => {
+            let h_a = cumhaz_at(arg);
+            if cumhaz_monotone_violation(h_a, h_lo, tol) {
+                return None;
+            }
+            Some((h_a - h_lo, h_a))
+        }
+        EventType::Exact => {
+            let h_val = hazard_at(arg);
+            if h_val <= 0.0 {
+                return None;
+            }
+            let h_a = cumhaz_at(arg);
+            if cumhaz_monotone_violation(h_a, h_lo, tol) {
+                return None;
+            }
+            Some(((h_a - h_lo) - h_val.ln(), h_a))
+        }
+        // Handled inline by the single-event path; rejected by the RTTE paths.
+        EventType::IntervalCensored { .. } => None,
+    }
+}
+
 /// Clock-forward (Andersen–Gill) **recurrent-event** (RTTE) negative log-likelihood
 /// from cumulative-hazard / hazard curves:
 ///
@@ -326,25 +364,14 @@ pub fn rtte_forward_nll_from_curves(
         }
 
         match event_type {
-            EventType::RightCensored => {
-                let h_t = cumhaz_at(*time);
-                if cumhaz_monotone_violation(h_t, h_lo, tol) {
-                    return 1e20;
+            EventType::RightCensored | EventType::Exact => {
+                match score_event(event_type, *time, h_lo, &cumhaz_at, &hazard_at, tol) {
+                    Some((contrib, h_t)) => {
+                        nll += contrib;
+                        h_lo = h_t;
+                    }
+                    None => return 1e20,
                 }
-                nll += h_t - h_lo;
-                h_lo = h_t;
-            }
-            EventType::Exact => {
-                let h_val = hazard_at(*time);
-                if h_val <= 0.0 {
-                    return 1e20;
-                }
-                let h_t = cumhaz_at(*time);
-                if cumhaz_monotone_violation(h_t, h_lo, tol) {
-                    return 1e20;
-                }
-                nll += (h_t - h_lo) - h_val.ln();
-                h_lo = h_t;
             }
             // RTTE + interval censoring is unsupported (rejected at the fit boundary by
             // `api::check_rtte_records`, since DV-driven censoring is invisible to the
@@ -447,23 +474,11 @@ pub fn rtte_reset_nll_from_curves(
         }
 
         match event_type {
-            EventType::RightCensored => {
-                let h_arg = cumhaz_at(arg);
-                if cumhaz_monotone_violation(h_arg, h_lo, tol) {
-                    return 1e20;
+            EventType::RightCensored | EventType::Exact => {
+                match score_event(event_type, arg, h_lo, &cumhaz_at, &hazard_at, tol) {
+                    Some((contrib, _)) => nll += contrib,
+                    None => return 1e20,
                 }
-                nll += h_arg - h_lo;
-            }
-            EventType::Exact => {
-                let h_val = hazard_at(arg);
-                if h_val <= 0.0 {
-                    return 1e20;
-                }
-                let h_arg = cumhaz_at(arg);
-                if cumhaz_monotone_violation(h_arg, h_lo, tol) {
-                    return 1e20;
-                }
-                nll += (h_arg - h_lo) - h_val.ln();
             }
             // RTTE + interval censoring is unsupported (rejected at parse); sentinel.
             EventType::IntervalCensored { .. } => return 1e20,

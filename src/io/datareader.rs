@@ -198,6 +198,33 @@ pub fn read_nonmem_csv_with_covariates(
     read_nonmem_csv_with_covariates_mapped(path, decls, extra_columns, iov_column, &[])
 }
 
+/// Build the covariate-column read set: declared names first (so the covariate
+/// table's column order matches the declaration), then each `extra` column not
+/// already present. Dedup is case-sensitive, matching the declared spelling.
+fn declared_union(decls: &[CovariateDecl], extra: &[String]) -> Vec<String> {
+    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
+    for c in extra {
+        if !union.iter().any(|n| n == c) {
+            union.push(c.clone());
+        }
+    }
+    union
+}
+
+/// Ensure every covariate column referenced by a `[data_selection]` filter is
+/// present in `cols`, so a filter on an otherwise-unread column still fires.
+/// Case-insensitive dedup: referenced names are lowercased, declared names may
+/// not be. No-op when `filter` is `None`.
+fn augment_with_filter(cols: &mut Vec<String>, filter: Option<&SelectionFilter>) {
+    if let Some(f) = filter {
+        for c in f.referenced_covariate_columns() {
+            if !cols.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
+                cols.push(c);
+            }
+        }
+    }
+}
+
 /// Like [`read_nonmem_csv_with_covariates`] but with a `[data]` column
 /// remapping (#730). See [`read_nonmem_csv_mapped`].
 pub(crate) fn read_nonmem_csv_with_covariates_mapped(
@@ -209,12 +236,7 @@ pub(crate) fn read_nonmem_csv_with_covariates_mapped(
 ) -> Result<(Population, CovariateTable), String> {
     // Population reads the union of declared + referenced-but-undeclared columns,
     // declared first so the table's column order matches the declaration.
-    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
-    for c in extra_columns {
-        if !union.iter().any(|n| n == c) {
-            union.push(c.clone());
-        }
-    }
+    let union = declared_union(decls, extra_columns);
     let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
     let (pop, table) = read_nonmem_csv_impl(
         path,
@@ -258,11 +280,7 @@ pub(crate) fn read_nonmem_csv_filtered_mapped(
     // augmentation is needed.) Symmetric with the `[covariates]` reader.
     let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
         let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
-        for c in filter.referenced_covariate_columns() {
-            if !v.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
-                v.push(c);
-            }
-        }
+        augment_with_filter(&mut v, Some(filter));
         v
     });
     let cols_ref: Option<Vec<&str>> = augmented
@@ -308,23 +326,14 @@ pub(crate) fn read_nonmem_csv_with_covariates_filtered_mapped(
     filter: &SelectionFilter,
     column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
-    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
-    for c in extra_columns {
-        if !union.iter().any(|n| n == c) {
-            union.push(c.clone());
-        }
-    }
+    let mut union = declared_union(decls, extra_columns);
     // Ensure any covariate column referenced by an ignore/accept clause is read
     // into each subject's covariate map, even if the model never declared it.
     // Without this, a filter on an undeclared column would silently never fire
     // on the declared-`[covariates]` read path (`union` would lack the column,
     // so it would be absent from `locf_state`). Case-insensitive dedup: the
     // referenced names are lowercased, declared names may not be.
-    for c in filter.referenced_covariate_columns() {
-        if !union.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
-            union.push(c);
-        }
-    }
+    augment_with_filter(&mut union, Some(filter));
     let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
     let (pop, table) = read_nonmem_csv_impl(
         path,
@@ -527,13 +536,7 @@ pub(crate) fn read_nonmem_csv_filtered_tte(
 ) -> Result<Population, String> {
     let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
         let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
-        if let Some(f) = filter {
-            for c in f.referenced_covariate_columns() {
-                if !v.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
-                    v.push(c);
-                }
-            }
-        }
+        augment_with_filter(&mut v, filter);
         v
     });
     let cols_ref: Option<Vec<&str>> = augmented
@@ -563,19 +566,8 @@ pub(crate) fn read_nonmem_csv_with_covariates_tte(
     discrete_cmts: &HashSet<usize>,
     column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
-    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
-    for c in extra_columns {
-        if !union.iter().any(|n| n == c) {
-            union.push(c.clone());
-        }
-    }
-    if let Some(f) = filter {
-        for c in f.referenced_covariate_columns() {
-            if !union.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
-                union.push(c);
-            }
-        }
-    }
+    let mut union = declared_union(decls, extra_columns);
+    augment_with_filter(&mut union, filter);
     let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
     let (pop, table) = read_nonmem_csv_impl(
         path,
@@ -714,6 +706,9 @@ fn read_nonmem_csv_impl(
     // TENTRY column: left-truncation / delayed-entry time for TTE rows.
     // Absent in Gaussian-only datasets; only read for `routing.tte` (Event) rows.
     let tentry_col = col_idx_ci("tentry");
+    // L2 column: NONMEM level-2 grouping id. Records sharing an L2 value form one
+    // correlated observation unit (`block_sigma` cross covariance). Optional.
+    let l2_col = col_idx_ci("l2");
 
     // FREMTYPE column (case-insensitive)
     let fremtype_col: Option<usize> = col_idx_ci("fremtype");
@@ -729,7 +724,7 @@ fn read_nonmem_csv_impl(
 
     const STANDARD_COLS: &[&str] = &[
         "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens", "addl",
-        "tentry", "fremtype",
+        "tentry", "fremtype", "l2",
     ];
     let is_standard = |h: &str| {
         STANDARD_COLS.iter().any(|s| h.eq_ignore_ascii_case(s))
@@ -896,6 +891,7 @@ fn read_nonmem_csv_impl(
                 occ_col,
                 addl_col,
                 fremtype_col,
+                l2_col,
                 &cov_indices,
                 filter,
                 routing,
@@ -1118,6 +1114,31 @@ fn parse_f64_or_nan(s: &str) -> f64 {
 
 fn parse_usize(s: &str) -> usize {
     s.parse::<usize>().unwrap_or(0)
+}
+
+/// Parse an `L2` grouping-id cell. NONMEM writes an integer, but pandas/R
+/// exports commonly float-format the whole column (`"10.0"`, `"11.0"`) once any
+/// row is blank — so a strict `i64` parse would silently ungroup every record
+/// and discard the user's block_sigma pairing (#830). Accept an integer literal
+/// or a *float-formatted integer* (fractional part exactly 0, within `i64`
+/// range). A genuinely non-integer value (`"2.4"`), an out-of-range magnitude, a
+/// blank, or an unparseable cell means "ungrouped" (`None` → 0) — left ungrouped
+/// rather than silently rounded/saturated into a group, which would mis-pair the
+/// residual correlation in a hard-to-debug way.
+fn parse_l2_id(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if is_missing_cell(t) {
+        return None;
+    }
+    if let Ok(i) = t.parse::<i64>() {
+        return Some(i);
+    }
+    let f = t.parse::<f64>().ok()?;
+    if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+        Some(f as i64)
+    } else {
+        None
+    }
 }
 
 fn parse_cens(s: &str) -> i8 {
@@ -1356,6 +1377,7 @@ fn parse_subject(
     occ_col: Option<usize>,
     addl_col: Option<usize>,
     fremtype_col: Option<usize>,
+    l2_col: Option<usize>,
     cov_indices: &[(String, usize)],
     filter: Option<&SelectionFilter>,
     // Per-CMT non-Gaussian endpoint routing (Event / DiscreteState / Count).
@@ -1379,6 +1401,7 @@ fn parse_subject(
     let mut occasions: Vec<u32> = Vec::new();
     let mut dose_occasions: Vec<u32> = Vec::new();
     let mut fremtype: Vec<u16> = Vec::new();
+    let mut obs_l2: Vec<i64> = Vec::new();
     let mut occ_parse_failures: usize = 0;
     // EVID=0/MDV=0 rows whose DV cell was missing and were skipped (issue #258).
     let mut missing_dv_skipped: usize = 0;
@@ -1973,6 +1996,15 @@ fn parse_subject(
                         .unwrap_or(0);
                     fremtype.push(ft);
                 }
+                if l2_col.is_some() {
+                    // NONMEM writes L2 as an integer id; a blank / unparsable
+                    // cell means "ungrouped" (0), matching the empty-vector case.
+                    let l2 = l2_col
+                        .and_then(|c| row.get(c))
+                        .and_then(|s| parse_l2_id(s))
+                        .unwrap_or(0);
+                    obs_l2.push(l2);
+                }
                 if any_tv {
                     obs_covariates.push(locf_state.clone());
                 }
@@ -2088,6 +2120,7 @@ fn parse_subject(
             reset_times,
             cens,
             occasions,
+            obs_l2,
             dose_occasions: sorted_dose_occ,
             fremtype,
             obs_records,
@@ -2934,6 +2967,33 @@ mod tests {
         let pop = read_nonmem_csv(f.path(), None, None).unwrap();
         assert!(pop.subjects[0].reset_times.is_empty());
         assert!(!pop.subjects[0].has_resets());
+    }
+
+    #[test]
+    fn test_l2_column_populates_obs_l2_and_is_not_a_covariate() {
+        // Two paired draws: each L2 id tags a total (FREE=0) + unbound (FREE=1)
+        // row of the same sample. obs_l2 is parallel to obs_times.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,FREE,L2\n\
+                   1,0,.,1,1,100,0,0\n\
+                   1,1,30.0,0,0,.,0,10\n\
+                   1,1,3.0,0,0,.,1,10\n\
+                   1,5,20.0,0,0,.,0,11\n\
+                   1,5,2.0,0,0,.,1,11\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(subj.obs_l2, vec![10, 10, 11, 11]);
+        assert_eq!(subj.obs_l2.len(), subj.obs_times.len());
+        // L2 is a recognized data item, never surfaced as a covariate.
+        assert!(!pop.covariate_names.contains(&"L2".to_string()));
+    }
+
+    #[test]
+    fn test_no_l2_column_leaves_obs_l2_empty() {
+        let csv = "ID,TIME,DV,EVID,MDV,AMT\n1,0,.,1,1,100\n1,1,5.0,0,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(pop.subjects[0].obs_l2.is_empty());
     }
 
     #[test]
@@ -3862,6 +3922,29 @@ mod tests {
         assert_eq!(parse_evid("."), 0);
         assert_eq!(parse_evid("NA"), 0);
         assert_eq!(parse_evid("x"), 0);
+    }
+
+    #[test]
+    fn test_parse_l2_id_accepts_integer_and_float_formats() {
+        // Plain integer ids.
+        assert_eq!(parse_l2_id("10"), Some(10));
+        assert_eq!(parse_l2_id(" 11 "), Some(11));
+        // #830: pandas/R exports float-format the whole column when any row is
+        // blank ("10.0"); a strict i64 parse would ungroup everything.
+        assert_eq!(parse_l2_id("10.0"), Some(10));
+        assert_eq!(parse_l2_id("11.0"), Some(11));
+        // A genuinely non-integer value is left ungrouped, NOT rounded into a
+        // group — silently mis-grouping would change the correlation pairing.
+        assert_eq!(parse_l2_id("2.4"), None);
+        assert_eq!(parse_l2_id("10.5"), None);
+        // Out-of-range magnitude is rejected rather than saturated.
+        assert_eq!(parse_l2_id("1e30"), None);
+        // Blank / missing / non-finite / unparseable → ungrouped.
+        assert_eq!(parse_l2_id(""), None);
+        assert_eq!(parse_l2_id("."), None);
+        assert_eq!(parse_l2_id("NA"), None);
+        assert_eq!(parse_l2_id("NaN"), None);
+        assert_eq!(parse_l2_id("x"), None);
     }
 
     #[test]

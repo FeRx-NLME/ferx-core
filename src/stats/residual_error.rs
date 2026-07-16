@@ -1,4 +1,4 @@
-use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SubjectResult};
+use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, Subject, SubjectResult};
 use nalgebra::DMatrix;
 
 const MIN_VARIANCE: f64 = 1e-12;
@@ -71,13 +71,28 @@ fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
     occasions.get(j).copied().unwrap_or(0)
 }
 
+/// Do observations `j` and `k` belong to the same correlated residual block?
+///
+/// When the data carries an `L2` grouping id (NONMEM's level-2 data item), it is
+/// authoritative: a row with a nonzero `L2` pairs **only** with rows sharing that
+/// id, so the user controls exactly which records form one correlated
+/// observation unit (total/unbound of a draw, replicate assays, any paired
+/// endpoints). Rows with no `L2` id (`0`, or an empty `obs_l2` when the dataset
+/// has no `L2` column) fall back to the implicit `(time, occasion)` rule.
 fn same_residual_block(
     obs_times: &[f64],
     _obs_raw_times: &[f64],
     occasions: &[u32],
+    obs_l2: &[i64],
     j: usize,
     k: usize,
 ) -> bool {
+    let l2j = obs_l2.get(j).copied().unwrap_or(0);
+    let l2k = obs_l2.get(k).copied().unwrap_or(0);
+    if l2j != 0 || l2k != 0 {
+        // At least one row is explicitly grouped: pair iff same L2 id.
+        return l2j == l2k;
+    }
     observation_time_key(obs_times, j) == observation_time_key(obs_times, k)
         && observation_occasion_key(occasions, j) == observation_occasion_key(occasions, k)
 }
@@ -131,6 +146,127 @@ fn cross_observation_covariance(
     cov
 }
 
+/// Do observations `j` and `k` share at least one `block_sigma` cross
+/// correlation, judged purely from which sigma slots their loadings occupy?
+///
+/// This mirrors the slot bookkeeping of [`cross_observation_covariance`]
+/// (identical within-observation skip) but ignores the loading *coefficients*,
+/// so the answer is independent of the prediction values. A pure proportional
+/// row at `f = 0` keeps its slot (as `(idx, 0.0)`), so it still pairs with its
+/// partner and the derivative builders keep emitting the nonzero slope-loading
+/// cross term.
+pub(crate) fn loadings_share_correlation(
+    load_j: &[(usize, f64)],
+    load_k: &[(usize, f64)],
+    correlations: &[ResidualCorrelation],
+) -> bool {
+    correlations.iter().any(|corr| {
+        let j_has_i = load_j.iter().any(|(idx, _)| *idx == corr.sigma_i);
+        let j_has_j = load_j.iter().any(|(idx, _)| *idx == corr.sigma_j);
+        let k_has_i = load_k.iter().any(|(idx, _)| *idx == corr.sigma_i);
+        let k_has_j = load_k.iter().any(|(idx, _)| *idx == corr.sigma_j);
+        // A row carrying both slots owns the correlation as a within-observation
+        // term, not a cross-observation one (matches `cross_observation_covariance`).
+        if (j_has_i && j_has_j) || (k_has_i && k_has_j) {
+            return false;
+        }
+        (j_has_i && k_has_j) || (j_has_j && k_has_i)
+    })
+}
+
+/// Match observations into cross-covariance pairs within each residual block.
+///
+/// [`same_residual_block`] decides which rows may pair, and the grouping source
+/// sets the pairing rule:
+///
+/// * **Explicit `L2` group** — the rows are one user-declared correlated unit,
+///   so **every** complementary pair in the group is correlated (all-to-all). A
+///   genuine 3+ endpoint block (e.g. parent + two metabolites, each pair
+///   correlated and jointly positive-definite) keeps its full cross-covariance
+///   structure. Over-grouping true replicates into one L2 unit would make that
+///   block indefinite and fail `R.cholesky()` loudly — which is the user telling
+///   the fit their grouping is wrong, not a silent drop.
+/// * **`(time, occasion)` fallback** — replicate assays cannot be told apart, so
+///   partners are matched **one-to-one, greedily in row order**: each unmatched
+///   row takes the first later unmatched row in its block with a nonzero cross
+///   covariance. This yields disjoint 2×2 pairs, so a co-temporal 4-row
+///   replicate block stays PD instead of collapsing to the invalid sentinel
+///   (issue #827).
+///
+/// Returns `(j, k, cov)` triples with `j < k`. `cov` is the value-loading cross
+/// covariance the two `R` builders reuse directly (avoiding a recompute); the
+/// derivative builders take only the `(j, k)` pairing and recompute with slope
+/// loadings. `loadings[j]` are observation `j`'s sigma value loadings (slot
+/// presence is identical for slope loadings, so the same pairing drives the
+/// derivative builders).
+fn match_partners(
+    loadings: &[Vec<(usize, f64)>],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+) -> Vec<(usize, usize, f64)> {
+    let n = loadings.len();
+    let mut pairs = Vec::new();
+    // Fallback (no L2) pairing is one-to-one: once a row is matched it is
+    // consumed and starts no further pairs. Explicit L2 rows are never consumed,
+    // so each pairs with every complementary row in its group (all-to-all).
+    let mut consumed = vec![false; n];
+    for j in 0..n {
+        if consumed[j] || loadings[j].is_empty() {
+            continue;
+        }
+        for k in (j + 1)..n {
+            if consumed[k]
+                || loadings[k].is_empty()
+                || !same_residual_block(obs_times, obs_raw_times, occasions, obs_l2, j, k)
+            {
+                continue;
+            }
+            // Gate the pairing on the *structural* slot overlap, not the value
+            // covariance: a pure proportional row whose prediction is momentarily
+            // `f = 0` has a zero value-loading covariance but a nonzero slope
+            // (derivative) cross term. Deciding on `cov != 0.0` would drop the
+            // pair — and with it that derivative term — exactly at `f ≈ 0`, and
+            // would let the pairing flicker as `f` crosses 0 across iterations.
+            if !loadings_share_correlation(&loadings[j], &loadings[k], correlations) {
+                continue;
+            }
+            let cov = cross_observation_covariance(
+                &loadings[j],
+                &loadings[k],
+                sigma_values,
+                correlations,
+            );
+            pairs.push((j, k, cov));
+            let explicit = obs_l2.get(j).copied().unwrap_or(0) != 0
+                && obs_l2.get(k).copied().unwrap_or(0) != 0;
+            if !explicit {
+                // (time, occasion) fallback: consume both rows and stop scanning
+                // for more partners of `j` — disjoint one-to-one pairing.
+                consumed[j] = true;
+                consumed[k] = true;
+                break;
+            }
+            // Explicit L2 group: keep scanning so `j` pairs with every
+            // complementary row in its group (all-to-all).
+        }
+    }
+    pairs
+}
+
+/// Write the off-diagonal cross-covariance entries of `R` from the matched pairs
+/// produced by [`match_partners`]. Shared by both `R` builders so the
+/// pairing-to-matrix fill lives in one place.
+fn fill_cross_covariances(r: &mut DMatrix<f64>, pairs: &[(usize, usize, f64)]) {
+    for &(j, k, cov) in pairs {
+        r[(j, k)] = cov;
+        r[(k, j)] = cov;
+    }
+}
+
 /// Build the subject-level residual covariance matrix `R`.
 ///
 /// The diagonal is the existing per-observation residual variance, including
@@ -147,6 +283,7 @@ pub fn compute_r_matrix_with_correlations(
     obs_times: &[f64],
     obs_raw_times: &[f64],
     occasions: &[u32],
+    obs_l2: &[i64],
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> DMatrix<f64> {
@@ -181,28 +318,16 @@ pub fn compute_r_matrix_with_correlations(
         .zip(obs_cmts.iter())
         .map(|(&f, &cmt)| error_spec.sigma_loadings(cmt, f, sigma_values.len()))
         .collect();
-    for j in 0..n {
-        if loadings[j].is_empty() {
-            continue;
-        }
-        for k in (j + 1)..n {
-            if loadings[k].is_empty()
-                || !same_residual_block(obs_times, obs_raw_times, occasions, j, k)
-            {
-                continue;
-            }
-            let cov = cross_observation_covariance(
-                &loadings[j],
-                &loadings[k],
-                sigma_values,
-                correlations,
-            );
-            if cov != 0.0 {
-                r[(j, k)] = cov;
-                r[(k, j)] = cov;
-            }
-        }
-    }
+    let pairs = match_partners(
+        &loadings,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        sigma_values,
+        correlations,
+    );
+    fill_cross_covariances(&mut r, &pairs);
     r
 }
 
@@ -225,6 +350,7 @@ pub fn compute_r_matrix_with_correlations_scaled(
     obs_times: &[f64],
     obs_raw_times: &[f64],
     occasions: &[u32],
+    obs_l2: &[i64],
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
     mult: &[Vec<f64>],
@@ -254,29 +380,61 @@ pub fn compute_r_matrix_with_correlations_scaled(
             .collect()
     };
     let loadings: Vec<Vec<(usize, f64)>> = (0..n).map(scale_loadings).collect();
-    for j in 0..n {
-        if loadings[j].is_empty() {
-            continue;
-        }
-        for k in (j + 1)..n {
-            if loadings[k].is_empty()
-                || !same_residual_block(obs_times, obs_raw_times, occasions, j, k)
-            {
-                continue;
-            }
-            let cov = cross_observation_covariance(
-                &loadings[j],
-                &loadings[k],
-                sigma_values,
-                correlations,
-            );
-            if cov != 0.0 {
-                r[(j, k)] = cov;
-                r[(k, j)] = cov;
-            }
-        }
-    }
+    let pairs = match_partners(
+        &loadings,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        sigma_values,
+        correlations,
+    );
+    fill_cross_covariances(&mut r, &pairs);
     r
+}
+
+/// Dense residual covariance `R`, dispatching on the optional per-observation
+/// custom-magnitude multiplier: `Some(mult)` routes through the `_scaled`
+/// association ([`compute_r_matrix_with_correlations_scaled`]) and `None` through
+/// the bare ([`compute_r_matrix_with_correlations`]) diagonal form. The two are
+/// equal in exact arithmetic but differ by ~1 ULP under IEEE-754 reassociation,
+/// so the split is preserved (not merged). `obs_times`/`obs_raw_times`/
+/// `occasions`/`obs_l2` are pulled off `subject`. Folds the identical `match`
+/// that the FOCE/FOCEI/data-term/CWRES paths each carried.
+pub(crate) fn r_matrix_maybe_scaled(
+    error_spec: &ErrorSpec,
+    preds: &[f64],
+    err_keys: &[usize],
+    subject: &Subject,
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    ruv_mult: Option<&[Vec<f64>]>,
+) -> DMatrix<f64> {
+    match ruv_mult {
+        Some(mult) => compute_r_matrix_with_correlations_scaled(
+            error_spec,
+            preds,
+            err_keys,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &subject.obs_l2,
+            sigma_values,
+            correlations,
+            mult,
+        ),
+        None => compute_r_matrix_with_correlations(
+            error_spec,
+            preds,
+            err_keys,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &subject.obs_l2,
+            sigma_values,
+            correlations,
+        ),
+    }
 }
 
 /// `∂R/∂f_m` matrices of the dense residual covariance built by
@@ -309,6 +467,7 @@ pub fn compute_dr_df_matrices(
     obs_times: &[f64],
     obs_raw_times: &[f64],
     occasions: &[u32],
+    obs_l2: &[i64],
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
     mult: Option<&[Vec<f64>]>,
@@ -346,23 +505,33 @@ pub fn compute_dr_df_matrices(
         })
         .collect();
 
+    let pairs = match_partners(
+        &vload,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        sigma_values,
+        correlations,
+    );
     let mut out = vec![DMatrix::<f64>::zeros(n, n); n];
     for m in 0..n {
         if vload[m].is_empty() {
             continue;
         }
         out[m][(m, m)] = diag_self_deriv(&vload[m], &sload[m], sigma_values, correlations);
-        for k in 0..n {
-            if k == m
-                || vload[k].is_empty()
-                || !same_residual_block(obs_times, obs_raw_times, occasions, m, k)
-            {
-                continue;
-            }
-            let d = cross_observation_covariance(&sload[m], &vload[k], sigma_values, correlations);
-            out[m][(m, k)] = d;
-            out[m][(k, m)] = d;
-        }
+    }
+    // ∂R_jk/∂f_j for each matched pair (mirrors the pairing that builds `R`):
+    // slope loadings of the differentiated row, value loadings of its partner.
+    // Each row picks up one cross term per partner (all-to-all within an L2
+    // group), so `dr[j]` and `dr[k]` carry independent slopes.
+    for &(j, k, _) in &pairs {
+        let djk = cross_observation_covariance(&sload[j], &vload[k], sigma_values, correlations);
+        out[j][(j, k)] = djk;
+        out[j][(k, j)] = djk;
+        let dkj = cross_observation_covariance(&sload[k], &vload[j], sigma_values, correlations);
+        out[k][(k, j)] = dkj;
+        out[k][(j, k)] = dkj;
     }
     out
 }
@@ -440,6 +609,7 @@ pub fn compute_d2r_df2_matrices(
     obs_times: &[f64],
     obs_raw_times: &[f64],
     occasions: &[u32],
+    obs_l2: &[i64],
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
     mult: Option<&[Vec<f64>]>,
@@ -476,6 +646,15 @@ pub fn compute_d2r_df2_matrices(
         })
         .collect();
 
+    let pairs = match_partners(
+        &vload,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        sigma_values,
+        correlations,
+    );
     let mut out = vec![vec![DMatrix::<f64>::zeros(n, n); n]; n];
     for m in 0..n {
         if vload[m].is_empty() {
@@ -483,20 +662,15 @@ pub fn compute_d2r_df2_matrices(
         }
         // Diagonal curvature ∂²R_mm/∂f_m².
         out[m][m][(m, m)] = diag_self_second_deriv(&sload[m], sigma_values, correlations);
-        // Mixed partial ∂²R_mk/∂f_m∂f_k for the off-diagonal cross-covariance.
-        for k in (m + 1)..n {
-            if vload[k].is_empty()
-                || !same_residual_block(obs_times, obs_raw_times, occasions, m, k)
-            {
-                continue;
-            }
-            let d = cross_observation_covariance(&sload[m], &sload[k], sigma_values, correlations);
-            if d != 0.0 {
-                out[m][k][(m, k)] = d;
-                out[m][k][(k, m)] = d;
-                out[k][m][(m, k)] = d;
-                out[k][m][(k, m)] = d;
-            }
+    }
+    // Mixed partial ∂²R_jk/∂f_j∂f_k for each matched pair (both slope loadings).
+    for &(j, k, _) in &pairs {
+        let d = cross_observation_covariance(&sload[j], &sload[k], sigma_values, correlations);
+        if d != 0.0 {
+            out[j][k][(j, k)] = d;
+            out[j][k][(k, j)] = d;
+            out[k][j][(j, k)] = d;
+            out[k][j][(k, j)] = d;
         }
     }
     out
@@ -796,6 +970,7 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
         );
@@ -804,6 +979,391 @@ mod tests {
         assert_relative_eq!(r[(0, 1)], 50.0 * 5.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
         assert_relative_eq!(r[(1, 0)], r[(0, 1)], epsilon = 1e-12);
         assert_eq!(r[(0, 2)], 0.0);
+    }
+
+    // #827: two physical samples at the SAME subject time (replicate assays,
+    // paired in NONMEM by the `L2` data item) must yield DISJOINT cross-covariance
+    // pairs — each total row correlates with exactly one unbound row, not both.
+    // An all-to-all 4×4 block would be indefinite and collapse the FOCEI objective
+    // to the invalid sentinel; the disjoint pairing keeps `R` positive-definite.
+    #[test]
+    fn test_replicate_time_samples_pair_disjointly_and_stay_pd() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        // Rows in the NONMEM-contiguous layout: (total#1, unbound#1, total#2,
+        // unbound#2), all at t = 1.0 — the replicate-time collision from ID 21.
+        let ipreds = [50.0, 5.0, 40.0, 4.0];
+        let cmts = [1usize, 2, 1, 2];
+        let times = [1.0, 1.0, 1.0, 1.0];
+        let sigma = [0.671, 0.644];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.93,
+        };
+        let r = compute_r_matrix_with_correlations(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+        );
+        // Matched pairs (0,1) and (2,3) carry the cross covariance; the
+        // cross-sample entries (0,3) and (1,2) must be exactly zero.
+        assert!(r[(0, 1)] != 0.0 && r[(1, 0)] != 0.0);
+        assert!(r[(2, 3)] != 0.0 && r[(3, 2)] != 0.0);
+        assert_eq!(r[(0, 3)], 0.0);
+        assert_eq!(r[(3, 0)], 0.0);
+        assert_eq!(r[(1, 2)], 0.0);
+        assert_eq!(r[(2, 1)], 0.0);
+        // The whole matrix is PD (before the fix this cholesky failed → 2e20).
+        assert!(
+            r.cholesky().is_some(),
+            "replicate-time residual R must be positive-definite"
+        );
+    }
+
+    // #827: an explicit `L2` grouping id is authoritative — it pairs rows the
+    // user grouped even across different times, and it keeps co-temporal rows in
+    // *different* groups uncorrelated. Four rows all at t = 1.0, two total
+    // (cmt 1) and two unbound (cmt 2), grouped L2 = {row0,row2} and {row1,row3}
+    // — i.e. the pairing crosses the file order deliberately.
+    #[test]
+    fn test_l2_grouping_controls_pairing_over_time_and_order() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let ipreds = [50.0, 5.0, 40.0, 4.0];
+        let cmts = [1usize, 2, 2, 1];
+        // Row times deliberately mixed: rows 0 and 2 share L2=10 but sit at
+        // different times, proving L2 overrides the (time, occasion) fallback.
+        let times = [1.0, 1.0, 9.0, 9.0];
+        let obs_l2 = [10i64, 20, 10, 20];
+        let sigma = [0.671, 0.644];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.93,
+        };
+        let r = compute_r_matrix_with_correlations(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &obs_l2,
+            &sigma,
+            &[corr],
+        );
+        // L2=10 pairs rows (0,2) across different times; L2=20 pairs (1,3).
+        assert!(r[(0, 2)] != 0.0 && r[(2, 0)] != 0.0);
+        assert!(r[(1, 3)] != 0.0 && r[(3, 1)] != 0.0);
+        // Co-temporal but different-L2 (rows 0 & 1 both at t=1) stay uncorrelated,
+        // as do all other cross-group entries.
+        assert_eq!(r[(0, 1)], 0.0);
+        assert_eq!(r[(0, 3)], 0.0);
+        assert_eq!(r[(1, 2)], 0.0);
+        assert_eq!(r[(2, 3)], 0.0);
+        assert!(r.cholesky().is_some(), "L2-grouped residual R must be PD");
+    }
+
+    // #830: within one explicit `L2` group the rows form a single correlated
+    // unit, so a genuine 3-endpoint block (parent + two metabolites, each pair
+    // correlated and jointly positive-definite) must keep ALL THREE cross
+    // covariances — not just one greedy pair. The disjoint greedy fallback would
+    // pair only (0,1) and silently zero the (0,2)/(1,2) terms; all-to-all within
+    // the L2 group restores the full block.
+    #[test]
+    fn test_l2_group_correlates_three_endpoints_all_to_all() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                3,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![2],
+                },
+            ),
+        ]));
+        let ipreds = [10.0, 20.0, 30.0];
+        let cmts = [1usize, 2, 3];
+        let times = [1.0, 1.0, 1.0];
+        let obs_l2 = [7i64, 7, 7];
+        let sigma = [0.3, 0.3, 0.3];
+        // Three pairwise correlations at a mild rho so the 3×3 block stays PD.
+        let corrs = [
+            crate::types::ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 1,
+                rho: 0.3,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 2,
+                rho: 0.3,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 2,
+                rho: 0.3,
+            },
+        ];
+        let r = compute_r_matrix_with_correlations(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &obs_l2,
+            &sigma,
+            &corrs,
+        );
+        // All three off-diagonals are populated (greedy one-to-one would leave
+        // row 2 unmatched, zeroing r[(0,2)] and r[(1,2)]).
+        assert!(r[(0, 1)] != 0.0 && r[(1, 0)] != 0.0);
+        assert!(r[(0, 2)] != 0.0 && r[(2, 0)] != 0.0);
+        assert!(r[(1, 2)] != 0.0 && r[(2, 1)] != 0.0);
+        assert!(
+            r.cholesky().is_some(),
+            "PD 3-endpoint L2 block must stay positive-definite"
+        );
+
+        // The derivative builder must track the same all-to-all pairing: ∂R/∂f
+        // matches a central difference of R for every observation.
+        let dr = compute_dr_df_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &obs_l2,
+            &sigma,
+            &corrs,
+            None,
+        );
+        let n = ipreds.len();
+        let r_at = |f: &[f64]| {
+            compute_r_matrix_with_correlations(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &obs_l2,
+                &sigma,
+                &corrs,
+            )
+        };
+        let h = 1e-4;
+        for m in 0..n {
+            let mut fp = ipreds.to_vec();
+            let mut fm = ipreds.to_vec();
+            fp[m] += h;
+            fm[m] -= h;
+            let fd = (r_at(&fp) - r_at(&fm)) / (2.0 * h);
+            for p in 0..n {
+                for q in 0..n {
+                    assert_relative_eq!(
+                        dr[m][(p, q)],
+                        fd[(p, q)],
+                        epsilon = 1e-5,
+                        max_relative = 1e-4
+                    );
+                }
+            }
+        }
+    }
+
+    // #830: the pairing is structural (slot overlap), not value-based, so a
+    // paired proportional row whose prediction is momentarily f = 0 keeps its
+    // partner and the derivative builder still emits the (nonzero) slope-loading
+    // cross term. Gating on `cov != 0.0` would drop it exactly at f ≈ 0.
+    #[test]
+    fn test_cross_derivative_survives_zero_prediction() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+        ]));
+        // Row 0's prediction is exactly zero — its value loading (and hence the
+        // value cross covariance) vanishes, but its slope loading does not.
+        let ipreds = [0.0, 5.0];
+        let cmts = [1usize, 2];
+        let times = [1.0, 1.0];
+        let sigma = [0.3, 0.4];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        // R's off-diagonal is genuinely 0 at f = 0 (value covariance), and the
+        // block stays PD.
+        let r = compute_r_matrix_with_correlations(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+        );
+        assert_eq!(r[(0, 1)], 0.0);
+        // ∂R_01/∂f_0 = slope_0 · value_1 · ρ·σ0·σ1 = 1·5·0.5·0.3·0.4 = 0.3.
+        let dr = compute_dr_df_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+            None,
+        );
+        assert_relative_eq!(dr[0][(0, 1)], 0.3, epsilon = 1e-12);
+        assert_relative_eq!(dr[0][(1, 0)], 0.3, epsilon = 1e-12);
+        assert!(
+            dr[0][(0, 1)] != 0.0,
+            "cross derivative must survive a zero prediction"
+        );
+    }
+
+    // The derivative builders must use the SAME disjoint pairing as
+    // `compute_r_matrix_with_correlations`, or `∂R/∂f` would not match a finite
+    // difference of `R`. Exercises the replicate-time (all-same-time) layout.
+    #[test]
+    fn test_compute_dr_df_matrices_matches_fd_replicate_time() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let ipreds = [50.0, 5.0, 40.0, 4.0];
+        let cmts = [1usize, 2, 1, 2];
+        let times = [1.0, 1.0, 1.0, 1.0];
+        let sigma = [0.671, 0.644];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.93,
+        };
+        let dr = compute_dr_df_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+            None,
+        );
+        let n = ipreds.len();
+        let r_at = |f: &[f64]| {
+            compute_r_matrix_with_correlations(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &[],
+                &sigma,
+                &[corr],
+            )
+        };
+        let h = 1e-4;
+        for m in 0..n {
+            let mut fp = ipreds.to_vec();
+            let mut fm = ipreds.to_vec();
+            fp[m] += h;
+            fm[m] -= h;
+            let fd = (r_at(&fp) - r_at(&fm)) / (2.0 * h);
+            for p in 0..n {
+                for q in 0..n {
+                    assert_relative_eq!(
+                        dr[m][(p, q)],
+                        fd[(p, q)],
+                        epsilon = 1e-5,
+                        max_relative = 1e-4
+                    );
+                }
+            }
+        }
     }
 
     // Central-difference check: ∂R/∂f_m from `compute_dr_df_matrices` must match
@@ -843,13 +1403,24 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
             None,
         );
         let n = ipreds.len();
         let r_at = |f: &[f64]| {
-            compute_r_matrix_with_correlations(&spec, f, &cmts, &times, &[], &[], &sigma, &[corr])
+            compute_r_matrix_with_correlations(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &[],
+                &sigma,
+                &[corr],
+            )
         };
         let h = 1e-4;
         for m in 0..n {
@@ -914,6 +1485,7 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
             Some(&mult),
@@ -925,6 +1497,7 @@ mod tests {
                 f,
                 &cmts,
                 &times,
+                &[],
                 &[],
                 &[],
                 &sigma,
@@ -991,13 +1564,25 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
             None,
         );
         let n = ipreds.len();
         let dr_at = |f: &[f64]| {
-            compute_dr_df_matrices(&spec, f, &cmts, &times, &[], &[], &sigma, &[corr], None)
+            compute_dr_df_matrices(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &[],
+                &sigma,
+                &[corr],
+                None,
+            )
         };
         let h = 1e-4;
         for b in 0..n {
@@ -1065,6 +1650,7 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
             Some(&mult),
@@ -1076,6 +1662,7 @@ mod tests {
                 f,
                 &cmts,
                 &times,
+                &[],
                 &[],
                 &[],
                 &sigma,
@@ -1129,6 +1716,7 @@ mod tests {
             &times,
             &[],
             &[],
+            &[],
             &sigma,
             &[corr],
             None,
@@ -1173,6 +1761,7 @@ mod tests {
             &cmts,
             &shifted_times,
             &raw_times,
+            &[],
             &[],
             &sigma,
             &[corr],
@@ -1283,7 +1872,8 @@ mod tests {
             reassociated.to_bits(),
             "fixture must be a pair where the two associations differ"
         );
-        let r = compute_r_matrix_with_correlations(&spec, &[f], &[1], &[0.0], &[], &[], &[s], &[]);
+        let r =
+            compute_r_matrix_with_correlations(&spec, &[f], &[1], &[0.0], &[], &[], &[], &[s], &[]);
         assert_eq!(
             r[(0, 0)].to_bits(),
             legacy.to_bits(),

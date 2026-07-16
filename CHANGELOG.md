@@ -19,6 +19,111 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **`method = agq` removed; adaptive quadrature is now an *argument*, not a method**
+  (#251). Adaptive Gauss–Hermite quadrature is not a separate estimator — it is the
+  single-point method (Laplace / FOCEI) evaluated on more nodes. So the **method name now
+  selects the Hessian anchor** and **`n_agq` (default 1) is the node count**:
+  - `method = laplace` — the exact-Hessian anchor. `n_agq = 1` is the Laplace approximation
+    (NONMEM `LAPLACIAN`); `n_agq > 1` is adaptive Gauss–Hermite quadrature (what `method =
+    agq` used to be).
+  - `method = focei` — the Gauss-Newton anchor. `n_agq = 1` is plain FOCEI (unchanged,
+    bit-identical); `n_agq > 1` is a **new** Gauss-Newton-anchored quadrature that refines
+    FOCEI toward the exact marginal (requires the analytic sensitivity scope).
+
+  Both anchors converge to the same marginal likelihood as `n_agq → ∞`; they differ only in
+  node placement and, at one node, in whether `½log|H|` carries the exact curvature or the
+  Gauss-Newton approximation. The old `method = agq` (and its `gauss_hermite` /
+  `adaptive_gaussian_quadrature` aliases) is rejected by the parser with a message pointing
+  to `method = laplace` + `n_agq`. **This is a breaking change to the model file's
+  `[fit_options]`; `method = agq` was unreleased, so no released version — and no persisted
+  `.fitrx` bundle — is affected.**
+- **Laplace / adaptive-GH quadrature uses a tighter default `inner_tol` (`1e-8`, was the
+  shared `1e-5`)** (#251). Its analytic gradient assumes the EBE is exactly the posterior
+  mode; a loose inner tolerance left `b̂` off-mode from a poor start and could stall the
+  outer optimizer. The tighter default converges robustly from realistic starts at
+  negligible cost near the optimum. FOCE/FOCEI are unchanged (their Gauss-Newton `log|H̃|`
+  is forgiving of a loose mode).
+
+### Fixed
+- **FREM: the analytic gradients differentiated the wrong likelihood on covariate
+  pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against
+  the prediction `theta[i] + eta[j]` with the dedicated covariate error `EPSCOV` — but the
+  sensitivity provider returned the ordinary **PK** jet for those rows, and the gradient
+  assemblies read the ordinary residual variance rather than the `EPSCOV` override that
+  SAEM, importance sampling and the CWRES path all already applied. Both loops were
+  affected:
+  - the **outer** (population) gradient, so FOCE/FOCEI were minimising one objective while
+    differentiating another; and
+  - the **inner** (EBE) gradient, so the empirical Bayes estimates themselves converged to
+    the mode of the wrong likelihood.
+
+  The provider now rewrites both jets for pseudo-observation rows (`f = theta[i] +
+  eta[j]`, unit first derivatives, zero second derivatives — the same `{0, 1}` Jacobian
+  the FOCE H-matrix already stamped in), and both gradient assemblies use the `EPSCOV`
+  variance — consistently at every consumer, not only the two that motivated the fix:
+  the outer jet override now also covers the ODE sensitivity provider (previously only
+  the closed-form/TV-cov routes got it, so an ODE FREM subject still combined the raw
+  PK jet with the `EPSCOV` variance); `method = foce`'s Sheiner–Beal `R⁰` and its σ-FD
+  now take the `EPSCOV` override (previously only FOCEI's `score_core` did); the FOCEI
+  `sigma_block` and `subject_eta_dx` σ-FD loops now use it too (previously they FD'd the
+  *PK* variance's — zero — dependence on `EPSCOV`, so `grad[EPSCOV]` was identically zero
+  under `focei` and a spurious term leaked into the other residual-error σ instead); and
+  the `iiv_on_ruv` residual-eta block and the custom-magnitude direct-θ channel now both
+  skip FREM rows (a pseudo-observation's likelihood has no η_ruv or magnitude dependence
+  at all).
+
+  On the warfarin FREM example the effect is large. A converged FOCEI fit goes from
+  **OFV 4900.6 to 211.0**, and the importance-sampling marginal (`method = imp`) from
+  **19781.1 to 211.6** — `imp` scores FREM rows correctly but centres its proposal on the
+  inner-loop EBEs, so it inherited the wrong mode, the weights collapsed, and its estimate
+  was meaningless.
+
+  This is primarily a gradient fix, and most of the OFV gap is simply the fit landing
+  somewhere else because the gradient that drove it there was wrong. One piece is not
+  gradient-only, though: `find_ebe`'s non-IOV `h_matrix` — the Jacobian `foce_subject_nll`
+  uses to build the `log|H̃|` Laplace curvature term, which **is** part of the reported
+  OFV — reuses the same provider choke point this fix corrects, and that Jacobian never
+  received the FREM `{0, 1}` override before (only the IOV path and the FD-Jacobian
+  fallback already had it). So a non-IOV FREM subject's own curvature term was also wrong
+  pre-fix, independently of the outer-gradient bug above. That the corrected FOCEI Laplace
+  OFV (211.0) and the corrected 6000-sample IS marginal (211.6) — two independent
+  approximations, and IS's data term does not go through `h_matrix` at all — now agree to
+  under one unit is nonetheless a strong check that the new values are the right ones.
+
+  Note the recovered covariate omegas barely move (118.71 → 118.67 for WT), because they
+  are pinned by the pseudo-observations themselves. **A FREM fit could therefore look
+  entirely plausible on the one diagnostic a user would naturally check, and still be badly
+  wrong.**
+
+  Latent because FREM models are conventionally fit with `method = saem`, which uses
+  neither gradient — and the covariate-omega regression test runs SAEM. Fits under `focei`,
+  `imp` (or now `agq` / `laplace`) were affected. **SAEM fits are unchanged.**
+
+- **AGQ / `laplace`: the analytic outer gradient now covers the same models as
+  FOCE/FOCEI** (#251). Its score previously carried a Gaussian-only residual chain,
+  so five endpoint families that FOCE/FOCEI already handled analytically — **M3
+  censoring, IIV-on-RUV, a custom or time-varying residual magnitude, LTBS, and
+  correlated residuals (`block_sigma`)** — silently fell back to a finite-differenced
+  score. They now share the same per-observation chain as FOCE/FOCEI and take the
+  analytic route, so scope parity holds by construction rather than by a list that
+  can drift. Under a custom residual magnitude this also **corrects** the θ gradient:
+  `mult(θ)` makes the residual variance depend on θ directly, and that channel was
+  not approximated before — it was missing entirely. FREM is included too — its
+  pseudo-observation rows now ride the same analytic score as FOCE/FOCEI via the FREM
+  fix above. TTE and categorical endpoints still take the finite-differenced score
+  (neither re-solves the inner loop, so they remain fast) — they have no analytic
+  chain in the `Dual2` provider at all, not merely an AGQ-side gate. `block_sigma` is
+  now accepted for `method = laplace` (previously rejected at `fit()` even
+  though the analytic score already carried a `corr_diag` branch for it). Under IOV,
+  the scope check now excludes non-Gaussian endpoints and bounds the custom-magnitude
+  axis count the same way the non-IOV gate does — previously an IOV + TTE/categorical
+  subject could pass the gate and silently score only the Ω prior, dropping the hazard
+  term. A per-subject runtime decline inside the analytic score (an off-diagonal
+  `block_sigma` subject, or magnitude × M3-censored) now falls back to the fixed-η FD
+  score for just that subject, rather than dropping the whole population onto the
+  `2·n_free`-inner-resolve `reconverged_fd_gradient` fallback.
+
 ### Added
 - **Steady-state (`SS=1`) dosing into a built-in absorption compartment** (#719):
   an `SS=1` dose into a `transit()` / `igd()` / `weibull()` / `first_order()`
@@ -35,6 +140,100 @@ section of the SDLC for the versioning policy).
   Still rejected, with clearer codes: `SS` into a `zero_order()` window
   (`E_ABSORPTION_SS_ZERO_ORDER`) and `SS` combined with an absorption lagtime
   (`E_ABSORPTION_SS_LAG`).
+- **Flat (zero-gradient) thetas are now frozen at start instead of killing the fit** (#826).
+  A pre-flight check computes the outer gradient at the initial estimate; any non-fixed
+  theta whose gradient is ≈ 0 (a parameter that never reaches the objective — typically
+  unmapped, or dropped from the structural / scaling model) is held fixed at its initial
+  value and reported with a `flat_parameter` warning naming it, rather than leaving a zero
+  search direction that made gradient-based NLopt return `Failure` on the first evaluation
+  and pin *every* parameter at its initial value. The remaining parameters now estimate
+  normally.
+- **Exact (analytic) inner EBE gradient for CTMM (`[markov_model]`) fits** (#759). The
+  transition likelihood `−Σ log P(Δt)[s,s']`, `P = expm(Q·Δt)`, was finite-differenced
+  end-to-end: every EBE step perturbed η, rebuilt `Q`, and redid a matrix exponential per
+  observation gap. The intensities are now replayed over dual numbers with θ and η seeded,
+  giving an exact `∂Q/∂η`, which is chained to `∂P/∂Q` through the Van Loan (1978) Fréchet
+  derivative of the matrix exponential. The generator's row-sum-zero constraint is inherited
+  for free (differentiation is linear, so the derivative of a valid generator is a valid
+  direction). Because only one *entry* of `P` is read per gap, the adjoint form
+  `⟨C, L(A,E)⟩ = ⟨L(Aᵀ,C), E⟩` lets a **single** Fréchet solve per gap serve every parameter
+  at once — so the exact gradient is *cheaper* than the finite differences it replaces, not
+  just more accurate. A drug-driven (time-inhomogeneous) `Q(t)` keeps the FD path: its
+  likelihood is an occupancy ODE, not an `expm`, so the identity does not apply. The FOCEI
+  Laplace `½log|H̃|` term and the outer θ-gradient are still FD.
+- **AGQ and `laplace` now support inter-occasion variability (`[iov]`)** (#251).
+  Under IOV the integral runs over the **stacked** random-effect vector
+  `b = [η, κ₁ … κ_K]`, whose prior is the block-diagonal `Ω ⊕ Ω_iov^⊕K` — which is
+  exactly what ferx's IOV likelihood already scores, so every AGQ formula carries
+  over with `d` the stacked dimension. IOV is a change of *dimension*, not of
+  method. The tensor grid is therefore `n_agq^(n_eta + K·n_kappa)` and grows with
+  the occasion count `K`, so the 100 000-node cap is now enforced against the
+  stacked dimension once the data is read (the error names `K`). **`method =
+  laplace` is always tractable under IOV** — its grid is a single point regardless
+  of `d`. Previously both methods rejected `[iov]` models outright.
+- **`method = laplace` — the Laplace approximation as a first-class estimator** (#251).
+  Alias `laplacian`. This is NONMEM's `$EST METHOD=1 LAPLACIAN`: the Laplace
+  approximation built from the **exact** Hessian of the conditional likelihood.
+  It is *not* the same estimator as `focei`, which builds its Gaussian from the
+  Gauss-Newton Hessian `CᵀC + Ω⁻¹` (dropping `∂²f/∂η²`) and therefore reports a
+  different OFV; `laplace` carries the curvature of the η-dependent residual
+  variance that the Gauss-Newton form discards, which is why it reproduces NONMEM's
+  LAPLACIAN to six significant figures on warfarin. At the default `n_agq = 1` it is a
+  single node, no grid — the cheapest configuration, and on warfarin it converges
+  *faster than FOCEI* (0.23 s vs 0.60 s); `n_agq > 1` turns it into adaptive
+  Gauss–Hermite quadrature over the same objective. See the
+  [AGQ docs page](https://ferx-nlme.github.io/ferx-core/estimation/agq.html).
+- **Exact (analytic) FOCE/FOCEI gradients for lagtime models with IOV, time-varying
+  covariates, or `TIME`** (#486): a closed-form model carrying an `ALAG`/`LAGTIME` used to
+  fall back to finite differences the moment the subject also had IOV, a time-varying
+  covariate, or a `TIME`-dependent parameter — which covers a large share of everyday oral
+  popPK models. Those fits now use the exact analytic gradient on both loops: they are
+  faster (FD costs one extra objective evaluation per parameter) and no longer inherit the
+  finite-difference step's accuracy loss. Estimates are unchanged within convergence
+  tolerance. Steady-state doses combined with a lagtime still use finite differences.
+- **Exact (analytic) gradients for steady-state dosing combined with an EVID 3/4 reset**
+  (#486) on the closed-form engine — previously finite differences (the ODE engine already
+  had it).
+- **Analytic gradients for `[scaling] y = <expr>` readouts that reference many parameters**
+  (#486): a Form-C readout whose individual parameters spilled past the eight structural PK
+  slots (e.g. a sigmoid-Emax readout on a 3-compartment oral model) fell back to finite
+  differences on the time-varying-covariate path; it is now analytic.
+- **Wider models keep the analytic gradient** (#486): the monomorphisation caps that decide
+  when a model is too wide for the exact gradient were raised from 16 to 24 `θ + η` (the ODE
+  and output-scaling paths). A mid-sized covariate model (5 structural θ + 6 covariate-effect
+  θ + 5 η) sat at exactly the old limit, so adding one more covariate silently dropped the
+  whole fit to finite differences. The closed-form event walk's cap is now coupled to the ODE
+  one, closing a pre-existing gap where a 17–24-axis model took an analytic *outer* gradient
+  against a finite-difference *inner* one.
+- **Guarded multi-start inner EBE, on by default** (#830, `inner_restarts`,
+  default `1`): escapes a multimodal individual objective, where a single
+  warm-started inner optimizer can settle in the wrong basin and inflate a
+  subject's objective. The classic case is saturable protein binding (a
+  high-volume/low-concentration and a low-volume/high-concentration fit both
+  explain a total-concentration profile). Subjects on the event-driven path
+  (system resets or time-varying covariates) now re-solve the EBE on a cold start
+  from Ω-scaled seeds per random effect and keep the lowest-objective mode; the
+  outer warm start carries it forward, so the scan runs once per subject per fit
+  (≈0 % overhead). A seed that reconverges to the same mode is not accepted, so
+  unimodal subjects are unchanged; only a genuinely trapped subject moves — to
+  the deeper, correct basin. On the fluconazole free/total binding model this
+  recovers the NONMEM fit (OFV 734.67 vs NONMEM 734.64, versus 749.3 before). Set
+  `inner_restarts = 0` to restore the previous single-start behaviour. See
+  [Fit options](https://ferx-nlme.github.io/ferx-core/model-file/fit-options.html).
+- **`L2` data column for correlated observation units** (#827): the reader now
+  recognizes NONMEM's level-2 grouping item. Observation rows sharing an `L2`
+  value within a subject are paired into one correlated unit for a `block_sigma`
+  residual (e.g. the total + unbound rows of one blood draw), giving the user
+  explicit control over which records the cross covariance couples instead of
+  relying on co-temporal row order. See
+  [Data format](https://ferx-nlme.github.io/ferx-core/data-format.html).
+- **Two `block_sigma` / `L2` data diagnostics** (#830), reported by `fit()` and
+  `ferx check`: `W_BLOCK_SIGMA_L2_ORDER` when a correlated residual has a
+  co-temporal group that can pair more than one way and no `L2` column is present
+  (the fallback pairs in CSV row order, so reordering rows changes the fit — add
+  an `L2` column); and `W_L2_UNUSED` when the data has an `L2` column but the
+  model declares no `block_sigma` correlation (the reserved column is inert and,
+  if it was meant as a covariate, was silently dropped).
 - **Continuous-time Markov model (CTMM) endpoint** (#759): a new
   `[markov_model]` block fits a discrete-state Markov process observed at
   irregular times. Declare states bound to their integer DV code
@@ -43,11 +242,33 @@ section of the SDLC for the versioning policy).
   and scores each consecutive observation pair with the exact transition
   matrix `P(Δt) = expm(Q·Δt)`. Time-homogeneous generators fit with FOCEI
   (default), SAEM, or IMP; intensities may carry covariates and between-subject
-  random effects. Requires the `markov` cargo feature. See the
+  random effects. An intensity may also depend on a **model state** — a drug
+  concentration (`central / V`) or a PD response — making the generator
+  time-inhomogeneous `Q(t) = f(state(t))` (#817); ferx then integrates the
+  occupancy ODE `dP/dτ = P·Q(state(t))` (forward Kolmogorov) over each
+  observation gap instead of the closed-form matrix exponential (requires an ODE
+  model). Requires the `markov`
+  cargo feature. See the
   [Markov models](https://ferx-nlme.github.io/ferx-core/model-file/markov-model.html)
   and [CTMM estimation](https://ferx-nlme.github.io/ferx-core/estimation/ctmm.html)
-  pages. (mCTMM/DTMM, drug-driven `Q(t)`, and CTMM simulation are planned
-  follow-ups.)
+  pages. (mCTMM/DTMM and CTMM simulation are planned follow-ups.)
+- **Adaptive Gaussian quadrature (`method = laplace` with `n_agq > 1`)** (#251):
+  generalises Laplace. Instead of approximating each subject's
+  marginal likelihood with a single Gaussian at the empirical-Bayes mode, it
+  evaluates the *exact* conditional likelihood on a Gauss-Hermite grid laid
+  around that mode (`[fit_options] n_agq`, default 1 node per random effect).
+  `n_agq = 1` reproduces the Laplace approximation identically — it matches NONMEM
+  `$EST METHOD=1 LAPLACIAN` to five significant figures on warfarin. Because it
+  makes no Gaussian-residual assumption it handles non-Gaussian endpoints (TTE,
+  categorical) that FOCE/FOCEI structurally cannot, and unlike SAEM/IMP its
+  objective is deterministic — the OFV is bit-identical run to run. AGQ carries an
+  **analytic outer gradient** (the posterior-weighted score over the quadrature
+  nodes), so a converged `n_agq = 3` warfarin fit takes 0.39 s against FOCEI's
+  0.29 s and NONMEM LAPLACIAN's 1.21 s, and reproduces NONMEM's estimates to 4–5
+  significant figures on every parameter. Cost is `n_agq ^ n_eta` per subject per
+  iteration, so it suits models with few random effects; grids over 100 000 nodes,
+  out-of-range node counts, and IOV models are rejected at check time. See the
+  [AGQ docs page](https://ferx-nlme.github.io/ferx-core/estimation/agq.html).
 - **Restart of an interrupted run from a checkpoint** (#755): a fit now
   periodically saves a small `{model}.tmp` resume point (throttled to
   `[fit_options] checkpoint_interval_secs`, default 300 s, so short runs write
@@ -383,6 +604,84 @@ section of the SDLC for the versioning policy).
   every model instead of slipping past the replay. No effect on correct models.
 
 ### Fixed
+- **AGQ / `laplace` fits no longer report "did not converge" while sitting on a settled
+  OFV** (#251). The gradient-based outer optimizer set NLopt's stopping tolerances to
+  `1e-12`, which FOCE/FOCEI can reach (their analytic gradient is exact to ~1e-11) but
+  AGQ cannot: AGQ's gradient is exact yet *finite-difference-limited* (the grid-response
+  term and the posterior Hessian are central differences), so it carries a noise floor.
+  L-BFGS ground on past the point where the objective had settled, until its line search
+  failed on a noise-dominated direction and NLopt returned a bare failure — reporting
+  "not converged" for a result that had been flat to eight significant figures. AGQ now
+  stops on the reachable objective-change criterion (`outer_ftol` / `outer_xtol`), which
+  both fixes the flag and makes the fits **faster** (AGQ+IOV on warfarin: 14.5 s → 8.2 s;
+  Laplace+IOV: 2.2 s → 1.3 s), with identical estimates. FOCE/FOCEI are unchanged.
+- **Wrong analytic gradient for an observation sampled exactly on a moving dose boundary**
+  (#486) — a modeled infusion end, or a lagged dose arrival. With a modeled `RATE=-1`/`-2` dose the infusion window end moves with the
+  estimated `D{cmt}`/`R{cmt}`. An observation whose time coincided with that end had its
+  gradient taken *along the moving boundary* rather than at the sample's own fixed clock
+  time, adding a spurious term: on a 1-cpt fixture it returned `−1.9`, which is not even a
+  valid subgradient in general. The closed-form walk now steps the read-out state back across
+  the zero-length window `end(D) − t_obs` with the infusion still running, recovering the
+  derivative at the sample's own time. Sampling at the end of an infusion is a normal design,
+  so this is worth knowing about even though the exact coincidence is transient (`D` is
+  estimated, so it only sweeps past a fixed sample time momentarily).
+
+  The prediction is genuinely **kinked** in `D` at that point — just above the coincidence the
+  infusion is still running at the sample, just below it the dose has finished and a decay term
+  appears — so no two-sided derivative exists there (the one-sided slopes are `−8.6` and
+  `+2.3`, and a central finite difference returns their average, `−3.2`). ferx returns the
+  **one-sided** derivative — specifically, the derivative of the branch ferx's own event
+  ordering already uses to define the *value* there (an infusion at its end is still
+  contributing; a dose at its arrival has landed). That is the same convention its ODE engine's
+  jump/saltation sensitivities already used, and the two engines now return the same number.
+
+  The same correction applies to an observation landing on a **lagged dose arrival**, where it
+  matters more than it looks: on an oral model the prediction's *value* at that instant is zero
+  (the depot bolus has only just landed, so the central compartment is still empty) while its
+  derivative is not — the closed form previously reported a derivative of zero, which looks
+  innocuous and is wrong.
+
+  Note the deliberate consequence: at *exactly* such a coincidence an analytic gradient and a
+  finite-difference gradient legitimately disagree — FD averages across a branch switch the
+  model does not make there. That is a property of a kinked model, not a defect.
+- **Multi-start (`n_starts`) no longer returns a diverged run as the "best" fit**
+  (#830): the start selection preferred any `converged` run over an unconverged
+  one *before* comparing OFVs, so a start that diverged — driving the residual
+  covariance indefinite and reporting a ~1e20 sentinel OFV while still flagged
+  `converged` — outranked a valid but unconverged start (including the exact-inits
+  start 0). Multi-start could therefore return a worthless fit with an enormous
+  OFV. Validity (a finite OFV below a divergence-large threshold) is now the
+  primary ranking key, so a valid run always wins; converged-vs-OFV ordering is
+  unchanged within a validity class.
+- **`block_sigma` correlated residuals no longer collapse the objective when a
+  subject has two samples at the same time** (#827): with a `block_sigma` +
+  covariate-selected / per-CMT error model (the free-vs-total assay pattern),
+  replicate assays at one `TIME` were cross-correlated all-to-all, making the
+  dense residual `R` indefinite so the FOCEI objective returned the invalid
+  sentinel and the optimizer was repelled from the correct (correlated) optimum.
+  Rows are now paired into disjoint correlated units — by the new `L2` column
+  when present, otherwise one-to-one in co-temporal row order — keeping `R`
+  positive-definite. On the fluconazole
+  2-cpt binding model this recovers the NONMEM fit (OFV 742 vs NONMEM 734.6,
+  previously stuck ~140 higher with a collapsed peripheral Q).
+- **`block_sigma` cross covariances within one `L2` group are now correlated
+  all-to-all** (#830): an explicit `L2` group is the user's declared correlated
+  unit, so a genuine block of 3+ distinct endpoints (e.g. parent + two
+  metabolites, each pair correlated) keeps its full cross-covariance structure
+  instead of only one greedy pair. The disjoint one-to-one pairing that keeps
+  co-temporal replicates positive-definite still applies to the implicit
+  `(time, occasion)` fallback, where replicate rows cannot be told apart.
+- **Float-formatted `L2` ids are no longer silently ungrouped** (#830):
+  pandas/R exports float-format the whole `L2` column (`"10.0"`) when any row is
+  blank; the reader now accepts integer and float-formatted ids, so the user's
+  `block_sigma` grouping is honoured instead of every record falling back to
+  ungrouped `(time, occasion)` pairing.
+- **`block_sigma` cross derivative is no longer dropped when a prediction hits
+  zero** (#830): the observation pairing is now decided from the loadings'
+  sigma-slot structure rather than the value covariance, so a pure proportional
+  paired endpoint whose prediction is momentarily `f = 0` keeps its (nonzero)
+  slope cross term in `∂R/∂f`. This also stops the pairing from flickering as a
+  prediction crosses zero between iterations.
 - **Standalone covariance step (`run_covariance`) now reproduces the inline
   covariance bit-for-bit for FOCE/FOCEI fits**: running the covariance step after a
   fit (`covariance = false` then `run_covariance`, e.g. the R wrapper's standalone

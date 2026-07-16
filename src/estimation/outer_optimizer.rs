@@ -110,7 +110,23 @@ pub fn optimize_population(
         };
         &owned_opts
     };
-    match resolved {
+    // Pre-flight flat-theta guard (#826): a non-fixed theta whose outer gradient is
+    // identically ~0 at the initial estimate never reaches the objective (typically
+    // unmapped / dropped from the structural or scaling model). Left in the optimized
+    // vector it gives a zero search direction that makes gradient NLopt return
+    // `Failure` on eval 1, pinning *every* parameter at its initial value. Freeze such
+    // thetas (treat as FIX) and warn, so the remaining parameters optimize normally.
+    let frozen_params;
+    let (init_params, preflight_warnings) =
+        match freeze_flat_thetas(model, population, init_params, options) {
+            Some((fp, w)) => {
+                frozen_params = fp;
+                (&frozen_params, w)
+            }
+            None => (init_params, Vec::new()),
+        };
+
+    let mut result = match resolved {
         // `Auto` is resolved away above; group it with the NLopt path defensively.
         Optimizer::Slsqp
         | Optimizer::NloptLbfgs
@@ -126,7 +142,127 @@ pub fn optimize_population(
             init_params,
             options,
         ),
+    };
+    // Surface the freeze warnings ahead of the optimizer's own (they explain why a
+    // parameter was held fixed, which the reader wants before any convergence notes).
+    if !preflight_warnings.is_empty() {
+        let mut w = preflight_warnings;
+        w.append(&mut result.warnings);
+        result.warnings = w;
     }
+    result
+}
+
+/// Pre-flight flat-theta detection (#826). Computes the outer gradient at the
+/// initial estimate and flags any non-fixed theta whose gradient is negligible
+/// relative to the largest theta gradient — i.e. a parameter that has no effect
+/// on the objective (unmapped, or dropped from the structural / scaling model).
+///
+/// Returns `None` when nothing is flat (the common case; the caller keeps the
+/// borrowed `init_params` untouched), or `Some((frozen, warnings))` with a
+/// modified clone whose `theta_fixed` marks the flat thetas so the rest of the
+/// pipeline treats them as FIX — the graceful-degradation the issue asks for
+/// instead of the whole fit dying on an eval-1 `Failure`.
+fn freeze_flat_thetas(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Option<(ModelParameters, Vec<String>)> {
+    let n_theta = init_params.theta.len();
+    // Nothing to freeze if every theta is already fixed.
+    if (0..n_theta).all(|i| init_params.theta_fixed.get(i).copied().unwrap_or(false)) {
+        return None;
+    }
+
+    let bounds = compute_bounds(init_params);
+    let mut x = pack_params(init_params);
+    clamp_to_bounds(&mut x, &bounds);
+    let params = unpack_params(&x, init_params);
+    let n_subj = population.subjects.len();
+    let n_eta = model.n_eta;
+
+    // One cold inner solve, then one outer-gradient eval — the same pair the first
+    // optimizer iteration would run, so the pre-flight costs roughly one iteration.
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let cold_etas = vec![DVector::zeros(n_eta); n_subj];
+    let (ehs, hms, _stats, kappas) = run_inner_loop_warm(
+        model,
+        population,
+        &params,
+        options.inner_maxiter,
+        options.inner_tol,
+        Some(&cold_etas),
+        Some(&mu_k),
+        options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
+    );
+    let mut grad_eval_idx = 0usize;
+    let grad = population_gradient(
+        &x,
+        n_subj,
+        init_params,
+        model,
+        population,
+        &ehs,
+        &hms,
+        &kappas,
+        &bounds,
+        options,
+        &mut grad_eval_idx,
+    );
+
+    // Thetas are the first `n_theta` packed coordinates (see `pack_params`), so
+    // `grad[i]` is d(OFV)/d(coord_i) for theta `i`. A structurally flat theta has an
+    // *identically* zero analytic sensitivity, so its gradient is ~0 to machine
+    // precision — freeze only that near-zero case, never a merely weakly-identified
+    // param (small-but-nonzero; covariance flags those as high RSE).
+    const FLAT_ABS: f64 = 1e-8;
+    const FLAT_REL: f64 = 1e-6;
+    let is_free = |i: usize| !init_params.theta_fixed.get(i).copied().unwrap_or(false);
+    let g_at = |i: usize| grad.get(i).copied().unwrap_or(0.0).abs();
+    // Reference scale for "negligible". If the whole theta gradient is ~0 the
+    // objective is globally flat (no data reaches it) — a different pathology, so
+    // bail rather than freeze every parameter.
+    let g_max = (0..n_theta)
+        .filter(|&i| is_free(i))
+        .map(g_at)
+        .fold(0.0_f64, f64::max);
+    if g_max <= FLAT_ABS {
+        return None;
+    }
+
+    let flat: Vec<usize> = (0..n_theta)
+        .filter(|&i| is_free(i) && g_at(i) <= FLAT_ABS && g_at(i) <= FLAT_REL * g_max)
+        .collect();
+    if flat.is_empty() {
+        return None;
+    }
+
+    let mut frozen = init_params.clone();
+    let mut warnings = Vec::new();
+    for &i in &flat {
+        // Pin the FIX at the *clamped* value the gradient was actually evaluated at
+        // (`params.theta`, not the raw `init_params.theta`): an out-of-bounds initial
+        // theta must not be frozen — nor reported — outside its declared bounds, and
+        // the printed value must match the point the flatness was decided at.
+        frozen.theta[i] = params.theta[i];
+        frozen.theta_fixed[i] = true;
+        let name = init_params
+            .theta_names
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("<theta>");
+        warnings.push(format!(
+            "[parameters] `{name}` has no effect on the objective (gradient ≈ 0 at the \
+             initial estimate) — it is likely computed but never used (unmapped, or dropped \
+             from the structural / scaling model). Freezing it at its initial value ({val}) \
+             so the remaining parameters can be estimated; map or remove `{name}` to silence \
+             this.",
+            val = params.theta[i],
+        ));
+    }
+    Some((frozen, warnings))
 }
 
 /// Evaluate the population objective at the initial parameters without running
@@ -164,16 +300,17 @@ fn evaluate_at_initial_params(
         Some(&cold_etas),
         Some(&mu_k),
         options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
     );
     let ofv = 2.0
-        * pop_nll(
+        * pop_nll_opts(
             model,
             population,
             &params,
             &eta_hats,
             &h_matrices,
             &kappas,
-            options.interaction,
+            options,
         );
 
     if options.verbose {
@@ -321,6 +458,53 @@ pub(crate) fn cap_slsqp_gradient(g: &mut [f64], lower_s: &[f64], upper_s: &[f64]
     } else {
         false
     }
+}
+
+/// The population objective the outer loop actually minimises: [`pop_nll`] (FOCE/FOCEI),
+/// or the AGQ marginal when the stage's method is `agq`.
+///
+/// **Every** production site that needs "the objective for *this* fit" must call this, not
+/// `pop_nll` — the objective closures, the reconverged-FD gradient, and the covariance
+/// stencil alike. An AGQ fit whose covariance step differenced the *FOCE* objective would
+/// report standard errors for a likelihood it never optimised.
+///
+/// Non-AGQ fits forward to `pop_nll` with identical arguments, so their OFV is unchanged
+/// bit for bit.
+pub(crate) fn pop_nll_opts(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> f64 {
+    if let Some(n_nodes) = options.agq_nodes() {
+        // AGQ integrates over whatever random effects the subject has: η alone, or the
+        // stacked (η, κ₁..κ_K) under IOV — the joint marginal, not the η-only one. The modes
+        // are the ones the shared inner loop already converged (`find_ebe_iov` returns the
+        // joint mode); AGQ does not re-optimise them, it lays its grid around them.
+        // `h_matrices` (the ∂f/∂η Jacobian) is a FOCE artefact AGQ has no use for — it
+        // finite-differences the true posterior Hessian instead. See `crate::estimation::agq`.
+        return crate::estimation::agq::agq_population_nll(
+            model,
+            population,
+            params,
+            eta_hats,
+            kappas,
+            n_nodes,
+            options.hessian_anchor(),
+        );
+    }
+    pop_nll(
+        model,
+        population,
+        params,
+        eta_hats,
+        h_matrices,
+        kappas,
+        options.interaction,
+    )
 }
 
 /// Dispatch to the IOV-aware or standard population NLL based on model.n_kappa.
@@ -562,16 +746,9 @@ fn run_global_presearch(
             Some(&cached_zero),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
-        let nll = pop_nll(
-            model,
-            population,
-            &params,
-            &ehs,
-            &hms,
-            &kappas,
-            options.interaction,
-        );
+        let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         let raw = 2.0 * nll;
         let guarded = ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac);
         if !raw.is_finite() || guarded {
@@ -609,17 +786,10 @@ fn run_global_presearch(
             Some(&state.cached_etas),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
 
-        let nll = pop_nll(
-            model,
-            population,
-            &params,
-            &ehs,
-            &hms,
-            &kappas,
-            options.interaction,
-        );
+        let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         let raw_ofv = 2.0 * nll;
 
         let ebe_guard =
@@ -1005,18 +1175,11 @@ fn optimize_nlopt(
             Some(&state.cached_etas),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
 
         // Compute OFV with fixed EBEs
-        let nll = pop_nll(
-            model,
-            population,
-            &params,
-            &ehs,
-            &hms,
-            &kappas,
-            options.interaction,
-        );
+        let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         let raw_ofv = 2.0 * nll;
 
         // EBE convergence guard: reject step when too many subjects unconverged or any
@@ -1250,10 +1413,34 @@ fn optimize_nlopt(
     } else {
         opt.set_maxeval(options.outer_maxiter as u32 * (n as u32 + 1))
             .unwrap();
-        // Use very loose tolerances — FOCE objective is noisy from EBE re-estimation.
-        // Let maxeval be the primary stopping criterion.
-        opt.set_xtol_rel(1e-12).unwrap();
-        opt.set_ftol_rel(1e-12).unwrap();
+        if options.agq_nodes().is_some() {
+            // AGQ's gradient is exact but **finite-difference-limited**: the grid-response
+            // term and the posterior Hessian are both central differences, so the gradient
+            // carries a noise floor (~1e-4 relative). The 1e-12 stops below are therefore
+            // *unreachable* for it — and unreachable stops are not harmless. L-BFGS keeps
+            // stepping until the true gradient drops under that floor, at which point the
+            // search direction is noise, the line search cannot find a decrease, and NLopt
+            // returns a bare `NLOPT_FAILURE`. The fit is fine (the engine restores the
+            // best-seen point) but it is reported as *not converged*, which is a lie about a
+            // result that has been flat to 8 significant figures for 15 evaluations.
+            //
+            // So stop AGQ where its objective actually settles — the same reachable
+            // objective-change / step-size criteria BOBYQA gets — rather than chasing a
+            // gradient norm the gradient cannot deliver. FOCE/FOCEI keep the 1e-12 stops:
+            // their gradient is analytic to ~1e-11 and they *do* reach `XtolReached`.
+            opt.set_xtol_rel(options.outer_xtol).unwrap();
+            let ftol = resolve_outer_ftol(
+                model.has_non_gaussian(),
+                model.is_ode_based(),
+                options.outer_ftol,
+            );
+            opt.set_ftol_rel(ftol).unwrap();
+        } else {
+            // FOCE objective is noisy from EBE re-estimation; let maxeval be the primary
+            // stopping criterion and rely on the analytic gradient to drive |g| down.
+            opt.set_xtol_rel(1e-12).unwrap();
+            opt.set_ftol_rel(1e-12).unwrap();
+        }
     }
 
     if options.verbose {
@@ -1350,16 +1537,17 @@ fn optimize_nlopt(
         None,
         Some(&final_mu_k),
         options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
     );
 
-    let final_nll = pop_nll(
+    let final_nll = pop_nll_opts(
         model,
         population,
         &final_params,
         &final_ehs,
         &final_hms,
         &final_kappas,
-        options.interaction,
+        options,
     );
     let final_ofv = 2.0 * final_nll;
 
@@ -1474,14 +1662,8 @@ fn optimize_bfgs(
                         kappas: &[Vec<DVector<f64>>]|
      -> f64 {
         let params = unpack_params(x, init_params);
-        2.0 * pop_nll(
-            model,
-            population,
-            &params,
-            eta_hats,
-            h_matrices,
-            kappas,
-            options.interaction,
+        2.0 * pop_nll_opts(
+            model, population, &params, eta_hats, h_matrices, kappas, options,
         )
     };
 
@@ -1497,17 +1679,9 @@ fn optimize_bfgs(
             Some(prev_etas),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
-        let ofv = 2.0
-            * pop_nll(
-                model,
-                population,
-                &params,
-                &ehs,
-                &hms,
-                &kappas,
-                options.interaction,
-            );
+        let ofv = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         if ofv.is_finite() {
             ofv
         } else {
@@ -1530,6 +1704,7 @@ fn optimize_bfgs(
             Some(prev_etas),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
         let ofv = ofv_at_fixed(x, &ehs, &hms, &kappas);
         // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x).
@@ -1821,6 +1996,7 @@ fn optimize_bfgs(
         Some(&cached_etas),
         Some(&bfgs_final_mu_k),
         options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
     );
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
@@ -1941,17 +2117,9 @@ fn reconverged_fd_gradient(
             Some(warm_etas),
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
-        let raw = 2.0
-            * pop_nll(
-                model,
-                population,
-                &params,
-                &ehs,
-                &hms,
-                &kappas,
-                options.interaction,
-            );
+        let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         if !raw.is_finite()
             || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
         {
@@ -2038,6 +2206,7 @@ fn subject_reconverged_fd_gradient(
             options.inner_tol,
             Some(warm_eta.as_slice()),
             Some(&mu_k),
+            0,
         );
         crate::stats::likelihood::foce_subject_nll(
             model,
@@ -2079,6 +2248,7 @@ fn subject_reconverged_fd_gradient_iov(
             options.inner_tol,
             Some(warm_eta.as_slice()),
             Some(&mu_k),
+            0,
         );
         crate::stats::likelihood::foce_subject_nll_iov(
             model,
@@ -2351,6 +2521,51 @@ fn population_gradient(
 ) -> Vec<f64> {
     let reconverge = reconverge_this_eval(options, *grad_eval_idx);
     *grad_eval_idx += 1;
+    // AGQ minimises a *different* objective (the quadrature marginal, not the FOCE/Laplace
+    // one), so every analytic and fixed-EBE gradient below — all of them closed forms of
+    // the FOCE marginal — is simply the gradient of the wrong function. Feeding one to the
+    // outer optimizer would not fail loudly; it would converge, smoothly, to the FOCE
+    // optimum while reporting AGQ OFVs. AGQ has its own gradient.
+    if let Some(n_nodes) = options.agq_nodes() {
+        // Preferred: AGQ's own exact gradient — the analytic posterior-weighted score over
+        // the nodes (Fisher identity) plus the grid-response term — which needs no inner
+        // re-solve, against the FD path's `2·n_free` *full population objective*
+        // re-evaluations. Exact at every `n_agq`. See `estimation::agq`.
+        // `reconverge_gradient_interval` is honoured here too: it is the documented escape
+        // hatch onto the numeric path, so it must override the analytic gradient for AGQ
+        // exactly as it does for FOCE/FOCEI below.
+        // `agq_population_gradient` is the analytic gradient of the quadrature objective for
+        // **either** anchor: the fixed-node score is anchor-independent, and the grid-response
+        // term differences whichever Hessian scales the grid (exact for `laplace`,
+        // Gauss-Newton for `focei` — `anchor` selects it, matching the objective).
+        if !reconverge && crate::estimation::agq::analytic_gradient_available(model) {
+            let params = unpack_params(x, init_params);
+            if let Some(mut g) = crate::estimation::agq::agq_population_gradient(
+                model,
+                population,
+                &params,
+                init_params,
+                x,
+                ehs,
+                kappas,
+                n_nodes,
+                options.hessian_anchor(),
+            ) {
+                // Fixed coordinates carry no gradient, matching the analytic FOCE path.
+                let fixed = packed_fixed_mask(init_params);
+                for (i, gi) in g.iter_mut().enumerate() {
+                    if fixed[i] {
+                        *gi = 0.0;
+                    }
+                }
+                return g;
+            }
+        }
+        // Fallback (always correct, just slower): central-difference the real objective,
+        // re-solving the inner loop at each perturbed point so the response of η̂ to the
+        // population parameters is captured too.
+        return reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options);
+    }
     // M3-censored models now have an exact analytic censored gradient on both the
     // FOCEI (`subject_packed_gradient` + `prepare`'s M3 branch) and the FOCE
     // (`subject_packed_gradient_foce`, censored rows excluded from R̃ and added as
@@ -3162,6 +3377,7 @@ pub(crate) fn compute_covariance(
                 cov_inner_tol,
                 Some(eta_hats[i].as_slice()),
                 Some(&mu_k),
+                0,
             );
             ehs.push(ebe.eta);
             hms.push(ebe.h_matrix);
@@ -3174,15 +3390,7 @@ pub(crate) fn compute_covariance(
     // marginal already carries ηᵀΩ⁻¹η + log|Ω|; for FOCE we add that prior here.
     let ofv = |xv: &[f64]| -> f64 {
         let (params, ehs, hms, kaps) = reconverge_point(xv);
-        let foce_nll = pop_nll(
-            model,
-            population,
-            &params,
-            &ehs,
-            &hms,
-            &kaps,
-            options.interaction,
-        );
+        let foce_nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kaps, options);
         // Covariance OFV = −2·logL = 2·pop_nll for both FOCE and FOCEI.
         //
         // FOCE uses the Sheiner–Beal linearised marginal `(y−f₀)ᵀR̃⁻¹(y−f₀) +
@@ -3293,15 +3501,7 @@ pub(crate) fn compute_covariance(
         let f0 = base_ofv;
         let serial_ofv = |xv: &[f64]| -> f64 {
             let (params, ehs, hms, kaps) = reconverge_point(xv);
-            2.0 * pop_nll(
-                model,
-                population,
-                &params,
-                &ehs,
-                &hms,
-                &kaps,
-                options.interaction,
-            )
+            2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kaps, options)
         };
 
         let nf = free_idx.len();
@@ -4680,6 +4880,7 @@ mod tests {
                 reset_times: Vec::new(),
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -4771,6 +4972,92 @@ mod tests {
     #[test]
     fn test_outer_ad_gradient_iiv() {
         check_gradient(&make_model(), &make_population(3), 1);
+    }
+
+    /// Pre-flight flat-theta guard (#826): a model whose second theta (TVV) is
+    /// structurally flat — V no longer reads it — is detected and frozen, while the
+    /// active TVCL is left free. A single unmapped theta must not kill the fit.
+    #[test]
+    fn preflight_freezes_flat_theta() {
+        let mut model = make_model();
+        // Drop theta[1] from the structural model: V becomes a constant, so TVV
+        // never reaches the objective (identically-zero outer gradient).
+        model.pk_param_fn = Box::new(
+            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp();
+                p.values[1] = 50.0;
+                p
+            },
+        );
+        let pop = make_population(3);
+        let mut options = FitOptions::default();
+        options.interaction = false;
+
+        let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &options)
+            .expect("flat TVV must be detected");
+        assert!(!frozen.theta_fixed[0], "active TVCL stays free");
+        assert!(frozen.theta_fixed[1], "flat TVV is frozen (FIX)");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("TVV") && w.contains("no effect")),
+            "warning must name the flat param: {warnings:?}"
+        );
+    }
+
+    /// Negative case: every theta of the baseline model reaches the objective, so
+    /// the pre-flight freezes nothing (returns `None`, leaving `init_params` alone).
+    #[test]
+    fn preflight_no_freeze_when_all_thetas_active() {
+        let model = make_model();
+        let pop = make_population(3);
+        let mut options = FitOptions::default();
+        options.interaction = false;
+        assert!(
+            freeze_flat_thetas(&model, &pop, &model.default_params, &options).is_none(),
+            "no theta is flat — nothing to freeze"
+        );
+    }
+
+    /// An out-of-bounds initial value for a flat theta must be frozen (and reported)
+    /// at the *clamped* value the gradient was evaluated at — never pinned outside its
+    /// declared bounds, and never reported as the raw out-of-bounds init.
+    #[test]
+    fn preflight_freezes_out_of_bounds_flat_theta_at_clamped_value() {
+        let mut model = make_model();
+        model.pk_param_fn = Box::new(
+            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp();
+                p.values[1] = 50.0; // TVV (theta[1]) is flat
+                p
+            },
+        );
+        // Push TVV's initial well above its declared upper bound (500).
+        model.default_params.theta[1] = 1000.0;
+        let upper = model.default_params.theta_upper[1];
+        let pop = make_population(3);
+        let mut options = FitOptions::default();
+        options.interaction = false;
+
+        let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &options)
+            .expect("flat TVV must be detected");
+        assert!(frozen.theta_fixed[1], "flat TVV is frozen");
+        assert!(
+            frozen.theta[1].is_finite() && frozen.theta[1] <= upper + 1e-6,
+            "frozen value {} must sit within the declared upper bound {upper}",
+            frozen.theta[1]
+        );
+        assert!(
+            frozen.theta[1] < 1000.0,
+            "must not pin at the out-of-bounds init (1000): {}",
+            frozen.theta[1]
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("1000")),
+            "warning must report the clamped value, not the out-of-bounds init: {warnings:?}"
+        );
     }
 
     /// Block omega (2×2 with off-diagonal): tests Cholesky-param gradient.
@@ -5189,6 +5476,7 @@ mod tests {
                 Some(&eta_hats),
                 Some(&mu_k),
                 options.min_obs_for_convergence_check as usize,
+                options.inner_restarts,
             );
             2.0 * pop_nll(&model, &population, &params, &ehs, &hms, &kaps, true)
         };
@@ -5360,6 +5648,7 @@ mod tests {
                 reset_times: Vec::new(),
                 cens: vec![0; 6],
                 occasions: vec![1, 1, 1, 2, 2, 2],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1],
                 obs_records: vec![],
             })
@@ -6134,6 +6423,7 @@ mod tests {
             1e-6,
             Some(&cold),
             Some(&mu_k),
+            0,
             0,
         );
         let init_ofv = 2.0 * pop_nll(&model, &population, &init_params, &ehs, &hms, &kappas, true);

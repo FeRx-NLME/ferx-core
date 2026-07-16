@@ -489,6 +489,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             reset_times: Vec::new(),
             cens: vec![0; sim_spec.obs_times.len()],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             // One right-censored template row per cause CMT, at the administrative
@@ -1530,6 +1531,20 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
     }
 }
 
+/// Shared check→`panic!` wrapper for the non-`fit` entry points (`predict()`/
+/// `simulate()`): if the sibling `check_*` produced a message, fail loudly with
+/// the common template naming `what` the engine received. `fit()` surfaces the
+/// same conditions as an `Err` instead of panicking. Callers holding a
+/// `Result`-returning check pass `first_error(&check).err()`.
+fn panic_if_unsupported(result: Option<String>, what: &str) {
+    if let Some(msg) = result {
+        panic!(
+            "predict()/simulate() received {what}: {msg}\n\
+             (fit() reports this as an error rather than panicking.)"
+        );
+    }
+}
+
 /// Features the analytic closed-form absorption models — transit (`one_cpt_transit`,
 /// `two_cpt_transit`, #386) and inverse-Gaussian (`one_cpt_ig`, `two_cpt_ig`, #790) —
 /// do not support: the exponential-tilting closed form is a constant-parameter
@@ -1969,13 +1984,10 @@ pub(crate) fn check_survival_tv_covariates(
 /// loudly rather than return a subtly wrong result.
 #[cfg(feature = "survival")]
 pub(crate) fn assert_survival_tv_covariates(model: &CompiledModel, population: &Population) {
-    if let Some(msg) = check_survival_tv_covariates(model, population) {
-        panic!(
-            "predict()/simulate() received a survival model / data combination with a \
-             time-varying covariate on a hazard: {msg}\n(fit() reports this as an error rather \
-             than panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_survival_tv_covariates(model, population),
+        "a survival model / data combination with a time-varying covariate on a hazard",
+    );
 }
 
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
@@ -2018,13 +2030,10 @@ pub(crate) fn assert_absorption_closed_form_support(
     model: &CompiledModel,
     population: &Population,
 ) {
-    if let Some(msg) = check_absorption_closed_form_support(model, population) {
-        panic!(
-            "predict()/simulate() received a model/data combination the analytic absorption \
-             closed form cannot honour: {msg}\n(fit() reports this as an error rather than \
-             panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_absorption_closed_form_support(model, population),
+        "a model/data combination the analytic absorption closed form cannot honour",
+    );
 }
 
 /// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
@@ -2095,25 +2104,20 @@ pub(crate) fn assert_absorption_flip_flop_no_twin(
     population: &Population,
     theta: &[f64],
 ) {
-    if let Some(msg) = check_absorption_flip_flop_no_twin(model, population, theta) {
-        panic!(
-            "predict()/simulate() received a model/data combination the absorption closed form \
-             cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_absorption_flip_flop_no_twin(model, population, theta),
+        "a model/data combination the absorption closed form cannot honour",
+    );
 }
 
 /// Panic on a depot-referencing analytic Form C readout + reset subject, for the
 /// `Vec`-returning `predict()`/`simulate()` paths (mirrors
 /// [`assert_absorption_closed_form_support`]). `fit()` returns this as an `Err`.
 pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population: &Population) {
-    if let Some(msg) = check_analytic_readout_support(model, population) {
-        panic!(
-            "predict()/simulate() received a model/data combination the analytic Form C \
-             readout cannot honour: {msg}\n(fit() reports this as an error rather than \
-             panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        check_analytic_readout_support(model, population),
+        "a model/data combination the analytic Form C readout cannot honour",
+    );
 }
 
 /// Panic on a malformed built-in **absorption input-rate** model/data combination —
@@ -2128,13 +2132,10 @@ pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population:
 /// [`check_absorption_dosing`] for the *value* / domain checks that need data. A
 /// no-op for any model with no built-in input-rate forcing (the common case).
 pub(crate) fn assert_absorption_dosing_supported(model: &CompiledModel, population: &Population) {
-    if let Err(msg) = first_error(&check_absorption_dosing(model, population)) {
-        panic!(
-            "predict()/simulate() received a model/data combination the built-in absorption \
-             input-rate machinery cannot honour: {msg}\n(fit() reports this as an error rather \
-             than panicking.)"
-        );
-    }
+    panic_if_unsupported(
+        first_error(&check_absorption_dosing(model, population)).err(),
+        "a model/data combination the built-in absorption input-rate machinery cannot honour",
+    );
 }
 
 /// Model + estimation-option *compatibility* checks that don't depend on data:
@@ -2275,6 +2276,96 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // ── Quadrature: FOCEI + n_agq > 1 is the Gauss-Newton-anchored refinement (#251) ──────
+    // The GN anchor's `H̃` comes from the sensitivity provider (`score_core`), so the
+    // refinement is available only where that provider reaches — the same analytic scope
+    // FOCEI's own outer gradient needs. Outside it (e.g. an ODE model without sensitivities,
+    // or a pure-TTE endpoint), reject up front rather than fail deep in the objective.
+    if chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI))
+        && options.n_agq > 1
+        && !crate::estimation::agq::analytic_score_supported(model)
+    {
+        diags.push(
+            Diagnostic::error(
+                "E_FOCEI_NAGQ_UNSUPPORTED",
+                "method = focei with n_agq > 1 (the Gauss-Newton-anchored quadrature) needs a \
+                 model in the analytic sensitivity scope. Use method = laplace with n_agq > 1 \
+                 for the exact-anchor quadrature, which has no such restriction.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
+    // ── AGQ / Laplace (#251) ──────────────────────────────────────────────────────────────
+    // Laplace is the exact-anchor quadrature. At `n_agq = 1` its grid is a single point no
+    // matter how many random effects there are, so the caps below never fire; at `n_agq > 1`
+    // they bound the tensor grid.
+    // Both quadrature methods hit these caps: `laplace` at any `n_agq`, and `focei` at
+    // `n_agq > 1` (the Gauss-Newton-anchored quadrature — same `n_agq^d` tensor grid). The
+    // block must fire for either, or a non-IOV FOCEI quadrature would skip the check-time
+    // caps entirely (the runtime cap in `fit_inner` only fires under IOV) and build a
+    // 100k+-node grid unchecked (#251 review #1).
+    let laplace_stage = chain
+        .iter()
+        .any(|&m| matches!(m, EstimationMethod::Laplace));
+    let focei_quadrature =
+        chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI)) && options.n_agq > 1;
+    if laplace_stage || focei_quadrature {
+        // IOV is **supported**: the quadrature integrates over the stacked (η, κ₁..κ_K),
+        // which is exactly what `individual_nll_iov` already scores. What IOV changes is the
+        // *dimension* — and hence the tensor grid — not the method. The grid cap below is
+        // what decides whether a given IOV model is tractable, and it is checked against the
+        // stacked dimension in `fit_inner` (which, unlike this function, can see the
+        // occasion count in the data).
+        //
+        // Name the quadrature method the user actually wrote.
+        let label = if laplace_stage { "laplace" } else { "focei" };
+        // The tensor rule costs `n_agq^d` full likelihood evaluations per subject per
+        // outer iteration. Past the cap that is not "slow", it is a fit that will never
+        // finish — so it is worth failing at check time, with the two levers spelled out.
+        // Both quadrature methods use `n_agq` as the node count.
+        let n_nodes = options.n_agq.max(1);
+        // Per-dimension node cap. The parser (`apply_fit_option`) enforces this for
+        // file-driven fits, but a `FitOptions` built directly against the Rust API
+        // bypasses that path — so re-check here, alongside the grid cap, or an
+        // out-of-range `n_agq` (e.g. 100 with a single η, which slips under the grid
+        // cap) would reach `gauss_hermite` past the point Golub–Welsch stays accurate.
+        if n_nodes > crate::estimation::agq::MAX_AGQ_NODES {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_NODES_TOO_LARGE",
+                    format!(
+                        "method = {label} with n_agq = {n_nodes} exceeds the {}-node per-dimension \
+                         limit: beyond ~20 nodes the Golub–Welsch rule loses its extreme nodes to \
+                         round-off and the marginal gains nothing. Lower n_agq (n_agq = 1 is the \
+                         Laplace approximation, i.e. FOCEI-equivalent cost).",
+                        crate::estimation::agq::MAX_AGQ_NODES,
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+        let grid = crate::estimation::agq::grid_size(n_nodes, model.n_eta);
+        if grid > crate::estimation::agq::MAX_AGQ_GRID {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_GRID_TOO_LARGE",
+                    format!(
+                        "method = {label} with n_agq = {n_nodes} and {} random effects needs a \
+                         {n_nodes}^{} = {grid}-node tensor grid per subject per iteration, over \
+                         the {} limit. Lower n_agq (n_agq = 1 is the Laplace approximation, i.e. \
+                         FOCEI-equivalent cost), reduce the number of random effects, or use \
+                         method = saem / imp, whose cost does not grow with the η dimension.",
+                        model.n_eta,
+                        model.n_eta,
+                        crate::estimation::agq::MAX_AGQ_GRID,
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
     // Explicit `gradient_method = ad`: the Enzyme autodiff path was retired in
     // favour of the hand-rolled `Dual2` analytic sensitivities. Reject it rather
     // than silently running a different method. `auto` (analytic where in scope,
@@ -2323,13 +2414,15 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     | EstimationMethod::FoceI
                     | EstimationMethod::Saem
                     | EstimationMethod::Imp
+                    | EstimationMethod::Laplace
             ) {
                 diags.push(
                     Diagnostic::error(
                         "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
                         "block_sigma correlated residual errors are currently supported for \
-                         method = foce, focei, saem, and imp only. The gn / gn_hybrid \
-                         Gauss-Newton paths still use diagonal residual-error derivatives.",
+                         method = foce, focei, saem, imp, agq, and laplace only. The gn / \
+                         gn_hybrid Gauss-Newton paths still use diagonal residual-error \
+                         derivatives.",
                     )
                     .with_block("fit_options"),
                 );
@@ -2825,6 +2918,92 @@ pub fn check_model_data_warnings(
         }
     }
 
+    // An `L2` column that nothing consumes (#830). `L2` is a reserved level-2
+    // grouping data item, so the reader always treats it as the block_sigma
+    // pairing id and never as a covariate. If the model declares no block_sigma
+    // correlated residual, an `L2` column is inert — and if the user actually
+    // meant it as a covariate it has silently vanished. Surface that.
+    if model.residual_correlations.is_empty()
+        && population.subjects.iter().any(|s| !s.obs_l2.is_empty())
+    {
+        diags.push(Diagnostic::warning(
+            "W_L2_UNUSED",
+            "The dataset has an `L2` column but the model declares no block_sigma \
+             correlated residual, so `L2` is read as the reserved level-2 grouping \
+             id and is not available as a covariate. Rename the column if you \
+             intended it as a covariate."
+                .to_string(),
+        ));
+    }
+
+    // block_sigma cross correlations with an ambiguous (time, occasion) fallback
+    // pairing (#830). Without an `L2` grouping column the reader pairs co-temporal
+    // correlated rows one-to-one in file row order. That is unambiguous for the
+    // standard two-row layout (one total + one unbound per draw), but when a
+    // (time, occasion) group holds a row that could correlate with two or more
+    // others — e.g. replicate assays written as total1, unbound1, total2, unbound2
+    // — the resulting cross covariances depend on the physical CSV row order.
+    // Point the user at an explicit `L2` column, which makes the grouping
+    // order-independent.
+    if !model.residual_correlations.is_empty() {
+        use crate::stats::residual_error::loadings_share_correlation;
+        let n_sigma = init_params.sigma.values.len();
+        let corrs = &model.residual_correlations;
+        let n_ambiguous = population
+            .subjects
+            .iter()
+            // A subject that already carries any L2 id is explicitly grouped —
+            // its pairing does not depend on row order.
+            .filter(|s| !s.obs_l2.iter().any(|&id| id != 0))
+            .filter(|s| {
+                let loads: Vec<Vec<(usize, f64)>> = s
+                    .obs_cmts
+                    .iter()
+                    .map(|&cmt| model.error_spec.sigma_loadings(cmt, 1.0, n_sigma))
+                    .collect();
+                // Group observation indices by (time, occasion) and flag any group
+                // where a row structurally shares a correlation with ≥2 others —
+                // the case where greedy row-order pairing is ambiguous.
+                let n = s.obs_times.len();
+                let key = |j: usize| {
+                    (
+                        s.obs_times.get(j).copied().unwrap_or(0.0).to_bits(),
+                        s.occasions.get(j).copied().unwrap_or(0),
+                    )
+                };
+                (0..n).any(|j| {
+                    if loads.get(j).is_none_or(|l| l.is_empty()) {
+                        return false;
+                    }
+                    let degree = (0..n)
+                        .filter(|&k| k != j && key(k) == key(j))
+                        .filter(|&k| {
+                            loads
+                                .get(k)
+                                .zip(loads.get(j))
+                                .is_some_and(|(lk, lj)| loadings_share_correlation(lj, lk, corrs))
+                        })
+                        .count();
+                    degree >= 2
+                })
+            })
+            .count();
+        if n_ambiguous > 0 {
+            diags.push(Diagnostic::warning(
+                "W_BLOCK_SIGMA_L2_ORDER",
+                format!(
+                    "{} subject(s) have a block_sigma correlated residual whose \
+                     co-temporal rows can pair more than one way, and the dataset \
+                     has no L2 grouping column — the cross covariances are paired \
+                     one-to-one in CSV row order, so reordering rows would change \
+                     the fit. Add an explicit `L2` column giving each correlated \
+                     unit its own id to make the pairing order-independent.",
+                    n_ambiguous
+                ),
+            ));
+        }
+    }
+
     diags
 }
 
@@ -3143,6 +3322,33 @@ fn perturb_init(
     p
 }
 
+/// Multi-start ranking: should the candidate `(c_ofv, c_conv)` replace the
+/// current best `(b_ofv, b_conv)`?
+///
+/// **Validity is the primary key.** A run whose OFV is non-finite or
+/// sentinel-large (block_sigma `R` gone indefinite, a divergent peripheral
+/// compartment, …) is a failed fit even if it reports `converged = true` — the
+/// inner objective returns the ~1e20 sentinel and the outer optimizer can
+/// "converge" on it. Such a run must never beat a valid but unconverged start
+/// (e.g. the exact-inits start 0), which the old "converged-first" rule allowed,
+/// so multi-start could return a divergence with a huge OFV. Within the same
+/// validity class: prefer converged, then lower OFV.
+///
+/// The validity cutoff sits well below the ~1e20 inner-objective sentinel but
+/// far above any legitimate population OFV, so a real fit never trips it; a NaN
+/// OFV is non-finite and therefore also invalid, so it can never block a finite
+/// valid candidate.
+fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: bool) -> bool {
+    /// OFVs at or above this are treated as diverged/invalid (see above).
+    const DIVERGENCE_OFV: f64 = 1e14;
+    let valid = |o: f64| o.is_finite() && o < DIVERGENCE_OFV;
+    match (valid(b_ofv), valid(c_ofv)) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => (!b_conv && c_conv) || (b_conv == c_conv && c_ofv < b_ofv),
+    }
+}
+
 /// Main fit entry point: CompiledModel + Population → FitResult.
 ///
 /// When `options.threads` is `Some(n)`, the fit runs inside a scoped rayon
@@ -3215,7 +3421,23 @@ pub fn fit(
     // CMT). Otherwise the code→index map would miss and fold into a silent sentinel.
     #[cfg(feature = "markov")]
     for (cmt, endpoint) in &model.endpoints {
-        if let EndpointLikelihood::Ctmm { state_codes, .. } = endpoint {
+        if let EndpointLikelihood::Ctmm {
+            state_codes,
+            generator_states,
+            ..
+        } = endpoint
+        {
+            // Time-inhomogeneous (drug/PD-driven Q(t), #817): an intensity references a
+            // model ODE state, scored by the per-gap occupancy integration in
+            // `ctmm_endpoint_nll_inhomogeneous`. That requires an ODE model — guaranteed at
+            // parse (`generator_states` indices point into `ode_spec`), asserted here for a
+            // hand-built `CompiledModel`.
+            if !generator_states.is_empty() && model.ode_spec.is_none() {
+                return Err(format!(
+                    "[markov_model] cmt = {cmt}: a transition intensity references a model state \
+                     (time-inhomogeneous Q(t)), but the model has no ODE system to supply it."
+                ));
+            }
             for subject in &population.subjects {
                 crate::markov::endpoint::validate_ctmm_states(
                     *cmt,
@@ -3306,6 +3528,45 @@ pub fn fit(
         population,
         &options.iov_occasion,
     ))?;
+    // AGQ + IOV: the tensor grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` (the
+    // occasion count) is a property of the *data*, not the model — so this cap cannot be
+    // checked in `check_model_options`, which never sees the population. Check it here, once
+    // the occasions are known, against the worst subject.
+    //
+    // `method = laplace` / `focei` at `n_agq = 1` is a single node regardless of `d`, so it
+    // always passes; only `n_agq > 1` (adaptive quadrature) can trip this. `agq_nodes()`
+    // fires for both quadrature methods, so name whichever the user actually wrote (#251
+    // review #4) rather than hardcoding "laplace".
+    if let Some(n_nodes) = options.agq_nodes() {
+        if model.n_kappa > 0 {
+            let max_occ = population
+                .subjects
+                .iter()
+                .map(|s| crate::stats::likelihood::iov_occasion_groups(s).len())
+                .max()
+                .unwrap_or(0);
+            let d = model.n_eta + max_occ * model.n_kappa;
+            let grid = crate::estimation::agq::grid_size(n_nodes, d);
+            if grid > crate::estimation::agq::MAX_AGQ_GRID {
+                let label = if matches!(options.method, EstimationMethod::Laplace) {
+                    "laplace"
+                } else {
+                    "focei"
+                };
+                return Err(format!(
+                    "method = {label} with n_agq = {n_nodes} needs a {n_nodes}^{d} = {grid}-node \
+                     tensor grid per subject per iteration — over the {} limit. Under IOV the \
+                     integral is over the stacked (η, κ₁..κ_{max_occ}), so the dimension is \
+                     n_eta ({}) + occasions ({max_occ}) × n_kappa ({}) = {d}. Lower n_agq \
+                     (n_agq = 1 is the single-node method — always tractable), or use \
+                     saem / imp, whose cost does not grow with the random-effect dimension.",
+                    crate::estimation::agq::MAX_AGQ_GRID,
+                    model.n_eta,
+                    model.n_kappa,
+                ));
+            }
+        }
+    }
     // If any subject has per-event covariate snapshots that don't carry
     // a variation in covariates the model actually references (e.g.
     // DAY / STIME columns in NONMEM-format datasets), clear those
@@ -3500,7 +3761,7 @@ pub fn fit(
         None => par_starts(),
     };
 
-    // Pick best converged result; fall back to best unconverged if none converged.
+    // Pick the best start (see `multistart_prefers` for the ranking).
     let mut best: Option<(usize, FitResult)> = None;
     let mut failed_starts: Vec<String> = Vec::new();
     for (k, res) in results {
@@ -3508,11 +3769,7 @@ pub fn fit(
             Ok(r) => {
                 let better = match &best {
                     None => true,
-                    Some((_, b)) => {
-                        // Prefer converged over unconverged; then lower OFV
-                        (!b.converged && r.converged)
-                            || (b.converged == r.converged && r.ofv < b.ofv)
-                    }
+                    Some((_, b)) => multistart_prefers(b.ofv, b.converged, r.ofv, r.converged),
                 };
                 if better {
                     best = Some((k, r));
@@ -3887,6 +4144,42 @@ fn build_indiv_map(pk: &PkParams, names: &[String], pk_indices: &[usize]) -> Has
         .filter(|(name, _)| !crate::parser::model_parser::is_synthetic_readout_param(name))
         .map(|(name, &idx)| (name.clone(), pk.values[idx]))
         .collect()
+}
+
+#[cfg(test)]
+mod multistart_prefers_tests {
+    use super::multistart_prefers;
+
+    const SENTINEL: f64 = 2.3e16; // block_sigma-indefinite divergence OFV
+
+    #[test]
+    fn valid_unconverged_beats_invalid_converged() {
+        // The regression: a diverged start reporting `converged = true` with a
+        // sentinel OFV must NOT beat the valid, unconverged exact-inits start.
+        assert!(multistart_prefers(SENTINEL, true, 867.0, false));
+        assert!(!multistart_prefers(867.0, false, SENTINEL, true));
+    }
+
+    #[test]
+    fn non_finite_is_invalid() {
+        assert!(multistart_prefers(f64::INFINITY, true, 900.0, false));
+        assert!(multistart_prefers(f64::NAN, true, 900.0, false));
+    }
+
+    #[test]
+    fn among_valid_prefers_converged_then_lower_ofv() {
+        // converged beats unconverged even at a (slightly) higher OFV.
+        assert!(multistart_prefers(730.0, false, 735.0, true));
+        // same convergence: lower OFV wins.
+        assert!(multistart_prefers(740.0, true, 734.0, true));
+        assert!(!multistart_prefers(734.0, true, 740.0, true));
+    }
+
+    #[test]
+    fn both_invalid_prefers_lower() {
+        assert!(multistart_prefers(3e16, false, 2e16, false));
+        assert!(!multistart_prefers(2e16, false, 3e16, false));
+    }
 }
 
 #[cfg(test)]
@@ -4806,6 +5099,9 @@ fn fit_inner(
         // (FOCE/FOCEI/GN) are driven by the inner-loop gradient; IMP consumes
         // the EBE Hessian built via that same route. SAEM is sampling-based, so
         // it reports its E-step kernel (MH/HMC) instead of a gradient route.
+        // AGQ included: it runs the same inner EBE solve as FOCE/FOCEI (it only replaces
+        // the *population* objective), so the inner analytic-vs-FD η-gradient route this
+        // reports is exactly as relevant to it.
         let uses_gradient_route = chain.iter().any(|m| {
             matches!(
                 m,
@@ -4815,6 +5111,7 @@ fn fit_inner(
                     | EstimationMethod::FoceGnHybrid
                     | EstimationMethod::Imp
                     | EstimationMethod::Impmap
+                    | EstimationMethod::Laplace
             )
         });
         if uses_gradient_route {
@@ -4910,6 +5207,7 @@ fn fit_inner(
                 | EstimationMethod::FoceGnHybrid
                 | EstimationMethod::Imp
                 | EstimationMethod::Impmap
+                | EstimationMethod::Laplace
         )
     }) {
         if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning(
@@ -5115,6 +5413,34 @@ fn fit_inner(
             EstimationMethod::Foce => stage_opts.interaction = false,
             _ => {}
         }
+        // AGQ resolves `auto` to L-BFGS, because it *has* a gradient: the analytic
+        // posterior-weighted score over the quadrature nodes (`estimation::agq`), with the
+        // reconverged-FD gradient as the always-correct fallback.
+        //
+        // BOBYQA — what `resolve_auto` hands every other FD-only fit — **false-converges**
+        // on this objective (the #317 failure mode): on warfarin it stops 0.015 OFV units
+        // above the optimum at the default `inner_tol`, and *worsens* to 0.18 as `inner_tol`
+        // is tightened, because a smoother objective merely lets its trust-region stopping
+        // rule trip sooner (63 -> 34 evaluations, still reporting "converged"). Its ω
+        // estimates land ~3% off NONMEM LAPLACIAN. L-BFGS on the analytic gradient matches
+        // NONMEM to 4-5 significant figures on every parameter, in 0.39 s against FOCEI's
+        // 0.29 s. See docs/estimation/agq.qmd. An explicit `optimizer = ...` is honoured.
+        if matches!(method, EstimationMethod::Laplace) && stage_opts.optimizer == Optimizer::Auto {
+            stage_opts.optimizer = Optimizer::NloptLbfgs;
+        }
+        // The **quadrature** methods need a tighter EBE than plain FOCE/FOCEI: their analytic
+        // grid gradient assumes b̂ is exactly the mode (Bartlett identity), so a loose b̂ from
+        // a poor start yields a non-descent direction that stalls the outer optimizer.
+        // Measured on warfarin (#251): the shared default 1e-5 fails to converge from a 1.3×
+        // start, while 1e-8 is robust across realistic starts at negligible cost near the
+        // optimum (the OFV is insensitive to inner_tol there). This is anchor-independent —
+        // `focei` with `n_agq > 1` reuses the same mode-dependent gradient (#251 review #3),
+        // so it needs the tighter EBE too; only plain FOCE/FOCEI (`agq_nodes() == None`, whose
+        // Gauss-Newton `log|H̃|` is forgiving of a loose b̂) keeps the looser default. `.min`
+        // so an explicit tighter `inner_tol` is preserved.
+        if stage_opts.agq_nodes().is_some() {
+            stage_opts.inner_tol = stage_opts.inner_tol.min(1e-8);
+        }
         // Run the covariance step (and SIR) only on the last *estimating* stage,
         // so a chain doesn't recompute the expensive FD covariance after every
         // method (#615). See `is_last_estimating_stage` for the eval-only-IMP rule.
@@ -5167,6 +5493,7 @@ fn fit_inner(
                         None,
                         Some(&mu_k),
                         stage_opts.min_obs_for_convergence_check as usize,
+                        stage_opts.inner_restarts,
                     );
                 let nll = crate::estimation::outer_optimizer::pop_nll(
                     model,
@@ -6703,42 +7030,72 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
     hits
 }
 
-/// Build the human message + native structured entry (with `details`) for
-/// theta estimates pinned to an optimizer bound, or `None` when none are.
-fn boundary_estimate_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
-    let hits = boundary_estimates(params);
+/// Construct a fit-end [`WarningEntry`] with the invariant fields every native
+/// emitter shares (`severity: Warning`, `source_method: None`), varying only
+/// `category`, `message`, and `details`.
+fn warning_entry(
+    category: WarningCode,
+    message: String,
+    details: Option<serde_json::Value>,
+) -> WarningEntry {
+    WarningEntry {
+        severity: WarningSeverity::Warning,
+        category,
+        message,
+        source_method: None,
+        details,
+    }
+}
+
+/// Shared scaffold for the list-style fit-end warnings: given a set of `hits`,
+/// return `None` when empty, otherwise join a human `list` string (`line` per
+/// hit), format the message (`msg` over the joined list), build the structured
+/// `details`, and wrap it in a [`WarningEntry`] as `Some((message, entry))`.
+fn list_warning<H>(
+    hits: Vec<H>,
+    category: WarningCode,
+    line: impl Fn(&H) -> String,
+    msg: impl Fn(&str) -> String,
+    details: impl Fn(&[H]) -> serde_json::Value,
+) -> Option<(String, WarningEntry)> {
     if hits.is_empty() {
         return None;
     }
-    let list = hits
-        .iter()
-        .map(|(name, est, _bound, side)| format!("{name} ({est:.4} at {side} bound)"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let msg = format!(
-        "Parameter estimate(s) pinned to an optimizer bound: {list}. This often \
-         indicates non-identifiability or a too-tight bound; inspect the affected \
-         parameter(s) and consider relaxing the bound or simplifying the model."
-    );
-    let params_json: Vec<serde_json::Value> = hits
-        .iter()
-        .map(|(name, est, bound, side)| {
-            serde_json::json!({
-                "parameter": name,
-                "estimate": est,
-                "bound": bound,
-                "side": side,
-            })
-        })
-        .collect();
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::BoundaryEstimate,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({ "parameters": params_json })),
-    };
+    let list = hits.iter().map(|h| line(h)).collect::<Vec<_>>().join(", ");
+    let msg = msg(&list);
+    let entry = warning_entry(category, msg.clone(), Some(details(&hits)));
     Some((msg, entry))
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// theta estimates pinned to an optimizer bound, or `None` when none are.
+fn boundary_estimate_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
+    list_warning(
+        boundary_estimates(params),
+        WarningCode::BoundaryEstimate,
+        |(name, est, _bound, side)| format!("{name} ({est:.4} at {side} bound)"),
+        |list| {
+            format!(
+                "Parameter estimate(s) pinned to an optimizer bound: {list}. This often \
+                 indicates non-identifiability or a too-tight bound; inspect the affected \
+                 parameter(s) and consider relaxing the bound or simplifying the model."
+            )
+        },
+        |hits| {
+            let params_json: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|(name, est, bound, side)| {
+                    serde_json::json!({
+                        "parameter": name,
+                        "estimate": est,
+                        "bound": bound,
+                        "side": side,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "parameters": params_json })
+        },
+    )
 }
 
 /// Relative-standard-error threshold (percent) above which a free THETA is
@@ -6784,45 +7141,38 @@ fn inflated_rse_warning(
     se_theta: &Option<Vec<f64>>,
     params: &ModelParameters,
 ) -> Option<(String, WarningEntry)> {
-    let hits = inflated_rse_thetas(se_theta, params);
-    if hits.is_empty() {
-        return None;
-    }
-    let list = hits
-        .iter()
+    list_warning(
+        inflated_rse_thetas(se_theta, params),
+        WarningCode::InflatedRse,
         // One decimal so a borderline value (e.g. 50.4%) is not displayed as
         // "50%" — which would read as below the threshold it just tripped.
-        .map(|(name, _est, _se, rse)| format!("{name} ({rse:.1}%)"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let msg = format!(
-        "High relative standard error (RSE > {:.0}%): {list}. These parameter(s) \
-         are imprecisely estimated — often a sign of over-parameterization or \
-         data that do not inform them; consider simplifying the model.",
-        RSE_WARN_THRESHOLD_PCT
-    );
-    let params_json: Vec<serde_json::Value> = hits
-        .iter()
-        .map(|(name, est, se, rse)| {
+        |(name, _est, _se, rse)| format!("{name} ({rse:.1}%)"),
+        |list| {
+            format!(
+                "High relative standard error (RSE > {:.0}%): {list}. These parameter(s) \
+                 are imprecisely estimated — often a sign of over-parameterization or \
+                 data that do not inform them; consider simplifying the model.",
+                RSE_WARN_THRESHOLD_PCT
+            )
+        },
+        |hits| {
+            let params_json: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|(name, est, se, rse)| {
+                    serde_json::json!({
+                        "parameter": name,
+                        "estimate": est,
+                        "se": se,
+                        "rse_pct": rse,
+                    })
+                })
+                .collect();
             serde_json::json!({
-                "parameter": name,
-                "estimate": est,
-                "se": se,
-                "rse_pct": rse,
+                "threshold_pct": RSE_WARN_THRESHOLD_PCT,
+                "parameters": params_json,
             })
-        })
-        .collect();
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::InflatedRse,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({
-            "threshold_pct": RSE_WARN_THRESHOLD_PCT,
-            "parameters": params_json,
-        })),
-    };
-    Some((msg, entry))
+        },
+    )
 }
 
 /// Absolute correlation above which a parameter pair is flagged as
@@ -6871,37 +7221,30 @@ fn high_correlation_pairs(
 /// Build the human message + native structured entry (with `details`) for
 /// highly correlated THETA pairs in the fit's covariance matrix, or `None`.
 fn high_correlation_warning(result: &FitResult) -> Option<(String, WarningEntry)> {
-    let pairs = high_correlation_pairs(result.covariance_matrix.as_ref(), &result.theta_names);
-    if pairs.is_empty() {
-        return None;
-    }
-    let list = pairs
-        .iter()
-        .map(|(a, b, r)| format!("{a} ~ {b} ({r:.2})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let msg = format!(
-        "Highly correlated parameter pair(s) (|r| >= {CORRELATION_WARN_THRESHOLD:.2}): \
-         {list}. Highly correlated estimates indicate over-parameterization or \
-         non-identifiability; consider fixing or removing one of each pair."
-    );
-    let pairs_json: Vec<serde_json::Value> = pairs
-        .iter()
-        .map(
-            |(a, b, r)| serde_json::json!({ "parameter_a": a, "parameter_b": b, "correlation": r }),
-        )
-        .collect();
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::HighCorrelation,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({
-            "threshold": CORRELATION_WARN_THRESHOLD,
-            "pairs": pairs_json,
-        })),
-    };
-    Some((msg, entry))
+    list_warning(
+        high_correlation_pairs(result.covariance_matrix.as_ref(), &result.theta_names),
+        WarningCode::HighCorrelation,
+        |(a, b, r)| format!("{a} ~ {b} ({r:.2})"),
+        |list| {
+            format!(
+                "Highly correlated parameter pair(s) (|r| >= {CORRELATION_WARN_THRESHOLD:.2}): \
+                 {list}. Highly correlated estimates indicate over-parameterization or \
+                 non-identifiability; consider fixing or removing one of each pair."
+            )
+        },
+        |pairs| {
+            let pairs_json: Vec<serde_json::Value> = pairs
+                .iter()
+                .map(|(a, b, r)| {
+                    serde_json::json!({ "parameter_a": a, "parameter_b": b, "correlation": r })
+                })
+                .collect();
+            serde_json::json!({
+                "threshold": CORRELATION_WARN_THRESHOLD,
+                "pairs": pairs_json,
+            })
+        },
+    )
 }
 
 /// Build the human message + native structured entry for a **twin-less** transit /
@@ -6979,17 +7322,15 @@ fn absorption_flip_flop_ebe_warning(
         ode_fn,
         params
     );
-    let entry = WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::FlipFlop,
-        message: msg.clone(),
-        source_method: None,
-        details: Some(serde_json::json!({
+    let entry = warning_entry(
+        WarningCode::FlipFlop,
+        msg.clone(),
+        Some(serde_json::json!({
             "phase": "ebe",
             "model": model.pk_model.canonical_name(),
             "subjects": crossers,
         })),
-    };
+    );
     Some((msg, entry))
 }
 
@@ -7213,6 +7554,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -8263,7 +8605,7 @@ pub fn simulate_with_options_diag(
     // tolerances only need to localize each EBE well enough to match on, not to
     // reproduce a specific fit's inner settings.
     let (eta_hats, _h, _stats, _kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
-        model, population, params, 100, 1e-6, None, None, 1,
+        model, population, params, 100, 1e-6, None, None, 1, 0,
     );
 
     // A divergent EBE can come back non-finite (`find_ebe` only gates its
@@ -8512,6 +8854,7 @@ fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             &params.sigma.values,
             &model.residual_correlations,
             mult,
@@ -8523,6 +8866,7 @@ fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             &params.sigma.values,
             &model.residual_correlations,
         ),
@@ -10269,6 +10613,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 6],
                 occasions: occasions.clone(),
+                obs_l2: Vec::new(),
                 dose_occasions: dose_occ.clone(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -10975,7 +11320,8 @@ mod iov_integration {
     }
 
     // block_sigma correlated residual errors are wired into the Gaussian FOCE,
-    // FOCEI, SAEM, and IMP paths; the Gauss-Newton (gn / gn_hybrid) methods still
+    // FOCEI, SAEM, IMP, AGQ, and Laplace paths (AGQ/Laplace via `score_core`'s
+    // `corr_diag` branch, #251); the Gauss-Newton (gn / gn_hybrid) methods still
     // use diagonal residual-error derivatives and must be rejected up front.
     #[test]
     fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
@@ -11002,12 +11348,13 @@ mod iov_integration {
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
 
-        // FOCE, FOCEI, SAEM, and IMP are all accepted (no method diagnostic).
+        // FOCE, FOCEI, SAEM, IMP, AGQ, and Laplace are all accepted (no method diagnostic).
         for method in [
             EstimationMethod::Foce,
             EstimationMethod::FoceI,
             EstimationMethod::Saem,
             EstimationMethod::Imp,
+            EstimationMethod::Laplace,
         ] {
             let opts = fast_opts(method, Optimizer::Bobyqa, false);
             assert!(
@@ -11146,6 +11493,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 4],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11234,6 +11582,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 4],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11320,6 +11669,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 3],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11414,6 +11764,7 @@ mod iov_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 3],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -11509,6 +11860,7 @@ mod iov_integration {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -11856,6 +12208,7 @@ mod iov_integration {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -12844,6 +13197,7 @@ mod simulate_with_uncertainty_tests {
             reset_times: Vec::new(),
             cens: vec![0; n],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),
@@ -13011,6 +13365,7 @@ mod simulate_with_uncertainty_tests {
                 reset_times: Vec::new(),
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -14069,6 +14424,7 @@ mod sde_integration {
                 reset_times: Vec::new(),
                 cens: vec![0; 3],
                 occasions: vec![1u32; 3],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1u32],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -14199,6 +14555,7 @@ mod sde_integration {
                 reset_times: Vec::new(),
                 cens: vec![0],
                 occasions: Vec::new(),
+                obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -14523,6 +14880,7 @@ mod tests_sdtab_tv_cov {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -14692,6 +15050,7 @@ mod tests_sdtab_tv_cov {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -14847,6 +15206,7 @@ mod tests_sdtab_tv_cov {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -15008,6 +15368,7 @@ mod tests_derived_session_clock {
             reset_times: vec![5.0], // boundary at shifted t=5
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -15246,6 +15607,7 @@ mod tests_derived_session_clock {
             reset_times: Vec::new(),
             cens: vec![0; 3],
             occasions: vec![1, 1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -15389,6 +15751,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             obs_records: vec![],
         }
@@ -15569,6 +15932,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             obs_records: vec![],
         };
@@ -15660,6 +16024,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -15730,6 +16095,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -15790,6 +16156,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -15811,6 +16178,159 @@ mod tests_derived_iov_kappa {
             !diags.iter().any(|d| d.message.contains("ALAG")),
             "no compartment-indexed ALAGn warning for an analytical (non-ODE) model"
         );
+    }
+
+    // ── #830: block_sigma L2 pairing warnings ───────────────────────────────
+
+    /// A two-endpoint block_sigma model correlating cmt-1 (slot 0) with cmt-2
+    /// (slot 1) via ρ.
+    fn block_sigma_two_endpoint_model() -> CompiledModel {
+        let mut m = minimal_iov_model(vec![]);
+        m.error_spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                crate::types::EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+            (
+                2,
+                crate::types::EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+        ]));
+        m.error_model = ErrorModel::Proportional;
+        m.n_epsilon = 2;
+        m.default_params.sigma = SigmaVector {
+            values: vec![0.3, 0.4],
+            names: vec!["S1".into(), "S2".into()],
+        };
+        m.default_params.sigma_fixed = vec![false, false];
+        m.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        m
+    }
+
+    fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject {
+        let n = cmts.len();
+        Subject {
+            fremtype: Vec::new(),
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: times.clone(),
+            obs_raw_times: times,
+            observations: vec![1.0; n],
+            obs_cmts: cmts,
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            obs_l2: l2,
+            dose_occasions: vec![1],
+            obs_records: vec![],
+        }
+    }
+
+    fn population_of(subject: Subject) -> Population {
+        Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Four co-temporal rows (total1, unbound1, total2, unbound2) with a
+    /// block_sigma correlation and NO L2 column: a total row can pair with either
+    /// unbound row, so the greedy row-order pairing is ambiguous and must warn.
+    #[test]
+    fn block_sigma_ambiguous_pairing_without_l2_warns() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(
+            vec![1, 2, 1, 2],
+            vec![1.0, 1.0, 1.0, 1.0],
+            Vec::new(),
+        ));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
+            "ambiguous co-temporal pairing with no L2 must warn"
+        );
+    }
+
+    /// The same four rows grouped by an explicit L2 id are unambiguous — no warning.
+    #[test]
+    fn block_sigma_l2_grouped_pairing_does_not_warn() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(
+            vec![1, 2, 1, 2],
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![1, 1, 2, 2],
+        ));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            !diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
+            "explicit L2 grouping is order-independent — must not warn"
+        );
+    }
+
+    /// A clean two-row draw (one total + one unbound) has only one possible
+    /// pairing even without L2 — no warning.
+    #[test]
+    fn block_sigma_two_row_layout_does_not_warn() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(vec![1, 2], vec![1.0, 1.0], Vec::new()));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            !diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
+            "an unambiguous two-row draw must not warn"
+        );
+    }
+
+    /// An L2 column present while the model declares no block_sigma correlation
+    /// means L2 is inert (and a covariate of that name was silently reserved) —
+    /// warn W_L2_UNUSED.
+    #[test]
+    fn l2_column_without_block_sigma_warns_unused() {
+        let model = minimal_iov_model(vec![]); // no residual_correlations
+        let pop = population_of(obs_only_subject(vec![1], vec![1.0], vec![0]));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_L2_UNUSED"),
+            "an L2 column unused by any block_sigma model must warn"
+        );
+    }
+
+    /// No L2 column and no block_sigma: nothing to warn about.
+    #[test]
+    fn no_l2_column_no_block_sigma_is_quiet() {
+        let model = minimal_iov_model(vec![]);
+        let pop = population_of(obs_only_subject(vec![1], vec![1.0], Vec::new()));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(!diags.iter().any(|d| d.code == "W_L2_UNUSED"));
+        assert!(!diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"));
+    }
+
+    /// A block_sigma model whose data DOES carry an L2 column must not raise
+    /// W_L2_UNUSED — the column is consumed.
+    #[test]
+    fn block_sigma_with_l2_is_not_flagged_unused() {
+        let model = block_sigma_two_endpoint_model();
+        let pop = population_of(obs_only_subject(vec![1, 2], vec![1.0, 1.0], vec![1, 1]));
+        let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+        assert!(!diags.iter().any(|d| d.code == "W_L2_UNUSED"));
     }
 
     /// An SS=1 dose combined with an [initial_conditions] baseline double-counts
@@ -15861,6 +16381,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             obs_records: vec![],
         };
@@ -15923,6 +16444,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             obs_records: vec![],
         };
@@ -15981,6 +16503,7 @@ mod tests_derived_iov_kappa {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             obs_records: vec![],
         };
@@ -16118,6 +16641,7 @@ mod adaptive_sim_tests {
             reset_times: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1u32; n],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1u32; n_dose],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -18111,6 +18635,7 @@ mod adaptive_snapshot_verify_tests {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![1, 1],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -18438,6 +18963,7 @@ mod adaptive_snapshot_verify_tests {
             reset_times: Vec::new(),
             cens: vec![0; decisions.len()],
             occasions: vec![1; decisions.len()],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],

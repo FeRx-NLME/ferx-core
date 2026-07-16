@@ -83,6 +83,7 @@ website:
         href: estimation/index.qmd
         contents:
           - estimation/foce.qmd
+          - estimation/agq.qmd
           - estimation/gauss-newton.qmd
           - estimation/saem.qmd
           - estimation/sir.qmd

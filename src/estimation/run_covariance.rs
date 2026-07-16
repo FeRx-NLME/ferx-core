@@ -249,6 +249,9 @@ pub fn run_covariance(
             None,
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
+            // Cold reconvergence: match the fit's inner multi-start so the EBEs
+            // land in the same basin (else SEs would differ from the inline path).
+            options.inner_restarts,
         );
 
     // --- Run the covariance step (identical to the inline path in fit()) ---
@@ -356,6 +359,137 @@ mod tests {
             return None;
         }
         Some(fit)
+    }
+
+    /// IOV analogue of `run_covariance_matches_inline_covariance` (#823). The
+    /// reuse path packs/unpacks the `omega_iov` Cholesky block too, and the
+    /// **diagonal-IOV branch of `unpack_params` reconstructs it through
+    /// `OmegaMatrix::from_diagonal` (square-then-re-decompose)** rather than the
+    /// `from_chol_factor` route the BSV `omega` takes — a distinct construction
+    /// with no prior parity coverage.
+    ///
+    /// It is nonetheless **bit-for-bit**: both the inline covariance step
+    /// (`compute_covariance(&x0, …)`) and this standalone step run the entire
+    /// numeric path — the base OFV, every FD-Hessian perturbation, and
+    /// `se_kappa`'s `iov.matrix[(i,i)]` factor — through the *same*
+    /// `unpack_params(x0, template)` on the *same* packed vector
+    /// `fit.packed_estimate`. So the `from_diagonal` construction is applied
+    /// identically on both sides and cannot introduce a divergence; the
+    /// asymmetry the issue flags lives inside `unpack_params`, not between the
+    /// two callers. Observed `max_abs_diff == 0.0`, with `se_kappa` matching to
+    /// the last bit.
+    ///
+    /// `fit_from_files` can't thread `iov_column` from `[fit_options]` (it
+    /// passes `None`), so — like every other IOV test — this drives the direct
+    /// `fit()` API with `read_nonmem_csv(.., Some("OCC"))` and hands both
+    /// `Some(model)` and `Some(pop)` to `run_covariance` (the documented IOV
+    /// workaround; a bare `Some(model)` for an IOV model is an error).
+    #[test]
+    fn run_covariance_matches_inline_covariance_iov() {
+        use crate::api::fit;
+
+        let model = crate::parser::model_parser::parse_full_model_file(std::path::Path::new(
+            "examples/warfarin_iov.ferx",
+        ))
+        .expect("parse warfarin_iov.ferx")
+        .model;
+        assert!(model.n_kappa > 0, "warfarin_iov.ferx must declare kappa");
+        let pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("data/warfarin_iov.csv"),
+            None,
+            Some("OCC"),
+        )
+        .expect("read warfarin_iov.csv");
+
+        // FOCEI (the IOV case the issue calls for) on the deterministic BOBYQA
+        // outer optimizer, so fit A and fit B converge to the same packed point.
+        let opts = FitOptions {
+            method: crate::types::EstimationMethod::FoceI,
+            interaction: true,
+            ..quick_opts()
+        };
+
+        // Fit A: inline covariance step. Skip (like the non-IOV sibling) if the
+        // FD cov step didn't produce a matrix — the parity assertions need a
+        // non-None reference, and FD conditioning is out of scope here.
+        let fit_a = fit(&model, &pop, &model.default_params, &opts).expect("iov fit A converges");
+        if fit_a.covariance_matrix.is_none() {
+            eprintln!(
+                "[skip] inline IOV covariance step produced no matrix (FD instability); \
+                 skipping run_covariance IOV parity assertions"
+            );
+            return;
+        }
+        // The whole point of the IOV variant: se_kappa must actually be exercised.
+        assert!(
+            fit_a.se_kappa.is_some(),
+            "inline IOV cov step must populate se_kappa"
+        );
+
+        // Fit B: identical settings, no inline covariance step.
+        let fit_b = fit(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                run_covariance_step: false,
+                ..opts.clone()
+            },
+        )
+        .expect("iov fit B converges");
+        assert!(
+            fit_b.covariance_matrix.is_none(),
+            "fit B should carry no covariance (run_covariance_step = false)"
+        );
+        // The bit-exact reuse relies on the FOCEI fit carrying the packed vector;
+        // guard it so a regression that stops populating it can't silently drop
+        // run_covariance onto the divergent re-decomposition fallback.
+        assert!(
+            fit_b.packed_estimate.is_some(),
+            "an IOV FOCEI fit must carry packed_estimate for run_covariance to reuse"
+        );
+
+        let out = run_covariance(&fit_b, Some(&model), Some(&pop), &opts)
+            .expect("run_covariance succeeds for the IOV model");
+
+        assert_eq!(out.covariance_status, CovarianceStatus::Computed);
+        let cov_ref = fit_a.covariance_matrix.as_ref().unwrap();
+        let cov_new = out
+            .covariance_matrix
+            .as_ref()
+            .expect("run_covariance populated covariance_matrix");
+        assert_eq!(cov_ref.shape(), cov_new.shape());
+        let max_abs_diff = cov_ref
+            .iter()
+            .zip(cov_new.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs_diff < 1e-12,
+            "IOV run_covariance matrix diverged from inline cov (max abs diff {max_abs_diff})"
+        );
+
+        // Every SE vector must agree bit-for-bit — se_kappa is the one the IOV
+        // reuse path (`from_diagonal` round-trip) newly covers.
+        let se_eq = |label: &str, a: &Option<Vec<f64>>, b: &Option<Vec<f64>>| {
+            assert_eq!(a.is_some(), b.is_some(), "{label}: presence differs");
+            if let (Some(a), Some(b)) = (a, b) {
+                assert_eq!(a.len(), b.len(), "{label}: length differs");
+                for (x, y) in a.iter().zip(b) {
+                    assert!((x - y).abs() < 1e-12, "{label} diverged: {x} vs {y}");
+                }
+            }
+        };
+        se_eq("se_theta", &fit_a.se_theta, &out.se_theta);
+        se_eq("se_omega", &fit_a.se_omega, &out.se_omega);
+        se_eq("se_sigma", &fit_a.se_sigma, &out.se_sigma);
+        se_eq("se_kappa", &fit_a.se_kappa, &out.se_kappa);
+
+        // Non-covariance fields round-trip unchanged — including omega_iov.
+        assert_eq!(out.theta, fit_b.theta);
+        assert_eq!(out.omega, fit_b.omega);
+        assert_eq!(out.omega_iov, fit_b.omega_iov);
+        assert_eq!(out.ofv, fit_b.ofv);
     }
 
     #[test]

@@ -32,49 +32,10 @@ use std::time::Instant;
 /// [`load`] rejects a checkpoint whose version this build doesn't understand.
 pub const SCHEMA_VERSION: u32 = 1;
 
-// ─── NaN-safe f64 serde (JSON has no NaN/±Inf) ───────────────────────────────
-// Mirrors the approach in `io/fitrx.rs`: non-finite serialises to `null` and
-// `null` deserialises back to NaN, so the round-trip never fails on a value
-// that is legitimately NaN early in a fit (e.g. the OFV before the first eval).
-
-mod nan_safe_f64 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
-        if v.is_finite() {
-            s.serialize_f64(*v)
-        } else {
-            s.serialize_none()
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
-        Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
-    }
-}
-
-mod nan_safe_vec {
-    use serde::{ser::SerializeSeq, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &Vec<f64>, s: S) -> Result<S::Ok, S::Error> {
-        let mut seq = s.serialize_seq(Some(v.len()))?;
-        for x in v {
-            if x.is_finite() {
-                seq.serialize_element(x)?;
-            } else {
-                seq.serialize_element(&Option::<f64>::None)?;
-            }
-        }
-        seq.end()
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f64>, D::Error> {
-        Ok(Vec::<Option<f64>>::deserialize(d)?
-            .into_iter()
-            .map(|o| o.unwrap_or(f64::NAN))
-            .collect())
-    }
-}
+// NaN-safe f64 serde (JSON has no NaN/±Inf) lives in the shared
+// `crate::io::serde_nan` module: non-finite serialises to `null` and `null`
+// deserialises back to NaN, so the round-trip never fails on a value that is
+// legitimately NaN early in a fit (e.g. the OFV before the first eval).
 
 /// The on-disk checkpoint payload (serialised as pretty JSON).
 ///
@@ -95,7 +56,7 @@ pub struct Checkpoint {
     /// Index into `method_chain` of the stage that was running when saved.
     pub stage_idx: usize,
     /// Packed unconstrained parameter vector (see struct docs).
-    #[serde(with = "nan_safe_vec")]
+    #[serde(with = "crate::io::serde_nan::vec")]
     pub packed: Vec<f64>,
     /// Optimizer coordinate names in packed order; length- and name-checked on
     /// resume so a structurally different model can never be resumed by mistake.
@@ -103,7 +64,7 @@ pub struct Checkpoint {
     /// Iteration / eval counter within the running stage at save time.
     pub iter: usize,
     /// Best OFV seen so far (informational; shown in the resume banner).
-    #[serde(with = "nan_safe_f64")]
+    #[serde(with = "crate::io::serde_nan::scalar")]
     pub ofv: f64,
     /// Unix seconds at save (informational).
     pub unix_time: u64,

@@ -363,3 +363,49 @@ fn bfgs_rescale2_and_covariate_covariance_paths_run() {
         "covariance was requested; status must be decided"
     );
 }
+
+/// Pre-flight flat-theta guard (#826): a model with a theta that never reaches
+/// the objective (TVFLAT, declared but unmapped) must degrade gracefully — the
+/// gradient NLopt path used to return `Failure` on eval 1 and pin every parameter
+/// at its initial value. The fit now returns `Ok`, warns, freezes the flat theta
+/// at its initial, and the remaining thetas move off their initials.
+#[test]
+fn flat_theta_is_frozen_and_fit_proceeds() {
+    let model = parse_model_file(Path::new("examples/flat_theta_warfarin.ferx"))
+        .expect("flat_theta_warfarin model must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data must load");
+    let init = &model.default_params;
+    let mut opts = base_options();
+    opts.method = EstimationMethod::FoceI;
+    opts.optimizer = Optimizer::NloptLbfgs; // gradient path that used to die at eval 1
+
+    let r = fit(&model, &population, init, &opts).expect("flat-theta fit must return Ok");
+    assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
+
+    // The flat param is named TVFLAT; locate it and its active siblings by name.
+    let idx = |name: &str| r.theta_names.iter().position(|n| n == name).unwrap();
+    let (i_flat, i_cl, i_v, i_ka) = (idx("TVFLAT"), idx("TVCL"), idx("TVV"), idx("TVKA"));
+
+    // Flat theta: frozen (FIX) and held exactly at its initial value.
+    assert!(r.theta_fixed[i_flat], "TVFLAT must be frozen");
+    assert_eq!(
+        r.theta[i_flat], init.theta[i_flat],
+        "frozen TVFLAT must stay at its initial value"
+    );
+    // A warning names the flat param and its lack of effect on the objective.
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("TVFLAT") && w.contains("no effect")),
+        "a flat-theta warning must be emitted: {:?}",
+        r.warnings
+    );
+    // The active thetas actually moved — the whole fit did not freeze at init.
+    let moved = |i: usize| (r.theta[i] - init.theta[i]).abs() > 1e-6;
+    assert!(
+        moved(i_cl) || moved(i_v) || moved(i_ka),
+        "active thetas must move off their initials (TVCL/TVV/TVKA): {:?}",
+        r.theta
+    );
+}

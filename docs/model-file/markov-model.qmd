@@ -103,12 +103,11 @@ An intensity may carry between-subject variability and covariates:
   transition asleep -> awake  = exp(LQ10)
 ```
 
-The generator is built once per subject from a **baseline** covariate snapshot (the CTMM
-is *time-homogeneous*). A covariate that is time-varying in the data is therefore
-rejected at fit setup rather than silently frozen; a genuinely drug-driven `Q(t)` is a
-planned extension. For the same reason a bare `TIME` in an intensity is rejected at parse
-(it would silently resolve to 0). Intensities are evaluated with per-subject (BSV) η only,
-so an inter-occasion (`[iov]` / κ) reference is rejected.
+The generator is built once per subject from a **baseline** covariate snapshot (a
+*time-homogeneous* generator). A covariate that is time-varying in the data is therefore
+rejected at fit setup rather than silently frozen. For the same reason a bare `TIME` in an
+intensity is rejected at parse (it would silently resolve to 0). Intensities are evaluated
+with per-subject (BSV) η only, so an inter-occasion (`[iov]` / κ) reference is rejected.
 
 An intensity is a **rate** and must evaluate non-negative for every subject: a
 parameter/covariate regime that drives an off-diagonal negative makes the generator
@@ -116,12 +115,50 @@ non-stochastic, and that subject's contribution is treated as degenerate (it rep
 optimizer) rather than silently scored. Write intensities on a scale that stays positive
 — e.g. `exp(...)` — rather than an unconstrained linear form.
 
-## Current limitations
+## Drug- / PD-driven intensities (time-inhomogeneous `Q(t)`)
 
-The first CTMM slice covers the **fit path** for a time-homogeneous generator:
+An intensity may instead depend on the **model state** — a drug concentration or a
+pharmacodynamic response that evolves over time — making the generator *time-inhomogeneous*,
+`Q(t) = f(state(t))`. Reference an ODE state by name in the transition (there is no `Cc`
+builtin — write a concentration as `central / V`, exactly as a drug-driven survival hazard
+does):
+
+```default
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + SLOPE * (central / V))
+  transition asleep -> awake  = exp(LQ10)
+```
+
+When an intensity references a state, ferx solves the model's ODE system for the subject and
+integrates the occupancy equation `dP/dτ = P·Q(state(t))` (forward Kolmogorov, so
+`P(Δt)[from,to] = Pr(to | from)`) over each observation gap (there is
+no closed form once `Q` varies within the gap), scoring the same
+`−Σ log P(Δt_m)[s_m, s_{m+1}]`. Any transform is written inline (e.g. an Emax effect
+`EMAX * R / (EC50 + R)` on a response state `R`); a state reached only through an
+`[individual_parameters]` value is rejected — reference the state **directly** in the
+`transition` line. This requires an ODE (`[odes]`) model; the occupancy integration uses the
+model's ODE tolerance (`TOL`).
+
+A complete runnable model is `examples/ctmm_pd_2state.ferx` (with `data/ctmm_pd_2state.csv`):
+a concentration-driven 2-state process where ferx recovers the transition intensities and the
+drug effect from the Gillespie-simulated data.
+
+## Current limitations
 
 - `type = mctmm` / `type = dtmm` (minimal-CTMM and discrete-time Markov) — planned.
 - The matrix (`q12 = …`) spelling and an `init` occupancy vector — planned.
 - Simulation / prediction of a CTMM endpoint — planned.
+- A drug/PD-driven intensity requires an ODE model and a state referenced **directly** in the
+  transition; analytic (closed-form) PK as a driver is planned.
 - Estimators: `focei` (default), `saem`, and `imp`. Gauss–Newton (`gn`/`gn_hybrid`) is
   rejected (its gradient is Gaussian-specific).

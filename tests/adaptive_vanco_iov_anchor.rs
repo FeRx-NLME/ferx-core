@@ -113,6 +113,7 @@ fn anchor_subject(decision_times: &[f64]) -> Subject {
         reset_times: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
+        obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],

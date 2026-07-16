@@ -1238,6 +1238,140 @@ fn read_observable(
         .eval(u, pk_params_flat, theta, eta, covariates, obs_cmt)
 }
 
+/// Record `read_observable` into `predictions[obs_idx]` for every observation
+/// sharing a break/save time — the state-independent obs-recording idiom copied
+/// across the dense drivers. `pk`/`eta` are the (constant) snapshot for these
+/// observations; the per-observation TV/IOV variants (which pick `pk`/`eta` per
+/// `obs_idx`) stay inline. When `states` is `Some`, the compartment state `u` is
+/// cloned into `states[obs_idx]` too (the `_with_states` driver).
+#[inline]
+fn record_observations(
+    ode: &OdeSpec,
+    obs_idxs: &[usize],
+    u: &[f64],
+    pk: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+    predictions: &mut [f64],
+    mut states: Option<&mut [Vec<f64>]>,
+) {
+    for &obs_idx in obs_idxs {
+        let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+        predictions[obs_idx] =
+            read_observable(ode, u, pk, theta, eta, subject.obs_cov(obs_idx), cmt);
+        if let Some(states) = states.as_deref_mut() {
+            states[obs_idx] = u.to_vec();
+        }
+    }
+}
+
+/// Clamp negative predictions to zero (ODE solver overshoot guard) — the shared
+/// epilogue of the dense drivers. NaN is intentionally NOT clamped (it survives
+/// `< 0.0` per IEEE 754) so it propagates to a NaN OFV.
+#[inline]
+fn clamp_negative_predictions(predictions: &mut [f64]) {
+    for p in predictions.iter_mut() {
+        if *p < 0.0 {
+            *p = 0.0;
+        }
+    }
+}
+
+/// TAD anchor for `ext_params[MAX_PK_PARAMS + 1]`: the last effective dose time at
+/// or before `t_start`, SS-aware (`rem_euclid` wraps the elapsed time back into
+/// `[0, II)` so TAD stays within one dosing interval). Returns NaN when no
+/// effective prior dose exists, so the ODE RHS injects NaN for TAD (matching the
+/// sdtab convention) rather than `+∞`.
+#[inline]
+fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
+    let last_dose_eff = subject
+        .doses
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
+        .map(|(i, d)| {
+            let lag = dose_lagtimes[i];
+            if d.ss && d.ii > 0.0 {
+                let elapsed = t_start - (d.time + lag);
+                t_start - elapsed.rem_euclid(d.ii)
+            } else {
+                d.time + lag
+            }
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    if last_dose_eff.is_finite() {
+        last_dose_eff
+    } else {
+        f64::NAN
+    }
+}
+
+/// Per dose-compartment lagtime / bioavailability vectors (`Fn`/`ALAGn`; issue
+/// #369, with fallback to the bare `lagtime`/`F` slots). Uniform on the no-TV
+/// dense path, where every dose reads the same `pk_params_flat`.
+#[inline]
+fn subject_dose_attrs(
+    subject: &Subject,
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let dose_lagtimes: Vec<f64> = subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
+        .collect();
+    let dose_f_bio: Vec<f64> = subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
+        .collect();
+    (dose_lagtimes, dose_f_bio)
+}
+
+/// Earliest dose record time, or `+∞` when the subject has no doses.
+#[inline]
+fn earliest_dose_time(subject: &Subject) -> f64 {
+    subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Seed the extended-parameter array for the ODE RHS: slots `0..MAX_PK_PARAMS`
+/// hold the PK snapshot; slot `MAX_PK_PARAMS` carries the TAFD anchor (the first
+/// dose time, NaN when there are no doses so the RHS injects NaN rather than `-∞`);
+/// slot `MAX_PK_PARAMS + 1` (TAD) is left NaN for the per-segment update.
+#[inline]
+fn seed_ext_params(
+    pk_params_flat: &[f64],
+    first_dose_time: f64,
+) -> [f64; crate::types::MAX_PK_PARAMS + 2] {
+    let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
+    ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
+    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
+        first_dose_time
+    } else {
+        f64::NAN
+    };
+    ext_params
+}
+
+/// Map each time (by bit pattern) to *all* its indices. Multiple observations can
+/// share a time (e.g. simultaneous PK/PD samples on different CMTs), so each time
+/// maps to every index — recording only one would leave the others at their
+/// initial NaN.
+#[inline]
+fn build_obs_index_map(times: &[f64]) -> HashMap<u64, Vec<usize>> {
+    let mut map: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, &t) in times.iter().enumerate() {
+        map.entry(t.to_bits()).or_default().push(i);
+    }
+    map
+}
+
 /// ODE specification for a model
 pub struct OdeSpec {
     /// RHS function: (u, pk_params_flat, t, du) — writes derivatives into du
@@ -1414,30 +1548,7 @@ fn integrate_segment(
 
     // Update TAD anchor (slot MAX_PK_PARAMS+1): last effective dose time
     // before this segment, SS-aware (gives TAD = t - last_dose_eff).
-    {
-        let last_dose_eff = subject
-            .doses
-            .iter()
-            .enumerate()
-            .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
-            .map(|(i, d)| {
-                let lag = dose_lagtimes[i];
-                if d.ss && d.ii > 0.0 {
-                    let elapsed = t_start - (d.time + lag);
-                    t_start - elapsed.rem_euclid(d.ii)
-                } else {
-                    d.time + lag
-                }
-            })
-            .fold(f64::NEG_INFINITY, f64::max);
-        // Store NaN when no effective prior dose exists so the ODE RHS injects
-        // NaN for TAD (consistent with sdtab) rather than +∞ (t - NEG_INFINITY).
-        ext_params[crate::types::MAX_PK_PARAMS + 1] = if last_dose_eff.is_finite() {
-            last_dose_eff
-        } else {
-            f64::NAN
-        };
-    }
+    ext_params[crate::types::MAX_PK_PARAMS + 1] = tad_anchor(subject, dose_lagtimes, t_start);
 
     // Integrate. If any infusions are active in this segment, wrap
     // the user RHS so it adds `+rate` to each infusion's compartment.
@@ -1488,18 +1599,17 @@ fn integrate_segment(
     // Extract predictions and update state
     for pt in &sol {
         if let Some(obs_idxs) = obs_map.get(&pt.t.to_bits()) {
-            for &obs_idx in obs_idxs {
-                let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-                predictions[obs_idx] = read_observable(
-                    ode,
-                    &pt.u,
-                    pk_params_flat,
-                    theta,
-                    eta,
-                    subject.obs_cov(obs_idx),
-                    cmt,
-                );
-            }
+            record_observations(
+                ode,
+                obs_idxs,
+                &pt.u,
+                pk_params_flat,
+                theta,
+                eta,
+                subject,
+                predictions,
+                None,
+            );
         }
     }
 
@@ -1680,43 +1790,18 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // models behave identically. Resolved **per dose compartment** so a model
     // with `Fn`/`ALAGn` (issue #369) applies the right value to each route; the
     // common bare-`F`/`lagtime` model gets a uniform vector.
-    let dose_lagtimes: Vec<f64> = subject
-        .doses
-        .iter()
-        .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
-        .collect();
-    let dose_f_bio: Vec<f64> = subject
-        .doses
-        .iter()
-        .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
-        .collect();
+    let (dose_lagtimes, dose_f_bio) = subject_dose_attrs(subject, ode, pk_params_flat);
 
     // Extended params: slots 0..MAX_PK_PARAMS hold the PK parameters; slots
     // MAX_PK_PARAMS and MAX_PK_PARAMS+1 carry TAFD/TAD anchors for the ODE RHS.
-    let first_dose_time = subject
-        .doses
-        .iter()
-        .map(|d| d.time)
-        .fold(f64::INFINITY, f64::min);
-    let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
-    let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
-    ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
-    // Store NaN when there are no doses so the ODE RHS injects NaN for TAFD
-    // (consistent with the sdtab convention) rather than -∞ (INFINITY - t).
-    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
-        first_dose_time
-    } else {
-        f64::NAN
-    };
+    let first_dose_time = earliest_dose_time(subject);
+    let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
 
     // Build obs_time → indices map. Multiple observations can share a time
     // (e.g. simultaneous PK/PD samples on different CMTs), so each time maps to
     // *all* its observation indices — recording only one would leave the others
     // at their initial NaN.
-    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in subject.obs_times.iter().enumerate() {
-        obs_map.entry(t.to_bits()).or_default().push(i);
-    }
+    let obs_map = build_obs_index_map(&subject.obs_times);
 
     // Break timeline at lagtime-shifted dose times — and, for infusions,
     // at lagtime-shifted infusion-end times too, so each segment is
@@ -1823,18 +1908,17 @@ fn ode_predictions_with_extra_breaks_and_stats(
 
         // Record observations exactly at t_start (after dose)
         if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
-            for &obs_idx in obs_idxs {
-                let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-                predictions[obs_idx] = read_observable(
-                    ode,
-                    &u,
-                    pk_params_flat,
-                    theta,
-                    eta,
-                    subject.obs_cov(obs_idx),
-                    cmt,
-                );
-            }
+            record_observations(
+                ode,
+                obs_idxs,
+                &u,
+                pk_params_flat,
+                theta,
+                eta,
+                subject,
+                &mut predictions,
+                None,
+            );
         }
 
         // #570: a soft (CHZ) time coinciding with this segment's *left* boundary is
@@ -1911,11 +1995,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // This is also what surfaces a missing `OdeReadout::PerCmt` entry as
     // a loud failure rather than a silent zero. (Pre-Phase-2 the clamp
     // included NaN; Copilot's review of #84 caught the inconsistency.)
-    for p in &mut predictions {
-        if *p < 0.0 {
-            *p = 0.0;
-        }
-    }
+    clamp_negative_predictions(&mut predictions);
 
     (predictions, chz_states)
 }
@@ -2879,11 +2959,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     }
 
     // Clamp negative predictions to zero, matching the static predictor.
-    for p in &mut predictions {
-        if *p < 0.0 {
-            *p = 0.0;
-        }
-    }
+    clamp_negative_predictions(&mut predictions);
 
     Ok(AdaptiveRun {
         predictions,
@@ -3103,12 +3179,10 @@ fn adaptive_frozen_replay_tv(
     // Injected doses carry no lag (a nonzero lag is rejected at injection).
     let dose_lagtimes = vec![0.0; subject.doses.len()];
 
+    // NB: PK slots are left NaN here (unlike `seed_ext_params`) — the replay
+    // overwrites them per-segment from each event's own snapshot before integrating.
     let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
-    let first_dose_time = subject
-        .doses
-        .iter()
-        .map(|d| d.time)
-        .fold(f64::INFINITY, f64::min);
+    let first_dose_time = earliest_dose_time(subject);
     ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
         first_dose_time
     } else {
@@ -3243,11 +3317,7 @@ fn adaptive_frozen_replay_tv(
         }
     }
 
-    for p in &mut predictions {
-        if *p < 0.0 {
-            *p = 0.0;
-        }
-    }
+    clamp_negative_predictions(&mut predictions);
     predictions
 }
 
@@ -3918,35 +3988,12 @@ pub fn ode_predictions_with_states(
     // Per dose-compartment bioavailability / lag (`Fn`/`ALAGn`; issue #369),
     // falling back to the bare `PK_IDX_F`/`PK_IDX_LAGTIME` slots. Uniform on
     // this no-TV path, where every dose reads the same `pk_params_flat`.
-    let dose_lagtimes: Vec<f64> = subject
-        .doses
-        .iter()
-        .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
-        .collect();
-    let dose_f_bio: Vec<f64> = subject
-        .doses
-        .iter()
-        .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
-        .collect();
+    let (dose_lagtimes, dose_f_bio) = subject_dose_attrs(subject, ode, pk_params_flat);
 
-    let first_dose_time = subject
-        .doses
-        .iter()
-        .map(|d| d.time)
-        .fold(f64::INFINITY, f64::min);
-    let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
-    let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
-    ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
-    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
-        first_dose_time
-    } else {
-        f64::NAN
-    };
+    let first_dose_time = earliest_dose_time(subject);
+    let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
 
-    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in subject.obs_times.iter().enumerate() {
-        obs_map.entry(t.to_bits()).or_default().push(i);
-    }
+    let obs_map = build_obs_index_map(&subject.obs_times);
 
     let t_last = subject.obs_times.iter().cloned().fold(0.0f64, f64::max);
     let mut break_times: Vec<f64> = vec![subject_integration_start(subject)];
@@ -4024,19 +4071,17 @@ pub fn ode_predictions_with_states(
 
         // Handle obs at t_start (after dose).
         if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
-            for &obs_idx in obs_idxs {
-                let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-                predictions[obs_idx] = read_observable(
-                    ode,
-                    &u,
-                    pk_params_flat,
-                    theta,
-                    eta,
-                    subject.obs_cov(obs_idx),
-                    cmt,
-                );
-                states[obs_idx] = u.clone();
-            }
+            record_observations(
+                ode,
+                obs_idxs,
+                &u,
+                pk_params_flat,
+                theta,
+                eta,
+                subject,
+                &mut predictions,
+                Some(states.as_mut_slice()),
+            );
         }
 
         // #731: integrate the open interval `(t_start, t_end]` to the next break, if
@@ -4072,28 +4117,7 @@ pub fn ode_predictions_with_states(
         // TAD anchor: last effective dose time before this segment, SS-aware.
         // For SS doses, rem_euclid maps the elapsed time back into [0, II) so
         // TAD stays within one dosing interval — matching ode_predictions.
-        ext_params[crate::types::MAX_PK_PARAMS + 1] = {
-            let last_dose_eff = subject
-                .doses
-                .iter()
-                .enumerate()
-                .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
-                .map(|(i, d)| {
-                    let lag = dose_lagtimes[i];
-                    if d.ss && d.ii > 0.0 {
-                        let elapsed = t_start - (d.time + lag);
-                        t_start - elapsed.rem_euclid(d.ii)
-                    } else {
-                        d.time + lag
-                    }
-                })
-                .fold(f64::NEG_INFINITY, f64::max);
-            if last_dose_eff.is_finite() {
-                last_dose_eff
-            } else {
-                f64::NAN
-            }
-        };
+        ext_params[crate::types::MAX_PK_PARAMS + 1] = tad_anchor(subject, &dose_lagtimes, t_start);
 
         active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
         // Resolve each active infusion to (cmt_idx, F·rate, t_start, t_end) for
@@ -4126,19 +4150,17 @@ pub fn ode_predictions_with_states(
 
         for pt in &sol {
             if let Some(obs_idxs) = obs_map.get(&pt.t.to_bits()) {
-                for &obs_idx in obs_idxs {
-                    let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-                    predictions[obs_idx] = read_observable(
-                        ode,
-                        &pt.u,
-                        pk_params_flat,
-                        theta,
-                        eta,
-                        subject.obs_cov(obs_idx),
-                        cmt,
-                    );
-                    states[obs_idx] = pt.u.clone();
-                }
+                record_observations(
+                    ode,
+                    obs_idxs,
+                    &pt.u,
+                    pk_params_flat,
+                    theta,
+                    eta,
+                    subject,
+                    &mut predictions,
+                    Some(states.as_mut_slice()),
+                );
             }
         }
 
@@ -4147,11 +4169,7 @@ pub fn ode_predictions_with_states(
         }
     }
 
-    for p in &mut predictions {
-        if *p < 0.0 {
-            *p = 0.0;
-        }
-    }
+    clamp_negative_predictions(&mut predictions);
 
     (predictions, states)
 }
@@ -4348,28 +4366,7 @@ fn apply_segment_boundary(
 
     // TAD anchor: SS-aware, matching ode_predictions (rem_euclid wraps the elapsed
     // time back into [0, II)).
-    ext_params[crate::types::MAX_PK_PARAMS + 1] = {
-        let last_dose_eff = subject
-            .doses
-            .iter()
-            .enumerate()
-            .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
-            .map(|(i, d)| {
-                let lag = dose_lagtimes[i];
-                if d.ss && d.ii > 0.0 {
-                    let elapsed = t_start - (d.time + lag);
-                    t_start - elapsed.rem_euclid(d.ii)
-                } else {
-                    d.time + lag
-                }
-            })
-            .fold(f64::NEG_INFINITY, f64::max);
-        if last_dose_eff.is_finite() {
-            last_dose_eff
-        } else {
-            f64::NAN
-        }
-    };
+    ext_params[crate::types::MAX_PK_PARAMS + 1] = tad_anchor(subject, dose_lagtimes, t_start);
 
     active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
     // Resolve to (cmt_idx, F·rate, t_start, t_end) for the seam's time-gated
@@ -4436,36 +4433,13 @@ pub fn ode_dense_solve_states(
     // Per dose-compartment bioavailability / lag (`Fn`/`ALAGn`; issue #369),
     // falling back to the bare `PK_IDX_F`/`PK_IDX_LAGTIME` slots. Uniform on
     // this no-TV path, where every dose reads the same `pk_params_flat`.
-    let dose_lagtimes: Vec<f64> = subject
-        .doses
-        .iter()
-        .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
-        .collect();
-    let dose_f_bio: Vec<f64> = subject
-        .doses
-        .iter()
-        .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
-        .collect();
+    let (dose_lagtimes, dose_f_bio) = subject_dose_attrs(subject, ode, pk_params_flat);
 
-    let first_dose_time = subject
-        .doses
-        .iter()
-        .map(|d| d.time)
-        .fold(f64::INFINITY, f64::min);
-    let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
-    let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
-    ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
-    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
-        first_dose_time
-    } else {
-        f64::NAN
-    };
+    let first_dose_time = earliest_dose_time(subject);
+    let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
 
     // Build saveat → index map for fast lookup.
-    let mut saveat_map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in saveat.iter().enumerate() {
-        saveat_map.entry(t.to_bits()).or_default().push(i);
-    }
+    let saveat_map = build_obs_index_map(saveat);
 
     let t_last = saveat.iter().cloned().fold(0.0f64, f64::max);
     // Zero-order absorption windows for this subject (#504): a single PK snapshot,
@@ -4478,6 +4452,22 @@ pub fn ode_dense_solve_states(
         build_segment_break_times(subject, &dose_lagtimes, &dose_f_bio, &zo_windows, t_last);
 
     let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();
+
+    // Saveat nodes earlier than the first integrated segment (e.g. a discrete-state
+    // CTMM observation recorded before the first dose, whose times the segment
+    // timeline — built from doses/obs_times/pk-only/resets, not `obs_records` — does
+    // not cover). Nothing has acted on the system before the first event, so the state
+    // there is the seeded initial state `u`; fill it so these nodes are not left as
+    // `NaN`, which a downstream finiteness guard (the inhomogeneous CTMM scorer) would
+    // otherwise read as a diverged solve and use to wrongly repel a valid subject. No-op
+    // for the usual case where every saveat is at or after the first event.
+    if let Some(&first_start) = break_times.first() {
+        for (i, &t) in saveat.iter().enumerate() {
+            if t < first_start - 1e-12 {
+                result[i] = u.clone();
+            }
+        }
+    }
 
     for w in break_times.windows(2) {
         let (t_start, t_end) = (w[0], w[1]);
@@ -4663,30 +4653,10 @@ pub(crate) fn ode_solve_until_chz_threshold(
     let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
     let subject: &Subject = &resolved;
 
-    let dose_lagtimes: Vec<f64> = subject
-        .doses
-        .iter()
-        .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
-        .collect();
-    let dose_f_bio: Vec<f64> = subject
-        .doses
-        .iter()
-        .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
-        .collect();
+    let (dose_lagtimes, dose_f_bio) = subject_dose_attrs(subject, ode, pk_params_flat);
 
-    let first_dose_time = subject
-        .doses
-        .iter()
-        .map(|d| d.time)
-        .fold(f64::INFINITY, f64::min);
-    let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
-    let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
-    ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
-    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
-        first_dose_time
-    } else {
-        f64::NAN
-    };
+    let first_dose_time = earliest_dose_time(subject);
+    let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
 
     // Zero-order windows, reused for the break points and the per-segment injection
     // (same as the dense path). The terminal break is the horizon; doses scheduled
@@ -4810,6 +4780,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],

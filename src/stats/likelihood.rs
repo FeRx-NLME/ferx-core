@@ -1,5 +1,4 @@
 use crate::pk;
-use crate::stats::residual_error::compute_r_matrix_with_correlations;
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -604,7 +603,8 @@ pub fn individual_nll_into_with_schedule(
 
 /// Dense correlated-residual (block_sigma) Gaussian data term for one subject.
 ///
-/// Builds the residual covariance `R` from [`compute_r_matrix_with_correlations`],
+/// Builds the residual covariance `R` from
+/// [`compute_r_matrix_with_correlations`](crate::stats::residual_error::compute_r_matrix_with_correlations),
 /// scales it by `ruv_scale`, adds the per-observation EKF process-noise `p_obs`
 /// to the diagonal (`&[]` on the SAEM / non-SDE paths), then returns the
 /// un-halved quadratic form plus log-determinant `rᵀ R⁻¹ r + log|R|`. Returns
@@ -627,29 +627,15 @@ fn dense_residual_data_term(
 ) -> Option<f64> {
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
-    let mut r = match ruv_mult {
-        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
-            &model.error_spec,
-            preds,
-            err_keys.as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            sigma_values,
-            &model.residual_correlations,
-            mult,
-        ),
-        None => compute_r_matrix_with_correlations(
-            &model.error_spec,
-            preds,
-            err_keys.as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            sigma_values,
-            &model.residual_correlations,
-        ),
-    };
+    let mut r = crate::stats::residual_error::r_matrix_maybe_scaled(
+        &model.error_spec,
+        preds,
+        err_keys.as_ref(),
+        subject,
+        sigma_values,
+        &model.residual_correlations,
+        ruv_mult,
+    );
     if ruv_scale != 1.0 {
         r *= ruv_scale;
     }
@@ -837,17 +823,7 @@ fn ekf_p_obs(
 
 /// Log-determinant of Omega via Cholesky: log|Omega| = 2 * sum(log(L_ii))
 fn omega_log_det(omega: &OmegaMatrix) -> f64 {
-    let n = omega.chol.nrows();
-    let mut ld = 0.0;
-    for i in 0..n {
-        let lii = omega.chol[(i, i)];
-        if lii > 0.0 {
-            ld += lii.ln();
-        } else {
-            return 1e20;
-        }
-    }
-    2.0 * ld
+    chol_log_det(&omega.chol)
 }
 
 /// FOCE per-subject negative log-likelihood.
@@ -1229,29 +1205,15 @@ pub fn foce_subject_nll_standard(
     // override must come last so it survives the r_pred_override re-evaluation
     // of R.
     let r_eval: &[f64] = r_pred_override.unwrap_or(&f0);
-    let mut r_matrix = match ruv_mult {
-        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
-            error_spec,
-            r_eval,
-            err_keys.as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            sigma_values,
-            residual_correlations,
-            mult,
-        ),
-        None => compute_r_matrix_with_correlations(
-            error_spec,
-            r_eval,
-            err_keys.as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            sigma_values,
-            residual_correlations,
-        ),
-    };
+    let mut r_matrix = crate::stats::residual_error::r_matrix_maybe_scaled(
+        error_spec,
+        r_eval,
+        err_keys.as_ref(),
+        subject,
+        sigma_values,
+        residual_correlations,
+        ruv_mult,
+    );
     for (j, v) in p_obs.iter().enumerate() {
         if j < r_matrix.nrows() {
             r_matrix[(j, j)] += *v;
@@ -1438,7 +1400,8 @@ pub fn foce_subject_nll_interaction(
 ///
 /// The diagonal interaction path forms `R` one observation at a time and so
 /// silently drops the `block_sigma` off-diagonals. This path instead carries the
-/// full residual covariance `R` (from [`compute_r_matrix_with_correlations`],
+/// full residual covariance `R` (from
+/// [`compute_r_matrix_with_correlations`](crate::stats::residual_error::compute_r_matrix_with_correlations),
 /// the same matrix the FOCE non-interaction and SAEM paths use), giving the
 /// Almquist 2015 first-order conditional Hessian
 ///
@@ -1483,29 +1446,15 @@ pub fn foce_subject_nll_interaction_dense(
 
     // Dense R at η̂ (+ SDE process noise on the diagonal), assembled exactly as
     // the data term and FOCE-standard path assemble it.
-    let mut r = match ruv_mult {
-        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
-            error_spec,
-            ipreds,
-            err_keys.as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            sigma_values,
-            correlations,
-            mult,
-        ),
-        None => compute_r_matrix_with_correlations(
-            error_spec,
-            ipreds,
-            err_keys.as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            sigma_values,
-            correlations,
-        ),
-    };
+    let mut r = crate::stats::residual_error::r_matrix_maybe_scaled(
+        error_spec,
+        ipreds,
+        err_keys.as_ref(),
+        subject,
+        sigma_values,
+        correlations,
+        ruv_mult,
+    );
     for (j, v) in p_obs.iter().enumerate() {
         if j < r.nrows() {
             r[(j, j)] += *v;
@@ -1543,6 +1492,7 @@ pub fn foce_subject_nll_interaction_dense(
         &subject.obs_times,
         &subject.obs_raw_times,
         &subject.occasions,
+        &subject.obs_l2,
         sigma_values,
         correlations,
         ruv_mult,
@@ -2226,29 +2176,15 @@ pub fn compute_cwres(
         .collect();
 
     // R_tilde
-    let mut r_matrix = match ruv_mult {
-        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
-            error_spec,
-            &f0,
-            err_keys.as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            sigma_values,
-            residual_correlations,
-            mult,
-        ),
-        None => compute_r_matrix_with_correlations(
-            error_spec,
-            &f0,
-            err_keys.as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            sigma_values,
-            residual_correlations,
-        ),
-    };
+    let mut r_matrix = crate::stats::residual_error::r_matrix_maybe_scaled(
+        error_spec,
+        &f0,
+        err_keys.as_ref(),
+        subject,
+        sigma_values,
+        residual_correlations,
+        ruv_mult,
+    );
     if let Some(overrides) = frem_r_override {
         apply_frem_r_matrix_overrides(&mut r_matrix, overrides);
     }
@@ -2518,6 +2454,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -3339,6 +3276,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 100],
             obs_records: vec![],
@@ -3390,6 +3328,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0, 0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 0],
             obs_records: vec![],

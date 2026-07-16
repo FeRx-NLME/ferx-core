@@ -1,8 +1,8 @@
-# Transit Absorption (Two-Compartment ODE)
+# Transit Absorption (Two-Compartment)
 
-This example demonstrates a two-compartment model with transit-compartment absorption and allometric scaling on body weight. The complete model file is [`examples/transit_2cpt.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_2cpt.ferx).
+This example demonstrates a two-compartment model with transit-compartment absorption, written with the built-in [`transit(n, mtt)`](../model-file/absorption.qmd) input-rate shortcut. The complete model file is [`examples/transit_2cpt_shortcut.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_2cpt_shortcut.ferx).
 
-> 💡 **Tip:** this page codes the transit chain as **explicit** ODE states (fixed integer `n`). For most models the built-in [`transit(n, mtt)`](../model-file/absorption.qmd) input-rate function is simpler — one line, with a single **continuous** (estimable) `n` — see `examples/transit_savic.ferx`.
+> 💡 **Tip:** this page uses the built-in `transit()` input rate — one line, with a single **continuous** (estimable) `n`. To code the same delay as a hand-written chain of **explicit** transit ODE states (fixed integer `n`), see [`examples/transit_2cpt.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_2cpt.ferx). For a one- or two-compartment disposition with **no ODE solve at all**, the analytic closed forms [`pk one_cpt_transit(...)`](../model-file/absorption.qmd#analytic-closed-form-pk-one_cpt_transitcl-v-n-mtt) / [`pk two_cpt_transit(...)`](../model-file/absorption.qmd#two-compartment-analytic-transit-pk-two_cpt_transitcl-v1-q-v2-n-mtt) are faster still.
 
 ## When to use
 
@@ -11,56 +11,43 @@ Use a transit-compartment chain when:
 - A lag-time model fits but the Durbin-Watson statistic is still below 1.5
 - The drug has delayed gastric emptying, dissolution-limited absorption, or enterohepatic recirculation
 
-The transit-compartment model (Savic et al., 2007) avoids an arbitrary lag-time parameter by distributing absorption over `n` sequential compartments, each with rate constant `KTR = (n+1)/MTT`, where `MTT` is the mean transit time.
-
-## Dataset
-
-```csv
-ID,TIME,DV,EVID,AMT,CMT,MDV,WT
-1,0,.,1,250,1,1,95.7
-1,0.5,0.0884,0,.,4,0,95.7
-...
-```
-
-`AMT` is in mg; `DV` (central compartment, CMT=4) is in mg/L. `WT` is body weight in kg, used for allometric scaling.
+The transit-compartment model (Savic et al., 2007) avoids an arbitrary lag-time parameter by distributing absorption over `n` sequential compartments with rate constant `KTR = (n+1)/MTT`, where `MTT` is the mean transit time. The `transit(n, mtt)` shortcut delivers exactly this input as a dose-driven appearance rate `R_in(tad)` — so you write the *shape* (the delay) in one line instead of hand-coding the chain, and `n` becomes a single **continuous** parameter you can estimate.
 
 ## Model file
 
-This is the contents of [`examples/transit_2cpt.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_2cpt.ferx):
+This is the contents of [`examples/transit_2cpt_shortcut.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_2cpt_shortcut.ferx). It is **self-contained** — the `[simulation]` block lets you run it with no data file:
 
 ```
 [parameters]
   theta TVCL(5.0,    0.1,  100.0)
   theta TVV1(50.0,   5.0,  500.0)
-  theta TVQ(10.0,    0.1,  200.0)
+  theta TVQ(10.0,    0.5,  200.0)
   theta TVV2(100.0,  5.0, 1000.0)
-  theta TVMTT(1.0,   0.1,   10.0)
+  theta TVMTT(1.0,  0.05,   24.0)
+  theta TVN(3.0,     0.0,   30.0)
 
   omega ETA_CL ~ 0.09
   omega ETA_V1 ~ 0.09
-  omega ETA_KA ~ 0.09
 
-  sigma PROP_ERR ~ 0.30 (sd)
+  sigma PROP_ERR ~ 0.15 (sd)
 
 [individual_parameters]
-  CL   = TVCL * (WT / 70)^0.75 * exp(ETA_CL)
-  V1   = TVV1 * (WT / 70)^1.00 * exp(ETA_V1)
-  Q    = TVQ
-  V2   = TVV2 * (WT / 70)^1.00
-  KTR  = 4.0 / TVMTT
-  KA   = KTR * exp(ETA_KA)
+  CL  = TVCL * exp(ETA_CL)
+  V1  = TVV1 * exp(ETA_V1)
+  Q   = TVQ
+  V2  = TVV2
+  MTT = TVMTT
+  NTR = TVN
 
 [structural_model]
-  ode(obs_cmt=central, states=[transit1, transit2, transit3, central, peripheral])
+  ode(states=[central, peripheral])
 
 [odes]
-  d/dt(transit1)   = -KTR * transit1
-  d/dt(transit2)   =  KTR * transit1 - KTR * transit2
-  d/dt(transit3)   =  KTR * transit2 - KTR * transit3
-  d/dt(central)    =  KA  * transit3 / V1
-                      - (CL / V1 + Q / V1) * central
-                      + Q / V2 * peripheral
-  d/dt(peripheral) =  Q * central / V1 - Q / V2 * peripheral
+  d/dt(central)    = transit(n=NTR, mtt=MTT) - (CL/V1 + Q/V1)*central + (Q/V2)*peripheral
+  d/dt(peripheral) = (Q/V1)*central - (Q/V2)*peripheral
+
+[scaling]
+  y = central / V1
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -69,35 +56,79 @@ This is the contents of [`examples/transit_2cpt.ferx`](https://github.com/FeRx-N
   method     = focei
   maxiter    = 500
   covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7
 ```
 
 Key design choices:
-- **3 transit compartments** (n=3): `KTR = (3+1)/MTT = 4/MTT`. Increasing `n` steepens the absorption peak but adds no new parameters — only `MTT` is estimated.
-- **`obs_cmt=central`**: the ODE state for `central` is concentration (mg/L); incoming flux from transit3 is divided by `V1` in the ODE to keep units consistent.
-- **Allometric scaling**: `CL ∝ WT^0.75` and `V ∝ WT^1.0` with reference weight 70 kg.
+- **`transit(n=NTR, mtt=MTT)`** replaces the hand-coded transit chain. The single input-rate term delivers the full dose (`∫₀^∞ R_in dt = F·Dose`) into `central` over time with the Savic transit-density shape. The AMT/CMT dose record on CMT=1 is **consumed by the forcing** — the dose feeds the function and is **not** also applied as an instantaneous bolus to the state. See [Transit-compartment absorption](../model-file/absorption.qmd#transit-compartment-absorption-transitn-mtt).
+- **Continuous `n`**: because `NTR` is an ordinary individual parameter, the number of compartments — the absorption *shape* — is estimated, not fixed at an integer. This is the shortcut's main advantage over the explicit chain, which fixes `n` structurally.
+- **Amount states + `[scaling]`**: the transit input carries dose **mass**, so `central`/`peripheral` are written as amounts (mg) and concentration is formed in `[scaling]` (`y = central / V1`, the NONMEM `A(1)/V` convention). `transit()` may not be scaled or divided, so it cannot be written straight into a concentration state — hence the amount form.
 
 ## Running the fit
 
+Run it on the built-in simulation with no data file:
+
 ```bash
-ferx examples/transit_2cpt.ferx --data data/transit_2cpt.csv
+ferx examples/transit_2cpt_shortcut.ferx --simulate
+```
+
+or point it at your own NONMEM-format CSV (AMT dose record on CMT=1 — delivered over time by the forcing — with concentration observed on CMT=1):
+
+```bash
+ferx examples/transit_2cpt_shortcut.ferx --data your_data.csv
 ```
 
 Or via the Rust API:
 
 ```rust
-let result = fit_from_files("examples/transit_2cpt.ferx", "data/transit_2cpt.csv")?;
+let result = fit_from_files("examples/transit_2cpt_shortcut.ferx", "your_data.csv")?;
 println!("MTT = {:.2} h", result.theta["TVMTT"].estimate);
+println!("N   = {:.2}",   result.theta["TVN"].estimate);
 ```
+
+## Validation — agrees with the analytic closed form
+
+The `transit()` ODE forcing and the analytic `pk two_cpt_transit(...)` closed form are two implementations of the *same* Savic 2-cpt transit model, so on identical data they must agree. Fitting both to the same simulated dataset (`--simulate`, `TVCL=5`, `TVV1=50`, `TVQ=10`, `TVV2=100`, `TVMTT=1`, `TVN=3`; IIV on CL & V1, ω²=0.09; proportional SD 0.15) they land on the same optimum:
+
+| Quantity | Truth | `transit()` ODE (this model) | Analytic `two_cpt_transit` |
+|----------|-------|------------------------------|----------------------------|
+| OFV      | —     | −585.01 | −585.03 |
+| TVMTT    | 1.0   | 0.934   | 0.933 |
+| TVN      | 3.0   | 3.170   | 3.173 |
+| TVQ      | 10.0  | 10.36   | 10.45 |
+
+The two objectives agree to **ΔOFV ≈ 0.02** and every fixed effect to the third digit — the ODE forcing reproduces the closed form to solver tolerance. The analytic form is itself anchored against a licensed NONMEM `ADVAN13` `$DES` run — see the [Verification against NONMEM](../model-file/absorption.qmd#verification-against-nonmem) table — so this equivalence transitively ties the ODE example to NONMEM.
 
 ## Interpreting output
 
-Check that the fit reports `converged: true` and that ETA shrinkage for all three random effects is below ~0.7. High shrinkage on `ETA_KA` suggests the absorption phase is not well-characterised in the data — consider fixing `KTR = (n+1)/MTT` to the population value (`KA = KTR`, no IIV on `ETA_KA`).
+Check that ETA shrinkage for both random effects is below ~0.7 (here ≈8%). The `transit()` input is stiff, so for accurate variance components tighten `ode_reltol`/`ode_abstol` toward `1e-9` in `[fit_options]`; the default tolerances (`ode_reltol=1e-4`, `ode_abstol=1e-6`) recover the fixed effects well but can inject integration noise into the FOCEI Hessian that biases the ω² estimates.
 
-The Durbin-Watson statistic should be closer to 2 than for a simple one-compartment oral model on the same data.
+At this small size (12 subjects) the peripheral disposition is sparsely informed, so `TVCL` and `TVV2` are strongly correlated (|r| ≈ 0.97) and the derivative-free outer optimiser reports "did not converge" on the resulting shallow ridge — the *same* behaviour the analytic `two_cpt_transit` example shows on this dataset, since it is the same likelihood surface, not an artefact of the forcing. With richer data (or by fixing `Q`/`V2`) the ridge tightens and the fit converges cleanly.
+
+## Variant — allometric scaling on body weight
+
+To add allometric scaling with a `WT` covariate column, expand the disposition parameters in `[individual_parameters]` (reference weight 70 kg):
+
+```text
+[individual_parameters]
+  CL  = TVCL * (WT / 70)^0.75 * exp(ETA_CL)
+  V1  = TVV1 * (WT / 70)^1.00 * exp(ETA_V1)
+  Q   = TVQ
+  V2  = TVV2 * (WT / 70)^1.00
+  MTT = TVMTT
+  NTR = TVN
+```
+
+The reference weight (70 kg) is conventional but can be replaced by the dataset median without changing the exponent. This needs a real dataset carrying `WT` (the `[simulation]` block does not synthesize covariates), so drop `[simulation]` and fit with `--data`.
 
 ## Tips
 
-- **Number of transit compartments**: start with n=3 (fixed). Only estimate `n` as a continuous parameter if the OFV improvement justifies it and the data are rich.
-- **IIV on KA vs. MTT**: IIV on `KA` in this model scales the entry rate from the last transit compartment; it captures variability in the absorption rate, not in the delay. To model variability in `MTT` (the delay itself), add `omega ETA_MTT` and set `MTT = TVMTT * exp(ETA_MTT)` in `[individual_parameters]`.
-- **Allometric scaling**: the reference weight (70 kg) is conventional but can be replaced by the dataset median without changing the exponent. Fixing `Q` and `V2` to population values (no IIV) is common when peripheral data are sparse.
+- **Number of transit compartments**: `n` is continuous here, so you can estimate it directly. Only trust a fitted `n` when the early-absorption data are rich; otherwise fix `TVN` and estimate only `MTT`.
+- **IIV on absorption**: to model between-subject variability in the absorption *delay*, add `omega ETA_MTT` and set `MTT = TVMTT * exp(ETA_MTT)` (the log-normal form keeps `MTT > 0`, which the input-rate domain requires). Drop it again if it shrinks toward zero — sparse early sampling often cannot inform it.
 - **FOCEI vs. FOCE**: use FOCEI (`method = focei`) for proportional error models — the interaction term matters most when individual predictions span a large dynamic range (which transit-compartment models tend to produce).

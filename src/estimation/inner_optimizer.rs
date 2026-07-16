@@ -588,6 +588,48 @@ fn inner_stall_enabled(model: &CompiledModel, subject: &Subject) -> bool {
 ///
 /// When `mu_k` is None every shift is zero and the behaviour is identical to
 /// the original (eta-space) implementation.
+/// The per-subject [`pk::event_driven::EventSchedule`] that may be built **once** and
+/// reused across many evaluations at differing `eta`, or `None` when no such reuse is
+/// sound. The schedule pre-computes the merged event timeline and the per-interval
+/// infusion bounds; those are subject-static — and so cacheable — only when nothing
+/// eta-dependent can move a baked-in break time:
+///
+/// - **lagtime** can be eta-dependent and the schedule bakes per-dose times in, so a
+///   cached schedule goes stale as eta varies. The non-cached path
+///   (`event_driven_predictions`) rebuilds it per call from the current per-dose
+///   `PkParams` (which carry lagtime).
+/// - **bioavailability `F`** scales a *rate*-defined infusion's duration (#419), which
+///   likewise moves the baked-in window as eta varies. Duration-defined infusions keep
+///   the cache (`F` scales their rate, not the window).
+///
+/// Only subjects that actually take the event-driven analytical path (TV covariates or
+/// EVID-3/4 resets, closed-form PK) can use a schedule at all; the no-TV fast path never
+/// calls `event_driven_predictions`, so `None` costs it nothing.
+///
+/// Shared by the inner EBE loop ([`find_ebe`]) and the AGQ node sweep
+/// ([`crate::estimation::agq`]), which both hold `eta` variable over one subject — so the
+/// staleness rules above cannot drift between them.
+pub(crate) fn cacheable_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> Option<pk::event_driven::EventSchedule> {
+    if (subject.has_tv_covariates() || subject.has_resets())
+        && model.ode_spec.is_none()
+        && pk::event_driven::supports_event_driven(model.pk_model)
+        && !model.has_lagtime()
+        && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
+    {
+        Some(pk::event_driven::EventSchedule::for_subject(
+            subject,
+            model.pk_model,
+            &subject.doses,
+            &[],
+        ))
+    } else {
+        None
+    }
+}
+
 pub fn find_ebe(
     model: &CompiledModel,
     subject: &Subject,
@@ -596,6 +638,7 @@ pub fn find_ebe(
     tol: f64,
     eta_init: Option<&[f64]>,
     mu_k: Option<&[f64]>,
+    restarts: usize,
 ) -> EbeResult {
     let n_eta = model.n_eta;
 
@@ -691,35 +734,7 @@ pub fn find_ebe(
     // analytical path — for the no-TV fast path the schedule is None and
     // event_driven_predictions is never called.
     let pk_scratch_cell = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
-    // Skip the schedule cache when the model declares lagtime: lagtime can
-    // be eta-dependent and the schedule bakes per-dose times in, so a
-    // cached schedule would go stale as the inner BFGS varies eta. The
-    // non-cached path (`event_driven_predictions`) rebuilds the schedule
-    // per call using the current per-dose PkParams (which carry lagtime).
-    // Reset-bearing subjects (EVID=3/4) also take the event-driven analytical
-    // path, so they benefit from a cached schedule too — the schedule now
-    // includes reset events.
-    // Also skip the cache when bioavailability `F` could reshape a rate-defined
-    // infusion window: `F` scales such an infusion's *duration* (#419), which
-    // moves the baked-in break times as the inner BFGS varies eta (the same
-    // staleness reason as `has_lagtime`). The non-cached path rebuilds per call
-    // with the current `F`. Duration-defined infusions keep the cache (`F` scales
-    // their rate, not the window).
-    let schedule = if (subject.has_tv_covariates() || subject.has_resets())
-        && model.ode_spec.is_none()
-        && pk::event_driven::supports_event_driven(model.pk_model)
-        && !model.has_lagtime()
-        && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
-    {
-        Some(pk::event_driven::EventSchedule::for_subject(
-            subject,
-            model.pk_model,
-            &subject.doses,
-            &[],
-        ))
-    } else {
-        None
-    };
+    let schedule = cacheable_schedule(model, subject);
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here — not inside `agrad`, which BFGS calls on
     // every inner step (and every line-search trial) — instead of re-walking
@@ -833,8 +848,61 @@ pub fn find_ebe(
         (false, false)
     };
 
-    let ebe_converged = bfgs_converged || nm_converged;
-    let nll = obj(&eta);
+    let mut ebe_converged = bfgs_converged || nm_converged;
+    let mut nll = obj(&eta);
+
+    // ── Guarded multi-start inner EBE (`[fit_options] inner_restarts`) ──────
+    // A multimodal individual objective (e.g. saturable binding: a high-V/low-
+    // conc basin vs a low-V/high-conc basin) traps a single warm-started BFGS in
+    // whichever basin the start point sits in. When `inner_restarts > 0`, subjects
+    // on the event-driven path (system resets / time-varying covariates — where
+    // this shows up) re-solve from `inner_restarts` Ω-scaled alternate seeds per
+    // random effect (`±2·sd`, `±3·sd`, …) and keep the lowest-objective mode.
+    // Gated on a COLD start (`eta_init.is_none()`): the outer loop warm-starts the
+    // inner EBE from the previous iteration's mode, so once the basin is picked at
+    // iteration 0 the warm start carries it forward — no need to re-scan every
+    // outer eval (that is ~12× slower). One multi-start per subject per fit.
+    // An alternate seed replaces the warm-start mode only when it reaches a
+    // meaningfully lower objective (`cand_nll + 1e-9 < nll`); a seed that merely
+    // reconverges to the same basin is rejected by that guard. So a scanned
+    // subject's EBE is unchanged from `inner_restarts = 0` unless a seed finds a
+    // strictly better mode — and subjects without resets / TV-covariates are
+    // never scanned at all, staying bit-identical.
+    if restarts > 0 && eta_init.is_none() && (subject.has_resets() || subject.has_tv_covariates()) {
+        let base = eta.clone();
+        for i in 0..n_eta {
+            let sd = params.omega.matrix[(i, i)].max(0.0).sqrt();
+            if sd == 0.0 {
+                continue;
+            }
+            for m in 1..=restarts {
+                let step = (m as f64 + 1.0) * sd;
+                for &k in &[-step, step] {
+                    let mut cand = base.clone();
+                    cand[i] = k;
+                    let ok = inner_minimize_with_grad(
+                        &obj,
+                        &agrad,
+                        &mut cand,
+                        n_eta,
+                        max_iter,
+                        tol,
+                        precond.as_deref(),
+                        stop_precond,
+                        enable_stall,
+                    );
+                    if cand.iter().all(|v| v.is_finite()) {
+                        let cand_nll = obj(&cand);
+                        if cand_nll + 1e-9 < nll {
+                            nll = cand_nll;
+                            eta = cand;
+                            ebe_converged = ebe_converged || ok;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // The optimiser variable already is eta_true (mean-zero, NONMEM-compatible).
     let eta_true: Vec<f64> = eta;
@@ -1468,6 +1536,50 @@ pub(crate) fn subject_has_survival_records(subject: &Subject) -> bool {
     }
 }
 
+/// Whether **every** non-Gaussian record on this subject is a CTMM state observation that
+/// the analytic path can serve exactly (#759) — i.e. the subject's whole non-Gaussian data
+/// term is `−Σ log P(Δt)[s,s']` on a time-homogeneous generator with a dual-evaluable
+/// program ([`ctmm_subject_eta_grad`](crate::markov::endpoint::ctmm_subject_eta_grad)).
+///
+/// Strict on purpose. The inner gradient is a *sum* of term gradients, so admitting a
+/// subject that also carries a TTE / binary / count record would silently drop that term's
+/// contribution — a wrong gradient, not a slow one. TTE and binary have no analytic η-channel
+/// at all (their `LinearPredictorFn` / `HazardParamFn` are `f64` closures outside `sens/`),
+/// so such a subject keeps FD for the whole objective.
+///
+/// Always `false` without the `markov` feature (there are no CTMM records to serve).
+fn ctmm_records_fully_analytic(model: &CompiledModel, subject: &Subject) -> bool {
+    #[cfg(feature = "markov")]
+    {
+        use crate::types::{EndpointLikelihood, ObsRecord};
+        if !model.has_ctmm() {
+            return false;
+        }
+        // The CMTs whose endpoint is a CTMM we can differentiate exactly. An endpoint with
+        // no `generator_program` — a time-inhomogeneous (drug-driven) generator, whose
+        // likelihood is an occupancy ODE rather than an `expm` — is not one of them.
+        let analytic_cmts: Vec<usize> = model
+            .endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| match ep {
+                EndpointLikelihood::Ctmm {
+                    generator_program, ..
+                } if generator_program.is_some() => Some(*cmt),
+                _ => None,
+            })
+            .collect();
+        subject.obs_records.iter().all(|r| match r {
+            ObsRecord::DiscreteState { cmt, .. } => analytic_cmts.contains(cmt),
+            _ => false,
+        })
+    }
+    #[cfg(not(feature = "markov"))]
+    {
+        let _ = (model, subject);
+        false
+    }
+}
+
 /// Model-level half of [`analytic_inner_grad_supported`]: every gate that does
 /// not depend on the subject. `build_info::gradient_method_inner` reports the
 /// inner route off **this same** predicate, so the reported `gradient_method_inner`
@@ -1484,7 +1596,37 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     if analytic_inner_common_bail(model) {
         return false;
     }
+    // CTMM (#759): a subject's CTMM term is analytic only when its generator carries a
+    // dual-evaluable program. Without one — a drug-driven `Q(t)`, a `(θ, η)` width past the
+    // dual dispatch cap, an intensity we could not resolve — *every* subject declines at the
+    // survival-record guard in `analytic_inner_grad_supported`, so reporting "analytic" here
+    // would be a pure misreport.
+    //
+    // `analytical_supported` below does **not** catch this, which is the trap: an
+    // endpoint-only model (a `[markov_model]` with no `[structural_model]`) is *still* given
+    // a default `pk_model` and a vacuous `tv_fn` (`model_parser.rs`, `tv_fn = Some(..)` for
+    // any non-ODE model), and its `pk_indices` are empty so the per-slot check passes
+    // trivially — so the closed-form scope check waves it straight through despite there
+    // being no closed form at all.
+    #[cfg(feature = "markov")]
+    if model.has_ctmm() && !all_ctmm_endpoints_analytic(model) {
+        return false;
+    }
     crate::sens::provider::analytical_supported(model)
+}
+
+/// Every `Ctmm` endpoint on the model carries a dual-evaluable generator program, i.e. its
+/// transition term can be differentiated exactly rather than finite-differenced. The
+/// model-level counterpart of [`ctmm_records_fully_analytic`]'s per-subject check.
+#[cfg(feature = "markov")]
+fn all_ctmm_endpoints_analytic(model: &CompiledModel) -> bool {
+    use crate::types::EndpointLikelihood;
+    model.endpoints.iter().all(|(_, ep)| match ep {
+        EndpointLikelihood::Ctmm {
+            generator_program, ..
+        } => generator_program.is_some(),
+        _ => true,
+    })
 }
 
 /// Whether the exact analytic η-gradient of the individual NLL
@@ -1498,8 +1640,34 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // provider models — the analytical path declines below, and the light ODE walk
     // (`run_subject_eta`) iterates only `subject.obs_times`, so it would silently
     // omit the survival term. Guard both routes up front.
-    if subject_has_survival_records(subject) {
+    //
+    // CTMM is the exception since #759: its transition likelihood *does* have an exact
+    // η-gradient now (`Q` rebuilt over `Dual1` for `∂Q/∂η`, chained through the Van Loan
+    // Fréchet derivative of `expm`), and `analytic_eta_nll_gradient_with_schedule` adds it
+    // to the Gaussian block. `ctmm_records_fully_analytic` is deliberately strict — it
+    // demands that *every* record on the subject be a CTMM state observation the program
+    // can serve, so a subject that also carries a TTE / binary / count record (whose terms
+    // remain FD-only) still declines the whole gradient rather than silently omitting them.
+    if subject_has_survival_records(subject) && !ctmm_records_fully_analytic(model, subject) {
         return false;
+    }
+    // No Gaussian observations ⇒ no Gaussian data term, hence nothing for the PK provider
+    // to serve: an **endpoint-only** fit (a `[markov_model]` with no `[structural_model]`,
+    // which the parser admits) has no PK model at all, and `analytical_supported` below
+    // would reject it on that basis alone. Its inner gradient is the prior plus the
+    // non-Gaussian term, both of which we have exactly, so only the global escape hatches
+    // apply. (`analytic_eta_nll_gradient_with_schedule` mirrors this by skipping the
+    // provider for such a subject.)
+    //
+    // **Ordering is load-bearing:** this branch is only sound *after* the guard above. A
+    // CTMM subject always carries `DiscreteState` records, so an endpoint-only CTMM whose
+    // generator has no dual-evaluable program (past the axis cap, or an intensity we could
+    // not resolve) is already rejected there — it can never fall through to here and claim
+    // an analytic route the gradient cannot supply. Reaching this line therefore means the
+    // subject's non-Gaussian term is either absent or exactly served, and the only thing
+    // left is the prior. (Pinned by `program_less_endpoint_only_ctmm_stays_fd`.)
+    if subject.obs_times.is_empty() {
+        return !analytic_inner_common_bail(model);
     }
     // ODE models use the light `Dual1` inner provider (#410) with their own
     // per-subject scope ([`ode_inner_grad_supported`]). The global escape hatches
@@ -1726,6 +1894,39 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
     mult: Option<&[Vec<f64>]>,
 ) -> Option<Vec<f64>> {
+    // The inner NLL is `½(η'Ω⁻¹η + log|Ω| + data_gauss + 2·data_nonGaussian)`, so its
+    // η-gradient is a plain **sum** of term gradients. Assemble the non-Gaussian block
+    // first, because it is the one that decides whether this subject can be served at all
+    // (the Gaussian provider's own `None` is handled below, as before).
+    //
+    // CTMM (#759): exact, via `∂Q/∂(θ,η)` over `Dual1` chained through the Van Loan Fréchet
+    // derivative of `expm`. The objective's `2×` on the data term and the outer `½` cancel,
+    // so this enters at 1× — the same scale `ctmm_subject_eta_grad` returns.
+    // TTE / binary / count records have no analytic η-channel and are refused upstream by
+    // `analytic_inner_grad_supported` → `ctmm_records_fully_analytic`, so a subject reaching
+    // here carries no other non-Gaussian term to omit.
+    #[cfg(feature = "markov")]
+    let ctmm_grad: Option<Vec<f64>> = if model.has_ctmm() {
+        Some(crate::markov::endpoint::ctmm_subject_eta_grad(model, subject, theta, eta)?.1)
+    } else {
+        None
+    };
+
+    // No Gaussian observations ⇒ no Gaussian data term and (for an endpoint-only fit) no PK
+    // model for the provider to evaluate. The gradient is prior + non-Gaussian; return it
+    // directly rather than asking a provider that has nothing to compute.
+    if subject.obs_times.is_empty() {
+        let eta_v = nalgebra::DVector::from_column_slice(eta);
+        let mut grad: Vec<f64> = (&omega.inv * &eta_v).as_slice().to_vec();
+        #[cfg(feature = "markov")]
+        if let Some(g) = &ctmm_grad {
+            for (acc, gi) in grad.iter_mut().zip(g.iter()) {
+                *acc += gi;
+            }
+        }
+        return Some(grad);
+    }
+
     // Light first-order provider (value + ∂f/∂η only); the inner gradient never
     // needs the second-order / θ blocks the full `subject_sensitivities` carries.
     let sens = crate::sens::provider::subject_eta_grad_with_schedule(
@@ -1735,11 +1936,24 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         eta,
         cached_schedule,
     )?;
+    // Fold the non-Gaussian block into whichever Gaussian branch runs below.
+    #[cfg(feature = "markov")]
+    let add_nongaussian = |mut g: Vec<f64>| -> Vec<f64> {
+        if let Some(c) = &ctmm_grad {
+            for (acc, gi) in g.iter_mut().zip(c.iter()) {
+                *acc += gi;
+            }
+        }
+        g
+    };
+    #[cfg(not(feature = "markov"))]
+    let add_nongaussian = |g: Vec<f64>| -> Vec<f64> { g };
     // Correlated residual (`block_sigma`, #627): the per-obs `coef·∂f/∂η` loop below
     // assumes a diagonal R. Route the dense-R generalisation here — it serves both the
     // analytical and the ODE (`Dual1`) inner path, since `sens` carries `∂f/∂η` for both.
     if !model.residual_correlations.is_empty() {
-        return dense_residual_inner_gradient(model, subject, theta, eta, omega, sigma, &sens);
+        return dense_residual_inner_gradient(model, subject, theta, eta, omega, sigma, &sens)
+            .map(add_nongaussian);
     }
     let n_eta = model.n_eta;
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
@@ -1761,7 +1975,24 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     let mut ruv_grad = 0.0_f64;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
+    // FREM covariate pseudo-observations: the objective scores these rows against the
+    // dedicated `EPSCOV` variance, not `error_spec.variance_at(f)`. The provider has
+    // already corrected their `f` and `∂f/∂η` (`apply_frem_pseudo_obs_grad`); this is the
+    // variance half. `R` is η-independent on such a row, so `∂R/∂f = 0` and the whole
+    // residual chain collapses to `∂L/∂η_k = (−ε/R)·δ_{k,ei}`. `None` on a non-FREM model.
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma,
+    );
     for (j, obs) in sens.iter().enumerate() {
+        if let Some(v) = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
+            let coef = -(subject.observations[j] - obs.f) / v;
+            for k in 0..n_eta {
+                grad[k] += coef * obs.df_deta[k];
+            }
+            continue;
+        }
         let cens = if m3 {
             subject.cens.get(j).copied().unwrap_or(0)
         } else {
@@ -1792,7 +2023,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     for (k, g) in grad.iter_mut().enumerate() {
         *g += prior[k];
     }
-    Some(grad)
+    Some(add_nongaussian(grad))
 }
 
 /// Dense-`R` (`block_sigma`, #627) analytic inner η-gradient — the correlated-residual
@@ -1844,6 +2075,7 @@ fn dense_residual_inner_gradient(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             sigma,
             corr,
             mult,
@@ -1855,6 +2087,7 @@ fn dense_residual_inner_gradient(
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
+            &subject.obs_l2,
             sigma,
             corr,
         ),
@@ -1877,6 +2110,7 @@ fn dense_residual_inner_gradient(
         &subject.obs_times,
         &subject.obs_raw_times,
         &subject.occasions,
+        &subject.obs_l2,
         sigma,
         corr,
         ruv_mult.as_deref(),
@@ -2737,19 +2971,7 @@ fn compute_jacobian_fd(
     // ∂Y/∂η_j = 1 if j == m, 0 otherwise. The FD values for these rows
     // are noisy (esp. cross-terms that should be exactly 0) and corrupt
     // the posterior Hessian used by the IS proposal.
-    if let Some(ref fc) = model.frem_config {
-        if !subject.fremtype.is_empty() {
-            for (i, &ft) in subject.fremtype.iter().enumerate() {
-                if ft > 0 {
-                    if let Some(&(_theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
-                        for j in 0..n_eta {
-                            h[(i, j)] = if j == eta_idx { 1.0 } else { 0.0 };
-                        }
-                    }
-                }
-            }
-        }
-    }
+    overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
 
     h
 }
@@ -2768,7 +2990,7 @@ pub fn run_inner_loop(
     InnerLoopStats,
     Vec<Vec<DVector<f64>>>,
 ) {
-    run_inner_loop_warm(model, population, params, max_iter, tol, None, None, 0)
+    run_inner_loop_warm(model, population, params, max_iter, tol, None, None, 0, 0)
 }
 
 /// Run inner loop with optional warm-start EBEs and optional mu-referencing shift.
@@ -2782,6 +3004,7 @@ pub fn run_inner_loop(
 /// Returns `(eta_hats, h_matrices, stats, kappas_per_subject)`.
 /// `kappas_per_subject[i]` contains per-occasion kappa EBEs for subject i; it is
 /// empty for non-IOV subjects or when `model.n_kappa == 0`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_inner_loop_warm(
     model: &CompiledModel,
     population: &Population,
@@ -2791,6 +3014,7 @@ pub fn run_inner_loop_warm(
     prev_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
     min_obs: usize,
+    restarts: usize,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -2805,7 +3029,7 @@ pub fn run_inner_loop_warm(
         .enumerate()
         .map(|(i, subject)| {
             let init = prev_etas.map(|pe| pe[i].as_slice());
-            find_ebe(model, subject, params, max_iter, tol, init, mu_k)
+            find_ebe(model, subject, params, max_iter, tol, init, mu_k, restarts)
         })
         .collect();
 
@@ -2831,6 +3055,144 @@ pub fn run_inner_loop_warm(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// An endpoint-only mixed-effects CTMM (#759): no `[structural_model]`, so no Gaussian
+    /// data term and no PK provider — the inner objective is `½(η'Ω⁻¹η + log|Ω|) + D_ctmm(η)`.
+    #[cfg(feature = "markov")]
+    mod ctmm_inner {
+        use crate::types::{ObsRecord, Subject};
+
+        const MIXED_CTMM: &str = r"
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  omega ETA_Q ~ 0.1
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + ETA_Q)
+  transition asleep -> awake  = exp(LQ10)
+";
+
+        fn subject() -> Subject {
+            Subject {
+                id: "1".into(),
+                obs_records: [(0.0, 0), (1.0, 0), (2.3, 1), (3.1, 1), (5.0, 0)]
+                    .iter()
+                    .map(|&(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        state,
+                        cmt: 5,
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        }
+
+        /// The route must actually change. Before #759 every subject with `obs_records`
+        /// declined the analytic inner gradient outright, so this predicate was `false` and
+        /// the EBE search finite-differenced the whole objective.
+        #[test]
+        fn endpoint_only_ctmm_reports_and_takes_the_analytic_inner_route() {
+            let model = crate::parser::model_parser::parse_model_string(MIXED_CTMM).unwrap();
+            // Model-level: what `build_info::gradient_method_inner` reports.
+            assert!(
+                super::super::analytic_inner_grad_supported_model(&model),
+                "an endpoint-only CTMM must report an analytic inner gradient"
+            );
+            // Subject-level: what `find_ebe` actually runs.
+            assert!(
+                super::super::analytic_inner_grad_supported(&model, &subject()),
+                "a CTMM subject must now take the analytic inner route"
+            );
+        }
+
+        /// An endpoint-only CTMM whose generator has **no** dual-evaluable program — here by
+        /// pushing the `(θ, η)` width past `MAX_CTMM_AXES` — must stay on FD, on *both* the
+        /// model-level predicate `build_info` reports and the per-subject gate `find_ebe`
+        /// runs. The two must agree, or the fit reports a gradient method it does not use.
+        ///
+        /// This pins the ordering inside `analytic_inner_grad_supported`: the survival-record
+        /// guard runs first and rejects a program-less CTMM subject, so it never reaches the
+        /// `obs_times.is_empty()` branch (which would otherwise wave it through on the
+        /// strength of having no Gaussian block). Swap those two and this test fails.
+        #[test]
+        fn program_less_endpoint_only_ctmm_stays_fd() {
+            let n_th = 25; // + 1 η = 26 axes > MAX_CTMM_AXES (24)
+            let mut src = String::from("[parameters]\n");
+            for i in 1..=n_th {
+                src += &format!("  theta T{i}(0.1, -6.0, 3.0)\n");
+            }
+            src += "  omega ETA_Q ~ 0.1\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
+                    states = [awake=0, asleep=1]\n  transition awake  -> asleep = exp(ETA_Q + ";
+            src += &(1..=n_th)
+                .map(|i| format!("T{i}"))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            src += ")\n  transition asleep -> awake  = exp(T1)\n";
+
+            let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+            assert_eq!(
+                model.n_theta + model.n_eta,
+                26,
+                "fixture must exceed the cap"
+            );
+            assert!(
+                !super::super::analytic_inner_grad_supported_model(&model),
+                "a CTMM past the dual dispatch cap must report FD"
+            );
+            assert!(
+                !super::super::analytic_inner_grad_supported(&model, &subject()),
+                "…and must actually take FD, not fall through the no-Gaussian-block branch"
+            );
+        }
+
+        /// The whole inner gradient — prior + CTMM data term — against a central difference
+        /// of `individual_nll`, the exact objective the EBE search minimizes. This is the
+        /// contract that matters: the two must agree, or BFGS converges on one function
+        /// while descending another.
+        #[test]
+        fn analytic_inner_gradient_matches_fd_of_individual_nll() {
+            let model = crate::parser::model_parser::parse_model_string(MIXED_CTMM).unwrap();
+            let subject = subject();
+            let params = &model.default_params;
+            let theta = &params.theta;
+
+            for &eta0 in &[-0.4_f64, 0.0, 0.55] {
+                let g = super::super::analytic_eta_nll_gradient_with_schedule(
+                    &model,
+                    &subject,
+                    theta,
+                    &[eta0],
+                    &params.omega,
+                    &params.sigma.values,
+                    None,
+                    None,
+                )
+                .expect("endpoint-only CTMM is in analytic scope");
+
+                let nll = |e: f64| {
+                    crate::stats::likelihood::individual_nll(
+                        &model,
+                        &subject,
+                        theta,
+                        &[e],
+                        &params.omega,
+                        &params.sigma.values,
+                    )
+                };
+                let h = 1e-6;
+                let fd = (nll(eta0 + h) - nll(eta0 - h)) / (2.0 * h);
+                assert!(
+                    (g[0] - fd).abs() < 1e-6,
+                    "η = {eta0}: analytic {}, FD {fd}",
+                    g[0]
+                );
+            }
+        }
+    }
 
     /// The M3 censored coefficient `∂/∂f[−logΦ((y−f)/√v)]` must equal a central
     /// finite difference of that data term — across additive (`dv_df = 0`) and
@@ -2929,6 +3291,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -2942,6 +3305,7 @@ mod tests {
             1e-5,
             None,
             None,
+            0,
         );
 
         assert!(
@@ -3032,6 +3396,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0, 0, 1, 1],
             occasions: vec![1; 6],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -3154,6 +3519,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0, 0, 1, 1],
             occasions: vec![1; 6],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -3627,6 +3993,7 @@ mod tests {
             reset_times: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 0, 100], // last obs is FREM
             obs_records: vec![],
@@ -3749,6 +4116,7 @@ mod iov_tests {
                 reset_times: Vec::new(),
                 cens: vec![0; 4],
                 occasions: vec![1, 1, 2, 2],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1, 2],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -3876,6 +4244,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: vec![1; 5],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -3942,6 +4311,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -3965,6 +4335,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; n_wide],
             occasions: (1..=n_wide as u32).collect(),
+            obs_l2: Vec::new(),
             dose_occasions: (1..=n_wide as u32).collect(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4010,6 +4381,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4059,6 +4431,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4101,6 +4474,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4143,6 +4517,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4181,6 +4556,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4225,6 +4601,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4344,6 +4721,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4355,7 +4733,7 @@ mod iov_tests {
         let model = make_iov_model();
         let subject = make_iov_subject();
         let params = model.default_params.clone();
-        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None);
+        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None, 0);
         assert_eq!(result.kappas.len(), 2, "Expected 2 kappas for 2 occasions");
         assert_eq!(result.kappas[0].len(), 1);
         assert_eq!(result.kappas[1].len(), 1);
@@ -4367,7 +4745,7 @@ mod iov_tests {
         let model = make_iov_model();
         let subject = make_iov_subject();
         let params = model.default_params.clone();
-        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None);
+        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None, 0);
         // H-matrix: n_obs × n_eta (BSV only, kappas fixed)
         assert_eq!(result.h_matrix.nrows(), subject.obs_times.len());
         assert_eq!(result.h_matrix.ncols(), model.n_eta);
@@ -4403,6 +4781,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4491,6 +4870,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4590,6 +4970,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; n],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4671,13 +5052,22 @@ mod iov_tests {
             individual_nll(m, &subject, &p.theta, e, &p.omega, &p.sigma.values)
         };
 
-        let e_an = find_ebe(&an, &subject, &an.default_params, 300, 1e-7, None, None);
+        let e_an = find_ebe(&an, &subject, &an.default_params, 300, 1e-7, None, None, 0);
         let eta_an: Vec<f64> = e_an.eta.iter().copied().collect();
         let ref_nll = nll(&an, &eta_an);
 
         // The ODE form must reach the same global minimum (objectives are identical), and
         // must report it as a converged EBE (not a fallback that left it non-stationary).
-        let e_od = find_ebe(&ode, &subject, &ode.default_params, 300, 1e-7, None, None);
+        let e_od = find_ebe(
+            &ode,
+            &subject,
+            &ode.default_params,
+            300,
+            1e-7,
+            None,
+            None,
+            0,
+        );
         let eta_od: Vec<f64> = e_od.eta.iter().copied().collect();
         let ode_nll = nll(&ode, &eta_od);
 
@@ -4819,6 +5209,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 2],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4883,6 +5274,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -4983,6 +5375,7 @@ mod iov_tests {
             // term differentiates them.
             cens: vec![0, 0, 0, 0, 1, 1],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5095,6 +5488,7 @@ mod iov_tests {
             // Occasion-2 tail is M3 *right*-censored (above ULOQ): upper tail.
             cens: vec![0, 0, 0, 0, -1, -1],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5211,6 +5605,7 @@ mod iov_tests {
                 reset_times: Vec::new(),
                 cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
                 occasions: vec![1, 1, 1, 2, 2, 2],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1, 2],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -5323,6 +5718,7 @@ mod iov_tests {
                 reset_times: Vec::new(),
                 cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
                 occasions: vec![1, 1, 1, 2, 2, 2],
+                obs_l2: Vec::new(),
                 dose_occasions: vec![1, 2],
                 fremtype: Vec::new(),
                 obs_records: vec![],
@@ -5434,6 +5830,7 @@ mod iov_tests {
             // Occasion-2 tail rows M3 left-censored, co-occurring with iiv_on_ruv.
             cens: vec![0, 0, 0, 0, 1, 1],
             occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5651,6 +6048,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1; 6],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5658,9 +6056,9 @@ mod iov_tests {
         let params = model.default_params.clone();
 
         set_inner_optimizer(InnerOptimizer::Bfgs);
-        let bfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None);
+        let bfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None, 0);
         set_inner_optimizer(InnerOptimizer::Lbfgs);
-        let lbfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None);
+        let lbfgs = find_ebe(&model, &subject, &params, 200, 1e-8, None, None, 0);
         set_inner_optimizer(InnerOptimizer::Auto);
 
         assert!(bfgs.converged && lbfgs.converged, "both must converge");
@@ -5718,6 +6116,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5754,6 +6153,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5836,6 +6236,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: vec![1; 5],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5879,6 +6280,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: vec![1; 5],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5929,6 +6331,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: vec![1; 5],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -5970,6 +6373,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6008,11 +6412,11 @@ mod iov_tests {
             analytic_inner_grad_supported(&model, &subject),
             "ODE-LTBS subject should now take the analytic inner gradient"
         );
-        let analytic = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+        let analytic = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
 
         model.gradient_method = GradientMethod::Fd; // force FD inner
         assert!(!analytic_inner_grad_supported(&model, &subject));
-        let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+        let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
 
         assert!(
             analytic.converged && fd.converged,
@@ -6052,6 +6456,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 5],
             occasions: vec![1; 5],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6113,6 +6518,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6204,6 +6610,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6233,11 +6640,11 @@ mod iov_tests {
             analytic_inner_grad_supported(&model, &subject),
             "plain ODE-LTBS subject should take the analytic inner gradient"
         );
-        let analytic = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+        let analytic = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
 
         model.gradient_method = GradientMethod::Fd; // force FD inner
         assert!(!analytic_inner_grad_supported(&model, &subject));
-        let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None);
+        let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
 
         assert!(
             analytic.converged && fd.converged,
@@ -6279,6 +6686,7 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 7],
             occasions: vec![1; 7],
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
@@ -6339,9 +6747,9 @@ mod iov_tests {
         assert!(!ebe_warm_start_enabled());
     }
 
-    #[test]
-    fn test_find_ebe_no_iov_kappas_empty() {
-        // A model without IOV should return empty kappas
+    /// A minimal non-IOV 1-cpt IV model (`CL = TVCL·exp(η)`, `V = TVV`) shared by
+    /// the plain-EBE and inner-restart tests.
+    fn no_iov_1cpt_model() -> CompiledModel {
         let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
         let default_params = crate::types::ModelParameters {
             theta: vec![5.0, 50.0],
@@ -6359,7 +6767,7 @@ mod iov_tests {
             omega_iov: None,
             kappa_fixed: Vec::new(),
         };
-        let model = CompiledModel {
+        CompiledModel {
             name: "no_iov".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
@@ -6419,8 +6827,11 @@ mod iov_tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
-        };
-        let subject = Subject {
+        }
+    }
+
+    fn no_iov_subject(reset_times: Vec<f64>) -> Subject {
+        Subject {
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
@@ -6432,16 +6843,48 @@ mod iov_tests {
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
+            reset_times,
             cens: vec![0; 3],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn test_find_ebe_no_iov_kappas_empty() {
+        // A model without IOV should return empty kappas.
+        let model = no_iov_1cpt_model();
+        let subject = no_iov_subject(Vec::new());
         let params = model.default_params.clone();
-        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None);
+        let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None, 0);
         assert!(result.kappas.is_empty());
+    }
+
+    /// The guarded inner multi-start (`inner_restarts > 0`) fires on a
+    /// reset-bearing subject (cold start), exercises the Ω-scaled seed scan, and
+    /// — because this 1-cpt objective is unimodal — reconverges to the SAME EBE
+    /// as `inner_restarts = 0`. This pins the "unimodal subjects stay
+    /// bit-identical" guarantee while covering the restart loop.
+    #[test]
+    fn test_inner_restart_unimodal_is_bit_identical() {
+        let model = no_iov_1cpt_model();
+        // reset_times non-empty ⇒ `has_resets()` ⇒ the restart trigger is armed.
+        let subject = no_iov_subject(vec![0.0]);
+        assert!(subject.has_resets());
+        let params = model.default_params.clone();
+        // Cold start (`eta_init = None`) is required for the restart to fire.
+        let base = find_ebe(&model, &subject, &params, 200, 1e-6, None, None, 0);
+        let restarted = find_ebe(&model, &subject, &params, 200, 1e-6, None, None, 2);
+        assert!(restarted.eta[0].is_finite());
+        assert!(
+            (restarted.eta[0] - base.eta[0]).abs() < 1e-7,
+            "unimodal EBE must be unchanged by the restart: base={} restarted={}",
+            base.eta[0],
+            restarted.eta[0]
+        );
     }
 
     /// Regression guard for #302: the non-IOV inner EBE must be invariant to the
@@ -6546,14 +6989,15 @@ mod iov_tests {
             reset_times: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
+            obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             obs_records: vec![],
         };
         let params = model.default_params.clone();
-        let r_none = find_ebe(&model, &subject, &params, 200, 1e-6, None, None);
+        let r_none = find_ebe(&model, &subject, &params, 200, 1e-6, None, None, 0);
         // A large mu (e.g. an additive mu-ref's typical value) is the case that
         // mis-converged in psi-space; the EBE must be unchanged.
-        let r_mu = find_ebe(&model, &subject, &params, 200, 1e-6, None, Some(&[8.0]));
+        let r_mu = find_ebe(&model, &subject, &params, 200, 1e-6, None, Some(&[8.0]), 0);
         assert!(
             (r_none.eta[0] - r_mu.eta[0]).abs() < 1e-9,
             "non-IOV EBE must be mu-shift invariant: none={}, mu=8 -> {}",
@@ -6574,12 +7018,12 @@ mod iov_tests {
         let params = model.default_params.clone();
 
         // Fit without mu_k.
-        let r1 = find_ebe(&model, &subject, &params, 200, 1e-5, None, None);
+        let r1 = find_ebe(&model, &subject, &params, 200, 1e-5, None, None, 0);
 
         // Fit with a non-zero mu_k. If mu were dropped, BSV eta would shift by
         // -mu; with the fix, BSV eta is recovered as psi - mu and matches r1.
         let mu = vec![0.1];
-        let r2 = find_ebe(&model, &subject, &params, 200, 1e-5, None, Some(&mu));
+        let r2 = find_ebe(&model, &subject, &params, 200, 1e-5, None, Some(&mu), 0);
 
         assert!(r1.converged && r2.converged);
         // This fixture's BSV mode sits far out (η̂ ≈ −7.6) where the FD-gradient
