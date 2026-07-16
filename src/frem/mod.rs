@@ -12,7 +12,7 @@
 //! 3. [`generate_frem_model`] — write a new `.ferx` model file with extended parameters
 //! 4. Fit the resulting FREM model normally
 
-use crate::types::{CompiledModel, Population};
+use crate::types::{CompiledModel, Population, RateMode};
 use nalgebra::DMatrix;
 use regex::Regex;
 use std::collections::HashMap;
@@ -323,7 +323,17 @@ pub fn transform_dataset_for_frem(
                 "1".to_string(), // EVID
                 format!("{}", dose.amt),
                 format!("{}", dose.cmt),
-                format!("{}", dose.rate),
+                // Reconstruct the RATE column from the dose's rate mode. NONMEM
+                // overloads RATE with negative sentinels for modeled infusions:
+                // RATE=-2 (ModeledDuration, D{cmt}) and RATE=-1 (ModeledRate,
+                // R{cmt}). `dose.rate` holds 0.0 for those, so writing it raw
+                // silently drops the sentinel and turns a modeled zero-order
+                // absorption into an instantaneous bolus (see FREM MAT drift).
+                match dose.rate_mode {
+                    RateMode::ModeledDuration => "-2".to_string(),
+                    RateMode::ModeledRate => "-1".to_string(),
+                    RateMode::Fixed => format!("{}", dose.rate),
+                },
                 "1".to_string(), // MDV
                 if dose.ii > 0.0 {
                     format!("{}", dose.ii)
@@ -1178,6 +1188,72 @@ mod tests {
         assert_eq!(lines[3].split(',').nth(ft_col).unwrap(), "200");
         // Lines 5-7 = PK obs for subject 1 → FREMTYPE=0
         assert_eq!(lines[4].split(',').nth(ft_col).unwrap(), "0");
+    }
+
+    #[test]
+    fn test_transform_dataset_preserves_modeled_rate_sentinel() {
+        // Regression: the FREM dataset writer must reconstruct the RATE column
+        // from `rate_mode`, not from `dose.rate` (which is 0.0 for a modeled
+        // infusion). Dropping the -2/-1 sentinel turns a modeled zero-order
+        // absorption into an instantaneous bolus, so structural absorption
+        // parameters (e.g. MAT) drift when the FREM model is re-fit.
+        let mut pop = make_test_population();
+        // Subject 1: RATE=-2 (ModeledDuration, D{cmt}).
+        pop.subjects[0].doses = vec![DoseEvent::modeled(
+            0.0,
+            100.0,
+            1,
+            false,
+            0.0,
+            RateMode::ModeledDuration,
+        )];
+        // Subject 2: RATE=-1 (ModeledRate, R{cmt}).
+        pop.subjects[1].doses = vec![DoseEvent::modeled(
+            0.0,
+            100.0,
+            1,
+            false,
+            0.0,
+            RateMode::ModeledRate,
+        )];
+        let model = make_test_model();
+        let covs = vec!["WT".to_string(), "AGE".to_string()];
+        let (csv, _) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
+
+        let lines: Vec<&str> = csv.lines().collect();
+        let header = lines[0];
+        let rate_col = header.split(',').position(|h| h == "RATE").unwrap();
+        let evid_col = header.split(',').position(|h| h == "EVID").unwrap();
+
+        // Collect the RATE value on every dose row (EVID=1), in file order.
+        let dose_rates: Vec<&str> = lines[1..]
+            .iter()
+            .filter(|l| l.split(',').nth(evid_col) == Some("1"))
+            .map(|l| l.split(',').nth(rate_col).unwrap())
+            .collect();
+        assert_eq!(dose_rates, vec!["-2", "-1"]);
+    }
+
+    #[test]
+    fn test_transform_dataset_preserves_fixed_positive_rate() {
+        // A literal RATE>0 infusion must round-trip its numeric rate unchanged.
+        let mut pop = make_test_population();
+        pop.subjects[0].doses = vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)];
+        let model = make_test_model();
+        let covs = vec!["WT".to_string(), "AGE".to_string()];
+        let (csv, _) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
+
+        let lines: Vec<&str> = csv.lines().collect();
+        let header = lines[0];
+        let rate_col = header.split(',').position(|h| h == "RATE").unwrap();
+        let evid_col = header.split(',').position(|h| h == "EVID").unwrap();
+        // Subject 1's dose row is the first EVID=1 line.
+        let rate = lines[1..]
+            .iter()
+            .find(|l| l.split(',').nth(evid_col) == Some("1"))
+            .map(|l| l.split(',').nth(rate_col).unwrap())
+            .unwrap();
+        assert_eq!(rate.parse::<f64>().unwrap(), 25.0);
     }
 
     #[test]
