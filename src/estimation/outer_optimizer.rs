@@ -1872,7 +1872,8 @@ fn optimize_bfgs(
         };
 
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
-        if dg >= 0.0 || !dg.is_finite() {
+        let non_descent_reset = dg >= 0.0 || !dg.is_finite();
+        if non_descent_reset {
             // Non-descent direction: discard curvature memory and take steepest
             // descent (L-BFGS clears its history; dense BFGS resets `h_inv`).
             d = g.iter().map(|gi| -gi).collect();
@@ -1880,9 +1881,32 @@ fn optimize_bfgs(
             y_hist.clear();
             h_inv = DMatrix::identity(n, n);
         }
+        // Directional derivative of the direction actually used (post any reset).
+        let dir_deriv: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
 
-        let alpha =
+        let ls =
             backtracking_line_search_warm(&xs, &d, &g, f_val, &bounds_s, &cached_etas, &f_only_s);
+        let alpha = ls.alpha;
+
+        // Line-search diagnostics (#864 P1). Emitted every iteration — including
+        // the stalled ones the FOCE trace skips (`continue` below) — so a stall
+        // (alpha → 0 while |g| is still large) is legible in `.optdiag.csv`.
+        if crate::estimation::trace::is_active() {
+            let step_norm_s: f64 = (0..n).map(|i| (alpha * d[i]).powi(2)).sum::<f64>().sqrt();
+            crate::estimation::trace::write_optdiag(
+                iter,
+                f_val,
+                g_norm,
+                dir_deriv,
+                non_descent_reset,
+                alpha,
+                ls.backtracks,
+                ls.outcome.as_str(),
+                step_norm_s,
+                &d,
+                &scale,
+            );
+        }
 
         if alpha < 1e-18 {
             stall_count += 1;
@@ -2775,6 +2799,41 @@ fn lbfgs_two_loop(g: &[f64], s_hist: &[DVector<f64>], y_hist: &[DVector<f64>]) -
     (-r).iter().copied().collect()
 }
 
+/// Why the Armijo backtracking line search stopped. Recorded in the `.optdiag`
+/// trace (#864 P1) so an ill-conditioned stall — the search collapsing to a
+/// near-zero step while the gradient is still large — is legible after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LsOutcome {
+    /// Armijo sufficient-decrease met at the returned `alpha`.
+    Accepted,
+    /// `d·g >= 0`: the supplied direction was not a descent direction.
+    NonDescent,
+    /// 30 halvings exhausted without meeting Armijo.
+    MaxBacktracks,
+    /// `alpha` underflowed below 1e-18 before Armijo was met.
+    AlphaUnderflow,
+}
+
+impl LsOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            LsOutcome::Accepted => "accepted",
+            LsOutcome::NonDescent => "non_descent",
+            LsOutcome::MaxBacktracks => "max_backtracks",
+            LsOutcome::AlphaUnderflow => "alpha_underflow",
+        }
+    }
+}
+
+/// Result of one backtracking line search: the accepted step (`alpha`, 0.0 on
+/// failure), how many halvings it took, and why it stopped.
+#[derive(Debug, Clone, Copy)]
+struct LineSearchResult {
+    alpha: f64,
+    backtracks: usize,
+    outcome: LsOutcome,
+}
+
 fn backtracking_line_search_warm(
     x: &[f64],
     d: &[f64],
@@ -2783,30 +2842,46 @@ fn backtracking_line_search_warm(
     bounds: &PackedBounds,
     prev_etas: &[DVector<f64>],
     f_only: &dyn Fn(&[f64], &[DVector<f64>]) -> f64,
-) -> f64 {
+) -> LineSearchResult {
     let c1 = 1e-4;
     let n = x.len();
     let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
     if dg >= 0.0 {
-        return 0.0;
+        return LineSearchResult {
+            alpha: 0.0,
+            backtracks: 0,
+            outcome: LsOutcome::NonDescent,
+        };
     }
 
     let mut alpha = 1.0;
     let mut x_new = vec![0.0; n];
-    for _ in 0..30 {
+    for k in 0..30 {
         for i in 0..n {
             x_new[i] = (x[i] + alpha * d[i]).clamp(bounds.lower[i], bounds.upper[i]);
         }
         let f_new = f_only(&x_new, prev_etas);
         if f_new <= f0 + c1 * alpha * dg {
-            return alpha;
+            return LineSearchResult {
+                alpha,
+                backtracks: k,
+                outcome: LsOutcome::Accepted,
+            };
         }
         alpha *= 0.5;
         if alpha < 1e-18 {
-            return 0.0;
+            return LineSearchResult {
+                alpha: 0.0,
+                backtracks: k + 1,
+                outcome: LsOutcome::AlphaUnderflow,
+            };
         }
     }
-    0.0
+    LineSearchResult {
+        alpha: 0.0,
+        backtracks: 30,
+        outcome: LsOutcome::MaxBacktracks,
+    }
 }
 
 /// Analytic covariance-step gradient with ETAs/H fixed: `2·pop_nll` with no
@@ -4869,6 +4944,85 @@ mod tests {
             "BFGS worsened OFV: init={init_ofv:.4} final={:.4}",
             result.ofv
         );
+    }
+
+    /// A non-descent direction (`d·g >= 0`) must be reported as `NonDescent`
+    /// with `alpha = 0`, not silently accepted (#864 P1 diagnostics).
+    #[test]
+    fn line_search_reports_non_descent() {
+        let x = [0.0, 0.0];
+        let g = [1.0, 1.0];
+        let d = [1.0, 1.0]; // d·g = +2 > 0 → ascent
+        let bounds = PackedBounds {
+            lower: vec![-10.0, -10.0],
+            upper: vec![10.0, 10.0],
+        };
+        let f_only = |_: &[f64], _: &[DVector<f64>]| 0.0;
+        let r = backtracking_line_search_warm(&x, &d, &g, 1.0, &bounds, &[], &f_only);
+        assert_eq!(r.outcome, LsOutcome::NonDescent);
+        assert_eq!(r.alpha, 0.0);
+        assert_eq!(r.backtracks, 0);
+    }
+
+    /// A genuine descent direction on a simple quadratic accepts at the full
+    /// step with zero backtracks and reports `Accepted`.
+    #[test]
+    fn line_search_accepts_descent_step() {
+        // f(x) = x0² + x1², minimum at 0. From (1,1) the steepest-descent
+        // direction d = -∇f = (-2,-2); a unit step lands at (-1,-1) with equal
+        // f, but a fractional Armijo step strictly decreases it.
+        let x = [1.0, 1.0];
+        let g = [2.0, 2.0];
+        let d = [-2.0, -2.0];
+        let bounds = PackedBounds {
+            lower: vec![-10.0, -10.0],
+            upper: vec![10.0, 10.0],
+        };
+        let f_only = |z: &[f64], _: &[DVector<f64>]| z[0] * z[0] + z[1] * z[1];
+        let f0 = f_only(&x, &[]);
+        let r = backtracking_line_search_warm(&x, &d, &g, f0, &bounds, &[], &f_only);
+        assert_eq!(r.outcome, LsOutcome::Accepted);
+        assert!(r.alpha > 0.0 && r.alpha <= 1.0);
+    }
+
+    /// The built-in BFGS path with the trace active must emit the `.optdiag.csv`
+    /// sibling with the line-search diagnostic columns (#864 P1).
+    #[test]
+    fn bfgs_emits_optdiag_sibling() {
+        use crate::types::{EstimationMethod, FitOptions, Optimizer};
+        let model = make_model();
+        let population = make_population(4);
+        let coord_names =
+            crate::estimation::parameterization::coordinate_names(&model.default_params);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = format!("/tmp/ferx_optdiag_{}_{}.csv", std::process::id(), nanos);
+        let sib = path.replace(".csv", ".optdiag.csv");
+        crate::estimation::trace::init(path.clone(), &coord_names).unwrap();
+        let opts = FitOptions {
+            method: EstimationMethod::Foce,
+            optimizer: Optimizer::Bfgs,
+            outer_maxiter: 4,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let _ = optimize_population(&model, &population, &model.default_params, &opts);
+        crate::estimation::trace::finish();
+
+        let contents = std::fs::read_to_string(&sib).expect("optdiag sibling written");
+        let header = contents.lines().next().unwrap();
+        assert!(header.contains("ls_outcome"));
+        assert!(header.contains("dir:"));
+        assert!(header.contains("scale:"));
+        // At least one diagnostic row, each with the fixed + per-coord columns.
+        let ncols = 10 + 2 * coord_names.len();
+        let row = contents.lines().nth(1).expect("at least one optdiag row");
+        assert_eq!(row.split(',').count(), ncols);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&sib).ok();
     }
 
     /// Built-in BFGS with the optimizer trace active must emit the per-parameter

@@ -380,3 +380,28 @@ fit <- ferx_fit("model.ferx", "data.csv", optimizer_trace = TRUE)
 trace <- read.csv(fit$trace_path)
 plot(trace$iter, trace$ofv, type = "l", xlab = "Iteration", ylab = "OFV")
 ```
+
+### Line-search diagnostics (`.optdiag.csv`)
+
+When the built-in BFGS / L-BFGS outer optimizer runs with the trace active, a
+**sibling** file is written next to the trace CSV at
+`/tmp/ferx_trace_<pid>_<ts>.optdiag.csv` — the trace path with `.csv` replaced
+by `.optdiag.csv`. It records *why each outer step was taken or refused*, which
+the per-iteration trace above does not capture: it is aimed at diagnosing
+ill-conditioned stalls where the line search collapses to a near-zero step while
+the gradient is still large.
+
+One row per outer iteration, with these columns (plus per-coordinate `dir:<name>`
+search-direction and `scale:<name>` preconditioner columns):
+
+| Column | Meaning |
+|---|---|
+| `dir_deriv` | Directional derivative `d·g` in scaled space; `< 0` means the direction descends. |
+| `non_descent_reset` | `1` when the curvature memory was reset to steepest descent because the quasi-Newton direction was not descent. |
+| `alpha` | Accepted step length (`0` on line-search failure). |
+| `ls_backtracks` | Armijo halvings before accept / give-up. |
+| `ls_outcome` | `accepted`, `non_descent`, `max_backtracks`, or `alpha_underflow`. |
+| `step_norm` | L2 norm of the intended step `alpha·d` (scaled space). |
+
+The sibling is created lazily, so optimizers that never run the built-in
+line search (BOBYQA, NLopt L-BFGS, SLSQP, SAEM) leave no `.optdiag.csv` behind.

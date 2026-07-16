@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Line-search diagnostics for the optimizer trace** (#864). With
+  `optimizer_trace = true`, the built-in BFGS / L-BFGS outer optimizer now also writes a
+  sibling `…​.optdiag.csv` next to the trace CSV, recording per outer iteration the
+  directional derivative, whether a non-descent reset fired, the accepted step length and
+  Armijo backtrack count, the line-search outcome, and the per-coordinate search direction
+  and scale — the signal needed to diagnose ill-conditioned stalls. The file is created only
+  when that optimizer runs (P1 of the outer-optimizer conditioning rework).
 - **Analytic sensitivities for steady-state dosing into a built-in absorption compartment**
   (#835). Fitting a model with an `SS=1` dose into a `first_order` / `transit` / `igd` /
   `weibull` absorption compartment now uses exact analytic FOCEI gradients — the closed-form

@@ -186,6 +186,102 @@ impl TraceWriter {
     }
 }
 
+// ─── optimizer line-search diagnostics (#864 P1) ─────────────────────────────
+
+/// Sibling diagnostic channel for the hand-rolled BFGS / L-BFGS outer loop.
+///
+/// The primary FOCE trace (17 fixed columns) logs *where* the optimizer is
+/// (ofv, grad_norm, estimates); it does not log *why a step was taken or
+/// refused* — the exact signal needed to diagnose the ill-conditioned stall in
+/// issue #864 (line search backtracks to ~0 while the gradient is still large).
+///
+/// This writer records, per outer iteration: the directional derivative `d·g`
+/// (is the search direction actually descent?), whether a non-descent reset
+/// fired, the accepted step length `alpha`, how many backtracks the Armijo
+/// search took, the line-search outcome, and the per-coordinate search
+/// direction and scale. It is written to `<trace_stem>.optdiag.csv` and only
+/// populated by the built-in BFGS path — other optimizers never call
+/// `write_optdiag`, so the file is created lazily on first use.
+pub struct OptDiagWriter {
+    writer: BufWriter<File>,
+    start: Instant,
+    n_coords: usize,
+}
+
+impl OptDiagWriter {
+    fn new(path: &str, coord_names: &[String]) -> std::io::Result<Self> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        let mut header = String::from(
+            "iter,wall_ms,ofv,grad_norm,dir_deriv,non_descent_reset,\
+             alpha,ls_backtracks,ls_outcome,step_norm",
+        );
+        for name in coord_names {
+            header.push(',');
+            header.push_str(&csv_field(&format!("dir:{}", name)));
+        }
+        for name in coord_names {
+            header.push(',');
+            header.push_str(&csv_field(&format!("scale:{}", name)));
+        }
+        writeln!(writer, "{}", header)?;
+        Ok(Self {
+            writer,
+            start: Instant::now(),
+            n_coords: coord_names.len(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_row(
+        &mut self,
+        iter: usize,
+        ofv: f64,
+        grad_norm: f64,
+        dir_deriv: f64,
+        non_descent_reset: bool,
+        alpha: f64,
+        ls_backtracks: usize,
+        ls_outcome: &str,
+        step_norm: f64,
+        direction: &[f64],
+        scale: &[f64],
+    ) {
+        let wall_ms = self.start.elapsed().as_millis() as u64;
+        let _ = write!(
+            self.writer,
+            "{},{},{:.6},{},{},{},{},{},{},{}",
+            iter,
+            wall_ms,
+            ofv,
+            fmt_opt(Some(grad_norm)),
+            fmt_opt(Some(dir_deriv)),
+            i32::from(non_descent_reset),
+            fmt_opt_sci(Some(alpha)),
+            ls_backtracks,
+            ls_outcome,
+            fmt_opt(Some(step_norm)),
+        );
+        for i in 0..self.n_coords {
+            let _ = write!(self.writer, ",{}", fmt_opt_sci(direction.get(i).copied()));
+        }
+        for i in 0..self.n_coords {
+            let _ = write!(self.writer, ",{}", fmt_opt_sci(scale.get(i).copied()));
+        }
+        let _ = writeln!(self.writer);
+        let _ = self.writer.flush();
+    }
+}
+
+/// Derive the optdiag sibling path from the primary trace path: replace a
+/// trailing `.csv` with `.optdiag.csv`, or append `.optdiag.csv` otherwise.
+fn optdiag_path_for(trace_path: &str) -> String {
+    match trace_path.strip_suffix(".csv") {
+        Some(stem) => format!("{stem}.optdiag.csv"),
+        None => format!("{trace_path}.optdiag.csv"),
+    }
+}
+
 fn fmt_opt(v: Option<f64>) -> String {
     match v {
         Some(f) if f.is_finite() => format!("{:.6}", f),
@@ -234,6 +330,14 @@ struct TraceState {
     /// Overrides the `phase` column.  Set to "focei" for the GN-hybrid
     /// polish phase and to "gn" / "" by the GN loop itself.
     phase_override: Option<&'static str>,
+    /// Line-search diagnostic sibling writer (#864 P1). Created lazily on the
+    /// first `write_optdiag` call so non-BFGS fits don't spawn an empty file.
+    optdiag: Option<OptDiagWriter>,
+    /// Where the lazy `optdiag` writer will be created, and the coordinate
+    /// names for its per-coord `dir:*` / `scale:*` columns — both captured at
+    /// `init` so `write_optdiag` needs no extra plumbing from the estimator.
+    optdiag_path: Option<String>,
+    coord_names: Vec<String>,
 }
 
 thread_local! {
@@ -245,12 +349,16 @@ thread_local! {
 /// Initialise the trace for this fit.  The CSV file is created immediately and
 /// its header row is written.  Called once per `fit_inner` invocation.
 pub fn init(path: String, coord_names: &[String]) -> std::io::Result<()> {
+    let optdiag_path = optdiag_path_for(&path);
     let writer = TraceWriter::new(path, coord_names)?;
     TRACE.with(|t| {
         let mut s = t.borrow_mut();
         s.writer = Some(writer);
         s.method_override = None;
         s.phase_override = None;
+        s.optdiag = None;
+        s.optdiag_path = Some(optdiag_path);
+        s.coord_names = coord_names.to_vec();
     });
     Ok(())
 }
@@ -278,7 +386,13 @@ pub fn finish() -> Option<String> {
         if let Some(ref mut w) = s.writer {
             w.flush();
         }
+        if let Some(ref mut od) = s.optdiag {
+            let _ = od.writer.flush();
+        }
         let path = s.writer.take().map(|w| w.path);
+        s.optdiag = None;
+        s.optdiag_path = None;
+        s.coord_names.clear();
         s.method_override = None;
         s.phase_override = None;
         path
@@ -392,6 +506,61 @@ pub fn write_saem(
         let mut s = t.borrow_mut();
         if let Some(ref mut w) = s.writer {
             w.write_saem_row(iter, phase, cond_nll, gamma, mh_accept_rate, values);
+        }
+    });
+}
+
+/// Write one built-in-BFGS line-search diagnostic row (#864 P1) to the
+/// `.optdiag.csv` sibling. No-op when no trace is active. The sibling writer is
+/// created lazily on the first call (using the coord names captured at `init`),
+/// so optimizers that never call this leave no empty file behind.
+///
+/// `dir_deriv`         — d·g in scaled space; < 0 means the direction descends
+/// `non_descent_reset` — the outer loop reset curvature to steepest descent
+/// `alpha`             — accepted step length (0.0 on line-search failure)
+/// `ls_backtracks`     — Armijo halvings before accept/give-up
+/// `ls_outcome`        — "accepted" | "non_descent" | "max_backtracks" | "alpha_underflow"
+/// `direction`/`scale` — per-coordinate search direction and scale (scaled space)
+#[allow(clippy::too_many_arguments)]
+pub fn write_optdiag(
+    iter: usize,
+    ofv: f64,
+    grad_norm: f64,
+    dir_deriv: f64,
+    non_descent_reset: bool,
+    alpha: f64,
+    ls_backtracks: usize,
+    ls_outcome: &str,
+    step_norm: f64,
+    direction: &[f64],
+    scale: &[f64],
+) {
+    TRACE.with(|t| {
+        let mut s = t.borrow_mut();
+        // Only meaningful when a trace is open; `optdiag_path` is Some exactly then.
+        if s.optdiag.is_none() {
+            let Some(path) = s.optdiag_path.clone() else {
+                return;
+            };
+            match OptDiagWriter::new(&path, &s.coord_names) {
+                Ok(w) => s.optdiag = Some(w),
+                Err(_) => return,
+            }
+        }
+        if let Some(ref mut od) = s.optdiag {
+            od.write_row(
+                iter,
+                ofv,
+                grad_norm,
+                dir_deriv,
+                non_descent_reset,
+                alpha,
+                ls_backtracks,
+                ls_outcome,
+                step_norm,
+                direction,
+                scale,
+            );
         }
     });
 }
@@ -658,6 +827,77 @@ mod tests {
         assert_eq!(cols1[1], "foce", "method override cleared");
         assert_eq!(cols1[2], "", "phase override cleared");
         std::fs::remove_file(&path).ok();
+    }
+
+    // ── optdiag line-search channel (#864 P1) ───────────────────────────────
+
+    #[test]
+    fn test_optdiag_path_derivation() {
+        assert_eq!(optdiag_path_for("run-trace.csv"), "run-trace.optdiag.csv");
+        assert_eq!(optdiag_path_for("noext"), "noext.optdiag.csv");
+    }
+
+    #[test]
+    fn test_optdiag_not_created_until_written() {
+        // A trace with no write_optdiag call must leave no sibling file.
+        let path = unique_path("optdiag_lazy");
+        let sib = optdiag_path_for(&path);
+        init(path.clone(), &["TVCL".to_string()]).unwrap();
+        write_foce(1, "foce", 1.0, None, None, "bfgs", None, None, &[1.0], None);
+        finish();
+        assert!(
+            !std::path::Path::new(&sib).exists(),
+            "sibling created lazily"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_optdiag_writes_header_and_row() {
+        let path = unique_path("optdiag_row");
+        let sib = optdiag_path_for(&path);
+        let names = vec!["TVCL".to_string(), "TVV".to_string()];
+        init(path.clone(), &names).unwrap();
+        write_optdiag(
+            2,
+            123.5,
+            0.8,
+            -0.4,
+            true,
+            0.25,
+            2,
+            "accepted",
+            0.1,
+            &[-0.3, 0.2],
+            &[1.0, 10.0],
+        );
+        finish();
+
+        let contents = read_file(&sib);
+        let mut lines = contents.lines();
+        let header = lines.next().unwrap();
+        assert!(header.starts_with(
+            "iter,wall_ms,ofv,grad_norm,dir_deriv,non_descent_reset,\
+             alpha,ls_backtracks,ls_outcome,step_norm"
+        ));
+        assert!(header.ends_with("dir:TVCL,dir:TVV,scale:TVCL,scale:TVV"));
+        let row: Vec<&str> = lines.next().unwrap().split(',').collect();
+        // 10 fixed + 2 dir + 2 scale = 14 columns.
+        assert_eq!(row.len(), 14);
+        assert_eq!(row[0], "2");
+        assert_eq!(row[5], "1", "non_descent_reset serialised as 1");
+        assert_eq!(row[7], "2", "backtracks");
+        assert_eq!(row[8], "accepted");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&sib).ok();
+    }
+
+    #[test]
+    fn test_write_optdiag_noop_without_init() {
+        // No active trace => write_optdiag is a silent no-op (estimators call it
+        // unconditionally under is_active(), but defend the contract anyway).
+        assert!(!is_active());
+        write_optdiag(1, 1.0, 0.1, -0.1, false, 1.0, 0, "accepted", 0.0, &[], &[]);
     }
 
     #[test]
