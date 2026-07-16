@@ -12314,6 +12314,64 @@ mod tests {
         );
     }
 
+    /// **ODE IOV × a logit-transformed absorption fraction** — inter-occasion variability on the
+    /// pathway split itself. A parallel model where the immediate-release fraction carries both
+    /// IIV and IOV on the **logit** scale, `FR1 = inv_logit(logit(TVFR1) + ETA_FR + KAPPA_FR)`
+    /// (so `FR1 ∈ (0,1)` for every occasion draw and `FR2 = 1 − FR1` keeps the split valid — an
+    /// `exp(κ)` fraction would let `κ > 0` push `FR1 > 1`). This pins that `∂f/∂κ` **through the
+    /// pathway fraction** (`frac_slot` seeded per occasion, then the logit inverse's chain rule)
+    /// is exact against central FD of `predict_iov` — the fraction's occasion sensitivity, not
+    /// just clearance's.
+    #[test]
+    fn ode_iov_logit_fraction_provider_matches_fd_of_predict_iov() {
+        const LOGIT_FRAC_IOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  omega ETA_CL ~ 0.09
+  omega ETA_FR ~ 0.04
+  kappa KAPPA_FR ~ 0.02
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA1 = TVKA1
+  KA2 = TVKA2
+  FR1 = inv_logit(logit(TVFR1) + ETA_FR + KAPPA_FR)
+  FR2 = 1 - FR1
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(LOGIT_FRAC_IOV).expect("parse logit-fraction IOV");
+        assert_eq!(model.n_kappa, 1, "one IOV kappa (on the fraction)");
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "IOV on a logit fraction must be admitted (κ is an ordinary axis on frac_slot)"
+        );
+        let subject = iov_subject();
+        // stacked = [η_cl, η_fr, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.5, 0.3, 0.6],
+            &[0.12, -0.08, 0.06, -0.11],
+        );
+    }
+
     /// **ODE IOV + `first_order` absorption × estimated (bare) lagtime** (#486 review). The
     /// non-IOV path admits `first_order` + lagtime (#643 onset saltation `Δr = R_in(0⁺)`);
     /// the IOV walk is the same, so it must too. Pins that the per-occasion rate-on onset
