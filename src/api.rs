@@ -8113,7 +8113,12 @@ pub(crate) fn extract_standard_errors(
     // flip the sign for a negative estimate). See `theta_packs_log`.
     let se_theta: Vec<f64> = (0..n_theta)
         .map(|i| {
-            if theta_packs_log(template.theta_lower[i]) {
+            // Guard a truncated `cov` (fewer rows than `template.theta`) the same
+            // way the omega/sigma/kappa branches below do — report 0.0 rather than
+            // panicking away an otherwise-converged fit.
+            if i >= n {
+                0.0
+            } else if theta_packs_log(template.theta_lower[i]) {
                 template.theta[i] * se_packed[i]
             } else {
                 se_packed[i]
@@ -8209,8 +8214,9 @@ pub(crate) fn extract_standard_errors(
 
     // IOV (kappa): SE for diagonal variances of omega_iov.
     //
-    // The packed Cholesky layout is column-major (see `pack_params`):
-    // L[i,i] sits at offset `i*n - i*(i-1)/2` within the IOV block.
+    // The packed Cholesky layout is column-major (see `pack_params`); the flat
+    // index of `L[i,i]` within the IOV block is `chol_lt_idx(i, i, n_kappa)` (the
+    // single source of that offset — do not re-spell the formula here).
     // Same delta-method approximation as `se_omega`: SE(var_i) ≈ 2 * var_i * SE(log L_ii),
     // which is exact for diagonal IOV and a first-order approximation for block_kappa.
     // Off-diagonal covariance SEs are not currently reported (matches BSV omega).
