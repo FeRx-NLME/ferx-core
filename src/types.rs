@@ -3616,6 +3616,20 @@ impl CompiledModel {
         })
     }
 
+    /// True when any built-in absorption input-rate forcing carries a per-route
+    /// lag (`fn(..., lag=L)`, #857) — the forcing switches on at its own
+    /// `t_dose + lag_cmt + lag_route`, distinct from the compartment lag
+    /// ([`Self::has_lagtime`]). Used to route a route-lag subject onto the
+    /// event-driven analytic walk (`integrate_tvcov_g`), where each route's onset
+    /// discontinuity is injected as its own rate-on saltation (#859) — mirroring
+    /// how `has_lagtime` routes an estimated compartment lag there. A model with
+    /// no `ode_spec` (analytical PK) has no input-rate forcings, so this is false.
+    pub fn has_route_absorption_lag(&self) -> bool {
+        self.ode_spec
+            .as_ref()
+            .is_some_and(|o| o.input_rate.iter().any(|f| f.lag_slot.is_some()))
+    }
+
     /// Compartment-scoped variant of [`Self::has_lagtime`]: true only when a
     /// lag actually resolves for a dose into 1-based `cmt` — a bare
     /// `LAGTIME`/`ALAG` (which, per [`DoseAttrMap::lagtime`]'s fallback, applies

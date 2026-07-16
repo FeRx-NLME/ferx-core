@@ -816,15 +816,24 @@ the steady-state pre-arrival seed does not yet route the dose through the absorp
 kernel over a lagged onset.
 
 ::: {.callout-note}
-## Gradients (FD for now)
+## Gradients (analytic)
 
-A model carrying any per-route `lag=` is fit over **finite differences** — the
-analytic event-driven walk injects one onset saltation per dose at the shared
-`dose + lag_cmt`, whereas a per-route lag needs a distinct onset (and rate-on
-saltation) per route. This is the exact analogue of the `weibull()` + lagtime FD
-fallback; predictions and simulation are exact (the onset is a real integration
-break), only the FOCEI gradient is FD. The per-route onset saltation (returning
-these models to the analytic path) is a planned follow-up
+A per-route `lag=` on a **`first_order`**, **`zero_order`**, **`transit`**, or **`igd`**
+forcing is fit with **exact analytic** FOCE/FOCEI gradients
+([#859](https://github.com/FeRx-NLME/ferx-core/issues/859)). The event-driven walk gives
+each route its own onset event at `dose + lag_cmt + lag_route`: for the discontinuous
+kernels (`first_order`, `zero_order`) that onset injects a rate-on saltation carrying the
+combined `∂/∂(lag_cmt + lag_route)` jet — and a route-lagged `zero_order` window also
+carries the same jet on its rate-off at the window end; for the smooth kernels
+(`transit`, `igd`) the onset is continuous (`R_in → 0`), so the route lag flows through the
+continuous `∂R_in/∂lag_route` alone, with a timeline break at the onset. The predicted
+values are unchanged — only the gradient moves off finite differences.
+
+Two cases remain on the **finite-difference** fallback: a per-route lag on a **`weibull`**
+forcing (its onset diverges for shape `β < 1`, so no finite rate-on saltation exists — the
+exact analogue of the `weibull()` + compartment-lagtime fallback), and a per-route lag
+combined with **IOV** (`κ`). Both stay exact in predictions and simulation; only their
+FOCEI gradient is FD. Analytic IOV per-route lag is a planned follow-up
 ([#856](https://github.com/FeRx-NLME/ferx-core/issues/856)).
 :::
 

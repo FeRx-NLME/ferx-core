@@ -12,9 +12,10 @@
 //! The check evaluates ferx's FOCEI marginal objective **at NONMEM's optimum** (no
 //! outer steps, NONMEM-equivalent ODE accuracy) against NONMEM's `#OBJV` — a
 //! path-independent implementation check that isolates the per-route-lag mechanism.
-//! (A per-route lag routes the ferx fit to finite differences, but the objective is
-//! an *evaluation* — the predictions are exact regardless of the gradient route, so
-//! this pins the same absorption mechanism the analytic parallel/mixed anchors do.)
+//! (Since #859 a `first_order` per-route lag is fit on the exact analytic path, but the
+//! objective here is an *evaluation* — the predictions are exact regardless of the
+//! gradient route, so this pins the same absorption mechanism the analytic parallel/mixed
+//! anchors do.)
 //! Final NONMEM values are read from `nonmem_anchor/results/per_route_lag.ext`.
 
 mod common;

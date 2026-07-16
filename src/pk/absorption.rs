@@ -370,9 +370,11 @@ impl InputRateForcing {
     /// the slot is absent, so an unlagged forcing is unaffected. The value is
     /// **added** to the dose's compartment lagtime to form the route's effective
     /// onset `t_dose + lag_cmt + lag_route`. Generic over `T: PkNum` so the same
-    /// reader serves the `f64` prediction / FD-fit path and (once the analytic
-    /// per-route onset saltation lands) the `Dual2` provider; today a model with
-    /// any per-route lag is gated to the FD path, so only `T = f64` reaches here.
+    /// reader serves the `f64` prediction / FD-fit path and the `Dual2` analytic
+    /// provider: since #859 a `first_order` per-route lag is served analytically on
+    /// the event-driven walk (its onset saltation injected at `K_ROUTE_ONSET`), so
+    /// `T = Dual2` reaches here too. The other kernels' route lags remain FD-gated
+    /// pending their slices (`zero_order`/`transit`/`igd`) or permanently (`weibull`).
     #[inline]
     pub fn route_lag<T: PkNum>(&self, params: &[T]) -> T {
         self.lag_slot

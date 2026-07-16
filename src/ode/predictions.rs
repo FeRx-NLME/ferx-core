@@ -959,10 +959,11 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
         // dose's compartment lag, so each parallel / mixed pathway can switch on at
         // its own time. Dose-invariant (a property of the forcing, not the dose), so
         // hoisted out of the per-dose loop; `0` for an unlagged forcing (the common
-        // case), a no-op there. A model carrying any per-route lag is served over FD
-        // (`ode_analytical_supported` gates it off), so on the `Dual2` walk this term
-        // never executes — only `T = f64` reaches here today; its jet is otherwise a
-        // continuous shift with no onset saltation, which is exactly why it is gated.
+        // case), a no-op there. Since #859 a `first_order` per-route lag is analytic on
+        // the `Dual2` event-driven walk: this continuous `∂R_in/∂lag_route` shift flows
+        // here, and the onset discontinuity is supplied separately as the `K_ROUTE_ONSET`
+        // rate-on saltation. Other kernels' route lags stay FD-gated (`zero_order`/
+        // `transit`/`igd` pending their slices; `weibull`'s divergent onset permanently).
         let route_lag = forcing.route_lag(params);
         let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {

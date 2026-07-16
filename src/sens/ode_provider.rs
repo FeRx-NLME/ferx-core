@@ -304,19 +304,35 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
         return false;
     }
-    // Per-route absorption lag (`fn(..., lag=L)`) is served over finite differences.
-    // The analytic event-driven walk injects ONE onset saltation per dose at the
-    // lagged arrival `t_dose + lag_cmt`; a per-route lag gives each forcing its own
-    // onset `t_dose + lag_cmt + lag_route`, so the walk would need distinct break
-    // points and a per-route rate-on saltation it does not yet emit. Gate it off here
-    // (BOTH the outer full provider and the inner light provider via
-    // `ode_subject_supported`) so it routes to FD — the exact `weibull()`+lagtime
-    // pattern. The pointwise `add_prepared_input_rate_forcing` DOES add `route_lag`
-    // to `t_eff` over any `T`, but that continuous shift without the onset saltation
-    // is precisely the wrong gradient this gate prevents from ever executing on a
-    // dual walk. Lifting the gate (per-route onset saltation) is the Phase-2 follow-up
-    // (#856).
-    if ode.input_rate.iter().any(|f| f.lag_slot.is_some()) {
+    // Per-route absorption lag (`fn(..., lag=L)`, #857): the analytic event-driven walk
+    // (`integrate_tvcov_g`) now emits a per-route onset saltation — each route-lagged
+    // forcing switches on at its own `t_dose + lag_cmt + lag_route`, injected as a rate-on
+    // saltation at that (moving) boundary with the combined `∂/∂(lag_cmt + lag_route)` jet
+    // (#859). The continuous `∂R_in/∂lag_route` already flows through
+    // `add_prepared_input_rate_forcing` (which adds `route_lag` to `t_eff` over any `T`);
+    // the walk adds only the missing onset-discontinuity term. Admitted per kernel, mirroring
+    // the `has_lagtime` classifier below:
+    //   • `first_order` — onset is the finite `ka·dose` jump the rate-on saltation handles.
+    //   • `zero_order` — the route-lagged window shifts BOTH boundaries: its rate-on saltation
+    //     at `t_dose + lag_cmt + lag_route` (`K_ROUTE_ONSET`) and its rate-off at `+ dur`
+    //     (`K_ZO_END`) both carry the `lag_route` jet.
+    //   • `transit` / `igd` — continuous onset (`R_in → 0` at the boundary), so no saltation:
+    //     the continuous `∂R_in/∂lag_route` plus the timeline break at the onset suffice.
+    //   • `weibull` — onset **diverges** for shape `β < 1` (an integrable spike, no finite
+    //     rate-on saltation), so a route-lagged `weibull` stays on the FD fallback, exactly as
+    //     `weibull` + a compartment lagtime does below.
+    // IOV (`n_kappa != 0`) route lag is out of scope on both gates (declined below here and, on
+    // the IOV path, in `ode_iov_supported`).
+    if ode.input_rate.iter().any(|f| {
+        f.lag_slot.is_some()
+            && !matches!(
+                f.kind,
+                crate::pk::absorption::InputRateKind::FirstOrder
+                    | crate::pk::absorption::InputRateKind::ZeroOrder
+                    | crate::pk::absorption::InputRateKind::Transit
+                    | crate::pk::absorption::InputRateKind::InverseGaussian
+            )
+    }) {
         return false;
     }
     if model.n_kappa != 0 {
@@ -484,7 +500,12 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
     // / `run_subject_tvcov`), where the per-dose event-time saltation handles it exactly
     // (uniform or per-compartment lags). The static superposition walk here assumes a
     // single param set with no event-time shift, so it never serves a lagtime subject.
-    if model.has_lagtime() {
+    // A per-route absorption lag (`fn(..., lag=L)`, #859) is the same kind of event-time
+    // shift — the route's onset is a moving boundary carrying a rate-on saltation — so it
+    // too routes to the event-driven walk, never the static one. (A *pure* route lag has
+    // `has_lagtime() == false`, so this needs its own decline, else the subject would fall
+    // through to the static walk which emits no onset saltation.)
+    if model.has_lagtime() || model.has_route_absorption_lag() {
         return false;
     }
     true
@@ -504,6 +525,26 @@ fn infusion_spans_segment(
 ) -> bool {
     let eps = crate::ode::predictions::INFUSION_EPS;
     start >= reset_floor && start <= seg_start + eps && start + duration >= seg_end - eps
+}
+
+/// The per-route absorption lag (`zero_order(..., lag=L)`, #859) of the single zero-order
+/// forcing feeding 0-based `cmt`, read from a PK snapshot, or `None` when that forcing is
+/// unlagged or absent. One zero-order forcing per compartment (parser-enforced), so the match
+/// is unambiguous. Shared by the event-driven walk's route-lagged window sites: the boundary
+/// shift on the rate-off saltation (`K_ZO_END`) and — for symmetry — the rate-on onset builder.
+fn zero_order_route_lag<T: crate::sens::num::PkNum>(
+    ode: &OdeSpec,
+    cmt: usize,
+    params: &[T],
+) -> Option<T> {
+    ode.input_rate
+        .iter()
+        .find(|f| {
+            f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
+                && f.cmt == cmt
+                && f.lag_slot.is_some()
+        })
+        .map(|f| f.route_lag(params))
 }
 
 /// Find dose `d`'s zero-order absorption forcing (the parser admits at most one `ZeroOrder`
@@ -583,9 +624,15 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // event times), so it routes through the event-driven walk even with no TV
     // covariates — mirroring the closed-form `subject_sensitivities_tvcov` (#486).
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    // A per-route absorption lag (`fn(..., lag=L)`, #859) makes each route's onset a moving
+    // boundary (`t_dose + lag_cmt + lag_route`) with its own rate-on saltation — the same
+    // event-time-shift family as a compartment lagtime — so it forces the event-driven walk
+    // even when the subject has no TV covariates and no compartment lagtime.
+    let has_route_lag = model.has_route_absorption_lag();
     if !ode_analytical_supported(model)
         || !(subject.has_tv_covariates()
             || model.has_lagtime()
+            || has_route_lag
             || has_ss
             || has_rate_defined_under_f
             || has_modeled_dose
@@ -826,6 +873,17 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // combination is still declined per subject in `ode_iov_subject_supported` — the SS dual
     // equilibration has no built-in-forcing channel; that is a real gap, not this decision.)
     if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
+        return false;
+    }
+    // Per-route absorption lag (`fn(..., lag=L)`, #857) under IOV stays on the FD fallback.
+    // #859 made per-route lag analytic on the NON-IOV event-driven walk (the `K_ROUTE_ONSET`
+    // onset saltation), but IOV was scoped out — as in #857 Phase 1 and mirroring the non-IOV
+    // gate's own `n_kappa != 0` decline. Without this a route-lagged IOV model would take the
+    // IOV analytic walk, whose per-route onset sensitivity under κ has not been validated
+    // against FD; decline it here so it differences the (exact) f64 predictor instead. (Analytic
+    // IOV per-route lag is a follow-up; the non-IOV gate `ode_analytical_supported` classifies
+    // per kind — here every kernel's route lag is declined uniformly while IOV is out of scope.)
+    if ode.input_rate.iter().any(|f| f.lag_slot.is_some()) {
         return false;
     }
     // `Weibull` + estimated lagtime stays FD on every path (IOV included): its onset diverges
@@ -4010,6 +4068,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // are exact). `dose_lag_slot` is empty when the model has no lagtime (byte-identical to
     // the pre-lag walk).
     let has_lagtime = !dose_lag_slot.is_empty();
+    // #859: does any built-in forcing carry a per-route lag (`fn(..., lag=L)`)? Route-lagged
+    // forcings switch on at their own `t_dose + lag_cmt + lag_route`, handled by the
+    // `K_ROUTE_ONSET` timeline events below rather than the shared `K_DOSE` onset. `false`
+    // (and byte-identical to the pre-#859 walk) for the common no-route-lag case. Computed
+    // from `ode` (this walk has no `&CompiledModel`); equals `model.has_route_absorption_lag()`.
+    let has_route_lag = ode.input_rate.iter().any(|f| f.lag_slot.is_some());
     // Carries `∂lag/∂(θ,η)` (incl. the lagtime axis itself) — fed into
     // `add_prepared_input_rate_forcing` as `dose_lagtimes` so a built-in input-rate
     // forcing's `tad = t − (dose.time + lag)` carries the exact continuous
@@ -4163,7 +4227,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 // for a `mixed` `FR*zero_order` leg (#505) — a linear multiplier on the rate.
                 let frac = f.frac::<T>(&pk_at_dose[k]);
                 let rate = f_bio_at_dose[k] * T::from_f64(d.amt) * frac / dur;
-                let w_start = d.time + lag_val(k);
+                // #859: a route-lagged zero-order window (`zero_order(..., lag=L)`) opens at
+                // `t_dose + lag_cmt + lag_route` — its whole `[w_start, w_end]` slides by the
+                // per-route lag (`0` for an unlagged window, byte-identical to the pre-#859
+                // walk). The rate-on saltation fires at this shifted `w_start` (`K_ROUTE_ONSET`),
+                // the rate-off at the shifted `w_end` (`K_ZO_END`), both carrying its jet.
+                let w_start = d.time + lag_val(k) + f.route_lag(&pk_at_dose[k]).val();
                 let w_end = w_start + dur.val();
                 Some((d.cmt.saturating_sub(1), rate, w_start, w_end, dur, k))
             })
@@ -4197,13 +4266,18 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     const K_RESET: u8 = 0;
     const K_SS_SEED: u8 = 1;
     const K_DOSE: u8 = 2;
-    const K_PKONLY: u8 = 3;
-    const K_OBS: u8 = 4;
-    const K_INF_END: u8 = 5;
+    // #859: per-route absorption onset (`fn(..., lag=L)`). A route-lagged forcing switches on
+    // at `t_dose + lag_cmt + lag_route`, PAST the dose's own `K_DOSE` arrival. Sorts right
+    // after `K_DOSE` and before the record/obs events (value 3), so — like a dose arrival —
+    // its rate-on saltation lands before any observation at the same instant reads the state.
+    const K_ROUTE_ONSET: u8 = 3;
+    const K_PKONLY: u8 = 4;
+    const K_OBS: u8 = 5;
+    const K_INF_END: u8 = 6;
     // #486: zero-order absorption window end. Sorts after `K_OBS` (like `K_INF_END`) so an
     // observation exactly at the window end reads the constant rate still on, matching the
     // static walk and production's `active_zero_order_inputs` full-containment convention.
-    const K_ZO_END: u8 = 6;
+    const K_ZO_END: u8 = 7;
     // Capacity includes one `K_INF_END` slot per infusion (each dose adds its window-end
     // event below) and one `K_SS_SEED` slot per lagged SS dose, matching production's
     // timeline reservation. `n_infusion_ends` was computed once above (and reused for
@@ -4214,6 +4288,29 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         .enumerate()
         .filter(|(k, d)| is_ss_dose(d) && lag_val(*k) > 0.0)
         .count();
+    // #859: per-route absorption onset events. Each forcing carrying its own `lag=`
+    // (`lag_slot`) switches on at `d.time + lag_cmt + lag_route`, past the dose's `K_DOSE`
+    // arrival. Collect `(dose_idx, forcing_idx)` for every (route-lagged forcing × dose
+    // feeding its compartment) — the `K_ROUTE_ONSET` handler injects that one forcing's
+    // rate-on saltation at its own onset. Empty (and byte-identical to the pre-#859 walk)
+    // when no forcing carries a `lag_slot` — the common case. Filter mirrors the f64
+    // `push_route_lag_break_times` (`amt > 0`, compartment match) so the break time matches.
+    let route_onsets: Vec<(usize, usize)> = if has_route_lag {
+        let mut v = Vec::new();
+        for (fi, f) in ode.input_rate.iter().enumerate() {
+            if f.lag_slot.is_none() {
+                continue;
+            }
+            for (k, d) in subject.doses.iter().enumerate() {
+                if d.amt > 0.0 && d.cmt.saturating_sub(1) == f.cmt {
+                    v.push((k, fi));
+                }
+            }
+        }
+        v
+    } else {
+        Vec::new()
+    };
     let mut tl: Vec<(f64, u8, usize)> = Vec::with_capacity(
         subject.doses.len()
             + n_obs
@@ -4221,7 +4318,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             + subject.reset_times.len()
             + n_infusion_ends
             + n_ss_seeds
-            + zero_windows.len(),
+            + zero_windows.len()
+            + route_onsets.len(),
     );
     for &rt in &subject.reset_times {
         tl.push((rt, K_RESET, 0));
@@ -4257,6 +4355,19 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // an exact break. Mirrors production's `Kind::InfusionEnd` break for a zero-order cutoff.
     for (wi, &(_, _, _, w_end, _, _)) in zero_windows.iter().enumerate() {
         tl.push((w_end, K_ZO_END, wi));
+    }
+    // #859: per-route onset break at `d.time + lag_cmt + lag_route` (value part — the solver
+    // integrates the f64 timeline; the onset's `∂/∂(lag_cmt + lag_route)` sensitivity is the
+    // saltation injected at the `K_ROUTE_ONSET` handler). Payload is the `route_onsets` index,
+    // not a dose index. The break time equals the f64 predictor's `push_route_lag_break_times`
+    // value, so the analytic value path stays bit-identical to the FD reference.
+    for (ri, &(k, fi)) in route_onsets.iter().enumerate() {
+        let route_lag = ode.input_rate[fi].route_lag(&pk_at_dose[k]).val();
+        tl.push((
+            subject.doses[k].time + lag_val(k) + route_lag,
+            K_ROUTE_ONSET,
+            ri,
+        ));
     }
     tl.sort_by(|a, b| {
         a.0.partial_cmp(&b.0)
@@ -4648,7 +4759,13 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             let dose_mass = f_bio_at_dose[idx] * T::from_f64(d.amt);
                             let mut onset = T::from_f64(0.0);
                             for (f, prep) in ode.input_rate.iter().zip(&prepared_forcings) {
-                                if f.cmt == cmt_idx {
+                                // #859: a forcing carrying its own `lag=` switches on later, at
+                                // `t_dose + lag_cmt + lag_route` — its onset saltation is injected
+                                // at its `K_ROUTE_ONSET` event with the combined jet, not summed
+                                // into this shared `t_dose + lag_cmt` onset. Skip it here (an
+                                // unlagged forcing has `lag_slot == None` — the common case, byte-
+                                // identical to the pre-#859 walk).
+                                if f.cmt == cmt_idx && f.lag_slot.is_none() {
                                     onset = onset
                                         + f.frac(&pk_at_dose[idx]) * prep.rate_at_zero(dose_mass);
                                 }
@@ -4662,7 +4779,18 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             // here, exactly as the two forcings switch on together.
                             for &(zcmt, zrate, _, _, _, zk) in &zero_windows {
                                 if zk == idx && zcmt == cmt_idx {
-                                    onset = onset + zrate;
+                                    // #859: a route-lagged zero-order window opens later, at its
+                                    // own `K_ROUTE_ONSET` (`w_start = t_dose + lag_cmt + lag_route`),
+                                    // not at this `K_DOSE` arrival — its rate-on fires there. Skip
+                                    // it here (unlagged windows, the common case, still fire here).
+                                    let route_lagged = ode.input_rate.iter().any(|f| {
+                                        f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
+                                            && f.cmt == zcmt
+                                            && f.lag_slot.is_some()
+                                    });
+                                    if !route_lagged {
+                                        onset = onset + zrate;
+                                    }
                                 }
                             }
                             inject_rate_saltation::<T>(
@@ -4876,6 +5004,68 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // `d.time + lag_val(idx)` (= `t_event` for a dose), matching production.
             last_dose_eff = last_dose_eff.max(t_event);
             last_params = &pk_at_dose[idx];
+        } else if kind == K_ROUTE_ONSET {
+            // #859: a route-lagged forcing (`fn(..., lag=L)`) switches on here, at
+            // `t_dose + lag_cmt + lag_route` — its onset is a discontinuity in `du/dt` (the
+            // forcing jumps from inactive to `R_in(0⁺)`), a moving boundary in BOTH lags.
+            // Inject that single forcing's rate-on saltation with the combined jet
+            // `∂/∂(lag_cmt + lag_route)` — the exact analogue of the shared-onset injection at
+            // `K_DOSE` (which now skips route-lagged forcings). Fires with or without a
+            // compartment lagtime: a *pure* route lag has `has_lagtime == false`, so `lag_cmt`
+            // is zero and this is the ONLY onset term. The magnitude is this forcing's own
+            // `frac·R_in(0⁺)` (`rate_at_zero`), not the summed onset — a finite `ka·dose` for
+            // `first_order`; zero for the smooth kernels (`transit`/`igd`, whose continuous
+            // onset needs only the timeline break). A `zero_order` route-lagged window adds its
+            // constant window rate here as the rate-on (its `rate_at_zero` is zero), with the
+            // matching rate-off carrying the same `lag_route` jet at `K_ZO_END` (#859 Slice 2).
+            let (dose_idx, fi) = route_onsets[idx];
+            let d = &subject.doses[dose_idx];
+            if d.cmt >= 1 && d.cmt - 1 < n_states {
+                let cmt_idx = d.cmt - 1;
+                let f = &ode.input_rate[fi];
+                let prep = &prepared_forcings[fi];
+                let lag_cmt = if has_lagtime {
+                    pk_at_dose[dose_idx][dose_lag_slot[dose_idx]]
+                } else {
+                    T::from_f64(0.0)
+                };
+                let dlag = jet_only(lag_cmt + f.route_lag(&pk_at_dose[dose_idx]));
+                let dose_mass = f_bio_at_dose[dose_idx] * T::from_f64(d.amt);
+                let mut onset = f.frac(&pk_at_dose[dose_idx]) * prep.rate_at_zero(dose_mass);
+                // #859 Slice 2: a route-lagged `zero_order` window's rate-on is its constant
+                // window rate (`rate_at_zero` is zero for `ZeroOrder`, so the term above is zero).
+                // One zero-order forcing per compartment, so match this dose's own window here.
+                if f.kind == crate::pk::absorption::InputRateKind::ZeroOrder {
+                    for &(zcmt, zrate, _, _, _, zk) in &zero_windows {
+                        if zk == dose_idx && zcmt == cmt_idx {
+                            onset = onset + zrate;
+                        }
+                    }
+                }
+                // TAD anchor for the saltation's `J·(Δr·e_cmt)` term = the most recent dose's
+                // (lagged) arrival (`last_dose_eff`), so a TAD-referencing RHS Jacobian sees the
+                // same `TAD` it uses throughout the segment ending here. Fall back to `t_event`
+                // before any dose has anchored TAD (mirrors the `K_DOSE` bolus-saltation guard).
+                let anchor = if last_dose_eff.is_finite() {
+                    last_dose_eff
+                } else {
+                    t_event
+                };
+                inject_rate_saltation::<T>(
+                    &mut u,
+                    cmt_idx,
+                    onset,
+                    dlag,
+                    -1.0,
+                    program,
+                    &pk_at_dose[dose_idx],
+                    t_event,
+                    first_dose_time,
+                    anchor,
+                    &mut d1_vars,
+                    &mut d1_stack,
+                );
+            }
         } else if kind == K_OBS {
             states[idx].copy_from_slice(&u);
             last_params = &pk_at_obs[idx];
@@ -5082,15 +5272,20 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 }
                 zo_end_done[idx] = true;
                 if !cohort.is_empty() {
-                    // Shared shift `δ = δlag + δdur` (co-terminating ⇒ same `t+lag+dur` ⇒ same
-                    // jet in the common case). Use the representative (first) cohort window.
-                    let (_, _, _, _, dur_rep, k_rep) = zero_windows[cohort[0]];
+                    // Shared shift `δ = δlag + δdur (+ δlag_route)` (co-terminating ⇒ same
+                    // `t + lag + lag_route + dur` ⇒ same jet in the common case). Use the
+                    // representative (first) cohort window.
+                    let (cmt_rep, _, _, _, dur_rep, k_rep) = zero_windows[cohort[0]];
                     let dlag = if has_lagtime {
                         jet_only(pk_at_dose[k_rep][dose_lag_slot[k_rep]])
                     } else {
                         T::from_f64(0.0)
                     };
-                    let d_off = dlag + jet_only(dur_rep);
+                    // #859 Slice 2: a route-lagged window's end `w_end = t + lag_cmt + lag_route
+                    // + dur` also moves with `lag_route`, so its jet joins the rate-off shift.
+                    let route_lag_rep = zero_order_route_lag(ode, cmt_rep, &pk_at_dose[k_rep])
+                        .map_or_else(|| T::from_f64(0.0), jet_only);
+                    let d_off = dlag + jet_only(dur_rep) + route_lag_rep;
                     // Pre-boundary params = the segment ending at `w_end` (`last_params`, this
                     // being a non-record boundary). Post-boundary params = the next real record
                     // at/after this instant, skipping co-located rate-off siblings (#653 #2).
@@ -5120,7 +5315,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             } else {
                                 T::from_f64(0.0)
                             };
-                            let d_off_j = dlag_j + jet_only(dur_j);
+                            // #859 Slice 2: this window's own route-lag jet (its end shifts with
+                            // `lag_route` too); `0` for an unlagged window (the common case).
+                            let route_lag_j = zero_order_route_lag(ode, cmt, &pk_at_dose[k_j])
+                                .map_or_else(|| T::from_f64(0.0), jet_only);
+                            let d_off_j = dlag_j + jet_only(dur_j) + route_lag_j;
                             inject_rate_saltation::<T>(
                                 &mut u,
                                 cmt,
@@ -7438,16 +7637,18 @@ mod tests {
         );
     }
 
-    /// A **per-route** absorption lag (`fn(..., lag=L)`) gates the model OFF the
-    /// analytic path onto FD — the correctness backstop for the feature's first
-    /// phase. The analytic event-driven walk injects one onset saltation per dose at
-    /// `t_dose + lag_cmt`; a per-route lag needs a distinct onset per route
-    /// (`+ lag_route`), which the walk does not yet emit, so serving it analytically
-    /// would silently drop the route-onset discontinuity. Neither the static nor the
-    /// TV-cov walk may claim it (both derive from `ode_analytical_supported`).
-    /// (Removing this gate — the per-route onset saltation — is the Phase-2 follow-up.)
+    /// A **`first_order` per-route** absorption lag (`fn(..., lag=L)`, #859) is served on
+    /// the exact analytic path (Slice 1 of the Phase-2 follow-up to #857). The event-driven
+    /// walk now injects each route's onset saltation at its own `t_dose + lag_cmt + lag_route`
+    /// (`K_ROUTE_ONSET`), so the analytic gradient — including `∂f/∂LAG2` — matches the f64
+    /// predictor's finite differences. This IR+DR model (immediate `first_order(ka=KA1)` plus
+    /// delayed `first_order(ka=KA2, lag=LAG2)` on one compartment) exercises both the shared
+    /// `K_DOSE` onset (the unlagged IR route) and the new `K_ROUTE_ONSET` onset (the lagged DR
+    /// route) in one subject. It routes to the event-driven walk, never the static one (a
+    /// *pure*-route-lag model has `has_lagtime() == false`, so the static-walk decline is its
+    /// own check, not a fallout of the lagtime decline).
     #[test]
-    fn per_route_lag_gates_off_analytic() {
+    fn first_order_per_route_lag_is_analytic() {
         const PER_ROUTE_LAG: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -7474,6 +7675,10 @@ mod tests {
   y = central / V
 [error_model]
   DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
 "#;
         let m = parse_model_string(PER_ROUTE_LAG).expect("parse per-route lag model");
         // Sanity: the model actually carries a per-route lag on exactly one forcing.
@@ -7487,13 +7692,510 @@ mod tests {
             "one route carries a per-route lag"
         );
         assert!(
-            !ode_analytical_supported(&m),
-            "a per-route lag must gate the model onto FD (no silent analytic path)"
+            ode_analytical_supported(&m),
+            "a first_order per-route lag is now analytic (#859)"
         );
-        // Neither per-subject walk may claim it either.
+        // Obs bracket the DR onset (LAG2 = 2.0): pre-onset (only IR active) and post-onset
+        // (both routes active), so the FD check exercises `∂f/∂LAG2` across the discontinuity.
+        let mut subject = bolus_subject(&[0.5, 1.0, 1.5, 2.5, 4.0, 8.0, 12.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        // Routes to the event-driven walk (the route onset is an event-time saltation), never
+        // the static superposition walk.
+        assert!(
+            ode_tvcov_supported(&m, &subject),
+            "route-lag subject routes to the event-driven walk"
+        );
+        assert!(
+            !ode_subject_supported(&m, &subject),
+            "route-lag subject is off the static walk"
+        );
+        // Analytic value / ∂f/∂η / ∂f/∂θ (incl. ∂f/∂LAG2) all match the f64 predictor's FD.
+        // (The value is independently correct: at this tolerance it matches the exact Bateman
+        // closed form for the two-route 1-cpt system to ~6e-8 — the loose-default kink
+        // resolution is what a tight `ode_reltol` sharpens, not a structural error.)
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3, 2.0];
+        let eta = [0.1];
+        check_vs_production(&m, &subject, &theta, &eta);
+        // Inner light-provider η-gradient must match the outer provider exactly (EBE-loop
+        // parity), so the route onset is consistent between the inner and outer walks.
+        check_inner_outer_eta_parity(&m, &subject, &theta, &eta);
+        // The new δlag² saltation coefficient (the route onset's 2nd-order term) is exercised
+        // against a ground-truth double-FD Hessian of the predictor.
+        check_hessian_vs_production_fd(&m, &subject, &theta, &eta);
+    }
+
+    /// **Compartment lag + per-route lag** (#859): the headline composition — a bare `ALAG1`
+    /// shifts *both* routes, and `lag=LAG2` shifts *one* further, so the delayed route's onset is
+    /// `dose + lag_cmt + lag_route`. This is the ONLY test exercising the `has_lagtime == true`
+    /// side: the `K_ROUTE_ONSET` `lag_cmt` term (read from `dose_lag_slot`), the combined
+    /// `∂/∂(lag_cmt + lag_route)` jet, AND the `K_DOSE` shared-onset **exclusion** of the
+    /// route-lagged forcing (the IR route still fires at `K_DOSE` under `ALAG1`, the DR route at
+    /// its own `K_ROUTE_ONSET`). `check_vs_production` FD-checks both `∂f/∂ALAG1` and `∂f/∂LAG2`.
+    #[test]
+    fn compartment_lag_plus_per_route_lag_is_analytic() {
+        const CMT_PLUS_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 20.0)
+  theta TVKA2(0.3, 0.05, 20.0)
+  theta TVLAG2(2.0, 0.0, 10.0)
+  theta TVALAG(0.5, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  FR1   = TVFR1
+  FR2   = 1 - TVFR1
+  KA1   = TVKA1
+  KA2   = TVKA2
+  LAG2  = TVLAG2
+  ALAG1 = TVALAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2, lag=LAG2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let m = parse_model_string(CMT_PLUS_ROUTE_LAG).expect("parse cmt-lag + route-lag model");
+        assert!(m.has_lagtime(), "model carries a compartment lag (ALAG1)");
+        assert!(
+            ode_analytical_supported(&m),
+            "compartment lag composed with a first_order route lag is analytic (#859)"
+        );
+        // IR onset at ALAG1 = 0.5, DR onset at ALAG1 + LAG2 = 2.5; obs straddle both.
+        let mut subject = bolus_subject(&[0.3, 1.0, 2.0, 3.0, 5.0, 9.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        assert!(
+            ode_tvcov_supported(&m, &subject),
+            "routes to the event-driven walk"
+        );
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3, 2.0, 0.5];
+        let eta = [0.1];
+        check_vs_production(&m, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&m, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&m, &subject, &theta, &eta);
+    }
+
+    /// **Multi-dose** per-route lag (#859): two doses each open their own delayed route, so the
+    /// per-`(dose, route)` `K_ROUTE_ONSET` events must superpose — each dose's delayed onset
+    /// carries its own boundary jet and its own TAD anchor (the most-recent dose), and the two
+    /// delayed routes overlap in time. Single-dose tests never exercise the `last_dose_eff`
+    /// anchor *selection* (only one dose), so this pins `∂f/∂LAG` exact across repeated dosing.
+    #[test]
+    fn multi_dose_first_order_per_route_lag_is_analytic() {
+        const PER_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 20.0)
+  theta TVKA2(0.3, 0.05, 20.0)
+  theta TVLAG2(2.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  FR1  = TVFR1
+  FR2  = 1 - TVFR1
+  KA1  = TVKA1
+  KA2  = TVKA2
+  LAG2 = TVLAG2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2, lag=LAG2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let m = parse_model_string(PER_ROUTE_LAG).expect("parse per-route lag model");
+        // Two doses at t=0 and t=8; DR onsets (LAG2=2) at t=2 and t=10. Obs straddle both.
+        let mut subject = bolus_subject(&[1.0, 2.5, 4.0, 7.0, 9.0, 11.0, 14.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(8.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3, 2.0];
+        let eta = [0.1];
+        check_vs_production(&m, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&m, &subject, &theta, &eta);
+    }
+
+    /// A **`zero_order` per-route** lag (`zero_order(..., lag=L)`, #859 Slice 2) is served on
+    /// the analytic path. The route-lagged window slides whole: its rate-on saltation fires at
+    /// the shifted `w_start = t_dose + lag_cmt + lag_route` (`K_ROUTE_ONSET`) and its rate-off at
+    /// `w_end = w_start + dur` (`K_ZO_END`), both carrying the `lag_route` jet — so the analytic
+    /// `∂f/∂LAG` and `∂f/∂DUR` match the f64 predictor's FD across both boundaries. `DUR` is
+    /// η-coupled so its moving-boundary η-block is FD-checked too.
+    #[test]
+    fn zero_order_per_route_lag_is_analytic() {
+        const ZO_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(4.0, 0.5, 24.0)
+  theta TVLAG(2.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR * exp(ETA_DUR)
+  LAG = TVLAG
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR, lag=LAG) - CL/V*central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let m = parse_model_string(ZO_ROUTE_LAG).expect("parse zero-order route-lag model");
+        assert!(
+            ode_analytical_supported(&m),
+            "a zero_order per-route lag is analytic (#859 Slice 2)"
+        );
+        // Window [LAG, LAG+DUR] = [2, 6]: obs straddle both the shifted start and the end.
+        let mut subject = bolus_subject(&[1.0, 3.0, 5.0, 6.5, 10.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        assert!(
+            ode_tvcov_supported(&m, &subject),
+            "route-lag subject routes to the event-driven walk"
+        );
+        assert!(
+            !ode_subject_supported(&m, &subject),
+            "route-lag subject is off the static walk"
+        );
+        let theta = [5.0, 50.0, 4.0, 2.0];
+        let eta = [0.12, -0.08];
+        check_vs_production(&m, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&m, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&m, &subject, &theta, &eta);
+    }
+
+    /// **Compartment lag + a route-lagged `zero_order` window** (#859): `ALAG1` shifts the dose
+    /// arrival and `lag=LAG` shifts the window further, so the window is `[dose + ALAG1 + LAG,
+    /// + dur]`. This is the `has_lagtime == true` path for `zero_order`: the `K_DOSE` shared-onset
+    /// loop runs (under `ALAG1`) but **skips** this route-lagged window (S2-3), which instead
+    /// fires its rate-on at `K_ROUTE_ONSET`; and the `K_ZO_END` rate-off carries the combined
+    /// `∂/∂(ALAG1 + LAG + dur)` jet. `∂f/∂ALAG1`, `∂f/∂LAG`, `∂f/∂DUR` all FD-checked.
+    #[test]
+    fn compartment_lag_plus_route_lagged_zero_order_is_analytic() {
+        const CMT_PLUS_ZO_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(4.0, 0.5, 24.0)
+  theta TVLAG(2.0, 0.0, 10.0)
+  theta TVALAG(0.5, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  DUR   = TVDUR * exp(ETA_DUR)
+  LAG   = TVLAG
+  ALAG1 = TVALAG
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR, lag=LAG) - CL/V*central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let m = parse_model_string(CMT_PLUS_ZO_LAG).expect("parse cmt-lag + zo-route-lag model");
+        assert!(m.has_lagtime(), "model carries a compartment lag (ALAG1)");
+        assert!(
+            ode_analytical_supported(&m),
+            "compartment lag composed with a zero_order route lag is analytic (#859)"
+        );
+        // Window [ALAG1 + LAG, + DUR] = [2.5, 6.5]: obs straddle both boundaries.
+        let mut subject = bolus_subject(&[1.0, 3.0, 5.0, 7.0, 10.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let theta = [5.0, 50.0, 4.0, 2.0, 0.5];
+        let eta = [0.12, -0.08];
+        check_vs_production(&m, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&m, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&m, &subject, &theta, &eta);
+    }
+
+    /// A **mixed** `first_order` + route-lagged `zero_order` on one compartment (#859 Slice 2):
+    /// the immediate `FR1*first_order` rides the smooth dual path with its onset at the dose
+    /// (`K_DOSE`, no route lag), while the delayed `FR2*zero_order(..., lag=L)` window opens at
+    /// `t_dose + lag` (`K_ROUTE_ONSET`) and closes at `+ dur` (`K_ZO_END`). One subject exercises
+    /// the shared `K_DOSE` onset (unlagged first-order) alongside the per-route window rate-on/off.
+    #[test]
+    fn mixed_first_order_route_lagged_zero_order_is_analytic() {
+        const MIXED_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVDUR(4.0, 0.5, 24.0)
+  theta TVLAG(2.0, 0.0, 10.0)
+  theta TVFR(0.6, 0.05, 0.95)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+  DUR = TVDUR
+  LAG = TVLAG
+  FR1 = TVFR
+  FR2 = 1 - TVFR
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA) + FR2*zero_order(dur=DUR, lag=LAG) - CL/V*central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let m = parse_model_string(MIXED_ROUTE_LAG).expect("parse mixed route-lag model");
+        assert!(
+            ode_analytical_supported(&m),
+            "mixed first_order + zero_order(lag) is analytic (#859 Slice 2)"
+        );
+        let mut subject = bolus_subject(&[1.0, 3.0, 5.0, 6.5, 10.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let theta = [5.0, 50.0, 1.2, 4.0, 2.0, 0.6];
+        let eta = [0.1];
+        check_vs_production(&m, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&m, &subject, &theta, &eta);
+    }
+
+    /// A **`transit` per-route** lag (`transit(..., lag=L)`, #859 Slice 3). The transit density
+    /// has a *continuous* onset (`R_in → 0` at `t_dose + lag_cmt + lag_route` for `n > 0`), so
+    /// no rate-on saltation is needed — the `K_ROUTE_ONSET` handler's `rate_at_zero` term is
+    /// zero. The route lag is served entirely by the continuous `∂R_in/∂lag_route` (through the
+    /// shared `add_prepared_input_rate_forcing` `t_eff` shift) plus the timeline break at the
+    /// onset. `∂f/∂LAG` therefore matches the f64 predictor's FD with no discontinuity term.
+    #[test]
+    fn transit_per_route_lag_is_analytic() {
+        const TRANSIT_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVN(5.0, 1.0, 30.0)
+  theta TVMTT(2.0, 0.1, 20.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  LAG = TVLAG
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = transit(n=N, mtt=MTT, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let m = parse_model_string(TRANSIT_ROUTE_LAG).expect("parse transit route-lag model");
+        assert!(
+            ode_analytical_supported(&m),
+            "a transit per-route lag is analytic (#859 Slice 3)"
+        );
+        let mut subject = bolus_subject(&[1.0, 2.5, 4.0, 6.0, 10.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        assert!(
+            ode_tvcov_supported(&m, &subject),
+            "route-lag subject routes to the event-driven walk"
+        );
+        let theta = [1.0, 20.0, 5.0, 2.0, 1.5];
+        let eta = [0.1];
+        check_vs_production(&m, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&m, &subject, &theta, &eta);
+    }
+
+    /// An **`igd` per-route** lag (inverse-Gaussian density, `igd(..., lag=L)`, #859 Slice 3).
+    /// Like `transit`, the IG onset is continuous (an essential singularity drives `R_in → 0` at
+    /// the onset for every valid `(mat, cv2)`), so there is no rate-on saltation — only the
+    /// continuous `∂R_in/∂lag_route` and the onset break. `∂f/∂LAG` matches FD.
+    #[test]
+    fn igd_per_route_lag_is_analytic() {
+        const IGD_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVMAT(2.0, 0.1, 20.0)
+  theta TVCV2(0.5, 0.01, 10.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  MAT = TVMAT
+  CV2 = TVCV2
+  LAG = TVLAG
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let m = parse_model_string(IGD_ROUTE_LAG).expect("parse igd route-lag model");
+        assert!(
+            ode_analytical_supported(&m),
+            "an igd per-route lag is analytic (#859 Slice 3)"
+        );
+        let mut subject = bolus_subject(&[1.0, 2.5, 4.0, 6.0, 10.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let theta = [1.0, 20.0, 2.0, 0.5, 1.5];
+        let eta = [0.1];
+        check_vs_production(&m, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&m, &subject, &theta, &eta);
+    }
+
+    /// A **`weibull` per-route** lag stays on the FD fallback: `weibull`'s onset diverges for
+    /// shape `β < 1` (an integrable spike, not a finite `R_in(0⁺)` jump), so no closed-form
+    /// rate-on saltation exists — the same reason `weibull` + a compartment lagtime stays FD.
+    /// The permanent backstop that the kernel-classified route-lag gate (#859) admits only the
+    /// kernels whose onset the walk can actually emit; unlike `first_order` (analytic above),
+    /// `weibull` must never silently take the analytic path.
+    #[test]
+    fn weibull_per_route_lag_stays_fd() {
+        const WEIBULL_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMAT(1.5, 0.05, 20.0)
+  theta TVBETA(0.8, 0.1, 5.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  MAT  = TVMAT
+  BETA = TVBETA
+  LAG  = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = weibull(td=MAT, beta=BETA, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(WEIBULL_ROUTE_LAG).expect("parse weibull route-lag model");
+        let ode = m.ode_spec.as_ref().expect("ode spec");
+        assert_eq!(
+            ode.input_rate
+                .iter()
+                .filter(|f| f.lag_slot.is_some())
+                .count(),
+            1,
+            "the weibull route carries a per-route lag"
+        );
+        assert!(
+            !ode_analytical_supported(&m),
+            "a weibull per-route lag must stay on FD (no closed-form onset saltation)"
+        );
         let subj = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0]);
         assert!(!ode_subject_supported(&m, &subj), "not on the static walk");
         assert!(!ode_tvcov_supported(&m, &subj), "not on the TV-cov walk");
+    }
+
+    /// A per-route lag **combined with IOV** (`n_kappa != 0`) stays on the FD fallback on BOTH
+    /// gates (#859). The non-IOV gate declines any `n_kappa != 0` model outright; the IOV gate
+    /// (`ode_iov_supported`) must decline the route lag specifically — before this it had no
+    /// `lag_slot` check, so a route-lagged IOV model would have taken the IOV analytic walk
+    /// whose per-route onset sensitivity under κ is unvalidated (a silent-wrong gradient). This
+    /// pins the decline: analytic IOV per-route lag is a follow-up; today it differences the
+    /// exact f64 predictor.
+    #[test]
+    fn per_route_lag_under_iov_stays_fd() {
+        const IOV_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.5, 0.05, 20.0)
+  theta TVLAG(2.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL + KAPPA_CL)
+  V   = TVV
+  KA  = TVKA
+  LAG = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(IOV_ROUTE_LAG).expect("parse IOV route-lag model");
+        assert_eq!(m.n_kappa, 1, "model carries one IOV kappa");
+        assert_eq!(
+            m.ode_spec
+                .as_ref()
+                .unwrap()
+                .input_rate
+                .iter()
+                .filter(|f| f.lag_slot.is_some())
+                .count(),
+            1,
+            "one route carries a per-route lag"
+        );
+        // Non-IOV gate: declined by the `n_kappa != 0` clause.
+        assert!(
+            !ode_analytical_supported(&m),
+            "an IOV model is off the non-IOV analytic gate"
+        );
+        // IOV gate: declined specifically by the per-route-lag clause (#859).
+        assert!(
+            !ode_iov_supported(&m),
+            "per-route lag under IOV must stay on the FD fallback"
+        );
     }
 
     /// Indexed `F` is now in model-level scope (parity test above), but the
