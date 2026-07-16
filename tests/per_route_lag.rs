@@ -636,3 +636,206 @@ fn shipped_per_route_lag_example_parses() {
         .expect("read per_route_lag_absorption.ferx");
     parse_full_model(&src).expect("per_route_lag_absorption.ferx parses");
 }
+
+// ── `lag=` is universal: transit() and igd() carry it too ─────────────────────
+//
+// The `lag=` argument is captured kind-agnostically by the parser and applied at a
+// single, kind-agnostic `t_eff` site in `add_prepared_input_rate_forcing`, so the
+// `first_order` / `zero_order` oracles above already exercise the shared code path.
+// These two tests pin the *end-to-end numerical* behaviour for the remaining smooth
+// kernels — `transit(n, mtt)` and `igd(mat, cv2)` — with the same reduction anchor:
+// a route with `lag=L` must predict identically to that route on a compartment
+// `lagtime`/`ALAG` (a NONMEM-anchored lag form), to 1e-5. Both are run in the
+// non-flip-flop regime (KTR / IG tilting abscissa ≫ ke), i.e. exactly where the
+// closed-form value path would be selected if it were eligible — so if the shared
+// `t_eff` shift were ever bypassed for these kernels, the pre-lag "must be ~0"
+// assertion would catch it.
+
+const TRANSIT_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVN(3.0, 0.1, 20.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVLAG(2.0, 0.0, 12.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  LAG = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = transit(n=N, mtt=MTT, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+const TRANSIT_COMP_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVN(3.0, 0.1, 20.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVLAG(2.0, 0.0, 12.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  N       = TVN
+  MTT     = TVMTT
+  lagtime = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = transit(n=N, mtt=MTT) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+const IGD_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.5, 0.01, 10.0)
+  theta TVLAG(2.0, 0.0, 12.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  MAT = TVMAT
+  CV2 = TVCV2
+  LAG = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+const IGD_COMP_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.5, 0.01, 10.0)
+  theta TVLAG(2.0, 0.0, 12.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  MAT     = TVMAT
+  CV2     = TVCV2
+  lagtime = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// `transit(n, mtt, lag=L)` ≡ `transit(n, mtt)` + compartment lagtime L (1e-5), and
+/// the curve is genuinely delayed (~0 before the lag, a real rise after).
+#[test]
+fn route_lag_equals_compartment_lag_transit() {
+    let obs: Vec<f64> = (0..=120).map(|i| i as f64 * 0.25).collect(); // 0..30 h
+    let route = predict_curve(TRANSIT_ROUTE_LAG, &obs);
+    let comp = predict_curve(TRANSIT_COMP_LAG, &obs);
+    assert_close(&route, &comp, &obs, 1e-5, "route-lag vs comp-lag (transit)");
+    let before = obs
+        .iter()
+        .zip(&route)
+        .filter(|(&t, _)| t < 2.0)
+        .map(|(_, &c)| c.abs())
+        .fold(0.0, f64::max);
+    let after = obs
+        .iter()
+        .zip(&route)
+        .filter(|(&t, _)| t > 6.0)
+        .map(|(_, &c)| c.abs())
+        .fold(0.0, f64::max);
+    assert!(
+        before < 1e-6,
+        "transit conc must be ~0 before the lag; got {before}"
+    );
+    assert!(
+        after > 1e-3,
+        "transit conc must rise after the lag; got {after}"
+    );
+}
+
+/// `igd(mat, cv2, lag=L)` ≡ `igd(mat, cv2)` + compartment lagtime L (1e-5).
+#[test]
+fn route_lag_equals_compartment_lag_igd() {
+    let obs: Vec<f64> = (0..=120).map(|i| i as f64 * 0.25).collect();
+    let route = predict_curve(IGD_ROUTE_LAG, &obs);
+    let comp = predict_curve(IGD_COMP_LAG, &obs);
+    assert_close(&route, &comp, &obs, 1e-5, "route-lag vs comp-lag (igd)");
+    let before = obs
+        .iter()
+        .zip(&route)
+        .filter(|(&t, _)| t < 2.0)
+        .map(|(_, &c)| c.abs())
+        .fold(0.0, f64::max);
+    let after = obs
+        .iter()
+        .zip(&route)
+        .filter(|(&t, _)| t > 6.0)
+        .map(|(_, &c)| c.abs())
+        .fold(0.0, f64::max);
+    assert!(
+        before < 1e-6,
+        "igd conc must be ~0 before the lag; got {before}"
+    );
+    assert!(
+        after > 1e-3,
+        "igd conc must rise after the lag; got {after}"
+    );
+}
+
+/// Multi-dose transit + route lag ≡ multi-dose transit + compartment lag — the route
+/// offset is re-applied per dose (mirrors `route_lag_multi_dose_equals_compartment_lag`
+/// for the `first_order` kernel).
+#[test]
+fn route_lag_multi_dose_equals_compartment_lag_transit() {
+    let obs: Vec<f64> = (0..=160).map(|i| i as f64 * 0.25).collect();
+    let dose_times = [0.0_f64, 12.0, 24.0];
+    let route = {
+        let m = parse_full_model(TRANSIT_ROUTE_LAG).expect("parses").model;
+        predict(&m, &pop_doses(&dose_times, obs.clone()), &m.default_params)
+            .iter()
+            .map(|p| p.pred)
+            .collect::<Vec<_>>()
+    };
+    let comp = {
+        let m = parse_full_model(TRANSIT_COMP_LAG).expect("parses").model;
+        predict(&m, &pop_doses(&dose_times, obs.clone()), &m.default_params)
+            .iter()
+            .map(|p| p.pred)
+            .collect::<Vec<_>>()
+    };
+    assert_close(
+        &route,
+        &comp,
+        &obs,
+        1e-5,
+        "transit multi-dose route vs comp",
+    );
+}
