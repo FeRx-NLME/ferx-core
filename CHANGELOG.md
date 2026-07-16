@@ -46,6 +46,21 @@ section of the SDLC for the versioning policy).
   is forgiving of a loose mode).
 
 ### Fixed
+- **Outer optimizer: gradient-based fits could silently stop at the initial estimates**
+  (#657 follow-up). The default outer optimizer (`auto` → NLopt L-BFGS on analytic-gradient
+  models) presents parameters to the optimizer in a per-coordinate–scaled space. On some
+  models one scaling choice leaves the very first quasi-Newton step so poorly conditioned
+  that NLopt's line search collapses and reports `XtolReached` **at the start point** — a
+  false convergence that pins every parameter at its initial value (e.g. plain warfarin
+  FOCEI stalled at OFV ≈ −250.8 instead of −286.0 under magnitude scaling; `two_cpt_oral_cov`
+  stalled under natural scaling). The automatic SLSQP fallback removed in #657 had been
+  masking this. The outer loop now detects the stall — the estimate barely moved from its
+  initial value despite a real descent direction there — and automatically re-runs once with
+  the complementary scaling, keeping the lower-OFV result and emitting a warning that names
+  the recovery. The check is positional (a genuinely-converged fit moves a long way even when
+  its final gradient is not tiny), so healthy fits are unaffected and pay no extra cost.
+  Standard errors on the affected fits are corrected as a consequence (they were inflated
+  ~2.4× by the wrong optimum).
 - **FREM: the analytic gradients differentiated the wrong likelihood on covariate
   pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against
   the prediction `theta[i] + eta[j]` with the dedicated covariate error `EPSCOV` — but the

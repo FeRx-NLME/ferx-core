@@ -99,6 +99,22 @@ fn covariance_rsr_assembles_finite_ses_fast() {
         ses.iter().all(|s| s.is_finite() && *s > 0.0),
         "all rsr SEs must be finite and positive, got {ses:?}"
     );
+    // Per-PR guard for the complementary-scaling recovery: the default optimizer
+    // (auto → NLopt L-BFGS) resolves to `Abs` scaling, under which this warfarin
+    // FOCEI fit false-converges at the initial estimates (OFV ≈ −250.8, its
+    // gradient line search collapsing to `XtolReached` at the start point). The
+    // outer loop must detect that stall and re-run under the complementary `None`
+    // scaling, reaching the true minimum near OFV −286. A fit stuck at the start
+    // would sit around −250; anything past −270 proves the recovery fired. (The
+    // slow NONMEM-anchored SE tests below pin the SEs; this cheap check runs on
+    // every PR so the recovery cannot silently regress.)
+    assert!(
+        r.ofv < -270.0,
+        "default (Abs-scaled L-BFGS) warfarin FOCEI must recover past the start-point \
+         stall (~−250.8) to the true minimum (~−286); got OFV {:.4} — the \
+         complementary-scaling retry likely did not fire",
+        r.ofv
+    );
 }
 
 #[test]

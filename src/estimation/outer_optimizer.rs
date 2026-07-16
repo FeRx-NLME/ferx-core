@@ -983,35 +983,104 @@ fn resolve_outer_ftol(is_non_gaussian: bool, is_ode: bool, override_ftol: Option
     })
 }
 
-fn optimize_nlopt(
+/// Outcome of one NLopt outer optimization attempt at a fixed scaling strategy.
+/// Extracted so the caller can run a second attempt with the complementary
+/// scaling when the first false-converges (see `run_nlopt_attempt`).
+struct NloptAttempt {
+    /// Best-seen packed vector, unscaled back to real (log/Cholesky) space.
+    x_real: Vec<f64>,
+    converged: bool,
+    /// Real-space outer gradient at the best-seen point (`None` if never taken).
+    final_gradient: Option<Vec<f64>>,
+    n_evals: usize,
+    ebe_convergence_warnings: u32,
+    max_unconverged: u32,
+    total_fallback: u32,
+    warnings: Vec<String>,
+}
+
+/// The complementary parameter-scaling for the false-convergence retry. Only the
+/// two auto-resolved gradient-optimizer scalings have a complement here: `Abs`
+/// (magnitude) and `None` (natural log-space) precondition the quasi-Newton step
+/// differently, and the NLopt line search can collapse under one while
+/// succeeding under the other (warfarin FOCEI stalls under `Abs`,
+/// `two_cpt_oral_cov` under `None`). An explicit `Rescale2` is a deliberate user
+/// choice and is left untouched.
+fn complementary_scaling(s: ParameterScaling) -> Option<ParameterScaling> {
+    match s {
+        ParameterScaling::Abs => Some(ParameterScaling::None),
+        ParameterScaling::None => Some(ParameterScaling::Abs),
+        _ => None,
+    }
+}
+
+/// Real-space outer-gradient norm at `x_real` (the start point). Reference value
+/// for the stall detector: a false-converged attempt ends with its gradient
+/// essentially unchanged from this, whereas a real descent drops it by orders of
+/// magnitude. One inner solve + one gradient eval — negligible next to a full
+/// outer optimization, and only computed for the gradient NLopt optimizers.
+fn initial_outer_grad_norm(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
-) -> OuterResult {
-    let bounds = compute_bounds(init_params);
-    let mut x0 = pack_params(init_params);
-    clamp_to_bounds(&mut x0, &bounds);
-    let n = x0.len();
-    let n_subj = population.subjects.len();
-    let n_eta = model.n_eta;
+    bounds: &PackedBounds,
+    x_real: &[f64],
+    n_subj: usize,
+) -> f64 {
+    let params = unpack_params(x_real, init_params);
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let (ehs, hms, _stats, kappas) = run_inner_loop_warm(
+        model,
+        population,
+        &params,
+        options.inner_maxiter,
+        options.inner_tol,
+        None,
+        Some(&mu_k),
+        options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
+    );
+    let mut n_grad = 0usize;
+    let g = population_gradient(
+        x_real,
+        n_subj,
+        init_params,
+        model,
+        population,
+        &ehs,
+        &hms,
+        &kappas,
+        bounds,
+        options,
+        &mut n_grad,
+    );
+    g.iter()
+        .filter(|v| v.is_finite())
+        .map(|v| v * v)
+        .sum::<f64>()
+        .sqrt()
+}
 
-    let mut warnings = Vec::new();
-
-    // Per-element scale factors: present O(1) coordinates to NLopt.
-    //
-    // `compute_scale` normalises by |packed value|, which gives O(1)
-    // scaled coords for log-packed thetas (CL, V, KA — log-magnitude
-    // is typically > 0.1) and a 1.0 fallback for everything near zero.
-    // For identity-packed thetas (those with `theta_lower < 0`,
-    // typically small covariate effects like THETA_AGE_CL = -0.01)
-    // this places the scaled value near zero, and SLSQP's BFGS-flavored
-    // Hessian estimate handles wildly different scaled magnitudes
-    // poorly — observed regression: SAD_SCEN1 FOCEI took 510+ evals
-    // (40+ min) vs ~90 evals (~5 min) with scaling off. Auto-disable
-    // scaling whenever any identity-packed theta is present, so the
-    // optimizer runs in the natural (mixed) packed space where
-    // BFGS's own scale-adaptation works correctly.
+/// Run one NLopt outer optimization from `x_start` (real packed space) at a fixed,
+/// already-resolved `resolved_scaling`. Returns the best-seen point plus the
+/// diagnostics the caller needs to detect a false convergence and (optionally)
+/// retry with the complementary scaling.
+#[allow(clippy::too_many_arguments)]
+fn run_nlopt_attempt(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+    bounds: &PackedBounds,
+    x_start: &[f64],
+    n: usize,
+    n_subj: usize,
+    n_eta: usize,
+    resolved_scaling: ParameterScaling,
+) -> NloptAttempt {
+    let mut x0 = x_start.to_vec();
+    let mut warnings: Vec<String> = Vec::new();
     let has_identity_theta = init_params.theta_lower.iter().any(|&lo| lo < 0.0);
     // IOV + SLSQP: auto-enable per-coordinate scaling (issue #101 rec #2). IOV
     // models pack disparate-magnitude parameters (block-diagonal omega plus the
@@ -1031,8 +1100,8 @@ fn optimize_nlopt(
     // intentional. This auto-enable now only fires for an explicit
     // `optimizer = slsqp` on IOV models (the path it was originally written for).
     let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
-    let scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
-        ParameterScaling::Rescale2 => compute_rescale2_scale(&bounds),
+    let scale: Vec<f64> = match resolved_scaling {
+        ParameterScaling::Rescale2 => compute_rescale2_scale(bounds),
         // Magnitude scaling, but disabled when an identity-packed theta is present
         // (covariate effects with `theta_lower < 0`): `compute_scale` leaves those
         // small coordinates near their raw value while log-packed θ become O(1), and
@@ -1239,7 +1308,7 @@ fn optimize_nlopt(
                     &ehs,
                     &hms,
                     &kappas,
-                    &bounds,
+                    bounds,
                     options,
                     &mut state.n_grad_evals,
                 );
@@ -1523,6 +1592,163 @@ fn optimize_nlopt(
     for i in 0..n {
         x0[i] *= scale[i];
     }
+    let final_gradient = last_gradient.lock().unwrap().clone();
+    let ebe_final = ebe_accum.lock().unwrap();
+    NloptAttempt {
+        x_real: x0,
+        converged,
+        final_gradient,
+        n_evals: n_evals_outer.load(Ordering::Relaxed),
+        ebe_convergence_warnings: ebe_final.n_convergence_warnings as u32,
+        max_unconverged: ebe_final.max_unconverged as u32,
+        total_fallback: ebe_final.total_fallback as u32,
+        warnings,
+    }
+}
+
+fn optimize_nlopt(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> OuterResult {
+    let bounds = compute_bounds(init_params);
+    let mut x0 = pack_params(init_params);
+    clamp_to_bounds(&mut x0, &bounds);
+    let n = x0.len();
+    let n_subj = population.subjects.len();
+    let n_eta = model.n_eta;
+
+    let mut warnings = Vec::new();
+
+    // Scale-selection, setup, and the NLopt run live in `run_nlopt_attempt` so the
+    // caller can retry with the complementary scaling on a false convergence (the
+    // #657 follow-up). `x_start` is the clamped packed init.
+    let x_start = x0.clone();
+    let resolved_scaling = resolve_scaling(options.parameter_scaling, options.optimizer);
+
+    let mut attempt = run_nlopt_attempt(
+        model,
+        population,
+        init_params,
+        options,
+        &bounds,
+        &x_start,
+        n,
+        n_subj,
+        n_eta,
+        resolved_scaling,
+    );
+
+    // Complementary-scaling recovery for the gradient NLopt optimizers. `Abs` /
+    // `None` preconditioning can make NLopt's line search collapse on the very
+    // first step and report `XtolReached` at the start point — a false
+    // convergence that leaves every parameter pinned at (essentially) its initial
+    // value (warfarin FOCEI stalls under `Abs`, `two_cpt_oral_cov` under `None`,
+    // the exact mirror image). The removed automatic SLSQP fallback (#657) used to
+    // mask this; instead, detect it directly and re-run once with the
+    // complementary scaling, keeping the lower-OFV result.
+    //
+    // The stall signature is *positional*, not gradient-magnitude: the estimate
+    // barely moves from `x_start` even though the start point had a real descent
+    // direction. Testing "did the estimate move" (rather than "is the final
+    // gradient still large") is essential — a genuinely-converged fit can end with
+    // a non-tiny gradient (e.g. FREM, whose covariate pseudo-observation rows keep
+    // the objective's gradient off zero at the optimum), and it moves a long way
+    // to get there; a gradient-ratio test alone false-fires on it and a spurious
+    // complementary re-run can land in a worse basin. The barely-moved test never
+    // fires on such a fit. The extra start-gradient eval is taken only for the
+    // barely-moved case (`&&` short-circuits), so healthy fits pay nothing.
+    if matches!(options.optimizer, Optimizer::NloptLbfgs | Optimizer::Slsqp) {
+        if let Some(alt_scaling) = complementary_scaling(resolved_scaling) {
+            let rel_move = {
+                let step: f64 = attempt
+                    .x_real
+                    .iter()
+                    .zip(&x_start)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f64>()
+                    .sqrt();
+                let x0_norm = x_start.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
+                step / x0_norm
+            };
+            // Barely moved *and* there was a real gradient to follow at the start:
+            // the optimizer either stalled (warfarin/two_cpt_oral_cov — a bad
+            // point) or the initial estimates were already near-optimal (e.g. FREM,
+            // whose covariate means seed near their sample values — a good point).
+            // Both look identical here, so try the complementary scaling and let the
+            // *reconverged* OFV decide (below); the barely-moved gate just limits
+            // when the extra work is done, so healthy (moved) fits pay nothing.
+            if rel_move < 1e-3 {
+                let initial_gnorm = initial_outer_grad_norm(
+                    model,
+                    population,
+                    init_params,
+                    options,
+                    &bounds,
+                    &x_start,
+                    n_subj,
+                );
+                if initial_gnorm > 1e-3 {
+                    let alt = run_nlopt_attempt(
+                        model,
+                        population,
+                        init_params,
+                        options,
+                        &bounds,
+                        &x_start,
+                        n,
+                        n_subj,
+                        n_eta,
+                        alt_scaling,
+                    );
+                    // Decide on the RECONVERGED OFV, not the optimizer's internal
+                    // best_ofv. On models where the inner EBEs and the outer
+                    // objective diverge at an off-optimum point (FREM), a lower
+                    // *internal* objective can correspond to a far worse fit once
+                    // the EBEs are reconverged — the internal best_ofv is not
+                    // comparable across the two scalings, but the reconverged OFV
+                    // (the value the fit is reported at) is.
+                    let recon_ofv = |x_real: &[f64]| -> f64 {
+                        let params = unpack_params(x_real, init_params);
+                        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+                        let (ehs, hms, _, kappas) = run_inner_loop_warm(
+                            model,
+                            population,
+                            &params,
+                            options.inner_maxiter,
+                            options.inner_tol,
+                            None,
+                            Some(&mu_k),
+                            options.min_obs_for_convergence_check as usize,
+                            options.inner_restarts,
+                        );
+                        2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options)
+                    };
+                    let cur_ofv = recon_ofv(&attempt.x_real);
+                    let alt_ofv = recon_ofv(&alt.x_real);
+                    if alt_ofv + 1e-3 < cur_ofv {
+                        warnings.push(format!(
+                            "Outer optimizer barely moved from the initial estimates under \
+                             {:?} scaling (relative step {:.1e}, start-point gradient norm \
+                             {:.2e}); recovered with {:?} scaling (OFV {:.4} -> {:.4}).",
+                            resolved_scaling,
+                            rel_move,
+                            initial_gnorm,
+                            alt_scaling,
+                            cur_ofv,
+                            alt_ofv,
+                        ));
+                        attempt = alt;
+                    }
+                }
+            }
+        }
+    }
+
+    let x0 = attempt.x_real.clone();
+    let converged = attempt.converged;
+    warnings.extend(attempt.warnings.iter().cloned());
 
     let final_params = unpack_params(&x0, init_params);
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
@@ -1600,9 +1826,8 @@ fn optimize_nlopt(
         warnings.push("Outer optimization did not converge".to_string());
     }
 
-    let final_gradient = last_gradient.lock().unwrap().clone();
+    let final_gradient = attempt.final_gradient.clone();
 
-    let ebe_final = ebe_accum.lock().unwrap();
     OuterResult {
         params: final_params,
         ofv: final_ofv,
@@ -1612,7 +1837,7 @@ fn optimize_nlopt(
         // objective-function evaluations instead — the only monotone
         // progress counter NLopt exposes, and the quantity most users
         // actually care about ("how much work did the fit do").
-        n_iterations: n_evals_outer.load(Ordering::Relaxed),
+        n_iterations: attempt.n_evals,
         eta_hats: final_ehs,
         h_matrices: final_hms,
         kappas: final_kappas,
@@ -1621,9 +1846,9 @@ fn optimize_nlopt(
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
-        ebe_convergence_warnings: ebe_final.n_convergence_warnings as u32,
-        max_unconverged_subjects: ebe_final.max_unconverged as u32,
-        total_ebe_fallbacks: ebe_final.total_fallback as u32,
+        ebe_convergence_warnings: attempt.ebe_convergence_warnings,
+        max_unconverged_subjects: attempt.max_unconverged,
+        total_ebe_fallbacks: attempt.total_fallback,
         final_gradient,
         sir_fallback_proposal,
         impmap_trace: None,
@@ -4061,6 +4286,21 @@ mod tests {
         assert_eq!(resolve_scaling(Rescale2, Optimizer::Bobyqa), Rescale2);
         assert_eq!(resolve_scaling(PsNone, Optimizer::Bfgs), PsNone);
         assert_eq!(resolve_scaling(Abs, Optimizer::Slsqp), Abs);
+    }
+
+    /// `complementary_scaling` pairs the two auto-resolved gradient scalings
+    /// (`Abs` ↔ `None`) for the false-convergence retry, and declines to retry
+    /// for an explicit `Rescale2` (a deliberate user choice) or the sentinel
+    /// `Auto` (always resolved away before the retry site). This is the mapping
+    /// that lets a warfarin FOCEI fit stalled under `Abs` recover under `None`,
+    /// and a `two_cpt_oral_cov` fit stalled under `None` recover under `Abs`.
+    #[test]
+    fn complementary_scaling_pairs_abs_and_none_only() {
+        use crate::types::ParameterScaling::{Abs, Auto, None as PsNone, Rescale2};
+        assert_eq!(complementary_scaling(Abs), Some(PsNone));
+        assert_eq!(complementary_scaling(PsNone), Some(Abs));
+        assert_eq!(complementary_scaling(Rescale2), Option::None);
+        assert_eq!(complementary_scaling(Auto), Option::None);
     }
 
     // ── invert_psd_with_floor: regularised PD inversion ──────────────────────
