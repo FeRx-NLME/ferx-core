@@ -63,6 +63,16 @@ section of the SDLC for the versioning policy).
   is forgiving of a loose mode).
 
 ### Fixed
+- **Steady-state dosing into a built-in absorption compartment now warns when its
+  equilibration does not converge** (#867). For an `SS=1` dose into a `first_order` /
+  `transit` / `igd` / `weibull` absorption compartment on a **nonlinear** (e.g.
+  Michaelis–Menten) disposition that accumulates heavily — elimination half-life far exceeding
+  the dosing interval `II` — the 50-cycle pulse-train equilibration can stop well short of the
+  true periodic steady state, previously returning a trough that was silently too low.
+  `predict()` (via `fit()` / `simulate()`) now estimates the remaining tail and surfaces a
+  warning when the returned steady state is materially under-converged, or when no periodic
+  steady state exists at all (mean input rate ≥ maximum elimination rate). The **linear** case
+  is exact and unaffected (it takes the closed-form `u_ss = (I − M)⁻¹·b` fast path, #835).
 - **FREM: the analytic gradients differentiated the wrong likelihood on covariate
   pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against
   the prediction `theta[i] + eta[j]` with the dedicated covariate error `EPSCOV` — but the

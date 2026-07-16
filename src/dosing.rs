@@ -140,19 +140,54 @@ pub(crate) fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
 #[derive(Default)]
 pub(crate) struct SsStopTracker {
     prev: Vec<f64>,
+    /// Relative-L∞ increments of the two most recent *non-converged* cycles, oldest first
+    /// (`[prev_increment, last_increment]`) — the geometric-tail inputs for the #867 cycle-cap
+    /// non-convergence check. Rolled only on the else branch of [`Self::should_stop`]; the dual
+    /// sensitivity paths (which reuse the same stop criterion via `ss_dual_cycle_should_stop`)
+    /// don't consult this.
+    increments: [f64; 2],
 }
 
 impl SsStopTracker {
     /// Record `cur` and report whether the trough has converged (from cycle 1 on). Returns
     /// `true` to break the equilibration loop.
     pub(crate) fn should_stop(&mut self, cycle: usize, cur: &[f64]) -> bool {
-        if cycle > 0 && ss_cycle_converged(cur, &self.prev, SS_EQUILIBRATION_TOL) {
-            return true;
+        if cycle > 0 {
+            if ss_cycle_converged(cur, &self.prev, SS_EQUILIBRATION_TOL) {
+                return true;
+            }
+            // Not converged this cycle: roll the two-deep increment history so a loop that runs
+            // out the cycle budget can estimate its un-taken geometric tail (#867).
+            self.increments = [self.increments[1], ss_relative_increment(cur, &self.prev)];
         }
         self.prev.clear();
         self.prev.extend_from_slice(cur);
         false
     }
+
+    /// The `[prev, last]` relative increments of the two most recent non-converged cycles — the
+    /// inputs to [`note_ss_nonconvergence_if_capped`] (#867). Both are `0.0` on a loop that
+    /// early-stopped or ran fewer than two non-converged cycles, which that check treats as
+    /// "nothing to warn about".
+    pub(crate) fn recent_increments(&self) -> (f64, f64) {
+        (self.increments[0], self.increments[1])
+    }
+}
+
+/// Relative-L∞ change between successive SS-equilibration cycles: `max|cur − prev| / max|cur|`
+/// (#867). The single-scalar reduction of the same magnitude [`ss_cycle_converged`] tests, used
+/// to estimate the geometric contraction ratio when a loop hits the cycle cap. `0.0` when `cur`
+/// is all-zero (nothing has accumulated, so there is no tail to worry about).
+fn ss_relative_increment(cur: &[f64], prev: &[f64]) -> f64 {
+    let max_mag = cur.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
+    if max_mag == 0.0 {
+        return 0.0;
+    }
+    let max_diff = cur
+        .iter()
+        .zip(prev)
+        .fold(0.0_f64, |m, (&a, &b)| m.max((a - b).abs()));
+    max_diff / max_mag
 }
 
 #[cfg(test)]
@@ -203,3 +238,172 @@ pub(crate) fn with_full_ss_equilibration<R>(f: impl FnOnce() -> R) -> R {
 #[cfg(not(test))]
 #[inline(always)]
 pub(crate) fn record_ss_equilibration_cycles(_n: usize) {}
+
+/// Relative-magnitude threshold above which a **cycle-capped** SS equilibration is reported as
+/// non-converged (#867). The pulse-train equilibration
+/// (`crate::ode::predictions::equilibrate_ss_state`) is a geometric contraction with per-cycle
+/// carryover ratio `ρ ≈ exp(−λ·II)`. A heavily-accumulating **nonlinear** disposition (e.g.
+/// Michaelis–Menten with elimination half-life ≫ dosing interval `II`) drives `ρ → 1`, so the
+/// [`SS_EQUILIBRATION_CYCLES`]-capped loop stops far short of the true periodic steady state and
+/// the returned trough is materially too low — silently, until now. The un-taken tail is estimated
+/// from the last two cycle increments as `incr·ρ/(1−ρ)` (the closed sum of the remaining geometric
+/// series); when it exceeds this fraction of the trough — or the sequence is not contracting
+/// (`ρ ≥ 1`: mean input ≥ maximum elimination, so no periodic steady state exists at all) — a
+/// warning is surfaced instead of returning the under-converged value silently.
+///
+/// `1e-2` (1%): the accurate low-accumulation cases sit at ~0% estimated tail while the
+/// pathological cases in #867 are 38–79% low, so the threshold separates them with wide margin.
+/// A **linear** disposition is unaffected — it takes the exact closed-form fast path
+/// (`(I − M)⁻¹·b`, #835) and never reaches this iteration.
+pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
+
+/// Process-global collector for steady-state equilibration non-convergence warnings (#867).
+///
+/// The capped pulse-train equilibration runs deep inside the per-subject prediction walk
+/// (`ode::predictions::equilibrate_ss_state`), which rayon parallelises across subjects and whose
+/// numeric signatures carry no warning channel. Threading a `&mut Vec<String>` through every
+/// `ode_predictions_*` variant and its callers would be a wide, invasive change for a rare
+/// diagnostic, and a thread-local would be lost on the rayon worker threads. So the message —
+/// written only on the rare non-converged nonlinear branch — is deduplicated into this cross-thread
+/// set and drained by the `api` boundary (`predict` / `simulate` / `fit`) into `FitResult.warnings`
+/// via [`take_ss_nonconvergence_warnings`].
+///
+/// The message is model-structural (independent of subject and of objective-eval count), so the
+/// `BTreeSet` collapses the thousands of identical writes a fit produces down to one entry, and its
+/// deterministic ordering keeps the surfaced list stable. This assumes one top-level `api`
+/// operation per process at a time (the CLI / ferx-r usage): each entrypoint
+/// [`clear_ss_nonconvergence_warnings`] on entry and [`take_ss_nonconvergence_warnings`] on exit to
+/// bracket its own run; genuinely concurrent in-process fits would share the sink.
+fn ss_nonconvergence_sink() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
+    static SINK: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    SINK.get_or_init(std::sync::Mutex::default)
+}
+
+/// Estimate the un-taken geometric tail of a cycle-capped SS equilibration and, if it is
+/// non-negligible, deduplicate a non-convergence warning into the [`ss_nonconvergence_sink`]
+/// (#867). `early_stopped` short-circuits (the loop converged, so there is nothing to warn about);
+/// `incr_prev` / `incr_last` are the two most recent relative-L∞ cycle increments
+/// ([`SsStopTracker::recent_increments`]).
+pub(crate) fn note_ss_nonconvergence_if_capped(
+    early_stopped: bool,
+    incr_prev: f64,
+    incr_last: f64,
+) {
+    if let Some(msg) = ss_equilibration_tail_warning(early_stopped, incr_prev, incr_last) {
+        if let Ok(mut set) = ss_nonconvergence_sink().lock() {
+            set.insert(msg);
+        }
+    }
+}
+
+/// Build the #867 non-convergence warning from the last two relative cycle increments, or `None`
+/// when the equilibration is trustworthy. Split out from [`note_ss_nonconvergence_if_capped`] so
+/// the geometric-tail arithmetic is unit-testable without touching the global sink.
+///
+/// `ρ = incr_last / incr_prev` is the estimated per-cycle carryover ratio; the remaining relative
+/// error is the closed geometric tail `incr_last·ρ/(1−ρ)`. `ρ ≥ 1` (or non-finite) means the
+/// sequence is not contracting — no periodic steady state — and always warns.
+fn ss_equilibration_tail_warning(
+    early_stopped: bool,
+    incr_prev: f64,
+    incr_last: f64,
+) -> Option<String> {
+    // Converged (broke out early), or nothing moving in the last cycle → trustworthy trough.
+    if early_stopped || incr_last <= 0.0 {
+        return None;
+    }
+    // Can't estimate ρ without a prior increment; a still-moving final cycle with no history is
+    // too little signal to cry non-convergence on. (Only happens if the very last cycle is the
+    // first non-converged one, which the cycle cap makes vanishingly unlikely.)
+    if incr_prev <= 0.0 {
+        return None;
+    }
+    let rho = incr_last / incr_prev;
+    if !rho.is_finite() {
+        return None;
+    }
+    if rho >= 1.0 {
+        return Some(format!(
+            "Steady-state (SS=1) equilibration did not converge within {SS_EQUILIBRATION_CYCLES} \
+             cycles: the per-cycle carryover is not contracting (ratio ≈ {rho:.3}), indicating no \
+             periodic steady state exists — the mean input rate meets or exceeds the maximum \
+             elimination rate (e.g. a saturable / Michaelis–Menten disposition dosed above its \
+             capacity). The returned SS trough is unreliable.",
+        ));
+    }
+    // Remaining tail relative to the (under-converged) *current* trough — the natural scale for
+    // the threshold, since that is what we hold.
+    let remaining_vs_current = incr_last * rho / (1.0 - rho);
+    if remaining_vs_current > SS_WARN_REL_TOL {
+        // Re-express as a fraction of the *true* steady state `u_ss ≈ u_last·(1 + tail)` for the
+        // human-facing "% below true SS" — the framing #867's evidence table uses (its 38% row is
+        // `remaining_vs_current ≈ 0.61`, i.e. 0.61/1.61 ≈ 38%). Reporting the ÷u_last figure would
+        // overstate the bias.
+        let pct_below_true = 100.0 * remaining_vs_current / (1.0 + remaining_vs_current);
+        return Some(format!(
+            "Steady-state (SS=1) equilibration reached the {SS_EQUILIBRATION_CYCLES}-cycle cap \
+             without converging (per-cycle carryover ratio ≈ {rho:.3}); the returned SS trough is \
+             approximately {pct_below_true:.0}% below the true periodic steady state. This affects \
+             slowly-accumulating nonlinear (e.g. Michaelis–Menten) disposition where the \
+             elimination half-life greatly exceeds the dosing interval II; predictions and \
+             simulations for such a model may be biased low.",
+        ));
+    }
+    None
+}
+
+/// Drain and return the collected SS non-convergence warnings (#867). The `api` boundary calls
+/// this after its prediction pass and appends the result to `FitResult.warnings`. See
+/// [`ss_nonconvergence_sink`].
+pub(crate) fn take_ss_nonconvergence_warnings() -> Vec<String> {
+    ss_nonconvergence_sink()
+        .lock()
+        .map(|mut set| std::mem::take(&mut *set).into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Clear any residual SS non-convergence warnings so a top-level `api` call starts from a clean
+/// sink (#867). See [`ss_nonconvergence_sink`].
+pub(crate) fn clear_ss_nonconvergence_warnings() {
+    if let Ok(mut set) = ss_nonconvergence_sink().lock() {
+        set.clear();
+    }
+}
+
+#[cfg(test)]
+mod ss_warn_tests {
+    use super::*;
+
+    #[test]
+    fn early_stop_never_warns() {
+        assert!(ss_equilibration_tail_warning(true, 0.5, 0.4).is_none());
+    }
+
+    #[test]
+    fn negligible_tail_does_not_warn() {
+        // ρ ≈ 0.1 (fast contraction): remaining ≈ 1e-4·0.1/0.9 ≈ 1.1e-5 ≪ 1% → trustworthy.
+        assert!(ss_equilibration_tail_warning(false, 1e-3, 1e-4).is_none());
+    }
+
+    #[test]
+    fn slow_contraction_warns_biased_low() {
+        // ρ = 0.9, incr_last = 0.05 → remaining ≈ 0.05·9 = 45% ≫ 1%.
+        let w = ss_equilibration_tail_warning(false, 0.05 / 0.9, 0.05).expect("should warn");
+        assert!(w.contains("below the true periodic steady state"), "{w}");
+    }
+
+    #[test]
+    fn non_contracting_warns_no_steady_state() {
+        // Increment growing (ρ > 1): no periodic steady state.
+        let w = ss_equilibration_tail_warning(false, 0.02, 0.03).expect("should warn");
+        assert!(w.contains("not contracting"), "{w}");
+        assert!(w.contains("no periodic steady state"), "{w}");
+    }
+
+    #[test]
+    fn zero_increment_is_trustworthy() {
+        assert!(ss_equilibration_tail_warning(false, 0.0, 0.0).is_none());
+        assert!(ss_equilibration_tail_warning(false, 0.1, 0.0).is_none());
+    }
+}

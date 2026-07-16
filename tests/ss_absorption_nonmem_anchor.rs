@@ -27,7 +27,7 @@
 //! `nonmem_anchor/results/ss_first_order.*`.
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::{fit, predict, read_nonmem_csv};
+use ferx_core::{fit, predict, read_nonmem_csv, simulate_with_options_diag, SimulateOptions};
 
 // `first_order(ka)` appears in central directly (its R_in is the appearance rate of an
 // ADVAN2 depot→central first-order absorption), and the readout `y = central/V` matches
@@ -146,4 +146,77 @@ fn fit_on_ss_absorption_converges() {
             "SS-absorption fit drifted a theta: got {est:.4}, truth {tv} (rel {rel:.2})"
         );
     }
+}
+
+/// A **saturable (Michaelis–Menten), heavily-accumulating** SS-absorption model whose closed-form
+/// linear fast path correctly declines, so equilibration falls to the 50-cycle pulse-train
+/// iteration — which under-converges when the per-cycle carryover ratio `ρ → 1` (#867). The
+/// dataset's mean absorbed input (AMT/II = 100/8 = 12.5) sits just below `Vmax = 13`, so the SS
+/// concentration saturates far above `Km = 20` and the iteration stops well short of the true
+/// periodic steady state. This drives the full public `simulate` path and asserts the
+/// non-convergence warning reaches `SimulationOutput.warnings` (the api-boundary drain) rather than
+/// being swallowed silently. Fast (an evaluation-only simulate, no convergence loop), so it is not
+/// slow-gated. The predictor-level detection is unit-tested in
+/// `ode::predictions::tests::ss_input_rate_heavy_accumulation_warns_non_convergence`.
+const SS_MM_HEAVY_ACCUM_MODEL: &str = r#"
+[parameters]
+  theta TVVMAX(13.0, 1.0, 100.0)
+  theta TVKM(20.0, 1.0, 5000.0)
+  theta TVKA(2.0, 0.05, 20.0)
+
+  omega ETA_X ~ 0.0
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  VMAX = TVVMAX
+  KM   = TVKM
+  KA   = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = first_order(ka=KA) - VMAX*central/(KM+central)
+
+[scaling]
+  y = central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  ode_reltol = 1e-6
+  ode_abstol = 1e-6
+"#;
+
+#[test]
+fn simulate_surfaces_ss_nonconvergence_warning_for_saturable_accumulation() {
+    let parsed = parse_full_model(SS_MM_HEAVY_ACCUM_MODEL).expect("model parses");
+    let model = parsed.model;
+    let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
+        .expect("dataset loads");
+
+    let out = simulate_with_options_diag(
+        &model,
+        &population,
+        &model.default_params,
+        1,
+        &SimulateOptions::default(),
+    )
+    .expect("simulate returns Ok");
+
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "saturable heavy-accumulation SS must surface a non-convergence warning through \
+         SimulationOutput.warnings; got: {:?}",
+        out.warnings
+    );
+    // Simulated rows are still produced (the under-converged trough is finite, just biased).
+    assert!(
+        !out.results.is_empty(),
+        "simulate must still return rows alongside the warning"
+    );
 }

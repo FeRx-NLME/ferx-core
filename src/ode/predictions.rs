@@ -54,8 +54,8 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
 // `last_ss_equilibration_cycles`, `with_full_ss_equilibration`) are referenced directly
 // as `crate::dosing::…` by the tests, so they are not imported here.
 use crate::dosing::{
-    record_ss_equilibration_cycles, resolve_subject_doses, resolve_subject_doses_with,
-    SsStopTracker, SS_EQUILIBRATION_CYCLES,
+    note_ss_nonconvergence_if_capped, record_ss_equilibration_cycles, resolve_subject_doses,
+    resolve_subject_doses_with, SsStopTracker, SS_EQUILIBRATION_CYCLES,
 };
 
 /// Relative floor for truncating the steady-state **input-rate periodic sum** (#719). An
@@ -362,6 +362,7 @@ fn equilibrate_ss_state(
         );
         let mut tracker = SsStopTracker::default();
         let mut cycles_run = 0usize;
+        let mut early_stopped = false;
         for m in 0..n_pulses {
             let seg_start = m as f64 * dose.ii;
             let seg_end = seg_start + dose.ii;
@@ -378,10 +379,18 @@ fn equilibrate_ss_state(
             }
             cycles_run = m + 1;
             if tracker.should_stop(m, &u) {
+                early_stopped = true;
                 break;
             }
         }
         record_ss_equilibration_cycles(cycles_run);
+        // If the pulse train hit the cycle cap without converging, the returned trough may be
+        // materially below the true periodic steady state — surface a warning instead of silently
+        // under-reporting it (#867). Only a *nonlinear* disposition reaches this fallback (the
+        // linear closed form above returns early), so this is exactly the saturable
+        // heavy-accumulation case; a fast-contracting model early-stops and is left alone.
+        let (incr_prev, incr_last) = tracker.recent_increments();
+        note_ss_nonconvergence_if_capped(early_stopped, incr_prev, incr_last);
         return u;
     }
 
@@ -8638,6 +8647,77 @@ mod tests {
         assert!(
             preds.iter().all(|p| p.is_finite() && *p >= 0.0),
             "nonlinear SS predictions (iteration fallback) must be finite: {preds:?}"
+        );
+    }
+
+    /// Serializes the tests that *read* the process-global SS non-convergence sink
+    /// (`take_ss_nonconvergence_warnings`, #867) so cargo's parallel harness can't have one test
+    /// drain another's entry mid-read. Writers don't drain, so only readers need to coordinate.
+    static SS_WARN_SINK_READER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A **heavily-accumulating** Michaelis–Menten SS-absorption model (mean input rate just below
+    /// `Vmax`, so the per-cycle carryover ratio `ρ → 1`) equilibrates far short of the true
+    /// periodic steady state in the 50-cycle cap. Before #867 the under-converged trough was
+    /// returned silently; now the predictor deduplicates a non-convergence warning into the sink.
+    /// End-to-end wiring test: a real `ode_predictions` walk over this model must populate the sink
+    /// (the `dosing` unit tests cover the tail-estimate arithmetic and the "no warning when it
+    /// converges" side).
+    #[test]
+    fn ss_input_rate_heavy_accumulation_warns_non_convergence() {
+        let _guard = SS_WARN_SINK_READER_GUARD.lock().unwrap();
+        crate::dosing::clear_ss_nonconvergence_warnings();
+        let ode = OdeSpec {
+            // Vmax reuses the CL slot, Km the V slot; `first_order` ka at slot 4.
+            rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let vmax = p[crate::types::PK_IDX_CL];
+                let km = p[crate::types::PK_IDX_V];
+                dy[0] = -vmax * y[0] / (km + y[0]);
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: vec![InputRateForcing {
+                cmt: 0,
+                kind: InputRateKind::FirstOrder,
+                arg_slots: vec![4],
+                frac_slot: None,
+                lag_slot: None,
+            }],
+            init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+        };
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 130.0; // Vmax
+        pk.values[crate::types::PK_IDX_V] = 1000.0; // Km (large → saturable, slow accumulation)
+        pk.values[4] = 2.0; // ka
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+        // Mean absorbed input 1000/8 = 125 < Vmax = 130: a periodic SS exists but ρ ≈ 0.96, so the
+        // 50-cycle iteration stops ~57% low (issue #867's Vmax=130,Km=1000 row).
+        let ss = DoseEvent::new(0.0, 1000.0, 1, 0.0, true, 8.0);
+        let subj = make_subject(vec![ss], vec![1.0, 4.0, 7.9]);
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+        assert!(
+            preds.iter().all(|p| p.is_finite()),
+            "predictions must stay finite even under-converged: {preds:?}"
+        );
+        // It must NOT have taken the closed-form fast path (that's linear-only) — the iteration ran
+        // its full budget.
+        assert_eq!(
+            crate::dosing::last_ss_equilibration_cycles(),
+            SS_EQUILIBRATION_CYCLES,
+            "heavy-accumulation nonlinear SS must run the full cycle budget"
+        );
+        let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("below the true periodic steady state")),
+            "heavy-accumulation nonlinear SS must surface a non-convergence warning; got: {warnings:?}"
         );
     }
 
