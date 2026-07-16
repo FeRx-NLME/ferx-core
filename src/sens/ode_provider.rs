@@ -606,27 +606,15 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     };
     // Steady-state dosing into a built-in absorption input-rate compartment is analytic (#835):
     // the dual walk equilibrates the trough through the closed-form fixed point
-    // (`equilibrate_ss_input_rate_state_g` → `equilibrate_ss_input_rate_fixed_point_g`), carrying
-    // `∂u_ss/∂(θ,η)` through `u_ss = (I − M)⁻¹·b` (linear) or the pulse-train fallback (nonlinear)
-    // — bit-identical in value to the f64 predictor, so the forward periodic `R_in` superposition
-    // composes on top exactly as on production. Two combinations remain out of scope and are
-    // hard-rejected upstream (`E_ABSORPTION_SS_ZERO_ORDER` / `E_ABSORPTION_SS_LAG`,
-    // `api::check_absorption_dosing`): SS into a `zero_order` window (a spanning-window
-    // equilibration the fixed point's pointwise `R_in` doesn't build) and SS + an absorption
-    // lagtime. The decline below is therefore normally unreachable, but keeps this gate
-    // self-consistent with those scope limits if either upstream check is relaxed — and never
-    // trips on the *supported* smooth-kernel-without-lag case. Scoped to the SS-dosed compartment:
-    // an SS dose targeting a plain compartment on a model that separately declares absorption for
-    // a different route is unaffected (its `R_in` is inert for that dose).
-    let ss_absorption_out_of_scope = subject.doses.iter().any(|d| {
-        d.ss && d.ii > 0.0
-            && ode.input_rate.iter().any(|f| {
-                f.cmt + 1 == d.cmt
-                    && (f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
-                        || model.has_lagtime_on_cmt(d.cmt))
-            })
-    });
-    if ss_absorption_out_of_scope {
+    // (`equilibrate_ss_input_rate_state_g`), carrying `∂u_ss/∂(θ,η)` through `u_ss = (I − M)⁻¹·b`
+    // (linear) or the pulse-train fallback (nonlinear) — bit-identical in value to the f64
+    // predictor, so the forward periodic `R_in` superposition composes on top exactly as on
+    // production. SS into a `zero_order` window and SS + an absorption lagtime stay out of scope
+    // and are hard-rejected upstream (`E_ABSORPTION_SS_ZERO_ORDER` / `E_ABSORPTION_SS_LAG`,
+    // `api::check_absorption_dosing`); the belt-and-suspenders decline below keeps this gate
+    // self-consistent with those scope limits if either upstream check is relaxed. Shared
+    // single source of truth: `CompiledModel::ss_absorption_out_of_scope`.
+    if model.ss_absorption_out_of_scope(subject) {
         return false;
     }
     // Built-in absorption input-rate forcing (transit/igd/weibull/first_order, #486):
@@ -2466,23 +2454,10 @@ fn ode_iov_subject_supported(
     // #835: a steady-state dose into a built-in absorption input-rate compartment is analytic
     // under IOV too — the shared `integrate_tvcov_g` walk equilibrates the trough via
     // `equilibrate_ss_input_rate_state_g`, whose fixed-point / pulse-train carries κ's jet through
-    // `params` exactly as it does η/θ. Only the two upstream-rejected combinations stay out of
-    // scope (SS into a `zero_order` window, SS + absorption lagtime); the decline below is the
-    // same belt-and-suspenders guard as the non-IOV gate (`ode_tvcov_supported`), normally
-    // unreachable. Scoped to the SS-dosed compartment: an SS dose into a plain compartment on a
-    // model that separately declares absorption for a different route is unaffected.
-    if has_ss
-        && model.ode_spec.as_ref().is_some_and(|o| {
-            subject.doses.iter().any(|d| {
-                d.ss && d.ii > 0.0
-                    && o.input_rate.iter().any(|f| {
-                        f.cmt + 1 == d.cmt
-                            && (f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
-                                || model.has_lagtime_on_cmt(d.cmt))
-                    })
-            })
-        })
-    {
+    // `params` exactly as it does η/θ. Only SS into a `zero_order` window and SS + an absorption
+    // lagtime stay out of scope; the decline below is the same belt-and-suspenders guard as the
+    // non-IOV gate (`ode_tvcov_supported`), sharing `CompiledModel::ss_absorption_out_of_scope`.
+    if model.ss_absorption_out_of_scope(subject) {
         return None;
     }
     // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are

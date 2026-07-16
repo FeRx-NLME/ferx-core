@@ -3640,6 +3640,36 @@ impl CompiledModel {
         })
     }
 
+    /// True when `subject` has a steady-state dose into a built-in absorption
+    /// input-rate compartment that the analytic dual SS fixed point does **not**
+    /// serve: SS into a `zero_order` spanning window (the pointwise `R_in` fixed
+    /// point doesn't build it) or SS combined with an absorption lagtime on the
+    /// dosed compartment. Both are hard-rejected upstream
+    /// (`E_ABSORPTION_SS_ZERO_ORDER` / `E_ABSORPTION_SS_LAG`,
+    /// `api::check_absorption_dosing`); the ODE support gates
+    /// (`ode_tvcov_supported`, `ode_iov_subject_supported`) and the IOV FD-reason
+    /// attribution (`iov_fd_reason`) re-check it as belt-and-suspenders so the
+    /// analytic-vs-FD routing stays self-consistent if either upstream check is
+    /// relaxed. Single source of truth for those three sites (#835 review) —
+    /// keeping the scope in one place so it cannot drift between them (cf. the
+    /// #814 attribution-drift class of bug). Scoped to the SS-dosed compartment:
+    /// an SS dose into a plain compartment on a model that separately declares
+    /// absorption for a different route is unaffected (its `R_in` is inert for
+    /// that dose).
+    pub(crate) fn ss_absorption_out_of_scope(&self, subject: &Subject) -> bool {
+        let Some(ode) = self.ode_spec.as_ref() else {
+            return false;
+        };
+        subject.doses.iter().any(|d| {
+            d.ss && d.ii > 0.0
+                && ode.input_rate.iter().any(|f| {
+                    f.cmt + 1 == d.cmt
+                        && (f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
+                            || self.has_lagtime_on_cmt(d.cmt))
+                })
+        })
+    }
+
     /// True when the model wires in a bioavailability `F`/`Fn` parameter (on
     /// either engine). Mirrors [`Self::has_lagtime`]: the analytical route puts
     /// [`PK_IDX_F`] in `pk_indices` (from `f=` on the `[structural_model]`

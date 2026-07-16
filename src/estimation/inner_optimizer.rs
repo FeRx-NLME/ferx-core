@@ -253,23 +253,19 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         {
             return "steady-state dose + time-dependent ODE RHS";
         }
+        // Infusion into a built-in absorption compartment (#719 gap 2) declines to FD under IOV
+        // (the dual walk's `+rate` would double-count the mass the convolved `R_in_inf` already
+        // delivers). `ode_iov_subject_supported` checks this *before* its SS-absorption bail, so
+        // naming it here keeps the attribution from drifting to the generic catch-all below.
+        if crate::sens::ode_provider::has_infusion_into_input_rate(eff, subject) {
+            return "infusion into built-in absorption compartment";
+        }
         // #835: a steady-state dose into a built-in absorption compartment is analytic for the
         // smooth density kernels (transit/igd/weibull/first_order) — the dual fixed point carries
         // its κ-coupled sensitivity. Only SS into a `zero_order` window and SS + an absorption
-        // lagtime stay on FD; mirror `ode_iov_subject_supported`'s flipped bail, in the same order,
-        // so this attribution can't drift. Scoped to the SS-dosed compartment.
-        if has_ss
-            && eff.ode_spec.as_ref().is_some_and(|o| {
-                subject.doses.iter().any(|d| {
-                    d.ss && d.ii > 0.0
-                        && o.input_rate.iter().any(|f| {
-                            f.cmt + 1 == d.cmt
-                                && (f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
-                                    || eff.has_lagtime_on_cmt(d.cmt))
-                        })
-                })
-            })
-        {
+        // lagtime stay on FD; mirror `ode_iov_subject_supported`'s flipped bail via the shared
+        // `CompiledModel::ss_absorption_out_of_scope` so this attribution can't drift.
+        if eff.ss_absorption_out_of_scope(subject) {
             return "steady-state dose + built-in absorption forcing";
         }
         let occ_groups = iov_occasion_groups(subject);
@@ -4576,6 +4572,48 @@ mod iov_tests {
         assert_eq!(
             iov_fd_reason(&model, &subject),
             "steady-state dose + built-in absorption forcing"
+        );
+    }
+
+    #[test]
+    fn iov_fd_reason_attributes_infusion_into_absorption() {
+        // #719 gap 2 / #835 review: a finite infusion into a built-in absorption compartment
+        // declines to FD under IOV (the dual `+rate` would double-count the convolved `R_in_inf`
+        // mass). `iov_fd_reason` must name the infusion — mirroring `ode_iov_subject_supported`'s
+        // bail, which fires *before* its SS-absorption gate — not fall through to the generic
+        // "subject outside IOV analytic scope".
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVDUR(5.0,0.1,24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_DUR ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  DUR = TVDUR * exp(ETA_DUR)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = zero_order(dur=DUR) - (CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse zero_order ODE IOV");
+        // Finite infusion (rate > 0, not steady state) into the absorption compartment.
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0)],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        assert!(
+            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
+            "infusion into absorption must route to FD under IOV"
+        );
+        assert_eq!(
+            iov_fd_reason(&model, &subject),
+            "infusion into built-in absorption compartment"
         );
     }
 

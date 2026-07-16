@@ -12230,10 +12230,11 @@ mod tests {
         check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
     }
 
-    /// **Still-FD edge: built-in absorption + steady state under IOV** (#486). The dual SS
-    /// equilibration (`equilibrate_ss_state_g`) seeds a bolus/infusion trough and does not
-    /// spread a periodic zero-order window (or a first-order `R_in` tail) over the cycle, so
-    /// a `zero_order` + SS subject routes to FD on BOTH loops. (The `weibull` + lagtime FD
+    /// **Still-FD edge: `zero_order` window + steady state under IOV** (#486, narrowed by #835).
+    /// The dual SS input-rate equilibration (`equilibrate_ss_input_rate_state_g`) now spreads a
+    /// periodic *smooth-kernel* `R_in` tail (first_order/transit/igd/weibull) over the cycle
+    /// analytically, but a `zero_order` spanning window is not built by the pointwise fixed point,
+    /// so a `zero_order` + SS subject still routes to FD on BOTH loops. (The `weibull` + lagtime FD
     /// case is pinned separately by `ode_iov_weibull_lagtime_falls_back_to_fd`.)
     #[test]
     fn ode_iov_zero_order_ss_falls_back_to_fd() {
@@ -12492,6 +12493,79 @@ mod tests {
             !crate::sens::ode_provider::ode_iov_supported(&model),
             "weibull + lagtime must stay FD under IOV (β<1 onset divergence, #486)"
         );
+    }
+
+    /// #835 review: `CompiledModel::ss_absorption_out_of_scope` is the single source of truth for
+    /// the SS-into-absorption FD decline shared by `ode_tvcov_supported`,
+    /// `ode_iov_subject_supported`, and `iov_fd_reason`. Pin both out-of-scope operands directly
+    /// on the helper — a `zero_order` window and an absorption lagtime on the dosed compartment —
+    /// plus the in-scope smooth-kernel-without-lag case, so a future edit to any single gate site
+    /// cannot silently diverge from the others. (At the gate call sites the lagtime operand is
+    /// short-circuited by `f.kind == ZeroOrder`, so this is its only direct coverage.)
+    #[test]
+    fn ss_absorption_out_of_scope_covers_both_operands() {
+        let ss_into = |cmt: usize| Subject {
+            doses: vec![DoseEvent::new(0.0, 100.0, cmt, 0.0, true, 12.0)],
+            ..iov_subject()
+        };
+        // Operand 1 — SS into a `zero_order` window → out of scope (FD).
+        let zo = parse_model_string(ZERO_ORDER_IOV_ODE).expect("parse zero_order IOV");
+        assert!(zo.ss_absorption_out_of_scope(&ss_into(1)));
+        // Operand 2 — SS + an absorption lagtime on the dosed compartment → out of scope (FD).
+        let weibull_lag = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVTD(2.0, 0.05, 24.0)
+  theta TVBETA(1.5, 0.1, 10.0)
+  theta TVLAG(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL + KAPPA_CL)
+  V       = TVV  * exp(ETA_V)
+  TD      = TVTD
+  BETA    = TVBETA
+  LAGTIME = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+        let wl = parse_model_string(weibull_lag).expect("parse weibull+lag IOV");
+        assert!(wl.has_lagtime_on_cmt(1));
+        assert!(wl.ss_absorption_out_of_scope(&ss_into(1)));
+        // In scope — the same smooth kernel WITHOUT a lagtime is analytic under #835; the helper
+        // must NOT decline it (guards against over-declining the supported path).
+        let weibull_nolag = weibull_lag
+            .replace("  theta TVLAG(0.3, 0.01, 5.0)\n", "")
+            .replace("  LAGTIME = TVLAG\n", "");
+        let wn = parse_model_string(&weibull_nolag).expect("parse weibull IOV");
+        assert!(!wn.has_lagtime_on_cmt(1));
+        assert!(!wn.ss_absorption_out_of_scope(&ss_into(1)));
+        // A bolus (ii = 0, not steady state) into the same compartment is never out of scope.
+        let bolus = Subject {
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            ..iov_subject()
+        };
+        assert!(!wl.ss_absorption_out_of_scope(&bolus));
+        // No ODE spec (a closed-form/analytical model) → the helper's early return: never out of
+        // scope, whatever the dose (there is no built-in input-rate forcing to consume it).
+        let analytic = parse_model_string(
+            "[parameters]\n  theta TVCL(10.0,1.0,100.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+        )
+        .expect("parse analytic one_cpt_iv");
+        assert!(analytic.ode_spec.is_none());
+        assert!(!analytic.ss_absorption_out_of_scope(&ss_into(1)));
     }
 
     /// **ODE IOV + compartment-indexed `ALAG{cmt}` / `F{cmt}`** (#486 IOV-scope parity). The
