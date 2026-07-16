@@ -100,6 +100,34 @@ The domain is `mtt > 0` and `n ≥ 0`. It is enforced in two places:
   estimates — it only keeps the optimiser numerically stable. (A log-normal
   parameterisation avoids the excursion entirely and is recommended.)
 
+### Steady-state dosing (`SS=1`)
+
+A steady-state dose into a built-in absorption compartment — the density kernels
+`transit()`, `igd()`, `weibull()`, and `first_order()` — **is supported** (#719).
+The single `SS=1` record stands for an infinite past pulse train, and ferx serves
+it *through* the absorption kernel rather than as a bolus: the still-arriving tail
+of every prior pulse is superposed as a periodic `R_in = Σⱼ R_in(tad + j·II)`, and
+the disposition carried in from those prior pulses (the trough) is the periodic
+steady state of the disposition. For a **linear** disposition (every built-in PK
+model) that trough is a closed form — `u_ss = (I − M)⁻¹·b`, with `M = e^{A·II}` one
+homogeneous cycle and `b` one forced cycle — so it costs a handful of ODE solves
+rather than iterating the pulse train (a nonlinear disposition self-detects and
+falls back to the iteration). Predictions therefore match an explicit long run-in
+of the same schedule (to solver precision) and NONMEM's exact analytic `ADVAN2`
+steady state (see `tests/ss_absorption_nonmem_anchor.rs`). A closed-form
+`pk *_transit` / `*_ig` model with an `SS` dose reroutes to its ODE twin
+automatically, exactly as for time-varying covariates and IOV.
+
+`fit()` on an SS-absorption model works and converges. Its sensitivities currently
+use a finite-difference fallback (the prediction they difference is exact, and the
+closed-form trough makes it smooth and cheap enough to converge), so fitting a
+*large* SS-absorption dataset is slower than an analytic ODE model; an analytic
+dual SS-equilibration through the kernel — restoring full-speed FOCEI parity — is a
+scoped follow-up. Two `SS` combinations remain **rejected with a clear error**: a
+`zero_order()` window (`E_ABSORPTION_SS_ZERO_ORDER` — a spanning window needs a
+distinct periodic-window equilibration) and an absorption **lagtime**
+(`E_ABSORPTION_SS_LAG` — the SS + lagtime pre-arrival seed is still bolus-only).
+
 ### Not yet supported (Phase 0)
 
 These combinations are **rejected with a clear error** rather than silently
@@ -110,9 +138,6 @@ mis-modeled:
   an infusion rate on the same record would double-count it. Use a plain bolus
   record (`RATE=0`) into the absorption compartment; the transit chain provides
   the input-rate shape.
-- **Steady-state dosing (`SS=1`) into a transit compartment** (`E_ABSORPTION_SS`)
-  — periodic steady state with an in-progress absorption tail needs dedicated
-  treatment. Expand the run-in with explicit dosing records instead.
 - **A `[diffusion]` block (SDE/EKF) together with `transit()`**
   (`E_ABSORPTION_DIFFUSION`) — the EKF propagation does not yet carry the
   input-rate forcing.
@@ -171,9 +196,11 @@ ODE forcing **bit-for-bit** at non-zero per-occasion κ, including multiple dose
 small, pre-existing ~8 OFV units from NONMEM — an ODE-path IOV marginal offset shared by every
 ODE+IOV model, orthogonal to this reroute, tracked in
 [#810](https://github.com/FeRx-NLME/ferx-core/issues/810) and guarded (not asserted-equal) by
-`tests/transit_iov_nonmem_anchor.rs`.) **Steady-state doses, infusions, system resets
-(EVID=3/4), a non-depot (`CMT≠1`) dose, and a `depot` initial amount are rejected** with an
-actionable message — use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
+`tests/transit_iov_nonmem_anchor.rs`.) A **steady-state (`SS=1`) dose reroutes** to the
+`transit()` ODE forcing automatically (#719) — the twin equilibrates it through the
+absorption kernel — exactly as TV-covariate and IOV subjects do. **Infusions, system resets
+(EVID=3/4), a non-depot (`CMT≠1`) dose, and a `depot` initial amount are still rejected** with
+an actionable message — use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
 tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
 drop-in choice when you need a feature the closed form does not yet cover.
 
@@ -225,8 +252,9 @@ The **domain** (`α < KTR`, since `α ≥ β`) and **scope/limits** are identica
 `one_cpt_transit` (bolus doses into the depot, bioavailability, lag time; time-varying
 covariates, `TIME`-dependent parameters, and IOV (`n_kappa > 0`) transparently rerouted to
 an exact 2-cpt ODE `transit()` twin; the flip-flop `α ≥ KTR` regime likewise auto-rerouted to
-that twin per evaluation — exactly as for `one_cpt_transit` above; SS / infusions / resets /
-non-depot (`CMT≠1`) doses / `depot`-init rejected — use an ODE transit model for those).
+that twin per evaluation — exactly as for `one_cpt_transit` above; an `SS=1` dose likewise
+reroutes to the twin (#719), while infusions / resets / non-depot (`CMT≠1`) doses / `depot`-init
+are still rejected — use an ODE transit model for those).
 
 [`examples/two_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_transit.ferx)
 is a complete self-contained example:
@@ -274,8 +302,9 @@ parameters, and **IOV** (`n_kappa > 0`) are transparently rerouted to an exact O
 twin (so they are supported, not rejected — IOV via the twin's exact cross-occasion
 carryover, #719); the **flip-flop** regime (`ke ≥ 1/(2·MAT·CV²)`) is likewise
 auto-rerouted to that twin per evaluation, with a `W_IG_FLIP_FLOP` note at the
-typical-value estimates. **Steady-state doses, infusions, system resets
-(EVID=3/4), a non-depot (`CMT≠1`) dose, and a `depot` initial amount are rejected**
+typical-value estimates. A **steady-state (`SS=1`) dose reroutes** to the `igd()` twin
+too (#719). **Infusions, system resets (EVID=3/4), a non-depot (`CMT≠1`) dose, and a
+`depot` initial amount are still rejected**
 with an actionable message — use the `igd()` ODE forcing below for those. A flip-flop
 model carrying a `lagtime`/`f`/user-`[odes]` mapping has no ODE twin to route to and is
 **rejected with a hard error** (`E_IG_FLIP_FLOP`). The analytic and ODE paths agree to

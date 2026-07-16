@@ -451,12 +451,14 @@ fn twin_less_flip_flop_transit_is_rejected_by_check() {
     let _ = std::fs::remove_file(&data);
 }
 
-/// `ferx check` now also surfaces the structural transit rejects (here a steady-state
-/// dose) as `E_TRANSIT_UNSUPPORTED`, so a clean check and a fit agree on transit
-/// models — previously only `fit()` reported these (#776 review).
+/// `ferx check` surfaces the structural transit rejects (here an infusion into the
+/// absorption compartment) as `E_TRANSIT_UNSUPPORTED`, so a clean check and a fit agree on
+/// transit models — previously only `fit()` reported these (#776 review). (Steady-state
+/// dosing is no longer among these rejects — it reroutes to the ODE twin, #719 — so this
+/// test now exercises the still-unsupported infusion case.)
 #[test]
 fn unsupported_transit_feature_is_rejected_by_check() {
-    // In-domain (ke = 0.05 < KTR = 0.2), so this is NOT a flip-flop reject; the SS dose is.
+    // In-domain (ke = 0.05 < KTR = 0.2), so this is NOT a flip-flop reject; the infusion is.
     let model = temp_model(
         "transit_ss",
         "\
@@ -482,11 +484,14 @@ fn unsupported_transit_feature_is_rejected_by_check() {
 ",
     );
     let data = temp_data(
-        "transit_ss",
-        "ID,TIME,AMT,EVID,DV,MDV,SS,II\n1,0,100,1,.,1,1,24\n1,2,0,1.0,0,0,0\n",
+        "transit_inf",
+        "ID,TIME,AMT,EVID,DV,MDV,RATE\n1,0,100,1,.,1,50\n1,2,0,0,1.0,0,0\n",
     );
     let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
-    assert!(!report.valid, "SS transit dose must fail ferx check");
+    assert!(
+        !report.valid,
+        "infusion into a transit compartment must fail ferx check"
+    );
     assert!(
         report
             .diagnostics
@@ -497,6 +502,69 @@ fn unsupported_transit_feature_is_rejected_by_check() {
             .diagnostics
             .iter()
             .map(|d| &d.code)
+            .collect::<Vec<_>>()
+    );
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
+}
+
+/// `ferx check` rejects an SS dose combined with an absorption lagtime on the closed-form
+/// transit model (`check_absorption_closed_form_support`'s lag branch) — the SS+lagtime
+/// pre-arrival seed is still bolus-only, so this stays out of scope even though plain SS now
+/// reroutes to the ODE twin (#719). (A `lagtime=` mapping also drops the twin itself, so this
+/// exercises the message text rather than isolating the lag condition from the no-twin one —
+/// `one_cpt_transit` has a single fixed dose route, so there is no second compartment to
+/// construct a lag-elsewhere case against, unlike the ODE-path scoping covered in
+/// `tests/ss_absorption_lag_gate.rs`.) Previously untested (review follow-up on PR #834): the
+/// sibling `E_ABSORPTION_SS_LAG` ODE-path branch had a test but this closed-form counterpart
+/// did not.
+#[test]
+fn ss_plus_lag_transit_is_rejected_by_check() {
+    let model = temp_model(
+        "transit_ss_lag",
+        "\
+[parameters]
+  theta TVCL(0.5, 0.001, 50.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  theta TVLAG(1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+  ALAG = TVLAG
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=ALAG)
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+    );
+    let data = temp_data(
+        "transit_ss_lag",
+        "ID,TIME,AMT,EVID,DV,MDV,SS,II\n1,0,100,1,.,1,1,24\n1,2,0,1.0,0,0,0\n",
+    );
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    assert!(
+        !report.valid,
+        "SS + lagtime transit dose must fail ferx check"
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_TRANSIT_UNSUPPORTED" && d.message.contains("lagtime")),
+        "expected E_TRANSIT_UNSUPPORTED mentioning lagtime, got: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
             .collect::<Vec<_>>()
     );
     let _ = std::fs::remove_file(&model);

@@ -125,6 +125,21 @@ section of the SDLC for the versioning policy).
   `2·n_free`-inner-resolve `reconverged_fd_gradient` fallback.
 
 ### Added
+- **Steady-state (`SS=1`) dosing into a built-in absorption compartment** (#719):
+  an `SS=1` dose into a `transit()` / `igd()` / `weibull()` / `first_order()`
+  absorption input-rate compartment is now supported on the ODE path — previously
+  rejected with `E_ABSORPTION_SS`. The dose is equilibrated *through* the
+  absorption kernel (the periodic pulse train is superposed as `R_in`, and the
+  disposition trough is the periodic steady state, a closed form
+  `(I − M)⁻¹·b` for a linear disposition), so predictions match an explicit long
+  run-in of the same schedule and NONMEM's exact analytic `ADVAN2` steady state.
+  Closed-form `pk *_transit` / `*_ig` models with an `SS` dose reroute to their ODE
+  twin automatically. `fit()` on an SS-absorption model converges; its sensitivities
+  currently use a finite-difference fallback of the (exact) prediction, so large-dataset
+  fits are slower than an analytic ODE model pending an analytic dual SS-equilibration.
+  Still rejected, with clearer codes: `SS` into a `zero_order()` window
+  (`E_ABSORPTION_SS_ZERO_ORDER`) and `SS` combined with an absorption lagtime
+  (`E_ABSORPTION_SS_LAG`).
 - **Flat (zero-gradient) thetas are now frozen at start instead of killing the fit** (#826).
   A pre-flight check computes the outer gradient at the initial estimate; any non-fixed
   theta whose gradient is ≈ 0 (a parameter that never reaches the objective — typically

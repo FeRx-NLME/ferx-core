@@ -509,14 +509,15 @@ fn transit_fit_err(pop: &Population) -> String {
         .expect_err("fit should reject the unsupported transit configuration")
 }
 
+/// Steady-state (`SS=1`) dosing on a closed-form transit model now reroutes to its ODE twin
+/// (#719, gap 1) instead of being rejected: the twin equilibrates the dose through the
+/// absorption kernel (a pulse-train trough + periodic forward `R_in`). The rerouted analytic
+/// path must match the hand-written `transit()` ODE at steady state, at eta = 0.
 #[test]
-fn transit_steady_state_dose_rejected() {
+fn transit_steady_state_matches_ode() {
     let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
-    let e = transit_fit_err(&population(vec![ss], vec![1.0, 4.0, 8.0]));
-    assert!(
-        e.contains("steady-state") || e.contains("SS"),
-        "expected an SS-rejection message, got: {e}"
-    );
+    let pop = population(vec![ss], vec![1.0, 4.0, 8.0, 11.5]);
+    assert_equiv("ss", false, false, &pop, ACCUM_RTOL);
 }
 
 #[test]
@@ -960,16 +961,22 @@ fn transit_short_fit_drives_analytic_sens() {
     assert!(r.ofv.is_finite(), "transit fit OFV not finite: {}", r.ofv);
 }
 
-/// `predict()` / `simulate()` panic (rather than silently mis-predict) on an unsupported
-/// transit configuration — the `Vec`-returning entry points use `assert_transit_support`.
+/// `predict()` on a closed-form transit model with an `SS=1` dose no longer panics — it
+/// reroutes to the ODE twin (#719) and returns finite steady-state predictions. (The
+/// still-unsupported configurations — infusion, non-depot dose — keep panicking via
+/// `assert_transit_support`; see `transit_infusion_dose_rejected`.)
 #[test]
-#[should_panic(expected = "one_cpt_transit")]
-fn transit_ss_dose_panics_in_predict() {
+fn transit_ss_dose_predicts_via_ode_twin() {
     let (an_src, _) = build_pair(false, false);
     let model = parse_full_model(&an_src).unwrap().model;
     let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0); // SS dose
     let pop = population(vec![ss], vec![1.0, 4.0, 8.0]);
-    let _ = predict(&model, &pop, &model.default_params);
+    let preds = predict(&model, &pop, &model.default_params);
+    assert_eq!(preds.len(), 3);
+    assert!(
+        preds.iter().all(|p| p.pred.is_finite() && p.pred > 0.0),
+        "SS predictions should be finite & positive: {preds:?}"
+    );
 }
 
 /// Committed benchmark (slow): the analytic `pk one_cpt_transit` and the ODE `transit()`
@@ -1325,20 +1332,14 @@ fn two_cpt_transit_short_fit_drives_analytic_sens() {
     );
 }
 
-/// The shared `check_transit_support` guard names the offending model — confirm the
-/// 2-cpt model surfaces its own canonical name in the SS-rejection message.
+/// Two-compartment closed-form transit with an `SS=1` dose reroutes to its 2-cpt ODE twin
+/// (#719) and matches it at steady state — the 2-cpt disposition carryover across intervals
+/// is handled by the same pulse-train equilibration as the 1-cpt case.
 #[test]
-fn two_cpt_transit_ss_dose_rejected() {
-    let (an_src, _) = build_pair_2cpt(false, false);
-    let model = parse_full_model(&an_src).expect("parses").model;
+fn two_cpt_transit_steady_state_matches_ode() {
     let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
-    let pop = population(vec![ss], vec![1.0, 4.0, 8.0]);
-    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("2cpt transit + SS dose should be rejected");
-    assert!(
-        e.contains("two_cpt_transit") && (e.contains("steady-state") || e.contains("SS")),
-        "expected a two_cpt_transit SS-rejection message, got: {e}"
-    );
+    let pop = population(vec![ss], vec![1.0, 4.0, 8.0, 11.5]);
+    assert_equiv_2cpt("2cpt ss", false, false, &pop, ACCUM_RTOL);
 }
 
 /// Flip-flop regime (fast macro-rate `α ≥ KTR`): the analytic 2-cpt transit closed

@@ -625,9 +625,10 @@ fn zero_order_normal_dosing_passes_data_checks() {
 
 #[test]
 fn zero_order_steady_state_dosing_is_rejected() {
-    // SS=1 into a zero_order compartment is rejected (E_ABSORPTION_SS): the
-    // steady-state equilibration applies the dose as a bolus pulse, not as the
-    // zero-order input over the cycle. Kind-agnostic, inherited from transit/igd.
+    // SS=1 into a zero_order compartment is rejected with E_ABSORPTION_SS_ZERO_ORDER (#719):
+    // the density kernels (transit/igd/weibull/first_order) now support SS through the
+    // periodic-sum R_in, but a zero_order input is a spanning window whose periodic steady
+    // state needs a distinct window-based equilibration (a follow-up), so it stays rejected.
     use ferx_core::check_model_data;
     let model = parse_full_model(ZERO_ORDER_MODEL)
         .expect("zero_order model parses")
@@ -650,8 +651,8 @@ fn zero_order_steady_state_dosing_is_rejected() {
     };
     let diags = check_model_data(&model, &pop);
     assert!(
-        diags.iter().any(|d| d.code == "E_ABSORPTION_SS"),
-        "SS into a zero_order compartment must raise E_ABSORPTION_SS, got: {:?}",
+        diags.iter().any(|d| d.code == "E_ABSORPTION_SS_ZERO_ORDER"),
+        "SS into a zero_order compartment must raise E_ABSORPTION_SS_ZERO_ORDER, got: {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
 }

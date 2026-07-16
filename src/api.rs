@@ -1244,22 +1244,60 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
         );
     }
 
-    // SS=1 dose into an input-rate compartment (data-level): the steady-state
-    // equilibration applies the dose as a bolus pulse, not as R_in over the cycle.
+    // SS=1 dose into a built-in absorption input-rate compartment (#719, gap 1). Supported
+    // for the smooth-density kernels (transit / igd / weibull / first_order): the dose is
+    // equilibrated *through* the absorption kernel (a pulse-train trough) and its infinite
+    // periodic pulse train is superposed as `R_in` on the forward walk, so predictions match
+    // an explicit run-in exactly (`ode::predictions::equilibrate_ss_state` +
+    // `add_prepared_input_rate_forcing`). Two combinations stay out of scope and are rejected
+    // here rather than silently mis-served:
+    //   * zero_order() absorption — its input is a spanning window, not a pointwise density,
+    //     so SS needs a periodic-window equilibration (separate follow-up under #719).
+    //   * a lagtime on the SS-dosed compartment — the SS+lagtime pre-arrival seed
+    //     (`ss_state_at_phase`) is still bolus-only for input-rate compartments.
     use std::collections::BTreeSet;
     let cmts: BTreeSet<usize> = ode.input_rate.iter().map(|f| f.cmt + 1).collect();
-    let has_ss = population.subjects.iter().any(|s| {
+    let zero_order_cmts: BTreeSet<usize> = ode
+        .input_rate
+        .iter()
+        .filter(|f| f.kind == crate::pk::absorption::InputRateKind::ZeroOrder)
+        .map(|f| f.cmt + 1)
+        .collect();
+    let has_ss_zero_order = population.subjects.iter().any(|s| {
         s.doses
             .iter()
-            .any(|d| d.ss && d.ii > 0.0 && cmts.contains(&d.cmt))
+            .any(|d| d.ss && d.ii > 0.0 && zero_order_cmts.contains(&d.cmt))
     });
-    if has_ss {
+    // Compartment-scoped, not model-wide (`model.has_lagtime()`): a lag declared on a
+    // *different* absorption pathway (e.g. `ALAG2`) must not block an SS dose into an
+    // un-lagged compartment (e.g. `CMT=1`).
+    let has_ss_lag = population.subjects.iter().any(|s| {
+        s.doses
+            .iter()
+            .any(|d| d.ss && d.ii > 0.0 && cmts.contains(&d.cmt) && model.has_lagtime_on_cmt(d.cmt))
+    });
+    if has_ss_zero_order {
         diags.push(
             Diagnostic::error(
-                "E_ABSORPTION_SS",
-                "Steady-state dosing (SS=1) into a built-in absorption input-rate \
-                 compartment (e.g. transit() or igd()) is not yet supported. Expand the \
-                 run-in with explicit dosing records, or remove the absorption term.",
+                "E_ABSORPTION_SS_ZERO_ORDER",
+                "Steady-state dosing (SS=1) into a zero_order() absorption compartment is not \
+                 yet supported: unlike the pointwise density kernels (transit/igd/weibull/\
+                 first_order), the zero-order input is a spanning window and its periodic \
+                 steady state needs a window-based equilibration (a follow-up under #719). \
+                 Expand the run-in with explicit dosing records, or use a density absorption \
+                 kernel.",
+            )
+            .with_block("odes"),
+        );
+    } else if has_ss_lag {
+        diags.push(
+            Diagnostic::error(
+                "E_ABSORPTION_SS_LAG",
+                "Steady-state dosing (SS=1) into a built-in absorption compartment combined \
+                 with an absorption lagtime is not yet supported: the SS+lagtime pre-arrival \
+                 seed does not yet route the dose through the absorption kernel over the \
+                 previous interval. Remove the lagtime, expand the run-in with explicit dosing \
+                 records, or dose without SS.",
             )
             .with_block("odes"),
         );
@@ -1610,12 +1648,27 @@ pub(crate) fn check_absorption_closed_form_support(
                 ));
             }
             if dose.ss {
-                return Some(format!(
-                    "{name} does not support steady-state (SS) doses yet (subject \
-                     {}): the periodic-sum SS closed form is a follow-up. Use a non-SS \
-                     multiple-dose schedule, or an ODE absorption model.",
-                    subject.id
-                ));
+                // Steady-state on a closed-form absorption model reroutes to its ODE twin
+                // (#719, like TV-cov/TIME/IOV above): the twin serves SS through the absorption
+                // kernel (a pulse-train equilibration trough + periodic forward `R_in`), so the
+                // closed form need not carry a periodic-sum SS form itself. Reject only what the
+                // twin can't yet serve: a twin-less form, or a model with an absorption lagtime
+                // (the twin's SS+lagtime pre-arrival seed is still bolus-only — same scope as the
+                // ODE-path `E_ABSORPTION_SS_LAG`). `effective_for` performs the reroute.
+                if model.absorption_ode_equivalent.is_none() || model.has_lagtime_on_cmt(dose.cmt) {
+                    return Some(format!(
+                        "{name} does not support steady-state (SS) doses in this form (subject \
+                         {}): SS reroutes to the ODE absorption twin, but this model has no twin \
+                         {}. Use a non-SS multiple-dose schedule, or write the model as an ODE \
+                         transit()/igd() forcing in [odes].",
+                        subject.id,
+                        if model.has_lagtime_on_cmt(dose.cmt) {
+                            "for the SS + lagtime combination (a follow-up)"
+                        } else {
+                            "(an unrecognised closed form)"
+                        }
+                    ));
+                }
             }
             if dose.is_infusion() {
                 return Some(format!(
