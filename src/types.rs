@@ -4975,13 +4975,18 @@ pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize
     let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
     let n_lt = n_eta * (n_eta + 1) / 2;
     if se.len() == n_lt && n_lt != n_eta {
-        // Full lower-triangle format (block omega).
-        let col_offset = if c == 0 {
-            0
+        // Full lower-triangle format (block omega). Shares the column-major
+        // packing index with `pack_params` via `chol_lt_idx`; the `r < n_eta`
+        // guard preserves the old None-on-out-of-range return and keeps
+        // `chol_lt_idx`'s `debug_assert!(i < n)` from firing on a pathological r.
+        if r < n_eta {
+            se.get(crate::estimation::parameterization::chol_lt_idx(
+                r, c, n_eta,
+            ))
+            .copied()
         } else {
-            c * n_eta - c * (c - 1) / 2
-        };
-        se.get(col_offset + (r - c)).copied()
+            None
+        }
     } else {
         // Diagonal-only format: only (i, i) is available.
         if r == c {

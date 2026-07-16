@@ -1,6 +1,6 @@
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
-use crate::estimation::parameterization::theta_packs_log;
+use crate::estimation::parameterization::{chol_lt_idx, theta_packs_log};
 use crate::estimation::saem;
 use crate::io::datareader::{
     read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
@@ -8072,19 +8072,6 @@ mod tests {
     }
 }
 
-/// Index of L[i,j] (i ≥ j) in column-major lower-triangle packing.
-///
-/// Layout: for j in 0..n { for i in j..n { ... } }, so column j starts at
-/// offset Σ_{k<j}(n−k) = j·n − j·(j−1)/2.
-#[inline]
-fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
-    debug_assert!(i >= j && i < n);
-    // Column j starts at offset j*n - j*(j-1)/2.
-    // For j==0: offset = 0. For j==1: offset = n. For j==2: offset = 2n-1.
-    let col_offset = if j == 0 { 0 } else { j * n - j * (j - 1) / 2 };
-    col_offset + (i - j)
-}
-
 /// Extract standard errors from covariance matrix on the packed parameter scale,
 /// then transform back to the original scale via delta method.
 pub(crate) fn extract_standard_errors(
@@ -8235,7 +8222,7 @@ pub(crate) fn extract_standard_errors(
                 let idx = if iov.diagonal {
                     kappa_start + i
                 } else {
-                    kappa_start + i * n_kappa - i * (i.saturating_sub(1)) / 2
+                    kappa_start + chol_lt_idx(i, i, n_kappa)
                 };
                 if idx < n {
                     2.0 * iov.matrix[(i, i)] * se_packed[idx]

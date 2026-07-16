@@ -784,7 +784,7 @@ fn accumulate_fixed_b_packed_gradient_fd(
 /// This is the fixed-η score: the θ block via the provider's exact `∂f/∂θ` chained through
 /// `∂nll/∂f`, the σ block in closed form, and the Ω block from the η-prior alone
 /// (`½(−zzᵀ + Ω⁻¹)`, mapped to Cholesky-packed space by the shared
-/// [`crate::estimation::sens_outer_gradient::chol_pack`]). Deliberately carries **no**
+/// [`crate::estimation::parameterization::chol_pack`]). Deliberately carries **no**
 /// `log|H̃|` and **no** EBE-response term — those belong to the Laplace marginal, not to
 /// `nll(η)` at a fixed η.
 ///
@@ -821,7 +821,7 @@ fn accumulate_fixed_eta_packed_gradient(
         }
     }
     let omega_start = n_theta;
-    let og = crate::estimation::sens_outer_gradient::chol_pack(
+    let og = crate::estimation::parameterization::chol_pack(
         &m_omega,
         &params.omega.chol,
         params.omega.diagonal,
@@ -859,7 +859,7 @@ fn accumulate_fixed_eta_packed_gradient(
                 m_iov[(r, c)] += 0.5 * (k_occ as f64) * iov.inv[(r, c)];
             }
         }
-        let ig = crate::estimation::sens_outer_gradient::chol_pack(&m_iov, &iov.chol, iov.diagonal);
+        let ig = crate::estimation::parameterization::chol_pack(&m_iov, &iov.chol, iov.diagonal);
         for (k, &v) in ig.iter().enumerate() {
             out[iov_start + k] += weight * v;
         }

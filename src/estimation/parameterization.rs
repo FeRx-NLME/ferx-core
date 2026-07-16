@@ -615,10 +615,117 @@ pub fn clamp_to_bounds(x: &mut [f64], bounds: &PackedBounds) {
     }
 }
 
+// ===== Cholesky-Ω packing layout — single source of truth =====
+// These express the column-major lower-triangle convention that `pack_params`
+// (above) is the authority for. They were previously re-derived independently in
+// `sens_outer_gradient` (lower_tri_entries / chol_pack / block_chol_full) and
+// `api` (chol_lt_idx); centralised here so the packing order has exactly one
+// definition. Pure integer/`f64` algebra moved verbatim — no result is reordered.
+
+/// Column-major lower-triangle entry list `(row, col)` with `row >= col`,
+/// matching `pack_params` order (diagonal → `(i, i)`).
+pub(crate) fn lower_tri_entries(n: usize, diagonal: bool) -> Vec<(usize, usize)> {
+    if diagonal {
+        (0..n).map(|i| (i, i)).collect()
+    } else {
+        let mut e = Vec::new();
+        for c in 0..n {
+            for r in c..n {
+                e.push((r, c));
+            }
+        }
+        e
+    }
+}
+
+/// Flat index of `L[i,j]` (i ≥ j) in the column-major lower-triangle packing.
+///
+/// Layout: `for j in 0..n { for i in j..n { .. } }`, so column `j` starts at
+/// offset `Σ_{k<j}(n−k) = j·n − j·(j−1)/2`.
+#[inline]
+pub(crate) fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
+    debug_assert!(i >= j && i < n);
+    let col_offset = if j == 0 { 0 } else { j * n - j * (j - 1) / 2 };
+    col_offset + (i - j)
+}
+
+/// Map a sub-block natural symmetric Ω-gradient to packed Cholesky space:
+/// `∂F/∂L = 2·M_sub·L` (L lower-triangular), with the diagonal log-chain
+/// (`x_ii = ln L_ii ⇒ ×L_ii`) and raw off-diagonals — the same convention/order
+/// as `pack_params`. Shared with `crate::estimation::agq`.
+pub(crate) fn chol_pack(m_sub: &DMatrix<f64>, l: &DMatrix<f64>, diagonal: bool) -> Vec<f64> {
+    let n = l.nrows();
+    let gl = (m_sub * l).scale(2.0);
+    let mut out = Vec::new();
+    if diagonal {
+        for i in 0..n {
+            out.push(gl[(i, i)] * l[(i, i)]);
+        }
+    } else {
+        for j in 0..n {
+            for i in j..n {
+                if i == j {
+                    out.push(gl[(i, i)] * l[(i, i)]);
+                } else {
+                    out.push(gl[(i, j)]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Block-diagonal Cholesky factor `L_Σb = blkdiag(L_bsv, L_iov × K)` of the IOV
+/// prior `Σ_b = Ω_bsv ⊕ K·Ω_iov`.
+pub(crate) fn block_chol_full(
+    l_bsv: &DMatrix<f64>,
+    l_iov: &DMatrix<f64>,
+    k: usize,
+    n_eta: usize,
+    n_iov: usize,
+) -> DMatrix<f64> {
+    let n = n_eta + k * n_iov;
+    let mut l = DMatrix::zeros(n, n);
+    for r in 0..n_eta {
+        for c in 0..n_eta {
+            l[(r, c)] = l_bsv[(r, c)];
+        }
+    }
+    for kk in 0..k {
+        let off = n_eta + kk * n_iov;
+        for r in 0..n_iov {
+            for c in 0..n_iov {
+                l[(off + r, off + c)] = l_iov[(r, c)];
+            }
+        }
+    }
+    l
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn test_lower_tri_entries_frozen_order() {
+        assert_eq!(lower_tri_entries(1, false), vec![(0, 0)]);
+        assert_eq!(lower_tri_entries(2, false), vec![(0, 0), (1, 0), (1, 1)]);
+        assert_eq!(
+            lower_tri_entries(3, false),
+            vec![(0, 0), (1, 0), (2, 0), (1, 1), (2, 1), (2, 2)]
+        );
+        assert_eq!(lower_tri_entries(3, true), vec![(0, 0), (1, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn test_chol_lt_idx_roundtrips_lower_tri_entries() {
+        for n in 1..=4 {
+            for (pos, &(i, j)) in lower_tri_entries(n, false).iter().enumerate() {
+                assert_eq!(chol_lt_idx(i, j, n), pos, "n={n} (i,j)=({i},{j})");
+            }
+        }
+    }
 
     fn make_template() -> ModelParameters {
         let omega =
