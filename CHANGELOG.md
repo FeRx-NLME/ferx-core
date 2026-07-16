@@ -125,6 +125,19 @@ section of the SDLC for the versioning policy).
   `2·n_free`-inner-resolve `reconverged_fd_gradient` fallback.
 
 ### Added
+- **Per-route absorption lag — an optional `lag=` argument on every input-rate
+  function** (#856) (`first_order(ka=KA, lag=L)`, `zero_order(dur=DUR, lag=L)`, …). Each
+  parallel / mixed pathway can now switch on at its own delay — the immediate-release +
+  delayed-release picture — instead of sharing one per-dose lagtime. The per-route lag is
+  additive on top of any compartment `lagtime`/`ALAG` (a route's onset is
+  `dose + lag_cmt + lag_route`); `lag=0` (or no `lag`) is bit-identical to an unlagged
+  route. A model carrying a per-route lag is fit over finite differences (the analytic
+  per-route onset saltation is a planned follow-up), like `weibull()` + lagtime; a
+  negative lag warns (`W_NEGATIVE_LAGTIME`), a non-finite one is rejected. New example
+  `examples/per_route_lag_absorption.ferx`; validated by reduction to the NONMEM-anchored
+  compartment lag (`tests/per_route_lag.rs`) and by a direct NONMEM `ADVAN13 $DES` anchor
+  — ferx's objective at NONMEM's optimum matches `#OBJV = −882.357` to ~1e-6
+  (`tests/per_route_lag_nonmem_anchor.rs`).
 - **Flat (zero-gradient) thetas are now frozen at start instead of killing the fit** (#826).
   A pre-flight check computes the outer gradient at the initial estimate; any non-fixed
   theta whose gradient is ≈ 0 (a parameter that never reaches the objective — typically

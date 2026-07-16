@@ -321,6 +321,18 @@ pub struct InputRateForcing {
     /// Optional slot of the pathway-fraction multiplier (`FR*fn(...)`, #388).
     /// `None` ⇒ fraction `1` (single pathway). See [`Self::frac`].
     pub frac_slot: Option<usize>,
+    /// Optional slot of this route's **own absorption lag** (`fn(..., lag=L)`),
+    /// an offset **added on top of** any compartment lagtime (`lagtime`/`ALAG`),
+    /// so each parallel / mixed pathway can switch on at its own delay. `None` ⇒
+    /// no per-route lag (this route rides the compartment lag alone). See
+    /// [`Self::route_lag`]. Unlike the compartment lag (a per-dose attribute keyed
+    /// by `DoseAttrMap`), this is a per-*forcing* offset: it is read only in the
+    /// pointwise forcing loop and the zero-order window construction, leaving the
+    /// `dose_lagtimes` machinery (`tad_anchor`, `subject_dose_attrs`) untouched.
+    /// A model carrying any `lag_slot` is served over finite differences — the
+    /// analytic sensitivity walk gates it off (its per-route onset saltation is a
+    /// Phase-2 follow-up, #856), mirroring the `weibull()`+lagtime FD fallback.
+    pub lag_slot: Option<usize>,
 }
 
 impl InputRateForcing {
@@ -352,6 +364,23 @@ impl InputRateForcing {
             .unwrap_or(T::from_f64(1.0))
     }
 
+    /// This route's own absorption lag (`fn(..., lag=L)`), read from the flat
+    /// individual-parameter vector `params`. Returns `0` when there is no
+    /// `lag_slot` (the default — this route rides the compartment lag alone) or
+    /// the slot is absent, so an unlagged forcing is unaffected. The value is
+    /// **added** to the dose's compartment lagtime to form the route's effective
+    /// onset `t_dose + lag_cmt + lag_route`. Generic over `T: PkNum` so the same
+    /// reader serves the `f64` prediction / FD-fit path and (once the analytic
+    /// per-route onset saltation lands) the `Dual2` provider; today a model with
+    /// any per-route lag is gated to the FD path, so only `T = f64` reaches here.
+    #[inline]
+    pub fn route_lag<T: PkNum>(&self, params: &[T]) -> T {
+        self.lag_slot
+            .and_then(|s| params.get(s))
+            .copied()
+            .unwrap_or(T::from_f64(0.0))
+    }
+
     /// Precompute the dose-invariant constants for this forcing's parameters
     /// (read from the flat individual-parameter vector `params`). Call **once**
     /// per RHS evaluation, then evaluate [`PreparedInputRate::rate`] per dose —
@@ -380,6 +409,18 @@ impl InputRateForcing {
     /// an out-of-domain or non-finite `n`/`mtt` is rejected loudly instead of
     /// propagating as a `NaN` through the ODE RHS.
     pub fn validate(&self, params: &[f64]) -> Result<(), String> {
+        // A per-route lag (`fn(..., lag=L)`) must be finite: it shifts the effective
+        // onset `t_eff = t_dose + lag_cmt + lag_route`, so a NaN/inf would poison
+        // every `tad` for this route and propagate as `NaN` through the RHS. A
+        // *negative* lag is not rejected here — it is physically odd but handled
+        // (onset earlier), warned via `W_NEGATIVE_LAGTIME` at fit-init like the
+        // compartment lag.
+        let route_lag = self.route_lag(params);
+        if !route_lag.is_finite() {
+            return Err(format!(
+                "per-route absorption lag (lag=…) must be finite, got {route_lag}"
+            ));
+        }
         match self.kind {
             InputRateKind::Transit => {
                 validate_transit(self.arg(params, 0, 0.0), self.arg(params, 1, 1.0))
@@ -857,6 +898,7 @@ mod tests {
             kind: InputRateKind::Transit,
             arg_slots: vec![6, 7], // n @ 6 (dim 0), mtt @ 7 (dim 1)
             frac_slot: None,
+            lag_slot: None,
         };
         // (n, mtt, label, clamped_dim): clamped_dim is the seeded dim whose jet the
         // clamp must zero out (None = interior, both jets live).
@@ -913,6 +955,7 @@ mod tests {
             kind: InputRateKind::Transit,
             arg_slots: vec![6, 7], // n @ 6, mtt @ 7
             frac_slot: None,
+            lag_slot: None,
         };
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
         params[6] = 3.0; // n
@@ -935,6 +978,7 @@ mod tests {
             kind: InputRateKind::Transit,
             arg_slots: vec![6, 7],
             frac_slot: None,
+            lag_slot: None,
         };
         let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
         ok[6] = 3.0;
@@ -1100,6 +1144,7 @@ mod tests {
             kind: InputRateKind::InverseGaussian,
             arg_slots: vec![4, 5], // mat @ 4, cv2 @ 5
             frac_slot: None,
+            lag_slot: None,
         };
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
         params[4] = 2.0; // mat
@@ -1122,6 +1167,7 @@ mod tests {
             kind: InputRateKind::InverseGaussian,
             arg_slots: vec![4, 5],
             frac_slot: None,
+            lag_slot: None,
         };
         let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
         ok[4] = 2.0;
@@ -1343,6 +1389,7 @@ mod tests {
             kind: InputRateKind::Weibull,
             arg_slots: vec![4, 5], // td @ 4 (dim 0), beta @ 5 (dim 1)
             frac_slot: None,
+            lag_slot: None,
         };
         // (td, beta, label, clamped_dim)
         let cases: &[(f64, f64, &str, Option<usize>)] = &[
@@ -1403,6 +1450,7 @@ mod tests {
             kind: InputRateKind::Weibull,
             arg_slots: vec![4, 5], // td @ 4 (dim 0), beta @ 5 (dim 1)
             frac_slot: None,
+            lag_slot: None,
         };
         let dose = 100.0;
         let h = 1e-6;
@@ -1434,6 +1482,7 @@ mod tests {
             kind: InputRateKind::Weibull,
             arg_slots: vec![4, 5], // td @ 4, beta @ 5
             frac_slot: None,
+            lag_slot: None,
         };
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
         params[4] = 2.0; // td
@@ -1456,6 +1505,7 @@ mod tests {
             kind: InputRateKind::Weibull,
             arg_slots: vec![4, 5],
             frac_slot: None,
+            lag_slot: None,
         };
         let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
         ok[4] = 2.0;
@@ -1542,6 +1592,7 @@ mod tests {
             kind: InputRateKind::ZeroOrder,
             arg_slots: vec![4], // dur @ 4
             frac_slot: None,
+            lag_slot: None,
         };
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
         params[4] = 4.0; // dur
@@ -1563,6 +1614,7 @@ mod tests {
             kind: InputRateKind::ZeroOrder,
             arg_slots: vec![4],
             frac_slot: None,
+            lag_slot: None,
         };
         let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
         ok[4] = 4.0;
@@ -1586,6 +1638,7 @@ mod tests {
             kind: InputRateKind::ZeroOrder,
             arg_slots: vec![4],
             frac_slot: None,
+            lag_slot: None,
         };
         let params = vec![1.0; crate::types::MAX_PK_PARAMS];
         assert!(forcing.prepare_dual::<f64>(&params).is_some());
@@ -1612,24 +1665,28 @@ mod tests {
             kind: InputRateKind::InverseGaussian,
             arg_slots: vec![4, 5], // mat @ 4, cv2 @ 5
             frac_slot: None,
+            lag_slot: None,
         };
         let transit = InputRateForcing {
             cmt: 0,
             kind: InputRateKind::Transit,
             arg_slots: vec![6, 7], // n @ 6, mtt @ 7
             frac_slot: None,
+            lag_slot: None,
         };
         let weibull = InputRateForcing {
             cmt: 0,
             kind: InputRateKind::Weibull,
             arg_slots: vec![4, 2], // td @ 4, beta @ 2
             frac_slot: None,
+            lag_slot: None,
         };
         let first_order = InputRateForcing {
             cmt: 1,
             kind: InputRateKind::FirstOrder,
             arg_slots: vec![3], // ka @ 3
             frac_slot: None,
+            lag_slot: None,
         };
         for forcing in [&ig, &transit, &weibull, &first_order] {
             let lifted = forcing
@@ -1664,6 +1721,7 @@ mod tests {
                 kind,
                 arg_slots: vec![4, 5],
                 frac_slot: None,
+                lag_slot: None,
             };
             assert_eq!(
                 kind.supported_over_dual(),
@@ -1774,6 +1832,7 @@ mod tests {
             kind: InputRateKind::FirstOrder,
             arg_slots: vec![3], // ka @ 3
             frac_slot: None,
+            lag_slot: None,
         };
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
         params[3] = 1.1; // ka
@@ -1795,6 +1854,7 @@ mod tests {
             kind: InputRateKind::FirstOrder,
             arg_slots: vec![3],
             frac_slot: None,
+            lag_slot: None,
         };
         let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
         ok[3] = 1.0;
@@ -1802,6 +1862,57 @@ mod tests {
         let mut bad = ok.clone();
         bad[3] = -1.0;
         assert!(forcing.validate(&bad).unwrap_err().contains("ka"));
+    }
+
+    /// [`InputRateForcing::route_lag`] reads the per-route lag slot (`fn(..., lag=L)`)
+    /// and defaults to `0` when there is none — the unlagged single-route case, so an
+    /// existing model without a `lag=` is bit-identically unaffected.
+    #[test]
+    fn route_lag_reads_slot_and_defaults_zero() {
+        let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
+        params[6] = 2.5;
+        let lagged = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![3],
+            frac_slot: None,
+            lag_slot: Some(6),
+        };
+        assert_eq!(lagged.route_lag(&params), 2.5);
+        let unlagged = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![3],
+            frac_slot: None,
+            lag_slot: None,
+        };
+        assert_eq!(unlagged.route_lag(&params), 0.0);
+    }
+
+    /// A non-finite per-route lag is rejected loudly by `validate` (it would poison
+    /// every `tad` for the route as `NaN` through the RHS). A finite negative lag is
+    /// **not** rejected here — it is warned at fit-init, mirroring the compartment lag.
+    #[test]
+    fn forcing_validate_rejects_nonfinite_route_lag() {
+        let forcing = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![3],
+            frac_slot: None,
+            lag_slot: Some(6),
+        };
+        let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
+        params[3] = 1.0;
+        params[6] = 1.5;
+        assert!(forcing.validate(&params).is_ok());
+        // finite negative lag passes `validate` (warned elsewhere, not fatal here)
+        params[6] = -1.0;
+        assert!(forcing.validate(&params).is_ok());
+        // non-finite lag is fatal
+        params[6] = f64::NAN;
+        assert!(forcing.validate(&params).unwrap_err().contains("finite"));
+        params[6] = f64::INFINITY;
+        assert!(forcing.validate(&params).unwrap_err().contains("finite"));
     }
 
     /// First-order **is** lifted over `Dual2` (a smooth `exp`-only density): the
@@ -1815,6 +1926,7 @@ mod tests {
             kind: InputRateKind::FirstOrder,
             arg_slots: vec![3],
             frac_slot: None,
+            lag_slot: None,
         };
         let params = vec![1.0; crate::types::MAX_PK_PARAMS];
         assert!(forcing.prepare_dual::<f64>(&params).is_some());
@@ -1837,6 +1949,7 @@ mod tests {
             kind: InputRateKind::FirstOrder,
             arg_slots: vec![4], // ka @ 4 (dim 0)
             frac_slot: Some(2), // frac @ 2 (dim 1)
+            lag_slot: None,
         };
         let dose = 100.0;
         let h = 1e-6;

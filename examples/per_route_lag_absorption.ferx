@@ -1,0 +1,87 @@
+# Per-route absorption lag — immediate-release + delayed-release (per-route `lag=`)
+#
+# Two parallel first-order pathways feeding the central compartment, split by a
+# dose fraction, where EACH pathway carries its own absorption lag via the optional
+# `lag=` argument on `first_order()`:
+#
+#   R_in(tad) = FR1·first_order(KA1, lag=LAG1) + FR2·first_order(KA2, lag=LAG2)
+#             = FR1·Dose·KA1·e^{−KA1·(tad−LAG1)}·[tad>LAG1]
+#             + FR2·Dose·KA2·e^{−KA2·(tad−LAG2)}·[tad>LAG2]
+#
+# This is the classic modified-release picture: an immediate-release (IR) fraction
+# that starts absorbing at once (LAG1 = 0), plus a delayed / enteric-coated fraction
+# that only begins after a gastric delay (LAG2 > 0). A single per-dose lagtime cannot
+# express it — both fractions would shift together — so each `first_order(...)` term
+# takes its own `lag=`.
+#
+# The per-route lag is an offset ON TOP of any compartment `lagtime`/`ALAG` (a bare
+# `lagtime` shifts BOTH routes; the per-route `lag=` adds a further route-specific
+# delay), and it composes with the #388 pathway fraction and #327 bioavailability F:
+# one dose record delivers F·Dose, split FR1/FR2 across the routes, each switched on
+# at its own `LAGk`.
+#
+# NOTE (engine): a model carrying any per-route `lag=` is fit over finite differences
+# (the analytic sensitivity walk's per-route onset saltation is a follow-up), exactly
+# like `weibull()` + lagtime — predictions and simulation are exact; only the FOCEI
+# gradient is FD. A single per-route-lagged route is, by construction, the same shift
+# as that route on a compartment lagtime — a lag form validated against NONMEM — so
+# the value path reduces to an already-anchored term (see tests/per_route_lag.rs).
+#
+# ── Unit convention (Form C: amount ODE + [scaling]) ─────────────────────────
+#   CMT=1  central  — drug AMOUNT (mg); receives R_in(tad), elimination CL/V
+#   observation y   — concentration (mg/L) = central / V, via the [scaling] block
+#
+# Self-contained: run it with no data file
+#   cargo run --release -- examples/per_route_lag_absorption.ferx --simulate
+# which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
+# fits it back. True simulation parameters: TVCL=5, TVV=50, TVFR1=0.5 (IR fraction),
+#   TVKA1=1.2 (IR), TVKA2=0.8 (DR), TVLAG2=3.0 (DR gastric delay),
+#   omega_CL=omega_V=0.09, sigma combined (0.02 additive + 0.10 proportional).
+
+[parameters]
+  theta TVCL(5.0,    0.1, 100.0)   # typical clearance (L/h)
+  theta TVV(50.0,    5.0, 500.0)   # typical central volume (L)
+  theta TVFR1(0.5,  0.05,  0.95)   # immediate-release fraction of the dose
+  theta TVKA1(1.2,  0.05,  24.0)   # IR absorption rate (1/h)
+  theta TVKA2(0.8,  0.05,  24.0)   # delayed-release absorption rate (1/h)
+  theta TVLAG2(3.0, 0.001, 12.0)   # delayed-release onset lag (h)
+
+  omega ETA_CL ~ 0.09              # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09              # IIV on V  (~30% CV)
+
+  sigma ADD_ERR  ~ 0.02 (sd)       # additive residual (defines PRED=0 in the dead time)
+  sigma PROP_ERR ~ 0.10 (sd)       # proportional residual (~10% CV)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  FR1  = TVFR1                     # IR fraction (lag 0)
+  FR2  = 1 - TVFR1                 # DR fraction (declared complement; FR1 + FR2 = 1)
+  KA1  = TVKA1
+  KA2  = TVKA2
+  LAG2 = TVLAG2                    # DR-route lag; IR route has no lag
+
+[structural_model]
+  ode(states=[central])            # no obs_cmt — Form C provides the observable
+
+[odes]
+  # IR route (no lag) + DR route (lag=LAG2), both first-order into central, then CL/V.
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2, lag=LAG2) - CL/V*central
+
+[scaling]
+  y = central / V                  # observable = concentration (mg/L)
+
+[error_model]
+  DV ~ combined(ADD_ERR, PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 2.9, 3.1, 3.5, 4.0, 5.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7

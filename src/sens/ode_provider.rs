@@ -302,6 +302,21 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
         return false;
     }
+    // Per-route absorption lag (`fn(..., lag=L)`) is served over finite differences.
+    // The analytic event-driven walk injects ONE onset saltation per dose at the
+    // lagged arrival `t_dose + lag_cmt`; a per-route lag gives each forcing its own
+    // onset `t_dose + lag_cmt + lag_route`, so the walk would need distinct break
+    // points and a per-route rate-on saltation it does not yet emit. Gate it off here
+    // (BOTH the outer full provider and the inner light provider via
+    // `ode_subject_supported`) so it routes to FD — the exact `weibull()`+lagtime
+    // pattern. The pointwise `add_prepared_input_rate_forcing` DOES add `route_lag`
+    // to `t_eff` over any `T`, but that continuous shift without the onset saltation
+    // is precisely the wrong gradient this gate prevents from ever executing on a
+    // dual walk. Lifting the gate (per-route onset saltation) is the Phase-2 follow-up
+    // (#856).
+    if ode.input_rate.iter().any(|f| f.lag_slot.is_some()) {
+        return false;
+    }
     if model.n_kappa != 0 {
         return false;
     }
@@ -6768,6 +6783,64 @@ mod tests {
             !ode_subject_supported(&m, &subj),
             "ALAG1 not on the static walk"
         );
+    }
+
+    /// A **per-route** absorption lag (`fn(..., lag=L)`) gates the model OFF the
+    /// analytic path onto FD — the correctness backstop for the feature's first
+    /// phase. The analytic event-driven walk injects one onset saltation per dose at
+    /// `t_dose + lag_cmt`; a per-route lag needs a distinct onset per route
+    /// (`+ lag_route`), which the walk does not yet emit, so serving it analytically
+    /// would silently drop the route-onset discontinuity. Neither the static nor the
+    /// TV-cov walk may claim it (both derive from `ode_analytical_supported`).
+    /// (Removing this gate — the per-route onset saltation — is the Phase-2 follow-up.)
+    #[test]
+    fn per_route_lag_gates_off_analytic() {
+        const PER_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 20.0)
+  theta TVKA2(0.3, 0.05, 20.0)
+  theta TVLAG2(2.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  FR1  = TVFR1
+  FR2  = 1 - TVFR1
+  KA1  = TVKA1
+  KA2  = TVKA2
+  LAG2 = TVLAG2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2, lag=LAG2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(PER_ROUTE_LAG).expect("parse per-route lag model");
+        // Sanity: the model actually carries a per-route lag on exactly one forcing.
+        let ode = m.ode_spec.as_ref().expect("ode spec");
+        assert_eq!(
+            ode.input_rate
+                .iter()
+                .filter(|f| f.lag_slot.is_some())
+                .count(),
+            1,
+            "one route carries a per-route lag"
+        );
+        assert!(
+            !ode_analytical_supported(&m),
+            "a per-route lag must gate the model onto FD (no silent analytic path)"
+        );
+        // Neither per-subject walk may claim it either.
+        let subj = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0]);
+        assert!(!ode_subject_supported(&m, &subj), "not on the static walk");
+        assert!(!ode_tvcov_supported(&m, &subj), "not on the TV-cov walk");
     }
 
     /// Indexed `F` is now in model-level scope (parity test above), but the

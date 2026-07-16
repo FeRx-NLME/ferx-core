@@ -543,16 +543,21 @@ fn zero_order_windows(
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
-    dur_frac_for_dose: impl Fn(usize, &DoseEvent) -> Option<(f64, f64)>,
+    dur_frac_for_dose: impl Fn(usize, &DoseEvent) -> Option<(f64, f64, f64)>,
 ) -> Vec<ZeroOrderWindow> {
     let mut out = Vec::new();
     for (k, d) in doses.iter().enumerate() {
-        let Some((dur, frac)) = dur_frac_for_dose(k, d) else {
+        let Some((dur, frac, route_lag)) = dur_frac_for_dose(k, d) else {
             continue;
         };
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let f_bio = dose_f_bio.get(k).copied().unwrap_or(1.0);
-        let w_start = d.time + lag;
+        // The window opens at `d.time + lag_cmt + lag_route`: the dose's compartment
+        // lagtime plus this zero-order route's own delay (`zero_order(..., lag=L)`,
+        // `0` for an unlagged route). The full-containment break at `w_end` shifts
+        // with it (via `zero_order_dur_and_lag_for_dose`), keeping every segment
+        // fully inside or outside the window (#504 mass-exactness) under a route lag.
+        let w_start = d.time + lag + route_lag;
         out.push((
             d.cmt.saturating_sub(1),
             f_bio * d.amt * frac / dur,
@@ -614,14 +619,16 @@ fn zero_order_dur_and_frac_for_dose(
     ode: &OdeSpec,
     dose: &DoseEvent,
     pk_params: &[f64],
-) -> Option<(f64, f64)> {
+) -> Option<(f64, f64, f64)> {
     if dose.amt <= 0.0 {
         return None;
     }
     ode.input_rate.iter().find_map(|f| {
         if f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt + 1 == dose.cmt {
             match f.prepare(pk_params) {
-                PreparedInputRate::ZeroOrder { dur, .. } => Some((dur, f.frac(pk_params))),
+                PreparedInputRate::ZeroOrder { dur, .. } => {
+                    Some((dur, f.frac(pk_params), f.route_lag(pk_params)))
+                }
                 _ => None,
             }
         } else {
@@ -630,13 +637,18 @@ fn zero_order_dur_and_frac_for_dose(
     })
 }
 
-/// The floored zero-order duration `dur` for `dose` (ignoring the pathway
-/// fraction) — used by the event-driven timeline's cutoff break, which needs the
-/// window *edge*, not the rate. A thin projection of
-/// [`zero_order_dur_and_frac_for_dose`] so the two never disagree on which forcing /
-/// `dur` a dose resolves to.
-fn zero_order_dur_for_dose(ode: &OdeSpec, dose: &DoseEvent, pk_params: &[f64]) -> Option<f64> {
-    zero_order_dur_and_frac_for_dose(ode, dose, pk_params).map(|(dur, _)| dur)
+/// The floored zero-order duration `dur` **and per-route lag** for `dose` (ignoring
+/// the pathway fraction) — used by the event-driven timeline's cutoff break, which
+/// needs the window *edge* `d.time + lag_cmt + lag_route + dur`, not the rate. A thin
+/// projection of [`zero_order_dur_and_frac_for_dose`] so the two never disagree on
+/// which forcing / `dur` / `lag_route` a dose resolves to.
+fn zero_order_dur_and_lag_for_dose(
+    ode: &OdeSpec,
+    dose: &DoseEvent,
+    pk_params: &[f64],
+) -> Option<(f64, f64)> {
+    zero_order_dur_and_frac_for_dose(ode, dose, pk_params)
+        .map(|(dur, _, route_lag)| (dur, route_lag))
 }
 
 /// True if a built-in absorption input-rate forcing (transit/etc.) feeds the
@@ -670,6 +682,32 @@ pub(crate) fn input_rate_consumes_cmt(ode: &OdeSpec, cmt_1based: usize) -> bool 
 /// window.
 fn push_zero_order_break_times(break_times: &mut Vec<f64>, windows: &[ZeroOrderWindow]) {
     break_times.extend(windows.iter().map(|&(_, _, _, w_end)| w_end));
+}
+
+/// Push a break at every per-route absorption onset `d.time + lag_cmt + lag_route`
+/// (`fn(..., lag=L)`) — for each input-rate forcing carrying a `lag_slot`, over every
+/// positive-amount dose feeding that forcing's compartment. `route_lag_of` reads the
+/// forcing's lag from the caller's PK snapshot (a single subject snapshot on the dense
+/// path; per-forcing over the event-driven walk's snapshot). A route lag delays that
+/// route's onset PAST the dose's `d.time + lag_cmt` break, so without this break the
+/// smooth routes' onset kink is unresolved and a lagged `zero_order` window's start is
+/// unbracketed (never fully contained in a segment → no mass delivered). A no-op when
+/// no forcing carries a lag (the `filter` yields nothing), so the common case is free.
+fn push_route_lag_break_times(
+    break_times: &mut Vec<f64>,
+    ode: &OdeSpec,
+    subject: &Subject,
+    dose_lagtimes: &[f64],
+    route_lag_of: impl Fn(&crate::pk::absorption::InputRateForcing) -> f64,
+) {
+    for forcing in ode.input_rate.iter().filter(|f| f.lag_slot.is_some()) {
+        let route_lag = route_lag_of(forcing);
+        for (k, d) in subject.doses.iter().enumerate() {
+            if d.amt > 0.0 && d.cmt.saturating_sub(1) == forcing.cmt {
+                break_times.push(d.time + dose_lagtimes.get(k).copied().unwrap_or(0.0) + route_lag);
+            }
+        }
+    }
 }
 
 /// How a segment's infusions are injected as a `+rate` derivative term in the
@@ -790,6 +828,15 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
         if forcing.kind == crate::pk::absorption::InputRateKind::ZeroOrder {
             continue;
         }
+        // Per-route absorption delay (`fn(..., lag=L)`): an offset ON TOP of the
+        // dose's compartment lag, so each parallel / mixed pathway can switch on at
+        // its own time. Dose-invariant (a property of the forcing, not the dose), so
+        // hoisted out of the per-dose loop; `0` for an unlagged forcing (the common
+        // case), a no-op there. A model carrying any per-route lag is served over FD
+        // (`ode_analytical_supported` gates it off), so on the `Dual2` walk this term
+        // never executes — only `T = f64` reaches here today; its jet is otherwise a
+        // continuous shift with no onset saltation, which is exactly why it is gated.
+        let route_lag = forcing.route_lag(params);
         let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
             if d.cmt.saturating_sub(1) != forcing.cmt {
@@ -803,7 +850,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
             // computation there. The gating comparisons use `.val()` (the boundary
             // itself never needs a jet — see `rate_at_zero`'s jump for that).
             let lag = dose_lagtimes.get(k).copied().unwrap_or(T::from_f64(0.0));
-            let t_eff = T::from_f64(d.time) + lag;
+            let t_eff = T::from_f64(d.time) + lag + route_lag;
             // Doses delivered before the most recent reset are off — the reset
             // zeroed the compartments, same rule as `active_infusions`.
             if t_eff.val() < reset_floor - INFUSION_EPS {
@@ -1584,6 +1631,17 @@ fn ode_predictions_with_extra_breaks_and_stats(
             break_times.push(dose.time);
         }
     }
+    // Per-route absorption lag (`fn(..., lag=L)`): a route with its own lag switches
+    // on at `d.time + lag_cmt + lag_route`, PAST the dose's `d.time + lag_cmt` break
+    // above — so add a break at each route onset. This resolves the smooth routes'
+    // onset kink (`R_in` jumping 0 → `ka·dose` etc.) exactly, and brackets a lagged
+    // `zero_order` window's START (its end is broken via the route-lag-shifted
+    // `zo_windows` below). Without it the adaptive solver smears the kink and a lagged
+    // zero-order window is never fully contained in a segment (delivering nothing).
+    // A no-op for unlagged forcings (`lag_slot = None`), the common case.
+    push_route_lag_break_times(&mut break_times, ode, subject, &dose_lagtimes, |f| {
+        f.route_lag(pk_params_flat)
+    });
     // Zero-order windows for this subject (#504): the dense paths have a single
     // PK snapshot, so the per-dose `dur`/`F`/`lag` come from `pk_params_flat`.
     // Break at each window end so segments align with the cutoff, and reuse the
@@ -3355,11 +3413,27 @@ pub fn ode_predictions_event_driven(
         }
         // Zero-order absorption cutoff (#504): a dose feeding a `zero_order(dur)`
         // compartment delivers a constant rate over `(0, dur]`, so break at the
-        // window end `d.time+lag+dur` exactly like an infusion end (no record, no
-        // state change — just a segment boundary so `active_zero_order_inputs`'s
-        // full-containment test sees each segment fully inside or outside).
-        if let Some(dur) = zero_order_dur_for_dose(ode, d, &pk_at_dose[k].values) {
-            timeline.push((d.time + lag + dur, Kind::InfusionEnd, k));
+        // window end `d.time+lag_cmt+lag_route+dur` exactly like an infusion end (no
+        // record, no state change — just a segment boundary so
+        // `active_zero_order_inputs`'s full-containment test sees each segment fully
+        // inside or outside). The route lag shifts this edge in lock-step with the
+        // window `w_start` built by `zero_order_windows` from the same helper.
+        if let Some((dur, route_lag)) =
+            zero_order_dur_and_lag_for_dose(ode, d, &pk_at_dose[k].values)
+        {
+            timeline.push((d.time + lag + route_lag + dur, Kind::InfusionEnd, k));
+        }
+        // Per-route absorption onset (`fn(..., lag=L)`): each route with its own lag
+        // switches on at `d.time + lag_cmt + lag_route`, past the `Kind::Dose` break at
+        // `d.time + lag_cmt` above — break there (a pure segment boundary, same
+        // `Kind::InfusionEnd` no-op the zero-order cutoff uses) so the smooth routes'
+        // onset kink resolves exactly and a lagged zero-order window's START is
+        // bracketed. No-op for unlagged forcings.
+        for forcing in ode.input_rate.iter().filter(|f| f.lag_slot.is_some()) {
+            if d.amt > 0.0 && d.cmt.saturating_sub(1) == forcing.cmt {
+                let route_lag = forcing.route_lag(&pk_at_dose[k].values);
+                timeline.push((d.time + lag + route_lag, Kind::InfusionEnd, k));
+            }
         }
     }
     for (j, &t) in subject.obs_times.iter().enumerate() {
@@ -6730,6 +6804,7 @@ mod tests {
             kind: crate::pk::absorption::InputRateKind::Transit,
             arg_slots: vec![],
             frac_slot: None,
+            lag_slot: None,
         }];
         let pk = pk_one(1.0, 10.0);
         let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
@@ -7231,6 +7306,7 @@ mod tests {
             kind: crate::pk::absorption::InputRateKind::Transit,
             arg_slots: vec![],
             frac_slot: None,
+            lag_slot: None,
         }];
         let pk = pk_one(1.0, 10.0);
         let mut controller = |_ctx: &ControllerCtx| {
@@ -7867,6 +7943,7 @@ mod tests {
                 kind: InputRateKind::Transit,
                 arg_slots: vec![6, 7],
                 frac_slot: None,
+                lag_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -7921,6 +7998,7 @@ mod tests {
                 kind: InputRateKind::ZeroOrder,
                 arg_slots: vec![4],
                 frac_slot: None,
+                lag_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -7971,6 +8049,51 @@ mod tests {
         let mut breaks = Vec::new();
         push_zero_order_break_times(&mut breaks, &windows);
         assert_eq!(breaks, vec![6.5]);
+    }
+
+    #[test]
+    fn push_route_lag_break_times_adds_route_onsets() {
+        // Two first-order routes on cmt 0: one with a per-route lag (slot 6), one
+        // without. A break is added at `d.time + lag_cmt + lag_route` for the LAGGED
+        // route only over a positive-amount dose feeding cmt 0; the unlagged route adds
+        // nothing, and doses into another compartment / with zero amount are skipped.
+        let mk = |lag_slot| InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![4],
+            frac_slot: None,
+            lag_slot,
+        };
+        let ode = OdeSpec {
+            rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: vec![mk(Some(6)), mk(None)],
+            init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+        };
+        let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
+        params[6] = 1.5; // per-route lag
+        let doses = vec![
+            DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0), // cmt 0, amt>0 → onset break
+            DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0), // other cmt → skipped
+            DoseEvent::new(5.0, 0.0, 1, 0.0, false, 0.0),   // zero amt → skipped
+        ];
+        let subj = make_subject(doses, vec![]);
+        let mut breaks = Vec::new();
+        push_route_lag_break_times(&mut breaks, &ode, &subj, &[0.5, 0.0, 0.0], |f| {
+            f.route_lag(&params)
+        });
+        // Only the lagged forcing × the valid dose: 2.0 + 0.5 (cmt lag) + 1.5 (route lag).
+        assert_eq!(breaks, vec![4.0]);
     }
 
     #[test]
@@ -8244,6 +8367,7 @@ mod tests {
             kind: InputRateKind::InverseGaussian,
             arg_slots,
             frac_slot: Some(frac_slot),
+            lag_slot: None,
         };
         let ode = OdeSpec {
             rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
