@@ -7942,6 +7942,65 @@ mod tests {
         check_hessian_vs_production_fd(&m, &subject, &theta, &eta);
     }
 
+    /// **TV-covariate across a route-lagged `zero_order` window end** (#859): closes the last
+    /// gap in the zero-order rate-off. When a time-varying covariate changes the PK params across
+    /// the window end `w_end`, the RHS Jacobian jumps, so `K_ZO_END` takes the **general**
+    /// `g⁻−g⁺` saltation branch (not the closed-form `pre == post` twin) — and there the
+    /// route-lag jet is carried by `route_lag_rep` on the cohort representative. A `WT`-on-`CL`
+    /// covariate switching between the obs bracketing `w_end = dose + LAG + DUR` forces that
+    /// branch; `check_vs_production` then FD-checks `∂f/∂LAG` (and `∂f/∂DUR`) through it, so the
+    /// `route_lag_rep` term is directly exercised, not just twin-verified against `route_lag_j`.
+    #[test]
+    fn tvcov_route_lagged_zero_order_matches_production() {
+        const TVCOV_ZO_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  theta TVDUR(3.0, 0.5, 24.0)
+  theta TVLAG(1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR
+  LAG = TVLAG
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR, lag=LAG) - CL/V*central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let m = parse_model_string(TVCOV_ZO_ROUTE_LAG).expect("parse tvcov zo-route-lag model");
+        // Window [LAG, LAG+DUR] = [1, 4]. Obs bracket w_end=4 (at t=3 and t=5) with DIFFERENT WT,
+        // so the PK params jump across the window end → the general rate-off branch fires. Obs
+        // deliberately avoid the window boundaries themselves (t=1, t=4): an obs coinciding with a
+        // moving saltation boundary is a measure-zero point where the one-sided analytic
+        // derivative and the symmetric FD disagree (FD averages the pre/post-jump sides).
+        let mut subject = bolus_subject(&[0.5, 3.0, 5.0, 8.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let wt = |w: f64| std::collections::HashMap::from([("WT".to_string(), w)]);
+        subject.covariates = wt(70.0);
+        subject.dose_covariates = vec![wt(60.0)];
+        subject.obs_covariates = vec![wt(60.0), wt(70.0), wt(90.0), wt(100.0)];
+        assert!(subject.has_tv_covariates(), "WT varies across records");
+        assert!(
+            ode_tvcov_supported(&m, &subject),
+            "TV-cov + route-lagged zero_order is analytic on the event-driven walk"
+        );
+        let theta = [1.0, 20.0, 0.75, 3.0, 1.0];
+        let eta = [0.1];
+        check_vs_production(&m, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&m, &subject, &theta, &eta);
+    }
+
     /// A **mixed** `first_order` + route-lagged `zero_order` on one compartment (#859 Slice 2):
     /// the immediate `FR1*first_order` rides the smooth dual path with its onset at the dose
     /// (`K_DOSE`, no route lag), while the delayed `FR2*zero_order(..., lag=L)` window opens at
