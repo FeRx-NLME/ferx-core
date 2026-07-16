@@ -38,8 +38,10 @@
 //! `weibull()` **combined with an estimated lagtime** (its `β < 1` onset has no
 //! closed-form rate-on saltation), an **expression `obs_scale` combined with LTBS**, and
 //! a few narrow compositions — **steady-state combined with a time-dependent
-//! (`TIME`/`TAD`) RHS**, and **IOV combined with FREM, LTBS, or a steady-state
-//! input-rate forcing**.
+//! (`TIME`/`TAD`) RHS**, and **IOV combined with FREM or LTBS**. (A steady-state dose into a
+//! built-in absorption compartment is analytic since #835, including under IOV; only SS into a
+//! `zero_order` window or SS + an absorption lagtime remain out of scope, and both are rejected
+//! upstream rather than routed here.)
 #![allow(clippy::needless_range_loop)]
 
 use super::dual1::Dual1;
@@ -6330,6 +6332,69 @@ mod tests {
   ode_abstol = 1e-11
 "#;
 
+    // weibull() is the fourth admitted kernel (gate + CHANGELOG) and rides the same generic SS
+    // fixed point / periodic forcing; its log-domain (`ln`/`exp`) Dual2 forcing under an SS pulse
+    // is otherwise unexercised (#835 review). β = 1.5 (> 1) so the density is smooth at the dose
+    // and analytic ≡ central-FD is clean.
+    const ONECPT_SS_WEIBULL: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVTD(2.0, 0.05, 24.0)
+  theta TVBETA(1.5, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  TD   = TVTD
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    // Estimated bioavailability F on an SS-absorption dose: every other SS fixture defaults F = 1,
+    // so the `f_bio: T` jet threaded into `equilibrate_ss_input_rate_state_g` is never
+    // differentiated. Here F rides both a θ (THETA_F) and an η (ETA_F) via `inv_logit`, so
+    // `∂u_ss/∂F` (through the SS trough) must match production FD (#835 review).
+    const ONECPT_SS_FIRST_ORDER_F: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  theta TVKA(0.15, 0.005, 20.0)
+  theta THETA_F(0.7, 0.001, 0.999)
+  omega ETA_CL ~ 0.09
+  omega ETA_F ~ 0.04
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = inv_logit(logit(THETA_F) + ETA_F)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
     // first_order absorption into a **Michaelis–Menten** (nonlinear) disposition: the closed-form
     // fixed point self-declines, so the dual walk falls back to the pulse-train iteration — its
     // gradient must still match production's (which uses the same fallback). η on Vmax.
@@ -6429,6 +6494,36 @@ mod tests {
         assert!(
             ode_tvcov_supported(&model, &subj),
             "#835: SS + first_order into a 2-cpt disposition analytic"
+        );
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
+    #[test]
+    fn ode_provider_ss_weibull_1cpt_matches_production() {
+        let model = parse_model_string(ONECPT_SS_WEIBULL).expect("parse SS weibull");
+        let theta = vec![1.0, 20.0, 2.0, 1.5];
+        let eta = vec![0.12];
+        let subj = ss_absorption_subject(&[0.5, 1.0, 2.0, 4.0, 6.0, 7.9], 8.0);
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "#835: SS + weibull analytic"
+        );
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
+    #[test]
+    fn ode_provider_ss_first_order_bioavailability_matches_production() {
+        let model =
+            parse_model_string(ONECPT_SS_FIRST_ORDER_F).expect("parse SS first_order under F");
+        assert!(model.has_bioavailability());
+        let theta = vec![1.0, 20.0, 0.15, 0.7];
+        let eta = vec![0.12, 0.1]; // [ETA_CL, ETA_F] — F on IIV exercises ∂u_ss/∂F through the trough
+        let subj = ss_absorption_subject(&[0.5, 1.0, 2.0, 4.0, 6.0, 7.9], 8.0);
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "#835: SS + first_order under an estimated F stays analytic"
         );
         check_vs_production(&model, &subj, &theta, &eta);
         check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
@@ -8103,6 +8198,43 @@ mod tests {
         assert!(
             !ode_subject_supported(&model, &subject),
             "SS still declines the static superposition walk (needs event-driven equilibration)"
+        );
+    }
+
+    /// #835 belt-and-suspenders: SS into a `zero_order` window is hard-rejected upstream
+    /// (`E_ABSORPTION_SS_ZERO_ORDER`), so it never reaches a real fit's gate — but the non-IOV
+    /// `ode_tvcov_supported` gate must *independently* decline it too, so the analytic walk can't
+    /// silently serve the (unbuilt) periodic-window trough if that upstream check is ever relaxed.
+    /// (The IOV twin is covered by `ode_iov_zero_order_ss_falls_back_to_fd`.)
+    #[test]
+    fn ode_gates_ss_into_zero_order_window_declines_dual_walk() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVDUR(2.0, 0.05, 12.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - (CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(M).expect("parse SS zero_order");
+        let mut subject = bolus_subject(&[1.0, 4.0, 7.9]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0)]; // SS=1, II=8
+        assert!(subject.has_periodic_ss_dose());
+        assert!(
+            !ode_tvcov_supported(&model, &subject),
+            "#835: SS into a zero_order window must decline the dual walk (no periodic-window trough)"
         );
     }
 

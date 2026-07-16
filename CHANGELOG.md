@@ -33,7 +33,8 @@ section of the SDLC for the versioning policy).
   (#834) now actually takes effect. Its self-verification tolerance sat just below the solver's
   own noise floor, so it silently fell back to the 50-cycle pulse-train iteration at every
   realistic `ode_reltol`; `predict()` / `simulate()` on these models are correspondingly faster.
-  Predictions are unchanged (#835).
+  Predictions are unchanged to within the ODE solver tolerance — the closed-form fixed point and
+  the iteration converge to the same periodic trough (#835).
 
 ### Changed
 - **`method = agq` removed; adaptive quadrature is now an *argument*, not a method**
