@@ -11,6 +11,7 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | **Biphasic IG** | `FR1*igd(...) + FR2*igd(...)` — [#388](https://github.com/FeRx-NLME/ferx-core/issues/388) | `freijer_biphasic_ig.ctl` | `biphasic_ig_fit.ferx` |
 | **Parallel** | `FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2)` — [#505](https://github.com/FeRx-NLME/ferx-core/issues/505) | `parallel_first_order.ctl` | `parallel_first_order_fit.ferx` |
 | **Mixed** | `FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR)` — [#505](https://github.com/FeRx-NLME/ferx-core/issues/505) | `mixed_zero_first.ctl` | `mixed_zero_first_fit.ferx` |
+| **Per-route lag** | `FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2, lag=LAG2)` (IR + delayed-release) | `per_route_lag.ctl` | `per_route_lag_fit.ferx` |
 | **Steady-state absorption** | `SS=1` into `first_order(ka)` — [#719](https://github.com/FeRx-NLME/ferx-core/issues/719) gap 1 (`ADVAN2` exact analytic SS; `KA` slow so the absorption tail spans `II`) | `ss_first_order.ctl` | *(in `tests/ss_absorption_nonmem_anchor.rs`)* |
 | **Infusion into absorption** | `RATE>0` into `first_order(ka)` — [#719](https://github.com/FeRx-NLME/ferx-core/issues/719) gap 2 (`ADVAN2` native zero-order-into-depot = the kernel convolution `R_in_inf`) | `inf_first_order.ctl` | *(in `tests/infusion_absorption_nonmem_anchor.rs`)* |
 

@@ -8409,10 +8409,11 @@ const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] =
 /// cleaned lines and the forcings.
 ///
 /// Validation (negative-tested): an input-rate call may appear only in a top-level
-/// `d/dt(...)` equation; its args are exactly the function's declared names, each a
-/// declared individual parameter; a non-fraction scaling / sign / grouping is
-/// rejected ([`parse_input_rate_prefix`]); a fraction multiplier must be a single
-/// declared parameter; and a fraction on `zero_order(...)` is rejected pending #505.
+/// `d/dt(...)` equation; its args are the function's declared names plus the
+/// universal optional `lag` (per-route absorption delay), each a declared
+/// individual parameter; a non-fraction scaling / sign / grouping is rejected
+/// ([`parse_input_rate_prefix`]); a fraction multiplier must be a single declared
+/// parameter; and a fraction on `zero_order(...)` is rejected pending #505.
 fn extract_input_rate_terms(
     rhs_lines: &[String],
     state_names: &[String],
@@ -8505,8 +8506,14 @@ fn extract_input_rate_terms(
             // in `build_ode_spec` (after the full forcing list is assembled), since
             // the single-window-per-dose channel would under-deliver them.
 
-            // Resolve each named arg into its declared slot position.
+            // Resolve each named arg into its declared slot position. `lag` is a
+            // **universal optional** argument on every input-rate function:
+            // `fn(..., lag=L)` gives that pathway its own absorption delay, added on
+            // top of any compartment lagtime, so parallel / mixed routes can switch
+            // on at different times. It is not one of the kind's required args, so it
+            // is captured separately into `lag_slot` rather than `slots`.
             let mut slots: Vec<Option<usize>> = vec![None; arg_names.len()];
+            let mut lag_slot: Option<usize> = None;
             for part in split_args_on_commas(&inner) {
                 let (name, val) = part.split_once('=').ok_or_else(|| {
                     format!(
@@ -8515,11 +8522,21 @@ fn extract_input_rate_terms(
                     )
                 })?;
                 let (name, val) = (name.trim(), val.trim());
+                if name == "lag" {
+                    if lag_slot.is_some() {
+                        return Err(format!(
+                            "[odes]: {fname}(...) has a duplicate `lag` argument"
+                        ));
+                    }
+                    lag_slot = Some(resolve_slot(fname, val, name)?);
+                    continue;
+                }
                 match arg_names.iter().position(|a| *a == name) {
                     Some(i) => slots[i] = Some(resolve_slot(fname, val, name)?),
                     None => {
                         return Err(format!(
-                            "[odes]: {fname}(...) has no argument `{name}` (expected {})",
+                            "[odes]: {fname}(...) has no argument `{name}` (expected {} \
+                             or the optional `lag`)",
                             arg_list(arg_names)
                         ))
                     }
@@ -8540,6 +8557,7 @@ fn extract_input_rate_terms(
                 kind,
                 arg_slots,
                 frac_slot,
+                lag_slot,
             });
 
             // Rewrite the `[FR*]fn(...)` span to `0`, then loop to find the next term.
@@ -17353,6 +17371,92 @@ mod tests {
             .expect("a first-order forcing");
         assert_eq!(zo.frac_slot, Some(3)); // FZO
         assert_eq!(fo.frac_slot, Some(2)); // FZO1
+    }
+
+    #[test]
+    fn extract_first_order_with_per_route_lag() {
+        // first_order(ka=KA, lag=LAG): the optional `lag` arg is captured into
+        // `lag_slot`, leaving `arg_slots` = [ka] (lag is not a required intrinsic arg).
+        let states = vec!["central".to_string()];
+        let names = vec!["KA".to_string(), "LAG".to_string()];
+        let slots = vec![4, 7];
+        let line = "d/dt(central) = first_order(ka=KA, lag=LAG) - CL/V*central".to_string();
+        let (_, forcings) = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap();
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(forcings[0].arg_slots, vec![4]); // ka @ 4 (lag NOT in arg_slots)
+        assert_eq!(forcings[0].lag_slot, Some(7)); // LAG @ 7
+        assert_eq!(forcings[0].frac_slot, None);
+    }
+
+    #[test]
+    fn extract_parallel_distinct_per_route_lags() {
+        // Each parallel route may carry its OWN lag: FR1*first_order(ka=KA1, lag=L1)
+        // + FR2*first_order(ka=KA2, lag=L2) → two forcings with distinct lag_slots.
+        let states = vec!["central".to_string()];
+        let names = vec![
+            "FR1".to_string(),
+            "FR2".to_string(),
+            "KA1".to_string(),
+            "KA2".to_string(),
+            "L1".to_string(),
+            "L2".to_string(),
+        ];
+        let slots = vec![2, 3, 4, 5, 6, 7];
+        let line = "d/dt(central) = FR1*first_order(ka=KA1, lag=L1) \
+                    + FR2*first_order(ka=KA2, lag=L2) - CL/V*central"
+            .to_string();
+        let (_, forcings) = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap();
+        assert_eq!(forcings.len(), 2);
+        assert_eq!(forcings[0].lag_slot, Some(6)); // L1
+        assert_eq!(forcings[1].lag_slot, Some(7)); // L2
+        assert_eq!(forcings[0].frac_slot, Some(2)); // FR1
+        assert_eq!(forcings[1].frac_slot, Some(3)); // FR2
+    }
+
+    #[test]
+    fn extract_zero_order_with_per_route_lag() {
+        // The `lag` arg is universal — a zero-order route takes it too (its window
+        // start/end shift by the route lag).
+        let states = vec!["central".to_string()];
+        let names = vec!["DUR".to_string(), "LAG".to_string()];
+        let slots = vec![4, 7];
+        let line = "d/dt(central) = zero_order(dur=DUR, lag=LAG) - CL/V*central".to_string();
+        let (_, forcings) = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap();
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::ZeroOrder
+        );
+        assert_eq!(forcings[0].arg_slots, vec![4]); // dur @ 4
+        assert_eq!(forcings[0].lag_slot, Some(7)); // LAG @ 7
+    }
+
+    #[test]
+    fn extract_rejects_duplicate_lag_arg() {
+        let states = vec!["central".to_string()];
+        let names = vec!["KA".to_string(), "L1".to_string(), "L2".to_string()];
+        let slots = vec![4, 6, 7];
+        let line = "d/dt(central) = first_order(ka=KA, lag=L1, lag=L2) - CL/V*central".to_string();
+        let err = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap_err();
+        assert!(
+            err.contains("duplicate") && err.contains("lag"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_unknown_arg_message_mentions_lag() {
+        // An unknown arg's error names the intrinsic args AND the universal `lag`, so
+        // the user learns `lag` is accepted.
+        let states = vec!["central".to_string()];
+        let names = vec!["KA".to_string(), "X".to_string()];
+        let slots = vec![4, 6];
+        let line = "d/dt(central) = first_order(ka=KA, foo=X) - CL/V*central".to_string();
+        let err = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap_err();
+        assert!(
+            err.contains("no argument `foo`") && err.contains("lag"),
+            "got: {err}"
+        );
     }
 
     #[test]

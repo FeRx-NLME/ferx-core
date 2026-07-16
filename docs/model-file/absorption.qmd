@@ -783,6 +783,51 @@ zero-order channel carries the fraction). At most **one** `zero_order(...)` term
 feed a compartment — biphasic zero-order is rejected when the model is parsed (so a
 `fit`, `simulate`, or `predict` run all surface the error the same way).
 
+### Per-route lag — `first_order(ka=…, lag=L)` {#per-route-lag}
+
+Every input-rate function takes an optional `lag` argument giving **that pathway its
+own absorption delay**, so parallel / mixed routes can switch on at different times —
+the classic immediate-release + delayed-release (enteric-coated) picture:
+
+```text
+[individual_parameters]
+  FR1  = TVFR1          # immediate-release fraction (no lag)
+  FR2  = 1 - TVFR1      # delayed-release fraction
+  LAG2 = TVLAG2         # delayed-release onset (h)
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1)
+                + FR2*first_order(ka=KA2, lag=LAG2) - CL/V*central
+```
+
+The per-route lag is an offset **on top of** any compartment lagtime (`lagtime` /
+`ALAG{n}`): a bare `lagtime` shifts *every* route together, while `lag=` adds a further
+delay to *one* route, so a route's effective onset is `dose time + lag_cmt + lag_route`.
+The argument is universal — `zero_order(dur=DUR, lag=L)` shifts the whole zero-order
+window (start, end, and its cutoff break) by `L`. `lag` must be a single declared
+individual parameter (like the `FR*` fraction), and must be finite; a negative value
+is warned (`W_NEGATIVE_LAGTIME`), not clamped. `lag=0` (or no `lag`) is bit-identical
+to an unlagged route, so the argument is a strict superset.
+
+A plain **infusion** (`RATE>0`) into a per-route-lagged compartment composes as expected
+(the whole infused-kernel appearance is delayed by `lag`). **Steady-state** dosing
+(`SS=1`) into a per-route-lagged compartment is *rejected* (`E_ABSORPTION_SS_LAG`) — the
+same limitation as a compartment `lagtime`/`ALAG` under `SS` ([#719](https://github.com/FeRx-NLME/ferx-core/issues/719)):
+the steady-state pre-arrival seed does not yet route the dose through the absorption
+kernel over a lagged onset.
+
+::: {.callout-note}
+## Gradients (FD for now)
+
+A model carrying any per-route `lag=` is fit over **finite differences** — the
+analytic event-driven walk injects one onset saltation per dose at the shared
+`dose + lag_cmt`, whereas a per-route lag needs a distinct onset (and rate-on
+saltation) per route. This is the exact analogue of the `weibull()` + lagtime FD
+fallback; predictions and simulation are exact (the onset is a real integration
+break), only the FOCEI gradient is FD. The per-route onset saltation (returning
+these models to the analytic path) is a planned follow-up
+([#856](https://github.com/FeRx-NLME/ferx-core/issues/856)).
+:::
+
 ### Sensitivities
 
 Both `parallel` (smooth `first_order` terms) and `mixed` (a `zero_order` term
@@ -825,6 +870,22 @@ is *also* anchored against a licensed NONMEM `ADVAN13 $DES` run (committed under
 `nonmem_anchor/`): ferx's FOCEI objective at NONMEM's optimum matches NONMEM's
 `#OBJV` to ~1e-5 for `parallel` (−688.019) and ~1e-4 for `mixed` (−698.966), and
 both recover the data-generating parameters (`tests/parallel_mixed_nonmem_anchor.rs`).
+
+The **per-route lag**
+([`examples/per_route_lag_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/per_route_lag_absorption.ferx),
+`tests/per_route_lag.rs`) is validated two ways. First, *reduction to an
+already-anchored term*: a single route with `lag=L` is, by construction, the same time
+shift as that route on a compartment `lagtime`/`ALAG` — a lag form validated against
+NONMEM above — so it must predict identically, which the tests pin to 1e-5 (matching the
+analytic Bateman-with-lag value); by the linearity of the disposition ODE the parallel /
+mixed cases are then the fraction-weighted sum of these anchored single-route curves. The
+single-route reduction also cross-validates the two f64 integration paths (a route lag
+rides the static superposition walk; its compartment-lag twin rides the event-driven
+walk). Second, a **direct NONMEM `ADVAN13 $DES` anchor** (an immediate-release +
+delayed-release model, the DR pathway's `$DES` input shifted by a per-route lag;
+committed under `nonmem_anchor/`): NONMEM recovers the data-generating per-route lag
+(`LAG2 = 3.074` from a truth of 3.0), and ferx's FOCEI objective at NONMEM's optimum
+matches NONMEM's `#OBJV = −882.357` to ~1e-6 (`tests/per_route_lag_nonmem_anchor.rs`).
 
 ## Numerical note
 

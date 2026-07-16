@@ -1268,13 +1268,28 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             .iter()
             .any(|d| d.ss && d.ii > 0.0 && zero_order_cmts.contains(&d.cmt))
     });
+    // A per-route lag (`fn(..., lag=L)`, #856) lives on the forcing's `lag_slot`, NOT the
+    // compartment-lag machinery, so `has_lagtime_on_cmt` does not see it — but the SS
+    // equilibration seed is just as unable to route the dose through a per-route-lagged
+    // onset over the previous interval as through a compartment `lagtime`/`ALAG`. Reject
+    // the combination the same way, compartment-scoped so a per-route lag on a *different*
+    // pathway does not block an SS dose into an un-lagged compartment.
+    let route_lag_cmts: BTreeSet<usize> = ode
+        .input_rate
+        .iter()
+        .filter(|f| f.lag_slot.is_some())
+        .map(|f| f.cmt + 1)
+        .collect();
     // Compartment-scoped, not model-wide (`model.has_lagtime()`): a lag declared on a
     // *different* absorption pathway (e.g. `ALAG2`) must not block an SS dose into an
-    // un-lagged compartment (e.g. `CMT=1`).
+    // un-lagged compartment (e.g. `CMT=1`). Covers both a compartment `lagtime`/`ALAG`
+    // and a per-route `lag=` on a forcing feeding the SS-dosed compartment.
     let has_ss_lag = population.subjects.iter().any(|s| {
-        s.doses
-            .iter()
-            .any(|d| d.ss && d.ii > 0.0 && cmts.contains(&d.cmt) && model.has_lagtime_on_cmt(d.cmt))
+        s.doses.iter().any(|d| {
+            d.ss && d.ii > 0.0
+                && cmts.contains(&d.cmt)
+                && (model.has_lagtime_on_cmt(d.cmt) || route_lag_cmts.contains(&d.cmt))
+        })
     });
     if has_ss_zero_order {
         diags.push(
@@ -1294,10 +1309,11 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             Diagnostic::error(
                 "E_ABSORPTION_SS_LAG",
                 "Steady-state dosing (SS=1) into a built-in absorption compartment combined \
-                 with an absorption lagtime is not yet supported: the SS+lagtime pre-arrival \
-                 seed does not yet route the dose through the absorption kernel over the \
-                 previous interval. Remove the lagtime, expand the run-in with explicit dosing \
-                 records, or dose without SS.",
+                 with an absorption lagtime (a compartment `lagtime`/`ALAG` or a per-route \
+                 `lag=`) is not yet supported: the SS+lagtime pre-arrival seed does not yet \
+                 route the dose through the absorption kernel over the previous interval. \
+                 Remove the lagtime, expand the run-in with explicit dosing records, or dose \
+                 without SS.",
             )
             .with_block("odes"),
         );
@@ -2875,6 +2891,39 @@ pub fn check_model_data_warnings(
                                  at the initial typical-value point (eta = 0). Negative lagtimes \
                                  are physically nonsensical and are not clamped — consider an \
                                  exp() or other positive-link parameterisation."
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Negative per-route absorption lag (`fn(..., lag=L)`) at the initial typical-value
+    // point (η = 0). A per-route lag lives on the forcing (its own `lag_slot`), NOT the
+    // dose-attribute lag machinery, so `model.has_lagtime()` does not cover it and the
+    // block above never sees it — this check stands on its own, gated on a forcing
+    // actually carrying a `lag_slot`. Same convention as `W_NEGATIVE_LAGTIME`: warned,
+    // not clamped (a negative lag shifts the onset earlier rather than crashing).
+    if let Some(ode) = &model.ode_spec {
+        if ode.input_rate.iter().any(|f| f.lag_slot.is_some()) {
+            if let Some(first_subj) = population.subjects.first() {
+                let zero_eta = vec![0.0_f64; model.n_eta];
+                let pk =
+                    (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates, 0.0);
+                for f in ode.input_rate.iter().filter(|f| f.lag_slot.is_some()) {
+                    let lag = f.route_lag(&pk.values);
+                    if lag < 0.0 {
+                        diags.push(Diagnostic::warning(
+                            "W_NEGATIVE_LAGTIME",
+                            format!(
+                                "Per-route absorption lag (a `{:?}` route on compartment {}) \
+                                 evaluates to {lag:.4} (< 0) at the initial typical-value point \
+                                 (eta = 0). Negative lagtimes are physically nonsensical and are \
+                                 not clamped — consider an exp() or other positive-link \
+                                 parameterisation.",
+                                f.kind,
+                                f.cmt + 1
                             ),
                         ));
                     }
@@ -16162,6 +16211,77 @@ mod tests_derived_iov_kappa {
         assert!(
             neg.message.contains("ALAG2") && neg.message.contains("compartment-2"),
             "warning must name the offending compartment-indexed lag, got: {}",
+            neg.message
+        );
+    }
+
+    /// A negative **per-route** lag (`fn(..., lag=L)`) must raise `W_NEGATIVE_LAGTIME`
+    /// too. A per-route lag lives on the forcing's `lag_slot`, NOT the dose-attribute
+    /// lag machinery, so `model.has_lagtime()` is false and the compartment-lag scan
+    /// never sees it — its own gate (any forcing with a `lag_slot`) is what fires here.
+    #[test]
+    fn negative_per_route_lag_emits_negative_lagtime_warning() {
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVLAG(-1.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+  LAG = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("parse ok")
+            .model;
+        let subject = Subject {
+            fremtype: Vec::new(),
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![3.0],
+            obs_raw_times: vec![3.0],
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1],
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        let neg = diags
+            .iter()
+            .find(|d| d.code == "W_NEGATIVE_LAGTIME")
+            .expect("a negative per-route lag must raise W_NEGATIVE_LAGTIME");
+        assert!(
+            neg.message.contains("Per-route") && neg.message.contains("FirstOrder"),
+            "warning must name the per-route lag and its route kind, got: {}",
             neg.message
         );
     }
