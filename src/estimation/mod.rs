@@ -1,5 +1,6 @@
 pub mod agq;
 pub mod bayes;
+pub mod covariance;
 pub mod gauss_newton;
 pub(crate) mod hmc;
 pub mod impmap;
