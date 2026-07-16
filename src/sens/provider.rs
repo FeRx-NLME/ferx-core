@@ -7081,6 +7081,90 @@ mod tests {
         check_full_provider_vs_fd(&model, &subject, &[10.0, 50.0, 500.0], &[0.12, -0.08, 0.05]);
     }
 
+    /// **SS dose into a plain compartment on an absorption-declaring model stays analytic**
+    /// (#719 review, finding 4). The SS-into-input-rate-compartment FD decline in
+    /// `ode_tvcov_supported` is scoped to the *SS-dosed* compartment: a model that declares a
+    /// built-in `first_order` absorption forcing on the depot, but whose subject's `SS=1` dose
+    /// is an IV loading straight into **central** (a non-forcing compartment, so `R_in` is inert
+    /// for this subject), must keep the exact event-driven analytic dual walk rather than fall to
+    /// the FD fallback. Pins both halves: (a) the gate now admits it (`subject_sensitivities`
+    /// returns `Some` — it returned `None` under the old model-wide `!input_rate.is_empty()`
+    /// decline), and (b) the analytic jets match central FD of the production predictor.
+    #[test]
+    fn provider_ss_into_plain_cmt_with_inert_absorption_matches_fd() {
+        use crate::types::DoseEvent;
+        // Depot (cmt 1) carries a `first_order` input-rate forcing; central (cmt 2) is the
+        // disposition compartment. The subject's only dose is an SS IV bolus into central, so
+        // the depot forcing never fires — the effective system is a 1-cpt IV SS bolus.
+        const DEPOT_FORCING_CENTRAL_SS: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot)   = first_order(ka=KA) - KA*depot
+  d/dt(central) = KA*depot - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let model = parse_model_string(DEPOT_FORCING_CENTRAL_SS).expect("parse");
+        assert!(
+            model
+                .ode_spec
+                .as_ref()
+                .is_some_and(|o| !o.input_rate.is_empty()),
+            "model must declare a built-in absorption forcing (on the depot)"
+        );
+        let n = 5usize;
+        // SS=1 bolus into central (cmt 2), II = 12; the depot forcing (cmt 1) is inert here.
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, true, 12.0)],
+            obs_times: vec![0.5, 2.0, 4.0, 8.0, 11.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        assert!(subject.has_periodic_ss_dose());
+        assert!(
+            crate::sens::ode_provider::ode_tvcov_supported(&model, &subject),
+            "an SS dose into a non-forcing compartment must stay on the analytic walk (#719)"
+        );
+        assert!(
+            subject_sensitivities(&model, &subject, &[0.2, 10.0, 1.0], &[0.1, -0.05, 0.15])
+                .is_some(),
+            "analytic provider must serve SS-into-plain-cmt (returned None under the old \
+             model-wide input-rate decline)"
+        );
+        check_full_provider_vs_fd(&model, &subject, &[0.2, 10.0, 1.0], &[0.1, -0.05, 0.15]);
+    }
+
     /// **Bit-parity cross-check vs the ODE twin for SS + modeled-duration.** The ODE
     /// `[odes]` SS + modeled-duration path is already analytic (#642) and independently
     /// NONMEM-anchored, so its outer `(η, θ)` jets are a strong oracle for the closed-form

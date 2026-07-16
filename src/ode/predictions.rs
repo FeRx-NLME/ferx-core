@@ -300,6 +300,7 @@ fn equilibrate_ss_input_rate_fixed_point(
     dose: &DoseEvent,
     f_bio: f64,
     opts: &OdeSolverOptions,
+    prepared: &[PreparedInputRate],
 ) -> Option<Vec<f64>> {
     use nalgebra::{DMatrix, DVector};
     let n = ode.n_states;
@@ -310,8 +311,9 @@ fn equilibrate_ss_input_rate_fixed_point(
 
     // Forced one-cycle RHS: the disposition plus the periodic absorption `R_in` of a single
     // local SS pulse at t = 0 (its SS branch superposes the prior-pulse tails). Reused for `b`
-    // and for the fixed-point verification.
-    let prepared = prepare_input_rates(ode, pk_params_flat);
+    // and for the fixed-point verification. `prepared` is built once by the caller
+    // (`equilibrate_ss_state`) and passed in so the fallback pulse-train iteration doesn't
+    // redo the same prep on a `None` return.
     let local_ss = [DoseEvent::new(0.0, dose.amt, dose.cmt, 0.0, true, ii)];
     let local_f_bio = [f_bio];
     let no_lag: [f64; 0] = [];
@@ -322,7 +324,7 @@ fn equilibrate_ss_input_rate_fixed_point(
         &no_lag,
         &local_f_bio,
         f64::NEG_INFINITY,
-        &prepared,
+        prepared,
         InfusionInput::Spanning(Vec::new()),
         &no_zero,
     );
@@ -365,11 +367,23 @@ fn equilibrate_ss_input_rate_fixed_point(
     let u_check = solve_to_ii(&forced_rhs, &u_ss)?;
     let scale = u_ss.iter().fold(1e-12_f64, |a, &x| a.max(x.abs()));
     let vtol = (32.0 * opts.reltol + 1e-9) * scale + 32.0 * opts.abstol;
-    let linear = u_check
+    let one_cycle_ok = u_check
         .iter()
         .zip(&u_ss)
         .all(|(&c, &u)| (c - u).abs() <= vtol);
-    if linear {
+    if !one_cycle_ok {
+        return None;
+    }
+    // Second cycle: a genuine (linear/affine) fixed point stays put under repeated forced
+    // application. A weakly-nonlinear disposition whose true fixed point merely happens to lie
+    // within `vtol` of the linear estimate after one cycle keeps drifting on a second — a single
+    // cycle can't tell the two apart, so require both to land within tolerance of `u_ss`.
+    let u_check2 = solve_to_ii(&forced_rhs, &u_check)?;
+    let two_cycle_ok = u_check2
+        .iter()
+        .zip(&u_ss)
+        .all(|(&c, &u)| (c - u).abs() <= vtol);
+    if two_cycle_ok {
         Some(u_ss)
     } else {
         None
@@ -447,13 +461,15 @@ fn equilibrate_ss_state(
         // solves rather than the up-to-`SS_EQUILIBRATION_CYCLES` pulse-train iteration below.
         // It self-verifies (a nonlinear RHS fails the fixed-point check), so a nonlinear
         // disposition transparently falls through to the exact-but-slower iteration.
+        // Built once and reused by both the fixed-point attempt and the fallback below —
+        // `equilibrate_ss_input_rate_fixed_point` no longer redoes this prep on `None`.
+        let prepared = prepare_input_rates(ode, pk_params_flat);
         if let Some(u_ss) =
-            equilibrate_ss_input_rate_fixed_point(ode, pk_params_flat, dose, f_bio, opts)
+            equilibrate_ss_input_rate_fixed_point(ode, pk_params_flat, dose, f_bio, opts, &prepared)
         {
             record_ss_equilibration_cycles(1);
             return u_ss;
         }
-        let prepared = prepare_input_rates(ode, pk_params_flat);
         let n_pulses = SS_EQUILIBRATION_CYCLES;
         let local_doses: Vec<DoseEvent> = (0..n_pulses)
             .map(|m| DoseEvent::new(m as f64 * dose.ii, dose.amt, dose.cmt, 0.0, false, 0.0))
@@ -1008,16 +1024,22 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
                 // [`SS_EQUILIBRATION_CYCLES`] (the same budget the trough uses).
                 let ii = T::from_f64(d.ii);
                 let mut j = 0usize;
+                // Break test is scoped to this dose's own periodic sum (`ss_acc`), not the
+                // cross-dose `acc`: a run-in dose processed earlier into the same compartment
+                // can otherwise inflate `acc` and trip the early-break on the SS sum's small
+                // leading terms, truncating the pulse-train tail prematurely.
+                let mut ss_acc = T::from_f64(0.0);
                 while j < SS_EQUILIBRATION_CYCLES {
                     let tad_j = tad + ii * T::from_f64(j as f64);
                     if tad_j.val() > 0.0 {
                         let term = prep.rate(tad_j, dose_mass);
                         acc = acc + term;
+                        ss_acc = ss_acc + term;
                         // Past the mode the density is monotone-decreasing, so a term below the
                         // relative floor means the remaining periodic tail is spent.
                         if j >= 1
-                            && acc.val().abs() > 0.0
-                            && term.val().abs() <= SS_TAIL_REL_FLOOR * acc.val().abs()
+                            && ss_acc.val().abs() > 0.0
+                            && term.val().abs() <= SS_TAIL_REL_FLOOR * ss_acc.val().abs()
                         {
                             break;
                         }
@@ -8342,9 +8364,17 @@ mod tests {
         let ss = DoseEvent::new(0.0, 50.0, 1, 0.0, true, 8.0);
 
         // The closed-form fixed point declines on the nonlinear one-cycle map.
+        let prepared = prepare_input_rates(&ode, &pk.values);
         assert!(
-            equilibrate_ss_input_rate_fixed_point(&ode, &pk.values, &ss, 1.0, &ode.solver_opts)
-                .is_none(),
+            equilibrate_ss_input_rate_fixed_point(
+                &ode,
+                &pk.values,
+                &ss,
+                1.0,
+                &ode.solver_opts,
+                &prepared
+            )
+            .is_none(),
             "nonlinear disposition must decline the closed-form SS fixed point"
         );
 

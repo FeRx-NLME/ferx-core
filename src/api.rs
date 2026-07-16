@@ -1262,15 +1262,18 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
         .filter(|f| f.kind == crate::pk::absorption::InputRateKind::ZeroOrder)
         .map(|f| f.cmt + 1)
         .collect();
-    let has_ss = population.subjects.iter().any(|s| {
-        s.doses
-            .iter()
-            .any(|d| d.ss && d.ii > 0.0 && cmts.contains(&d.cmt))
-    });
     let has_ss_zero_order = population.subjects.iter().any(|s| {
         s.doses
             .iter()
             .any(|d| d.ss && d.ii > 0.0 && zero_order_cmts.contains(&d.cmt))
+    });
+    // Compartment-scoped, not model-wide (`model.has_lagtime()`): a lag declared on a
+    // *different* absorption pathway (e.g. `ALAG2`) must not block an SS dose into an
+    // un-lagged compartment (e.g. `CMT=1`).
+    let has_ss_lag = population.subjects.iter().any(|s| {
+        s.doses
+            .iter()
+            .any(|d| d.ss && d.ii > 0.0 && cmts.contains(&d.cmt) && model.has_lagtime_on_cmt(d.cmt))
     });
     if has_ss_zero_order {
         diags.push(
@@ -1285,7 +1288,7 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             )
             .with_block("odes"),
         );
-    } else if has_ss && model.has_lagtime() {
+    } else if has_ss_lag {
         diags.push(
             Diagnostic::error(
                 "E_ABSORPTION_SS_LAG",
@@ -1637,14 +1640,14 @@ pub(crate) fn check_absorption_closed_form_support(
                 // twin can't yet serve: a twin-less form, or a model with an absorption lagtime
                 // (the twin's SS+lagtime pre-arrival seed is still bolus-only — same scope as the
                 // ODE-path `E_ABSORPTION_SS_LAG`). `effective_for` performs the reroute.
-                if model.absorption_ode_equivalent.is_none() || model.has_lagtime() {
+                if model.absorption_ode_equivalent.is_none() || model.has_lagtime_on_cmt(dose.cmt) {
                     return Some(format!(
                         "{name} does not support steady-state (SS) doses in this form (subject \
                          {}): SS reroutes to the ODE absorption twin, but this model has no twin \
                          {}. Use a non-SS multiple-dose schedule, or write the model as an ODE \
                          transit()/igd() forcing in [odes].",
                         subject.id,
-                        if model.has_lagtime() {
+                        if model.has_lagtime_on_cmt(dose.cmt) {
                             "for the SS + lagtime combination (a follow-up)"
                         } else {
                             "(an unrecognised closed form)"

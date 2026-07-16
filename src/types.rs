@@ -3593,6 +3593,30 @@ impl CompiledModel {
         })
     }
 
+    /// Compartment-scoped variant of [`Self::has_lagtime`]: true only when a
+    /// lag actually resolves for a dose into 1-based `cmt` — a bare
+    /// `LAGTIME`/`ALAG` (which, per [`DoseAttrMap::lagtime`]'s fallback, applies
+    /// to every compartment lacking its own indexed override) or an
+    /// `ALAG{cmt}`/`LAGTIME{cmt}` indexed specifically for this compartment.
+    /// Unlike `has_lagtime`, a lag declared on a *different* compartment
+    /// (`ALAG2` while `cmt` is 1) does not count — used to scope the SS+lag
+    /// rejection (#719 gap 1) to the actual SS-dosed compartment.
+    pub fn has_lagtime_on_cmt(&self, cmt: usize) -> bool {
+        if self.pk_indices.iter().any(|&i| i == PK_IDX_LAGTIME) {
+            return true;
+        }
+        self.indiv_param_names.iter().any(|n| {
+            let u = n.to_uppercase();
+            u == "LAGTIME"
+                || u == "ALAG"
+                || (self.ode_spec.is_some()
+                    && matches!(
+                        DoseAttr::from_indexed_name(n),
+                        Some((DoseAttr::Lag, indexed_cmt)) if indexed_cmt == cmt
+                    ))
+        })
+    }
+
     /// True when the model wires in a bioavailability `F`/`Fn` parameter (on
     /// either engine). Mirrors [`Self::has_lagtime`]: the analytical route puts
     /// [`PK_IDX_F`] in `pk_indices` (from `f=` on the `[structural_model]`

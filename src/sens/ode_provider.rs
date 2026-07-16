@@ -561,7 +561,7 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };
-    // Steady-state dosing into a built-in absorption input-rate compartment (#719) stays on
+    // Steady-state dosing *into* a built-in absorption input-rate compartment (#719) stays on
     // the FD fallback: the dual SS equilibration (`equilibrate_ss_state_g`) still seeds a
     // bolus/infusion trough and does not spread the periodic absorption `R_in` over the cycle,
     // so its (θ,η) sensitivity is not yet validated against the corrected f64 SS prediction.
@@ -569,7 +569,16 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // the periodic forward `R_in` in `ode::predictions`), so FD differences the right
     // prediction — this mirrors the IOV gate (`ode_iov_subject_supported`) declining the same
     // combination, and the analytic dual SS-equilibration through the kernel is a follow-up.
-    if has_ss && !ode.input_rate.is_empty() {
+    // Scoped to the SS-dosed compartment, not "the model declares any input-rate forcing":
+    // a subject whose SS dose targets a plain (non-absorption) compartment — e.g. an IV
+    // loading dose into central on a model that separately declares `transit()`/`igd()`
+    // absorption for a different route — has `R_in` inert for that dose and stays on the
+    // exact event-driven walk.
+    let ss_into_absorption = subject
+        .doses
+        .iter()
+        .any(|d| d.ss && d.ii > 0.0 && ode.input_rate.iter().any(|f| f.cmt + 1 == d.cmt));
+    if ss_into_absorption {
         return false;
     }
     // Built-in absorption input-rate forcing (transit/igd/weibull/first_order, #486):
@@ -2402,12 +2411,17 @@ fn ode_iov_subject_supported(
     // does not spread a periodic zero-order window (or a first-order R_in tail) over the
     // cycle, so its κ-coupled sensitivity is not yet validated. Non-SS input-rate + IOV is
     // the analytic scope this PR opens; SS × input-rate stays FD (as it effectively is on the
-    // non-IOV walk for the same equilibration reason).
+    // non-IOV walk for the same equilibration reason). Scoped to the SS-dosed compartment
+    // (mirrors `ode_tvcov_supported`, #719 review): a subject whose SS dose targets a plain
+    // compartment on a model that separately declares absorption forcing elsewhere is
+    // unaffected and stays on this analytic walk.
     if has_ss
-        && model
-            .ode_spec
-            .as_ref()
-            .is_some_and(|o| !o.input_rate.is_empty())
+        && model.ode_spec.as_ref().is_some_and(|o| {
+            subject
+                .doses
+                .iter()
+                .any(|d| d.ss && d.ii > 0.0 && o.input_rate.iter().any(|f| f.cmt + 1 == d.cmt))
+        })
     {
         return None;
     }
