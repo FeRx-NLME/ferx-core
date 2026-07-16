@@ -331,6 +331,41 @@ fn steady_state_infusion_into_transit_compartment_is_rejected() {
 }
 
 #[test]
+fn steady_state_infusion_with_zero_ii_into_transit_compartment_is_rejected() {
+    // Regression: the ODE-native SS-infusion gate must reject an SS infusion regardless of `II`,
+    // matching the closed-form gate (which rejects `dose.ss && dose.is_infusion()` with no `II`
+    // condition). With `II = 0` an SS infusion would otherwise slip past a gate that required
+    // `d.ii > 0.0` and fall to the plain-infusion branch — silently served as a single non-SS
+    // infusion (a different model than asked for) while the closed-form path errors on the same
+    // dose. The unsupported combination must error on both paths (#719 gap 2 review).
+    let model = parse_full_model(TRANSIT_MODEL)
+        .expect("transit model parses")
+        .model;
+    let ss_inf = DoseEvent::new(0.0, 100.0, 1, 25.0, true, 0.0); // SS=1, RATE=25, II=0
+    let pop = Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![common::subject(
+            "1",
+            vec![ss_inf],
+            vec![1.0, 6.0],
+            vec![0.0; 2],
+            vec![2; 2],
+        )],
+    };
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags.iter().any(|d| d.code == "E_ABSORPTION_SS_INFUSION"),
+        "SS infusion with II=0 into a transit compartment must still raise \
+         E_ABSORPTION_SS_INFUSION, got: {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn transit_with_diffusion_block_is_rejected() {
     // A built-in input-rate model + a [diffusion] block (SDE/EKF) is rejected:
     // the EKF propagation does not carry the R_in forcing.

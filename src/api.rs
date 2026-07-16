@@ -1314,10 +1314,22 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     //   * a steady-state infusion (SS=1 + RATE>0) into an absorption compartment — neither the SS
     //     equilibration (bolus-record only) nor the infusion convolution handles the periodic
     //     zero-order-into-kernel steady state yet.
+    //
+    // Unlike the SS-*bolus* gates above (`has_ss` / `has_ss_zero_order`), this reject is
+    // **`II`-independent** — it fires on `d.ss && d.is_infusion()` with no `d.ii > 0.0` condition.
+    // An SS bolus with `II ≤ 0` legitimately degrades to a single non-SS bolus (a valid prediction,
+    // flagged by the `W_STEADY_STATE_II` warning), so those gates let it through. But an SS infusion
+    // is an *unsupported combination*: were it allowed to skip this gate on `II = 0`, it would fall
+    // to the plain-infusion branch of `add_prepared_input_rate_forcing` and be silently served as a
+    // single non-SS infusion — a different model than the SS one asked for. Rejecting regardless of
+    // `II` also keeps this ODE-native gate consistent with the closed-form absorption gate
+    // (`check_absorption_closed_form_support`, which rejects `dose.ss && dose.is_infusion()` with no
+    // `II` condition), so the same subject errors on both paths instead of one erroring and the
+    // other silently mis-serving.
     let has_ss_infusion = population.subjects.iter().any(|s| {
         s.doses
             .iter()
-            .any(|d| d.ss && d.ii > 0.0 && d.is_infusion() && cmts.contains(&d.cmt))
+            .any(|d| d.ss && d.is_infusion() && cmts.contains(&d.cmt))
     });
     let has_infusion_zero_order = population.subjects.iter().any(|s| {
         s.doses

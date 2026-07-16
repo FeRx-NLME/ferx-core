@@ -8439,6 +8439,192 @@ mod tests {
         }
     }
 
+    /// The infusion-into-kernel branch of `add_prepared_input_rate_forcing` must apply
+    /// bioavailability `F` through the **mode-aware** window reshaping (`bioavailable_infusion`,
+    /// #419), not merely the `F = 1` identity the sub-dose-train tests exercise. For the *same*
+    /// nominal `(rate, duration)` the two infusion definitions reshape differently under `F < 1`:
+    ///   * **rate-defined** (`RATE>0`): the rate is held and the window *shrinks* to `F·(amt/rate)`
+    ///     — `R_in_inf` = mass `F·amt` over `F·T`.
+    ///   * **duration-defined** (`RATE=-2`): the window is *held* at `amt/rate` and the rate scales
+    ///     to `F·rate` — `R_in_inf` = mass `F·amt` over `T`.
+    /// Both deliver `F·amt` total, but the differing windows give different appearance rates. A
+    /// swapped arm — or an `F` dropped from the mass or the window — is caught here, at the exact
+    /// seam (`predictions.rs`'s `d.bioavailable_infusion(f).1` / `dose_mass = F·amt`), against a
+    /// `rate_infused` evaluated with a *hand-literal* window (not `bioavailable_infusion` itself, so
+    /// the check is not circular).
+    #[test]
+    fn infusion_into_kernel_f_reshaping_is_mode_aware() {
+        let ode = first_order_one_cpt_spec();
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 2.0;
+        pk.values[crate::types::PK_IDX_V] = 20.0;
+        pk.values[4] = 0.6; // ka
+        let prepared = prepare_input_rates(&ode, &pk.values);
+
+        let (amt, rate, f) = (100.0_f64, 25.0_f64, 0.6_f64);
+        // The F = 1 infusion length, amt/rate = 4 h.
+        let nominal_window = amt / rate;
+        // tad = 3 sits *inside* the held duration-defined window (4 h) but *past* the shrunk
+        // rate-defined window (F·4 = 2.4 h), so the two arms must give genuinely different rates.
+        let tad = 3.0_f64;
+
+        let rate_defined = DoseEvent::new(0.0, amt, 1, rate, false, 0.0); // InfusionDef::RateDefined
+        let mut dur_defined = DoseEvent::new(0.0, amt, 1, rate, false, 0.0);
+        dur_defined.infusion_def = crate::types::InfusionDef::DurationDefined;
+
+        let lags = [0.0_f64];
+        let f_bio = [f];
+        let mut dy_rate = [0.0_f64];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            &pk.values,
+            std::slice::from_ref(&rate_defined),
+            &lags,
+            &f_bio,
+            f64::NEG_INFINITY,
+            tad,
+            &mut dy_rate,
+        );
+        let mut dy_dur = [0.0_f64];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            &pk.values,
+            std::slice::from_ref(&dur_defined),
+            &lags,
+            &f_bio,
+            f64::NEG_INFINITY,
+            tad,
+            &mut dy_dur,
+        );
+
+        // Rate-defined: mass F·amt = 60 over the *shrunk* window F·nominal = 2.4 h.
+        let want_rate = prepared[0].rate_infused(tad, f * amt, f * nominal_window);
+        // Duration-defined: mass F·amt = 60 over the *held* window nominal = 4 h.
+        let want_dur = prepared[0].rate_infused(tad, f * amt, nominal_window);
+        assert_relative_eq!(dy_rate[0], want_rate, max_relative = 1e-12);
+        assert_relative_eq!(dy_dur[0], want_dur, max_relative = 1e-12);
+        assert!(
+            (dy_rate[0] - dy_dur[0]).abs() > 1e-6,
+            "the two infusion definitions must reshape F into distinct windows: \
+             rate-defined {:.6} vs duration-defined {:.6}",
+            dy_rate[0],
+            dy_dur[0]
+        );
+    }
+
+    /// A **rate-defined** infusion (`RATE>0`) under `F < 1` into a `first_order()` kernel, through
+    /// the full ODE engine (#719 gap 2, #419). `F < 1` holds the rate and *shrinks* the window to
+    /// `F·(amt/rate)`, delivering the bioavailable mass `F·amt` over `[0, F·T]`. The oracle sub-dose
+    /// train spreads N nominal `amt/N` boluses (the engine applies the *same* `F`) over that shrunk
+    /// window — so it matches only if the rate-defined arm is selected at `predictions.rs`'s
+    /// `bioavailable_infusion(f).1`. Complements the `F = 1` train test above.
+    #[test]
+    fn infusion_into_first_order_absorption_with_f_below_one_matches_subdose_train() {
+        let mut ode = first_order_one_cpt_spec();
+        ode.solver_opts.reltol = 1e-11;
+        ode.solver_opts.abstol = 1e-11;
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 2.0;
+        pk.values[crate::types::PK_IDX_V] = 20.0;
+        pk.values[4] = 0.6; // ka
+        let f = 0.6_f64;
+        pk.values[crate::types::PK_IDX_F] = f;
+
+        let (d, t_inf) = (100.0_f64, 3.0_f64); // rate-defined: RATE = d/t_inf, nominal window t_inf
+        let obs = vec![0.5, 1.5, 3.0, 5.0, 9.0];
+        let inf_subj = make_subject(
+            vec![DoseEvent::new(0.0, d, 1, d / t_inf, false, 0.0)],
+            obs.clone(),
+        );
+        let inf_preds = ode_predictions(&ode, &pk.values, &[], &[], &inf_subj);
+
+        // Sub-dose train over the *shrunk* window [0, F·t_inf].
+        let window = f * t_inf;
+        let n = 300usize;
+        let subdoses: Vec<DoseEvent> = (0..n)
+            .map(|k| {
+                let tk = (k as f64 + 0.5) * window / n as f64;
+                DoseEvent::new(tk, d / n as f64, 1, 0.0, false, 0.0)
+            })
+            .collect();
+        let train_preds = ode_predictions(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &make_subject(subdoses, obs.clone()),
+        );
+
+        assert_eq!(inf_preds.len(), train_preds.len());
+        for (i, (&a, &b)) in inf_preds.iter().zip(&train_preds).enumerate() {
+            assert!(a.is_finite() && b > 0.0);
+            let rel = (a - b).abs() / b;
+            assert!(
+                rel < 1e-3,
+                "obs {i} (t={}): F<1 infusion {a:.6} vs sub-dose train {b:.6} (rel {rel:.2e})",
+                obs[i]
+            );
+        }
+    }
+
+    /// A **duration-defined** infusion (`RATE=-2` → `D{cmt}`) into a `first_order()` kernel, through
+    /// the full ODE engine (#719 gap 2, #419). Unlike the rate-defined case, `F < 1` *holds* the
+    /// window at `amt/rate` and scales the rate to `F·rate`, delivering `F·amt` over the full
+    /// `[0, T]`. The dose reaches the forcing seam already resolved (`rate_mode = Fixed`) but with
+    /// `infusion_def = DurationDefined` persisted (the tag survives `resolve_rate`, #419), so the
+    /// seam takes the held-window arm. The oracle train therefore spreads over the *unshrunk*
+    /// window — the opposite reshaping from the rate-defined test, which pins the arm selection.
+    #[test]
+    fn duration_defined_infusion_into_first_order_absorption_matches_subdose_train() {
+        let mut ode = first_order_one_cpt_spec();
+        ode.solver_opts.reltol = 1e-11;
+        ode.solver_opts.abstol = 1e-11;
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 2.0;
+        pk.values[crate::types::PK_IDX_V] = 20.0;
+        pk.values[4] = 0.6; // ka
+        let f = 0.6_f64;
+        pk.values[crate::types::PK_IDX_F] = f;
+
+        let (d, t_inf) = (100.0_f64, 3.0_f64);
+        let obs = vec![0.5, 1.5, 3.0, 5.0, 9.0];
+        // Resolved duration-defined infusion: concrete rate/duration (Fixed), DurationDefined tag.
+        let mut dur_defined = DoseEvent::new(0.0, d, 1, d / t_inf, false, 0.0);
+        dur_defined.infusion_def = crate::types::InfusionDef::DurationDefined;
+        let inf_subj = make_subject(vec![dur_defined], obs.clone());
+        let inf_preds = ode_predictions(&ode, &pk.values, &[], &[], &inf_subj);
+
+        // Sub-dose train over the *held* window [0, t_inf] (F scales the rate, not the window).
+        let n = 300usize;
+        let subdoses: Vec<DoseEvent> = (0..n)
+            .map(|k| {
+                let tk = (k as f64 + 0.5) * t_inf / n as f64;
+                DoseEvent::new(tk, d / n as f64, 1, 0.0, false, 0.0)
+            })
+            .collect();
+        let train_preds = ode_predictions(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &make_subject(subdoses, obs.clone()),
+        );
+
+        assert_eq!(inf_preds.len(), train_preds.len());
+        for (i, (&a, &b)) in inf_preds.iter().zip(&train_preds).enumerate() {
+            assert!(a.is_finite() && b > 0.0);
+            let rel = (a - b).abs() / b;
+            assert!(
+                rel < 1e-3,
+                "obs {i} (t={}): duration-defined infusion {a:.6} vs sub-dose train {b:.6} \
+                 (rel {rel:.2e})",
+                obs[i]
+            );
+        }
+    }
+
     /// `first_order(ka)` absorption into a compartment with **Michaelis–Menten** (nonlinear)
     /// elimination: the one-cycle map is not affine, so the closed-form SS fixed point must
     /// decline (`equilibrate_ss_input_rate_fixed_point` → `None`) and the caller falls back to
