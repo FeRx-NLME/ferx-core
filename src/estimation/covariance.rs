@@ -1118,14 +1118,65 @@ pub(crate) struct CovStepOutcome {
     pub sir_fallback_proposal: Option<DMatrix<f64>>,
 }
 
-/// Shared covariance-step orchestration: the `run_covariance_step && !is_cancelled`
-/// gate + timer + `Success/Unusable/FailedNonPd` match that used to be copy-pasted,
-/// byte-identical apart from args and one verbose string, into all eight estimator
-/// finalizers. Contains NO floating-point arithmetic — it only wraps
-/// `compute_covariance`, so it cannot change any numeric result. `pre_msg`
-/// reproduces each site's verbose stderr line: the caller folds its own `verbose`
-/// flag in via `.then_some("...")`, so `Some` prints and `None` stays silent
-/// (impmap). Printing happens inside the gate, exactly as before.
+/// The covariance step WITHOUT the `run_covariance_step` gate: timer + optional
+/// verbose line + `Success/Unusable/FailedNonPd` match. Contains NO floating-point
+/// arithmetic — it only wraps `compute_covariance`, so it cannot change any numeric
+/// result. This is the single home of the `CovarianceStepResult` match; both the
+/// gated estimator finalizers (via [`run_covariance_step`]) and the ungated
+/// standalone API (`run_covariance`, which deliberately ignores the flag) call it,
+/// so the match has exactly one copy. `pre_msg` is the verbose stderr line the
+/// caller folds its own `verbose` flag into (`Some` prints, `None` stays silent).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_covariance_step_inner(
+    x_hat: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+    pre_msg: Option<&str>,
+) -> CovStepOutcome {
+    if let Some(m) = pre_msg {
+        eprintln!("{m}");
+    }
+    let mut warnings = Vec::new();
+    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
+    let cov_timer = std::time::Instant::now();
+    let matrix = match compute_covariance(
+        x_hat, template, model, population, eta_hats, h_matrices, kappas, options,
+    ) {
+        CovarianceStepResult::Success(out) => {
+            warnings.extend(out.warnings);
+            Some(out.matrix)
+        }
+        CovarianceStepResult::Unusable(msg) => {
+            warnings.push(msg);
+            None
+        }
+        CovarianceStepResult::FailedNonPd {
+            reason,
+            fallback_proposal,
+        } => {
+            warnings.push(reason);
+            sir_fallback_proposal = Some(fallback_proposal);
+            None
+        }
+    };
+    CovStepOutcome {
+        matrix,
+        wall_time_secs: cov_timer.elapsed().as_secs_f64(),
+        warnings,
+        sir_fallback_proposal,
+    }
+}
+
+/// Gated covariance-step orchestration used by the estimator finalizers: the
+/// `run_covariance_step && !is_cancelled` gate around [`run_covariance_step_inner`].
+/// When the gate is closed, returns an empty outcome (`matrix = None`,
+/// `wall_time_secs = 0.0`, no warnings) — exactly what the old inline `else` arm
+/// produced. `pre_msg` is only evaluated/printed when the gate is open.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_covariance_step(
     x_hat: &[f64],
@@ -1138,45 +1189,16 @@ pub(crate) fn run_covariance_step(
     options: &FitOptions,
     pre_msg: Option<&str>,
 ) -> CovStepOutcome {
-    let mut warnings = Vec::new();
-    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
-        if let Some(m) = pre_msg {
-            eprintln!("{m}");
-        }
-        let cov_timer = std::time::Instant::now();
-        let matrix = match compute_covariance(
-            x_hat, template, model, population, eta_hats, h_matrices, kappas, options,
-        ) {
-            CovarianceStepResult::Success(out) => {
-                warnings.extend(out.warnings);
-                Some(out.matrix)
-            }
-            CovarianceStepResult::Unusable(msg) => {
-                warnings.push(msg);
-                None
-            }
-            CovarianceStepResult::FailedNonPd {
-                reason,
-                fallback_proposal,
-            } => {
-                warnings.push(reason);
-                sir_fallback_proposal = Some(fallback_proposal);
-                None
-            }
-        };
-        CovStepOutcome {
-            matrix,
-            wall_time_secs: cov_timer.elapsed().as_secs_f64(),
-            warnings,
-            sir_fallback_proposal,
-        }
+        run_covariance_step_inner(
+            x_hat, template, model, population, eta_hats, h_matrices, kappas, options, pre_msg,
+        )
     } else {
         CovStepOutcome {
             matrix: None,
             wall_time_secs: 0.0,
-            warnings,
-            sir_fallback_proposal,
+            warnings: Vec::new(),
+            sir_fallback_proposal: None,
         }
     }
 }

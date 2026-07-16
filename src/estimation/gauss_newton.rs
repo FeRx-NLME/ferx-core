@@ -407,10 +407,13 @@ pub fn run_foce_gn(
             options,
             verbose.then_some("Running covariance step..."),
         );
-        let covariance_matrix = out.matrix;
-        let covariance_wall_time_secs = out.wall_time_secs;
-        warnings.extend(out.warnings);
-        let sir_fallback_proposal = out.sir_fallback_proposal;
+        let crate::estimation::covariance::CovStepOutcome {
+            matrix: covariance_matrix,
+            wall_time_secs: covariance_wall_time_secs,
+            warnings: cov_warnings,
+            sir_fallback_proposal,
+        } = out;
+        warnings.extend(cov_warnings);
 
         if verbose {
             eprintln!("FOCE-GN completed. Final OFV = {:.4}", ofv);
@@ -515,10 +518,13 @@ pub fn run_foce_gn(
         options,
         verbose.then_some("Running covariance step..."),
     );
-    let covariance_matrix = out.matrix;
-    let covariance_wall_time_secs = out.wall_time_secs;
-    warnings.extend(out.warnings);
-    let sir_fallback_proposal = out.sir_fallback_proposal;
+    let crate::estimation::covariance::CovStepOutcome {
+        matrix: covariance_matrix,
+        wall_time_secs: covariance_wall_time_secs,
+        warnings: cov_warnings,
+        sir_fallback_proposal,
+    } = out;
+    warnings.extend(cov_warnings);
 
     if verbose {
         eprintln!("FOCE-GN completed. Final OFV = {:.4}", final_ofv);

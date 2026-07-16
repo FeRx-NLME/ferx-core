@@ -408,10 +408,13 @@ pub fn optimize_trust_region(
         options,
         options.verbose.then_some("Computing covariance matrix..."),
     );
-    let covariance_matrix = out.matrix;
-    let covariance_wall_time_secs = out.wall_time_secs;
-    warnings.extend(out.warnings);
-    let sir_fallback_proposal = out.sir_fallback_proposal;
+    let crate::estimation::covariance::CovStepOutcome {
+        matrix: covariance_matrix,
+        wall_time_secs: covariance_wall_time_secs,
+        warnings: cov_warnings,
+        sir_fallback_proposal,
+    } = out;
+    warnings.extend(cov_warnings);
 
     OuterResult {
         params: final_params,
