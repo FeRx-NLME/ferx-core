@@ -2,14 +2,21 @@ use crate::estimation::inner_optimizer::{find_ebe, run_inner_loop_warm, InnerLoo
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
 use crate::types::*;
-use nalgebra::{DMatrix, DVector, SymmetricEigen};
+use nalgebra::{DMatrix, DVector};
+// `SymmetricEigen` is used only by this module's `#[cfg(test)]` code (the non-PD
+// fallback tests); gate the import so a non-test build doesn't flag it unused.
+#[cfg(test)]
+use nalgebra::SymmetricEigen;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-// The covariance/SE subsystem moved to `estimation::covariance` (refactor T4).
-// Re-export the two symbols other estimators/tests import via the historical
-// `outer_optimizer::{compute_covariance, CovarianceStepResult}` paths.
+// The covariance/SE subsystem moved to `estimation::covariance` (refactor T4). The
+// re-export exists only so this module's `#[cfg(test)] mod tests` can reach
+// `compute_covariance` / `CovarianceStepResult` via `super::*`; no non-test code uses
+// the historical `outer_optimizer::{..}` path, so gate it to avoid an unused-import
+// warning in a non-test build.
+#[cfg(test)]
 pub(crate) use crate::estimation::covariance::{compute_covariance, CovarianceStepResult};
 
 /// Result of outer optimization
