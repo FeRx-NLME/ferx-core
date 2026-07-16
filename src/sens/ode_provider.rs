@@ -3487,7 +3487,7 @@ fn pk_snapshot_equal<T: crate::sens::num::PkNum>(a: &[T], b: &[T]) -> bool {
 /// `equilibrate_ss_state`. NONMEM SS=1 loads the compartments with the steady-state
 /// amounts of an infinite-past pulse train of interval `II`. There is no closed form for
 /// a general ODE, so production expands the train as a **finite**
-/// [`crate::ode::predictions::SS_EQUILIBRATION_CYCLES`] loop of `(apply dose; integrate II)`
+/// [`crate::dosing::SS_EQUILIBRATION_CYCLES`] loop of `(apply dose; integrate II)`
 /// from a zero state, returning the pre-pulse trough (the shared const keeps this trough
 /// from drifting from the f64 predictor). Because the loop is finite and explicit, running
 /// it over the dual type `T` propagates `∂(SS state)/∂(θ,η)` directly — no implicit
@@ -3561,7 +3561,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
         let mut prev = vec![0.0_f64; n_states];
         let mut cur = vec![0.0_f64; n_states];
         let mut cycles_run = 0usize;
-        for cycle in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
+        for cycle in 0..crate::dosing::SS_EQUILIBRATION_CYCLES {
             let rhs_active = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                 bare_rhs(us, ps, t, du);
                 if cmt_idx < du.len() {
@@ -3604,7 +3604,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
                 break;
             }
         }
-        crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
+        crate::dosing::record_ss_equilibration_cycles(cycles_run);
         return u;
     }
     // Bolus SS: each cycle applies the pulse `F·amt`, then decays over one interval.
@@ -3613,7 +3613,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     let mut prev = vec![0.0_f64; n_states];
     let mut cur = vec![0.0_f64; n_states];
     let mut cycles_run = 0usize;
-    for cycle in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
+    for cycle in 0..crate::dosing::SS_EQUILIBRATION_CYCLES {
         u[cmt_idx] = u[cmt_idx] + f_bio * amt;
         let sol = solve_ode_g(&bare_rhs, &u, (0.0, dose.ii), params, &saveat, opts);
         if let Some(last) = sol.last() {
@@ -3624,7 +3624,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
             break;
         }
     }
-    crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
+    crate::dosing::record_ss_equilibration_cycles(cycles_run);
     u
 }
 
@@ -7663,16 +7663,16 @@ mod tests {
         let eta = [0.1, 0.05];
 
         let early = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
-        let early_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
-        let full = crate::ode::predictions::with_full_ss_equilibration(|| {
+        let early_cycles = crate::dosing::last_ss_equilibration_cycles();
+        let full = crate::dosing::with_full_ss_equilibration(|| {
             ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported")
         });
-        let full_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
+        let full_cycles = crate::dosing::last_ss_equilibration_cycles();
 
         // The dual stop must actually fire on this model, or the comparison is vacuous (#532 #5).
         assert_eq!(
             full_cycles,
-            crate::ode::predictions::SS_EQUILIBRATION_CYCLES,
+            crate::dosing::SS_EQUILIBRATION_CYCLES,
             "forced-full must run the whole budget"
         );
         assert!(
@@ -7880,15 +7880,15 @@ mod tests {
         let eta = [0.1, 0.05];
 
         let early = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
-        let early_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
-        let full = crate::ode::predictions::with_full_ss_equilibration(|| {
+        let early_cycles = crate::dosing::last_ss_equilibration_cycles();
+        let full = crate::dosing::with_full_ss_equilibration(|| {
             ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported")
         });
-        let full_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
+        let full_cycles = crate::dosing::last_ss_equilibration_cycles();
 
         assert_eq!(
             full_cycles,
-            crate::ode::predictions::SS_EQUILIBRATION_CYCLES,
+            crate::dosing::SS_EQUILIBRATION_CYCLES,
             "forced-full must run the whole budget"
         );
         assert!(

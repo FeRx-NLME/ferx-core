@@ -699,10 +699,6 @@ impl<T: PkNum> OneCptPk<T> {
     }
 }
 
-/// Cycles to expand for SS equilibration — mirrors
-/// `event_driven::EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES` (kept private there).
-const SS_EQUILIBRATION_CYCLES: usize = 50;
-
 /// State-vector dimension and central-compartment read-out slot for a `pk_model`.
 /// Mirrors `event_driven::state_layout` (kept private there). 3-cpt rows are
 /// included for the forthcoming extension; the walk currently propagates 1-/2-cpt.
@@ -1053,7 +1049,7 @@ fn obs_boundary_correction<T: PkNum>(
 
 /// Shared early-stop driver for the **dual** SS-equilibration loops (#519; #532 review #9/#10):
 /// refresh `cur` from the value parts (`PkNum::val`) of the dual state `u`, decide the stop on
-/// the *same* [`crate::ode::predictions::ss_cycle_converged`] criterion the f64 predictor uses
+/// the *same* [`crate::dosing::ss_cycle_converged`] criterion the f64 predictor uses
 /// (from cycle 1 on), and roll `cur`→`prev` by swap — no per-cycle `O(n_states)` copy. Returns
 /// `true` to break. Used by both `equilibrate_ss_g` (here) and `equilibrate_ss_state_g` (the
 /// ODE provider) so the dual convergence logic lives in **one** place.
@@ -1082,11 +1078,7 @@ pub(crate) fn ss_dual_cycle_should_stop<T: PkNum>(
         *c = x.val();
     }
     if cycle > 0
-        && crate::ode::predictions::ss_cycle_converged(
-            cur,
-            prev,
-            crate::ode::predictions::SS_EQUILIBRATION_TOL,
-        )
+        && crate::dosing::ss_cycle_converged(cur, prev, crate::dosing::SS_EQUILIBRATION_TOL)
     {
         return true;
     }
@@ -1142,7 +1134,7 @@ fn equilibrate_ss_g<T: PkNum>(
     let mut prev = vec![0.0_f64; n_states];
     let mut cur = vec![0.0_f64; n_states];
     let mut cycles_run = 0usize;
-    for cycle in 0..SS_EQUILIBRATION_CYCLES {
+    for cycle in 0..crate::dosing::SS_EQUILIBRATION_CYCLES {
         if !is_inf {
             state[cmt_idx] = state[cmt_idx] + pk.f * T::from_f64(dose.amt);
         }
@@ -1165,7 +1157,7 @@ fn equilibrate_ss_g<T: PkNum>(
             break;
         }
     }
-    crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
+    crate::dosing::record_ss_equilibration_cycles(cycles_run);
     state
 }
 

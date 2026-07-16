@@ -178,7 +178,7 @@ pub(crate) fn model_preds(
         // to a concrete duration/rate before the analytical closed form — mirrors
         // the ODE `resolve_subject_doses` step inside `compute_predictions_ode`.
         // Borrowed (no allocation) for the all-`Fixed` common case.
-        let resolved = crate::ode::resolve_subject_doses(
+        let resolved = crate::dosing::resolve_subject_doses(
             subject,
             model.active_dose_attr_map(),
             &pk_params.values,
