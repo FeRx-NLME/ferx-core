@@ -7,9 +7,7 @@
 ///   Phase 1 (exploration, k ≤ K1):  γₖ = 1          — rapid basin convergence
 ///   Phase 2 (convergence, k > K1):  γₖ = 1/(k−K1)   — almost-sure convergence to MLE
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
-use crate::estimation::outer_optimizer::{
-    compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
-};
+use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
@@ -2244,45 +2242,25 @@ pub fn run_saem(
         );
 
     // ---- Covariance step ----
-    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let (covariance_matrix, covariance_wall_time_secs) =
-        if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
-            if verbose {
-                eprintln!("Running covariance step...");
-            }
-            let cov_timer = std::time::Instant::now();
-            let packed = pack_params(&final_params);
-            let cm = match compute_covariance(
-                &packed,
-                &final_params,
-                model,
-                population,
-                &eta_hats,
-                &h_matrices,
-                &final_kappas,
-                options,
-            ) {
-                CovarianceStepResult::Success(out) => {
-                    warnings.extend(out.warnings);
-                    Some(out.matrix)
-                }
-                CovarianceStepResult::Unusable(msg) => {
-                    warnings.push(msg);
-                    None
-                }
-                CovarianceStepResult::FailedNonPd {
-                    reason,
-                    fallback_proposal,
-                } => {
-                    warnings.push(reason);
-                    sir_fallback_proposal = Some(fallback_proposal);
-                    None
-                }
-            };
-            (cm, cov_timer.elapsed().as_secs_f64())
-        } else {
-            (None, 0.0)
-        };
+    let packed = pack_params(&final_params);
+    let out = crate::estimation::covariance::run_covariance_step(
+        &packed,
+        &final_params,
+        model,
+        population,
+        &eta_hats,
+        &h_matrices,
+        &final_kappas,
+        options,
+        verbose.then_some("Running covariance step..."),
+    );
+    let crate::estimation::covariance::CovStepOutcome {
+        matrix: covariance_matrix,
+        wall_time_secs: covariance_wall_time_secs,
+        warnings: cov_warnings,
+        sir_fallback_proposal,
+    } = out;
+    warnings.extend(cov_warnings);
 
     if verbose {
         eprintln!("SAEM completed. Final OFV = {:.4}", ofv);
