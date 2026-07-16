@@ -34,7 +34,10 @@
 // Indexed loops index parallel grad/Hessian/Jacobian buffers; clearer than zips.
 #![allow(clippy::needless_range_loop)]
 
-use crate::estimation::parameterization::{packed_fixed_mask, theta_packs_log, unpack_params};
+use crate::estimation::parameterization::{
+    block_chol_full, chol_pack, lower_tri_entries, packed_fixed_mask, theta_packs_log,
+    unpack_params,
+};
 use crate::sens::provider::{subject_sensitivities, ObsSens, SubjectSens};
 use crate::stats::special::m3_censored_outer;
 use crate::types::{CompiledModel, ModelParameters, Population, Subject};
@@ -1822,36 +1825,6 @@ fn natural_omega_grad_matrix(prep: &Prep, eta_hat: &[f64]) -> DMatrix<f64> {
     m
 }
 
-/// Map a sub-block's natural symmetric gradient `M_sub` (`∂F/∂Ω_sub`) to the
-/// packed Cholesky-space gradient for that block: `∂F/∂L = 2·M_sub·L` (L lower-
-/// triangular), with the diagonal log-chain (`x_ii = ln L_ii ⇒ ×L_ii`) and raw
-/// off-diagonals — the same convention/order as [`omega_packed_block`] /
-/// `pack_params`.
-///
-/// Shared with [`crate::estimation::agq`], whose fixed-η natural Ω gradient is the
-/// same `M_sub` shape (just without the Laplace `log|H̃|` and EBE-response terms).
-pub(crate) fn chol_pack(m_sub: &DMatrix<f64>, l: &DMatrix<f64>, diagonal: bool) -> Vec<f64> {
-    let n = l.nrows();
-    let gl = (m_sub * l).scale(2.0);
-    let mut out = Vec::new();
-    if diagonal {
-        for i in 0..n {
-            out.push(gl[(i, i)] * l[(i, i)]);
-        }
-    } else {
-        for j in 0..n {
-            for i in j..n {
-                if i == j {
-                    out.push(gl[(i, i)] * l[(i, i)]);
-                } else {
-                    out.push(gl[(i, j)]);
-                }
-            }
-        }
-    }
-    out
-}
-
 /// The exact per-subject FOCEI packed gradient `dFᵢ/dx` for an analytical **IOV**
 /// subject, in `pack_params` order `[θ, Ω_bsv, σ, Ω_iov]`. `stacked_eta_hat` is
 /// the joint EBE `[η_bsv, κ₁..κ_K]` for `unpack_params(x)`. `None` outside the
@@ -2484,22 +2457,6 @@ pub fn population_gradient_sens_foce(
     })
 }
 
-/// Lower-triangle packed-entry list for an Ω of dimension `n` (diagonal: `(i,i)`;
-/// block: `(r,c)`, `c ≤ r`), matching `pack_params` order.
-fn lower_tri_entries(n: usize, diagonal: bool) -> Vec<(usize, usize)> {
-    if diagonal {
-        (0..n).map(|i| (i, i)).collect()
-    } else {
-        let mut e = Vec::new();
-        for c in 0..n {
-            for r in c..n {
-                e.push((r, c));
-            }
-        }
-        e
-    }
-}
-
 /// θ→packed chain rule `∂θ/∂x`: `θ` when the parameter packs in log-space,
 /// else `1.0`. Shared by every θ-loop of the packed-gradient / eta-dx functions.
 #[inline]
@@ -2509,33 +2466,6 @@ fn theta_dx_chain(template: &ModelParameters, theta: &[f64], m: usize) -> f64 {
     } else {
         1.0
     }
-}
-
-/// Block-diagonal Cholesky factor `L_Σb = blkdiag(L_bsv, L_iov × K)` of the IOV
-/// prior `Σ_b = Ω_bsv ⊕ K·Ω_iov`.
-fn block_chol_full(
-    l_bsv: &DMatrix<f64>,
-    l_iov: &DMatrix<f64>,
-    k: usize,
-    n_eta: usize,
-    n_iov: usize,
-) -> DMatrix<f64> {
-    let n = n_eta + k * n_iov;
-    let mut l = DMatrix::zeros(n, n);
-    for r in 0..n_eta {
-        for c in 0..n_eta {
-            l[(r, c)] = l_bsv[(r, c)];
-        }
-    }
-    for kk in 0..k {
-        let off = n_eta + kk * n_iov;
-        for r in 0..n_iov {
-            for c in 0..n_iov {
-                l[(off + r, off + c)] = l_iov[(r, c)];
-            }
-        }
-    }
-    l
 }
 
 /// EBE response `dη̂/dx` for an analytical **IOV** subject (FOCE coupling +

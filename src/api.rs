@@ -1,6 +1,6 @@
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
-use crate::estimation::parameterization::theta_packs_log;
+use crate::estimation::parameterization::{chol_lt_idx, theta_packs_log};
 use crate::estimation::saem;
 use crate::io::datareader::{
     read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
@@ -8072,19 +8072,6 @@ mod tests {
     }
 }
 
-/// Index of L[i,j] (i ≥ j) in column-major lower-triangle packing.
-///
-/// Layout: for j in 0..n { for i in j..n { ... } }, so column j starts at
-/// offset Σ_{k<j}(n−k) = j·n − j·(j−1)/2.
-#[inline]
-fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
-    debug_assert!(i >= j && i < n);
-    // Column j starts at offset j*n - j*(j-1)/2.
-    // For j==0: offset = 0. For j==1: offset = n. For j==2: offset = 2n-1.
-    let col_offset = if j == 0 { 0 } else { j * n - j * (j - 1) / 2 };
-    col_offset + (i - j)
-}
-
 /// Extract standard errors from covariance matrix on the packed parameter scale,
 /// then transform back to the original scale via delta method.
 pub(crate) fn extract_standard_errors(
@@ -8126,7 +8113,12 @@ pub(crate) fn extract_standard_errors(
     // flip the sign for a negative estimate). See `theta_packs_log`.
     let se_theta: Vec<f64> = (0..n_theta)
         .map(|i| {
-            if theta_packs_log(template.theta_lower[i]) {
+            // Guard a truncated `cov` (fewer rows than `template.theta`) the same
+            // way the omega/sigma/kappa branches below do — report 0.0 rather than
+            // panicking away an otherwise-converged fit.
+            if i >= n {
+                0.0
+            } else if theta_packs_log(template.theta_lower[i]) {
                 template.theta[i] * se_packed[i]
             } else {
                 se_packed[i]
@@ -8222,8 +8214,9 @@ pub(crate) fn extract_standard_errors(
 
     // IOV (kappa): SE for diagonal variances of omega_iov.
     //
-    // The packed Cholesky layout is column-major (see `pack_params`):
-    // L[i,i] sits at offset `i*n - i*(i-1)/2` within the IOV block.
+    // The packed Cholesky layout is column-major (see `pack_params`); the flat
+    // index of `L[i,i]` within the IOV block is `chol_lt_idx(i, i, n_kappa)` (the
+    // single source of that offset — do not re-spell the formula here).
     // Same delta-method approximation as `se_omega`: SE(var_i) ≈ 2 * var_i * SE(log L_ii),
     // which is exact for diagonal IOV and a first-order approximation for block_kappa.
     // Off-diagonal covariance SEs are not currently reported (matches BSV omega).
@@ -8235,7 +8228,7 @@ pub(crate) fn extract_standard_errors(
                 let idx = if iov.diagonal {
                     kappa_start + i
                 } else {
-                    kappa_start + i * n_kappa - i * (i.saturating_sub(1)) / 2
+                    kappa_start + chol_lt_idx(i, i, n_kappa)
                 };
                 if idx < n {
                     2.0 * iov.matrix[(i, i)] * se_packed[idx]

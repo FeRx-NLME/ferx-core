@@ -4975,13 +4975,25 @@ pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize
     let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
     let n_lt = n_eta * (n_eta + 1) / 2;
     if se.len() == n_lt && n_lt != n_eta {
-        // Full lower-triangle format (block omega).
-        let col_offset = if c == 0 {
-            0
+        // Full lower-triangle format (block omega). The packed index is the
+        // shared column-major `chol_lt_idx` (same convention as `pack_params`).
+        //
+        // DELIBERATE behavior change vs the old inline offset (NOT pure motion):
+        // an out-of-range `r >= n_eta` now returns `None`. The old code did
+        // `se.get(col_offset + (r - c))`, which for e.g. `(3,0)` on an n_eta=3
+        // block returned `Some(se[3])` — a silently-wrong SE for a flat index
+        // that happened to land inside the packed vector. `None` is the correct
+        // answer. This is only reachable by an external caller: every in-repo
+        // caller loops `i,j < n_eta`, so the guard is inert internally. The
+        // guard also keeps `chol_lt_idx`'s `debug_assert!(i < n)` from firing.
+        if r < n_eta {
+            se.get(crate::estimation::parameterization::chol_lt_idx(
+                r, c, n_eta,
+            ))
+            .copied()
         } else {
-            c * n_eta - c * (c - 1) / 2
-        };
-        se.get(col_offset + (r - c)).copied()
+            None
+        }
     } else {
         // Diagonal-only format: only (i, i) is available.
         if r == c {
