@@ -1,6 +1,6 @@
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
-use crate::estimation::parameterization::{chol_lt_idx, theta_packs_log};
+use crate::estimation::parameterization::{chol_lt_idx, lower_tri_iter, theta_packs_log};
 use crate::estimation::saem;
 use crate::io::datareader::{
     read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
@@ -8204,41 +8204,39 @@ pub(crate) fn extract_standard_errors(
         let cov_omega = cov.view((omega_start, omega_start), (n_lt, n_lt));
 
         let mut se_vec = Vec::with_capacity(n_lt);
-        // Column-major lower-triangle: for j in 0..n, for i in j..n
-        for j in 0..n_eta {
-            for i in j..n_eta {
-                // Build gradient of omega_{ij} w.r.t. packed omega params.
-                // omega_{ij} = Σ_{k=0}^{j} L_{ik} * L_{jk}
-                let mut grad = vec![0.0f64; n_lt];
-                for k in 0..=j {
-                    let idx_ik = chol_lt_idx(i, k, n_eta);
-                    let idx_jk = chol_lt_idx(j, k, n_eta);
-                    // Chain rule: ∂L_{ab}/∂x_{ab} = L_{ab} if a==b (log), else 1.
-                    let chain_ik = if i == k { l[(i, k)] } else { 1.0 };
-                    let chain_jk = if j == k { l[(j, k)] } else { 1.0 };
-                    grad[idx_ik] += l[(j, k)] * chain_ik;
-                    if i != j {
-                        grad[idx_jk] += l[(i, k)] * chain_jk;
-                    } else {
-                        // i == j: both terms contribute to the same index
-                        grad[idx_ik] += l[(i, k)] * chain_ik;
-                    }
+        // Column-major lower-triangle order — single source: `lower_tri_iter`.
+        for (i, j) in lower_tri_iter(n_eta, false) {
+            // Build gradient of omega_{ij} w.r.t. packed omega params.
+            // omega_{ij} = Σ_{k=0}^{j} L_{ik} * L_{jk}
+            let mut grad = vec![0.0f64; n_lt];
+            for k in 0..=j {
+                let idx_ik = chol_lt_idx(i, k, n_eta);
+                let idx_jk = chol_lt_idx(j, k, n_eta);
+                // Chain rule: ∂L_{ab}/∂x_{ab} = L_{ab} if a==b (log), else 1.
+                let chain_ik = if i == k { l[(i, k)] } else { 1.0 };
+                let chain_jk = if j == k { l[(j, k)] } else { 1.0 };
+                grad[idx_ik] += l[(j, k)] * chain_ik;
+                if i != j {
+                    grad[idx_jk] += l[(i, k)] * chain_jk;
+                } else {
+                    // i == j: both terms contribute to the same index
+                    grad[idx_ik] += l[(i, k)] * chain_ik;
                 }
-                // SE²(omega_{ij}) = g^T * C_omega * g
-                let mut var = 0.0;
-                for a in 0..n_lt {
-                    if grad[a] == 0.0 {
+            }
+            // SE²(omega_{ij}) = g^T * C_omega * g
+            let mut var = 0.0;
+            for a in 0..n_lt {
+                if grad[a] == 0.0 {
+                    continue;
+                }
+                for b in 0..n_lt {
+                    if grad[b] == 0.0 {
                         continue;
                     }
-                    for b in 0..n_lt {
-                        if grad[b] == 0.0 {
-                            continue;
-                        }
-                        var += grad[a] * cov_omega[(a, b)] * grad[b];
-                    }
+                    var += grad[a] * cov_omega[(a, b)] * grad[b];
                 }
-                se_vec.push(if var > 0.0 { var.sqrt() } else { 0.0 });
             }
+            se_vec.push(if var > 0.0 { var.sqrt() } else { 0.0 });
         }
         se_vec
     };

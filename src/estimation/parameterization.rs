@@ -52,22 +52,15 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
         }
     }
 
-    // Omega Cholesky factor: diagonal as log, off-diagonal as-is
+    // Omega Cholesky factor: diagonal as log, off-diagonal as-is. `lower_tri_iter`
+    // yields only `(i,i)` when `diagonal`, so this one loop covers both cases.
     let l = &params.omega.chol;
     let n_eta = l.nrows();
-    if params.omega.diagonal {
-        for i in 0..n_eta {
-            v.push(l[(i, i)].max(1e-10).ln());
-        }
-    } else {
-        for j in 0..n_eta {
-            for i in j..n_eta {
-                if i == j {
-                    v.push(l[(i, j)].max(1e-10).ln());
-                } else {
-                    v.push(l[(i, j)]);
-                }
-            }
+    for (i, j) in lower_tri_iter(n_eta, params.omega.diagonal) {
+        if i == j {
+            v.push(l[(i, j)].max(1e-10).ln());
+        } else {
+            v.push(l[(i, j)]);
         }
     }
 
@@ -79,20 +72,11 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
     // IOV omega: diagonal elements as log; off-diagonal as-is (mirrors BSV omega).
     if let Some(ref iov) = params.omega_iov {
         let l = &iov.chol;
-        let n = iov.dim();
-        if iov.diagonal {
-            for i in 0..n {
-                v.push(l[(i, i)].max(1e-10).ln());
-            }
-        } else {
-            for j in 0..n {
-                for i in j..n {
-                    if i == j {
-                        v.push(l[(i, j)].max(1e-10).ln());
-                    } else {
-                        v.push(l[(i, j)]);
-                    }
-                }
+        for (i, j) in lower_tri_iter(iov.dim(), iov.diagonal) {
+            if i == j {
+                v.push(l[(i, j)].max(1e-10).ln());
+            } else {
+                v.push(l[(i, j)]);
             }
         }
     }
@@ -120,24 +104,12 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         })
         .collect();
 
-    // Omega Cholesky
+    // Omega Cholesky. `lower_tri_iter` yields only `(i,i)` when `diagonal`, so this
+    // one loop covers both cases (same packed order as `pack_params`).
     let mut l = DMatrix::zeros(n_eta, n_eta);
-    if template.omega.diagonal {
-        for i in 0..n_eta {
-            l[(i, i)] = v[idx].exp();
-            idx += 1;
-        }
-    } else {
-        for j in 0..n_eta {
-            for i in j..n_eta {
-                if i == j {
-                    l[(i, j)] = v[idx].exp();
-                } else {
-                    l[(i, j)] = v[idx];
-                }
-                idx += 1;
-            }
-        }
+    for (i, j) in lower_tri_iter(n_eta, template.omega.diagonal) {
+        l[(i, j)] = if i == j { v[idx].exp() } else { v[idx] };
+        idx += 1;
     }
     let omega = OmegaMatrix::from_chol_factor(
         l,
@@ -175,15 +147,9 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
             ))
         } else {
             let mut l = DMatrix::zeros(n_iov, n_iov);
-            for j in 0..n_iov {
-                for i in j..n_iov {
-                    if i == j {
-                        l[(i, j)] = v[idx].exp();
-                    } else {
-                        l[(i, j)] = v[idx];
-                    }
-                    idx += 1;
-                }
+            for (i, j) in lower_tri_iter(n_iov, false) {
+                l[(i, j)] = if i == j { v[idx].exp() } else { v[idx] };
+                idx += 1;
             }
             Some(OmegaMatrix::from_chol_factor(
                 l,
@@ -230,18 +196,12 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
 
     let n_eta = template.omega.dim();
     let omega_fixed: &[bool] = &template.omega_fixed;
-    if template.omega.diagonal {
-        for i in 0..n_eta {
-            mask.push(omega_fixed.get(i).copied().unwrap_or(false));
-        }
-    } else {
-        for j in 0..n_eta {
-            for i in j..n_eta {
-                let fi = omega_fixed.get(i).copied().unwrap_or(false);
-                let fj = omega_fixed.get(j).copied().unwrap_or(false);
-                mask.push(fi || fj);
-            }
-        }
+    // `lower_tri_iter` yields only `(i,i)` when diagonal, where `fi || fj`
+    // reduces to `omega_fixed[i]` — the same value the diagonal branch pushed.
+    for (i, j) in lower_tri_iter(n_eta, template.omega.diagonal) {
+        let fi = omega_fixed.get(i).copied().unwrap_or(false);
+        let fj = omega_fixed.get(j).copied().unwrap_or(false);
+        mask.push(fi || fj);
     }
 
     for &f in &template.sigma_fixed {
@@ -250,20 +210,11 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
 
     // IOV: mirrors BSV omega mask logic, checking the diagonal flag.
     if let Some(ref iov) = template.omega_iov {
-        let n = iov.dim();
         let kf = &template.kappa_fixed;
-        if iov.diagonal {
-            for i in 0..n {
-                mask.push(kf.get(i).copied().unwrap_or(false));
-            }
-        } else {
-            for j in 0..n {
-                for i in j..n {
-                    let fi = kf.get(i).copied().unwrap_or(false);
-                    let fj = kf.get(j).copied().unwrap_or(false);
-                    mask.push(fi || fj);
-                }
-            }
+        for (i, j) in lower_tri_iter(iov.dim(), iov.diagonal) {
+            let fi = kf.get(i).copied().unwrap_or(false);
+            let fj = kf.get(j).copied().unwrap_or(false);
+            mask.push(fi || fj);
         }
     }
 
@@ -288,15 +239,12 @@ pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
         if om.diagonal {
             return; // diagonal Ω has no off-diagonal entries to mark
         }
-        let n = om.dim();
         let mut p = start;
-        for j in 0..n {
-            for i in j..n {
-                if i != j && !om.free_mask[(i, j)] {
-                    mask[p] = true;
-                }
-                p += 1;
+        for (i, j) in lower_tri_iter(om.dim(), false) {
+            if i != j && !om.free_mask[(i, j)] {
+                mask[p] = true;
             }
+            p += 1;
         }
     };
 
@@ -370,22 +318,15 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
     // whose covariate omega diagonals can reach 15 000+.  With 6.0 the cap
     // is exp(6) ≈ 403, max variance ≈ 162 000 — sufficient for practical
     // FREM covariate variances while still preventing runaway.
-    if template.omega.diagonal {
-        for _ in 0..n_eta {
-            lower.push(-6.0); // exp(-6) ≈ 0.0025
-            upper.push(6.0); // exp(6) ≈ 403
-        }
-    } else {
-        for j in 0..n_eta {
-            for i in j..n_eta {
-                if i == j {
-                    lower.push(-6.0);
-                    upper.push(6.0);
-                } else {
-                    lower.push(-10.0);
-                    upper.push(10.0);
-                }
-            }
+    // `lower_tri_iter` yields only `(i,i)` when diagonal, so the `i == j` arm
+    // (`[-6, 6]`) covers the diagonal case; off-diagonals get `[-10, 10]`.
+    for (i, j) in lower_tri_iter(n_eta, template.omega.diagonal) {
+        if i == j {
+            lower.push(-6.0); // exp(-6) ≈ 0.0025 .. exp(6) ≈ 403
+            upper.push(6.0);
+        } else {
+            lower.push(-10.0);
+            upper.push(10.0);
         }
     }
 
@@ -397,23 +338,13 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
 
     // IOV bounds: diagonal same as BSV diagonal; off-diagonal same as BSV off-diagonal.
     if let Some(ref iov) = template.omega_iov {
-        let n = iov.dim();
-        if iov.diagonal {
-            for _ in 0..n {
+        for (i, j) in lower_tri_iter(iov.dim(), iov.diagonal) {
+            if i == j {
                 lower.push(-6.0);
                 upper.push(6.0);
-            }
-        } else {
-            for j in 0..n {
-                for i in j..n {
-                    if i == j {
-                        lower.push(-6.0);
-                        upper.push(6.0);
-                    } else {
-                        lower.push(-10.0);
-                        upper.push(10.0);
-                    }
-                }
+            } else {
+                lower.push(-10.0);
+                upper.push(10.0);
             }
         }
     }
@@ -470,24 +401,17 @@ fn named_or(v: &[String], i: usize, fallback: impl FnOnce() -> String) -> String
 fn push_omega_names(names: &mut Vec<String>, om: &OmegaMatrix) {
     let n = om.dim();
     let diag_name = |i: usize| named_or(&om.eta_names, i, || format!("OMEGA({},{})", i + 1, i + 1));
-    if om.diagonal {
-        for i in 0..n {
+    // Column-major lower triangle — mirrors `pack_params`. `lower_tri_iter` yields
+    // only `(i,i)` when diagonal, so the `i == j` arm covers the diagonal case.
+    for (i, j) in lower_tri_iter(n, om.diagonal) {
+        if i == j {
             names.push(diag_name(i));
-        }
-    } else {
-        // Column-major lower triangle — mirrors `pack_params`.
-        for j in 0..n {
-            for i in j..n {
-                if i == j {
-                    names.push(diag_name(i));
-                } else {
-                    let ni = om.eta_names.get(i).filter(|s| !s.is_empty());
-                    let nj = om.eta_names.get(j).filter(|s| !s.is_empty());
-                    match (ni, nj) {
-                        (Some(a), Some(b)) => names.push(format!("{}~{}", a, b)),
-                        _ => names.push(format!("OMEGA({},{})", i + 1, j + 1)),
-                    }
-                }
+        } else {
+            let ni = om.eta_names.get(i).filter(|s| !s.is_empty());
+            let nj = om.eta_names.get(j).filter(|s| !s.is_empty());
+            match (ni, nj) {
+                (Some(a), Some(b)) => names.push(format!("{}~{}", a, b)),
+                _ => names.push(format!("OMEGA({},{})", i + 1, j + 1)),
             }
         }
     }
@@ -528,17 +452,8 @@ pub fn coordinate_values_raw(
 }
 
 fn push_omega_vals(v: &mut Vec<f64>, m: &DMatrix<f64>, diagonal: bool) {
-    let n = m.nrows();
-    if diagonal {
-        for i in 0..n {
-            v.push(m[(i, i)]);
-        }
-    } else {
-        for j in 0..n {
-            for i in j..n {
-                v.push(m[(i, j)]);
-            }
-        }
+    for (i, j) in lower_tri_iter(m.nrows(), diagonal) {
+        v.push(m[(i, j)]);
     }
 }
 
@@ -625,17 +540,21 @@ pub fn clamp_to_bounds(x: &mut [f64], bounds: &PackedBounds) {
 /// Column-major lower-triangle entry list `(row, col)` with `row >= col`,
 /// matching `pack_params` order (diagonal → `(i, i)`).
 pub(crate) fn lower_tri_entries(n: usize, diagonal: bool) -> Vec<(usize, usize)> {
-    if diagonal {
-        (0..n).map(|i| (i, i)).collect()
-    } else {
-        let mut e = Vec::new();
-        for c in 0..n {
-            for r in c..n {
-                e.push((r, c));
-            }
-        }
-        e
-    }
+    lower_tri_iter(n, diagonal).collect()
+}
+
+/// Non-allocating iterator over the column-major lower-triangle entries `(row, col)`
+/// (`row >= col`), in `pack_params` order. `diagonal` restricts each column to its
+/// single `(c, c)` entry. This is the single source of the `for j in 0..n { for i
+/// in j..n }` packing convention: `pack_params`/`unpack_params` and the mask/bounds
+/// walkers all iterate through it, so a change to the packing order is a one-place
+/// edit. Returns an iterator (not a `Vec`) so the hot `pack`/`unpack` paths allocate
+/// nothing.
+pub(crate) fn lower_tri_iter(n: usize, diagonal: bool) -> impl Iterator<Item = (usize, usize)> {
+    (0..n).flat_map(move |c| {
+        let end = if diagonal { c + 1 } else { n };
+        (c..end).map(move |r| (r, c))
+    })
 }
 
 /// Flat index of `L[i,j]` (i ≥ j) in the column-major lower-triangle packing.
@@ -656,23 +575,17 @@ pub(crate) fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
 pub(crate) fn chol_pack(m_sub: &DMatrix<f64>, l: &DMatrix<f64>, diagonal: bool) -> Vec<f64> {
     let n = l.nrows();
     let gl = (m_sub * l).scale(2.0);
-    let mut out = Vec::new();
-    if diagonal {
-        for i in 0..n {
-            out.push(gl[(i, i)] * l[(i, i)]);
-        }
-    } else {
-        for j in 0..n {
-            for i in j..n {
-                if i == j {
-                    out.push(gl[(i, i)] * l[(i, i)]);
-                } else {
-                    out.push(gl[(i, j)]);
-                }
+    // `lower_tri_iter` yields only `(i,i)` when diagonal, where the `i == j` arm
+    // (diagonal log-chain `×L_ii`) applies; off-diagonals are raw.
+    lower_tri_iter(n, diagonal)
+        .map(|(i, j)| {
+            if i == j {
+                gl[(i, j)] * l[(i, j)]
+            } else {
+                gl[(i, j)]
             }
-        }
-    }
-    out
+        })
+        .collect()
 }
 
 /// Block-diagonal Cholesky factor `L_Σb = blkdiag(L_bsv, L_iov × K)` of the IOV
