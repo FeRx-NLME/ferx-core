@@ -71,28 +71,12 @@ pub(crate) fn packed_param_label(packed_idx: usize, template: &ModelParameters) 
         format!("theta[{}]", name)
     } else if packed_idx < n_theta + n_omega {
         let omega_idx = packed_idx - n_theta;
-        let (row, col) = if template.omega.diagonal {
-            (omega_idx, omega_idx)
-        } else {
-            let mut cnt = 0usize;
-            let mut found = false;
-            let mut res = (0, 0);
-            'search: for c in 0..n_eta {
-                for r in c..n_eta {
-                    if cnt == omega_idx {
-                        res = (r, c);
-                        found = true;
-                        break 'search;
-                    }
-                    cnt += 1;
-                }
-            }
-            debug_assert!(
-                found,
-                "unreachable: omega_idx={omega_idx} >= n_omega={n_omega}"
-            );
-            res
-        };
+        // Decode a packed Ω index back to (row, col) via the centralized packing
+        // order (single source: `lower_tri_entries`; `omega_idx < n_omega` here, so
+        // the index is always in range). Cold path (labelling), so the Vec is fine.
+        let (row, col) =
+            crate::estimation::parameterization::lower_tri_entries(n_eta, template.omega.diagonal)
+                [omega_idx];
         let nr = template
             .omega
             .eta_names

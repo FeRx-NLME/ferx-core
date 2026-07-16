@@ -895,17 +895,8 @@ fn subject_nll_pop_grad_analytical(
 
     // ── Omega packed parameters ────────────────────────────────────────────
     let omega_start = n_theta;
-    let omega_entries: Vec<(usize, usize)> = if template.omega.diagonal {
-        (0..n_eta).map(|i| (i, i)).collect()
-    } else {
-        let mut v = Vec::new();
-        for j in 0..n_eta {
-            for i in j..n_eta {
-                v.push((i, j));
-            }
-        }
-        v
-    };
+    // Single source: same column-major lower-tri order as `pack_params`.
+    let omega_entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, template.omega.diagonal);
     let free_mask = &template.omega.free_mask;
 
     for (ko, &(row, col)) in omega_entries.iter().enumerate() {
@@ -1339,17 +1330,8 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     let g_mat: DMatrix<f64> = &omega.inv * &htilde_inv * &omega.inv;
 
     let omega_start = n_theta;
-    let omega_entries: Vec<(usize, usize)> = if template.omega.diagonal {
-        (0..n_eta).map(|i| (i, i)).collect()
-    } else {
-        let mut v = Vec::new();
-        for j in 0..n_eta {
-            for i in j..n_eta {
-                v.push((i, j));
-            }
-        }
-        v
-    };
+    // Single source: same column-major lower-tri order as `pack_params`.
+    let omega_entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, template.omega.diagonal);
     let l_omega = &omega.chol;
     let free_mask = &template.omega.free_mask;
 

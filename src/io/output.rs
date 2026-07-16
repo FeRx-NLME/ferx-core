@@ -1530,16 +1530,15 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
             names.push(format!("log_chol_{name}"));
         }
     } else {
-        for j in 0..n_eta {
-            for i in j..n_eta {
-                if i == j {
-                    names.push(format!("log_chol_{}", result.eta_names[i]));
-                } else {
-                    names.push(format!(
-                        "chol_{}_{}",
-                        result.eta_names[i], result.eta_names[j]
-                    ));
-                }
+        // Block lower-triangle order — single source: `lower_tri_iter`.
+        for (i, j) in crate::estimation::parameterization::lower_tri_iter(n_eta, false) {
+            if i == j {
+                names.push(format!("log_chol_{}", result.eta_names[i]));
+            } else {
+                names.push(format!(
+                    "chol_{}_{}",
+                    result.eta_names[i], result.eta_names[j]
+                ));
             }
         }
     }
@@ -1552,16 +1551,14 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
                 names.push(format!("log_chol_{name}"));
             }
         } else {
-            for j in 0..n_kappa {
-                for i in j..n_kappa {
-                    if i == j {
-                        names.push(format!("log_chol_{}", result.kappa_names[i]));
-                    } else {
-                        names.push(format!(
-                            "chol_{}_{}",
-                            result.kappa_names[i], result.kappa_names[j]
-                        ));
-                    }
+            for (i, j) in crate::estimation::parameterization::lower_tri_iter(n_kappa, false) {
+                if i == j {
+                    names.push(format!("log_chol_{}", result.kappa_names[i]));
+                } else {
+                    names.push(format!(
+                        "chol_{}_{}",
+                        result.kappa_names[i], result.kappa_names[j]
+                    ));
                 }
             }
         }
