@@ -389,8 +389,8 @@ fn equilibrate_ss_state(
         // under-reporting it (#867). Only a *nonlinear* disposition reaches this fallback (the
         // linear closed form above returns early), so this is exactly the saturable
         // heavy-accumulation case; a fast-contracting model early-stops and is left alone.
-        let (incr_prev, incr_last) = tracker.recent_increments();
-        note_ss_nonconvergence_if_capped(early_stopped, incr_prev, incr_last);
+        let (incr_prev, incr_last, incr_mag) = tracker.recent_increments();
+        note_ss_nonconvergence_if_capped(early_stopped, incr_prev, incr_last, incr_mag);
         return u;
     }
 

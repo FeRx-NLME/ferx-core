@@ -3800,6 +3800,12 @@ pub fn fit(
         };
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
+            // Surface any SS-equilibration non-convergence seen during this (default, single-start)
+            // fit's prediction passes (#867). This is the common path — `n_starts` defaults to 1 —
+            // so it must drain the sink too, not just the multi-start arm below.
+            for w in crate::dosing::take_ss_nonconvergence_warnings() {
+                result.warnings.push(w);
+            }
             rebuild_warnings_structured(&mut result);
             result
         });

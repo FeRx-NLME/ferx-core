@@ -220,3 +220,66 @@ fn simulate_surfaces_ss_nonconvergence_warning_for_saturable_accumulation() {
         "simulate must still return rows alongside the warning"
     );
 }
+
+/// The blocking-bug regression (#874 review): `n_starts` defaults to `1`, so a plain `fit()` takes
+/// the single-start fast path — which must drain the SS non-convergence sink into
+/// `FitResult.warnings`, not just the multi-start arm. A couple of outer iterations run enough
+/// objective prediction passes to populate the sink; no convergence loop is needed (Tier-2), and
+/// covariance is off to keep it quick.
+#[test]
+fn fit_surfaces_ss_nonconvergence_warning_for_saturable_accumulation() {
+    let parsed = parse_full_model(SS_MM_HEAVY_ACCUM_MODEL).expect("model parses");
+    let model = parsed.model;
+    let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
+        .expect("dataset loads");
+
+    let mut opts = parsed.fit_options;
+    opts.outer_maxiter = 2;
+    opts.run_covariance_step = false;
+
+    let result = fit(&model, &population, &model.default_params, &opts).expect("fit returns Ok");
+
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "default single-start fit() must surface the SS non-convergence warning to \
+         FitResult.warnings; got: {:?}",
+        result.warnings
+    );
+}
+
+/// False-positive guard (#874 review): a *nonlinear* (Michaelis–Menten) SS-absorption model that
+/// still declines the linear closed-form fast path, but eliminates fast (`Vmax` ≫ mean input, so
+/// little saturation) — the pulse train contracts quickly and settles well inside the cycle
+/// budget. The sink must stay **empty**: a converged nonlinear model must not trip the warning on
+/// solver-noise jitter (the `rho ≥ 1` noise-floor short-circuit).
+#[test]
+fn simulate_stays_silent_for_benign_nonlinear_ss_absorption() {
+    let src = SS_MM_HEAVY_ACCUM_MODEL.replace(
+        "theta TVVMAX(13.0, 1.0, 100.0)",
+        "theta TVVMAX(500.0, 1.0, 5000.0)",
+    );
+    let parsed = parse_full_model(&src).expect("model parses");
+    let model = parsed.model;
+    let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
+        .expect("dataset loads");
+
+    let out = simulate_with_options_diag(
+        &model,
+        &population,
+        &model.default_params,
+        1,
+        &SimulateOptions::default(),
+    )
+    .expect("simulate returns Ok");
+
+    assert!(
+        !out.warnings
+            .iter()
+            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "benign fast-contracting nonlinear SS model must stay silent; got: {:?}",
+        out.warnings
+    );
+}
