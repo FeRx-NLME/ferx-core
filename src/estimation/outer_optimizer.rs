@@ -1482,21 +1482,23 @@ fn run_nlopt_attempt(
     } else {
         opt.set_maxeval(options.outer_maxiter as u32 * (n as u32 + 1))
             .unwrap();
-        if options.agq_nodes().is_some() {
-            // AGQ's gradient is exact but **finite-difference-limited**: the grid-response
-            // term and the posterior Hessian are both central differences, so the gradient
-            // carries a noise floor (~1e-4 relative). The 1e-12 stops below are therefore
-            // *unreachable* for it — and unreachable stops are not harmless. L-BFGS keeps
-            // stepping until the true gradient drops under that floor, at which point the
-            // search direction is noise, the line search cannot find a decrease, and NLopt
-            // returns a bare `NLOPT_FAILURE`. The fit is fine (the engine restores the
-            // best-seen point) but it is reported as *not converged*, which is a lie about a
-            // result that has been flat to 8 significant figures for 15 evaluations.
-            //
-            // So stop AGQ where its objective actually settles — the same reachable
-            // objective-change / step-size criteria BOBYQA gets — rather than chasing a
-            // gradient norm the gradient cannot deliver. FOCE/FOCEI keep the 1e-12 stops:
-            // their gradient is analytic to ~1e-11 and they *do* reach `XtolReached`.
+        if options.agq_nodes().is_some() || matches!(options.optimizer, Optimizer::NloptLbfgs) {
+            // Stop L-BFGS (and AGQ) on a **reachable** objective-change / step-size
+            // criterion — the same ones BOBYQA gets — rather than the historical
+            // unreachable `1e-12` stops. Unreachable stops are not harmless: L-BFGS
+            // keeps stepping until the true gradient drops under a floor it cannot
+            // reach (the FOCE objective carries EBE re-estimation noise; AGQ's
+            // grid-response gradient is finite-difference-limited to ~1e-4), at
+            // which point the search direction is noise, the line search cannot
+            // find a decrease, and NLopt returns a bare `NLOPT_FAILURE`. The fit is
+            // fine — the engine restores the best-seen point and the OFV has been
+            // flat to many significant figures — but it is reported as *not
+            // converged*, which is a lie (and, since #657 removed the SLSQP
+            // fallback that used to re-run and reach `XtolReached`, one that turns
+            // several correct fits red: reset / SS / tvcov / LTBS / schnider land
+            // on their true minima yet flag non-convergence). Stopping where the
+            // objective actually settles reports convergence honestly and reaches
+            // the same optimum.
             opt.set_xtol_rel(options.outer_xtol).unwrap();
             let ftol = resolve_outer_ftol(
                 model.has_non_gaussian(),
@@ -1505,8 +1507,12 @@ fn run_nlopt_attempt(
             );
             opt.set_ftol_rel(ftol).unwrap();
         } else {
-            // FOCE objective is noisy from EBE re-estimation; let maxeval be the primary
-            // stopping criterion and rely on the analytic gradient to drive |g| down.
+            // SLSQP / MMA keep the tight stops. SLSQP takes much smaller
+            // per-iteration objective steps than L-BFGS, so a reachable `ftol_rel`
+            // (1e-6) fires *prematurely* and throttles it short of the optimum
+            // (two_cpt_oral_cov FOCEI: −1182 → −966). Its own `cap_slsqp_gradient`
+            // handling and `maxeval` are the primary stops here; the unreachable
+            // 1e-12 keeps it stepping until it genuinely settles.
             opt.set_xtol_rel(1e-12).unwrap();
             opt.set_ftol_rel(1e-12).unwrap();
         }
@@ -1640,28 +1646,32 @@ fn optimize_nlopt(
         resolved_scaling,
     );
 
-    // Complementary-scaling recovery for the gradient NLopt optimizers. `Abs` /
-    // `None` preconditioning can make NLopt's line search collapse on the very
-    // first step and report `XtolReached` at the start point — a false
-    // convergence that leaves every parameter pinned at (essentially) its initial
-    // value (warfarin FOCEI stalls under `Abs`, `two_cpt_oral_cov` under `None`,
-    // the exact mirror image). The removed automatic SLSQP fallback (#657) used to
-    // mask this; instead, detect it directly and re-run once with the
-    // complementary scaling, keeping the lower-OFV result.
+    // Complementary-scaling recovery for the gradient NLopt optimizers. The
+    // per-coordinate scaling preconditioner (`Abs` magnitude vs `None` natural
+    // log-space) can fail in two ways, and which one is safe is model-dependent
+    // — neither is universally best (warfarin FOCEI needs `None`,
+    // `two_cpt_oral_cov` needs `Abs`, the exact mirror image). The automatic SLSQP
+    // fallback removed in #657 used to mask both; instead, detect them and re-run
+    // once with the complementary scaling, letting the *reconverged* OFV pick the
+    // winner:
     //
-    // The stall signature is *positional*, not gradient-magnitude: the estimate
-    // barely moves from `x_start` even though the start point had a real descent
-    // direction. Testing "did the estimate move" (rather than "is the final
-    // gradient still large") is essential — a genuinely-converged fit can end with
-    // a non-tiny gradient (e.g. FREM, whose covariate pseudo-observation rows keep
-    // the objective's gradient off zero at the optimum), and it moves a long way
-    // to get there; a gradient-ratio test alone false-fires on it and a spurious
-    // complementary re-run can land in a worse basin. The barely-moved test never
-    // fires on such a fit. The extra start-gradient eval is taken only for the
-    // barely-moved case (`&&` short-circuits), so healthy fits pay nothing.
+    //   1. **Stall** — NLopt's line search collapses on the first step and reports
+    //      `XtolReached` at the start point (a false *convergence*: the estimate
+    //      barely moved from init although the start had a real descent direction).
+    //   2. **Divergence** — the fit runs off to a garbage basin and NLopt returns
+    //      `NLOPT_FAILURE` (`converged == false`); e.g. `ss_oral`/`Abs` lands at
+    //      OFV 121 / TVCL 0.10 (truth 2.0) where `None` reaches OFV −54 / TVCL 1.99.
+    //
+    // Trigger on non-convergence, or on the barely-moved *positional* stall
+    // signature. The positional test (not a gradient-magnitude one) is what keeps a
+    // genuinely-converged fit that legitimately started near-optimal and ends with
+    // a non-tiny gradient (e.g. FREM, whose covariate means seed near their sample
+    // values) from firing: such a fit is `converged` and moved, so neither arm
+    // triggers. The extra start-gradient eval short-circuits behind the move test,
+    // so healthy fits pay nothing.
     if matches!(options.optimizer, Optimizer::NloptLbfgs | Optimizer::Slsqp) {
         if let Some(alt_scaling) = complementary_scaling(resolved_scaling) {
-            let rel_move = {
+            let stalled = {
                 let step: f64 = attempt
                     .x_real
                     .iter()
@@ -1670,77 +1680,70 @@ fn optimize_nlopt(
                     .sum::<f64>()
                     .sqrt();
                 let x0_norm = x_start.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
-                step / x0_norm
-            };
-            // Barely moved *and* there was a real gradient to follow at the start:
-            // the optimizer either stalled (warfarin/two_cpt_oral_cov — a bad
-            // point) or the initial estimates were already near-optimal (e.g. FREM,
-            // whose covariate means seed near their sample values — a good point).
-            // Both look identical here, so try the complementary scaling and let the
-            // *reconverged* OFV decide (below); the barely-moved gate just limits
-            // when the extra work is done, so healthy (moved) fits pay nothing.
-            if rel_move < 1e-3 {
-                let initial_gnorm = initial_outer_grad_norm(
-                    model,
-                    population,
-                    init_params,
-                    options,
-                    &bounds,
-                    &x_start,
-                    n_subj,
-                );
-                if initial_gnorm > 1e-3 {
-                    let alt = run_nlopt_attempt(
+                (step / x0_norm) < 1e-3
+                    && initial_outer_grad_norm(
                         model,
                         population,
                         init_params,
                         options,
                         &bounds,
                         &x_start,
-                        n,
                         n_subj,
-                        n_eta,
-                        alt_scaling,
+                    ) > 1e-3
+            };
+            if !attempt.converged || stalled {
+                let alt = run_nlopt_attempt(
+                    model,
+                    population,
+                    init_params,
+                    options,
+                    &bounds,
+                    &x_start,
+                    n,
+                    n_subj,
+                    n_eta,
+                    alt_scaling,
+                );
+                // Decide on the RECONVERGED OFV, not the optimizer's internal
+                // best objective. On models where the inner EBEs and the outer
+                // objective diverge at an off-optimum point (FREM), a lower
+                // *internal* objective can correspond to a far worse fit once the
+                // EBEs are reconverged — the internal value is not comparable
+                // across the two scalings, but the reconverged OFV (the value the
+                // fit is reported at) is.
+                let recon_ofv = |x_real: &[f64]| -> f64 {
+                    let params = unpack_params(x_real, init_params);
+                    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+                    let (ehs, hms, _, kappas) = run_inner_loop_warm(
+                        model,
+                        population,
+                        &params,
+                        options.inner_maxiter,
+                        options.inner_tol,
+                        None,
+                        Some(&mu_k),
+                        options.min_obs_for_convergence_check as usize,
+                        options.inner_restarts,
                     );
-                    // Decide on the RECONVERGED OFV, not the optimizer's internal
-                    // best_ofv. On models where the inner EBEs and the outer
-                    // objective diverge at an off-optimum point (FREM), a lower
-                    // *internal* objective can correspond to a far worse fit once
-                    // the EBEs are reconverged — the internal best_ofv is not
-                    // comparable across the two scalings, but the reconverged OFV
-                    // (the value the fit is reported at) is.
-                    let recon_ofv = |x_real: &[f64]| -> f64 {
-                        let params = unpack_params(x_real, init_params);
-                        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-                        let (ehs, hms, _, kappas) = run_inner_loop_warm(
-                            model,
-                            population,
-                            &params,
-                            options.inner_maxiter,
-                            options.inner_tol,
-                            None,
-                            Some(&mu_k),
-                            options.min_obs_for_convergence_check as usize,
-                            options.inner_restarts,
-                        );
-                        2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options)
-                    };
-                    let cur_ofv = recon_ofv(&attempt.x_real);
-                    let alt_ofv = recon_ofv(&alt.x_real);
-                    if alt_ofv + 1e-3 < cur_ofv {
-                        warnings.push(format!(
-                            "Outer optimizer barely moved from the initial estimates under \
-                             {:?} scaling (relative step {:.1e}, start-point gradient norm \
-                             {:.2e}); recovered with {:?} scaling (OFV {:.4} -> {:.4}).",
-                            resolved_scaling,
-                            rel_move,
-                            initial_gnorm,
-                            alt_scaling,
-                            cur_ofv,
-                            alt_ofv,
-                        ));
-                        attempt = alt;
-                    }
+                    2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options)
+                };
+                let cur_ofv = recon_ofv(&attempt.x_real);
+                let alt_ofv = recon_ofv(&alt.x_real);
+                if alt_ofv + 1e-3 < cur_ofv {
+                    warnings.push(format!(
+                        "Outer optimizer under {:?} scaling {} (OFV {:.4}); recovered with \
+                         {:?} scaling (OFV {:.4}).",
+                        resolved_scaling,
+                        if attempt.converged {
+                            "stalled at the initial estimates"
+                        } else {
+                            "did not converge"
+                        },
+                        cur_ofv,
+                        alt_scaling,
+                        alt_ofv,
+                    ));
+                    attempt = alt;
                 }
             }
         }

@@ -46,21 +46,28 @@ section of the SDLC for the versioning policy).
   is forgiving of a loose mode).
 
 ### Fixed
-- **Outer optimizer: gradient-based fits could silently stop at the initial estimates**
-  (#657 follow-up). The default outer optimizer (`auto` → NLopt L-BFGS on analytic-gradient
-  models) presents parameters to the optimizer in a per-coordinate–scaled space. On some
-  models one scaling choice leaves the very first quasi-Newton step so poorly conditioned
-  that NLopt's line search collapses and reports `XtolReached` **at the start point** — a
-  false convergence that pins every parameter at its initial value (e.g. plain warfarin
-  FOCEI stalled at OFV ≈ −250.8 instead of −286.0 under magnitude scaling; `two_cpt_oral_cov`
-  stalled under natural scaling). The automatic SLSQP fallback removed in #657 had been
-  masking this. The outer loop now detects the stall — the estimate barely moved from its
-  initial value despite a real descent direction there — and automatically re-runs once with
-  the complementary scaling, keeping the lower-OFV result and emitting a warning that names
-  the recovery. The check is positional (a genuinely-converged fit moves a long way even when
-  its final gradient is not tiny), so healthy fits are unaffected and pay no extra cost.
-  Standard errors on the affected fits are corrected as a consequence (they were inflated
-  ~2.4× by the wrong optimum).
+- **Outer optimizer: gradient-based fits could silently fail at the initial estimates or
+  be reported as non-converged at a correct optimum** (#657 follow-up). Two related
+  regressions from the removal of the automatic SLSQP fallback in #657:
+  - *Scaling stall / divergence.* The default outer optimizer (`auto` → NLopt L-BFGS on
+    analytic-gradient models) presents parameters in a per-coordinate–scaled space, and no
+    single scaling is robust across models — magnitude scaling stalls plain warfarin FOCEI at
+    OFV ≈ −250.8 (vs −286.0) while natural scaling makes `two_cpt_oral_cov` and `ss_oral`
+    diverge to nonsense. The fallback used to mask this. The outer loop now detects it — the
+    fit either did not converge or barely moved from init despite a real start-point
+    gradient — and re-runs once with the complementary scaling, keeping whichever reaches the
+    lower **reconverged** OFV (a comparison that stays valid even where the optimizer's
+    internal objective and the reconverged OFV diverge, e.g. FREM). It emits a warning naming
+    the recovery and fires only on the failure signature, so healthy fits pay nothing.
+    Standard errors on the affected fits are corrected as a consequence (they were inflated
+    ~2.4× by the wrong optimum).
+  - *False non-convergence.* L-BFGS was stopped on an unreachable `1e-12` `xtol`/`ftol`, so
+    on a settled optimum its line search failed and NLopt returned `NLOPT_FAILURE` — a fit
+    that reached its true minimum yet reported `converged = false` (reset / SS / tvcov / LTBS /
+    schnider). L-BFGS (and AGQ) now stop on a reachable objective-change / step-size criterion
+    — the pharmacometric analogue of lowering NONMEM's `NSIG` to escape a rounding-error stall
+    — and report convergence honestly at the same optimum. SLSQP/MMA keep the tight stops
+    (a reachable `ftol` throttles SLSQP short of the optimum).
 - **FREM: the analytic gradients differentiated the wrong likelihood on covariate
   pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against
   the prediction `theta[i] + eta[j]` with the dedicated covariate error `EPSCOV` — but the
