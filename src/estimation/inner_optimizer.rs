@@ -253,16 +253,22 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         {
             return "steady-state dose + time-dependent ODE RHS";
         }
-        // #486: a steady-state dose combined with a built-in absorption input-rate forcing
-        // (`zero_order`/`first_order`, or a transit/IG twin's `transit()`/`igd()` forcing)
-        // declines to FD — the dual SS equilibration does not spread a periodic zero-order
-        // window / first-order tail over the cycle. Mirror `ode_iov_subject_supported`'s bail,
-        // in the same order, so this attribution can't drift.
+        // #835: a steady-state dose into a built-in absorption compartment is analytic for the
+        // smooth density kernels (transit/igd/weibull/first_order) — the dual fixed point carries
+        // its κ-coupled sensitivity. Only SS into a `zero_order` window and SS + an absorption
+        // lagtime stay on FD; mirror `ode_iov_subject_supported`'s flipped bail, in the same order,
+        // so this attribution can't drift. Scoped to the SS-dosed compartment.
         if has_ss
-            && eff
-                .ode_spec
-                .as_ref()
-                .is_some_and(|o| !o.input_rate.is_empty())
+            && eff.ode_spec.as_ref().is_some_and(|o| {
+                subject.doses.iter().any(|d| {
+                    d.ss && d.ii > 0.0
+                        && o.input_rate.iter().any(|f| {
+                            f.cmt + 1 == d.cmt
+                                && (f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
+                                    || eff.has_lagtime_on_cmt(d.cmt))
+                        })
+                })
+            })
         {
             return "steady-state dose + built-in absorption forcing";
         }
@@ -4573,15 +4579,16 @@ mod iov_tests {
         );
     }
 
-    /// #814: `iov_fd_reason` must attribute against the *effective* (ODE-twin) model. A
-    /// closed-form `one_cpt_transit` + IOV subject with a steady-state dose declines to FD for a
-    /// twin-specific reason — the twin's built-in `transit()` absorption forcing under an SS dose
-    /// — the analytic-primary analogue of `iov_fd_reason_attributes_ss_input_rate`'s hand-written
-    /// `zero_order` twin. Before the effective-model switch, `iov_fd_reason` read the analytic
-    /// primary's `ode_spec` (`None`), skipped the whole ODE attribution block, and mislabeled this
-    /// the generic "subject outside IOV analytic scope".
+    /// #835: an SS dose into a built-in absorption compartment is now analytic for the smooth
+    /// density kernels, *including through a closed-form primary's ODE twin*. A closed-form
+    /// `one_cpt_transit` + IOV subject with a steady-state dose reroutes to its ODE twin
+    /// (`effective_for`, #719/#814); the twin carries a `transit()` forcing, which #835 admits, so
+    /// the subject now routes to the analytic ODE-IOV inner gradient rather than FD. (Pre-#835 it
+    /// declined with "steady-state dose + built-in absorption forcing"; the still-FD combinations —
+    /// SS into a `zero_order` window, SS + absorption lagtime — remain covered by
+    /// `iov_fd_reason_attributes_ss_input_rate`.)
     #[test]
-    fn iov_fd_reason_attributes_transit_twin_ss_forcing() {
+    fn transit_twin_ss_forcing_is_analytic_under_iov() {
         let model = crate::parser::model_parser::parse_model_string(TRANSIT_IOV_MODEL)
             .expect("parse transit IOV");
         assert!(
@@ -4609,13 +4616,8 @@ mod iov_tests {
             obs_records: vec![],
         };
         assert!(
-            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
-            "SS + transit-twin absorption forcing must route to FD under IOV"
-        );
-        assert_eq!(
-            iov_fd_reason(&model, &subject),
-            "steady-state dose + built-in absorption forcing",
-            "#814: attribution must read the effective (twin) model, not the analytic primary"
+            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_some(),
+            "#835: SS + transit-twin absorption forcing is now analytic under IOV (via the twin)"
         );
     }
 

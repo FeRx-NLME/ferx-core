@@ -19,6 +19,7 @@ pub mod dual1;
 pub mod dual2;
 pub mod dual_mixed;
 pub mod jet;
+pub(crate) mod linsolve;
 pub mod num;
 pub mod ode_provider;
 pub mod one_cpt;

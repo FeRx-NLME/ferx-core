@@ -19,6 +19,22 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **Analytic sensitivities for steady-state dosing into a built-in absorption compartment**
+  (#835). Fitting a model with an `SS=1` dose into a `first_order` / `transit` / `igd` /
+  `weibull` absorption compartment now uses exact analytic FOCEI gradients — the closed-form
+  steady-state trough `u_ss = (I − M)⁻¹·b` carried over dual numbers — instead of finite
+  differences, so these fits run at full analytic speed. Steady-state into a `zero_order`
+  window, and steady-state combined with an absorption lagtime, remain out of scope (rejected
+  with a clear error).
+
+### Performance
+- The closed-form steady-state equilibration for dosing into a built-in absorption compartment
+  (#834) now actually takes effect. Its self-verification tolerance sat just below the solver's
+  own noise floor, so it silently fell back to the 50-cycle pulse-train iteration at every
+  realistic `ode_reltol`; `predict()` / `simulate()` on these models are correspondingly faster.
+  Predictions are unchanged (#835).
+
 ### Changed
 - **`method = agq` removed; adaptive quadrature is now an *argument*, not a method**
   (#251). Adaptive Gauss–Hermite quadrature is not a separate estimator — it is the
