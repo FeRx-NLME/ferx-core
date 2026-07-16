@@ -1428,29 +1428,7 @@ impl PkModel {
     /// this set is rejected at parse time rather than silently mis-routed (no-TV
     /// path) or panicking (event-driven path).
     pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
-        match self {
-            PkModel::OneCptIv => &[1],
-            // Oral: cmt 1 = depot (zero-order-into-depot, #400), cmt 2 = central
-            // (depot-bypassing infusion).
-            PkModel::OneCptOral => &[1, 2],
-            // Transit models a bolus absorbed through the Gamma transit chain;
-            // modeled-duration infusions are unsupported in v1, so a `D{cmt}` on a
-            // transit model is rejected at parse (#386).
-            PkModel::OneCptTransit => &[],
-            // Inverse-Gaussian, like transit: absorbs an instantaneous bolus through
-            // the IG absorption-time density; modeled-duration infusions are
-            // unsupported, so a `D{cmt}` on an IG model is rejected at parse (#790).
-            PkModel::OneCptIg => &[],
-            PkModel::TwoCptIv => &[1, 2],
-            PkModel::TwoCptOral => &[1, 2],
-            // Like the 1-cpt transit: modeled-duration infusions unsupported in v1,
-            // so a `D{cmt}` on a 2-cpt transit model is rejected at parse (#386).
-            PkModel::TwoCptTransit => &[],
-            // Inverse-Gaussian 2-cpt: same as the 1-cpt IG (#790).
-            PkModel::TwoCptIg => &[],
-            PkModel::ThreeCptIv => &[1, 2, 3],
-            PkModel::ThreeCptOral => &[1, 2],
-        }
+        self.topology().infusable_compartments()
     }
 
     /// Resolve a `[structural_model]` model name (canonical or long-form alias,
@@ -3896,29 +3874,37 @@ impl CompiledModel {
             "analytical_compartment_names called on an ODE model — use ode_spec.state_names instead"
         );
         use std::sync::OnceLock;
-        macro_rules! names {
-            ($lock:ident, $($name:expr),+) => {{
+        // Exhaustive `match` on `pk_model` so adding an 11th `PkModel` variant is a
+        // COMPILE error here (a missing arm), not a runtime index-out-of-bounds on a
+        // fixed-size array. Each arm lazily materialises its own owned `Vec<String>`
+        // from the compartment-name literals in `pk::topology` — the single source of
+        // truth — that the public `&'static [String]` API returns.
+        macro_rules! cached_names {
+            ($lock:ident) => {{
                 static $lock: OnceLock<Vec<String>> = OnceLock::new();
-                $lock.get_or_init(|| vec![$($name.to_string()),+]).as_slice()
+                $lock
+                    .get_or_init(|| {
+                        self.pk_model
+                            .topology()
+                            .compartment_names
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .as_slice()
             }};
         }
         match self.pk_model {
-            PkModel::OneCptIv => names!(ONE_CMT_IV, "central"),
-            PkModel::OneCptOral => names!(ONE_CMT_ORAL, "depot", "central"),
-            PkModel::OneCptTransit => names!(ONE_CMT_TRANSIT, "depot", "central"),
-            PkModel::OneCptIg => names!(ONE_CMT_IG, "depot", "central"),
-            PkModel::TwoCptIv => names!(TWO_CMT_IV, "central", "peripheral"),
-            PkModel::TwoCptOral => names!(TWO_CMT_ORAL, "depot", "central", "peripheral"),
-            PkModel::TwoCptTransit => names!(TWO_CMT_TRANSIT, "depot", "central", "peripheral"),
-            PkModel::TwoCptIg => names!(TWO_CMT_IG, "depot", "central", "peripheral"),
-            PkModel::ThreeCptIv => names!(THREE_CMT_IV, "central", "peripheral1", "peripheral2"),
-            PkModel::ThreeCptOral => names!(
-                THREE_CMT_ORAL,
-                "depot",
-                "central",
-                "peripheral1",
-                "peripheral2"
-            ),
+            PkModel::OneCptIv => cached_names!(ONE_CPT_IV),
+            PkModel::OneCptOral => cached_names!(ONE_CPT_ORAL),
+            PkModel::OneCptTransit => cached_names!(ONE_CPT_TRANSIT),
+            PkModel::OneCptIg => cached_names!(ONE_CPT_IG),
+            PkModel::TwoCptIv => cached_names!(TWO_CPT_IV),
+            PkModel::TwoCptOral => cached_names!(TWO_CPT_ORAL),
+            PkModel::TwoCptTransit => cached_names!(TWO_CPT_TRANSIT),
+            PkModel::TwoCptIg => cached_names!(TWO_CPT_IG),
+            PkModel::ThreeCptIv => cached_names!(THREE_CPT_IV),
+            PkModel::ThreeCptOral => cached_names!(THREE_CPT_ORAL),
         }
     }
 }

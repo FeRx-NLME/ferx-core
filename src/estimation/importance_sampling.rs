@@ -27,6 +27,10 @@ use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
 use crate::stats::likelihood::{iov_occasion_groups, m3_logcdf, obs_nll_subject_into};
 use crate::stats::residual_error::compute_r_diag;
 use crate::stats::special::ln_gamma;
+use crate::stats::util::{
+    ess_from_weights, log_sum_exp2 as logsumexp2,
+    log_sum_exp_normalised as logsumexp_with_normalised,
+};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
@@ -42,65 +46,14 @@ const TWO_PI: f64 = std::f64::consts::TAU;
 // Inverse normal CDF (Acklam rational approximation)
 // ---------------------------------------------------------------------------
 
-/// Inverse normal CDF (probit function): given u ∈ (0, 1), returns z such that
-/// Φ(z) = u. Uses the Acklam rational approximation with full f64 precision
-/// (~1.15e-9 relative error over the entire range).
-///
-/// Used to transform uniform Sobol quasi-random points to N(0,1) draws.
+/// Inverse normal CDF (probit) for Sobol quasi-random N(0,1) draws. Clamps u to
+/// the historical open interval [1e-15, 1-1e-15] (the shared copy returns ±inf at
+/// the raw boundary), then delegates to the canonical Acklam implementation in
+/// [`crate::stats::special::normal_inv_cdf`]. Because the clamped u is always in
+/// (0,1), that function's `p<=0`/`p>=1` ±inf guards never fire, so the output is
+/// bit-identical to the prior inline copy for every input this wrapper receives.
 fn inv_normal_cdf(u: f64) -> f64 {
-    let u = u.clamp(1e-15, 1.0 - 1e-15);
-
-    // Acklam (2003) rational approximation coefficients
-    const A: [f64; 6] = [
-        -3.969683028665376e+01,
-        2.209460984245205e+02,
-        -2.759285104469687e+02,
-        1.383577518672690e+02,
-        -3.066479806614716e+01,
-        2.506628277459239e+00,
-    ];
-    const B: [f64; 5] = [
-        -5.447609879822406e+01,
-        1.615858368580409e+02,
-        -1.556989798598866e+02,
-        6.680131188771972e+01,
-        -1.328068155288572e+01,
-    ];
-    const C: [f64; 6] = [
-        -7.784894002430293e-03,
-        -3.223964580411365e-01,
-        -2.400758277161838e+00,
-        -2.549732539343734e+00,
-        4.374664141464968e+00,
-        2.938163982698783e+00,
-    ];
-    const D: [f64; 4] = [
-        7.784695709041462e-03,
-        3.224671290700398e-01,
-        2.445134137142996e+00,
-        3.754408661907416e+00,
-    ];
-
-    const P_LOW: f64 = 0.02425;
-    const P_HIGH: f64 = 1.0 - P_LOW;
-
-    if u < P_LOW {
-        // Lower tail
-        let q = (-2.0 * u.ln()).sqrt();
-        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
-            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
-    } else if u <= P_HIGH {
-        // Central region
-        let q = u - 0.5;
-        let r = q * q;
-        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
-            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
-    } else {
-        // Upper tail (symmetry)
-        let q = (-2.0 * (1.0 - u).ln()).sqrt();
-        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
-            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
-    }
+    crate::stats::special::normal_inv_cdf(u.clamp(1e-15, 1.0 - 1e-15))
 }
 
 /// Generate `k_samples` quasi-random N(0,1) vectors of dimension `d` using
@@ -1934,18 +1887,6 @@ fn student_t_gamma_ratio(nu: f64, d: usize) -> f64 {
     ln_gamma(0.5 * (nu + d as f64)) - ln_gamma(0.5 * nu)
 }
 
-/// Effective sample size `1 / Σ w̃ₖ²` from normalised weights. Returns `0.0`
-/// when the weights are empty or all-zero (matches the prior inline guards).
-#[inline]
-fn ess_from_weights(weights: &[f64]) -> f64 {
-    let sum_sq: f64 = weights.iter().map(|w| w * w).sum();
-    if sum_sq > 0.0 {
-        1.0 / sum_sq
-    } else {
-        0.0
-    }
-}
-
 /// Asymptotic variance of `log p̂(yᵢ)` for a self-normalised IS estimator:
 /// `(1/ESS_fraction − 1) / K` (Geweke 1989). For the degenerate
 /// `ess_fraction == 0` case it returns a finite-but-large `1.0` so the overall
@@ -1957,64 +1898,6 @@ fn var_log_marginal_from_ess_fraction(ess_fraction: f64, k: f64) -> f64 {
     } else {
         1.0
     }
-}
-
-/// Stable `log(eᵃ + eᵇ)` for the two-component defensive-mixture denominator.
-fn logsumexp2(a: f64, b: f64) -> f64 {
-    let m = a.max(b);
-    if m == f64::NEG_INFINITY {
-        return f64::NEG_INFINITY;
-    }
-    m + ((a - m).exp() + (b - m).exp()).ln()
-}
-
-/// Numerically stable `log Σ exp(xᵢ)` plus the normalised weights `wᵢ`.
-fn logsumexp_with_normalised(xs: &[f64]) -> (f64, Vec<f64>) {
-    if xs.is_empty() {
-        return (f64::NEG_INFINITY, Vec::new());
-    }
-
-    let n_pos_inf = xs
-        .iter()
-        .filter(|x| x.is_infinite() && x.is_sign_positive())
-        .count();
-    if n_pos_inf > 0 {
-        let w = 1.0 / n_pos_inf as f64;
-        let weights = xs
-            .iter()
-            .map(|x| {
-                if x.is_infinite() && x.is_sign_positive() {
-                    w
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        return (f64::INFINITY, weights);
-    }
-
-    let m = xs
-        .iter()
-        .copied()
-        .filter(|x| x.is_finite())
-        .fold(f64::NEG_INFINITY, f64::max);
-    if !m.is_finite() {
-        return (f64::NEG_INFINITY, vec![0.0; xs.len()]);
-    }
-    let mut sum = 0.0;
-    let mut shifted: Vec<f64> = Vec::with_capacity(xs.len());
-    for &x in xs {
-        let s = if x.is_finite() { (x - m).exp() } else { 0.0 };
-        shifted.push(s);
-        sum += s;
-    }
-    let lse = m + sum.ln();
-    let weights: Vec<f64> = if sum > 0.0 {
-        shifted.iter().map(|&s| s / sum).collect()
-    } else {
-        vec![0.0; xs.len()]
-    };
-    (lse, weights)
 }
 
 /// Sheiner–Beal posterior-Hessian approximation at η̂.

@@ -584,7 +584,7 @@ mod tests {
         let d2 = time_it("Dual2<2> (minimal width)", &|t| {
             iv_bolus_width::<2>(amt, t, cl, v)
         });
-        let d4 = time_it("Dual2<4>", &|t| iv_bolus_width::<4>(amt, t, cl, v));
+        let _d4 = time_it("Dual2<4>", &|t| iv_bolus_width::<4>(amt, t, cl, v));
         let d8 = time_it("Dual2<8> (provider width)", &|t| {
             iv_bolus_width::<8>(amt, t, cl, v)
         });

@@ -29,6 +29,7 @@
 //! Infusion into an oral peripheral compartment still panics — a rare
 //! clinical setup tracked as a follow-up.
 
+use crate::pk::topology::Channel;
 use crate::types::{DoseEvent, PkModel, PkParams, Subject};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -297,32 +298,13 @@ fn compute_propagation_bounds(
 /// Caller-side dispatch (in `pk::compute_predictions`) uses this to fall
 /// back to the existing superposition path for unsupported models.
 pub fn supports_event_driven(pk_model: PkModel) -> bool {
-    matches!(
-        pk_model,
-        PkModel::OneCptIv
-            | PkModel::OneCptOral
-            | PkModel::TwoCptIv
-            | PkModel::TwoCptOral
-            | PkModel::ThreeCptIv
-            | PkModel::ThreeCptOral
-    )
+    pk_model.topology().event_walk_supported
 }
 
 /// State-vector dimension and central-compartment slot index for a given
 /// pk_model. Central is where the observation read-out reads from.
 fn state_layout(pk_model: PkModel) -> (usize, usize) {
-    match pk_model {
-        PkModel::OneCptIv => (1, 0),
-        PkModel::OneCptOral => (2, 1),    // [depot, central]
-        PkModel::OneCptTransit => (2, 1), // [depot (lumped transit), central]
-        PkModel::OneCptIg => (2, 1),      // [depot (unabsorbed IG mass), central]
-        PkModel::TwoCptIv => (2, 0),
-        PkModel::TwoCptOral => (3, 1),    // [depot, central, periph]
-        PkModel::TwoCptTransit => (3, 1), // [depot (lumped transit), central, periph]
-        PkModel::TwoCptIg => (3, 1),      // [depot (unabsorbed IG mass), central, periph]
-        PkModel::ThreeCptIv => (3, 0),
-        PkModel::ThreeCptOral => (4, 1), // [depot, central, periph1, periph2]
-    }
+    pk_model.topology().state_layout()
 }
 
 /// Number of cycles to expand for SS equilibration in the event-driven
@@ -872,20 +854,12 @@ fn propagate_with_bounds(
             }
             if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
                 let r = d.rate;
-                match (pk_model, d.cmt) {
-                    (PkModel::OneCptIv, 1) => rate_central += r,
-                    (PkModel::OneCptOral, 1) => rate_depot += r,
-                    (PkModel::OneCptOral, 2) => rate_central += r,
-                    (PkModel::TwoCptIv, 1) => rate_central += r,
-                    (PkModel::TwoCptIv, 2) => rate_periph1 += r,
-                    (PkModel::TwoCptOral, 1) => rate_depot += r,
-                    (PkModel::TwoCptOral, 2) => rate_central += r,
-                    (PkModel::ThreeCptIv, 1) => rate_central += r,
-                    (PkModel::ThreeCptIv, 2) => rate_periph1 += r,
-                    (PkModel::ThreeCptIv, 3) => rate_periph2 += r,
-                    (PkModel::ThreeCptOral, 1) => rate_depot += r,
-                    (PkModel::ThreeCptOral, 2) => rate_central += r,
-                    _ => panic!(
+                match pk_model.topology().dose_channel(d.cmt) {
+                    Some(Channel::Central) => rate_central += r,
+                    Some(Channel::Periph1) => rate_periph1 += r,
+                    Some(Channel::Periph2) => rate_periph2 += r,
+                    Some(Channel::Depot) => rate_depot += r,
+                    None => panic!(
                         "event-driven PK: infusion into compartment {} not supported \
                          for model {:?}. Supported: central for all models; depot (cmt 1) \
                          for oral models; periph1/2 for 2- and 3-cpt IV models. Oral \

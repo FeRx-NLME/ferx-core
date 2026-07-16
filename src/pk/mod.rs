@@ -4,6 +4,7 @@ pub mod event_driven;
 pub mod ode_template;
 pub mod one_compartment;
 pub mod three_compartment;
+pub(crate) mod topology;
 pub mod two_compartment;
 
 use crate::types::{CompiledModel, DoseEvent, PkModel, PkParams, ScalingSpec, Subject};
@@ -1661,18 +1662,7 @@ pub fn analytical_state_at_times(
          return empty states for analytical+reset subjects instead"
     );
     let lagtime = pk_params.lagtime();
-    let n_states = match pk_model {
-        PkModel::OneCptIv => 1,
-        PkModel::OneCptOral => 2,
-        PkModel::OneCptTransit => 2,
-        PkModel::OneCptIg => 2,
-        PkModel::TwoCptIv => 2,
-        PkModel::TwoCptOral => 3,
-        PkModel::TwoCptTransit => 3,
-        PkModel::TwoCptIg => 3,
-        PkModel::ThreeCptIv => 3,
-        PkModel::ThreeCptOral => 4,
-    };
+    let n_states = pk_model.topology().n_states;
     times
         .iter()
         .map(|&t| {
