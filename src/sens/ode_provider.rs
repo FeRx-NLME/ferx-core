@@ -389,11 +389,39 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     (1..=MAX_ODE_SENS_DIM).contains(&n)
 }
 
+/// True when `subject` has an infusion (RATE>0) into a compartment fed by a built-in absorption
+/// input-rate forcing (#719 gap 2). The f64 predictor serves this exactly — the dose is a
+/// zero-order source feeding the kernel (`R_in_inf`), with its plain `+rate` injection suppressed
+/// — but the dual sensitivity walk still injects that `+rate`, so it would double-count. The
+/// analytic gates therefore decline these subjects to the FD fallback, which differences the
+/// (exact, cheap) f64 prediction. An analytic infusion-into-kernel sensitivity is a follow-up
+/// (`rate_infused` is already `Dual2`-differentiable; only the walk's `+rate` suppression and the
+/// `F`-reshaped-window boundary jet remain).
+pub(crate) fn has_infusion_into_input_rate(model: &CompiledModel, subject: &Subject) -> bool {
+    let Some(ode) = model.ode_spec.as_ref() else {
+        return false;
+    };
+    !ode.input_rate.is_empty()
+        && subject.doses.iter().any(|d| {
+            d.is_infusion()
+                && ode
+                    .input_rate
+                    .iter()
+                    .any(|f| f.cmt == d.cmt.saturating_sub(1))
+        })
+}
+
 /// Per-subject scope gate, shared by the full (outer `Dual2`) and light (inner
 /// `Dual1`) ODE providers so a subject is served analytically for **both** the
 /// outer gradient and the inner EBE loop, or neither (the inner/outer scope must
 /// match — a split would mix an analytic gradient with an FD Jacobian).
 pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    // Infusion into a built-in absorption compartment (#719 gap 2) → FD fallback (see
+    // `has_infusion_into_input_rate`): the f64 prediction is exact, but the dual walk's `+rate`
+    // injection would double-count the mass the convolved `R_in_inf` already delivers.
+    if has_infusion_into_input_rate(model, subject) {
+        return false;
+    }
     // Model-level scope + time-varying covariates (the static dual walk holds the PK
     // params constant across the integration). A `TIME`-built-in structural parameter
     // is per-event dynamic for the same reason a TV covariate is, so the static walk
@@ -514,6 +542,12 @@ pub(crate) fn modeled_slot_for(
 }
 
 pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> bool {
+    // Infusion into a built-in absorption compartment (#719 gap 2) → FD fallback (the f64
+    // prediction is exact; the dual walk would double-count the suppressed `+rate`). Same decline
+    // as the static gate above — see `has_infusion_into_input_rate`.
+    if has_infusion_into_input_rate(model, subject) {
+        return false;
+    }
     // The event-driven walk serves a subject with time-varying covariates, an estimated
     // lagtime (per-dose event-time saltation), a steady-state dose (dual SS equilibration),
     // **or** a rate-defined infusion under `F ≠ 1` (#419: the bioavailable window length is
@@ -2414,6 +2448,12 @@ fn ode_iov_subject_supported(
             .and_then(|o| o.rhs_program.as_ref())
             .is_some_and(|p| p.uses_time_vars())
     {
+        return None;
+    }
+    // Infusion into a built-in absorption compartment (#719 gap 2) → FD fallback under IOV too:
+    // the f64 prediction is exact, but the dual walk's `+rate` would double-count the mass the
+    // convolved `R_in_inf` already delivers (see `has_infusion_into_input_rate`).
+    if has_infusion_into_input_rate(model, subject) {
         return None;
     }
     // #486: a steady-state dose combined with a built-in absorption input-rate forcing

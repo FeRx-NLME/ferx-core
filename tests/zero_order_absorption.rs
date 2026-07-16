@@ -657,6 +657,42 @@ fn zero_order_steady_state_dosing_is_rejected() {
     );
 }
 
+#[test]
+fn infusion_into_zero_order_compartment_is_rejected() {
+    // An infusion (RATE>0) into a zero_order compartment is rejected with
+    // E_ABSORPTION_RATE_ZERO_ORDER (#719 gap 2): the density kernels now serve an infusion via
+    // the convolution `R_in_inf`, but a zero_order input is itself a spanning window, so infusing
+    // it is a window-with-window convolution (a follow-up).
+    use ferx_core::check_model_data;
+    let model = parse_full_model(ZERO_ORDER_MODEL)
+        .expect("zero_order model parses")
+        .model;
+    // RATE=25 → an infusion window of AMT/RATE = 4 h into the zero_order compartment (CMT 1).
+    let inf_dose = DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0);
+    let pop = Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![common::subject(
+            "1",
+            vec![inf_dose],
+            vec![1.0, 4.0, 8.0],
+            vec![0.0; 3],
+            vec![1; 3],
+        )],
+    };
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == "E_ABSORPTION_RATE_ZERO_ORDER"),
+        "infusion into a zero_order compartment must raise E_ABSORPTION_RATE_ZERO_ORDER, got: {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
 /// Tier-3 (slow): full FOCEI fit recovering the zero-order **duration**. Gated out
 /// of the default PR job; runs nightly / on estimation-touching pushes.
 ///

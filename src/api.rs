@@ -1303,28 +1303,60 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
         );
     }
 
-    // Infusion (RATE>0) into an input-rate compartment (data-level): the dose
-    // would be delivered twice — once as the `+rate` infusion injection in the
-    // ODE RHS wrapper, and again as `R_in(tad)` superposed by the input-rate
-    // forcing — silently ~doubling exposure. A transit dose carries its mass
-    // through `R_in` from the bolus amount; an infusion rate on that record is
-    // undefined, so reject it loudly. Both modeled coded-RATE forms (RATE=-2
-    // duration, RATE=-1 rate) are also infusions (`is_infusion()` is true for
-    // them), so they are caught here too.
-    let has_infusion = population.subjects.iter().any(|s| {
+    // Infusion (RATE>0) into a built-in absorption input-rate compartment (#719 gap 2). Supported
+    // for the smooth-density kernels: the dose is a *zero-order source feeding the kernel*, so
+    // `R_in` becomes the convolution `(F·amt/T)·[G(tad) − G(tad − T)]` (`R_in_inf`,
+    // `PreparedInputRate::rate_infused`), and the dose's plain `+rate` injection is suppressed
+    // (`active_infusions` skips the compartment) so there is no double count. Two combinations
+    // stay out of scope and are rejected here rather than silently mis-served:
+    //   * an infusion into a zero_order() window — infusing a spanning window is a
+    //     window-with-window convolution, a separate follow-up (like the SS case).
+    //   * a steady-state infusion (SS=1 + RATE>0) into an absorption compartment — neither the SS
+    //     equilibration (bolus-record only) nor the infusion convolution handles the periodic
+    //     zero-order-into-kernel steady state yet.
+    //
+    // Unlike the SS-*bolus* gates above (`has_ss` / `has_ss_zero_order`), this reject is
+    // **`II`-independent** — it fires on `d.ss && d.is_infusion()` with no `d.ii > 0.0` condition.
+    // An SS bolus with `II ≤ 0` legitimately degrades to a single non-SS bolus (a valid prediction,
+    // flagged by the `W_STEADY_STATE_II` warning), so those gates let it through. But an SS infusion
+    // is an *unsupported combination*: were it allowed to skip this gate on `II = 0`, it would fall
+    // to the plain-infusion branch of `add_prepared_input_rate_forcing` and be silently served as a
+    // single non-SS infusion — a different model than the SS one asked for. Rejecting regardless of
+    // `II` also keeps this ODE-native gate consistent with the closed-form absorption gate
+    // (`check_absorption_closed_form_support`, which rejects `dose.ss && dose.is_infusion()` with no
+    // `II` condition), so the same subject errors on both paths instead of one erroring and the
+    // other silently mis-serving.
+    let has_ss_infusion = population.subjects.iter().any(|s| {
         s.doses
             .iter()
-            .any(|d| d.is_infusion() && cmts.contains(&d.cmt))
+            .any(|d| d.ss && d.is_infusion() && cmts.contains(&d.cmt))
     });
-    if has_infusion {
+    let has_infusion_zero_order = population.subjects.iter().any(|s| {
+        s.doses
+            .iter()
+            .any(|d| d.is_infusion() && zero_order_cmts.contains(&d.cmt))
+    });
+    if has_ss_infusion {
         diags.push(
             Diagnostic::error(
-                "E_ABSORPTION_RATE",
-                "An infusion (RATE>0) into a built-in absorption input-rate \
-                 compartment (e.g. transit() or igd()) is not supported: the dose mass is \
-                 delivered through the input-rate function R_in computed from the dose \
-                 amount, so an infusion rate would double-count it. Use a plain bolus \
-                 dose record (RATE=0) into the absorption compartment.",
+                "E_ABSORPTION_SS_INFUSION",
+                "A steady-state infusion (SS=1 with RATE>0) into a built-in absorption \
+                 compartment is not yet supported: steady-state dosing and infusion-into-kernel \
+                 are each supported alone, but their combination (a periodic zero-order source \
+                 feeding the absorption kernel) is a follow-up. Use a non-SS infusion, or an SS \
+                 bolus.",
+            )
+            .with_block("odes"),
+        );
+    } else if has_infusion_zero_order {
+        diags.push(
+            Diagnostic::error(
+                "E_ABSORPTION_RATE_ZERO_ORDER",
+                "An infusion (RATE>0) into a zero_order() absorption compartment is not yet \
+                 supported: unlike the pointwise density kernels (transit/igd/weibull/\
+                 first_order), a zero-order input is itself a spanning window, so infusing it is a \
+                 window-with-window convolution (a follow-up). Use a plain bolus into the \
+                 zero_order compartment, or a density absorption kernel.",
             )
             .with_block("odes"),
         );
@@ -1647,6 +1679,20 @@ pub(crate) fn check_absorption_closed_form_support(
                     subject.id, dose.cmt
                 ));
             }
+            if dose.ss && dose.is_infusion() {
+                // A steady-state *infusion* into a closed-form absorption model has no route:
+                // the twin serves SS (bolus) and infusion each alone, but not their combination
+                // (a periodic zero-order source feeding the kernel), so reject rather than reroute
+                // into a case the twin mis-handles (same scope as the ODE-path
+                // `E_ABSORPTION_SS_INFUSION`).
+                return Some(format!(
+                    "{name} does not support a steady-state infusion (SS=1 with RATE>0) into an \
+                     absorption compartment (subject {}): steady-state dosing and infusion are \
+                     each supported alone (rerouted to the ODE twin), but their combination is a \
+                     follow-up. Use a non-SS infusion, or an SS bolus.",
+                    subject.id
+                ));
+            }
             if dose.ss {
                 // Steady-state on a closed-form absorption model reroutes to its ODE twin
                 // (#719, like TV-cov/TIME/IOV above): the twin serves SS through the absorption
@@ -1671,12 +1717,19 @@ pub(crate) fn check_absorption_closed_form_support(
                 }
             }
             if dose.is_infusion() {
-                return Some(format!(
-                    "{name} does not support infusion doses (subject {}): the analytic \
-                     absorption closed form absorbs an instantaneous bolus through the \
-                     absorption process. Use an ODE absorption model for a zero-order input.",
-                    subject.id
-                ));
+                // Infusion on a closed-form absorption model reroutes to its ODE twin (#719 gap
+                // 2): the twin delivers the dose as a zero-order source feeding the kernel (the
+                // convolved `R_in_inf`), which the instantaneous-bolus closed form cannot express.
+                // Reject only a twin-less form; `effective_for` performs the reroute.
+                if model.absorption_ode_equivalent.is_none() {
+                    return Some(format!(
+                        "{name} does not support infusion doses in this form (subject {}): an \
+                         infusion reroutes to the ODE absorption twin, but this model has no twin \
+                         (an unrecognised closed form). Write the model as an ODE transit()/igd() \
+                         forcing in [odes] for a zero-order input into the kernel.",
+                        subject.id
+                    ));
+                }
             }
         }
     }

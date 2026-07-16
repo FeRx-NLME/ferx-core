@@ -3360,6 +3360,11 @@ impl CompiledModel {
                 // `R_in`). The SS + lagtime combination the twin can't yet serve is rejected
                 // upfront by `check_absorption_closed_form_support`, so it never reaches here.
                 || subject.has_periodic_ss_dose()
+                // Infusion doses reroute to the ODE twin too (#719 gap 2): the closed form
+                // absorbs an instantaneous bolus, but the twin delivers the dose as a zero-order
+                // source feeding the kernel (`R_in_inf`). The SS-infusion / zero-order-window
+                // combinations the twin can't yet serve are rejected upfront.
+                || subject.doses.iter().any(|d| d.is_infusion())
             {
                 return eq.get_or_build();
             }

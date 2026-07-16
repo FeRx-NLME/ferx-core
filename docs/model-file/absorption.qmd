@@ -128,16 +128,40 @@ scoped follow-up. Two `SS` combinations remain **rejected with a clear error**: 
 distinct periodic-window equilibration) and an absorption **lagtime**
 (`E_ABSORPTION_SS_LAG` — the SS + lagtime pre-arrival seed is still bolus-only).
 
+### Infusion (`RATE>0`) into an absorption compartment
+
+An infusion into a built-in absorption compartment — the density kernels
+`transit()`, `igd()`, `weibull()`, and `first_order()` — **is supported** (#719):
+the dose is a **zero-order source feeding the kernel**. Instead of an
+instantaneous bolus, its mass is released at a constant rate over the infusion
+window `T` (`= F·amt/RATE`), so `R_in` becomes the convolution of the kernel with
+that rectangle,
+
+$$R_{\text{in,inf}}(t_{ad}) = \frac{F\cdot amt}{T}\,\bigl[G(t_{ad}) - G(t_{ad}-T)\bigr],$$
+
+where `G` is the kernel's absorbed-fraction CDF (`PreparedInputRate::rate_infused`).
+This is mass-exact (`∫R_in_inf = F·amt`) and reduces to the bolus `R_in` as `T→0`;
+the dose's plain `+rate` injection is suppressed so it is not double-counted. It
+matches NONMEM's native `ADVAN2` zero-order-into-depot behaviour exactly (see
+`tests/infusion_absorption_nonmem_anchor.rs`) and an explicit sub-dose train. A
+closed-form `pk *_transit` / `*_ig` model with an infusion reroutes to its ODE
+twin automatically. Because every kernel's CDF is a closed form
+(`regularized_gamma_p` for transit, the two-`Φ` IG CDF, elementary for
+Weibull/first-order), `R_in_inf` is exact and cheap; fit-time sensitivities use a
+finite-difference fallback (the dual walk's `+rate` suppression is a follow-up),
+which runs at normal FOCEI speed since an infusion prediction needs no
+equilibration.
+
+Two infusion combinations remain **rejected with a clear error**: into a
+`zero_order()` window (`E_ABSORPTION_RATE_ZERO_ORDER` — a window-with-window
+convolution) and a **steady-state infusion** (`SS=1` with `RATE>0`,
+`E_ABSORPTION_SS_INFUSION` — a periodic zero-order source feeding the kernel).
+
 ### Not yet supported (Phase 0)
 
 These combinations are **rejected with a clear error** rather than silently
 mis-modeled:
 
-- **An infusion (`RATE>0`) into a transit compartment** (`E_ABSORPTION_RATE`) —
-  the dose mass is delivered through `R_in`, computed from the dose *amount*, so
-  an infusion rate on the same record would double-count it. Use a plain bolus
-  record (`RATE=0`) into the absorption compartment; the transit chain provides
-  the input-rate shape.
 - **A `[diffusion]` block (SDE/EKF) together with `transit()`**
   (`E_ABSORPTION_DIFFUSION`) — the EKF propagation does not yet carry the
   input-rate forcing.
@@ -196,11 +220,12 @@ ODE forcing **bit-for-bit** at non-zero per-occasion κ, including multiple dose
 small, pre-existing ~8 OFV units from NONMEM — an ODE-path IOV marginal offset shared by every
 ODE+IOV model, orthogonal to this reroute, tracked in
 [#810](https://github.com/FeRx-NLME/ferx-core/issues/810) and guarded (not asserted-equal) by
-`tests/transit_iov_nonmem_anchor.rs`.) A **steady-state (`SS=1`) dose reroutes** to the
-`transit()` ODE forcing automatically (#719) — the twin equilibrates it through the
-absorption kernel — exactly as TV-covariate and IOV subjects do. **Infusions, system resets
-(EVID=3/4), a non-depot (`CMT≠1`) dose, and a `depot` initial amount are still rejected** with
-an actionable message — use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
+`tests/transit_iov_nonmem_anchor.rs`.) A **steady-state (`SS=1`) dose or an infusion
+(`RATE>0`) reroutes** to the `transit()` ODE forcing automatically (#719) — the twin
+equilibrates SS through the absorption kernel and delivers an infusion as a zero-order source
+feeding it — exactly as TV-covariate and IOV subjects do. **System resets (EVID=3/4), a
+non-depot (`CMT≠1`) dose, and a `depot` initial amount are still rejected** with an actionable
+message — use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
 tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
 drop-in choice when you need a feature the closed form does not yet cover.
 
@@ -253,8 +278,8 @@ The **domain** (`α < KTR`, since `α ≥ β`) and **scope/limits** are identica
 covariates, `TIME`-dependent parameters, and IOV (`n_kappa > 0`) transparently rerouted to
 an exact 2-cpt ODE `transit()` twin; the flip-flop `α ≥ KTR` regime likewise auto-rerouted to
 that twin per evaluation — exactly as for `one_cpt_transit` above; an `SS=1` dose likewise
-reroutes to the twin (#719), while infusions / resets / non-depot (`CMT≠1`) doses / `depot`-init
-are still rejected — use an ODE transit model for those).
+reroutes to the twin (#719); an infusion likewise reroutes (gap 2), while resets / non-depot
+(`CMT≠1`) doses / `depot`-init are still rejected — use an ODE transit model for those).
 
 [`examples/two_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_transit.ferx)
 is a complete self-contained example:
@@ -302,8 +327,8 @@ parameters, and **IOV** (`n_kappa > 0`) are transparently rerouted to an exact O
 twin (so they are supported, not rejected — IOV via the twin's exact cross-occasion
 carryover, #719); the **flip-flop** regime (`ke ≥ 1/(2·MAT·CV²)`) is likewise
 auto-rerouted to that twin per evaluation, with a `W_IG_FLIP_FLOP` note at the
-typical-value estimates. A **steady-state (`SS=1`) dose reroutes** to the `igd()` twin
-too (#719). **Infusions, system resets (EVID=3/4), a non-depot (`CMT≠1`) dose, and a
+typical-value estimates. A **steady-state (`SS=1`) dose or an infusion (`RATE>0`) reroutes**
+to the `igd()` twin too (#719). **System resets (EVID=3/4), a non-depot (`CMT≠1`) dose, and a
 `depot` initial amount are still rejected**
 with an actionable message — use the `igd()` ODE forcing below for those. A flip-flop
 model carrying a `lagtime`/`f`/user-`[odes]` mapping has no ODE twin to route to and is
@@ -413,9 +438,10 @@ convention:
 - **Parameter domains** `mat > 0`, `cv2 > 0` are validated at typical values
   (`E_ABSORPTION_DOMAIN`) and clamped for transient mid-fit excursions — a
   log-normal parameterisation avoids excursions and is recommended.
-- The same **not-yet-supported** combinations (an infusion `RATE>0`, `SS=1`, or a
-  `[diffusion]` block into the input-rate compartment) are rejected with a clear
-  error.
+- Steady-state (`SS=1`) dosing and an infusion (`RATE>0`) into the input-rate
+  compartment are now **supported** (#719 — SS through a periodic-sum `R_in`,
+  infusion as a zero-order source feeding the kernel); a `[diffusion]` block
+  (SDE/EKF) into the input-rate compartment is still rejected with a clear error.
 
 ### Worked example
 
@@ -542,9 +568,10 @@ Add `weibull(...)` to the **central** compartment's ODE, writing the state as an
 - **Parameter domains** `td > 0`, `beta > 0` are validated at typical values
   (`E_ABSORPTION_DOMAIN`) and clamped for transient mid-fit excursions — a
   log-normal parameterisation avoids excursions and is recommended.
-- The same **not-yet-supported** combinations (an infusion `RATE>0`, `SS=1`, or a
-  `[diffusion]` block into the input-rate compartment) are rejected with a clear
-  error.
+- Steady-state (`SS=1`) dosing and an infusion (`RATE>0`) into the input-rate
+  compartment are now **supported** (#719 — SS through a periodic-sum `R_in`,
+  infusion as a zero-order source feeding the kernel); a `[diffusion]` block
+  (SDE/EKF) into the input-rate compartment is still rejected with a clear error.
 
 Unlike `transit`/`igd`, the Weibull has **no elementary closed form** with linear
 disposition, so it is permanently a numerical-ODE model — it always requires an
@@ -625,9 +652,10 @@ term (there is no separate `sequential` keyword):
   window stays `dur`). Do not multiply `zero_order(...)` by `F`.
 - **Parameter domain** `dur > 0` is validated at typical values
   (`E_ABSORPTION_DOMAIN`) and clamped for transient mid-fit excursions.
-- The same **not-yet-supported** combinations (an infusion `RATE>0`, `SS=1`, or a
-  `[diffusion]` block into the input-rate compartment) are rejected with a clear
-  error.
+- Steady-state (`SS=1`) dosing and an infusion (`RATE>0`) into the input-rate
+  compartment are now **supported** (#719 — SS through a periodic-sum `R_in`,
+  infusion as a zero-order source feeding the kernel); a `[diffusion]` block
+  (SDE/EKF) into the input-rate compartment is still rejected with a clear error.
 
 The hard cutoff at `tad = dur` is handled exactly: ferx breaks the integration
 timeline at the window end and delivers the input as a per-segment constant (the
