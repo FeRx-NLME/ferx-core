@@ -572,24 +572,27 @@ fn ig_fit_err(pop: &Population) -> String {
         .expect_err("fit should reject the unsupported IG configuration")
 }
 
+/// Steady-state (`SS=1`) dosing on a closed-form inverse-Gaussian model reroutes to its
+/// `igd()` ODE twin (#719) rather than being rejected: the twin equilibrates the dose
+/// through the IG absorption kernel. The rerouted analytic path must match the hand-written
+/// `igd()` ODE at steady state (eta = 0).
 #[test]
-fn ig_steady_state_dose_rejected() {
+fn ig_steady_state_matches_ode() {
+    let (an_src, ode_src) = build_pair_1cpt(false, false);
     let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
-    let e = ig_fit_err(&population(vec![ss], vec![1.0, 4.0, 8.0]));
-    assert!(
-        e.contains("steady-state") || e.contains("SS"),
-        "expected an SS-rejection message, got: {e}"
-    );
+    let pop = population(vec![ss], vec![1.0, 4.0, 8.0, 11.5]);
+    assert_equiv(&an_src, &ode_src, "ig-ss", &pop, ACCUM_RTOL);
 }
 
+/// An infusion on a closed-form inverse-Gaussian model reroutes to its `igd()` ODE twin (#719
+/// gap 2) and matches it — the twin delivers the dose as a zero-order source feeding the IG
+/// kernel (`R_in_inf`).
 #[test]
-fn ig_infusion_dose_rejected() {
-    let inf = DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0); // rate > 0 → infusion
-    let e = ig_fit_err(&population(vec![inf], vec![1.0, 4.0, 8.0]));
-    assert!(
-        e.contains("infusion"),
-        "expected an infusion-rejection message, got: {e}"
-    );
+fn ig_infusion_matches_ode() {
+    let (an_src, ode_src) = build_pair_1cpt(false, false);
+    let inf = DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0); // rate 25 → 4 h window
+    let pop = population(vec![inf], vec![1.0, 2.0, 4.0, 6.0, 10.0]);
+    assert_equiv(&an_src, &ode_src, "ig-infusion", &pop, ACCUM_RTOL);
 }
 
 #[test]

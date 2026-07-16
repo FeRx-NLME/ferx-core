@@ -80,6 +80,7 @@ use crate::estimation::importance_sampling::build_proposal;
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
 use crate::stats::likelihood::individual_nll_into_with_schedule;
+use crate::stats::util::log_sum_exp as logsumexp;
 use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Subject};
 
 /// Upper bound on `n_agq`. Beyond ~20 nodes the Golub–Welsch eigenproblem starts to lose
@@ -145,15 +146,6 @@ pub(crate) fn gauss_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
     // independent of whatever order the eigensolver happened to converge in.
     pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("GH nodes are finite"));
     pairs.into_iter().unzip()
-}
-
-/// Numerically stable `log Σ exp(xᵢ)`.
-fn logsumexp(xs: &[f64]) -> f64 {
-    let max = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if !max.is_finite() {
-        return max;
-    }
-    max + xs.iter().map(|x| (x - max).exp()).sum::<f64>().ln()
 }
 
 /// The per-subject **integration variable** and its prior.
@@ -2005,15 +1997,5 @@ mod tests {
         // 21^50 overflows u64/usize many times over; must saturate, not wrap to something
         // small that would sneak past the MAX_AGQ_GRID check.
         assert_eq!(grid_size(21, 50), usize::MAX);
-    }
-
-    #[test]
-    fn logsumexp_is_stable_and_handles_sentinels() {
-        let want = (1.0f64.exp() + 2.0f64.exp()).ln();
-        assert!((logsumexp(&[1.0, 2.0]) - want).abs() < 1e-12);
-        // Huge magnitudes must not overflow.
-        assert!((logsumexp(&[1e5, 1e5]) - (1e5 + 2.0f64.ln())).abs() < 1e-9);
-        // A diverged node (the −1e20 term) is simply ignored next to a live one.
-        assert!((logsumexp(&[-1e20, 3.0]) - 3.0).abs() < 1e-12);
     }
 }

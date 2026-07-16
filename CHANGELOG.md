@@ -138,6 +138,36 @@ section of the SDLC for the versioning policy).
   compartment lag (`tests/per_route_lag.rs`) and by a direct NONMEM `ADVAN13 $DES` anchor
   — ferx's objective at NONMEM's optimum matches `#OBJV = −882.357` to ~1e-6
   (`tests/per_route_lag_nonmem_anchor.rs`).
+- **Infusion (`RATE>0`) into a built-in absorption compartment** (#719): an
+  infusion into a `transit()` / `igd()` / `weibull()` / `first_order()` absorption
+  input-rate compartment is now supported on the ODE path — previously rejected
+  with `E_ABSORPTION_RATE`. The dose is treated as a **zero-order source feeding
+  the kernel**: its mass is released at a constant rate over the infusion window
+  `T`, so `R_in` becomes the convolution `(F·amt/T)·[G(t) − G(t − T)]` of the
+  kernel with the rectangle (`G` = the kernel's absorbed-fraction CDF), and the
+  dose's plain `+rate` injection is suppressed. Predictions match NONMEM's native
+  `ADVAN2` zero-order-into-depot behaviour and an explicit sub-dose train.
+  Closed-form `pk *_transit` / `*_ig` models with an infusion reroute to their ODE
+  twin automatically. Sensitivities use a finite-difference fallback (at normal
+  FOCEI speed — an infusion prediction needs no equilibration). Still rejected,
+  with clear codes: an infusion into a `zero_order()` window
+  (`E_ABSORPTION_RATE_ZERO_ORDER`) and a steady-state infusion
+  (`E_ABSORPTION_SS_INFUSION`).
+- **Steady-state (`SS=1`) dosing into a built-in absorption compartment** (#719):
+  an `SS=1` dose into a `transit()` / `igd()` / `weibull()` / `first_order()`
+  absorption input-rate compartment is now supported on the ODE path — previously
+  rejected with `E_ABSORPTION_SS`. The dose is equilibrated *through* the
+  absorption kernel (the periodic pulse train is superposed as `R_in`, and the
+  disposition trough is the periodic steady state, a closed form
+  `(I − M)⁻¹·b` for a linear disposition), so predictions match an explicit long
+  run-in of the same schedule and NONMEM's exact analytic `ADVAN2` steady state.
+  Closed-form `pk *_transit` / `*_ig` models with an `SS` dose reroute to their ODE
+  twin automatically. `fit()` on an SS-absorption model converges; its sensitivities
+  currently use a finite-difference fallback of the (exact) prediction, so large-dataset
+  fits are slower than an analytic ODE model pending an analytic dual SS-equilibration.
+  Still rejected, with clearer codes: `SS` into a `zero_order()` window
+  (`E_ABSORPTION_SS_ZERO_ORDER`) and `SS` combined with an absorption lagtime
+  (`E_ABSORPTION_SS_LAG`).
 - **Flat (zero-gradient) thetas are now frozen at start instead of killing the fit** (#826).
   A pre-flight check computes the outer gradient at the initial estimate; any non-fixed
   theta whose gradient is ≈ 0 (a parameter that never reaches the objective — typically

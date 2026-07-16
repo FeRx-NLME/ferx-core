@@ -15,7 +15,7 @@
 //!   the point of `run_covariance` is to refuse stale inputs.
 
 use crate::api::{cov_diagnostics, extract_standard_errors, resolve_covariance_status};
-use crate::estimation::outer_optimizer::{compute_covariance, CovarianceStepResult};
+use crate::estimation::covariance::{run_covariance_step_inner, CovStepOutcome};
 use crate::estimation::parameterization::{compute_mu_k, pack_params, packed_len, unpack_params};
 use crate::estimation::uncertainty_samples::fitted_params_from_result;
 use crate::io::hash::sha256_file;
@@ -254,10 +254,17 @@ pub fn run_covariance(
             options.inner_restarts,
         );
 
-    // --- Run the covariance step (identical to the inline path in fit()) ---
-    let cov_timer = std::time::Instant::now();
-    let mut new_warnings: Vec<String> = Vec::new();
-    let covariance_matrix: Option<nalgebra::DMatrix<f64>> = match compute_covariance(
+    // --- Run the covariance step (UNGATED: calling `run_covariance` IS the
+    // request to run it, so it deliberately ignores `options.run_covariance_step`;
+    // hence `run_covariance_step_inner`, not the gated `run_covariance_step`). The
+    // `FailedNonPd` proposal is only useful to the SIR fallback, a separate step
+    // here — callers wanting it run `run_sir` afterwards — so it is discarded.
+    let CovStepOutcome {
+        matrix: covariance_matrix,
+        wall_time_secs: covariance_wall_time_secs,
+        warnings: mut new_warnings,
+        sir_fallback_proposal: _,
+    } = run_covariance_step_inner(
         &x_hat,
         &params,
         model_ref,
@@ -266,25 +273,8 @@ pub fn run_covariance(
         &h_matrices,
         &kappas,
         options,
-    ) {
-        CovarianceStepResult::Success(out) => {
-            new_warnings.extend(out.warnings);
-            Some(out.matrix)
-        }
-        CovarianceStepResult::Unusable(msg) => {
-            new_warnings.push(msg);
-            None
-        }
-        CovarianceStepResult::FailedNonPd { reason, .. } => {
-            // The |eigenvalue|-rectified proposal is only useful to the SIR
-            // fallback, which is a separate step here — surface the diagnostic
-            // and leave the covariance unavailable. Callers wanting the SIR
-            // fallback run `run_sir` afterwards.
-            new_warnings.push(reason);
-            None
-        }
-    };
-    let covariance_wall_time_secs = cov_timer.elapsed().as_secs_f64();
+        None,
+    );
 
     // --- Build the refreshed FitResult ------------------------------------
     let (se_theta, se_omega, se_sigma, se_kappa) =

@@ -8023,7 +8023,7 @@ mod tests {
         let occasions = vec![1u32, 1, 1, 2, 2, 2];
         let obs_wts = [70.0, 72.0, 78.0, 88.0, 90.0, 95.0];
         let n = obs_times.len();
-        let mut wt_map = |w: f64| {
+        let wt_map = |w: f64| {
             let mut m = std::collections::HashMap::new();
             m.insert("WT".to_string(), w);
             m

@@ -3257,6 +3257,9 @@ mod tests {
                         .map(|r| match r {
                             ObsRecord::DiscreteState { time, .. }
                             | ObsRecord::Count { time, .. } => *time,
+                            // Reachable only when non-default endpoint features add
+                            // more `ObsRecord` variants; unreachable under default features.
+                            #[allow(unreachable_patterns)]
                             other => panic!("{set_name}/{missing}: unexpected record {other:?}"),
                         })
                         .collect();

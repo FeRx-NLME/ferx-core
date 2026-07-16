@@ -249,7 +249,15 @@ pub fn solve_ekf(
         // Active infusion rates for this segment (shared with the FOCEI ODE
         // path so the F·RATE / span / lag / reset semantics stay in lockstep).
         // The EKF path has no per-dose lagtimes and no system resets.
-        let active = active_infusions(doses, t_start, t_end, &[], &dose_f_bio, f64::NEG_INFINITY);
+        let active = active_infusions(
+            &[],
+            doses,
+            t_start,
+            t_end,
+            &[],
+            &dose_f_bio,
+            f64::NEG_INFINITY,
+        );
 
         let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
             rhs(y, p, t, dy);

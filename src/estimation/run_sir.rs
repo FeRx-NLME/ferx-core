@@ -483,7 +483,6 @@ mod tests {
         // wrapper uses them as-is — no hash verification. Tampering with
         // the on-disk files (so the recorded hashes no longer match)
         // must NOT trigger a hash mismatch error in this branch.
-        use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let (model_path, data_path) = copy_example_to_tempdir(dir.path());
 

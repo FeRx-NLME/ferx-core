@@ -1428,29 +1428,7 @@ impl PkModel {
     /// this set is rejected at parse time rather than silently mis-routed (no-TV
     /// path) or panicking (event-driven path).
     pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
-        match self {
-            PkModel::OneCptIv => &[1],
-            // Oral: cmt 1 = depot (zero-order-into-depot, #400), cmt 2 = central
-            // (depot-bypassing infusion).
-            PkModel::OneCptOral => &[1, 2],
-            // Transit models a bolus absorbed through the Gamma transit chain;
-            // modeled-duration infusions are unsupported in v1, so a `D{cmt}` on a
-            // transit model is rejected at parse (#386).
-            PkModel::OneCptTransit => &[],
-            // Inverse-Gaussian, like transit: absorbs an instantaneous bolus through
-            // the IG absorption-time density; modeled-duration infusions are
-            // unsupported, so a `D{cmt}` on an IG model is rejected at parse (#790).
-            PkModel::OneCptIg => &[],
-            PkModel::TwoCptIv => &[1, 2],
-            PkModel::TwoCptOral => &[1, 2],
-            // Like the 1-cpt transit: modeled-duration infusions unsupported in v1,
-            // so a `D{cmt}` on a 2-cpt transit model is rejected at parse (#386).
-            PkModel::TwoCptTransit => &[],
-            // Inverse-Gaussian 2-cpt: same as the 1-cpt IG (#790).
-            PkModel::TwoCptIg => &[],
-            PkModel::ThreeCptIv => &[1, 2, 3],
-            PkModel::ThreeCptOral => &[1, 2],
-        }
+        self.topology().infusable_compartments()
     }
 
     /// Resolve a `[structural_model]` model name (canonical or long-form alias,
@@ -3363,16 +3341,30 @@ impl CompiledModel {
     /// subject — a `TIME`-dependent structural parameter or time-varying covariates make the
     /// disposition switch mid-absorption, which the per-dose absorption convolution assumes
     /// constant, or IOV (`n_kappa > 0`, #719) needs cross-occasion dose carryover (#104) that
-    /// the superposition cannot express — return its exact ODE (`transit()` / `igd()`) equivalent
+    /// the superposition cannot express, or a **steady-state** (`SS=1`) dose (#719) needs the
+    /// periodic pulse train equilibrated through the absorption kernel — which the ODE twin
+    /// does (`ode::predictions::equilibrate_ss_state`) but the closed form has no periodic-sum
+    /// form for — return its exact ODE (`transit()` / `igd()`) equivalent
     /// (`absorption_ode_equivalent`, built at parse time); otherwise `self`. Constant-parameter,
-    /// non-IOV subjects keep the fast, exact closed form. The equivalent shares this model's θ/η layout,
-    /// so callers pass the same parameter vector (#486, #790). A no-op (`self`) for every model
-    /// without an ODE twin.
+    /// non-IOV, non-SS subjects keep the fast, exact closed form. The equivalent shares this
+    /// model's θ/η layout, so callers pass the same parameter vector (#486, #790). A no-op
+    /// (`self`) for every model without an ODE twin.
     pub fn effective_for<'a>(&'a self, subject: &Subject) -> &'a CompiledModel {
         if let Some(eq) = &self.absorption_ode_equivalent {
             if crate::parser::model_parser::compiled_model_uses_time_builtin(self)
                 || subject.has_tv_covariates()
                 || self.n_kappa > 0
+                // Steady-state doses reroute to the ODE twin (#719): the closed-form
+                // superposition has no periodic-sum SS form, but the twin equilibrates the
+                // dose through the absorption kernel (a pulse-train trough + periodic forward
+                // `R_in`). The SS + lagtime combination the twin can't yet serve is rejected
+                // upfront by `check_absorption_closed_form_support`, so it never reaches here.
+                || subject.has_periodic_ss_dose()
+                // Infusion doses reroute to the ODE twin too (#719 gap 2): the closed form
+                // absorbs an instantaneous bolus, but the twin delivers the dose as a zero-order
+                // source feeding the kernel (`R_in_inf`). The SS-infusion / zero-order-window
+                // combinations the twin can't yet serve are rejected upfront.
+                || subject.doses.iter().any(|d| d.is_infusion())
             {
                 return eq.get_or_build();
             }
@@ -3624,6 +3616,30 @@ impl CompiledModel {
         })
     }
 
+    /// Compartment-scoped variant of [`Self::has_lagtime`]: true only when a
+    /// lag actually resolves for a dose into 1-based `cmt` — a bare
+    /// `LAGTIME`/`ALAG` (which, per [`DoseAttrMap::lagtime`]'s fallback, applies
+    /// to every compartment lacking its own indexed override) or an
+    /// `ALAG{cmt}`/`LAGTIME{cmt}` indexed specifically for this compartment.
+    /// Unlike `has_lagtime`, a lag declared on a *different* compartment
+    /// (`ALAG2` while `cmt` is 1) does not count — used to scope the SS+lag
+    /// rejection (#719 gap 1) to the actual SS-dosed compartment.
+    pub fn has_lagtime_on_cmt(&self, cmt: usize) -> bool {
+        if self.pk_indices.iter().any(|&i| i == PK_IDX_LAGTIME) {
+            return true;
+        }
+        self.indiv_param_names.iter().any(|n| {
+            let u = n.to_uppercase();
+            u == "LAGTIME"
+                || u == "ALAG"
+                || (self.ode_spec.is_some()
+                    && matches!(
+                        DoseAttr::from_indexed_name(n),
+                        Some((DoseAttr::Lag, indexed_cmt)) if indexed_cmt == cmt
+                    ))
+        })
+    }
+
     /// True when the model wires in a bioavailability `F`/`Fn` parameter (on
     /// either engine). Mirrors [`Self::has_lagtime`]: the analytical route puts
     /// [`PK_IDX_F`] in `pk_indices` (from `f=` on the `[structural_model]`
@@ -3863,29 +3879,37 @@ impl CompiledModel {
             "analytical_compartment_names called on an ODE model — use ode_spec.state_names instead"
         );
         use std::sync::OnceLock;
-        macro_rules! names {
-            ($lock:ident, $($name:expr),+) => {{
+        // Exhaustive `match` on `pk_model` so adding an 11th `PkModel` variant is a
+        // COMPILE error here (a missing arm), not a runtime index-out-of-bounds on a
+        // fixed-size array. Each arm lazily materialises its own owned `Vec<String>`
+        // from the compartment-name literals in `pk::topology` — the single source of
+        // truth — that the public `&'static [String]` API returns.
+        macro_rules! cached_names {
+            ($lock:ident) => {{
                 static $lock: OnceLock<Vec<String>> = OnceLock::new();
-                $lock.get_or_init(|| vec![$($name.to_string()),+]).as_slice()
+                $lock
+                    .get_or_init(|| {
+                        self.pk_model
+                            .topology()
+                            .compartment_names
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .as_slice()
             }};
         }
         match self.pk_model {
-            PkModel::OneCptIv => names!(ONE_CMT_IV, "central"),
-            PkModel::OneCptOral => names!(ONE_CMT_ORAL, "depot", "central"),
-            PkModel::OneCptTransit => names!(ONE_CMT_TRANSIT, "depot", "central"),
-            PkModel::OneCptIg => names!(ONE_CMT_IG, "depot", "central"),
-            PkModel::TwoCptIv => names!(TWO_CMT_IV, "central", "peripheral"),
-            PkModel::TwoCptOral => names!(TWO_CMT_ORAL, "depot", "central", "peripheral"),
-            PkModel::TwoCptTransit => names!(TWO_CMT_TRANSIT, "depot", "central", "peripheral"),
-            PkModel::TwoCptIg => names!(TWO_CMT_IG, "depot", "central", "peripheral"),
-            PkModel::ThreeCptIv => names!(THREE_CMT_IV, "central", "peripheral1", "peripheral2"),
-            PkModel::ThreeCptOral => names!(
-                THREE_CMT_ORAL,
-                "depot",
-                "central",
-                "peripheral1",
-                "peripheral2"
-            ),
+            PkModel::OneCptIv => cached_names!(ONE_CPT_IV),
+            PkModel::OneCptOral => cached_names!(ONE_CPT_ORAL),
+            PkModel::OneCptTransit => cached_names!(ONE_CPT_TRANSIT),
+            PkModel::OneCptIg => cached_names!(ONE_CPT_IG),
+            PkModel::TwoCptIv => cached_names!(TWO_CPT_IV),
+            PkModel::TwoCptOral => cached_names!(TWO_CPT_ORAL),
+            PkModel::TwoCptTransit => cached_names!(TWO_CPT_TRANSIT),
+            PkModel::TwoCptIg => cached_names!(TWO_CPT_IG),
+            PkModel::ThreeCptIv => cached_names!(THREE_CPT_IV),
+            PkModel::ThreeCptOral => cached_names!(THREE_CPT_ORAL),
         }
     }
 }

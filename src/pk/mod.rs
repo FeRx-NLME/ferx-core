@@ -4,6 +4,7 @@ pub mod event_driven;
 pub mod ode_template;
 pub mod one_compartment;
 pub mod three_compartment;
+pub(crate) mod topology;
 pub mod two_compartment;
 
 use crate::types::{CompiledModel, DoseEvent, PkModel, PkParams, ScalingSpec, Subject};
@@ -1153,19 +1154,22 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
 
     let raw = if dose.ss && dose.ii > 0.0 {
         match pk_model {
-            // Transit / IG reject SS doses at parse (#386/#790); the periodic-sum SS
-            // closed form is a follow-up, so these arms are unreachable for a valid model.
+            // Transit / IG never reach this closed-form SS branch: an SS subject on such a
+            // model is rerouted to its `transit()`/`igd()` ODE twin by `effective_for`
+            // (#719) — the twin equilibrates the dose through the absorption kernel — so the
+            // closed-form dispatch below is only ever entered by non-SS subjects. (Before
+            // #719 these were rejected outright; now they are served, just on the ODE path.)
             PkModel::OneCptTransit => {
-                unreachable!("one_cpt_transit does not support SS doses (rejected at parse)")
+                unreachable!("one_cpt_transit SS doses reroute to the ODE twin (effective_for)")
             }
             PkModel::TwoCptTransit => {
-                unreachable!("two_cpt_transit does not support SS doses (rejected at parse)")
+                unreachable!("two_cpt_transit SS doses reroute to the ODE twin (effective_for)")
             }
             PkModel::OneCptIg => {
-                unreachable!("one_cpt_ig does not support SS doses (rejected at parse)")
+                unreachable!("one_cpt_ig SS doses reroute to the ODE twin (effective_for)")
             }
             PkModel::TwoCptIg => {
-                unreachable!("two_cpt_ig does not support SS doses (rejected at parse)")
+                unreachable!("two_cpt_ig SS doses reroute to the ODE twin (effective_for)")
             }
             PkModel::OneCptIv => {
                 if infusion {
@@ -1355,16 +1359,16 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
         match pk_model {
             // Transit / IG reject SS doses at parse (#386/#790) — unreachable for a valid model.
             PkModel::OneCptTransit => {
-                unreachable!("one_cpt_transit does not support SS doses (rejected at parse)")
+                unreachable!("one_cpt_transit SS doses reroute to the ODE twin (effective_for)")
             }
             PkModel::TwoCptTransit => {
-                unreachable!("two_cpt_transit does not support SS doses (rejected at parse)")
+                unreachable!("two_cpt_transit SS doses reroute to the ODE twin (effective_for)")
             }
             PkModel::OneCptIg => {
-                unreachable!("one_cpt_ig does not support SS doses (rejected at parse)")
+                unreachable!("one_cpt_ig SS doses reroute to the ODE twin (effective_for)")
             }
             PkModel::TwoCptIg => {
-                unreachable!("two_cpt_ig does not support SS doses (rejected at parse)")
+                unreachable!("two_cpt_ig SS doses reroute to the ODE twin (effective_for)")
             }
             PkModel::OneCptIv => {
                 let c = if infusion {
@@ -1658,18 +1662,7 @@ pub fn analytical_state_at_times(
          return empty states for analytical+reset subjects instead"
     );
     let lagtime = pk_params.lagtime();
-    let n_states = match pk_model {
-        PkModel::OneCptIv => 1,
-        PkModel::OneCptOral => 2,
-        PkModel::OneCptTransit => 2,
-        PkModel::OneCptIg => 2,
-        PkModel::TwoCptIv => 2,
-        PkModel::TwoCptOral => 3,
-        PkModel::TwoCptTransit => 3,
-        PkModel::TwoCptIg => 3,
-        PkModel::ThreeCptIv => 3,
-        PkModel::ThreeCptOral => 4,
-    };
+    let n_states = pk_model.topology().n_states;
     times
         .iter()
         .map(|&t| {
@@ -3792,11 +3785,12 @@ mod tests {
         assert!((states[1] - c).abs() <= 1e-9 * c.abs().max(1.0));
     }
 
-    /// SS doses are rejected at parse for IG; the SS arms of
-    /// `single_dose_concentration` / `single_dose_states` are `unreachable!` — calling
-    /// them directly with an SS dose must hit those guards (covers the defensive arms).
+    /// SS doses reroute to the ODE twin before reaching the closed forms (`effective_for`,
+    /// #719), so the SS arms of `single_dose_concentration` / `single_dose_states` are
+    /// `unreachable!` — calling them directly with an SS dose must hit those guards (covers the
+    /// defensive arms).
     #[test]
-    #[should_panic(expected = "one_cpt_ig does not support SS")]
+    #[should_panic(expected = "one_cpt_ig SS doses reroute")]
     fn single_dose_concentration_one_cpt_ig_ss_unreachable() {
         let p = PkParams::default();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
@@ -3804,18 +3798,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "two_cpt_ig does not support SS")]
+    #[should_panic(expected = "two_cpt_ig SS doses reroute")]
     fn single_dose_states_two_cpt_ig_ss_unreachable() {
         let p = PkParams::default();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let _ = single_dose_states(PkModel::TwoCptIg, &ss, 2.0, &p);
     }
 
-    /// SS doses are rejected at parse for transit (`check_absorption_closed_form_support`), so the
-    /// SS arm of `single_dose_concentration` is `unreachable!`; calling it directly
-    /// with an SS dose must hit that guard (covers the defensive arm + its message).
+    /// SS doses reroute to the ODE twin (`effective_for`, #719) before reaching the transit
+    /// closed form, so the SS arm of `single_dose_concentration` is `unreachable!`; calling it
+    /// directly with an SS dose must hit that guard (covers the defensive arm + its message).
     #[test]
-    #[should_panic(expected = "two_cpt_transit does not support SS")]
+    #[should_panic(expected = "two_cpt_transit SS doses reroute")]
     fn single_dose_concentration_two_cpt_transit_ss_unreachable() {
         let p = PkParams::default();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
@@ -3824,7 +3818,7 @@ mod tests {
 
     /// The mirror SS `unreachable!` arm in `single_dose_states`.
     #[test]
-    #[should_panic(expected = "two_cpt_transit does not support SS")]
+    #[should_panic(expected = "two_cpt_transit SS doses reroute")]
     fn single_dose_states_two_cpt_transit_ss_unreachable() {
         let p = PkParams::default();
         let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);

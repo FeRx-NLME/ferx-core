@@ -464,16 +464,19 @@ fn multiple_zero_order_rejected_on_simulate_path() {
 }
 
 #[test]
-fn parallel_steady_state_dosing_is_rejected() {
-    // SS=1 into a parallel/mixed compartment is rejected (E_ABSORPTION_SS), inherited
-    // kind-agnostically from the transit/igd/zero-order family: the steady-state
-    // equilibration applies the dose as a bolus pulse, not as R_in over the cycle.
+fn parallel_steady_state_dosing_is_supported() {
+    // SS=1 into a **parallel** (dual first-order) compartment is now supported (#719): both
+    // pathways are smooth density kernels, so each superposes its own periodic-sum R_in and
+    // the compartment equilibrates through the kernels — no E_ABSORPTION_SS. (A **mixed**
+    // model that includes a zero_order pathway is still rejected, with E_ABSORPTION_SS_ZERO_ORDER.)
     use ferx_core::check_model_data;
     let model = parse_full_model(PARALLEL_MODEL)
         .expect("parallel parses")
         .model;
     let mut ss_dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
     ss_dose.ii = 12.0;
+    let obs = vec![1.0, 4.0, 8.0, 11.5];
+    let n = obs.len();
     let pop = Population {
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
@@ -483,16 +486,22 @@ fn parallel_steady_state_dosing_is_rejected() {
         subjects: vec![common::subject(
             "1",
             vec![ss_dose],
-            vec![1.0, 4.0, 8.0],
-            vec![0.0; 3],
-            vec![1; 3],
+            obs,
+            vec![0.0; n],
+            vec![1; n],
         )],
     };
     let diags = check_model_data(&model, &pop);
     assert!(
-        diags.iter().any(|d| d.code == "E_ABSORPTION_SS"),
-        "SS into a parallel compartment must raise E_ABSORPTION_SS, got: {:?}",
+        !diags.iter().any(|d| d.code.starts_with("E_ABSORPTION_SS")),
+        "SS into a parallel (dual first-order) compartment is supported, got: {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+    let preds = ferx_core::predict(&model, &pop, &model.default_params);
+    assert_eq!(preds.len(), n);
+    assert!(
+        preds.iter().all(|p| p.pred.is_finite() && p.pred >= 0.0),
+        "SS parallel predictions must be finite: {preds:?}"
     );
 }
 
