@@ -307,12 +307,6 @@ fn state_layout(pk_model: PkModel) -> (usize, usize) {
     pk_model.topology().state_layout()
 }
 
-/// Number of cycles to expand for SS equilibration in the event-driven
-/// analytical path. Matches the ODE-side default in `ode/predictions.rs`
-/// for consistency. 50 cycles puts `exp(-50·k·II)` well below 1e-9 of
-/// the SS amount for any realistic PK.
-const EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES: usize = 50;
-
 /// Pre-equilibrate the event-driven analytical state to its SS value for
 /// an SS=1 dose. Same scheme as `ode/predictions.rs::equilibrate_ss_state`:
 /// reset state, then loop N cycles of (apply dose; propagate one II).
@@ -369,9 +363,9 @@ fn equilibrate_ss_state_event_driven(
     let mut eigen = crate::sens::propagate::EigenCacheG::default();
     // Shared early stop (#519, #532 review #6/#11): same mixed atol/rtol criterion and scaffold
     // (`SsStopTracker`) as the ODE f64 path.
-    let mut tracker = crate::ode::predictions::SsStopTracker::default();
+    let mut tracker = crate::dosing::SsStopTracker::default();
     let mut cycles_run = 0usize;
-    for cycle in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
+    for cycle in 0..crate::dosing::SS_EQUILIBRATION_CYCLES {
         if !is_inf {
             // Bolus pulse: instantaneous amount jump (with F).
             state[cmt_idx] += pk.bioavailable_amount(dose.amt);
@@ -391,7 +385,7 @@ fn equilibrate_ss_state_event_driven(
             break;
         }
     }
-    crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
+    crate::dosing::record_ss_equilibration_cycles(cycles_run);
 
     state
 }

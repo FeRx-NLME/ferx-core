@@ -19,7 +19,6 @@ use crate::sim::adaptive::{
 #[cfg(test)]
 use crate::sim::adaptive::MonitorSpec;
 use crate::types::{DoseEvent, PkParams, Subject};
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Epsilon used to decide whether an infusion fully spans a segment.
@@ -46,60 +45,30 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
     d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
 }
 
-/// Resolve any modeled-`RATE` doses (#324, e.g. `RATE=-2` → modeled duration
-/// `D{cmt}`) in `subject` to concrete (`Fixed`) doses. `pk_for_dose(k)` supplies
-/// the per-dose `PkParams::values` slice used to evaluate dose `k`'s modeled
-/// parameter — pass a constant closure for the no-TV-covariate paths (see
-/// [`resolve_subject_doses`]) or `|k| &pk_at_dose[k].values` for the per-dose
-/// event-driven path. Returns the subject **borrowed** (no allocation) when every
-/// dose is already `Fixed` (the common case — see [`Subject::all_doses_fixed`]),
-/// and an owned copy with resolved `doses` otherwise.
-///
-/// Single source of truth: every ODE entrypoint funnels its subject through this
-/// (or the thin [`resolve_subject_doses`] wrapper) before building the dose
-/// timeline, so the integrator and SS helpers only ever see a concrete
-/// `rate`/`duration` and a coded `RATE=-2` cannot reach them unresolved.
-///
-/// The owned branch clones the whole `Subject`, not just `doses`, because the
-/// downstream machinery ([`crate::pk::event_driven::EventSchedule::for_subject`],
-/// the SS pre-equilibration, the break-time timeline) consumes a unified
-/// `&Subject` and reads `obs_times` / `pk_only_times` / `reset_times` alongside
-/// the resolved `doses`. Cloning only `doses` would force every one of those deep
-/// helpers to take the resolved doses as a separate argument — the
-/// "thread the resolved doses through every helper" design that was deliberately
-/// rejected in favour of resolving once at the entrypoint. The clone is paid
-/// only on the (uncommon) modeled-`RATE` path; the all-`Fixed` path is borrowed.
-pub(crate) fn resolve_subject_doses_with<'a>(
-    subject: &'a Subject,
-    attr_map: &crate::types::DoseAttrMap,
-    pk_for_dose: impl Fn(usize) -> &'a [f64],
-) -> Cow<'a, Subject> {
-    // Fast path: with no compartment-indexed attribute there can be no modeled
-    // dose to resolve, so skip the per-dose `all_doses_fixed()` scan entirely —
-    // the overwhelmingly common case (no `D{cmt}`). A modeled dose cannot reach
-    // here with an empty map: it would have been rejected by the data gate first.
-    if attr_map.is_empty() || subject.all_doses_fixed() {
-        return Cow::Borrowed(subject);
-    }
-    let mut owned = subject.clone();
-    for (k, d) in owned.doses.iter_mut().enumerate() {
-        *d = d.resolve_rate(attr_map, pk_for_dose(k));
-    }
-    Cow::Owned(owned)
-}
+// Dose resolution + SS-equilibration primitives moved to `crate::dosing` (a neutral
+// leaf module) so pk/sens/api don't depend upward on ode/. A PRIVATE import (NOT a
+// `pub(crate) use` re-export) so these do not leak back out as `crate::ode::…` — the
+// upward dependency this move removed stays removed. The ode-internal resolve callers
+// + `equilibrate_ss_state` use the bare names; the `#[cfg(test)] mod tests` picks them
+// up via `use super::*`. Test-only symbols (`ss_cycle_converged`, `SS_EQUILIBRATION_TOL`,
+// `last_ss_equilibration_cycles`, `with_full_ss_equilibration`) are referenced directly
+// as `crate::dosing::…` by the tests, so they are not imported here.
+use crate::dosing::{
+    record_ss_equilibration_cycles, resolve_subject_doses, resolve_subject_doses_with,
+    SsStopTracker, SS_EQUILIBRATION_CYCLES,
+};
 
-/// Resolve modeled-`RATE` doses using `params` for **every** dose — the
-/// no-time-varying-covariate ODE paths, where the PK snapshot is constant across
-/// doses. The event-driven / TV-covariate path calls
-/// [`resolve_subject_doses_with`] directly with a per-dose closure. See
-/// [`resolve_subject_doses_with`].
-pub(crate) fn resolve_subject_doses<'a>(
-    subject: &'a Subject,
-    attr_map: &crate::types::DoseAttrMap,
-    params: &'a [f64],
-) -> Cow<'a, Subject> {
-    resolve_subject_doses_with(subject, attr_map, |_| params)
-}
+/// Relative floor for truncating the steady-state **input-rate periodic sum** (#719). An
+/// `SS=1` dose into a built-in absorption compartment stands for an infinite past pulse
+/// train, so its appearance rate at time `t` is `Σ_{j≥0} R_in(tad + j·II)` — the tail of
+/// every prior pulse still arriving (see [`add_prepared_input_rate_forcing`]). The absorption
+/// density is eventually monotone-decreasing, so once a term falls below this fraction of the
+/// running sum the remaining tail is spent and the sum stops (hard-capped at
+/// [`crate::dosing::SS_EQUILIBRATION_CYCLES`] so a pathologically slow absorption — mode ≫ II
+/// — still terminates, matching the trough's own cycle budget). Conservative (`1e-10`): the
+/// dropped tail is far below the provider-vs-production parity tolerance. (Kept in
+/// `ode/predictions` — its only consumers — rather than in the neutral `dosing` module.)
+const SS_TAIL_REL_FLOOR: f64 = 1e-10;
 
 /// The time at which a subject's integration begins: the earliest event on the
 /// subject's timeline (first dose, observation, PK-only sample, or reset).
@@ -131,147 +100,6 @@ pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
         0.0
     }
 }
-
-/// Number of dosing cycles to simulate when pre-equilibrating an SS=1
-/// dose. With a typical t₁/₂/II ratio under 2 (the common clinical range)
-/// this is comfortably past saturation — each additional cycle adds
-/// `exp(-k·II)` of the prior decay, so by N=50 the truncation tail is
-/// well below 1e-6 for any reasonable PK. The analytic-sensitivity SS
-/// equilibration (`sens::ode_provider::equilibrate_ss_state_g`) reuses this
-/// same constant so its trough can't drift from this f64 predictor (#473 review #11).
-pub(crate) const SS_EQUILIBRATION_CYCLES: usize = 50;
-
-/// Relative-`L∞` tolerance for the steady-state equilibration **early stop** (#519). The
-/// `(apply dose; integrate II)` cycle is a geometric contraction with ratio `≈ exp(−λ·II)`;
-/// once the cycle-to-cycle state change falls below this *relative* threshold, every
-/// remaining cycle would move the trough by less still, so the truncation is already at f64
-/// precision and we stop. Conservative (`1e-12`): the dropped tail is far below the
-/// `provider`-vs-production parity tolerance, so the value is unchanged for any realistic
-/// PK. Fast disposition (`λ·II ≈ 2`) converges in ~14 cycles; slow PK (`λ·II ≈ 0.1`) never
-/// trips it and runs the full [`SS_EQUILIBRATION_CYCLES`] — identical to the old behaviour.
-pub(crate) const SS_EQUILIBRATION_TOL: f64 = 1e-12;
-
-/// Relative floor for truncating the steady-state **input-rate periodic sum** (#719). An
-/// `SS=1` dose into a built-in absorption compartment stands for an infinite past pulse
-/// train, so its appearance rate at time `t` is `Σ_{j≥0} R_in(tad + j·II)` — the tail of
-/// every prior pulse still arriving (see [`add_prepared_input_rate_forcing`]). The absorption
-/// density is eventually monotone-decreasing, so once a term falls below this fraction of the
-/// running sum the remaining tail is spent and the sum stops (hard-capped at
-/// [`SS_EQUILIBRATION_CYCLES`] so a pathologically slow absorption — mode ≫ II — still
-/// terminates, matching the trough's own cycle budget). Conservative (`1e-10`): the dropped
-/// tail is far below the provider-vs-production parity tolerance.
-pub(crate) const SS_TAIL_REL_FLOOR: f64 = 1e-10;
-
-/// Whether the SS-equilibration trough has converged between two successive cycles. Shared
-/// by the f64 predictor, the event-driven f64 loop, and the dual gradient path so every path
-/// truncates on the *same* criterion — the dual feeds the value parts (`PkNum::val`) of its
-/// state (#519), which keeps its stop cycle identical to the f64 path's, so the truncated
-/// gradient is the exact derivative of the truncated value (see [`crate::sens::propagate::ss_dual_cycle_should_stop`]).
-///
-/// **Mixed `atol`/`rtol` test on the per-cycle *increment*** (#532 review #1): a compartment
-/// is converged when its movement since the previous cycle is below `tol·|cur| + tol·max_mag`
-/// — negligible both relative to itself and relative to the dominant compartment. Testing the
-/// *increment* (not the magnitude) is what makes this safe in a scale-separated model: a small
-/// compartment still in transit (effect-site / metabolite many orders below central) keeps the
-/// loop running until it too stops moving, rather than being declared converged merely for
-/// being small. The `tol·max_mag` term is the absolute floor that lets a genuinely-settled
-/// near-zero compartment — where the pure relative test is ill-conditioned — pass; without it
-/// the loop could never stop. Because the stop only fires once every compartment's increment
-/// is below f64-relative precision, the value has reached its fixed point and the elided cycles
-/// do not move it — predictions are unchanged to f64 precision, and gradients match a full
-/// budget to `< 1e-6` (see `ode_provider_ss_early_stop_matches_full_budget`).
-///
-/// A **non-finite** (`NaN`/`Inf`) compartment means the integration blew up: never report
-/// convergence — don't early-exit and silently return a poisoned state; run the full cycle
-/// budget exactly as the pre-#519 code did so the failure surfaces identically (#532 review
-/// #4). Required because `f64::max` would otherwise *drop* a `NaN` and mask it.
-pub(crate) fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
-    // Test-only escape hatch: force every path to run the full cycle budget so a test can
-    // compare the early-stopped result against the fully-equilibrated one (#532 review #4).
-    #[cfg(test)]
-    if FORCE_FULL_SS_EQUILIBRATION.with(|c| c.get()) {
-        return false;
-    }
-    if cur.iter().any(|x| !x.is_finite()) {
-        return false;
-    }
-    let max_mag = cur.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
-    let atol = tol * max_mag;
-    cur.iter()
-        .zip(prev)
-        .all(|(&a, &b)| (a - b).abs() <= tol * a.abs() + atol)
-}
-
-/// Rolling prev-state tracker for the f64 SS-equilibration early stop. Owns the previous
-/// cycle's state so the f64 predictor and the event-driven f64 loop share one scaffold instead
-/// of each re-implementing the `cycle > 0` + `copy_from_slice` dance — a later tweak missed in
-/// one site would reintroduce cross-path trough drift (#532 review #6). The dual paths use the
-/// generic [`crate::sens::propagate::ss_dual_cycle_should_stop`], which applies the same
-/// [`ss_cycle_converged`] criterion to the value parts of the dual state.
-#[derive(Default)]
-pub(crate) struct SsStopTracker {
-    prev: Vec<f64>,
-}
-
-impl SsStopTracker {
-    /// Record `cur` and report whether the trough has converged (from cycle 1 on). Returns
-    /// `true` to break the equilibration loop.
-    pub(crate) fn should_stop(&mut self, cycle: usize, cur: &[f64]) -> bool {
-        if cycle > 0 && ss_cycle_converged(cur, &self.prev, SS_EQUILIBRATION_TOL) {
-            return true;
-        }
-        self.prev.clear();
-        self.prev.extend_from_slice(cur);
-        false
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Cycles the most recent SS-equilibration call ran — a **test-only** observation of the
-    /// #519 early stop, so a test can assert it fired for fast PK and ran the full budget for
-    /// slow PK (#532 review #5/#6 — otherwise the stop logic ships unverified, since the loose
-    /// end-value tolerances absorb a too-early exit). Set by the f64 predictor, the dual ODE /
-    /// closed-form loops, and the event-driven loop.
-    static LAST_SS_EQUILIBRATION_CYCLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-
-    /// When set, [`ss_cycle_converged`] always reports "not converged" so every path runs the
-    /// full cycle budget — lets a test pin that early-stop is value-preserving vs full
-    /// equilibration (#532 review #4).
-    static FORCE_FULL_SS_EQUILIBRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-pub(crate) fn record_ss_equilibration_cycles(n: usize) {
-    LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.set(n));
-}
-
-/// Cycles the most recent SS-equilibration call ran (test observation; see above).
-#[cfg(test)]
-pub(crate) fn last_ss_equilibration_cycles() -> usize {
-    LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.get())
-}
-
-/// Run `f` with every SS-equilibration path forced to the full cycle budget (#532 review #4).
-/// The reset rides a drop guard so a panic in `f` cannot leave the flag set and poison a later
-/// test sharing the harness thread.
-#[cfg(test)]
-pub(crate) fn with_full_ss_equilibration<R>(f: impl FnOnce() -> R) -> R {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            FORCE_FULL_SS_EQUILIBRATION.with(|c| c.set(false));
-        }
-    }
-    FORCE_FULL_SS_EQUILIBRATION.with(|c| c.set(true));
-    let _reset = Reset;
-    f()
-}
-
-/// No-op in non-test builds (zero cost on the hot path).
-#[cfg(not(test))]
-#[inline(always)]
-pub(crate) fn record_ss_equilibration_cycles(_n: usize) {}
 
 /// Closed-form periodic steady-state trough for an `SS=1` dose into a built-in absorption
 /// input-rate compartment on a **linear** disposition (#719).
@@ -795,16 +623,21 @@ fn zero_order_windows(
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
-    dur_frac_for_dose: impl Fn(usize, &DoseEvent) -> Option<(f64, f64)>,
+    dur_frac_for_dose: impl Fn(usize, &DoseEvent) -> Option<(f64, f64, f64)>,
 ) -> Vec<ZeroOrderWindow> {
     let mut out = Vec::new();
     for (k, d) in doses.iter().enumerate() {
-        let Some((dur, frac)) = dur_frac_for_dose(k, d) else {
+        let Some((dur, frac, route_lag)) = dur_frac_for_dose(k, d) else {
             continue;
         };
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let f_bio = dose_f_bio.get(k).copied().unwrap_or(1.0);
-        let w_start = d.time + lag;
+        // The window opens at `d.time + lag_cmt + lag_route`: the dose's compartment
+        // lagtime plus this zero-order route's own delay (`zero_order(..., lag=L)`,
+        // `0` for an unlagged route). The full-containment break at `w_end` shifts
+        // with it (via `zero_order_dur_and_lag_for_dose`), keeping every segment
+        // fully inside or outside the window (#504 mass-exactness) under a route lag.
+        let w_start = d.time + lag + route_lag;
         out.push((
             d.cmt.saturating_sub(1),
             f_bio * d.amt * frac / dur,
@@ -866,14 +699,16 @@ fn zero_order_dur_and_frac_for_dose(
     ode: &OdeSpec,
     dose: &DoseEvent,
     pk_params: &[f64],
-) -> Option<(f64, f64)> {
+) -> Option<(f64, f64, f64)> {
     if dose.amt <= 0.0 {
         return None;
     }
     ode.input_rate.iter().find_map(|f| {
         if f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt + 1 == dose.cmt {
             match f.prepare(pk_params) {
-                PreparedInputRate::ZeroOrder { dur, .. } => Some((dur, f.frac(pk_params))),
+                PreparedInputRate::ZeroOrder { dur, .. } => {
+                    Some((dur, f.frac(pk_params), f.route_lag(pk_params)))
+                }
                 _ => None,
             }
         } else {
@@ -882,13 +717,18 @@ fn zero_order_dur_and_frac_for_dose(
     })
 }
 
-/// The floored zero-order duration `dur` for `dose` (ignoring the pathway
-/// fraction) — used by the event-driven timeline's cutoff break, which needs the
-/// window *edge*, not the rate. A thin projection of
-/// [`zero_order_dur_and_frac_for_dose`] so the two never disagree on which forcing /
-/// `dur` a dose resolves to.
-fn zero_order_dur_for_dose(ode: &OdeSpec, dose: &DoseEvent, pk_params: &[f64]) -> Option<f64> {
-    zero_order_dur_and_frac_for_dose(ode, dose, pk_params).map(|(dur, _)| dur)
+/// The floored zero-order duration `dur` **and per-route lag** for `dose` (ignoring
+/// the pathway fraction) — used by the event-driven timeline's cutoff break, which
+/// needs the window *edge* `d.time + lag_cmt + lag_route + dur`, not the rate. A thin
+/// projection of [`zero_order_dur_and_frac_for_dose`] so the two never disagree on
+/// which forcing / `dur` / `lag_route` a dose resolves to.
+fn zero_order_dur_and_lag_for_dose(
+    ode: &OdeSpec,
+    dose: &DoseEvent,
+    pk_params: &[f64],
+) -> Option<(f64, f64)> {
+    zero_order_dur_and_frac_for_dose(ode, dose, pk_params)
+        .map(|(dur, _, route_lag)| (dur, route_lag))
 }
 
 /// True if a built-in absorption input-rate forcing (transit/etc.) feeds the
@@ -922,6 +762,32 @@ pub(crate) fn input_rate_consumes_cmt(ode: &OdeSpec, cmt_1based: usize) -> bool 
 /// window.
 fn push_zero_order_break_times(break_times: &mut Vec<f64>, windows: &[ZeroOrderWindow]) {
     break_times.extend(windows.iter().map(|&(_, _, _, w_end)| w_end));
+}
+
+/// Push a break at every per-route absorption onset `d.time + lag_cmt + lag_route`
+/// (`fn(..., lag=L)`) — for each input-rate forcing carrying a `lag_slot`, over every
+/// positive-amount dose feeding that forcing's compartment. `route_lag_of` reads the
+/// forcing's lag from the caller's PK snapshot (a single subject snapshot on the dense
+/// path; per-forcing over the event-driven walk's snapshot). A route lag delays that
+/// route's onset PAST the dose's `d.time + lag_cmt` break, so without this break the
+/// smooth routes' onset kink is unresolved and a lagged `zero_order` window's start is
+/// unbracketed (never fully contained in a segment → no mass delivered). A no-op when
+/// no forcing carries a lag (the `filter` yields nothing), so the common case is free.
+fn push_route_lag_break_times(
+    break_times: &mut Vec<f64>,
+    ode: &OdeSpec,
+    subject: &Subject,
+    dose_lagtimes: &[f64],
+    route_lag_of: impl Fn(&crate::pk::absorption::InputRateForcing) -> f64,
+) {
+    for forcing in ode.input_rate.iter().filter(|f| f.lag_slot.is_some()) {
+        let route_lag = route_lag_of(forcing);
+        for (k, d) in subject.doses.iter().enumerate() {
+            if d.amt > 0.0 && d.cmt.saturating_sub(1) == forcing.cmt {
+                break_times.push(d.time + dose_lagtimes.get(k).copied().unwrap_or(0.0) + route_lag);
+            }
+        }
+    }
 }
 
 /// How a segment's infusions are injected as a `+rate` derivative term in the
@@ -1089,6 +955,15 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
         if forcing.kind == crate::pk::absorption::InputRateKind::ZeroOrder {
             continue;
         }
+        // Per-route absorption delay (`fn(..., lag=L)`): an offset ON TOP of the
+        // dose's compartment lag, so each parallel / mixed pathway can switch on at
+        // its own time. Dose-invariant (a property of the forcing, not the dose), so
+        // hoisted out of the per-dose loop; `0` for an unlagged forcing (the common
+        // case), a no-op there. A model carrying any per-route lag is served over FD
+        // (`ode_analytical_supported` gates it off), so on the `Dual2` walk this term
+        // never executes — only `T = f64` reaches here today; its jet is otherwise a
+        // continuous shift with no onset saltation, which is exactly why it is gated.
+        let route_lag = forcing.route_lag(params);
         let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
             if d.cmt.saturating_sub(1) != forcing.cmt {
@@ -1102,7 +977,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
             // computation there. The gating comparisons use `.val()` (the boundary
             // itself never needs a jet — see `rate_at_zero`'s jump for that).
             let lag = dose_lagtimes.get(k).copied().unwrap_or(T::from_f64(0.0));
-            let t_eff = T::from_f64(d.time) + lag;
+            let t_eff = T::from_f64(d.time) + lag + route_lag;
             // Doses delivered before the most recent reset are off — the reset
             // zeroed the compartments, same rule as `active_infusions`.
             if t_eff.val() < reset_floor - INFUSION_EPS {
@@ -1901,6 +1776,17 @@ fn ode_predictions_with_extra_breaks_and_stats(
             break_times.push(dose.time);
         }
     }
+    // Per-route absorption lag (`fn(..., lag=L)`): a route with its own lag switches
+    // on at `d.time + lag_cmt + lag_route`, PAST the dose's `d.time + lag_cmt` break
+    // above — so add a break at each route onset. This resolves the smooth routes'
+    // onset kink (`R_in` jumping 0 → `ka·dose` etc.) exactly, and brackets a lagged
+    // `zero_order` window's START (its end is broken via the route-lag-shifted
+    // `zo_windows` below). Without it the adaptive solver smears the kink and a lagged
+    // zero-order window is never fully contained in a segment (delivering nothing).
+    // A no-op for unlagged forcings (`lag_slot = None`), the common case.
+    push_route_lag_break_times(&mut break_times, ode, subject, &dose_lagtimes, |f| {
+        f.route_lag(pk_params_flat)
+    });
     // Zero-order windows for this subject (#504): the dense paths have a single
     // PK snapshot, so the per-dose `dur`/`F`/`lag` come from `pk_params_flat`.
     // Break at each window end so segments align with the cutoff, and reuse the
@@ -3672,11 +3558,27 @@ pub fn ode_predictions_event_driven(
         }
         // Zero-order absorption cutoff (#504): a dose feeding a `zero_order(dur)`
         // compartment delivers a constant rate over `(0, dur]`, so break at the
-        // window end `d.time+lag+dur` exactly like an infusion end (no record, no
-        // state change — just a segment boundary so `active_zero_order_inputs`'s
-        // full-containment test sees each segment fully inside or outside).
-        if let Some(dur) = zero_order_dur_for_dose(ode, d, &pk_at_dose[k].values) {
-            timeline.push((d.time + lag + dur, Kind::InfusionEnd, k));
+        // window end `d.time+lag_cmt+lag_route+dur` exactly like an infusion end (no
+        // record, no state change — just a segment boundary so
+        // `active_zero_order_inputs`'s full-containment test sees each segment fully
+        // inside or outside). The route lag shifts this edge in lock-step with the
+        // window `w_start` built by `zero_order_windows` from the same helper.
+        if let Some((dur, route_lag)) =
+            zero_order_dur_and_lag_for_dose(ode, d, &pk_at_dose[k].values)
+        {
+            timeline.push((d.time + lag + route_lag + dur, Kind::InfusionEnd, k));
+        }
+        // Per-route absorption onset (`fn(..., lag=L)`): each route with its own lag
+        // switches on at `d.time + lag_cmt + lag_route`, past the `Kind::Dose` break at
+        // `d.time + lag_cmt` above — break there (a pure segment boundary, same
+        // `Kind::InfusionEnd` no-op the zero-order cutoff uses) so the smooth routes'
+        // onset kink resolves exactly and a lagged zero-order window's START is
+        // bracketed. No-op for unlagged forcings.
+        for forcing in ode.input_rate.iter().filter(|f| f.lag_slot.is_some()) {
+            if d.amt > 0.0 && d.cmt.saturating_sub(1) == forcing.cmt {
+                let route_lag = forcing.route_lag(&pk_at_dose[k].values);
+                timeline.push((d.time + lag + route_lag, Kind::InfusionEnd, k));
+            }
         }
     }
     for (j, &t) in subject.obs_times.iter().enumerate() {
@@ -7048,6 +6950,7 @@ mod tests {
             kind: crate::pk::absorption::InputRateKind::Transit,
             arg_slots: vec![],
             frac_slot: None,
+            lag_slot: None,
         }];
         let pk = pk_one(1.0, 10.0);
         let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
@@ -7549,6 +7452,7 @@ mod tests {
             kind: crate::pk::absorption::InputRateKind::Transit,
             arg_slots: vec![],
             frac_slot: None,
+            lag_slot: None,
         }];
         let pk = pk_one(1.0, 10.0);
         let mut controller = |_ctx: &ControllerCtx| {
@@ -8185,6 +8089,7 @@ mod tests {
                 kind: InputRateKind::Transit,
                 arg_slots: vec![6, 7],
                 frac_slot: None,
+                lag_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -8232,6 +8137,7 @@ mod tests {
                 kind: InputRateKind::FirstOrder,
                 arg_slots: vec![4],
                 frac_slot: None,
+                lag_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -8315,6 +8221,7 @@ mod tests {
                 kind: InputRateKind::Transit,
                 arg_slots: vec![6, 7],
                 frac_slot: None,
+                lag_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -8694,6 +8601,7 @@ mod tests {
                 kind: InputRateKind::FirstOrder,
                 arg_slots: vec![4],
                 frac_slot: None,
+                lag_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -8761,6 +8669,7 @@ mod tests {
                 kind: InputRateKind::FirstOrder,
                 arg_slots: vec![4],
                 frac_slot: None,
+                lag_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -8792,7 +8701,7 @@ mod tests {
         let subj = make_subject(vec![ss], vec![1.0, 4.0, 7.9]);
         let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
         assert_eq!(
-            last_ss_equilibration_cycles(),
+            crate::dosing::last_ss_equilibration_cycles(),
             1,
             "linear SS-absorption must equilibrate via the closed-form fixed point"
         );
@@ -8828,6 +8737,7 @@ mod tests {
                 kind: InputRateKind::ZeroOrder,
                 arg_slots: vec![4],
                 frac_slot: None,
+                lag_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -8878,6 +8788,51 @@ mod tests {
         let mut breaks = Vec::new();
         push_zero_order_break_times(&mut breaks, &windows);
         assert_eq!(breaks, vec![6.5]);
+    }
+
+    #[test]
+    fn push_route_lag_break_times_adds_route_onsets() {
+        // Two first-order routes on cmt 0: one with a per-route lag (slot 6), one
+        // without. A break is added at `d.time + lag_cmt + lag_route` for the LAGGED
+        // route only over a positive-amount dose feeding cmt 0; the unlagged route adds
+        // nothing, and doses into another compartment / with zero amount are skipped.
+        let mk = |lag_slot| InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![4],
+            frac_slot: None,
+            lag_slot,
+        };
+        let ode = OdeSpec {
+            rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: vec![mk(Some(6)), mk(None)],
+            init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+        };
+        let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
+        params[6] = 1.5; // per-route lag
+        let doses = vec![
+            DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0), // cmt 0, amt>0 → onset break
+            DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0), // other cmt → skipped
+            DoseEvent::new(5.0, 0.0, 1, 0.0, false, 0.0),   // zero amt → skipped
+        ];
+        let subj = make_subject(doses, vec![]);
+        let mut breaks = Vec::new();
+        push_route_lag_break_times(&mut breaks, &ode, &subj, &[0.5, 0.0, 0.0], |f| {
+            f.route_lag(&params)
+        });
+        // Only the lagged forcing × the valid dose: 2.0 + 0.5 (cmt lag) + 1.5 (route lag).
+        assert_eq!(breaks, vec![4.0]);
     }
 
     #[test]
@@ -9214,6 +9169,7 @@ mod tests {
             kind: InputRateKind::InverseGaussian,
             arg_slots,
             frac_slot: Some(frac_slot),
+            lag_slot: None,
         };
         let ode = OdeSpec {
             rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
@@ -9920,6 +9876,9 @@ mod tests {
 
     #[test]
     fn ss_cycle_converged_is_mixed_atol_rtol_on_increment() {
+        // Referenced directly from `crate::dosing` (test-only here — not re-exported by
+        // the private facade above).
+        use crate::dosing::{ss_cycle_converged, SS_EQUILIBRATION_TOL};
         // Increment below tol: a 1e-13 move on a magnitude-100 state is ≪ tol·(|a| + max) →
         // converged.
         assert!(ss_cycle_converged(
@@ -9994,7 +9953,7 @@ mod tests {
         // so the early stop fires well inside SS_EQUILIBRATION_CYCLES.
         let fast = pk_one(20.0, 10.0);
         let _ = equilibrate_ss_state(&ode, &fast.values, &dose, &ode.solver_opts);
-        let fast_cycles = LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.get());
+        let fast_cycles = crate::dosing::last_ss_equilibration_cycles();
         assert!(
             (2..SS_EQUILIBRATION_CYCLES).contains(&fast_cycles),
             "fast PK should early-stop inside the budget, ran {fast_cycles}"
@@ -10005,7 +9964,7 @@ mod tests {
         // pre-existing slow-PK truncation, tracked separately — #532 review #12).
         let slow = pk_one(0.05, 100.0);
         let _ = equilibrate_ss_state(&ode, &slow.values, &dose, &ode.solver_opts);
-        let slow_cycles = LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.get());
+        let slow_cycles = crate::dosing::last_ss_equilibration_cycles();
         assert_eq!(
             slow_cycles, SS_EQUILIBRATION_CYCLES,
             "slow PK should run the full budget, ran {slow_cycles}"

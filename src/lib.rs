@@ -4,6 +4,7 @@ pub mod cancel;
 #[cfg(feature = "survival")]
 pub mod categorical;
 pub mod diagnostics;
+pub(crate) mod dosing;
 pub mod environment;
 pub mod estimation;
 pub mod frem;

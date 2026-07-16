@@ -304,6 +304,21 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
         return false;
     }
+    // Per-route absorption lag (`fn(..., lag=L)`) is served over finite differences.
+    // The analytic event-driven walk injects ONE onset saltation per dose at the
+    // lagged arrival `t_dose + lag_cmt`; a per-route lag gives each forcing its own
+    // onset `t_dose + lag_cmt + lag_route`, so the walk would need distinct break
+    // points and a per-route rate-on saltation it does not yet emit. Gate it off here
+    // (BOTH the outer full provider and the inner light provider via
+    // `ode_subject_supported`) so it routes to FD — the exact `weibull()`+lagtime
+    // pattern. The pointwise `add_prepared_input_rate_forcing` DOES add `route_lag`
+    // to `t_eff` over any `T`, but that continuous shift without the onset saltation
+    // is precisely the wrong gradient this gate prevents from ever executing on a
+    // dual walk. Lifting the gate (per-route onset saltation) is the Phase-2 follow-up
+    // (#856).
+    if ode.input_rate.iter().any(|f| f.lag_slot.is_some()) {
+        return false;
+    }
     if model.n_kappa != 0 {
         return false;
     }
@@ -3471,7 +3486,7 @@ fn pk_snapshot_equal<T: crate::sens::num::PkNum>(a: &[T], b: &[T]) -> bool {
 /// `equilibrate_ss_state`. NONMEM SS=1 loads the compartments with the steady-state
 /// amounts of an infinite-past pulse train of interval `II`. There is no closed form for
 /// a general ODE, so production expands the train as a **finite**
-/// [`crate::ode::predictions::SS_EQUILIBRATION_CYCLES`] loop of `(apply dose; integrate II)`
+/// [`crate::dosing::SS_EQUILIBRATION_CYCLES`] loop of `(apply dose; integrate II)`
 /// from a zero state, returning the pre-pulse trough (the shared const keeps this trough
 /// from drifting from the f64 predictor). Because the loop is finite and explicit, running
 /// it over the dual type `T` propagates `∂(SS state)/∂(θ,η)` directly — no implicit
@@ -3545,7 +3560,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
         let mut prev = vec![0.0_f64; n_states];
         let mut cur = vec![0.0_f64; n_states];
         let mut cycles_run = 0usize;
-        for cycle in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
+        for cycle in 0..crate::dosing::SS_EQUILIBRATION_CYCLES {
             let rhs_active = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                 bare_rhs(us, ps, t, du);
                 if cmt_idx < du.len() {
@@ -3588,7 +3603,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
                 break;
             }
         }
-        crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
+        crate::dosing::record_ss_equilibration_cycles(cycles_run);
         return u;
     }
     // Bolus SS: each cycle applies the pulse `F·amt`, then decays over one interval.
@@ -3597,7 +3612,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     let mut prev = vec![0.0_f64; n_states];
     let mut cur = vec![0.0_f64; n_states];
     let mut cycles_run = 0usize;
-    for cycle in 0..crate::ode::predictions::SS_EQUILIBRATION_CYCLES {
+    for cycle in 0..crate::dosing::SS_EQUILIBRATION_CYCLES {
         u[cmt_idx] = u[cmt_idx] + f_bio * amt;
         let sol = solve_ode_g(&bare_rhs, &u, (0.0, dose.ii), params, &saveat, opts);
         if let Some(last) = sol.last() {
@@ -3608,7 +3623,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
             break;
         }
     }
-    crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
+    crate::dosing::record_ss_equilibration_cycles(cycles_run);
     u
 }
 
@@ -3713,7 +3728,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
         |u0| advance(&disposition, u0),
         |u0| advance(&forced, u0),
     ) {
-        crate::ode::predictions::record_ss_equilibration_cycles(1);
+        crate::dosing::record_ss_equilibration_cycles(1);
         return u_ss;
     }
 
@@ -3722,7 +3737,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
     // segment-by-segment from a zero state; `R_in` is re-evaluated by absolute pulse age so an
     // absorption tail longer than `II` keeps contributing across cycle boundaries (mirrors the
     // f64 `equilibrate_ss_state` input-rate fallback). The dual jets ride the finite loop.
-    let n_pulses = crate::ode::predictions::SS_EQUILIBRATION_CYCLES;
+    let n_pulses = crate::dosing::SS_EQUILIBRATION_CYCLES;
     let local_doses: Vec<crate::types::DoseEvent> = (0..n_pulses)
         .map(|m| crate::types::DoseEvent::new(m as f64 * ii, dose.amt, dose.cmt, 0.0, false, 0.0))
         .collect();
@@ -3758,7 +3773,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
             break;
         }
     }
-    crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
+    crate::dosing::record_ss_equilibration_cycles(cycles_run);
     u
 }
 
@@ -6426,7 +6441,7 @@ mod tests {
         // the up-to-50-cycle iteration — the fast path #835 restores for sensitivities.
         let _ = ode_subject_sensitivities(&model, &subj, &theta, &eta).expect("supported");
         assert_eq!(
-            crate::ode::predictions::last_ss_equilibration_cycles(),
+            crate::dosing::last_ss_equilibration_cycles(),
             1,
             "a linear disposition must equilibrate via the closed-form fixed point"
         );
@@ -6523,7 +6538,7 @@ mod tests {
         // single-cycle closed-form fixed point.
         let _ = ode_subject_sensitivities(&model, &subj, &theta, &eta).expect("supported");
         assert!(
-            crate::ode::predictions::last_ss_equilibration_cycles() > 1,
+            crate::dosing::last_ss_equilibration_cycles() > 1,
             "a nonlinear disposition must fall back to the pulse-train iteration"
         );
     }
@@ -7423,6 +7438,64 @@ mod tests {
         );
     }
 
+    /// A **per-route** absorption lag (`fn(..., lag=L)`) gates the model OFF the
+    /// analytic path onto FD — the correctness backstop for the feature's first
+    /// phase. The analytic event-driven walk injects one onset saltation per dose at
+    /// `t_dose + lag_cmt`; a per-route lag needs a distinct onset per route
+    /// (`+ lag_route`), which the walk does not yet emit, so serving it analytically
+    /// would silently drop the route-onset discontinuity. Neither the static nor the
+    /// TV-cov walk may claim it (both derive from `ode_analytical_supported`).
+    /// (Removing this gate — the per-route onset saltation — is the Phase-2 follow-up.)
+    #[test]
+    fn per_route_lag_gates_off_analytic() {
+        const PER_ROUTE_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 20.0)
+  theta TVKA2(0.3, 0.05, 20.0)
+  theta TVLAG2(2.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  FR1  = TVFR1
+  FR2  = 1 - TVFR1
+  KA1  = TVKA1
+  KA2  = TVKA2
+  LAG2 = TVLAG2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2, lag=LAG2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(PER_ROUTE_LAG).expect("parse per-route lag model");
+        // Sanity: the model actually carries a per-route lag on exactly one forcing.
+        let ode = m.ode_spec.as_ref().expect("ode spec");
+        assert_eq!(
+            ode.input_rate
+                .iter()
+                .filter(|f| f.lag_slot.is_some())
+                .count(),
+            1,
+            "one route carries a per-route lag"
+        );
+        assert!(
+            !ode_analytical_supported(&m),
+            "a per-route lag must gate the model onto FD (no silent analytic path)"
+        );
+        // Neither per-subject walk may claim it either.
+        let subj = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0]);
+        assert!(!ode_subject_supported(&m, &subj), "not on the static walk");
+        assert!(!ode_tvcov_supported(&m, &subj), "not on the TV-cov walk");
+    }
+
     /// Indexed `F` is now in model-level scope (parity test above), but the
     /// *per-subject* gate must still route a **rate-defined infusion under `F ≠ 1`**
     /// to FD. NONMEM reshapes such an infusion's window (holds the rate, scales the
@@ -8288,16 +8361,16 @@ mod tests {
         let eta = [0.1, 0.05];
 
         let early = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
-        let early_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
-        let full = crate::ode::predictions::with_full_ss_equilibration(|| {
+        let early_cycles = crate::dosing::last_ss_equilibration_cycles();
+        let full = crate::dosing::with_full_ss_equilibration(|| {
             ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported")
         });
-        let full_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
+        let full_cycles = crate::dosing::last_ss_equilibration_cycles();
 
         // The dual stop must actually fire on this model, or the comparison is vacuous (#532 #5).
         assert_eq!(
             full_cycles,
-            crate::ode::predictions::SS_EQUILIBRATION_CYCLES,
+            crate::dosing::SS_EQUILIBRATION_CYCLES,
             "forced-full must run the whole budget"
         );
         assert!(
@@ -8505,15 +8578,15 @@ mod tests {
         let eta = [0.1, 0.05];
 
         let early = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
-        let early_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
-        let full = crate::ode::predictions::with_full_ss_equilibration(|| {
+        let early_cycles = crate::dosing::last_ss_equilibration_cycles();
+        let full = crate::dosing::with_full_ss_equilibration(|| {
             ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported")
         });
-        let full_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
+        let full_cycles = crate::dosing::last_ss_equilibration_cycles();
 
         assert_eq!(
             full_cycles,
-            crate::ode::predictions::SS_EQUILIBRATION_CYCLES,
+            crate::dosing::SS_EQUILIBRATION_CYCLES,
             "forced-full must run the whole budget"
         );
         assert!(

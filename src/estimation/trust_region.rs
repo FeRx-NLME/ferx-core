@@ -5,9 +5,7 @@ use rayon::prelude::*;
 
 use crate::estimation::gauss_newton::subject_nll_pop_grad;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
-use crate::estimation::outer_optimizer::{
-    compute_covariance, pop_nll_opts, CovarianceStepResult, OuterResult,
-};
+use crate::estimation::outer_optimizer::{pop_nll_opts, OuterResult};
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params, PackedBounds,
 };
@@ -399,44 +397,24 @@ pub fn optimize_trust_region(
         eprintln!("Final OFV = {:.6}", final_ofv);
     }
 
-    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let (covariance_matrix, covariance_wall_time_secs) =
-        if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
-            if options.verbose {
-                eprintln!("Computing covariance matrix...");
-            }
-            let cov_timer = std::time::Instant::now();
-            let cm = match compute_covariance(
-                &best_x,
-                init_params,
-                model,
-                population,
-                &final_ehs,
-                &final_hms,
-                &final_kappas,
-                options,
-            ) {
-                CovarianceStepResult::Success(out) => {
-                    warnings.extend(out.warnings);
-                    Some(out.matrix)
-                }
-                CovarianceStepResult::Unusable(msg) => {
-                    warnings.push(msg);
-                    None
-                }
-                CovarianceStepResult::FailedNonPd {
-                    reason,
-                    fallback_proposal,
-                } => {
-                    warnings.push(reason);
-                    sir_fallback_proposal = Some(fallback_proposal);
-                    None
-                }
-            };
-            (cm, cov_timer.elapsed().as_secs_f64())
-        } else {
-            (None, 0.0)
-        };
+    let out = crate::estimation::covariance::run_covariance_step(
+        &best_x,
+        init_params,
+        model,
+        population,
+        &final_ehs,
+        &final_hms,
+        &final_kappas,
+        options,
+        options.verbose.then_some("Computing covariance matrix..."),
+    );
+    let crate::estimation::covariance::CovStepOutcome {
+        matrix: covariance_matrix,
+        wall_time_secs: covariance_wall_time_secs,
+        warnings: cov_warnings,
+        sir_fallback_proposal,
+    } = out;
+    warnings.extend(cov_warnings);
 
     OuterResult {
         params: final_params,

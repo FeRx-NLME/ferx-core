@@ -15,7 +15,7 @@
 /// converges in 10-30 iterations vs 100+ for first-order methods.
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::pop_nll;
-use crate::estimation::outer_optimizer::{compute_covariance, CovarianceStepResult, OuterResult};
+use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
 use crate::stats::likelihood::{chol_log_det, compute_r_tilde};
@@ -396,44 +396,24 @@ pub fn run_foce_gn(
 
     if !do_polish {
         // Pure GN — skip FOCEI polish, go directly to covariance step
-        let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-        let (covariance_matrix, covariance_wall_time_secs) =
-            if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
-                if verbose {
-                    eprintln!("Running covariance step...");
-                }
-                let cov_timer = std::time::Instant::now();
-                let cm = match compute_covariance(
-                    &x,
-                    &gn_params,
-                    model,
-                    population,
-                    &eta_hats,
-                    &h_matrices,
-                    &kappas,
-                    options,
-                ) {
-                    CovarianceStepResult::Success(out) => {
-                        warnings.extend(out.warnings);
-                        Some(out.matrix)
-                    }
-                    CovarianceStepResult::Unusable(msg) => {
-                        warnings.push(msg);
-                        None
-                    }
-                    CovarianceStepResult::FailedNonPd {
-                        reason,
-                        fallback_proposal,
-                    } => {
-                        warnings.push(reason);
-                        sir_fallback_proposal = Some(fallback_proposal);
-                        None
-                    }
-                };
-                (cm, cov_timer.elapsed().as_secs_f64())
-            } else {
-                (None, 0.0)
-            };
+        let out = crate::estimation::covariance::run_covariance_step(
+            &x,
+            &gn_params,
+            model,
+            population,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            options,
+            verbose.then_some("Running covariance step..."),
+        );
+        let crate::estimation::covariance::CovStepOutcome {
+            matrix: covariance_matrix,
+            wall_time_secs: covariance_wall_time_secs,
+            warnings: cov_warnings,
+            sir_fallback_proposal,
+        } = out;
+        warnings.extend(cov_warnings);
 
         if verbose {
             eprintln!("FOCE-GN completed. Final OFV = {:.4}", ofv);
@@ -527,44 +507,24 @@ pub fn run_foce_gn(
     let final_packed = pack_params(&final_params);
 
     // ---- Covariance step ----
-    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let (covariance_matrix, covariance_wall_time_secs) =
-        if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
-            if verbose {
-                eprintln!("Running covariance step...");
-            }
-            let cov_timer = std::time::Instant::now();
-            let cm = match compute_covariance(
-                &final_packed,
-                &final_params,
-                model,
-                population,
-                &final_etas,
-                &final_h_mats,
-                &final_kappas,
-                options,
-            ) {
-                CovarianceStepResult::Success(out) => {
-                    warnings.extend(out.warnings);
-                    Some(out.matrix)
-                }
-                CovarianceStepResult::Unusable(msg) => {
-                    warnings.push(msg);
-                    None
-                }
-                CovarianceStepResult::FailedNonPd {
-                    reason,
-                    fallback_proposal,
-                } => {
-                    warnings.push(reason);
-                    sir_fallback_proposal = Some(fallback_proposal);
-                    None
-                }
-            };
-            (cm, cov_timer.elapsed().as_secs_f64())
-        } else {
-            (None, 0.0)
-        };
+    let out = crate::estimation::covariance::run_covariance_step(
+        &final_packed,
+        &final_params,
+        model,
+        population,
+        &final_etas,
+        &final_h_mats,
+        &final_kappas,
+        options,
+        verbose.then_some("Running covariance step..."),
+    );
+    let crate::estimation::covariance::CovStepOutcome {
+        matrix: covariance_matrix,
+        wall_time_secs: covariance_wall_time_secs,
+        warnings: cov_warnings,
+        sir_fallback_proposal,
+    } = out;
+    warnings.extend(cov_warnings);
 
     if verbose {
         eprintln!("FOCE-GN completed. Final OFV = {:.4}", final_ofv);

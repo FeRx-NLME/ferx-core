@@ -940,7 +940,7 @@ pub fn predict_iov(
         // reads the analytical model's `dose_attr_map`.) Borrowed no-op when every
         // dose is already `Fixed`.
         let resolved =
-            crate::ode::resolve_subject_doses_with(subject, model.active_dose_attr_map(), |k| {
+            crate::dosing::resolve_subject_doses_with(subject, model.active_dose_attr_map(), |k| {
                 &dose_params[k].values
             });
         event_driven::event_driven_predictions(
@@ -1802,7 +1802,7 @@ pub fn compute_predictions_with_states(
             // Reached only when !uses_time (guarded above), so t=0 is exact.
             let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
             // Resolve modeled-`RATE` doses (#394) before the superposition states.
-            let resolved = crate::ode::resolve_subject_doses(
+            let resolved = crate::dosing::resolve_subject_doses(
                 subject,
                 model.active_dose_attr_map(),
                 &pk.values,
@@ -2071,7 +2071,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
         // event-driven walker builds its infusion bounds. Borrowed (no allocation)
         // for the all-`Fixed` common case.
         let resolved =
-            crate::ode::resolve_subject_doses_with(subject, model.active_dose_attr_map(), |k| {
+            crate::dosing::resolve_subject_doses_with(subject, model.active_dose_attr_map(), |k| {
                 &scratch.dose[k].values
             });
         // A cached `EventSchedule` was built from the *unresolved* subject, whose
@@ -2109,7 +2109,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
         let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
         // Resolve any modeled-`RATE` doses (#394) before the closed-form math.
         let resolved =
-            crate::ode::resolve_subject_doses(subject, model.active_dose_attr_map(), &pk.values);
+            crate::dosing::resolve_subject_doses(subject, model.active_dose_attr_map(), &pk.values);
         compute_predictions(model.pk_model, &resolved, &pk)
     };
 
