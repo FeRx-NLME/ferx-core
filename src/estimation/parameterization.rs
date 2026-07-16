@@ -251,12 +251,7 @@ pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
     mark(&mut mask, &template.omega, n_theta);
 
     if let Some(ref iov) = template.omega_iov {
-        let n_eta = template.omega.dim();
-        let n_omega = if template.omega.diagonal {
-            n_eta
-        } else {
-            n_eta * (n_eta + 1) / 2
-        };
+        let n_omega = omega_packed_len(template.omega.dim(), template.omega.diagonal);
         let iov_start = n_theta + n_omega + template.sigma.values.len();
         mark(&mut mask, iov, iov_start);
     }
@@ -267,21 +262,12 @@ pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
 /// Compute the number of packed parameters
 pub fn packed_len(template: &ModelParameters) -> usize {
     let n_theta = template.theta.len();
-    let n_eta = template.omega.dim();
-    let n_omega = if template.omega.diagonal {
-        n_eta
-    } else {
-        n_eta * (n_eta + 1) / 2
-    };
+    let n_omega = omega_packed_len(template.omega.dim(), template.omega.diagonal);
     let n_sigma = template.sigma.values.len();
-    let n_iov = template.omega_iov.as_ref().map_or(0, |m| {
-        let d = m.dim();
-        if m.diagonal {
-            d
-        } else {
-            d * (d + 1) / 2
-        }
-    });
+    let n_iov = template
+        .omega_iov
+        .as_ref()
+        .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
     n_theta + n_omega + n_sigma + n_iov
 }
 
@@ -555,6 +541,19 @@ pub(crate) fn lower_tri_iter(n: usize, diagonal: bool) -> impl Iterator<Item = (
         let end = if diagonal { c + 1 } else { n };
         (c..end).map(move |r| (r, c))
     })
+}
+
+/// Number of packed entries for an Ω / Ω_iov of dimension `n`: `n` if `diagonal`
+/// (variances only), else the full lower-triangle `n*(n+1)/2`. Single source of the
+/// triangular-length formula that was re-derived at ~10 sites (api/covariance/output/
+/// types/parameterization). Equals `lower_tri_iter(n, diagonal).count()`, without allocating.
+#[inline]
+pub(crate) fn omega_packed_len(n: usize, diagonal: bool) -> usize {
+    if diagonal {
+        n
+    } else {
+        n * (n + 1) / 2
+    }
 }
 
 /// Flat index of `L[i,j]` (i ≥ j) in the column-major lower-triangle packing.
