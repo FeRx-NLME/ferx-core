@@ -933,6 +933,53 @@ fn prepare_input_rates(ode: &OdeSpec, params: &[f64]) -> Vec<PreparedInputRate> 
     ode.input_rate.iter().map(|f| f.prepare(params)).collect()
 }
 
+/// The steady-state periodic-sum forcing of a **single** SS dose into a built-in
+/// absorption compartment (#719): `Σ_{j≥0} R_in(tad + j·II)`, the still-in-flight
+/// absorption of the infinite past pulse train the one `SS=1` record stands for.
+/// `R_in` is the stateless, dose-scaled per-dose kernel and the absorption chain
+/// is linear, so the appearance rate at the evaluation time is the superposition
+/// of every prior pulse's tail. (The *already-absorbed* mass of those pulses —
+/// now distributing/clearing — is seeded separately as the initial state by
+/// [`equilibrate_ss_state`]'s trough, disjoint from this sum, so there is no
+/// double count.)
+///
+/// Past the density's mode the terms decrease monotonically, so the sum truncates
+/// once a tail term is negligible **relative to this dose's own running total**
+/// (`local`), hard-capped at [`SS_EQUILIBRATION_CYCLES`] (the trough's budget).
+/// Keeping the break total *local* is load-bearing: the caller superposes this
+/// over every dose into the compartment, and comparing each SS tail term against a
+/// shared cross-dose accumulator would let an unrelated (e.g. large run-in) dose
+/// inflate the threshold and truncate this train's small pre-mode leading terms
+/// prematurely. Extracting the sum here makes that cross-dose contamination
+/// structurally impossible — the function has no access to the outer accumulator.
+/// Generic over `T: PkNum` so the one implementation serves the `f64` predictor
+/// and the `Dual*` sensitivity walk identically.
+#[inline]
+fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
+    prep: &PreparedInputRate<T>,
+    tad: T,
+    ii: T,
+    dose_mass: T,
+) -> T {
+    let mut local = T::from_f64(0.0);
+    let mut j = 0usize;
+    while j < SS_EQUILIBRATION_CYCLES {
+        let tad_j = tad + ii * T::from_f64(j as f64);
+        if tad_j.val() > 0.0 {
+            let term = prep.rate(tad_j, dose_mass);
+            local = local + term;
+            if j >= 1
+                && local.val().abs() > 0.0
+                && term.val().abs() <= SS_TAIL_REL_FLOOR * local.val().abs()
+            {
+                break;
+            }
+        }
+        j += 1;
+    }
+    local
+}
+
 /// Add every built-in absorption input-rate forcing into `dy` at integration
 /// time `t`, using the per-segment-hoisted `prepared` constants. For each
 /// forcing, sums `R_in(tad)` over all doses targeting its compartment (Savic
@@ -1011,41 +1058,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
             let dose_mass =
                 dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
             if d.ss && d.ii > 0.0 {
-                // Steady-state dose into a built-in absorption compartment (#719): the single
-                // SS data record stands for an infinite past pulse train dosed at `d.time −
-                // j·II`. Because `R_in` is the (stateless, dose-scaled) per-dose kernel and the
-                // absorption chain is linear, the appearance rate at `t` is the superposition of
-                // every pulse's tail still arriving — `Σ_{j≥0} R_in(tad + j·II)`. The *already-
-                // absorbed* mass of those prior pulses (now distributing/clearing) is supplied
-                // separately as the initial state by `equilibrate_ss_state`'s trough; this loop
-                // adds only the still-in-flight absorption, so the two are disjoint and there is
-                // no double count. Terms decay past the density's mode, so the sum truncates once
-                // a tail term is negligible relative to the running total, hard-capped at
-                // [`SS_EQUILIBRATION_CYCLES`] (the same budget the trough uses).
-                let ii = T::from_f64(d.ii);
-                let mut j = 0usize;
-                // Break test is scoped to this dose's own periodic sum (`ss_acc`), not the
-                // cross-dose `acc`: a run-in dose processed earlier into the same compartment
-                // can otherwise inflate `acc` and trip the early-break on the SS sum's small
-                // leading terms, truncating the pulse-train tail prematurely.
-                let mut ss_acc = T::from_f64(0.0);
-                while j < SS_EQUILIBRATION_CYCLES {
-                    let tad_j = tad + ii * T::from_f64(j as f64);
-                    if tad_j.val() > 0.0 {
-                        let term = prep.rate(tad_j, dose_mass);
-                        acc = acc + term;
-                        ss_acc = ss_acc + term;
-                        // Past the mode the density is monotone-decreasing, so a term below the
-                        // relative floor means the remaining periodic tail is spent.
-                        if j >= 1
-                            && ss_acc.val().abs() > 0.0
-                            && term.val().abs() <= SS_TAIL_REL_FLOOR * ss_acc.val().abs()
-                        {
-                            break;
-                        }
-                    }
-                    j += 1;
-                }
+                acc = acc + ss_periodic_forcing(prep, tad, T::from_f64(d.ii), dose_mass);
             } else {
                 if tad.val() <= 0.0 {
                     continue;
@@ -8721,6 +8734,69 @@ mod tests {
             &mut dy_off,
         );
         assert_eq!(dy_off[0], 0.0);
+    }
+
+    /// **`ss_periodic_forcing`'s truncation break is dose-local** (#719 review, finding 2).
+    /// The SS pulse-train sum truncates once a tail term is negligible relative to *its own*
+    /// running total. Extracting it into a pure helper makes the pre-refactor hazard —
+    /// comparing each SS tail term against a cross-dose accumulator inflated by an unrelated
+    /// run-in dose — structurally impossible. This pins both directions:
+    ///   * the local-break sum equals a brute-force full sum (the break only drops negligible
+    ///     terms), and
+    ///   * a break taken against an externally inflated accumulator (the old shared-`acc`
+    ///     scheme) truncates the pre-mode leading terms and materially under-counts — so the
+    ///     two are *not* interchangeable, which is exactly why the extraction matters.
+    #[test]
+    fn ss_periodic_forcing_break_is_dose_local_not_cross_dose() {
+        // transit(n = 3, mtt = 4) ⇒ density mode at tad = mtt·(n−1)/n ≈ 2.67. A small starting
+        // `tad` with a sub-mode `II` means the first several pulse-train terms are pre-mode
+        // (small and *rising* toward the mode) — precisely the terms an inflated cross-dose
+        // threshold would wrongly discard.
+        let prep = transit_accumulator_spec().input_rate[0].prepare(&pk_transit_vec(3.0, 4.0, 1.0));
+        let tad = 0.1_f64;
+        let ii = 0.5_f64;
+        let dose_mass = 1.0_f64;
+
+        let got = ss_periodic_forcing(&prep, tad, ii, dose_mass);
+
+        // Brute-force reference: every in-range term, no early break.
+        let mut full = 0.0_f64;
+        for j in 0..SS_EQUILIBRATION_CYCLES {
+            let tad_j = tad + ii * j as f64;
+            if tad_j > 0.0 {
+                full += prep.rate(tad_j, dose_mass);
+            }
+        }
+        assert!(full > 0.0);
+        // The dose-local break drops only negligible tail terms.
+        assert_relative_eq!(got, full, max_relative = 1e-9);
+
+        // Replicate the pre-refactor cross-dose scheme: seed the break accumulator with a large
+        // unrelated run-in contribution, then break each SS term against that shared total.
+        let external_runin = 1e12_f64; // a huge prior dose's R_in already summed into `acc`
+        let mut shared = external_runin;
+        let mut buggy = 0.0_f64;
+        for j in 0..SS_EQUILIBRATION_CYCLES {
+            let tad_j = tad + ii * j as f64;
+            if tad_j > 0.0 {
+                let term = prep.rate(tad_j, dose_mass);
+                shared += term;
+                buggy += term;
+                if j >= 1 && shared.abs() > 0.0 && term.abs() <= SS_TAIL_REL_FLOOR * shared.abs() {
+                    break;
+                }
+            }
+        }
+        // The inflated threshold breaks on the small pre-mode terms, dropping the mode and the
+        // bulk of the absorption — so the cross-dose sum is far below the true (local) sum.
+        assert!(
+            buggy < 0.5 * full,
+            "cross-dose break should truncate the pre-mode train (buggy {buggy:.6}, full {full:.6})"
+        );
+        assert!(
+            (got - buggy).abs() > 0.25 * full,
+            "the dose-local helper must not reproduce the truncated cross-dose value"
+        );
     }
 
     #[test]
