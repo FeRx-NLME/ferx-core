@@ -262,7 +262,7 @@ pub fn run_covariance(
     let CovStepOutcome {
         matrix: covariance_matrix,
         wall_time_secs: covariance_wall_time_secs,
-        warnings: mut new_warnings,
+        warnings: new_warnings,
         sir_fallback_proposal: _,
     } = run_covariance_step_inner(
         &x_hat,
