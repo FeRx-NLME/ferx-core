@@ -154,7 +154,7 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | `estimation/parameterization.rs` | Pack/unpack optimizer vector (log-theta, Cholesky-omega, log-sigma) |
 | `estimation/covariance.rs` | Covariance/SE step: FD-of-OFV Hessian, eigen-floor inverse, score cross-product, non-PD SIR fallback (`compute_covariance`, `run_covariance_step`) |
 | `stats/likelihood.rs` | Individual, FOCE, and FOCEI negative log-likelihood computations |
-| `stats/residual_error.rs` | Additive, proportional, combined error models; IWRES/CWRES |
+| `stats/residual_error.rs` | Additive, proportional, combined error models; IWRES/CWRES. **Sole owner of the residual-variance-and-derivatives math**: the `residual_variance` primitive, the `ErrorSpec` dispatch layer (`variance_at{,_scaled,_with_correlations}`, `dvar_df{,_scaled}`, `d2var_df2{,_scaled}`, `sigma_loadings`/`_slopes`, …), the `residual_rd`/`residual_rd2` scalar accessors, and the dense-`R`/IWRES consumers. `types.rs` keeps only the `ErrorSpec` data definition + `obs_key`/`obs_keys`. Two association traps: `variance_at` (legacy `(f·σ)·(f·σ)`) is deliberately **not** collapsed into `variance_at_scaled` (`((f·f)·σ)·σ`) — they differ by ~1 ULP and every bare-σ R/OFV/CWRES is pinned to the legacy form; and `ruv_scale` is applied by each **caller**, never folded into `residual_rd` |
 | `sens/` | Hand-rolled `Dual2` analytic sensitivities (`∂f/∂η`, `∂f/∂θ`) over the `PkNum` trait — the exact gradients FOCE/FOCEI/HMC use |
 | `io/datareader.rs` | NONMEM-format CSV reader (ID, TIME, DV, EVID, AMT, CMT, RATE, MDV, II, SS) |
 
