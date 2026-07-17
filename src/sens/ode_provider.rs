@@ -2452,31 +2452,9 @@ fn run_subject_tvcov<const M: usize>(
 
     let mut out = Vec::with_capacity(preds.len());
     for fd in &preds {
-        let g = &fd.grad;
-        let h = &fd.hess;
-        let mut df_deta = vec![0.0; n_eta];
-        let mut df_dtheta = vec![0.0; n_theta];
-        let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
-        let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
-        for k in 0..n_eta {
-            df_deta[k] = g[n_theta + k];
-            for l in 0..n_eta {
-                d2f_deta2[k * n_eta + l] = h[n_theta + k][n_theta + l];
-            }
-            for m in 0..n_theta {
-                d2f_deta_dtheta[k * n_theta + m] = h[n_theta + k][m];
-            }
-        }
-        for m in 0..n_theta {
-            df_dtheta[m] = g[m];
-        }
-        out.push(ObsSens {
-            f: fd.value,
-            df_deta,
-            d2f_deta2,
-            df_dtheta,
-            d2f_deta_dtheta,
-        });
+        out.push(crate::sens::provider::obs_sens_from_dual2::<M>(
+            fd, n_theta, n_eta,
+        ));
     }
     let mut sens = SubjectSens { obs: out };
     // η-dependent `ExpressionScale` divisor: apply the subject-static quotient on the

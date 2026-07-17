@@ -65,9 +65,14 @@ pub enum MrDispositionKind {
 }
 
 /// The identified disposition: its shape plus the state indices of central and
-/// (for two-compartment) peripheral. Built once per model by
-/// [`identify_disposition`]; the per-subject rates are recovered separately over
-/// `T` by [`recover_disp_params_g`] so `T = Dual2` carries their sensitivities.
+/// (for two-compartment) peripheral. Produced by [`identify_disposition`] from
+/// the immutable [`OdeSpec`] structure, so it is **model-invariant** (independent
+/// of subject, `θ`, `η`). It is currently recovered afresh on each [`mr_scope`]
+/// call rather than cached on the model — a memoisation opportunity, since the
+/// numeric Jacobian probing repeats every value / gradient evaluation (tracked as
+/// a follow-up; the fast path still avoids all ODE integration, so the probing is
+/// a second-order cost). The per-subject rates are recovered separately over `T`
+/// by [`recover_disp_params_g`] so `T = Dual2` carries their sensitivities.
 #[derive(Debug, Clone, Copy)]
 pub struct MrDisposition {
     pub kind: MrDispositionKind,
@@ -750,31 +755,10 @@ fn mr_sens_dual<const M: usize>(
         // that function's doc). `ExpressionScale` is handled separately, after
         // the whole `SubjectSens` is assembled, by `apply_event_walk_expression_scale_outer`.
         let fd = crate::sens::ode_provider::apply_output_transform(model, fd);
-        let g = &fd.grad;
-        let h = &fd.hess;
-        let mut df_deta = vec![0.0; n_eta];
-        let mut df_dtheta = vec![0.0; n_theta];
-        let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
-        let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
-        for k in 0..n_eta {
-            df_deta[k] = g[n_theta + k];
-            for l in 0..n_eta {
-                d2f_deta2[k * n_eta + l] = h[n_theta + k][n_theta + l];
-            }
-            for m in 0..n_theta {
-                d2f_deta_dtheta[k * n_theta + m] = h[n_theta + k][m];
-            }
-        }
-        for m in 0..n_theta {
-            df_dtheta[m] = g[m];
-        }
-        out.push(crate::sens::provider::ObsSens {
-            f: fd.value,
-            df_deta,
-            d2f_deta2,
-            df_dtheta,
-            d2f_deta_dtheta,
-        });
+        // Shared jet→ObsSens scatter (identical axis layout in every provider).
+        out.push(crate::sens::provider::obs_sens_from_dual2::<M>(
+            &fd, n_theta, n_eta,
+        ));
     }
     Some(crate::sens::provider::SubjectSens { obs: out })
 }

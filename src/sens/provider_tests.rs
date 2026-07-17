@@ -2996,6 +2996,143 @@ fn mr_2cpt_parallel_provider_matches_fd_and_takes_fast_path() {
     check_full_provider_vs_fd(&model, &subject, &theta, &eta);
 }
 
+// A 2-cpt disposition fed by a mixed first_order + zero_order absorption. This
+// is the ONLY full-provider FD check that exercises `two_cpt_zero_order_g`'s
+// gradient w.r.t. the disposition params (CL/V1/Q/V2) — the macro-rate (α/β)
+// and `v2 = q/k21` quotient under `Dual2` the parallel-2cpt test (all
+// first_order) never touches. IIV on both CL and V1 so ∂/∂η and ∂²/∂η∂θ of the
+// box-car kernel are checked, not just ∂/∂θ.
+const MR_ZERO_ORDER_2CPT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(10.0, 0.1, 100.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.5, 0.05, 24.0)
+  theta TVDUR(2.0, 0.1, 12.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q = TVQ
+  V2 = TVV2
+  FZO = TVFZO
+  FZO1 = 1 - TVFZO
+  KA = TVKA
+  DUR = TVDUR
+[structural_model]
+  ode(states=[central, periph])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V1*central - Q/V1*central + Q/V2*periph
+  d/dt(periph) = Q/V1*central - Q/V2*periph
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+#[test]
+fn mr_2cpt_zero_order_provider_matches_fd_and_takes_fast_path() {
+    let model = parse_model_string(MR_ZERO_ORDER_2CPT).expect("parse");
+    // Obs times off the TVDUR=2.0 boundary (see the 1-cpt mixed test's rationale).
+    let subject = oral_subject(&[0.5, 1.3, 2.7, 4.0, 8.0, 16.0]);
+    let theta = [5.0, 50.0, 10.0, 100.0, 0.4, 1.5, 2.0];
+    let eta = [0.1, -0.05];
+    assert!(
+        crate::pk::modified_release::mr_subject_sensitivities(&model, &subject, &theta, &eta)
+            .is_some(),
+        "expected the MR fast path to admit this static 2-cpt zero_order subject"
+    );
+    check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+}
+
+// A per-route `lag=` on the zero_order route: the box-car onset is a MOVING
+// boundary at `t = dose + lag`, so the kernel has two `t`-dependent boundaries
+// (onset at τ=0 and window-end at τ=dur), and ∂/∂lag threads a compound
+// saltation. No other MR test lags the zero_order route (MR_MIXED_1CPT lags the
+// first_order route). Exercises ∂/∂lag of `one_cpt_zero_order_g` end-to-end.
+const MR_ZERO_ORDER_LAGGED_1CPT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFZO(0.5, 0.05, 0.95)
+  theta TVKA(1.2, 0.05, 24.0)
+  theta TVDUR(2.0, 0.1, 12.0)
+  theta TVLAGZO(1.5, 0.001, 6.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  FZO = TVFZO
+  FZO1 = 1 - TVFZO
+  KA = TVKA
+  DUR = TVDUR
+  LAGZO = TVLAGZO
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR, lag=LAGZO) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+#[test]
+fn mr_1cpt_lagged_zero_order_provider_matches_fd_and_takes_fast_path() {
+    let model = parse_model_string(MR_ZERO_ORDER_LAGGED_1CPT).expect("parse");
+    // Obs times off both moving boundaries: the window is [LAGZO, LAGZO+DUR] =
+    // [1.5, 3.5]; avoid t == 1.5 (onset) and t == 3.5 (window-end).
+    let subject = oral_subject(&[0.5, 1.1, 2.3, 3.1, 4.2, 8.0, 12.0]);
+    let theta = [5.0, 50.0, 0.5, 1.2, 2.0, 1.5];
+    let eta = [0.1, -0.05];
+    assert!(
+        crate::pk::modified_release::mr_subject_sensitivities(&model, &subject, &theta, &eta)
+            .is_some(),
+        "expected the MR fast path to admit this static lagged-zero_order subject"
+    );
+    check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+}
+
+// Multi-dose with OVERLAPPING zero_order windows: `mr_observable_g` selects the
+// `t <= dur` box-car branch independently per dose in its superposition loop, so
+// the derivative-discontinuous branch is the one place a per-dose superposition
+// bug hides. Two doses at 0 and 1.5 with DUR=2.0 → windows [0,2] and [1.5,3.5]
+// overlap in [1.5,2.0]; obs times are placed so some see dose-A post-window while
+// dose-B is mid-window (and t=1.8 sees BOTH mid-window). Off every dur/lag edge.
+#[test]
+fn mr_1cpt_zero_order_multidose_overlapping_matches_fd() {
+    let model = parse_model_string(MR_MIXED_1CPT).expect("parse");
+    let mut subject = oral_subject(&[0.7, 1.8, 2.6, 3.2, 5.0, 9.0]);
+    // MR_MIXED_1CPT lags the first_order route (LAG=1.0) and has DUR=2.0 on the
+    // zero_order route; second dose at 1.5 overlaps the first's zero_order window.
+    subject.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(1.5, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let theta = [5.0, 50.0, 0.4, 1.5, 2.0, 1.0];
+    let eta = [0.1, -0.05];
+    assert!(
+        crate::pk::modified_release::mr_subject_sensitivities(&model, &subject, &theta, &eta)
+            .is_some(),
+        "expected the MR fast path to admit this multi-dose zero_order subject"
+    );
+    check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+}
+
 /// The MR closed-form jet and the ODE-integrated jet are two different schemes
 /// computing the same "analytic" gradient for the same subject
 /// (`ode_analytical_supported` already reports this model analytic;
@@ -3158,9 +3295,16 @@ fn mr_subject_sensitivities_with_scalar_scale_matches_ode_provider() {
 }
 
 // Regression: `PerCmt` scaling is the one `ScalingSpec` variant
-// `ode_analytical_supported` declines outright (routes to FD) — `mr_scope`
-// must decline it too via the same `ode_scaling_supported` gate, not silently
-// admit it with a plain (wrong, unscaled-per-CMT) jet.
+// `ode_analytical_supported` declines outright (routes to FD) — the MR GRADIENT
+// paths must decline it too via the same `ode_scaling_supported` gate, not
+// silently admit it with a plain (wrong, unscaled-per-CMT) jet. The VALUE path
+// (`mr_predictions` / `mr_scope`) deliberately does NOT gate on scaling: it
+// returns the raw closed-form concentration, and the caller
+// (`compute_predictions_with_tv`) applies the per-CMT scale afterward — so the
+// value stays fast while the gradient falls to FD of that same scaled value.
+// This test pins that intentional value-admits / gradient-declines asymmetry so
+// it can't silently flip to "value declines" (a perf loss) or "gradient admits"
+// (a correctness bug — an unscaled jet).
 #[test]
 fn mr_subject_sensitivities_declines_percmt_scaling() {
     const MR_PERCMT_SCALE: &str = r#"
@@ -3193,10 +3337,16 @@ fn mr_subject_sensitivities_declines_percmt_scaling() {
     let subject = oral_subject(&[0.5, 1.3, 2.7]);
     let theta = [5.0, 50.0, 0.4, 1.5, 2.0];
     let eta = [0.1];
+    // Value path admits (the raw closed form; the per-CMT scale is a caller step).
+    assert!(
+        crate::pk::modified_release::mr_predictions(&model, &subject, &theta, &eta).is_some(),
+        "PerCmt scaling must NOT decline the MR value path — scaling is applied by the caller"
+    );
+    // Both gradient paths decline (→ ODE provider → FD of the scaled value).
     assert!(
         crate::pk::modified_release::mr_subject_sensitivities(&model, &subject, &theta, &eta)
             .is_none(),
-        "PerCmt scaling must decline the MR fast path, matching ode_scaling_supported"
+        "PerCmt scaling must decline the MR outer gradient, matching ode_scaling_supported"
     );
     assert!(
         crate::pk::modified_release::mr_subject_eta_grad(&model, &subject, &theta, &eta).is_none(),
