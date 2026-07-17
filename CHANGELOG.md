@@ -71,6 +71,17 @@ section of the SDLC for the versioning policy).
   is forgiving of a loose mode).
 
 ### Fixed
+- **Pre-flight flat-theta freeze no longer freezes an identifiable parameter with a
+  coincidentally-tiny initial gradient** (#826 follow-up). The #826 guard freezes a theta
+  whose outer gradient is ~0 at the initial estimate, on the premise it is unmapped. But a
+  near-zero *initial* gradient is not sufficient: e.g. a joint PK-TTE fit's event-model
+  hazard baseline `H0`, evaluated at `BETA = 0` where `hazard = H0` is momentarily flat in
+  the coupling term (and whose ODE-path outer gradient is finite-differenced), tripped the
+  guard and was frozen at its wrong initial value — biasing every other estimate
+  (`joint_pktte` CL/V drifted out of tolerance). The guard now **confirms** each candidate
+  with a perturbation probe: it only freezes a theta that leaves the reconverged objective
+  exactly unchanged when moved (genuinely unmapped). Identifiable-but-flat-at-init thetas are
+  left free, so the fit recovers them.
 - **FREM: the analytic gradients differentiated the wrong likelihood on covariate
   pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against
   the prediction `theta[i] + eta[j]` with the dedicated covariate error `EPSCOV` — but the

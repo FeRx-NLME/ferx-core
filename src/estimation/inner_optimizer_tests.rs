@@ -1,0 +1,983 @@
+use super::*;
+use std::collections::HashMap;
+
+/// An endpoint-only mixed-effects CTMM (#759): no `[structural_model]`, so no Gaussian
+/// data term and no PK provider — the inner objective is `½(η'Ω⁻¹η + log|Ω|) + D_ctmm(η)`.
+#[cfg(feature = "markov")]
+mod ctmm_inner {
+    use crate::types::{ObsRecord, Subject};
+
+    const MIXED_CTMM: &str = r"
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  omega ETA_Q ~ 0.1
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + ETA_Q)
+  transition asleep -> awake  = exp(LQ10)
+";
+
+    fn subject() -> Subject {
+        Subject {
+            id: "1".into(),
+            obs_records: [(0.0, 0), (1.0, 0), (2.3, 1), (3.1, 1), (5.0, 0)]
+                .iter()
+                .map(|&(time, state)| ObsRecord::DiscreteState {
+                    time,
+                    state,
+                    cmt: 5,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The route must actually change. Before #759 every subject with `obs_records`
+    /// declined the analytic inner gradient outright, so this predicate was `false` and
+    /// the EBE search finite-differenced the whole objective.
+    #[test]
+    fn endpoint_only_ctmm_reports_and_takes_the_analytic_inner_route() {
+        let model = crate::parser::model_parser::parse_model_string(MIXED_CTMM).unwrap();
+        // Model-level: what `build_info::gradient_method_inner` reports.
+        assert!(
+            super::super::analytic_inner_grad_supported_model(&model),
+            "an endpoint-only CTMM must report an analytic inner gradient"
+        );
+        // Subject-level: what `find_ebe` actually runs.
+        assert!(
+            super::super::analytic_inner_grad_supported(&model, &subject()),
+            "a CTMM subject must now take the analytic inner route"
+        );
+    }
+
+    /// An endpoint-only CTMM whose generator has **no** dual-evaluable program — here by
+    /// pushing the `(θ, η)` width past `MAX_CTMM_AXES` — must stay on FD, on *both* the
+    /// model-level predicate `build_info` reports and the per-subject gate `find_ebe`
+    /// runs. The two must agree, or the fit reports a gradient method it does not use.
+    ///
+    /// This pins the ordering inside `analytic_inner_grad_supported`: the survival-record
+    /// guard runs first and rejects a program-less CTMM subject, so it never reaches the
+    /// `obs_times.is_empty()` branch (which would otherwise wave it through on the
+    /// strength of having no Gaussian block). Swap those two and this test fails.
+    #[test]
+    fn program_less_endpoint_only_ctmm_stays_fd() {
+        let n_th = 25; // + 1 η = 26 axes > MAX_CTMM_AXES (24)
+        let mut src = String::from("[parameters]\n");
+        for i in 1..=n_th {
+            src += &format!("  theta T{i}(0.1, -6.0, 3.0)\n");
+        }
+        src += "  omega ETA_Q ~ 0.1\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
+                    states = [awake=0, asleep=1]\n  transition awake  -> asleep = exp(ETA_Q + ";
+        src += &(1..=n_th)
+            .map(|i| format!("T{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        src += ")\n  transition asleep -> awake  = exp(T1)\n";
+
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+        assert_eq!(
+            model.n_theta + model.n_eta,
+            26,
+            "fixture must exceed the cap"
+        );
+        assert!(
+            !super::super::analytic_inner_grad_supported_model(&model),
+            "a CTMM past the dual dispatch cap must report FD"
+        );
+        assert!(
+            !super::super::analytic_inner_grad_supported(&model, &subject()),
+            "…and must actually take FD, not fall through the no-Gaussian-block branch"
+        );
+    }
+
+    /// The whole inner gradient — prior + CTMM data term — against a central difference
+    /// of `individual_nll`, the exact objective the EBE search minimizes. This is the
+    /// contract that matters: the two must agree, or BFGS converges on one function
+    /// while descending another.
+    #[test]
+    fn analytic_inner_gradient_matches_fd_of_individual_nll() {
+        let model = crate::parser::model_parser::parse_model_string(MIXED_CTMM).unwrap();
+        let subject = subject();
+        let params = &model.default_params;
+        let theta = &params.theta;
+
+        for &eta0 in &[-0.4_f64, 0.0, 0.55] {
+            let g = super::super::analytic_eta_nll_gradient_with_schedule(
+                &model,
+                &subject,
+                theta,
+                &[eta0],
+                &params.omega,
+                &params.sigma.values,
+                None,
+                None,
+            )
+            .expect("endpoint-only CTMM is in analytic scope");
+
+            let nll = |e: f64| {
+                crate::stats::likelihood::individual_nll(
+                    &model,
+                    &subject,
+                    theta,
+                    &[e],
+                    &params.omega,
+                    &params.sigma.values,
+                )
+            };
+            let h = 1e-6;
+            let fd = (nll(eta0 + h) - nll(eta0 - h)) / (2.0 * h);
+            assert!(
+                (g[0] - fd).abs() < 1e-6,
+                "η = {eta0}: analytic {}, FD {fd}",
+                g[0]
+            );
+        }
+    }
+}
+
+/// The M3 censored coefficient `∂/∂f[−logΦ((y−f)/√v)]` must equal a central
+/// finite difference of that data term — across additive (`dv_df = 0`) and
+/// f-dependent (`dv_df ≠ 0`, e.g. proportional/combined) variance, and across
+/// the regimes `f < LLOQ`, `f ≈ LLOQ`, and `f ≫ LLOQ` (deep tail, where the
+/// inverse Mills ratio's log-domain evaluation matters).
+#[test]
+fn m3_censored_dterm_df_matches_fd() {
+    // Per-row censored data term −logΦ(z), z = (y−f)/√v(f), with v(f) a
+    // generic affine-in-f² residual variance: v = sig_add² + (sig_prop·f)².
+    let term = |y: f64, f: f64, sig_add: f64, sig_prop: f64| -> f64 {
+        let v = sig_add * sig_add + sig_prop * sig_prop * f * f;
+        let z = (y - f) / v.sqrt();
+        -crate::stats::special::log_normal_cdf(z)
+    };
+    let lloq = 1.0_f64;
+    let cases = [
+        // (f, sig_add, sig_prop)
+        (0.6, 0.2, 0.0),  // additive, f below LLOQ
+        (1.0, 0.2, 0.0),  // additive, f at LLOQ
+        (0.8, 0.0, 0.25), // proportional, dv_df ≠ 0
+        (0.7, 0.15, 0.2), // combined, dv_df ≠ 0
+        (3.0, 0.2, 0.0),  // f ≫ LLOQ: deep tail (Φ(z)→0)
+    ];
+    for (f, sig_add, sig_prop) in cases {
+        let v = sig_add * sig_add + sig_prop * sig_prop * f * f;
+        let dv_df = 2.0 * sig_prop * sig_prop * f; // ∂v/∂f
+        let analytic = m3_censored_dterm_df(lloq, f, v, dv_df, 1);
+        // `normal_cdf` is a rational approximation (~1.5e-7 abs error); a tiny
+        // FD step amplifies that noise (noise/h), so use a moderate step where
+        // truncation and approximation error both sit well under the band.
+        let h = 1e-3;
+        let fd = (term(lloq, f + h, sig_add, sig_prop) - term(lloq, f - h, sig_add, sig_prop))
+            / (2.0 * h);
+        assert!(
+            (analytic - fd).abs() < 1e-3 * (1.0 + fd.abs()),
+            "f={f}, sig_add={sig_add}, sig_prop={sig_prop}: analytic {analytic} vs FD {fd}"
+        );
+    }
+}
+
+#[test]
+fn find_ebe_uses_fd_h_matrix_when_inner_gradient_forced_fd() {
+    use crate::parser::model_parser::parse_model_string;
+
+    let mut model = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(0.15, 0.01, 10.0)
+  theta TVV(5.0, 0.1, 100.0)
+  theta TVIMAX(-0.3, -10.0, 10.0)
+  theta TVTI50(100.0, 1.0, 700.0)
+  theta TVHILL(3.0, 0.1, 10.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.01
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  IMAX = TVIMAX
+  TI50 = TVTI50
+  HILL = TVHILL
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL * exp(IMAX * TIME^HILL / (TI50^HILL + TIME^HILL)) / V) * central
+
+[scaling]
+  obs_scale = V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  gradient = fd
+"#,
+    )
+    .expect("parse");
+    model.gradient_method = GradientMethod::Fd;
+
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 200.0, 1, 9600.0, false, 0.0)],
+        obs_times: vec![20.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![12.0],
+        obs_cmts: vec![1],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0],
+        occasions: Vec::new(),
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+
+    let result = find_ebe(
+        &model,
+        &subject,
+        &model.default_params,
+        50,
+        1e-5,
+        None,
+        None,
+        0,
+    );
+
+    assert!(
+        result.h_matrix.iter().all(|v| v.is_finite()),
+        "forced-FD inner route must not consume a non-finite analytic h_matrix: {:?}",
+        result.h_matrix
+    );
+}
+
+/// End-to-end: the analytic M3 inner η-gradient must match a central finite
+/// difference of the inner objective (`individual_nll_into_with_schedule`,
+/// which carries the `−2·logΦ(z)` censored term) on the real warfarin BLOQ
+/// model + data — exercising the full wiring (provider, cens lookup, coef
+/// dispatch), not just the isolated coefficient.
+#[test]
+fn analytic_inner_gradient_m3_matches_fd_on_warfarin_bloq() {
+    use std::cell::RefCell;
+    use std::path::Path;
+    let model =
+        crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin_bloq.ferx"))
+            .expect("warfarin BLOQ model parses");
+    assert!(
+        matches!(model.bloq_method, crate::types::BloqMethod::M3),
+        "model must be M3"
+    );
+    let pop =
+        crate::io::datareader::read_nonmem_csv(Path::new("data/warfarin_bloq.csv"), None, None)
+            .expect("warfarin BLOQ data loads");
+    let subject = pop
+        .subjects
+        .iter()
+        .find(|s| s.cens.iter().any(|&c| c != 0))
+        .expect("at least one subject with a censored row");
+
+    let theta = &model.default_params.theta;
+    let omega = &model.default_params.omega;
+    let sigma = &model.default_params.sigma.values;
+    let eta = vec![0.12, -0.05, 0.2];
+
+    let analytic = analytic_eta_nll_gradient(&model, subject, theta, &eta, omega, sigma)
+        .expect("analytic M3 inner gradient must be supported");
+
+    let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
+    let obj = |e: &[f64]| -> f64 {
+        let mut s = scratch.borrow_mut();
+        individual_nll_into_with_schedule(&model, subject, theta, e, omega, sigma, &mut s, None)
+    };
+    let fd = gradient_fd(&obj, &eta, model.n_eta);
+
+    for k in 0..model.n_eta {
+        assert!(
+            (analytic[k] - fd[k]).abs() < 1e-4 * (1.0 + fd[k].abs()),
+            "η[{k}]: analytic {} vs FD {}",
+            analytic[k],
+            fd[k]
+        );
+    }
+}
+
+/// Closed-form `iiv_on_ruv` + M3 BLOQ (#4c): the analytic non-IOV inner
+/// η-gradient must match central FD of `individual_nll`, exercising the censored
+/// `η_ruv` data column `h·z` and the `exp(2·η_ruv)` variance scaling on the
+/// censored rows (which previously forced FD).
+#[test]
+fn analytic_inner_gradient_iiv_on_ruv_m3_matches_fd() {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    let mut model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.05\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse closed-form iiv_on_ruv");
+    model.bloq_method = crate::types::BloqMethod::M3;
+    assert_eq!(model.residual_error_eta, Some(3));
+
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 24.0],
+        obs_raw_times: Vec::new(),
+        // The last two rows are below the LLOQ = 2.0 (carried in `observations`).
+        observations: vec![8.0, 7.0, 5.0, 3.0, 2.0, 2.0],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0, 0, 0, 0, 1, 1],
+        occasions: vec![1; 6],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+
+    let theta = &model.default_params.theta;
+    let omega = &model.default_params.omega;
+    let sigma = &model.default_params.sigma.values;
+    let eta = vec![0.12, -0.05, 0.2, 0.15]; // non-zero η_ruv
+
+    let analytic = analytic_eta_nll_gradient(&model, &subject, theta, &eta, omega, sigma)
+        .expect("analytic closed-form M3 + iiv_on_ruv inner gradient");
+
+    let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(&subject));
+    let obj = |e: &[f64]| -> f64 {
+        let mut s = scratch.borrow_mut();
+        individual_nll_into_with_schedule(&model, &subject, theta, e, omega, sigma, &mut s, None)
+    };
+    let fd = gradient_fd(&obj, &eta, model.n_eta);
+    for k in 0..model.n_eta {
+        assert!(
+            (analytic[k] - fd[k]).abs() < 1e-4 * (1.0 + fd[k].abs()),
+            "η[{k}]: analytic {} vs FD {}",
+            analytic[k],
+            fd[k]
+        );
+    }
+}
+
+/// ODE counterpart of [`analytic_inner_gradient_m3_matches_fd_on_warfarin_bloq`]:
+/// the analytic M3 inner η-gradient produced via the **event-driven ODE
+/// sensitivity walk** (not the closed-form provider) must match a central FD of
+/// the inner objective on the warfarin BLOQ data — confirming non-IOV ODE+M3 is
+/// served analytically on the inner loop (the censored `−logΦ` coefficient rides
+/// the same provider-agnostic `apply_*_inner` path as the closed-form engine).
+#[test]
+fn analytic_inner_gradient_m3_matches_fd_on_warfarin_ode_bloq() {
+    use std::cell::RefCell;
+    use std::path::Path;
+    let model =
+        crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin_ode_bloq.ferx"))
+            .expect("warfarin ODE BLOQ model parses");
+    assert!(
+        matches!(model.bloq_method, crate::types::BloqMethod::M3),
+        "model must be M3"
+    );
+    assert!(
+        model.is_ode_based(),
+        "model must be on the ODE path for this probe"
+    );
+    let pop =
+        crate::io::datareader::read_nonmem_csv(Path::new("data/warfarin_bloq.csv"), None, None)
+            .expect("warfarin BLOQ data loads");
+    let subject = pop
+        .subjects
+        .iter()
+        .find(|s| s.cens.iter().any(|&c| c != 0))
+        .expect("at least one subject with a censored row");
+
+    let theta = &model.default_params.theta;
+    let omega = &model.default_params.omega;
+    let sigma = &model.default_params.sigma.values;
+    let eta = vec![0.12, -0.05, 0.2];
+
+    let analytic = analytic_eta_nll_gradient(&model, subject, theta, &eta, omega, sigma)
+        .expect("analytic M3 inner gradient must be supported on ODE path");
+
+    let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
+    let obj = |e: &[f64]| -> f64 {
+        let mut s = scratch.borrow_mut();
+        individual_nll_into_with_schedule(&model, subject, theta, e, omega, sigma, &mut s, None)
+    };
+    let fd = gradient_fd(&obj, &eta, model.n_eta);
+
+    for k in 0..model.n_eta {
+        assert!(
+            (analytic[k] - fd[k]).abs() < 1e-4 * (1.0 + fd[k].abs()),
+            "η[{k}]: analytic {} vs FD {}",
+            analytic[k],
+            fd[k]
+        );
+    }
+}
+
+/// **Non-IOV ODE** M3 BLOQ + `iiv_on_ruv` (#486 — the last `iiv_on_ruv` holdout):
+/// the ODE counterpart of [`analytic_inner_gradient_iiv_on_ruv_m3_matches_fd`]. The
+/// censored residual-eta data column `h·z` and the `exp(2·η_ruv)` variance scaling are
+/// applied by the provider-agnostic `residual_inner_obs` over the **event-driven ODE
+/// walk's** `ObsSens` (not the closed-form provider), so the analytic inner η-gradient
+/// must match central FD of `individual_nll` — the non-IOV ODE M3 + `iiv_on_ruv` combo
+/// the inner loop now admits (#623).
+#[test]
+fn analytic_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    let mut model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.05\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n[odes]\n  d/dt(depot)   = -KA * depot\n  d/dt(central) =  KA * depot / V - (CL/V) * central\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  method = focei\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+        )
+        .expect("parse ODE iiv_on_ruv");
+    model.bloq_method = crate::types::BloqMethod::M3;
+    assert_eq!(model.residual_error_eta, Some(3));
+    assert!(model.is_ode_based(), "model must be on the ODE path");
+
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 24.0],
+        obs_raw_times: Vec::new(),
+        // The last two rows are below the LLOQ (carried in `cens`).
+        observations: vec![8.0, 7.0, 5.0, 3.0, 2.0, 2.0],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0, 0, 0, 0, 1, 1],
+        occasions: vec![1; 6],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+
+    let theta = &model.default_params.theta;
+    let omega = &model.default_params.omega;
+    let sigma = &model.default_params.sigma.values;
+    let eta = vec![0.12, -0.05, 0.2, 0.15]; // non-zero η_ruv
+
+    let analytic = analytic_eta_nll_gradient(&model, &subject, theta, &eta, omega, sigma)
+        .expect("analytic non-IOV ODE M3 + iiv_on_ruv inner gradient");
+
+    let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(&subject));
+    let obj = |e: &[f64]| -> f64 {
+        let mut s = scratch.borrow_mut();
+        individual_nll_into_with_schedule(&model, &subject, theta, e, omega, sigma, &mut s, None)
+    };
+    let fd = gradient_fd(&obj, &eta, model.n_eta);
+    for k in 0..model.n_eta {
+        assert!(
+            (analytic[k] - fd[k]).abs() < 1e-4 * (1.0 + fd[k].abs()),
+            "η[{k}]: analytic {} vs FD {}",
+            analytic[k],
+            fd[k]
+        );
+    }
+}
+
+/// Dense BFGS vs L-BFGS scaling with inner dimension `n`, on an
+/// ill-conditioned 1-D-Laplacian quadratic `½xᵀLx − 1ᵀx` (cond ≈ (n/π)², so
+/// the solve needs ~O(n) curvature updates — representative of a curved inner
+/// NLL). Both use the **analytic** gradient `Lx − 1` so the per-iteration cost
+/// is dominated by the solver's linear algebra, not the gradient: dense is
+/// `O(n²)`/step (matvec + rank-2 update), L-BFGS `O(m·n)`/step. Isolates the
+/// solver, unlike a real fit where the prediction/FD cost dominates.
+#[test]
+#[ignore = "bench: cargo test --release ... -- --ignored --nocapture inner_solver_scaling_bench"]
+fn inner_solver_scaling_bench() {
+    use std::time::Instant;
+    eprintln!("inner-solver scaling (analytic-gradient Laplacian quadratic):");
+    for &n in &[4usize, 8, 16, 32, 64, 128, 256] {
+        // f(x) = ½ Σ_i (x_i − x_{i-1})² + ½ x_0²  −  Σ_i x_i   (x_{-1}=0).
+        let obj = move |x: &[f64]| -> f64 {
+            let mut f = 0.5 * x[0] * x[0];
+            for i in 1..n {
+                let d = x[i] - x[i - 1];
+                f += 0.5 * d * d;
+            }
+            f - x.iter().sum::<f64>()
+        };
+        // grad = L x − 1, L the Dirichlet 1-D Laplacian (tridiag 2,−1).
+        let grad = move |x: &[f64]| -> Vec<f64> {
+            let mut g = vec![0.0; n];
+            for i in 0..n {
+                let mut v = 2.0 * x[i];
+                if i > 0 {
+                    v -= x[i - 1];
+                }
+                if i + 1 < n {
+                    v -= x[i + 1];
+                }
+                g[i] = v - 1.0;
+            }
+            g
+        };
+        let runs = 50;
+        let time_it = |solver: &dyn Fn(&mut [f64]) -> bool| -> f64 {
+            let t0 = Instant::now();
+            for _ in 0..runs {
+                let mut x = vec![0.0; n];
+                std::hint::black_box(solver(&mut x));
+            }
+            t0.elapsed().as_secs_f64() * 1e3 / runs as f64
+        };
+        let t_dense =
+            time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
+        let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
+        eprintln!(
+            "  n={n:4}  dense={t_dense:8.3} ms  lbfgs={t_lbfgs:8.3} ms  dense/lbfgs={:.2}x",
+            t_dense / t_lbfgs
+        );
+    }
+}
+
+/// The interpolating backtracking line search returns a step that satisfies
+/// the Armijo sufficient-decrease test and strictly lowers the objective,
+/// using only a handful of trial evaluations (the property the FOCEI inner
+/// loop relies on — fixed halving used ~20 here and frequently hit the cap).
+#[test]
+fn line_search_finds_armijo_step_quickly() {
+    // f(x) = (x − 3)²; at x = 0 the unit Newton-less step −g overshoots the
+    // minimiser, so a fixed-halving search would backtrack repeatedly.
+    let obj = |x: &[f64]| -> f64 { (x[0] - 3.0) * (x[0] - 3.0) };
+    let x = [0.0];
+    let g = [2.0 * (x[0] - 3.0)]; // = −6
+    let d = [-g[0]]; // steepest descent, dg = −36 < 0
+    let f0 = obj(&x);
+    let evals = std::cell::Cell::new(0usize);
+    let counting = |xx: &[f64]| {
+        evals.set(evals.get() + 1);
+        obj(xx)
+    };
+    let (alpha, f_new) = backtracking_line_search(&counting, &x, &d, &g, 1, f0);
+    let evals = evals.get();
+    assert!(alpha > 0.0, "a descent step must be found");
+    let c1 = 1e-4;
+    let dg: f64 = d.iter().zip(g.iter()).map(|(a, b)| a * b).sum();
+    assert!(
+        f_new <= f0 + c1 * alpha * dg,
+        "returned step must satisfy Armijo"
+    );
+    assert!(f_new < f0, "objective must strictly decrease");
+    assert!(
+        evals <= 5,
+        "interpolation should converge in a few evals, got {evals}"
+    );
+}
+
+/// A non-descent direction (dg ≥ 0) yields `alpha == 0` and leaves the
+/// objective baseline untouched — the signal the inner BFGS uses to stop /
+/// fall back rather than step uphill.
+#[test]
+fn line_search_rejects_non_descent_direction() {
+    let obj = |x: &[f64]| -> f64 { (x[0] - 3.0) * (x[0] - 3.0) };
+    let x = [0.0];
+    let g = [2.0 * (x[0] - 3.0)]; // = −6
+    let d = [g[0]]; // SAME sign as g → dg = +36 ≥ 0 (ascent)
+    let f0 = obj(&x);
+    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, 1, f0);
+    assert_eq!(alpha, 0.0);
+    assert_eq!(f_new, f0);
+}
+
+/// A trial point where the objective goes **non-finite** — an out-of-domain η
+/// where an absorption closed form leaves its convergence region and returns
+/// ±inf/NaN — must not crash the line search. The quadratic safeguard has no
+/// finite sample to interpolate, so it falls back to plain halving and
+/// eventually reports "no step" (`alpha == 0`). Regression for the
+/// `clamp(NaN, NaN)` SIGABRT surfaced by the transit multi-dose + covariate
+/// anchor (#719 close-out): a non-finite `f_new` used to poison `alpha`, and
+/// the next trial's `clamp(0.1·α, 0.5·α)` — bounds both NaN — aborted.
+#[test]
+fn line_search_survives_non_finite_objective() {
+    let x = [0.0];
+    let g = [-6.0];
+    let d = [6.0]; // dg = −36 < 0 (a genuine descent direction)
+    let f0 = 10.0;
+    // Every trial step returns NaN — must not panic, must report no step.
+    let nan_obj = |_: &[f64]| -> f64 { f64::NAN };
+    let (alpha, f_new) = backtracking_line_search(&nan_obj, &x, &d, &g, 1, f0);
+    assert_eq!(alpha, 0.0, "a never-finite objective yields no step");
+    assert_eq!(f_new, f0, "baseline objective is returned unchanged");
+    // +inf trials behave identically (never accepted, never a panic).
+    let inf_obj = |_: &[f64]| -> f64 { f64::INFINITY };
+    let (alpha, f_new) = backtracking_line_search(&inf_obj, &x, &d, &g, 1, f0);
+    assert_eq!(alpha, 0.0);
+    assert_eq!(f_new, f0);
+}
+
+/// A **non-finite search direction** (`dg = ±inf`, from a blown-up BFGS
+/// update) is rejected up front rather than driving `−dg·α²/denom` to
+/// `inf/inf = NaN`. Companion regression to the clamp-panic fix.
+#[test]
+fn line_search_rejects_non_finite_direction() {
+    let obj = |x: &[f64]| -> f64 { (x[0] - 3.0) * (x[0] - 3.0) };
+    let x = [0.0];
+    let g = [-6.0];
+    let d = [f64::INFINITY]; // dg = −inf: a non-finite "descent" direction
+    let f0 = obj(&x);
+    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, 1, f0);
+    assert_eq!(alpha, 0.0);
+    assert_eq!(f_new, f0);
+}
+
+/// The refactored dense BFGS (objective-tracked line search) still drives a
+/// well-conditioned quadratic to its analytic minimiser.
+#[test]
+fn dense_bfgs_converges_on_quadratic() {
+    // f(x) = (x0−1)² + 4(x1+2)², minimiser (1, −2).
+    let obj =
+        |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
+    let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
+    let mut x = vec![0.0, 0.0];
+    let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None, false);
+    assert!(ok, "BFGS should report convergence");
+    assert!((x[0] - 1.0).abs() < 1e-6, "x0 = {}", x[0]);
+    assert!((x[1] + 2.0).abs() < 1e-6, "x1 = {}", x[1]);
+}
+
+#[test]
+fn test_inner_loop_stats_default() {
+    let s = InnerLoopStats::default();
+    assert_eq!(s.n_unconverged, 0);
+    assert_eq!(s.n_fallback, 0);
+}
+
+// ── FREM inner-loop preconditioner (issue #406) ──────────────────────────
+
+#[test]
+fn preconditioner_scales_each_dim_by_its_own_curvature() {
+    // 4 etas: 2 PK (dims 0,1; no FREM pseudo-obs) and 2 covariate (dims 2,3;
+    // FREMTYPE 100→eta2, 200→eta3). The covariate pseudo-obs precision is
+    // 1/R = 1/(EPSCOV²) = 1e6; PK dims have no data term and fall back to the
+    // prior conditional scale 1/Ω⁻¹ᵢᵢ.
+    let mut fremtype_to_indices = std::collections::HashMap::new();
+    fremtype_to_indices.insert(100u16, (5usize, 2usize));
+    fremtype_to_indices.insert(200u16, (6usize, 3usize));
+    let fc = FremConfig {
+        fremtype_to_indices,
+        covariate_sigma_index: 1,
+    };
+    // Ω⁻¹: PK precisions 10 and 4; covariate prior precisions tiny (0.01).
+    let omega_inv = DMatrix::from_diagonal(&DVector::from_column_slice(&[10.0, 4.0, 0.01, 0.01]));
+    // sigma[1] = EPSCOV = 1e-3 (SD) → R = 1e-6 → data precision 1e6.
+    let sigma = [0.3, 1e-3];
+    // One PK obs row (ft=0) plus one pseudo-obs row per covariate.
+    let fremtype = [0u16, 100, 200];
+
+    let p = preconditioner_from_parts(&fc, &fremtype, &omega_inv, &sigma, 4)
+        .expect("Some for n_eta > 0");
+
+    // PK dims: 1/Ω⁻¹ᵢᵢ.
+    assert!((p[0] - 0.1).abs() < 1e-9, "p0 = {}", p[0]);
+    assert!((p[1] - 0.25).abs() < 1e-9, "p1 = {}", p[1]);
+    // Covariate dims: 1/(0.01 + 1e6) ≈ 1e-6 — sharply smaller than PK.
+    assert!(p[2] < 1.1e-6 && p[2] > 0.9e-6, "p2 = {}", p[2]);
+    assert!(p[3] < 1.1e-6 && p[3] > 0.9e-6, "p3 = {}", p[3]);
+    // The whole point: covariate dims get a step scale ~1e5× tighter than PK,
+    // so a single preconditioned BFGS step is near-Newton for them.
+    assert!(p[0] / p[2] > 1e4);
+}
+
+#[test]
+fn preconditioner_is_none_for_zero_eta() {
+    let fc = FremConfig {
+        fremtype_to_indices: std::collections::HashMap::new(),
+        covariate_sigma_index: 0,
+    };
+    let omega_inv = DMatrix::<f64>::zeros(0, 0);
+    assert!(preconditioner_from_parts(&fc, &[], &omega_inv, &[1e-3], 0).is_none());
+}
+
+/// The general (non-FREM) inner preconditioner inverts the Ω⁻¹ diagonal so
+/// each BFGS dimension is scaled by its prior conditional variance, giving a
+/// well-scaled H0 for multi-scale / correlated Ω.
+#[test]
+fn inner_precond_from_omega_inverts_diagonal() {
+    // Diagonal Ω⁻¹ = diag(10, 2, 0.5) → precond = diag(0.1, 0.5, 2.0).
+    let omega_inv = DMatrix::from_diagonal(&DVector::from_column_slice(&[10.0, 2.0, 0.5]));
+    let p = inner_preconditioner_from_omega(&omega_inv, 3).expect("usable diagonal");
+    assert!((p[0] - 0.1).abs() < 1e-12);
+    assert!((p[1] - 0.5).abs() < 1e-12);
+    assert!((p[2] - 2.0).abs() < 1e-12);
+    // n_eta == 0 → None (identity H0).
+    assert!(inner_preconditioner_from_omega(&DMatrix::<f64>::zeros(0, 0), 0).is_none());
+    // A non-positive diagonal entry is skipped but a usable one still yields Some.
+    let mixed = DMatrix::from_diagonal(&DVector::from_column_slice(&[0.0, 4.0]));
+    let pm = inner_preconditioner_from_omega(&mixed, 2).expect("one usable entry");
+    assert_eq!(pm[0], 1.0); // untouched default for the zero diagonal
+    assert!((pm[1] - 0.25).abs() < 1e-12);
+}
+
+#[test]
+fn test_ebe_result_converged_flag() {
+    // Verify EbeResult struct has the expected fields.
+    let r = EbeResult {
+        eta: nalgebra::DVector::zeros(2),
+        h_matrix: nalgebra::DMatrix::identity(2, 2),
+        converged: true,
+        used_fallback: false,
+        grad_norm: 0.0,
+        nll: 1.5,
+        kappas: Vec::new(),
+        hard_reject: false,
+    };
+    assert!(r.converged);
+    assert!(!r.used_fallback);
+    assert_eq!(r.grad_norm, 0.0);
+}
+
+#[test]
+fn test_inner_loop_stats_min_obs_filter() {
+    // min_obs filter: subjects with fewer obs than min_obs are excluded
+    // from n_unconverged count. We exercise this logic by constructing
+    // InnerLoopStats manually (simulating what run_inner_loop_warm does).
+    let results = vec![
+        EbeResult {
+            eta: nalgebra::DVector::zeros(1),
+            h_matrix: nalgebra::DMatrix::identity(1, 1),
+            converged: false, // unconverged
+            used_fallback: false,
+            grad_norm: 0.0,
+            nll: 1.0,
+            kappas: Vec::new(),
+            hard_reject: false,
+        },
+        EbeResult {
+            eta: nalgebra::DVector::zeros(1),
+            h_matrix: nalgebra::DMatrix::identity(1, 1),
+            converged: false, // also unconverged
+            used_fallback: true,
+            grad_norm: 0.0,
+            nll: 2.0,
+            kappas: Vec::new(),
+            hard_reject: false,
+        },
+    ];
+    // Simulate filter: first subject has 1 obs (below min_obs=2), second has 3 obs.
+    let obs_counts = [1_usize, 3_usize];
+    let min_obs = 2_usize;
+    let n_unconverged = results
+        .iter()
+        .zip(obs_counts.iter())
+        .filter(|(r, &n_obs)| !r.converged && n_obs >= min_obs.max(1))
+        .count();
+    let n_fallback = results.iter().filter(|r| r.used_fallback).count();
+    // Only second subject counts (3 obs >= 2); first is filtered out.
+    assert_eq!(n_unconverged, 1);
+    // Both fallback counts regardless of min_obs.
+    assert_eq!(n_fallback, 1);
+}
+
+/// #603 review #1/#2: a hard-rejected subject must be counted even with a short record,
+/// so a single one forces the outer guard to reject the trial. Mirrors the `n_start_rejected`
+/// derivation in `run_inner_loop_warm` (no `min_obs` filter, unlike `n_unconverged`).
+#[test]
+fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
+    let make = |hard_reject: bool| EbeResult {
+        eta: nalgebra::DVector::zeros(1),
+        h_matrix: nalgebra::DMatrix::zeros(1, 1),
+        converged: false,
+        used_fallback: false,
+        grad_norm: 0.0,
+        nll: 1.0,
+        kappas: Vec::new(),
+        hard_reject,
+    };
+    // One hard-rejected subject with a single observation, one normal subject.
+    let results = [make(true), make(false)];
+    let obs_counts = [1_usize, 5_usize];
+    let min_obs = 3_usize;
+
+    // The `min_obs` filter would drop the 1-obs subject from `n_unconverged` …
+    let n_unconverged = results
+        .iter()
+        .zip(obs_counts.iter())
+        .filter(|(r, &n_obs)| !r.converged && n_obs >= min_obs.max(1))
+        .count();
+    assert_eq!(n_unconverged, 1); // only the 5-obs subject
+
+    // … but `n_start_rejected` counts the hard reject regardless of obs count.
+    let n_start_rejected = results.iter().filter(|r| r.hard_reject).count();
+    assert_eq!(n_start_rejected, 1);
+}
+
+#[test]
+fn test_frem_jacobian_overrides_fd_with_exact_values() {
+    use crate::types::{
+        DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkModel, PkParams, SigmaVector,
+    };
+    use std::collections::HashMap;
+
+    // Build a minimal model with 3 etas: CL, V, COV_WT(FREM)
+    let omega = OmegaMatrix::from_diagonal(
+        &[0.09, 0.09, 100.0],
+        vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
+    );
+    let default_params = crate::types::ModelParameters {
+        theta: vec![10.0, 100.0, 90.0],
+        theta_names: vec!["TVCL".into(), "TVV".into(), "TV_WT".into()],
+        theta_lower: vec![0.01, 1.0, 0.0],
+        theta_upper: vec![100.0, 500.0, 200.0],
+        theta_fixed: vec![false, false, true],
+        omega,
+        omega_fixed: vec![false, false, false],
+        sigma: SigmaVector {
+            values: vec![0.05],
+            names: vec!["RUV".into()],
+        },
+        sigma_fixed: vec![false],
+        omega_iov: None,
+        kappa_fixed: vec![],
+    };
+    let model = CompiledModel {
+        has_conditional_eta_params: false,
+        name: "frem_jac_test".into(),
+        pk_model: PkModel::OneCptIv,
+        error_model: ErrorModel::Additive,
+        error_spec: crate::types::ErrorSpec::Single(ErrorModel::Additive),
+        residual_correlations: Vec::new(),
+        pk_param_fn: Box::new(
+            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp(); // CL
+                p.values[1] = theta[1] * eta[1].exp(); // V
+                p
+            },
+        ),
+        n_theta: 3,
+        n_eta: 3,
+        n_epsilon: 1,
+        n_kappa: 0,
+        kappa_names: vec![],
+        theta_names: vec!["TVCL".into(), "TVV".into(), "TV_WT".into()],
+        eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
+        indiv_param_names: vec!["CL".into(), "V".into(), "COV_WT".into()],
+        indiv_param_partials: crate::types::IndivParamPartials::empty(),
+        default_params,
+        omega_init_as_sd: vec![false; 3],
+        sigma_init_as_sd: vec![false],
+        kappa_init_as_sd: vec![],
+        mu_refs: HashMap::new(),
+        kappa_mu_refs: HashMap::new(),
+        tv_fn: None,
+        pk_indices: vec![0, 1],
+        eta_map: vec![0, 1, 2],
+        pk_idx_f64: vec![0.0, 1.0],
+        sel_flat: vec![1.0, 0.0],
+        ode_spec: None,
+        diffusion_theta_start: None,
+        diffusion_state_indices: Vec::new(),
+        bloq_method: crate::types::BloqMethod::Drop,
+        referenced_covariates: Vec::new(),
+        gradient_method: GradientMethod::default(),
+        parse_warnings: Vec::new(),
+        eta_param_info: Vec::new(),
+        theta_transform: Vec::new(),
+        #[cfg(feature = "nn")]
+        covariate_nns: Vec::new(),
+        scaling: crate::types::ScalingSpec::None,
+        log_transform: false,
+        dv_pre_logged: false,
+        derived_exprs: vec![],
+        output_columns: vec![],
+        dose_attr_map: Default::default(),
+        #[cfg(feature = "survival")]
+        endpoints: std::collections::HashMap::new(),
+        frem_config: Some(crate::types::FremConfig {
+            fremtype_to_indices: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(100u16, (2usize, 2usize)); // TV_WT / ETA_WT_FREM
+                m
+            },
+            covariate_sigma_index: 0,
+        }),
+        residual_error_eta: None,
+        analytical_init: Vec::new(),
+        analytic_readout: None,
+        ruv_magnitude: None,
+        absorption_ode_equivalent: None,
+    };
+
+    // Subject: 2 PK obs + 1 FREM obs
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![1.0, 2.0, 0.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![5.0, 3.0, 90.0],
+        obs_cmts: vec![1, 1, 1],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0, 0, 0],
+        occasions: Vec::new(),
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        fremtype: vec![0, 0, 100], // last obs is FREM
+        obs_records: vec![],
+    };
+
+    let theta = [10.0, 100.0, 90.0];
+    let eta = [0.1, -0.05, 2.5];
+
+    let mut scratch = pk::EventPkParams::default();
+    let jac = compute_jacobian_fd(&model, &subject, &theta, &eta, &mut scratch, None);
+
+    // Row 2 (FREM obs) must be exactly [0, 0, 1]
+    assert_eq!(jac[(2, 0)], 0.0, "FREM row: ∂Y/∂η_CL must be exactly 0");
+    assert_eq!(jac[(2, 1)], 0.0, "FREM row: ∂Y/∂η_V must be exactly 0");
+    assert_eq!(jac[(2, 2)], 1.0, "FREM row: ∂Y/∂η_COV must be exactly 1");
+
+    // PK rows should be non-zero for at least CL (row 0, col 0)
+    assert!(
+        jac[(0, 0)].abs() > 1e-10,
+        "PK row: ∂Y/∂η_CL should be nonzero"
+    );
+}
+
+#[test]
+fn test_nelder_mead_nan_objective_does_not_panic() {
+    // Regression for issue #97: when a simplex vertex evaluates to a NaN
+    // objective (e.g. an ODE prediction blowing up during the EBE search),
+    // the `partial_cmp().unwrap()` sort used to panic — and, unwinding
+    // through the non-unwinding optimizer callback, abort the whole fit.
+    // NaN must now sort as worst and get reflected away instead.
+    let obj = |x: &[f64]| -> f64 {
+        if x[0] < 0.0 {
+            // The "blow-up" region: objective is non-finite here.
+            f64::NAN
+        } else {
+            (x[0] - 1.0).powi(2) + (x[1] - 1.0).powi(2)
+        }
+    };
+    // Seed the simplex entirely inside the NaN region so the very first
+    // sort encounters only NaN vertices.
+    let mut x = vec![-1.0, -1.0];
+    // The contract under test is "does not panic"; the return flag and
+    // final point are secondary. Coordinates must stay finite.
+    let _converged = nelder_mead_minimize(&obj, &mut x, 2, 200, 1e-8);
+    assert!(
+        x.iter().all(|v| v.is_finite()),
+        "Nelder-Mead must leave the point finite, got {x:?}"
+    );
+}

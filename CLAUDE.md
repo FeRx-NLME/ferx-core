@@ -52,8 +52,10 @@ The binary is called `ferx` and outputs `{model}-fit.yaml` (estimates) and `{mod
 
 There are three tiers of tests. Put a new test in the lowest tier whose constraints it fits.
 
-**Tier 1 — Fast unit tests** (inline `#[cfg(test)] mod tests { ... }` blocks in `src/**/*.rs`)
+**Tier 1 — Fast unit tests** (`#[cfg(test)] mod tests { ... }` in `src/**/*.rs`)
 Test the smallest helper that isolates the behaviour; avoid calling `fit()`. Run with `cargo test --lib`. These run on every PR and must stay fast (seconds total).
+
+The test module is inline in most files, but in the largest ones it lives in a **sibling `#[path]` file** so the production source stays navigable: the parent declares `#[cfg(test)] #[path = "<file>_tests.rs"] mod tests;` and the body sits in `src/.../<file>_tests.rs` (or `<file>_<modname>.rs` when a file has several test modules; api's siblings live under `src/api/tests/`). The module is still a child of the parent, so `super::…` and cross-module `crate::<mod>::test_helpers` paths resolve unchanged, and the test's fully-qualified name is identical to the inline form. **Add new tests to the sibling when one exists.** A bare module-scope `#[cfg(test)]` helper (a `fn`, `thread_local!`, or `use`) stays in the parent — only the `mod` blocks move — so `super::` in the sibling still finds it.
 
 **Tier 2 — Integration tests** (`tests/*.rs`)
 Call the public API (`fit()`, `predict()`, etc.) but must return immediately — either with an `Ok` after a handful of outer iterations or with an `Err`. No convergence loops. These files are compile-checked on every PR (`cargo check --tests`) and run nightly in `slow-tests.yml`. Put tests here when you need to exercise a public-API boundary that can't be reached from a `src/` unit test.
@@ -88,6 +90,8 @@ These run nightly via `slow-tests.yml` and on any push to `main` that touches es
 > the same convention it was drawn from. A committed external reference dataset (e.g. flexsurv) is
 > added when that tool is available in the environment; its absence does not block the closed-form
 > + reduction validation above.
+
+**Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a `Dual2`-vs-FD parity test.** The closed-form PK solutions and event-driven propagators are written once as generic `*_g<T: PkNum>` functions; instantiating `T = Dual2<M>` yields the exact `∂f/∂η` / `∂f/∂θ` that FOCE/FOCEI/HMC consume (`sens/`). A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the provider that assembles them, assert it against central finite differences of the `T = f64` production predictor, to tolerance, in a Tier-1 unit test. Follow the existing pattern: per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`, `sens/dual2.rs`) and the end-to-end `check_full_provider_vs_fd` harness (`sens/provider_tests.rs`). If a model is outside the analytic scope it must route to FD via the support predicates (`sens_supported` / `analytic_inner_grad_supported_model`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.)
 
 **Coverage is gated per PR.** A PR's changed lines must carry their own tests — the Codecov `patch` status enforces ≥90% coverage on the diff, and a 90% project floor is enforced on the weekly `main` run (see `codecov.yml`). This is the automated backstop to the rules above; slow-tests never run on PRs, so unit / Tier-2 tests are what register coverage. When excluding code from coverage, **scope `ignore`s by role, not by coverage %**: leave code out for *what it is* — dev-only tooling (e.g. `src/bin/generate_data.rs`), generated code (`build.rs`), or test scaffolding (`tests/`) — never because it reads red. (Feature-gated code that the coverage build doesn't compile reads as "missed" but is a measurement gap, not an ignore target — see #293.)
 
@@ -130,7 +134,7 @@ Set via `[fit_options]` in the model file or `EstimationMethod::FoceGn` / `FoceG
 ```
 .ferx file → parser/model_parser.rs → CompiledModel
 NONMEM CSV  → io/datareader.rs       → Population
-(CompiledModel, Population) → api.rs:fit() → FitResult
+(CompiledModel, Population) → api/mod.rs:fit() → FitResult
 FitResult → io/output.rs → sdtab CSV + fit YAML
 ```
 
@@ -139,7 +143,8 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | Module | Purpose |
 |--------|---------|
 | `types.rs` | Core structs: `CompiledModel`, `Population`, `Subject`, `FitResult`, `FitOptions` |
-| `api.rs` | Public API: `fit()`, `simulate()`, `predict()`, `fit_from_files()` |
+| `api/mod.rs` | Public API: `fit()`, `simulate()`, `predict()`, `fit_from_files()` |
+| `api/validation.rs` | Model/data validation gauntlet (`check_model_data`, `check_model_options`, `validate_model_file`, absorption/dosing/survival support asserts) shared by `fit()` and `ferx check`; re-exported through `api::` so paths are unchanged |
 | `parser/model_parser.rs` | Parses `.ferx` model DSL into `CompiledModel` with closures |
 | `pk/` | Analytical 1-cpt and 2-cpt PK solutions (IV, oral, infusion) with superposition |
 | `ode/solver.rs` | Dormand-Prince RK45 adaptive ODE solver |

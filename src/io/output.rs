@@ -1490,13 +1490,10 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
     let n_kappa = result.kappa_names.len();
 
     let n_omega_diag = n_eta;
-    let n_omega_full = n_eta * (n_eta + 1) / 2;
+    let n_omega_full = crate::estimation::parameterization::omega_packed_len(n_eta, false);
     let n_kappa_diag = n_kappa;
-    let n_kappa_full = if n_kappa > 0 {
-        n_kappa * (n_kappa + 1) / 2
-    } else {
-        0
-    };
+    // `omega_packed_len(0, false) == 0`, so this covers the no-IOV case too.
+    let n_kappa_full = crate::estimation::parameterization::omega_packed_len(n_kappa, false);
     let n_remaining = n.saturating_sub(n_theta + n_sigma);
 
     // Try all four diagonal/block combinations; take the first match.
@@ -1530,16 +1527,15 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
             names.push(format!("log_chol_{name}"));
         }
     } else {
-        for j in 0..n_eta {
-            for i in j..n_eta {
-                if i == j {
-                    names.push(format!("log_chol_{}", result.eta_names[i]));
-                } else {
-                    names.push(format!(
-                        "chol_{}_{}",
-                        result.eta_names[i], result.eta_names[j]
-                    ));
-                }
+        // Block lower-triangle order — single source: `lower_tri_iter`.
+        for (i, j) in crate::estimation::parameterization::lower_tri_iter(n_eta, false) {
+            if i == j {
+                names.push(format!("log_chol_{}", result.eta_names[i]));
+            } else {
+                names.push(format!(
+                    "chol_{}_{}",
+                    result.eta_names[i], result.eta_names[j]
+                ));
             }
         }
     }
@@ -1552,16 +1548,14 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
                 names.push(format!("log_chol_{name}"));
             }
         } else {
-            for j in 0..n_kappa {
-                for i in j..n_kappa {
-                    if i == j {
-                        names.push(format!("log_chol_{}", result.kappa_names[i]));
-                    } else {
-                        names.push(format!(
-                            "chol_{}_{}",
-                            result.kappa_names[i], result.kappa_names[j]
-                        ));
-                    }
+            for (i, j) in crate::estimation::parameterization::lower_tri_iter(n_kappa, false) {
+                if i == j {
+                    names.push(format!("log_chol_{}", result.kappa_names[i]));
+                } else {
+                    names.push(format!(
+                        "chol_{}_{}",
+                        result.kappa_names[i], result.kappa_names[j]
+                    ));
                 }
             }
         }
