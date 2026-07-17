@@ -290,6 +290,29 @@ impl InputRateKind {
             InputRateKind::ZeroOrder => true,
         }
     }
+
+    /// Whether a **per-route absorption lag** (`fn(..., lag=L)`, #859) on this kind
+    /// is served with exact analytic FOCE/FOCEI gradients on the event-driven walk,
+    /// or stays on the finite-difference fallback. The event-driven walk gives each
+    /// route its own onset saltation at `t_dose + lag_cmt + lag_route` (`K_ROUTE_ONSET`
+    /// in `sens/ode_provider.rs`): a finite `ka·dose` rate-on for `FirstOrder`, the
+    /// constant window rate for `ZeroOrder` (with a matching rate-off at `K_ZO_END`),
+    /// and a zero-magnitude no-op for the smooth `Transit`/`InverseGaussian` onsets
+    /// (which need only the timeline break plus the continuous `∂R_in/∂lag_route`).
+    /// `Weibull`'s onset **diverges** for shape `β < 1` (an integrable spike, no finite
+    /// rate-on saltation), so it stays FD — exactly as `weibull` + a compartment
+    /// lagtime does. Exhaustive (no `_` arm), the sibling of [`Self::supported_over_dual`]:
+    /// adding a kind forces a decision here, and this must stay consistent with the
+    /// `K_ROUTE_ONSET` handler's per-kind onset magnitude.
+    pub fn route_lag_analytic(self) -> bool {
+        match self {
+            InputRateKind::FirstOrder
+            | InputRateKind::ZeroOrder
+            | InputRateKind::Transit
+            | InputRateKind::InverseGaussian => true,
+            InputRateKind::Weibull => false,
+        }
+    }
 }
 
 /// A built-in absorption input-rate term attached to one ODE compartment.
@@ -370,9 +393,11 @@ impl InputRateForcing {
     /// the slot is absent, so an unlagged forcing is unaffected. The value is
     /// **added** to the dose's compartment lagtime to form the route's effective
     /// onset `t_dose + lag_cmt + lag_route`. Generic over `T: PkNum` so the same
-    /// reader serves the `f64` prediction / FD-fit path and (once the analytic
-    /// per-route onset saltation lands) the `Dual2` provider; today a model with
-    /// any per-route lag is gated to the FD path, so only `T = f64` reaches here.
+    /// reader serves the `f64` prediction / FD-fit path and the `Dual2` analytic
+    /// provider: since #859 a `first_order` per-route lag is served analytically on
+    /// the event-driven walk (its onset saltation injected at `K_ROUTE_ONSET`), so
+    /// `T = Dual2` reaches here too. The other kernels' route lags remain FD-gated
+    /// pending their slices (`zero_order`/`transit`/`igd`) or permanently (`weibull`).
     #[inline]
     pub fn route_lag<T: PkNum>(&self, params: &[T]) -> T {
         self.lag_slot

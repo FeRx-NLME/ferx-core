@@ -35,6 +35,14 @@ section of the SDLC for the versioning policy).
   realistic `ode_reltol`; `predict()` / `simulate()` on these models are correspondingly faster.
   Predictions are unchanged to within the ODE solver tolerance — the closed-form fixed point and
   the iteration converge to the same periodic trough (#835).
+- **Exact analytic FOCE/FOCEI gradients for per-route absorption lag** (`fn(..., lag=L)`, #859).
+  Fitting a model with a per-route absorption lag on a `first_order`, `zero_order`, `transit`, or
+  `igd` input-rate forcing now uses exact analytic sensitivities instead of finite differences —
+  each route's onset is a moving boundary carried by a rate-on saltation (and, for `zero_order`,
+  a matching rate-off at the window end), so these fits run at full analytic speed. A per-route
+  lag on a `weibull` forcing keeps the finite-difference fallback (its onset diverges for shape
+  β < 1, so no closed-form saltation exists), as does a per-route lag combined with IOV. The
+  predicted values are unchanged — only the gradient moves off finite differences.
 
 ### Changed
 - **`method = agq` removed; adaptive quadrature is now an *argument*, not a method**

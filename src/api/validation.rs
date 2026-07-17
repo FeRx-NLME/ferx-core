@@ -1966,7 +1966,7 @@ pub fn check_model_data_warnings(
     // actually carrying a `lag_slot`. Same convention as `W_NEGATIVE_LAGTIME`: warned,
     // not clamped (a negative lag shifts the onset earlier rather than crashing).
     if let Some(ode) = &model.ode_spec {
-        if ode.input_rate.iter().any(|f| f.lag_slot.is_some()) {
+        if ode.has_route_lag() {
             if let Some(first_subj) = population.subjects.first() {
                 let zero_eta = vec![0.0_f64; model.n_eta];
                 let pk =
