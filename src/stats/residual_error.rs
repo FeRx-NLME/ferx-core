@@ -196,9 +196,10 @@ impl ErrorSpec {
     ///
     /// Like [`variance_at_with_correlations`] but scales each sigma loading by
     /// the per-observation multiplier `mult[idx]` (1-based on the flat sigma
-    /// vector, supplied by [`RuvMagnitude::eval_obs`]). A `mult` of all ones
-    /// reproduces [`variance_at_with_correlations`] exactly. Cross terms from
-    /// `block_sigma` scale by the product of the two loadings' multipliers.
+    /// vector, supplied by [`crate::types::RuvMagnitude::eval_obs`]). A `mult`
+    /// of all ones reproduces [`variance_at_with_correlations`] exactly. Cross
+    /// terms from `block_sigma` scale by the product of the two loadings'
+    /// multipliers.
     ///
     /// [`variance_at_with_correlations`]: ErrorSpec::variance_at_with_correlations
     pub fn variance_at_scaled(
