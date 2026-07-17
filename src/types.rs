@@ -1147,9 +1147,6 @@ impl OmegaMatrix {
         let mut free_mask = DMatrix::from_element(n, n, false);
         for i in 0..n {
             for j in 0..n {
-                // Diagonal entries are always free; an off-diagonal entry is
-                // free only in a non-diagonal block, and only where the parsed
-                // matrix is structurally non-zero (cross-block zeros stay fixed).
                 free_mask[(i, j)] = i == j || (!diagonal && m[(i, j)] != 0.0);
             }
         }
@@ -1530,6 +1527,12 @@ impl ErrorModel {
     }
 }
 
+/// Closure signature for [`ErrorSelector::eval`]: maps one observation's
+/// covariate snapshot to a 0-based endpoint key into `ErrorSpec::Selected
+/// .endpoints` (issue #658). Total — the parser requires a final `else`, so
+/// every observation resolves to some declared endpoint.
+pub type ErrorSelectFn = Box<dyn Fn(&HashMap<String, f64>) -> usize + Send + Sync>;
+
 /// Covariate-driven residual-error endpoint selector (issue #658).
 ///
 /// Maps one observation's covariate snapshot to a 0-based endpoint key into the
@@ -1540,11 +1543,6 @@ impl ErrorModel {
 /// σ channel once the endpoint is chosen). The closure mirrors the boxed-closure
 /// pattern used by [`ScaleFn`]; `branch_labels` carries source-order branch
 /// descriptions purely for `Debug`/diagnostics.
-/// Maps one observation's covariate snapshot to a 0-based endpoint key into
-/// `ErrorSpec::Selected.endpoints` (issue #658). Total: the parser requires a
-/// final `else`, so every observation resolves to some declared endpoint.
-pub type ErrorSelectFn = Box<dyn Fn(&HashMap<String, f64>) -> usize + Send + Sync>;
-
 pub struct ErrorSelector {
     /// Covariate map → 0-based endpoint key. Total: the parser requires a final
     /// `else`, so every observation resolves to some declared endpoint.
@@ -4021,14 +4019,6 @@ pub struct WarningEntry {
 /// stripped into `source_method`; the remaining message is matched against the
 /// fixed category vocabulary. Unrecognised messages fall back to
 /// `Warning`/`general`.
-// `if_same_then_else`: several arms of the match chain deliberately share an
-// outcome (notably the four `DataQuality` arms — ADDL/II, IOV occasion, missing
-// DV, and the LTBS/SS/EVID data group). They are kept as separate, individually
-// commented arms because each is a distinct warning family that happens to
-// classify the same today; collapsing them into one `||` condition would erase
-// the grouping and make re-categorising a single family a rewrite instead of a
-// one-line edit.
-#[allow(clippy::if_same_then_else)]
 pub fn classify_warning(raw: &str) -> WarningEntry {
     // Strip a leading "[METHOD] " chain prefix into source_method.
     let (source_method, msg) = if let Some(rest) = raw.strip_prefix('[') {
@@ -4047,6 +4037,15 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
 
     // (severity, category) keyed off distinctive substrings. Order matters:
     // more specific patterns first.
+    // `if_same_then_else`: several arms below deliberately share an outcome —
+    // notably the four `DataQuality` arms (ADDL/II, IOV occasion, missing DV,
+    // and the LTBS/SS/EVID data group). Each is a distinct warning family that
+    // merely classifies the same today, so they are kept as separate,
+    // individually commented arms; collapsing them into one `||` condition
+    // would erase the grouping and make re-categorising a single family a
+    // rewrite instead of a one-line edit. Scoped to this statement rather than
+    // the whole fn so a future duplicated arm in another chain still lints.
+    #[allow(clippy::if_same_then_else)]
     let (severity, category) = if lower.contains("did not converge")
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")
