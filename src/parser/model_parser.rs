@@ -1940,54 +1940,53 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // tv_fn uses the extended eta context (BSV + kappa) so KAPPA_* vars evaluate
     // to 0 at population-typical predictions, which is correct.
     let tv_eta_names = eta_names.clone(); // extended (BSV + kappa)
-    let tv_fn: Option<Box<dyn Fn(&[f64], &HashMap<String, f64>) -> Vec<f64> + Send + Sync>> =
-        if !is_ode {
-            let stmts_for_tv = indiv_stmts.clone();
-            let var_names_for_tv = indiv_var_names.clone();
-            #[cfg(feature = "nn")]
-            let tv_covariate_nns: Vec<crate::nn::CovariateNn> = covariate_nns_for_closure.clone();
-            Some(Box::new(
-                move |theta: &[f64], covariates: &HashMap<String, f64>| {
-                    let zero_eta = vec![0.0; tv_eta_names.len()];
-                    let mut vars: HashMap<String, f64> = HashMap::new();
-                    // Pre-compute each NN's forward output once per call so
-                    // `TYPICAL_PK.CL`-style references inside the eta=0
-                    // expression evaluate consistently and share the work.
-                    #[cfg(feature = "nn")]
-                    let nn_outputs: Vec<Vec<f64>> = tv_covariate_nns
-                        .iter()
-                        .map(|nn| {
-                            use crate::nn::CovariateMapper;
-                            let n_w = nn.mapper.n_weights();
-                            let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
-                            nn.mapper.forward_raw(weights, covariates).expect(
-                                "NN forward_raw failed in tv_fn: this indicates a \
+    let tv_fn: Option<crate::types::TvFn> = if !is_ode {
+        let stmts_for_tv = indiv_stmts.clone();
+        let var_names_for_tv = indiv_var_names.clone();
+        #[cfg(feature = "nn")]
+        let tv_covariate_nns: Vec<crate::nn::CovariateNn> = covariate_nns_for_closure.clone();
+        Some(Box::new(
+            move |theta: &[f64], covariates: &HashMap<String, f64>| {
+                let zero_eta = vec![0.0; tv_eta_names.len()];
+                let mut vars: HashMap<String, f64> = HashMap::new();
+                // Pre-compute each NN's forward output once per call so
+                // `TYPICAL_PK.CL`-style references inside the eta=0
+                // expression evaluate consistently and share the work.
+                #[cfg(feature = "nn")]
+                let nn_outputs: Vec<Vec<f64>> = tv_covariate_nns
+                    .iter()
+                    .map(|nn| {
+                        use crate::nn::CovariateMapper;
+                        let n_w = nn.mapper.n_weights();
+                        let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
+                        nn.mapper.forward_raw(weights, covariates).expect(
+                            "NN forward_raw failed in tv_fn: this indicates a \
                                  weight-offset/length wiring bug (missing covariates \
                                  are substituted with 0.0, not errored on)",
-                            )
-                        })
-                        .collect();
-                    #[cfg(not(feature = "nn"))]
-                    let nn_outputs: Vec<Vec<f64>> = Vec::new();
-                    eval_statements(
-                        &stmts_for_tv,
-                        theta,
-                        &zero_eta,
-                        covariates,
-                        &mut vars,
-                        None,
-                        None,
-                        &nn_outputs,
-                    );
-                    var_names_for_tv
-                        .iter()
-                        .map(|n| vars.get(n).copied().unwrap_or(0.0))
-                        .collect()
-                },
-            ))
-        } else {
-            None
-        };
+                        )
+                    })
+                    .collect();
+                #[cfg(not(feature = "nn"))]
+                let nn_outputs: Vec<Vec<f64>> = Vec::new();
+                eval_statements(
+                    &stmts_for_tv,
+                    theta,
+                    &zero_eta,
+                    covariates,
+                    &mut vars,
+                    None,
+                    None,
+                    &nn_outputs,
+                );
+                var_names_for_tv
+                    .iter()
+                    .map(|n| vars.get(n).copied().unwrap_or(0.0))
+                    .collect()
+            },
+        ))
+    } else {
+        None
+    };
 
     // Detect mu-referencing relationships from [individual_parameters].
     // Run detection over all eta names (BSV + kappa) so we can derive the
