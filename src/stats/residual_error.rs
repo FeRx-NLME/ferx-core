@@ -489,9 +489,9 @@ impl ErrorSpec {
                         // is 2, so a stack buffer avoids a per-observation alloc.
                         let n = ep.error_model.n_sigma();
                         let mut buf = [0.0f64; 2];
-                        for k in 0..n.min(2) {
+                        for (k, slot) in buf.iter_mut().take(n.min(2)).enumerate() {
                             match ep.sigma_idx.get(k).and_then(|&i| sigma.get(i)) {
-                                Some(&v) => buf[k] = v,
+                                Some(&v) => *slot = v,
                                 None => return f64::NAN, // malformed spec / sigma length
                             }
                         }
