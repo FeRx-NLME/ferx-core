@@ -141,9 +141,16 @@ pub fn identify_disposition(spec: &OdeSpec, p: &[f64], t: f64) -> Option<MrDispo
         return None;
     }
 
-    // No autonomous term: f(0, p, t) ≈ 0.
+    // No autonomous term: f(0, p, t) ≈ 0. The `!is_finite()` guard is load-bearing:
+    // a `NaN` probe (a pathological mid-fit param excursion, e.g. `V → 0`) would
+    // slip past a bare `d.abs() > TOL` because `NaN > TOL` is false — decline it so
+    // the fast path never serves NaN where the sign/linearity checks below (also
+    // `.abs() > …` comparisons) would silently admit it.
     let du0 = probe_rhs_f64(spec, &vec![0.0; n], p, t)?;
-    if du0.iter().any(|d| d.abs() > LINEARITY_TOL) {
+    if du0
+        .iter()
+        .any(|d| !d.is_finite() || d.abs() > LINEARITY_TOL)
+    {
         return None;
     }
 
@@ -160,6 +167,9 @@ pub fn identify_disposition(spec: &OdeSpec, p: &[f64], t: f64) -> Option<MrDispo
         let ei_t2 = probe_rhs_f64(spec, &basis, p, t2)?;
         basis[i] = 0.0;
         for j in 0..n {
+            if !ei[j].is_finite() || !two_ei[j].is_finite() || !ei_t2[j].is_finite() {
+                return None; // NaN/Inf probe — see the `du0` guard above
+            }
             if (two_ei[j] - 2.0 * ei[j]).abs() > LINEARITY_TOL * (1.0 + two_ei[j].abs()) {
                 return None; // nonlinear in u_i
             }
@@ -255,8 +265,23 @@ pub fn recover_disp_params_g<T: PkNum>(
     let zero_state = vec![T::from_f64(0.0); n];
     let mut e_c = vec![T::from_f64(0.0); n];
     e_c[disp.central] = T::from_f64(1.0);
+    let mut e_c2 = vec![T::from_f64(0.0); n];
+    e_c2[disp.central] = T::from_f64(2.0);
     let y0 = ro.eval_output_g::<T>(&zero_state, p, cov, &mut vars, &mut stack);
     let y1 = ro.eval_output_g::<T>(&e_c, p, cov, &mut vars, &mut stack);
+    let y2 = ro.eval_output_g::<T>(&e_c2, p, cov, &mut vars, &mut stack);
+    // The observable must be **linear through the origin** in the central amount:
+    // `mr_observable_g` sums `mass·kernel_conc = m·amount`, so a readout with a
+    // non-zero intercept (a baseline `y = central/V + BASE`) or any curvature in
+    // central (`y = central²/V`) would be silently mispredicted — the `identify`
+    // readout check only pins *which* state is read, not that it is read linearly.
+    // Require `readout(0) ≈ 0` and `readout(2) ≈ 2·readout(1)`, else decline.
+    if y0.val().abs() > LINEARITY_TOL * (1.0 + y1.val().abs()) {
+        return None;
+    }
+    if (y2.val() - 2.0 * y1.val()).abs() > LINEARITY_TOL * (1.0 + y2.val().abs()) {
+        return None;
+    }
     let m = y1 - y0;
     if m.val() <= 0.0 {
         return None;
@@ -421,20 +446,53 @@ fn is_closed_form_kind(kind: InputRateKind) -> bool {
 /// its presence declines the whole model from the closed-form path — mirroring
 /// the single-route flip-flop reroute (`absorption_flip_flop_at`). `first_order`
 /// never flips (the `ka ≈ ke` limit is handled inside the kernel).
+// `!(ke < bound)` is deliberate (not `ke >= bound`): it declines a transient `NaN`
+// `ke`/`bound` too (`NaN < x` is false → `!false` = true → decline), matching the
+// kernels' own `!(ke < ktr)` NaN-safe guards. Suppress the partial-ord lint that
+// would "simplify" it to the NaN-unsafe `>=` form.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn route_flips(f: &InputRateForcing, dp: &DispParams<f64>, p: &[f64]) -> bool {
-    let ke = dp.cl / dp.v;
-    match f.kind {
-        InputRateKind::Transit => {
-            let n = forcing_arg(f, p, 0, 0.0);
-            let mtt = forcing_arg(f, p, 1, 1.0);
-            mtt <= 0.0 || !(ke < (n + 1.0) / mtt)
+    match dp.periph {
+        None => {
+            // One-compartment: the convergence bound is on `ke = CL/V`, matching
+            // `one_cpt_transit_amt_g` / `one_cpt_ig_amt_g` exactly.
+            let ke = dp.cl / dp.v;
+            match f.kind {
+                InputRateKind::Transit => {
+                    let n = forcing_arg(f, p, 0, 0.0);
+                    let mtt = forcing_arg(f, p, 1, 1.0);
+                    mtt <= 0.0 || !(ke < (n + 1.0) / mtt)
+                }
+                InputRateKind::InverseGaussian => {
+                    let mat = forcing_arg(f, p, 0, 1.0);
+                    let cv2 = forcing_arg(f, p, 1, 1.0);
+                    mat <= 0.0 || cv2 <= 0.0 || !(ke < 1.0 / (2.0 * mat * cv2))
+                }
+                _ => false,
+            }
         }
-        InputRateKind::InverseGaussian => {
-            let mat = forcing_arg(f, p, 0, 1.0);
-            let cv2 = forcing_arg(f, p, 1, 1.0);
-            mat <= 0.0 || cv2 <= 0.0 || !(ke < 1.0 / (2.0 * mat * cv2))
+        Some((q, v2)) => {
+            // Two-compartment: the tilting converges on the **fast macro-rate α**
+            // (an eigenvalue, α > k10 = CL/V1) and needs distinct eigenvalues —
+            // NOT `ke = CL/V1`. Reuse the 2-cpt kernel's OWN domain predicate so
+            // `route_flips` can never disagree with what the kernel actually does
+            // (a route that fails it would otherwise return a silent 0).
+            match f.kind {
+                InputRateKind::Transit => {
+                    let n = forcing_arg(f, p, 0, 0.0);
+                    let mtt = forcing_arg(f, p, 1, 1.0);
+                    crate::sens::two_cpt::transit_2cpt_domain_ok::<f64>(dp.cl, dp.v, q, v2, n, mtt)
+                        .is_none()
+                }
+                InputRateKind::InverseGaussian => {
+                    let mat = forcing_arg(f, p, 0, 1.0);
+                    let cv2 = forcing_arg(f, p, 1, 1.0);
+                    crate::sens::two_cpt::ig_2cpt_domain_ok::<f64>(dp.cl, dp.v, q, v2, mat, cv2)
+                        .is_none()
+                }
+                _ => false,
+            }
         }
-        _ => false,
     }
 }
 
@@ -448,10 +506,16 @@ fn route_flips(f: &InputRateForcing, dp: &DispParams<f64>, p: &[f64]) -> bool {
 /// covariates, resets, `init(...)`, steady-state or infusion doses, or
 /// compartment-indexed `F{c}`/`ALAG{c}` (the `dose_attr_map`, which would make
 /// the per-dose `F`/lag non-uniform); and no route in its flip-flop domain
-/// ([`route_flips`]). This is the **value** path (predict / simulate / the FD-fit
-/// value evals — all self-consistent, the FD gradient reads these values); the
-/// analytic FOCE/FOCEI gradient path is wired separately so a fit never mixes a
-/// closed-form value with an ODE-integrated gradient.
+/// ([`route_flips`]). This is the **value** path: `predict` / `simulate` and the
+/// FOCE/FOCEI marginal-objective value ([`crate::stats`]'s `model_predictions` →
+/// [`crate::pk::compute_predictions_with_tv`]). For an FD-method fit the gradient
+/// finite-differences these same values, so it is fully self-consistent. For an
+/// analytic-sensitivity fit the gradient still comes from the ODE provider (a
+/// follow-up wires the closed form there); value and gradient then come from
+/// different schemes, but they **agree to solver tolerance** — the closed form
+/// reduces to the same integrated twin — so the objective stays consistent to far
+/// within `inner_tol` (the `per_route_lag` NONMEM anchor is unchanged by this
+/// routing). The mix is never *divergent*, only different-scheme-same-answer.
 pub(crate) fn mr_predictions(
     model: &crate::types::CompiledModel,
     subject: &crate::types::Subject,
@@ -481,6 +545,19 @@ pub(crate) fn mr_predictions(
     }
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let disp = identify_disposition(spec, &pk.values, 1.0)?;
+    // Every dose must feed the central compartment (the forcings' shared target).
+    // `mr_observable_g` splits each dose across all forcings, mirroring the ODE
+    // forcing seam — which applies each forcing only to doses into *its own*
+    // compartment (`predictions.rs`: `d.cmt-1 != forcing.cmt → continue`). A dose
+    // into any other compartment is a bolus the superposition does not represent,
+    // so decline it. (`dose.cmt` is 1-based; `disp.central` is a 0-based state.)
+    if subject
+        .doses
+        .iter()
+        .any(|d| d.cmt.saturating_sub(1) != disp.central)
+    {
+        return None;
+    }
     let dp = recover_disp_params_g::<f64>(spec, &disp, &pk.values, &subject.covariates)?;
     if spec
         .input_rate
@@ -1094,6 +1171,295 @@ mod tests {
             &[5.0, 50.0, 0.6, 1.5, 0.3, 0.7],
             &[0.0],
             vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    // ── Decline branches (the "no happy paths" safety): a subject/model outside
+    //    scope must return None so the caller integrates. A gate that silently
+    //    fails to fire is exactly the bug these guard against. ─────────────────
+    const MIXED_ZERO_ORDER: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.5, 0.05, 24.0)
+  theta TVDUR(2.0, 0.1, 12.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  FZO = TVFZO
+  FZO1 = 1 - TVFZO
+  KA = TVKA
+  DUR = TVDUR
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    // TIME in the RHS makes the disposition non-autonomous — must decline.
+    const TIME_DEPENDENT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.5, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central*(1 + 0.01*TIME)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    // Single transit route whose ke = CL/V has crossed the flip-flop bound
+    // KTR = (n+1)/mtt — the closed form does not converge, must decline.
+    const TRANSIT_FLIPFLOP: &str = r#"
+[parameters]
+  theta TVCL(60.0, 0.1, 200.0)
+  theta TVV(10.0, 1.0, 500.0)
+  theta TVN(2.0, 0.1, 20.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  N = TVN
+  MTT = TVMTT
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = transit(n=N, mtt=MTT) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    fn parse(src: &str) -> crate::types::CompiledModel {
+        crate::parser::model_parser::parse_model_string(src).unwrap()
+    }
+
+    #[test]
+    fn declines_zero_order_pathway() {
+        let model = parse(MIXED_ZERO_ORDER);
+        let subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 2.0, 4.0],
+        );
+        assert!(
+            mr_predictions(&model, &subject, &[5.0, 50.0, 0.4, 1.5, 2.0], &[0.0]).is_none(),
+            "a zero_order pathway (Phase B) must decline to the ODE path"
+        );
+    }
+
+    #[test]
+    fn declines_time_dependent_disposition() {
+        let model = parse(TIME_DEPENDENT);
+        let subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 2.0, 4.0],
+        );
+        assert!(
+            mr_predictions(&model, &subject, &[5.0, 50.0, 1.5], &[0.0]).is_none(),
+            "a TIME-dependent disposition must decline"
+        );
+    }
+
+    #[test]
+    fn declines_flip_flop_transit_route() {
+        let model = parse(TRANSIT_FLIPFLOP);
+        // ke = CL/V = 60/10 = 6 ≥ KTR = (2+1)/1 = 3 → flip-flop, no closed form.
+        let subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![0.5, 1.0, 2.0],
+        );
+        assert!(
+            mr_predictions(&model, &subject, &[60.0, 10.0, 2.0, 1.0], &[0.0]).is_none(),
+            "a transit route past its flip-flop bound must decline"
+        );
+    }
+
+    #[test]
+    fn declines_steady_state_and_infusion_doses() {
+        let model = parse(REDUCE_1CPT);
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let obs = vec![1.0, 4.0, 8.0];
+        // Steady-state dose.
+        let ss = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
+            obs.clone(),
+        );
+        assert!(
+            mr_predictions(&model, &ss, &theta, &[0.0, 0.0]).is_none(),
+            "SS dose declines"
+        );
+        // Infusion dose (RATE > 0).
+        let inf = mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)], obs);
+        assert!(
+            mr_predictions(&model, &inf, &theta, &[0.0, 0.0]).is_none(),
+            "infusion dose declines"
+        );
+    }
+
+    #[test]
+    fn route_conc_g_zero_order_and_weibull_are_inert() {
+        // The defensive arms in `route_conc_g` (the gate excludes these kinds, so
+        // they are never reached in production) return 0 for both dispositions.
+        let p = vec![2.0_f64];
+        let one = DispParams {
+            cl: 5.0,
+            v: 50.0,
+            periph: None,
+        };
+        let two = DispParams {
+            cl: 5.0,
+            v: 50.0,
+            periph: Some((10.0, 100.0)),
+        };
+        for dp in [one, two] {
+            for kind in [InputRateKind::ZeroOrder, InputRateKind::Weibull] {
+                let f = forcing(kind, vec![0], None, None);
+                let got = route_conc_g::<f64>(kind, &f, &p, &dp, 2.0, 100.0);
+                assert_eq!(got, 0.0, "{kind:?} must be inert in route_conc_g");
+            }
+        }
+    }
+
+    // ── Review regressions (PR #889): each of these was silently mispredicted
+    //    before the fix, and is outside the #505/#856 shape the other tests use. ─
+
+    // H1: a readout with a non-zero intercept (baseline) — `Σ mass·kernel` drops
+    // the baseline, so it must decline (the readout is not linear-through-origin).
+    const BASELINE_READOUT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.5, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central
+[scaling]
+  y = central / V + 5
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    #[test]
+    fn declines_baseline_readout() {
+        let model = parse(BASELINE_READOUT);
+        let subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 2.0, 4.0],
+        );
+        assert!(
+            mr_predictions(&model, &subject, &[5.0, 50.0, 1.5], &[0.0]).is_none(),
+            "a readout with a baseline (non-zero intercept) must decline"
+        );
+    }
+
+    // H2: a dose into a non-central compartment is a bolus the superposition does
+    // not represent — must decline (2-cpt model so cmt 2 is a real state).
+    #[test]
+    fn declines_dose_into_noncentral_compartment() {
+        let model = parse(REDUCE_2CPT);
+        let theta = [5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3];
+        let central_ok = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 4.0],
+        );
+        assert!(
+            mr_predictions(&model, &central_ok, &theta, &[0.0]).is_some(),
+            "sanity: a central dose is served"
+        );
+        let periph_dose = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
+            vec![1.0, 4.0],
+        );
+        assert!(
+            mr_predictions(&model, &periph_dose, &theta, &[0.0]).is_none(),
+            "a dose into the peripheral compartment must decline"
+        );
+    }
+
+    // H3: a 2-cpt transit route whose ke = CL/V1 is inside the (1-cpt) bound but
+    // whose fast macro-rate α is NOT — the kernel would return a silent 0, so the
+    // 2-cpt domain check must decline it. Positive twin: an in-domain 2-cpt
+    // transit reduces to ODE.
+    const TWOCPT_TRANSIT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(10.0, 0.1, 100.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVN(3.0, 0.1, 20.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  N = TVN
+  MTT = TVMTT
+[structural_model]
+  ode(states=[central, periph])
+[odes]
+  d/dt(central) = transit(n=N, mtt=MTT) - CL/V1*central - Q/V1*central + Q/V2*periph
+  d/dt(periph) = Q/V1*central - Q/V2*periph
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    #[test]
+    fn reduces_to_ode_2cpt_transit_in_domain() {
+        // k10=0.1, k12=0.2, k21=0.1 → α≈0.37 < KTR=(3+1)/1=4: in domain.
+        assert_reduces_to_ode(
+            TWOCPT_TRANSIT,
+            &[5.0, 50.0, 10.0, 100.0, 3.0, 1.0],
+            &[0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    #[test]
+    fn declines_2cpt_transit_when_macro_rate_out_of_domain() {
+        let model = parse(TWOCPT_TRANSIT);
+        // CL=5,V1=50 → k10=0.1; Q=100,V2=10 → k12=2, k21=10 → α≈12.
+        // KTR=(1+1)/0.5=4. So ke=k10=0.1 < 4 (the OLD 1-cpt check WRONGLY passes),
+        // but α≈12 ≥ 4 (the kernel returns 0) → the 2-cpt check must decline.
+        let theta = [5.0, 50.0, 100.0, 10.0, 1.0, 0.5];
+        let subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![0.5, 1.0, 2.0],
+        );
+        assert!(
+            mr_predictions(&model, &subject, &theta, &[0.0]).is_none(),
+            "a 2-cpt transit route past its macro-rate domain (α≥KTR while k10<KTR) must decline"
         );
     }
 }
