@@ -148,19 +148,17 @@ fn fit_on_ss_absorption_converges() {
     }
 }
 
-/// A **saturable (Michaelis–Menten), heavily-accumulating** SS-absorption model whose closed-form
-/// linear fast path correctly declines, so equilibration falls to the 50-cycle pulse-train
-/// iteration — which under-converges when the per-cycle carryover ratio `ρ → 1` (#867). The
-/// dataset's mean absorbed input (AMT/II = 100/8 = 12.5) sits just below `Vmax = 13`, so the SS
-/// concentration saturates far above `Km = 20` and the iteration stops well short of the true
-/// periodic steady state. This drives the full public `simulate` path and asserts the
-/// non-convergence warning reaches `SimulationOutput.warnings` (the api-boundary drain) rather than
-/// being swallowed silently. Fast (an evaluation-only simulate, no convergence loop), so it is not
-/// slow-gated. The predictor-level detection is unit-tested in
-/// `ode::predictions::tests::ss_input_rate_heavy_accumulation_warns_non_convergence`.
-const SS_MM_HEAVY_ACCUM_MODEL: &str = r#"
+/// A **saturable (Michaelis–Menten) SS-absorption model dosed above its elimination capacity**: the
+/// dataset's mean absorbed input (AMT/II = 100/8 = 12.5) *exceeds* `Vmax = 10`, so no periodic
+/// steady state exists — the Anderson fixed-point solve (#867) correctly declines, equilibration
+/// falls to the capped pulse train, and a non-convergence warning is raised. This drives the full
+/// public `simulate` path and asserts the warning reaches `SimulationOutput.warnings` (the
+/// api-boundary drain) rather than being swallowed silently. Fast (an evaluation-only simulate, no
+/// convergence loop), so it is not slow-gated. The predictor-level detection and the converging
+/// (Anderson-solved) case are unit-tested in `ode::predictions::tests` (`ss_input_rate_*`).
+const SS_MM_NO_STEADY_STATE_MODEL: &str = r#"
 [parameters]
-  theta TVVMAX(13.0, 1.0, 100.0)
+  theta TVVMAX(10.0, 1.0, 100.0)
   theta TVKM(20.0, 1.0, 5000.0)
   theta TVKA(2.0, 0.05, 20.0)
 
@@ -190,9 +188,89 @@ const SS_MM_HEAVY_ACCUM_MODEL: &str = r#"
   ode_abstol = 1e-6
 "#;
 
+// ── #867: nonlinear (Michaelis–Menten) SS-absorption vs NONMEM ────────────────────────────────
+//
+// A saturable disposition declines the linear closed form, so ferx solves the periodic steady
+// state by Anderson acceleration of the one-cycle fixed point (#867). This anchors that solve
+// against NONMEM 7.6.0's own general-ODE (`ADVAN13`) steady-state solver.
+//
+// `first_order(ka)` appears directly in `central` (its `R_in` is the appearance rate of a
+// depot→central first-order absorption); `y = central` matches NONMEM's `S2 = 1` amount. Mean
+// absorbed input (AMT/II = 100/12 ≈ 8.33) sits below `VM = 15`, so a periodic SS exists and is
+// saturable (`C_ss ≈ 375`, comparable to `KM = 300`). Thetas are FIXed at the NONMEM values.
+//
+// Reference `DV` in `data/ss_mm.csv` is the NONMEM PRED (`$ESTIMATION MAXEVAL=0`) from
+// `nonmem_anchor/ss_mm.{ctl,csv}` — `ADVAN13 TOL=9`, `$DES` MM elimination, `SS=1, II=12, AMT=100`,
+// observations at TIME = 1, 3, 6, 9, 11.9.
+const SS_MM_MODEL: &str = r#"
+[parameters]
+  theta TVKA(1.0, 0.01, 20.0)
+  theta TVVM(15.0, 0.1, 200.0)
+  theta TVKM(300.0, 1.0, 5000.0)
+
+  omega ETA_X ~ 0.0
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  KA = TVKA
+  VM = TVVM
+  KM = TVKM
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = first_order(ka=KA) - VM*central/(KM+central)
+
+[scaling]
+  y = central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  ode_reltol = 1e-8
+  ode_abstol = 1e-10
+"#;
+
 #[test]
-fn simulate_surfaces_ss_nonconvergence_warning_for_saturable_accumulation() {
-    let parsed = parse_full_model(SS_MM_HEAVY_ACCUM_MODEL).expect("model parses");
+fn predict_matches_nonmem_mm_ss_absorption() {
+    let parsed = parse_full_model(SS_MM_MODEL).expect("model parses");
+    let model = parsed.model;
+    let population =
+        read_nonmem_csv(std::path::Path::new("data/ss_mm.csv"), None, None).expect("dataset loads");
+    assert!(
+        population.subjects.iter().any(|s| s.has_ss_doses()),
+        "dataset should contain SS=1 doses"
+    );
+
+    let preds = predict(&model, &population, &model.default_params);
+
+    // NONMEM 7.6.0 PRED (ADVAN13 general-ODE steady state), keyed by observation time.
+    let nonmem: &[(f64, f64)] = &[
+        (1.0, 389.60439420601),
+        (3.0, 404.23630702376),
+        (6.0, 383.39866222919),
+        (9.0, 358.75370734093),
+        (11.9, 335.43641567078),
+    ];
+    assert_eq!(preds.len(), nonmem.len());
+
+    for (p, &(t, expected)) in preds.iter().zip(nonmem) {
+        assert!((p.time - t).abs() < 1e-9, "time {} != {t}", p.time);
+        let rel = (p.pred - expected).abs() / expected;
+        assert!(
+            rel < 1e-3,
+            "t={t}: ferx PRED {:.5} vs NONMEM {expected:.5} (rel err {rel:.2e})",
+            p.pred
+        );
+    }
+}
+
+#[test]
+fn simulate_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
+    let parsed = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL).expect("model parses");
     let model = parsed.model;
     let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
         .expect("dataset loads");
@@ -210,11 +288,11 @@ fn simulate_surfaces_ss_nonconvergence_warning_for_saturable_accumulation() {
         out.warnings
             .iter()
             .any(|w| w.contains("Steady-state (SS=1) equilibration")),
-        "saturable heavy-accumulation SS must surface a non-convergence warning through \
+        "a saturable SS model dosed above capacity must surface a non-convergence warning through \
          SimulationOutput.warnings; got: {:?}",
         out.warnings
     );
-    // Simulated rows are still produced (the under-converged trough is finite, just biased).
+    // Simulated rows are still produced (the returned trough is finite, just unreliable).
     assert!(
         !out.results.is_empty(),
         "simulate must still return rows alongside the warning"
@@ -227,8 +305,8 @@ fn simulate_surfaces_ss_nonconvergence_warning_for_saturable_accumulation() {
 /// objective prediction passes to populate the sink; no convergence loop is needed (Tier-2), and
 /// covariance is off to keep it quick.
 #[test]
-fn fit_surfaces_ss_nonconvergence_warning_for_saturable_accumulation() {
-    let parsed = parse_full_model(SS_MM_HEAVY_ACCUM_MODEL).expect("model parses");
+fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
+    let parsed = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL).expect("model parses");
     let model = parsed.model;
     let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
         .expect("dataset loads");
@@ -257,8 +335,8 @@ fn fit_surfaces_ss_nonconvergence_warning_for_saturable_accumulation() {
 /// solver-noise jitter (the `rho ≥ 1` noise-floor short-circuit).
 #[test]
 fn simulate_stays_silent_for_benign_nonlinear_ss_absorption() {
-    let src = SS_MM_HEAVY_ACCUM_MODEL.replace(
-        "theta TVVMAX(13.0, 1.0, 100.0)",
+    let src = SS_MM_NO_STEADY_STATE_MODEL.replace(
+        "theta TVVMAX(10.0, 1.0, 100.0)",
         "theta TVVMAX(500.0, 1.0, 5000.0)",
     );
     let parsed = parse_full_model(&src).expect("model parses");

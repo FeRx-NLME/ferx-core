@@ -6474,3 +6474,27 @@ fn ode_provider_mixed_tvcov_matches_production() {
     // gradient (the value/1st-order parity above does not exercise `coef2`).
     check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
 }
+
+/// #867: a nonlinear (MM) disposition that **admits** a periodic steady state (mean input
+/// `100/12 ≈ 8.3 < VM·e^{η} ≈ 16.6`) is equilibrated by the Anderson-accelerated fixed-point
+/// solve, and its **analytic dual** value + `∂f/∂η` + `∂f/∂θ` must match the production
+/// predictor and finite differences. This is the teeth on the AA-over-dual gradient path (the
+/// mixing coefficients, chosen on the value residual, must carry the correct implicit derivative
+/// through the whole `[η, θ]` jet), exercised end-to-end through the real ODE — distinct from the
+/// no-steady-state fallback covered by `..._nonlinear_disposition_matches_production` above.
+#[test]
+fn ode_provider_ss_absorption_nonlinear_converged_dual_matches_production() {
+    let model = parse_model_string(MM_SS_FIRST_ORDER).expect("parse MM SS first_order");
+    // SS-admitting thetas (VM=15, KM=300, KA=1) with a longer II so mean input < VM.
+    let theta = vec![15.0, 300.0, 1.0];
+    let eta = vec![0.1];
+    let subj = ss_absorption_subject(&[1.0, 3.0, 6.0, 9.0, 11.9], 12.0);
+    check_vs_production(&model, &subj, &theta, &eta);
+    // Prove Anderson converged (not the linear 1-cycle fast path, not the 50-cycle cap).
+    let _ = ode_subject_sensitivities(&model, &subj, &theta, &eta).expect("supported");
+    let cycles = crate::dosing::last_ss_equilibration_cycles();
+    assert!(
+        (2..crate::dosing::SS_EQUILIBRATION_CYCLES).contains(&cycles),
+        "a converging nonlinear SS must be solved by Anderson (2..cap cycles), got {cycles}"
+    );
+}
