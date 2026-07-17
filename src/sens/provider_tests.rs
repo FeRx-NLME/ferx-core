@@ -6962,6 +6962,528 @@ fn ode_iov_weibull_lagtime_falls_back_to_fd() {
     );
 }
 
+// ─── #877: analytic per-route absorption-lag gradients under IOV ─────────────────────────────
+// #859/#875 made per-route lag (`fn(..., lag=L)`) analytic on the NON-IOV event-driven walk;
+// #877 lifts the IOV decline so a route-lag model with inter-occasion variability gets exact
+// analytic FOCE/FOCEI gradients too. The IOV walk is the *same* `integrate_tvcov_g` — the gate
+// flip admits `first_order`/`zero_order`/`transit`/`igd` route lags (weibull stays FD), and the
+// onset saltation + its #880/#883 δ² onset-slope curvature carry κ through the per-occasion
+// `pk_at_dose[k]` jet exactly as η/θ. Each fixture is validated value + gradient + **Hessian**
+// against central FD of `predict_iov` (`check_iov_provider_vs_fd`). Crucially these are NOT
+// happy-path: the δ² onset-slope term is `dr_dtad_value · (∂lag/∂axis_i)(∂lag/∂axis_j)`, so it
+// lands on a checked stacked (η/κ) Hessian axis ONLY when a lag carries that axis's jet — a
+// fixed-θ lag would hide the term in the unchecked `d2f_dtheta2` block. So the lag itself carries
+// η and/or κ here, the axis where the FOCEI Hessian would be wrong without #883.
+
+/// #877 teeth: `first_order` per-route lag with **both η and κ on the lag** (`LAG` carries
+/// `ETA_LAG + KAPPA_LAG`). The δlag² onset-slope curvature (`½·∂Δr/∂tad`, #880/#883) therefore
+/// lands on the checked `d2f_deta2` blocks — `κ×κ`, `κ×η_LAG`, `η_LAG×η_LAG` — the exact
+/// FOCEI-Hessian axes that were wrong before #883. Value + gradient + Hessian must match central
+/// FD of `predict_iov` over the stacked `[η_CL, η_LAG, κ_g0, κ_g1]`.
+#[test]
+fn ode_iov_first_order_route_lag_iiv_iov_on_lag_matches_fd() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.04
+  kappa KAPPA_LAG ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+  LAG = TVLAG * exp(ETA_LAG + KAPPA_LAG)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let model = parse_model_string(src).expect("parse first_order route-lag IOV (η+κ on lag)");
+    assert_eq!(model.n_kappa, 1);
+    let ode = model.ode_spec.as_ref().expect("ode spec");
+    assert_eq!(
+        ode.input_rate
+            .iter()
+            .filter(|f| f.lag_slot.is_some())
+            .count(),
+        1,
+        "the forcing carries a per-route lag"
+    );
+    assert!(
+        crate::sens::ode_provider::ode_iov_supported(&model),
+        "#877: first_order route lag must now be analytic under IOV"
+    );
+    let subject = iov_subject();
+    // stacked = [η_CL, η_LAG, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2). Values chosen so
+    // each occasion's onset (t_dose + LAG) stays ≥ 0.4 h from every observation — no obs
+    // crosses an onset under the FD steps, so the Hessian FD stays kink-free.
+    check_iov_provider_vs_fd(
+        &model,
+        &subject,
+        &[1.0, 20.0, 1.2, 1.5],
+        &[0.1, 0.05, 0.03, -0.04],
+    );
+}
+
+/// #877 × #880/#883 onset snapshot: `first_order` route lag with a **TV covariate on the onset
+/// kernel `KA`** (`KA = TVKA·exp(KAPPA_KA + KA_WT·(WT−70))`) crossing the onset, plus κ on KA.
+/// The onset saltation reads `ka`/`frac`/post-Jacobian from the POST-arrival record snapshot
+/// (#883), not `last_params`; under a TV cov those diverge, a several-percent gradient error on
+/// the **κ axis** here. Guards that the onset-snapshot fix carries κ correctly under IOV.
+#[test]
+fn ode_iov_first_order_route_lag_tvcov_on_kernel_matches_fd() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  theta KA_WT(0.01, -0.1, 0.1)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_KA ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA * exp(KAPPA_KA + KA_WT * (WT - 70))
+  LAG = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let model = parse_model_string(src).expect("parse first_order route-lag IOV + TV cov");
+    assert!(
+        crate::sens::ode_provider::ode_iov_supported(&model),
+        "#877: first_order route lag + TV cov must be analytic under IOV"
+    );
+    // Per-record WT so the onset kernel KA jumps across the route onset (dose record WT=70,
+    // observations 60..85) — the case the onset-segment snapshot fixes.
+    let mut subject = iov_subject();
+    subject.dose_covariates = vec![
+        std::collections::HashMap::from([("WT".to_string(), 70.0)]),
+        std::collections::HashMap::from([("WT".to_string(), 70.0)]),
+    ];
+    subject.obs_covariates = (0..subject.obs_times.len())
+        .map(|i| std::collections::HashMap::from([("WT".to_string(), 60.0 + 5.0 * (i as f64))]))
+        .collect();
+    assert!(subject.has_tv_covariates(), "WT must be time-varying");
+    // stacked = [η_CL, κ_g0, κ_g1].
+    check_iov_provider_vs_fd(
+        &model,
+        &subject,
+        &[1.0, 20.0, 1.2, 1.5, 0.01],
+        &[0.1, 0.03, -0.04],
+    );
+}
+
+/// #877: `zero_order` per-route lag with **κ on the lag**. A route-lagged zero-order window
+/// shifts BOTH boundaries with `lag_route` — the rate-on saltation at `K_ROUTE_ONSET` and the
+/// rate-off at `K_ZO_END` — so both must carry the κ jet. Its onset slope is zero (constant
+/// window rate), so this isolates the moving-window κ sensitivity (distinct from the
+/// first_order δ² term). Value + gradient + Hessian vs FD of `predict_iov`.
+#[test]
+fn ode_iov_zero_order_route_lag_kappa_on_lag_matches_fd() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVDUR(2.0, 0.1, 12.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_LAG ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR
+  LAG = TVLAG * exp(KAPPA_LAG)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let model = parse_model_string(src).expect("parse zero_order route-lag IOV");
+    assert!(
+        crate::sens::ode_provider::ode_iov_supported(&model),
+        "#877: zero_order route lag must be analytic under IOV"
+    );
+    let subject = iov_subject();
+    // stacked = [η_CL, κ_g0, κ_g1]. Windows [onset, onset+2] at ~1.5 and ~25.5 clear the
+    // observation grid's kink-free zones.
+    check_iov_provider_vs_fd(
+        &model,
+        &subject,
+        &[1.0, 20.0, 2.0, 1.5],
+        &[0.1, 0.03, -0.04],
+    );
+}
+
+/// #877: `transit` per-route lag with **κ on the lag**. Unlike `first_order`/`zero_order`, the
+/// transit onset is *continuous* (`R_in → 0` smoothly at `t_dose + LAG`), so `K_ROUTE_ONSET`
+/// injects a **zero-magnitude** saltation (`rate_at_zero` = 0 for `Transit`) — the κ-sensitivity
+/// rides entirely through the continuous `∂R_in/∂lag_route` of the shifted gamma density, over the
+/// per-occasion `pk_at_dose[k]` jet. This is the direct Dual2-vs-FD parity the gate's admission of
+/// `Transit` under IOV requires (the `route_lag_analytic()` classifier admits it; only
+/// `first_order`/`zero_order` had a κ-on-lag fixture before). Value + gradient + Hessian vs FD.
+#[test]
+fn ode_iov_transit_route_lag_kappa_on_lag_matches_fd() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVN(5.0, 1.0, 30.0)
+  theta TVMTT(2.0, 0.1, 20.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_LAG ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  LAG = TVLAG * exp(KAPPA_LAG)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = transit(n=N, mtt=MTT, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+    let model = parse_model_string(src).expect("parse transit route-lag IOV");
+    assert_eq!(model.n_kappa, 1);
+    assert!(model.has_route_absorption_lag(), "per-route lag present");
+    assert!(
+        crate::sens::ode_provider::ode_iov_supported(&model),
+        "#877: transit route lag must be analytic under IOV"
+    );
+    let subject = iov_subject();
+    // stacked = [η_CL, κ_g0, κ_g1]. Onsets t_dose + LAG ≈ 1.5 / 25.5 clear every obs.
+    check_iov_provider_vs_fd(
+        &model,
+        &subject,
+        &[1.0, 20.0, 5.0, 2.0, 1.5],
+        &[0.1, 0.03, -0.04],
+    );
+}
+
+/// #877: `igd` (inverse-Gaussian density) per-route lag with **κ on the lag**. Like `transit`, the
+/// IG onset is continuous (an essential singularity drives `R_in → 0` at `t_dose + LAG`), so the
+/// `K_ROUTE_ONSET` saltation is zero-magnitude and κ rides the continuous `∂R_in/∂lag_route` of the
+/// shifted IG density over the per-occasion jet. Direct FD parity for the fourth kernel the gate
+/// admits under IOV. Value + gradient + Hessian vs FD of `predict_iov`.
+#[test]
+fn ode_iov_igd_route_lag_kappa_on_lag_matches_fd() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVMAT(2.0, 0.1, 20.0)
+  theta TVCV2(0.5, 0.01, 10.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_LAG ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  MAT = TVMAT
+  CV2 = TVCV2
+  LAG = TVLAG * exp(KAPPA_LAG)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+    let model = parse_model_string(src).expect("parse igd route-lag IOV");
+    assert_eq!(model.n_kappa, 1);
+    assert!(model.has_route_absorption_lag(), "per-route lag present");
+    assert!(
+        crate::sens::ode_provider::ode_iov_supported(&model),
+        "#877: igd route lag must be analytic under IOV"
+    );
+    let subject = iov_subject();
+    // stacked = [η_CL, κ_g0, κ_g1]. Onsets t_dose + LAG ≈ 1.5 / 25.5 clear every obs.
+    check_iov_provider_vs_fd(
+        &model,
+        &subject,
+        &[1.0, 20.0, 2.0, 0.5, 1.5],
+        &[0.1, 0.03, -0.04],
+    );
+}
+
+/// #877: **compartment lagtime × per-route lag** composition under IOV, with η on the
+/// compartment lag (`LAGTIME`) and κ on the route lag (`LAG`). The onset shift is
+/// `∂/∂(lag_cmt + lag_route)`, so the δlag² jet carries both `η_LAGC` and `κ_LAGR` — cross terms
+/// `η_LAGC×κ_LAGR` in the checked Hessian. Guards that the combined onset jet is exact under κ.
+#[test]
+fn ode_iov_compartment_plus_route_lag_matches_fd() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVLAGC(0.8, 0.0, 10.0)
+  theta TVLAGR(0.7, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAGC ~ 0.03
+  kappa KAPPA_LAGR ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  KA      = TVKA
+  LAGTIME = TVLAGC * exp(ETA_LAGC)
+  LAGR    = TVLAGR * exp(KAPPA_LAGR)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA, lag=LAGR) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let model = parse_model_string(src).expect("parse comp-lag × route-lag IOV");
+    assert!(model.has_lagtime(), "compartment LAGTIME present");
+    assert!(model.has_route_absorption_lag(), "per-route lag present");
+    assert!(
+        crate::sens::ode_provider::ode_iov_supported(&model),
+        "#877: compartment lag × route lag must be analytic under IOV"
+    );
+    let subject = iov_subject();
+    // stacked = [η_CL, η_LAGC, κ_g0, κ_g1]. Combined onset t_dose + LAGC + LAGR ≈ 1.5 / 25.5.
+    check_iov_provider_vs_fd(
+        &model,
+        &subject,
+        &[1.0, 20.0, 1.2, 0.8, 0.7],
+        &[0.1, 0.05, 0.03, -0.04],
+    );
+}
+
+/// #877: parallel **IR + DR** absorption (two `first_order` arms, only the DR arm route-lagged)
+/// under IOV — the `first_order` composition the issue names. Fractions `FR1 + FR2 = 1` split the
+/// dose across an immediate and a delayed pathway; only the DR arm carries `lag=LAGR`, with κ on
+/// it. Guards that the per-forcing onset summation (the DR onset saltation, the IR one at
+/// `K_DOSE`) composes correctly under κ. Value + gradient + Hessian vs FD.
+#[test]
+fn ode_iov_parallel_ir_dr_route_lag_matches_fd() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVKA1(1.6, 0.05, 20.0)
+  theta TVKA2(0.6, 0.05, 20.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVLAGR(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_LAGR ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA1  = TVKA1
+  KA2  = TVKA2
+  FR1  = TVFR1
+  FR2  = 1 - TVFR1
+  LAGR = TVLAGR * exp(KAPPA_LAGR)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2, lag=LAGR) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+    // Two absorption phases (ka1=1.6, ka2=0.6) make the prediction's 4th derivative larger, so
+    // the 4-point FD **Hessian** hits the ODE noise floor sooner than the single-arm models —
+    // tighten the solver to 1e-12/1e-14 so the FD cross-Hessian is clean at the harness's fixed
+    // 1e-4 step. (Verified: the analytic term is unchanged across tolerances; only the FD
+    // reference converges onto it, i.e. this is FD-vs-ODE-precision, not an analytic error.)
+    let model = parse_model_string(src).expect("parse parallel IR+DR route-lag IOV");
+    let ode = model.ode_spec.as_ref().expect("ode spec");
+    assert_eq!(ode.input_rate.len(), 2, "two first_order arms (IR + DR)");
+    assert_eq!(
+        ode.input_rate
+            .iter()
+            .filter(|f| f.lag_slot.is_some())
+            .count(),
+        1,
+        "only the DR arm is route-lagged"
+    );
+    assert!(
+        crate::sens::ode_provider::ode_iov_supported(&model),
+        "#877: parallel IR+DR route lag must be analytic under IOV"
+    );
+    let subject = iov_subject();
+    // stacked = [η_CL, κ_g0, κ_g1].
+    check_iov_provider_vs_fd(
+        &model,
+        &subject,
+        &[1.0, 20.0, 1.6, 0.6, 0.6, 1.5],
+        &[0.1, 0.03, -0.04],
+    );
+}
+
+/// #877 routing (kept FD): a `weibull` per-route lag stays on finite differences under IOV, its
+/// onset diverging for shape `β < 1` (an integrable spike, no finite rate-on saltation) — exactly
+/// as on the non-IOV path and as the compartment-lagtime `weibull` gate. The lifted IOV gate uses
+/// the per-kernel `route_lag_analytic()` classifier, so broadening it must NOT admit `weibull`.
+#[test]
+fn ode_iov_weibull_route_lag_falls_back_to_fd() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVTD(2.0, 0.05, 24.0)
+  theta TVBETA(1.5, 0.1, 10.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_LAG ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  TD  = TVTD
+  BETA = TVBETA
+  LAG = TVLAG * exp(KAPPA_LAG)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+    let model = parse_model_string(src).expect("parse weibull route-lag IOV");
+    assert!(model.has_route_absorption_lag(), "per-route lag present");
+    assert!(
+        !crate::sens::ode_provider::ode_iov_supported(&model),
+        "#877: weibull route lag must stay FD under IOV (β<1 onset divergence)"
+    );
+}
+
+/// #877 subject routing: an in-scope route-lag IOV subject resolves to analytic ODE-IOV
+/// sensitivities, while the SAME model with a **steady-state** dose into the route-lagged
+/// compartment declines to FD (`ss_absorption_out_of_scope`'s `lag_slot` operand — the SS dual
+/// seed does not carry the per-route onset). Belt on the per-subject gate, not just the model gate.
+#[test]
+fn ode_iov_route_lag_subject_gate_admits_transient_declines_ss() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_LAG ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+  LAG = TVLAG * exp(KAPPA_LAG)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let model = parse_model_string(src).expect("parse route-lag IOV");
+    let theta = [1.0, 20.0, 1.2, 1.5];
+    // Transient (non-SS) route-lag subject → analytic.
+    let transient = iov_subject();
+    assert!(
+        crate::sens::ode_provider::ode_subject_sensitivities_iov(
+            &model,
+            &transient,
+            &theta,
+            &[0.1, 0.03, -0.04],
+        )
+        .is_some(),
+        "#877: a transient route-lag IOV subject must be analytic"
+    );
+    // SS dose into the route-lagged compartment → declines to FD (out of scope).
+    assert!(
+        model.ss_absorption_out_of_scope(&Subject {
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
+            ..iov_subject()
+        }),
+        "SS + route lag must stay FD (lag_slot operand of ss_absorption_out_of_scope)"
+    );
+}
+
 /// #835 review: `CompiledModel::ss_absorption_out_of_scope` is the single source of truth for
 /// the SS-into-absorption FD decline shared by `ode_tvcov_supported`,
 /// `ode_iov_subject_supported`, and `iov_fd_reason`. Pin all three out-of-scope operands

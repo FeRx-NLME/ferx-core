@@ -352,9 +352,13 @@ pub struct InputRateForcing {
     /// by `DoseAttrMap`), this is a per-*forcing* offset: it is read only in the
     /// pointwise forcing loop and the zero-order window construction, leaving the
     /// `dose_lagtimes` machinery (`tad_anchor`, `subject_dose_attrs`) untouched.
-    /// A model carrying any `lag_slot` is served over finite differences — the
-    /// analytic sensitivity walk gates it off (its per-route onset saltation is a
-    /// Phase-2 follow-up, #856), mirroring the `weibull()`+lagtime FD fallback.
+    /// Since #859/#875 a per-route lag is served with **analytic** FOCE/FOCEI
+    /// gradients on the event-driven walk for every kernel except `weibull` — its
+    /// onset saltation is injected at `K_ROUTE_ONSET` (`sens/ode_provider.rs`), under
+    /// both the non-IOV and IOV (#877) paths. A `weibull` route lag stays on finite
+    /// differences (its `β < 1` onset diverges, an integrable spike with no finite
+    /// rate-on saltation), mirroring the `weibull()` + compartment-lagtime FD fallback.
+    /// See [`InputRateKind::route_lag_analytic`].
     pub lag_slot: Option<usize>,
 }
 
@@ -394,10 +398,11 @@ impl InputRateForcing {
     /// **added** to the dose's compartment lagtime to form the route's effective
     /// onset `t_dose + lag_cmt + lag_route`. Generic over `T: PkNum` so the same
     /// reader serves the `f64` prediction / FD-fit path and the `Dual2` analytic
-    /// provider: since #859 a `first_order` per-route lag is served analytically on
-    /// the event-driven walk (its onset saltation injected at `K_ROUTE_ONSET`), so
-    /// `T = Dual2` reaches here too. The other kernels' route lags remain FD-gated
-    /// pending their slices (`zero_order`/`transit`/`igd`) or permanently (`weibull`).
+    /// provider: since #859/#875 a per-route lag is served analytically on the
+    /// event-driven walk for every kernel except `weibull` (its onset saltation
+    /// injected at `K_ROUTE_ONSET`), so `T = Dual2` reaches here too — under both the
+    /// non-IOV and IOV (#877) paths. A `weibull` route lag stays FD (divergent `β < 1`
+    /// onset). See [`InputRateKind::route_lag_analytic`].
     #[inline]
     pub fn route_lag<T: PkNum>(&self, params: &[T]) -> T {
         self.lag_slot
