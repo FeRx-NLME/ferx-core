@@ -857,6 +857,66 @@ impl<T: PkNum> PreparedInputRate<T> {
             PreparedInputRate::FirstOrder { ka } => dose * ka,
         }
     }
+
+    /// The right-hand limit `lim_{tad→0⁺} ∂R_in/∂tad(tad, dose)` — the forcing's
+    /// onset **slope**, the companion to [`Self::rate_at_zero`] (its onset value).
+    /// Needed by the rate-on saltation's second-order (curvature) term: a moving
+    /// absorption boundary (estimated lagtime, #486) that carries IIV lands the
+    /// δ²-in-`δlag` correction in the checked `d²f/∂η²` Hessian block, and that
+    /// coefficient is `½·jg + ½·∂R_in/∂tad` — the state-Jacobian part `jg = J·(Δr·e)`
+    /// **plus** the forcing's own explicit time-variation at the onset (#880). For a
+    /// **constant**-rate forcing (infusion, zero-order window) this slope is zero, so
+    /// the old `½·jg`-only coefficient was already exact there; it is the decaying
+    /// `first_order`/Bateman kernels where the omitted `∂R_in/∂tad` biased the
+    /// analytic Hessian (near sign-mirror of FD).
+    ///
+    /// Defined only for the **finite-jump** onsets — the arms whose
+    /// [`Self::rate_at_zero`] is non-zero: `FirstOrder` (`−dose·ka²`), the degenerate
+    /// `Transit` `n = 0` (pure first-order, `−dose·ktr²`), and `Weibull` `β = 1`
+    /// (`−dose/Td²`). Every **vanishing**-onset arm returns `0`: `Transit` `n > 0`,
+    /// `InverseGaussian`, and `ZeroOrder` are continuous at onset (`rate_at_zero = 0`),
+    /// so they carry no finite-jump rate-on saltation for this term to correct — this
+    /// deliberately does **not** attempt the (generally singular, e.g. `Transit`
+    /// `0 < n < 1`) curvature of a smooth-but-non-differentiable onset, which has no
+    /// finite closed form and is not a finite-jump saltation. `Weibull` `β < 1`
+    /// diverges (mirrors `rate_at_zero`, `NaN`) and is unreachable — the lagtime gate
+    /// (`ode_analytical_supported`) keeps `Weibull` on the FD fallback.
+    #[inline]
+    pub(crate) fn rate_dtad_at_zero(&self, dose: T) -> T {
+        if dose.val() <= 0.0 {
+            return T::from_f64(0.0);
+        }
+        match *self {
+            // R_in(0⁺) = 0 for n > 0 (the Γ-density vanishes), so no finite-jump onset;
+            // n = 0 is pure first-order (rate ktr), slope −dose·ktr².
+            PreparedInputRate::Transit { ktr, n, .. } => {
+                if n.val() <= 0.0 {
+                    -dose * ktr * ktr
+                } else {
+                    T::from_f64(0.0)
+                }
+            }
+            // Onset value and every derivative vanish (essential singularity).
+            PreparedInputRate::InverseGaussian { .. } => T::from_f64(0.0),
+            PreparedInputRate::Weibull { beta, c0, .. } => {
+                let b = beta.val();
+                if b > 1.0 {
+                    T::from_f64(0.0)
+                } else if b == 1.0 {
+                    // First-order with ka = 1/Td = exp(c0): slope −dose·(1/Td)².
+                    let ka = c0.exp();
+                    -dose * ka * ka
+                } else {
+                    // β < 1: divergent onset, unreachable (excluded by the lagtime gate).
+                    T::from_f64(f64::NAN)
+                }
+            }
+            // Constant rate over the window — flat, so zero onset slope.
+            PreparedInputRate::ZeroOrder { .. } => T::from_f64(0.0),
+            // R_in = dose·ka·exp(−ka·tad) ⇒ ∂R_in/∂tad|₀ = −dose·ka².
+            PreparedInputRate::FirstOrder { ka } => -dose * ka * ka,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2201,5 +2261,104 @@ mod tests {
         // discontinuity at the boundary, not just in the divergent direction.
         let prep = PreparedInputRate::weibull(td, 1.0 + f64::EPSILON);
         assert_eq!(prep.rate_at_zero(dose), 0.0);
+    }
+
+    /// #880: `rate_dtad_at_zero` is the onset **slope** companion to `rate_at_zero`,
+    /// feeding the rate-on saltation's δlag² (curvature) term. For the finite-jump
+    /// (first-order-like) arms it must equal the one-sided derivative of [`Self::rate`]
+    /// at `tad → 0⁺`; for the vanishing-onset arms it is 0. Cross-checked against a
+    /// forward difference of `rate` at a small `tad` so the closed forms can't drift
+    /// from the actual kernel.
+    #[test]
+    fn rate_dtad_at_zero_first_order_matches_fd() {
+        let dose = 100.0;
+        let h = 1e-6;
+        for &ka in &[0.1, 1.0, 5.0] {
+            let prep = PreparedInputRate::first_order(ka);
+            // Analytic onset slope −dose·ka².
+            assert_relative_eq!(
+                prep.rate_dtad_at_zero(dose),
+                -dose * ka * ka,
+                max_relative = 1e-12
+            );
+            // Forward difference of `rate` from the onset value `rate_at_zero`.
+            let fd = (prep.rate(h, dose) - prep.rate_at_zero(dose)) / h;
+            assert_relative_eq!(prep.rate_dtad_at_zero(dose), fd, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn rate_dtad_at_zero_transit_arms() {
+        let dose = 100.0;
+        let ktr = 2.0;
+        // n = 0 (Bateman-degenerate, rate ktr): slope −dose·ktr², matching first-order.
+        let prep = PreparedInputRate::transit(0.0, 1.0 / ktr);
+        assert_relative_eq!(
+            prep.rate_dtad_at_zero(dose),
+            -dose * ktr * ktr,
+            max_relative = 1e-12
+        );
+        let fd = (prep.rate(1e-6, dose) - prep.rate_at_zero(dose)) / 1e-6;
+        assert_relative_eq!(prep.rate_dtad_at_zero(dose), fd, max_relative = 1e-4);
+        // n < 0 clamps to 0 → same degenerate first-order slope.
+        let prep = PreparedInputRate::transit(-1.0, 1.0 / ktr);
+        assert_relative_eq!(
+            prep.rate_dtad_at_zero(dose),
+            -dose * ktr * ktr,
+            max_relative = 1e-12
+        );
+        // n > 0: onset value AND slope vanish (no finite-jump saltation). Deliberately
+        // NOT the (singular for 0<n<1) true curvature — the term is the companion to
+        // the finite onset jump, which is zero here.
+        let prep = PreparedInputRate::transit(3.0, 2.0);
+        assert_eq!(prep.rate_dtad_at_zero(dose), 0.0);
+    }
+
+    #[test]
+    fn rate_dtad_at_zero_vanishing_arms_are_zero() {
+        let dose = 100.0;
+        // Inverse-Gaussian: onset and every derivative vanish (essential singularity).
+        for &(mat, cv2) in &[(1.0, 0.5), (5.0, 0.1), (0.2, 2.0)] {
+            let prep = PreparedInputRate::inverse_gaussian(mat, cv2);
+            assert_eq!(prep.rate_dtad_at_zero(dose), 0.0);
+        }
+        // Zero-order: constant rate ⇒ flat, zero onset slope.
+        assert_eq!(
+            PreparedInputRate::zero_order(3.0).rate_dtad_at_zero(dose),
+            0.0
+        );
+        // Zero/negative dose short-circuits to 0 for every arm.
+        assert_eq!(
+            PreparedInputRate::first_order(1.0).rate_dtad_at_zero(0.0),
+            0.0
+        );
+        assert_eq!(
+            PreparedInputRate::first_order(1.0).rate_dtad_at_zero(-5.0),
+            0.0
+        );
+    }
+
+    /// Weibull mirrors `rate_at_zero`'s three sub-cases; unreachable on the analytic
+    /// lagtime path (Weibull is FD-gated) so this is its only coverage. `β = 1` is the
+    /// first-order slope `−dose/Td²`; `β > 1` vanishes; `β < 1` is `NaN` (divergent).
+    #[test]
+    fn rate_dtad_at_zero_weibull_arms() {
+        let dose = 100.0;
+        let td = 2.0;
+        assert_eq!(
+            PreparedInputRate::weibull(td, 1.5).rate_dtad_at_zero(dose),
+            0.0
+        );
+        let prep = PreparedInputRate::weibull(td, 1.0);
+        assert_relative_eq!(
+            prep.rate_dtad_at_zero(dose),
+            -dose / (td * td),
+            max_relative = 1e-12
+        );
+        let fd = (prep.rate(1e-6, dose) - prep.rate_at_zero(dose)) / 1e-6;
+        assert_relative_eq!(prep.rate_dtad_at_zero(dose), fd, max_relative = 1e-4);
+        assert!(PreparedInputRate::weibull(td, 0.5)
+            .rate_dtad_at_zero(dose)
+            .is_nan());
     }
 }

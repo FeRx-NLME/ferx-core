@@ -3329,15 +3329,24 @@ fn jet_only<T: crate::sens::num::PkNum>(x: T) -> T {
 /// with `lag`. Unlike a bolus, the state is continuous and only `ẋ` jumps by the forcing
 /// `Δr = F·rate` in `cmt`, so the injection is exact in closed form (no pre/post RHS
 /// evals): with `s = −1` at the rate-on boundary and `s = +1` at rate-off,
-///   `u[cmt] += s·Δr·δlag`,  `u += −s·½·J·(Δr·e_cmt)·δlag²`,
+///   `u[cmt] += s·Δr·δlag`,  `u += (−s·½·J·(Δr·e_cmt) + ½·(∂Δr/∂tad)·e_cmt)·δlag²`,
 /// matching the general `D·δlag + (½ẋ̇⁻+½ẋ̇⁺−J⁺ẋ⁻)·δlag²` with `D = s·Δr·e_cmt` and
-/// `J⁻ = J⁺ = J` (state continuous). `J·(Δr·e_cmt)` is the exact directional RHS
-/// derivative along the rate vector, via a `Dual1<1>` eval — no finite differences (#439).
+/// `J⁻ = J⁺ = J` (state continuous). The δlag² coefficient is `½(v⁺−v⁻)`'s **full**
+/// second time-derivative jump `½(ẋ̇⁺−ẋ̇⁻)`: the state-Jacobian part `J·(Δr·e_cmt)` (the
+/// exact directional RHS derivative along the rate vector, via a `Dual1<1>` eval — no
+/// finite differences, #439) **plus** the forcing's own explicit time-variation at the
+/// boundary, `∂Δr/∂tad` (`dr_dtad`). For a **constant**-rate forcing (infusion,
+/// zero-order window) `∂Δr/∂tad = 0` and this reduces to the old `−s·½·jg`; it is the
+/// decaying `first_order`/Bateman onset (`∂Δr/∂tad = −Δr·ka ≠ 0`) whose omitted term
+/// biased the analytic Hessian — the near sign-mirror-of-FD `d²f/∂η²` of #880. `dr_dtad`
+/// is the exact onset slope from [`PreparedInputRate::rate_dtad_at_zero`], summed over
+/// every forcing feeding `cmt` exactly as `dr` sums their onset values.
 #[allow(clippy::too_many_arguments)]
 fn inject_rate_saltation<T: crate::sens::num::PkNum>(
     u: &mut [T],
     cmt_idx: usize,
     dr: T,
+    dr_dtad: T,
     dlag: T,
     s: f64,
     program: &crate::parser::model_parser::OdeRhsProgram,
@@ -3374,8 +3383,14 @@ fn inject_rate_saltation<T: crate::sens::num::PkNum>(
     );
     let dlag2 = dlag * dlag;
     for (c, uc) in u.iter_mut().enumerate() {
-        // δlag² coefficient = −s·½·(J·(Δr·e_cmt))[c].
-        let coef2 = T::from_f64(-s * 0.5 * jg[c]);
+        // δlag² coefficient = −s·½·(J·(Δr·e_cmt))[c], plus — in the forced compartment
+        // only — the forcing's explicit onset time-variation ½·∂Δr/∂tad (#880). The
+        // latter enters `ẋ̇` on whichever side the forcing is active and is `s`-invariant
+        // (rate-on: post-side ẋ̇⁺; rate-off: pre-side ẋ̇⁻), so it is added, not scaled by `s`.
+        let mut coef2 = T::from_f64(-s * 0.5 * jg[c]);
+        if c == cmt_idx {
+            coef2 = coef2 + T::from_f64(0.5) * dr_dtad;
+        }
         *uc = *uc + coef2 * dlag2;
     }
 }
@@ -3582,6 +3597,8 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
                 &mut u,
                 cmt_idx,
                 rate_forcing,
+                // Constant infusion rate ⇒ no onset time-variation (#880).
+                T::from_f64(0.0),
                 dtinf,
                 1.0,
                 program,
@@ -3920,9 +3937,21 @@ fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
             // (modeled `D`/`R`, or `F·duration`) — inject the same rate-off saltation
             // `equilibrate_ss_state_g`'s cycle loop uses (`d_off = inf_window − t_inf_val`).
             let dtinf = inf_window - T::from_f64(t_inf_val);
+            // Constant infusion rate ⇒ no onset time-variation (#880).
             inject_rate_saltation::<T>(
-                &mut u, cmt_idx, inf_rate, dtinf, 1.0, program, params, t_inf_val, 0.0, 0.0,
-                d1_vars, d1_stack,
+                &mut u,
+                cmt_idx,
+                inf_rate,
+                T::from_f64(0.0),
+                dtinf,
+                1.0,
+                program,
+                params,
+                t_inf_val,
+                0.0,
+                0.0,
+                d1_vars,
+                d1_stack,
             );
             let quiet_val = phase_val - t_inf_val;
             let sol = solve_ode_g(&bare_rhs, &u, (0.0, quiet_val), params, &[quiet_val], opts);
@@ -4646,11 +4675,51 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
                             let dlag = jet_only(lag);
                             let dose_mass = f_bio_at_dose[idx] * T::from_f64(d.amt);
+                            // Onset-segment snapshot (#880). Production's `R_in` turns on in the
+                            // segment STARTING at the lagged arrival, integrated (NONMEM
+                            // end-of-interval) with the NEXT record's PK snapshot — not the dose
+                            // record's. So the onset jump's kernel (`ka`/shape, via `prep`) and
+                            // pathway `frac` must be read from that post-arrival snapshot, exactly
+                            // as `add_prepared_input_rate_forcing` reads them for the continuous
+                            // forcing on that segment; under a TV covariate crossing the onset the
+                            // dose snapshot diverges (a several-percent gradient error). The dose
+                            // **mass** `F·amt` stays fixed at dose time (`f_bio_at_dose`,
+                            // mass-exact), matching production. Skip co-located rate-off siblings
+                            // (no record params); fall back to the dose snapshot if no later
+                            // record exists (the onset then feeds no observed segment anyway).
+                            let onset_params: &[T] = 'onset_snap: {
+                                let leps = crate::ode::predictions::INFUSION_EPS;
+                                for q in (p + 1)..tl.len() {
+                                    let (tq, kq, iq) = tl[q];
+                                    if (kq == K_INF_END || kq == K_ZO_END)
+                                        && (tq - t_event).abs() <= leps
+                                    {
+                                        continue;
+                                    }
+                                    break 'onset_snap match kq {
+                                        K_DOSE | K_SS_SEED => &pk_at_dose[iq],
+                                        K_PKONLY => &pk_at_pk_only[iq],
+                                        K_OBS => &pk_at_obs[iq],
+                                        _ => &pk_at_dose[idx],
+                                    };
+                                }
+                                &pk_at_dose[idx]
+                            };
+                            let prep_onset = prep_for(onset_params);
                             let mut onset = T::from_f64(0.0);
-                            for (f, prep) in ode.input_rate.iter().zip(&prepared_forcings) {
+                            // Onset **slope** `∂Δr/∂tad` (#880), summed over the same forcings
+                            // exactly as `onset` sums their values — the curvature companion the
+                            // rate-on saltation's δlag² term needs (`½·∂Δr/∂tad`). Zero for the
+                            // vanishing-onset kernels (`transit n>0`, IG) and for the constant
+                            // zero-order window below, non-zero for the decaying `first_order`
+                            // /Bateman onset that biased the Hessian.
+                            let mut onset_dtad = T::from_f64(0.0);
+                            for (f, prep) in ode.input_rate.iter().zip(&prep_onset) {
                                 if f.cmt == cmt_idx {
-                                    onset = onset
-                                        + f.frac(&pk_at_dose[idx]) * prep.rate_at_zero(dose_mass);
+                                    onset =
+                                        onset + f.frac(onset_params) * prep.rate_at_zero(dose_mass);
+                                    onset_dtad = onset_dtad
+                                        + f.frac(onset_params) * prep.rate_dtad_at_zero(dose_mass);
                                 }
                             }
                             // #486: a zero-order window feeding this compartment also switches
@@ -4669,10 +4738,13 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 &mut u,
                                 cmt_idx,
                                 onset,
+                                onset_dtad,
                                 dlag,
                                 -1.0,
                                 program,
-                                &pk_at_dose[idx],
+                                // Post-side Jacobian uses the onset-segment snapshot (#880),
+                                // matching where the forcing actually turns on.
+                                onset_params,
                                 t_event,
                                 first_dose_time,
                                 t_event,
@@ -4741,6 +4813,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 &mut u,
                                 cmt_idx,
                                 inf_eff[idx].0,
+                                // Constant infusion rate ⇒ no onset time-variation (#880).
+                                T::from_f64(0.0),
                                 dlag,
                                 -1.0,
                                 program,
@@ -4987,6 +5061,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         &mut u,
                         cmt,
                         inf_eff[idx].0,
+                        // Constant infusion rate ⇒ no onset time-variation (#880).
+                        T::from_f64(0.0),
                         d_off,
                         1.0,
                         program,
@@ -5125,6 +5201,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 &mut u,
                                 cmt,
                                 rate,
+                                // Constant zero-order rate ⇒ no onset time-variation (#880).
+                                T::from_f64(0.0),
                                 d_off_j,
                                 1.0,
                                 program,
@@ -5445,6 +5523,8 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                         &mut u,
                         cmt,
                         rate,
+                        // Constant zero-order rate ⇒ no onset time-variation (#880).
+                        T::from_f64(0.0),
                         ddur,
                         1.0,
                         program,

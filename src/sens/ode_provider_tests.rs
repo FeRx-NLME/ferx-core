@@ -5912,3 +5912,111 @@ fn ode_provider_mixed_tvcov_matches_production() {
     // gradient (the value/1st-order parity above does not exercise `coef2`).
     check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
 }
+
+// ---- #880: analytic Hessian for IIV on an absorption lag feeding a rate-on
+// `first_order` input-rate forcing (the `inject_rate_saltation` δ² time-partial term) ----
+
+/// #880 regression. An η on a compartment lagtime (`ALAG1`) that shifts the onset of
+/// a **decaying** `first_order` forcing lands the δlag² curvature correction in the
+/// checked `d²f/∂η²` block. The old coefficient used only the state-Jacobian part
+/// `½·J·(Δr·e)` and dropped the forcing's own onset time-variation `½·∂R_in/∂tad`
+/// (`= −½·Δr·ka ≠ 0` for `first_order`), biasing the analytic Hessian to a near
+/// sign-mirror of FD (`≈ +301` vs `≈ −304`). The 1st-order gradient was always
+/// correct (`check_vs_production`), so predictions and the FOCEI *gradient* were fine;
+/// only the curvature (SEs, Hessian-consuming line searches) was wrong.
+#[test]
+fn ode_provider_880_rate_on_first_order_lag_iiv_hessian() {
+    const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVLAG(2.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  ALAG1 = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+    let m = parse_model_string(M).expect("parse #880 model");
+    let subject = bolus_subject(&[0.5, 1.0, 3.0, 5.0]);
+    assert!(
+        ode_analytical_supported(&m),
+        "first_order + compartment ALAG1 must be on the analytic event-driven walk"
+    );
+    let theta = [1.0, 20.0, 1.2, 2.0];
+    let eta = [0.1, 0.05];
+    check_vs_production(&m, &subject, &theta, &eta); // 1st order was always fine
+    check_hessian_vs_fd_of_grad(&m, &subject, &theta, &eta); // FAILED pre-#880
+}
+
+/// #880 twin: the same rate-on onset with a **time-varying covariate crossing it**.
+/// `KA` (hence the onset value `Δr` and slope `∂R_in/∂tad`) carries a WT covariate that
+/// changes record-to-record, and `ALAG1` carries IIV — so the onset saltation runs on
+/// the TV-cov `(θ,η)`-basis walk with a per-segment PK snapshot. Guards that the δ²
+/// time-partial term is fed the right per-onset `Δr`/`∂R_in/∂tad` (and that the onset
+/// snapshot is self-consistent) under a covariate that moves across the onset — the
+/// scenario #880 flagged as the `K_ROUTE_ONSET` snapshot concern.
+#[test]
+fn ode_provider_880_rate_on_first_order_lag_iiv_tvcov_hessian() {
+    const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  theta KA_WT(0.01, -0.1, 0.1)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA * exp(KA_WT * (WT - 70))
+  ALAG1 = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+    let m = parse_model_string(M).expect("parse #880 TV-cov model");
+    // Onset at t_dose + lag ≈ 1.5; observations straddle it (some before, some after),
+    // and WT changes at each record so the RHS Jacobian (via KA) moves across the onset.
+    let times = [0.75, 1.0, 2.0, 3.0, 5.0, 8.0];
+    let mut subject = bolus_subject(&times);
+    subject.dose_covariates = vec![HashMap::from([("WT".to_string(), 70.0)])];
+    subject.obs_covariates = (0..times.len())
+        .map(|i| HashMap::from([("WT".to_string(), 60.0 + 8.0 * (i as f64))]))
+        .collect();
+    assert!(
+        subject.has_tv_covariates(),
+        "WT must register as time-varying (per-obs values differ)"
+    );
+    assert!(
+        ode_tvcov_supported(&m, &subject),
+        "first_order + ALAG1 + TV-cov must be on the analytic TV-cov walk"
+    );
+    let theta = [1.0, 20.0, 1.2, 1.5, 0.01];
+    let eta = [0.1, 0.05];
+    check_vs_production(&m, &subject, &theta, &eta);
+    check_hessian_vs_fd_of_grad(&m, &subject, &theta, &eta);
+}
