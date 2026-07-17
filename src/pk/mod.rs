@@ -1,6 +1,7 @@
 pub mod absorption;
 pub mod analytical_absorption;
 pub mod event_driven;
+pub mod modified_release;
 pub mod ode_template;
 pub mod one_compartment;
 pub mod three_compartment;
