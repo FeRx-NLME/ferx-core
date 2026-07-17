@@ -37,11 +37,16 @@
 //! observable equals `Σ mass·kernel_conc` exactly when the kernel is evaluated
 //! with `v = 1/m`, `cl = ke/m` (see [`recover_disp_params_g`]).
 //!
-//! A model is only routed here when a **runtime verify-gate** (closed form vs a
-//! short reference integration of its own `OdeSpec`, at several probe points)
-//! agrees — so a mis-identification cannot mispredict, it merely declines back to
-//! the ODE path (`crate::pk::mr_supported`). The failure surface is "missed
-//! speed-up", never "wrong".
+//! Identification is deliberately **conservative** — it declines on any
+//! nonlinearity, time-variance, non-canonical sign pattern, or non-central /
+//! nonlinear readout — and the ODE path is always a correct fallback, so an
+//! un-admitted model is only ever *slower*, never wrong. The remaining risk (a
+//! model that identifies but whose parameters are recovered wrongly) is closed
+//! by the **reduction-to-ODE test anchor**: the admitted closed form is asserted
+//! bit-for-bit (to solver tolerance) against its own integrated `OdeSpec` twin
+//! across a model zoo, and transitively against the NONMEM `$DES` anchor the ODE
+//! path already matches. [`mr_predictions`] is the routing entry; it returns
+//! `None` (→ ODE) for anything outside scope.
 
 use crate::ode::predictions::OdeSpec;
 use crate::pk::absorption::{InputRateForcing, InputRateKind};
@@ -397,6 +402,114 @@ pub fn mr_observable_g<T: PkNum>(
     c.guard_floor(0.0)
 }
 
+/// Whether this input-rate kind has an elementary closed-form central response
+/// that can be superposed. `first_order`/`transit`/`igd` do (Phase A);
+/// `zero_order` is Phase B (its `∂/∂dur` carries a moving-boundary saltation, a
+/// separate kernel); `weibull` has no elementary convolution with exponential
+/// disposition and stays on the ODE path permanently. Exhaustive so a new kind
+/// forces a decision here.
+fn is_closed_form_kind(kind: InputRateKind) -> bool {
+    match kind {
+        InputRateKind::FirstOrder | InputRateKind::Transit | InputRateKind::InverseGaussian => true,
+        InputRateKind::ZeroOrder | InputRateKind::Weibull => false,
+    }
+}
+
+/// Whether a `transit`/`igd` route is in its flip-flop domain, where the
+/// exponential-tilting closed form does not converge and the kernel returns `0`.
+/// Such a subject must integrate (the ODE forcing is valid for any params), so
+/// its presence declines the whole model from the closed-form path — mirroring
+/// the single-route flip-flop reroute (`absorption_flip_flop_at`). `first_order`
+/// never flips (the `ka ≈ ke` limit is handled inside the kernel).
+fn route_flips(f: &InputRateForcing, dp: &DispParams<f64>, p: &[f64]) -> bool {
+    let ke = dp.cl / dp.v;
+    match f.kind {
+        InputRateKind::Transit => {
+            let n = forcing_arg(f, p, 0, 0.0);
+            let mtt = forcing_arg(f, p, 1, 1.0);
+            mtt <= 0.0 || !(ke < (n + 1.0) / mtt)
+        }
+        InputRateKind::InverseGaussian => {
+            let mat = forcing_arg(f, p, 0, 1.0);
+            let cv2 = forcing_arg(f, p, 1, 1.0);
+            mat <= 0.0 || cv2 <= 0.0 || !(ke < 1.0 / (2.0 * mat * cv2))
+        }
+        _ => false,
+    }
+}
+
+/// Closed-form modified-release predictions for `subject` at its observation
+/// times, or `None` when the model/subject is outside the closed-form scope —
+/// in which case the caller falls back to the ODE path (always correct).
+///
+/// Scope (all must hold): an `[odes]` model with ≥1 input-rate forcing, every one
+/// of a closed-form-able kind ([`is_closed_form_kind`]); a canonical linear
+/// 1-/2-cpt disposition ([`identify_disposition`]); no IOV, time-varying
+/// covariates, resets, `init(...)`, steady-state or infusion doses, or
+/// compartment-indexed `F{c}`/`ALAG{c}` (the `dose_attr_map`, which would make
+/// the per-dose `F`/lag non-uniform); and no route in its flip-flop domain
+/// ([`route_flips`]). This is the **value** path (predict / simulate / the FD-fit
+/// value evals — all self-consistent, the FD gradient reads these values); the
+/// analytic FOCE/FOCEI gradient path is wired separately so a fit never mixes a
+/// closed-form value with an ODE-integrated gradient.
+pub(crate) fn mr_predictions(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<f64>> {
+    let spec = model.ode_spec.as_ref()?;
+    if model.n_kappa > 0 || subject.has_tv_covariates() || subject.has_resets() {
+        return None;
+    }
+    // A `TIME`-dependent model is time-varying: the single `t = 0` parameter
+    // snapshot below cannot represent it, and a `TIME`-via-parameter dependence is
+    // invisible to `identify_disposition`'s fixed-`p` Jacobian probe (only
+    // `TIME` *in the RHS* fails the time-invariance check). Decline it here so a
+    // direct caller is safe, independent of the routing site's own guard.
+    if crate::pk::model_uses_time_builtin(model) {
+        return None;
+    }
+    if spec.init_fn.is_some() || !spec.dose_attr_map.is_empty() {
+        return None;
+    }
+    if spec.input_rate.is_empty() || !spec.input_rate.iter().all(|f| is_closed_form_kind(f.kind)) {
+        return None;
+    }
+    if subject.doses.iter().any(|d| d.ss || d.is_infusion()) {
+        return None;
+    }
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let disp = identify_disposition(spec, &pk.values, 1.0)?;
+    let dp = recover_disp_params_g::<f64>(spec, &disp, &pk.values, &subject.covariates)?;
+    if spec
+        .input_rate
+        .iter()
+        .any(|f| route_flips(f, &dp, &pk.values))
+    {
+        return None;
+    }
+    let lag_cmt = pk.lagtime();
+    let f_bio = pk.f_bio();
+    Some(
+        subject
+            .obs_times
+            .iter()
+            .map(|&t| {
+                mr_observable_g(
+                    &dp,
+                    &spec.input_rate,
+                    &subject.doses,
+                    t,
+                    &pk.values,
+                    lag_cmt,
+                    f_bio,
+                )
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +789,311 @@ mod tests {
         assert!(
             identify_disposition(spec, &p, 1.0).is_none(),
             "MM elimination must be declined (nonlinear)"
+        );
+    }
+
+    // ── Layer 3 (the anchor): the admitted closed form must reduce to its own
+    //    integrated OdeSpec twin, to solver tolerance. This is what ties the
+    //    fast path to the (NONMEM-anchored) ODE path. Tight solver tol so the
+    //    integrator's own onset-kink error (~1e-3 at default reltol) does not
+    //    mask a real discrepancy. ───────────────────────────────────────────
+    fn mk_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> crate::types::Subject {
+        let n = obs_times.len();
+        let nd = doses.len();
+        crate::types::Subject {
+            id: "R".into(),
+            doses,
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1; nd],
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }
+    }
+
+    fn assert_reduces_to_ode(model_src: &str, theta: &[f64], eta: &[f64], doses: Vec<DoseEvent>) {
+        let model = crate::parser::model_parser::parse_model_string(model_src).unwrap();
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let obs: Vec<f64> = (1..=60).map(|i| i as f64 * 0.4).collect(); // 0.4 .. 24 h
+        let subject = mk_subject(doses, obs.clone());
+        let mr = mr_predictions(&model, &subject, theta, eta).expect("MR-supported");
+        let p = flat_params(&model, theta, eta);
+        let ode = crate::ode::ode_predictions(spec, &p, theta, eta, &subject);
+        assert_eq!(mr.len(), ode.len());
+        for (i, (&a, &b)) in mr.iter().zip(&ode).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5 * (1.0 + b.abs()),
+                "obs {i} t={}: MR {a} vs ODE {b}",
+                obs[i]
+            );
+        }
+    }
+
+    const REDUCE_1CPT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    // IR + delayed-release: a per-route lag on the second pathway (the classic
+    // modified-release picture, #856). The closed form shifts τ; the twin lags
+    // the forcing onset — they must agree.
+    const REDUCE_1CPT_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.5, 0.05, 0.95)
+  theta TVKA1(1.2, 0.05, 24.0)
+  theta TVKA2(0.8, 0.05, 24.0)
+  theta TVLAG2(3.0, 0.001, 12.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+  LAG2 = TVLAG2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2, lag=LAG2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    const REDUCE_2CPT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(10.0, 0.1, 100.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central, periph])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V1*central - Q/V1*central + Q/V2*periph
+  d/dt(periph) = Q/V1*central - Q/V2*periph
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    #[test]
+    fn reduces_to_ode_1cpt_parallel() {
+        assert_reduces_to_ode(
+            REDUCE_1CPT,
+            &[5.0, 50.0, 0.6, 1.5, 0.3],
+            &[0.0, 0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    #[test]
+    fn reduces_to_ode_1cpt_parallel_nonzero_eta() {
+        // η ≠ 0 exercises the recovered ke/V carrying the individual shift.
+        assert_reduces_to_ode(
+            REDUCE_1CPT,
+            &[5.0, 50.0, 0.6, 1.5, 0.3],
+            &[0.3, -0.2],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    #[test]
+    fn reduces_to_ode_1cpt_per_route_lag() {
+        assert_reduces_to_ode(
+            REDUCE_1CPT_LAG,
+            &[5.0, 50.0, 0.5, 1.2, 0.8, 3.0],
+            &[0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    #[test]
+    fn reduces_to_ode_1cpt_multi_dose() {
+        assert_reduces_to_ode(
+            REDUCE_1CPT,
+            &[5.0, 50.0, 0.6, 1.5, 0.3],
+            &[0.0, 0.0],
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn reduces_to_ode_2cpt_parallel() {
+        assert_reduces_to_ode(
+            REDUCE_2CPT,
+            &[5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3],
+            &[0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    // A *static* covariate (WT on CL) is baked into the parameters at the single
+    // `t = 0` snapshot — valid because it does not vary in time — and the recovered
+    // `ke` must carry it, matching the twin which reads the same covariate.
+    const REDUCE_1CPT_COV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * WT / 70
+  V = TVV
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    // Bioavailability F (< 1) scales the whole dose before the FR split, in both
+    // the closed form (`mass = FR·F·D`) and the twin (`dose_f_bio`).
+    const REDUCE_1CPT_F: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  theta TVF(0.7, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+  F = TVF
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    #[test]
+    fn reduces_to_ode_1cpt_static_covariate() {
+        let model = crate::parser::model_parser::parse_model_string(REDUCE_1CPT_COV).unwrap();
+        let spec = model.ode_spec.as_ref().unwrap();
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.1];
+        let obs: Vec<f64> = (1..=60).map(|i| i as f64 * 0.4).collect();
+        let mut subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs.clone(),
+        );
+        subject.covariates = std::collections::HashMap::from([("WT".to_string(), 140.0)]);
+        let mr = mr_predictions(&model, &subject, &theta, &eta).expect("MR-supported");
+        // Flat params WITH the covariate baked in, for the ODE reference.
+        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
+        let ode = crate::ode::ode_predictions(spec, &pk.values, &theta, &eta, &subject);
+        for (i, (&a, &b)) in mr.iter().zip(&ode).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5 * (1.0 + b.abs()),
+                "cov obs {i} t={}: MR {a} vs ODE {b}",
+                obs[i]
+            );
+        }
+    }
+
+    #[test]
+    fn reduces_to_ode_1cpt_bioavailability() {
+        assert_reduces_to_ode(
+            REDUCE_1CPT_F,
+            &[5.0, 50.0, 0.6, 1.5, 0.3, 0.7],
+            &[0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         );
     }
 }

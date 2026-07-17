@@ -29,6 +29,17 @@ section of the SDLC for the versioning policy).
   with a clear error).
 
 ### Performance
+- **Closed-form modified-release absorption** (#860). A static multi-route absorption model
+  (parallel / mixed pathways #505, per-route lag #856 — one `[odes]` central compartment fed by a
+  fraction-weighted superposition of `first_order` / `transit` / `igd` input-rate forcings into a
+  linear 1-/2-compartment disposition) now evaluates `predict()` / `simulate()` and
+  finite-difference fits as a **closed-form superposition of shifted single-route solutions, with
+  no ODE integration**, when the subject has no time-varying covariates, IOV, resets, or
+  steady-state / infusion doses. The disposition is recognised from the compiled model by its
+  behaviour (a probed constant, canonical 1-/2-cpt Jacobian), not by matching how it is written,
+  and a non-linear disposition is declined and integrated as before. Predictions are unchanged to
+  within the ODE solver tolerance — the closed form reduces to the same integrated twin — and any
+  model outside this scope (including `zero_order` / `weibull` pathways) continues to integrate.
 - The closed-form steady-state equilibration for dosing into a built-in absorption compartment
   (#834) now actually takes effect. Its self-verification tolerance sat just below the solver's
   own noise floor, so it silently fell back to the 50-cycle pulse-train iteration at every

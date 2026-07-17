@@ -2059,6 +2059,21 @@ pub fn compute_predictions_with_tv_into_with_schedule(
                 &scratch.obs,
                 &scratch.pk_only,
             )
+        } else if let Some(mr) = modified_release::mr_predictions(model, subject, theta, eta) {
+            // Closed-form modified-release fast path (#860): a *static* multi-route
+            // model (parallel / mixed / per-route-lagged absorption, #505/#856) with
+            // a canonical linear 1-/2-cpt disposition evaluates as a superposition of
+            // shifted single-route closed forms — no integration. Kept in this static
+            // branch (after the TV / reset / `TIME` guard) because a single `t = 0`
+            // parameter snapshot cannot represent a time-varying disposition — a
+            // `TIME`-dependent parameter is invisible to `identify_disposition`'s
+            // fixed-`p` Jacobian probe, so the branch guard, not that probe, is what
+            // excludes it. `mr_predictions` returns `None` (→ the `ode_predictions`
+            // twin below) for anything else outside scope (IOV, SS / infusion doses,
+            // flip-flop, non-linear / non-canonical disposition); the admitted result
+            // reduces to that twin to solver tolerance
+            // (`modified_release::tests::reduces_to_ode_*`).
+            mr
         } else {
             let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
             crate::ode::ode_predictions(ode, &pk.values, theta, eta, subject)
