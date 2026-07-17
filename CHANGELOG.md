@@ -39,7 +39,20 @@ section of the SDLC for the versioning policy).
   behaviour (a probed constant, canonical 1-/2-cpt Jacobian), not by matching how it is written,
   and a non-linear disposition is declined and integrated as before. Predictions are unchanged to
   within the ODE solver tolerance — the closed form reduces to the same integrated twin — and any
-  model outside this scope (including `zero_order` / `weibull` pathways) continues to integrate.
+  model outside this scope (including `weibull` pathways) continues to integrate.
+- **Closed-form modified-release absorption now covers `zero_order` routes** (#860 Phase B). A
+  `zero_order(dur=...)` pathway in a static multi-route model no longer falls back to ODE
+  integration for `predict()` / `simulate()` / finite-difference fits — the box-car input rate has
+  its own closed-form convolution against the linear 1-/2-cpt disposition, superposed exactly like
+  the other pathway kinds. Predictions are unchanged to within solver tolerance.
+- **Closed-form modified-release absorption now accelerates the analytic FOCE/FOCEI gradient
+  too** (#860 Phase A6). Fitting a static multi-route model with the default analytic-sensitivity
+  method now skips the ODE integration for both the value AND the gradient — previously only the
+  value took the closed-form fast path, and the gradient still integrated. The disposition-recovery
+  and superposition formulas are evaluated once, generically, over dual numbers instead of plain
+  doubles, so there is no separate hand-derived gradient to drift out of sync. Gradients are
+  unchanged to within solver tolerance — verified directly against the ODE-integrated analytic
+  provider, not only against finite differences.
 - The closed-form steady-state equilibration for dosing into a built-in absorption compartment
   (#834) now actually takes effect. Its self-verification tolerance sat just below the solver's
   own noise floor, so it silently fell back to the 50-cycle pulse-train iteration at every

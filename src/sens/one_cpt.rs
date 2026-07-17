@@ -143,6 +143,34 @@ pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, 
     }
 }
 
+/// 1-cpt zero-order (box-car) absorption of duration `dur` — the closed-form
+/// modified-release counterpart of [`one_cpt_infusion_g`] with `dur` (and hence
+/// the rate `mass/dur`) itself generic over [`PkNum`], so a `Dual2` carries
+/// `∂C/∂dur` (#860 Phase B). `amt`/`f_bio` follow the same convention as the
+/// other MR-superposable kernels (`route_conc_g` calls with unit `amt = 1.0`
+/// and folds the dose mass in via `f_bio` externally). The value formula is
+/// identical to `one_cpt_infusion_g`'s (same box-car-into-1cpt convolution);
+/// only the domain of `dur` differs (a fitted individual parameter here, not
+/// dose data), so this is not a duplicate derivation. The branch on
+/// `t.val() <= dur.val()` picks one side's smooth formula at the boundary
+/// (like every other `.val()`-branching kernel in this module) — the resulting
+/// `∂/∂dur` jet is exact on whichever side is selected; real observation times
+/// essentially never land exactly on `dur`.
+pub fn one_cpt_zero_order_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, dur: T, f_bio: T) -> T {
+    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || dur.val() <= 0.0 {
+        return T::from_f64(0.0);
+    }
+    let k = cl / v;
+    let d = f_bio * T::from_f64(amt);
+    let r_cl = d / (dur * cl);
+    let one = T::from_f64(1.0);
+    if t.val() <= dur.val() {
+        r_cl * (one - (-(k * t)).exp())
+    } else {
+        r_cl * (one - (-(k * dur)).exp()) * (-(k * (t - dur))).exp()
+    }
+}
+
 /// 1-cpt IV bolus at steady state (interval `ii`).
 pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T) -> T {
     if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || ii <= 0.0 {

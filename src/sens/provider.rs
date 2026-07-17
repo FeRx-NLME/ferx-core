@@ -3748,6 +3748,17 @@ fn subject_eta_grad_impl(
     // scope the outer provider uses, so inner and outer stay on the same route.
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
+            // Closed-form modified-release fast path (#860 Phase A6): a *static*
+            // multi-route subject `mr_scope` admits skips the ODE integration
+            // entirely (same "analytic" report as `ode_subject_eta_grad` below —
+            // `ode_analytical_supported` already covers this model — just a
+            // faster computation of the identical jet). `None` falls through to
+            // the ODE provider unchanged.
+            if let Some(g) =
+                crate::pk::modified_release::mr_subject_eta_grad(model, subject, theta, eta)
+            {
+                return Some(g);
+            }
             return crate::sens::ode_provider::ode_subject_eta_grad(model, subject, theta, eta);
         }
         return None;
@@ -4782,6 +4793,19 @@ fn subject_sensitivities_impl(
     // `ODE_SENS_ENABLED` master switch stays as a single kill-switch for the path.
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
+            // Closed-form modified-release fast path (#860 Phase A6): try the
+            // no-integration superposition first for the *static* subjects
+            // `mr_scope` admits — a pure speed swap inside the branch
+            // `ode_analytical_supported` already reports "analytic" for, not a
+            // new supported/declined predicate (so `sens_supported` /
+            // `analytic_outer_gradient_available` need no change). `None` (out
+            // of `mr_scope`'s narrower static scope, or an axis-count mismatch)
+            // falls through to the ODE provider unchanged.
+            if let Some(sens) =
+                crate::pk::modified_release::mr_subject_sensitivities(model, subject, theta, eta)
+            {
+                return Some(sens);
+            }
             return crate::sens::ode_provider::ode_subject_sensitivities(
                 model, subject, theta, eta,
             );

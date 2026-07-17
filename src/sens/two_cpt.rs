@@ -140,6 +140,46 @@ pub fn two_cpt_infusion_g<T: PkNum>(
     }
 }
 
+/// 2-cpt zero-order (box-car) absorption of duration `dur` — the closed-form
+/// modified-release counterpart of [`two_cpt_infusion_g`] with `dur` (and the
+/// rate `mass/dur`) generic over [`PkNum`], carrying `∂C/∂dur` (#860 Phase B).
+/// Same value formula as `two_cpt_infusion_g`, same `.val()`-branch convention
+/// at the `t == dur` boundary as every other kernel here; see
+/// [`one_cpt_zero_order_g`] for the rationale (only the domain of `dur` differs
+/// from the fixed-duration infusion kernel).
+#[allow(clippy::too_many_arguments)]
+pub fn two_cpt_zero_order_g<T: PkNum>(
+    amt: f64,
+    t: T,
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    dur: T,
+    f_bio: T,
+) -> T {
+    if t.val() < 0.0 || v1.val() <= 0.0 || cl.val() <= 0.0 || dur.val() <= 0.0 {
+        return T::from_f64(0.0);
+    }
+    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
+    let diff = alpha - beta;
+    if diff.val().abs() < 1e-12 || alpha.val().abs() < 1e-12 || beta.val().abs() < 1e-12 {
+        return T::from_f64(0.0);
+    }
+    let d = f_bio * T::from_f64(amt);
+    let r_v1 = d / (dur * v1);
+    let a_coeff = r_v1 * (alpha - k21) / (diff * alpha);
+    let b_coeff = r_v1 * (k21 - beta) / (diff * beta);
+    let one = T::from_f64(1.0);
+    if t.val() <= dur.val() {
+        a_coeff * (one - (-(alpha * t)).exp()) + b_coeff * (one - (-(beta * t)).exp())
+    } else {
+        let dt = t - dur;
+        a_coeff * (one - (-(alpha * dur)).exp()) * (-(alpha * dt)).exp()
+            + b_coeff * (one - (-(beta * dur)).exp()) * (-(beta * dt)).exp()
+    }
+}
+
 /// 2-cpt oral (first-order absorption), with `ka ≈ α`/`ka ≈ β` L'Hôpital limits.
 pub fn two_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T) -> T {
     two_cpt_oral_amt_g(T::from_f64(amt), t, cl, v1, q, v2, ka, f_bio)

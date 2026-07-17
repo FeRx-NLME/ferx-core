@@ -248,6 +248,28 @@ fn expression_scale_axes_admissible(
         && (1..=MAX_ODE_AXES).contains(&p.n_axes())
 }
 
+/// The model-level scaling allowlist [`ode_analytical_supported`] requires: `None`
+/// and a constant `ScalarScale` divisor are always analytic (handled per-observation
+/// by [`apply_output_transform`]); an `ExpressionScale` divisor is analytic only when
+/// [`expression_scale_axes_admissible`] (which also excludes it under LTBS); anything
+/// else (e.g. `PerCmt`) declines. Allowlist, not denylist, so a future scaling variant
+/// can only *narrow* the analytic scope, never silently admit an unhandled one.
+///
+/// Factored out (not just inlined in `ode_analytical_supported`) so
+/// `pk::modified_release`'s closed-form MR gradient fast path (#860 Phase A6) — which
+/// additionally applies [`apply_output_transform`] itself, since it does not go through
+/// `run_subject`'s per-observation loop — can require the identical scaling scope
+/// without a second, driftable copy of this match.
+pub(crate) fn ode_scaling_supported(model: &CompiledModel) -> bool {
+    match &model.scaling {
+        ScalingSpec::None | ScalingSpec::ScalarScale(_) => true,
+        ScalingSpec::ExpressionScale { deriv: Some(p), .. } => {
+            expression_scale_axes_admissible(p, model)
+        }
+        _ => false,
+    }
+}
+
 /// True when [`ode_subject_sensitivities`] can serve this model: an ODE model
 /// with a compiled RHS program, single `ObsCmt` readout, no built-in absorption,
 /// no `init(...)`, no IOV/SDE, no output transform, and an individual-parameter
@@ -348,11 +370,8 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // LTBS keeps the FD fallback). Both compose with a Form-C readout (`y = state/V`), the
     // other supported route. Allowlist (not denylist) so a future scaling variant can only
     // *narrow* the analytic scope, never silently admit an unhandled one.
-    match &model.scaling {
-        ScalingSpec::None | ScalingSpec::ScalarScale(_) => {}
-        ScalingSpec::ExpressionScale { deriv: Some(p), .. }
-            if expression_scale_axes_admissible(p, model) => {}
-        _ => return false,
+    if !ode_scaling_supported(model) {
+        return false;
     }
     // (ODE models have no `tv_fn` — typical values come from `pk_param_fn` at
     // η = 0 instead; see `run_subject`.)
@@ -1664,7 +1683,15 @@ fn init_taylor_seed_at<T: crate::sens::num::PkNum>(
 /// `pk::apply_scaling` (`pred /= k`) and `pk::apply_log_transform`
 /// (`p = max(p, LTBS_FLOOR).ln()`; below the floor the value is clamped to a
 /// constant, so the jet vanishes).
-fn apply_output_transform<T: crate::sens::num::PkNum>(model: &CompiledModel, p: T) -> T {
+///
+/// Basis-agnostic: it only divides/logs the dual `p` as a whole, so it works
+/// identically whether `p`'s axes are PK-parameter space (the static walk,
+/// chained to `(θ,η)` afterward) or already `(θ,η)`-space (the TV-cov walk's
+/// `seed_pk_dual2` convention) — already proven by [`resolve_obs_readout`]
+/// calling it from both. `pub(crate)`: also reused by
+/// `pk::modified_release::mr_sens_dual`/`mr_eta_grad_dual` (#860 Phase A6),
+/// whose `mr_observable_g::<Dual2<M>>` result is `(θ,η)`-seeded the same way.
+pub(crate) fn apply_output_transform<T: crate::sens::num::PkNum>(model: &CompiledModel, p: T) -> T {
     // A NaN readout (e.g. a per-CMT map miss — rejected upstream by fit-time
     // `validate_per_cmt_scaling`, so unreachable in a real fit) must stay NaN as a
     // visible tripwire: neither the `ScalarScale` divisor nor the LTBS floor below
@@ -2131,7 +2158,12 @@ fn run_subject_eta<const N: usize>(
 /// individual parameter `i` carries `∂p/∂θ_m` on axis `m` and `∂p/∂η_k` on axis
 /// `n_theta+k` (plus the η-η / η-θ 2nd-order blocks); every other slot is a
 /// constant. The returned `Vec` is indexed by PK slot (what the ODE RHS reads).
-fn seed_pk_dual2<const M: usize>(
+///
+/// `pub(crate)`: also reused by the closed-form MR gradient path
+/// (`pk::modified_release::mr_subject_sensitivities`, #860 Phase A6), which
+/// needs the identical `(θ,η)`-seeded PK-slot duals `mr_observable_g::<Dual2<M>>`
+/// consumes — not a second copy of this seeding logic.
+pub(crate) fn seed_pk_dual2<const M: usize>(
     model: &CompiledModel,
     prog: &crate::parser::model_parser::IndivParamProgram,
     theta: &[f64],
@@ -3219,7 +3251,10 @@ pub(crate) fn param_derivatives_at_cov(
 /// Per-event flat PK-slot duals seeded on **η only** (`Dual1<N>`, `N = n_eta`) at a
 /// covariate snapshot — the light-inner counterpart of [`seed_pk_dual2`]. Slot for
 /// individual parameter `i` carries `∂p/∂η_k` on axis `k`; other slots are constant.
-fn seed_pk_dual1<const N: usize>(
+///
+/// `pub(crate)`: also reused by `pk::modified_release::mr_subject_eta_grad`
+/// (#860 Phase A6), the closed-form counterpart of `ode_subject_eta_grad`.
+pub(crate) fn seed_pk_dual1<const N: usize>(
     model: &CompiledModel,
     prog: &crate::parser::model_parser::IndivParamProgram,
     theta: &[f64],

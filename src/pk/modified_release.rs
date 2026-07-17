@@ -51,8 +51,8 @@
 use crate::ode::predictions::OdeSpec;
 use crate::pk::absorption::{InputRateForcing, InputRateKind};
 use crate::sens::num::PkNum;
-use crate::sens::one_cpt::{one_cpt_ig_g, one_cpt_oral_g, one_cpt_transit_g};
-use crate::sens::two_cpt::{two_cpt_ig_g, two_cpt_oral_g, two_cpt_transit_g};
+use crate::sens::one_cpt::{one_cpt_ig_g, one_cpt_oral_g, one_cpt_transit_g, one_cpt_zero_order_g};
+use crate::sens::two_cpt::{two_cpt_ig_g, two_cpt_oral_g, two_cpt_transit_g, two_cpt_zero_order_g};
 use crate::types::DoseEvent;
 
 /// Linear disposition shape recovered from an [`OdeSpec`] by numeric probing.
@@ -342,11 +342,12 @@ fn forcing_arg<T: PkNum>(f: &InputRateForcing, p: &[T], i: usize, dflt: f64) -> 
 /// The kernel is evaluated at unit amount / unit `F` (its response is linear in
 /// dose mass) and multiplied by `mass = FR·F·D` outside — so a `Dual2` `mass`
 /// threads the exact `∂/∂FR` (and `∂/∂F`) via the product rule, and the kernel's
-/// own `τ.val() < 0 → 0` guard supplies the pre-onset gate. Phase A covers the
-/// smooth kernels (`first_order`/`transit`/`igd`); `zero_order` is Phase B (its
-/// `∂/∂dur` carries a moving-boundary saltation) and `weibull` has no elementary
-/// closed form — both are excluded by the support gate and return `0` here as a
-/// defensive no-op.
+/// own `τ.val() < 0 → 0` guard supplies the pre-onset gate. Covers the smooth
+/// kernels (`first_order`/`transit`/`igd`) and the box-car `zero_order` kernel
+/// (`∂/∂dur` exact on whichever side of the `t == dur` boundary is selected,
+/// see [`crate::sens::one_cpt::one_cpt_zero_order_g`]); `weibull` has no
+/// elementary closed form and is excluded by the support gate, returning `0`
+/// here as a defensive no-op.
 fn route_conc_g<T: PkNum>(
     kind: InputRateKind,
     f: &InputRateForcing,
@@ -372,7 +373,11 @@ fn route_conc_g<T: PkNum>(
                 let cv2 = forcing_arg(f, p, 1, 1.0);
                 one_cpt_ig_g(1.0, tau, dp.cl, dp.v, mat, cv2, one)
             }
-            InputRateKind::ZeroOrder | InputRateKind::Weibull => T::from_f64(0.0),
+            InputRateKind::ZeroOrder => {
+                let dur = forcing_arg(f, p, 0, 1.0);
+                one_cpt_zero_order_g(1.0, tau, dp.cl, dp.v, dur, one)
+            }
+            InputRateKind::Weibull => T::from_f64(0.0),
         },
         Some((q, v2)) => match kind {
             InputRateKind::FirstOrder => {
@@ -389,7 +394,11 @@ fn route_conc_g<T: PkNum>(
                 let cv2 = forcing_arg(f, p, 1, 1.0);
                 two_cpt_ig_g(1.0, tau, dp.cl, dp.v, q, v2, mat, cv2, one)
             }
-            InputRateKind::ZeroOrder | InputRateKind::Weibull => T::from_f64(0.0),
+            InputRateKind::ZeroOrder => {
+                let dur = forcing_arg(f, p, 0, 1.0);
+                two_cpt_zero_order_g(1.0, tau, dp.cl, dp.v, q, v2, dur, one)
+            }
+            InputRateKind::Weibull => T::from_f64(0.0),
         },
     };
     mass * unit
@@ -428,15 +437,17 @@ pub fn mr_observable_g<T: PkNum>(
 }
 
 /// Whether this input-rate kind has an elementary closed-form central response
-/// that can be superposed. `first_order`/`transit`/`igd` do (Phase A);
-/// `zero_order` is Phase B (its `∂/∂dur` carries a moving-boundary saltation, a
-/// separate kernel); `weibull` has no elementary convolution with exponential
-/// disposition and stays on the ODE path permanently. Exhaustive so a new kind
-/// forces a decision here.
-fn is_closed_form_kind(kind: InputRateKind) -> bool {
+/// that can be superposed. `first_order`/`transit`/`igd` (smooth kernels) and
+/// `zero_order` (box-car convolution, #860 Phase B) do; `weibull` has no
+/// elementary convolution with an exponential disposition and stays on the ODE
+/// path permanently. Exhaustive so a new kind forces a decision here.
+pub(crate) fn is_closed_form_kind(kind: InputRateKind) -> bool {
     match kind {
-        InputRateKind::FirstOrder | InputRateKind::Transit | InputRateKind::InverseGaussian => true,
-        InputRateKind::ZeroOrder | InputRateKind::Weibull => false,
+        InputRateKind::FirstOrder
+        | InputRateKind::Transit
+        | InputRateKind::InverseGaussian
+        | InputRateKind::ZeroOrder => true,
+        InputRateKind::Weibull => false,
     }
 }
 
@@ -496,9 +507,23 @@ fn route_flips(f: &InputRateForcing, dp: &DispParams<f64>, p: &[f64]) -> bool {
     }
 }
 
-/// Closed-form modified-release predictions for `subject` at its observation
-/// times, or `None` when the model/subject is outside the closed-form scope —
-/// in which case the caller falls back to the ODE path (always correct).
+/// Everything the closed-form MR path needs once a subject is admitted: the
+/// compiled ODE spec, the identified disposition, its recovered `f64` rates
+/// (used for the `route_flips` domain check both the value and gradient path
+/// share), and the `f64` PK-parameter snapshot at `(θ, η, t=0)`.
+pub(crate) struct MrScope<'a> {
+    pub spec: &'a OdeSpec,
+    pub disp: MrDisposition,
+    pub dp: DispParams<f64>,
+    pub pk: crate::types::PkParams,
+}
+
+/// The single closed-form MR scope gate, shared by the value path
+/// ([`mr_predictions`]) and the gradient path (`mr_subject_sensitivities` /
+/// `mr_subject_eta_grad`) so the two can never admit a different set of
+/// subjects — a value/gradient scope drift is exactly the silent-wrong class
+/// the reduction-to-ODE tests guard against, and it can only be prevented by
+/// having one gate, not two independently-maintained copies.
 ///
 /// Scope (all must hold): an `[odes]` model with ≥1 input-rate forcing, every one
 /// of a closed-form-able kind ([`is_closed_form_kind`]); a canonical linear
@@ -506,22 +531,14 @@ fn route_flips(f: &InputRateForcing, dp: &DispParams<f64>, p: &[f64]) -> bool {
 /// covariates, resets, `init(...)`, steady-state or infusion doses, or
 /// compartment-indexed `F{c}`/`ALAG{c}` (the `dose_attr_map`, which would make
 /// the per-dose `F`/lag non-uniform); and no route in its flip-flop domain
-/// ([`route_flips`]). This is the **value** path: `predict` / `simulate` and the
-/// FOCE/FOCEI marginal-objective value ([`crate::stats`]'s `model_predictions` →
-/// [`crate::pk::compute_predictions_with_tv`]). For an FD-method fit the gradient
-/// finite-differences these same values, so it is fully self-consistent. For an
-/// analytic-sensitivity fit the gradient still comes from the ODE provider (a
-/// follow-up wires the closed form there); value and gradient then come from
-/// different schemes, but they **agree to solver tolerance** — the closed form
-/// reduces to the same integrated twin — so the objective stays consistent to far
-/// within `inner_tol` (the `per_route_lag` NONMEM anchor is unchanged by this
-/// routing). The mix is never *divergent*, only different-scheme-same-answer.
-pub(crate) fn mr_predictions(
-    model: &crate::types::CompiledModel,
+/// ([`route_flips`]). Returns `None` when out of scope, in which case the
+/// caller falls back to the ODE path (always correct).
+pub(crate) fn mr_scope<'a>(
+    model: &'a crate::types::CompiledModel,
     subject: &crate::types::Subject,
     theta: &[f64],
     eta: &[f64],
-) -> Option<Vec<f64>> {
+) -> Option<MrScope<'a>> {
     let spec = model.ode_spec.as_ref()?;
     if model.n_kappa > 0 || subject.has_tv_covariates() || subject.has_resets() {
         return None;
@@ -535,6 +552,23 @@ pub(crate) fn mr_predictions(
         return None;
     }
     if spec.init_fn.is_some() || !spec.dose_attr_map.is_empty() {
+        return None;
+    }
+    // An SDE (`[diffusion]` block on one or more states): `identify_disposition`'s
+    // Jacobian probe reads only `rhs_program` (the drift), so it is structurally blind
+    // to a diffusion term on an otherwise-canonical-linear state and would admit it.
+    // For the *value* this is harmless (the SDE mean prediction IS the drift solution —
+    // `likelihood::model_predictions` returns the drift, EKF noise enters only the
+    // variance `p_obs`), so the closed form would give the correct mean. For the
+    // *gradient* it is not: the analytic jet of the drift omits `∂p_obs/∂θ`, which the
+    // FD gradient of the full OFV carries — so an SDE must take FD, exactly as
+    // `ode_analytical_supported` enforces (`!diffusion_var.is_empty() → false`). Higher
+    // gates (`sens_supported` / `analytic_inner_grad_supported_model`) already route SDE
+    // to FD before either provider is reached, so this is the same defensive re-check
+    // `ode_subject_sensitivities` keeps (fail loudly to FD, never a silent wrong jet;
+    // the #637 layering principle) — placed in the shared gate so value and gradient
+    // stay on one scope.
+    if !spec.diffusion_var.is_empty() {
         return None;
     }
     if spec.input_rate.is_empty() || !spec.input_rate.iter().all(|f| is_closed_form_kind(f.kind)) {
@@ -566,25 +600,264 @@ pub(crate) fn mr_predictions(
     {
         return None;
     }
-    let lag_cmt = pk.lagtime();
-    let f_bio = pk.f_bio();
+    Some(MrScope { spec, disp, dp, pk })
+}
+
+/// Closed-form modified-release predictions for `subject` at its observation
+/// times, or `None` when out of scope ([`mr_scope`]). This is the **value**
+/// path: `predict` / `simulate` and the FOCE/FOCEI marginal-objective value
+/// ([`crate::stats`]'s `model_predictions` →
+/// [`crate::pk::compute_predictions_with_tv`]). For an FD-method fit the
+/// gradient finite-differences these same values, so it is fully
+/// self-consistent. For an analytic-sensitivity fit the gradient comes from
+/// [`mr_subject_sensitivities`]/[`mr_subject_eta_grad`] when in scope
+/// (identical `mr_scope`, so never a different subject set), else the ODE
+/// provider — either way value and gradient **agree to solver tolerance** (the
+/// closed form reduces to the same integrated twin), so the objective stays
+/// consistent to far within `inner_tol`.
+pub(crate) fn mr_predictions(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<f64>> {
+    let s = mr_scope(model, subject, theta, eta)?;
+    let lag_cmt = s.pk.lagtime();
+    let f_bio = s.pk.f_bio();
     Some(
         subject
             .obs_times
             .iter()
             .map(|&t| {
                 mr_observable_g(
-                    &dp,
-                    &spec.input_rate,
+                    &s.dp,
+                    &s.spec.input_rate,
                     &subject.doses,
                     t,
-                    &pk.values,
+                    &s.pk.values,
                     lag_cmt,
                     f_bio,
                 )
             })
             .collect(),
     )
+}
+
+/// Analytic-provider axis-count guard shared by [`mr_subject_sensitivities`] and
+/// [`mr_subject_eta_grad`]: the compiled individual-parameter program's `(θ,η)`
+/// axis counts must match the model's exactly (a mismatch is an NN-θ / IOV-κ
+/// desugaring this fast path does not carry) — mirrors
+/// [`crate::sens::ode_provider::ode_analytical_supported`]'s identical check.
+/// Declining here (→ `None` → the ODE provider, which re-checks the same
+/// invariant) is cheap insurance against a silently-wrong jet; it is not a new
+/// "is this subject analytic" report, since `ode_analytical_supported` already
+/// requires this for the model to be reported analytic at all.
+fn mr_prog_axes_match(
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    n_theta: usize,
+    n_eta: usize,
+) -> bool {
+    prog.n_theta_axis() == n_theta
+        && prog.n_eta_axis() == n_eta
+        && prog.n_axes() <= crate::sens::ode_provider::MAX_ODE_AXES
+}
+
+/// Closed-form analytic FOCE/FOCEI outer sensitivities for a modified-release
+/// subject (#860 Phase A6) — the fast-path alternative to
+/// [`crate::sens::ode_provider::ode_subject_sensitivities`] for the same
+/// (already-analytic, per `ode_analytical_supported`) subjects `mr_scope`
+/// additionally admits. `mr_observable_g` is evaluated at `T = Dual2<M>`
+/// seeded directly on `(θ, η)` via
+/// [`crate::sens::ode_provider::seed_pk_dual2`] — the same seeding the TV-cov
+/// event-driven walk (`run_subject_tvcov`) uses — so no ODE integration and no
+/// separate outer chain-rule step: composing `mr_observable_g`'s arithmetic
+/// over an already-`(θ,η)`-seeded `Dual2` *is* the chain rule. `None` when
+/// `mr_scope` declines, or the axis-count guard fails — either way the caller
+/// falls back to `ode_subject_sensitivities`.
+pub(crate) fn mr_subject_sensitivities(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<crate::sens::provider::SubjectSens> {
+    let s = mr_scope(model, subject, theta, eta)?;
+    let prog = s.spec.indiv_param_program.as_ref()?;
+    if !mr_prog_axes_match(prog, model.n_theta, model.n_eta)
+        || !crate::sens::ode_provider::ode_scaling_supported(model)
+    {
+        return None;
+    }
+    macro_rules! dispatch {
+        ($($m:literal),+) => {
+            match model.n_theta + model.n_eta {
+                $($m => mr_sens_dual::<$m>(model, subject, &s, prog, theta, eta),)+
+                _ => None,
+            }
+        };
+    }
+    let mut sens = dispatch!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    )?;
+    crate::sens::provider::apply_event_walk_expression_scale_outer(
+        &mut sens, model, subject, prog, theta, eta,
+    )?;
+    Some(sens)
+}
+
+/// `Dual2<M>`-width monomorphisation of [`mr_subject_sensitivities`]. Seeds the
+/// PK-slot duals, recovers the disposition params over the same duals (so
+/// `v = 1/m`, `cl = ke/m`, and the 2-cpt `v2 = q/k21` division all carry exact
+/// `(θ,η)` sensitivities), evaluates `mr_observable_g` per observation, then
+/// unpacks the jet into [`crate::sens::provider::ObsSens`] — the identical
+/// field layout `run_subject_tvcov` uses (axes `0..n_theta` = θ,
+/// `n_theta..M` = η).
+fn mr_sens_dual<const M: usize>(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    s: &MrScope,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<crate::sens::provider::SubjectSens> {
+    use crate::sens::dual2::Dual2;
+    let n_theta = model.n_theta;
+    let n_eta = model.n_eta;
+    let p: Vec<Dual2<M>> = crate::sens::ode_provider::seed_pk_dual2::<M>(
+        model,
+        prog,
+        theta,
+        eta,
+        &subject.covariates,
+        0.0,
+    );
+    let dp = recover_disp_params_g::<Dual2<M>>(s.spec, &s.disp, &p, &subject.covariates)?;
+    let lag_cmt = p[crate::types::PK_IDX_LAGTIME];
+    let f_bio = p[crate::types::PK_IDX_F];
+    let mut out = Vec::with_capacity(subject.obs_times.len());
+    for &t in &subject.obs_times {
+        let fd = mr_observable_g::<Dual2<M>>(
+            &dp,
+            &s.spec.input_rate,
+            &subject.doses,
+            Dual2::constant(t),
+            &p,
+            lag_cmt,
+            f_bio,
+        );
+        // `ScalarScale`/LTBS output transform, mirroring the ODE provider's
+        // `resolve_obs_readout` → `apply_output_transform` (same per-observation
+        // site, basis-agnostic over which space the dual's axes represent — see
+        // that function's doc). `ExpressionScale` is handled separately, after
+        // the whole `SubjectSens` is assembled, by `apply_event_walk_expression_scale_outer`.
+        let fd = crate::sens::ode_provider::apply_output_transform(model, fd);
+        let g = &fd.grad;
+        let h = &fd.hess;
+        let mut df_deta = vec![0.0; n_eta];
+        let mut df_dtheta = vec![0.0; n_theta];
+        let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
+        let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
+        for k in 0..n_eta {
+            df_deta[k] = g[n_theta + k];
+            for l in 0..n_eta {
+                d2f_deta2[k * n_eta + l] = h[n_theta + k][n_theta + l];
+            }
+            for m in 0..n_theta {
+                d2f_deta_dtheta[k * n_theta + m] = h[n_theta + k][m];
+            }
+        }
+        for m in 0..n_theta {
+            df_dtheta[m] = g[m];
+        }
+        out.push(crate::sens::provider::ObsSens {
+            f: fd.value,
+            df_deta,
+            d2f_deta2,
+            df_dtheta,
+            d2f_deta_dtheta,
+        });
+    }
+    Some(crate::sens::provider::SubjectSens { obs: out })
+}
+
+/// Closed-form light **inner** η-gradient for a modified-release subject (#860
+/// Phase A6) — the fast-path alternative to
+/// [`crate::sens::ode_provider::ode_subject_eta_grad`], mirroring
+/// [`mr_subject_sensitivities`] at `Dual1<N>` (`N = n_eta`) width via
+/// [`crate::sens::ode_provider::seed_pk_dual1`]. Per the shared per-subject
+/// scope contract ([`crate::sens::ode_provider::ode_subject_supported`]'s doc),
+/// this and [`mr_subject_sensitivities`] must serve exactly the same subjects —
+/// both share `mr_scope` and `mr_prog_axes_match`, so that holds structurally.
+pub(crate) fn mr_subject_eta_grad(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<crate::sens::provider::ObsGrad>> {
+    let s = mr_scope(model, subject, theta, eta)?;
+    let prog = s.spec.indiv_param_program.as_ref()?;
+    if !mr_prog_axes_match(prog, model.n_theta, model.n_eta)
+        || !crate::sens::ode_provider::ode_scaling_supported(model)
+    {
+        return None;
+    }
+    macro_rules! dispatch {
+        ($($n:literal),+) => {
+            match model.n_eta {
+                $($n => mr_eta_grad_dual::<$n>(model, subject, &s, prog, theta, eta),)+
+                _ => None,
+            }
+        };
+    }
+    let mut out = dispatch!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    )?;
+    crate::sens::provider::apply_event_walk_expression_scale_inner(
+        &mut out, model, subject, prog, theta, eta,
+    )?;
+    Some(out)
+}
+
+/// `Dual1<N>`-width monomorphisation of [`mr_subject_eta_grad`].
+fn mr_eta_grad_dual<const N: usize>(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    s: &MrScope,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<crate::sens::provider::ObsGrad>> {
+    use crate::sens::dual1::Dual1;
+    let p: Vec<Dual1<N>> = crate::sens::ode_provider::seed_pk_dual1::<N>(
+        model,
+        prog,
+        theta,
+        eta,
+        &subject.covariates,
+        0.0,
+    )?;
+    let dp = recover_disp_params_g::<Dual1<N>>(s.spec, &s.disp, &p, &subject.covariates)?;
+    let lag_cmt = p[crate::types::PK_IDX_LAGTIME];
+    let f_bio = p[crate::types::PK_IDX_F];
+    let mut out = Vec::with_capacity(subject.obs_times.len());
+    for &t in &subject.obs_times {
+        let fd = mr_observable_g::<Dual1<N>>(
+            &dp,
+            &s.spec.input_rate,
+            &subject.doses,
+            Dual1::constant(t),
+            &p,
+            lag_cmt,
+            f_bio,
+        );
+        // See the matching comment in `mr_sens_dual`: `ScalarScale`/LTBS via the
+        // same shared, basis-agnostic `apply_output_transform`.
+        let fd = crate::sens::ode_provider::apply_output_transform(model, fd);
+        out.push(crate::sens::provider::ObsGrad {
+            f: fd.value,
+            df_deta: fd.grad.to_vec(),
+        });
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -1072,6 +1345,54 @@ mod tests {
         );
     }
 
+    // #860 Phase B, 2-cpt: a zero_order route mixed with first_order into a
+    // two-compartment disposition — exercises `two_cpt_zero_order_g`'s macro-rate
+    // (α/β) form, not just the 1-cpt kernel.
+    const MIXED_ZERO_ORDER_2CPT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(10.0, 0.1, 100.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.5, 0.05, 24.0)
+  theta TVDUR(2.0, 0.1, 12.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  FZO = TVFZO
+  FZO1 = 1 - TVFZO
+  KA = TVKA
+  DUR = TVDUR
+[structural_model]
+  ode(states=[central, periph])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V1*central - Q/V1*central + Q/V2*periph
+  d/dt(periph) = Q/V1*central - Q/V2*periph
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    #[test]
+    fn reduces_to_ode_2cpt_zero_order_mixed() {
+        assert_reduces_to_ode(
+            MIXED_ZERO_ORDER_2CPT,
+            &[5.0, 50.0, 10.0, 100.0, 0.4, 1.5, 2.0],
+            &[0.0],
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
     // A *static* covariate (WT on CL) is baked into the parameters at the single
     // `t = 0` snapshot — valid because it does not vary in time — and the recovered
     // `ke` must carry it, matching the twin which reads the same covariate.
@@ -1255,15 +1576,14 @@ mod tests {
     }
 
     #[test]
-    fn declines_zero_order_pathway() {
-        let model = parse(MIXED_ZERO_ORDER);
-        let subject = mk_subject(
+    fn admits_zero_order_pathway_and_reduces_to_ode() {
+        // #860 Phase B: a mixed first_order + zero_order model no longer declines —
+        // it must both admit the closed form AND reduce to the ODE twin.
+        assert_reduces_to_ode(
+            MIXED_ZERO_ORDER,
+            &[5.0, 50.0, 0.4, 1.5, 2.0],
+            &[0.0],
             vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            vec![1.0, 2.0, 4.0],
-        );
-        assert!(
-            mr_predictions(&model, &subject, &[5.0, 50.0, 0.4, 1.5, 2.0], &[0.0]).is_none(),
-            "a zero_order pathway (Phase B) must decline to the ODE path"
         );
     }
 
@@ -1277,6 +1597,50 @@ mod tests {
         assert!(
             mr_predictions(&model, &subject, &[5.0, 50.0, 1.5], &[0.0]).is_none(),
             "a TIME-dependent disposition must decline"
+        );
+    }
+
+    #[test]
+    fn declines_sde_diffusion() {
+        // A parsed SDE model always uses an `ObsCmt` readout (Form-C `y = <expr>`
+        // is rejected on SDE at parse), and `ObsCmt` has no `readout_program`, so
+        // `identify_disposition` already declines it at its `readout_program.as_ref()?`
+        // — the `diffusion_var` guard can't be reached through the normal parse path
+        // *today*. It is forward-defensive: were `ObsCmt` (or a future readout) ever
+        // made MR-identifiable, an SDE's linear *drift* would identify and the guard
+        // is the only thing keeping the stochastic model off the deterministic closed
+        // form. Exercise it directly by injecting a diffusion term into a model
+        // `mr_scope` otherwise admits, proving the guard is load-bearing.
+        let mut model = parse(REDUCE_1CPT);
+        let subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 2.0, 4.0],
+        );
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+        // Baseline: this model IS admitted (sanity — else the test proves nothing).
+        assert!(
+            mr_scope(&model, &subject, &theta, &eta).is_some(),
+            "REDUCE_1CPT must be MR-admitted before the diffusion injection"
+        );
+        // Inject a state diffusion term without touching the (still canonical-linear)
+        // drift RHS the disposition probe reads. The guard keys on `diffusion_var`,
+        // exactly as the ODE provider's `ode_analytical_supported` does (both read
+        // `diffusion_var`, not `is_sde()`'s `diffusion_theta_start`), so setting this
+        // one field is what exercises the guard.
+        let spec = model.ode_spec.as_mut().unwrap();
+        spec.diffusion_var = vec![0.01; spec.n_states];
+        assert!(
+            mr_scope(&model, &subject, &theta, &eta).is_none(),
+            "an SDE (diffusion term) must decline the closed-form MR scope"
+        );
+        assert!(
+            mr_predictions(&model, &subject, &theta, &eta).is_none(),
+            "an SDE must decline the MR value path"
+        );
+        assert!(
+            mr_subject_sensitivities(&model, &subject, &theta, &eta).is_none(),
+            "an SDE must decline the MR analytic-gradient path"
         );
     }
 
@@ -1317,9 +1681,9 @@ mod tests {
     }
 
     #[test]
-    fn route_conc_g_zero_order_and_weibull_are_inert() {
-        // The defensive arms in `route_conc_g` (the gate excludes these kinds, so
-        // they are never reached in production) return 0 for both dispositions.
+    fn route_conc_g_weibull_is_inert() {
+        // The defensive arm in `route_conc_g` (the gate excludes this kind, so it
+        // is never reached in production) returns 0 for both dispositions.
         let p = vec![2.0_f64];
         let one = DispParams {
             cl: 5.0,
@@ -1332,11 +1696,92 @@ mod tests {
             periph: Some((10.0, 100.0)),
         };
         for dp in [one, two] {
-            for kind in [InputRateKind::ZeroOrder, InputRateKind::Weibull] {
-                let f = forcing(kind, vec![0], None, None);
-                let got = route_conc_g::<f64>(kind, &f, &p, &dp, 2.0, 100.0);
-                assert_eq!(got, 0.0, "{kind:?} must be inert in route_conc_g");
-            }
+            let f = forcing(InputRateKind::Weibull, vec![0], None, None);
+            let got = route_conc_g::<f64>(InputRateKind::Weibull, &f, &p, &dp, 2.0, 100.0);
+            assert_eq!(got, 0.0, "Weibull must be inert in route_conc_g");
+        }
+    }
+
+    // ── #860 Phase B: zero_order box-car kernel. ──────────────────────────────
+
+    #[test]
+    fn single_zero_order_route_matches_infusion_kernel() {
+        // A single, unlagged, full-fraction zero_order route must match the
+        // fixed-duration infusion kernel exactly (same box-car-into-1cpt physics,
+        // `dur` generic here vs `f64` there) — the bit-reduction anchor for the
+        // new kernel, mirroring `single_first_order_route_reduces_to_bateman`.
+        let dur = 2.5_f64;
+        let p = vec![dur];
+        let dp = DispParams {
+            cl: 5.0,
+            v: 50.0,
+            periph: None,
+        };
+        let f = vec![forcing(InputRateKind::ZeroOrder, vec![0], None, None)];
+        let doses = vec![dose(0.0, 100.0)];
+        let rate = 100.0 / dur;
+        for &t in &[0.5, 1.0, dur, 2.0 * dur, 8.0] {
+            let got = mr_observable_g(&dp, &f, &doses, t, &p, 0.0, 1.0);
+            let want = crate::sens::one_cpt::one_cpt_infusion_g(rate, dur, 100.0, t, dp.cl, dp.v);
+            assert!((got - want).abs() < 1e-9, "t={t}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn zero_order_dual2_matches_fd_near_dur_boundary() {
+        // The real risk in #860 Phase B: `∂/∂dur` near the moving t == dur
+        // boundary. Central-FD the f64 kernel against the analytic Dual2 kernel
+        // at observation times straddling `dur` (just below/just above), 1-cpt
+        // and 2-cpt. `t == dur` exactly is deliberately excluded: there, central
+        // FD perturbs `dur` past the *fixed* `t`, so the finite difference mixes
+        // the during- and after-window branches (a genuine secant across a kink,
+        // not a one-sided derivative) — no analytic one-sided derivative can
+        // match it, and no real observation time lands there exactly.
+        use crate::sens::dual2::Dual2;
+        let h = 1e-5;
+        let cl = 5.0_f64;
+        let v = 50.0_f64;
+        let q = 3.0_f64;
+        let v2 = 80.0_f64;
+        let dur0 = 3.0_f64;
+        for &t in &[1.0, 2.999, 3.001, 6.0] {
+            // 1-cpt.
+            let plus = one_cpt_zero_order_g(1.0, t, cl, v, dur0 + h, 1.0);
+            let minus = one_cpt_zero_order_g(1.0, t, cl, v, dur0 - h, 1.0);
+            let fd = (plus - minus) / (2.0 * h);
+            let dur_d = Dual2::<1>::var(dur0, 0);
+            let got = one_cpt_zero_order_g(
+                1.0,
+                Dual2::<1>::constant(t),
+                Dual2::constant(cl),
+                Dual2::constant(v),
+                dur_d,
+                Dual2::constant(1.0),
+            );
+            assert!(
+                (got.grad[0] - fd).abs() < 1e-4 * (1.0 + fd.abs()),
+                "1cpt t={t}: analytic {} vs FD {fd}",
+                got.grad[0]
+            );
+            // 2-cpt.
+            let plus2 = two_cpt_zero_order_g(1.0, t, cl, v, q, v2, dur0 + h, 1.0);
+            let minus2 = two_cpt_zero_order_g(1.0, t, cl, v, q, v2, dur0 - h, 1.0);
+            let fd2 = (plus2 - minus2) / (2.0 * h);
+            let got2 = two_cpt_zero_order_g(
+                1.0,
+                Dual2::<1>::constant(t),
+                Dual2::constant(cl),
+                Dual2::constant(v),
+                Dual2::constant(q),
+                Dual2::constant(v2),
+                dur_d,
+                Dual2::constant(1.0),
+            );
+            assert!(
+                (got2.grad[0] - fd2).abs() < 1e-4 * (1.0 + fd2.abs()),
+                "2cpt t={t}: analytic {} vs FD {fd2}",
+                got2.grad[0]
+            );
         }
     }
 
