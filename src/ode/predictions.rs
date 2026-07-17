@@ -54,8 +54,8 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
 // `last_ss_equilibration_cycles`, `with_full_ss_equilibration`) are referenced directly
 // as `crate::dosing::…` by the tests, so they are not imported here.
 use crate::dosing::{
-    record_ss_equilibration_cycles, resolve_subject_doses, resolve_subject_doses_with,
-    SsStopTracker, SS_EQUILIBRATION_CYCLES,
+    note_ss_nonconvergence_if_capped, record_ss_equilibration_cycles, resolve_subject_doses,
+    resolve_subject_doses_with, SsStopTracker, SS_EQUILIBRATION_CYCLES,
 };
 
 /// Relative floor for truncating the steady-state **input-rate periodic sum** (#719). An
@@ -362,6 +362,7 @@ fn equilibrate_ss_state(
         );
         let mut tracker = SsStopTracker::default();
         let mut cycles_run = 0usize;
+        let mut early_stopped = false;
         for m in 0..n_pulses {
             let seg_start = m as f64 * dose.ii;
             let seg_end = seg_start + dose.ii;
@@ -378,10 +379,18 @@ fn equilibrate_ss_state(
             }
             cycles_run = m + 1;
             if tracker.should_stop(m, &u) {
+                early_stopped = true;
                 break;
             }
         }
         record_ss_equilibration_cycles(cycles_run);
+        // If the pulse train hit the cycle cap without converging, the returned trough may be
+        // materially below the true periodic steady state — surface a warning instead of silently
+        // under-reporting it (#867). Only a *nonlinear* disposition reaches this fallback (the
+        // linear closed form above returns early), so this is exactly the saturable
+        // heavy-accumulation case; a fast-contracting model early-stops and is left alone.
+        let (incr_prev, incr_last, incr_mag) = tracker.recent_increments();
+        note_ss_nonconvergence_if_capped(early_stopped, incr_prev, incr_last, incr_mag);
         return u;
     }
 
@@ -959,10 +968,11 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
         // dose's compartment lag, so each parallel / mixed pathway can switch on at
         // its own time. Dose-invariant (a property of the forcing, not the dose), so
         // hoisted out of the per-dose loop; `0` for an unlagged forcing (the common
-        // case), a no-op there. A model carrying any per-route lag is served over FD
-        // (`ode_analytical_supported` gates it off), so on the `Dual2` walk this term
-        // never executes — only `T = f64` reaches here today; its jet is otherwise a
-        // continuous shift with no onset saltation, which is exactly why it is gated.
+        // case), a no-op there. Since #859 a `first_order` per-route lag is analytic on
+        // the `Dual2` event-driven walk: this continuous `∂R_in/∂lag_route` shift flows
+        // here, and the onset discontinuity is supplied separately as the `K_ROUTE_ONSET`
+        // rate-on saltation. Other kernels' route lags stay FD-gated (`zero_order`/
+        // `transit`/`igd` pending their slices; `weibull`'s divergent onset permanently).
         let route_lag = forcing.route_lag(params);
         let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
@@ -1395,6 +1405,17 @@ impl OdeSpec {
             Some(f) => f(params),
             None => vec![0.0; self.n_states],
         }
+    }
+
+    /// True when any built-in absorption input-rate forcing carries a per-route
+    /// lag (`fn(..., lag=L)`, #859). The single predicate shared by the sensitivity
+    /// gates (`ode_analytical_supported`'s subject variants), the IOV gate
+    /// (`ode_iov_supported`), the event-driven walk (`integrate_tvcov_g`), the
+    /// initial-point diagnostics (`api::check_absorption_dosing`), and
+    /// [`crate::types::CompiledModel::has_route_absorption_lag`] — so the "does this
+    /// model have a route lag?" test cannot drift between them.
+    pub fn has_route_lag(&self) -> bool {
+        self.input_rate.iter().any(|f| f.lag_slot.is_some())
     }
 
     /// Convenience accessor: returns the canonical `obs_cmt_idx` when the

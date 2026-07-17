@@ -290,6 +290,29 @@ impl InputRateKind {
             InputRateKind::ZeroOrder => true,
         }
     }
+
+    /// Whether a **per-route absorption lag** (`fn(..., lag=L)`, #859) on this kind
+    /// is served with exact analytic FOCE/FOCEI gradients on the event-driven walk,
+    /// or stays on the finite-difference fallback. The event-driven walk gives each
+    /// route its own onset saltation at `t_dose + lag_cmt + lag_route` (`K_ROUTE_ONSET`
+    /// in `sens/ode_provider.rs`): a finite `ka·dose` rate-on for `FirstOrder`, the
+    /// constant window rate for `ZeroOrder` (with a matching rate-off at `K_ZO_END`),
+    /// and a zero-magnitude no-op for the smooth `Transit`/`InverseGaussian` onsets
+    /// (which need only the timeline break plus the continuous `∂R_in/∂lag_route`).
+    /// `Weibull`'s onset **diverges** for shape `β < 1` (an integrable spike, no finite
+    /// rate-on saltation), so it stays FD — exactly as `weibull` + a compartment
+    /// lagtime does. Exhaustive (no `_` arm), the sibling of [`Self::supported_over_dual`]:
+    /// adding a kind forces a decision here, and this must stay consistent with the
+    /// `K_ROUTE_ONSET` handler's per-kind onset magnitude.
+    pub fn route_lag_analytic(self) -> bool {
+        match self {
+            InputRateKind::FirstOrder
+            | InputRateKind::ZeroOrder
+            | InputRateKind::Transit
+            | InputRateKind::InverseGaussian => true,
+            InputRateKind::Weibull => false,
+        }
+    }
 }
 
 /// A built-in absorption input-rate term attached to one ODE compartment.
@@ -370,9 +393,11 @@ impl InputRateForcing {
     /// the slot is absent, so an unlagged forcing is unaffected. The value is
     /// **added** to the dose's compartment lagtime to form the route's effective
     /// onset `t_dose + lag_cmt + lag_route`. Generic over `T: PkNum` so the same
-    /// reader serves the `f64` prediction / FD-fit path and (once the analytic
-    /// per-route onset saltation lands) the `Dual2` provider; today a model with
-    /// any per-route lag is gated to the FD path, so only `T = f64` reaches here.
+    /// reader serves the `f64` prediction / FD-fit path and the `Dual2` analytic
+    /// provider: since #859 a `first_order` per-route lag is served analytically on
+    /// the event-driven walk (its onset saltation injected at `K_ROUTE_ONSET`), so
+    /// `T = Dual2` reaches here too. The other kernels' route lags remain FD-gated
+    /// pending their slices (`zero_order`/`transit`/`igd`) or permanently (`weibull`).
     #[inline]
     pub fn route_lag<T: PkNum>(&self, params: &[T]) -> T {
         self.lag_slot
@@ -870,29 +895,42 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// `first_order`/Bateman kernels where the omitted `∂R_in/∂tad` biased the
     /// analytic Hessian (near sign-mirror of FD).
     ///
-    /// Defined only for the **finite-jump** onsets — the arms whose
-    /// [`Self::rate_at_zero`] is non-zero: `FirstOrder` (`−dose·ka²`), the degenerate
-    /// `Transit` `n = 0` (pure first-order, `−dose·ktr²`), and `Weibull` `β = 1`
-    /// (`−dose/Td²`). Every **vanishing**-onset arm returns `0`: `Transit` `n > 0`,
-    /// `InverseGaussian`, and `ZeroOrder` are continuous at onset (`rate_at_zero = 0`),
-    /// so they carry no finite-jump rate-on saltation for this term to correct — this
-    /// deliberately does **not** attempt the (generally singular, e.g. `Transit`
-    /// `0 < n < 1`) curvature of a smooth-but-non-differentiable onset, which has no
-    /// finite closed form and is not a finite-jump saltation. `Weibull` `β < 1`
-    /// diverges (mirrors `rate_at_zero`, `NaN`) and is unreachable — the lagtime gate
-    /// (`ode_analytical_supported`) keeps `Weibull` on the FD fallback.
+    /// This is the companion to the jump in the **second** time-derivative `ẍ` at the
+    /// onset, which the saltation's `δlag²` term needs — NOT only to a jump in the onset
+    /// **value** `ẋ`. So it is non-zero in two cases:
+    /// - a **finite-value-jump** onset (`rate_at_zero ≠ 0`): `FirstOrder` (`−dose·ka²`),
+    ///   the degenerate `Transit` `n = 0` (pure first-order, `−dose·ktr²`), and `Weibull`
+    ///   `β = 1` (`−dose/Td²`); and
+    /// - a **continuous-but-kinked** onset: `Transit` `n = 1` (Erlang-2), whose onset
+    ///   value is `0` yet whose slope jumps from `0` to `+dose·ktr²` — a pure curvature
+    ///   saltation with no first-order term.
+    ///
+    /// It returns `0` for the genuinely **flat**-onset arms: `Transit` `n > 1` (slope →0),
+    /// `InverseGaussian` and `ZeroOrder`. It deliberately returns `0` — a documented
+    /// limitation, leaving those Hessians on FD — for the **singular** `Transit`
+    /// `0 < n < 1` (slope →`+∞`, no finite companion). `Weibull` `β < 1` diverges
+    /// (mirrors `rate_at_zero`, `NaN`) and is unreachable — the lagtime gate
+    /// (`ode_analytical_supported`) keeps `Weibull` on the FD fallback. The `Transit`
+    /// `n = 0`/`n = 1` and `Weibull` `β = 1` arms branch on **exact** `f64` equality
+    /// (as `rate_at_zero` does), since the slope is discontinuous across each.
     #[inline]
     pub(crate) fn rate_dtad_at_zero(&self, dose: T) -> T {
         if dose.val() <= 0.0 {
             return T::from_f64(0.0);
         }
         match *self {
-            // R_in(0⁺) = 0 for n > 0 (the Γ-density vanishes), so no finite-jump onset;
-            // n = 0 is pure first-order (rate ktr), slope −dose·ktr².
             PreparedInputRate::Transit { ktr, n, .. } => {
-                if n.val() <= 0.0 {
+                let nv = n.val();
+                if nv <= 0.0 {
+                    // n ≤ 0 (or clamped): pure first-order kernel (rate ktr), slope −dose·ktr².
                     -dose * ktr * ktr
+                } else if nv == 1.0 {
+                    // n = 1 (Erlang-2): onset value 0 (continuous) but slope jumps to
+                    // +dose·ktr² — a curvature saltation with no first-order onset jump.
+                    dose * ktr * ktr
                 } else {
+                    // n > 1: true onset slope → 0. 0 < n < 1: slope → +∞ (singular, no
+                    // finite companion) — returns 0 (documented limitation, FD-only Hessian).
                     T::from_f64(0.0)
                 }
             }
@@ -2307,9 +2345,19 @@ mod tests {
             -dose * ktr * ktr,
             max_relative = 1e-12
         );
-        // n > 0: onset value AND slope vanish (no finite-jump saltation). Deliberately
-        // NOT the (singular for 0<n<1) true curvature — the term is the companion to
-        // the finite onset jump, which is zero here.
+        // n = 1 (Erlang-2): onset VALUE is 0 (continuous) but the SLOPE jumps to
+        // +dose·ktr² — a curvature saltation the term MUST carry (#880). ktr = (n+1)/mtt,
+        // so mtt = 2/ktr gives this ktr. FD-checked (the value 0 makes rate_at_zero=0, so
+        // the FD numerator is just rate(h)).
+        let prep = PreparedInputRate::transit(1.0, 2.0 / ktr);
+        assert_relative_eq!(
+            prep.rate_dtad_at_zero(dose),
+            dose * ktr * ktr,
+            max_relative = 1e-12
+        );
+        let fd = (prep.rate(1e-6, dose) - prep.rate_at_zero(dose)) / 1e-6;
+        assert_relative_eq!(prep.rate_dtad_at_zero(dose), fd, max_relative = 1e-4);
+        // n > 1: true onset slope vanishes (Γ-density and its slope both →0).
         let prep = PreparedInputRate::transit(3.0, 2.0);
         assert_eq!(prep.rate_dtad_at_zero(dose), 0.0);
     }

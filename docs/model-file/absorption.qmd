@@ -118,6 +118,22 @@ steady state (see `tests/ss_absorption_nonmem_anchor.rs`). A closed-form
 `pk *_transit` / `*_ig` model with an `SS` dose reroutes to its ODE twin
 automatically, exactly as for time-varying covariates and IOV.
 
+::: {.callout-warning}
+## Slowly-accumulating saturable disposition
+
+The nonlinear fallback iterates the pulse train for a fixed budget (50 cycles). That is
+ample for the usual clinical range, but a **saturable** disposition (e.g. Michaelis–Menten)
+that accumulates heavily — elimination half-life far exceeding the interval `II`, so the
+per-cycle carryover ratio approaches 1 — can stop short of the true periodic steady state,
+returning an `SS` trough that is biased low. ferx now estimates the remaining tail and emits
+a warning (in `predict()` via `fit()` / `simulate()`) when the equilibration is materially
+under-converged, or when no periodic steady state exists at all because the mean input rate
+meets or exceeds the maximum elimination rate (phenytoin-like dosing above capacity). The
+**linear** case is exact and never triggers this — it uses the closed form above. A genuine
+nonlinear periodic-SS solve (accelerated iteration / Newton on the one-cycle map) is a scoped
+follow-up (#867).
+:::
+
 `fit()` on an SS-absorption model works and converges. Its sensitivities currently
 use a finite-difference fallback (the prediction they difference is exact, and the
 closed-form trough makes it smooth and cheap enough to converge), so fitting a
@@ -816,15 +832,24 @@ the steady-state pre-arrival seed does not yet route the dose through the absorp
 kernel over a lagged onset.
 
 ::: {.callout-note}
-## Gradients (FD for now)
+## Gradients (analytic)
 
-A model carrying any per-route `lag=` is fit over **finite differences** — the
-analytic event-driven walk injects one onset saltation per dose at the shared
-`dose + lag_cmt`, whereas a per-route lag needs a distinct onset (and rate-on
-saltation) per route. This is the exact analogue of the `weibull()` + lagtime FD
-fallback; predictions and simulation are exact (the onset is a real integration
-break), only the FOCEI gradient is FD. The per-route onset saltation (returning
-these models to the analytic path) is a planned follow-up
+A per-route `lag=` on a **`first_order`**, **`zero_order`**, **`transit`**, or **`igd`**
+forcing is fit with **exact analytic** FOCE/FOCEI gradients
+([#859](https://github.com/FeRx-NLME/ferx-core/issues/859)). The event-driven walk gives
+each route its own onset event at `dose + lag_cmt + lag_route`: for the discontinuous
+kernels (`first_order`, `zero_order`) that onset injects a rate-on saltation carrying the
+combined `∂/∂(lag_cmt + lag_route)` jet — and a route-lagged `zero_order` window also
+carries the same jet on its rate-off at the window end; for the smooth kernels
+(`transit`, `igd`) the onset is continuous (`R_in → 0`), so the route lag flows through the
+continuous `∂R_in/∂lag_route` alone, with a timeline break at the onset. The predicted
+values are unchanged — only the gradient moves off finite differences.
+
+Two cases remain on the **finite-difference** fallback: a per-route lag on a **`weibull`**
+forcing (its onset diverges for shape `β < 1`, so no finite rate-on saltation exists — the
+exact analogue of the `weibull()` + compartment-lagtime fallback), and a per-route lag
+combined with **IOV** (`κ`). Both stay exact in predictions and simulation; only their
+FOCEI gradient is FD. Analytic IOV per-route lag is a planned follow-up
 ([#856](https://github.com/FeRx-NLME/ferx-core/issues/856)).
 :::
 

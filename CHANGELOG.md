@@ -35,6 +35,14 @@ section of the SDLC for the versioning policy).
   realistic `ode_reltol`; `predict()` / `simulate()` on these models are correspondingly faster.
   Predictions are unchanged to within the ODE solver tolerance — the closed-form fixed point and
   the iteration converge to the same periodic trough (#835).
+- **Exact analytic FOCE/FOCEI gradients for per-route absorption lag** (`fn(..., lag=L)`, #859).
+  Fitting a model with a per-route absorption lag on a `first_order`, `zero_order`, `transit`, or
+  `igd` input-rate forcing now uses exact analytic sensitivities instead of finite differences —
+  each route's onset is a moving boundary carried by a rate-on saltation (and, for `zero_order`,
+  a matching rate-off at the window end), so these fits run at full analytic speed. A per-route
+  lag on a `weibull` forcing keeps the finite-difference fallback (its onset diverges for shape
+  β < 1, so no closed-form saltation exists), as does a per-route lag combined with IOV. The
+  predicted values are unchanged — only the gradient moves off finite differences.
 
 ### Changed
 - **`method = agq` removed; adaptive quadrature is now an *argument*, not a method**
@@ -64,18 +72,20 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 - **Analytic FOCEI sensitivities for IIV on an absorption lag feeding a `first_order` forcing**
-  (#880). Two fixes to the rate-on onset of a built-in `first_order` (Bateman) input-rate
-  forcing whose lagged arrival is a moving boundary (an IIV lagtime `ALAG1`/`LAGTIME`):
-  (1) the exact second-order sensitivity block (`∂²f/∂η²`) was wrong — disagreeing in sign and
-  magnitude with finite differences — because the onset saltation's curvature term dropped the
-  forcing's own time-variation at the onset (`∂R_in/∂tad`), non-zero only for such decaying
-  kernels (constant infusion and zero-order windows were unaffected); and (2) under a
-  time-varying covariate crossing the onset, the onset jump read its absorption-rate constant
-  and pathway fraction from the dose record's covariate snapshot instead of the segment where
-  the forcing actually turns on (NONMEM end-of-interval), giving a several-percent gradient
-  error. Ordinary predictions and — outside the TV-covariate case — the FOCEI gradient were
-  already correct; standard errors (the objective curvature) and the TV-covariate gradient now
-  match finite differences.
+  (#880). Fixes to the rate-on onset of a built-in `first_order` (Bateman) input-rate forcing
+  whose arrival is a moving boundary — a compartment lagtime (`ALAG1`/`LAGTIME`) **or** a
+  per-route `lag=` (#859): (1) the exact second-order sensitivity block (`∂²f/∂η²`) was wrong —
+  disagreeing in sign and magnitude with finite differences — because the onset saltation's
+  curvature term dropped the forcing's own time-variation at the onset (`∂R_in/∂tad`), non-zero
+  only for such decaying kernels (constant infusion and zero-order windows were unaffected);
+  (2) under a time-varying covariate crossing the onset, the onset jump read its absorption-rate
+  constant and pathway fraction from the dose record's covariate snapshot instead of the segment
+  where the forcing actually turns on (NONMEM end-of-interval), giving a several-percent gradient
+  error; and (3) an `n = 1` (Erlang-2) `transit` kernel's continuous-but-kinked onset dropped its
+  curvature term. Both the shared-dose onset and the per-route onset are covered. Ordinary
+  predictions and — outside the TV-covariate case — the FOCEI gradient were already correct;
+  standard errors (the objective curvature) and the TV-covariate gradient now match finite
+  differences.
 - **Pre-flight flat-theta freeze no longer freezes an identifiable parameter with a
   coincidentally-tiny initial gradient** (#826 follow-up). The #826 guard freezes a theta
   whose outer gradient is ~0 at the initial estimate, on the premise it is unmapped. But a
@@ -87,6 +97,16 @@ section of the SDLC for the versioning policy).
   with a perturbation probe: it only freezes a theta that leaves the reconverged objective
   exactly unchanged when moved (genuinely unmapped). Identifiable-but-flat-at-init thetas are
   left free, so the fit recovers them.
+- **Steady-state dosing into a built-in absorption compartment now warns when its
+  equilibration does not converge** (#867). For an `SS=1` dose into a `first_order` /
+  `transit` / `igd` / `weibull` absorption compartment on a **nonlinear** (e.g.
+  Michaelis–Menten) disposition that accumulates heavily — elimination half-life far exceeding
+  the dosing interval `II` — the 50-cycle pulse-train equilibration can stop well short of the
+  true periodic steady state, previously returning a trough that was silently too low.
+  `fit()` / `simulate()` now estimate the remaining tail and surface a
+  warning when the returned steady state is materially under-converged, or when no periodic
+  steady state exists at all (mean input rate ≥ maximum elimination rate). The **linear** case
+  is exact and unaffected (it takes the closed-form `u_ss = (I − M)⁻¹·b` fast path, #835).
 - **FREM: the analytic gradients differentiated the wrong likelihood on covariate
   pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against
   the prediction `theta[i] + eta[j]` with the dedicated covariate error `EPSCOV` — but the

@@ -1117,6 +1117,9 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
+    // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
+    crate::dosing::clear_ss_nonconvergence_warnings();
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
     if let Some(e) = check_absorption_closed_form_support(model, population) {
@@ -1439,6 +1442,12 @@ pub fn fit(
         };
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
+            // Surface any SS-equilibration non-convergence seen during this (default, single-start)
+            // fit's prediction passes (#867). This is the common path — `n_starts` defaults to 1 —
+            // so it must drain the sink too, not just the multi-start arm below.
+            for w in crate::dosing::take_ss_nonconvergence_warnings() {
+                result.warnings.push(w);
+            }
             rebuild_warnings_structured(&mut result);
             result
         });
@@ -1543,6 +1552,13 @@ pub fn fit(
                     "Multi-start: best result from start {k}/{n} (OFV = {:.4})",
                     result.ofv
                 ));
+            }
+            // Surface any SS-equilibration non-convergence seen during this fit's prediction passes
+            // (#867). The capped nonlinear pulse-train can silently under-report the SS trough and
+            // bias estimates low; the sink deduplicated it across every objective evaluation and
+            // multi-start replicate to a single message.
+            for w in crate::dosing::take_ss_nonconvergence_warnings() {
+                result.warnings.push(w);
             }
             rebuild_warnings_structured(&mut result);
             Ok(result)
@@ -5422,6 +5438,11 @@ pub fn simulate_with_options_diag(
 ) -> Result<SimulationOutput, String> {
     use rand::SeedableRng;
 
+    // Start the SS-equilibration non-convergence sink clean, then drain it into this run's
+    // `warnings` at each return (#867): a capped nonlinear pulse-train can silently under-report
+    // the SS trough, biasing simulated concentrations low.
+    crate::dosing::clear_ss_nonconvergence_warnings();
+
     // ODE-accumulated (joint PK-TTE) TTE simulation samples drug-driven event times
     // via the augmented-ODE root-finder (Slice 2.2). Validate its preventable
     // preconditions up front so a caller gets a clean Err here rather than a panic
@@ -5510,6 +5531,7 @@ pub fn simulate_with_options_diag(
                 &mut rng,
                 &mut warnings,
             );
+            warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
             return Ok(SimulationOutput { results, warnings });
         }
     };
@@ -5570,6 +5592,7 @@ pub fn simulate_with_options_diag(
         &mut rng,
         &mut warnings,
     );
+    warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
     Ok(SimulationOutput { results, warnings })
 }
 

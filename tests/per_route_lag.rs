@@ -547,11 +547,12 @@ fn route_lag_on_event_driven_path_equals_compartment_lag() {
     );
 }
 
-/// Tier-2 (fast): a per-route-lag model runs through the optimizer on the FD path
-/// (the analytic gate declines it). A couple of outer iterations, no convergence
-/// loop — just proves the end-to-end fit path is wired and returns a finite OFV.
+/// Tier-2 (fast): a per-route-lag model runs through the optimizer end-to-end. Since #859
+/// a `first_order` per-route lag is served on the exact analytic path (the gate admits it),
+/// so this now exercises the analytic gradient wiring. A couple of outer iterations, no
+/// convergence loop — just proves the fit path is wired and returns a finite OFV.
 #[test]
-fn per_route_lag_fit_runs_via_fd() {
+fn per_route_lag_fit_runs_end_to_end() {
     use ferx_core::{fit, FitOptions};
     let model = parse_full_model(ROUTE_LAG_SINGLE).expect("parses").model;
     let obs_times: Vec<f64> = (1..=20).map(|i| i as f64 * 0.5).collect();
@@ -575,7 +576,7 @@ fn per_route_lag_fit_runs_via_fd() {
         outer_maxiter: 2,
         ..FitOptions::default()
     };
-    let fitted = fit(&model, &pop, &model.default_params, &opts).expect("fit runs on FD path");
+    let fitted = fit(&model, &pop, &model.default_params, &opts).expect("fit runs end-to-end");
     assert!(
         fitted.ofv.is_finite(),
         "OFV must be finite, got {}",
@@ -583,8 +584,9 @@ fn per_route_lag_fit_runs_via_fd() {
     );
 }
 
-/// Tier-3 (slow): a full FOCEI (FD) fit recovers the per-route lag from a perturbed
-/// start on noise-free data — the optimum sits at the data-generating lag.
+/// Tier-3 (slow): a full FOCEI fit (exact analytic gradients since #859) recovers the
+/// per-route lag from a perturbed start on noise-free data — the optimum sits at the
+/// data-generating lag.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -621,7 +623,7 @@ fn per_route_lag_fit_recovers_lag() {
     init.theta[2] = 0.7; // KA off truth (1.0)
     init.theta[3] = 3.0; // LAG off truth (2.0)
     let fitted = fit(&model, &pop, &init, &FitOptions::default()).expect("fit converges");
-    assert!(fitted.converged, "per-route-lag FD fit should converge");
+    assert!(fitted.converged, "per-route-lag fit should converge");
     assert!(
         (fitted.theta[3] - 2.0).abs() < 0.1,
         "recovered per-route lag {} should be near 2.0",
