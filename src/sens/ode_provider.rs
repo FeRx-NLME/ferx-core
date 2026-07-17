@@ -4255,14 +4255,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         }
     };
 
-    // Merged timeline: (time, kind, idx), kind ∈ {Reset=0, SsSeed=1, Dose=2, PkOnly=3, Obs=4,
-    // InfEnd=5} — the sort key matching production's `kind_order` (Reset before a co-timed
-    // Dose so an EVID=4 reset+dose zeros the state before its own dose lands; a per-dose
-    // SS pre-arrival seed — see below — before its own later Dose event; Dose before PkOnly
-    // before Obs; infusion-end last so an obs at the end reads the infusion still
-    // contributing). Doses (and infusion windows) sit at their lagged arrival
-    // `d.time + lag_val(k)`; resets and pk-only records are at their record time (fixed, not
-    // lag-shifted).
+    // Merged timeline: (time, kind, idx), kind ∈ {Reset=0, SsSeed=1, Dose=2, RouteOnset=3,
+    // PkOnly=4, Obs=5, InfEnd=6, ZoEnd=7} — the sort key matching production's `kind_order`
+    // (Reset before a co-timed Dose so an EVID=4 reset+dose zeros the state before its own dose
+    // lands; a per-dose SS pre-arrival seed — see below — before its own later Dose event; Dose
+    // before a per-route absorption onset (#859) before PkOnly before Obs; infusion-end and
+    // zero-order window-end last so an obs at the end reads the rate still contributing). Doses
+    // (and infusion windows) sit at their lagged arrival `d.time + lag_val(k)`; resets and
+    // pk-only records are at their record time (fixed, not lag-shifted).
     const K_RESET: u8 = 0;
     const K_SS_SEED: u8 = 1;
     const K_DOSE: u8 = 2;

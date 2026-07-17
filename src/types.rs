@@ -3624,7 +3624,7 @@ impl CompiledModel {
     /// discontinuity is injected as its own rate-on saltation (#859) — mirroring
     /// how `has_lagtime` routes an estimated compartment lag there. A model with
     /// no `ode_spec` (analytical PK) has no input-rate forcings, so this is false.
-    pub fn has_route_absorption_lag(&self) -> bool {
+    pub(crate) fn has_route_absorption_lag(&self) -> bool {
         self.ode_spec
             .as_ref()
             .is_some_and(|o| o.input_rate.iter().any(|f| f.lag_slot.is_some()))
@@ -3657,15 +3657,21 @@ impl CompiledModel {
     /// True when `subject` has a steady-state dose into a built-in absorption
     /// input-rate compartment that the analytic dual SS fixed point does **not**
     /// serve: SS into a `zero_order` spanning window (the pointwise `R_in` fixed
-    /// point doesn't build it) or SS combined with an absorption lagtime on the
-    /// dosed compartment. Both are hard-rejected upstream
-    /// (`E_ABSORPTION_SS_ZERO_ORDER` / `E_ABSORPTION_SS_LAG`,
-    /// `api::check_absorption_dosing`); the ODE support gates
+    /// point doesn't build it), or SS combined with an absorption lag on the dosed
+    /// compartment — either a compartment `lagtime`/`ALAG` ([`Self::has_lagtime_on_cmt`])
+    /// or a per-route `lag=` on the forcing ([`crate::pk::absorption::InputRateForcing`]'s
+    /// `lag_slot`, #859). All are hard-rejected upstream (`E_ABSORPTION_SS_ZERO_ORDER`
+    /// / `E_ABSORPTION_SS_LAG`, `api::check_absorption_dosing` — whose `has_ss_lag`
+    /// covers a per-route lag via `route_lag_cmts`); the ODE support gates
     /// (`ode_tvcov_supported`, `ode_iov_subject_supported`) and the IOV FD-reason
     /// attribution (`iov_fd_reason`) re-check it as belt-and-suspenders so the
     /// analytic-vs-FD routing stays self-consistent if either upstream check is
-    /// relaxed. Single source of truth for those three sites (#835 review) —
-    /// keeping the scope in one place so it cannot drift between them (cf. the
+    /// relaxed. This must therefore mirror the upstream predicate exactly — the
+    /// per-route `lag_slot` clause was added with #859 (which made a `first_order`
+    /// route lag analytic, so without it a relaxed upstream reject would route an
+    /// SS + route-lag model onto the analytic SS seed, which does not carry the
+    /// per-route onset). Single source of truth for those three sites (#835 review)
+    /// — keeping the scope in one place so it cannot drift between them (cf. the
     /// #814 attribution-drift class of bug). Scoped to the SS-dosed compartment:
     /// an SS dose into a plain compartment on a model that separately declares
     /// absorption for a different route is unaffected (its `R_in` is inert for
@@ -3679,6 +3685,7 @@ impl CompiledModel {
                 && ode.input_rate.iter().any(|f| {
                     f.cmt + 1 == d.cmt
                         && (f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
+                            || f.lag_slot.is_some()
                             || self.has_lagtime_on_cmt(d.cmt))
                 })
         })

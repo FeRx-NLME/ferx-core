@@ -12497,13 +12497,18 @@ mod tests {
 
     /// #835 review: `CompiledModel::ss_absorption_out_of_scope` is the single source of truth for
     /// the SS-into-absorption FD decline shared by `ode_tvcov_supported`,
-    /// `ode_iov_subject_supported`, and `iov_fd_reason`. Pin both out-of-scope operands directly
-    /// on the helper — a `zero_order` window and an absorption lagtime on the dosed compartment —
-    /// plus the in-scope smooth-kernel-without-lag case, so a future edit to any single gate site
-    /// cannot silently diverge from the others. (At the gate call sites the lagtime operand is
-    /// short-circuited by `f.kind == ZeroOrder`, so this is its only direct coverage.)
+    /// `ode_iov_subject_supported`, and `iov_fd_reason`. Pin all three out-of-scope operands
+    /// directly on the helper — a `zero_order` window, a compartment absorption lagtime on the
+    /// dosed compartment, and a per-route `lag=` on the forcing feeding it (#859) — plus the
+    /// in-scope smooth-kernel-without-lag case, so a future edit to any single gate site cannot
+    /// silently diverge from the others, and so the helper keeps mirroring the upstream
+    /// `check_absorption_dosing` reject (whose `has_ss_lag` covers a per-route lag via
+    /// `route_lag_cmts`). Without the `lag_slot` operand a `first_order` route lag — which #859
+    /// makes analytic — would slip the belt-and-suspenders decline (its onset is NOT carried by
+    /// the SS seed). (At the gate call sites the lagtime/route-lag operands are short-circuited by
+    /// `f.kind == ZeroOrder` for a zero-order forcing, so this is their only direct coverage.)
     #[test]
-    fn ss_absorption_out_of_scope_covers_both_operands() {
+    fn ss_absorption_out_of_scope_covers_all_operands() {
         let ss_into = |cmt: usize| Subject {
             doses: vec![DoseEvent::new(0.0, 100.0, cmt, 0.0, true, 12.0)],
             ..iov_subject()
@@ -12552,6 +12557,52 @@ mod tests {
         let wn = parse_model_string(&weibull_nolag).expect("parse weibull IOV");
         assert!(!wn.has_lagtime_on_cmt(1));
         assert!(!wn.ss_absorption_out_of_scope(&ss_into(1)));
+        // Operand 3 (#859) — SS into a `first_order` forcing carrying a per-route `lag=` → out of
+        // scope (FD). The per-route lag lives on the forcing's `lag_slot`, NOT the compartment-lag
+        // machinery, so `has_lagtime_on_cmt` is FALSE here — the decline must come from the
+        // `lag_slot` operand alone, mirroring the upstream `route_lag_cmts` reject. Without it, a
+        // route-lagged SS dose (which #859 makes analytic) would take the analytic SS seed, which
+        // does not route the dose through the lagged onset.
+        let route_lag = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.05, 20.0)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL + KAPPA_CL)
+  V   = TVV  * exp(ETA_V)
+  KA  = TVKA
+  LAG = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA, lag=LAG) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+        let rl = parse_model_string(route_lag).expect("parse first_order route-lag IOV");
+        assert!(
+            !rl.has_lagtime_on_cmt(1),
+            "a per-route lag is NOT a compartment lagtime"
+        );
+        assert!(
+            rl.has_route_absorption_lag(),
+            "the forcing carries a lag_slot"
+        );
+        assert!(
+            rl.ss_absorption_out_of_scope(&ss_into(1)),
+            "SS + per-route lag must decline to FD via the lag_slot operand (#859)"
+        );
         // A bolus (ii = 0, not steady state) into the same compartment is never out of scope.
         let bolus = Subject {
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
