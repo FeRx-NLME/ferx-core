@@ -323,16 +323,11 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     //     `weibull` + a compartment lagtime does below.
     // IOV (`n_kappa != 0`) route lag is out of scope on both gates (declined below here and, on
     // the IOV path, in `ode_iov_supported`).
-    if ode.input_rate.iter().any(|f| {
-        f.lag_slot.is_some()
-            && !matches!(
-                f.kind,
-                crate::pk::absorption::InputRateKind::FirstOrder
-                    | crate::pk::absorption::InputRateKind::ZeroOrder
-                    | crate::pk::absorption::InputRateKind::Transit
-                    | crate::pk::absorption::InputRateKind::InverseGaussian
-            )
-    }) {
+    if ode
+        .input_rate
+        .iter()
+        .any(|f| f.lag_slot.is_some() && !f.kind.route_lag_analytic())
+    {
         return false;
     }
     if model.n_kappa != 0 {
@@ -883,7 +878,7 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // against FD; decline it here so it differences the (exact) f64 predictor instead. (Analytic
     // IOV per-route lag is a follow-up; the non-IOV gate `ode_analytical_supported` classifies
     // per kind — here every kernel's route lag is declined uniformly while IOV is out of scope.)
-    if ode.input_rate.iter().any(|f| f.lag_slot.is_some()) {
+    if ode.has_route_lag() {
         return false;
     }
     // `Weibull` + estimated lagtime stays FD on every path (IOV included): its onset diverges
@@ -4073,7 +4068,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // `K_ROUTE_ONSET` timeline events below rather than the shared `K_DOSE` onset. `false`
     // (and byte-identical to the pre-#859 walk) for the common no-route-lag case. Computed
     // from `ode` (this walk has no `&CompiledModel`); equals `model.has_route_absorption_lag()`.
-    let has_route_lag = ode.input_rate.iter().any(|f| f.lag_slot.is_some());
+    let has_route_lag = ode.has_route_lag();
     // Carries `∂lag/∂(θ,η)` (incl. the lagtime axis itself) — fed into
     // `add_prepared_input_rate_forcing` as `dose_lagtimes` so a built-in input-rate
     // forcing's `tad = t − (dose.time + lag)` carries the exact continuous

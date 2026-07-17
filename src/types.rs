@@ -3625,9 +3625,7 @@ impl CompiledModel {
     /// how `has_lagtime` routes an estimated compartment lag there. A model with
     /// no `ode_spec` (analytical PK) has no input-rate forcings, so this is false.
     pub(crate) fn has_route_absorption_lag(&self) -> bool {
-        self.ode_spec
-            .as_ref()
-            .is_some_and(|o| o.input_rate.iter().any(|f| f.lag_slot.is_some()))
+        self.ode_spec.as_ref().is_some_and(|o| o.has_route_lag())
     }
 
     /// Compartment-scoped variant of [`Self::has_lagtime`]: true only when a
