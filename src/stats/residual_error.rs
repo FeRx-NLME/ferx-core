@@ -1,4 +1,4 @@
-use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, Subject, SubjectResult};
+use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SigmaType, Subject, SubjectResult};
 use nalgebra::DMatrix;
 
 const MIN_VARIANCE: f64 = 1e-12;
@@ -23,6 +23,485 @@ pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f
         }
     };
     v.max(MIN_VARIANCE)
+}
+
+// ── ErrorSpec residual-variance math ─────────────────────────────────────────
+//
+// This module is the single owner of the residual variance-and-derivatives
+// math, so the `ErrorSpec` dispatch layer lives with its primitive
+// (`residual_variance`, above) and its consumers (below). It previously sat in
+// `types.rs`, which meant `variance_at` had to reach back across the module
+// boundary for `residual_variance`; `types.rs` now keeps only the `ErrorSpec`
+// data definition + `obs_key`/`obs_keys` (data/dispatch concerns).
+impl ErrorSpec {
+    /// Observation-level loadings onto the flat residual-error vector.
+    ///
+    /// For an observation with prediction `f`, additive error contributes a
+    /// coefficient of `1`, proportional error contributes `f`, and combined
+    /// error contributes both. Multiplying these loadings by the residual
+    /// sigma covariance matrix yields the scalar variance on the diagonal and
+    /// the cross-observation covariance off diagonal.
+    pub fn sigma_loadings(&self, cmt: usize, f: f64, n_sigma: usize) -> Vec<(usize, f64)> {
+        match self {
+            ErrorSpec::Single(em) => match em {
+                ErrorModel::Additive => {
+                    if n_sigma > 0 {
+                        vec![(0, 1.0)]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                ErrorModel::Proportional => {
+                    if n_sigma > 0 {
+                        vec![(0, f)]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                ErrorModel::Combined => {
+                    let mut out = Vec::with_capacity(2);
+                    if n_sigma > 0 {
+                        out.push((0, f));
+                    }
+                    if n_sigma > 1 {
+                        out.push((1, 1.0));
+                    }
+                    out
+                }
+            },
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => match ep.error_model {
+                        ErrorModel::Additive => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, 1.0)])
+                            .unwrap_or_default(),
+                        ErrorModel::Proportional => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, f)])
+                            .unwrap_or_default(),
+                        ErrorModel::Combined => {
+                            let mut out = Vec::with_capacity(2);
+                            if let Some(&i) = ep.sigma_idx.first() {
+                                out.push((i, f));
+                            }
+                            if let Some(&i) = ep.sigma_idx.get(1) {
+                                out.push((i, 1.0));
+                            }
+                            out
+                        }
+                    },
+                    None => Vec::new(),
+                }
+            }
+        }
+    }
+
+    /// `∂(sigma loading coefficient)/∂f` for each slot an observation loads on,
+    /// parallel in shape to [`sigma_loadings`].
+    ///
+    /// Every loading coefficient is affine in the prediction `f`: the
+    /// proportional slot loads `f` (slope `1`), the additive slot loads the
+    /// constant `1` (slope `0`). Returning the slopes with the *same slot
+    /// presence* as [`sigma_loadings`] lets the dense-`R` derivative
+    /// ([`crate::stats::residual_error::compute_dr_df_matrices`]) reuse the exact
+    /// bilinear cross-covariance assembly with the value loadings replaced by
+    /// these slopes — the off-diagonal `R` is linear in each observation's
+    /// loadings, so `∂R_jk/∂f_j = cross(slopes_j, values_k)`.
+    pub fn sigma_loading_slopes(&self, cmt: usize, n_sigma: usize) -> Vec<(usize, f64)> {
+        match self {
+            ErrorSpec::Single(em) => match em {
+                ErrorModel::Additive => {
+                    if n_sigma > 0 {
+                        vec![(0, 0.0)]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                ErrorModel::Proportional => {
+                    if n_sigma > 0 {
+                        vec![(0, 1.0)]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                ErrorModel::Combined => {
+                    let mut out = Vec::with_capacity(2);
+                    if n_sigma > 0 {
+                        out.push((0, 1.0));
+                    }
+                    if n_sigma > 1 {
+                        out.push((1, 0.0));
+                    }
+                    out
+                }
+            },
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => match ep.error_model {
+                        ErrorModel::Additive => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, 0.0)])
+                            .unwrap_or_default(),
+                        ErrorModel::Proportional => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, 1.0)])
+                            .unwrap_or_default(),
+                        ErrorModel::Combined => {
+                            let mut out = Vec::with_capacity(2);
+                            if let Some(&i) = ep.sigma_idx.first() {
+                                out.push((i, 1.0));
+                            }
+                            if let Some(&i) = ep.sigma_idx.get(1) {
+                                out.push((i, 0.0));
+                            }
+                            out
+                        }
+                    },
+                    None => Vec::new(),
+                }
+            }
+        }
+    }
+
+    /// Residual variance including fixed residual correlations from
+    /// `block_sigma`.
+    pub fn variance_at_with_correlations(
+        &self,
+        cmt: usize,
+        f_pred: f64,
+        sigma: &[f64],
+        correlations: &[ResidualCorrelation],
+    ) -> f64 {
+        if correlations.is_empty() {
+            return self.variance_at(cmt, f_pred, sigma);
+        }
+        // The correlated variance is exactly [`variance_at_scaled`] with an
+        // all-ones multiplier: an empty `mult` makes every loading's multiplier
+        // default to 1.0. Delegate so the loading + cross-covariance formula
+        // lives in one place (#484 review #9) and the magnitude path can never
+        // silently diverge from the bare-sigma path.
+        self.variance_at_scaled(cmt, f_pred, sigma, correlations, &[])
+    }
+
+    /// Residual variance with a per-observation custom magnitude (#484).
+    ///
+    /// Like [`variance_at_with_correlations`] but scales each sigma loading by
+    /// the per-observation multiplier `mult[idx]` (1-based on the flat sigma
+    /// vector, supplied by [`RuvMagnitude::eval_obs`]). A `mult` of all ones
+    /// reproduces [`variance_at_with_correlations`] exactly. Cross terms from
+    /// `block_sigma` scale by the product of the two loadings' multipliers.
+    ///
+    /// [`variance_at_with_correlations`]: ErrorSpec::variance_at_with_correlations
+    pub fn variance_at_scaled(
+        &self,
+        cmt: usize,
+        f_pred: f64,
+        sigma: &[f64],
+        correlations: &[ResidualCorrelation],
+        mult: &[f64],
+    ) -> f64 {
+        let loadings = self.sigma_loadings(cmt, f_pred, sigma.len());
+        if loadings.is_empty() {
+            return f64::NAN;
+        }
+        let m = |idx: usize| mult.get(idx).copied().unwrap_or(1.0);
+        let mut v = 0.0;
+        for &(idx, coeff) in &loadings {
+            let Some(&s) = sigma.get(idx) else {
+                return f64::NAN;
+            };
+            let c = coeff * m(idx);
+            v += c * c * s * s;
+        }
+        for corr in correlations {
+            let ci = loadings
+                .iter()
+                .find(|(idx, _)| *idx == corr.sigma_i)
+                .map(|(_, coeff)| *coeff * m(corr.sigma_i));
+            let cj = loadings
+                .iter()
+                .find(|(idx, _)| *idx == corr.sigma_j)
+                .map(|(_, coeff)| *coeff * m(corr.sigma_j));
+            let (Some(ci), Some(cj)) = (ci, cj) else {
+                continue;
+            };
+            let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
+                return f64::NAN;
+            };
+            v += 2.0 * ci * cj * corr.rho * si * sj;
+        }
+        v.max(1e-12)
+    }
+
+    /// `SigmaType` for each entry of the flat global sigma vector, as a `Vec`
+    /// of length `n_sigma`, so `FitResult` can label/scale every sigma.
+    ///
+    /// `Single` stamps the error model's own sigma types into the leading
+    /// slots and leaves any further declared sigmas as `Additive`. `PerCmt`
+    /// stamps the type of every sigma index each endpoint owns; sigmas not
+    /// referenced by any endpoint default to `Additive`. Either way the
+    /// returned length always equals `n_sigma`.
+    pub fn sigma_types(&self, n_sigma: usize) -> Vec<SigmaType> {
+        let mut out = vec![SigmaType::Additive; n_sigma];
+        match self {
+            ErrorSpec::Single(em) => {
+                for (i, t) in em.sigma_types().into_iter().enumerate() {
+                    if i < out.len() {
+                        out[i] = t;
+                    }
+                }
+            }
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                for ep in map.values() {
+                    let types = ep.error_model.sigma_types();
+                    for (k, &idx) in ep.sigma_idx.iter().enumerate() {
+                        if idx < out.len() {
+                            out[idx] = types[k];
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `d(residual variance)/d(prediction f)` for one observation at `cmt`.
+    ///
+    /// The score term the SAEM M-step needs alongside the variance. Additive
+    /// endpoints contribute 0; proportional/combined endpoints contribute
+    /// `2·f·σ_prop²` (σ_prop is the endpoint's proportional sigma, which is the
+    /// first sigma for both `Proportional` and `Combined`). `Single` ignores
+    /// `cmt`; `PerCmt` dispatches on the endpoint registered for `cmt`.
+    pub fn dvar_df(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
+        let (em, prop_sigma) = match self {
+            ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => (
+                        ep.error_model,
+                        ep.sigma_idx
+                            .first()
+                            .and_then(|&i| sigma.get(i))
+                            .copied()
+                            .unwrap_or(0.0),
+                    ),
+                    None => return 0.0,
+                }
+            }
+        };
+        match em {
+            ErrorModel::Additive => 0.0,
+            ErrorModel::Proportional | ErrorModel::Combined => 2.0 * f * prop_sigma * prop_sigma,
+        }
+    }
+
+    /// Flat sigma-vector index of `cmt`'s proportional sigma (the slot a
+    /// magnitude multiplier scales for the `f`-derivative chain): slot `0` for
+    /// `Single`, the endpoint's first `sigma_idx` for `PerCmt`. `None` when
+    /// `PerCmt` has no endpoint registered for `cmt`, or that endpoint declares
+    /// no sigma at all — both cases the `_scaled` derivative callers treat as
+    /// "no residual error here" (`0.0`). Single source for
+    /// [`dvar_df_scaled`](Self::dvar_df_scaled) and
+    /// [`d2var_df2_scaled`](Self::d2var_df2_scaled) so the two can't resolve a
+    /// different slot for the same `(cmt, mult)` (#486 review).
+    fn prop_sigma_slot(&self, cmt: usize) -> Option<usize> {
+        match self {
+            ErrorSpec::Single(_) => Some(0),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                map.get(&cmt)?.sigma_idx.first().copied()
+            }
+        }
+    }
+
+    /// `dvar_df` with a per-observation custom magnitude (#484).
+    ///
+    /// The proportional loading carries the multiplier `m_prop`, so the
+    /// variance's `f`-dependent term is `(f·m_prop·σ_prop)²` and its `f`
+    /// derivative scales by `m_prop²`. The proportional sigma is the first sigma
+    /// slot for both `Proportional` and `Combined`; `mult` is indexed on the
+    /// flat sigma vector. A `mult` of all ones reproduces [`dvar_df`].
+    ///
+    /// [`dvar_df`]: ErrorSpec::dvar_df
+    pub fn dvar_df_scaled(&self, cmt: usize, f: f64, sigma: &[f64], mult: &[f64]) -> f64 {
+        let Some(prop_slot) = self.prop_sigma_slot(cmt) else {
+            return 0.0;
+        };
+        let m = mult.get(prop_slot).copied().unwrap_or(1.0);
+        self.dvar_df(cmt, f, sigma) * m * m
+    }
+
+    /// `d²(residual variance)/d(prediction f)²` for one observation at `cmt`.
+    ///
+    /// Additive endpoints contribute 0 (variance is `σ_add²`, independent of f).
+    /// Proportional and combined endpoints contribute `2·σ_prop²` (variance has
+    /// a `f²·σ_prop²` term, so the second derivative w.r.t. f is constant).
+    /// `Single` ignores `cmt`; `PerCmt` dispatches on the endpoint registered
+    /// for `cmt`. Used by the Almquist Laplace FOCEI gradient's θ-axis β_j
+    /// chain — keeping the per-CMT routing here lets the same closed-form
+    /// gradient handle multi-endpoint models without changing the call site.
+    pub fn d2var_df2(&self, cmt: usize, sigma: &[f64]) -> f64 {
+        let (em, prop_sigma) = match self {
+            ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => (
+                        ep.error_model,
+                        ep.sigma_idx
+                            .first()
+                            .and_then(|&i| sigma.get(i))
+                            .copied()
+                            .unwrap_or(0.0),
+                    ),
+                    None => return 0.0,
+                }
+            }
+        };
+        match em {
+            ErrorModel::Additive => 0.0,
+            ErrorModel::Proportional | ErrorModel::Combined => 2.0 * prop_sigma * prop_sigma,
+        }
+    }
+
+    /// `d²(residual variance)/d(prediction f)²` with a per-observation custom
+    /// magnitude (#484/#576) — the second-derivative analogue of [`dvar_df_scaled`].
+    ///
+    /// The proportional loading carries the multiplier `m_prop`, so the variance's
+    /// `f²·(m_prop·σ_prop)²` term differentiates twice to `2·(m_prop·σ_prop)²`,
+    /// i.e. [`d2var_df2`] scaled by `m_prop²` — exactly the `m²` factor
+    /// [`dvar_df_scaled`] applies to `dvar_df`. Keeping the same scaling here lets
+    /// the M3 censored curvature (which differentiates the same `v(f)`) stay
+    /// internally consistent under a custom RUV magnitude, and the FOCEI outer
+    /// θ/σ gradient's direct-θ channel (`sens_outer_gradient::prepare_stacked`)
+    /// consume the same magnitude-scaled second derivative. A `mult` of all ones
+    /// reproduces [`d2var_df2`].
+    ///
+    /// [`dvar_df_scaled`]: ErrorSpec::dvar_df_scaled
+    /// [`dvar_df`]: ErrorSpec::dvar_df
+    /// [`d2var_df2`]: ErrorSpec::d2var_df2
+    pub fn d2var_df2_scaled(&self, cmt: usize, sigma: &[f64], mult: &[f64]) -> f64 {
+        let Some(prop_slot) = self.prop_sigma_slot(cmt) else {
+            return 0.0;
+        };
+        let m = mult.get(prop_slot).copied().unwrap_or(1.0);
+        self.d2var_df2(cmt, sigma) * m * m
+    }
+
+    /// `d(residual variance)/d(log σ_k)` for one observation at `cmt`, where
+    /// `k` indexes the flat global sigma vector. Zero when `σ_k` does not enter
+    /// this observation's endpoint, so the SAEM sigma-gradient can sum this over
+    /// every observation and have each sigma pick up only its own endpoint's
+    /// contributions. (`Proportional` slot → `2·σ_k²·f²`, `Additive` slot →
+    /// `2·σ_k²`.)
+    pub fn dvar_dlogsigma(&self, cmt: usize, k: usize, f: f64, sigma: &[f64]) -> f64 {
+        let sk = match sigma.get(k) {
+            Some(&s) => s,
+            None => return 0.0,
+        };
+        let sk2 = sk * sk;
+        // Resolve which `SigmaType` (if any) global index `k` plays for this
+        // observation's endpoint.
+        let stype = match self {
+            ErrorSpec::Single(em) => em.sigma_types().get(k).copied(),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => ep
+                        .sigma_idx
+                        .iter()
+                        .position(|&i| i == k)
+                        .and_then(|p| ep.error_model.sigma_types().get(p).copied()),
+                    None => None,
+                }
+            }
+        };
+        match stype {
+            Some(SigmaType::Proportional) => 2.0 * sk2 * f * f,
+            Some(SigmaType::Additive) => 2.0 * sk2,
+            None => 0.0,
+        }
+    }
+
+    /// Residual variance for one observation, dispatching on its compartment.
+    ///
+    /// For `Single` the `cmt` is ignored and the full `sigma` slice is used
+    /// (the back-compat path). For `PerCmt` the endpoint registered for `cmt`
+    /// selects the error model and slices `sigma` by its `sigma_idx`. Returns
+    /// `NaN` when `cmt` has no registered endpoint, or when an endpoint's
+    /// `sigma_idx` points outside `sigma` — defensive guards mirroring the
+    /// scaling path. Fit-time validation rejects an uncovered CMT up front,
+    /// and `build_error_spec` resolves indices against the real sigma vector,
+    /// so a `NaN` here is only reachable via a hand-constructed model.
+    /// Whether the residual variance depends on the prediction `f` for any
+    /// endpoint (proportional or combined). When `false` (purely additive),
+    /// the variance is constant in `f`, so FOCE's choice of evaluation point
+    /// (linearized `f0` vs population `f(η=0)`) is irrelevant and the cheap
+    /// path stays bit-identical. Used to gate the FOCE population-variance
+    /// (`f(η=0)`) treatment in the marginal, analytical gradient, and
+    /// covariance step.
+    pub fn has_f_dependent_variance(&self) -> bool {
+        match self {
+            ErrorSpec::Single(em) => !matches!(em, ErrorModel::Additive),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => map
+                .values()
+                .any(|ep| !matches!(ep.error_model, ErrorModel::Additive)),
+        }
+    }
+
+    /// Global `sigma.values` indices of the additive component of every
+    /// `Combined` endpoint (the second sigma slot). De-duplicated; empty when
+    /// no endpoint is combined.
+    pub fn combined_additive_sigma_indices(&self) -> Vec<usize> {
+        match self {
+            ErrorSpec::Single(ErrorModel::Combined) => vec![1],
+            ErrorSpec::Single(_) => Vec::new(),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                let mut out = Vec::new();
+                for endpoint in map.values() {
+                    if matches!(endpoint.error_model, ErrorModel::Combined) {
+                        if let Some(&idx) = endpoint.sigma_idx.get(1) {
+                            if !out.contains(&idx) {
+                                out.push(idx);
+                            }
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
+        match self {
+            ErrorSpec::Single(em) => residual_variance(*em, f_pred, sigma),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => {
+                        // Slice length is tied to the endpoint's error model
+                        // (1 for additive/proportional, 2 for combined); the max
+                        // is 2, so a stack buffer avoids a per-observation alloc.
+                        let n = ep.error_model.n_sigma();
+                        let mut buf = [0.0f64; 2];
+                        for k in 0..n.min(2) {
+                            match ep.sigma_idx.get(k).and_then(|&i| sigma.get(i)) {
+                                Some(&v) => buf[k] = v,
+                                None => return f64::NAN, // malformed spec / sigma length
+                            }
+                        }
+                        residual_variance(ep.error_model, f_pred, &buf[..n.min(2)])
+                    }
+                    None => f64::NAN,
+                }
+            }
+        }
+    }
 }
 
 /// Compute the R diagonal (vector of residual variances for all observations),
@@ -2002,5 +2481,52 @@ mod tests {
         let (r, dw) = iwres_autocorrelation(&[subj]);
         assert!(r.is_nan());
         assert!(dw.is_nan());
+    }
+}
+
+/// Residual variance `R` and its `f`-derivative `d = ∂R/∂f` for one observation,
+/// dispatching on whether a custom σ-magnitude is active (`mult_row = Some`): the
+/// scaled closed forms when it is, the legacy ones when it is not (`None` keeps
+/// the exact `variance_at`/`dvar_df` association bit-for-bit — the `_scaled`
+/// variants reassociate the `f`-dependent term by ~1 ULP). Callers apply
+/// `ruv_scale` (and any FD combination) at the call site so float association is
+/// unchanged. Diagonal-`R` only (`block_sigma` correlations force FD upstream).
+#[inline]
+pub(crate) fn residual_rd(
+    es: &ErrorSpec,
+    cmt: usize,
+    f: f64,
+    sigma: &[f64],
+    mult_row: Option<&[f64]>,
+) -> (f64, f64) {
+    match mult_row {
+        Some(m) => (
+            es.variance_at_scaled(cmt, f, sigma, &[], m),
+            es.dvar_df_scaled(cmt, f, sigma, m),
+        ),
+        None => (es.variance_at(cmt, f, sigma), es.dvar_df(cmt, f, sigma)),
+    }
+}
+
+/// [`residual_rd`] plus the second `f`-derivative `d2 = ∂²R/∂f²`.
+#[inline]
+pub(crate) fn residual_rd2(
+    es: &ErrorSpec,
+    cmt: usize,
+    f: f64,
+    sigma: &[f64],
+    mult_row: Option<&[f64]>,
+) -> (f64, f64, f64) {
+    match mult_row {
+        Some(m) => (
+            es.variance_at_scaled(cmt, f, sigma, &[], m),
+            es.dvar_df_scaled(cmt, f, sigma, m),
+            es.d2var_df2_scaled(cmt, sigma, m),
+        ),
+        None => (
+            es.variance_at(cmt, f, sigma),
+            es.dvar_df(cmt, f, sigma),
+            es.d2var_df2(cmt, sigma),
+        ),
     }
 }
