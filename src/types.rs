@@ -1147,11 +1147,10 @@ impl OmegaMatrix {
         let mut free_mask = DMatrix::from_element(n, n, false);
         for i in 0..n {
             for j in 0..n {
-                if i == j {
-                    free_mask[(i, j)] = true;
-                } else if !diagonal && m[(i, j)] != 0.0 {
-                    free_mask[(i, j)] = true;
-                }
+                // Diagonal entries are always free; an off-diagonal entry is
+                // free only in a non-diagonal block, and only where the parsed
+                // matrix is structurally non-zero (cross-block zeros stay fixed).
+                free_mask[(i, j)] = i == j || (!diagonal && m[(i, j)] != 0.0);
             }
         }
         Self::from_matrix_with_mask(m, names, diagonal, free_mask)
@@ -1541,10 +1540,15 @@ impl ErrorModel {
 /// σ channel once the endpoint is chosen). The closure mirrors the boxed-closure
 /// pattern used by [`ScaleFn`]; `branch_labels` carries source-order branch
 /// descriptions purely for `Debug`/diagnostics.
+/// Maps one observation's covariate snapshot to a 0-based endpoint key into
+/// `ErrorSpec::Selected.endpoints` (issue #658). Total: the parser requires a
+/// final `else`, so every observation resolves to some declared endpoint.
+pub type ErrorSelectFn = Box<dyn Fn(&HashMap<String, f64>) -> usize + Send + Sync>;
+
 pub struct ErrorSelector {
     /// Covariate map → 0-based endpoint key. Total: the parser requires a final
     /// `else`, so every observation resolves to some declared endpoint.
-    pub eval: Box<dyn Fn(&HashMap<String, f64>) -> usize + Send + Sync>,
+    pub eval: ErrorSelectFn,
     /// Human-readable branch descriptions (source order), for `Debug` output.
     pub branch_labels: Vec<String>,
 }
@@ -1800,6 +1804,12 @@ pub struct EtaParamInfo {
 pub type PkParamFn =
     Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>, f64) -> PkParams + Send + Sync>;
 
+/// Closure signature for `CompiledModel::tv_fn`: the typical-value evaluator.
+/// Receives `(theta, covariates)` and returns one typical value per
+/// `[individual_parameters]` assignment, in declaration order — parallel to
+/// `pk_indices` and `eta_map`.
+pub type TvFn = Box<dyn Fn(&[f64], &HashMap<String, f64>) -> Vec<f64> + Send + Sync>;
+
 /// Closure signature for `[scaling] obs_scale = <expr>` (Form B). Receives
 /// `(theta, eta, covariates, pk_params)` and returns the per-subject scale
 /// factor used to divide the raw prediction. `pk_params` is the subject-
@@ -1919,8 +1929,10 @@ impl AnalyticReadout {
 /// `y = <expr>`) is handled inside the ODE timeline loop via
 /// `OdeSpec::output_fn` instead — it replaces the state readout entirely,
 /// so it doesn't share the post-multiply path.
+#[derive(Default)]
 pub enum ScalingSpec {
     /// No scaling: prediction is returned as-is.
+    #[default]
     None,
     /// Constant divisor applied to every prediction.
     ScalarScale(f64),
@@ -1946,12 +1958,6 @@ pub enum ScalingSpec {
     /// at runtime as a defensive guard against hand-constructed
     /// CompiledModels.
     PerCmt(HashMap<usize, ScalingSpec>),
-}
-
-impl Default for ScalingSpec {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl ScalingSpec {
@@ -2557,7 +2563,7 @@ pub struct CompiledModel {
     /// and the eta application is driven by `sel_flat` rather than being
     /// positional. When `Some`, enables AD gradient computation in the
     /// inner loop; when `None` (e.g. ODE models), falls back to FD.
-    pub tv_fn: Option<Box<dyn Fn(&[f64], &HashMap<String, f64>) -> Vec<f64> + Send + Sync>>,
+    pub tv_fn: Option<TvFn>,
     /// Maps each `[individual_parameters]` assignment (by declaration order)
     /// to its PK parameter slot. E.g. for a model with CL, V, KA:
     /// `[PK_IDX_CL, PK_IDX_V, PK_IDX_KA] = [0, 1, 4]`. Parallel to the
@@ -2843,17 +2849,12 @@ pub struct FremConfig {
 /// The analytic `Dual2` gradient is exact up to floating-point roundoff; FD
 /// introduces `O(1e-9)` noise per component. For well-conditioned problems
 /// both converge to the same OFV within line-search tolerance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GradientMethod {
+    #[default]
     Auto,
     Ad,
     Fd,
-}
-
-impl Default for GradientMethod {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl CompiledModel {
@@ -3128,7 +3129,7 @@ impl CompiledModel {
     ///      `build_pk_param_fn`'s ODE branch (sequential pk_indices do not
     ///      reflect this), so we fall back to scanning `indiv_param_names`.
     pub fn has_lagtime(&self) -> bool {
-        if self.pk_indices.iter().any(|&i| i == PK_IDX_LAGTIME) {
+        if self.pk_indices.contains(&PK_IDX_LAGTIME) {
             return true;
         }
         self.indiv_param_names.iter().any(|n| {
@@ -3165,7 +3166,7 @@ impl CompiledModel {
     /// (`ALAG2` while `cmt` is 1) does not count — used to scope the SS+lag
     /// rejection (#719 gap 1) to the actual SS-dosed compartment.
     pub fn has_lagtime_on_cmt(&self, cmt: usize) -> bool {
-        if self.pk_indices.iter().any(|&i| i == PK_IDX_LAGTIME) {
+        if self.pk_indices.contains(&PK_IDX_LAGTIME) {
             return true;
         }
         self.indiv_param_names.iter().any(|n| {
@@ -3226,7 +3227,7 @@ impl CompiledModel {
     /// event-driven [`crate::pk::event_driven::EventSchedule`] cache when `F`
     /// could reshape an infusion window across the inner search (#419).
     pub fn has_bioavailability(&self) -> bool {
-        if self.pk_indices.iter().any(|&i| i == PK_IDX_F) {
+        if self.pk_indices.contains(&PK_IDX_F) {
             return true;
         }
         self.indiv_param_names.iter().any(|n| {
@@ -4020,6 +4021,14 @@ pub struct WarningEntry {
 /// stripped into `source_method`; the remaining message is matched against the
 /// fixed category vocabulary. Unrecognised messages fall back to
 /// `Warning`/`general`.
+// `if_same_then_else`: several arms of the match chain deliberately share an
+// outcome (notably the four `DataQuality` arms — ADDL/II, IOV occasion, missing
+// DV, and the LTBS/SS/EVID data group). They are kept as separate, individually
+// commented arms because each is a distinct warning family that happens to
+// classify the same today; collapsing them into one `||` condition would erase
+// the grouping and make re-categorising a single family a rewrite instead of a
+// one-line edit.
+#[allow(clippy::if_same_then_else)]
 pub fn classify_warning(raw: &str) -> WarningEntry {
     // Strip a leading "[METHOD] " chain prefix into source_method.
     let (source_method, msg) = if let Some(rest) = raw.strip_prefix('[') {
