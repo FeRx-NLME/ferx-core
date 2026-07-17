@@ -240,7 +240,7 @@ impl ErrorSpec {
             };
             v += 2.0 * ci * cj * corr.rho * si * sj;
         }
-        v.max(1e-12)
+        v.max(MIN_VARIANCE)
     }
 
     /// `SigmaType` for each entry of the flat global sigma vector, as a `Vec`
