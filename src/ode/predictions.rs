@@ -54,8 +54,8 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
 // `last_ss_equilibration_cycles`, `with_full_ss_equilibration`) are referenced directly
 // as `crate::dosing::…` by the tests, so they are not imported here.
 use crate::dosing::{
-    record_ss_equilibration_cycles, resolve_subject_doses, resolve_subject_doses_with,
-    SsStopTracker, SS_EQUILIBRATION_CYCLES,
+    note_ss_nonconvergence_if_capped, record_ss_equilibration_cycles, resolve_subject_doses,
+    resolve_subject_doses_with, SsStopTracker, SS_EQUILIBRATION_CYCLES,
 };
 
 /// Relative floor for truncating the steady-state **input-rate periodic sum** (#719). An
@@ -362,6 +362,7 @@ fn equilibrate_ss_state(
         );
         let mut tracker = SsStopTracker::default();
         let mut cycles_run = 0usize;
+        let mut early_stopped = false;
         for m in 0..n_pulses {
             let seg_start = m as f64 * dose.ii;
             let seg_end = seg_start + dose.ii;
@@ -378,10 +379,18 @@ fn equilibrate_ss_state(
             }
             cycles_run = m + 1;
             if tracker.should_stop(m, &u) {
+                early_stopped = true;
                 break;
             }
         }
         record_ss_equilibration_cycles(cycles_run);
+        // If the pulse train hit the cycle cap without converging, the returned trough may be
+        // materially below the true periodic steady state — surface a warning instead of silently
+        // under-reporting it (#867). Only a *nonlinear* disposition reaches this fallback (the
+        // linear closed form above returns early), so this is exactly the saturable
+        // heavy-accumulation case; a fast-contracting model early-stops and is left alone.
+        let (incr_prev, incr_last, incr_mag) = tracker.recent_increments();
+        note_ss_nonconvergence_if_capped(early_stopped, incr_prev, incr_last, incr_mag);
         return u;
     }
 

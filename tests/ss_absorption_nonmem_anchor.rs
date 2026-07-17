@@ -27,7 +27,7 @@
 //! `nonmem_anchor/results/ss_first_order.*`.
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::{fit, predict, read_nonmem_csv};
+use ferx_core::{fit, predict, read_nonmem_csv, simulate_with_options_diag, SimulateOptions};
 
 // `first_order(ka)` appears in central directly (its R_in is the appearance rate of an
 // ADVAN2 depot→central first-order absorption), and the readout `y = central/V` matches
@@ -146,4 +146,140 @@ fn fit_on_ss_absorption_converges() {
             "SS-absorption fit drifted a theta: got {est:.4}, truth {tv} (rel {rel:.2})"
         );
     }
+}
+
+/// A **saturable (Michaelis–Menten), heavily-accumulating** SS-absorption model whose closed-form
+/// linear fast path correctly declines, so equilibration falls to the 50-cycle pulse-train
+/// iteration — which under-converges when the per-cycle carryover ratio `ρ → 1` (#867). The
+/// dataset's mean absorbed input (AMT/II = 100/8 = 12.5) sits just below `Vmax = 13`, so the SS
+/// concentration saturates far above `Km = 20` and the iteration stops well short of the true
+/// periodic steady state. This drives the full public `simulate` path and asserts the
+/// non-convergence warning reaches `SimulationOutput.warnings` (the api-boundary drain) rather than
+/// being swallowed silently. Fast (an evaluation-only simulate, no convergence loop), so it is not
+/// slow-gated. The predictor-level detection is unit-tested in
+/// `ode::predictions::tests::ss_input_rate_heavy_accumulation_warns_non_convergence`.
+const SS_MM_HEAVY_ACCUM_MODEL: &str = r#"
+[parameters]
+  theta TVVMAX(13.0, 1.0, 100.0)
+  theta TVKM(20.0, 1.0, 5000.0)
+  theta TVKA(2.0, 0.05, 20.0)
+
+  omega ETA_X ~ 0.0
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  VMAX = TVVMAX
+  KM   = TVKM
+  KA   = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = first_order(ka=KA) - VMAX*central/(KM+central)
+
+[scaling]
+  y = central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  ode_reltol = 1e-6
+  ode_abstol = 1e-6
+"#;
+
+#[test]
+fn simulate_surfaces_ss_nonconvergence_warning_for_saturable_accumulation() {
+    let parsed = parse_full_model(SS_MM_HEAVY_ACCUM_MODEL).expect("model parses");
+    let model = parsed.model;
+    let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
+        .expect("dataset loads");
+
+    let out = simulate_with_options_diag(
+        &model,
+        &population,
+        &model.default_params,
+        1,
+        &SimulateOptions::default(),
+    )
+    .expect("simulate returns Ok");
+
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "saturable heavy-accumulation SS must surface a non-convergence warning through \
+         SimulationOutput.warnings; got: {:?}",
+        out.warnings
+    );
+    // Simulated rows are still produced (the under-converged trough is finite, just biased).
+    assert!(
+        !out.results.is_empty(),
+        "simulate must still return rows alongside the warning"
+    );
+}
+
+/// The blocking-bug regression (#874 review): `n_starts` defaults to `1`, so a plain `fit()` takes
+/// the single-start fast path — which must drain the SS non-convergence sink into
+/// `FitResult.warnings`, not just the multi-start arm. A couple of outer iterations run enough
+/// objective prediction passes to populate the sink; no convergence loop is needed (Tier-2), and
+/// covariance is off to keep it quick.
+#[test]
+fn fit_surfaces_ss_nonconvergence_warning_for_saturable_accumulation() {
+    let parsed = parse_full_model(SS_MM_HEAVY_ACCUM_MODEL).expect("model parses");
+    let model = parsed.model;
+    let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
+        .expect("dataset loads");
+
+    let mut opts = parsed.fit_options;
+    opts.outer_maxiter = 2;
+    opts.run_covariance_step = false;
+
+    let result = fit(&model, &population, &model.default_params, &opts).expect("fit returns Ok");
+
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "default single-start fit() must surface the SS non-convergence warning to \
+         FitResult.warnings; got: {:?}",
+        result.warnings
+    );
+}
+
+/// False-positive guard (#874 review): a *nonlinear* (Michaelis–Menten) SS-absorption model that
+/// still declines the linear closed-form fast path, but eliminates fast (`Vmax` ≫ mean input, so
+/// little saturation) — the pulse train contracts quickly and settles well inside the cycle
+/// budget. The sink must stay **empty**: a converged nonlinear model must not trip the warning on
+/// solver-noise jitter (the `rho ≥ 1` noise-floor short-circuit).
+#[test]
+fn simulate_stays_silent_for_benign_nonlinear_ss_absorption() {
+    let src = SS_MM_HEAVY_ACCUM_MODEL.replace(
+        "theta TVVMAX(13.0, 1.0, 100.0)",
+        "theta TVVMAX(500.0, 1.0, 5000.0)",
+    );
+    let parsed = parse_full_model(&src).expect("model parses");
+    let model = parsed.model;
+    let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
+        .expect("dataset loads");
+
+    let out = simulate_with_options_diag(
+        &model,
+        &population,
+        &model.default_params,
+        1,
+        &SimulateOptions::default(),
+    )
+    .expect("simulate returns Ok");
+
+    assert!(
+        !out.warnings
+            .iter()
+            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "benign fast-contracting nonlinear SS model must stay silent; got: {:?}",
+        out.warnings
+    );
 }
