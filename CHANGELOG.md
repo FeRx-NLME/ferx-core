@@ -71,6 +71,21 @@ section of the SDLC for the versioning policy).
   is forgiving of a loose mode).
 
 ### Fixed
+- **Analytic FOCEI sensitivities for IIV on an absorption lag feeding a `first_order` forcing**
+  (#880). Fixes to the rate-on onset of a built-in `first_order` (Bateman) input-rate forcing
+  whose arrival is a moving boundary — a compartment lagtime (`ALAG1`/`LAGTIME`) **or** a
+  per-route `lag=` (#859): (1) the exact second-order sensitivity block (`∂²f/∂η²`) was wrong —
+  disagreeing in sign and magnitude with finite differences — because the onset saltation's
+  curvature term dropped the forcing's own time-variation at the onset (`∂R_in/∂tad`), non-zero
+  only for such decaying kernels (constant infusion and zero-order windows were unaffected);
+  (2) under a time-varying covariate crossing the onset, the onset jump read its absorption-rate
+  constant and pathway fraction from the dose record's covariate snapshot instead of the segment
+  where the forcing actually turns on (NONMEM end-of-interval), giving a several-percent gradient
+  error; and (3) an `n = 1` (Erlang-2) `transit` kernel's continuous-but-kinked onset dropped its
+  curvature term. Both the shared-dose onset and the per-route onset are covered. Ordinary
+  predictions and — outside the TV-covariate case — the FOCEI gradient were already correct;
+  standard errors (the objective curvature) and the TV-covariate gradient now match finite
+  differences.
 - **Pre-flight flat-theta freeze no longer freezes an identifiable parameter with a
   coincidentally-tiny initial gradient** (#826 follow-up). The #826 guard freezes a theta
   whose outer gradient is ~0 at the initial estimate, on the premise it is unmapped. But a
