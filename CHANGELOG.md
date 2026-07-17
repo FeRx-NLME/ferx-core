@@ -74,16 +74,20 @@ section of the SDLC for the versioning policy).
   with a perturbation probe: it only freezes a theta that leaves the reconverged objective
   exactly unchanged when moved (genuinely unmapped). Identifiable-but-flat-at-init thetas are
   left free, so the fit recovers them.
-- **Steady-state dosing into a built-in absorption compartment now warns when its
-  equilibration does not converge** (#867). For an `SS=1` dose into a `first_order` /
-  `transit` / `igd` / `weibull` absorption compartment on a **nonlinear** (e.g.
-  Michaelis–Menten) disposition that accumulates heavily — elimination half-life far exceeding
-  the dosing interval `II` — the 50-cycle pulse-train equilibration can stop well short of the
-  true periodic steady state, previously returning a trough that was silently too low.
-  `fit()` / `simulate()` now estimate the remaining tail and surface a
-  warning when the returned steady state is materially under-converged, or when no periodic
-  steady state exists at all (mean input rate ≥ maximum elimination rate). The **linear** case
-  is exact and unaffected (it takes the closed-form `u_ss = (I − M)⁻¹·b` fast path, #835).
+- **Steady-state dosing into a built-in absorption compartment with a nonlinear disposition is
+  now solved accurately** (#867). For an `SS=1` dose into a `first_order` / `transit` / `igd` /
+  `weibull` absorption compartment on a **nonlinear** (e.g. Michaelis–Menten) disposition that
+  accumulates heavily — elimination half-life far exceeding the dosing interval `II` — the old
+  50-cycle pulse-train equilibration stopped well short of the true periodic steady state and
+  silently returned a trough that was too low (38–79% low in pathological cases). The periodic
+  steady state is now found by an Anderson-accelerated solve of the exact one-cycle fixed point
+  `u = P(u)` — a bounded handful of cycles across the clinical accumulation range — so
+  `predict()` / `simulate()` / `fit()` return the correct trough (and, for fits, analytic
+  sensitivities via a dual Newton derivative correction). A non-convergence warning is raised
+  (through `simulate()` / `fit()`) when **no** periodic steady state exists — mean input rate ≥
+  maximum elimination rate, a saturable drug dosed above its capacity — or, for an extreme model
+  the bounded solve cannot converge, in place of a silently-biased trough. The **linear** case is
+  exact via the closed form `u_ss = (I − M)⁻¹·b` (#835) and unchanged.
 - **FREM: the analytic gradients differentiated the wrong likelihood on covariate
   pseudo-observation rows** (#251). `individual_nll` scores a `FREMTYPE > 0` row against
   the prediction `theta[i] + eta[j]` with the dedicated covariate error `EPSCOV` — but the

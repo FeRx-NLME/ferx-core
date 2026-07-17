@@ -101,28 +101,48 @@ pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
     }
 }
 
-/// Closed-form periodic steady-state trough for an `SS=1` dose into a built-in absorption
-/// input-rate compartment on a **linear** disposition (#719).
+/// Tighten the ODE tolerance used for the SS **fixed-point equilibration** (#867). The value error
+/// of the periodic-SS trough is the one-cycle residual amplified by `1/(1−ρ)`, and a heavily-
+/// accumulating disposition has `ρ → 1`, so the per-cycle integration must be tighter than the
+/// model's *prediction* tolerance for the trough to be accurate (and for the Anderson stop not to
+/// false-fire on a still-drifting no-steady-state iterate). Floors `reltol`/`abstol` at
+/// `1e-9`/`1e-12` — a no-op when the model already integrates tighter. Cheap: equilibration is a
+/// one-time setup per evaluation, separate from the forward walk (which keeps the model tolerance).
 ///
-/// The system is `du/dt = A·u + f(t)`, where `A` is the (constant) disposition and `f` is the
-/// periodic absorption `R_in` (period `II`, the superposed pulse train — see
-/// [`add_prepared_input_rate_forcing`]'s SS branch). A linear periodic system has a closed-form
-/// boundary value:
+/// Also raises `max_steps` for the equilibration: at the tighter `reltol` one `II` cycle needs more
+/// adaptive steps, and `solve_ode` *silently returns the partial (under-integrated) state* on
+/// step-budget exhaustion (`solver.rs`, "Fill any remaining saveat points with last state"). A
+/// truncated one-cycle map `P` would hand the Anderson fixed point a wrong operator with no error
+/// signal, so give the tightened integration enough headroom (`≥ 200_000`) that a realistic PK
+/// cycle completes rather than truncating.
+pub(crate) fn ss_equilibration_opts(opts: &OdeSolverOptions) -> OdeSolverOptions {
+    let mut o = *opts;
+    o.reltol = o.reltol.min(1e-9);
+    o.abstol = o.abstol.min(1e-12);
+    o.max_steps = o.max_steps.max(200_000);
+    o
+}
+
+/// Periodic steady-state trough for an `SS=1` dose into a built-in absorption input-rate
+/// compartment (#719; nonlinear solve #867).
 ///
-/// ```text
-///   u_ss = (I − M)⁻¹ · b,   M = e^{A·II},   b = ∫₀^II e^{A(II−s)} f(s) ds.
-/// ```
+/// The system is `du/dt = f(u) + R_in(t)`, where `R_in` is the periodic absorption forcing
+/// (period `II`, the superposed pulse train — see [`add_prepared_input_rate_forcing`]'s SS branch).
+/// The steady-state trough is the fixed point `u = P(u)` of the one-cycle Poincaré map
+/// `P(u₀)` = "integrate one `II` cycle under `R_in` from `u₀`".
 ///
-/// `M` is built column-by-column from the *unforced* propagator (`ode.rhs` alone integrated one
-/// cycle), differenced against the unforced zero-state evolution so a constant source term
-/// (`rhs(0) ≠ 0`, an affine disposition) cancels; `b` is one forced cycle from a zero state under
-/// the periodic `R_in`. This costs `n_states + 3` ODE solves versus the up-to-50-cycle iteration.
+/// For a **linear** disposition that fixed point is a closed form —
+/// `u_ss = (I − M)⁻¹·b`, `M = e^{A·II}`, `b` one forced cycle from a zero state — costing
+/// `n_states + 3` ODE solves ([`equilibrate_ss_input_rate_fixed_point_g`]). For a **nonlinear**
+/// disposition (its self-check declines) the same fixed point is found by an Anderson-accelerated
+/// iteration on the identical `P` ([`anderson_ss_fixed_point_g`]) — a bounded handful of one-cycle
+/// solves, unlike the plain pulse train's `O(1/(1−ρ))`. Delegates both to
+/// [`equilibrate_ss_input_rate_g`].
 ///
-/// Returns `None` — so the caller falls back to the iterative equilibration — when the disposition
-/// is **nonlinear**: the returned `u_ss` is checked against one true forced cycle
-/// (`one_cycle(u_ss) == u_ss`), which only a linear (or affine) one-cycle map satisfies. Also
-/// declines on a singular `I − M` or any non-finite intermediate.
-fn equilibrate_ss_input_rate_fixed_point(
+/// Returns `None` — so the caller falls back to the capped pulse train + #867 warning — only when
+/// *neither* converges: a singular `I − M`, a non-finite intermediate, or `ρ ≥ 1` (mean input ≥
+/// maximum elimination, so no periodic steady state exists).
+fn equilibrate_ss_input_rate(
     ode: &crate::ode::OdeSpec,
     pk_params_flat: &[f64],
     dose: &DoseEvent,
@@ -137,10 +157,10 @@ fn equilibrate_ss_input_rate_fixed_point(
     }
 
     // Forced one-cycle RHS: the disposition plus the periodic absorption `R_in` of a single
-    // local SS pulse at t = 0 (its SS branch superposes the prior-pulse tails). Reused for `b`
-    // and for the fixed-point verification. `prepared` is built once by the caller
-    // (`equilibrate_ss_state`) and passed in so the fallback pulse-train iteration doesn't
-    // redo the same prep on a `None` return.
+    // local SS pulse at t = 0 (its SS branch superposes the prior-pulse tails). Reused for `b`,
+    // the fixed-point verification, and the Anderson iteration's `P`. `prepared` is built once by
+    // the caller (`equilibrate_ss_state`) and passed in so the fallback pulse-train iteration
+    // doesn't redo the same prep on a `None` return.
     let local_ss = [DoseEvent::new(0.0, dose.amt, dose.cmt, 0.0, true, ii)];
     let local_f_bio = [f_bio];
     let no_lag: [f64; 0] = [];
@@ -156,25 +176,26 @@ fn equilibrate_ss_input_rate_fixed_point(
         &no_zero,
     );
 
-    // Advance a state one cycle `[0, II]` under `rhs`, using production's own f64 stepper — so
-    // the trough *value* stays byte-identical to every other f64 SS prediction (only the linear
-    // solve inside the shared body differs from the historical nalgebra LU, by ~1e-13).
+    // Advance a state one cycle `[0, II]` under `rhs`. The equilibration integrates at a tightened
+    // tolerance (`ss_equilibration_opts`) so the fixed-point trough is accurate even when `ρ → 1`
+    // amplifies the per-cycle solver noise — the forward walk keeps the model tolerance.
+    let eq_opts = ss_equilibration_opts(opts);
     let advance = |rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64]| -> Option<Vec<f64>> {
-        solve_ode(rhs, u0, (0.0, ii), pk_params_flat, &[ii], opts)
+        solve_ode(rhs, u0, (0.0, ii), pk_params_flat, &[ii], &eq_opts)
             .last()
             .map(|p| p.u.clone())
     };
-    equilibrate_ss_input_rate_fixed_point_g::<f64, _, _>(
+    equilibrate_ss_input_rate_g::<f64, _, _>(
         n,
         ii,
-        opts.reltol,
-        opts.abstol,
+        eq_opts.reltol,
+        eq_opts.abstol,
         |u0| advance(ode.rhs.as_ref(), u0),
         |u0| advance(&forced_rhs, u0),
     )
 }
 
-/// Numeric-generic core of [`equilibrate_ss_input_rate_fixed_point`], shared by the production
+/// Numeric-generic core of [`equilibrate_ss_input_rate`], shared by the production
 /// `f64` predictor and the analytic-sensitivity walk (`T = Dual1/Dual2`, #835) so the fixed-point
 /// formula lives in exactly one place.
 ///
@@ -189,9 +210,9 @@ fn equilibrate_ss_input_rate_fixed_point(
 /// carries `∂u_ss/∂(θ,η)` (and the 2nd order) through the solve automatically — the implicit-
 /// function derivative, with no hand-assembled `dM`/`db`.
 ///
-/// Returns `None` — caller falls back to the iterative equilibration — on a **nonlinear**
-/// disposition (the one-/two-cycle self-check fails), a singular `I − M`, or any non-finite
-/// intermediate.
+/// Returns `None` — the caller ([`equilibrate_ss_input_rate_g`]) then tries the Anderson solve —
+/// on a **nonlinear** disposition (the one-/two-cycle self-check fails), a singular `I − M`, or any
+/// non-finite intermediate. (Only when Anderson *also* declines does the pulse-train fallback run.)
 pub(crate) fn equilibrate_ss_input_rate_fixed_point_g<T, FUnf, FFor>(
     n: usize,
     ii: f64,
@@ -263,6 +284,300 @@ where
     }
 }
 
+/// Bounded iteration budget for the Anderson-accelerated nonlinear periodic-SS solve (#867).
+/// Anderson converges geometrically-fast (in the number of *distinct decay modes*, not in
+/// `1/(1−ρ)`) even as the per-cycle carryover ratio `ρ → 1`, so a few dozen one-cycle solves
+/// suffice for any `ρ < 1` that admits a steady state. The cap is only a backstop for `ρ ≥ 1`
+/// (mean input ≥ maximum elimination → no periodic steady state), which falls through to the
+/// capped pulse train and the #867 non-convergence warning.
+const SS_ANDERSON_MAX_ITERS: usize = 80;
+
+/// Anderson-acceleration depth: how many past residual differences are mixed. A handful covers the
+/// low-dimensional PK compartment count (typically 1–3 states); more would only add near-parallel
+/// columns the Tikhonov damping discards.
+const SS_ANDERSON_WINDOW: usize = 5;
+
+/// One dual Newton correction of a value-converged Anderson iterate that snaps the **derivative**
+/// jets to the exact implicit-function derivative of the fixed point (#867).
+///
+/// Anderson's accelerated iterate has the converged *value* but a *derivative* that is a by-product
+/// of the (possibly large) extrapolation coefficients — for a slowly-contracting map (`ρ → 1`) that
+/// derivative can be several percent off, and a plain fixed-point cleanup would only contract it at
+/// the map's own rate `ρ`, so it does not scale. Instead take one Newton step of `F(u) = P(u) − u`
+/// from the converged value `u*`:
+///
+/// ```text
+///   u_new = u* + (I − J_P)⁻¹ · (P(u*) − u*),    J_P = ∂P/∂u |_{u*}.
+/// ```
+///
+/// Carried over the dual `T`, the artifact derivative `du*` of `u*` **cancels** in the step
+/// (`du_new = du* − (I − J_P)⁻¹[(I − J_P)·du* − P_θ] = (I − J_P)⁻¹ P_θ`), leaving exactly the
+/// implicit derivative `∂u*/∂(θ,η)` — the same object #835's linear closed form obtains from its
+/// `(I − M)⁻¹` dual solve, here linearised at the nonlinear fixed point. `J_P` is a finite-
+/// difference state-Jacobian (`n + 1` one-cycle solves), so the cost is `O(n)` regardless of how
+/// slowly the model accumulates. Returns `None` on a singular `I − J_P` or a failed solve, so the
+/// caller keeps the value-only result.
+fn newton_ss_derivative_correction_g<T, FFor>(
+    u_star: &[T],
+    n: usize,
+    advance_forced: &FFor,
+) -> Option<Vec<T>>
+where
+    T: crate::sens::num::PkNum,
+    FFor: Fn(&[T]) -> Option<Vec<T>>,
+{
+    let g0 = advance_forced(u_star)?; // P(u*)
+    let residual: Vec<T> = (0..n).map(|i| g0[i] - u_star[i]).collect();
+    // FD state-Jacobian `J_P` at `u*`. The perturbation is a *real* bump on the state value (it
+    // carries no jet), so each column's dual parts are `∂J_P/∂(θ,η)` — exactly what the dual solve
+    // below needs to propagate the 2nd-order derivative. Relative step, floored for a near-zero
+    // trough; one-sided (reusing `g0`) keeps it to `n + 1` solves.
+    let scale = u_star.iter().fold(1e-8_f64, |m, x| m.max(x.val().abs()));
+    let eps = 1e-5 * scale;
+    let mut i_minus_j = vec![T::from_f64(0.0); n * n];
+    for i in 0..n {
+        let mut up = u_star.to_vec();
+        up[i] = up[i] + T::from_f64(eps);
+        let gi = advance_forced(&up)?;
+        for r in 0..n {
+            let j_ri = (gi[r] - g0[r]) / T::from_f64(eps);
+            let delta_ri = T::from_f64(if r == i { 1.0 } else { 0.0 });
+            i_minus_j[r * n + i] = delta_ri - j_ri;
+        }
+    }
+    let step = crate::sens::linsolve::solve_linear_system_g::<T>(&i_minus_j, &residual, n)?;
+    let u_new: Vec<T> = (0..n).map(|i| u_star[i] + step[i]).collect();
+    if u_new.iter().any(|x| !x.val().is_finite()) {
+        return None;
+    }
+    Some(u_new)
+}
+
+/// Solve the nonlinear periodic steady state `u* = P(u*)` for an SS-into-absorption dose on a
+/// **nonlinear** disposition (#867), where `P = advance_forced` integrates one `II` cycle under the
+/// periodic absorption forcing `R_in` — the *same* stationary Poincaré map the linear closed form
+/// `u_ss = (I − M)⁻¹·b` inverts exactly, here solved by [Anderson acceleration] for a disposition
+/// whose one-cycle map is not affine. This replaces the plain pulse-train iteration, which is a
+/// geometric contraction costing `O(1/(1−ρ))` cycles and so silently under-converges when a
+/// saturable disposition accumulates heavily (`ρ → 1`); Anderson reaches the same fixed point in a
+/// bounded handful of one-cycle solves, cheap enough for the fit hot path.
+///
+/// Generic over `T`: run over a dual it carries `∂u*/∂(θ,η)` (and the 2nd order) through the same
+/// recursion. The mixing coefficients `γ` are chosen to annihilate the **value** residual and then
+/// applied to the whole `T` state, so the converged derivative is the implicit-function derivative
+/// of the converged value — the analytic gradient, with no hand-assembled `dM`/`db`, exactly as the
+/// linear fixed point obtains it from the dual linear solve (verified against FD in
+/// `ss_input_rate_nonlinear_dual_gradient_matches_fd`).
+///
+/// Returns `None` — caller falls back to the capped pulse train + warning — when it fails to
+/// contract within [`SS_ANDERSON_MAX_ITERS`] (a non-finite iterate, or `ρ ≥ 1`: no periodic SS).
+///
+/// [Anderson acceleration]: https://doi.org/10.1137/10078356X
+fn anderson_ss_fixed_point_g<T, FFor>(
+    n: usize,
+    ii: f64,
+    reltol: f64,
+    abstol: f64,
+    advance_forced: &FFor,
+) -> Option<Vec<T>>
+where
+    T: crate::sens::num::PkNum,
+    FFor: Fn(&[T]) -> Option<Vec<T>>,
+{
+    if !(ii > 0.0) || n == 0 {
+        return None;
+    }
+    // Each `P` evaluation carries O(reltol) adaptive-quadrature noise, so the value part cannot be
+    // driven below a small multiple of `reltol`; target that floor (with an abstol cushion).
+    let conv_tol = (8.0 * reltol).max(1e-12);
+    let zero = vec![T::from_f64(0.0); n];
+    // Seed with one forced cycle from a zero state (the linear `b` — the single-period response
+    // ignoring accumulation): finite, cheap, and in the basin of any disposition that admits a
+    // steady state.
+    let mut u = advance_forced(&zero)?;
+    // Divergence ceiling: a genuine periodic SS is at most `≈ 1/(1−ρ)` times this single-period
+    // response, so any iterate a huge factor beyond it means the map is not contracting (no SS) —
+    // and, crucially, Anderson can extrapolate a *divergent* map to a spurious near-stationary
+    // point (a huge value where a saturated RHS barely moves), whose small *relative* residual
+    // would otherwise false-trip the convergence test. Bail so the caller falls to the capped
+    // pulse train + #867 warning instead of returning garbage (e.g. a huge negative "trough").
+    let seed_mag = u.iter().fold(1.0_f64, |m, x| m.max(x.val().abs()));
+    let diverged_ceiling = 1e8 * seed_mag;
+    // Seed-scale residual bound (#867). The `conv_tol·max_mag` test above is *relative to the
+    // current iterate*, so once Anderson inflates a divergent (no-SS, over-capacity) map to a huge
+    // value the real per-cycle surplus `Δ = (mean input − max elimination)·II` — an `O(input)`
+    // quantity, NOT solver noise — hides beneath it and false-trips convergence (returning a huge
+    // or even negative "trough"). A *genuine* fixed point's residual is only solver noise
+    // (`≈ reltol·magnitude`), so it also clears a bound anchored to the SEED: `√reltol` leaves ample
+    // headroom for a legitimately huge deep-accumulation SS (up to `≈ seed/√reltol`) while an
+    // `O(input)` surplus fails it. Combined with a non-negativity check (compartment amounts cannot
+    // be negative) at the acceptance point below, this rejects the spurious inflation.
+    let seed_residual_bound = reltol.sqrt().max(1e-7) * seed_mag + abstol;
+    let mut u_hist: Vec<Vec<T>> = Vec::with_capacity(SS_ANDERSON_WINDOW + 1);
+    let mut g_hist: Vec<Vec<T>> = Vec::with_capacity(SS_ANDERSON_WINDOW + 1);
+    // Previous iterate, to confirm the sequence has *settled* (see the step test below).
+    let mut u_prev: Option<Vec<T>> = None;
+    for iter in 0..SS_ANDERSON_MAX_ITERS {
+        let g = advance_forced(&u)?;
+        if g.iter()
+            .any(|x| !x.val().is_finite() || x.val().abs() > diverged_ceiling)
+        {
+            return None;
+        }
+        // Relative-L∞ residual of the one-cycle map on the value parts.
+        let (mut max_res, mut max_mag) = (0.0_f64, 0.0_f64);
+        for (gi, ui) in g.iter().zip(&u) {
+            max_res = max_res.max((gi.val() - ui.val()).abs());
+            max_mag = max_mag.max(gi.val().abs());
+        }
+        let tol = conv_tol * max_mag + abstol;
+        // Convergence needs BOTH a small residual (`u` is a fixed point of `P`) AND a settled
+        // iterate (`u` barely moved since the previous step). The step test is what stops a
+        // *divergent* map from false-converging: Anderson can hurl the iterate to a huge value
+        // where a saturated RHS is nearly stationary — its residual is small *relative* to that
+        // inflated magnitude, but it was reached by an enormous jump, so the step is not small.
+        let settled_step = match &u_prev {
+            Some(p) => {
+                u.iter()
+                    .zip(p)
+                    .fold(0.0_f64, |m, (a, b)| m.max((a.val() - b.val()).abs()))
+                    <= tol
+            }
+            None => false, // the seed is not, on its own, evidence of convergence
+        };
+        if max_res <= tol && settled_step {
+            // The magnitude-relative test flagged a candidate fixed point — but confirm it is a
+            // *genuine* periodic SS, not a spurious no-steady-state inflation (#867): the residual
+            // must also be small on the seed scale, and a compartment amount cannot be negative. A
+            // candidate that satisfies the relative test yet fails either is an over-capacity map
+            // Anderson extrapolated to garbage; there is no periodic SS, so decline (→ caller's
+            // capped pulse train + #867 warning) rather than return it.
+            let nonneg = g.iter().all(|x| x.val() >= -(tol + abstol));
+            if max_res > seed_residual_bound || !nonneg {
+                return None;
+            }
+            // Value converged. One dual Newton step snaps the derivative jets to the exact
+            // implicit-function derivative (the Anderson iterate's derivative is an extrapolation
+            // by-product). On a singular `I − J_P` — the `ρ ≈ 1` degenerate boundary, where the
+            // value would barely have converged anyway — fall back to the value-converged image `g`
+            // (which then carries the artifact derivative; a `ρ ≈ 1` corner not reached by any
+            // genuinely-contracting model).
+            record_ss_equilibration_cycles(iter + 1);
+            return newton_ss_derivative_correction_g(&g, n, advance_forced).or(Some(g));
+        }
+        u_hist.push(u.clone());
+        g_hist.push(g.clone());
+        if u_hist.len() > SS_ANDERSON_WINDOW + 1 {
+            u_hist.remove(0);
+            g_hist.remove(0);
+        }
+        u_prev = Some(u.clone());
+        u = anderson_combine::<T>(&u_hist, &g_hist, n);
+    }
+    None
+}
+
+/// One Anderson-acceleration mixing step (β = 1). Given the retained iterate/image history
+/// (`u_hist[i]`, `g_hist[i] = P(u_hist[i])`), form the residual differences `ΔF` on the **value**
+/// parts, solve the small least-squares `γ = argmin‖f_last − ΔF·γ‖` via the Tikhonov-damped normal
+/// equations ([`solve_linear_system_g`](crate::sens::linsolve::solve_linear_system_g) over `f64`),
+/// and return `g_last − ΔG·γ` in `T` arithmetic so a dual state's derivative rides the same
+/// combination. Reduces to a plain Picard step (`g_last`) with a single history point or a singular
+/// least-squares.
+fn anderson_combine<T: crate::sens::num::PkNum>(
+    u_hist: &[Vec<T>],
+    g_hist: &[Vec<T>],
+    n: usize,
+) -> Vec<T> {
+    let k = u_hist.len();
+    let g_last = &g_hist[k - 1];
+    if k < 2 {
+        return g_last.clone(); // Picard
+    }
+    let m = k - 1; // difference-column count
+                   // Residual value parts f_i = g_i − u_i, then columns ΔF_j = f_{j+1} − f_j (n × m).
+    let f: Vec<Vec<f64>> = (0..k)
+        .map(|i| {
+            (0..n)
+                .map(|r| g_hist[i][r].val() - u_hist[i][r].val())
+                .collect()
+        })
+        .collect();
+    let df = |r: usize, j: usize| f[j + 1][r] - f[j][r];
+    // Normal equations A = ΔFᵀΔF (m × m), rhs = ΔFᵀ f_last.
+    let mut a = vec![0.0_f64; m * m];
+    let mut rhs = vec![0.0_f64; m];
+    for i in 0..m {
+        for j in 0..m {
+            let mut s = 0.0;
+            for r in 0..n {
+                s += df(r, i) * df(r, j);
+            }
+            a[i * m + j] = s;
+        }
+        let mut s = 0.0;
+        for r in 0..n {
+            s += df(r, i) * f[k - 1][r];
+        }
+        rhs[i] = s;
+    }
+    // Tikhonov floor stabilises a rank-deficient history (near-parallel difference columns).
+    let diag_max = (0..m).fold(0.0_f64, |mx, i| mx.max(a[i * m + i]));
+    let lambda = 1e-12 * diag_max.max(1.0);
+    for i in 0..m {
+        a[i * m + i] += lambda;
+    }
+    let gamma = match crate::sens::linsolve::solve_linear_system_g::<f64>(&a, &rhs, m) {
+        Some(g) => g,
+        None => return g_last.clone(), // singular → Picard
+    };
+    // u_next = g_last − Σ_j γ_j (g_{j+1} − g_j)   [T arithmetic threads the dual jets].
+    let mut u_next = g_last.clone();
+    for j in 0..m {
+        let gj = T::from_f64(gamma[j]);
+        for r in 0..n {
+            u_next[r] = u_next[r] - gj * (g_hist[j + 1][r] - g_hist[j][r]);
+        }
+    }
+    u_next
+}
+
+/// Periodic steady-state trough for an SS-into-absorption dose, generic over `T` (#867). Tries the
+/// **linear** closed form [`equilibrate_ss_input_rate_fixed_point_g`] first (exact, one linear
+/// solve); on a nonlinear disposition — where its self-check declines — falls to the
+/// [Anderson-accelerated][`anderson_ss_fixed_point_g`] solve of the same `u = P(u)` fixed point.
+/// Both share the injected one-cycle propagators, so a caller assembles its solver/forcings once.
+/// Returns `None` only when *neither* converges (`ρ ≥ 1`: no periodic steady state), leaving the
+/// caller's capped pulse-train fallback to run and the #867 warning to fire.
+pub(crate) fn equilibrate_ss_input_rate_g<T, FUnf, FFor>(
+    n: usize,
+    ii: f64,
+    reltol: f64,
+    abstol: f64,
+    advance_unforced: FUnf,
+    advance_forced: FFor,
+) -> Option<Vec<T>>
+where
+    T: crate::sens::num::PkNum,
+    FUnf: Fn(&[T]) -> Option<Vec<T>>,
+    FFor: Fn(&[T]) -> Option<Vec<T>>,
+{
+    // `&F` still implements `Fn` when `F: Fn`, so borrowing lets the linear attempt and the
+    // Anderson fallback share the same two closures without moving them.
+    if let Some(u_ss) = equilibrate_ss_input_rate_fixed_point_g::<T, _, _>(
+        n,
+        ii,
+        reltol,
+        abstol,
+        &advance_unforced,
+        &advance_forced,
+    ) {
+        record_ss_equilibration_cycles(1);
+        return Some(u_ss);
+    }
+    anderson_ss_fixed_point_g::<T, _>(n, ii, reltol, abstol, &advance_forced)
+}
+
 /// Pre-equilibrate the ODE state to its steady-state value for an SS=1
 /// dose with interval `dose.ii`. NONMEM SS=1 semantics: at the time of
 /// the SS dose, the compartments are loaded with the steady-state
@@ -329,18 +644,17 @@ fn equilibrate_ss_state(
     // *infusion* into an absorption compartment is out of scope here (gap 2, #719) — this
     // branch is bolus-record SS only.
     if !is_inf && input_rate_consumes_cmt(ode, dose.cmt) {
-        // Fast path: a *linear* disposition has a closed-form periodic steady state
-        // `u_ss = (I − M)⁻¹ b` (`equilibrate_ss_input_rate_fixed_point`), costing a handful of
-        // solves rather than the up-to-`SS_EQUILIBRATION_CYCLES` pulse-train iteration below.
-        // It self-verifies (a nonlinear RHS fails the fixed-point check), so a nonlinear
-        // disposition transparently falls through to the exact-but-slower iteration.
-        // Built once and reused by both the fixed-point attempt and the fallback below —
-        // `equilibrate_ss_input_rate_fixed_point` no longer redoes this prep on `None`.
+        // Periodic-SS solve for the fixed point `u = P(u)` of the one-cycle map: a *linear*
+        // disposition has the closed form `u_ss = (I − M)⁻¹ b` (a handful of solves); a *nonlinear*
+        // one is found by an Anderson-accelerated iteration on the same `P`, also in a bounded
+        // handful of one-cycle solves (`equilibrate_ss_input_rate`, records its own cycle count).
+        // Only `ρ ≥ 1` (no periodic steady state) returns `None` and falls through to the capped
+        // pulse-train iteration + #867 warning below. `prepared` is built once and reused by both
+        // the solve and the fallback.
         let prepared = prepare_input_rates(ode, pk_params_flat);
         if let Some(u_ss) =
-            equilibrate_ss_input_rate_fixed_point(ode, pk_params_flat, dose, f_bio, opts, &prepared)
+            equilibrate_ss_input_rate(ode, pk_params_flat, dose, f_bio, opts, &prepared)
         {
-            record_ss_equilibration_cycles(1);
             return u_ss;
         }
         let n_pulses = SS_EQUILIBRATION_CYCLES;

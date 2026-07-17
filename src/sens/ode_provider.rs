@@ -3638,8 +3638,11 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
 /// by [`equilibrate_ss_input_rate_fixed_point_g`](crate::ode::predictions::equilibrate_ss_input_rate_fixed_point_g)
 /// so `∂u_ss/∂(θ,η[,κ])` (and the 2nd order) fall out of the linear solve — exact analytic parity
 /// with production's fast path, and bit-identical in value. A **nonlinear** disposition fails the
-/// fixed point's self-check, so this falls back to the explicit pulse-train iteration (mirroring
-/// production's fallback), carrying the same jets through its finite loop.
+/// fixed point's self-check, so [`equilibrate_ss_input_rate_g`](crate::ode::predictions::equilibrate_ss_input_rate_g)
+/// solves the same `u = P(u)` by Anderson acceleration (#867), carrying the jets through its
+/// recursion + the dual Newton derivative correction. Only when *that* also declines — `ρ ≥ 1`, no
+/// periodic steady state — does this fall back to the explicit pulse-train iteration, carrying the
+/// same jets through its finite loop.
 ///
 /// Either way the returned trough is the pre-pulse SS carryover; the forward walk's
 /// `add_prepared_input_rate_forcing` superposes the current + prior pulses' still-arriving tails
@@ -3715,24 +3718,29 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
             du,
         );
     };
+    // Tightened equilibration tolerance so the fixed-point trough — and its dual jets — stay
+    // accurate as `ρ → 1` (mirrors the f64 `equilibrate_ss_input_rate`; #867). Bit-identical to the
+    // f64 path because both floor the same way.
+    let eq_opts = crate::ode::predictions::ss_equilibration_opts(opts);
     let advance = |rhs: &dyn Fn(&[T], &[T], f64, &mut [T]), u0: &[T]| -> Option<Vec<T>> {
-        solve_ode_g(rhs, u0, (0.0, ii), params, &[ii], opts)
+        solve_ode_g(rhs, u0, (0.0, ii), params, &[ii], &eq_opts)
             .last()
             .map(|p| p.u.clone())
     };
-    if let Some(u_ss) = crate::ode::predictions::equilibrate_ss_input_rate_fixed_point_g::<T, _, _>(
+    if let Some(u_ss) = crate::ode::predictions::equilibrate_ss_input_rate_g::<T, _, _>(
         n,
         ii,
-        opts.reltol,
-        opts.abstol,
+        eq_opts.reltol,
+        eq_opts.abstol,
         |u0| advance(&disposition, u0),
         |u0| advance(&forced, u0),
     ) {
-        crate::dosing::record_ss_equilibration_cycles(1);
         return u_ss;
     }
 
-    // ---- Fallback: explicit pulse-train iteration (nonlinear disposition). ----
+    // ---- Fallback: explicit pulse-train iteration (no periodic steady state, ρ ≥ 1). ----
+    // Reached only when both the linear closed form and the Anderson solve declined (a nonlinear
+    // disposition *with* a steady state is solved by Anderson above, not here).
     // Lay out `SS_EQUILIBRATION_CYCLES` past **non-SS** pulses at 0, II, 2II, … and integrate
     // segment-by-segment from a zero state; `R_in` is re-evaluated by absolute pulse age so an
     // absorption tail longer than `II` keeps contributing across cycle boundaries (mirrors the
