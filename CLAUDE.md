@@ -134,7 +134,7 @@ Set via `[fit_options]` in the model file or `EstimationMethod::FoceGn` / `FoceG
 ```
 .ferx file → parser/model_parser.rs → CompiledModel
 NONMEM CSV  → io/datareader.rs       → Population
-(CompiledModel, Population) → api/mod.rs:fit() → FitResult
+(CompiledModel, Population) → api/fit.rs:fit() → FitResult
 FitResult → io/output.rs → sdtab CSV + fit YAML
 ```
 
@@ -143,8 +143,7 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | Module | Purpose |
 |--------|---------|
 | `types.rs` | Core structs: `CompiledModel`, `Population`, `Subject`, `FitResult`, `FitOptions` |
-| `api/mod.rs` | Public API: `fit()`, `simulate()`, `predict()`, `fit_from_files()` |
-| `api/validation.rs` | Model/data validation gauntlet (`check_model_data`, `check_model_options`, `validate_model_file`, absorption/dosing/survival support asserts) shared by `fit()` and `ferx check`; re-exported through `api::` so paths are unchanged |
+| `api/` | Public API split into a thin `mod.rs` facade + domain submodules: `fit.rs` (`fit`/`fit_inner`), `run.rs` (file/data entrypoints), `simulate.rs`, `adaptive.rs`, `predict.rs`, `postfit.rs` (covariance/SE/shrinkage/warnings), `output_columns.rs`, `pool.rs` (thread pool), `validation.rs` (model/data checks — `check_model_data`, `validate_model_file`, absorption/dosing/survival asserts). `mod.rs` re-exports everything so `crate::api::*` paths and the crate-root `pub use api::{..}` are unchanged |
 | `parser/model_parser.rs` | Parses `.ferx` model DSL into `CompiledModel` with closures |
 | `pk/` | Analytical 1-cpt and 2-cpt PK solutions (IV, oral, infusion) with superposition |
 | `ode/solver.rs` | Dormand-Prince RK45 adaptive ODE solver |
