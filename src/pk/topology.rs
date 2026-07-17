@@ -228,15 +228,29 @@ mod tests {
                     .unwrap(),
                 "{m:?} central_slot"
             );
-            for (i, c) in t.channels.iter().enumerate() {
-                if c.is_some() {
-                    assert!(
-                        t.infusable.contains(&(i + 1)),
-                        "{m:?}: cmt {} is routable (channels[{i}]=Some) but not in infusable {:?}",
-                        i + 1,
-                        t.infusable
-                    );
-                }
+            let channel_set: Vec<usize> = t
+                .channels
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.map(|_| i + 1))
+                .collect();
+            // Every routable compartment must be a parse-accepted infusion target.
+            for &cmt in &channel_set {
+                assert!(
+                    t.infusable.contains(&cmt),
+                    "{m:?}: cmt {cmt} is routable but not in infusable {:?}",
+                    t.infusable
+                );
+            }
+            // For a WALK-SUPPORTED model `infusable` must EQUAL the channel set: an
+            // extra entry would let the parser accept a `D{cmt}` that `dose_channel`
+            // can't route, panicking the event walk at fit time. (A no-walk transit/IG
+            // model may legitimately keep `infusable` a superset — direction-only above.)
+            if t.event_walk_supported {
+                assert_eq!(
+                    t.infusable, channel_set,
+                    "{m:?}: walk-supported model's infusable must equal its channel set"
+                );
             }
         }
     }

@@ -74,6 +74,11 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
     // so the IOV branch must be reported explicitly (#466 review round 4 #1).
     let analytic = crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(model)
         || (crate::sens::provider::iov_sens_supported(model)
+            // Match the live IOV inner gate (`analytic_iov_inner`, inner_optimizer.rs):
+            // it also requires `omega_iov.is_some()`. `iov_sens_supported` can be true
+            // structurally for a non-IOV model, so without this the report would claim
+            // "Analytic" where the model actually has no IOV inner gradient at all.
+            && model.default_params.omega_iov.is_some()
             && !crate::estimation::inner_optimizer::analytic_inner_common_bail(model));
     if analytic {
         GradientMethodKind::Analytic

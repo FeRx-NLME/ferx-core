@@ -63,13 +63,24 @@ section of the SDLC for the versioning policy).
   is forgiving of a loose mode).
 
 ### Fixed
+- **Pre-flight flat-theta freeze no longer freezes an identifiable parameter with a
+  coincidentally-tiny initial gradient** (#826 follow-up). The #826 guard freezes a theta
+  whose outer gradient is ~0 at the initial estimate, on the premise it is unmapped. But a
+  near-zero *initial* gradient is not sufficient: e.g. a joint PK-TTE fit's event-model
+  hazard baseline `H0`, evaluated at `BETA = 0` where `hazard = H0` is momentarily flat in
+  the coupling term (and whose ODE-path outer gradient is finite-differenced), tripped the
+  guard and was frozen at its wrong initial value — biasing every other estimate
+  (`joint_pktte` CL/V drifted out of tolerance). The guard now **confirms** each candidate
+  with a perturbation probe: it only freezes a theta that leaves the reconverged objective
+  exactly unchanged when moved (genuinely unmapped). Identifiable-but-flat-at-init thetas are
+  left free, so the fit recovers them.
 - **Steady-state dosing into a built-in absorption compartment now warns when its
   equilibration does not converge** (#867). For an `SS=1` dose into a `first_order` /
   `transit` / `igd` / `weibull` absorption compartment on a **nonlinear** (e.g.
   Michaelis–Menten) disposition that accumulates heavily — elimination half-life far exceeding
   the dosing interval `II` — the 50-cycle pulse-train equilibration can stop well short of the
   true periodic steady state, previously returning a trough that was silently too low.
-  `predict()` (via `fit()` / `simulate()`) now estimates the remaining tail and surfaces a
+  `fit()` / `simulate()` now estimate the remaining tail and surface a
   warning when the returned steady state is materially under-converged, or when no periodic
   steady state exists at all (mean input rate ≥ maximum elimination rate). The **linear** case
   is exact and unaffected (it takes the closed-form `u_ss = (I − M)⁻¹·b` fast path, #835).
