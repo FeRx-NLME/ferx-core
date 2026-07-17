@@ -1,4 +1,5 @@
 use crate::pk;
+use crate::stats::residual_error::{residual_rd, residual_rd2};
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -1684,14 +1685,16 @@ fn gaussian_foce_accum(
         // residual-eta c̃ column only on ordinary PK rows.
         let frem_ov = frem_r_override.and_then(|o| o.get(j)).and_then(|v| *v);
         let is_pk_row = frem_ov.is_none();
-        let v_resid = if let Some(v) = frem_ov {
-            v
-        } else {
-            match mult_row(j) {
-                Some(m) => {
-                    error_spec.variance_at_scaled(err_keys[j], f, sigma_values, &[], m) * ruv_scale
-                }
-                None => error_spec.variance_at(err_keys[j], f, sigma_values) * ruv_scale,
+        // `residual_rd` returns the bare `(R, ∂R/∂f)` pair and leaves `ruv_scale`
+        // to the caller, so both carry the factor: scaling `R` by `exp(2·η_ruv)`
+        // multiplies `∂R/∂f` by the same amount, and the two cancel in `c_scale`
+        // below. FREM covariate rows take their variance from the override and
+        // contribute `∂R/∂f = 0` (additive near-zero sigma).
+        let (v_resid, dvar_df) = match frem_ov {
+            Some(v) => (v, 0.0),
+            None => {
+                let (rv, dv) = residual_rd(error_spec, err_keys[j], f, sigma_values, mult_row(j));
+                (rv * ruv_scale, dv * ruv_scale)
             }
         };
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
@@ -1702,18 +1705,9 @@ fn gaussian_foce_accum(
         data_ll += r * r / v + v.ln();
 
         // a_j = row j of H (∂f_j/∂η); c̃_{j,k} = (∂R_j/∂η_k)/R_j.
-        // For a PK eta: (∂R/∂f)·a / R; scaling R by exp(2η_ruv) multiplies both
-        // ∂R/∂f and R, so the factor cancels — hence scale dvar_df too.
+        // For a PK eta: (∂R/∂f)·a / R.
         // For the residual eta: ∂R/∂η_ruv = 2·R, so the column is the constant 2.
         let aj = h_matrix.row(j);
-        let dvar_df = if is_pk_row {
-            match mult_row(j) {
-                Some(m) => error_spec.dvar_df_scaled(err_keys[j], f, sigma_values, m) * ruv_scale,
-                None => error_spec.dvar_df(err_keys[j], f, sigma_values) * ruv_scale,
-            }
-        } else {
-            0.0 // FREM rows: additive near-zero sigma, ∂R/∂f = 0
-        };
         let c_scale = dvar_df / v;
         let inv_v = 1.0 / v;
         let c_ruv = |k: usize| -> f64 {
@@ -1746,18 +1740,8 @@ fn gaussian_foce_accum(
         // `v_resid`/`d`/`d2` all carry the same proportional-loading (`m²`) and
         // `exp(2·η_ruv)` scaling, so the censored curvature is built from mutually
         // consistent derivatives of one `v(f)`.
-        let (v_resid, d, d2) = match mult_row(j) {
-            Some(m) => (
-                error_spec.variance_at_scaled(cmt, f, sigma_values, &[], m) * ruv_scale,
-                error_spec.dvar_df_scaled(cmt, f, sigma_values, m) * ruv_scale,
-                error_spec.d2var_df2_scaled(cmt, sigma_values, m) * ruv_scale,
-            ),
-            None => (
-                error_spec.variance_at(cmt, f, sigma_values) * ruv_scale,
-                error_spec.dvar_df(cmt, f, sigma_values) * ruv_scale,
-                error_spec.d2var_df2(cmt, sigma_values) * ruv_scale,
-            ),
-        };
+        let (rv, dv, d2v) = residual_rd2(error_spec, cmt, f, sigma_values, mult_row(j));
+        let (v_resid, d, d2) = (rv * ruv_scale, dv * ruv_scale, d2v * ruv_scale);
         // Inflate by the EKF process-noise term exactly as the quantified rows do
         // (line above), so a censored row's `v` — in both the data term and `H̃` —
         // matches its subject's Gaussian rows under an SDE model. `p_obs` is
