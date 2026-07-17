@@ -3857,137 +3857,6 @@ fn duration_defined_infusion_into_first_order_absorption_matches_subdose_train()
     }
 }
 
-/// `first_order(ka)` absorption into a compartment with **Michaelis–Menten** (nonlinear)
-/// elimination: the one-cycle map is not affine, so the closed-form SS fixed point must
-/// decline (`equilibrate_ss_input_rate_fixed_point` → `None`) and the caller falls back to
-/// the iterative pulse-train equilibration, which handles the nonlinearity and still returns
-/// a finite steady-state profile (#719).
-#[test]
-fn ss_input_rate_nonlinear_disposition_falls_back_to_iteration() {
-    let ode = OdeSpec {
-        // Vmax reuses the CL slot, Km the V slot; `first_order` ka at slot 4.
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let vmax = p[crate::types::PK_IDX_CL];
-            let km = p[crate::types::PK_IDX_V];
-            dy[0] = -vmax * y[0] / (km + y[0]);
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: vec![InputRateForcing {
-            cmt: 0,
-            kind: InputRateKind::FirstOrder,
-            arg_slots: vec![4],
-            frac_slot: None,
-            lag_slot: None,
-        }],
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-    };
-    let mut pk = PkParams::default();
-    pk.values[crate::types::PK_IDX_CL] = 5.0; // Vmax
-    pk.values[crate::types::PK_IDX_V] = 8.0; // Km
-    pk.values[4] = 0.5; // ka
-    pk.values[crate::types::PK_IDX_F] = 1.0;
-    let ss = DoseEvent::new(0.0, 50.0, 1, 0.0, true, 8.0);
-
-    // The closed-form fixed point declines on the nonlinear one-cycle map.
-    let prepared = prepare_input_rates(&ode, &pk.values);
-    assert!(
-        equilibrate_ss_input_rate_fixed_point(
-            &ode,
-            &pk.values,
-            &ss,
-            1.0,
-            &ode.solver_opts,
-            &prepared
-        )
-        .is_none(),
-        "nonlinear disposition must decline the closed-form SS fixed point"
-    );
-
-    // The full equilibration still produces finite predictions via the iteration fallback.
-    let subj = make_subject(vec![ss], vec![1.0, 4.0, 7.9]);
-    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
-    assert_eq!(preds.len(), 3);
-    assert!(
-        preds.iter().all(|p| p.is_finite() && *p >= 0.0),
-        "nonlinear SS predictions (iteration fallback) must be finite: {preds:?}"
-    );
-}
-
-/// Calibration guard for the `256·reltol` verification bound (#835): a `first_order(ka)`
-/// absorption into a **linear** 1-cpt disposition MUST accept the closed-form fixed point —
-/// and the full equilibration record exactly one cycle — even at a tight `ode_reltol` (1e-10).
-/// The linear one-cycle residual is a solver-noise floor (≈ 45·reltol, from the two forced
-/// solves taking different adaptive step sequences); the earlier `32·reltol` bound sat *below*
-/// that floor, so the fast path was silently abandoned to the 50-cycle iteration at every
-/// realistic `reltol`. Without the fix this fails (`is_none()` / 50 cycles).
-#[test]
-fn ss_input_rate_linear_disposition_uses_fixed_point() {
-    let mut solver_opts = OdeSolverOptions::default();
-    solver_opts.reltol = 1e-10;
-    solver_opts.abstol = 1e-10;
-    let ode = OdeSpec {
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            dy[0] = -(cl / v) * y[0];
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts,
-        input_rate: vec![InputRateForcing {
-            cmt: 0,
-            kind: InputRateKind::FirstOrder,
-            arg_slots: vec![4],
-            frac_slot: None,
-            lag_slot: None,
-        }],
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-    };
-    let mut pk = PkParams::default();
-    pk.values[crate::types::PK_IDX_CL] = 1.0;
-    pk.values[crate::types::PK_IDX_V] = 20.0;
-    pk.values[4] = 0.15; // slow ka: t½,abs ≈ II, so the fixed point must handle carryover
-    pk.values[crate::types::PK_IDX_F] = 1.0;
-    let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0);
-
-    let prepared = prepare_input_rates(&ode, &pk.values);
-    assert!(
-        equilibrate_ss_input_rate_fixed_point(
-            &ode,
-            &pk.values,
-            &ss,
-            1.0,
-            &ode.solver_opts,
-            &prepared
-        )
-        .is_some(),
-        "a linear disposition must accept the closed-form SS fixed point at tight reltol"
-    );
-    // End-to-end: the full equilibration takes the fast path (one recorded cycle).
-    let subj = make_subject(vec![ss], vec![1.0, 4.0, 7.9]);
-    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
-    assert_eq!(
-        crate::dosing::last_ss_equilibration_cycles(),
-        1,
-        "linear SS-absorption must equilibrate via the closed-form fixed point"
-    );
-    assert!(preds.iter().all(|p| p.is_finite() && *p >= 0.0));
-}
-
 #[test]
 fn input_rate_consumes_cmt_matches_forcing_compartment() {
     let ode = transit_accumulator_spec(); // forcing on state 0 ≡ 1-based CMT 1
@@ -5938,18 +5807,11 @@ fn adaptive_observe_expression_flows_through_driver() {
 /// drain another's entry mid-read. Writers don't drain, so only readers need to coordinate.
 static SS_WARN_SINK_READER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A **heavily-accumulating** Michaelis–Menten SS-absorption model (mean input rate just below
-/// `Vmax`, so the per-cycle carryover ratio `ρ → 1`) equilibrates far short of the true
-/// periodic steady state in the 50-cycle cap. Before #867 the under-converged trough was
-/// returned silently; now the predictor deduplicates a non-convergence warning into the sink.
-/// End-to-end wiring test: a real `ode_predictions` walk over this model must populate the sink
-/// (the `dosing` unit tests cover the tail-estimate arithmetic and the "no warning when it
-/// converges" side).
-#[test]
-fn ss_input_rate_heavy_accumulation_warns_non_convergence() {
-    let _guard = SS_WARN_SINK_READER_GUARD.lock().unwrap();
-    crate::dosing::clear_ss_nonconvergence_warnings();
-    let ode = OdeSpec {
+/// A 1-cpt Michaelis–Menten SS-absorption `OdeSpec` (`first_order(ka)` into MM elimination),
+/// with `Vmax`/`Km`/`ka` in the CL/V/slot-4 positions the tests set. Shared by the #867
+/// nonlinear-SS tests.
+fn mm_ss_absorption_spec() -> OdeSpec {
+    OdeSpec {
         // Vmax reuses the CL slot, Km the V slot; `first_order` ka at slot 4.
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let vmax = p[crate::types::PK_IDX_CL];
@@ -5973,33 +5835,319 @@ fn ss_input_rate_heavy_accumulation_warns_non_convergence() {
         readout_program: None,
         indiv_param_program: None,
         dose_attr_map: Default::default(),
-    };
+    }
+}
+
+/// Explicit ground-truth trough: integrate a run-in of past pulses (non-SS, at 0, II, 2II, …)
+/// from a zero state until the pre-next-pulse trough stops moving — the #867 evidence table's
+/// methodology, a genuine periodic-SS reference independent of the solver under test. Returns
+/// `(trough, cycles_used)`; `cycles_used == max_cycles` means it did **not** converge (the
+/// caller asserts otherwise, so the reference is trustworthy). Each pulse's absorption tail is
+/// re-evaluated by absolute age, so a tail longer than `II` keeps contributing across cycles.
+fn explicit_ss_run_in(
+    ode: &OdeSpec,
+    pk: &[f64],
+    dose: &DoseEvent,
+    max_cycles: usize,
+) -> (Vec<f64>, usize) {
+    let prepared = prepare_input_rates(ode, pk);
+    let doses: Vec<DoseEvent> = (0..max_cycles)
+        .map(|m| DoseEvent::new(m as f64 * dose.ii, dose.amt, dose.cmt, 0.0, false, 0.0))
+        .collect();
+    let fbios = vec![1.0; max_cycles];
+    let no_lag: [f64; 0] = [];
+    let no_zero: [(usize, f64); 0] = [];
+    let train = wrap_rhs_with_forcings(
+        ode,
+        &doses,
+        &no_lag,
+        &fbios,
+        f64::NEG_INFINITY,
+        &prepared,
+        InfusionInput::Spanning(Vec::new()),
+        &no_zero,
+    );
+    let eq_opts = ss_equilibration_opts(&ode.solver_opts);
+    let mut u = vec![0.0; ode.n_states];
+    for m in 0..max_cycles {
+        let prev = u.clone();
+        let seg = (m as f64 * dose.ii, (m + 1) as f64 * dose.ii);
+        let sol = solve_ode(&train, &u, seg, pk, &[seg.1], &eq_opts);
+        if let Some(last) = sol.last() {
+            u.copy_from_slice(&last.u);
+        }
+        // Converged once the pre-pulse trough stops moving (relative-L∞ increment tiny).
+        let mag = u.iter().fold(0.0_f64, |a, &x| a.max(x.abs())).max(1e-300);
+        let inc = u
+            .iter()
+            .zip(&prev)
+            .fold(0.0_f64, |a, (&c, &p)| a.max((c - p).abs()));
+        if m > 0 && inc / mag < 1e-9 {
+            return (u, m + 1);
+        }
+    }
+    (u, max_cycles)
+}
+
+/// #867 fix: a slowly-accumulating saturable (Michaelis–Menten) SS-absorption model whose plain
+/// pulse-train needs **more than the 50-cycle cap** to converge is nonetheless solved to the
+/// true periodic steady state by the Anderson-accelerated fixed point. The trough must (a) match
+/// a self-certified explicit run-in (the genuine SS), (b) be reached in fewer cycles than that
+/// run-in — and specifically inside the cap that would have left the plain iteration short — and
+/// (c) emit **no** non-convergence warning.
+#[test]
+fn ss_input_rate_heavy_accumulation_converges_via_anderson() {
+    // Proves convergence via the thread-local cycle counter (`last_ss_equilibration_cycles`),
+    // not the process-global warning sink, so it needs no cross-test serialization.
+    let ode = mm_ss_absorption_spec();
     let mut pk = PkParams::default();
-    pk.values[crate::types::PK_IDX_CL] = 130.0; // Vmax
-    pk.values[crate::types::PK_IDX_V] = 1000.0; // Km (large → saturable, slow accumulation)
+    pk.values[crate::types::PK_IDX_CL] = 20.0; // Vmax
+    pk.values[crate::types::PK_IDX_V] = 100.0; // Km
     pk.values[4] = 2.0; // ka
     pk.values[crate::types::PK_IDX_F] = 1.0;
-    // Mean absorbed input 1000/8 = 125 < Vmax = 130: a periodic SS exists but ρ ≈ 0.96, so the
-    // 50-cycle iteration stops ~57% low (issue #867's Vmax=130,Km=1000 row).
-    let ss = DoseEvent::new(0.0, 1000.0, 1, 0.0, true, 8.0);
+    // Mean absorbed input 130/8 ≈ 16.3 < Vmax = 20 but deep into saturation (C_ss ≫ Km): the
+    // per-cycle carryover ρ ≈ 0.94, so the plain iteration needs a few hundred cycles — far past
+    // the 50-cycle cap that silently under-converged pre-#867.
+    let ss = DoseEvent::new(0.0, 130.0, 1, 0.0, true, 8.0);
+
+    // Self-certified reference: a plain run-in iterated until the trough stops moving.
+    let (truth, runin_cycles) = explicit_ss_run_in(&ode, &pk.values, &ss, 3000);
+    assert!(
+        runin_cycles < 3000,
+        "run-in reference must converge to be trustworthy (used {runin_cycles})"
+    );
+    assert!(
+        runin_cycles > SS_EQUILIBRATION_CYCLES,
+        "test model must genuinely exceed the {SS_EQUILIBRATION_CYCLES}-cycle cap (run-in used \
+         {runin_cycles}) — otherwise it would not exercise the pre-#867 under-convergence"
+    );
+
+    let prepared = prepare_input_rates(&ode, &pk.values);
+    let aa = equilibrate_ss_input_rate(&ode, &pk.values, &ss, 1.0, &ode.solver_opts, &prepared)
+        .expect("Anderson must converge for a disposition that admits a steady state");
+    // Anderson reached the fixed point in far fewer cycles than the plain run-in, and inside the
+    // cap that left the plain iteration short.
+    let aa_cycles = crate::dosing::last_ss_equilibration_cycles();
+    assert!(
+        (2..runin_cycles).contains(&aa_cycles),
+        "Anderson ({aa_cycles} cycles) must beat the plain run-in ({runin_cycles})"
+    );
+    // Matches the true periodic SS to solver precision (the 50-cap value would be materially low).
+    let rel = (aa[0] - truth[0]).abs() / truth[0];
+    assert!(
+        rel < 1e-2,
+        "Anderson trough {:.3} vs run-in {:.3} (rel {rel:.2e})",
+        aa[0],
+        truth[0]
+    );
+}
+
+/// #867 regression: a **deeply-saturated** over-capacity model (mean input just above `Vmax`,
+/// `Km` huge) has no periodic steady state, but the per-cycle surplus `Δ = (mean input − Vmax)·II`
+/// is tiny next to the single-period seed — so Anderson can extrapolate the divergent map to a
+/// huge (even negative) iterate where `Δ` hides beneath the magnitude-relative tolerance and
+/// false-trips convergence. Before the seed-scale residual + non-negativity guards these returned
+/// `Some(huge_or_negative)` with no warning; now every one must decline (`None`) so the caller
+/// warns. (The shallow `Km` case in `ss_input_rate_no_steady_state_warns` declined even without
+/// the guards — these are the cases that did not.)
+#[test]
+fn ss_input_rate_over_capacity_deep_saturation_declines() {
+    // (vmax, km, ka, amt, ii): mean = amt/ii > vmax (no SS); Km huge (deep saturation) so the
+    // per-cycle surplus Δ ≪ seed — the false-convergence regime.
+    let configs = [
+        (10.0, 5000.0, 2.0, 82.0, 8.0),
+        (10.0, 20000.0, 2.0, 85.0, 8.0),
+        (10.0, 50000.0, 3.0, 81.0, 8.0),
+        (20.0, 50000.0, 2.0, 165.0, 8.0),
+        (10.0, 200000.0, 3.0, 80.5, 8.0),
+    ];
+    for (vmax, km, ka, amt, ii) in configs {
+        let ode = mm_ss_absorption_spec();
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = vmax;
+        pk.values[crate::types::PK_IDX_V] = km;
+        pk.values[4] = ka;
+        pk.values[crate::types::PK_IDX_F] = 1.0;
+        let ss = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
+        let prepared = prepare_input_rates(&ode, &pk.values);
+        let res =
+            equilibrate_ss_input_rate(&ode, &pk.values, &ss, 1.0, &ode.solver_opts, &prepared);
+        assert!(
+            res.is_none(),
+            "over-capacity vmax={vmax} km={km} amt={amt} (mean {:.2} > vmax) has no SS: the \
+             solve must decline, not return a spurious trough {res:?}",
+            amt / ii
+        );
+    }
+}
+
+/// #867 boundary: when the mean input rate meets or exceeds the maximum elimination rate
+/// (`amt/II = 6.25 > Vmax = 5`), *no* periodic steady state exists — the per-cycle map is not a
+/// contraction. The Anderson solve must decline (not manufacture a false fixed point or hang),
+/// the caller falls to the capped pulse train, and the non-convergence warning fires.
+#[test]
+fn ss_input_rate_no_steady_state_warns() {
+    let _guard = SS_WARN_SINK_READER_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::dosing::clear_ss_nonconvergence_warnings();
+    let ode = mm_ss_absorption_spec();
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 5.0; // Vmax
+    pk.values[crate::types::PK_IDX_V] = 8.0; // Km
+    pk.values[4] = 0.5; // ka
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+    let ss = DoseEvent::new(0.0, 50.0, 1, 0.0, true, 8.0); // mean input 6.25 > Vmax 5
+
+    let prepared = prepare_input_rates(&ode, &pk.values);
+    assert!(
+        equilibrate_ss_input_rate(&ode, &pk.values, &ss, 1.0, &ode.solver_opts, &prepared)
+            .is_none(),
+        "no steady state exists (input ≥ Vmax): the solve must decline"
+    );
+
     let subj = make_subject(vec![ss], vec![1.0, 4.0, 7.9]);
     let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
     assert!(
         preds.iter().all(|p| p.is_finite()),
-        "predictions must stay finite even under-converged: {preds:?}"
+        "predictions must stay finite: {preds:?}"
     );
-    // It must NOT have taken the closed-form fast path (that's linear-only) — the iteration ran
-    // its full budget.
-    assert_eq!(
-        crate::dosing::last_ss_equilibration_cycles(),
-        SS_EQUILIBRATION_CYCLES,
-        "heavy-accumulation nonlinear SS must run the full cycle budget"
-    );
+    // A warning must fire (both the ρ ≥ 1 "no steady state" text and the near-ρ = 1 "below the
+    // true periodic steady state" text are valid here — the capped drift can estimate ρ either
+    // side of 1 — so assert on the shared prefix rather than one branch).
     let warnings = crate::dosing::take_ss_nonconvergence_warnings();
     assert!(
         warnings
             .iter()
-            .any(|w| w.contains("below the true periodic steady state")),
-        "heavy-accumulation nonlinear SS must surface a non-convergence warning; got: {warnings:?}"
+            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "an input-above-capacity model must surface a non-convergence warning; got: {warnings:?}"
     );
+}
+
+/// The Anderson solve carries analytic sensitivities: run over a dual it must return the
+/// *implicit-function derivative* `∂u*/∂θ` of the fixed point, not merely the value (#867). This
+/// isolates that mechanism on a scalar nonlinear contraction `P(u; θ) = θ/(1 + u)` whose fixed
+/// point and derivative are known in closed form — `u* = (−1 + √(1+4θ))/2`,
+/// `∂u*/∂θ = 1/√(1+4θ)` — and cross-checks against a finite difference of the f64 solve. If the
+/// AA mixing coefficients (chosen on the value residual) were applied incorrectly to the dual
+/// jets, the derivative would be wrong even though the value converged.
+#[test]
+fn ss_input_rate_nonlinear_dual_gradient_matches_fd() {
+    use crate::sens::dual1::Dual1;
+    let theta_val = 2.0_f64;
+    // P(u; θ) = θ / (1 + u), with θ seeded as the single differentiation variable.
+    let advance_dual = |u: &[Dual1<1>]| -> Option<Vec<Dual1<1>>> {
+        let theta = Dual1::<1>::var(theta_val, 0);
+        Some(vec![theta / (Dual1::<1>::constant(1.0) + u[0])])
+    };
+    let u_star = anderson_ss_fixed_point_g::<Dual1<1>, _>(1, 1.0, 1e-12, 1e-14, &advance_dual)
+        .expect("a scalar contraction converges");
+    let analytic_deriv = 1.0 / (1.0 + 4.0 * theta_val).sqrt(); // 1/3
+    assert!(
+        (u_star[0].value - 1.0).abs() < 1e-9,
+        "fixed-point value {} != 1",
+        u_star[0].value
+    );
+    assert!(
+        (u_star[0].grad[0] - analytic_deriv).abs() < 1e-5,
+        "dual ∂u*/∂θ {} vs analytic {analytic_deriv}",
+        u_star[0].grad[0]
+    );
+    // Cross-check the dual derivative against a central FD of the f64 fixed point.
+    let f64_fp = |th: f64| {
+        let adv = |u: &[f64]| -> Option<Vec<f64>> { Some(vec![th / (1.0 + u[0])]) };
+        anderson_ss_fixed_point_g::<f64, _>(1, 1.0, 1e-12, 1e-14, &adv).unwrap()[0]
+    };
+    let h = 1e-6;
+    let fd = (f64_fp(theta_val + h) - f64_fp(theta_val - h)) / (2.0 * h);
+    assert!(
+        (u_star[0].grad[0] - fd).abs() < 1e-4,
+        "dual ∂u*/∂θ {} vs FD {fd}",
+        u_star[0].grad[0]
+    );
+}
+
+/// #867 unit guards on `anderson_ss_fixed_point_g` itself (no ODE): a divergent map must be
+/// declined via the divergence ceiling / non-contraction, and the degenerate arguments return
+/// `None`. Uses synthetic scalar maps so it stays in the fast-test budget.
+#[test]
+fn anderson_declines_divergent_and_degenerate_maps() {
+    // Expanding affine map P(u) = 2u + 1: no fixed point above the seed, the iterate blows up
+    // past `diverged_ceiling` (or is caught as non-contracting) → None, never a false SS.
+    let diverging = |u: &[f64]| -> Option<Vec<f64>> { Some(vec![2.0 * u[0] + 1.0]) };
+    assert!(
+        anderson_ss_fixed_point_g::<f64, _>(1, 1.0, 1e-9, 1e-12, &diverging).is_none(),
+        "an expanding map has no periodic SS and must decline"
+    );
+    // A constant-surplus saturated map P(u) = u + 5: the value residual is a fixed 5 that never
+    // clears the seed-scale bound, so it must not false-converge to a huge iterate.
+    let surplus = |u: &[f64]| -> Option<Vec<f64>> { Some(vec![u[0] + 5.0]) };
+    assert!(
+        anderson_ss_fixed_point_g::<f64, _>(1, 1.0, 1e-9, 1e-12, &surplus).is_none(),
+        "a constant per-cycle surplus (no SS) must decline, not inflate to a false trough"
+    );
+    // Degenerate arguments.
+    let ok = |u: &[f64]| -> Option<Vec<f64>> { Some(vec![u[0]]) };
+    assert!(anderson_ss_fixed_point_g::<f64, _>(1, 0.0, 1e-9, 1e-12, &ok).is_none());
+    assert!(anderson_ss_fixed_point_g::<f64, _>(0, 1.0, 1e-9, 1e-12, &ok).is_none());
+}
+
+/// Calibration guard for the `256·reltol` verification bound (#835): a `first_order(ka)`
+/// absorption into a **linear** 1-cpt disposition MUST accept the closed-form fixed point —
+/// and the full equilibration record exactly one cycle — even at a tight `ode_reltol` (1e-10).
+/// The linear one-cycle residual is a solver-noise floor (≈ 45·reltol, from the two forced
+/// solves taking different adaptive step sequences); the earlier `32·reltol` bound sat *below*
+/// that floor, so the fast path was silently abandoned to the 50-cycle iteration at every
+/// realistic `reltol`. Without the fix this fails (`is_none()` / 50 cycles).
+#[test]
+fn ss_input_rate_linear_disposition_uses_fixed_point() {
+    let mut solver_opts = OdeSolverOptions::default();
+    solver_opts.reltol = 1e-10;
+    solver_opts.abstol = 1e-10;
+    let ode = OdeSpec {
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            dy[0] = -(cl / v) * y[0];
+        }),
+        n_states: 1,
+        state_names: vec!["central".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts,
+        input_rate: vec![InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![4],
+            frac_slot: None,
+            lag_slot: None,
+        }],
+        init_fn: None,
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+    };
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 1.0;
+    pk.values[crate::types::PK_IDX_V] = 20.0;
+    pk.values[4] = 0.15; // slow ka: t½,abs ≈ II, so the fixed point must handle carryover
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+    let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0);
+
+    let prepared = prepare_input_rates(&ode, &pk.values);
+    assert!(
+        equilibrate_ss_input_rate(&ode, &pk.values, &ss, 1.0, &ode.solver_opts, &prepared)
+            .is_some(),
+        "a linear disposition must accept the closed-form SS fixed point at tight reltol"
+    );
+    // End-to-end: the full equilibration takes the fast path (one recorded cycle).
+    let subj = make_subject(vec![ss], vec![1.0, 4.0, 7.9]);
+    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_cycles(),
+        1,
+        "linear SS-absorption must equilibrate via the closed-form fixed point"
+    );
+    assert!(preds.iter().all(|p| p.is_finite() && *p >= 0.0));
 }

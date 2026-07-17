@@ -118,28 +118,30 @@ steady state (see `tests/ss_absorption_nonmem_anchor.rs`). A closed-form
 `pk *_transit` / `*_ig` model with an `SS` dose reroutes to its ODE twin
 automatically, exactly as for time-varying covariates and IOV.
 
-::: {.callout-warning}
-## Slowly-accumulating saturable disposition
+::: {.callout-note}
+## Saturable (nonlinear) disposition
 
-The nonlinear fallback iterates the pulse train for a fixed budget (50 cycles). That is
-ample for the usual clinical range, but a **saturable** disposition (e.g. Michaelis–Menten)
-that accumulates heavily — elimination half-life far exceeding the interval `II`, so the
-per-cycle carryover ratio approaches 1 — can stop short of the true periodic steady state,
-returning an `SS` trough that is biased low. ferx now estimates the remaining tail and emits
-a warning (in `predict()` via `fit()` / `simulate()`) when the equilibration is materially
-under-converged, or when no periodic steady state exists at all because the mean input rate
-meets or exceeds the maximum elimination rate (phenytoin-like dosing above capacity). The
-**linear** case is exact and never triggers this — it uses the closed form above. A genuine
-nonlinear periodic-SS solve (accelerated iteration / Newton on the one-cycle map) is a scoped
-follow-up (#867).
+A nonlinear disposition (e.g. Michaelis–Menten) declines the linear closed form, so its
+periodic steady state is found by an **Anderson-accelerated solve** of the same one-cycle fixed
+point `u = P(u)` (#867). Across the clinical accumulation range this converges in a bounded handful
+of cycles even when the elimination half-life far exceeds `II` and the per-cycle carryover ratio
+approaches 1 — the regime where the earlier fixed-budget iteration silently stopped short and
+returned an `SS` trough biased low — so the trough (and its analytic sensitivities) are correct
+there. A case with **no periodic steady state** — a saturable drug whose mean input rate meets or
+exceeds its maximum elimination rate (phenytoin-like dosing above capacity), where the amount grows
+without bound — is declined and falls to the capped pulse train with a non-convergence warning
+(surfaced through `simulate()` / `fit()`; `predict()` returns the value without a warnings channel).
+An extreme genuinely-accumulating model that the bounded solve cannot converge degrades the same
+way rather than returning a silently-biased trough.
 :::
 
-`fit()` on an SS-absorption model works and converges. Its sensitivities currently
-use a finite-difference fallback (the prediction they difference is exact, and the
-closed-form trough makes it smooth and cheap enough to converge), so fitting a
-*large* SS-absorption dataset is slower than an analytic ODE model; an analytic
-dual SS-equilibration through the kernel — restoring full-speed FOCEI parity — is a
-scoped follow-up. Two `SS` combinations remain **rejected with a clear error**: a
+`fit()` on an SS-absorption model works and converges, with **analytic** FOCEI sensitivities:
+the closed-form linear trough carries its `∂u_ss/∂(θ,η)` through the dual linear solve (#835), and
+the nonlinear Anderson solve carries them through the same fixed-point recursion plus a dual Newton
+derivative correction (#867) — not the FD-of-prediction fallback the earlier nonlinear case used.
+(The Newton correction's state-Jacobian `J_P` is itself a finite difference, so the nonlinear-SS
+gradient carries an `O(reltol/eps)` term amplified by `1/(1−ρ)`; it is accurate across the clinical
+range but loosens as `ρ → 1`.) Two `SS` combinations remain **rejected with a clear error**: a
 `zero_order()` window (`E_ABSORPTION_SS_ZERO_ORDER` — a spanning window needs a
 distinct periodic-window equilibration) and an absorption **lagtime**
 (`E_ABSORPTION_SS_LAG` — the SS + lagtime pre-arrival seed is still bolus-only).
