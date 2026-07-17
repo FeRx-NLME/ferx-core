@@ -52,8 +52,10 @@ The binary is called `ferx` and outputs `{model}-fit.yaml` (estimates) and `{mod
 
 There are three tiers of tests. Put a new test in the lowest tier whose constraints it fits.
 
-**Tier 1 — Fast unit tests** (inline `#[cfg(test)] mod tests { ... }` blocks in `src/**/*.rs`)
+**Tier 1 — Fast unit tests** (`#[cfg(test)] mod tests { ... }` in `src/**/*.rs`)
 Test the smallest helper that isolates the behaviour; avoid calling `fit()`. Run with `cargo test --lib`. These run on every PR and must stay fast (seconds total).
+
+The test module is inline in most files, but in the largest ones it lives in a **sibling `#[path]` file** so the production source stays navigable: the parent declares `#[cfg(test)] #[path = "<file>_tests.rs"] mod tests;` and the body sits in `src/.../<file>_tests.rs` (or `<file>_<modname>.rs` when a file has several test modules; api's siblings live under `src/api/tests/`). The module is still a child of the parent, so `super::…` and cross-module `crate::<mod>::test_helpers` paths resolve unchanged, and the test's fully-qualified name is identical to the inline form. **Add new tests to the sibling when one exists.** A bare module-scope `#[cfg(test)]` helper (a `fn`, `thread_local!`, or `use`) stays in the parent — only the `mod` blocks move — so `super::` in the sibling still finds it.
 
 **Tier 2 — Integration tests** (`tests/*.rs`)
 Call the public API (`fit()`, `predict()`, etc.) but must return immediately — either with an `Ok` after a handful of outer iterations or with an `Err`. No convergence loops. These files are compile-checked on every PR (`cargo check --tests`) and run nightly in `slow-tests.yml`. Put tests here when you need to exercise a public-API boundary that can't be reached from a `src/` unit test.
@@ -132,7 +134,7 @@ Set via `[fit_options]` in the model file or `EstimationMethod::FoceGn` / `FoceG
 ```
 .ferx file → parser/model_parser.rs → CompiledModel
 NONMEM CSV  → io/datareader.rs       → Population
-(CompiledModel, Population) → api.rs:fit() → FitResult
+(CompiledModel, Population) → api/mod.rs:fit() → FitResult
 FitResult → io/output.rs → sdtab CSV + fit YAML
 ```
 
@@ -141,7 +143,8 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | Module | Purpose |
 |--------|---------|
 | `types.rs` | Core structs: `CompiledModel`, `Population`, `Subject`, `FitResult`, `FitOptions` |
-| `api.rs` | Public API: `fit()`, `simulate()`, `predict()`, `fit_from_files()` |
+| `api/mod.rs` | Public API: `fit()`, `simulate()`, `predict()`, `fit_from_files()` |
+| `api/validation.rs` | Model/data validation gauntlet (`check_model_data`, `check_model_options`, `validate_model_file`, absorption/dosing/survival support asserts) shared by `fit()` and `ferx check`; re-exported through `api::` so paths are unchanged |
 | `parser/model_parser.rs` | Parses `.ferx` model DSL into `CompiledModel` with closures |
 | `pk/` | Analytical 1-cpt and 2-cpt PK solutions (IV, oral, infusion) with superposition |
 | `ode/solver.rs` | Dormand-Prince RK45 adaptive ODE solver |
