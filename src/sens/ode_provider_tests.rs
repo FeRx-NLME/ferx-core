@@ -2381,15 +2381,15 @@ fn weibull_per_route_lag_stays_fd() {
     assert!(!ode_tvcov_supported(&m, &subj), "not on the TV-cov walk");
 }
 
-/// A per-route lag **combined with IOV** (`n_kappa != 0`) stays on the FD fallback on BOTH
-/// gates (#859). The non-IOV gate declines any `n_kappa != 0` model outright; the IOV gate
-/// (`ode_iov_supported`) must decline the route lag specifically — before this it had no
-/// `lag_slot` check, so a route-lagged IOV model would have taken the IOV analytic walk
-/// whose per-route onset sensitivity under κ is unvalidated (a silent-wrong gradient). This
-/// pins the decline: analytic IOV per-route lag is a follow-up; today it differences the
-/// exact f64 predictor.
+/// A per-route lag **combined with IOV** (`n_kappa != 0`) is analytic on the IOV gate since #877
+/// (was FD-gated under #859). The IOV walk is the same `integrate_tvcov_g`, so the per-kernel
+/// `route_lag_analytic()` classifier admits `first_order` here — its κ-sensitivity rides the
+/// per-occasion `pk_at_dose[k]` jet, FD-validated (value + gradient + Hessian) by the
+/// `ode_iov_*_route_lag_*_matches_fd` family in `provider_tests.rs`. The non-IOV gate still
+/// declines any `n_kappa != 0` model outright (its `n_kappa != 0` clause). A `weibull` route lag
+/// still declines on both gates (divergent β < 1 onset — see `ode_iov_weibull_route_lag_*`).
 #[test]
-fn per_route_lag_under_iov_stays_fd() {
+fn per_route_lag_under_iov_is_analytic() {
     const IOV_ROUTE_LAG: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -2426,15 +2426,15 @@ fn per_route_lag_under_iov_stays_fd() {
         1,
         "one route carries a per-route lag"
     );
-    // Non-IOV gate: declined by the `n_kappa != 0` clause.
+    // Non-IOV gate: still declined by the `n_kappa != 0` clause (an IOV model is off it).
     assert!(
         !ode_analytical_supported(&m),
         "an IOV model is off the non-IOV analytic gate"
     );
-    // IOV gate: declined specifically by the per-route-lag clause (#859).
+    // IOV gate: `first_order` route lag is now admitted analytically (#877).
     assert!(
-        !ode_iov_supported(&m),
-        "per-route lag under IOV must stay on the FD fallback"
+        ode_iov_supported(&m),
+        "#877: first_order per-route lag under IOV is analytic"
     );
 }
 

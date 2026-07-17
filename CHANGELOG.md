@@ -41,8 +41,15 @@ section of the SDLC for the versioning policy).
   each route's onset is a moving boundary carried by a rate-on saltation (and, for `zero_order`,
   a matching rate-off at the window end), so these fits run at full analytic speed. A per-route
   lag on a `weibull` forcing keeps the finite-difference fallback (its onset diverges for shape
-  β < 1, so no closed-form saltation exists), as does a per-route lag combined with IOV. The
-  predicted values are unchanged — only the gradient moves off finite differences.
+  β < 1, so no closed-form saltation exists). The predicted values are unchanged — only the
+  gradient moves off finite differences.
+- **Exact analytic FOCE/FOCEI gradients for per-route absorption lag under IOV** (#877). A
+  per-route absorption lag (`first_order` / `zero_order` / `transit` / `igd`) combined with
+  inter-occasion variability now uses exact analytic sensitivities too — the per-route onset
+  saltation carries each occasion's `κ` through the same event-driven walk as `η`/`θ`, so a
+  route-lag model with IOV fits at full analytic speed instead of finite differences. A
+  `weibull` per-route lag keeps the finite-difference fallback (as on the non-IOV path).
+  Predictions are unchanged.
 
 ### Changed
 - **`method = agq` removed; adaptive quadrature is now an *argument*, not a method**

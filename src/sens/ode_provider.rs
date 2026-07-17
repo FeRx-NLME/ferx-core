@@ -870,15 +870,27 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
         return false;
     }
-    // Per-route absorption lag (`fn(..., lag=L)`, #857) under IOV stays on the FD fallback.
-    // #859 made per-route lag analytic on the NON-IOV event-driven walk (the `K_ROUTE_ONSET`
-    // onset saltation), but IOV was scoped out — as in #857 Phase 1 and mirroring the non-IOV
-    // gate's own `n_kappa != 0` decline. Without this a route-lagged IOV model would take the
-    // IOV analytic walk, whose per-route onset sensitivity under κ has not been validated
-    // against FD; decline it here so it differences the (exact) f64 predictor instead. (Analytic
-    // IOV per-route lag is a follow-up; the non-IOV gate `ode_analytical_supported` classifies
-    // per kind — here every kernel's route lag is declined uniformly while IOV is out of scope.)
-    if ode.has_route_lag() {
+    // Per-route absorption lag (`fn(..., lag=L)`, #857) under IOV — admitted per kernel (#877),
+    // mirroring the non-IOV gate's own route-lag classifier (`ode_tvcov_supported`). The shared
+    // `integrate_tvcov_g` walk injects each route's onset saltation at its own
+    // `t_dose + lag_cmt + lag_route` (`K_ROUTE_ONSET`); the κ-sensitivity rides through the
+    // per-occasion `pk_at_dose[k]` jet exactly as η/θ do, and the onset-slope curvature term
+    // (`½·∂Δr/∂tad`, #880/#883) makes the FOCEI Hessian exact for the decaying `first_order`
+    // onset (whose δ² term is nonzero on any axis the lag carries — η or κ). So
+    // `first_order`/`zero_order`/`transit`/`igd` route lags are analytic under IOV, validated
+    // against central FD of `predict_iov` (`check_iov_provider_vs_fd`, value + gradient +
+    // Hessian). Only `weibull` + route lag stays FD — its onset diverges for shape `β < 1` (an
+    // integrable spike, no finite rate-on saltation), exactly as on the non-IOV path and as the
+    // compartment-lagtime gate below declines `weibull`. `route_lag_analytic()` is the
+    // exhaustive per-kind classifier (no `_` arm), shared with `ode_tvcov_supported` so the two
+    // paths cannot drift. (SS × route lag stays FD regardless, declined per subject in
+    // `ode_iov_subject_supported` via `ss_absorption_out_of_scope`'s `lag_slot` operand — the SS
+    // dual seed does not carry the per-route onset.)
+    if ode
+        .input_rate
+        .iter()
+        .any(|f| f.lag_slot.is_some() && !f.kind.route_lag_analytic())
+    {
         return false;
     }
     // `Weibull` + estimated lagtime stays FD on every path (IOV included): its onset diverges
