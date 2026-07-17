@@ -511,6 +511,37 @@ pub fn compute_scale(x: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+/// Gradient-based diagonal preconditioner (#864, [`ParameterScaling::Gradient`]).
+///
+/// Given an initial packed gradient `g0`, returns per-coordinate scale factors
+/// `s_i = 1 / max(|g0_i|, ε·max|g0|)`. In this module's convention the scale is a
+/// divisor of `x` (`x_s = x / s`) and a multiplier of the gradient
+/// (`g_s = g · s`), so `s_i = 1/|g0_i|` balances every scaled gradient component
+/// to ≈ ±1 at the start point — a coordinate-agnostic preconditioner that, unlike
+/// [`compute_scale`], does not assume log-space magnitudes.
+///
+/// The `ε·max|g0|` floor (ε = 1e-3) caps the scale ratio at 1e3, so a coordinate
+/// with a vanishing initial gradient (the log-transform trap, #864) gets a large
+/// but bounded step amplification rather than an unbounded one. A degenerate
+/// all-zero / non-finite gradient falls back to no scaling (`1.0`).
+pub fn compute_gradient_scale(g0: &[f64]) -> Vec<f64> {
+    const REL_FLOOR: f64 = 1e-3;
+    let gmax = g0.iter().fold(
+        0.0_f64,
+        |m, &g| if g.is_finite() { m.max(g.abs()) } else { m },
+    );
+    if gmax <= 0.0 {
+        return vec![1.0; g0.len()];
+    }
+    let floor = REL_FLOOR * gmax;
+    g0.iter()
+        .map(|&g| {
+            let mag = if g.is_finite() { g.abs() } else { 0.0 };
+            1.0 / mag.max(floor)
+        })
+        .collect()
+}
+
 /// Divide each element of `x` by the corresponding scale factor.
 /// `x_s = x / scale` — the representation seen by the outer optimizer.
 pub fn apply_scale(x: &[f64], scale: &[f64]) -> Vec<f64> {
@@ -619,6 +650,51 @@ pub(crate) fn block_chol_full(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    // ── gradient-based preconditioner (#864) ────────────────────────────────
+
+    #[test]
+    fn gradient_scale_balances_scaled_gradient_to_unit() {
+        // s_i = 1/|g_i| (well above the floor) → scaled gradient g_i·s_i = ±1.
+        let g0 = [4.0, -2.0, 8.0];
+        let s = compute_gradient_scale(&g0);
+        for (gi, si) in g0.iter().zip(&s) {
+            assert_relative_eq!((gi * si).abs(), 1.0, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn gradient_scale_floors_tiny_components() {
+        // A near-zero component (the log-transform trap) must not blow the scale
+        // up unboundedly: it is floored at ε·max|g| ⇒ scale ratio capped at 1e3.
+        let g0 = [1000.0, 1e-9];
+        let s = compute_gradient_scale(&g0);
+        // gmax = 1000, floor = 1e-3·1000 = 1.0 ⇒ s[1] = 1/1.0 = 1.0.
+        assert_relative_eq!(s[0], 1.0 / 1000.0, epsilon = 1e-12);
+        assert_relative_eq!(s[1], 1.0, epsilon = 1e-12);
+        // Ratio bounded by 1/REL_FLOOR = 1e3.
+        let ratio = s.iter().cloned().fold(0.0_f64, f64::max)
+            / s.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(ratio <= 1e3 + 1e-6, "scale ratio {ratio} exceeds 1e3 cap");
+    }
+
+    #[test]
+    fn gradient_scale_degenerate_gradient_is_identity() {
+        assert_eq!(compute_gradient_scale(&[0.0, 0.0]), vec![1.0, 1.0]);
+        let with_nan = compute_gradient_scale(&[f64::NAN, 0.0]);
+        assert_eq!(with_nan, vec![1.0, 1.0], "all non-finite/zero → no scaling");
+    }
+
+    #[test]
+    fn gradient_scale_ignores_nonfinite_component() {
+        // A non-finite component is treated as zero magnitude (floored), and does
+        // not corrupt gmax from the finite components.
+        let g0 = [5.0, f64::INFINITY];
+        let s = compute_gradient_scale(&g0);
+        assert_relative_eq!(s[0], 1.0 / 5.0, epsilon = 1e-12);
+        // floor = 1e-3·5 = 5e-3 ⇒ s[1] = 1/5e-3 = 200.
+        assert_relative_eq!(s[1], 200.0, epsilon = 1e-9);
+    }
 
     #[test]
     fn test_lower_tri_entries_frozen_order() {

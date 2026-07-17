@@ -144,7 +144,7 @@ pub fn optimize_population(
         | Optimizer::Mma
         | Optimizer::Bobyqa
         | Optimizer::Auto => optimize_nlopt(model, population, init_params, options),
-        Optimizer::Bfgs | Optimizer::Lbfgs => {
+        Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::Conditioned => {
             optimize_bfgs(model, population, init_params, options)
         }
         Optimizer::TrustRegion => crate::estimation::trust_region::optimize_trust_region(
@@ -974,6 +974,50 @@ fn compute_rescale2_scale(bounds: &PackedBounds) -> Vec<f64> {
         .collect()
 }
 
+/// One FOCE/FOCEI outer gradient at the (unscaled, packed) start point `x0`, for
+/// the [`ParameterScaling::Gradient`] preconditioner (#864). Runs a cold inner
+/// EBE solve (no warm start) then the analytic population gradient — the same
+/// machinery the outer loop uses per iteration, so the returned vector is exactly
+/// what `compute_gradient_scale` needs to balance the first step. Non-finite
+/// components are left as-is; `compute_gradient_scale` treats them as zero.
+fn initial_packed_gradient(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x0: &[f64],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let n_subj = population.subjects.len();
+    let params = unpack_params(x0, init_params);
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let (ehs, hms, _, kappas) = run_inner_loop_warm(
+        model,
+        population,
+        &params,
+        options.inner_maxiter,
+        options.inner_tol,
+        None,
+        Some(&mu_k),
+        options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
+    );
+    let mut idx = 0usize;
+    population_gradient(
+        x0,
+        n_subj,
+        init_params,
+        model,
+        population,
+        &ehs,
+        &hms,
+        &kappas,
+        bounds,
+        options,
+        &mut idx,
+    )
+}
+
 /// Resolve [`ParameterScaling::Auto`] to a concrete strategy. `Auto` applies
 /// `Abs` (per-coordinate magnitude scaling, normalise by |packed value|) to the
 /// gradient-based optimizers (`Bfgs`, `Lbfgs`, `NloptLbfgs`, `Slsqp`) and `None`
@@ -1096,6 +1140,12 @@ fn optimize_nlopt(
             } else {
                 compute_scale(&x0)
             }
+        }
+        // Gradient-based preconditioner (#864): one initial gradient at x0, then
+        // s_i = 1/max(|g_i|, ε·max|g|). Opt-in and independent of packing.
+        ParameterScaling::Gradient => {
+            let g0 = initial_packed_gradient(model, population, init_params, &x0, &bounds, options);
+            crate::estimation::parameterization::compute_gradient_scale(&g0)
         }
         // `Auto` is resolved away by `resolve_scaling`; group with `None`.
         ParameterScaling::None | ParameterScaling::Auto => {
@@ -1756,10 +1806,28 @@ fn optimize_bfgs(
         (f, g, ehs, hms)
     };
 
+    // The conditioned optimizer (#864) co-designs the whole path: it always uses
+    // the gradient-based preconditioner (not whatever `parameter_scaling` says),
+    // L-BFGS memory, and a strong-Wolfe line search (see the line-search call
+    // and `use_lbfgs` below). Isolating these behind the flag keeps the existing
+    // `Bfgs`/`Lbfgs` behaviour bit-identical.
+    let conditioned = matches!(options.optimizer, Optimizer::Conditioned);
+    let effective_scaling = if conditioned {
+        ParameterScaling::Gradient
+    } else {
+        resolve_scaling(options.parameter_scaling, options.optimizer)
+    };
+
     // Per-element scale factors for the BFGS outer loop.
-    let scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
+    let scale: Vec<f64> = match effective_scaling {
         ParameterScaling::Rescale2 => compute_rescale2_scale(&bounds),
         ParameterScaling::Abs => compute_scale(&x),
+        // Gradient-based preconditioner (#864): one initial gradient at x, then
+        // s_i = 1/max(|g_i|, ε·max|g|). Opt-in; independent of packing.
+        ParameterScaling::Gradient => {
+            let g0 = initial_packed_gradient(model, population, init_params, &x, &bounds, options);
+            crate::estimation::parameterization::compute_gradient_scale(&g0)
+        }
         ParameterScaling::None | ParameterScaling::Auto => {
             if options.scale_params {
                 compute_scale(&x)
@@ -1833,7 +1901,7 @@ fn optimize_bfgs(
     // curvature pairs (no dense matrix); `Optimizer::Bfgs` keeps the full inverse
     // Hessian `h_inv`. Both consume the same analytic gradient and Eq. 48 warm
     // EBEs below.
-    let use_lbfgs = matches!(options.optimizer, Optimizer::Lbfgs);
+    let use_lbfgs = matches!(options.optimizer, Optimizer::Lbfgs | Optimizer::Conditioned);
     const LBFGS_MEMORY: usize = 10;
     let mut s_hist: Vec<DVector<f64>> = Vec::new();
     let mut y_hist: Vec<DVector<f64>> = Vec::new();
@@ -1884,8 +1952,19 @@ fn optimize_bfgs(
         // Directional derivative of the direction actually used (post any reset).
         let dir_deriv: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
 
-        let ls =
-            backtracking_line_search_warm(&xs, &d, &g, f_val, &bounds_s, &cached_etas, &f_only_s);
+        let ls = if conditioned {
+            // Strong-Wolfe needs (f, ∇f) at trial points. Wrap `fdfg_s` with a
+            // throwaway gradient counter so line-search probes don't advance the
+            // reconverge schedule, and warm each probe from the current EBEs.
+            let mut ls_idx = grad_eval_idx;
+            let mut fg_ls = |xp: &[f64]| -> (f64, Vec<f64>) {
+                let (f, g_s, _e, _h) = fdfg_s(xp, &cached_etas, &mut ls_idx);
+                (f, g_s)
+            };
+            strong_wolfe_line_search_warm(&xs, &d, &g, f_val, &bounds_s, &mut fg_ls)
+        } else {
+            backtracking_line_search_warm(&xs, &d, &g, f_val, &bounds_s, &cached_etas, &f_only_s)
+        };
         let alpha = ls.alpha;
 
         // Line-search diagnostics (#864 P1). Emitted every iteration — including
@@ -1993,6 +2072,7 @@ fn optimize_bfgs(
             };
             let optimizer_str = match options.optimizer {
                 Optimizer::Lbfgs => "lbfgs",
+                Optimizer::Conditioned => "conditioned",
                 _ => "bfgs",
             };
             // Recompute the real (unscaled) point rather than reuse
@@ -2881,6 +2961,137 @@ fn backtracking_line_search_warm(
         alpha: 0.0,
         backtracks: 30,
         outcome: LsOutcome::MaxBacktracks,
+    }
+}
+
+/// Strong-Wolfe line search (Nocedal & Wright, Alg. 3.5 + `zoom` 3.6) for the
+/// conditioned optimizer (#864 root cause #2). Unlike the Armijo-only
+/// [`backtracking_line_search_warm`], this enforces the **curvature condition**
+/// `|φ'(α)| ≤ c2·|φ'(0)|` as well as sufficient decrease, so it will not accept a
+/// tiny step where a dominant coordinate's descent drags a coupled, weakly-
+/// identified coordinate into the wrong basin — the stall #864 targets.
+///
+/// `fg(x_scaled) -> (f, g_scaled)` evaluates the objective and its scaled
+/// gradient at a scaled point; each call is a full inner-loop + gradient sweep,
+/// so the eval budget is capped. The search operates in scaled space and clamps
+/// trial points to `bounds` (matching the backtracking variant). It always
+/// returns an `α` that at least satisfies sufficient decrease when one is found,
+/// so the outer loop makes progress even when the curvature test is elusive on a
+/// flat ridge; a genuine failure returns `α = 0` for the restart-on-stall path.
+fn strong_wolfe_line_search_warm(
+    xs: &[f64],
+    d: &[f64],
+    g0: &[f64],
+    f0: f64,
+    bounds: &PackedBounds,
+    fg: &mut dyn FnMut(&[f64]) -> (f64, Vec<f64>),
+) -> LineSearchResult {
+    const C1: f64 = 1e-4;
+    const C2: f64 = 0.9;
+    const MAX_EVALS: usize = 20;
+    const ALPHA_MAX: f64 = 16.0;
+    let n = xs.len();
+    let dphi0: f64 = d.iter().zip(g0).map(|(di, gi)| di * gi).sum();
+    if dphi0 >= 0.0 || !dphi0.is_finite() {
+        return LineSearchResult {
+            alpha: 0.0,
+            backtracks: 0,
+            outcome: LsOutcome::NonDescent,
+        };
+    }
+
+    // φ(α), φ'(α) at a clamped trial step.
+    let mut evals = 0usize;
+    let mut probe = |alpha: f64| -> (f64, f64) {
+        let mut x_try = vec![0.0; n];
+        for i in 0..n {
+            x_try[i] = (xs[i] + alpha * d[i]).clamp(bounds.lower[i], bounds.upper[i]);
+        }
+        let (f, g) = fg(&x_try);
+        let dphi: f64 = d.iter().zip(&g).map(|(di, gi)| di * gi).sum();
+        (f, dphi)
+    };
+
+    // `zoom` (Alg. 3.6): shrink [lo, hi] until strong Wolfe holds, tracking the
+    // best sufficient-decrease α as a fallback so we never return 0 once we have
+    // *some* decrease.
+    let zoom = |probe: &mut dyn FnMut(f64) -> (f64, f64),
+                evals: &mut usize,
+                mut a_lo: f64,
+                mut f_lo: f64,
+                mut a_hi: f64|
+     -> Option<f64> {
+        let mut best_armijo = if f_lo <= f0 + C1 * a_lo * dphi0 {
+            Some(a_lo)
+        } else {
+            None
+        };
+        while *evals < MAX_EVALS {
+            let a = 0.5 * (a_lo + a_hi);
+            if (a_hi - a_lo).abs() < 1e-14 || a <= 0.0 {
+                return best_armijo;
+            }
+            let (fa, dpa) = probe(a);
+            *evals += 1;
+            if fa > f0 + C1 * a * dphi0 || fa >= f_lo {
+                a_hi = a;
+            } else {
+                best_armijo = Some(a);
+                if dpa.abs() <= -C2 * dphi0 {
+                    return Some(a); // strong Wolfe
+                }
+                if dpa * (a_hi - a_lo) >= 0.0 {
+                    a_hi = a_lo;
+                }
+                a_lo = a;
+                f_lo = fa;
+            }
+        }
+        best_armijo
+    };
+
+    let mut a_prev = 0.0;
+    let mut f_prev = f0;
+    let mut alpha = 1.0;
+    let mut iter = 0usize;
+    let accepted = loop {
+        let (fa, dpa) = probe(alpha);
+        evals += 1;
+        if fa > f0 + C1 * alpha * dphi0 || (iter > 0 && fa >= f_prev) {
+            break zoom(&mut probe, &mut evals, a_prev, f_prev, alpha);
+        }
+        if dpa.abs() <= -C2 * dphi0 {
+            break Some(alpha); // strong Wolfe satisfied directly
+        }
+        if dpa >= 0.0 {
+            break zoom(&mut probe, &mut evals, alpha, fa, a_prev);
+        }
+        if evals >= MAX_EVALS || alpha >= ALPHA_MAX {
+            // Ran out of budget on a still-descending ray: accept the last point
+            // if it met sufficient decrease (it did, to reach here), else fail.
+            break if fa <= f0 + C1 * alpha * dphi0 {
+                Some(alpha)
+            } else {
+                None
+            };
+        }
+        a_prev = alpha;
+        f_prev = fa;
+        alpha = (alpha * 2.0).min(ALPHA_MAX);
+        iter += 1;
+    };
+
+    match accepted {
+        Some(a) if a > 0.0 => LineSearchResult {
+            alpha: a,
+            backtracks: evals,
+            outcome: LsOutcome::Accepted,
+        },
+        _ => LineSearchResult {
+            alpha: 0.0,
+            backtracks: evals,
+            outcome: LsOutcome::MaxBacktracks,
+        },
     }
 }
 
@@ -4983,6 +5194,91 @@ mod tests {
         let r = backtracking_line_search_warm(&x, &d, &g, f0, &bounds, &[], &f_only);
         assert_eq!(r.outcome, LsOutcome::Accepted);
         assert!(r.alpha > 0.0 && r.alpha <= 1.0);
+    }
+
+    /// The conditioned optimizer (#864) must run end-to-end and not worsen the
+    /// OFV on a small well-conditioned problem — the zero-regression guarantee
+    /// that gates it (the ill-conditioned win awaits the hybrid-packing lever).
+    #[test]
+    fn conditioned_optimizer_runs_and_does_not_worsen_ofv() {
+        use crate::types::{EstimationMethod, FitOptions, Optimizer};
+        let model = make_model();
+        let population = make_population(4);
+        let base = FitOptions {
+            method: EstimationMethod::Foce,
+            optimizer: Optimizer::Conditioned,
+            outer_maxiter: 5,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let init_ofv = optimize_population(
+            &model,
+            &population,
+            &model.default_params,
+            &FitOptions {
+                outer_maxiter: 0,
+                ..base.clone()
+            },
+        )
+        .ofv;
+        let result = optimize_population(&model, &population, &model.default_params, &base);
+        assert!(
+            result.ofv.is_finite(),
+            "conditioned produced non-finite OFV"
+        );
+        assert_eq!(result.eta_hats.len(), population.subjects.len());
+        assert!(
+            result.ofv <= init_ofv + 1e-6,
+            "conditioned worsened OFV: init={init_ofv:.4} final={:.4}",
+            result.ofv
+        );
+    }
+
+    /// Strong-Wolfe (#864 conditioned path) on a quadratic must accept a step
+    /// that satisfies both Armijo sufficient decrease and the curvature
+    /// condition `|φ'(α)| ≤ c2|φ'(0)|`.
+    #[test]
+    fn strong_wolfe_accepts_and_satisfies_curvature() {
+        // f(x) = ½ xᵀx, ∇f = x. From (2,2), d = -∇f = (-2,-2).
+        let xs = [2.0, 2.0];
+        let g0 = [2.0, 2.0];
+        let d = [-2.0, -2.0];
+        let f0 = 0.5 * (xs[0] * xs[0] + xs[1] * xs[1]);
+        let bounds = PackedBounds {
+            lower: vec![-100.0, -100.0],
+            upper: vec![100.0, 100.0],
+        };
+        let mut fg = |x: &[f64]| -> (f64, Vec<f64>) {
+            let f = 0.5 * (x[0] * x[0] + x[1] * x[1]);
+            (f, vec![x[0], x[1]])
+        };
+        let r = strong_wolfe_line_search_warm(&xs, &d, &g0, f0, &bounds, &mut fg);
+        assert_eq!(r.outcome, LsOutcome::Accepted);
+        // The exact line minimum is α = 1 (lands at 0); accept near there.
+        assert!(r.alpha > 0.0);
+        // Curvature: |φ'(α)| = |d·∇f(x+αd)| ≤ 0.9·|d·g0|.
+        let x_new: Vec<f64> = (0..2).map(|i| xs[i] + r.alpha * d[i]).collect();
+        let dphi: f64 = d.iter().zip(&x_new).map(|(di, xi)| di * xi).sum();
+        let dphi0: f64 = d.iter().zip(&g0).map(|(di, gi)| di * gi).sum();
+        assert!(dphi.abs() <= 0.9 * dphi0.abs() + 1e-9, "curvature not met");
+    }
+
+    /// A non-descent direction must be reported as `NonDescent` (α = 0) by the
+    /// strong-Wolfe search too, feeding the restart-on-stall path.
+    #[test]
+    fn strong_wolfe_reports_non_descent() {
+        let xs = [0.0, 0.0];
+        let g0 = [1.0, 1.0];
+        let d = [1.0, 1.0]; // ascent
+        let bounds = PackedBounds {
+            lower: vec![-10.0, -10.0],
+            upper: vec![10.0, 10.0],
+        };
+        let mut fg = |x: &[f64]| -> (f64, Vec<f64>) { (x[0] + x[1], vec![1.0, 1.0]) };
+        let r = strong_wolfe_line_search_warm(&xs, &d, &g0, 0.0, &bounds, &mut fg);
+        assert_eq!(r.outcome, LsOutcome::NonDescent);
+        assert_eq!(r.alpha, 0.0);
     }
 
     /// The built-in BFGS path with the trace active must emit the `.optdiag.csv`

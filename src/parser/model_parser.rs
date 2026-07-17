@@ -6099,6 +6099,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 "mma" => Optimizer::Mma,
                 "bobyqa" => Optimizer::Bobyqa,
                 "trust_region" | "newton_tr" => Optimizer::TrustRegion,
+                // #864 conditioned optimizer: the hand-rolled loop with the
+                // gradient preconditioner + strong-Wolfe + restart-on-stall.
+                "conditioned" => Optimizer::Conditioned,
                 other => {
                     return Err(format!(
                         "fit option `optimizer`: unknown value `{other}` — expected \
@@ -6322,6 +6325,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 "none" | "off" => ParameterScaling::None,
                 "abs" => ParameterScaling::Abs,
                 "rescale2" => ParameterScaling::Rescale2,
+                // `ParameterScaling::Gradient` is intentionally NOT selectable
+                // here: alone it freezes NLopt L-BFGS on standard models (#864).
+                // It is used only inside `optimizer = conditioned`, which bundles
+                // it with a strong-Wolfe line search + restart-on-stall.
                 other => {
                     return Err(format!(
                         "fit option `parameter_scaling`: unknown value `{other}` — \

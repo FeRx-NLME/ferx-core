@@ -5829,6 +5829,18 @@ pub enum Optimizer {
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
     TrustRegion,
+    /// **Conditioned optimizer** (#864, opt-in, default-off). One co-designed
+    /// outer path for ill-conditioned cold starts: the hand-rolled L-BFGS loop
+    /// driven with the gradient-based diagonal preconditioner
+    /// ([`ParameterScaling::Gradient`]), a strong-Wolfe (curvature-condition)
+    /// line search instead of Armijo-only backtracking, and restart-on-stall
+    /// (reset the L-BFGS memory to a scaled steepest-descent step and continue
+    /// rather than give up at a non-stationary point). The four levers are
+    /// deliberately bundled: each alone regresses standard fits (a gradient
+    /// preconditioner alone freezes NLopt L-BFGS; a strong line search alone
+    /// still overshoots on the log-transform trap), so they only condition the
+    /// surface together. File-selectable as `optimizer = conditioned`.
+    Conditioned,
 }
 
 /// Inner-loop (EBE) optimizer, set via `[fit_options] inner_optimizer`. Lets the
@@ -5888,6 +5900,22 @@ pub enum ParameterScaling {
     /// range, mapping it toward `(−1, 1)`. The recommended scaling for
     /// gradient-based optimizers (`bfgs`/`lbfgs`); harmful to `Bobyqa`.
     Rescale2,
+    /// **Gradient-based diagonal preconditioner** (#864). Not selectable via
+    /// `parameter_scaling` — alone it freezes NLopt L-BFGS on standard models; it
+    /// is used only inside [`Optimizer::Conditioned`], which bundles it with a
+    /// strong-Wolfe line search and restart-on-stall. Takes one initial
+    /// FOCE/FOCEI gradient at the start point and sets each coordinate's
+    /// scale to `1 / max(|g_i|, ε·max|g|)`, so the scaled gradient components are
+    /// balanced to O(1) irrespective of coordinate magnitude. Unlike `Abs`
+    /// (magnitude of the *value*) and `Rescale2` (bound half-width), this scales
+    /// by observed *curvature-proxy* (gradient magnitude): coordinates with a
+    /// near-zero initial gradient — a sign-constrained θ caught in the
+    /// log-transform trap (#864 root cause #1), or a weakly-identified parameter —
+    /// get a large scale that amplifies their step instead of freezing them.
+    /// Costs one extra inner-loop + gradient evaluation at the start point. This
+    /// is the coordinate-agnostic preconditioner of the outer-optimizer
+    /// conditioning rework; it is default-off until validated end-to-end.
+    Gradient,
 }
 
 impl Optimizer {
@@ -5906,6 +5934,7 @@ impl Optimizer {
             Optimizer::Mma => "mma",
             Optimizer::Bobyqa => "bobyqa",
             Optimizer::TrustRegion => "trust_region",
+            Optimizer::Conditioned => "conditioned",
         }
     }
 

@@ -140,6 +140,7 @@ pub fn gradient_method_outer(
                 Optimizer::Auto
                 | Optimizer::Bfgs
                 | Optimizer::Lbfgs
+                | Optimizer::Conditioned
                 | Optimizer::Slsqp
                 | Optimizer::NloptLbfgs
                 | Optimizer::Mma

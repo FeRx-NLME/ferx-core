@@ -65,6 +65,12 @@ aliases for `nlopt_lbfgs`. The built-in implementation is slated for removal.
 |-----|-----------|-------|
 | `trust_region` | Newton trust-region with Steihaug CG | Uses the analytic outer gradient and a BHHH approximate Hessian `H ≈ 4 Σ gᵢgᵢᵀ` (always positive semi-definite). The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)`; pin it with `steihaug_max_iters`. Best combined with `inits_from_nca` since it benefits from good starting values. |
 
+### Conditioned (experimental, #864)
+
+| Key | Algorithm | Notes |
+|-----|-----------|-------|
+| `conditioned` | Preconditioned L-BFGS + strong-Wolfe | **Experimental, opt-in, default-off — a work-in-progress prototype.** One co-designed path for ill-conditioned cold starts: the built-in L-BFGS loop driven with a gradient-based diagonal preconditioner, a strong-Wolfe (curvature-condition) line search, and restart-on-stall. **Not yet recommended for production**: on the current prototype it matches the default on well-conditioned fits but does *not* yet beat it on ill-conditioned models — the coordinate (hybrid `log θ` / `θ/θ_init`) lever is still to land. Selecting it is only useful for evaluating the conditioning rework. |
+
 ---
 
 ## When to use which

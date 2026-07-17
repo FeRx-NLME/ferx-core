@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Experimental `optimizer = conditioned`** (#864, opt-in, default-off). A
+  work-in-progress prototype of the outer-optimizer conditioning rework: the
+  built-in L-BFGS loop driven with a gradient-based diagonal preconditioner, a
+  strong-Wolfe (curvature-condition) line search, and restart-on-stall. It
+  matches the default on well-conditioned fits (zero regression) but does **not
+  yet** beat it on ill-conditioned models — the hybrid-packing lever is still to
+  land — so it is not recommended for production and exists only to evaluate the
+  rework. See `docs/estimation/optimizers.qmd`.
 - **Line-search diagnostics for the optimizer trace** (#864). With
   `optimizer_trace = true`, the built-in BFGS / L-BFGS outer optimizer now also writes a
   sibling `…​.optdiag.csv` next to the trace CSV, recording per outer iteration the
