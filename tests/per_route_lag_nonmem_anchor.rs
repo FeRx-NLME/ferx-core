@@ -17,6 +17,13 @@
 //! gradient route, so this pins the same absorption mechanism the analytic parallel/mixed
 //! anchors do.)
 //! Final NONMEM values are read from `nonmem_anchor/results/per_route_lag.ext`.
+//!
+//! This same static model is what the **closed-form modified-release** path (#860) serves for
+//! `predict()` / `simulate()` — a superposition of shifted single-route Bateman terms, no
+//! integration. That closed form is anchored to NONMEM *transitively*: the reduction-to-ODE
+//! tests (`pk::modified_release::tests::reduces_to_ode_1cpt_per_route_lag`) pin it bit-for-bit
+//! (to solver tolerance) against this same integrated `[odes]` twin, and this test pins the
+//! twin against NONMEM's `#OBJV` — so closed form ≡ twin ≡ NONMEM.
 
 mod common;
 
