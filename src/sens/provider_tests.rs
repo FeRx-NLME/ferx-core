@@ -7150,6 +7150,116 @@ fn ode_iov_zero_order_route_lag_kappa_on_lag_matches_fd() {
     );
 }
 
+/// #877: `transit` per-route lag with **κ on the lag**. Unlike `first_order`/`zero_order`, the
+/// transit onset is *continuous* (`R_in → 0` smoothly at `t_dose + LAG`), so `K_ROUTE_ONSET`
+/// injects a **zero-magnitude** saltation (`rate_at_zero` = 0 for `Transit`) — the κ-sensitivity
+/// rides entirely through the continuous `∂R_in/∂lag_route` of the shifted gamma density, over the
+/// per-occasion `pk_at_dose[k]` jet. This is the direct Dual2-vs-FD parity the gate's admission of
+/// `Transit` under IOV requires (the `route_lag_analytic()` classifier admits it; only
+/// `first_order`/`zero_order` had a κ-on-lag fixture before). Value + gradient + Hessian vs FD.
+#[test]
+fn ode_iov_transit_route_lag_kappa_on_lag_matches_fd() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVN(5.0, 1.0, 30.0)
+  theta TVMTT(2.0, 0.1, 20.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_LAG ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  LAG = TVLAG * exp(KAPPA_LAG)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = transit(n=N, mtt=MTT, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+    let model = parse_model_string(src).expect("parse transit route-lag IOV");
+    assert_eq!(model.n_kappa, 1);
+    assert!(model.has_route_absorption_lag(), "per-route lag present");
+    assert!(
+        crate::sens::ode_provider::ode_iov_supported(&model),
+        "#877: transit route lag must be analytic under IOV"
+    );
+    let subject = iov_subject();
+    // stacked = [η_CL, κ_g0, κ_g1]. Onsets t_dose + LAG ≈ 1.5 / 25.5 clear every obs.
+    check_iov_provider_vs_fd(
+        &model,
+        &subject,
+        &[1.0, 20.0, 5.0, 2.0, 1.5],
+        &[0.1, 0.03, -0.04],
+    );
+}
+
+/// #877: `igd` (inverse-Gaussian density) per-route lag with **κ on the lag**. Like `transit`, the
+/// IG onset is continuous (an essential singularity drives `R_in → 0` at `t_dose + LAG`), so the
+/// `K_ROUTE_ONSET` saltation is zero-magnitude and κ rides the continuous `∂R_in/∂lag_route` of the
+/// shifted IG density over the per-occasion jet. Direct FD parity for the fourth kernel the gate
+/// admits under IOV. Value + gradient + Hessian vs FD of `predict_iov`.
+#[test]
+fn ode_iov_igd_route_lag_kappa_on_lag_matches_fd() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVMAT(2.0, 0.1, 20.0)
+  theta TVCV2(0.5, 0.01, 10.0)
+  theta TVLAG(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_LAG ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  MAT = TVMAT
+  CV2 = TVCV2
+  LAG = TVLAG * exp(KAPPA_LAG)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2, lag=LAG) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+    let model = parse_model_string(src).expect("parse igd route-lag IOV");
+    assert_eq!(model.n_kappa, 1);
+    assert!(model.has_route_absorption_lag(), "per-route lag present");
+    assert!(
+        crate::sens::ode_provider::ode_iov_supported(&model),
+        "#877: igd route lag must be analytic under IOV"
+    );
+    let subject = iov_subject();
+    // stacked = [η_CL, κ_g0, κ_g1]. Onsets t_dose + LAG ≈ 1.5 / 25.5 clear every obs.
+    check_iov_provider_vs_fd(
+        &model,
+        &subject,
+        &[1.0, 20.0, 2.0, 0.5, 1.5],
+        &[0.1, 0.03, -0.04],
+    );
+}
+
 /// #877: **compartment lagtime × per-route lag** composition under IOV, with η on the
 /// compartment lag (`LAGTIME`) and κ on the route lag (`LAG`). The onset shift is
 /// `∂/∂(lag_cmt + lag_route)`, so the δlag² jet carries both `η_LAGC` and `κ_LAGR` — cross terms

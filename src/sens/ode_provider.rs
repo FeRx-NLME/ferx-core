@@ -321,8 +321,9 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     //   • `weibull` — onset **diverges** for shape `β < 1` (an integrable spike, no finite
     //     rate-on saltation), so a route-lagged `weibull` stays on the FD fallback, exactly as
     //     `weibull` + a compartment lagtime does below.
-    // IOV (`n_kappa != 0`) route lag is out of scope on both gates (declined below here and, on
-    // the IOV path, in `ode_iov_supported`).
+    // IOV (`n_kappa != 0`) route lag is declined *here* by the `n_kappa != 0` clause below (an IOV
+    // model is off the non-IOV analytic gate outright), but IS analytic on the IOV path since #877
+    // — `ode_iov_supported` admits it via this same per-kernel `route_lag_analytic()` classifier.
     if ode
         .input_rate
         .iter()
