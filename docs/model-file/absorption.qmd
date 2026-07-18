@@ -836,8 +836,8 @@ kernel over a lagged onset.
 ### Closed-form evaluation {#mr-closed-form}
 
 A parallel / mixed / per-route-lagged model with a **linear disposition** (1- or
-2-compartment) whose pathways are all smooth (`first_order`, `transit`, `igd`) is evaluated
-**without integrating the ODE**. Because the disposition is linear and time-invariant its
+2-compartment) whose pathways are all `first_order`, `zero_order`, `transit`, or `igd` is
+evaluated **without integrating the ODE**. Because the disposition is linear and time-invariant its
 inputs superpose, so the observable is a fraction-weighted sum of the *single-route* closed
 forms, each shifted by its onset:
 
@@ -851,12 +851,16 @@ observable's scale off the readout, so `- CL/V*central`, `- KE*central`, and mic
 forms are all detected, while a non-linear disposition (e.g. Michaelis–Menten) is *declined*
 and integrated instead. The closed form is used for `predict()`, `simulate()`, and
 finite-difference fits; it reduces to the integrated `[odes]` twin to solver tolerance, and so
-to the same NONMEM `$DES` optimum the twin already matches.
+to the same NONMEM `$DES` optimum the twin already matches. An **analytic-sensitivity**
+(default) FOCE/FOCEI fit on the same static subjects also skips the ODE integration for its
+gradient — the disposition-recovery and superposition formulas are evaluated once over dual
+numbers instead of over plain doubles, giving the exact `∂/∂(θ,η)` jet with no separate
+integration pass.
 
 It applies only to **static** subjects: a time-varying covariate, IOV, a reset (`EVID 3/4`),
-a steady-state or infusion dose, a compartment-indexed `F{c}`/`ALAG{c}`, a `zero_order` or
-`weibull` pathway, or a route in its flip-flop domain routes the subject back to the ODE
-solver automatically — the result is identical, only slower.
+a steady-state or infusion dose, a compartment-indexed `F{c}`/`ALAG{c}`, a `weibull` pathway,
+or a route in its flip-flop domain routes the subject back to the ODE solver automatically —
+the result is identical, only slower.
 
 ::: {.callout-note}
 ## Gradients (analytic)

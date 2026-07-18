@@ -65,6 +65,49 @@ pub struct SubjectSens {
     pub obs: Vec<ObsSens>,
 }
 
+/// Scatter one observation's `(θ,η)`-seeded `Dual2<M>` jet into an [`ObsSens`],
+/// with the canonical axis layout every provider uses: θ on dual axes
+/// `0..n_theta`, η on `n_theta..M` (`M = n_theta + n_eta`). The second-order
+/// blocks kept are the η-η Hessian and the η-θ cross block (the only ones the
+/// FOCEI outer gradient consumes). The dual must already carry any output
+/// transform (`apply_output_transform` / readout) — this only reshapes.
+///
+/// Single home for a loop that was written verbatim in three places
+/// (`run_subject_tvcov`, `subject_sensitivities_tvcov`, and the closed-form MR
+/// `mr_sens_dual`, #860); a drift in the axis convention here would otherwise be
+/// silently wrong in whichever copy was missed.
+pub(crate) fn obs_sens_from_dual2<const M: usize>(
+    fd: &Dual2<M>,
+    n_theta: usize,
+    n_eta: usize,
+) -> ObsSens {
+    let g = &fd.grad;
+    let h = &fd.hess;
+    let mut df_deta = vec![0.0; n_eta];
+    let mut df_dtheta = vec![0.0; n_theta];
+    let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
+    let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
+    for k in 0..n_eta {
+        df_deta[k] = g[n_theta + k];
+        for l in 0..n_eta {
+            d2f_deta2[k * n_eta + l] = h[n_theta + k][n_theta + l];
+        }
+        for m in 0..n_theta {
+            d2f_deta_dtheta[k * n_theta + m] = h[n_theta + k][m];
+        }
+    }
+    for m in 0..n_theta {
+        df_dtheta[m] = g[m];
+    }
+    ObsSens {
+        f: fd.value,
+        df_deta,
+        d2f_deta2,
+        df_dtheta,
+        d2f_deta_dtheta,
+    }
+}
+
 /// Shared accessor letting the constant-`ScalarScale` divide run once over both the
 /// outer full-jet ([`ObsSens`]) and the inner η-grad ([`ObsGrad`]) observation types.
 /// `for_each_scaled_axis` visits every derivative the scale multiplies by `1/k`, in the
@@ -3188,30 +3231,7 @@ fn run_obs_tvcov<const M: usize>(
         } else {
             c_clamped
         };
-        let c = &c;
-        let mut df_deta = vec![0.0; n_eta];
-        let mut df_dtheta = vec![0.0; n_theta];
-        let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
-        let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
-        for k in 0..n_eta {
-            df_deta[k] = c.grad[n_theta + k];
-            for l in 0..n_eta {
-                d2f_deta2[k * n_eta + l] = c.hess[n_theta + k][n_theta + l];
-            }
-            for m in 0..n_theta {
-                d2f_deta_dtheta[k * n_theta + m] = c.hess[n_theta + k][m];
-            }
-        }
-        for m in 0..n_theta {
-            df_dtheta[m] = c.grad[m];
-        }
-        obs_out.push(ObsSens {
-            f: c.value,
-            df_deta,
-            d2f_deta2,
-            df_dtheta,
-            d2f_deta_dtheta,
-        });
+        obs_out.push(obs_sens_from_dual2::<M>(&c, n_theta, n_eta));
     }
     Some(SubjectSens { obs: obs_out })
 }
@@ -3748,6 +3768,17 @@ fn subject_eta_grad_impl(
     // scope the outer provider uses, so inner and outer stay on the same route.
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
+            // Closed-form modified-release fast path (#860 Phase A6): a *static*
+            // multi-route subject `mr_scope` admits skips the ODE integration
+            // entirely (same "analytic" report as `ode_subject_eta_grad` below —
+            // `ode_analytical_supported` already covers this model — just a
+            // faster computation of the identical jet). `None` falls through to
+            // the ODE provider unchanged.
+            if let Some(g) =
+                crate::pk::modified_release::mr_subject_eta_grad(model, subject, theta, eta)
+            {
+                return Some(g);
+            }
             return crate::sens::ode_provider::ode_subject_eta_grad(model, subject, theta, eta);
         }
         return None;
@@ -4782,6 +4813,19 @@ fn subject_sensitivities_impl(
     // `ODE_SENS_ENABLED` master switch stays as a single kill-switch for the path.
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
+            // Closed-form modified-release fast path (#860 Phase A6): try the
+            // no-integration superposition first for the *static* subjects
+            // `mr_scope` admits — a pure speed swap inside the branch
+            // `ode_analytical_supported` already reports "analytic" for, not a
+            // new supported/declined predicate (so `sens_supported` /
+            // `analytic_outer_gradient_available` need no change). `None` (out
+            // of `mr_scope`'s narrower static scope, or an axis-count mismatch)
+            // falls through to the ODE provider unchanged.
+            if let Some(sens) =
+                crate::pk::modified_release::mr_subject_sensitivities(model, subject, theta, eta)
+            {
+                return Some(sens);
+            }
             return crate::sens::ode_provider::ode_subject_sensitivities(
                 model, subject, theta, eta,
             );
