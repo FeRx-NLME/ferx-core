@@ -54,6 +54,31 @@ $$
 
 Use when both proportional and additive error sources are present. Requires two sigma parameters defined in `[parameters]`.
 
+::: {.callout-warning}
+## Choose the additive initial estimate on the scale of your data
+
+A combined error model has a competing local minimum in which the **additive**
+term collapses toward zero and the proportional term inflates to absorb the
+scatter. Starting the additive SD far below the scale of the observations can
+trap the fit in that worse basin: low-magnitude points then carry near-infinite
+`1/Var` weight, and the optimizer is happy to keep the additive term at zero.
+This is not a ferx-specific quirk — NONMEM shows the same trapping, and it is
+most damaging on multimodal / over-parameterised models.
+
+ferx emits a `W_ADDITIVE_INIT_SCALE` warning before fitting when the additive SD
+initial estimate is below **1% of the data scale** (median `|DV|`) on that
+endpoint. It never changes your value — it advises a larger start. As a rule of
+thumb, seed the additive SD at a few percent of the typical observed
+concentration (e.g. `median(|DV|) / 10`) rather than an arbitrary small number.
+
+**Worked example (cyclophosphamide parent→metabolite).** Metabolite
+concentrations reach the hundreds/thousands of ng/mL. Seeding the additive
+*variance* at 0.5 (SD ≈ 0.7) traps both ferx and NONMEM at additive variance
+≈ 0.94, ~50 OFV points worse than the global optimum (additive variance ≈ 1878,
+matching Pumas). Re-seeding the additive SD to a data-scaled value (tens of
+ng/mL) reaches the correct basin.
+:::
+
 ## Time-varying / covariate-dependent magnitude
 
 > **Maturity: experimental** ([#484](https://github.com/FeRx-NLME/ferx-core/issues/484)).

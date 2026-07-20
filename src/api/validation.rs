@@ -2166,8 +2166,157 @@ pub fn check_model_data_warnings(
         }
     }
 
+    diags.extend(additive_init_scale_warnings(model, population, init_params));
+
     diags
 }
+
+/// Warn when a `combined` error model's **additive** SD initial estimate is
+/// negligible relative to the scale of the observations it covers.
+///
+/// With a combined variance `Var(f) = (f·σ_prop)² + σ_add²`, an additive init
+/// orders of magnitude below the data starts the fit in a near-pure-proportional
+/// regime where low-magnitude observations receive enormous `1/Var` weight. On
+/// multimodal / over-parameterised problems the optimizer can then settle in a
+/// local minimum where the additive term stays collapsed (σ_add ≈ 0) and the
+/// proportional term inflates — the *worse* basin. The cyclophosphamide
+/// parent→metabolite fit is the canonical case: additive variance seeded at 0.5
+/// traps at ≈0.94, whereas the global optimum is ≈1878 (~50 OFV points better);
+/// both ferx and NONMEM miss it from that start, Pumas found it.
+///
+/// This is a **pre-fit heuristic on the initial estimate only** — it never
+/// changes the value (per the warn-only design), it advises a larger start.
+/// The threshold is deliberately conservative (additive SD below 1% of the data
+/// scale): a genuinely small-but-intended additive floor of a few % of the data
+/// does not trip it; only an essentially-zero start does.
+fn additive_init_scale_warnings(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    use crate::types::{ErrorModel, ErrorSpec, SigmaType};
+
+    let mut diags = Vec::new();
+
+    // (additive global sigma index, endpoint dispatch key or None for `Single`).
+    // For `Combined` the additive sigma is the 2nd sigma (residual_variance uses
+    // sigma[0]=prop, sigma[1]=add); for `Single` the global sigma vector is in
+    // that order, for `PerCmt`/`Selected` the endpoint's `sigma_idx[1]`.
+    let mut combined_endpoints: Vec<(usize, Option<usize>)> = Vec::new();
+    match &model.error_spec {
+        ErrorSpec::Single(ErrorModel::Combined) => combined_endpoints.push((1, None)),
+        ErrorSpec::Single(_) => {}
+        ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+            for (&key, ee) in map {
+                if ee.error_model == ErrorModel::Combined {
+                    if let Some(pos) = ee
+                        .error_model
+                        .sigma_types()
+                        .iter()
+                        .position(|t| *t == SigmaType::Additive)
+                    {
+                        if let Some(&idx) = ee.sigma_idx.get(pos) {
+                            combined_endpoints.push((idx, Some(key)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Deterministic order: HashMap iteration (PerCmt/Selected) is unordered.
+    combined_endpoints.sort_unstable();
+
+    for (add_idx, key) in combined_endpoints {
+        let Some(&add_sd_init) = init_params.sigma.values.get(add_idx) else {
+            continue;
+        };
+        // |DV| of the observations this endpoint covers.
+        let mut mags: Vec<f64> = Vec::new();
+        for subject in &population.subjects {
+            for j in 0..subject.observations.len() {
+                let covered = match key {
+                    None => true,
+                    Some(k) => model.error_spec.obs_key(subject, j) == k,
+                };
+                if covered {
+                    let v = subject.observations[j].abs();
+                    if v.is_finite() {
+                        mags.push(v);
+                    }
+                }
+            }
+        }
+        let sigma_name = init_params
+            .sigma
+            .names
+            .get(add_idx)
+            .cloned()
+            .unwrap_or_else(|| format!("SIGMA({})", add_idx + 1));
+        let scope = match key {
+            Some(k) => format!("CMT={k}"),
+            None => "all observations".to_string(),
+        };
+        if let Some(d) = additive_init_scale_check(&scope, &sigma_name, add_sd_init, &mut mags) {
+            diags.push(d);
+        }
+    }
+
+    diags
+}
+
+/// Pure decision for [`additive_init_scale_warnings`]: given one combined
+/// endpoint's additive SD initial estimate and the `|DV|` magnitudes of the
+/// observations it covers, return a warning iff the additive start is negligible
+/// (below [`NEGLIGIBLE_ADD_FRACTION`]) relative to the data scale (median `|DV|`).
+///
+/// `mags` is taken by `&mut` because it is sorted in place to find the median;
+/// the caller does not reuse it afterwards. Returns `None` for an empty/all-zero
+/// data scale (nothing to compare against) or a non-negligible additive start.
+fn additive_init_scale_check(
+    scope: &str,
+    sigma_name: &str,
+    add_sd_init: f64,
+    mags: &mut [f64],
+) -> Option<Diagnostic> {
+    if mags.is_empty() {
+        return None;
+    }
+    mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = mags.len() / 2;
+    let data_scale = if mags.len() % 2 == 0 {
+        0.5 * (mags[mid - 1] + mags[mid])
+    } else {
+        mags[mid]
+    };
+    if data_scale <= 0.0 || add_sd_init >= NEGLIGIBLE_ADD_FRACTION * data_scale {
+        return None;
+    }
+    Some(Diagnostic::warning(
+        "W_ADDITIVE_INIT_SCALE",
+        format!(
+            "Combined error model on {scope}: additive SD initial estimate \
+             '{sigma_name}' = {add_sd_init:.4} is negligible (< {pct:.0}%) \
+             relative to the data scale (median |DV| = {data_scale:.4}). A \
+             near-zero additive start can trap the fit in a local minimum where \
+             the additive term collapses and the proportional term inflates — \
+             the worse basin on multimodal problems. If the fit converges with \
+             this additive variance near zero, retry from a larger additive \
+             initial estimate (e.g. SD ≈ {suggest:.4}, a few % of the data \
+             scale).",
+            pct = NEGLIGIBLE_ADD_FRACTION * 100.0,
+            suggest = 0.1 * data_scale,
+        ),
+    ))
+}
+
+/// Additive SD init counts as "negligible" below this fraction of the data scale
+/// (median `|DV|`) — deliberately conservative so a genuinely small-but-intended
+/// additive floor of a few % of the data does not trip the warning.
+const NEGLIGIBLE_ADD_FRACTION: f64 = 0.01;
+
+#[cfg(test)]
+#[path = "tests/additive_init_scale_tests.rs"]
+mod additive_init_scale_tests;
 
 /// Feature-presence (data-independent) *warning*-level checks for experimental
 /// features (issue #175). Stochastic differential equations and neural-network
