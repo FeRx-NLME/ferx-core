@@ -68,8 +68,8 @@ most damaging on multimodal / over-parameterised models.
 ferx emits a `W_ADDITIVE_INIT_SCALE` warning before fitting when the additive SD
 initial estimate is below **1% of the data scale** (median `|DV|`) on that
 endpoint. It never changes your value — it advises a larger start. As a rule of
-thumb, seed the additive SD at a few percent of the typical observed
-concentration (e.g. `median(|DV|) / 10`) rather than an arbitrary small number.
+thumb, seed the additive SD at roughly **10%** of the typical observed
+concentration (`median(|DV|) / 10`) rather than an arbitrary small number.
 
 **Worked example (cyclophosphamide parent→metabolite).** Metabolite
 concentrations reach the hundreds/thousands of ng/mL. Seeding the additive

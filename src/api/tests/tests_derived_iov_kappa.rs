@@ -1039,3 +1039,40 @@ fn additive_init_scale_silent_when_well_scaled() {
         "a data-scaled additive init must not warn"
     );
 }
+
+/// #847 (Copilot review): `ErrorSpec::Selected` dispatch keys are covariate
+/// **branch indices**, not CMTs — the warning must label them `endpoint={k}`,
+/// not `CMT={k}`. A single-branch selector routes every observation to key 0.
+#[test]
+fn additive_init_scale_selected_labels_endpoint_not_cmt() {
+    let mut model = combined_endpoint_model();
+    model.error_spec = ErrorSpec::Selected {
+        selector: crate::types::ErrorSelector {
+            eval: Box::new(|_cov| 0), // one branch → key 0 for every obs
+            branch_labels: vec!["all".into()],
+        },
+        endpoints: HashMap::from([(
+            0,
+            crate::types::EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![0, 1],
+            },
+        )]),
+    };
+    let pop = population_of(subject_with_obs(1, vec![100.0, 200.0, 300.0]));
+    let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+    let d = diags
+        .iter()
+        .find(|d| d.code == "W_ADDITIVE_INIT_SCALE")
+        .expect("negligible additive init on a Selected combined endpoint must warn");
+    assert!(
+        d.message.contains("endpoint=0"),
+        "Selected key must be labelled endpoint=, got: {}",
+        d.message
+    );
+    assert!(
+        !d.message.contains("CMT="),
+        "Selected key must not be mislabelled CMT=, got: {}",
+        d.message
+    );
+}

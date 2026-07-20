@@ -2194,52 +2194,60 @@ fn additive_init_scale_warnings(
     population: &Population,
     init_params: &ModelParameters,
 ) -> Vec<Diagnostic> {
-    use crate::types::{ErrorModel, ErrorSpec, SigmaType};
+    use crate::types::{EndpointError, ErrorModel, ErrorSpec, SigmaType};
+    use std::collections::HashMap;
 
     let mut diags = Vec::new();
 
-    // (additive global sigma index, endpoint dispatch key or None for `Single`).
-    // For `Combined` the additive sigma is the 2nd sigma (residual_variance uses
-    // sigma[0]=prop, sigma[1]=add); for `Single` the global sigma vector is in
-    // that order, for `PerCmt`/`Selected` the endpoint's `sigma_idx[1]`.
-    let mut combined_endpoints: Vec<(usize, Option<usize>)> = Vec::new();
-    match &model.error_spec {
-        ErrorSpec::Single(ErrorModel::Combined) => combined_endpoints.push((1, None)),
-        ErrorSpec::Single(_) => {}
-        ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
-            for (&key, ee) in map {
-                if ee.error_model == ErrorModel::Combined {
-                    if let Some(pos) = ee
-                        .error_model
-                        .sigma_types()
-                        .iter()
-                        .position(|t| *t == SigmaType::Additive)
-                    {
-                        if let Some(&idx) = ee.sigma_idx.get(pos) {
-                            combined_endpoints.push((idx, Some(key)));
-                        }
+    // (additive global sigma index, endpoint dispatch key or None for `Single`,
+    // scope label). For `Combined` the additive sigma is the 2nd sigma
+    // (residual_variance uses sigma[0]=prop, sigma[1]=add); for `Single` the
+    // global sigma vector is in that order, for `PerCmt`/`Selected` the
+    // endpoint's `sigma_idx[1]`. `PerCmt` keys are 1-based CMTs; `Selected` keys
+    // are 0-based covariate-branch indices — labelled `endpoint=` not `CMT=` so
+    // the message doesn't misname a branch as a compartment.
+    let mut combined_endpoints: Vec<(usize, Option<usize>, String)> = Vec::new();
+    let mut push_endpoints = |map: &HashMap<usize, EndpointError>, label: &str| {
+        for (&key, ee) in map {
+            if ee.error_model == ErrorModel::Combined {
+                if let Some(pos) = ee
+                    .error_model
+                    .sigma_types()
+                    .iter()
+                    .position(|t| *t == SigmaType::Additive)
+                {
+                    if let Some(&idx) = ee.sigma_idx.get(pos) {
+                        combined_endpoints.push((idx, Some(key), format!("{label}={key}")));
                     }
                 }
             }
         }
+    };
+    match &model.error_spec {
+        ErrorSpec::Single(ErrorModel::Combined) => {
+            combined_endpoints.push((1, None, "all observations".to_string()))
+        }
+        ErrorSpec::Single(_) => {}
+        ErrorSpec::PerCmt(map) => push_endpoints(map, "CMT"),
+        ErrorSpec::Selected { endpoints, .. } => push_endpoints(endpoints, "endpoint"),
     }
     // Deterministic order: HashMap iteration (PerCmt/Selected) is unordered.
     combined_endpoints.sort_unstable();
 
-    for (add_idx, key) in combined_endpoints {
+    for (add_idx, key, scope) in combined_endpoints {
         let Some(&add_sd_init) = init_params.sigma.values.get(add_idx) else {
             continue;
         };
         // |DV| of the observations this endpoint covers.
         let mut mags: Vec<f64> = Vec::new();
         for subject in &population.subjects {
-            for j in 0..subject.observations.len() {
+            for (j, &obs) in subject.observations.iter().enumerate() {
                 let covered = match key {
                     None => true,
                     Some(k) => model.error_spec.obs_key(subject, j) == k,
                 };
                 if covered {
-                    let v = subject.observations[j].abs();
+                    let v = obs.abs();
                     if v.is_finite() {
                         mags.push(v);
                     }
@@ -2252,10 +2260,6 @@ fn additive_init_scale_warnings(
             .get(add_idx)
             .cloned()
             .unwrap_or_else(|| format!("SIGMA({})", add_idx + 1));
-        let scope = match key {
-            Some(k) => format!("CMT={k}"),
-            None => "all observations".to_string(),
-        };
         if let Some(d) = additive_init_scale_check(&scope, &sigma_name, add_sd_init, &mut mags) {
             diags.push(d);
         }
@@ -2283,10 +2287,10 @@ fn additive_init_scale_check(
     }
     mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = mags.len() / 2;
-    let data_scale = if mags.len() % 2 == 0 {
-        0.5 * (mags[mid - 1] + mags[mid])
-    } else {
+    let data_scale = if mags.len() % 2 == 1 {
         mags[mid]
+    } else {
+        0.5 * (mags[mid - 1] + mags[mid])
     };
     if data_scale <= 0.0 || add_sd_init >= NEGLIGIBLE_ADD_FRACTION * data_scale {
         return None;
@@ -2301,8 +2305,8 @@ fn additive_init_scale_check(
              the additive term collapses and the proportional term inflates — \
              the worse basin on multimodal problems. If the fit converges with \
              this additive variance near zero, retry from a larger additive \
-             initial estimate (e.g. SD ≈ {suggest:.4}, a few % of the data \
-             scale).",
+             initial estimate (e.g. SD ≈ {suggest:.4}, ~10% of the data scale \
+             — median |DV| / 10).",
             pct = NEGLIGIBLE_ADD_FRACTION * 100.0,
             suggest = 0.1 * data_scale,
         ),
