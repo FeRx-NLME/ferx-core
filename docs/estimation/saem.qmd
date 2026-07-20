@@ -321,9 +321,18 @@ For a `block_omega` (correlated) random-effects block, a faulty E-step/M-step co
 
 ### IIV on residual error (`iiv_on_ruv`): σ × ω_RUV ridge
 
-With `iiv_on_ruv = ETA`, the residual variance is $\sigma^2 \exp(2\eta_{\text{RUV}})$, so the *marginal* residual is a function of $\sigma^2 \exp(2\omega_{\text{RUV}})$: $\sigma$ and $\omega_{\text{RUV}}$ trade off along a ridge and are only jointly identified. If the E-step mixes poorly, the M-step can ride that ridge until $\sigma$ hits its internal e⁵ (≈148 SD) ceiling while $\omega_{\text{RUV}}$ inflates to compensate — the failure reported in issue #895 (against 0.2.0, before the componentwise kernel).
+With `iiv_on_ruv = ETA`, the residual variance is $\sigma^2 \exp(2\eta_{\text{RUV}})$, so the *marginal* residual is a function of $\sigma^2 \exp(2\omega_{\text{RUV}})$: $\sigma$ and $\omega_{\text{RUV}}$ are only *jointly* identified. When both are free, the SAEM M-step can walk $\sigma$ and $\omega_{\text{RUV}}$ **up together** in an unstable feedback loop — $\omega_{\text{RUV}}$ inflating toward ~49 and $\sigma$ toward its e⁵ (≈148 SD) ceiling — which was the failure reported in issue #895. It is worst for FREM models with an extreme $\Omega$-diagonal scale range and a `log_additive` error, where $\exp(2\eta_{\text{RUV}})$ then makes a handful of observations dominate a runaway objective.
 
-ferx guards this two ways. The componentwise kernel keeps the E-step mixing even for the FREM-scale $\Omega$ that triggered the original report, so the ridge does not run away in practice. As a backstop, each free RUV-scaled residual $\sigma$ is capped during SAEM at $\approx 20\times$ its starting SD (the cap is a post-M-step clamp, so a well-posed fit whose $\sigma$ stays below it is reproduced bit-for-bit). If a $\sigma$ ends pinned against that cap, SAEM warns that the σ × ω_RUV split is weakly identified — fix $\sigma$ (or the RUV $\omega$) at a known value, or drop `iiv_on_ruv`.
+::: {.callout-warning}
+## Free-σ `iiv_on_ruv` on FREM models is not fully solved
+ferx bounds the blow-up but does **not** yet recover the correct split on the hardest FREM + `iiv_on_ruv` fits with both $\sigma$ and $\omega_{\text{RUV}}$ free. The reliable recipe is to **FIX $\sigma$** at a known value (e.g. from an IMP/IMPMAP run or NONMEM) and estimate $\omega_{\text{RUV}}$ — that breaks the ridge and $\omega_{\text{RUV}}$ recovers (matching NONMEM). Deeper work is tracked upstream.
+:::
+
+Backstops (all no-ops on a well-posed fit, so ordinary runs are unaffected):
+
+- **σ growth cap** — each free RUV-scaled residual $\sigma$ is capped at $\approx 20\times$ its starting SD (a post-M-step clamp, so a fit whose $\sigma$ stays below it is reproduced bit-for-bit).
+- **ω_RUV growth cap** — the RUV $\Omega$ variance is capped at $\approx 20\times$ its starting value, applied as a correlation-preserving rescale of the RUV row/column so a block $\Omega$ stays positive-definite.
+- **Warnings** — if $\sigma$ or $\omega_{\text{RUV}}$ ends pinned against its cap, SAEM warns that the split is weakly identified and recommends fixing $\sigma$.
 
 ### Slow Convergence
 

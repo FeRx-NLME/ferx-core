@@ -115,8 +115,12 @@ section of the SDLC for the versioning policy).
   each FREM covariate coordinate by `min(1, √EPSCOV/√Ω_jj)` so its joint acceptance recovers from
   0% (non-FREM models are unaffected — the multiplier is exactly 1). SAEM also now warns when the
   combined post-burn-in acceptance stays below 1% (the sampler is not mixing, so Ω/σ are
-  unreliable), and, for `iiv_on_ruv` models, caps a free residual σ's growth during the run so a
-  poorly-identified σ × ω_RUV ridge cannot ride σ up to its e⁵ ceiling — warning if the cap binds.
+  unreliable). For `iiv_on_ruv` models it caps the growth of both the free residual σ and the RUV
+  Ω variance during the run (each ≈ 20× its starting value; the Ω cap is a correlation-preserving
+  rescale so a block Ω stays positive-definite), bounding the σ × ω_RUV runaway reported in the
+  issue, and warns — recommending σ be FIXed and the fit re-run — if either cap binds. **Note:**
+  the hardest free-σ FREM + `iiv_on_ruv` fits are bounded but not yet fully corrected; FIX σ (e.g.
+  from an IMP/IMPMAP run) to recover ω_RUV. Deeper investigation is tracked separately.
 - **Analytic FOCEI sensitivities for IIV on an absorption lag feeding a `first_order` forcing**
   (#880). Fixes to the rate-on onset of a built-in `first_order` (Bateman) input-rate forcing
   whose arrival is a moving boundary — a compartment lagtime (`ALAG1`/`LAGTIME`) **or** a

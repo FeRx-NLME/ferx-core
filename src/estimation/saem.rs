@@ -69,6 +69,16 @@ const SAEM_MH_STUCK_ACCEPT: f64 = 0.01;
 /// σ(s) — a FREM EPSCOV (always FIX) is untouched.
 const SAEM_RUV_SIGMA_LN_GROWTH: f64 = 3.0;
 
+/// Maximum growth of the `iiv_on_ruv` Ω *variance* during a SAEM run, in
+/// natural-log units (issue #895). The other half of the σ × ω_RUV ridge: with
+/// both free, the residual-error IIV variance can run away symmetrically to σ
+/// (observed ω_RUV → ~49 in the original report). Capping ω_RUV's growth to
+/// e³ ≈ 20× its starting variance bounds a genuinely ill-posed run near sensible
+/// values while never binding on a well-posed fit. Applied as a
+/// correlation-preserving rescale of the RUV row/column so a block Ω stays
+/// positive-definite; a FIXed RUV Ω is untouched.
+const SAEM_RUV_OMEGA_LN_GROWTH: f64 = 3.0;
+
 /// Maximum per-iteration stochastic-approximation step for the Ω sufficient
 /// statistic *during the exploration phase*. The θ/σ M-step uses the full γ
 /// (1.0 in exploration), but Ω is averaged at no more than this rate so a single
@@ -1177,6 +1187,52 @@ fn compute_ruv_sigma_caps(
         .collect()
 }
 
+/// Log-variance ceiling for the `iiv_on_ruv` Ω diagonal in a SAEM run (#895).
+///
+/// Returns `Some(cap)` = `log(ω₀) + SAEM_RUV_OMEGA_LN_GROWTH` for the RUV eta's
+/// variance when the model has an `iiv_on_ruv` eta whose Ω is free and in range,
+/// else `None` (no `iiv_on_ruv`, out of range, or a FIXed RUV Ω). The cap is
+/// enforced as a correlation-preserving rescale after the Ω M-step, so a
+/// well-posed fit whose ω_RUV stays below it is unaffected.
+fn compute_ruv_omega_cap(
+    residual_error_eta: Option<usize>,
+    n_eta: usize,
+    omega_init: &DMatrix<f64>,
+    omega_fixed: &[bool],
+) -> Option<f64> {
+    let k = residual_error_eta?;
+    if k >= n_eta || omega_fixed.get(k).copied().unwrap_or(false) {
+        return None;
+    }
+    let v0 = omega_init[(k, k)];
+    if !(v0 > 0.0) {
+        return None;
+    }
+    Some(v0.ln() + SAEM_RUV_OMEGA_LN_GROWTH)
+}
+
+/// Cap the `iiv_on_ruv` Ω diagonal at `exp(log_cap)` in place, rescaling the RUV
+/// row/column covariances by `√(v_cap/v_old)` so every correlation with the RUV
+/// eta is preserved and the matrix stays positive-definite (#895). A no-op when
+/// the diagonal is already at or below the cap. Returns `true` when it clamped.
+fn apply_ruv_omega_cap(omega_mat: &mut DMatrix<f64>, k: usize, log_cap: f64) -> bool {
+    let v_old = omega_mat[(k, k)];
+    let v_cap = log_cap.exp();
+    if !(v_old > v_cap) {
+        return false;
+    }
+    let s = (v_cap / v_old).sqrt();
+    let n = omega_mat.nrows();
+    for j in 0..n {
+        if j != k {
+            omega_mat[(k, j)] *= s;
+            omega_mat[(j, k)] *= s;
+        }
+    }
+    omega_mat[(k, k)] = v_cap;
+    true
+}
+
 /// Decide whether SAEM should warn that its E-step never mixed (issue #895).
 ///
 /// `cum_acc` / `cum_prop` are the run-cumulative combined (block + componentwise)
@@ -1623,6 +1679,15 @@ pub fn run_saem(
         &init_params.sigma_fixed,
     );
 
+    // #895: log-variance ceiling for the iiv_on_ruv Ω diagonal — the ω_RUV half
+    // of the σ × ω_RUV ridge backstop (see `compute_ruv_omega_cap`).
+    let ruv_omega_cap: Option<f64> = compute_ruv_omega_cap(
+        model.residual_error_eta,
+        n_eta,
+        &init_params.omega.matrix,
+        &init_params.omega_fixed,
+    );
+
     let mut state = SaemState {
         etas,
         kappas: kappas_init,
@@ -2046,6 +2111,13 @@ pub fn run_saem(
                 SAEM_OMEGA_DIAG_FLOOR,
             );
 
+            // #895: cap the iiv_on_ruv Ω variance so a runaway ridge can't inflate
+            // ω_RUV without bound (the original report saw ~49). No-op for a
+            // well-posed fit; a correlation-preserving rescale keeps Ω PD.
+            if let (Some(k), Some(log_cap)) = (model.residual_error_eta, ruv_omega_cap) {
+                apply_ruv_omega_cap(&mut state.omega_mat, k, log_cap);
+            }
+
             // ---- Step 3b: Omega_iov (analytic, IOV only) ----
             // Apply the SA sufficient statistic, zeroing structural off-diagonals
             // and restoring FIX-ed kappa entries, mirroring the BSV omega treatment.
@@ -2409,8 +2481,10 @@ pub fn run_saem(
             if final_params.sigma.values[i].max(1e-300).ln() >= cap - 1e-6 {
                 warnings.push(format!(
                     "SAEM residual sigma '{}' hit its iiv_on_ruv growth cap (≈{:.4}); the \
-                     sigma × omega_RUV ridge is weakly identified. Consider fixing sigma or \
-                     the RUV omega, or removing iiv_on_ruv.",
+                     sigma × omega_RUV ridge is weakly identified and the estimates are not \
+                     trustworthy. The most reliable fix is to FIX sigma at a known value (e.g. \
+                     from an IMP/IMPMAP run) and re-fit — omega_RUV then recovers; alternatively \
+                     FIX the RUV omega or remove iiv_on_ruv.",
                     final_params
                         .sigma
                         .names
@@ -2420,6 +2494,26 @@ pub fn run_saem(
                     cap.exp()
                 ));
             }
+        }
+    }
+
+    // #895: warn when the iiv_on_ruv Ω variance ended pinned against its growth
+    // cap — the ω_RUV half of the same ridge instability. Same guidance: fix σ (or
+    // the RUV Ω) and re-fit.
+    if let (Some(k), Some(log_cap)) = (model.residual_error_eta, ruv_omega_cap) {
+        if final_params.omega.matrix[(k, k)].max(1e-300).ln() >= log_cap - 1e-6 {
+            warnings.push(format!(
+                "SAEM iiv_on_ruv omega '{}' hit its growth cap (≈{:.4}); the sigma × omega_RUV \
+                 ridge is weakly identified and the estimates are not trustworthy. FIX sigma at \
+                 a known value (e.g. from an IMP/IMPMAP run) and re-fit — omega_RUV then recovers.",
+                final_params
+                    .omega
+                    .eta_names
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| format!("eta[{k}]")),
+                log_cap.exp()
+            ));
         }
     }
 
@@ -3900,6 +3994,61 @@ mod tests {
         // takes the tighter of the two — it can only ever tighten σ, never loosen.
         let caps = compute_ruv_sigma_caps(true, None, &[0.0], &[1.0], &[false]);
         assert_eq!(caps[0], Some(1.0));
+    }
+
+    // ---- #895: iiv_on_ruv omega-ridge cap ----
+
+    #[test]
+    fn ruv_omega_cap_none_without_ruv_or_when_fixed() {
+        let om = DMatrix::from_diagonal(&DVector::from_vec(vec![0.3, 0.2]));
+        // No iiv_on_ruv eta.
+        assert_eq!(compute_ruv_omega_cap(None, 2, &om, &[false, false]), None);
+        // RUV eta index out of range.
+        assert_eq!(
+            compute_ruv_omega_cap(Some(5), 2, &om, &[false, false]),
+            None
+        );
+        // RUV omega FIXed.
+        assert_eq!(compute_ruv_omega_cap(Some(0), 2, &om, &[true, false]), None);
+    }
+
+    #[test]
+    fn ruv_omega_cap_is_log_variance_plus_growth() {
+        let om = DMatrix::from_diagonal(&DVector::from_vec(vec![0.2977886, 0.2]));
+        let cap = compute_ruv_omega_cap(Some(0), 2, &om, &[false, false]).unwrap();
+        assert!((cap - (0.2977886_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH)).abs() < 1e-12);
+        // ≈ 20× the starting variance.
+        assert!((cap.exp() / 0.2977886 - SAEM_RUV_OMEGA_LN_GROWTH.exp()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_ruv_omega_cap_noop_below_cap() {
+        let mut om = DMatrix::from_row_slice(2, 2, &[0.3, 0.05, 0.05, 0.2]);
+        let before = om.clone();
+        // cap = exp(log(0.3)+3) ≈ 6.0, well above 0.3 → no change.
+        let clamped = apply_ruv_omega_cap(&mut om, 0, 0.3_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH);
+        assert!(!clamped);
+        assert_eq!(om, before);
+    }
+
+    #[test]
+    fn apply_ruv_omega_cap_preserves_correlation_and_pd() {
+        // ω_RUV runaway to 9.0, correlated with a second eta (var 0.2).
+        let cov = 0.9_f64; // corr = 0.9/sqrt(9*0.2) ≈ 0.671
+        let mut om = DMatrix::from_row_slice(2, 2, &[9.0, cov, cov, 0.2]);
+        let corr_before = om[(0, 1)] / (om[(0, 0)] * om[(1, 1)]).sqrt();
+        let log_cap = 0.2977886_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH; // ≈ log(5.98)
+        let clamped = apply_ruv_omega_cap(&mut om, 0, log_cap);
+        assert!(clamped);
+        // Diagonal pulled down to the cap.
+        assert!((om[(0, 0)] - log_cap.exp()).abs() < 1e-9);
+        // Correlation with the other eta preserved.
+        let corr_after = om[(0, 1)] / (om[(0, 0)] * om[(1, 1)]).sqrt();
+        assert!((corr_after - corr_before).abs() < 1e-9);
+        // Still symmetric and positive-definite (2×2: det > 0, diag > 0).
+        assert_eq!(om[(0, 1)], om[(1, 0)]);
+        let det = om[(0, 0)] * om[(1, 1)] - om[(0, 1)] * om[(1, 0)];
+        assert!(det > 0.0 && om[(0, 0)] > 0.0);
     }
 
     // ---- #895: MH mixing warning ----
