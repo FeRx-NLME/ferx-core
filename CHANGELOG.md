@@ -101,7 +101,37 @@ section of the SDLC for the versioning policy).
   negligible cost near the optimum. FOCE/FOCEI are unchanged (their Gauss-Newton `log|H̃|`
   is forgiving of a loose mode).
 
+### Added
+- **Infusion into an oral model's peripheral compartment on the analytical engine** (#375).
+  `two_cpt_oral` (`CMT=3`) and `three_cpt_oral` (`CMT=3`/`CMT=4`) previously rejected a
+  positive `RATE` — and, before that, crashed on one — because the oral closed-form
+  propagators had no peripheral forcing term where the IV ones did. They need no new closed
+  form: nothing flows back into the depot, so a rate into a peripheral drives exactly the
+  central/peripheral sub-system the IV model has, and the oral propagator superposes that
+  same forced response onto its own homogeneous evolution. Combined with the bolus change
+  below, **every compartment of every analytical model now accepts both a bolus and an
+  infusion**, alone or together. Validated against NONMEM 7.6.0 `ADVAN4`/`ADVAN12` and —
+  more tightly than NONMEM can express, since its own forced response carries ~2e-6 here —
+  against a `1e-12` integration of the same system written out as explicit `[odes]`, which
+  agrees to ~1e-11 (`tests/oral_peripheral_infusion.rs`), including a peripheral infusion
+  overlapping an oral depot dose.
+
 ### Fixed
+- **A dose into a non-default compartment is now computed in that compartment on the
+  analytical engine** (#375). The closed-form dose-superposition path never read the dose's
+  `CMT`: it chose the formula from the *model*, so it placed every bolus in compartment 1
+  (the depot of an oral model, central of an IV one) and every infusion into central,
+  whatever the data said. A bolus into an IV model's peripheral, or into an oral model's
+  central compartment (an IV loading dose against an oral maintenance model), was therefore
+  computed in the wrong compartment — silently, with a finite OFV and no warning, and
+  disagreeing with NONMEM by up to two orders of magnitude on a 3-compartment model. Which
+  answer you got depended only on whether the subject happened to carry a time-varying
+  covariate, an `EVID=3/4` reset, or IOV, since those route to the event-driven walk, which
+  places doses correctly. Such doses now route to that walk on every dataset, so both paths
+  agree and both match NONMEM. Validated against NONMEM 7.6.0 `ADVAN1/2/3/4/11/12`
+  (`tests/nonmem_dose_compartment_anchor.rs`). Per-compartment amounts in
+  sdtab / `[derived]` are reported as `NaN` for these subjects rather than wrong, with the
+  existing warning extended to explain why; predictions are exact.
 - **A steady-state dose with `CMT=0` no longer loses its accumulation on the analytical
   event-driven path** (#375). `CMT=0` is NONMEM's "default dose compartment", and every dose
   site resolves it to the model's first compartment — except the event-driven walk's

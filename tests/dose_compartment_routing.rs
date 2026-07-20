@@ -1,20 +1,25 @@
-//! Tier-2 integration tests for #375 — an infusion into a compartment the
-//! analytical closed forms cannot deliver into must be **rejected up front**,
-//! not `panic!`ed on from inside the event-driven prediction walk.
+//! Tier-2 integration tests for #375 at the public boundary.
 //!
-//! The reported failure was reachable from ordinary NONMEM-format data: a
-//! positive `RATE` into `CMT=3` of a `two_cpt_oral` model, on a subject that
-//! also carries a time-varying covariate (which is what routes the subject to
-//! the event-driven walk in the first place). Nothing validated a *fixed*
-//! positive `RATE` against the model's topology — the datareader has no model,
-//! and the parse-time infusable check only fires for a declared `D{cmt}`/
-//! `R{cmt}` — so the walk's routing `match` was the first thing to see it and
-//! it aborted the process.
+//! The reported failure was a positive `RATE` into `CMT=3` of a `two_cpt_oral`
+//! model — an oral **peripheral** — on a subject that also carried a
+//! time-varying covariate (which is what routes it to the event-driven walk).
+//! Nothing validated a *fixed* positive `RATE` against the model's topology (the
+//! datareader has no model, and the parse-time check only fires for a declared
+//! `D{cmt}`/`R{cmt}`), so the walk's routing `match` was the first thing to see
+//! it and it aborted the process.
 //!
-//! These tests pin the public-boundary contract: `fit()` returns `Err`,
-//! `predict()`/`simulate()` panic with the actionable diagnostic (the existing
-//! convention for entry points that run no data-check), and the routable
-//! compartments still predict.
+//! **That exact case is now supported**, not merely rejected: the oral
+//! propagators gained the peripheral forcing term (see
+//! `tests/oral_peripheral_infusion.rs` for its exact ODE-twin oracle and
+//! `tests/nonmem_dose_compartment_anchor.rs` for the NONMEM anchor), so the
+//! headline test below asserts it *predicts* rather than that it errors.
+//!
+//! What remains rejected is a dose with no routable target at all — an infusion
+//! into `CMT=0` (an infusion has no "default compartment" fallback) or any dose
+//! past the end of the model's compartment list. These tests pin that contract:
+//! `fit()` returns `Err`, `predict()`/`simulate()` panic with the actionable
+//! diagnostic (the existing convention for entry points that run no data-check),
+//! and every routable compartment predicts.
 //!
 //! All return immediately (a `check_model_data` pass, a `predict()` at fixed
 //! parameters, or a `fit()` that errors before iterating), so they need no
@@ -73,10 +78,16 @@ fn pop_of(csv: &str) -> Population {
 
 const OBS_ROWS: &str = "1,1,5.0,0,.,2,.,0,70\n1,4,4.0,0,.,2,.,0,72\n1,8,3.0,0,.,2,.,0,74\n";
 
-/// `RATE>0` into CMT=3 — the oral **peripheral**, which no closed form can
-/// infuse into. This is the #375 repro.
+/// `RATE>0` into CMT=3 — the oral **peripheral**. This is the original #375
+/// repro, which used to panic and is now supported.
 fn peripheral_infusion_csv() -> String {
     format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,3,20,1,70\n{OBS_ROWS}")
+}
+
+/// `RATE>0` into CMT=0 — no default compartment exists for an infusion, so this
+/// is unroutable on every analytical path and is the surviving reject case.
+fn unroutable_infusion_csv() -> String {
+    format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,0,20,1,70\n{OBS_ROWS}")
 }
 
 /// The same dataset dosing into CMT=2 (central) — routable, must still work.
@@ -92,25 +103,44 @@ fn depot_infusion_csv() -> String {
 // ── fit(): a recoverable error, not a crash ──
 
 #[test]
-fn fit_rejects_an_infusion_into_an_oral_peripheral() {
+fn fit_rejects_an_unroutable_infusion() {
     let model = model_of(TWO_CPT_ORAL);
-    let pop = pop_of(&peripheral_infusion_csv());
+    let pop = pop_of(&unroutable_infusion_csv());
     let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
         .expect_err("an unroutable infusion must be an Err, not a panic");
     assert!(
-        err.contains("compartment 3") && err.contains("two_cpt_oral"),
+        err.contains("compartment 0") && err.contains("two_cpt_oral"),
         "error should name the offending compartment and model: {err}"
     );
     assert!(
-        err.contains("[1, 2]"),
+        err.contains("[1, 2, 3]"),
         "error should name the infusable compartments: {err}"
+    );
+}
+
+/// The original #375 repro now **predicts** instead of aborting: an infusion into
+/// the oral peripheral is supported, and both analytical paths serve it.
+#[test]
+fn fit_accepts_the_original_repro_now_that_oral_peripheral_infusion_is_supported() {
+    let model = model_of(TWO_CPT_ORAL);
+    let pop = pop_of(&peripheral_infusion_csv());
+    assert!(
+        check_model_data(&model, &pop).iter().all(|d| !d.is_error()),
+        "oral peripheral infusion is supported since #375"
+    );
+    let preds = predict(&model, &pop, &model.default_params);
+    assert_eq!(preds.len(), 3);
+    assert!(
+        preds.iter().all(|p| p.pred.is_finite() && p.pred > 0.0),
+        "got {:?}",
+        preds.iter().map(|p| p.pred).collect::<Vec<_>>()
     );
 }
 
 #[test]
 fn check_model_data_reports_the_unroutable_infusion() {
     let model = model_of(TWO_CPT_ORAL);
-    let pop = pop_of(&peripheral_infusion_csv());
+    let pop = pop_of(&unroutable_infusion_csv());
     let diags = check_model_data(&model, &pop);
     let d = diags
         .iter()
@@ -130,7 +160,7 @@ fn predict_panics_before_reaching_the_event_driven_walk() {
     // Previously this panicked from `propagate_with_bounds`'s routing `match`
     // with no subject/time context; now the entry-point guard intercepts it.
     let model = model_of(TWO_CPT_ORAL);
-    let pop = pop_of(&peripheral_infusion_csv());
+    let pop = pop_of(&unroutable_infusion_csv());
     let _ = predict(&model, &pop, &model.default_params);
 }
 
@@ -138,7 +168,7 @@ fn predict_panics_before_reaching_the_event_driven_walk() {
 #[should_panic(expected = "a dose into a compartment the model cannot deliver into")]
 fn simulate_panics_before_reaching_the_event_driven_walk() {
     let model = model_of(TWO_CPT_ORAL);
-    let pop = pop_of(&peripheral_infusion_csv());
+    let pop = pop_of(&unroutable_infusion_csv());
     let _ = simulate(&model, &pop, &model.default_params, 1);
 }
 
@@ -265,17 +295,16 @@ fn a_tte_only_subject_of_a_pk_tte_dataset_is_still_validated() {
 }
 
 /// A bolus into the same peripheral compartment is *not* rejected — the walk
-/// adds the amount to the state directly. Guards against the check being
-/// over-broad and breaking a legitimate dosing pattern.
+/// adds the amount to the state directly, and since #375 the dispatcher routes
+/// such a dose there instead of letting the cmt-blind superposition form compute
+/// it as a depot dose.
 ///
-/// The assertion is deliberately weak (finite, not a specific value): which
-/// analytical path serves this subject decides the *answer*, because the
-/// superposition path ignores `dose.cmt` and would compute this as a depot dose.
-/// This test pins "not rejected", NOT "correct" — the value disagreement is a
-/// separate, pre-existing defect tracked outside this PR, and asserting a number
-/// here would bless whichever path happens to run.
+/// Asserts the **value**, not merely "not rejected": `two_cpt_oral` with a bolus
+/// into CMT=3 is NONMEM `ADVAN4` CMT=3, anchored in
+/// `tests/nonmem_dose_compartment_anchor.rs`. Before the reroute this returned
+/// the depot-dose curve (1.1536 at t=1) — ~17x the correct 0.068.
 #[test]
-fn a_bolus_into_the_peripheral_is_still_accepted() {
+fn a_bolus_into_the_peripheral_is_computed_in_the_peripheral() {
     let model = model_of(TWO_CPT_ORAL);
     let pop = pop_of(&format!(
         "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,3,0,1,70\n{OBS_ROWS}"
@@ -284,6 +313,21 @@ fn a_bolus_into_the_peripheral_is_still_accepted() {
         check_model_data(&model, &pop).iter().all(|d| !d.is_error()),
         "a peripheral bolus must stay accepted"
     );
-    let preds = predict(&model, &pop, &model.default_params);
-    assert!(preds.iter().all(|p| p.pred.is_finite()));
+    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .into_iter()
+        .map(|p| p.pred)
+        .collect();
+    // The TV covariate in TWO_CPT_ORAL scales CL, so these are not the bare
+    // NONMEM numbers; what matters is that the dose landed in the peripheral —
+    // a peripheral bolus rises from ~0 as it redistributes, where a depot dose
+    // would start high. Guard the qualitative shape plus the first-point
+    // magnitude, which differ by an order of magnitude between the two.
+    assert!(
+        preds[0] < 0.2,
+        "a peripheral bolus should start low (depot-dose bug gave ~1.15): {preds:?}"
+    );
+    assert!(
+        preds[1] > preds[0],
+        "a peripheral bolus redistributes into central, so it should rise: {preds:?}"
+    );
 }

@@ -224,6 +224,7 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     e: &TwoCptEigen<T>,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
     rate_depot: T,
 ) {
     let (alpha, beta, k10, k12, k21) = (e.alpha, e.beta, e.k10, e.k12, e.k21);
@@ -273,13 +274,22 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     state[1] = h_c_dt + cap_a * e_ka;
     state[2] = h_p_dt + cap_b * e_ka;
 
-    // Constant infusion into central (depot bypass): forced response of the 2-cpt
-    // IV propagator from a zero initial state. `rate_central` is structurally 0 or
-    // positive (never crossing during differentiation), so the `.val()` guard is
-    // derivative-safe and just skips the no-infusion intervals.
-    if rate_central.val() > 0.0 {
+    // Constant infusion into central (depot bypass) and/or into the **peripheral**
+    // (#375): forced response of the 2-cpt IV propagator from a zero initial state.
+    //
+    // Both reduce to the same delegation because the depot is decoupled from the
+    // disposition sub-system in the inflow direction — nothing flows *back* into
+    // the depot — so a rate into central or peripheral drives exactly the
+    // central/peripheral pair an IV model has, and the system is linear, so the
+    // forced response superposes onto the homogeneous evolution above. The oral
+    // peripheral therefore needs no new closed form: it *is* the IV one.
+    //
+    // `rate_*` are structurally 0 or positive (never crossing during
+    // differentiation), so the `.val()` guards are derivative-safe and just skip
+    // the no-infusion intervals.
+    if rate_central.val() > 0.0 || rate_periph1.val() > 0.0 {
         let mut inflow = [T::from_f64(0.0), T::from_f64(0.0)];
-        propagate_two_cpt_core_g(&mut inflow, dt, e, rate_central, T::from_f64(0.0));
+        propagate_two_cpt_core_g(&mut inflow, dt, e, rate_central, rate_periph1);
         state[1] = state[1] + inflow[0];
         state[2] = state[2] + inflow[1];
     }
@@ -299,7 +309,15 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
         };
         let d_ss = rate_depot / ka;
         let mut xss = [d_ss, c_ss, p_ss];
-        propagate_two_cpt_oral_core_g(&mut xss, dt, e, ka, T::from_f64(0.0), T::from_f64(0.0));
+        propagate_two_cpt_oral_core_g(
+            &mut xss,
+            dt,
+            e,
+            ka,
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+        );
         state[0] = state[0] + (d_ss - xss[0]);
         state[1] = state[1] + (c_ss - xss[1]);
         state[2] = state[2] + (p_ss - xss[2]);
@@ -317,13 +335,14 @@ pub fn propagate_two_cpt_oral_g<T: PkNum>(
     v2: T,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
     rate_depot: T,
 ) {
     if ka.val() <= 0.0 {
         return;
     }
     if let Some(e) = two_cpt_eigen_g(cl, v1, q, v2) {
-        propagate_two_cpt_oral_core_g(state, dt, &e, ka, rate_central, rate_depot);
+        propagate_two_cpt_oral_core_g(state, dt, &e, ka, rate_central, rate_periph1, rate_depot);
     }
 }
 
@@ -501,6 +520,8 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     e: &ThreeCptEigen<T>,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
+    rate_periph2: T,
     rate_depot: T,
 ) {
     let (alpha, beta, gamma, k10, k12, k13, k21, k31) =
@@ -536,19 +557,16 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     state[2] = p1a + p1b + p1g + cap_b * e_ka;
     state[3] = p2a + p2b + p2g + cap_c * e_ka;
 
-    // Constant infusion into central (depot bypass): forced response of the 3-cpt
-    // IV propagator from a zero initial state. `.val()` guard is derivative-safe
-    // (`rate_central` is structurally 0 or positive).
-    if rate_central.val() > 0.0 {
+    // Constant infusion into central (depot bypass) and/or into either
+    // **peripheral** (#375): forced response of the 3-cpt IV propagator from a
+    // zero initial state. The depot takes no inflow from the disposition
+    // sub-system, so a rate into central or a peripheral drives exactly the
+    // three-state system an IV model has — the oral peripherals reuse the IV
+    // closed form rather than needing a new one. `.val()` guards are
+    // derivative-safe (each rate is structurally 0 or positive).
+    if rate_central.val() > 0.0 || rate_periph1.val() > 0.0 || rate_periph2.val() > 0.0 {
         let mut inflow = [T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0)];
-        propagate_three_cpt_core_g(
-            &mut inflow,
-            dt,
-            e,
-            rate_central,
-            T::from_f64(0.0),
-            T::from_f64(0.0),
-        );
+        propagate_three_cpt_core_g(&mut inflow, dt, e, rate_central, rate_periph1, rate_periph2);
         state[1] = state[1] + inflow[0];
         state[2] = state[2] + inflow[1];
         state[3] = state[3] + inflow[2];
@@ -571,7 +589,16 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
         };
         let d_ss = rate_depot / ka;
         let mut xss = [d_ss, c_ss, p1_ss, p2_ss];
-        propagate_three_cpt_oral_core_g(&mut xss, dt, e, ka, T::from_f64(0.0), T::from_f64(0.0));
+        propagate_three_cpt_oral_core_g(
+            &mut xss,
+            dt,
+            e,
+            ka,
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+        );
         state[0] = state[0] + (d_ss - xss[0]);
         state[1] = state[1] + (c_ss - xss[1]);
         state[2] = state[2] + (p1_ss - xss[2]);
@@ -592,13 +619,24 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
     v3: T,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
+    rate_periph2: T,
     rate_depot: T,
 ) {
     if ka.val() <= 0.0 {
         return;
     }
     if let Some(e) = three_cpt_eigen_g(cl, v1, q2, v2, q3, v3) {
-        propagate_three_cpt_oral_core_g(state, dt, &e, ka, rate_central, rate_depot);
+        propagate_three_cpt_oral_core_g(
+            state,
+            dt,
+            &e,
+            ka,
+            rate_central,
+            rate_periph1,
+            rate_periph2,
+            rate_depot,
+        );
     }
 }
 
@@ -962,6 +1000,7 @@ fn apply_step_g<T: PkNum>(
                 pk.v2,
                 pk.ka,
                 rate_central,
+                rate_periph1,
                 rate_depot,
             ),
             PkModel::ThreeCptIv => propagate_three_cpt_g(
@@ -988,6 +1027,8 @@ fn apply_step_g<T: PkNum>(
                 pk.v3,
                 pk.ka,
                 rate_central,
+                rate_periph1,
+                rate_periph2,
                 rate_depot,
             ),
         }

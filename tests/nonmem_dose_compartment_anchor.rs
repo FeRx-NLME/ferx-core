@@ -22,9 +22,11 @@
 //!    with ferx's **event-driven walk**. It disagrees sharply with the
 //!    dose-superposition path, which never reads `dose.cmt` and computes every
 //!    dose as going into the model's default route — by up to two orders of
-//!    magnitude. These cases are therefore asserted against the walk; the
-//!    superposition path's disagreement is a separate, pre-existing defect
-//!    (tracked separately) and is deliberately *not* asserted here.
+//!    magnitude — because it never reads `dose.cmt` and computes every dose as
+//!    going into the model's default route. Since #375 such a dose reroutes to
+//!    the walk, so **every case here asserts both paths** — each against NONMEM,
+//!    and against each other. That three-way agreement is the acceptance
+//!    criterion; before the fix the `[default dispatch]` arm failed.
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{predict, read_nonmem_csv, CompiledModel, Population};
@@ -74,7 +76,29 @@ fn walk_preds(src: &str, dose_cmt: usize, obs_cmt: usize, rate: f64, ss: u8, ii:
         .collect::<Vec<_>>()
         .join("\n");
     let csv = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II,WT\n{dose}\n{obs}\n");
-    predict(&model, &pop_of(&csv), &model.default_params)
+    preds_of(&model, &csv)
+}
+
+/// Predictions on the **plain** dataset — no time-varying covariate, so the
+/// dispatcher's default route. Historically this was the dose-superposition
+/// path, which ignores `dose.cmt`; since #375 a dose the superposition form
+/// cannot place reroutes to the same walk, so this must now agree with
+/// `walk_preds` *and* with NONMEM. That agreement is the point of asserting
+/// both.
+fn plain_preds(src: &str, dose_cmt: usize, obs_cmt: usize, rate: f64, ss: u8, ii: f64) -> Vec<f64> {
+    let model: CompiledModel = parse_full_model(src).expect("model parses").model;
+    let dose = format!("1,0,.,1,100,{dose_cmt},{rate},1,{ss},{ii}");
+    let obs: String = [1, 4, 8]
+        .iter()
+        .map(|t| format!("1,{t},5.0,0,.,{obs_cmt},.,0,0,0"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let csv = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n{dose}\n{obs}\n");
+    preds_of(&model, &csv)
+}
+
+fn preds_of(model: &CompiledModel, csv: &str) -> Vec<f64> {
+    predict(model, &pop_of(csv), &model.default_params)
         .into_iter()
         .map(|p| p.pred)
         .collect()
@@ -87,6 +111,51 @@ fn walk_preds(src: &str, dose_cmt: usize, obs_cmt: usize, rate: f64, ss: u8, ii:
 fn assert_matches_nonmem(got: &[f64], nonmem: &[f64], case: &str) {
     assert_close(got, nonmem, 1e-9, case)
 }
+
+/// Assert **both** analytical paths reproduce NONMEM for the same dose row: the
+/// event-driven walk, and the plain dispatcher route. Before #375 the second one
+/// was dose superposition, which ignores `dose.cmt` and disagreed with NONMEM by
+/// up to two orders of magnitude; the two paths agreeing *and* both landing on
+/// NONMEM is the acceptance criterion.
+fn assert_both_paths_match(
+    src: &str,
+    dose_cmt: usize,
+    obs_cmt: usize,
+    rate: f64,
+    ss: u8,
+    ii: f64,
+    nonmem: &[f64],
+    tol: f64,
+    case: &str,
+) {
+    let walk = walk_preds(src, dose_cmt, obs_cmt, rate, ss, ii);
+    let plain = plain_preds(src, dose_cmt, obs_cmt, rate, ss, ii);
+    assert_close(&walk, nonmem, tol, &format!("{case} [event-driven walk]"));
+    assert_close(&plain, nonmem, tol, &format!("{case} [default dispatch]"));
+    assert_close(&plain, &walk, tol, &format!("{case} [paths agree]"));
+}
+
+/// 3-compartment **infusion** cases. NONMEM's own `ADVAN11`/`ADVAN12` forced
+/// response carries ~2e-6 relative error here, and it is NONMEM that is off, not
+/// ferx: the closed form was cross-checked against a 1e-12 RK45 solve of the
+/// *same* ODE system (`d/dt` written out explicitly, `ode_reltol = 1e-12`) and
+/// the two ferx paths agree to **1.8e-12**, while both differ from NONMEM by the
+/// same 2.15e-6. The bolus cases on the identical eigenvalues agree with NONMEM
+/// to <1e-8, so this is specific to its infusion forced response. The tolerance
+/// is therefore set by the *reference's* accuracy, not ferx's — and
+/// `three_cpt_oral_peripheral_infusion_matches_the_ode_twin` pins the exact
+/// oracle so this looser bound cannot hide a regression.
+fn assert_matches_nonmem_3cpt_infusion(got: &[f64], nonmem: &[f64], case: &str) {
+    assert_close(got, nonmem, NONMEM_3CPT_INFUSION_TOL, case)
+}
+
+/// Bound set by **NONMEM's** accuracy on these cases, not ferx's: the measured
+/// gap is 2.1e-6 on `ADVAN11 CMT=2` and 1.1e-5 on the smallest-magnitude case
+/// (`ADVAN12 CMT=4`, PRED ~1.6e-3). ferx's own agreement with an independent
+/// 1e-12 integration of the same system is ~1e-11 — see
+/// `tests/oral_peripheral_infusion.rs`, which is the tight oracle. This anchor's
+/// job is cross-tool corroboration; that file's job is precision.
+const NONMEM_3CPT_INFUSION_TOL: f64 = 3e-5;
 
 /// 3-compartment closed forms obtain their eigenvalues by solving a **cubic**;
 /// ferx and NONMEM use different root-finders, so the last couple of digits
@@ -160,8 +229,17 @@ fn three_cpt_oral() -> String {
 fn ss_dose_cmt_zero_and_one_match_nonmem() {
     const NONMEM_SS: [f64; 3] = [2.5896677831, 1.9184730793, 1.2859909628];
     for cmt in [0usize, 1] {
-        let got = walk_preds(&one_cpt_iv(), cmt, 1, 0.0, 1, 12.0);
-        assert_matches_nonmem(&got, &NONMEM_SS, &format!("ADVAN1 SS=1 CMT={cmt}"));
+        assert_both_paths_match(
+            &one_cpt_iv(),
+            cmt,
+            1,
+            0.0,
+            1,
+            12.0,
+            &NONMEM_SS,
+            1e-9,
+            &format!("ADVAN1 SS=1 CMT={cmt}"),
+        );
     }
 }
 
@@ -172,10 +250,15 @@ fn ss_dose_cmt_zero_and_one_match_nonmem() {
 /// (it treats it as a depot dose); NONMEM and the walk agree on 1.8097.
 #[test]
 fn one_cpt_oral_bolus_into_central_matches_nonmem() {
-    let got = walk_preds(&one_cpt_oral(), 2, 2, 0.0, 0, 0.0);
-    assert_matches_nonmem(
-        &got,
+    assert_both_paths_match(
+        &one_cpt_oral(),
+        2,
+        2,
+        0.0,
+        0,
+        0.0,
         &[1.8096748361, 1.3406400921, 0.89865792823],
+        1e-9,
         "ADVAN2 bolus CMT=2",
     );
 }
@@ -183,10 +266,15 @@ fn one_cpt_oral_bolus_into_central_matches_nonmem() {
 /// `ADVAN3` (2-cpt IV), bolus into `CMT=2` — the peripheral compartment.
 #[test]
 fn two_cpt_iv_bolus_into_peripheral_matches_nonmem() {
-    let got = walk_preds(&two_cpt_iv(), 2, 1, 0.0, 0, 0.0);
-    assert_matches_nonmem(
-        &got,
+    assert_both_paths_match(
+        &two_cpt_iv(),
+        2,
+        1,
+        0.0,
+        0,
+        0.0,
         &[0.068015673681, 0.20535408329, 0.29007691882],
+        1e-9,
         "ADVAN3 bolus CMT=2",
     );
 }
@@ -194,10 +282,15 @@ fn two_cpt_iv_bolus_into_peripheral_matches_nonmem() {
 /// `ADVAN4` (2-cpt oral), bolus into `CMT=3` — the peripheral compartment.
 #[test]
 fn two_cpt_oral_bolus_into_peripheral_matches_nonmem() {
-    let got = walk_preds(&two_cpt_oral(), 3, 2, 0.0, 0, 0.0);
-    assert_matches_nonmem(
-        &got,
+    assert_both_paths_match(
+        &two_cpt_oral(),
+        3,
+        2,
+        0.0,
+        0,
+        0.0,
         &[0.068015673681, 0.20535408329, 0.29007691882],
+        1e-9,
         "ADVAN4 bolus CMT=3",
     );
 }
@@ -205,10 +298,15 @@ fn two_cpt_oral_bolus_into_peripheral_matches_nonmem() {
 /// `ADVAN11` (3-cpt IV), bolus into `CMT=3` — the second peripheral.
 #[test]
 fn three_cpt_iv_bolus_into_peripheral2_matches_nonmem() {
-    let got = walk_preds(&three_cpt_iv(), 3, 1, 0.0, 0, 0.0);
-    assert_matches_nonmem_3cpt(
-        &got,
+    assert_both_paths_match(
+        &three_cpt_iv(),
+        3,
+        1,
+        0.0,
+        0,
+        0.0,
         &[0.015193556553, 0.046937359706, 0.069431483504],
+        1e-8,
         "ADVAN11 bolus CMT=3",
     );
 }
@@ -216,10 +314,15 @@ fn three_cpt_iv_bolus_into_peripheral2_matches_nonmem() {
 /// `ADVAN12` (3-cpt oral), bolus into `CMT=2` — the central compartment.
 #[test]
 fn three_cpt_oral_bolus_into_central_matches_nonmem() {
-    let got = walk_preds(&three_cpt_oral(), 2, 2, 0.0, 0, 0.0);
-    assert_matches_nonmem(
-        &got,
+    assert_both_paths_match(
+        &three_cpt_oral(),
+        2,
+        2,
+        0.0,
+        0,
+        0.0,
         &[1.6726602861, 0.99662213471, 0.53066189083],
+        1e-8,
         "ADVAN12 bolus CMT=2",
     );
 }
@@ -232,10 +335,105 @@ fn three_cpt_oral_bolus_into_central_matches_nonmem() {
 /// accepting it is correct and not merely permissive.
 #[test]
 fn two_cpt_iv_infusion_into_peripheral_matches_nonmem() {
-    let got = walk_preds(&two_cpt_iv(), 2, 1, 20.0, 0, 0.0);
-    assert_matches_nonmem(
-        &got,
+    assert_both_paths_match(
+        &two_cpt_iv(),
+        2,
+        1,
+        20.0,
+        0,
+        0.0,
         &[0.0070275296315, 0.09332945504, 0.24115537856],
+        1e-9,
         "ADVAN3 infusion CMT=2",
+    );
+}
+
+// ── 4. infusion into an ORAL model's peripheral (#375) ───────────────────────
+
+/// `ADVAN4` (2-cpt oral) with `RATE=20` into `CMT=3` — the **peripheral** of an
+/// oral model. Previously rejected: the oral propagators had no peripheral-rate
+/// forcing term where the IV ones did.
+///
+/// The closed form needed is the IV one. Nothing flows back into the depot, so a
+/// rate into the peripheral drives exactly the central/peripheral pair a 2-cpt IV
+/// model has, and the oral propagator superposes that forced response onto its
+/// homogeneous evolution. NONMEM confirms the reduction exactly: this run prints
+/// the *same* `PRED` as `ADVAN3` with an infusion into `CMT=2`
+/// (`two_cpt_iv_infusion_into_peripheral_matches_nonmem`), because the depot is
+/// empty throughout.
+#[test]
+fn two_cpt_oral_infusion_into_peripheral_matches_nonmem() {
+    assert_both_paths_match(
+        &two_cpt_oral(),
+        3,
+        2,
+        20.0,
+        0,
+        0.0,
+        &[0.0070275296315, 0.09332945504, 0.24115537856],
+        1e-9,
+        "ADVAN4 infusion CMT=3",
+    );
+}
+
+/// `ADVAN12` (3-cpt oral), infusion into the **first** peripheral (`CMT=3`).
+#[test]
+fn three_cpt_oral_infusion_into_peripheral1_matches_nonmem() {
+    assert_both_paths_match(
+        &three_cpt_oral(),
+        3,
+        2,
+        20.0,
+        0,
+        0.0,
+        &[0.0069821063874, 0.091126295438, 0.2297334849],
+        NONMEM_3CPT_INFUSION_TOL,
+        "ADVAN12 infusion CMT=3",
+    );
+}
+
+/// `ADVAN12` (3-cpt oral), infusion into the **second** peripheral (`CMT=4`).
+#[test]
+fn three_cpt_oral_infusion_into_peripheral2_matches_nonmem() {
+    assert_both_paths_match(
+        &three_cpt_oral(),
+        4,
+        2,
+        20.0,
+        0,
+        0.0,
+        &[0.0015668828542, 0.021085941254, 0.056167606771],
+        NONMEM_3CPT_INFUSION_TOL,
+        "ADVAN12 infusion CMT=4",
+    );
+}
+
+/// 3-cpt **IV** peripheral infusions — the same forced response the oral cases
+/// above delegate to. Anchored separately so a discrepancy is attributed to the
+/// right place (the shared `propagate_three_cpt_core_g`), not to the oral wiring.
+/// NONMEM prints identical `PRED` for these and their `ADVAN12` twins.
+#[test]
+fn three_cpt_iv_infusion_into_peripherals_matches_nonmem() {
+    assert_both_paths_match(
+        &three_cpt_iv(),
+        2,
+        1,
+        20.0,
+        0,
+        0.0,
+        &[0.0069821063874, 0.091126295438, 0.2297334849],
+        NONMEM_3CPT_INFUSION_TOL,
+        "ADVAN11 infusion CMT=2",
+    );
+    assert_both_paths_match(
+        &three_cpt_iv(),
+        3,
+        1,
+        20.0,
+        0,
+        0.0,
+        &[0.0015668828542, 0.021085941254, 0.056167606771],
+        NONMEM_3CPT_INFUSION_TOL,
+        "ADVAN11 infusion CMT=3",
     );
 }

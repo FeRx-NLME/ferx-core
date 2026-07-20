@@ -373,10 +373,11 @@ misread the coded forms as a bolus (#324).
 ### Which compartments can an analytical model be infused into?
 
 On the analytical `pk(...)` engine the closed forms can deliver a zero-order
-input into the **central** compartment of every model, the **oral depot**
-(`CMT=1`, a zero-order release followed by first-order `ka` absorption), and the
-**peripheral** compartment(s) of the 2- and 3-compartment IV models. An oral
-model's peripherals have no closed form and are not infusable.
+input into **any compartment the model has**: the **central** compartment of
+every model, the **oral depot** (`CMT=1`, a zero-order release followed by
+first-order `ka` absorption), and the **peripheral** compartment(s) of both the
+IV and the oral models. A **bolus** likewise targets any compartment the model
+has.
 
 An infusion into any other compartment is rejected up front with
 `E_DOSE_CMT_NOT_INFUSABLE`, naming the subject, time, and the compartments the

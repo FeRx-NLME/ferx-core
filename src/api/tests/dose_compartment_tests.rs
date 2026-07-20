@@ -69,21 +69,51 @@ fn codes(model: &CompiledModel, population: &Population) -> Vec<String> {
 
 // ── the reported case: infusion into a compartment the walk cannot route ──
 
-/// The #375 repro: `two_cpt_oral` has no closed form for an infusion into its
-/// peripheral, and the event-driven walk used to `panic!` on it.
+/// The #375 repro — an infusion into an oral model's peripheral. It used to
+/// `panic!` from inside the event-driven walk, then (mid-#375) was rejected, and
+/// is now **supported**: the oral propagators gained the peripheral forcing term
+/// by reusing the IV forced response. Validated against NONMEM `ADVAN4`/`ADVAN12`
+/// and, exactly, against an ODE twin (`tests/oral_peripheral_infusion.rs`).
 #[test]
-fn infusion_into_oral_peripheral_is_rejected() {
-    let model = model_with(PkModel::TwoCptOral);
-    let population = population_with_doses(vec![infusion(3)]);
-    assert_eq!(codes(&model, &population), vec!["E_DOSE_CMT_NOT_INFUSABLE"]);
+fn infusion_into_oral_peripheral_is_supported() {
+    for (pk_model, cmt) in [
+        (PkModel::TwoCptOral, 3),
+        (PkModel::ThreeCptOral, 3),
+        (PkModel::ThreeCptOral, 4),
+    ] {
+        let model = model_with(pk_model);
+        let population = population_with_doses(vec![infusion(cmt)]);
+        assert!(
+            codes(&model, &population).is_empty(),
+            "{pk_model:?} cmt {cmt} infusion should be supported"
+        );
+    }
 }
 
-/// Same class, one compartment further out.
+/// With every in-range compartment of every walk-supported model now infusable,
+/// `E_DOSE_CMT_NOT_INFUSABLE` narrows to exactly one case: `CMT=0`, which has no
+/// rate channel because an infusion has no "default compartment" fallback. Pinned
+/// so the code isn't quietly dead.
 #[test]
-fn infusion_into_three_cpt_oral_peripheral_is_rejected() {
-    let model = model_with(PkModel::ThreeCptOral);
-    let population = population_with_doses(vec![infusion(3)]);
-    assert_eq!(codes(&model, &population), vec!["E_DOSE_CMT_NOT_INFUSABLE"]);
+fn every_in_range_compartment_is_infusable_on_walk_models() {
+    for pk_model in [
+        PkModel::OneCptIv,
+        PkModel::OneCptOral,
+        PkModel::TwoCptIv,
+        PkModel::TwoCptOral,
+        PkModel::ThreeCptIv,
+        PkModel::ThreeCptOral,
+    ] {
+        let n = pk_model.topology().state_layout().0;
+        for cmt in 1..=n {
+            let model = model_with(pk_model);
+            let population = population_with_doses(vec![infusion(cmt)]);
+            assert!(
+                codes(&model, &population).is_empty(),
+                "{pk_model:?} cmt {cmt} infusion should be supported"
+            );
+        }
+    }
 }
 
 /// `one_cpt_iv` has a single compartment, so cmt 2 is neither infusable nor in
@@ -130,13 +160,13 @@ fn infusion_into_cmt_zero_is_rejected() {
 #[test]
 fn rejection_message_names_the_subject_time_and_infusable_set() {
     let model = model_with(PkModel::TwoCptOral);
-    let population = population_with_doses(vec![infusion(3)]);
+    let population = population_with_doses(vec![infusion(0)]);
     let diags = check_dose_compartments(&model, &population);
     let msg = &diags[0].message;
     assert!(msg.contains("subject 1"), "{msg}");
-    assert!(msg.contains("compartment 3"), "{msg}");
+    assert!(msg.contains("compartment 0"), "{msg}");
     assert!(msg.contains("two_cpt_oral"), "{msg}");
-    assert!(msg.contains("[1, 2]"), "{msg}");
+    assert!(msg.contains("[1, 2, 3]"), "{msg}");
     assert_eq!(diags[0].block.as_deref(), Some("structural_model"));
 }
 
@@ -282,9 +312,9 @@ fn transit_bolus_range_is_still_checked() {
 fn errors_are_deduped_per_kind_and_compartment() {
     let model = model_with(PkModel::TwoCptOral);
     let population = population_with_doses(vec![
-        infusion(3),
-        infusion(3),
-        infusion(3),
+        infusion(0),
+        infusion(0),
+        infusion(0),
         bolus(9),
         bolus(9),
     ]);
@@ -307,12 +337,13 @@ fn infusion_and_bolus_into_the_same_compartment_report_separately() {
     );
 }
 
-/// …and where the two rules genuinely differ: on `two_cpt_oral` cmt 3 exists
-/// (so a bolus is fine) but is not infusable, so only the infusion is reported.
+/// …and where the two rules genuinely differ: `CMT=0` is the default dose
+/// compartment for a **bolus** (accepted) but has no rate channel for an
+/// **infusion** (rejected), so only the infusion is reported.
 #[test]
-fn the_two_rules_are_distinguished_on_an_in_range_non_infusable_compartment() {
+fn the_two_rules_are_distinguished_on_cmt_zero() {
     let model = model_with(PkModel::TwoCptOral);
-    let population = population_with_doses(vec![infusion(3), bolus(3)]);
+    let population = population_with_doses(vec![infusion(0), bolus(0)]);
     assert_eq!(codes(&model, &population), vec!["E_DOSE_CMT_NOT_INFUSABLE"]);
 }
 
@@ -325,6 +356,22 @@ fn a_clean_population_reports_nothing() {
     assert!(codes(&model, &population).is_empty());
 }
 
+/// A zero-amount dose is a no-op on every path — the walk's bolus branch adds
+/// `F·0` and its infusion branch needs `duration > 0`, which `AMT=0` never has.
+/// `is_infusion()` still reports `true` for it (it is `rate > 0 || !is_fixed()`,
+/// broader than the walk's predicate), so without an explicit skip the check
+/// would reject a dataset that previously ran fine and delivered nothing.
+#[test]
+fn a_zero_amount_dose_is_not_rejected() {
+    let model = model_with(PkModel::TwoCptOral);
+    let mut inf = infusion(3); // cmt 3 is not infusable
+    inf.amt = 0.0;
+    let mut bol = bolus(9); // cmt 9 is out of range
+    bol.amt = 0.0;
+    assert!(codes(&model, &population_with_doses(vec![inf])).is_empty());
+    assert!(codes(&model, &population_with_doses(vec![bol])).is_empty());
+}
+
 // ── wiring ──
 
 /// `fit()` reaches this through `check_model_data`, so the new codes must be in
@@ -332,7 +379,7 @@ fn a_clean_population_reports_nothing() {
 #[test]
 fn check_model_data_surfaces_the_new_error() {
     let model = model_with(PkModel::TwoCptOral);
-    let population = population_with_doses(vec![infusion(3)]);
+    let population = population_with_doses(vec![infusion(0)]);
     let diags = crate::api::check_model_data(&model, &population);
     assert!(
         diags.iter().any(|d| d.code == "E_DOSE_CMT_NOT_INFUSABLE"),

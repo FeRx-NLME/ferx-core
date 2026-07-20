@@ -1808,15 +1808,18 @@ pub fn compute_predictions_with_states(
                 model.active_dose_attr_map(),
                 &pk.values,
             );
-            if has_oral_depot_infusion(model.pk_model, &resolved) {
-                // The superposition state helper (`single_dose_states`) models an
-                // oral infusion as a depot-bypassing input into central, so it
-                // cannot express a zero-order input into the **depot** (#400) —
-                // it would report silently-wrong compartment amounts. The
-                // event-driven path (used for `ipred` above) has no states
-                // variant yet, so return outer-empty → NaN compartments, matching
-                // the reset/TV-analytical convention. ipred stays correct;
-                // sdtab/`[derived]` compartment amounts degrade to NaN.
+            if dose_needs_event_walk(model.pk_model, &resolved) {
+                // `single_dose_states` shares `single_dose_concentration`'s
+                // cmt-blindness: it models an oral infusion as a depot-bypassing
+                // input into central (so it cannot express a zero-order input
+                // into the **depot**, #400) and every bolus as going into
+                // compartment 1 — so for any dose outside those it would report
+                // silently-wrong compartment amounts. `ipred` above is correct
+                // either way (it reroutes to the event-driven walk), but that
+                // path has no states variant yet, so return outer-empty → NaN
+                // compartments, matching the reset/TV-analytical convention.
+                // sdtab/`[derived]` compartment amounts degrade to NaN rather
+                // than being wrong (#375).
                 vec![]
             } else {
                 predict_all_states(model.pk_model, &resolved, &pk)
@@ -1861,7 +1864,11 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
     // have no depot-infusion form, so a `D{depot}` infusion would be silently
     // mishandled. The event-driven propagator implements the depot zero-order
     // forced response, so route depot-infusion subjects there too.
-    if (subject.has_resets() || has_oral_depot_infusion(pk_model, subject))
+    // `dose_needs_event_walk` subsumes the depot-infusion case above and extends
+    // it to every dose whose compartment superposition cannot express — any
+    // bolus outside compartment 1, and any infusion outside central. NONMEM
+    // agrees with the walk on all of them (#375).
+    if (subject.has_resets() || dose_needs_event_walk(pk_model, subject))
         && event_driven::supports_event_driven(pk_model)
     {
         let pk_dose = vec![*pk_params; subject.doses.len()];
@@ -1901,6 +1908,57 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
 /// warning — so the three can never disagree about which subjects are affected.
 pub(crate) fn has_oral_depot_infusion(pk_model: PkModel, subject: &Subject) -> bool {
     pk_model.is_oral() && subject.doses.iter().any(|d| d.cmt == 1 && d.is_infusion())
+}
+
+/// True when any dose targets a compartment the **dose-superposition** dispatch
+/// cannot express, so the subject must be served by the event-driven walk.
+///
+/// [`single_dose_concentration`] never reads `dose.cmt`. It branches only on
+/// `is_infusion()` and then picks the closed form from the *model*, which fixes
+/// where the dose lands:
+///
+/// - a **bolus** takes the model's own form — an oral model absorbs it through
+///   the depot, an IV model injects it into central. Either way that is
+///   compartment **1**, so any bolus into compartment ≥ 2 is computed in the
+///   wrong compartment.
+/// - an **infusion** takes the IV infusion form, which delivers into
+///   **central** — compartment 2 for an oral model (the documented depot-bypass,
+///   #350), compartment 1 for an IV model. Any other target is wrong: the oral
+///   **depot** (#400, previously the only case handled, by
+///   [`has_oral_depot_infusion`]) and every **peripheral**.
+///
+/// `CMT=0` is NONMEM's default dose compartment and resolves to compartment 1,
+/// so it is treated as such here.
+///
+/// The event-driven walk applies each dose to its actual compartment and is
+/// **NONMEM-anchored for exactly these cases** — `ADVAN2` central bolus,
+/// `ADVAN3`/`ADVAN4` peripheral bolus, `ADVAN11` peripheral-2 bolus, `ADVAN12`
+/// central bolus, and an `ADVAN3` peripheral infusion all match to <1e-8
+/// relative (`tests/nonmem_dose_compartment_anchor.rs`), while superposition
+/// disagrees with NONMEM by up to two orders of magnitude. Rerouting is
+/// therefore a correction, not a preference (#375).
+///
+/// Subsumes [`has_oral_depot_infusion`] (an oral depot infusion is an infusion
+/// whose compartment is not central); that predicate is kept for the
+/// compartment-state degradation and its warning, which are about a different
+/// question.
+pub(crate) fn dose_needs_event_walk(pk_model: PkModel, subject: &Subject) -> bool {
+    // Transit/IG cannot be state-propagated, so there is no walk to route to.
+    // They reject non-depot doses up front instead (`check_absorption_dosing` /
+    // `check_absorption_closed_form_support`).
+    if !event_driven::supports_event_driven(pk_model) {
+        return false;
+    }
+    let central_cmt = if pk_model.is_oral() { 2 } else { 1 };
+    subject.doses.iter().any(|d| {
+        // `CMT=0` == the default dose compartment == 1.
+        let cmt = if d.cmt == 0 { 1 } else { d.cmt };
+        if d.is_infusion() {
+            cmt != central_cmt
+        } else {
+            cmt != 1
+        }
+    })
 }
 
 /// Compute predictions using ODE integration.

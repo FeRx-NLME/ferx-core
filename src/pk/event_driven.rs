@@ -878,9 +878,8 @@ fn propagate_with_bounds(
                     None => panic!(
                         "event-driven PK: infusion into compartment {} not supported \
                          for model {:?}. Supported: central for all models; depot (cmt 1) \
-                         for oral models; periph1/2 for 2- and 3-cpt IV models. Oral \
-                         peripheral infusion is unsupported — should have been rejected \
-                         by `check_dose_compartments`.",
+                         and peripheral(s) for oral models; periph1/2 for 2- and 3-cpt IV \
+                         models — should have been rejected by `check_dose_compartments`.",
                         d.cmt, pk_model
                     ),
                 }
@@ -932,6 +931,7 @@ fn propagate_with_bounds(
                         &e,
                         pk.ka(),
                         rate_central,
+                        rate_periph1,
                         rate_depot,
                     );
                 }
@@ -958,6 +958,8 @@ fn propagate_with_bounds(
                         &e,
                         pk.ka(),
                         rate_central,
+                        rate_periph1,
+                        rate_periph2,
                         rate_depot,
                     );
                 }

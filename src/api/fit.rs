@@ -1600,24 +1600,27 @@ fn fit_inner(
                     .to_string(),
             );
         }
-        // Analytical oral model with a zero-order input into the depot (#400):
-        // the superposition state helper models an oral infusion as a depot
-        // bypass, so it cannot express a depot zero-order input. ipred is exact
-        // (event-driven path), but per-obs compartment states return empty (→ NaN)
-        // rather than report silently-wrong amounts.
+        // Analytical model with a dose into a compartment the superposition state
+        // helper cannot express — a zero-order input into the oral depot (#400),
+        // or any bolus outside compartment 1 / infusion outside central (#375).
+        // ipred is exact (those subjects reroute to the event-driven walk), but
+        // per-obs compartment states return empty (→ NaN) rather than report
+        // silently-wrong amounts.
         if model.ode_spec.is_none()
             && population
                 .subjects
                 .iter()
-                .any(|s| crate::pk::has_oral_depot_infusion(model.pk_model, s))
+                .any(|s| crate::pk::dose_needs_event_walk(model.pk_model, s))
         {
             warnings.push(
-                "W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL: analytical oral model \
-                 with a zero-order input into the depot (RATE=-2 D1 / infusion into \
-                 compartment 1) — compartment states are not available for those \
-                 subjects (predictions are exact); [derived] expressions that \
+                "W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL: analytical model with a \
+                 dose the closed-form superposition cannot place — a zero-order input \
+                 into the oral depot (RATE=-2 D1 / infusion into compartment 1), or a \
+                 bolus into a compartment other than 1, or an infusion into a \
+                 non-central compartment — compartment states are not available for \
+                 those subjects (predictions are exact); [derived] expressions that \
                  reference compartments[i] evaluate to NaN for them. Use an ODE model \
-                 if depot/central compartment amounts are required."
+                 if per-compartment amounts are required."
                     .to_string(),
             );
         }

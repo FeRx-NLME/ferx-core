@@ -686,8 +686,10 @@ fn population_uses_analytical_pk(model: &CompiledModel, population: &Population)
 ///   - **Infusion** (`RATE>0`, or a resolved modeled rate/duration): the
 ///     compartment must be in [`PkModel::infusable_compartments`] — central for
 ///     every model, the oral depot since #400, and the peripheral(s) of the
-///     2-/3-cpt IV models. Oral peripherals have no closed form and are
-///     rejected rather than mis-routed. Checked only for the six event-walk
+///     2-/3-cpt IV models, and — since #375 — the oral models' peripheral(s)
+///     too (the oral propagators reuse the IV forced response; nothing flows
+///     back into the depot). What remains rejected is a compartment with no
+///     rate channel at all. Checked only for the six event-walk
 ///     models: `dose_channel` *is* the walk's routing table, and a transit/IG
 ///     subject never takes that walk — an infusion reroutes it to the model's
 ///     ODE twin (`CompiledModel::effective_for`, #719 gap 2), which addresses
@@ -735,6 +737,17 @@ pub(crate) fn check_dose_compartments(
     }
     for subject in &population.subjects {
         for dose in &subject.doses {
+            // A zero-amount dose delivers nothing on any path and never reaches
+            // the routing `match` this check guards: the walk's bolus branch adds
+            // `F·0`, and its infusion branch requires `duration > 0`, which an
+            // `AMT=0` infusion never has (`duration = AMT/RATE = 0`). Such a row
+            // is a no-op, not a mis-routed dose — rejecting a whole fit over it
+            // would be stricter than the failure being fixed. (`is_infusion()` is
+            // `rate > 0 || !is_fixed()`, which is deliberately broader than the
+            // walk's `rate > 0 && duration > 0`; this is where the two reconcile.)
+            if dose.amt == 0.0 {
+                continue;
+            }
             let is_infusion = dose.is_infusion();
             if !reported.insert((is_infusion, dose.cmt)) {
                 continue;
