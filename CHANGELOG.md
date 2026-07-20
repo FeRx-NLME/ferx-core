@@ -76,6 +76,11 @@ section of the SDLC for the versioning policy).
   Predictions are unchanged.
 
 ### Changed
+- **SAEM prints its final OFV before the covariance step** (#893). In a verbose run
+  (the CLI default), the `SAEM completed. Final OFV = …` line is now emitted *before*
+  the covariance matrix is computed rather than after, so you can judge the fit and
+  interrupt (Ctrl-C) before paying for the — often expensive — covariance step when the
+  OFV already rules the run out.
 - **`method = agq` removed; adaptive quadrature is now an *argument*, not a method**
   (#251). Adaptive Gauss–Hermite quadrature is not a separate estimator — it is the
   single-point method (Laplace / FOCEI) evaluated on more nodes. So the **method name now

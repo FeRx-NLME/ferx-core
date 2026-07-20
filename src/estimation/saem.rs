@@ -1224,6 +1224,16 @@ fn saem_state_to_params(
 // Main SAEM loop
 // ---------------------------------------------------------------------------
 
+/// Progress line printed once SAEM's final OFV is known, *before* the covariance
+/// step runs (#893). SAEM learns its OFV only at the very end (the final FOCE
+/// approximation), and the covariance step is often the most expensive part of
+/// the run, so reporting the OFV first lets a CLI user interrupt (Ctrl-C) on a
+/// bad OFV before paying for the covariance matrix. Kept as a pure function so
+/// the message is unit-testable.
+fn saem_final_ofv_report(ofv: f64) -> String {
+    format!("SAEM completed. Final OFV = {:.4}", ofv)
+}
+
 pub fn run_saem(
     model: &CompiledModel,
     population: &Population,
@@ -2241,6 +2251,15 @@ pub fn run_saem(
             options.interaction,
         );
 
+    // ---- Report OFV *before* the covariance step (#893) ----
+    // SAEM only learns its OFV here (the final FOCE approximation); the covariance
+    // step that follows can be the most expensive part of the run. Print the OFV
+    // first so a CLI user can judge the fit and interrupt (Ctrl-C) before paying
+    // for the covariance matrix when the OFV already rules the run out.
+    if verbose {
+        eprintln!("{}", saem_final_ofv_report(ofv));
+    }
+
     // ---- Covariance step ----
     let packed = pack_params(&final_params);
     let out = crate::estimation::covariance::run_covariance_step(
@@ -2261,10 +2280,6 @@ pub fn run_saem(
         sir_fallback_proposal,
     } = out;
     warnings.extend(cov_warnings);
-
-    if verbose {
-        eprintln!("SAEM completed. Final OFV = {:.4}", ofv);
-    }
 
     let saem_mu_ref_m_step_evals_saved = if use_closed_form_mstep {
         Some(mstep_grad_step_evals_saved)
@@ -2335,6 +2350,20 @@ mod tests {
     use super::*;
     use crate::types::test_helpers::analytical_model;
     use crate::types::{GradientMethod, MuRef};
+
+    #[test]
+    fn saem_final_ofv_report_formats_ofv_to_four_decimals() {
+        // #893: the pre-covariance progress line reports the OFV to 4 dp so a
+        // CLI user can judge the fit before the covariance step runs.
+        assert_eq!(
+            saem_final_ofv_report(1234.56789),
+            "SAEM completed. Final OFV = 1234.5679"
+        );
+        assert_eq!(
+            saem_final_ofv_report(-42.0),
+            "SAEM completed. Final OFV = -42.0000"
+        );
+    }
 
     #[test]
     fn fold_nll_grad_sums_nll_and_grad_elementwise_in_input_order() {

@@ -340,7 +340,14 @@ SAEM: 10 subjects, 3 ETAs, 400 total iter (150 explore + 250 converge)
   SAEM iter  400/400 [converge] γ=0.004  condNLL=38.096
 SAEM iterations complete. Computing final EBEs and OFV...
 SAEM completed. Final OFV = ...
+Running covariance step...
 ```
+
+The `Final OFV = ...` line is printed **before** the covariance step starts (#893).
+SAEM only learns its OFV at the very end (the final FOCE approximation), and the
+covariance matrix is often the most expensive part of the run — so seeing the OFV
+first lets you interrupt (Ctrl-C) when the OFV already rules the run out, instead of
+waiting for a covariance matrix you won't use.
 
 ### Why `γ` (gamma) is shown
 
