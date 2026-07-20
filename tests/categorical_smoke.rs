@@ -432,4 +432,98 @@ mod binary_smoke {
         let pop = common::binary_pop(&sim_subjects(), 3);
         assert!(ferx_core::predict(&model, &pop, &model.default_params).is_empty());
     }
+
+    // ---- Slice 1b: sdtab diagnostics ---------------------------------------------------
+
+    /// A binary fit emits one sdtab row per binary record, with `IPRED` = `p`, `DV` the
+    /// observed 0/1, and `IWRES` the standardized residual. `CWRES` is blank: the
+    /// conditional weighted residual is defined through the Gaussian residual-variance
+    /// model, which a Bernoulli outcome has none of.
+    #[test]
+    fn binary_sdtab_emits_one_row_per_record() {
+        use ferx_core::io::output::sdtab;
+        let model = parse_model_string(MIXED_MODEL).unwrap();
+        let subjects = sim_subjects();
+        let n_records: usize = subjects.iter().map(|(_, obs)| obs.len()).sum();
+        let pop = common::binary_pop(&subjects, 3);
+        let res = fit(&model, &pop, &model.default_params, &smoke_opts()).expect("fit");
+
+        let cols = sdtab(&res, &pop);
+        let get = |name: &str| -> &Vec<f64> {
+            &cols
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "sdtab must have a {name} column; got {:?}",
+                        cols.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+                    )
+                })
+                .1
+        };
+
+        // A binary-only model has no Gaussian rows, so every sdtab row is a discrete one.
+        assert_eq!(
+            get("DV").len(),
+            n_records,
+            "one sdtab row per binary record"
+        );
+        // The endpoint's CMT must survive even with no Gaussian rows to trigger the
+        // usual multi-CMT heuristic.
+        assert!(
+            get("CMT").iter().all(|&c| c == 3.0),
+            "CMT column must carry the binary CMT"
+        );
+
+        for (i, (&dv, &ipred)) in get("DV").iter().zip(get("IPRED").iter()).enumerate() {
+            assert!(dv == 0.0 || dv == 1.0, "row {i}: DV must be 0/1, got {dv}");
+            assert!(
+                (0.0..=1.0).contains(&ipred),
+                "row {i}: IPRED must be a probability, got {ipred}"
+            );
+        }
+        assert!(
+            get("IWRES").iter().all(|r| r.is_finite()),
+            "IWRES must be finite"
+        );
+        assert!(get("PRED").iter().all(|p| (0.0..=1.0).contains(p)));
+        // CWRES is undefined for a Bernoulli outcome → NaN → blank cell on write.
+        assert!(
+            get("CWRES").iter().all(|c| c.is_nan()),
+            "CWRES must be blank for discrete rows"
+        );
+    }
+
+    /// **Table-integrity invariant.** Every sdtab column is built by its own pass, and the
+    /// CSV writer indexes each column by row — so a column that fails to extend for the
+    /// discrete rows panics on write. Assert all columns are equal length, which is what
+    /// keeps a *newly added* column from silently truncating the table later.
+    #[test]
+    fn binary_sdtab_columns_are_all_equal_length() {
+        use ferx_core::io::output::sdtab;
+        let model = parse_model_string(MIXED_MODEL).unwrap();
+        let pop = common::binary_pop(&sim_subjects(), 3);
+        let res = fit(&model, &pop, &model.default_params, &smoke_opts()).expect("fit");
+
+        let cols = sdtab(&res, &pop);
+        let n = cols[0].1.len();
+        for (name, values) in &cols {
+            assert_eq!(
+                values.len(),
+                n,
+                "column {name} has {} rows, expected {n} — write_sdtab_csv would panic",
+                values.len()
+            );
+        }
+        // And the writer itself must survive a round trip to disk.
+        let path = std::env::temp_dir().join("ferx_binary_sdtab_smoke.csv");
+        ferx_core::io::output::write_sdtab_csv(&res, &pop, path.to_str().unwrap())
+            .expect("write_sdtab_csv must succeed for a binary-only fit");
+        let written = std::fs::read_to_string(&path).expect("sdtab file must exist");
+        let mut lines = written.lines();
+        let header = lines.next().expect("header");
+        assert!(header.contains("CMT") && header.contains("IPRED"));
+        assert_eq!(lines.count(), n, "one CSV data row per sdtab row");
+        let _ = std::fs::remove_file(&path);
+    }
 }

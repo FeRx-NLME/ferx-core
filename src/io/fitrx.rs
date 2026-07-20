@@ -1033,6 +1033,11 @@ fn parse_subjects(
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
+            // The .fitrx checkpoint format carries only the Gaussian per-observation
+            // vectors; discrete-endpoint diagnostics are recomputed post-fit rather
+            // than round-tripped, so a restored result starts with none.
+            #[cfg(feature = "survival")]
+            discrete_rows: Vec::new(),
         });
     }
 
@@ -1836,6 +1841,8 @@ mod tests {
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
+            #[cfg(feature = "survival")]
+            discrete_rows: Vec::new(),
         }
     }
 

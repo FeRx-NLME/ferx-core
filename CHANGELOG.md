@@ -29,6 +29,12 @@ section of the SDLC for the versioning policy).
   observed on the fixed grid), and the simulated states are written back to the output dataset.
   Validated by a simulate → fit recovery (SSE) round trip on top of the existing R `glm` / NONMEM
   fit anchors.
+- **sdtab diagnostics for binary endpoints** (#760). `{model}-sdtab.csv` now carries one row per
+  binary observation record — `DV` (observed 0/1), `PRED` (`P(Y=1)` at η=0), `IPRED` (at the EBE η)
+  and `IWRES` (standardized Pearson residual). `CWRES` is left blank, since the conditional
+  weighted residual is defined through the Gaussian residual-variance model that a Bernoulli
+  outcome does not have; columns undefined for a discrete record are likewise blank rather than
+  sentinel values. Previously a binary endpoint produced no diagnostic rows at all.
 - **Analytic sensitivities for steady-state dosing into a built-in absorption compartment**
   (#835). Fitting a model with an `SS=1` dose into a `first_order` / `transit` / `igd` /
   `weibull` absorption compartment now uses exact analytic FOCEI gradients — the closed-form

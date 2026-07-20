@@ -20,8 +20,8 @@
 
 use crate::parser::model_parser::with_model_time;
 use crate::types::{
-    CompiledModel, EndpointLikelihood, EndpointPredictionResult, LinearPredictorFn, LinkFn,
-    ObsRecord, Prediction, Subject,
+    CompiledModel, DiscreteObsDiagnostic, EndpointLikelihood, EndpointPredictionResult,
+    LinearPredictorFn, LinkFn, ObsRecord, Prediction, Subject,
 };
 use rand::RngExt;
 use std::collections::HashMap;
@@ -337,6 +337,65 @@ pub fn binary_pearson_residual(y: f64, p: f64) -> f64 {
         return f64::NAN;
     }
     (y - p) / v.sqrt()
+}
+
+/// Post-fit per-record diagnostics for one subject's binary endpoints (§8.8.5): the
+/// population prediction at `η = 0`, the individual prediction at the subject's EBE `η`,
+/// and the standardized residual between the observed 0/1 and the individual `p`.
+///
+/// Returns an empty vec for a subject with no binary records, so a Gaussian-only or
+/// TTE-only fit carries nothing and its output is unchanged.
+pub fn binary_diagnostics(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<DiscreteObsDiagnostic> {
+    let mut rows = Vec::new();
+    if subject.obs_records.is_empty() {
+        return rows;
+    }
+    let zero_eta = vec![0.0_f64; eta.len()];
+    for (cmt, endpoint) in &model.endpoints {
+        let EndpointLikelihood::Binary { link, lp_fn, .. } = endpoint else {
+            continue;
+        };
+        // PRED is the typical-subject probability (η = 0), mirroring the Gaussian
+        // `pred`/`ipred` split; IPRED conditions on this subject's EBE.
+        let mut pred_p = Vec::new();
+        for_each_binary_lp(
+            lp_fn,
+            *cmt,
+            &subject.obs_records,
+            theta,
+            &zero_eta,
+            &subject.covariates,
+            |_t, _s, lp| pred_p.push(binary_prob(*link, lp)),
+        );
+        let mut k = 0usize;
+        for_each_binary_lp(
+            lp_fn,
+            *cmt,
+            &subject.obs_records,
+            theta,
+            eta,
+            &subject.covariates,
+            |time, state, lp| {
+                let p = binary_prob(*link, lp);
+                let y = (state as f64).min(1.0);
+                rows.push(DiscreteObsDiagnostic {
+                    cmt: *cmt,
+                    time,
+                    dv: y,
+                    pred: pred_p.get(k).copied().unwrap_or(f64::NAN),
+                    ipred: p,
+                    iwres: binary_pearson_residual(y, p),
+                });
+                k += 1;
+            },
+        );
+    }
+    rows
 }
 
 /// Fail-loud check that every binary record's observed state is `0` or `1`. Run once

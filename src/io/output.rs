@@ -1052,10 +1052,20 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .iter()
         .any(|s| s.cens.iter().any(|&c| c != 0));
     let any_occ = population.subjects.iter().any(|s| !s.occasions.is_empty());
-    let any_multicmt = population
-        .subjects
-        .iter()
-        .any(|s| s.obs_cmts.iter().any(|&c| c != 1));
+    // Discrete (binary) rows always carry their endpoint's CMT, and that CMT is the
+    // only thing distinguishing them from the Gaussian rows they are appended after —
+    // so their presence forces the column on. Without this a binary-only fit (no
+    // Gaussian rows at all, hence no `obs_cmts`) would emit an sdtab with the endpoint
+    // CMT silently dropped.
+    #[cfg(feature = "survival")]
+    let any_discrete = result.subjects.iter().any(|s| !s.discrete_rows.is_empty());
+    #[cfg(not(feature = "survival"))]
+    let any_discrete = false;
+    let any_multicmt = any_discrete
+        || population
+            .subjects
+            .iter()
+            .any(|s| s.obs_cmts.iter().any(|&c| c != 1));
 
     let mut ids = Vec::with_capacity(n_total);
     let mut times = Vec::with_capacity(n_total);
@@ -1232,7 +1242,53 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         }
     }
 
+    #[cfg(feature = "survival")]
+    append_discrete_rows(&mut cols, result);
+
     cols
+}
+
+/// Append one sdtab row per discrete (binary) observation record, after the Gaussian
+/// rows (§8.8.5).
+///
+/// Every sdtab column above is built by its own independent pass over
+/// `result.subjects × sr.ipred.len()`, and [`write_sdtab_csv`] indexes each column by
+/// row — so a pass that forgot to extend would panic at write time. Rather than edit
+/// each pass (and risk missing one as columns are added later), this extends **whatever
+/// columns exist** in one place: a column it knows how to fill for a discrete record
+/// gets the value, everything else gets NaN, which the writer already renders as an
+/// empty cell. New columns therefore stay correct-by-default (blank on discrete rows)
+/// instead of silently truncating the table.
+///
+/// `CWRES` is deliberately blank: the conditional weighted residual is defined through
+/// the Gaussian residual-variance model, and there is none for a Bernoulli outcome.
+/// `IWRES` carries the standardized (Pearson) residual instead.
+#[cfg(feature = "survival")]
+fn append_discrete_rows(cols: &mut [(String, Vec<f64>)], result: &FitResult) {
+    let n_discrete: usize = result.subjects.iter().map(|s| s.discrete_rows.len()).sum();
+    if n_discrete == 0 {
+        return;
+    }
+    for (name, values) in cols.iter_mut() {
+        for (si, sr) in result.subjects.iter().enumerate() {
+            for row in &sr.discrete_rows {
+                values.push(match name.as_str() {
+                    "ID" => sr.id.parse::<f64>().unwrap_or(si as f64 + 1.0),
+                    "TIME" => row.time,
+                    "DV" => row.dv,
+                    "CMT" => row.cmt as f64,
+                    "PRED" => row.pred,
+                    "IPRED" => row.ipred,
+                    "IWRES" => row.iwres,
+                    "EBE_OFV" => sr.ofv_contribution,
+                    "N_OBS" => sr.n_obs as f64,
+                    // CWRES, CENS, OCC, NPDE, NPD, TAFD, TAD and any [derived] /
+                    // [output] column: undefined for a discrete record → blank cell.
+                    _ => f64::NAN,
+                });
+            }
+        }
+    }
 }
 
 /// Write SDTAB as a CSV file
@@ -2568,6 +2624,8 @@ mod tests {
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
+            #[cfg(feature = "survival")]
+            discrete_rows: Vec::new(),
         }
     }
 
@@ -3057,6 +3115,8 @@ mod tests {
             extra_columns: Vec::new(),
             per_obs_tad: Vec::new(),
             compartment_states: Vec::new(),
+            #[cfg(feature = "survival")]
+            discrete_rows: Vec::new(),
         };
         let result = minimal_sdtab_result(vec![sr]);
         let population = Population {

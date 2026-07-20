@@ -136,6 +136,8 @@ fn sr_iov(n_obs: usize) -> SubjectResult {
         extra_columns: Vec::new(),
         per_obs_tad: Vec::new(),
         compartment_states: Vec::new(),
+        #[cfg(feature = "survival")]
+        discrete_rows: Vec::new(),
     }
 }
 

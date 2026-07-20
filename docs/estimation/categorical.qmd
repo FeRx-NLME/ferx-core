@@ -77,6 +77,29 @@ record (`P(Y = 0)`, `P(Y = 1)`) rather than a scalar. The plain `predict()` is t
 Gaussian predictor and returns no rows for a binary endpoint — the same split as
 `predict_survival()` for time-to-event.
 
+## Diagnostics (sdtab)
+
+A binary endpoint contributes one `{model}-sdtab.csv` row per observation record, after
+the Gaussian rows:
+
+| Column | Binary meaning |
+|--------|----------------|
+| `DV` | the observed 0/1 outcome |
+| `CMT` | the endpoint's compartment |
+| `PRED` | `P(Y = 1)` at `η = 0` (typical subject) |
+| `IPRED` | `P(Y = 1)` at the subject's EBE `η` |
+| `IWRES` | standardized (Pearson) residual `(y − p) / √(p(1−p))` |
+| `CWRES` | *blank* |
+
+`CWRES` is empty by design: the conditional weighted residual is defined through the
+Gaussian residual-variance model, and a Bernoulli outcome has none. Columns that cannot
+be defined for a discrete record — `CENS`, `OCC`, `NPDE`/`NPD`, `TAFD`, `TAD`, and any
+`[derived]` / `[output]` column — are likewise written as empty cells rather than
+sentinel values.
+
+A degenerate `p ∈ {0, 1}` makes the standardized residual undefined; `IWRES` is then
+blank rather than a large finite number that would look meaningful in a plot.
+
 ## Reference R session
 
 ```r

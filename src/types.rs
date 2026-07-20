@@ -3558,6 +3558,33 @@ impl std::fmt::Debug for CompiledModel {
     }
 }
 
+/// One discrete-endpoint (binary) observation's post-fit diagnostics — the
+/// non-Gaussian analogue of a row of [`SubjectResult`]'s parallel `ipred`/`iwres`
+/// vectors (`plans/tte-survival-markov.md` §8.8.5).
+///
+/// Kept as its own row type rather than appended to those vectors because a discrete
+/// record is not on the Gaussian observation grid: it has no residual variance, no
+/// CWRES, and its `ipred` is a probability rather than a concentration. Every column
+/// the Gaussian rows carry but a discrete row cannot define is emitted as an empty
+/// sdtab cell.
+#[cfg(feature = "survival")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct DiscreteObsDiagnostic {
+    /// CMT of the endpoint that produced this record.
+    pub cmt: usize,
+    /// Raw data TIME (joins back to the input CSV).
+    pub time: f64,
+    /// Observed outcome (the 0/1 DV for a binary endpoint).
+    pub dv: f64,
+    /// Population prediction `P(Y = 1)` at η = 0.
+    pub pred: f64,
+    /// Individual prediction `P(Y = 1)` at the subject's EBE η.
+    pub ipred: f64,
+    /// Standardized (Pearson) residual `(y − p)/√(p(1−p))` at the EBE. NaN at a
+    /// degenerate `p ∈ {0,1}`, where it is undefined.
+    pub iwres: f64,
+}
+
 /// Per-subject estimation results
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SubjectResult {
@@ -3598,6 +3625,12 @@ pub struct SubjectResult {
     /// NaN in `[derived]`; see W_DERIVED_CMT_IOV_UNSUPPORTED / W_DERIVED_CMT_TV_ANALYTICAL).
     /// Scaling (`apply_scaling`, Form A/C) is never applied here — only `ipred` is scaled.
     pub compartment_states: Vec<Vec<f64>>,
+    /// Post-fit diagnostics for this subject's **discrete** (binary) endpoint records,
+    /// one entry per record (§8.8.5). Empty for models with no discrete endpoint, which
+    /// keeps every existing `FitResult` serialization byte-identical.
+    #[cfg(feature = "survival")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discrete_rows: Vec<DiscreteObsDiagnostic>,
 }
 
 /// Per-subject conditional distribution of the random effects, produced by the
