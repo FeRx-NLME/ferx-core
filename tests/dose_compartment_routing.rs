@@ -166,9 +166,114 @@ fn central_and_depot_infusions_still_predict_on_the_event_driven_walk() {
     }
 }
 
+// ── pure-TTE subjects: the PK model is a placeholder, do not validate against it ──
+
+/// A pure-TTE model still needs a `[structural_model]` line, and the idiom is a
+/// **dummy** `one_cpt_iv` with throwaway CL/V (see `tests/tte_smoke.rs`; the
+/// parser supplies exactly that when the block is absent). That placeholder has
+/// one compartment, so validating a TTE dataset's dose records against it would
+/// reject a working model over a dose the PK engine never reads — the subject
+/// has no Gaussian observation, so the analytical predictor is never invoked.
+#[cfg(feature = "survival")]
+const TTE_ONLY: &str = r#"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 5.0)
+  theta DUMMY_CL(1.0, 0.01, 100.0)
+  theta DUMMY_V(10.0, 0.1, 1000.0)
+  omega ETA_LAMBDA ~ 0.0
+  sigma SIGMA_DV ~ 0.1
+
+[individual_parameters]
+  LAMBDA = TVLAMBDA * exp(ETA_LAMBDA)
+  CL     = DUMMY_CL
+  V      = DUMMY_V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = LAMBDA
+"#;
+
+#[cfg(feature = "survival")]
+#[test]
+fn pure_tte_subject_is_not_validated_against_the_placeholder_pk_model() {
+    let model = model_of(TTE_ONLY);
+    assert_eq!(
+        format!("{:?}", model.pk_model),
+        "OneCptIv",
+        "fixture must exercise the 1-compartment placeholder"
+    );
+    // A dose row into CMT=2 — out of range for `one_cpt_iv`, but this subject's
+    // only observation is the TTE event at CMT=2, so no PK prediction happens.
+    let pop = pop_of("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n");
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags.iter().all(|d| !d.is_error()),
+        "a pure-TTE subject must not be rejected over its dose compartment: {diags:?}"
+    );
+}
+
+/// …but a subject that *does* carry a Gaussian observation is still checked,
+/// even on a model that also has a TTE endpoint. Guards against the exemption
+/// being too broad and silently disabling the fix for joint PK-TTE models.
+#[cfg(feature = "survival")]
+#[test]
+fn a_gaussian_observation_on_a_tte_model_is_still_validated() {
+    let model = model_of(TTE_ONLY);
+    // Same model; this subject has a Gaussian PK observation at CMT=1 as well as
+    // the TTE record at CMT=2, so the analytical predictor does run for it.
+    let pop =
+        pop_of("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,3,4.2,0,.,1,0\n1,5,1,0,.,2,0\n");
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags.iter().any(|d| d.code == "E_DOSE_CMT_OUT_OF_RANGE"),
+        "a subject with Gaussian observations must still be validated: {diags:?}"
+    );
+}
+
+/// The exemption above must be **population**-level, not per-subject. In a joint
+/// PK-TTE dataset a subject can legitimately carry dose records and a TTE record
+/// but no PK sample (an early dropout, or a TTE-only arm) — and the PK path
+/// still runs for it, because the event-driven walk is driven by the event
+/// schedule and the FOCE/FOCEI sensitivity provider runs per subject regardless.
+/// A per-subject exemption let exactly this subject carry an unroutable dose
+/// straight back into the panics, which is strictly worse than the bug #375
+/// reports. Subject 1 supplies the PK samples; subject 2 is the dangerous one.
+#[cfg(feature = "survival")]
+#[test]
+fn a_tte_only_subject_of_a_pk_tte_dataset_is_still_validated() {
+    let model = model_of(TTE_ONLY);
+    let pop = pop_of(
+        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+         1,0,.,1,100,1,0,1\n\
+         1,3,4.2,0,.,1,.,0\n\
+         1,9,0,0,.,2,.,0\n\
+         2,0,.,1,100,2,20,1\n\
+         2,5,1,0,.,2,.,0\n",
+    );
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags.iter().any(|d| d.code == "E_DOSE_CMT_OUT_OF_RANGE"),
+        "the TTE-only subject's out-of-range dose must still be caught: {diags:?}"
+    );
+}
+
 /// A bolus into the same peripheral compartment is *not* rejected — the walk
 /// adds the amount to the state directly. Guards against the check being
 /// over-broad and breaking a legitimate dosing pattern.
+///
+/// The assertion is deliberately weak (finite, not a specific value): which
+/// analytical path serves this subject decides the *answer*, because the
+/// superposition path ignores `dose.cmt` and would compute this as a depot dose.
+/// This test pins "not rejected", NOT "correct" — the value disagreement is a
+/// separate, pre-existing defect tracked outside this PR, and asserting a number
+/// here would bless whichever path happens to run.
 #[test]
 fn a_bolus_into_the_peripheral_is_still_accepted() {
     let model = model_of(TWO_CPT_ORAL);

@@ -614,6 +614,49 @@ pub(crate) fn check_modeled_dose_rates(
     diags
 }
 
+/// Whether **anything in this dataset** asks the analytical PK predictor for a
+/// value — any Gaussian observation, or any `EVID=2` PK-only request.
+///
+/// This exists for one narrow case: a pure-TTE / pure-discrete model still needs
+/// a `[structural_model]` line, and the idiom is a **placeholder** `one_cpt_iv`
+/// with dummy `CL`/`V` (the parser supplies exactly that when the block is
+/// absent, `model_parser.rs`). Validating dose compartments against that
+/// placeholder's 1-compartment topology would reject a working model over dose
+/// records no PK code ever reads.
+///
+/// Deliberately a **population**-level predicate, not a per-subject one. "This
+/// subject has no Gaussian observation" does **not** imply the PK path is
+/// skipped for it: the event-driven walk is driven by the subject's event
+/// schedule (doses and `EVID=2` times), and the FOCE/FOCEI sensitivity provider
+/// runs per subject regardless. A per-subject exemption would let a TTE-only
+/// subject *of a joint PK-TTE model* carry an unroutable infusion straight back
+/// into the panics this check exists to prevent — a routine pattern (an early
+/// dropout, or a TTE-only arm, that still has dose records).
+///
+/// Non-Gaussian endpoints are registered per CMT in `CompiledModel::endpoints`,
+/// so an observation CMT absent from that map is Gaussian. Without the
+/// `survival` feature no non-Gaussian endpoint can be parsed, so every
+/// observation is Gaussian by construction and this is always `true`.
+fn population_uses_analytical_pk(model: &CompiledModel, population: &Population) -> bool {
+    #[cfg(feature = "survival")]
+    {
+        if model.endpoints.is_empty() {
+            return true;
+        }
+        population.subjects.iter().any(|s| {
+            !s.pk_only_times.is_empty()
+                || s.obs_cmts
+                    .iter()
+                    .any(|cmt| !model.endpoints.contains_key(cmt))
+        })
+    }
+    #[cfg(not(feature = "survival"))]
+    {
+        let _ = (model, population);
+        true
+    }
+}
+
 /// Every dose must name a compartment the **analytical** engine can actually
 /// deliver it into (#375). The datareader cannot make this call — it has no
 /// model — and the parse-time infusable check
@@ -623,8 +666,21 @@ pub(crate) fn check_modeled_dose_rates(
 /// predictors unvalidated. The three analytical paths then disagreed on it:
 /// the dose-superposition path never reads `dose.cmt` and silently routed the
 /// infusion into central, the event-driven walk `panic!`ed, and the `sens`
-/// gradient walk silently dropped the infusion. Rejecting up front is what
-/// makes all three agree, and keeps the prediction hot path panic-free.
+/// gradient walk silently dropped the infusion. Rejecting up front removes that
+/// disagreement **for the doses it rejects**, and keeps the prediction hot path
+/// panic-free.
+///
+/// It does **not** make the three paths agree in general, and this check should
+/// not be read as claiming that. The superposition path never reads `dose.cmt`
+/// at all: it dispatches on the *model*, so it computes every accepted dose as
+/// going into that model's default route (the depot for an oral model, central
+/// for an IV one). For every compartment other than that default the two paths
+/// therefore still disagree — an IV-peripheral infusion and any non-default
+/// bolus among them, by orders of magnitude on the 2-/3-compartment models.
+/// Those doses are *accepted* here because the event-driven walk computes them
+/// correctly and rejecting them would break working models; the fix is to route
+/// them to that walk (as `has_oral_depot_infusion` already does for depot
+/// infusions), which is tracked separately.
 ///
 /// Two rules, both 1-based like NONMEM's `CMT`:
 ///   - **Infusion** (`RATE>0`, or a resolved modeled rate/duration): the
@@ -644,7 +700,13 @@ pub(crate) fn check_modeled_dose_rates(
 ///     silent mis-route.
 ///
 /// ODE models are exempt: `ode/predictions.rs` indexes the state vector
-/// directly and honours any compartment the `[odes]` block declares.
+/// directly, so every compartment the `[odes]` block **declares** is
+/// addressable and none of this analytical routing applies. Note this is an
+/// exemption, not a clean bill of health — an ODE dose whose `CMT` is past the
+/// end of the declared state vector is still silently dropped by that engine's
+/// `if cmt_idx < n { … }` guards. Closing that is a separate change (it needs
+/// the ODE state count, not a `PkModel` topology) and is tracked separately;
+/// this check deliberately does not half-do it.
 ///
 /// Reported once per `(kind, compartment)` so a dataset with many offending
 /// rows yields one actionable error per cause, matching
@@ -665,6 +727,12 @@ pub(crate) fn check_dose_compartments(
     // De-dup by (is_infusion, compartment): an infusion and a bolus into the
     // same bad compartment are independent causes and are reported separately.
     let mut reported: std::collections::HashSet<(bool, usize)> = std::collections::HashSet::new();
+    // Nothing in this dataset asks the analytical predictor for a value — the
+    // `pk` line is a pure-TTE / pure-discrete model's placeholder. See
+    // `population_uses_analytical_pk` for why this is a population-level test.
+    if !population_uses_analytical_pk(model, population) {
+        return diags;
+    }
     for subject in &population.subjects {
         for dose in &subject.doses {
             let is_infusion = dose.is_infusion();
@@ -672,7 +740,25 @@ pub(crate) fn check_dose_compartments(
                 continue;
             }
             let cmt = dose.cmt;
-            if is_infusion {
+            // Range first, and for **both** dose kinds. Transit/IG skip the
+            // routing rule below but are still 2-/3-state models, so without this
+            // an out-of-range infusion on them would pass validation and then be
+            // silently dropped by the ODE twin's bounds check — the exact
+            // silent-drop failure this check exists to remove.
+            if cmt > n_states {
+                diags.push(
+                    Diagnostic::error(
+                        "E_DOSE_CMT_OUT_OF_RANGE",
+                        format!(
+                            "subject {}, time {}: dose into compartment {cmt}, but the \
+                             analytical `{name}` model has only {n_states} compartment(s) \
+                             (CMT is 1-based: {:?}).",
+                            subject.id, dose.time, topology.compartment_names,
+                        ),
+                    )
+                    .with_block("structural_model"),
+                );
+            } else if is_infusion {
                 // Transit/IG (`event_walk_supported == false`) never take the
                 // walk this routing table belongs to — an infusion reroutes them
                 // to their ODE twin (#719 gap 2), which addresses compartments
@@ -700,19 +786,6 @@ pub(crate) fn check_dose_compartments(
                         .with_block("structural_model"),
                     );
                 }
-            } else if cmt > n_states {
-                diags.push(
-                    Diagnostic::error(
-                        "E_DOSE_CMT_OUT_OF_RANGE",
-                        format!(
-                            "subject {}, time {}: dose into compartment {cmt}, but the \
-                             analytical `{name}` model has only {n_states} compartment(s) \
-                             (CMT is 1-based: {:?}).",
-                            subject.id, dose.time, topology.compartment_names,
-                        ),
-                    )
-                    .with_block("structural_model"),
-                );
             }
         }
     }

@@ -102,6 +102,18 @@ section of the SDLC for the versioning policy).
   is forgiving of a loose mode).
 
 ### Fixed
+- **A steady-state dose with `CMT=0` no longer loses its accumulation on the analytical
+  event-driven path** (#375). `CMT=0` is NONMEM's "default dose compartment", and every dose
+  site resolves it to the model's first compartment — except the event-driven walk's
+  steady-state equilibration, which bailed out early on `CMT=0` and returned an unequilibrated
+  (all-zero) starting state. An `SS=1` dose written with `CMT=0` therefore produced the
+  *single-dose* curve instead of the accumulated steady state whenever the subject took that
+  path (a time-varying covariate, an `EVID=3/4` reset, or IOV), while the same dataset without
+  those features returned the correct steady state from the superposition path — a silent
+  ~43 % under-prediction on a one-compartment example, with no warning. Both the value walk and
+  the gradient walk now equilibrate the default compartment like any other, matching the
+  closed form `(D/V)·e^{−kt}/(1−e^{−k·II})`. Predictions change only for `SS` doses written
+  with `CMT=0`; every other dataset is bit-identical.
 - **An infusion into a compartment the analytical model cannot deliver into is now an error,
   not a crash** (#375). A positive `RATE` into a compartment outside the model's infusable set
   — most commonly an oral model's peripheral (`CMT=3` on `two_cpt_oral`) — used to abort the

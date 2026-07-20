@@ -323,9 +323,18 @@ fn equilibrate_ss_state_event_driven(
     let (n_states, _) = state_layout(pk_model);
     let mut state = vec![0.0_f64; n_states];
 
-    if dose.ii <= 0.0 || dose.cmt == 0 {
+    if dose.ii <= 0.0 {
         return state;
     }
+    // `CMT=0` is NONMEM's "default dose compartment", and every other dose site
+    // on this walk resolves it that way via `saturating_sub(1)` → state 0 (the
+    // depot for an oral model, central for an IV one), matching the
+    // superposition path, which ignores `cmt` entirely. This branch used to bail
+    // to an all-zero state on `cmt == 0` instead, silently dropping the
+    // steady-state accumulation of an `SS=1` dose — the walk returned the
+    // single-dose curve while superposition returned the correct
+    // `(D/V)·e^{-kt}/(1−e^{-k·II})` (#375). Fall through so the default
+    // compartment equilibrates like any other.
     let cmt_idx = dose.cmt.saturating_sub(1);
     if cmt_idx >= n_states {
         return state;
@@ -1064,6 +1073,47 @@ mod tests {
             std::slice::from_ref(&pk),
             &[],
         );
+    }
+
+    /// #375: `CMT=0` is NONMEM's default dose compartment, and
+    /// `check_dose_compartments` permits it on a **bolus** precisely because
+    /// both analytical paths agree on it. `equilibrate_ss_state_event_driven`
+    /// used to break that agreement for `SS=1`: it bailed to an all-zero state
+    /// on `cmt == 0`, so the walk returned the single-dose curve while the
+    /// superposition path returned the accumulated steady state.
+    ///
+    /// Anchored on the closed form rather than on the other path, so this pins
+    /// the right answer and not merely agreement:
+    /// `C_ss(t) = (D/V)·e^{−kt} / (1 − e^{−k·II})`.
+    #[test]
+    fn ss_dose_into_cmt_zero_equilibrates_like_the_default_compartment() {
+        let (cl, v, amt, ii) = (5.0, 50.0, 100.0, 12.0);
+        let obs_times = vec![1.0, 4.0, 8.0];
+        let pk = pk_one(cl, v);
+        let run = |cmt: usize| -> Vec<f64> {
+            let dose = DoseEvent::new(0.0, amt, cmt, 0.0, true, ii);
+            let subject = make_subject(vec![dose], obs_times.clone());
+            event_driven_predictions(
+                PkModel::OneCptIv,
+                &subject,
+                std::slice::from_ref(&pk),
+                &vec![pk; obs_times.len()],
+                &[],
+            )
+        };
+        let k = cl / v;
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|t| (amt / v) * (-k * t).exp() / (1.0 - (-k * ii).exp()))
+            .collect();
+        for (label, got) in [("cmt 0", run(0)), ("cmt 1", run(1))] {
+            for (j, (&g, &e)) in got.iter().zip(&expected).enumerate() {
+                assert!(
+                    (g - e).abs() < 1e-9,
+                    "{label} obs {j}: walk {g} vs closed-form steady state {e}"
+                );
+            }
+        }
     }
 
     /// #375: the walk's routing `match` is the guard `check_dose_compartments`

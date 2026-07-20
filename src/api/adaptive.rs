@@ -337,6 +337,10 @@ where
     // the model is an analytic absorption closed form, which this ODE-only path rejects
     // up front — but is wired for parity and #702 base-regimen support.)
     first_error(&check_modeled_dose_rates(model, population))?;
+    // Parity-only today, like `check_absorption_closed_form_support` above: this
+    // path is ODE-only and `check_dose_compartments` is a no-op for ODE models.
+    // Wired so the chokepoint keeps one uniform contract if an analytical model
+    // ever reaches it (#375).
     first_error(&check_dose_compartments(model, population))?;
     if let Some(msg) = check_absorption_closed_form_support(model, population) {
         return Err(msg);

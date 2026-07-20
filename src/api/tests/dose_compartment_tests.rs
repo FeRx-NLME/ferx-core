@@ -87,12 +87,32 @@ fn infusion_into_three_cpt_oral_peripheral_is_rejected() {
 }
 
 /// `one_cpt_iv` has a single compartment, so cmt 2 is neither infusable nor in
-/// range. The infusion rule owns it (it is reported once, not twice).
+/// range. The **range** rule owns it — "the model has only 1 compartment" is a
+/// more useful message than "that compartment is not infusable" — and it is
+/// reported once, not twice.
 #[test]
-fn infusion_beyond_the_state_count_is_rejected_once() {
+fn infusion_beyond_the_state_count_is_rejected_once_as_out_of_range() {
     let model = model_with(PkModel::OneCptIv);
     let population = population_with_doses(vec![infusion(2)]);
-    assert_eq!(codes(&model, &population), vec!["E_DOSE_CMT_NOT_INFUSABLE"]);
+    assert_eq!(codes(&model, &population), vec!["E_DOSE_CMT_OUT_OF_RANGE"]);
+}
+
+/// The range rule must apply to infusions on transit/IG too. They skip the
+/// *routing* rule (an infusion reroutes them to their ODE twin, #719 gap 2), but
+/// they are still 2-/3-state models: without a range check an out-of-range
+/// infusion passes validation and is then silently dropped by the twin's bounds
+/// check — the silent-drop failure this whole check exists to remove.
+#[test]
+fn out_of_range_infusion_on_transit_is_still_rejected() {
+    for pk_model in [PkModel::OneCptTransit, PkModel::OneCptIg] {
+        let model = model_with(pk_model);
+        let population = population_with_doses(vec![infusion(9)]);
+        assert_eq!(
+            codes(&model, &population),
+            vec!["E_DOSE_CMT_OUT_OF_RANGE"],
+            "{pk_model:?} out-of-range infusion"
+        );
+    }
 }
 
 /// An infusion has no "default compartment" fallback — `dose_channel(0)` is
@@ -276,14 +296,24 @@ fn errors_are_deduped_per_kind_and_compartment() {
 
 /// An infusion and a bolus into the same bad compartment are independent
 /// causes — reporting only one would hide the other after the user fixes it.
+/// Both are out of range on `one_cpt_iv`, so both take the range rule.
 #[test]
 fn infusion_and_bolus_into_the_same_compartment_report_separately() {
     let model = model_with(PkModel::OneCptIv);
     let population = population_with_doses(vec![infusion(2), bolus(2)]);
     assert_eq!(
         codes(&model, &population),
-        vec!["E_DOSE_CMT_NOT_INFUSABLE", "E_DOSE_CMT_OUT_OF_RANGE"]
+        vec!["E_DOSE_CMT_OUT_OF_RANGE", "E_DOSE_CMT_OUT_OF_RANGE"]
     );
+}
+
+/// …and where the two rules genuinely differ: on `two_cpt_oral` cmt 3 exists
+/// (so a bolus is fine) but is not infusable, so only the infusion is reported.
+#[test]
+fn the_two_rules_are_distinguished_on_an_in_range_non_infusable_compartment() {
+    let model = model_with(PkModel::TwoCptOral);
+    let population = population_with_doses(vec![infusion(3), bolus(3)]);
+    assert_eq!(codes(&model, &population), vec!["E_DOSE_CMT_NOT_INFUSABLE"]);
 }
 
 /// The common dataset — every dose routable — costs one scan and reports

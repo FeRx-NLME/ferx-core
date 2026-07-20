@@ -1110,9 +1110,14 @@ fn equilibrate_ss_g<T: PkNum>(
 ) -> Vec<T> {
     let (n_states, _) = state_layout_g(pk_model);
     let mut state = vec![T::from_f64(0.0); n_states];
-    if dose.ii <= 0.0 || dose.cmt == 0 {
+    if dose.ii <= 0.0 {
         return state;
     }
+    // `CMT=0` = NONMEM's default dose compartment — resolved by
+    // `saturating_sub(1)` like every other dose site. Mirrors the value walk's
+    // `equilibrate_ss_state_event_driven`, whose identical `cmt == 0` bail
+    // silently dropped an `SS=1` dose's accumulation (#375); the gradient must
+    // equilibrate the same state the value does.
     let cmt_idx = dose.cmt.saturating_sub(1);
     if cmt_idx >= n_states {
         return state;
@@ -1286,6 +1291,18 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     let cmt_idx = d.cmt.saturating_sub(1);
                     if cmt_idx < n_states {
                         state[cmt_idx] = state[cmt_idx] + pk_now.f * T::from_f64(d.amt);
+                    } else {
+                        // Unreachable from a validated call — `check_dose_compartments`
+                        // (#375) rejects `cmt > n_states` up front. Kept as a defensive
+                        // guard that matches the value walk's twin in
+                        // `pk::event_driven`: silently dropping the dose here would
+                        // differentiate a different dosing history than was predicted.
+                        panic!(
+                            "sens PK walk: dose into compartment {} but model has {} states \
+                             (cmt is 1-based) — should have been rejected by \
+                             `check_dose_compartments`",
+                            d.cmt, n_states
+                        );
                     }
                 }
             }
