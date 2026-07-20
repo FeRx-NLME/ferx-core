@@ -565,27 +565,33 @@ fn frem_iiv_on_ruv_saem_stays_bounded() {
 
     assert!(fit_result.ofv.is_finite(), "OFV should be finite");
 
-    // ETA_RUV is the 6th eta (index 5). It must not blow up toward the reported
-    // ~49; a bounded run keeps it O(1).
+    // ETA_RUV is the 6th eta (index 5). Before the #904 η_RUV re-centering fix
+    // this ran away (ω_RUV → tens; the original report saw ~49). With the fix it
+    // stays small and well-controlled — this warfarin data carries no real
+    // residual-error IIV, so ω_RUV should be a small fraction. A tight bound makes
+    // this a sharp regression guard against the σ × ω_RUV runaway returning.
     let omega_ruv = fit_result.omega[(5, 5)];
     assert!(
-        omega_ruv.is_finite() && omega_ruv < 5.0,
-        "omega_RUV ({omega_ruv:.3}) exploded — #895 mixing regression"
+        omega_ruv.is_finite() && omega_ruv < 1.0,
+        "omega_RUV ({omega_ruv:.3}) is not well-controlled — #895/#904 regression"
     );
 
-    // The PK residual sigma (index 0) must not ride the ridge to the e⁵ SD
-    // ceiling (148.4). Well below the growth cap for this well-mixed run.
+    // The PK residual sigma (index 0) must not ride the ridge — it stays well
+    // below its growth cap (and nowhere near the e⁵ ≈ 148 SD ceiling).
     let sigma_pk = fit_result.sigma[0];
     assert!(
-        sigma_pk.is_finite() && sigma_pk < 5.0,
-        "residual sigma ({sigma_pk:.3}) hit the ridge ceiling — #895 regression"
+        sigma_pk.is_finite() && sigma_pk < 1.0,
+        "residual sigma ({sigma_pk:.3}) inflated — #895/#904 regression"
     );
 
-    // The E-step mixes here (componentwise kernel), so the "not mixing" warning
-    // must NOT fire.
+    // With the runaway fixed, neither the "not mixing" nor the cap-binding
+    // warnings should fire on this well-behaved fit.
     assert!(
-        !fit_result.warnings.iter().any(|w| w.contains("not mixing")),
-        "unexpected mixing warning: {:?}",
+        !fit_result
+            .warnings
+            .iter()
+            .any(|w| w.contains("not mixing") || w.contains("growth cap")),
+        "unexpected instability warning: {:?}",
         fit_result.warnings
     );
 }

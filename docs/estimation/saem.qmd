@@ -321,18 +321,16 @@ For a `block_omega` (correlated) random-effects block, a faulty E-step/M-step co
 
 ### IIV on residual error (`iiv_on_ruv`): σ × ω_RUV ridge
 
-With `iiv_on_ruv = ETA`, the residual variance is $\sigma^2 \exp(2\eta_{\text{RUV}})$, so the *marginal* residual is a function of $\sigma^2 \exp(2\omega_{\text{RUV}})$: $\sigma$ and $\omega_{\text{RUV}}$ are only *jointly* identified. When both are free, the SAEM M-step can walk $\sigma$ and $\omega_{\text{RUV}}$ **up together** in an unstable feedback loop — $\omega_{\text{RUV}}$ inflating toward ~49 and $\sigma$ toward its e⁵ (≈148 SD) ceiling — which was the failure reported in issue #895. It is worst for FREM models with an extreme $\Omega$-diagonal scale range and a `log_additive` error, where $\exp(2\eta_{\text{RUV}})$ then makes a handful of observations dominate a runaway objective.
+With `iiv_on_ruv = ETA`, the residual is $Y = f + \varepsilon \exp(\eta_{\text{RUV}})$, so the residual variance is $\sigma^2 \exp(2\eta_{\text{RUV}})$. This form is invariant to $\eta_{\text{RUV}} \to \eta_{\text{RUV}} - c,\ \sigma \to \sigma\,e^{c}$ — $\sigma$ and a *shift* of $\eta_{\text{RUV}}$ are a degenerate pair. Unlike a mu-referenced structural $\eta$ (whose mean is folded into its typical value $\theta$ each M-step), $\eta_{\text{RUV}}$ has **no typical-value $\theta$**, so nothing absorbs its mean: it drifts along that degenerate direction, and because $\omega_{\text{RUV}}$ is estimated as $\overline{\eta_{\text{RUV}}^2}$ the drift injects a spurious $\text{mean}^2$ term that pumps $\sigma$ and $\omega_{\text{RUV}}$ **up together** — the runaway reported in issue #895 ($\omega_{\text{RUV}}$ toward ~49, $\sigma$ toward its e⁵ ceiling), worst on FREM models with an extreme $\Omega$-diagonal scale range.
 
-::: {.callout-warning}
-## Free-σ `iiv_on_ruv` on FREM models is not fully solved
-ferx bounds the blow-up but does **not** yet recover the correct split on the hardest FREM + `iiv_on_ruv` fits with both $\sigma$ and $\omega_{\text{RUV}}$ free. The reliable recipe is to **FIX $\sigma$** at a known value (e.g. from an IMP/IMPMAP run or NONMEM) and estimate $\omega_{\text{RUV}}$ — that breaks the ridge and $\omega_{\text{RUV}}$ recovers (matching NONMEM). Deeper work is tracked upstream.
-:::
+ferx fixes this by treating $\sigma$ as the residual-scale typical value: each iteration $\eta_{\text{RUV}}$ is **re-centred to zero mean**, absorbing the shift into $\sigma$ ($\eta_{\text{RUV}} \mathrel{-}= \overline{\eta_{\text{RUV}}}$, every RUV-scaled $\sigma \mathrel{\times}= e^{\overline{\eta_{\text{RUV}}}}$). Each subject's residual variance is exactly unchanged, so the likelihood is untouched, but $E[\eta_{\text{RUV}}]=0$ is restored and $\omega_{\text{RUV}}$ measures the true variance. On the 475-subject FREM reprex this converges to $\omega_{\text{RUV}} \approx 0.28$, $\sigma \approx 0.20$ from both a too-small and a too-large $\sigma$ start (NONMEM: 0.28 / 0.18), where it previously ran to $\omega_{\text{RUV}} \approx 49$. Re-centring is applied only when a free RUV-scaled $\sigma$ exists to absorb the shift (a FIXed $\sigma$ already pins the mean).
 
-Backstops (all no-ops on a well-posed fit, so ordinary runs are unaffected):
+Two growth caps remain as belt-and-braces backstops, both no-ops on a well-behaved fit:
 
-- **σ growth cap** — each free RUV-scaled residual $\sigma$ is capped at $\approx 20\times$ its starting SD (a post-M-step clamp, so a fit whose $\sigma$ stays below it is reproduced bit-for-bit).
+- **σ growth cap** — each free RUV-scaled residual $\sigma$ is capped at $\approx 20\times$ its starting SD (a post-M-step clamp).
 - **ω_RUV growth cap** — the RUV $\Omega$ variance is capped at $\approx 20\times$ its starting value, applied as a correlation-preserving rescale of the RUV row/column so a block $\Omega$ stays positive-definite.
-- **Warnings** — if $\sigma$ or $\omega_{\text{RUV}}$ ends pinned against its cap, SAEM warns that the split is weakly identified and recommends fixing $\sigma$.
+
+If either cap ever binds (it should not, now that the drift is removed), SAEM warns that the split is weakly identified and suggests fixing $\sigma$.
 
 ### Slow Convergence
 

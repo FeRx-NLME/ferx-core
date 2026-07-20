@@ -1187,6 +1187,44 @@ fn compute_ruv_sigma_caps(
         .collect()
 }
 
+/// Re-center the `iiv_on_ruv` η to zero mean, absorbing the shift into the
+/// RUV-scaled residual σ (issue #904). Returns the mean that was removed.
+///
+/// `Y = f + EPS·exp(η_RUV)` has no typical-value θ, so — unlike a mu-referenced
+/// structural η — η_RUV's mean is otherwise never absorbed and drifts along the
+/// degenerate direction (`σ²·exp(2η)` is invariant to η→η−c, σ→σ·exp(c)),
+/// polluting `ω_RUV = mean(η²)` with a spurious `mean²`. Shifting η_RUV by
+/// `−mean` and scaling every absorbing σ by `exp(mean)` leaves each subject's
+/// residual variance exactly unchanged while restoring `E[η_RUV] = 0`. `σ` is the
+/// residual-scale typical value that plays the role of the structural TVP here.
+///
+/// `absorb_sigma[k]` marks the free, non-FREM, RUV-scaled σ that may take the
+/// shift; when none absorb (every RUV σ FIXed) this is a no-op and the mean is
+/// left in η_RUV, since a FIXed σ already pins the mean (no degeneracy).
+fn recenter_ruv_eta(
+    etas: &mut [Vec<f64>],
+    kr: usize,
+    log_sigma: &mut [f64],
+    sigma_vals: &mut [f64],
+    absorb_sigma: &[bool],
+) -> f64 {
+    let n = etas.len();
+    if n == 0 || !absorb_sigma.iter().any(|&a| a) {
+        return 0.0;
+    }
+    let mean = etas.iter().map(|e| e[kr]).sum::<f64>() / n as f64;
+    for e in etas.iter_mut() {
+        e[kr] -= mean;
+    }
+    for k_s in 0..log_sigma.len() {
+        if absorb_sigma.get(k_s).copied().unwrap_or(false) {
+            log_sigma[k_s] += mean;
+            sigma_vals[k_s] = log_sigma[k_s].exp();
+        }
+    }
+    mean
+}
+
 /// Log-variance ceiling for the `iiv_on_ruv` Ω diagonal in a SAEM run (#895).
 ///
 /// Returns `Some(cap)` = `log(ω₀) + SAEM_RUV_OMEGA_LN_GROWTH` for the RUV eta's
@@ -1679,6 +1717,11 @@ pub fn run_saem(
         &init_params.sigma_fixed,
     );
 
+    // #904: which residual σ absorb the iiv_on_ruv η-mean during re-centering —
+    // exactly the free, non-FREM, RUV-scaled σ (the same set that carries a growth
+    // cap). A FREM EPSCOV or a FIXed σ is never scaled.
+    let ruv_sigma_absorb: Vec<bool> = ruv_sigma_caps.iter().map(|c| c.is_some()).collect();
+
     // #895: log-variance ceiling for the iiv_on_ruv Ω diagonal — the ω_RUV half
     // of the σ × ω_RUV ridge backstop (see `compute_ruv_omega_cap`).
     let ruv_omega_cap: Option<f64> = compute_ruv_omega_cap(
@@ -2030,6 +2073,28 @@ pub fn run_saem(
         state.steps_since_adapt += 1;
 
         // ---- Step 2: SA update of sufficient statistic for Omega ----
+        // #904: re-center the iiv_on_ruv η to zero mean, absorbing the shift into
+        // the residual σ. `Y = f + EPS·exp(η_RUV)` has no typical-value θ, so —
+        // unlike a mu-referenced structural η (CL/V…), whose mean is folded into
+        // its TVP each iteration — η_RUV's mean is otherwise never absorbed. It
+        // then drifts along the degenerate direction (`σ²·exp(2η)` is invariant to
+        // η→η−c, σ→σ·exp(c)), and the drift pollutes ω_RUV = mean(η²) with a
+        // spurious mean² term that pumps the σ × ω_RUV runaway. σ plays the role
+        // of the residual-scale typical value here: shifting η_RUV by −mean and
+        // scaling every RUV-scaled σ by exp(mean) leaves each subject's residual
+        // variance exactly unchanged while restoring E[η_RUV] = 0, so the next Ω
+        // M-step sees the true variance. Only done when a free RUV σ exists to
+        // absorb the shift (a FIXed σ already pins the mean — no degeneracy).
+        if let Some(kr) = model.residual_error_eta {
+            recenter_ruv_eta(
+                &mut state.etas,
+                kr,
+                &mut log_sigma,
+                &mut state.sigma_vals,
+                &ruv_sigma_absorb,
+            );
+        }
+
         let mut eta_outer = DMatrix::zeros(n_eta, n_eta);
         for eta in &state.etas {
             let ev = DVector::from_column_slice(eta);
@@ -3994,6 +4059,56 @@ mod tests {
         // takes the tighter of the two — it can only ever tighten σ, never loosen.
         let caps = compute_ruv_sigma_caps(true, None, &[0.0], &[1.0], &[false]);
         assert_eq!(caps[0], Some(1.0));
+    }
+
+    // ---- #904: iiv_on_ruv eta re-centering ----
+
+    #[test]
+    fn recenter_ruv_eta_zeroes_mean_and_preserves_residual_variance() {
+        // η_RUV at index 1, with a non-zero mean; two etas per subject.
+        let mut etas = vec![vec![0.3, 0.8], vec![-0.1, -0.4], vec![0.2, 0.2]];
+        let kr = 1;
+        // Per-subject residual variance before: σ²·exp(2·η_RUV) (σ = sd = 0.2).
+        let sd0 = 0.2_f64;
+        let var_before: Vec<f64> = etas
+            .iter()
+            .map(|e| sd0 * sd0 * (2.0_f64 * e[kr]).exp())
+            .collect();
+        let mean_in = (0.8 - 0.4 + 0.2) / 3.0;
+
+        let mut log_sigma = vec![sd0.ln()];
+        let mut sigma_vals = vec![sd0];
+        let removed = recenter_ruv_eta(&mut etas, kr, &mut log_sigma, &mut sigma_vals, &[true]);
+
+        // Removed exactly the mean; η_RUV now zero-mean.
+        assert!((removed - mean_in).abs() < 1e-12);
+        let mean_after = etas.iter().map(|e| e[kr]).sum::<f64>() / 3.0;
+        assert!(mean_after.abs() < 1e-12);
+        // σ scaled by exp(mean).
+        assert!((sigma_vals[0] - sd0 * mean_in.exp()).abs() < 1e-12);
+        assert!((log_sigma[0] - (sd0.ln() + mean_in)).abs() < 1e-12);
+        // Each subject's residual variance is exactly unchanged (the invariance).
+        for (e, &v0) in etas.iter().zip(var_before.iter()) {
+            let v_after = sigma_vals[0] * sigma_vals[0] * (2.0_f64 * e[kr]).exp();
+            assert!(
+                (v_after - v0).abs() < 1e-12,
+                "residual variance moved: {v_after} vs {v0}"
+            );
+        }
+        // Non-RUV coordinate untouched.
+        assert_eq!(etas[0][0], 0.3);
+    }
+
+    #[test]
+    fn recenter_ruv_eta_noop_when_no_sigma_absorbs() {
+        // Every RUV σ FIXed (none absorbs) → η mean is left in place, σ untouched.
+        let mut etas = vec![vec![0.5], vec![-0.1]];
+        let mut log_sigma = vec![0.2_f64.ln()];
+        let mut sigma_vals = vec![0.2];
+        let removed = recenter_ruv_eta(&mut etas, 0, &mut log_sigma, &mut sigma_vals, &[false]);
+        assert_eq!(removed, 0.0);
+        assert_eq!(etas, vec![vec![0.5], vec![-0.1]]);
+        assert_eq!(sigma_vals, vec![0.2]);
     }
 
     // ---- #895: iiv_on_ruv omega-ridge cap ----

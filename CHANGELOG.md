@@ -115,12 +115,18 @@ section of the SDLC for the versioning policy).
   each FREM covariate coordinate by `min(1, √EPSCOV/√Ω_jj)` so its joint acceptance recovers from
   0% (non-FREM models are unaffected — the multiplier is exactly 1). SAEM also now warns when the
   combined post-burn-in acceptance stays below 1% (the sampler is not mixing, so Ω/σ are
-  unreliable). For `iiv_on_ruv` models it caps the growth of both the free residual σ and the RUV
-  Ω variance during the run (each ≈ 20× its starting value; the Ω cap is a correlation-preserving
-  rescale so a block Ω stays positive-definite), bounding the σ × ω_RUV runaway reported in the
-  issue, and warns — recommending σ be FIXed and the fit re-run — if either cap binds. **Note:**
-  the hardest free-σ FREM + `iiv_on_ruv` fits are bounded but not yet fully corrected; FIX σ (e.g.
-  from an IMP/IMPMAP run) to recover ω_RUV. Deeper investigation is tracked separately.
+  unreliable).
+- **SAEM `iiv_on_ruv` σ × ω_RUV runaway fixed** (#895, #904). Free-σ `iiv_on_ruv` models — where
+  the residual is `Y = f + EPS·exp(η_RUV)` — could diverge under SAEM, with ω_RUV inflating toward
+  ~49 and σ toward its ceiling (worst on FREM models with an extreme Ω-diagonal scale range). Root
+  cause: η_RUV is a residual-scale random effect with no typical-value θ, so its mean was never
+  absorbed and drifted along the σ × η_RUV degenerate direction, injecting a spurious mean² into
+  `ω_RUV = mean(η_RUV²)`. SAEM now re-centres η_RUV to zero mean each iteration, absorbing the
+  shift into σ (which leaves every subject's residual variance exactly unchanged) — the same
+  device mu-referenced structural etas already use with their θ. On the 475-subject FREM reprex
+  this converges to ω_RUV ≈ 0.28 / σ ≈ 0.20 from both a too-small and a too-large σ start (NONMEM:
+  0.28 / 0.18). Belt-and-braces σ and ω_RUV growth caps (each ≈ 20× the starting value; the Ω cap
+  is a correlation-preserving rescale) remain as no-op backstops, warning if they ever bind.
 - **Analytic FOCEI sensitivities for IIV on an absorption lag feeding a `first_order` forcing**
   (#880). Fixes to the rate-on onset of a built-in `first_order` (Bateman) input-rate forcing
   whose arrival is a moving boundary — a compartment lagtime (`ALAG1`/`LAGTIME`) **or** a
