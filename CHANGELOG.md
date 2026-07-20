@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Warning when a `combined` error model's additive initial estimate is negligibly
+  small** (#847). A pre-fit check (`W_ADDITIVE_INIT_SCALE`) flags an additive SD start
+  below 1% of the observation scale (median `|DV|`) on that endpoint. A near-zero
+  additive start can trap the fit in a local minimum where the additive term collapses
+  and the proportional term inflates — the worse basin on multimodal / over-parameterised
+  problems (e.g. the cyclophosphamide parent→metabolite fit, where additive variance
+  seeded at 0.5 traps at ≈0.94 instead of the global optimum ≈1878). The initial estimate
+  is never changed — the warning advises a larger start.
 - **Analytic sensitivities for steady-state dosing into a built-in absorption compartment**
   (#835). Fitting a model with an `SS=1` dose into a `first_order` / `transit` / `igd` /
   `weibull` absorption compartment now uses exact analytic FOCEI gradients — the closed-form
