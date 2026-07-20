@@ -50,6 +50,10 @@ pub fn predict(
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
+    // …and that every dose names a compartment the analytical engine can route
+    // it into, so an unroutable infusion errors here with subject/time context
+    // instead of panicking deep inside the event-driven walk (#375).
+    assert_dose_compartments_supported(model, population);
     assert_absorption_closed_form_support(model, population);
     assert_absorption_flip_flop_no_twin(model, population, &params.theta);
     // A time-varying covariate on a survival hazard would be silently frozen — panic

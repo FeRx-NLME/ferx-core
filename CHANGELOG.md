@@ -102,6 +102,25 @@ section of the SDLC for the versioning policy).
   is forgiving of a loose mode).
 
 ### Fixed
+- **An infusion into a compartment the analytical model cannot deliver into is now an error,
+  not a crash** (#375). A positive `RATE` into a compartment outside the model's infusable set
+  — most commonly an oral model's peripheral (`CMT=3` on `two_cpt_oral`) — used to abort the
+  process from deep inside the event-driven prediction walk whenever the subject also had a
+  time-varying covariate, an `EVID=3/4` reset, or IOV. Nothing validated a *fixed* `RATE`
+  against the model's topology: the data reader has no model, and the parse-time check only
+  fires for a declared `D{cmt}`/`R{cmt}`. Such doses are now rejected up front, naming the
+  subject, time, and the compartments the model *can* infuse — `fit()` returns an error, and
+  `predict()`/`simulate()` fail with the same message, matching every other dose precondition.
+  An out-of-range dose compartment (`CMT` past the end of the model's compartment list) is
+  rejected the same way. This also removes a silent disagreement between the three analytical
+  paths on the same dataset: the dose-superposition path used to route the infusion into the
+  central compartment regardless of `CMT`, and the gradient (sensitivity) walk used to drop it
+  entirely — so a fit could have differentiated a different dosing history than it predicted.
+  Two behaviour changes worth noting: an infusion with `CMT=0` is now rejected (there is no
+  "default compartment" for an infusion — it previously mis-routed to central or panicked,
+  depending on the path), while a **bolus** with `CMT=0` is unchanged, since both analytical
+  paths already agree it means NONMEM's default dose compartment. Boluses into an existing but
+  non-infusable compartment (e.g. a peripheral) are unaffected.
 - **Analytic FOCEI sensitivities for IIV on an absorption lag feeding a `first_order` forcing**
   (#880). Fixes to the rate-on onset of a built-in `first_order` (Bateman) input-rate forcing
   whose arrival is a moving boundary — a compartment lagtime (`ALAG1`/`LAGTIME`) **or** a

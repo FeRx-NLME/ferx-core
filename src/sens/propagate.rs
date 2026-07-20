@@ -894,7 +894,18 @@ fn active_rates_g<T: PkNum>(
                 Some(Channel::Periph1) => rate_periph1 = rate_periph1 + r,
                 Some(Channel::Periph2) => rate_periph2 = rate_periph2 + r,
                 Some(Channel::Depot) => rate_depot = rate_depot + r,
-                None => {}
+                // Unreachable from a validated call — `check_dose_compartments`
+                // (#375) rejects an unroutable infusion before any prediction. The
+                // old silent `{}` was worse than the value walk's `panic!` twin in
+                // `pk::event_driven::propagate_with_bounds`: it dropped the
+                // infusion from the *gradient* only, so FOCE/FOCEI would have
+                // differentiated a different dosing history than it predicted.
+                // Fail the same way the value walk does instead.
+                None => panic!(
+                    "sens PK walk: infusion into compartment {} not supported for model \
+                     {:?} — should have been rejected by `check_dose_compartments`",
+                    d.cmt, pk_model
+                ),
             }
         }
     }
@@ -1541,6 +1552,38 @@ mod tests {
             ka: p.ka(),
             f: p.f_bio(),
         }
+    }
+
+    /// #375: `active_rates_g` used to answer an unroutable infusion with a silent
+    /// `None => {}`, dropping the dose from the **gradient** while the production
+    /// value walk (`pk::event_driven::propagate_with_bounds`) panicked on the same
+    /// input — so had the value path been made lenient, FOCE/FOCEI would have
+    /// differentiated a different dosing history than it predicted. Both walks now
+    /// fail the same way; `check_dose_compartments` makes this unreachable from a
+    /// validated call, and this test is the direct-call proof that the guard is
+    /// still there.
+    #[test]
+    #[should_panic(expected = "infusion into compartment 2 not supported")]
+    fn sens_walk_panics_on_an_unroutable_infusion_like_the_value_walk() {
+        // `one_cpt_iv` has a single compartment, so cmt 2 has no rate channel.
+        let dose = DoseEvent::new(0.0, 100.0, 2, 20.0, false, 0.0);
+        let subject = make_subject(vec![dose], vec![1.0, 4.0]);
+        let pk = pk_full(5.0, 50.0, 1.0);
+        let schedule = EventSchedule::for_subject(
+            &subject,
+            PkModel::OneCptIv,
+            &subject.doses,
+            &[pk.lagtime()],
+        );
+        let pk_g = one_cpt_pk_f64(&pk);
+        let _ = event_driven_sens_one_cpt_g::<f64>(
+            false,
+            &subject,
+            &schedule,
+            &[pk_g],
+            &vec![pk_g; 2],
+            &[],
+        );
     }
 
     /// The `f64` instantiation of the full event walk must reproduce the

@@ -337,6 +337,7 @@ where
     // the model is an analytic absorption closed form, which this ODE-only path rejects
     // up front — but is wired for parity and #702 base-regimen support.)
     first_error(&check_modeled_dose_rates(model, population))?;
+    first_error(&check_dose_compartments(model, population))?;
     if let Some(msg) = check_absorption_closed_form_support(model, population) {
         return Err(msg);
     }

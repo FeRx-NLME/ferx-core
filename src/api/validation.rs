@@ -132,6 +132,7 @@ pub fn check_model_data_rule(
     diags.extend(check_iov_occasions(model, population, iov_rule));
     diags.extend(check_absorption_dosing(model, population));
     diags.extend(check_modeled_dose_rates(model, population));
+    diags.extend(check_dose_compartments(model, population));
     diags.extend(validate_output_columns(model, population));
     diags
 }
@@ -611,6 +612,125 @@ pub(crate) fn check_modeled_dose_rates(
         }
     }
     diags
+}
+
+/// Every dose must name a compartment the **analytical** engine can actually
+/// deliver it into (#375). The datareader cannot make this call — it has no
+/// model — and the parse-time infusable check
+/// (`model_parser`, [`PkModel::infusable_compartments`]) only fires for a
+/// *declared* `D{cmt}`/`R{cmt}`, so an explicit positive `RATE` (or an
+/// out-of-range bolus `CMT`) read straight from the dataset reached the
+/// predictors unvalidated. The three analytical paths then disagreed on it:
+/// the dose-superposition path never reads `dose.cmt` and silently routed the
+/// infusion into central, the event-driven walk `panic!`ed, and the `sens`
+/// gradient walk silently dropped the infusion. Rejecting up front is what
+/// makes all three agree, and keeps the prediction hot path panic-free.
+///
+/// Two rules, both 1-based like NONMEM's `CMT`:
+///   - **Infusion** (`RATE>0`, or a resolved modeled rate/duration): the
+///     compartment must be in [`PkModel::infusable_compartments`] — central for
+///     every model, the oral depot since #400, and the peripheral(s) of the
+///     2-/3-cpt IV models. Oral peripherals have no closed form and are
+///     rejected rather than mis-routed. Checked only for the six event-walk
+///     models: `dose_channel` *is* the walk's routing table, and a transit/IG
+///     subject never takes that walk — an infusion reroutes it to the model's
+///     ODE twin (`CompiledModel::effective_for`, #719 gap 2), which addresses
+///     compartments directly. Applying this table to them would reject a
+///     supported model.
+///   - **Bolus**: `cmt` must not exceed the model's state count. `CMT=0` is
+///     left alone — both analytical paths already treat it as NONMEM's
+///     "default dose compartment" (the walk via `saturating_sub(1)`, the
+///     superposition path by ignoring `cmt`), so it is consistent, not a
+///     silent mis-route.
+///
+/// ODE models are exempt: `ode/predictions.rs` indexes the state vector
+/// directly and honours any compartment the `[odes]` block declares.
+///
+/// Reported once per `(kind, compartment)` so a dataset with many offending
+/// rows yields one actionable error per cause, matching
+/// [`check_modeled_dose_rates`].
+pub(crate) fn check_dose_compartments(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    // ODE engine: any declared compartment is addressable, nothing to check.
+    if model.ode_spec.is_some() {
+        return Vec::new();
+    }
+    let pk_model = model.pk_model;
+    let topology = pk_model.topology();
+    let (n_states, _) = topology.state_layout();
+    let name = pk_model.canonical_name();
+    let mut diags = Vec::new();
+    // De-dup by (is_infusion, compartment): an infusion and a bolus into the
+    // same bad compartment are independent causes and are reported separately.
+    let mut reported: std::collections::HashSet<(bool, usize)> = std::collections::HashSet::new();
+    for subject in &population.subjects {
+        for dose in &subject.doses {
+            let is_infusion = dose.is_infusion();
+            if !reported.insert((is_infusion, dose.cmt)) {
+                continue;
+            }
+            let cmt = dose.cmt;
+            if is_infusion {
+                // Transit/IG (`event_walk_supported == false`) never take the
+                // walk this routing table belongs to — an infusion reroutes them
+                // to their ODE twin (#719 gap 2), which addresses compartments
+                // directly. Rejecting here would break a supported model.
+                if !topology.event_walk_supported {
+                    continue;
+                }
+                // For a walk-supported model `infusable` *equals* the walk's
+                // routing table (pinned by `topology_fields_are_internally_consistent`),
+                // so this is exactly the set `dose_channel` can route.
+                if !pk_model.infusable_compartments().contains(&cmt) {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_DOSE_CMT_NOT_INFUSABLE",
+                            format!(
+                                "subject {}, time {}: infusion into compartment {cmt}, \
+                                 but the analytical `{name}` model can only infuse into \
+                                 compartment(s) {:?}. An infusion into another compartment \
+                                 (e.g. an oral peripheral) needs an `ode(...)` model.",
+                                subject.id,
+                                dose.time,
+                                pk_model.infusable_compartments(),
+                            ),
+                        )
+                        .with_block("structural_model"),
+                    );
+                }
+            } else if cmt > n_states {
+                diags.push(
+                    Diagnostic::error(
+                        "E_DOSE_CMT_OUT_OF_RANGE",
+                        format!(
+                            "subject {}, time {}: dose into compartment {cmt}, but the \
+                             analytical `{name}` model has only {n_states} compartment(s) \
+                             (CMT is 1-based: {:?}).",
+                            subject.id, dose.time, topology.compartment_names,
+                        ),
+                    )
+                    .with_block("structural_model"),
+                );
+            }
+        }
+    }
+    diags
+}
+
+/// Precondition shared by [`predict`] and the `simulate*` family: every dose
+/// must name a compartment the analytical engine can deliver it into (#375) —
+/// the `predict()`/`simulate()` twin of [`check_dose_compartments`], which
+/// `fit()` reaches through [`check_model_data`]. Without it these entry points
+/// reach the event-driven walk's routing `match` with an unroutable
+/// compartment, which used to `panic!` from deep inside the prediction loop
+/// with no subject/time context.
+pub(crate) fn assert_dose_compartments_supported(model: &CompiledModel, population: &Population) {
+    panic_if_unsupported(
+        first_error(&check_dose_compartments(model, population)).err(),
+        "a dose into a compartment the model cannot deliver into",
+    );
 }
 
 /// Precondition shared by [`predict`] and the `simulate*` family: every

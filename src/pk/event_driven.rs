@@ -701,9 +701,16 @@ fn event_driven_predictions_with_schedule_impl(
                     if cmt_idx < n_states {
                         state[cmt_idx] += pk_now.bioavailable_amount(d.amt);
                     } else {
+                        // Unreachable from a validated call: `check_dose_compartments`
+                        // (#375) rejects `cmt > n_states` up front — as an `Err` from
+                        // `fit()`, as a panic naming the subject/time from
+                        // `predict()`/`simulate()`. Kept as a defensive guard so an
+                        // internal caller that skips validation still fails loudly
+                        // instead of dropping the dose.
                         panic!(
                             "event-driven PK: dose into compartment {} but model has \
-                             {} states (cmt is 1-based)",
+                             {} states (cmt is 1-based) — should have been rejected by \
+                             `check_dose_compartments`",
                             d.cmt, n_states
                         );
                     }
@@ -853,11 +860,18 @@ fn propagate_with_bounds(
                     Some(Channel::Periph1) => rate_periph1 += r,
                     Some(Channel::Periph2) => rate_periph2 += r,
                     Some(Channel::Depot) => rate_depot += r,
+                    // Unreachable from a validated call: `check_dose_compartments`
+                    // (#375) rejects an infusion outside `infusable_compartments()`
+                    // up front, with the subject/time context this deep-in-the-walk
+                    // panic could never carry. Kept as a defensive guard, and
+                    // mirrored by `sens::propagate::active_rates_g` so the value
+                    // and gradient walks agree on what is unroutable.
                     None => panic!(
                         "event-driven PK: infusion into compartment {} not supported \
                          for model {:?}. Supported: central for all models; depot (cmt 1) \
                          for oral models; periph1/2 for 2- and 3-cpt IV models. Oral \
-                         peripheral infusion is a tracked follow-up.",
+                         peripheral infusion is unsupported — should have been rejected \
+                         by `check_dose_compartments`.",
                         d.cmt, pk_model
                     ),
                 }
@@ -1042,6 +1056,44 @@ mod tests {
         use crate::types::RateMode;
         let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
         let subject = make_subject(vec![modeled], vec![1.0]);
+        let pk = pk_one(5.0, 50.0);
+        let _ = event_driven_predictions(
+            PkModel::OneCptIv,
+            &subject,
+            std::slice::from_ref(&pk),
+            std::slice::from_ref(&pk),
+            &[],
+        );
+    }
+
+    /// #375: the walk's routing `match` is the guard `check_dose_compartments`
+    /// makes unreachable from a validated call. Direct call (bypassing the
+    /// entry-point gates) confirms the predictor still fails loudly rather than
+    /// silently dropping the infusion, and pins the message the sens walk
+    /// mirrors.
+    #[test]
+    #[should_panic(expected = "infusion into compartment 2 not supported")]
+    fn event_driven_predictions_panics_on_an_unroutable_infusion() {
+        // `one_cpt_iv` has a single compartment, so cmt 2 has no rate channel.
+        let infusion = DoseEvent::new(0.0, 100.0, 2, 20.0, false, 0.0);
+        let subject = make_subject(vec![infusion], vec![1.0]);
+        let pk = pk_one(5.0, 50.0);
+        let _ = event_driven_predictions(
+            PkModel::OneCptIv,
+            &subject,
+            std::slice::from_ref(&pk),
+            std::slice::from_ref(&pk),
+            &[],
+        );
+    }
+
+    /// #375's sibling: a bolus past the end of the state vector. Same contract —
+    /// rejected up front, defensive panic if an internal caller skips validation.
+    #[test]
+    #[should_panic(expected = "should have been rejected by `check_dose_compartments`")]
+    fn event_driven_predictions_panics_on_an_out_of_range_bolus() {
+        let bolus = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0);
+        let subject = make_subject(vec![bolus], vec![1.0]);
         let pk = pk_one(5.0, 50.0);
         let _ = event_driven_predictions(
             PkModel::OneCptIv,
