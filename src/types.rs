@@ -2461,6 +2461,60 @@ impl SimOutcome {
     }
 }
 
+/// Prediction for one (subject, time, CMT) point — the predict-side analogue of
+/// [`SimOutcome`] (`plans/tte-survival-markov.md` §8.8.1).
+///
+/// A non-Gaussian endpoint's prediction is a **probability vector or a curve, never
+/// one scalar**, which is why the legacy [`crate::api::PredictionResult`] (`pred: f64`)
+/// cannot carry it. That struct is unchanged and still backs the Gaussian
+/// [`crate::predict`]; this enum backs the per-endpoint predictors
+/// ([`crate::api::predict_categorical`] today).
+///
+/// Only variants with a **live producer** are declared. The plan also sketches
+/// `Survival` and `Rate` arms; TTE prediction already ships as the richer
+/// [`crate::api::SurvivalPredictionResult`] (S/H/h + CIF + median/mean, more than a
+/// three-field variant would hold), and `Rate` waits on the Poisson/count slice —
+/// adding either before it can be produced would be an untestable dead arm.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Prediction {
+    /// Gaussian continuous prediction (the existing scalar path).
+    Continuous { pred: f64 },
+    /// Category probabilities `P(Y = k)`, indexed by the endpoint's own state
+    /// order. Binary uses `[1 − p, p]` so index == the observed 0/1 DV code.
+    /// CTMM occupancy `π(t)` reuses this variant (#820), indexed by generator
+    /// state; callers map back to DV codes through the endpoint's `state_codes`.
+    CatProbs { probs: Vec<f64> },
+}
+
+impl Prediction {
+    /// `P(Y = k)` for state index `k`, or `None` when this is not a categorical
+    /// prediction or `k` is out of range. Keeps callers from indexing `probs`
+    /// directly and panicking on a shape they did not check.
+    pub fn prob(&self, k: usize) -> Option<f64> {
+        match self {
+            Prediction::CatProbs { probs } => probs.get(k).copied(),
+            Prediction::Continuous { .. } => None,
+        }
+    }
+}
+
+/// A prediction attached to a specific endpoint CMT — the multi-endpoint analogue
+/// of [`crate::api::PredictionResult`], which has no CMT field because it predates
+/// per-CMT endpoints.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EndpointPredictionResult {
+    pub id: String,
+    /// CMT of the endpoint that produced this prediction.
+    pub cmt: usize,
+    /// Raw data TIME of the observation being predicted (matches sdtab / input).
+    pub time: f64,
+    /// Observed outcome at this record, when the dataset carries one — the 0/1 DV
+    /// for a binary endpoint. Paired here so a caller can form a residual without
+    /// re-joining against the input population.
+    pub observed: Option<f64>,
+    pub prediction: Prediction,
+}
+
 /// A compiled model ready for estimation
 pub struct CompiledModel {
     pub name: String,

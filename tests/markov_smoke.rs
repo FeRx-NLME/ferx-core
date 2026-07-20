@@ -426,6 +426,19 @@ mod ctmm_smoke {
         let _ = simulate(&model, &pop, &model.default_params, 1);
     }
 
+    /// …and so does `predict()`. The simulate guard's message already *claimed* to cover
+    /// `predict()`, but it sits in the simulate chokepoint only — so a CTMM model reaching
+    /// `predict()` silently returned zero rows (its discrete records are not on the Gaussian
+    /// observation grid). Occupancy prediction π(t) is #820.
+    #[test]
+    #[should_panic(expected = "CTMM")]
+    fn ctmm_predict_panics() {
+        use ferx_core::predict;
+        let model = parse_model_string(FIXED_MODEL).unwrap();
+        let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
+        let _ = predict(&model, &pop, &model.default_params);
+    }
+
     /// Out-of-order CTMM observation times are rejected at fit setup (the datareader sorts
     /// doses, not observations), rather than silently collapsing the subject to the 1e20
     /// sentinel and biasing the population OFV.

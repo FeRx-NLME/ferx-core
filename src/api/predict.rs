@@ -41,6 +41,12 @@ use std::time::Instant;
 /// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
 /// callers that obtained `population` via [`read_nonmem_csv`] should inspect
 /// `population.warnings` before calling this function.
+///
+/// **Gaussian rows only.** Non-Gaussian endpoints keep their own entry points, because
+/// their prediction is not a scalar concentration: TTE → [`predict_survival`], binary →
+/// [`predict_categorical`]. A model whose only endpoint is non-Gaussian therefore gets an
+/// empty vec here — call the matching predictor instead. (CTMM has no predictor yet and
+/// is rejected fail-loud below rather than returning empty.)
 pub fn predict(
     model: &CompiledModel,
     population: &Population,
@@ -58,6 +64,18 @@ pub fn predict(
     assert_survival_tv_covariates(model, population);
     assert_analytic_readout_support(model, population);
     assert_absorption_dosing_supported(model, population);
+    // CTMM (#759) has no prediction path: its records live in `obs_records`, which the
+    // Gaussian loop below never visits, so a CTMM-only model would silently return an
+    // empty vec rather than an occupancy π(t). `simulate()`'s twin assert already
+    // *claims* to cover predict() — it does not, because it sits in the simulate
+    // chokepoint — so state the contract here too. Occupancy prediction is #820.
+    #[cfg(feature = "markov")]
+    assert!(
+        !model.has_ctmm(),
+        "predict() does not support a [markov_model] (CTMM) endpoint yet — its discrete-state \
+         records are not on the Gaussian observation grid, so this call would silently return \
+         no rows for them. State-occupancy prediction π(t) is a later slice (#820)."
+    );
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
@@ -89,6 +107,31 @@ pub struct PredictionResult {
     pub id: String,
     pub time: f64,
     pub pred: f64,
+}
+
+/// Category probabilities for every binary-endpoint record in the population
+/// (#760 Slice 1b) — the categorical analogue of [`predict_survival`].
+///
+/// [`predict`] cannot serve this: its [`PredictionResult`] carries a single `f64`,
+/// and a categorical prediction is a probability vector (§8.8.1). It is a separate
+/// entry point rather than a change to `predict`'s return type so the existing
+/// Gaussian signature — which the R wrapper binds — stays untouched.
+///
+/// Predictions are at `η = 0` (the population-typical subject), matching [`predict`]'s
+/// own convention; the EBE-conditioned per-subject values are an sdtab concern.
+/// Returns an empty vec for a model with no `Binary` endpoint.
+#[cfg(feature = "survival")]
+pub fn predict_categorical(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Vec<EndpointPredictionResult> {
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    let mut results = Vec::new();
+    for subject in &population.subjects {
+        crate::categorical::predict_binary(model, subject, &params.theta, &zero_eta, &mut results);
+    }
+    results
 }
 
 /// Survival function prediction for one (subject, time) grid point.

@@ -46,8 +46,36 @@ ferx's OFV equals the glm deviance / NONMEM `−2 log L` to five decimals — wh
 the Bernoulli likelihood constant *and* form — with the θ estimates matching the MLE to
 the derivative-free (BOBYQA) outer tolerance. The comparison is guarded by the Tier-3
 test `tests/categorical_convergence.rs` (the NONMEM control file is committed at
-`tests/reference/binary_logistic/`); the simulate → fit recovery (SSE) guard is added
-with the categorical simulation slice.
+`tests/reference/binary_logistic/`).
+
+## Validation — simulate → fit recovery (SSE)
+
+The `glm` / NONMEM anchor above scores *observed* data, so it cannot detect a wrong
+**sampler**: `simulate()` could draw from the wrong probability and every fit-side test
+would still pass. The companion guard is a simulation-estimation round trip — simulate
+binary outcomes from a known `θ`, refit them, and require the generating `θ` back
+(`binary_simulate_then_fit_recovers_theta`, Tier 3).
+
+Internally the likelihood, the sampler and the predictor share a single linear-predictor
+evaluator, so they cannot disagree about which records belong to the endpoint, what a
+`TIME` term resolves to, or what `lp` a record carries.
+
+## Simulation and prediction
+
+```r
+sim  <- simulate(model, data, params, n_sim = 100)  # one 0/1 draw per binary record
+```
+
+`simulate()` emits one categorical row per binary observation record, on the endpoint's
+CMT, with `ipred` carrying the probability `p` the outcome was drawn around. Binary
+outcomes are observed on the **fixed observation grid** — unlike a time-to-event
+endpoint there is no horizon and no event location, so a `[simulation]` block needs
+`times`, not a `horizon`.
+
+Predictions come from `predict_categorical()`, which returns a probability vector per
+record (`P(Y = 0)`, `P(Y = 1)`) rather than a scalar. The plain `predict()` is the
+Gaussian predictor and returns no rows for a binary endpoint — the same split as
+`predict_survival()` for time-to-event.
 
 ## Reference R session
 

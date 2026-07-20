@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Simulation and prediction for binary (`[binary_model]`) endpoints** (#760). `simulate()` now
+  draws a 0/1 outcome per binary observation record (previously it emitted **no rows at all** for
+  a binary endpoint, silently and without an error), and the new `predict_categorical()` returns
+  the category probabilities `P(Y = 0)` / `P(Y = 1)` per record — a probability vector, which the
+  scalar `predict()` cannot represent. `predict()` itself is unchanged and remains the Gaussian
+  predictor. A `[simulation]` block driving a binary endpoint needs `times` (binary outcomes are
+  observed on the fixed grid), and the simulated states are written back to the output dataset.
+  Validated by a simulate → fit recovery (SSE) round trip on top of the existing R `glm` / NONMEM
+  fit anchors.
 - **Analytic sensitivities for steady-state dosing into a built-in absorption compartment**
   (#835). Fitting a model with an `SS=1` dose into a `first_order` / `transit` / `igd` /
   `weibull` absorption compartment now uses exact analytic FOCEI gradients — the closed-form
@@ -27,6 +36,12 @@ section of the SDLC for the versioning policy).
   differences, so these fits run at full analytic speed. Steady-state into a `zero_order`
   window, and steady-state combined with an absorption lagtime, remain out of scope (rejected
   with a clear error).
+
+### Fixed
+- **`predict()` on a CTMM (`[markov_model]`) model now fails loud instead of silently returning
+  no rows** (#759). The equivalent `simulate()` guard already existed and its message claimed to
+  cover `predict()`, but it only ran on the simulate path. State-occupancy prediction `π(t)` is
+  still to come (#820).
 
 ### Performance
 - **Closed-form modified-release absorption** (#860). A static multi-route absorption model

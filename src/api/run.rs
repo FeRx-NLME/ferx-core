@@ -289,6 +289,12 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     }
     let model_has_continuous = !parsed.model.default_params.sigma.values.is_empty();
     let model_has_tte = parsed.model.has_tte();
+    // Binary endpoints observe on the **fixed grid** (§8.8.2), so — like a continuous
+    // endpoint and unlike TTE — they need `times`, not a `horizon` (#760 Slice 1b).
+    #[cfg(feature = "survival")]
+    let binary_cmts: Vec<usize> = parsed.model.binary_cmts();
+    #[cfg(not(feature = "survival"))]
+    let binary_cmts: Vec<usize> = Vec::new();
     if sim_spec.obs_times.is_empty() {
         if model_has_continuous {
             return Err(
@@ -296,6 +302,15 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                  (residual-error) endpoint that needs observation times — add \
                  `times = [...]` (a joint PK + TTE design needs both `times` and a \
                  `horizon`)"
+                    .to_string(),
+            );
+        }
+        if !binary_cmts.is_empty() {
+            return Err(
+                "[simulation] has no `times`, but the model has a [binary_model] endpoint. \
+                 A binary outcome is observed on a fixed schedule, not located in time like \
+                 a TTE event, so it needs `times = [...]` (a `horizon` alone gives it nothing \
+                 to observe)"
                     .to_string(),
             );
         }
@@ -351,6 +366,21 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                     entry_time: 0.0,
                     cmt,
                 })
+                // Binary template rows: one placeholder per (binary CMT × observation
+                // time), since a binary endpoint observes on the fixed grid. `state = 0`
+                // is a placeholder overwritten by the draw in the write-back below —
+                // the same template-then-realise shape the TTE rows above use (#522).
+                // Without these the sampler has no records to walk and `--simulate`
+                // emits zero binary rows (#760 Slice 1b).
+                .chain(binary_cmts.iter().flat_map(|&cmt| {
+                    sim_spec.obs_times.iter().map(move |&time| {
+                        crate::types::ObsRecord::DiscreteState {
+                            time,
+                            state: 0,
+                            cmt,
+                        }
+                    })
+                }))
                 .collect(),
             // `obs_records` is unconditional since Phase 4.0, but the only records
             // this synthetic TTE subject carries are `Event`s (survival-gated); with
@@ -462,6 +492,37 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                 .collect();
             if !events.is_empty() {
                 subject.obs_records = events;
+            }
+        }
+
+        // Binary write-back (#760 Slice 1b): stamp each simulated 0/1 outcome onto its
+        // template `DiscreteState` row, so the fitted dataset carries the drawn states
+        // rather than the all-zero placeholders. Unlike the TTE arm above this is an
+        // **in-place merge**, not a wholesale replace, so it composes with whatever
+        // records already exist instead of dropping them.
+        //
+        // Rows are paired per CMT in emission order: `simulate_binary` walks
+        // `obs_records` in order and pushes one row per record, and `sims` preserves
+        // that order, so the k-th `Category` row on a CMT is the k-th `DiscreteState`
+        // row on that CMT. A short `sims` list (records skipped for a NaN predictor —
+        // warned about at draw time) leaves the remaining templates untouched rather
+        // than shifting every later row onto the wrong record.
+        #[cfg(feature = "survival")]
+        {
+            let mut drawn: HashMap<usize, std::collections::VecDeque<usize>> = HashMap::new();
+            for s in sims {
+                if let crate::types::SimOutcome::Category { state } = s.outcome {
+                    drawn.entry(s.cmt).or_default().push_back(state);
+                }
+            }
+            if !drawn.is_empty() {
+                for rec in &mut subject.obs_records {
+                    if let crate::types::ObsRecord::DiscreteState { state, cmt, .. } = rec {
+                        if let Some(next) = drawn.get_mut(cmt).and_then(|q| q.pop_front()) {
+                            *state = next;
+                        }
+                    }
+                }
             }
         }
     }
