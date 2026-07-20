@@ -185,6 +185,7 @@ pub fn run_conditional_distribution(
                     omega,
                     sigma,
                     step_block,
+                    None,
                     &mut rng,
                     n_mh_steps,
                     pk_scratch,

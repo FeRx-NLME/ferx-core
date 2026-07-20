@@ -516,6 +516,80 @@ fn frem_covariate_omega_matches_sample_variance() {
     );
 }
 
+/// #895 regression: a FREM model with `iiv_on_ruv` must estimate under SAEM
+/// without the omega_RUV / sigma explosion the issue reported (omega_RUV ≈ 49,
+/// sigma at the e⁵ ceiling). The near-deterministic FREM covariate ETAs give the
+/// joint block kernel a 0% acceptance rate, but the componentwise sweep mixes the
+/// chain and the block per-coordinate damping keeps the block kernel useful — so
+/// the fit stays bounded, the "sampler not mixing" warning is NOT emitted, and
+/// the residual sigma never rides the ridge to its cap.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn frem_iiv_on_ruv_saem_stays_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = setup_frem(tmp.path());
+
+    // Inject an IIV-on-RUV random effect into the generated FREM model.
+    let gen = std::fs::read_to_string(&result.model_path).unwrap();
+    let m = gen
+        .replacen(
+            "[individual_parameters]",
+            "  omega ETA_RUV ~ 0.28\n\n[individual_parameters]",
+            1,
+        )
+        .replacen(
+            "[fit_options]",
+            "  iiv_on_ruv = ETA_RUV\n\n[fit_options]",
+            1,
+        );
+    let ruv_model = tmp.path().join("frem_ruv.ferx");
+    std::fs::write(&ruv_model, &m).unwrap();
+
+    let model = parse_model_file(&ruv_model).unwrap();
+    let pop = read_nonmem_csv(&result.data_path, None, None).unwrap();
+
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Saem;
+    opts.saem_n_exploration = 500;
+    opts.saem_n_convergence = 500;
+    opts.saem_omega_burnin = 20;
+    opts.imp_seed = Some(12345);
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+
+    let fit_result = fit(&model, &pop, &model.default_params, &opts)
+        .expect("FREM iiv_on_ruv SAEM should succeed");
+
+    assert!(fit_result.ofv.is_finite(), "OFV should be finite");
+
+    // ETA_RUV is the 6th eta (index 5). It must not blow up toward the reported
+    // ~49; a bounded run keeps it O(1).
+    let omega_ruv = fit_result.omega[(5, 5)];
+    assert!(
+        omega_ruv.is_finite() && omega_ruv < 5.0,
+        "omega_RUV ({omega_ruv:.3}) exploded — #895 mixing regression"
+    );
+
+    // The PK residual sigma (index 0) must not ride the ridge to the e⁵ SD
+    // ceiling (148.4). Well below the growth cap for this well-mixed run.
+    let sigma_pk = fit_result.sigma[0];
+    assert!(
+        sigma_pk.is_finite() && sigma_pk < 5.0,
+        "residual sigma ({sigma_pk:.3}) hit the ridge ceiling — #895 regression"
+    );
+
+    // The E-step mixes here (componentwise kernel), so the "not mixing" warning
+    // must NOT fire.
+    assert!(
+        !fit_result.warnings.iter().any(|w| w.contains("not mixing")),
+        "unexpected mixing warning: {:?}",
+        fit_result.warnings
+    );
+}
+
 /// The gradient-based twin of `frem_covariate_omega_matches_sample_variance` (#251).
 ///
 /// Two independent checks, and it matters which one does the regression work.

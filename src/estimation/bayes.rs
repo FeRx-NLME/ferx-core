@@ -633,6 +633,7 @@ pub fn run_bayes(
                         &omega_cur,
                         &sigma,
                         eta_scale,
+                        None,
                         &mut rng,
                         n_eta_mh,
                         &mut scratch,

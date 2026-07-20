@@ -107,6 +107,16 @@ section of the SDLC for the versioning policy).
   is forgiving of a loose mode).
 
 ### Fixed
+- **SAEM FREM / `iiv_on_ruv` mixing diagnostics and safeguards** (#895). The optimizer-trace
+  `mh_accept_rate` (and the verbose banner) now reports the **combined** block + componentwise
+  Metropolis-Hastings acceptance rate. Previously it showed only the block kernel, which reads a
+  misleading 0% for FREM-scale Ω — the near-deterministic covariate ETAs reject every joint
+  move — even when the componentwise sweep is mixing the chain fine. The block kernel now damps
+  each FREM covariate coordinate by `min(1, √EPSCOV/√Ω_jj)` so its joint acceptance recovers from
+  0% (non-FREM models are unaffected — the multiplier is exactly 1). SAEM also now warns when the
+  combined post-burn-in acceptance stays below 1% (the sampler is not mixing, so Ω/σ are
+  unreliable), and, for `iiv_on_ruv` models, caps a free residual σ's growth during the run so a
+  poorly-identified σ × ω_RUV ridge cannot ride σ up to its e⁵ ceiling — warning if the cap binds.
 - **Analytic FOCEI sensitivities for IIV on an absorption lag feeding a `first_order` forcing**
   (#880). Fixes to the rate-on onset of a built-in `first_order` (Bateman) input-rate forcing
   whose arrival is a moving boundary — a compartment lagtime (`ALAG1`/`LAGTIME`) **or** a
