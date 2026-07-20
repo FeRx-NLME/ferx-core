@@ -17,7 +17,10 @@ use crate::types::PkModel;
 /// Which internal rate accumulator a 1-based dose compartment routes into for
 /// the closed-form event walk. Returned by [`PkTopology::dose_channel`]; callers
 /// map each arm onto their own `rate_*` accumulator and decide the `None` policy
-/// (event_driven panics on an unsupported infusion cmt; active_rates_g skips).
+/// — since #375 both walks `panic!` on it (silently dropping an infusion from
+/// the *gradient* only would make FOCE differentiate a different dosing history
+/// than it predicted), and `check_dose_compartments` makes that unreachable from
+/// a validated call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Channel {
     Central,
@@ -76,10 +79,14 @@ impl PkTopology {
     }
 
     /// Rate channel for a 1-based dose compartment. `None` = not infusable for
-    /// this model (caller decides panic vs skip). Preserves the old
+    /// this model; every caller panics on it (see [`Channel`]). Preserves the old
     /// `match (pk_model, d.cmt) { .. , _ => .. }` fall-through: any cmt not
-    /// explicitly mapped (incl. cmt 0 and peripherals of oral models) yields
-    /// `None`, exactly the arms the old `_` caught.
+    /// explicitly mapped yields `None`, exactly the arms the old `_` caught.
+    /// Since #375 the oral peripherals map to `Some(Periph1)`/`Some(Periph2)`,
+    /// so for the six walk-supported models the only in-range `None` is `cmt 0`
+    /// (`checked_sub(1)`), NONMEM's default dose compartment — which has no
+    /// meaning for a zero-order input and is rejected by
+    /// `check_dose_compartments`.
     #[inline]
     pub(crate) fn dose_channel(&self, cmt_1based: usize) -> Option<Channel> {
         cmt_1based

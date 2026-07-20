@@ -26,8 +26,14 @@
 //!     depot-bypassing infusion) AND into the **depot** (cmt 1, #400) —
 //!     a zero-order release into the depot, then first-order `ka`
 //!     absorption into central.
-//! Infusion into an oral peripheral compartment still panics — a rare
-//! clinical setup tracked as a follow-up.
+//!   - Oral models, since #375: into the **peripheral** compartment(s) too
+//!     (cmt 3 on `two_cpt_oral`, cmt 3/4 on `three_cpt_oral`). Nothing flows
+//!     back into the depot, so a rate into a peripheral drives exactly the
+//!     central/peripheral sub-system the IV model has, and the oral propagator
+//!     superposes that same IV forced response onto its homogeneous evolution.
+//! Every compartment of the six walk-supported models is therefore infusable;
+//! what remains rejected is `CMT=0` (no default compartment for a zero-order
+//! input) and anything past the end of the state vector.
 
 use crate::pk::topology::Channel;
 use crate::types::{DoseEvent, PkModel, PkParams, Subject};

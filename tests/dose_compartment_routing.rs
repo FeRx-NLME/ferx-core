@@ -196,6 +196,55 @@ fn central_and_depot_infusions_still_predict_on_the_event_driven_walk() {
     }
 }
 
+/// Regression (#375): a **zero-amount** dose with an out-of-range `CMT` must be
+/// rejected, not accepted-then-panicked.
+///
+/// An earlier revision skipped every `AMT=0` dose in `check_dose_compartments`,
+/// reasoning that a zero bolus "delivers nothing on any path". That is true of the
+/// *addition* but not of the guard around it: both walks evaluate
+/// `if cmt_idx < n_states { state[cmt_idx] += … } else { panic!(…) }`, so control
+/// never reaches the `F·0`. Combined with `dose_needs_event_walk` routing any
+/// `cmt != 1` bolus to the walk, such a row made `ferx check` report the dataset
+/// clean and `fit()` abort the process — the exact failure #375 exists to remove.
+/// Reachable from ordinary NONMEM data as an `EVID=4` reset row with a stale `CMT`.
+#[test]
+fn a_zero_amount_out_of_range_dose_is_rejected_not_panicked() {
+    let model = model_of(TWO_CPT_ORAL); // depot, central, peripheral → 3 states
+    let pop = pop_of(&format!(
+        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n\
+         1,0,.,1,100,1,0,1,70\n\
+         1,0,.,1,0,9,0,1,70\n{OBS_ROWS}"
+    ));
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.is_error() && d.code == "E_DOSE_CMT_OUT_OF_RANGE"),
+        "a zero-amount dose into compartment 9 of a 3-state model must be rejected \
+         by the range rule, which applies regardless of amount; got {diags:?}"
+    );
+}
+
+/// …while a zero-amount dose into an **in-range** compartment stays accepted: the
+/// range rule is the only one that ignores the amount. A zero-amount *infusion*
+/// has `duration = AMT/RATE = 0`, so no path ever opens a rate window for it and
+/// rejecting a whole fit over an inert row would be stricter than the bug fixed.
+#[test]
+fn a_zero_amount_in_range_dose_is_still_accepted() {
+    let model = model_of(TWO_CPT_ORAL);
+    let pop = pop_of(&format!(
+        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n\
+         1,0,.,1,100,1,0,1,70\n\
+         1,0,.,1,0,3,20,1,70\n{OBS_ROWS}"
+    ));
+    assert!(
+        check_model_data(&model, &pop).iter().all(|d| !d.is_error()),
+        "an inert AMT=0 row into an existing compartment must not fail the fit"
+    );
+    let preds = predict(&model, &pop, &model.default_params);
+    assert_eq!(preds.len(), 3);
+}
+
 // ── pure-TTE subjects: the PK model is a placeholder, do not validate against it ──
 
 /// A pure-TTE model still needs a `[structural_model]` line, and the idiom is a
@@ -330,4 +379,74 @@ fn a_bolus_into_the_peripheral_is_computed_in_the_peripheral() {
         preds[1] > preds[0],
         "a peripheral bolus redistributes into central, so it should rise: {preds:?}"
     );
+}
+
+// ── analytic Form C readout: the depot is reconstructed by superposition ─────
+
+/// Regression (#375): an analytic `[scaling]` readout that references the oral
+/// `depot` must be **rejected** on a subject dosing a non-default compartment,
+/// not silently fed a phantom depot amount.
+///
+/// `apply_analytic_readout` reconstructs the depot with
+/// `analytical_state_at_times` → `single_dose_states`, which never reads
+/// `dose.cmt`: it places every bolus in compartment 1 and every infusion in
+/// central. A bolus written `CMT=2` on a `one_cpt_oral` model was therefore
+/// reconstructed as if absorbed through the depot, adding a phantom amount to
+/// `PRED` — and so to the **objective**, not just a diagnostic column. Measured
+/// on `y = (central + depot)/V`: OFV 188.37 where an explicit `[odes]` twin of
+/// the same model gives 1761.47; with the dose at `CMT=1` the two agree exactly.
+///
+/// The `ipred` path is correct for these subjects (it reroutes to the
+/// event-driven walk), but that walk has no states variant the readout could
+/// read, so there is nothing to fall back to — hence reject rather than degrade.
+#[test]
+fn depot_readout_with_a_non_default_dose_compartment_is_rejected() {
+    const READOUT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 3.0, 300.0)
+  theta TVKA(1.0, 0.05, 20.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[scaling]
+  y = (central + depot) / V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  maxiter = 0
+"#;
+    let model = model_of(READOUT);
+    let obs = "1,0.25,3.1,0,.,2,.,0,70\n1,1,2.2,0,.,2,.,0,70\n1,4,1.5,0,.,2,.,0,70\n";
+
+    // Dose into CMT=2 (central) — not the depot the readout reconstructs.
+    // The readout gate lives on the `fit()`/`predict()` boundary (alongside the
+    // pre-existing reset rejection), not in `check_model_data`.
+    let bad = pop_of(&format!(
+        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,2,0,1,70\n{obs}"
+    ));
+    let err = fit(&model, &bad, &model.default_params, &FitOptions::default())
+        .expect_err("a depot readout with a CMT=2 bolus must be an Err, not a mis-prediction");
+    assert!(
+        err.contains("phantom depot"),
+        "the error should explain the phantom depot amount: {err}"
+    );
+
+    // Control: the same model dosing the depot is unaffected. `maxiter = 0` makes
+    // this an evaluation-only run, so the test still returns immediately (Tier 2).
+    let good = pop_of(&format!(
+        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,1,0,1,70\n{obs}"
+    ));
+    fit(&model, &good, &model.default_params, &FitOptions::default())
+        .expect("a depot readout dosing the depot must stay accepted");
 }

@@ -362,14 +362,27 @@ fn a_clean_population_reports_nothing() {
 /// broader than the walk's predicate), so without an explicit skip the check
 /// would reject a dataset that previously ran fine and delivered nothing.
 #[test]
-fn a_zero_amount_dose_is_not_rejected() {
+fn a_zero_amount_dose_is_exempt_from_the_routing_rule_but_not_the_range_rule() {
     let model = model_with(PkModel::TwoCptOral);
-    let mut inf = infusion(3); // cmt 3 is not infusable
+    // Exempt: an in-range zero-amount infusion delivers nothing on any path
+    // (`duration = AMT/RATE = 0`, and the walk's infusion branch needs
+    // `duration > 0`), so failing a whole fit over an inert row would be
+    // stricter than the bug being fixed.
+    let mut inf = infusion(0); // cmt 0 has no channel for an infusion
     inf.amt = 0.0;
-    let mut bol = bolus(9); // cmt 9 is out of range
-    bol.amt = 0.0;
     assert!(codes(&model, &population_with_doses(vec![inf])).is_empty());
-    assert!(codes(&model, &population_with_doses(vec![bol])).is_empty());
+
+    // NOT exempt: both walks bound-check the compartment *before* the amount is
+    // read (`if cmt_idx < n_states { … } else { panic! }`), so a zero-amount
+    // dose with an out-of-range CMT reaches the panic exactly like a real one —
+    // and since #375 routes any `cmt != 1` bolus to the walk, it gets there.
+    // Exempting it here made `ferx check` bless the dataset and `fit()` abort.
+    let mut bol = bolus(9); // cmt 9 is past the end of the 3-state model
+    bol.amt = 0.0;
+    assert_eq!(
+        codes(&model, &population_with_doses(vec![bol])),
+        vec!["E_DOSE_CMT_OUT_OF_RANGE"],
+    );
 }
 
 // ── wiring ──

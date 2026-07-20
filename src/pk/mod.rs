@@ -1889,27 +1889,6 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
         .collect()
 }
 
-/// Whether `subject` has a zero-order infusion into the **depot** (cmt 1) of an
-/// oral model (#400) — a dose into compartment 1 of `one_cpt_oral` /
-/// `two_cpt_oral` / `three_cpt_oral` that [`DoseEvent::is_infusion`] reports as
-/// an infusion (an explicit positive `RATE`, or a still-modeled `RATE=-2` `D1`).
-///
-/// Such doses have no closed form in the superposition path (which models the
-/// oral depot as bolus-only), so the dispatcher routes them through the
-/// event-driven propagator instead, and their per-compartment states degrade to
-/// NaN. IV models and oral **central** infusions (cmt 2, handled by the
-/// depot-bypass IV formula) return `false`.
-///
-/// Uses `is_infusion()` rather than `rate > 0` so the predicate gives the same
-/// answer on the **raw** subject (modeled `RATE=-2` doses still read `rate == 0`)
-/// and the **resolved** subject (where it reduces to `rate > 0`). This is the
-/// single source of truth shared by the prediction dispatch, the compartment-
-/// state degradation, and the `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL`
-/// warning — so the three can never disagree about which subjects are affected.
-pub(crate) fn has_oral_depot_infusion(pk_model: PkModel, subject: &Subject) -> bool {
-    pk_model.is_oral() && subject.doses.iter().any(|d| d.cmt == 1 && d.is_infusion())
-}
-
 /// True when any dose targets a compartment the **dose-superposition** dispatch
 /// cannot express, so the subject must be served by the event-driven walk.
 ///
@@ -1924,8 +1903,8 @@ pub(crate) fn has_oral_depot_infusion(pk_model: PkModel, subject: &Subject) -> b
 /// - an **infusion** takes the IV infusion form, which delivers into
 ///   **central** — compartment 2 for an oral model (the documented depot-bypass,
 ///   #350), compartment 1 for an IV model. Any other target is wrong: the oral
-///   **depot** (#400, previously the only case handled, by
-///   [`has_oral_depot_infusion`]) and every **peripheral**.
+///   **depot** (#400, previously the only case handled, by the since-removed
+///   `has_oral_depot_infusion`) and every **peripheral**.
 ///
 /// `CMT=0` is NONMEM's default dose compartment and resolves to compartment 1,
 /// so it is treated as such here.
@@ -1938,10 +1917,18 @@ pub(crate) fn has_oral_depot_infusion(pk_model: PkModel, subject: &Subject) -> b
 /// disagrees with NONMEM by up to two orders of magnitude. Rerouting is
 /// therefore a correction, not a preference (#375).
 ///
-/// Subsumes [`has_oral_depot_infusion`] (an oral depot infusion is an infusion
-/// whose compartment is not central); that predicate is kept for the
-/// compartment-state degradation and its warning, which are about a different
-/// question.
+/// **Single source of truth.** This is the *only* predicate deciding which
+/// subjects superposition cannot serve, and every consumer must use it: the
+/// prediction dispatch (`compute_predictions`), the compartment-state
+/// degradation (`compute_predictions_with_states`), the dense `[derived]` grid
+/// states (`api::output_columns`), the analytic Form-C readout gate
+/// (`check_analytic_readout_support`), the `sens` gradient router
+/// (`provider::subject_routes_to_event_walk`), and the
+/// `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` warning. It replaced the
+/// narrower `has_oral_depot_infusion` (which handled only the #400 depot case);
+/// leaving one consumer on the old predicate is exactly how a `[derived]` grid
+/// integral came to report a confident wrong number while the adjacent per-obs
+/// column was NaN.
 pub(crate) fn dose_needs_event_walk(pk_model: PkModel, subject: &Subject) -> bool {
     // Transit/IG cannot be state-propagated, so there is no walk to route to.
     // They reject non-depot doses up front instead (`check_absorption_dosing` /

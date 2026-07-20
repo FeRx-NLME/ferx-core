@@ -2730,6 +2730,111 @@ fn oral_infusion_provider_matches_fd_of_production() {
     }
 }
 
+/// #375 gradient oracle: an infusion into an **oral model's peripheral**
+/// (`two_cpt_oral` cmt 3, `three_cpt_oral` cmt 3/4) is a brand-new forcing term
+/// on the analytic sensitivity path — `propagate_{two,three}_cpt_oral_core_g`
+/// delegate it to the IV core. The value path is pinned against an ODE twin
+/// (`tests/oral_peripheral_infusion.rs`), but the **`Dual2` gradient** has no
+/// second copy of the formula to disagree with it, so it must be asserted
+/// against central FD of the `T = f64` production predictor (CLAUDE.md's
+/// `Dual2`-vs-FD rule).
+///
+/// Cases exercise, in order: peripheral alone; peripheral **overlapping an
+/// absorbing depot dose** (the reduction is only valid if the depot's
+/// contribution is counted exactly once); **central + peripheral simultaneously
+/// active** (the combined-rate steady state in the IV core); and both 3-cpt
+/// peripherals.
+#[test]
+fn oral_peripheral_infusion_provider_matches_fd_of_production() {
+    let times = [1.0, 3.0, 5.0, 7.0, 10.0, 24.0];
+    let two_theta = vec![10.0, 50.0, 15.0, 100.0, 1.0];
+    let three_theta = vec![5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 1.5];
+    let eta = vec![0.1, -0.05, 0.08];
+    let cases: Vec<(&str, CompiledModel, Subject, Vec<f64>)> = vec![
+        // 2-cpt oral: infusion into the peripheral (cmt 3) only. amt 1000 at
+        // rate 125 → an 8 h window, so obs straddle it.
+        (
+            "2cpt periph only",
+            parse_model_string(TWOCPT_ORAL).expect("parse 2cpt oral"),
+            subject_with_dose(DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0), &times),
+            two_theta.clone(),
+        ),
+        // …plus an oral depot bolus landing *inside* the infusion window, so the
+        // depot's Bateman term and the peripheral forced response superpose.
+        (
+            "2cpt periph + depot bolus mid-window",
+            parse_model_string(TWOCPT_ORAL).expect("parse 2cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0),
+                    DoseEvent::new(2.0, 500.0, 1, 0.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            two_theta.clone(),
+        ),
+        // Central AND peripheral infusion simultaneously active (the `||` guard's
+        // combined branch: one must not clobber the other).
+        (
+            "2cpt central + periph simultaneous",
+            parse_model_string(TWOCPT_ORAL).expect("parse 2cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0),
+                    DoseEvent::new(1.0, 600.0, 2, 100.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            two_theta.clone(),
+        ),
+        // 3-cpt oral, peripheral-1 (cmt 3) + a depot bolus.
+        (
+            "3cpt periph1 + depot bolus",
+            parse_model_string(THREECPT_ORAL).expect("parse 3cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0),
+                    DoseEvent::new(2.0, 500.0, 1, 0.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            three_theta.clone(),
+        ),
+        // 3-cpt oral, peripheral-2 (cmt 4) — the `rate_periph2` channel.
+        (
+            "3cpt periph2 + depot bolus",
+            parse_model_string(THREECPT_ORAL).expect("parse 3cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 4, 125.0, false, 0.0),
+                    DoseEvent::new(2.0, 500.0, 1, 0.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            three_theta.clone(),
+        ),
+    ];
+    for (label, m, s, theta) in &cases {
+        assert!(
+            crate::pk::dose_needs_event_walk(m.pk_model, s),
+            "[{label}] fixture must route to the event walk"
+        );
+        assert!(
+            subject_routes_to_event_walk(m, s),
+            "[{label}] the gradient must follow production onto the walk"
+        );
+        assert!(
+            subject_sensitivities(m, s, theta, &eta).is_some(),
+            "[{label}] must be served analytically, not by FD"
+        );
+        check_full_provider_vs_fd(m, s, theta, &eta);
+    }
+}
+
 /// Two infusion occasions on a 3-cpt IV model separated by an EVID=4 reset:
 /// occasion-2 observations must rebuild from zero (no occasion-1 carryover).
 /// The provider's reset-segment superposition must reproduce the production

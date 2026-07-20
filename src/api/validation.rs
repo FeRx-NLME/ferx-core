@@ -670,36 +670,39 @@ fn population_uses_analytical_pk(model: &CompiledModel, population: &Population)
 /// disagreement **for the doses it rejects**, and keeps the prediction hot path
 /// panic-free.
 ///
-/// It does **not** make the three paths agree in general, and this check should
-/// not be read as claiming that. The superposition path never reads `dose.cmt`
-/// at all: it dispatches on the *model*, so it computes every accepted dose as
-/// going into that model's default route (the depot for an oral model, central
-/// for an IV one). For every compartment other than that default the two paths
-/// therefore still disagree — an IV-peripheral infusion and any non-default
-/// bolus among them, by orders of magnitude on the 2-/3-compartment models.
-/// Those doses are *accepted* here because the event-driven walk computes them
-/// correctly and rejecting them would break working models; the fix is to route
-/// them to that walk (as `has_oral_depot_infusion` already does for depot
-/// infusions), which is tracked separately.
+/// This check alone does **not** make the paths agree — it only removes the
+/// doses that have no target at all. Agreement for the doses it *accepts* comes
+/// from [`crate::pk::dose_needs_event_walk`], which reroutes every dose the
+/// superposition dispatch cannot place (it never reads `dose.cmt`, so it would
+/// compute the dose as going into the model's default route — the depot for an
+/// oral model, central for an IV one) to the event-driven walk, which places it
+/// correctly and is NONMEM-anchored. The two are complements and must be read
+/// together: this one rejects the unroutable, that one routes the rest.
 ///
 /// Two rules, both 1-based like NONMEM's `CMT`:
-///   - **Infusion** (`RATE>0`, or a resolved modeled rate/duration): the
-///     compartment must be in [`PkModel::infusable_compartments`] — central for
-///     every model, the oral depot since #400, and the peripheral(s) of the
-///     2-/3-cpt IV models, and — since #375 — the oral models' peripheral(s)
-///     too (the oral propagators reuse the IV forced response; nothing flows
-///     back into the depot). What remains rejected is a compartment with no
-///     rate channel at all. Checked only for the six event-walk
-///     models: `dose_channel` *is* the walk's routing table, and a transit/IG
-///     subject never takes that walk — an infusion reroutes it to the model's
-///     ODE twin (`CompiledModel::effective_for`, #719 gap 2), which addresses
+///   - **Range — every dose, whatever its amount.** `cmt` must not exceed the
+///     model's state count. This is deliberately *not* skipped for `AMT=0`:
+///     both walks bound-check the compartment before the amount is read, so an
+///     inert row with an out-of-range `CMT` panics exactly like a real dose.
+///     `CMT=0` is left alone — every path treats it as NONMEM's "default dose
+///     compartment" (the walk via `saturating_sub(1)`, `dose_needs_event_walk`
+///     by mapping it to 1, the superposition path by ignoring `cmt`), so it is
+///     consistent, not a silent mis-route.
+///   - **Routing — infusions that actually deliver.** The compartment must be
+///     in [`PkModel::infusable_compartments`] — central for every model, the
+///     oral depot since #400, the peripheral(s) of the 2-/3-cpt IV models, and
+///     — since #375 — the oral models' peripheral(s) too (the oral propagators
+///     reuse the IV forced response; nothing flows back into the depot). That
+///     makes the set `1..=n_states` for all six walk-supported models, so with
+///     the range rule claimed first the only value this rule can still reject
+///     is `CMT=0`, which has no meaning for a zero-order input. A zero-amount
+///     infusion is exempt (`duration = AMT/RATE = 0`, so no path opens a rate
+///     window). Checked only for the six event-walk models: `dose_channel` *is*
+///     the walk's routing table, and a transit/IG subject never takes that walk
+///     — an infusion reroutes it to the model's ODE twin
+///     (`CompiledModel::effective_for`, #719 gap 2), which addresses
 ///     compartments directly. Applying this table to them would reject a
 ///     supported model.
-///   - **Bolus**: `cmt` must not exceed the model's state count. `CMT=0` is
-///     left alone — both analytical paths already treat it as NONMEM's
-///     "default dose compartment" (the walk via `saturating_sub(1)`, the
-///     superposition path by ignoring `cmt`), so it is consistent, not a
-///     silent mis-route.
 ///
 /// ODE models are exempt: `ode/predictions.rs` indexes the state vector
 /// directly, so every compartment the `[odes]` block **declares** is
@@ -707,8 +710,8 @@ fn population_uses_analytical_pk(model: &CompiledModel, population: &Population)
 /// exemption, not a clean bill of health — an ODE dose whose `CMT` is past the
 /// end of the declared state vector is still silently dropped by that engine's
 /// `if cmt_idx < n { … }` guards. Closing that is a separate change (it needs
-/// the ODE state count, not a `PkModel` topology) and is tracked separately;
-/// this check deliberately does not half-do it.
+/// the ODE state count, not a `PkModel` topology) and is tracked as #899; this
+/// check deliberately does not half-do it.
 ///
 /// Reported once per `(kind, compartment)` so a dataset with many offending
 /// rows yields one actionable error per cause, matching
@@ -737,68 +740,84 @@ pub(crate) fn check_dose_compartments(
     }
     for subject in &population.subjects {
         for dose in &subject.doses {
-            // A zero-amount dose delivers nothing on any path and never reaches
-            // the routing `match` this check guards: the walk's bolus branch adds
-            // `F·0`, and its infusion branch requires `duration > 0`, which an
-            // `AMT=0` infusion never has (`duration = AMT/RATE = 0`). Such a row
-            // is a no-op, not a mis-routed dose — rejecting a whole fit over it
-            // would be stricter than the failure being fixed. (`is_infusion()` is
-            // `rate > 0 || !is_fixed()`, which is deliberately broader than the
-            // walk's `rate > 0 && duration > 0`; this is where the two reconcile.)
-            if dose.amt == 0.0 {
-                continue;
-            }
             let is_infusion = dose.is_infusion();
-            if !reported.insert((is_infusion, dose.cmt)) {
-                continue;
-            }
             let cmt = dose.cmt;
-            // Range first, and for **both** dose kinds. Transit/IG skip the
-            // routing rule below but are still 2-/3-state models, so without this
-            // an out-of-range infusion on them would pass validation and then be
-            // silently dropped by the ODE twin's bounds check — the exact
-            // silent-drop failure this check exists to remove.
+            // **Range rule — every dose, whatever its amount.** Both walks
+            // bound-check the compartment *before* the amount is read
+            // (`event_driven::…impl`'s `if cmt_idx < n_states { … } else { panic! }`
+            // and its `sens::propagate` twin), so an `AMT=0` row with an
+            // out-of-range `CMT` reaches the panic exactly like a real dose —
+            // and since #375 routes any `cmt != 1` bolus to the walk, it now
+            // gets there. Exempting zero-amount doses here (as an earlier
+            // revision did, on the incorrect premise that the bolus branch just
+            // "adds `F·0`") re-opened that panic for a NONMEM-idiomatic
+            // `EVID=4, AMT=0` reset row carrying a stale `CMT`.
+            //
+            // Transit/IG skip the routing rule below but are still 2-/3-state
+            // models, so this also stops an out-of-range infusion on them from
+            // passing validation and being silently dropped by the ODE twin's
+            // bounds check.
             if cmt > n_states {
-                diags.push(
-                    Diagnostic::error(
-                        "E_DOSE_CMT_OUT_OF_RANGE",
-                        format!(
-                            "subject {}, time {}: dose into compartment {cmt}, but the \
-                             analytical `{name}` model has only {n_states} compartment(s) \
-                             (CMT is 1-based: {:?}).",
-                            subject.id, dose.time, topology.compartment_names,
-                        ),
-                    )
-                    .with_block("structural_model"),
-                );
-            } else if is_infusion {
-                // Transit/IG (`event_walk_supported == false`) never take the
-                // walk this routing table belongs to — an infusion reroutes them
-                // to their ODE twin (#719 gap 2), which addresses compartments
-                // directly. Rejecting here would break a supported model.
-                if !topology.event_walk_supported {
-                    continue;
-                }
-                // For a walk-supported model `infusable` *equals* the walk's
-                // routing table (pinned by `topology_fields_are_internally_consistent`),
-                // so this is exactly the set `dose_channel` can route.
-                if !pk_model.infusable_compartments().contains(&cmt) {
+                if reported.insert((is_infusion, cmt)) {
                     diags.push(
                         Diagnostic::error(
-                            "E_DOSE_CMT_NOT_INFUSABLE",
+                            "E_DOSE_CMT_OUT_OF_RANGE",
                             format!(
-                                "subject {}, time {}: infusion into compartment {cmt}, \
-                                 but the analytical `{name}` model can only infuse into \
-                                 compartment(s) {:?}. An infusion into another compartment \
-                                 (e.g. an oral peripheral) needs an `ode(...)` model.",
-                                subject.id,
-                                dose.time,
-                                pk_model.infusable_compartments(),
+                                "subject {}, time {}: dose into compartment {cmt}, but the \
+                                 analytical `{name}` model has only {n_states} compartment(s) \
+                                 (CMT is 1-based: {:?}).",
+                                subject.id, dose.time, topology.compartment_names,
                             ),
                         )
                         .with_block("structural_model"),
                     );
                 }
+                continue;
+            }
+            // **Routing rule — infusions that actually deliver.** Unlike the
+            // range rule, the zero-amount exemption is sound here: an `AMT=0`
+            // infusion has `duration = AMT/RATE = 0`, and the walk's infusion
+            // branch requires `duration > 0`, so no path ever opens a rate
+            // window for it. Rejecting a whole fit over an inert row would be
+            // stricter than the failure being fixed. (`is_infusion()` is
+            // `rate > 0 || !is_fixed()`, deliberately broader than the walk's
+            // `rate > 0 && duration > 0`; this is where the two reconcile.)
+            if !is_infusion || dose.amt == 0.0 {
+                continue;
+            }
+            // Transit/IG (`event_walk_supported == false`) never take the walk
+            // this routing table belongs to — an infusion reroutes them to their
+            // ODE twin (#719 gap 2), which addresses compartments directly.
+            // Rejecting here would break a supported model.
+            if !topology.event_walk_supported {
+                continue;
+            }
+            // For a walk-supported model `infusable` *equals* the walk's routing
+            // table (pinned by `topology_fields_are_internally_consistent`), so
+            // this is exactly the set `dose_channel` can route. Since #375 that
+            // set is `1..=n_states` for all six of them, and `cmt > n_states` is
+            // already claimed above — so the only value that reaches this arm is
+            // `CMT=0`, which has no meaning for an infusion (see the message).
+            if !pk_model.infusable_compartments().contains(&cmt)
+                && reported.insert((is_infusion, cmt))
+            {
+                diags.push(
+                    Diagnostic::error(
+                        "E_DOSE_CMT_NOT_INFUSABLE",
+                        format!(
+                            "subject {}, time {}: infusion into compartment {cmt}, but the \
+                             analytical `{name}` model can only infuse into compartment(s) \
+                             {:?}. `CMT=0` is NONMEM's *default dose compartment*, which is \
+                             defined for a bolus but not for a zero-order input — name the \
+                             target compartment explicitly (1-based: {:?}).",
+                            subject.id,
+                            dose.time,
+                            pk_model.infusable_compartments(),
+                            topology.compartment_names,
+                        ),
+                    )
+                    .with_block("structural_model"),
+                );
             }
         }
     }
@@ -1326,13 +1345,32 @@ pub(crate) fn assert_survival_tv_covariates(model: &CompiledModel, population: &
 }
 
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
-/// the oral **depot** amount on a subject carrying an EVID=3/4 reset.
+/// the oral **depot** amount on a subject whose dose history dose superposition
+/// cannot reconstruct — an EVID=3/4 reset, or a dose the superposition state
+/// helper cannot place (#375).
 ///
-/// The depot amount is reconstructed by dose superposition (`apply_analytic_readout`),
-/// which is invalid across a reset — the closed form cannot restart the accumulation,
-/// so the readout would silently see a zero depot after the reset and mis-predict.
+/// `apply_analytic_readout` reconstructs the depot amount with
+/// [`crate::pk::analytical_state_at_times`], and both failure modes make that
+/// reconstruction wrong in a way that reaches `PRED` — and therefore the **OFV**,
+/// not just a diagnostic column:
+///
+///  - a **reset** zeroes the compartments mid-record, which is not a sum of
+///    independent dose responses, so the readout would see a zero depot after
+///    the reset;
+///  - a **non-default dose compartment** is invisible to `single_dose_states`,
+///    which never reads `dose.cmt` and places every bolus in compartment 1 and
+///    every infusion in central. A bolus written `CMT=2` on a `one_cpt_oral`
+///    model is therefore reconstructed as if it had been absorbed through the
+///    depot, adding a phantom depot amount. Measured on
+///    `[scaling] y = (central + depot)/V`: OFV 188.37 against an ODE twin's
+///    1761.47, where the same model with the dose at `CMT=1` agrees with the
+///    twin exactly.
+///
+/// The `ipred` path itself is correct for these subjects (it reroutes to the
+/// event-driven walk, `dose_needs_event_walk`), but that walk has no states
+/// variant for the readout to read, so there is nothing to fall back to.
 /// Rather than return a subtly wrong `PRED`/OFV, fail loudly and point at an ODE
-/// model (which integrates the depot state across resets). A `central`-only readout
+/// model (which integrates the depot state directly). A `central`-only readout
 /// is unaffected. Returns `None` for the common no-readout / IV / central-only case.
 pub(crate) fn check_analytic_readout_support(
     model: &CompiledModel,
@@ -1351,6 +1389,20 @@ pub(crate) fn check_analytic_readout_support(
                  across a reset. Reference only the `central` amount, or use an ODE model \
                  (`ode(states=[depot, central])`) which integrates the depot across resets. \
                  See issue #650.",
+                subject.id
+            ));
+        }
+        if crate::pk::dose_needs_event_walk(model.pk_model, subject) {
+            return Some(format!(
+                "[scaling] y: an analytic Form C readout that references the oral `depot` \
+                 amount is not supported on a subject dosing a non-default compartment \
+                 (subject {}): the depot amount is reconstructed by dose superposition, \
+                 which places every bolus in compartment 1 and every infusion in central \
+                 regardless of `CMT`, so a dose elsewhere would contribute a phantom depot \
+                 amount to `PRED` (and to the objective). Reference only the `central` \
+                 amount, dose the default compartment, or use an ODE model \
+                 (`ode(states=[depot, central])`) which addresses compartments directly. \
+                 See issue #375.",
                 subject.id
             ));
         }

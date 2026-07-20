@@ -246,3 +246,58 @@ fn three_cpt_peripheral_infusion_overlapping_oral_dose_matches_the_ode_twin() {
         "three_cpt_oral peripheral infusion + overlapping depot dose",
     );
 }
+
+/// A **central AND peripheral infusion simultaneously active**. The oral
+/// propagator makes one delegated call carrying both rates, so the IV core's
+/// combined steady state (`A_c = (R_c+R_p)/k10`,
+/// `A_p = (k12·R_c + (k10+k12)·R_p)/(k21·k10)`) is what decides whether one
+/// clobbers the other. Every other test drives exactly one channel, so this is
+/// the only one that can see a clobber.
+#[test]
+fn simultaneous_central_and_peripheral_infusion_matches_the_ode_twin() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+               1,0,.,1,100,3,20,1\n\
+               1,1,.,1,120,2,30,1\n\
+               1,2,4.5,0,.,2,.,0\n1,4,4.0,0,.,2,.,0\n1,6,3.5,0,.,2,.,0\n\
+               1,8,3.0,0,.,2,.,0\n1,12,2.0,0,.,2,.,0\n";
+    assert_agree(
+        &preds(TWO_CPT_ORAL_CF, csv),
+        &preds(TWO_CPT_ORAL_ODE, csv),
+        1e-9,
+        "two_cpt_oral central + peripheral infusion overlapping",
+    );
+}
+
+/// **Steady state** into an oral peripheral (`SS=1`, `II=24`, window 5 h). The
+/// walk's `equilibrate_ss_state_event_driven` runs the synthetic pulse through
+/// the same routing table, so the peripheral channel has to survive the
+/// equilibration loop as well as the ordinary walk.
+#[test]
+fn ss_peripheral_infusion_matches_the_ode_twin() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
+               1,0,.,1,100,3,20,1,1,24\n\
+               1,1,5.0,0,.,2,.,0,.,.\n1,4,4.0,0,.,2,.,0,.,.\n\
+               1,8,3.0,0,.,2,.,0,.,.\n1,20,2.0,0,.,2,.,0,.,.\n";
+    assert_agree(
+        &preds(TWO_CPT_ORAL_CF, csv),
+        &preds(TWO_CPT_ORAL_ODE, csv),
+        1e-6,
+        "two_cpt_oral SS peripheral infusion",
+    );
+}
+
+/// Steady-state **bolus** into an oral peripheral — the other half of the SS
+/// routing (`state[cmt_idx] += F·amt` inside the equilibration loop).
+#[test]
+fn ss_peripheral_bolus_matches_the_ode_twin() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
+               1,0,.,1,100,3,.,1,1,24\n\
+               1,1,5.0,0,.,2,.,0,.,.\n1,4,4.0,0,.,2,.,0,.,.\n\
+               1,8,3.0,0,.,2,.,0,.,.\n1,20,2.0,0,.,2,.,0,.,.\n";
+    assert_agree(
+        &preds(TWO_CPT_ORAL_CF, csv),
+        &preds(TWO_CPT_ORAL_ODE, csv),
+        1e-6,
+        "two_cpt_oral SS peripheral bolus",
+    );
+}

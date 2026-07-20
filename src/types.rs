@@ -1419,10 +1419,13 @@ impl PkModel {
     /// the **central** compartment for every model, plus the **peripheral**
     /// compartment(s) for the 2-/3-cpt IV models, and — since #400 — the oral
     /// **depot** (cmt 1), a zero-order release into the depot followed by
-    /// first-order `ka` absorption into central. Notably this still EXCLUDES oral
-    /// peripherals, which the closed forms cannot infuse into. A `D{cmt}` outside
-    /// this set is rejected at parse time rather than silently mis-routed (no-TV
-    /// path) or panicking (event-driven path).
+    /// first-order `ka` absorption into central, and — since #375 — the oral
+    /// models' **peripheral**(s) too (the oral propagators reuse the IV forced
+    /// response; nothing flows back into the depot). That makes the set
+    /// `1..=n_states` for all six walk-supported models; transit/IG stay `&[]`
+    /// (they have no walk, and reroute an infusion to their ODE twin). A
+    /// `D{cmt}` outside this set is rejected at parse time rather than silently
+    /// mis-routed (no-TV path) or panicking (event-driven path).
     pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
         self.topology().infusable_compartments()
     }
