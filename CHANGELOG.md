@@ -132,6 +132,38 @@ section of the SDLC for the versioning policy).
   overlapping an oral depot dose.
 
 ### Fixed
+- **A dose into a compartment an `[odes]` model does not declare is now an error, not a
+  silent drop** (#899). On the ODE engine every dose-application site was an unguarded
+  `if cmt_idx < n { … }` with no `else`, and nothing upstream rejected an out-of-range
+  `CMT`: the data reader has no model, and the analytical dose-compartment check returned
+  early for ODE models. A typo'd `CMT` therefore produced a fit that **converged and
+  reported a finite OFV having ignored the dose entirely** — no error, no warning. Such
+  doses are now rejected up front, naming the subject, time, and the states the `[odes]`
+  block declares; `fit()` returns an error and `predict()`/`simulate()` fail with the same
+  message, matching every other dose precondition. This is the ODE half of the analytical
+  fix in #375. `predict_survival()` — the one member of the `predict`/`simulate` family
+  that was missing the guard — now enforces it too, so an unroutable dose can no longer
+  silently change the exposure a joint PK-TTE hazard reads.
+- **`CMT=0` means the same thing on both engines** (#899). `CMT=0` is NONMEM's *default
+  dose compartment* and resolves to compartment 1. The analytical engine has done this
+  consistently since #375; the ODE engine did **four** different things with it depending
+  on which driver a subject happened to take. The plain dataset path computed `0 − 1` on an
+  unsigned index and underflowed — a debug build panicked with "attempt to subtract with
+  overflow", a release build wrapped to `usize::MAX`, failed the bounds check, and dropped
+  the dose in silence. The event-driven driver (taken when a subject has a time-varying
+  covariate, an `EVID=3/4` reset, or IOV) applied it to compartment 1. The steady-state
+  equilibration bailed out and returned the *single-dose* curve. The remaining sites — the
+  infusion channel list, the `_with_states` driver, the segment-boundary walk, and the
+  `sens/` gradient twins — skipped the dose outright. So the same dataset could get three
+  different answers, and a fit could differentiate a different dosing history than it
+  predicted. Every site now resolves `CMT=0` to compartment 1 — including **compartment-indexed
+  dose attributes**: a dose written `CMT=0` now reads `F1` / `ALAG1` where before it missed the
+  indexed lookup and silently fell back to the bare `F` / `ALAG` slot, which on a model declaring
+  only `F1` means bioavailability defaulted to `1.0` and the dose was delivered at full amount.
+  Predictions change for ODE datasets written with `CMT=0`, which previously got nothing (or
+  crashed). As on the analytical engine, an **infusion** with `CMT=0` is rejected rather than
+  remapped: the default dose compartment is defined for a bolus but not for a zero-order input.
+  This closes the cross-engine disagreement on `SS` + `CMT=0` noted under #375 below.
 - **SAEM FREM / `iiv_on_ruv` mixing diagnostics and safeguards** (#895). The optimizer-trace
   `mh_accept_rate` (and the verbose banner) now reports the **combined** block + componentwise
   Metropolis-Hastings acceptance rate. Previously it showed only the block kernel, which reads a
@@ -243,8 +275,9 @@ section of the SDLC for the versioning policy).
   ~30 % under-prediction on a one-compartment example, with no warning. Both the value walk and
   the gradient walk now equilibrate the default compartment like any other, matching the
   closed form `(D/V)·e^{−kt}/(1−e^{−k·II})`. Predictions change only for `SS` doses written
-  with `CMT=0`. Note the ODE engine still bails on `SS` with `CMT=0`, so an analytical model
-  and its explicit `[odes]` twin currently disagree on that combination.
+  with `CMT=0`. (The ODE engine bailed on `SS` with `CMT=0` for a while longer, so an
+  analytical model and its explicit `[odes]` twin disagreed on that combination; #899 above
+  brought the ODE engine into line and closed that gap.)
 - **An infusion into a compartment the analytical model cannot deliver into is now an error,
   not a crash** (#375). A positive `RATE` into a compartment outside the model's infusable set
   — an oral model's peripheral (`CMT=3` on `two_cpt_oral`), which the `Added` entry above now

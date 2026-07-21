@@ -704,14 +704,18 @@ fn population_uses_analytical_pk(model: &CompiledModel, population: &Population)
 ///     compartments directly. Applying this table to them would reject a
 ///     supported model.
 ///
-/// ODE models are exempt: `ode/predictions.rs` indexes the state vector
-/// directly, so every compartment the `[odes]` block **declares** is
-/// addressable and none of this analytical routing applies. Note this is an
-/// exemption, not a clean bill of health — an ODE dose whose `CMT` is past the
-/// end of the declared state vector is still silently dropped by that engine's
-/// `if cmt_idx < n { … }` guards. Closing that is a separate change (it needs
-/// the ODE state count, not a `PkModel` topology) and is tracked as #899; this
-/// check deliberately does not half-do it.
+/// **ODE models take the range rule but not the routing rule** (#899).
+/// `ode/predictions.rs` indexes the state vector directly, so every compartment
+/// the `[odes]` block declares is addressable and the `infusable_compartments`
+/// table has no ODE analogue — but "declares" is the operative word. A `CMT`
+/// past the end of the declared state vector used to fall through that engine's
+/// `if cmt_idx < n { … }` guards and be **silently dropped**: the fit converged,
+/// reported a finite OFV, and quietly ignored the dose. So the range rule runs
+/// for both engines, reading `OdeSpec::n_states` instead of a `PkModel`
+/// topology, and names the declared `state_names` in the message. `CMT=0`
+/// splits the same way on both engines: accepted for a **bolus** (it is the
+/// default dose compartment, which every dose site resolves to compartment 1)
+/// and rejected for an **infusion** (a zero-order input has no such default).
 ///
 /// Reported once per `(kind, compartment)` so a dataset with many offending
 /// rows yields one actionable error per cause, matching
@@ -720,14 +724,19 @@ pub(crate) fn check_dose_compartments(
     model: &CompiledModel,
     population: &Population,
 ) -> Vec<Diagnostic> {
-    // ODE engine: any declared compartment is addressable, nothing to check.
-    if model.ode_spec.is_some() {
-        return Vec::new();
-    }
     let pk_model = model.pk_model;
     let topology = pk_model.topology();
-    let (n_states, _) = topology.state_layout();
     let name = pk_model.canonical_name();
+    // Range-rule input, per engine (#899). The ODE engine indexes its state
+    // vector directly, so its bound is the `[odes]` block's declared state
+    // count — a `PkModel` topology says nothing about it (`model.pk_model` is
+    // still populated on an ODE model, and is *not* the model being solved).
+    // The routing rule below stays analytical-only.
+    let ode_spec = model.ode_spec.as_ref();
+    let n_states = match ode_spec {
+        Some(spec) => spec.n_states,
+        None => topology.state_layout().0,
+    };
     let mut diags = Vec::new();
     // De-dup by (is_infusion, compartment): an infusion and a bolus into the
     // same bad compartment are independent causes and are reported separately.
@@ -735,7 +744,13 @@ pub(crate) fn check_dose_compartments(
     // Nothing in this dataset asks the analytical predictor for a value — the
     // `pk` line is a pure-TTE / pure-discrete model's placeholder. See
     // `population_uses_analytical_pk` for why this is a population-level test.
-    if !population_uses_analytical_pk(model, population) {
+    //
+    // **Analytical models only.** An `[odes]` block is never a placeholder: a
+    // hazard that reads an ODE state has the system integrated for it even when
+    // the dataset carries no PK observation at all, so the exemption that is
+    // sound for a dummy `pk` line would re-open the silent drop for exactly the
+    // TTE-only-plus-ODE-PK model where it is hardest to notice (#899).
+    if ode_spec.is_none() && !population_uses_analytical_pk(model, population) {
         return diags;
     }
     for subject in &population.subjects {
@@ -759,8 +774,21 @@ pub(crate) fn check_dose_compartments(
             // bounds check.
             if cmt > n_states {
                 if reported.insert((is_infusion, cmt)) {
-                    diags.push(
-                        Diagnostic::error(
+                    // Same code and shape on both engines; only the source of
+                    // the compartment list differs, and the block named in the
+                    // message is the one the user would edit to add a state.
+                    let diag = match ode_spec {
+                        Some(spec) => Diagnostic::error(
+                            "E_DOSE_CMT_OUT_OF_RANGE",
+                            format!(
+                                "subject {}, time {}: dose into compartment {cmt}, but the \
+                                 `[odes]` block declares only {n_states} state(s) \
+                                 (CMT is 1-based: {:?}).",
+                                subject.id, dose.time, spec.state_names,
+                            ),
+                        )
+                        .with_block("odes"),
+                        None => Diagnostic::error(
                             "E_DOSE_CMT_OUT_OF_RANGE",
                             format!(
                                 "subject {}, time {}: dose into compartment {cmt}, but the \
@@ -770,7 +798,8 @@ pub(crate) fn check_dose_compartments(
                             ),
                         )
                         .with_block("structural_model"),
-                    );
+                    };
+                    diags.push(diag);
                 }
                 continue;
             }
@@ -785,10 +814,50 @@ pub(crate) fn check_dose_compartments(
             if !is_infusion || dose.amt == 0.0 {
                 continue;
             }
+            // **ODE engine (#899): the `CMT=0` half of the routing rule carries
+            // over, the infusable-subset half does not.** An in-range ODE dose is
+            // delivered by indexing the state vector, or — for a compartment fed
+            // by a built-in absorption function — as an `R_in` forcing over time
+            // (`input_rate_consumes_cmt`, a legitimate skip of the bolus branch,
+            // not a drop). Every declared state therefore accepts both a bolus
+            // and a zero-order input, and there is no ODE analogue of
+            // `PkModel::infusable_compartments` to consult. `CMT=0` is the one
+            // value that still has no target: it is NONMEM's default dose
+            // *compartment*, defined for a bolus (where both engines resolve it
+            // to compartment 1) but not for a zero-order input. The analytical
+            // engine rejects it, so rejecting it here keeps the two engines'
+            // answer to the same dataset identical — the whole point of #899.
+            if let Some(spec) = ode_spec {
+                if cmt == 0 && reported.insert((is_infusion, cmt)) {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_DOSE_CMT_NOT_INFUSABLE",
+                            format!(
+                                "subject {}, time {}: infusion into compartment 0. `CMT=0` is \
+                                 NONMEM's *default dose compartment*, which is defined for a \
+                                 bolus but not for a zero-order input — name the target \
+                                 compartment explicitly (1-based: {:?}).",
+                                subject.id, dose.time, spec.state_names,
+                            ),
+                        )
+                        .with_block("odes"),
+                    );
+                }
+                continue;
+            }
             // Transit/IG (`event_walk_supported == false`) never take the walk
             // this routing table belongs to — an infusion reroutes them to their
             // ODE twin (#719 gap 2), which addresses compartments directly.
             // Rejecting here would break a supported model.
+            //
+            // Caveat, tracked as #910: that twin does *not* preserve this model's
+            // `CMT` numbering — it drops the depot (absorption becomes a forcing
+            // term), so its state count is one lower and every compartment shifts
+            // down by one. `CMT=2` on a `one_cpt_transit` therefore passes the
+            // range rule above (2 <= n_states 2) and is out of range on the twin
+            // that actually solves it. The range rule cannot catch it: the
+            // primary carries `ode_spec: None`, and the twin's spec is built
+            // lazily inside `effective_for`, after validation has run.
             if !topology.event_walk_supported {
                 continue;
             }

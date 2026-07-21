@@ -468,8 +468,23 @@ impl DoseAttrMap {
 
     /// The PkParams slot holding `attr` for compartment `cmt`, if the model
     /// declared a compartment-indexed parameter for it.
+    ///
+    /// `cmt` is 1-based, and `CMT=0` — NONMEM's *default dose compartment* — is
+    /// compartment 1, so it resolves to the `{attr}1` entry (#899). Without the
+    /// `max(1)` a dose written `CMT=0` misses the indexed map and silently falls
+    /// back to the bare slot: on a model declaring `F1 = 0.6` and nothing else,
+    /// `PkParams::default()` leaves `PK_IDX_F` at **1.0**, so the dose would be
+    /// delivered at full amount with no error and no warning — the same silent
+    /// class #899 exists to remove, and the last site where `CMT=0` still meant
+    /// something other than compartment 1.
+    ///
+    /// Analytical models are unaffected: per-compartment `F{cmt}`/`ALAG{cmt}` are
+    /// ODE-only (`model_parser`, which rejects an unbound `F{cmt}` on a `pk(...)`
+    /// model outright), so their `indexed` map holds only `D{cmt}`/`R{cmt}` — and
+    /// a `CMT=0` modeled-`RATE` dose is an infusion by `DoseEvent::is_infusion`,
+    /// which `check_dose_compartments` rejects on both engines.
     pub fn indexed_slot(&self, attr: DoseAttr, cmt: usize) -> Option<usize> {
-        self.indexed.get(&(attr, cmt)).copied()
+        self.indexed.get(&(attr, cmt.max(1))).copied()
     }
 
     /// Whether any compartment-indexed entry for `attr` is declared (e.g. `F1`/`F2`

@@ -3609,10 +3609,14 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     d1_stack: &mut Vec<Dual1<1>>,
 ) -> Vec<T> {
     let mut u = vec![T::from_f64(0.0); n_states];
-    if dose.ii <= 0.0 || dose.cmt == 0 {
+    if dose.ii <= 0.0 {
         return u;
     }
-    let cmt_idx = dose.cmt - 1;
+    // `CMT=0` equilibrates compartment 1 — NONMEM's default dose compartment
+    // (#899) — mirroring the f64 `equilibrate_ss_state`. The gradient twin must
+    // move with the value path or FOCEI would differentiate a different dosing
+    // history than it predicts.
+    let cmt_idx = dose.cmt.saturating_sub(1);
     if cmt_idx >= n_states {
         return u;
     }
@@ -3967,13 +3971,13 @@ fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
     if phase_val <= 0.0 {
         return u;
     }
-    // CMT is 1-based; a malformed `CMT=0` must no-op (return the trough unchanged), matching
-    // `equilibrate_ss_state_g`'s own `dose.cmt == 0` zero-guard. `saturating_sub(1)` would
-    // instead alias it to the valid index 0 and silently dose compartment 0 (#642 review #1).
-    if dose.cmt == 0 {
-        return u;
-    }
-    let cmt_idx = dose.cmt - 1;
+    // CMT is 1-based, and `CMT=0` is NONMEM's *default dose compartment* — state index 0 —
+    // not a malformed value. `saturating_sub(1)` is therefore the correct mapping, matching
+    // `equilibrate_ss_state_g` and the f64 path (#899). This previously no-op'd on the
+    // premise that aliasing to index 0 would "silently dose compartment 0" (#642 review #1);
+    // #375 settled the opposite convention on the analytical engine, and #899 brought the ODE
+    // engine into line, so the no-op was the silent drop rather than the guard against one.
+    let cmt_idx = dose.cmt.saturating_sub(1);
     if cmt_idx >= n_states {
         return u;
     }
@@ -4518,6 +4522,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         // Infusions active or ending at `t_ev` (mode-aware effective forcing `inf_eff[k].0`).
         if has_any_infusion {
             for (k, d) in subject.doses.iter().enumerate() {
+                // `d.cmt < 1`: an infusion with `CMT=0` has no target and is rejected up
+                // front on both engines (#375 / #899) — see the `filter` in the saltation
+                // walk below. Unreachable from a validated call.
                 if !is_inf(d) || d.cmt < 1 {
                     continue;
                 }
@@ -4643,9 +4650,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     .doses
                     .iter()
                     .enumerate()
-                    // `d.cmt >= 1`: a malformed `CMT=0` infusion must not saturate to
-                    // compartment 0 and force the wrong state, matching the dose-application
-                    // guard (the datareader rejects `CMT=0` upstream) (#472 #6 / #473 #3).
+                    // `d.cmt >= 1`: an infusion with `CMT=0` has no target — the default dose
+                    // compartment is defined for a bolus but not for a zero-order input, so
+                    // both engines reject it up front (analytical since #375, ODE since #899;
+                    // the datareader does *not* reject it, contrary to #472 #6 / #473 #3 —
+                    // only a *missing* CMT column defaults to 1). Unreachable from a validated
+                    // call, kept for hand-built specs that run no validation.
                     .filter(|(_, d)| is_inf(d) && d.cmt >= 1)
                     .filter(|(k, d)| {
                         // (Lagged) window start; an infusion before the most recent reset is
@@ -4790,10 +4800,13 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     ),
                 };
             }
-            // CMT is 1-based; a malformed `CMT=0` must not silently dose compartment
-            // 0 (the datareader rejects it upstream) (#449 review #8).
-            if d.cmt >= 1 {
-                let cmt_idx = d.cmt - 1;
+            // CMT is 1-based, and `CMT=0` is NONMEM's *default dose compartment*, which
+            // resolves to state index 0 on both engines (#899). The `d.cmt >= 1` skip this
+            // replaces rested on the datareader rejecting `CMT=0` upstream (#449 review #8);
+            // it does not — a missing `CMT` column defaults to 1, but an explicitly written
+            // `CMT=0` reaches here unchanged, and was silently dropped from the gradient.
+            {
+                let cmt_idx = d.cmt.saturating_sub(1);
                 if cmt_idx < n_states {
                     if has_input_rate && input_rate_consumes_cmt(ode, d.cmt) {
                         // The dose feeds a built-in absorption forcing (`R_in`), not a
@@ -5123,8 +5136,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // matching rate-off carrying the same `lag_route` jet at `K_ZO_END` (#859 Slice 2).
             let (dose_idx, fi) = route_onsets[idx];
             let d = &subject.doses[dose_idx];
-            if d.cmt >= 1 && d.cmt - 1 < n_states {
-                let cmt_idx = d.cmt - 1;
+            // `saturating_sub`: `CMT=0` is the default dose compartment, state index 0 (#899).
+            // The former `d.cmt >= 1` gate dropped this onset jet for such a dose, which is a
+            // *wrong gradient* rather than a visibly zero value.
+            let cmt_idx = d.cmt.saturating_sub(1);
+            if cmt_idx < n_states {
                 let f = &ode.input_rate[fi];
                 // #880: read the onset kernel (`ka`/shape via `prep`), pathway `frac`, and the
                 // post-side Jacobian from the POST-ARRIVAL segment snapshot — the record ending
@@ -5271,12 +5287,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // #530: a modeled-duration dose's window end `t+dur` moves with `D` (the `dtinf`
             // jet below carries `∂/∂D`); a modeled-rate dose is already `is_rate_defined`.
             let is_modeled = modeled_at(idx).is_some();
+            // `saturating_sub`: `CMT=0` is the default dose compartment, state index 0 (#899).
+            // The former `d.cmt >= 1` gate dropped this saltation term for such a dose — again
+            // a wrong gradient rather than a visibly zero value.
             if (has_lagtime || is_rate_defined || is_modeled)
                 && d.time + lag_val(idx) >= reset_floor
-                && d.cmt >= 1
-                && d.cmt - 1 < n_states
+                && d.cmt.saturating_sub(1) < n_states
             {
-                let cmt = d.cmt - 1;
+                let cmt = d.cmt.saturating_sub(1);
                 let dlag = if has_lagtime {
                     jet_only(pk_at_dose[idx][dose_lag_slot[idx]])
                 } else {
@@ -5731,18 +5749,20 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             reset_floor = t_start;
         }
 
-        // Apply bolus doses (non-infusions) at t_start: u[cmt] += F·amt. CMT is 1-based;
-        // a malformed `CMT=0` must not silently dose compartment 0 (#449 #8). A compartment
-        // fed by a built-in absorption input rate is skipped here — the dose feeds R_in
-        // (the forcing in the RHS below), not a bolus (#430). `F` is per dose compartment
-        // via `dose_f_bio[k]` (#486).
+        // Apply bolus doses (non-infusions) at t_start: u[cmt] += F·amt. CMT is 1-based, and
+        // `CMT=0` is NONMEM's default dose compartment — state index 0 — on both engines
+        // (#899). The `dose.cmt >= 1` skip this replaces rested on the datareader rejecting
+        // `CMT=0` upstream (#449 #8); it does not, so the analytic gradient saw an *undosed*
+        // subject while production dosed it — `f = 0` against a production `PRED` of ~7.8 on
+        // the 2-cpt parity fixture. A compartment fed by a built-in absorption input rate is
+        // skipped here — the dose feeds R_in (the forcing in the RHS below), not a bolus
+        // (#430). `F` is per dose compartment via `dose_f_bio[k]` (#486).
         for (k, dose) in subject.doses.iter().enumerate() {
             if !dose.is_infusion()
                 && (dose.time - t_start).abs() < 1e-12
-                && dose.cmt >= 1
                 && !input_rate_consumes_cmt(ode, dose.cmt)
             {
-                let cmt_idx = dose.cmt - 1;
+                let cmt_idx = dose.cmt.saturating_sub(1);
                 if cmt_idx < n_states {
                     u[cmt_idx] = u[cmt_idx] + dose_f_bio[k] * T::from_f64(dose.amt);
                 }

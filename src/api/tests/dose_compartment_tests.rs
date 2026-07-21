@@ -264,13 +264,101 @@ fn bolus_into_the_last_compartment_is_accepted() {
 
 // ── scope: which engines and models this check owns ──
 
-/// ODE models index the state vector directly and honour any compartment the
-/// `[odes]` block declares — this analytical-routing check must not fire.
+/// ODE models index the state vector directly, so every compartment the
+/// `[odes]` block **declares** is addressable and the analytical routing table
+/// must not fire on them — but "declares" is the operative word (#899). A `CMT`
+/// past the end of the declared state vector used to fall through the engine's
+/// `if cmt_idx < n { … }` guards and be silently dropped: the fit converged and
+/// reported a finite OFV having ignored the dose entirely.
+///
+/// The helper model declares 2 states (`depot`, `central`).
 #[test]
-fn ode_models_are_exempt() {
+fn an_ode_dose_beyond_the_declared_state_count_is_rejected() {
     let model = ode_model(GradientMethod::Fd);
-    let population = population_with_doses(vec![infusion(9), bolus(9)]);
-    assert!(codes(&model, &population).is_empty());
+    // One report per (kind, compartment): a bolus and an infusion into the same
+    // bad compartment are independent causes.
+    let population = population_with_doses(vec![bolus(3), infusion(3)]);
+    assert_eq!(
+        codes(&model, &population),
+        vec!["E_DOSE_CMT_OUT_OF_RANGE", "E_DOSE_CMT_OUT_OF_RANGE"]
+    );
+}
+
+/// The message must name the states the `[odes]` block actually declares — the
+/// whole point of routing this through the ODE spec rather than a `PkModel`
+/// topology, which on an ODE model describes a system that is not being solved.
+#[test]
+fn the_ode_out_of_range_message_names_the_declared_states() {
+    let model = ode_model(GradientMethod::Fd);
+    let population = population_with_doses(vec![bolus(3)]);
+    let diags = check_dose_compartments(&model, &population);
+    let msg = &diags[0].message;
+    assert!(
+        msg.contains("depot"),
+        "should name the declared states: {msg}"
+    );
+    assert!(
+        msg.contains("central"),
+        "should name the declared states: {msg}"
+    );
+    assert!(
+        msg.contains("only 2 state(s)"),
+        "should give the declared state count: {msg}"
+    );
+    assert_eq!(diags[0].block.as_deref(), Some("odes"));
+}
+
+/// Positive control — the check must not be over-broad. Every declared state
+/// accepts both a bolus and an infusion: the ODE engine has no infusable subset
+/// (it indexes the state vector directly), so there is no ODE analogue of
+/// `PkModel::infusable_compartments` to narrow this.
+#[test]
+fn every_declared_ode_state_accepts_a_bolus_and_an_infusion() {
+    let model = ode_model(GradientMethod::Fd);
+    let n = model.ode_spec.as_ref().unwrap().n_states;
+    assert_eq!(n, 2, "helper model shape assumed by this test");
+    for cmt in 1..=n {
+        for dose in [bolus(cmt), infusion(cmt)] {
+            let population = population_with_doses(vec![dose]);
+            assert!(
+                codes(&model, &population).is_empty(),
+                "ODE cmt {cmt} should be accepted"
+            );
+        }
+    }
+}
+
+/// `CMT=0` splits exactly as it does on the analytical engine (#375): it is
+/// NONMEM's default dose *compartment*, which resolves to compartment 1 for a
+/// **bolus** (accepted — the ODE dose sites resolve it with `saturating_sub(1)`
+/// since #899) but has no meaning for a zero-order **input** (rejected). Keeping
+/// the split identical across engines is the point — an `[odes]` model and its
+/// analytical twin must answer the same dataset the same way.
+#[test]
+fn ode_cmt_zero_is_a_bolus_default_but_not_an_infusion_target() {
+    let model = ode_model(GradientMethod::Fd);
+    let population = population_with_doses(vec![infusion(0), bolus(0)]);
+    assert_eq!(codes(&model, &population), vec!["E_DOSE_CMT_NOT_INFUSABLE"]);
+}
+
+/// The zero-amount split carries over to ODE models too: an inert `AMT=0`
+/// infusion opens no rate window and is exempt from the `CMT=0` rule, but the
+/// **range** rule still applies to it — the dose sites bound-check the
+/// compartment before the amount is read, so an `EVID=4, AMT=0` reset row with a
+/// stale `CMT` is exactly as unroutable as a real dose.
+#[test]
+fn ode_zero_amount_doses_follow_the_same_split_as_analytical() {
+    let model = ode_model(GradientMethod::Fd);
+    let mut inert_inf = infusion(0);
+    inert_inf.amt = 0.0;
+    assert!(codes(&model, &population_with_doses(vec![inert_inf])).is_empty());
+
+    let mut inert_bolus = bolus(7);
+    inert_bolus.amt = 0.0;
+    assert_eq!(
+        codes(&model, &population_with_doses(vec![inert_bolus])),
+        vec!["E_DOSE_CMT_OUT_OF_RANGE"]
+    );
 }
 
 /// Transit/IG never take the event-driven walk, so its routing table does not

@@ -450,3 +450,158 @@ fn depot_readout_with_a_non_default_dose_compartment_is_rejected() {
     fit(&model, &good, &model.default_params, &FitOptions::default())
         .expect("a depot readout dosing the depot must stay accepted");
 }
+
+// ── the ODE engine (#899) ───────────────────────────────────────────────────
+//
+// The ODE half of everything above. Before #899 an out-of-range `CMT` fell through
+// `ode/predictions.rs`'s `if cmt_idx < n { … }` guards and was silently dropped —
+// `fit()` converged and reported a finite OFV having ignored the dose — because
+// `check_dose_compartments` returned early for ODE models by design.
+
+/// Two declared states, so `CMT=1` is the depot, `CMT=2` is central, and `CMT=3`
+/// is past the end. `maxiter = 0` keeps every `fit()` below evaluation-only (Tier 2).
+const ODE_TWO_STATE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  ode(states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL / V) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  maxiter = 0
+"#;
+
+const ODE_OBS_ROWS: &str = "1,1,5.0,0,.,2,.,0\n1,4,4.0,0,.,2,.,0\n1,8,3.0,0,.,2,.,0\n";
+
+/// A bolus into `cmt`, with observations read out by the Form C `[scaling]` line.
+fn ode_csv(cmt: usize) -> String {
+    format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,{cmt},0,1\n{ODE_OBS_ROWS}")
+}
+
+#[test]
+fn fit_rejects_an_ode_dose_past_the_declared_states() {
+    let model = model_of(ODE_TWO_STATE);
+    let pop = pop_of(&ode_csv(3));
+    let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("a dose past the declared states must be an Err, not a silent drop");
+    assert!(
+        err.contains("compartment 3") && err.contains("only 2 state(s)"),
+        "error should name the compartment and the declared state count: {err}"
+    );
+    assert!(
+        err.contains("depot") && err.contains("central"),
+        "error should name the declared states: {err}"
+    );
+}
+
+#[test]
+fn check_model_data_reports_the_out_of_range_ode_dose() {
+    let model = model_of(ODE_TWO_STATE);
+    let pop = pop_of(&ode_csv(3));
+    let diags = check_model_data(&model, &pop);
+    let d = diags
+        .iter()
+        .find(|d| d.code == "E_DOSE_CMT_OUT_OF_RANGE")
+        .unwrap_or_else(|| panic!("expected E_DOSE_CMT_OUT_OF_RANGE, got {diags:?}"));
+    assert_eq!(d.severity, Severity::Error);
+    assert_eq!(d.block.as_deref(), Some("odes"));
+    assert!(d.message.contains("subject 1"), "{}", d.message);
+    assert!(d.message.contains("time 0"), "{}", d.message);
+}
+
+#[test]
+#[should_panic(expected = "a dose into a compartment the model cannot deliver into")]
+fn predict_panics_on_an_ode_dose_past_the_declared_states() {
+    let model = model_of(ODE_TWO_STATE);
+    let pop = pop_of(&ode_csv(3));
+    let _ = predict(&model, &pop, &model.default_params);
+}
+
+/// Positive control — the check must not be over-broad. Every declared state is
+/// dosable, and dosing central directly (bypassing the depot) is a legitimate model.
+#[test]
+fn every_declared_ode_state_still_predicts() {
+    let model = model_of(ODE_TWO_STATE);
+    for cmt in 1..=2 {
+        let pop = pop_of(&ode_csv(cmt));
+        let preds = predict(&model, &pop, &model.default_params);
+        assert_eq!(preds.len(), 3, "cmt {cmt}");
+        assert!(
+            preds.iter().all(|p| p.pred.is_finite() && p.pred > 0.0),
+            "cmt {cmt} should predict a non-trivial curve, got {:?}",
+            preds.iter().map(|p| p.pred).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// End-to-end proof of the `CMT=0` convention: NONMEM's default dose compartment
+/// resolves to compartment 1, so this dataset must predict exactly like the one
+/// written `CMT=1`. Through `predict()` this used to reach the plain segment loop's
+/// `dose.cmt - 1`, which underflowed — debug panic, release silent drop.
+#[test]
+fn an_ode_cmt_zero_bolus_predicts_like_cmt_one() {
+    let model = model_of(ODE_TWO_STATE);
+    let zero = predict(&model, &pop_of(&ode_csv(0)), &model.default_params);
+    let one = predict(&model, &pop_of(&ode_csv(1)), &model.default_params);
+    assert_eq!(zero.len(), one.len());
+    assert!(
+        one.iter().all(|p| p.pred > 0.0),
+        "control must be non-trivial"
+    );
+    for (z, o) in zero.iter().zip(one.iter()) {
+        assert_eq!(
+            z.pred, o.pred,
+            "CMT=0 must dose the default compartment exactly like CMT=1"
+        );
+    }
+}
+
+/// Issue #899 point 3: an out-of-range `CMT` on an **observation** row is *not* the
+/// same problem, and needs no fix. A Form C `[scaling] y = <expr>` readout computes
+/// the observable from the state vector and never indexes by the observation's `CMT`,
+/// so a stray value is inert rather than silently zeroing a prediction. (The per-CMT
+/// readout — the only form that does index by it — is already covered up front by
+/// `check_per_cmt_scaling` / `check_per_cmt_error_model`.) Pinned so the claim is
+/// tested rather than asserted.
+#[test]
+fn an_out_of_range_observation_cmt_is_inert_on_a_form_c_readout() {
+    let model = model_of(ODE_TWO_STATE);
+    let stray_obs = "1,1,5.0,0,.,99,.,0\n1,4,4.0,0,.,99,.,0\n1,8,3.0,0,.,99,.,0\n";
+    let stray = pop_of(&format!(
+        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,0,1\n{stray_obs}"
+    ));
+    let normal = pop_of(&ode_csv(1));
+
+    let a = predict(&model, &stray, &model.default_params);
+    let b = predict(&model, &normal, &model.default_params);
+    assert_eq!(a.len(), b.len());
+    assert!(
+        b.iter().all(|p| p.pred > 0.0),
+        "control must be non-trivial"
+    );
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(
+            x.pred, y.pred,
+            "a Form C readout must ignore the observation's CMT entirely"
+        );
+    }
+}

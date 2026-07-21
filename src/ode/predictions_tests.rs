@@ -5614,19 +5614,21 @@ fn ode_with_states_applies_dose_on_last_observation() {
     );
 }
 
-/// Bug regression: CMT out-of-range (CMT=0 or CMT > n_states) must be
-/// ignored by both new functions, matching ode_predictions behaviour.
-/// Before the fix, saturating_sub(1).min(n-1) applied the dose to
-/// compartment 0 or the last compartment instead.
+/// Bug regression: a CMT past the end of the state vector must be ignored by
+/// both new functions, matching `ode_predictions` behaviour. Before the original
+/// fix, `saturating_sub(1).min(n-1)` applied the dose to the *last* compartment
+/// instead. (Rejecting it up front is `check_dose_compartments`' job since #899;
+/// this pins the engine-level fallback, which these `pub fn`s still need because
+/// they are reachable from hand-built `OdeSpec`s that run no validation.)
 #[test]
 fn ode_with_states_ignores_out_of_range_cmt() {
     let cl = 5.0_f64;
     let v = 80.0_f64;
     let ode = one_cpt_ode_spec();
     let pk = pk_one(cl, v);
-    // CMT=0 — out-of-range for a 1-state ODE (states are CMT 1).
     let dose_valid = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
-    let dose_oor = DoseEvent::new(0.0, 999.0, 0, 0.0, false, 0.0); // CMT=0
+    // CMT=2 — past the end of a 1-state ODE (its only state is CMT 1).
+    let dose_oor = DoseEvent::new(0.0, 999.0, 2, 0.0, false, 0.0);
     let obs_times = vec![4.0, 12.0];
 
     let subj_ref = make_subject(vec![dose_valid.clone()], obs_times.clone());
@@ -5637,11 +5639,50 @@ fn ode_with_states_ignores_out_of_range_cmt() {
     for j in 0..obs_times.len() {
         assert!(
             approx::relative_eq!(preds_ref[j], preds_oor[j], max_relative = 1e-9),
-            "obs {j}: CMT=0 dose was applied (got {}) instead of being ignored (expected {})",
+            "obs {j}: out-of-range dose was applied (got {}) instead of being ignored \
+             (expected {})",
             preds_oor[j],
             preds_ref[j]
         );
     }
+}
+
+/// `CMT=0` is **not** out of range — it is NONMEM's default dose compartment and
+/// resolves to compartment 1 (#899). This function used to skip it outright,
+/// while `ode_predictions_event_driven` on the identical dataset applied it to
+/// compartment 1 and the plain `ode_predictions` segment loop underflowed
+/// (debug panic / release silent drop). All three now agree, so a `CMT=0` dose
+/// must be indistinguishable from the same dose written `CMT=1`.
+#[test]
+fn ode_with_states_applies_cmt_zero_to_the_default_compartment() {
+    let cl = 5.0_f64;
+    let v = 80.0_f64;
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(cl, v);
+    let obs_times = vec![4.0, 12.0];
+
+    let subj_one = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times.clone(),
+    );
+    let subj_zero = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0)],
+        obs_times.clone(),
+    );
+
+    let (preds_one, _) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subj_one);
+    let (preds_zero, _) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subj_zero);
+    for j in 0..obs_times.len() {
+        assert!(
+            approx::relative_eq!(preds_one[j], preds_zero[j], max_relative = 1e-12),
+            "obs {j}: CMT=0 should dose the default compartment like CMT=1 \
+             (got {} vs {})",
+            preds_zero[j],
+            preds_one[j]
+        );
+    }
+    // Guard against the assertion passing vacuously on an all-zero curve.
+    assert!(preds_one[0] > 0.0, "reference curve should be non-trivial");
 }
 
 /// Bug regression: TAD for SS doses must be computed with rem_euclid so it
