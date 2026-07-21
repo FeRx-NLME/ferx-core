@@ -1069,19 +1069,22 @@ fn inner_restarts_bit_identical_on_wellidentified_subject() {
     let off = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 0);
     let on = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 3);
 
+    // Bit-identical is the exact contract, not mere closeness: for a unimodal
+    // subject no alternate seed beats the improvement guard (`cand_nll + 1e-9 <
+    // nll`), so `eta`/`nll` are never reassigned — `on` returns the very same
+    // f64s the base solve produced. The two solves are deterministic (pure
+    // objective, no RNG), so assert exact equality.
     assert!(off.nll.is_finite() && on.nll.is_finite());
-    assert!(
-        on.nll <= off.nll + 1e-12,
-        "multi-start must never worsen the objective: on {} vs off {}",
-        on.nll,
-        off.nll
+    assert_eq!(
+        on.nll, off.nll,
+        "objective must be bit-identical on a unimodal subject: on {} vs off {}",
+        on.nll, off.nll
     );
     for k in 0..model.n_eta {
-        assert!(
-            (on.eta[k] - off.eta[k]).abs() < 1e-9,
-            "η[{k}] must be unchanged on a unimodal subject: on {} vs off {}",
-            on.eta[k],
-            off.eta[k]
+        assert_eq!(
+            on.eta[k], off.eta[k],
+            "η[{k}] must be bit-identical on a unimodal subject: on {} vs off {}",
+            on.eta[k], off.eta[k]
         );
     }
 }

@@ -649,9 +649,14 @@ pub(crate) fn cacheable_schedule(
 /// exactly, so `data_infoᵢ = Hᵢᵢ − (Ω⁻¹)ᵢᵢ`. A coordinate is flagged weakly
 /// identified when the data adds *less* curvature than the prior already carries
 /// (`data_infoᵢ < (Ω⁻¹)ᵢᵢ`, i.e. `Hᵢᵢ < 2·(Ω⁻¹)ᵢᵢ`) — a conditional shrinkage of
-/// roughly ≳0.3. A non-finite or non-positive curvature (degenerate / genuinely
-/// flat) is treated as weakly identified so a pathological coordinate is scanned
-/// rather than silently skipped.
+/// roughly ≳0.3.
+///
+/// Two degeneracy cases are handled differently. A non-finite objective *at the
+/// mode* (`nll`) makes every per-coordinate difference meaningless, so the probe
+/// is disabled entirely and returns all-`false` (no coordinate scanned). A
+/// non-finite or non-positive *per-coordinate curvature* (numerical noise, or a
+/// genuinely flat / non-minimum direction) instead flags that one coordinate as
+/// weakly identified, so a pathological direction is scanned rather than skipped.
 ///
 /// Cost: two `obj` evaluations per non-fixed coordinate, on the cold start only.
 fn weakly_identified_coords(
