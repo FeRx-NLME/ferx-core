@@ -132,6 +132,17 @@ section of the SDLC for the versioning policy).
   overlapping an oral depot dose.
 
 ### Fixed
+- **Guarded multi-start inner EBE now covers weakly-identified random effects** (#891). The
+  per-subject EBE search (`inner_restarts`, default `1`) previously re-seeded only subjects with
+  system resets or time-varying covariates. It now also detects a **weakly-identified coordinate**
+  — a random effect whose individual objective is flat (the data adds less curvature than the
+  prior, i.e. high per-subject shrinkage) — and re-seeds just that coordinate on the cold start,
+  so a distant lower posterior mode is no longer silently missed (e.g. a poorly-identified `V1` in
+  a saturable-clearance fluconazole model). The flatness check is a two-point finite difference per
+  coordinate; well-identified subjects are unchanged and pay only that probe. The guarded
+  multi-start now also runs on an **evaluation-only** fit (`maxiter = 0`, NONMEM `MAXEVAL=0`),
+  which previously seeded the inner EBE from `η = 0` but was not recognised as a cold start, so
+  the reported per-subject EBEs and objective now reflect the recovered modes.
 - **An analytic `[scaling]` readout that references the oral `depot` is rejected when the
   data dose a non-default compartment, instead of silently corrupting the objective**
   (#375). The depot amount behind a Form C readout is reconstructed by dose superposition,
