@@ -632,6 +632,82 @@ pub(crate) fn cacheable_schedule(
     }
 }
 
+/// Per-coordinate "weakly-identified random effect" detector for the guarded
+/// multi-start inner EBE (#891).
+///
+/// A random effect whose individual objective is *flat* in its own direction has
+/// a posterior that is barely tighter than the prior (high per-subject
+/// shrinkage). That flatness is exactly what lets a distant, lower posterior mode
+/// hide from a single warm/cold BFGS descent, so these are the coordinates worth
+/// re-seeding — and, conversely, a well-informed coordinate can be skipped so the
+/// multi-start cost is paid only where a missed mode is plausible.
+///
+/// The signal is a cheap central-difference of the inner objective at the
+/// converged mode `eta`. Because `obj` already carries the prior term
+/// `½·ηᵀΩ⁻¹η`, the second difference along coordinate `i` estimates the posterior
+/// curvature `Hᵢᵢ = data_infoᵢ + (Ω⁻¹)ᵢᵢ`. The prior curvature `(Ω⁻¹)ᵢᵢ` is known
+/// exactly, so `data_infoᵢ = Hᵢᵢ − (Ω⁻¹)ᵢᵢ`. A coordinate is flagged weakly
+/// identified when the data adds *less* curvature than the prior already carries
+/// (`data_infoᵢ < (Ω⁻¹)ᵢᵢ`, i.e. `Hᵢᵢ < 2·(Ω⁻¹)ᵢᵢ`) — a conditional shrinkage of
+/// roughly ≳0.3.
+///
+/// Two degeneracy cases are handled differently. A non-finite objective *at the
+/// mode* (`nll`) makes every per-coordinate difference meaningless, so the probe
+/// is disabled entirely and returns all-`false` (no coordinate scanned). A
+/// non-finite or non-positive *per-coordinate curvature* (numerical noise, or a
+/// genuinely flat / non-minimum direction) instead flags that one coordinate as
+/// weakly identified, so a pathological direction is scanned rather than skipped.
+///
+/// Cost: two `obj` evaluations per non-fixed coordinate, on the cold start only.
+fn weakly_identified_coords(
+    obj: &dyn Fn(&[f64]) -> f64,
+    eta: &[f64],
+    nll: f64,
+    omega: &OmegaMatrix,
+    n_eta: usize,
+) -> Vec<bool> {
+    // Prior variances below this are effectively fixed effects. `from_matrix`
+    // floors a zero-variance diagonal to a 1e-8 eigenvalue (it must stay PD for
+    // the cached Cholesky/inverse), so an exactly-zero test never survives; this
+    // floor sits above that regularisation yet far below any genuinely free
+    // random effect (a 1% CV is variance ~1e-4), so a pinned effect is skipped
+    // without ever excluding a real one.
+    const FIXED_VAR_FLOOR: f64 = 1e-7;
+    let mut flags = vec![false; n_eta];
+    if !nll.is_finite() {
+        return flags;
+    }
+    for i in 0..n_eta {
+        let var_prior = omega.matrix[(i, i)].max(0.0);
+        let sd = var_prior.sqrt();
+        // Fixed / effectively-zero-variance effect: it cannot move, so never
+        // scan it (the prior pins it at 0 regardless of seed).
+        if var_prior <= FIXED_VAR_FLOOR {
+            continue;
+        }
+        let prior_curv = omega.inv[(i, i)];
+        if !prior_curv.is_finite() || prior_curv <= 0.0 {
+            continue;
+        }
+        // Central second difference at a one-prior-SD step — the scale at which a
+        // flat coordinate is measured against its own prior.
+        let h = sd;
+        let mut plus = eta.to_vec();
+        let mut minus = eta.to_vec();
+        plus[i] += h;
+        minus[i] -= h;
+        let post_curv = (obj(&plus) + obj(&minus) - 2.0 * nll) / (h * h);
+        // Degenerate curvature (numerical noise / genuinely flat) → scan.
+        if !post_curv.is_finite() || post_curv <= 0.0 {
+            flags[i] = true;
+            continue;
+        }
+        // Weakly identified when the data curvature is below the prior curvature.
+        flags[i] = post_curv < 2.0 * prior_curv;
+    }
+    flags
+}
+
 pub fn find_ebe(
     model: &CompiledModel,
     subject: &Subject,
@@ -854,25 +930,46 @@ pub fn find_ebe(
     let mut nll = obj(&eta);
 
     // ── Guarded multi-start inner EBE (`[fit_options] inner_restarts`) ──────
-    // A multimodal individual objective (e.g. saturable binding: a high-V/low-
-    // conc basin vs a low-V/high-conc basin) traps a single warm-started BFGS in
-    // whichever basin the start point sits in. When `inner_restarts > 0`, subjects
-    // on the event-driven path (system resets / time-varying covariates — where
-    // this shows up) re-solve from `inner_restarts` Ω-scaled alternate seeds per
-    // random effect (`±2·sd`, `±3·sd`, …) and keep the lowest-objective mode.
-    // Gated on a COLD start (`eta_init.is_none()`): the outer loop warm-starts the
-    // inner EBE from the previous iteration's mode, so once the basin is picked at
-    // iteration 0 the warm start carries it forward — no need to re-scan every
-    // outer eval (that is ~12× slower). One multi-start per subject per fit.
+    // A multimodal individual objective traps a single warm-started BFGS in
+    // whichever basin the start point sits in. Two families produce this:
+    //   1. Saturable / reset dynamics (a high-V/low-conc basin vs a low-V/high-
+    //      conc basin) on the event-driven path — subjects with system resets or
+    //      time-varying covariates. These are scanned on *every* random effect.
+    //   2. Weakly-identified random effects on a nonlinear readout (#891): a flat
+    //      individual objective in some η direction admits a distant, lower mode
+    //      that a warm/cold BFGS descent silently misses (e.g. fluconazole's
+    //      poorly-identified V1, ~48% shrinkage — η̂≈+0.5 vs the global −2.0).
+    //      These subjects carry no resets / TV-covariates, so family 1's gate
+    //      never scanned them; we now detect the flat coordinate directly and
+    //      scan only it.
+    // When `inner_restarts > 0` a scanned coordinate re-solves from `inner_restarts`
+    // Ω-scaled alternate seeds (`±2·sd`, `±3·sd`, …) and keeps the lowest-objective
+    // mode. Gated on a COLD start (`eta_init.is_none()`): the outer loop warm-starts
+    // the inner EBE from the previous iteration's mode, so once the basin is picked at
+    // iteration 0 the warm start carries it forward — no re-scan every outer eval
+    // (~12× slower). One multi-start per subject per fit.
     // An alternate seed replaces the warm-start mode only when it reaches a
     // meaningfully lower objective (`cand_nll + 1e-9 < nll`); a seed that merely
     // reconverges to the same basin is rejected by that guard. So a scanned
-    // subject's EBE is unchanged from `inner_restarts = 0` unless a seed finds a
-    // strictly better mode — and subjects without resets / TV-covariates are
-    // never scanned at all, staying bit-identical.
-    if restarts > 0 && eta_init.is_none() && (subject.has_resets() || subject.has_tv_covariates()) {
+    // coordinate's EBE is unchanged from `inner_restarts = 0` unless a seed finds a
+    // strictly better mode.
+    if restarts > 0 && eta_init.is_none() {
+        // Reset / TV-covariate subjects (family 1) scan every coordinate, exactly
+        // as before — bit-identical. Everyone else (family 2) is probed per
+        // coordinate and scans only the weakly-identified ones, so well-informed
+        // subjects pay just `2·n_eta` cheap objective evaluations and their EBE
+        // stays bit-identical to `inner_restarts = 0` (no seed solve runs).
+        let scan_all = subject.has_resets() || subject.has_tv_covariates();
+        let scan_coord: Vec<bool> = if scan_all {
+            vec![true; n_eta]
+        } else {
+            weakly_identified_coords(&obj, &eta, nll, &params.omega, n_eta)
+        };
         let base = eta.clone();
         for i in 0..n_eta {
+            if !scan_coord[i] {
+                continue;
+            }
             let sd = params.omega.matrix[(i, i)].max(0.0).sqrt();
             if sd == 0.0 {
                 continue;

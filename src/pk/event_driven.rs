@@ -26,8 +26,14 @@
 //!     depot-bypassing infusion) AND into the **depot** (cmt 1, #400) —
 //!     a zero-order release into the depot, then first-order `ka`
 //!     absorption into central.
-//! Infusion into an oral peripheral compartment still panics — a rare
-//! clinical setup tracked as a follow-up.
+//!   - Oral models, since #375: into the **peripheral** compartment(s) too
+//!     (cmt 3 on `two_cpt_oral`, cmt 3/4 on `three_cpt_oral`). Nothing flows
+//!     back into the depot, so a rate into a peripheral drives exactly the
+//!     central/peripheral sub-system the IV model has, and the oral propagator
+//!     superposes that same IV forced response onto its homogeneous evolution.
+//! Every compartment of the six walk-supported models is therefore infusable;
+//! what remains rejected is `CMT=0` (no default compartment for a zero-order
+//! input) and anything past the end of the state vector.
 
 use crate::pk::topology::Channel;
 use crate::types::{DoseEvent, PkModel, PkParams, Subject};
@@ -323,9 +329,18 @@ fn equilibrate_ss_state_event_driven(
     let (n_states, _) = state_layout(pk_model);
     let mut state = vec![0.0_f64; n_states];
 
-    if dose.ii <= 0.0 || dose.cmt == 0 {
+    if dose.ii <= 0.0 {
         return state;
     }
+    // `CMT=0` is NONMEM's "default dose compartment", and every other dose site
+    // on this walk resolves it that way via `saturating_sub(1)` → state 0 (the
+    // depot for an oral model, central for an IV one), matching the
+    // superposition path, which ignores `cmt` entirely. This branch used to bail
+    // to an all-zero state on `cmt == 0` instead, silently dropping the
+    // steady-state accumulation of an `SS=1` dose — the walk returned the
+    // single-dose curve while superposition returned the correct
+    // `(D/V)·e^{-kt}/(1−e^{-k·II})` (#375). Fall through so the default
+    // compartment equilibrates like any other.
     let cmt_idx = dose.cmt.saturating_sub(1);
     if cmt_idx >= n_states {
         return state;
@@ -701,9 +716,16 @@ fn event_driven_predictions_with_schedule_impl(
                     if cmt_idx < n_states {
                         state[cmt_idx] += pk_now.bioavailable_amount(d.amt);
                     } else {
+                        // Unreachable from a validated call: `check_dose_compartments`
+                        // (#375) rejects `cmt > n_states` up front — as an `Err` from
+                        // `fit()`, as a panic naming the subject/time from
+                        // `predict()`/`simulate()`. Kept as a defensive guard so an
+                        // internal caller that skips validation still fails loudly
+                        // instead of dropping the dose.
                         panic!(
                             "event-driven PK: dose into compartment {} but model has \
-                             {} states (cmt is 1-based)",
+                             {} states (cmt is 1-based) — should have been rejected by \
+                             `check_dose_compartments`",
                             d.cmt, n_states
                         );
                     }
@@ -853,11 +875,17 @@ fn propagate_with_bounds(
                     Some(Channel::Periph1) => rate_periph1 += r,
                     Some(Channel::Periph2) => rate_periph2 += r,
                     Some(Channel::Depot) => rate_depot += r,
+                    // Unreachable from a validated call: `check_dose_compartments`
+                    // (#375) rejects an infusion outside `infusable_compartments()`
+                    // up front, with the subject/time context this deep-in-the-walk
+                    // panic could never carry. Kept as a defensive guard, and
+                    // mirrored by `sens::propagate::active_rates_g` so the value
+                    // and gradient walks agree on what is unroutable.
                     None => panic!(
                         "event-driven PK: infusion into compartment {} not supported \
                          for model {:?}. Supported: central for all models; depot (cmt 1) \
-                         for oral models; periph1/2 for 2- and 3-cpt IV models. Oral \
-                         peripheral infusion is a tracked follow-up.",
+                         and peripheral(s) for oral models; periph1/2 for 2- and 3-cpt IV \
+                         models — should have been rejected by `check_dose_compartments`.",
                         d.cmt, pk_model
                     ),
                 }
@@ -909,6 +937,7 @@ fn propagate_with_bounds(
                         &e,
                         pk.ka(),
                         rate_central,
+                        rate_periph1,
                         rate_depot,
                     );
                 }
@@ -935,6 +964,8 @@ fn propagate_with_bounds(
                         &e,
                         pk.ka(),
                         rate_central,
+                        rate_periph1,
+                        rate_periph2,
                         rate_depot,
                     );
                 }
@@ -1042,6 +1073,85 @@ mod tests {
         use crate::types::RateMode;
         let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
         let subject = make_subject(vec![modeled], vec![1.0]);
+        let pk = pk_one(5.0, 50.0);
+        let _ = event_driven_predictions(
+            PkModel::OneCptIv,
+            &subject,
+            std::slice::from_ref(&pk),
+            std::slice::from_ref(&pk),
+            &[],
+        );
+    }
+
+    /// #375: `CMT=0` is NONMEM's default dose compartment, and
+    /// `check_dose_compartments` permits it on a **bolus** precisely because
+    /// both analytical paths agree on it. `equilibrate_ss_state_event_driven`
+    /// used to break that agreement for `SS=1`: it bailed to an all-zero state
+    /// on `cmt == 0`, so the walk returned the single-dose curve while the
+    /// superposition path returned the accumulated steady state.
+    ///
+    /// Anchored on the closed form rather than on the other path, so this pins
+    /// the right answer and not merely agreement:
+    /// `C_ss(t) = (D/V)·e^{−kt} / (1 − e^{−k·II})`.
+    #[test]
+    fn ss_dose_into_cmt_zero_equilibrates_like_the_default_compartment() {
+        let (cl, v, amt, ii) = (5.0, 50.0, 100.0, 12.0);
+        let obs_times = vec![1.0, 4.0, 8.0];
+        let pk = pk_one(cl, v);
+        let run = |cmt: usize| -> Vec<f64> {
+            let dose = DoseEvent::new(0.0, amt, cmt, 0.0, true, ii);
+            let subject = make_subject(vec![dose], obs_times.clone());
+            event_driven_predictions(
+                PkModel::OneCptIv,
+                &subject,
+                std::slice::from_ref(&pk),
+                &vec![pk; obs_times.len()],
+                &[],
+            )
+        };
+        let k = cl / v;
+        let expected: Vec<f64> = obs_times
+            .iter()
+            .map(|t| (amt / v) * (-k * t).exp() / (1.0 - (-k * ii).exp()))
+            .collect();
+        for (label, got) in [("cmt 0", run(0)), ("cmt 1", run(1))] {
+            for (j, (&g, &e)) in got.iter().zip(&expected).enumerate() {
+                assert!(
+                    (g - e).abs() < 1e-9,
+                    "{label} obs {j}: walk {g} vs closed-form steady state {e}"
+                );
+            }
+        }
+    }
+
+    /// #375: the walk's routing `match` is the guard `check_dose_compartments`
+    /// makes unreachable from a validated call. Direct call (bypassing the
+    /// entry-point gates) confirms the predictor still fails loudly rather than
+    /// silently dropping the infusion, and pins the message the sens walk
+    /// mirrors.
+    #[test]
+    #[should_panic(expected = "infusion into compartment 2 not supported")]
+    fn event_driven_predictions_panics_on_an_unroutable_infusion() {
+        // `one_cpt_iv` has a single compartment, so cmt 2 has no rate channel.
+        let infusion = DoseEvent::new(0.0, 100.0, 2, 20.0, false, 0.0);
+        let subject = make_subject(vec![infusion], vec![1.0]);
+        let pk = pk_one(5.0, 50.0);
+        let _ = event_driven_predictions(
+            PkModel::OneCptIv,
+            &subject,
+            std::slice::from_ref(&pk),
+            std::slice::from_ref(&pk),
+            &[],
+        );
+    }
+
+    /// #375's sibling: a bolus past the end of the state vector. Same contract —
+    /// rejected up front, defensive panic if an internal caller skips validation.
+    #[test]
+    #[should_panic(expected = "should have been rejected by `check_dose_compartments`")]
+    fn event_driven_predictions_panics_on_an_out_of_range_bolus() {
+        let bolus = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0);
+        let subject = make_subject(vec![bolus], vec![1.0]);
         let pk = pk_one(5.0, 50.0);
         let _ = event_driven_predictions(
             PkModel::OneCptIv,

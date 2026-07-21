@@ -75,6 +75,7 @@ pub fn inits_from_nca(
     // dose precondition here too — same loud-not-silent contract as
     // `predict()`/`simulate()` (#324). No-op for the common all-`Fixed` dataset.
     crate::api::assert_modeled_doses_supported(model, population);
+    crate::api::assert_dose_compartments_supported(model, population);
     match method {
         NcaInit::Nca => nca_only(model, population),
         NcaInit::Sweep => nca_with_sweep(model, population),

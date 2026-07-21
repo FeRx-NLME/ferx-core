@@ -224,6 +224,7 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     e: &TwoCptEigen<T>,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
     rate_depot: T,
 ) {
     let (alpha, beta, k10, k12, k21) = (e.alpha, e.beta, e.k10, e.k12, e.k21);
@@ -273,13 +274,22 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     state[1] = h_c_dt + cap_a * e_ka;
     state[2] = h_p_dt + cap_b * e_ka;
 
-    // Constant infusion into central (depot bypass): forced response of the 2-cpt
-    // IV propagator from a zero initial state. `rate_central` is structurally 0 or
-    // positive (never crossing during differentiation), so the `.val()` guard is
-    // derivative-safe and just skips the no-infusion intervals.
-    if rate_central.val() > 0.0 {
+    // Constant infusion into central (depot bypass) and/or into the **peripheral**
+    // (#375): forced response of the 2-cpt IV propagator from a zero initial state.
+    //
+    // Both reduce to the same delegation because the depot is decoupled from the
+    // disposition sub-system in the inflow direction — nothing flows *back* into
+    // the depot — so a rate into central or peripheral drives exactly the
+    // central/peripheral pair an IV model has, and the system is linear, so the
+    // forced response superposes onto the homogeneous evolution above. The oral
+    // peripheral therefore needs no new closed form: it *is* the IV one.
+    //
+    // `rate_*` are structurally 0 or positive (never crossing during
+    // differentiation), so the `.val()` guards are derivative-safe and just skip
+    // the no-infusion intervals.
+    if rate_central.val() > 0.0 || rate_periph1.val() > 0.0 {
         let mut inflow = [T::from_f64(0.0), T::from_f64(0.0)];
-        propagate_two_cpt_core_g(&mut inflow, dt, e, rate_central, T::from_f64(0.0));
+        propagate_two_cpt_core_g(&mut inflow, dt, e, rate_central, rate_periph1);
         state[1] = state[1] + inflow[0];
         state[2] = state[2] + inflow[1];
     }
@@ -299,7 +309,15 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
         };
         let d_ss = rate_depot / ka;
         let mut xss = [d_ss, c_ss, p_ss];
-        propagate_two_cpt_oral_core_g(&mut xss, dt, e, ka, T::from_f64(0.0), T::from_f64(0.0));
+        propagate_two_cpt_oral_core_g(
+            &mut xss,
+            dt,
+            e,
+            ka,
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+        );
         state[0] = state[0] + (d_ss - xss[0]);
         state[1] = state[1] + (c_ss - xss[1]);
         state[2] = state[2] + (p_ss - xss[2]);
@@ -317,13 +335,14 @@ pub fn propagate_two_cpt_oral_g<T: PkNum>(
     v2: T,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
     rate_depot: T,
 ) {
     if ka.val() <= 0.0 {
         return;
     }
     if let Some(e) = two_cpt_eigen_g(cl, v1, q, v2) {
-        propagate_two_cpt_oral_core_g(state, dt, &e, ka, rate_central, rate_depot);
+        propagate_two_cpt_oral_core_g(state, dt, &e, ka, rate_central, rate_periph1, rate_depot);
     }
 }
 
@@ -501,6 +520,8 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     e: &ThreeCptEigen<T>,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
+    rate_periph2: T,
     rate_depot: T,
 ) {
     let (alpha, beta, gamma, k10, k12, k13, k21, k31) =
@@ -536,19 +557,16 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     state[2] = p1a + p1b + p1g + cap_b * e_ka;
     state[3] = p2a + p2b + p2g + cap_c * e_ka;
 
-    // Constant infusion into central (depot bypass): forced response of the 3-cpt
-    // IV propagator from a zero initial state. `.val()` guard is derivative-safe
-    // (`rate_central` is structurally 0 or positive).
-    if rate_central.val() > 0.0 {
+    // Constant infusion into central (depot bypass) and/or into either
+    // **peripheral** (#375): forced response of the 3-cpt IV propagator from a
+    // zero initial state. The depot takes no inflow from the disposition
+    // sub-system, so a rate into central or a peripheral drives exactly the
+    // three-state system an IV model has — the oral peripherals reuse the IV
+    // closed form rather than needing a new one. `.val()` guards are
+    // derivative-safe (each rate is structurally 0 or positive).
+    if rate_central.val() > 0.0 || rate_periph1.val() > 0.0 || rate_periph2.val() > 0.0 {
         let mut inflow = [T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0)];
-        propagate_three_cpt_core_g(
-            &mut inflow,
-            dt,
-            e,
-            rate_central,
-            T::from_f64(0.0),
-            T::from_f64(0.0),
-        );
+        propagate_three_cpt_core_g(&mut inflow, dt, e, rate_central, rate_periph1, rate_periph2);
         state[1] = state[1] + inflow[0];
         state[2] = state[2] + inflow[1];
         state[3] = state[3] + inflow[2];
@@ -571,7 +589,16 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
         };
         let d_ss = rate_depot / ka;
         let mut xss = [d_ss, c_ss, p1_ss, p2_ss];
-        propagate_three_cpt_oral_core_g(&mut xss, dt, e, ka, T::from_f64(0.0), T::from_f64(0.0));
+        propagate_three_cpt_oral_core_g(
+            &mut xss,
+            dt,
+            e,
+            ka,
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+        );
         state[0] = state[0] + (d_ss - xss[0]);
         state[1] = state[1] + (c_ss - xss[1]);
         state[2] = state[2] + (p1_ss - xss[2]);
@@ -592,13 +619,24 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
     v3: T,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
+    rate_periph2: T,
     rate_depot: T,
 ) {
     if ka.val() <= 0.0 {
         return;
     }
     if let Some(e) = three_cpt_eigen_g(cl, v1, q2, v2, q3, v3) {
-        propagate_three_cpt_oral_core_g(state, dt, &e, ka, rate_central, rate_depot);
+        propagate_three_cpt_oral_core_g(
+            state,
+            dt,
+            &e,
+            ka,
+            rate_central,
+            rate_periph1,
+            rate_periph2,
+            rate_depot,
+        );
     }
 }
 
@@ -894,7 +932,18 @@ fn active_rates_g<T: PkNum>(
                 Some(Channel::Periph1) => rate_periph1 = rate_periph1 + r,
                 Some(Channel::Periph2) => rate_periph2 = rate_periph2 + r,
                 Some(Channel::Depot) => rate_depot = rate_depot + r,
-                None => {}
+                // Unreachable from a validated call — `check_dose_compartments`
+                // (#375) rejects an unroutable infusion before any prediction. The
+                // old silent `{}` was worse than the value walk's `panic!` twin in
+                // `pk::event_driven::propagate_with_bounds`: it dropped the
+                // infusion from the *gradient* only, so FOCE/FOCEI would have
+                // differentiated a different dosing history than it predicted.
+                // Fail the same way the value walk does instead.
+                None => panic!(
+                    "sens PK walk: infusion into compartment {} not supported for model \
+                     {:?} — should have been rejected by `check_dose_compartments`",
+                    d.cmt, pk_model
+                ),
             }
         }
     }
@@ -951,6 +1000,7 @@ fn apply_step_g<T: PkNum>(
                 pk.v2,
                 pk.ka,
                 rate_central,
+                rate_periph1,
                 rate_depot,
             ),
             PkModel::ThreeCptIv => propagate_three_cpt_g(
@@ -977,6 +1027,8 @@ fn apply_step_g<T: PkNum>(
                 pk.v3,
                 pk.ka,
                 rate_central,
+                rate_periph1,
+                rate_periph2,
                 rate_depot,
             ),
         }
@@ -1099,9 +1151,14 @@ fn equilibrate_ss_g<T: PkNum>(
 ) -> Vec<T> {
     let (n_states, _) = state_layout_g(pk_model);
     let mut state = vec![T::from_f64(0.0); n_states];
-    if dose.ii <= 0.0 || dose.cmt == 0 {
+    if dose.ii <= 0.0 {
         return state;
     }
+    // `CMT=0` = NONMEM's default dose compartment — resolved by
+    // `saturating_sub(1)` like every other dose site. Mirrors the value walk's
+    // `equilibrate_ss_state_event_driven`, whose identical `cmt == 0` bail
+    // silently dropped an `SS=1` dose's accumulation (#375); the gradient must
+    // equilibrate the same state the value does.
     let cmt_idx = dose.cmt.saturating_sub(1);
     if cmt_idx >= n_states {
         return state;
@@ -1275,6 +1332,18 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     let cmt_idx = d.cmt.saturating_sub(1);
                     if cmt_idx < n_states {
                         state[cmt_idx] = state[cmt_idx] + pk_now.f * T::from_f64(d.amt);
+                    } else {
+                        // Unreachable from a validated call — `check_dose_compartments`
+                        // (#375) rejects `cmt > n_states` up front. Kept as a defensive
+                        // guard that matches the value walk's twin in
+                        // `pk::event_driven`: silently dropping the dose here would
+                        // differentiate a different dosing history than was predicted.
+                        panic!(
+                            "sens PK walk: dose into compartment {} but model has {} states \
+                             (cmt is 1-based) — should have been rejected by \
+                             `check_dose_compartments`",
+                            d.cmt, n_states
+                        );
                     }
                 }
             }
@@ -1541,6 +1610,38 @@ mod tests {
             ka: p.ka(),
             f: p.f_bio(),
         }
+    }
+
+    /// #375: `active_rates_g` used to answer an unroutable infusion with a silent
+    /// `None => {}`, dropping the dose from the **gradient** while the production
+    /// value walk (`pk::event_driven::propagate_with_bounds`) panicked on the same
+    /// input — so had the value path been made lenient, FOCE/FOCEI would have
+    /// differentiated a different dosing history than it predicted. Both walks now
+    /// fail the same way; `check_dose_compartments` makes this unreachable from a
+    /// validated call, and this test is the direct-call proof that the guard is
+    /// still there.
+    #[test]
+    #[should_panic(expected = "infusion into compartment 2 not supported")]
+    fn sens_walk_panics_on_an_unroutable_infusion_like_the_value_walk() {
+        // `one_cpt_iv` has a single compartment, so cmt 2 has no rate channel.
+        let dose = DoseEvent::new(0.0, 100.0, 2, 20.0, false, 0.0);
+        let subject = make_subject(vec![dose], vec![1.0, 4.0]);
+        let pk = pk_full(5.0, 50.0, 1.0);
+        let schedule = EventSchedule::for_subject(
+            &subject,
+            PkModel::OneCptIv,
+            &subject.doses,
+            &[pk.lagtime()],
+        );
+        let pk_g = one_cpt_pk_f64(&pk);
+        let _ = event_driven_sens_one_cpt_g::<f64>(
+            false,
+            &subject,
+            &schedule,
+            &[pk_g],
+            &vec![pk_g; 2],
+            &[],
+        );
     }
 
     /// The `f64` instantiation of the full event walk must reproduce the
