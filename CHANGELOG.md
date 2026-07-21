@@ -172,16 +172,35 @@ section of the SDLC for the versioning policy).
   agree and both match NONMEM. Validated against NONMEM 7.6.0 `ADVAN1/2/3/4/11/12`
   (`tests/nonmem_dose_compartment_anchor.rs`). Per-compartment amounts in
   sdtab / `[derived]` are reported as `NaN` for these subjects rather than wrong, with the
-  existing warning extended to explain why; predictions are exact.
+  existing warning extended to explain why; the rerouted doses themselves are computed
+  exactly (that is what the NONMEM anchors pin).
 
-  One caveat worth knowing: rerouting is per *subject*, so a single dose into a
-  non-default compartment moves that subject's **other** doses onto the walk too. The
-  walk equilibrates a steady-state dose with a 50-cycle iterative pulse train where dose
-  superposition uses the exact periodic closed form, so an `SS` dose on such a subject
-  shifts by the truncation difference — up to 4.5e-3 relative on a 3-compartment model at
-  `II = 12` (3.7e-5 at `II = 24`, 2.7e-9 at `II = 48`), below 1e-7 on 1-/2-compartment
-  models. Not new behaviour — any subject with a time-varying covariate, an `EVID=3/4`
-  reset, or IOV already took the walk — but it now applies to more datasets.
+  One caveat worth knowing, and it is not small for slow drugs. Rerouting is per
+  *subject*, so a single dose into a non-default compartment moves that subject's
+  **other** doses onto the walk too — and the walk equilibrates a steady-state dose with
+  a truncated 50-cycle pulse train, whereas dose superposition uses the exact periodic
+  closed form. An `SS` dose on such a subject therefore shifts by the truncation
+  remainder, which is roughly `exp(−50 · λ_slow · II)` where `λ_slow` is the slowest
+  disposition rate constant. It is negligible once `λ_slow · II ≳ 0.5` and can reach
+  **tens of percent** when it is not — on *any* compartment count, including
+  one-compartment models. Measured worst relative shift:
+
+  | model | `II` | shift |
+  |---|---|---|
+  | `three_cpt_iv` (CL 5, V1 50, Q 3, V2 80, Q3 1, V3 120 — the parameters these anchors use) | 12 | 6.0e-3 |
+  | same | 24 | 1.3e-4 |
+  | same | 6 | 3.8e-2 |
+  | `three_cpt_iv` with a deeper third compartment (Q3 0.5, V3 400) | 12 | 7.6e-2 |
+  | `two_cpt_iv` (CL 5, V1 50, Q 3, V2 80) | 12 | 1.9e-6 |
+  | `two_cpt_iv` (Q 0.5, V2 500) | 12 | 8.9e-2 |
+  | `one_cpt_oral` (CL 1, V 50) | 12 | 5.5e-6 |
+  | `one_cpt_oral` (CL 0.1, V 50 — t½ ≈ 350 h) | 12 | **3.0e-1** |
+
+  These are one model each, not bounds. Not new behaviour — any subject with a
+  time-varying covariate, an `EVID=3/4` reset, or IOV already took the walk — but it now
+  applies to more datasets. The walk's truncation is silent: no warning is emitted. See
+  `docs/model-file/steady-state.qmd`; #908 tracks replacing the pulse train with the exact
+  `(I − M)⁻¹·b` steady-state solve, which removes the truncation entirely.
 - **A steady-state dose with `CMT=0` no longer loses its accumulation on the analytical
   event-driven path** (#375). `CMT=0` is NONMEM's "default dose compartment", and every dose
   site resolves it to the model's first compartment — except the event-driven walk's
