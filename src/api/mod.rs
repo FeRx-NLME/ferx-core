@@ -14,10 +14,10 @@ mod validation;
 pub(crate) use validation::{
     apply_iov_occasion_rule, assert_absorption_closed_form_support,
     assert_absorption_dosing_supported, assert_absorption_flip_flop_no_twin,
-    assert_analytic_readout_support, assert_modeled_doses_supported,
-    check_absorption_closed_form_support, check_absorption_dosing,
+    assert_analytic_readout_support, assert_dose_compartments_supported,
+    assert_modeled_doses_supported, check_absorption_closed_form_support, check_absorption_dosing,
     check_absorption_flip_flop_no_twin, check_analytic_readout_support, check_covariates,
-    check_modeled_dose_rates,
+    check_dose_compartments, check_modeled_dose_rates,
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
@@ -160,6 +160,10 @@ mod build_indiv_map_tests;
 #[cfg(test)]
 #[path = "tests/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/dose_compartment_tests.rs"]
+mod dose_compartment_tests;
 
 // ======================================================================
 // Adaptive (state-reactive / feedback) dosing — epic #391, beta.

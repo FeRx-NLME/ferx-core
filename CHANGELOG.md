@@ -114,6 +114,23 @@ section of the SDLC for the versioning policy).
   negligible cost near the optimum. FOCE/FOCEI are unchanged (their Gauss-Newton `log|H̃|`
   is forgiving of a loose mode).
 
+### Added
+- **Infusion into an oral model's peripheral compartment on the analytical engine** (#375).
+  `two_cpt_oral` (`CMT=3`) and `three_cpt_oral` (`CMT=3`/`CMT=4`) previously rejected a
+  positive `RATE` — and, before that, crashed on one — because the oral closed-form
+  propagators had no peripheral forcing term where the IV ones did. They need no new closed
+  form: nothing flows back into the depot, so a rate into a peripheral drives exactly the
+  central/peripheral sub-system the IV model has, and the oral propagator superposes that
+  same forced response onto its own homogeneous evolution. Combined with the bolus change
+  below, **every compartment of the six analytical disposition models now accepts both a
+  bolus and an infusion**, alone or together. (The transit and inverse-Gaussian absorption
+  models are unchanged — they are dosed through the depot, `CMT=1`, only.) Validated
+  against NONMEM 7.6.0 `ADVAN4`/`ADVAN12` and —
+  more tightly than NONMEM can express, since its own forced response carries ~2e-6 here —
+  against a `1e-12` integration of the same system written out as explicit `[odes]`, which
+  agrees to ~1e-11 (`tests/oral_peripheral_infusion.rs`), including a peripheral infusion
+  overlapping an oral depot dose.
+
 ### Fixed
 - **Guarded multi-start inner EBE now covers weakly-identified random effects** (#891). The
   per-subject EBE search (`inner_restarts`, default `1`) previously re-seeded only subjects with
@@ -126,6 +143,82 @@ section of the SDLC for the versioning policy).
   multi-start now also runs on an **evaluation-only** fit (`maxiter = 0`, NONMEM `MAXEVAL=0`),
   which previously seeded the inner EBE from `η = 0` but was not recognised as a cold start, so
   the reported per-subject EBEs and objective now reflect the recovered modes.
+- **An analytic `[scaling]` readout that references the oral `depot` is rejected when the
+  data dose a non-default compartment, instead of silently corrupting the objective**
+  (#375). The depot amount behind a Form C readout is reconstructed by dose superposition,
+  which never reads the dose's `CMT` — so a bolus written `CMT=2` on a `one_cpt_oral` model
+  was reconstructed as if it had been absorbed through the depot, adding a phantom depot
+  amount to `PRED` and therefore to the OFV. Measured on `y = (central + depot)/V`: OFV
+  188.37 where an explicit `[odes]` twin of the same model gives 1761.47 (the same model
+  with the dose at `CMT=1` agrees with the twin exactly). This joins the existing
+  reset-based rejection in `check_analytic_readout_support`, with the same remedy —
+  reference only `central`, or use an `ode(...)` model.
+- **A `[derived]` integral over `compartments[i]` no longer returns a wrong finite value
+  for a subject dosing a non-default compartment** (#375). The per-observation compartment
+  columns correctly degrade to `NaN` for those subjects, and the emitted warning says so —
+  but the separate dense-grid reconstruction used by `integral(...)` still used the older,
+  narrower predicate and fell through to the compartment-blind superposition helper. In the
+  same sdtab row, `compartments[1]` read `NaN` while `integral(compartments[1], 0→24)` read
+  19.17 against a true 31.13. Both paths now use the same predicate.
+- **A zero-amount dose with an out-of-range `CMT` is rejected instead of aborting the
+  process** (#375). The dose-compartment check skipped `AMT=0` rows entirely, on the
+  reasoning that a zero bolus is a no-op — but both prediction walks bound-check the
+  compartment *before* the amount is read, so such a row still panicked. It is reachable
+  from ordinary NONMEM data: an `EVID=4` reset row written with `AMT=0` and a stale `CMT`.
+  `ferx check` reported the dataset clean and `fit()` then aborted. The range rule now
+  applies to every dose regardless of amount; the zero-amount exemption is kept only for the
+  infusion routing rule, where `duration = AMT/RATE = 0` genuinely means nothing is
+  delivered.
+- **A dose into a non-default compartment is now computed in that compartment on the
+  analytical engine** (#375). The closed-form dose-superposition path never read the dose's
+  `CMT`: it chose the formula from the *model*, so it placed every bolus in compartment 1
+  (the depot of an oral model, central of an IV one) and every infusion into central,
+  whatever the data said. A bolus into an IV model's peripheral, or into an oral model's
+  central compartment (an IV loading dose against an oral maintenance model), was therefore
+  computed in the wrong compartment — silently, with a finite OFV and no warning, and
+  disagreeing with NONMEM by up to two orders of magnitude on a 3-compartment model. Which
+  answer you got depended only on whether the subject happened to carry a time-varying
+  covariate, an `EVID=3/4` reset, or IOV, since those route to the event-driven walk, which
+  places doses correctly. Such doses now route to that walk on every dataset, so both paths
+  agree and both match NONMEM. Validated against NONMEM 7.6.0 `ADVAN1/2/3/4/11/12`
+  (`tests/nonmem_dose_compartment_anchor.rs`). Per-compartment amounts in
+  sdtab / `[derived]` are reported as `NaN` for these subjects rather than wrong, with the
+  existing warning extended to explain why; predictions are exact.
+- **A steady-state dose with `CMT=0` no longer loses its accumulation on the analytical
+  event-driven path** (#375). `CMT=0` is NONMEM's "default dose compartment", and every dose
+  site resolves it to the model's first compartment — except the event-driven walk's
+  steady-state equilibration, which bailed out early on `CMT=0` and returned an unequilibrated
+  (all-zero) starting state. An `SS=1` dose written with `CMT=0` therefore produced the
+  *single-dose* curve instead of the accumulated steady state whenever the subject took that
+  path (a time-varying covariate, an `EVID=3/4` reset, or IOV), while the same dataset without
+  those features returned the correct steady state from the superposition path — a silent
+  ~30 % under-prediction on a one-compartment example, with no warning. Both the value walk and
+  the gradient walk now equilibrate the default compartment like any other, matching the
+  closed form `(D/V)·e^{−kt}/(1−e^{−k·II})`. Predictions change only for `SS` doses written
+  with `CMT=0`. Note the ODE engine still bails on `SS` with `CMT=0`, so an analytical model
+  and its explicit `[odes]` twin currently disagree on that combination.
+- **An infusion into a compartment the analytical model cannot deliver into is now an error,
+  not a crash** (#375). A positive `RATE` into a compartment outside the model's infusable set
+  — an oral model's peripheral (`CMT=3` on `two_cpt_oral`), which the `Added` entry above now
+  makes work, or a `CMT` the model does not have at all — used to abort the
+  process from deep inside the event-driven prediction walk whenever the subject also had a
+  time-varying covariate, an `EVID=3/4` reset, or IOV. Nothing validated a *fixed* `RATE`
+  against the model's topology: the data reader has no model, and the parse-time check only
+  fires for a declared `D{cmt}`/`R{cmt}`. Such doses are now rejected up front, naming the
+  subject, time, and the compartments the model *can* infuse — `fit()` returns an error, and
+  `predict()`/`simulate()` fail with the same message, matching every other dose precondition.
+  An out-of-range dose compartment (`CMT` past the end of the model's compartment list) is
+  rejected the same way. This also removes a silent disagreement between the three analytical
+  paths on the same dataset: the dose-superposition path used to route the infusion into the
+  central compartment regardless of `CMT`, and the gradient (sensitivity) walk used to drop it
+  entirely — so a fit could have differentiated a different dosing history than it predicted.
+  One behaviour change worth calling out: an infusion with `CMT=0` is now **rejected**. On an
+  IV model that previously fitted, since superposition delivers into central, which is what
+  `CMT=0` means — so this is a deliberate tightening, not a bug fix: `CMT=0` is NONMEM's
+  *default dose compartment*, well defined for a bolus but not for a zero-order input, and
+  leaving it implicit hid which compartment was being infused. Write the compartment
+  explicitly. A **bolus** with `CMT=0` is unchanged (every path agrees it means compartment 1),
+  as is `SS` with `CMT=0` after the fix above.
 - **Analytic FOCEI sensitivities for IIV on an absorption lag feeding a `first_order` forcing**
   (#880). Fixes to the rate-on onset of a built-in `first_order` (Bateman) input-rate forcing
   whose arrival is a moving boundary — a compartment lagtime (`ALAG1`/`LAGTIME`) **or** a

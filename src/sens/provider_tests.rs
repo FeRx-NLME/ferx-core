@@ -2730,6 +2730,119 @@ fn oral_infusion_provider_matches_fd_of_production() {
     }
 }
 
+/// #375 gradient oracle: an infusion into an **oral model's peripheral**
+/// (`two_cpt_oral` cmt 3, `three_cpt_oral` cmt 3/4) is a brand-new forcing term
+/// on the analytic sensitivity path — `propagate_{two,three}_cpt_oral_core_g`
+/// delegate it to the IV core. The value path is pinned against an ODE twin
+/// (`tests/oral_peripheral_infusion.rs`), but the **`Dual2` gradient** has no
+/// second copy of the formula to disagree with it, so it must be asserted
+/// against central FD of the `T = f64` production predictor (CLAUDE.md's
+/// `Dual2`-vs-FD rule).
+///
+/// Cases exercise, in order: peripheral alone; peripheral **overlapping an
+/// absorbing depot dose** (the reduction is only valid if the depot's
+/// contribution is counted exactly once); **central + peripheral simultaneously
+/// active** (the combined-rate steady state in the IV core); and both 3-cpt
+/// peripherals.
+#[test]
+fn oral_peripheral_infusion_provider_matches_fd_of_production() {
+    let times = [1.0, 3.0, 5.0, 7.0, 10.0, 24.0];
+    let two_theta = vec![10.0, 50.0, 15.0, 100.0, 1.0];
+    let three_theta = vec![5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 1.5];
+    let eta = vec![0.1, -0.05, 0.08];
+    let cases: Vec<(&str, CompiledModel, Subject, Vec<f64>)> = vec![
+        // 2-cpt oral: infusion into the peripheral (cmt 3) only. amt 1000 at
+        // rate 125 → an 8 h window, so obs straddle it.
+        (
+            "2cpt periph only",
+            parse_model_string(TWOCPT_ORAL).expect("parse 2cpt oral"),
+            subject_with_dose(DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0), &times),
+            two_theta.clone(),
+        ),
+        // …plus an oral depot bolus landing *inside* the infusion window, so the
+        // depot's Bateman term and the peripheral forced response superpose.
+        (
+            "2cpt periph + depot bolus mid-window",
+            parse_model_string(TWOCPT_ORAL).expect("parse 2cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0),
+                    DoseEvent::new(2.0, 500.0, 1, 0.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            two_theta.clone(),
+        ),
+        // Central AND peripheral infusion simultaneously active (the `||` guard's
+        // combined branch: one must not clobber the other).
+        (
+            "2cpt central + periph simultaneous",
+            parse_model_string(TWOCPT_ORAL).expect("parse 2cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0),
+                    DoseEvent::new(1.0, 600.0, 2, 100.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            two_theta.clone(),
+        ),
+        // 3-cpt oral, peripheral-1 (cmt 3) + a depot bolus.
+        (
+            "3cpt periph1 + depot bolus",
+            parse_model_string(THREECPT_ORAL).expect("parse 3cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0),
+                    DoseEvent::new(2.0, 500.0, 1, 0.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            three_theta.clone(),
+        ),
+        // 3-cpt oral, peripheral-2 (cmt 4) — the `rate_periph2` channel.
+        (
+            "3cpt periph2 + depot bolus",
+            parse_model_string(THREECPT_ORAL).expect("parse 3cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 4, 125.0, false, 0.0),
+                    DoseEvent::new(2.0, 500.0, 1, 0.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            three_theta.clone(),
+        ),
+    ];
+    for (label, m, s, theta) in &cases {
+        assert!(
+            crate::pk::dose_needs_event_walk(m.pk_model, s),
+            "[{label}] fixture must route to the event walk"
+        );
+        assert!(
+            subject_routes_to_event_walk(m, s),
+            "[{label}] the gradient must follow production onto the walk"
+        );
+        assert!(
+            subject_sensitivities(m, s, theta, &eta).is_some(),
+            "[{label}] must be served analytically, not by FD"
+        );
+        // `1e-3` rather than the harness default `1e-4`: on these cases the
+        // mixed `∂²f/∂η∂θ` FD is roundoff-dominated at `1e-4` and clears the
+        // (unchanged) `3e-3` bound by only 1.4%, which last-bit libm differences
+        // flip between platforms. The FD converges to the analytic value as the
+        // step is refined toward its optimum, so this is a better-conditioned
+        // reference, not a looser test — it tightens the observed agreement from
+        // ~3e-3 to 1.5e-4. See `check_full_provider_vs_fd_with_step` for the
+        // step-refinement study.
+        check_full_provider_vs_fd_with_step(m, s, theta, &eta, 1e-3);
+    }
+}
+
 /// Two infusion occasions on a 3-cpt IV model separated by an EVID=4 reset:
 /// occasion-2 observations must rebuild from zero (no occasion-1 carryover).
 /// The provider's reset-segment superposition must reproduce the production
@@ -2779,6 +2892,39 @@ fn provider_1cpt_reset_midinfusion_matches_production() {
 /// applies the matching `g = ln(f)` jet transform, so the same FD check covers
 /// the log-scale value, gradient, and Hessian.
 fn check_full_provider_vs_fd(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
+    check_full_provider_vs_fd_with_step(model, subject, theta, eta, 1e-4);
+}
+
+/// As [`check_full_provider_vs_fd`], with the **second-derivative** FD step as a
+/// parameter (the first-derivative steps stay at `1e-6`).
+///
+/// The second-derivative blocks use 4-point central differences, whose total
+/// error is `O(h²)` truncation plus `O(ε/h²)` roundoff — a U-curve with a
+/// problem-dependent optimum. The default `1e-4` sits comfortably inside the
+/// `3e-3` bound for the models this harness was written against, but it is *not*
+/// universally well-conditioned: on the 3-cpt oral peripheral-infusion cases the
+/// mixed `∂²f/∂η∂θ` entries are roundoff-dominated there. Measured worst
+/// assert-margin (1.0 == the assert fails) over every entry of both
+/// second-derivative blocks, `3cpt periph1 + depot bolus`:
+///
+/// | h        | 1e-2 | 3e-3  | 1e-3      | 3e-4  | 1e-4      | 3e-5 | 1e-5 |
+/// |----------|------|-------|-----------|-------|-----------|------|------|
+/// | margin   | 4.25 | 0.386 | **0.049** | 0.151 | **0.986** | 6.16 | 69.9 |
+///
+/// At `1e-4` that case clears the assert by 1.4% — close enough that last-bit
+/// `exp`/`ln` differences between platforms flip it (it passed on macOS and
+/// failed on the Linux CI runners). The FD converges *to* the analytic value as
+/// `h` is refined toward the optimum — the analytic kernel is the accurate party
+/// — so the fix is a better-conditioned reference, not a looser bound: at `1e-3`
+/// the same entry agrees to `1.5e-4` relative, a 20× margin under the unchanged
+/// `3e-3` tolerance.
+fn check_full_provider_vs_fd_with_step(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    heh: f64,
+) {
     let n_eta = model.n_eta;
     let n_theta = theta.len();
 
@@ -2790,7 +2936,6 @@ fn check_full_provider_vs_fd(model: &CompiledModel, subject: &Subject, theta: &[
     };
     let he = 1e-6; // first-derivative step
     let ht = 1e-6;
-    let heh = 1e-4; // second-derivative step (4-point central is roundoff-prone)
 
     for (j, obs) in sens.obs.iter().enumerate() {
         // value

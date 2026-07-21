@@ -17,7 +17,10 @@ use crate::types::PkModel;
 /// Which internal rate accumulator a 1-based dose compartment routes into for
 /// the closed-form event walk. Returned by [`PkTopology::dose_channel`]; callers
 /// map each arm onto their own `rate_*` accumulator and decide the `None` policy
-/// (event_driven panics on an unsupported infusion cmt; active_rates_g skips).
+/// — since #375 both walks `panic!` on it (silently dropping an infusion from
+/// the *gradient* only would make FOCE differentiate a different dosing history
+/// than it predicted), and `check_dose_compartments` makes that unreachable from
+/// a validated call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Channel {
     Central,
@@ -76,10 +79,14 @@ impl PkTopology {
     }
 
     /// Rate channel for a 1-based dose compartment. `None` = not infusable for
-    /// this model (caller decides panic vs skip). Preserves the old
+    /// this model; every caller panics on it (see [`Channel`]). Preserves the old
     /// `match (pk_model, d.cmt) { .. , _ => .. }` fall-through: any cmt not
-    /// explicitly mapped (incl. cmt 0 and peripherals of oral models) yields
-    /// `None`, exactly the arms the old `_` caught.
+    /// explicitly mapped yields `None`, exactly the arms the old `_` caught.
+    /// Since #375 the oral peripherals map to `Some(Periph1)`/`Some(Periph2)`,
+    /// so for the six walk-supported models the only in-range `None` is `cmt 0`
+    /// (`checked_sub(1)`), NONMEM's default dose compartment — which has no
+    /// meaning for a zero-order input and is rejected by
+    /// `check_dose_compartments`.
     #[inline]
     pub(crate) fn dose_channel(&self, cmt_1based: usize) -> Option<Channel> {
         cmt_1based
@@ -147,8 +154,12 @@ static TWO_CPT_ORAL: PkTopology = PkTopology {
     n_states: 3,
     central_slot: 1,
     compartment_names: &["depot", "central", "peripheral"],
-    channels: &[Some(Depot), Some(Central)],
-    infusable: &[1, 2],
+    // The oral peripheral is infusable since #375: the depot takes no inflow from
+    // the disposition sub-system, so a rate into the peripheral drives exactly the
+    // central/peripheral pair the 2-cpt IV model has, and the oral propagator
+    // reuses that IV forced response.
+    channels: &[Some(Depot), Some(Central), Some(Periph1)],
+    infusable: &[1, 2, 3],
     event_walk_supported: true,
 };
 // 2-cpt transit: same as the 1-cpt transit — modeled-duration infusion rejected at parse
@@ -182,8 +193,10 @@ static THREE_CPT_ORAL: PkTopology = PkTopology {
     n_states: 4,
     central_slot: 1,
     compartment_names: &["depot", "central", "peripheral1", "peripheral2"],
-    channels: &[Some(Depot), Some(Central)],
-    infusable: &[1, 2],
+    // Both oral peripherals are infusable since #375 — same reduction to the
+    // 3-cpt IV forced response as `TWO_CPT_ORAL`.
+    channels: &[Some(Depot), Some(Central), Some(Periph1), Some(Periph2)],
+    infusable: &[1, 2, 3, 4],
     event_walk_supported: true,
 };
 
@@ -285,16 +298,25 @@ mod tests {
             (TwoCptIv, 2, Some(Channel::Periph1)),
             (TwoCptOral, 1, Some(Channel::Depot)),
             (TwoCptOral, 2, Some(Channel::Central)),
+            // Oral peripherals gained a rate channel in #375 — the oral
+            // propagators reuse the IV forced response, so an infusion into them
+            // is routable rather than rejected.
+            (TwoCptOral, 3, Some(Channel::Periph1)),
             (ThreeCptIv, 1, Some(Channel::Central)),
             (ThreeCptIv, 2, Some(Channel::Periph1)),
             (ThreeCptIv, 3, Some(Channel::Periph2)),
             (ThreeCptOral, 1, Some(Channel::Depot)),
             (ThreeCptOral, 2, Some(Channel::Central)),
-            // old `_` arms -> None
+            (ThreeCptOral, 3, Some(Channel::Periph1)),
+            (ThreeCptOral, 4, Some(Channel::Periph2)),
+            // Still unroutable: cmt 0 (an infusion has no default compartment)
+            // and anything past the end of the state vector.
             (OneCptIv, 0, None),
             (OneCptIv, 2, None),
-            (TwoCptOral, 3, None),
-            (ThreeCptOral, 3, None),
+            (TwoCptOral, 0, None),
+            (TwoCptOral, 4, None),
+            (ThreeCptOral, 0, None),
+            (ThreeCptOral, 5, None),
         ];
         for (m, cmt, want) in cases {
             assert_eq!(m.topology().dose_channel(cmt), want, "{m:?} cmt {cmt}");

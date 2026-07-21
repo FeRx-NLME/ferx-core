@@ -167,6 +167,14 @@ pub fn run_covariance(
         }
     };
 
+    // This entry point re-runs the inner loop (EBEs → the prediction walk), so
+    // it needs the same dose-compartment precondition `fit()` enforces (#375) —
+    // otherwise a caller-supplied population with an unroutable dose aborts the
+    // process from inside the walk, from a `Result`-returning API. Matches the
+    // `Result` form used at the adaptive chokepoint rather than the
+    // `predict()`/`simulate()` panic.
+    crate::diagnostics::first_error(&crate::api::check_dose_compartments(model_ref, pop_ref))?;
+
     // --- Sanity-check dimensions ------------------------------------------
     if model_ref.n_eta != fit.omega.nrows() {
         return Err(format!(

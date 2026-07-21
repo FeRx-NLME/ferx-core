@@ -1635,15 +1635,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 }
             };
             // Reject a `D{cmt}`/`R{cmt}` whose compartment the analytical engine
-            // cannot infuse into — the central compartment for every model, plus
-            // the peripheral compartment(s) of the 2-/3-cpt IV models, but NOT an
-            // oral depot or oral peripheral (see `PkModel::infusable_compartments`).
-            // A looser bound (e.g. raw compartment count) would let a coded `RATE`
-            // into an oral depot pass parse + the data gate, then either silently
-            // route into central (no-TV superposition) or panic in the
-            // event-driven walker — the silent/abrupt failure class this feature
-            // exists to prevent. Caught here at parse time with an actionable
-            // message.
+            // cannot infuse into (see `PkModel::infusable_compartments`): every
+            // compartment of the six walk-supported models is infusable — central
+            // for all, the oral depot since #400, the oral peripherals since #375
+            // — so what this actually catches is a `D{cmt}` past the end of the
+            // state vector, and any `D{cmt}` at all on a transit/IG model (whose
+            // `infusable` is empty). A looser bound (e.g. raw compartment count)
+            // would let such a coded `RATE` pass parse + the data gate, then
+            // either silently route into central (no-TV superposition) or panic in
+            // the event-driven walker — the silent/abrupt failure class this
+            // feature exists to prevent. Caught here at parse time with an
+            // actionable message.
             let infusable = pk_model.infusable_compartments();
             if !infusable.contains(&cmt) {
                 let supported = infusable
@@ -1655,17 +1657,18 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     "[individual_parameters]: `{name}` is a modeled infusion {kind} \
                      (RATE={rate_code}) for compartment {cmt}, but the analytical `{}` model \
                      can only infuse into compartment(s) {:?} ({supported}). A zero-order \
-                     input into another compartment (e.g. an oral depot) needs an \
-                     `ode(...)` model.",
+                     input into a compartment the closed form does not have — or into any \
+                     compartment of a transit / inverse-Gaussian absorption model — needs \
+                     an `ode(...)` model.",
                     pk_model.canonical_name(),
                     infusable,
                 ));
             }
-            // `infusable_compartments()` has ≤ 3 entries and at most one `D` and
-            // one `R` per compartment, so at most 6 distinct modeled-dose
-            // parameters are routed — comfortably inside the 9..16 (7-slot) spare
-            // region. A debug assertion documents that invariant without a
-            // permanently-dead user-facing error arm.
+            // `infusable_compartments()` has ≤ 4 entries (`three_cpt_oral`, since
+            // #375) and at most one `D` and one `R` per compartment, so at most 8
+            // distinct modeled-dose parameters are routed — comfortably inside
+            // `MAX_PK_PARAMS`. A debug assertion documents that invariant without
+            // a permanently-dead user-facing error arm.
             debug_assert!(
                 next_slot < crate::types::MAX_PK_PARAMS,
                 "modeled-dose slot {next_slot} exceeds MAX_PK_PARAMS; \

@@ -640,14 +640,23 @@ pub(crate) fn compute_extra_output_columns(
                                 // so every grid point evaluates to NaN, consistent with
                                 // W_DERIVED_CMT_TV_ANALYTICAL warning.
                                 vec![]
-                            } else if crate::pk::has_oral_depot_infusion(model.pk_model, subject) {
-                                // Analytical oral model + zero-order input into the depot
-                                // (#400): the superposition state helper models an oral
-                                // infusion as a depot bypass and cannot express a depot
-                                // zero-order input, so it would return silently-wrong finite
-                                // amounts. Return empty so every grid point evaluates to NaN,
-                                // matching the per-obs path in compute_predictions_with_states
-                                // and the W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL warning.
+                            } else if crate::pk::dose_needs_event_walk(model.pk_model, subject) {
+                                // Analytical model + a dose the superposition state helper
+                                // cannot place: a zero-order input into the oral depot
+                                // (#400), any bolus outside compartment 1, or any infusion
+                                // outside central (#375). `single_dose_states` never reads
+                                // `dose.cmt` — it picks the closed form from the *model* —
+                                // so it would return silently-wrong finite amounts (measured
+                                // 38% low on a `two_cpt_iv` peripheral-bolus AUC against a
+                                // 1e-12 ODE twin). Return empty so every grid point evaluates
+                                // to NaN, matching the per-obs path in
+                                // compute_predictions_with_states and the
+                                // W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL warning, which
+                                // promises exactly that. Must stay the *same* predicate as
+                                // the per-obs path: when this branch used the narrower
+                                // `has_oral_depot_infusion` the two disagreed, and a
+                                // `[derived]` grid integral returned a confident wrong number
+                                // while the adjacent per-obs column was NaN.
                                 vec![]
                             } else {
                                 // Time-independent params: one snapshot (t=0) is exact

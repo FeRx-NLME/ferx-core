@@ -317,10 +317,12 @@ absorption** model: drug is released into the depot at a constant rate over the
 modeled duration, then absorbed first-order into central via `KA`. This stays on
 the closed-form engine — no `ode(...)` block needed. (Per-compartment amounts in
 `sdtab`/`[derived]` are not available for those subjects — the predictions are
-exact; use an `ode(...)` model if you need the compartment amounts.) Infusing
-into an oral **peripheral** compartment is still not modelled by the closed forms,
-so a `D{periph}` (or any other non-infusable compartment) is **rejected at parse
-time** — use an `ode(...)` model.
+exact; use an `ode(...)` model if you need the compartment amounts.) Since #375
+the closed forms also infuse an oral **peripheral** compartment, so `D3` on
+`two_cpt_oral` (and `D3`/`D4` on `three_cpt_oral`) is accepted. A `D{cmt}` naming
+a compartment the model does not have — or any `D{cmt}` on a transit /
+inverse-Gaussian absorption model — is still **rejected at parse time**; use an
+`ode(...)` model for those.
 
 > One subtlety: when a subject has any modeled-`RATE` dose (`RATE=-2` or `-1`) on
 > an **analytical** model, that subject's inner-loop gradient falls back to finite

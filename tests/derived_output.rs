@@ -496,3 +496,75 @@ fn integral_window_zero_is_rejected_at_parse() {
         "error should cite window= and positive, got: {err}"
     )
 }
+
+/// Regression (#375): a `[derived]` **grid integral** over `compartments[i]` must
+/// degrade to `NaN` for a subject dosing a non-default compartment, exactly like
+/// the per-observation `compartments[i]` column next to it.
+///
+/// The two are computed by different code paths — the per-obs column by
+/// `compute_predictions_with_states`, the integral by a dense-grid reconstruction
+/// in `api::output_columns` — and they must consult the *same* predicate for
+/// "superposition cannot place this dose". When the grid path still used the older,
+/// narrower `has_oral_depot_infusion`, it fell through to the compartment-blind
+/// `analytical_state_at_times`: in the same sdtab row `compartments[1]` read `NaN`
+/// while `integral(compartments[1], 0→24)` read 19.17 against a true 31.13 (a
+/// `1e-12` `[odes]` twin of the same system) — a confident wrong number beside a
+/// column that correctly admitted it had none.
+#[test]
+fn derived_grid_integral_over_compartments_is_nan_for_a_rerouted_subject() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(5.0, 0.1, 50.0)
+  theta V1(30.0, 3.0, 300.0)
+  theta Q(2.0, 0.1, 20.0)
+  theta V2(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V1 = V1
+  Q  = Q
+  V2 = V2
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+  C_P   = compartments[1]
+  AUC_P = integral(compartments[1], from=0, to=24)
+
+[fit_options]
+  method   = focei
+  maxiter  = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    // Bolus into CMT=2 — the peripheral. Superposition cannot place it, so the
+    // subject reroutes to the event-driven walk and has no compartment states.
+    let mut pop = one_dose_population();
+    pop.subjects[0].doses = vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)];
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("short fit must not error");
+
+    for sr in &result.subjects {
+        for name in &["C_P", "AUC_P"] {
+            let col = sr
+                .extra_columns
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("extra column '{name}' missing"));
+            assert!(
+                col.1.iter().all(|v| v.is_nan()),
+                "'{name}' must be NaN for a subject dosing a non-default compartment \
+                 (superposition cannot reconstruct its states), got {:?}",
+                col.1
+            );
+        }
+    }
+}
