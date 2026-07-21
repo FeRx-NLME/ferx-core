@@ -167,15 +167,31 @@ Hessian-vs-FD-of-gradient test suite.
 
 ### Why `N = 50`?
 
-The truncation tail after `N` cycles is bounded by `exp(-N·λ·II)` for
-each disposition rate `λ`. For typical PK
-(`λ·II ≈ 2`, i.e. ~3 half-lives per dosing interval),
-`exp(-100) ≈ 4e-44` — well below any meaningful precision. For very
-slow PK (`λ·II = 0.1`, ~14 half-lives total over the 50 cycles),
-`exp(-5) ≈ 7e-3` — the slowest realistic case. ferx uses fixed
-`N = 50` rather than adaptive convergence checking because (a) the
-bound is conservative and (b) skipping the convergence check keeps
-the hot path branch-free.
+The truncation tail after `N` cycles is bounded by `exp(-N·λ_slow·II)`, where
+`λ_slow` is the **slowest** disposition rate constant. For typical PK
+(`λ_slow·II ≈ 2`, i.e. ~3 half-lives per dosing interval), `exp(-100) ≈ 4e-44` —
+well below any meaningful precision.
+
+It is **not** always negligible, and the governing quantity is `λ_slow·II`, not the
+number of compartments. A one-compartment oral model with `CL = 0.1`, `V = 50`
+(t½ ≈ 350 h) dosed `II = 12` has `λ_slow·II ≈ 0.024`, giving `exp(-1.2) ≈ 0.30` — a
+**30 %** difference from the exact periodic steady state. A two-compartment model
+with a slow, deep peripheral (`Q = 0.5`, `V2 = 500`) reaches ~9 % at the same `II`.
+Both are measured, not estimated. As a rule of thumb the truncation is negligible
+once `λ_slow·II ≳ 0.5` and can reach tens of percent when it is not.
+
+This matters only when a subject is served by the **pulse-train** path. The
+dose-superposition closed form uses the exact periodic solution and is unaffected;
+the event-driven walk and the ODE path use the pulse train. A subject is routed to
+the walk by a time-varying covariate, an `EVID=3/4` reset, IOV, or (since #375) a
+dose into a non-default compartment — so the same dataset can move between the two
+representations. **No warning is emitted** when the tail is significant.
+
+ferx loops up to `N = 50` cycles with an early stop once the cycle-to-cycle change
+falls below `SS_EQUILIBRATION_TOL` (`1e-12` relative, `src/dosing.rs`) — added in
+#519/#532, so the loop is no longer unconditionally fixed-length. The early stop
+fires for fast PK; for the slow cases above it never trips and the full 50 cycles
+run, which is exactly when the residual tail is largest.
 
 If you need tighter accuracy for an unusually slow PK, the constant has a single
 definition: `SS_EQUILIBRATION_CYCLES` in `src/dosing.rs` (the analytical
@@ -192,7 +208,7 @@ event-driven and ODE paths both use it).
 SS doses are typically rare (one per subject at the start of a
 maintenance regimen), so the absolute overhead per fit iteration is
 modest even for ODE models. If a benchmark shows SS equilibration as
-a hot spot, an adaptive `N` (loop until `||state - prev|| / ||state||
+a hot spot, a tighter early-stop (loop until `||state - prev|| / ||state||
 < tol`) is the obvious follow-up — it would early-exit on fast PK.
 
 ## DSL example

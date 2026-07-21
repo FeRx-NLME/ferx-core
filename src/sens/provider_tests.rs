@@ -9751,3 +9751,143 @@ fn iov_tvcov_3cpt_matches_fd_of_predict_iov() {
         &[0.12, -0.08, 0.20, 0.05, -0.10],
     );
 }
+
+const ONECPT_IV_TVCOV_SS: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// **The gradient twin of the SS `CMT=0` fix** (#375).
+///
+/// `CMT=0` is NONMEM's *default dose compartment*. #375 fixed the **value** walk
+/// (`equilibrate_ss_state_event_driven`), which had bailed out early on it and
+/// returned an unequilibrated all-zero state — the single-dose curve instead of
+/// the accumulated steady state. The same early return existed in the **gradient**
+/// walk (`equilibrate_ss_g`) and was fixed alongside it, but nothing exercised it:
+/// mutation testing showed that restoring `|| dose.cmt == 0` there left the entire
+/// suite green. That is the dangerous half — a gradient that equilibrates
+/// differently from the value it accompanies makes FOCE/FOCEI differentiate a
+/// dosing history that was never predicted.
+///
+/// `equilibrate_ss_g` is reachable only from the event-driven sensitivity walk, so
+/// the subject needs a TV covariate to be routed there (an SS `CMT=0` dose alone
+/// stays on dose superposition, which is `cmt`-blind and equilibrates correctly by
+/// accident). Two independent checks:
+///
+///   (a) the full provider matches central FD of the **production** predictor,
+///       which does equilibrate `CMT=0`. This is what actually kills the original
+///       bug — it fires on the value assert (analytic 10.77 vs production 40.62,
+///       the ratio being the lost accumulation factor `1/(1 − e^{−k·II})`), and it
+///       also catches a corrupted θ-, η- or Hessian-block of the trough jet.
+///   (b) `CMT=0` and `CMT=1` must produce identical sensitivities, since they
+///       denote the same compartment. Not redundant with (a): (a) compares the
+///       gradient walk against a *value* walk that is a separate driver but shares
+///       the leaf kernel and the truncation policy, so a bug present in **both**
+///       walks is invisible to it and caught only here.
+///
+/// Both were established by mutation rather than assumed: restoring the bail kills
+/// (a); restoring it in both walks is caught only by (b); zeroing any single
+/// derivative block of the trough jet is caught by (a). What neither catches is a
+/// change to the *shared* cycle budget (`SS_EQUILIBRATION_CYCLES`) — an 8-cycle
+/// budget moves both walks together and leaves this test green, so absolute
+/// steady-state accuracy rests on the separate NONMEM `ss_cmt0` anchor, not here.
+#[test]
+fn ss_cmt_zero_gradient_equilibrates_like_the_default_compartment() {
+    let m = parse_model_string(ONECPT_IV_TVCOV_SS).expect("parse");
+    let theta = vec![0.2, 10.0, 0.75];
+    let eta = vec![0.15, -0.10];
+    let obs_times = [1.0, 3.0, 6.0, 11.0];
+    let obs_wts = [70.0, 80.0, 90.0, 100.0];
+
+    let mk = |cmt: usize| {
+        tvcov_subject(
+            vec![DoseEvent::new(0.0, 100.0, cmt, 0.0, true, 12.0)],
+            // Deliberately **not** the reference weight. At `WT = 70` the covariate
+            // term `(WT/70)^THETA_WT` is identically 1 with an identically-zero jet,
+            // so `THETA_WT`'s axis is dead inside `equilibrate_ss_g` and a mutation
+            // zeroing only that axis survives the whole suite. Off-reference makes
+            // the covariate-θ path live.
+            &[85.0],
+            &obs_times,
+            &obs_wts,
+            Vec::new(),
+            Vec::new(),
+            &[],
+        )
+    };
+    let s0 = mk(0);
+    let s1 = mk(1);
+
+    assert!(
+        s0.has_tv_covariates() && subject_routes_to_event_walk(&m, &s0),
+        "fixture must reach the event-driven sens walk, where `equilibrate_ss_g` lives"
+    );
+
+    // (a) analytic vs FD of production.
+    check_full_provider_vs_fd(&m, &s0, &theta, &eta);
+
+    // (b) CMT=0 and CMT=1 denote the same compartment — sensitivities must be
+    // identical, not merely close.
+    let a = subject_sensitivities(&m, &s0, &theta, &eta).expect("cmt 0 supported");
+    let b = subject_sensitivities(&m, &s1, &theta, &eta).expect("cmt 1 supported");
+
+    // Every θ axis must be live inside the equilibration, or a mutation that
+    // corrupts only a dead one passes unnoticed. `THETA_WT` (index 2) is the one
+    // at risk: it enters as `(WT/70)^THETA_WT`, so at the reference weight its jet
+    // is identically zero and the axis is untested. Guards the `&[85.0]` above
+    // against silently reverting to `70.0`.
+    for (i, o) in a.obs.iter().enumerate() {
+        for (k, g) in o.df_dtheta.iter().enumerate() {
+            assert!(
+                *g != 0.0,
+                "obs {i}: df_dtheta[{k}] is exactly zero — that θ axis is dead in this \
+                 fixture, so nothing here tests it (is the dose covariate back at the \
+                 reference weight?)"
+            );
+        }
+    }
+    assert_eq!(a.obs.len(), b.obs.len());
+    for (i, (o0, o1)) in a.obs.iter().zip(b.obs.iter()).enumerate() {
+        assert_eq!(o0.f, o1.f, "obs {i}: value differs between CMT=0 and CMT=1");
+        assert_eq!(o0.df_deta, o1.df_deta, "obs {i}: df_deta differs");
+        assert_eq!(o0.df_dtheta, o1.df_dtheta, "obs {i}: df_dtheta differs");
+        assert_eq!(o0.d2f_deta2, o1.d2f_deta2, "obs {i}: d2f_deta2 differs");
+        assert_eq!(
+            o0.d2f_deta_dtheta, o1.d2f_deta_dtheta,
+            "obs {i}: d2f_deta_dtheta differs"
+        );
+    }
+    // Guard against a vacuous pass: an SS dose must actually accumulate above the
+    // single-dose curve, so the equilibration is doing something.
+    let single = tvcov_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[70.0],
+        &obs_times,
+        &obs_wts,
+        Vec::new(),
+        Vec::new(),
+        &[],
+    );
+    let sd = subject_sensitivities(&m, &single, &theta, &eta).expect("single-dose supported");
+    assert!(
+        a.obs[0].f > sd.obs[0].f * 1.05,
+        "SS must accumulate well above the single-dose curve (got {} vs {}); \
+         if these are equal the equilibration was skipped and the test is vacuous",
+        a.obs[0].f,
+        sd.obs[0].f
+    );
+}

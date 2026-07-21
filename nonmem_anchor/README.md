@@ -14,6 +14,7 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | **Per-route lag** | `FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2, lag=LAG2)` (IR + delayed-release) | `per_route_lag.ctl` | `per_route_lag_fit.ferx` |
 | **Steady-state absorption** | `SS=1` into `first_order(ka)` — [#719](https://github.com/FeRx-NLME/ferx-core/issues/719) gap 1 (`ADVAN2` exact analytic SS; `KA` slow so the absorption tail spans `II`) | `ss_first_order.ctl` | *(in `tests/ss_absorption_nonmem_anchor.rs`)* |
 | **Infusion into absorption** | `RATE>0` into `first_order(ka)` — [#719](https://github.com/FeRx-NLME/ferx-core/issues/719) gap 2 (`ADVAN2` native zero-order-into-depot = the kernel convolution `R_in_inf`) | `inf_first_order.ctl` | *(in `tests/infusion_absorption_nonmem_anchor.rs`)* |
+| **Dose compartment** | any `CMT` on the six analytical disposition models — [#375](https://github.com/FeRx-NLME/ferx-core/issues/375) (`ADVAN1/2/3/4/11/12`, `MAXEVAL=0`, `$TABLE FORMAT=,1PE17.10`) | `dose_cmt_*.ctl` (13) | *(in `tests/nonmem_dose_compartment_anchor.rs`)* |
 
 The transit control runs on `transit_oral.csv`; the IG and Weibull controls run
 on `igd_oral.csv` (the same data re-keyed to a 1-compartment layout — every record
@@ -557,3 +558,56 @@ shared optimum, and NONMEM recovers the lagtime (0.501 vs truth 0.5) and disposi
 Together with the analytic covariate anchor above, lagtime, F, TV-covariates, and multi-dose
 superposition are now each NONMEM-anchored on the transit absorption model across both the analytic
 and ODE-twin engines.
+
+## Dose-compartment anchors (#375)
+
+`dose_cmt_*.ctl` — 13 evaluation-only runs (`$ESTIMATION MAXEVAL=0`, `$OMEGA 0 FIX`,
+structural values hard-coded in `$PK`) pinning how NONMEM places a dose into a
+**non-default compartment**, and how it treats `SS` with `CMT=0`. One subject, a
+100 mg dose at `t = 0`, observations at `t = 1, 4, 8 h`, and throughout
+`CL = 5, V/V1 = 50, Q = 3, V2 = 80, Q3 = 1, V3 = 120, KA = 1`. Note that NONMEM's
+`TRANS4` parameter *names* are per-ADVAN, so the same physical values are renumbered in
+the control streams: `ADVAN4` reads `V2 = 50` (central) / `V3 = 80` (peripheral), and
+`ADVAN12` reads `V2 = 50`, `Q3 = 3`, `V3 = 80`, `Q4 = 1`, `V4 = 120`. Each run has its own
+matched dataset (`dose_cmt_<case>.csv`) differing only in the dose record's `CMT`
+(and `RATE` / `SS`+`II` where the case needs it).
+
+| case | ADVAN | what it pins |
+|------|-------|--------------|
+| `ss_cmt0`, `ss_cmt1` | 1 | `SS=1 II=12`: NONMEM prints **identical** `PRED` for `CMT=0` and `CMT=1`, so `CMT=0` is the *default dose compartment* and must equilibrate like any other |
+| `advan2_bolus_cmt2` | 2 | oral model, bolus straight into central |
+| `advan3_bolus_cmt2` | 3 | 2-cpt IV, bolus into the peripheral |
+| `advan4_bolus_cmt3` | 4 | 2-cpt oral, bolus into the peripheral |
+| `advan11_bolus_cmt3` | 11 | 3-cpt IV, bolus into peripheral-2 |
+| `advan12_bolus_cmt2` | 12 | 3-cpt oral, bolus into central |
+| `advan3_inf_cmt2` | 3 | `RATE=20` into an IV peripheral |
+| `advan4_inf_cmt3` | 4 | `RATE=20` into an **oral** peripheral — prints the same `PRED` as `advan3_inf_cmt2`, confirming the oral propagator may reuse the IV forced response (the depot is empty throughout) |
+| `advan12_inf_cmt3`, `advan12_inf_cmt4` | 12 | `RATE=20` into an oral 3-cpt peripheral-1 / peripheral-2 |
+| `advan11_inf_cmt2`, `advan11_inf_cmt3` | 11 | the IV twins of the two above — anchored separately so a discrepancy is attributed to the shared 3-cpt forced response rather than the oral wiring |
+
+**On the 3-cpt infusion tolerance.** `tests/nonmem_dose_compartment_anchor.rs` compares
+the `ADVAN11`/`ADVAN12` infusion cases at `3e-5` rather than the `1e-9` / `1e-8` used
+elsewhere, and the bound is set by *NONMEM's* accuracy, not ferx's: NONMEM's 3-cpt forced
+response differs from a `1e-12` RK45 integration of the same ODE system by 2.15e-6
+(1.09e-5 on the smallest-magnitude case), while ferx's closed form agrees with that same
+reference to ~2e-11 (1.8e-12 on the largest-magnitude case). Bolus cases on identical
+eigenvalues match to <1e-8, so the discrepancy is
+specific to NONMEM's infusion path. `tests/oral_peripheral_infusion.rs` is the tight
+oracle (1e-9 against an ODE twin), so the looser cross-tool bound cannot hide a regression.
+
+### Run it
+
+From this directory (the `$TABLE FILE=` paths are relative), then move the output into
+`results/`:
+
+```bash
+for f in dose_cmt_*.ctl; do nmfe76 "$f" "${f%.ctl}.lst"; done
+mv dose_cmt_*.lst dose_cmt_*.tab results/
+```
+
+> **Run status — DONE (#375).** All 13 runs executed on NONMEM 7.6.0 via
+> `nmfe76` under the committed filenames; `results/dose_cmt_*.{lst,tab}` are the verbatim
+> output of the committed `.ctl`. Every value
+> transcribed into `tests/nonmem_dose_compartment_anchor.rs` reproduces at **zero**
+> relative deviation, so the committed anchors are re-derivable rather than
+> taken on trust.
