@@ -798,6 +798,7 @@ mod ctmm_smoke {
             .iter()
             .map(|&(time, state)| ObsRecord::DiscreteState {
                 time,
+                raw_time: time,
                 state,
                 cmt: 5,
             })
@@ -864,6 +865,7 @@ mod ctmm_smoke {
             .iter()
             .map(|&(time, state)| ObsRecord::DiscreteState {
                 time,
+                raw_time: time,
                 state,
                 cmt: 5,
             })
@@ -892,6 +894,7 @@ mod ctmm_smoke {
             .iter()
             .map(|&(time, state)| ObsRecord::DiscreteState {
                 time,
+                raw_time: time,
                 state,
                 cmt: 5,
             })
@@ -938,6 +941,7 @@ mod ctmm_smoke {
             .iter()
             .map(|&(time, state)| ObsRecord::DiscreteState {
                 time,
+                raw_time: time,
                 state,
                 cmt: 5,
             })
@@ -1025,6 +1029,7 @@ mod ctmm_smoke {
             .iter()
             .map(|&(time, state)| ObsRecord::DiscreteState {
                 time,
+                raw_time: time,
                 state,
                 cmt: 5,
             })
@@ -1116,6 +1121,7 @@ mod ctmm_smoke {
                 .iter()
                 .map(|&(time, state)| ObsRecord::DiscreteState {
                     time,
+                    raw_time: time,
                     state,
                     cmt: 5,
                 })
@@ -1210,6 +1216,7 @@ mod ctmm_smoke {
                     .iter()
                     .map(|&(time, state)| ObsRecord::DiscreteState {
                         time,
+                        raw_time: time,
                         state,
                         cmt: 5,
                     })

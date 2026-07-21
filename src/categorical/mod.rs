@@ -69,11 +69,12 @@ fn for_each_binary_lp<F>(
     covariates: &HashMap<String, f64>,
     mut f: F,
 ) where
-    F: FnMut(f64, usize, f64),
+    F: FnMut(BinaryRecordLp),
 {
     for r in records {
         if let ObsRecord::DiscreteState {
             time,
+            raw_time,
             state,
             cmt: c,
         } = r
@@ -84,11 +85,48 @@ fn for_each_binary_lp<F>(
             // The predictor is evaluated **once per record** inside `with_model_time`
             // so a `TIME` term resolves to that record's time; a predictor without
             // `TIME` is constant across records (the guard is a cheap thread-local
-            // set/restore).
+            // set/restore). The guard gets the **internal** clock (what the engine and
+            // the likelihood use); `raw_time` is carried alongside purely for reporting.
             let lp = with_model_time(*time, || lp_fn(theta, eta, covariates));
-            f(*time, *state, lp);
+            f(BinaryRecordLp {
+                model_time: *time,
+                raw_time: *raw_time,
+                state: *state,
+                lp,
+            });
         }
     }
+}
+
+/// One binary record as seen by [`for_each_binary_lp`].
+///
+/// `raw_time` is the **user clock** — the TIME the input CSV carried — so every
+/// reported row (sdtab, `simulate()`, `predict_categorical`) joins back to the input
+/// and to covtab. It differs from the engine's internal clock whenever a subject has
+/// reset-delimited occasions, where the internal timeline is shifted to stay monotonic.
+/// The predictor itself is always evaluated on the internal clock; only reporting uses
+/// this field.
+struct BinaryRecordLp {
+    /// Internal (occasion-shifted) clock — what `with_model_time` must be given for any
+    /// *further* predictor evaluation on this record, so it agrees with `lp` above.
+    model_time: f64,
+    raw_time: f64,
+    state: usize,
+    lp: f64,
+}
+
+/// The binary endpoints of `model`, in ascending CMT order.
+///
+/// **Never iterate `model.endpoints` directly when the result is observable.** It is a
+/// `HashMap`, so its iteration order is randomized per process — RNG consumption order,
+/// emitted row order, and therefore `simulate_with_seed`'s reproducibility all depend on
+/// visiting endpoints deterministically. `binary_cmts()` sorts, which is why the
+/// `--simulate` template builder already uses it.
+fn binary_endpoints(model: &CompiledModel) -> impl Iterator<Item = (usize, &EndpointLikelihood)> {
+    model
+        .binary_cmts()
+        .into_iter()
+        .filter_map(move |cmt| model.endpoints.get(&cmt).map(|ep| (cmt, ep)))
 }
 
 /// Negative Bernoulli log-likelihood for one subject's binary records on `cmt`.
@@ -116,32 +154,25 @@ pub(crate) fn binary_data_term(
     covariates: &HashMap<String, f64>,
 ) -> f64 {
     let mut nll = 0.0;
-    for_each_binary_lp(
-        lp_fn,
-        cmt,
-        records,
-        theta,
-        eta,
-        covariates,
-        |_t, state, lp| {
-            debug_assert!(state <= 1, "binary state must be 0/1 (validated pre-fit)");
-            if !lp.is_finite() {
-                // An overflowed predictor (extreme θ / covariate) makes
-                // `softplus(±∞) − y·(±∞)` a NaN/∞ that the FOCEI outer objective
-                // (`foce_subject_nll_interaction_with_tte`) does not guard at its final
-                // return — repel the optimizer with the survival module's `1e20`
-                // sentinel instead (fail-loud-but-alive), as `tte_data_term` does for
-                // its own degenerate cases.
-                nll += 1e20;
-                return;
-            }
-            let y = (state as f64).min(1.0);
-            nll += match link {
-                // p = inv_logit(lp): −[y·log p + (1−y)·log(1−p)] = softplus(lp) − y·lp.
-                LinkFn::Logit => softplus(lp) - y * lp,
-            };
-        },
-    );
+    for_each_binary_lp(lp_fn, cmt, records, theta, eta, covariates, |r| {
+        let (state, lp) = (r.state, r.lp);
+        debug_assert!(state <= 1, "binary state must be 0/1 (validated pre-fit)");
+        if !lp.is_finite() {
+            // An overflowed predictor (extreme θ / covariate) makes
+            // `softplus(±∞) − y·(±∞)` a NaN/∞ that the FOCEI outer objective
+            // (`foce_subject_nll_interaction_with_tte`) does not guard at its final
+            // return — repel the optimizer with the survival module's `1e20`
+            // sentinel instead (fail-loud-but-alive), as `tte_data_term` does for
+            // its own degenerate cases.
+            nll += 1e20;
+            return;
+        }
+        let y = (state as f64).min(1.0);
+        nll += match link {
+            // p = inv_logit(lp): −[y·log p + (1−y)·log(1−p)] = softplus(lp) − y·lp.
+            LinkFn::Logit => softplus(lp) - y * lp,
+        };
+    });
     nll
 }
 
@@ -175,7 +206,7 @@ pub(crate) fn discrete_subject_nll(
         return 0.0;
     }
     let mut nll = 0.0;
-    for (cmt, endpoint) in &model.endpoints {
+    for (cmt, endpoint) in binary_endpoints(model) {
         // Binary today; a new discrete family (ordinal / Poisson / negative-binomial …) adds
         // its branch here — reached through this one function, so no likelihood dispatch site
         // changes. (Gaussian is scored by the residual path, TTE by the hazard dispatch.)
@@ -185,7 +216,7 @@ pub(crate) fn discrete_subject_nll(
             nll += binary_data_term(
                 *link,
                 lp_fn,
-                *cmt,
+                cmt,
                 &subject.obs_records,
                 theta,
                 eta,
@@ -228,19 +259,20 @@ pub fn simulate_binary<R: rand::Rng>(
     if subject.obs_records.is_empty() {
         return;
     }
-    for (cmt, endpoint) in &model.endpoints {
+    for (cmt, endpoint) in binary_endpoints(model) {
         let EndpointLikelihood::Binary { link, lp_fn, .. } = endpoint else {
             continue;
         };
         let mut n_nonfinite = 0usize;
         for_each_binary_lp(
             lp_fn,
-            *cmt,
+            cmt,
             &subject.obs_records,
             theta,
             eta,
             &subject.covariates,
-            |time, _state, lp| {
+            |r| {
+                let lp = r.lp;
                 // A NaN predictor has no Bernoulli law to draw from. Unlike the fit
                 // path there is no optimizer to steer away from it (§8.8.3's "simulation
                 // has no optimizer to steer"), so count it and warn rather than emit a
@@ -261,8 +293,9 @@ pub fn simulate_binary<R: rand::Rng>(
                     draw,
                     sim,
                     id: subject.id.clone(),
-                    time,
-                    cmt: *cmt,
+                    // Raw data TIME, matching the Gaussian rows and sdtab.
+                    time: r.raw_time,
+                    cmt,
                     ipred: p,
                     outcome: crate::types::SimOutcome::Category { state },
                 });
@@ -295,24 +328,28 @@ pub fn predict_binary(
     if subject.obs_records.is_empty() {
         return;
     }
-    for (cmt, endpoint) in &model.endpoints {
+    for (cmt, endpoint) in binary_endpoints(model) {
         let EndpointLikelihood::Binary { link, lp_fn, .. } = endpoint else {
             continue;
         };
         for_each_binary_lp(
             lp_fn,
-            *cmt,
+            cmt,
             &subject.obs_records,
             theta,
             eta,
             &subject.covariates,
-            |time, state, lp| {
-                let p = binary_prob(*link, lp);
+            |r| {
+                let p = binary_prob(*link, r.lp);
                 results.push(EndpointPredictionResult {
                     id: subject.id.clone(),
-                    cmt: *cmt,
-                    time,
-                    observed: Some(state as f64),
+                    cmt,
+                    time: r.raw_time,
+                    // Clamped like every other consumer: `validate_binary_states` runs
+                    // at fit setup only, so an out-of-range DV can reach this public
+                    // entry point and must not escape as `observed: Some(2.0)` against
+                    // a two-element `probs` (breaking the "index is the DV code" contract).
+                    observed: Some((r.state as f64).min(1.0)),
                     prediction: Prediction::CatProbs {
                         probs: vec![1.0 - p, p],
                     },
@@ -322,18 +359,25 @@ pub fn predict_binary(
     }
 }
 
-/// Standardized (Pearson) residual for a binary record: `(y − p) / √(p(1−p))`
-/// (§8.8.5). Returns NaN at a degenerate `p ∈ {0, 1}`, where the residual is
-/// undefined — callers surface it rather than silently substituting a finite value.
+/// Standardized (Pearson) residual for a binary record: `(y − p) / √(p·q)`, where
+/// `q = 1 − p` is supplied **independently** rather than recomputed (§8.8.5).
 ///
-/// Pairs with [`predict_binary`], whose rows carry both the observed DV and `p`, so a
-/// caller (the R wrapper, a diagnostics table) can form the residual without
-/// re-deriving the probability. The core `{model}-sdtab.csv` writer is still
-/// Gaussian-shaped (IPRED/IWRES/CWRES) and does not yet emit a discrete-endpoint row;
-/// giving every non-Gaussian endpoint its own diagnostics block is a separate slice.
-pub fn binary_pearson_residual(y: f64, p: f64) -> f64 {
-    let v = p * (1.0 - p);
-    if v <= 0.0 {
+/// Taking `q` as its own argument is the whole point. `inv_logit` saturates to exactly
+/// `1.0` once `lp ≳ 36.7`, so a caller computing `1.0 - p` there gets exactly `0` to
+/// catastrophic cancellation and the residual collapses to NaN — blanking precisely the
+/// most extreme, most diagnostic observations, and only on the *positive* tail (the
+/// negative tail keeps full resolution because `1 − p ≈ 1` there). Evaluating `q` as
+/// `inv_logit(−lp)` instead preserves it down to ~1e-308, so the two tails behave
+/// symmetrically. The likelihood has no such cliff — `softplus` resolves `lp = 40` to
+/// 4.2e-18 — so recomputing `q` here would make the diagnostics and the OFV disagree
+/// about which records are informative.
+///
+/// Returns NaN only when the variance genuinely underflows to zero, where the residual
+/// is undefined; callers surface that as an empty sdtab cell rather than substituting a
+/// finite value.
+pub fn binary_pearson_residual(y: f64, p: f64, q: f64) -> f64 {
+    let v = p * q;
+    if !(v > 0.0) {
         return f64::NAN;
     }
     (y - p) / v.sqrt()
@@ -356,42 +400,40 @@ pub fn binary_diagnostics(
         return rows;
     }
     let zero_eta = vec![0.0_f64; eta.len()];
-    for (cmt, endpoint) in &model.endpoints {
+    for (cmt, endpoint) in binary_endpoints(model) {
         let EndpointLikelihood::Binary { link, lp_fn, .. } = endpoint else {
             continue;
         };
-        // PRED is the typical-subject probability (η = 0), mirroring the Gaussian
-        // `pred`/`ipred` split; IPRED conditions on this subject's EBE.
-        let mut pred_p = Vec::new();
+        // One pass, computing both predictions per record. An earlier version walked the
+        // records twice (once at η = 0 for PRED, once at the EBE for IPRED) and paired
+        // them by index; that pairing was only incidentally correct, and the fallback it
+        // needed was dead code that would have masked a divergence rather than failing
+        // loudly. Evaluating both here makes the alignment structural.
         for_each_binary_lp(
             lp_fn,
-            *cmt,
-            &subject.obs_records,
-            theta,
-            &zero_eta,
-            &subject.covariates,
-            |_t, _s, lp| pred_p.push(binary_prob(*link, lp)),
-        );
-        let mut k = 0usize;
-        for_each_binary_lp(
-            lp_fn,
-            *cmt,
+            cmt,
             &subject.obs_records,
             theta,
             eta,
             &subject.covariates,
-            |time, state, lp| {
-                let p = binary_prob(*link, lp);
-                let y = (state as f64).min(1.0);
-                rows.push(DiscreteObsDiagnostic {
-                    cmt: *cmt,
-                    time,
-                    dv: y,
-                    pred: pred_p.get(k).copied().unwrap_or(f64::NAN),
-                    ipred: p,
-                    iwres: binary_pearson_residual(y, p),
+            |r| {
+                let p = binary_prob(*link, r.lp);
+                // `q` from `inv_logit(−lp)`, never `1 − p` — see `binary_pearson_residual`.
+                let q = binary_prob(*link, -r.lp);
+                // PRED is the typical-subject probability (η = 0), mirroring the Gaussian
+                // `pred`/`ipred` split; IPRED conditions on this subject's EBE.
+                let pred = with_model_time(r.model_time, || {
+                    binary_prob(*link, lp_fn(theta, &zero_eta, &subject.covariates))
                 });
-                k += 1;
+                let y = (r.state as f64).min(1.0);
+                rows.push(DiscreteObsDiagnostic {
+                    cmt,
+                    time: r.raw_time,
+                    dv: y,
+                    pred,
+                    ipred: p,
+                    iwres: binary_pearson_residual(y, p, q),
+                });
             },
         );
     }
@@ -430,6 +472,7 @@ mod tests {
     fn rec(time: f64, state: usize) -> ObsRecord {
         ObsRecord::DiscreteState {
             time,
+            raw_time: time,
             state,
             cmt: 3,
         }
@@ -594,18 +637,52 @@ mod tests {
     }
 
     /// Pearson residual: sign follows `y − p`, magnitude is standardized, and a
-    /// degenerate `p` yields NaN rather than a plausible-looking finite number.
+    /// genuinely degenerate variance yields NaN rather than a plausible-looking number.
     #[test]
     fn pearson_residual_standardizes_and_flags_degenerate_p() {
-        // p = 0.5 ⇒ √(p(1−p)) = 0.5 ⇒ residual = ±1.
-        assert!((binary_pearson_residual(1.0, 0.5) - 1.0).abs() < 1e-12);
-        assert!((binary_pearson_residual(0.0, 0.5) + 1.0).abs() < 1e-12);
+        let res = |y: f64, p: f64| binary_pearson_residual(y, p, 1.0 - p);
+        // p = 0.5 ⇒ √(p·q) = 0.5 ⇒ residual = ±1.
+        assert!((res(1.0, 0.5) - 1.0).abs() < 1e-12);
+        assert!((res(0.0, 0.5) + 1.0).abs() < 1e-12);
         // A surprising observation is a large positive residual.
-        let r = binary_pearson_residual(1.0, 0.01);
+        let r = res(1.0, 0.01);
         assert!(r > 9.0, "expected a large residual, got {r}");
-        // Degenerate p: undefined, surfaced as NaN (not 0, not ±∞).
-        assert!(binary_pearson_residual(1.0, 0.0).is_nan());
-        assert!(binary_pearson_residual(0.0, 1.0).is_nan());
+        // Degenerate variance: undefined, surfaced as NaN (not 0, not ±∞).
+        assert!(binary_pearson_residual(1.0, 0.0, 1.0).is_nan());
+        assert!(binary_pearson_residual(0.0, 1.0, 0.0).is_nan());
+        // NaN inputs must not sneak through the `!(v > 0.0)` guard as a finite number.
+        assert!(binary_pearson_residual(1.0, f64::NAN, f64::NAN).is_nan());
+    }
+
+    /// **The tail-symmetry guard.** `q` is passed independently precisely so the
+    /// residual does not collapse on the positive tail, where `1 − p` cancels to exactly
+    /// zero once `inv_logit` saturates. Both tails must stay finite and mirror each other.
+    #[test]
+    fn pearson_residual_survives_the_saturating_tail() {
+        // `1 - inv_logit(lp)` is exactly 0 here — the cancellation that used to blank
+        // the most extreme (most diagnostic) observations.
+        assert_eq!(1.0 - inv_logit(40.0), 0.0);
+        let from_lp = |y: f64, lp: f64| {
+            binary_pearson_residual(
+                y,
+                binary_prob(LinkFn::Logit, lp),
+                binary_prob(LinkFn::Logit, -lp),
+            )
+        };
+        for lp in [36.0_f64, 36.8, 40.0, 50.0] {
+            let pos = from_lp(0.0, lp); // surprising: y=0 at p≈1
+            let neg = from_lp(1.0, -lp); // its mirror image: y=1 at p≈0
+            assert!(pos.is_finite(), "lp={lp}: positive tail collapsed to {pos}");
+            assert!(neg.is_finite(), "lp={lp}: negative tail collapsed to {neg}");
+            // Bernoulli symmetry: the two are exact negatives of each other.
+            assert!(
+                (pos + neg).abs() < 1e-6 * neg.abs().max(1.0),
+                "lp={lp}: tails asymmetric ({pos} vs {neg})"
+            );
+            assert!(pos < -1e7, "lp={lp}: expected a large residual, got {pos}");
+        }
+        // And it must not quantize: a larger lp is a strictly larger residual.
+        assert!(from_lp(0.0, 40.0).abs() > from_lp(0.0, 36.0).abs());
     }
 
     /// `Prediction::prob` reads a category out by index and refuses a continuous

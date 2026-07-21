@@ -146,6 +146,7 @@ pub fn binary_pop(subjects: &[(f64, Vec<(f64, u8)>)], cmt: usize) -> ferx_core::
                 .iter()
                 .map(|&(t, st)| ObsRecord::DiscreteState {
                     time: t,
+                    raw_time: t,
                     state: st as usize,
                     cmt,
                 })

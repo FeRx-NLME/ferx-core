@@ -1034,8 +1034,10 @@ fn parse_subjects(
             per_obs_tad: vec![],
             compartment_states: vec![],
             // The .fitrx checkpoint format carries only the Gaussian per-observation
-            // vectors; discrete-endpoint diagnostics are recomputed post-fit rather
-            // than round-tripped, so a restored result starts with none.
+            // vectors (`predictions.csv`), so a restored result has **no** discrete
+            // rows and nothing recomputes them — `sdtab()` on a restored binary fit
+            // emits no discrete rows, unlike the live run's own sdtab. Round-tripping
+            // them belongs with the checkpoint format, not here (#897 follow-up).
             #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
         });

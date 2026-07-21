@@ -1281,7 +1281,11 @@ fn append_discrete_rows(cols: &mut [(String, Vec<f64>)], result: &FitResult) {
                     "IPRED" => row.ipred,
                     "IWRES" => row.iwres,
                     "EBE_OFV" => sr.ofv_contribution,
-                    "N_OBS" => sr.n_obs as f64,
+                    // `N_OBS` deliberately blank: `SubjectResult::n_obs` counts Gaussian
+                    // observations only, so a binary-only fit would write `N_OBS = 0` on
+                    // every row of a table plainly full of observations. Blank is honest;
+                    // 0 invites a reader to filter the dataset away.
+                    "N_OBS" => f64::NAN,
                     // CWRES, CENS, OCC, NPDE, NPD, TAFD, TAD and any [derived] /
                     // [output] column: undefined for a discrete record → blank cell.
                     _ => f64::NAN,

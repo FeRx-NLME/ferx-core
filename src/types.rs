@@ -2173,7 +2173,17 @@ pub enum ObsRecord {
     /// Discrete-state observation: an integer category or Markov state index.
     /// Serves binary/ordinal (Track C) and DTMM/CTMM state observations
     /// (Track D); the CMT's declared endpoint disambiguates the meaning.
-    DiscreteState { time: f64, state: usize, cmt: usize },
+    /// Discrete-state (binary / categorical / Markov) observation. `time` is the
+    /// **internal** occasion-shifted clock the engine and likelihood run on;
+    /// `raw_time` is the TIME the input CSV carried, and is what every reported row
+    /// (sdtab, `simulate()`, `predict_categorical`) must use so output joins back to
+    /// the input and to covtab. They differ only for reset-delimited occasions.
+    DiscreteState {
+        time: f64,
+        raw_time: f64,
+        state: usize,
+        cmt: usize,
+    },
     /// Non-negative integer count observation (Poisson / negative-binomial, Track C).
     Count { time: f64, count: u32, cmt: usize },
 }

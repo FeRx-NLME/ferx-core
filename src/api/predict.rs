@@ -126,6 +126,11 @@ pub fn predict_categorical(
     population: &Population,
     params: &ModelParameters,
 ) -> Vec<EndpointPredictionResult> {
+    // Same guard `predict()` and `fit()` apply: a time-varying covariate on the linear
+    // predictor would be silently frozen at its baseline value, since `LinearPredictorFn`
+    // takes no time argument (#741). Without this, `predict_categorical` was the one
+    // public entry point that returned quietly-wrong probabilities.
+    assert_survival_tv_covariates(model, population);
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
     for subject in &population.subjects {

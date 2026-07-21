@@ -376,6 +376,9 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                     sim_spec.obs_times.iter().map(move |&time| {
                         crate::types::ObsRecord::DiscreteState {
                             time,
+                            // Synthetic `[simulation]` subjects carry no resets, so the
+                            // internal and user clocks coincide.
+                            raw_time: time,
                             state: 0,
                             cmt,
                         }
@@ -491,7 +494,15 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                 })
                 .collect();
             if !events.is_empty() {
-                subject.obs_records = events;
+                // Replace only the TTE rows. An earlier version assigned `events`
+                // wholesale, which silently destroyed the binary `DiscreteState`
+                // templates created above — so a joint TTE + binary `--simulate`
+                // emitted zero binary rows, reintroducing the very bug the binary
+                // producer exists to fix.
+                subject
+                    .obs_records
+                    .retain(|r| !matches!(r, crate::types::ObsRecord::Event { .. }));
+                subject.obs_records.splice(0..0, events);
             }
         }
 
@@ -509,17 +520,28 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         // than shifting every later row onto the wrong record.
         #[cfg(feature = "survival")]
         {
-            let mut drawn: HashMap<usize, std::collections::VecDeque<usize>> = HashMap::new();
+            // Key by (cmt, raw_time) rather than popping a per-CMT queue in order. A
+            // queue silently misaligns the moment `simulate_binary` skips a record (NaN
+            // predictor): every later draw lands on the previous record and the last
+            // template keeps its placeholder. Keying by identity means a skipped record
+            // simply keeps its placeholder and its neighbours stay correct.
+            let mut drawn: HashMap<(usize, u64), usize> = HashMap::new();
             for s in sims {
                 if let crate::types::SimOutcome::Category { state } = s.outcome {
-                    drawn.entry(s.cmt).or_default().push_back(state);
+                    drawn.insert((s.cmt, s.time.to_bits()), state);
                 }
             }
             if !drawn.is_empty() {
                 for rec in &mut subject.obs_records {
-                    if let crate::types::ObsRecord::DiscreteState { state, cmt, .. } = rec {
-                        if let Some(next) = drawn.get_mut(cmt).and_then(|q| q.pop_front()) {
-                            *state = next;
+                    if let crate::types::ObsRecord::DiscreteState {
+                        state,
+                        cmt,
+                        raw_time,
+                        ..
+                    } = rec
+                    {
+                        if let Some(next) = drawn.get(&(*cmt, raw_time.to_bits())) {
+                            *state = *next;
                         }
                     }
                 }

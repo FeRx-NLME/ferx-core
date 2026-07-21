@@ -1542,6 +1542,7 @@ mod tests {
                 event,
                 ObsRecord::DiscreteState {
                     time: 1.0,
+                    raw_time: 1.0,
                     state: 0,
                     cmt: 3,
                 },
@@ -1587,6 +1588,7 @@ mod tests {
             1,
             ObsRecord::DiscreteState {
                 time: 3.0,
+                raw_time: 3.0,
                 state: 1,
                 cmt: 3,
             },

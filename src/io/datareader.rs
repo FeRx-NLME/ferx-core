@@ -1947,6 +1947,7 @@ fn parse_subject(
                 obs_records.push(match kind {
                     IntDvKind::DiscreteState => crate::types::ObsRecord::DiscreteState {
                         time,
+                        raw_time,
                         state: magnitude as usize,
                         cmt,
                     },

@@ -516,7 +516,11 @@ mod binary_smoke {
             );
         }
         // And the writer itself must survive a round trip to disk.
-        let path = std::env::temp_dir().join("ferx_binary_sdtab_smoke.csv");
+        // A unique temp dir, not a fixed filename: this repo routinely has several
+        // worktrees building at once, and two concurrent `cargo test` runs sharing one
+        // path would delete each other's file mid-read.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("binary_sdtab.csv");
         ferx_core::io::output::write_sdtab_csv(&res, &pop, path.to_str().unwrap())
             .expect("write_sdtab_csv must succeed for a binary-only fit");
         let written = std::fs::read_to_string(&path).expect("sdtab file must exist");
@@ -524,6 +528,113 @@ mod binary_smoke {
         let header = lines.next().expect("header");
         assert!(header.contains("CMT") && header.contains("IPRED"));
         assert_eq!(lines.count(), n, "one CSV data row per sdtab row");
-        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Determinism across endpoints.** `model.endpoints` is a `HashMap`, so iterating it
+    /// while consuming the RNG made seeded draws depend on per-process hash ordering — two
+    /// runs of the same seed could assign different uniforms to different CMTs. With two
+    /// binary endpoints, assert the seed contract holds and that rows come back in
+    /// ascending-CMT order. (A single-endpoint model cannot detect this.)
+    #[test]
+    fn two_binary_endpoints_simulate_deterministically() {
+        use ferx_core::types::SimOutcome;
+        let two = r"
+[parameters]
+  theta TH0(0.0, -10.0, 10.0)
+  theta TH1(0.5, -10.0, 10.0)
+
+[binary_model]
+  cmt   = 3
+  logit = TH0
+
+[binary_model B]
+  cmt   = 4
+  logit = TH1
+";
+        let model = parse_model_string(two).expect("two [binary_model] blocks must parse");
+        assert_eq!(
+            model.binary_cmts(),
+            vec![3, 4],
+            "fixture must actually have two binary endpoints"
+        );
+        let mut pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1), (2.0, 0)])], 3);
+        // Give the same subject a second endpoint's records on CMT 4.
+        for subj in &mut pop.subjects {
+            let extra: Vec<_> = [(0.0_f64, 1_usize), (1.0, 0), (2.0, 1)]
+                .iter()
+                .map(
+                    |&(time, state)| ferx_core::types::ObsRecord::DiscreteState {
+                        time,
+                        raw_time: time,
+                        state,
+                        cmt: 4,
+                    },
+                )
+                .collect();
+            subj.obs_records.extend(extra);
+        }
+
+        let run = || -> Vec<(usize, usize)> {
+            ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 20260721)
+                .iter()
+                .map(|r| match r.outcome {
+                    SimOutcome::Category { state } => (r.cmt, state),
+                    ref o => panic!("expected Category, got {o:?}"),
+                })
+                .collect()
+        };
+        let first = run();
+        assert_eq!(first, run(), "same seed must reproduce the draw");
+        let cmts: Vec<usize> = first.iter().map(|(c, _)| *c).collect();
+        let mut sorted = cmts.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            cmts, sorted,
+            "rows must be emitted in ascending CMT order, got {cmts:?}"
+        );
+    }
+
+    /// A predictor that evaluates to NaN yields no simulated row for that record and a
+    /// warning naming the CMT and subject — rather than an arbitrary 0/1 drawn from a
+    /// meaningless probability. Covers the skip + warning branch of `simulate_binary`.
+    ///
+    /// The NaN comes from a **NaN covariate**, not a pathological expression: the DSL's
+    /// evaluator guards `log(0)`, `0/0` and friends, so an arithmetic route never reaches
+    /// this branch. A non-numeric covariate value in the dataset does.
+    #[test]
+    fn nan_predictor_records_are_skipped_with_a_warning() {
+        use ferx_core::SimulateOptions;
+        let model = parse_model_string(MIXED_MODEL).unwrap();
+        // Same fixture as the other sim tests, but this subject's covariate X is NaN, so
+        // `lp = TH0 + THX*X + ETA_I` is NaN at every one of its records.
+        let pop = common::binary_pop(&[(f64::NAN, vec![(0.0, 0), (1.0, 1), (2.0, 0)])], 3);
+        let out = ferx_core::simulate_with_options_diag(
+            &model,
+            &pop,
+            &model.default_params,
+            1,
+            &SimulateOptions::default(),
+        )
+        .expect("simulate must not fail on a NaN predictor");
+
+        assert!(
+            out.results.is_empty(),
+            "a NaN predictor must emit no rows, got {:?}",
+            out.results.len()
+        );
+        let w = out
+            .warnings
+            .iter()
+            .find(|w| w.contains("[binary_model]"))
+            .unwrap_or_else(|| panic!("expected a NaN-predictor warning, got {:?}", out.warnings));
+        assert!(w.contains("cmt = 3"), "warning must name the CMT: {w}");
+        assert!(
+            w.contains("subject 1"),
+            "warning must name the subject: {w}"
+        );
+        assert!(
+            w.contains("3 record(s)"),
+            "warning must count the records: {w}"
+        );
     }
 }
