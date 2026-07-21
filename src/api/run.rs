@@ -765,7 +765,11 @@ pub fn read_population_for(
     // set covers binary/categorical (#760) and CTMM (#759) endpoints, which share the
     // discrete-state plumbing.
     #[cfg(feature = "survival")]
-    let binary_cmts: std::collections::HashSet<usize> = {
+    // Binary **∪ CTMM** — every CMT whose integer DV routes to `ObsRecord::DiscreteState`.
+    // Deliberately not named `binary_cmts`: this function used to share that name with the
+    // binary-only `Vec` above, and the two are equal today only because CTMM `--simulate`
+    // is rejected upstream. When CTMM simulation lands (#820) they diverge.
+    let discrete_cmts: std::collections::HashSet<usize> = {
         let mut discrete: std::collections::HashSet<usize> =
             model.binary_cmts().into_iter().collect();
         #[cfg(feature = "markov")]
@@ -773,9 +777,9 @@ pub fn read_population_for(
         discrete
     };
     #[cfg(not(feature = "survival"))]
-    let binary_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let discrete_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    if tte_cmts.is_empty() && binary_cmts.is_empty() {
+    if tte_cmts.is_empty() && discrete_cmts.is_empty() {
         // Gaussian-only model: use the existing (faster) path without TTE overhead.
         match (covariate_decls, filter) {
             (Some(decls), Some(sel)) => {
@@ -833,7 +837,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
-                    &binary_cmts,
+                    &discrete_cmts,
                     column_map,
                 )?;
                 Ok((pop, Some(table)))
@@ -845,7 +849,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
-                    &binary_cmts,
+                    &discrete_cmts,
                     column_map,
                 )?;
                 Ok((pop, None))
