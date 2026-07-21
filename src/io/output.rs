@@ -1301,36 +1301,6 @@ pub fn write_sdtab_csv(
     population: &Population,
     path: &str,
 ) -> Result<(), String> {
-    // A result restored from a `.fitrx` checkpoint carries only the Gaussian
-    // per-observation vectors — `discrete_rows` is not round-tripped (see
-    // `io::fitrx::parse_subjects`). Writing anyway would emit a table silently missing
-    // every discrete-endpoint row, and, for a binary-only fit, a header with no rows at
-    // all — while the same run's live sdtab has a full table. Fail loud instead; the
-    // caller can regenerate from the original fit.
-    #[cfg(feature = "survival")]
-    {
-        let pop_has_discrete = population.subjects.iter().any(|s| {
-            s.obs_records.iter().any(|r| {
-                matches!(
-                    r,
-                    crate::types::ObsRecord::DiscreteState { .. }
-                        | crate::types::ObsRecord::Count { .. }
-                )
-            })
-        });
-        let result_has_discrete = result.subjects.iter().any(|s| !s.discrete_rows.is_empty());
-        if pop_has_discrete && !result_has_discrete {
-            return Err(
-                "refusing to write sdtab: the dataset has discrete-endpoint observations \
-                 (binary / categorical) but the fit result carries no per-record diagnostics \
-                 for them. This happens when the result was restored from a `.fitrx` \
-                 checkpoint, which does not round-trip discrete rows — the table would be \
-                 silently missing them. Re-run the fit to write sdtab."
-                    .to_string(),
-            );
-        }
-    }
-
     let cols = sdtab(result, population);
     if cols.is_empty() {
         return Err("No data to write".to_string());

@@ -587,35 +587,6 @@ mod binary_smoke {
         );
     }
 
-    /// A fit result that carries no discrete diagnostics for a dataset that plainly has
-    /// discrete observations is a restored `.fitrx` checkpoint (which does not round-trip
-    /// them). Writing sdtab anyway would emit a table silently missing every binary row —
-    /// header-only for a binary-only fit — so the writer refuses.
-    #[test]
-    fn sdtab_refuses_to_write_a_result_missing_its_discrete_rows() {
-        let model = parse_model_string(MIXED_MODEL).unwrap();
-        let pop = common::binary_pop(&sim_subjects(), 3);
-        let mut res = fit(&model, &pop, &model.default_params, &smoke_opts()).expect("fit");
-        assert!(
-            res.subjects.iter().any(|s| !s.discrete_rows.is_empty()),
-            "a live fit must carry discrete rows"
-        );
-
-        // Simulate the restore path: drop the diagnostics, keep everything else.
-        for s in &mut res.subjects {
-            s.discrete_rows.clear();
-        }
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("sdtab.csv");
-        let err = ferx_core::io::output::write_sdtab_csv(&res, &pop, path.to_str().unwrap())
-            .expect_err("writing a discrete-less result over discrete data must fail loud");
-        assert!(
-            err.contains("discrete") && err.contains("fitrx"),
-            "error should name the cause and the checkpoint path: {err}"
-        );
-        assert!(!path.exists(), "no partial file may be left behind");
-    }
-
     /// Binary subjects are sparse, so #891's guarded multi-start inner EBE flags them as
     /// weakly identified and runs its extra probes on them. The posterior is log-concave
     /// (Bernoulli likelihood × Gaussian prior), so multistart cannot relocate the mode —

@@ -558,7 +558,11 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                         .push_back(state);
                 }
             }
-            if !drawn.is_empty() {
+            // Runs unconditionally. Nesting this under `!drawn.is_empty()` meant a
+            // subject whose records were *all* NaN-skipped kept every placeholder — the
+            // exact fabricated-data outcome the removal exists to prevent, just for the
+            // all-NaN subject instead of the partial one.
+            {
                 subject.obs_records.retain_mut(|rec| {
                     let crate::types::ObsRecord::DiscreteState {
                         state,
@@ -569,6 +573,15 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                     else {
                         return true; // not a discrete row — untouched
                     };
+                    // Only this endpoint family's rows are ours to stamp or drop. A CTMM
+                    // `DiscreteState` row is also a discrete row, and matching it here
+                    // would silently delete it once CTMM simulation lands (#820) —
+                    // unreachable today only because CTMM `--simulate` is rejected
+                    // upstream, which is exactly the kind of latent data loss this PR
+                    // exists to remove.
+                    if !binary_cmts.contains(cmt) {
+                        return true;
+                    }
                     match drawn
                         .get_mut(&(*cmt, raw_time.to_bits()))
                         .and_then(|q| q.pop_front())

@@ -35,6 +35,12 @@ fn softplus(x: f64) -> f64 {
 /// `1 / (1 + e^{−x})`, computed without overflow by branching on the sign so the
 /// exponential always has a non-positive argument. Maps `±∞` to `1`/`0` and
 /// propagates NaN (callers guard that case explicitly).
+///
+/// Identical in form to `nn::sigmoid` (`src/nn/mod.rs`), which cannot be called from here: `nn`
+/// and `survival` are independent cargo features, so neither module is guaranteed to be
+/// compiled alongside the other. Sharing it needs an ungated math home — worth doing, but
+/// it touches `nn` and belongs in a cleanup that can. **If you change the tail behaviour
+/// here, change it there too.**
 #[inline]
 fn inv_logit(x: f64) -> f64 {
     if x >= 0.0 {
@@ -212,6 +218,28 @@ pub(crate) fn discrete_subject_nll(
         return 0.0;
     }
     let mut nll = 0.0;
+    // Hot path (FOCEI inner loop + the FD-Hessian stencil): with a single binary endpoint
+    // — every real model today — there is no ordering question and no reason to build the
+    // sorted CMT list, so read it straight out of the map. `binary_endpoints`' allocation
+    // is reserved for the multi-endpoint case, where deterministic summation order is what
+    // keeps the OFV from being ULP-nondeterministic across processes.
+    let cmts = model.binary_cmts();
+    if let [only] = cmts[..] {
+        if let Some(endpoint @ EndpointLikelihood::Binary { .. }) = model.endpoints.get(&only) {
+            let EndpointLikelihood::Binary { link, lp_fn, .. } = endpoint else {
+                unreachable!("matched Binary above")
+            };
+            return binary_data_term(
+                *link,
+                lp_fn,
+                only,
+                &subject.obs_records,
+                theta,
+                eta,
+                &subject.covariates,
+            );
+        }
+    }
     for (cmt, endpoint) in binary_endpoints(model) {
         // Binary today; a new discrete family (ordinal / Poisson / negative-binomial …) adds
         // its branch here — reached through this one function, so no likelihood dispatch site

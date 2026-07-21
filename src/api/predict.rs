@@ -45,8 +45,9 @@ use std::time::Instant;
 /// **Gaussian rows only.** Non-Gaussian endpoints keep their own entry points, because
 /// their prediction is not a scalar concentration: TTE → [`predict_survival`], binary →
 /// [`predict_categorical`]. A model whose only endpoint is non-Gaussian therefore gets an
-/// empty vec here — call the matching predictor instead. (CTMM has no predictor yet and
-/// is rejected fail-loud below rather than returning empty.)
+/// empty vec here — call the matching predictor instead. (CTMM has no predictor at all
+/// yet, so a CTMM model with *no* continuous endpoint is rejected fail-loud below rather
+/// than returning empty; a mixed continuous + CTMM model still gets its Gaussian rows.)
 pub fn predict(
     model: &CompiledModel,
     population: &Population,
@@ -75,10 +76,12 @@ pub fn predict(
     // chokepoint — so state the contract here too. Occupancy prediction is #820.
     #[cfg(feature = "markov")]
     assert!(
-        !model.has_ctmm(),
-        "predict() does not support a [markov_model] (CTMM) endpoint yet — its discrete-state \
-         records are not on the Gaussian observation grid, so this call would silently return \
-         no rows for them. State-occupancy prediction π(t) is a later slice (#820)."
+        !model.has_ctmm() || !model.default_params.sigma.values.is_empty(),
+        "predict() does not support a [markov_model] (CTMM) endpoint yet, and this model has no \
+         continuous endpoint either — so the call would return an empty vec rather than an \
+         occupancy π(t). State-occupancy prediction is a later slice (#820). (A model that *also* \
+         has a Gaussian endpoint is fine: it gets its continuous rows, and the CTMM rows are \
+         simply absent, exactly as a binary endpoint's are.)"
     );
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];

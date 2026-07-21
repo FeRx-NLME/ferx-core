@@ -426,6 +426,34 @@ mod ctmm_smoke {
         let _ = simulate(&model, &pop, &model.default_params, 1);
     }
 
+    /// A live CTMM fit must still write an sdtab. CTMM observations are
+    /// `ObsRecord::DiscreteState`, the same variant a binary endpoint uses, but only the
+    /// binary endpoint populates `SubjectResult::discrete_rows` (occupancy diagnostics are
+    /// #820) — so anything that infers "diagnostics were dropped" from the record variant
+    /// alone rejects every healthy CTMM fit. No markov test previously called
+    /// `write_sdtab_csv`, which is why an earlier revision of #900 did exactly that.
+    #[test]
+    fn ctmm_fit_still_writes_an_sdtab() {
+        let model = parse_model_string(MIXED_MODEL).unwrap();
+        let subjects: Vec<(f64, Vec<(f64, u8)>)> = vec![
+            (0.0, vec![(0.0, 0), (1.0, 0), (2.0, 1)]),
+            (0.0, vec![(0.0, 1), (1.0, 0), (2.0, 0)]),
+            (0.0, vec![(0.0, 0), (1.0, 1), (2.0, 1)]),
+        ];
+        let pop = common::binary_pop(&subjects, 5);
+        let res = fit(&model, &pop, &model.default_params, &smoke_opts()).expect("ctmm fit");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("ctmm-sdtab.csv");
+        ferx_core::io::output::write_sdtab_csv(&res, &pop, path.to_str().unwrap())
+            .expect("a live CTMM fit must write an sdtab, not be mistaken for a dropped restore");
+        let written = std::fs::read_to_string(&path).expect("sdtab must exist");
+        assert!(
+            written.lines().next().is_some_and(|h| h.contains("ID")),
+            "sdtab must have a header"
+        );
+    }
+
     /// …and so does `predict()`. The simulate guard's message already *claimed* to cover
     /// `predict()`, but it sits in the simulate chokepoint only — so a CTMM model reaching
     /// `predict()` silently returned zero rows (its discrete records are not on the Gaussian
