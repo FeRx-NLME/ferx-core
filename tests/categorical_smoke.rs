@@ -531,66 +531,169 @@ mod binary_smoke {
     }
 
     /// **Determinism across endpoints.** `model.endpoints` is a `HashMap`, so iterating it
-    /// while consuming the RNG made seeded draws depend on per-process hash ordering — two
-    /// runs of the same seed could assign different uniforms to different CMTs. With two
-    /// binary endpoints, assert the seed contract holds and that rows come back in
-    /// ascending-CMT order. (A single-endpoint model cannot detect this.)
+    /// while consuming the RNG made seeded draws depend on per-process hash ordering.
+    ///
+    /// An in-process test cannot reproduce cross-process hash randomization — re-running
+    /// with the same seed in the same process is a tautology, since the map instance is
+    /// unchanged. What *is* testable is that emission order equals the sorted CMT order
+    /// the fix guarantees. With five endpoints a random hash order matches sorted with
+    /// probability 1/120, so a regression is caught ~99% of the time rather than ~50%.
     #[test]
-    fn two_binary_endpoints_simulate_deterministically() {
-        use ferx_core::types::SimOutcome;
-        let two = r"
+    fn binary_endpoints_are_visited_in_ascending_cmt_order() {
+        use ferx_core::types::{ObsRecord, SimOutcome};
+        let cmts = [3usize, 4, 5, 6, 7];
+        let mut src = String::from("[parameters]\n  theta TH0(0.3, -10.0, 10.0)\n");
+        for (i, c) in cmts.iter().enumerate() {
+            let name = if i == 0 {
+                String::new()
+            } else {
+                format!(" B{i}")
+            };
+            src.push_str(&format!(
+                "\n[binary_model{name}]\n  cmt   = {c}\n  logit = TH0\n"
+            ));
+        }
+        let model = parse_model_string(&src).expect("multiple [binary_model] blocks must parse");
+        assert_eq!(
+            model.binary_cmts(),
+            cmts.to_vec(),
+            "fixture must have all five binary endpoints"
+        );
+
+        let mut pop = common::binary_pop(&[(0.0, vec![(0.0, 0)])], cmts[0]);
+        for subj in &mut pop.subjects {
+            for &c in &cmts[1..] {
+                subj.obs_records.push(ObsRecord::DiscreteState {
+                    time: 0.0,
+                    raw_time: 0.0,
+                    state: 0,
+                    cmt: c,
+                });
+            }
+        }
+
+        let emitted: Vec<usize> =
+            ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 20260721)
+                .iter()
+                .map(|r| match r.outcome {
+                    SimOutcome::Category { .. } => r.cmt,
+                    ref o => panic!("expected Category, got {o:?}"),
+                })
+                .collect();
+        assert_eq!(
+            emitted,
+            cmts.to_vec(),
+            "rows must be emitted in ascending CMT order (the RNG is consumed in this order)"
+        );
+    }
+
+    /// **The `--simulate` round trip.** `run_model_simulate` builds a synthetic design from
+    /// `[simulation]`, draws, writes the outcomes back, and fits. This path had no test, and
+    /// that gap hid a real bug: the synthetic subject materialised `observations` /
+    /// `obs_cmts` on CMT 1 unconditionally, so a binary-only design (which *must* supply
+    /// `times`) fabricated phantom Gaussian rows and died in `check_per_cmt_error_model`
+    /// with "[error_model] has no entry for observed compartment(s) 1".
+    #[test]
+    fn binary_only_simulate_round_trips_through_run_model_simulate() {
+        use ferx_core::types::ObsRecord;
+        let src = r"
 [parameters]
-  theta TH0(0.0, -10.0, 10.0)
-  theta TH1(0.5, -10.0, 10.0)
+  theta TH0(0.2, -10.0, 10.0)
 
 [binary_model]
   cmt   = 3
   logit = TH0
 
-[binary_model B]
-  cmt   = 4
-  logit = TH1
-";
-        let model = parse_model_string(two).expect("two [binary_model] blocks must parse");
-        assert_eq!(
-            model.binary_cmts(),
-            vec![3, 4],
-            "fixture must actually have two binary endpoints"
-        );
-        let mut pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1), (2.0, 0)])], 3);
-        // Give the same subject a second endpoint's records on CMT 4.
-        for subj in &mut pop.subjects {
-            let extra: Vec<_> = [(0.0_f64, 1_usize), (1.0, 0), (2.0, 1)]
-                .iter()
-                .map(
-                    |&(time, state)| ferx_core::types::ObsRecord::DiscreteState {
-                        time,
-                        raw_time: time,
-                        state,
-                        cmt: 4,
-                    },
-                )
-                .collect();
-            subj.obs_records.extend(extra);
-        }
+[simulation]
+  n_subjects = 4
+  times      = [0, 1, 2]
 
-        let run = || -> Vec<(usize, usize)> {
-            ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 20260721)
+[fit_options]
+  method  = focei
+  maxiter = 2
+";
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("binonly.ferx");
+        std::fs::write(&path, src).expect("write model");
+
+        let (res, pop) = ferx_core::run_model_simulate(path.to_str().unwrap())
+            .expect("binary-only --simulate must round-trip");
+
+        assert!(res.ofv.is_finite(), "OFV must be finite, got {}", res.ofv);
+        // No phantom Gaussian rows: a binary-only design has an empty continuous grid.
+        assert!(
+            pop.subjects.iter().all(|s| s.observations.is_empty()),
+            "binary-only design must not fabricate Gaussian observations"
+        );
+        // 4 subjects x 3 times of realised binary rows.
+        let states: Vec<usize> = pop
+            .subjects
+            .iter()
+            .flat_map(|s| s.obs_records.iter())
+            .filter_map(|r| match r {
+                ObsRecord::DiscreteState { state, cmt: 3, .. } => Some(*state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states.len(), 12, "one binary row per (subject x time)");
+        assert!(states.iter().all(|&s| s <= 1), "states must be 0/1");
+        // At TH0 = 0.2 (p ~ 0.55) across 12 draws, an all-identical column means the
+        // write-back stamped placeholders rather than the realised outcomes.
+        assert!(
+            states.iter().any(|&s| s == 1) && states.iter().any(|&s| s == 0),
+            "expected a mix of realised outcomes, got {states:?}"
+        );
+    }
+
+    /// Duplicated `[simulation] times` are legal (the parser does not dedup). Each duplicate
+    /// record must get its **own** draw — an identity-keyed write-back that stored one state
+    /// per (cmt, time) would collapse them and force the two rows to agree.
+    #[test]
+    fn duplicate_simulation_times_each_get_their_own_draw() {
+        use ferx_core::types::ObsRecord;
+        let src = r"
+[parameters]
+  theta TH0(0.0, -10.0, 10.0)
+
+[binary_model]
+  cmt   = 3
+  logit = TH0
+
+[simulation]
+  n_subjects = 40
+  times      = [0.5, 0.5]
+
+[fit_options]
+  method  = focei
+  maxiter = 2
+";
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("dup.ferx");
+        std::fs::write(&path, src).expect("write model");
+        let (_res, pop) =
+            ferx_core::run_model_simulate(path.to_str().unwrap()).expect("simulate must succeed");
+
+        let mut disagreements = 0usize;
+        for s in &pop.subjects {
+            let st: Vec<usize> = s
+                .obs_records
                 .iter()
-                .map(|r| match r.outcome {
-                    SimOutcome::Category { state } => (r.cmt, state),
-                    ref o => panic!("expected Category, got {o:?}"),
+                .filter_map(|r| match r {
+                    ObsRecord::DiscreteState { state, .. } => Some(*state),
+                    _ => None,
                 })
-                .collect()
-        };
-        let first = run();
-        assert_eq!(first, run(), "same seed must reproduce the draw");
-        let cmts: Vec<usize> = first.iter().map(|(c, _)| *c).collect();
-        let mut sorted = cmts.clone();
-        sorted.sort_unstable();
-        assert_eq!(
-            cmts, sorted,
-            "rows must be emitted in ascending CMT order, got {cmts:?}"
+                .collect();
+            assert_eq!(st.len(), 2, "both duplicated-time records must survive");
+            if st[0] != st[1] {
+                disagreements += 1;
+            }
+        }
+        // Two independent p = 0.5 draws disagree half the time; over 40 subjects the
+        // chance of zero disagreements by luck is 2^-40. A collapsing write-back gives
+        // exactly zero.
+        assert!(
+            disagreements > 0,
+            "duplicated times collapsed onto one shared draw across all 40 subjects"
         );
     }
 

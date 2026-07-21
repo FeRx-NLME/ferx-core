@@ -323,6 +323,18 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         }
     }
 
+    // The Gaussian observation grid exists only for a model that actually has a
+    // continuous endpoint. A binary-only (or TTE + binary) design also needs `times` —
+    // discrete outcomes are observed on the fixed grid — but materialising the grid as
+    // `observations`/`obs_cmts` would fabricate |times| phantom Gaussian rows on CMT 1,
+    // which `check_per_cmt_error_model` then rejects ("[error_model] has no entry for
+    // observed compartment(s) 1"). The binary rows live in `obs_records` instead, so a
+    // model with no residual error contributes an empty Gaussian grid.
+    let n_gauss = if model_has_continuous {
+        sim_spec.obs_times.len()
+    } else {
+        0
+    };
     // Build template population
     let subjects: Vec<Subject> = (1..=sim_spec.n_subjects)
         .map(|i| Subject {
@@ -335,17 +347,21 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                 false,
                 0.0,
             )],
-            obs_times: sim_spec.obs_times.clone(),
+            obs_times: if model_has_continuous {
+                sim_spec.obs_times.clone()
+            } else {
+                Vec::new()
+            },
             obs_raw_times: Vec::new(),
-            observations: vec![0.0; sim_spec.obs_times.len()],
-            obs_cmts: vec![1; sim_spec.obs_times.len()],
+            observations: vec![0.0; n_gauss],
+            obs_cmts: vec![1; n_gauss],
             covariates: HashMap::new(),
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
-            cens: vec![0; sim_spec.obs_times.len()],
+            cens: vec![0; n_gauss],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
@@ -520,31 +536,52 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         // than shifting every later row onto the wrong record.
         #[cfg(feature = "survival")]
         {
-            // Key by (cmt, raw_time) rather than popping a per-CMT queue in order. A
-            // queue silently misaligns the moment `simulate_binary` skips a record (NaN
-            // predictor): every later draw lands on the previous record and the last
-            // template keeps its placeholder. Keying by identity means a skipped record
-            // simply keeps its placeholder and its neighbours stay correct.
-            let mut drawn: HashMap<(usize, u64), usize> = HashMap::new();
+            // Pair each simulated draw with its template by identity `(cmt, raw_time)`,
+            // holding a queue per key so that duplicated `[simulation] times` (the parser
+            // permits `times = [0.5, 0.5, 2]`) each receive their own draw instead of
+            // collapsing onto one. A per-CMT queue alone would misalign after a skipped
+            // record; a bare map would drop a duplicate's draw. This does both.
+            //
+            // A template that receives **no** draw is removed, not left at its
+            // placeholder. `simulate_binary` skips a record whose predictor is NaN
+            // (warning at draw time), and a placeholder `state = 0` left behind would
+            // pass `validate_binary_states` and then be scored by the Bernoulli
+            // likelihood as a genuine observed failure — fabricated data, which is worse
+            // than the misalignment this replaced.
+            let mut drawn: HashMap<(usize, u64), std::collections::VecDeque<usize>> =
+                HashMap::new();
             for s in sims {
                 if let crate::types::SimOutcome::Category { state } = s.outcome {
-                    drawn.insert((s.cmt, s.time.to_bits()), state);
+                    drawn
+                        .entry((s.cmt, s.time.to_bits()))
+                        .or_default()
+                        .push_back(state);
                 }
             }
             if !drawn.is_empty() {
-                for rec in &mut subject.obs_records {
-                    if let crate::types::ObsRecord::DiscreteState {
+                subject.obs_records.retain_mut(|rec| {
+                    let crate::types::ObsRecord::DiscreteState {
                         state,
                         cmt,
                         raw_time,
                         ..
                     } = rec
+                    else {
+                        return true; // not a discrete row — untouched
+                    };
+                    match drawn
+                        .get_mut(&(*cmt, raw_time.to_bits()))
+                        .and_then(|q| q.pop_front())
                     {
-                        if let Some(next) = drawn.get(&(*cmt, raw_time.to_bits())) {
-                            *state = *next;
+                        Some(next) => {
+                            *state = next;
+                            true
                         }
+                        // No draw for this record (NaN predictor): drop it rather than
+                        // fit its placeholder as an observed 0.
+                        None => false,
                     }
-                }
+                });
             }
         }
     }

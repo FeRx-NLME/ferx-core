@@ -2239,6 +2239,7 @@ mod survival_smoke {
             0,
             ObsRecord::Count {
                 time: 12.0,
+                raw_time: 12.0,
                 count: 2,
                 cmt: 4,
             },

@@ -1953,6 +1953,7 @@ fn parse_subject(
                     },
                     IntDvKind::Count => crate::types::ObsRecord::Count {
                         time,
+                        raw_time,
                         count: magnitude as u32,
                         cmt,
                     },

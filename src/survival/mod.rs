@@ -1548,6 +1548,7 @@ mod tests {
                 },
                 ObsRecord::Count {
                     time: 2.0,
+                    raw_time: 2.0,
                     count: 4,
                     cmt: 4,
                 },
@@ -1622,6 +1623,7 @@ mod tests {
             1,
             ObsRecord::Count {
                 time: 3.0,
+                raw_time: 3.0,
                 count: 2,
                 cmt: 4,
             },

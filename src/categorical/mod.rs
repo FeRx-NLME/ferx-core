@@ -57,6 +57,12 @@ fn inv_logit(x: f64) -> f64 {
 /// (§8.8.8) — sharing the evaluator makes that class of drift unrepresentable
 /// rather than merely tested-for.
 ///
+/// They share `lp`, not the mapping from `lp` to an outcome: [`binary_data_term`] repels
+/// the optimizer with the `1e20` sentinel for **any** non-finite `lp`, whereas
+/// [`simulate_binary`] treats `±∞` as a legitimate degenerate `p = 1/0` and draws from it
+/// (only NaN is skipped). So a saturated predictor is sampled but scored as a repel — the
+/// one place the two deliberately differ.
+///
 /// Filtering by CMT here (rather than trusting the caller) keeps a second binary
 /// CMT's rows from being double-counted and lets callers pass a subject's full
 /// `obs_records` with zero allocation.
@@ -211,8 +217,12 @@ pub(crate) fn discrete_subject_nll(
         // its branch here — reached through this one function, so no likelihood dispatch site
         // changes. (Gaussian is scored by the residual path, TTE by the hazard dispatch.)
         if let EndpointLikelihood::Binary { link, lp_fn, .. } = endpoint {
-            // `binary_data_term` filters `obs_records` by `cmt` itself — no per-call
-            // allocation, even inside the FD-Hessian closure.
+            // `binary_data_term` filters `obs_records` by `cmt` itself, so no records
+            // are copied. `binary_endpoints` does allocate a small sorted `Vec` of CMTs
+            // per call — deliberate even on this hot path (the FD-Hessian closure): the
+            // sum below is over f64s, so a `HashMap`-order walk would make the OFV
+            // ULP-nondeterministic across processes for a multi-endpoint model. One
+            // 1-2 element Vec is the price of a reproducible objective.
             nll += binary_data_term(
                 *link,
                 lp_fn,

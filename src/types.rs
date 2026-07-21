@@ -2188,7 +2188,14 @@ pub enum ObsRecord {
         cmt: usize,
     },
     /// Non-negative integer count observation (Poisson / negative-binomial, Track C).
-    Count { time: f64, count: u32, cmt: usize },
+    /// Carries both clocks for the same reason [`Self::DiscreteState`] does — reporting
+    /// must use `raw_time` or the rows cannot be joined back to the input.
+    Count {
+        time: f64,
+        raw_time: f64,
+        count: u32,
+        cmt: usize,
+    },
 }
 
 #[cfg(feature = "survival")]

@@ -58,7 +58,11 @@ binary outcomes from a known `θ`, refit them, and require the generating `θ` b
 
 Internally the likelihood, the sampler and the predictor share a single linear-predictor
 evaluator, so they cannot disagree about which records belong to the endpoint, what a
-`TIME` term resolves to, or what `lp` a record carries.
+`TIME` term resolves to, or what `lp` a record carries. They deliberately differ in one
+place: a *saturated* predictor (`lp = ±∞`, from an extreme parameter or covariate) is a
+valid degenerate probability to the sampler, which draws from it, but the likelihood
+repels the optimizer away from it. Simulation has no optimizer to steer, so it must
+produce something; fitting can and should refuse.
 
 ## Simulation and prediction
 
@@ -88,7 +92,7 @@ the Gaussian rows:
 | `CMT` | the endpoint's compartment |
 | `PRED` | `P(Y = 1)` at `η = 0` (typical subject) |
 | `IPRED` | `P(Y = 1)` at the subject's EBE `η` |
-| `IWRES` | standardized (Pearson) residual `(y − p) / √(p(1−p))` |
+| `IWRES` | standardized (Pearson) residual `(y − p) / √(p·q)` |
 | `CWRES` | *blank* |
 
 `CWRES` is empty by design: the conditional weighted residual is defined through the
@@ -97,8 +101,15 @@ be defined for a discrete record — `CENS`, `OCC`, `NPDE`/`NPD`, `TAFD`, `TAD`,
 `[derived]` / `[output]` column — are likewise written as empty cells rather than
 sentinel values.
 
-A degenerate `p ∈ {0, 1}` makes the standardized residual undefined; `IWRES` is then
-blank rather than a large finite number that would look meaningful in a plot.
+`q = P(Y = 0)` is computed independently rather than as `1 − p`. That matters at the
+tails: `p` saturates to exactly `1.0` in double precision once the log-odds exceed
+about 36.7, so `1 − p` would cancel to zero and blank the *largest* residuals — and only
+on the positive side, since `1 − p ≈ 1` keeps full precision at the other end. Computing
+`q` directly keeps both tails symmetric and resolvable.
+
+`IWRES` is left blank only when the variance genuinely underflows, where the residual is
+undefined — never substituted with a large finite number that would look meaningful in a
+plot.
 
 ## Reference R session
 
