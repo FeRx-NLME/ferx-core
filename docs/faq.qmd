@@ -370,6 +370,35 @@ Both codes are *parameter*-driven; neither reads a separate `DURATION` data colu
 Any other negative or non-finite `RATE` is rejected — earlier versions silently
 misread the coded forms as a bolus (#324).
 
+### Which compartments can an analytical model be infused into?
+
+On the six analytical **disposition** models — `one_cpt_iv`, `one_cpt_oral`,
+`two_cpt_iv`, `two_cpt_oral`, `three_cpt_iv`, `three_cpt_oral` — the closed
+forms deliver a zero-order input into **any compartment the model has**: the
+**central** compartment of every model, the **oral depot** (`CMT=1`, a
+zero-order release followed by first-order `ka` absorption), and the
+**peripheral** compartment(s) of both the IV and the oral models. A **bolus**
+likewise targets any compartment those models have.
+
+Two cases are still rejected, both up front, naming the subject and time:
+
+- `CMT=0` on an **infusion** → `E_DOSE_CMT_NOT_INFUSABLE`. `CMT=0` is NONMEM's
+  *default dose compartment*, which is defined for a bolus (and treated as
+  compartment 1 throughout ferx, including under `SS`) but has no meaning for a
+  zero-order input. Name the target compartment explicitly.
+- A `CMT` past the end of the model's compartment list, for **either** dose kind
+  → `E_DOSE_CMT_OUT_OF_RANGE` (#375).
+
+`fit()` returns the error; `predict()` / `simulate()` fail with the same message.
+
+The **transit** and **inverse-Gaussian** absorption models are the exception:
+they are dosed through the depot (`CMT=1`) only, for either dose kind, because
+the closed form routes every dose through the absorption process regardless of
+compartment while their ODE twin would bolus it into a disposition compartment —
+so the two paths would disagree. Use an `ode(...)` model to dose those
+compartments directly; ODE models address any compartment their `[odes]` block
+declares, so neither check applies to them.
+
 For bioavailability `F ≠ 1`, ferx reshapes an infusion the NONMEM way (#419): a
 *rate-defined* infusion (`RATE>0` data and `RATE=-1` → `R{cmt}`) holds the rate and
 scales the **duration** to `F·AMT/RATE`, while a *duration-defined* infusion

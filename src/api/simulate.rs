@@ -400,6 +400,7 @@ pub fn simulate_with_options_diag(
     // integrates the whole warm-EBE pass first and fails only at the chokepoint,
     // with a confusable "EBE did not converge" instead of the real cause.
     assert_modeled_doses_supported(model, population);
+    assert_dose_compartments_supported(model, population);
     assert_absorption_closed_form_support(model, population);
     assert_absorption_flip_flop_no_twin(model, population, &params.theta);
     // A time-varying covariate on a survival hazard would be silently frozen — panic
@@ -788,8 +789,10 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // Single chokepoint for every `simulate*` variant (both `simulate_inner` and
     // the propensity path funnel through here). Guard the modeled-`RATE` dose
     // precondition once per call, as `predict()` does — `simulate()` runs no
-    // data-check otherwise. #324.
+    // data-check otherwise. #324. The dose-compartment routing guard (#375) rides
+    // the same chokepoint.
     assert_modeled_doses_supported(model, population);
+    assert_dose_compartments_supported(model, population);
     assert_absorption_closed_form_support(model, population);
     assert_absorption_flip_flop_no_twin(model, population, &params.theta);
     // A time-varying covariate on a survival hazard would be silently frozen — panic

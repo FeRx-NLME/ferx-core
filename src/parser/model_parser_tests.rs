@@ -12310,11 +12310,13 @@ fn analytical_modeled_duration_into_oral_depot_parses() {
 }
 
 #[test]
-fn analytical_modeled_duration_into_oral_peripheral_is_rejected() {
-    // `D3` on a `two_cpt_oral` model targets a PERIPHERAL (cmt 3), which the
-    // analytical oral closed forms still cannot infuse into (infusable =
-    // {1 depot, 2 central}). It must be a loud parse error pointing at
-    // `ode(...)` — not silently routed or a runtime panic (#400).
+fn analytical_modeled_duration_into_oral_peripheral_parses() {
+    // `D3` on a `two_cpt_oral` model targets a PERIPHERAL (cmt 3). Since #375 the
+    // analytical oral closed forms CAN infuse a peripheral — the oral propagators
+    // reuse the 2-cpt IV forced response, since nothing flows back into the depot
+    // — so `infusable = {1 depot, 2 central, 3 peripheral}` and this must parse.
+    // (It was a loud parse error before #375, when the oral propagators had no
+    // peripheral forcing term; see #400 for the depot case.)
     let src = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
@@ -12340,12 +12342,43 @@ fn analytical_modeled_duration_into_oral_peripheral_is_rejected() {
 [error_model]
   DV ~ proportional(PROP)
 "#;
+    parse_full_model(src).expect("D3 (oral peripheral) is infusable since #375");
+}
+
+/// …but a `D{cmt}` past the end of the state vector is still a loud parse error.
+#[test]
+fn analytical_modeled_duration_beyond_oral_state_count_is_rejected() {
+    let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 1.0, 500.0)
+  theta TVQ(5.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVD4(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+  D4 = TVD4
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
     let err = parse_full_model(src)
         .err()
-        .expect("D3 (oral peripheral) on an analytical oral model must error");
+        .expect("D4 on a 3-state oral model must error");
     assert!(
-        err.contains("compartment 3") && err.contains("D3") && err.contains("ode("),
-        "error must name the compartment, the param, and point to ode(...): {err}"
+        err.contains("compartment 4") && err.contains("D4"),
+        "error should name the offending slot: {err}"
     );
 }
 
