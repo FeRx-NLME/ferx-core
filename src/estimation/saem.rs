@@ -51,6 +51,34 @@ pub(crate) const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
 /// (Roberts & Rosenthal 2001), higher than the block kernel's 0.40 target.
 const CW_TARGET_ACCEPT: f64 = 0.44;
 
+/// Combined (block + componentwise) post-burn-in MH acceptance rate below which
+/// SAEM appends a "sampler is not mixing" warning to `FitResult.warnings`
+/// (issue #895). A genuinely stuck E-step never updates the ETAs, so the M-step
+/// runs on degenerate sufficient statistics and the estimates are unreliable.
+const SAEM_MH_STUCK_ACCEPT: f64 = 0.01;
+
+/// Maximum growth of a free PK-residual σ during a SAEM run, in natural-log
+/// units, when `iiv_on_ruv` is active (issue #895). The IIV-on-RUV
+/// parameterization writes the residual variance as `σ²·exp(2·η_RUV)`, so the
+/// *marginal* residual is a function of `σ²·exp(2·ω_RUV)`: σ and ω_RUV trade off
+/// along a ridge. If the E-step mixes poorly the M-step can ride that ridge until
+/// σ hits its e⁵ ceiling. Capping σ's growth to e³ ≈ 20× its initial SD keeps a
+/// genuinely ill-posed run bounded near sensible values while leaving ample room
+/// for a well-posed fit to correct a modest starting guess. The cap only ever
+/// *tightens* the existing σ upper bound and only for the RUV-scaled residual
+/// σ(s) — a FREM EPSCOV (always FIX) is untouched.
+const SAEM_RUV_SIGMA_LN_GROWTH: f64 = 3.0;
+
+/// Maximum growth of the `iiv_on_ruv` Ω *variance* during a SAEM run, in
+/// natural-log units (issue #895). The other half of the σ × ω_RUV ridge: with
+/// both free, the residual-error IIV variance can run away symmetrically to σ
+/// (observed ω_RUV → ~49 in the original report). Capping ω_RUV's growth to
+/// e³ ≈ 20× its starting variance bounds a genuinely ill-posed run near sensible
+/// values while never binding on a well-posed fit. Applied as a
+/// correlation-preserving rescale of the RUV row/column so a block Ω stays
+/// positive-definite; a FIXed RUV Ω is untouched.
+const SAEM_RUV_OMEGA_LN_GROWTH: f64 = 3.0;
+
 /// Maximum per-iteration stochastic-approximation step for the Ω sufficient
 /// statistic *during the exploration phase*. The θ/σ M-step uses the full γ
 /// (1.0 in exploration), but Ω is averaged at no more than this rate so a single
@@ -150,6 +178,14 @@ pub(crate) fn mh_steps(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
     step_scale: f64,
+    // Optional per-coordinate multiplier on the joint proposal (issue #895).
+    // `None` (or a row of 1.0) reproduces the plain `chol(Ω)·z` block move. A
+    // value < 1 shrinks the joint step for that coordinate — used to damp
+    // near-deterministic FREM covariate ETAs (posterior SD ≈ √EPSCOV ≪ √Ω_jj),
+    // whose full-scale block move would otherwise be rejected every time and
+    // pin the whole joint acceptance at 0%. The multiplier is deterministic and
+    // symmetric in η, so detailed balance is preserved. Indexed `[0, n_eta)`.
+    eta_block_scale: Option<&[f64]>,
     rng: &mut impl Rng,
     n_steps: usize,
     pk_scratch: &mut EventPkParams,
@@ -169,7 +205,10 @@ pub(crate) fn mh_steps(
         let perturbation = l * z_vec;
 
         let eta_prop: Vec<f64> = (0..n_eta)
-            .map(|j| eta[j] + step_scale * perturbation[j])
+            .map(|j| {
+                let bs = eta_block_scale.map_or(1.0, |s| s[j]);
+                eta[j] + step_scale * bs * perturbation[j]
+            })
             .collect();
 
         // For non-IOV models: reuse pk_scratch to avoid per-call allocation
@@ -1115,6 +1154,149 @@ fn combined_additive_sigma_at_floor(model: &CompiledModel, params: &ModelParamet
         })
 }
 
+/// Per-σ growth ceiling (log scale) for iiv_on_ruv SAEM runs (issue #895).
+///
+/// The IIV-on-RUV parameterization writes the residual variance as
+/// `σ²·exp(2·η_RUV)`, so σ and ω_RUV trade off along a ridge; a poorly-mixing
+/// E-step can let the M-step ride σ up to its e⁵ ceiling. This returns, per σ,
+/// `Some(cap)` = `min(log σ₀ + SAEM_RUV_SIGMA_LN_GROWTH, existing log-upper)` for
+/// each *free* RUV-scaled residual σ, and `None` for any σ that must not be
+/// capped: every σ when the model has no `iiv_on_ruv` (`has_ruv_eta == false`), a
+/// FIXed σ, or the FREM covariate σ (EPSCOV — always FIX and independent of the
+/// RUV scaling). The cap is enforced as a post-M-step clamp, never as an NLopt
+/// bound, so a well-posed fit whose σ stays below the cap is unaffected.
+fn compute_ruv_sigma_caps(
+    has_ruv_eta: bool,
+    frem_cov_sigma: Option<usize>,
+    log_sigma_init: &[f64],
+    log_sigma_upper: &[f64],
+    sigma_fixed: &[bool],
+) -> Vec<Option<f64>> {
+    let n = log_sigma_init.len();
+    if !has_ruv_eta {
+        return vec![None; n];
+    }
+    (0..n)
+        .map(|i| {
+            if sigma_fixed.get(i).copied().unwrap_or(false) || Some(i) == frem_cov_sigma {
+                return None;
+            }
+            let upper = log_sigma_upper.get(i).copied().unwrap_or(f64::INFINITY);
+            Some((log_sigma_init[i] + SAEM_RUV_SIGMA_LN_GROWTH).min(upper))
+        })
+        .collect()
+}
+
+/// Re-center the `iiv_on_ruv` η to zero mean, absorbing the shift into the
+/// RUV-scaled residual σ (issue #904). Returns the mean that was removed.
+///
+/// `Y = f + EPS·exp(η_RUV)` has no typical-value θ, so — unlike a mu-referenced
+/// structural η — η_RUV's mean is otherwise never absorbed and drifts along the
+/// degenerate direction (`σ²·exp(2η)` is invariant to η→η−c, σ→σ·exp(c)),
+/// polluting `ω_RUV = mean(η²)` with a spurious `mean²`. Shifting η_RUV by
+/// `−mean` and scaling every absorbing σ by `exp(mean)` leaves each subject's
+/// residual variance exactly unchanged while restoring `E[η_RUV] = 0`. `σ` is the
+/// residual-scale typical value that plays the role of the structural TVP here.
+///
+/// `absorb_sigma[k]` marks the free, non-FREM, RUV-scaled σ that may take the
+/// shift; when none absorb (every RUV σ FIXed) this is a no-op and the mean is
+/// left in η_RUV, since a FIXed σ already pins the mean (no degeneracy).
+fn recenter_ruv_eta(
+    etas: &mut [Vec<f64>],
+    kr: usize,
+    log_sigma: &mut [f64],
+    sigma_vals: &mut [f64],
+    absorb_sigma: &[bool],
+) -> f64 {
+    let n = etas.len();
+    if n == 0 || !absorb_sigma.iter().any(|&a| a) {
+        return 0.0;
+    }
+    let mean = etas.iter().map(|e| e[kr]).sum::<f64>() / n as f64;
+    for e in etas.iter_mut() {
+        e[kr] -= mean;
+    }
+    for k_s in 0..log_sigma.len() {
+        if absorb_sigma.get(k_s).copied().unwrap_or(false) {
+            log_sigma[k_s] += mean;
+            sigma_vals[k_s] = log_sigma[k_s].exp();
+        }
+    }
+    mean
+}
+
+/// Log-variance ceiling for the `iiv_on_ruv` Ω diagonal in a SAEM run (#895).
+///
+/// Returns `Some(cap)` = `log(ω₀) + SAEM_RUV_OMEGA_LN_GROWTH` for the RUV eta's
+/// variance when the model has an `iiv_on_ruv` eta whose Ω is free and in range,
+/// else `None` (no `iiv_on_ruv`, out of range, or a FIXed RUV Ω). The cap is
+/// enforced as a correlation-preserving rescale after the Ω M-step, so a
+/// well-posed fit whose ω_RUV stays below it is unaffected.
+fn compute_ruv_omega_cap(
+    residual_error_eta: Option<usize>,
+    n_eta: usize,
+    omega_init: &DMatrix<f64>,
+    omega_fixed: &[bool],
+) -> Option<f64> {
+    let k = residual_error_eta?;
+    if k >= n_eta || omega_fixed.get(k).copied().unwrap_or(false) {
+        return None;
+    }
+    let v0 = omega_init[(k, k)];
+    if !(v0 > 0.0) {
+        return None;
+    }
+    Some(v0.ln() + SAEM_RUV_OMEGA_LN_GROWTH)
+}
+
+/// Cap the `iiv_on_ruv` Ω diagonal at `exp(log_cap)` in place, rescaling the RUV
+/// row/column covariances by `√(v_cap/v_old)` so every correlation with the RUV
+/// eta is preserved and the matrix stays positive-definite (#895). A no-op when
+/// the diagonal is already at or below the cap. Returns `true` when it clamped.
+fn apply_ruv_omega_cap(omega_mat: &mut DMatrix<f64>, k: usize, log_cap: f64) -> bool {
+    let v_old = omega_mat[(k, k)];
+    let v_cap = log_cap.exp();
+    if !(v_old > v_cap) {
+        return false;
+    }
+    let s = (v_cap / v_old).sqrt();
+    let n = omega_mat.nrows();
+    for j in 0..n {
+        if j != k {
+            omega_mat[(k, j)] *= s;
+            omega_mat[(j, k)] *= s;
+        }
+    }
+    omega_mat[(k, k)] = v_cap;
+    true
+}
+
+/// Decide whether SAEM should warn that its E-step never mixed (issue #895).
+///
+/// `cum_acc` / `cum_prop` are the run-cumulative combined (block + componentwise)
+/// MH accept / proposal counts over the post-burn-in iterations. Returns the
+/// warning string when the acceptance rate is below `SAEM_MH_STUCK_ACCEPT` (and
+/// at least one proposal was made), else `None`. A near-zero rate means the
+/// sampled ETAs barely moved, so the M-step ran on degenerate sufficient
+/// statistics and Ω/σ are unreliable.
+fn saem_mixing_warning(cum_acc: u64, cum_prop: u64) -> Option<String> {
+    if cum_prop == 0 {
+        return None;
+    }
+    let rate = cum_acc as f64 / cum_prop as f64;
+    if rate < SAEM_MH_STUCK_ACCEPT {
+        Some(format!(
+            "SAEM Metropolis-Hastings acceptance was {:.2}% over the post-burn-in \
+             iterations — the E-step is not mixing, so Ω/σ estimates are unreliable. \
+             Check for extreme Ω-diagonal scale differences (e.g. FREM covariate ETAs) \
+             or a mis-scaled initial Ω.",
+            rate * 100.0
+        ))
+    } else {
+        None
+    }
+}
+
 /// Build (theta_idx, eta_idx) pairs for log-transformed mu-references only.
 ///
 /// Only `log_transformed = true` mu-refs (patterns `THETA*exp(ETA)` and
@@ -1511,6 +1693,44 @@ pub fn run_saem(
         }
     }
 
+    // #895: iiv_on_ruv creates a σ × ω_RUV ridge (residual var = σ²·exp(2·η_RUV)),
+    // so a poorly-mixing E-step can let the M-step ride σ up to its e⁵ ceiling.
+    // Cap each *free* RUV-scaled residual σ's growth to a generous multiple of its
+    // starting value (`SAEM_RUV_SIGMA_LN_GROWTH`) so a genuinely ill-posed run
+    // stays bounded near sensible SDs. A FREM EPSCOV (always FIX, and independent
+    // of the RUV scaling) is skipped, as is any FIXed σ.
+    //
+    // The cap is applied as a post-M-step clamp on `log_sigma`, NOT by tightening
+    // the NLopt upper bound: a well-posed fit whose σ never approaches the cap
+    // must reproduce the un-capped trajectory bit-for-bit (changing the bound
+    // handed to NLopt perturbs its search path even when the optimum is interior).
+    // `None` means "no cap for this σ"; a `Some(cap)` records the log-σ ceiling so
+    // the update can be clamped and a run that ends pinned against it flagged.
+    let ruv_sigma_caps: Vec<Option<f64>> = compute_ruv_sigma_caps(
+        model.residual_error_eta.is_some(),
+        model
+            .frem_config
+            .as_ref()
+            .map(|fc| fc.covariate_sigma_index),
+        &log_sigma,
+        &log_sigma_upper,
+        &init_params.sigma_fixed,
+    );
+
+    // #904: which residual σ absorb the iiv_on_ruv η-mean during re-centering —
+    // exactly the free, non-FREM, RUV-scaled σ (the same set that carries a growth
+    // cap). A FREM EPSCOV or a FIXed σ is never scaled.
+    let ruv_sigma_absorb: Vec<bool> = ruv_sigma_caps.iter().map(|c| c.is_some()).collect();
+
+    // #895: log-variance ceiling for the iiv_on_ruv Ω diagonal — the ω_RUV half
+    // of the σ × ω_RUV ridge backstop (see `compute_ruv_omega_cap`).
+    let ruv_omega_cap: Option<f64> = compute_ruv_omega_cap(
+        model.residual_error_eta,
+        n_eta,
+        &init_params.omega.matrix,
+        &init_params.omega_fixed,
+    );
+
     let mut state = SaemState {
         etas,
         kappas: kappas_init,
@@ -1549,8 +1769,19 @@ pub fn run_saem(
     // Only meaningful when `using_hmc = true`; stays all-false otherwise.
     let mut hmc_subjects = vec![false; n_subjects];
 
+    // Run-cumulative combined (block + componentwise) MH accept / proposal counts
+    // over the post-burn-in iterations, for the end-of-run "sampler not mixing"
+    // warning (#895). Kept separate from `state.*_counts`, which the adaptation
+    // step resets every `adapt_interval`.
+    let mut cum_mh_acc: u64 = 0;
+    let mut cum_mh_prop: u64 = 0;
+
     // Main loop
     for k in 1..=n_iter {
+        // Per-iteration combined (block + componentwise) accept / proposal
+        // tallies — the honest E-step mixing rate reported to the trace (#895).
+        let mut iter_acc: usize = 0;
+        let mut iter_prop: usize = 0;
         if crate::cancel::is_cancelled(&options.cancel) {
             if verbose {
                 eprintln!("SAEM: cancelled at iteration {}", k);
@@ -1623,6 +1854,25 @@ pub fn run_saem(
                 .map(|j| omega_k.matrix[(j, j)].max(SAEM_OMEGA_DIAG_FLOOR).sqrt())
                 .collect();
             let cw_sd_ref = &cw_sd;
+            // Per-coordinate multiplier for the block kernel (issue #895). 1.0 for
+            // every ordinary ETA — so non-FREM models get the exact `chol(Ω)·z`
+            // move, byte-for-byte (×1.0). FREM covariate ETAs are near-
+            // deterministic (posterior SD ≈ √EPSCOV ≪ √Ω_jj), so a full-scale
+            // joint proposal for them is rejected every time and pins the whole
+            // block acceptance at 0%; damp their coordinate to ≈ √EPSCOV/√Ω_jj so
+            // the joint move can still explore the correlated PK block. The
+            // componentwise kernel handles the covariate ETAs themselves.
+            let blk_eta_scale: Option<Vec<f64>> = model.frem_config.as_ref().map(|fc| {
+                let epscov = state.sigma_vals[fc.covariate_sigma_index];
+                let mut v = vec![1.0_f64; n_eta];
+                for &(_theta_idx, eta_idx) in fc.fremtype_to_indices.values() {
+                    if eta_idx < n_eta {
+                        v[eta_idx] = (epscov.sqrt() / cw_sd[eta_idx]).clamp(1e-6, 1.0);
+                    }
+                }
+                v
+            });
+            let blk_eta_scale_ref = blk_eta_scale.as_deref();
             // For IOV models, eta proposals must target p(η | κ, θ, data):
             // the per-occasion [eta_prop, kappa_k] predictions determine
             // which etas are accepted.  Pass omega_iov to mh_steps so it
@@ -1696,6 +1946,7 @@ pub fn run_saem(
                                 omega_ref,
                                 sigma_ref,
                                 scale,
+                                blk_eta_scale_ref,
                                 &mut rng,
                                 n_mh_steps,
                                 pk_scratch,
@@ -1736,7 +1987,7 @@ pub fn run_saem(
                 )
                 .collect();
 
-            for (i, (eta_new, nll_new, n_acc, n_prop, per_eta_acc_cw, _n_prop_cw, used_hmc)) in
+            for (i, (eta_new, nll_new, n_acc, n_prop, per_eta_acc_cw, n_prop_cw, used_hmc)) in
                 results.into_iter().enumerate()
             {
                 state.etas[i] = eta_new;
@@ -1744,12 +1995,26 @@ pub fn run_saem(
                 state.accept_counts[i] += n_acc;
                 state.proposal_counts[i] += n_prop;
                 // Accumulate per-eta CW acceptance counts
+                let cw_acc_i: usize = per_eta_acc_cw.iter().sum();
                 for j in 0..n_eta {
                     state.cw_accept_counts[i][j] += per_eta_acc_cw[j];
                     state.cw_proposal_counts[i][j] += n_cw_sweeps;
                 }
                 hmc_subjects[i] |= used_hmc;
+                // Combined (block + componentwise) acceptance for this iteration —
+                // the honest E-step mixing metric (#895). The block kernel alone
+                // reads 0% for FREM-scale Ω even when the componentwise sweep is
+                // mixing fine, so a block-only rate is misleading.
+                iter_acc += n_acc + cw_acc_i;
+                iter_prop += n_prop + n_prop_cw;
             }
+        }
+
+        // Fold this iteration's combined tallies into the post-burn-in totals
+        // that back the end-of-run mixing warning (#895).
+        if k > omega_burnin {
+            cum_mh_acc += iter_acc as u64;
+            cum_mh_prop += iter_prop as u64;
         }
 
         // ---- Step 1b: Per-occasion kappa MH (IOV models only) ----
@@ -1808,6 +2073,28 @@ pub fn run_saem(
         state.steps_since_adapt += 1;
 
         // ---- Step 2: SA update of sufficient statistic for Omega ----
+        // #904: re-center the iiv_on_ruv η to zero mean, absorbing the shift into
+        // the residual σ. `Y = f + EPS·exp(η_RUV)` has no typical-value θ, so —
+        // unlike a mu-referenced structural η (CL/V…), whose mean is folded into
+        // its TVP each iteration — η_RUV's mean is otherwise never absorbed. It
+        // then drifts along the degenerate direction (`σ²·exp(2η)` is invariant to
+        // η→η−c, σ→σ·exp(c)), and the drift pollutes ω_RUV = mean(η²) with a
+        // spurious mean² term that pumps the σ × ω_RUV runaway. σ plays the role
+        // of the residual-scale typical value here: shifting η_RUV by −mean and
+        // scaling every RUV-scaled σ by exp(mean) leaves each subject's residual
+        // variance exactly unchanged while restoring E[η_RUV] = 0, so the next Ω
+        // M-step sees the true variance. Only done when a free RUV σ exists to
+        // absorb the shift (a FIXed σ already pins the mean — no degeneracy).
+        if let Some(kr) = model.residual_error_eta {
+            recenter_ruv_eta(
+                &mut state.etas,
+                kr,
+                &mut log_sigma,
+                &mut state.sigma_vals,
+                &ruv_sigma_absorb,
+            );
+        }
+
         let mut eta_outer = DMatrix::zeros(n_eta, n_eta);
         for eta in &state.etas {
             let ev = DVector::from_column_slice(eta);
@@ -1888,6 +2175,13 @@ pub fn run_saem(
                 &init_params.omega_fixed,
                 SAEM_OMEGA_DIAG_FLOOR,
             );
+
+            // #895: cap the iiv_on_ruv Ω variance so a runaway ridge can't inflate
+            // ω_RUV without bound (the original report saw ~49). No-op for a
+            // well-posed fit; a correlation-preserving rescale keeps Ω PD.
+            if let (Some(k), Some(log_cap)) = (model.residual_error_eta, ruv_omega_cap) {
+                apply_ruv_omega_cap(&mut state.omega_mat, k, log_cap);
+            }
 
             // ---- Step 3b: Omega_iov (analytic, IOV only) ----
             // Apply the SA sufficient statistic, zeroing structural off-diagonals
@@ -2027,6 +2321,18 @@ pub fn run_saem(
                 log_sigma = sigma_new;
             }
 
+            // #895: clamp any RUV-scaled residual σ that the M-step pushed past its
+            // growth cap. A no-op for a well-posed fit (σ stays well below the cap),
+            // so the un-capped trajectory is reproduced bit-for-bit; only a runaway
+            // riding the σ × ω_RUV ridge is pulled back.
+            for (i, cap) in ruv_sigma_caps.iter().enumerate() {
+                if let Some(cap) = cap {
+                    if log_sigma[i] > *cap {
+                        log_sigma[i] = *cap;
+                    }
+                }
+            }
+
             state.theta = (0..n_theta)
                 .map(|i| unpack_theta(i, log_theta[i]))
                 .collect();
@@ -2151,11 +2457,12 @@ pub fn run_saem(
         {
             let phase = if k <= k1 { "explore" } else { "converge" };
             let cond_nll: f64 = state.nll_cache.iter().sum();
-            // Rolling accept rate since the last adapt reset (per-subject proposal counts
-            // as denominator so mixed HMC/MH runs report a meaningful rate).
-            let total_proposals: usize = state.proposal_counts.iter().sum();
-            let mh_accept_rate: f64 =
-                state.accept_counts.iter().sum::<usize>() as f64 / total_proposals.max(1) as f64;
+            // Combined (block + componentwise) acceptance for this iteration (#895).
+            // Reporting the block kernel alone reads a misleading 0% for FREM-scale
+            // Ω — the near-deterministic covariate ETAs reject every joint move —
+            // even though the componentwise sweep is mixing the chain fine. The
+            // combined rate is the honest E-step mixing diagnostic.
+            let mh_accept_rate: f64 = iter_acc as f64 / iter_prop.max(1) as f64;
 
             if verbose && (k == 1 || k % 50 == 0 || k == n_iter) {
                 eprintln!(
@@ -2218,6 +2525,61 @@ pub fn run_saem(
     if combined_additive_sigma_at_floor(model, &final_params) {
         warnings
             .push("SAEM combined-error additive sigma collapsed to its lower bound.".to_string());
+    }
+
+    // #895: warn when the E-step never mixed. A combined (block + componentwise)
+    // post-burn-in acceptance rate near zero means the sampled ETAs barely moved
+    // from their starting values, so the M-step ran on degenerate sufficient
+    // statistics and the Ω/σ estimates are unreliable (the classic FREM-scale
+    // "0% acceptance" failure).
+    if let Some(w) = saem_mixing_warning(cum_mh_acc, cum_mh_prop) {
+        warnings.push(w);
+    }
+
+    // #895: warn when a free RUV-scaled residual σ ended pinned against the
+    // iiv_on_ruv growth cap. That signals the σ × ω_RUV ridge is poorly
+    // identified from the data alone; the cap kept σ bounded but the split
+    // between σ and ω_RUV should not be trusted — fix one of them (e.g. σ at a
+    // known value) or drop the IIV on the residual error.
+    for (i, cap) in ruv_sigma_caps.iter().enumerate() {
+        if let Some(cap) = cap {
+            if final_params.sigma.values[i].max(1e-300).ln() >= cap - 1e-6 {
+                warnings.push(format!(
+                    "SAEM residual sigma '{}' hit its iiv_on_ruv growth cap (≈{:.4}); the \
+                     sigma × omega_RUV ridge is weakly identified and the estimates are not \
+                     trustworthy. The most reliable fix is to FIX sigma at a known value (e.g. \
+                     from an IMP/IMPMAP run) and re-fit — omega_RUV then recovers; alternatively \
+                     FIX the RUV omega or remove iiv_on_ruv.",
+                    final_params
+                        .sigma
+                        .names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("sigma[{i}]")),
+                    cap.exp()
+                ));
+            }
+        }
+    }
+
+    // #895: warn when the iiv_on_ruv Ω variance ended pinned against its growth
+    // cap — the ω_RUV half of the same ridge instability. Same guidance: fix σ (or
+    // the RUV Ω) and re-fit.
+    if let (Some(k), Some(log_cap)) = (model.residual_error_eta, ruv_omega_cap) {
+        if final_params.omega.matrix[(k, k)].max(1e-300).ln() >= log_cap - 1e-6 {
+            warnings.push(format!(
+                "SAEM iiv_on_ruv omega '{}' hit its growth cap (≈{:.4}); the sigma × omega_RUV \
+                 ridge is weakly identified and the estimates are not trustworthy. FIX sigma at \
+                 a known value (e.g. from an IMP/IMPMAP run) and re-fit — omega_RUV then recovers.",
+                final_params
+                    .omega
+                    .eta_names
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| format!("eta[{k}]")),
+                log_cap.exp()
+            ));
+        }
     }
 
     // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----
@@ -2677,6 +3039,7 @@ mod tests {
             &omega,
             &sigma.values,
             0.0, // zero perturbation: random walk MUST stay put exactly
+            None,
             &mut rng,
             100,
             &mut pk_scratch,
@@ -3642,5 +4005,304 @@ mod tests {
         }
         assert!(rows >= 1, "expected at least one SAEM trace row");
         std::fs::remove_file(&path).ok();
+    }
+
+    // ---- #895: iiv_on_ruv sigma-ridge cap ----
+
+    #[test]
+    fn ruv_sigma_caps_none_without_iiv_on_ruv() {
+        // A model with no iiv_on_ruv carries no cap on any sigma, so the M-step
+        // sigma trajectory is left exactly as the un-capped code produced it.
+        let caps = compute_ruv_sigma_caps(
+            false,
+            None,
+            &[(-1.75_f64), 0.0],
+            &[5.0, 5.0],
+            &[false, false],
+        );
+        assert_eq!(caps, vec![None, None]);
+    }
+
+    #[test]
+    fn ruv_sigma_caps_bounds_free_residual_sigma_growth() {
+        // iiv_on_ruv active: the free residual sigma gets a cap of
+        // log(σ₀) + SAEM_RUV_SIGMA_LN_GROWTH (well below the e⁵ ceiling).
+        let ln_s0 = 0.1738_f64.ln(); // ≈ -1.75
+        let caps = compute_ruv_sigma_caps(true, None, &[ln_s0], &[5.0], &[false]);
+        assert_eq!(caps.len(), 1);
+        let cap = caps[0].expect("free residual sigma must carry a cap");
+        assert!((cap - (ln_s0 + SAEM_RUV_SIGMA_LN_GROWTH)).abs() < 1e-12);
+        // e³ ≈ 20× growth in SD, and comfortably under the e⁵ ceiling.
+        assert!(cap < 5.0);
+        assert!((cap.exp() / 0.1738 - SAEM_RUV_SIGMA_LN_GROWTH.exp()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ruv_sigma_caps_skip_fixed_and_frem_covariate_sigma() {
+        // sigma[0] = free PK residual (capped), sigma[1] = FREM EPSCOV (skipped),
+        // sigma[2] = FIXed (skipped).
+        let caps = compute_ruv_sigma_caps(
+            true,
+            Some(1),
+            &[0.0, -6.0, -1.0],
+            &[5.0, 5.0, 5.0],
+            &[false, true, true],
+        );
+        assert!(caps[0].is_some());
+        assert_eq!(caps[1], None, "FREM EPSCOV must not be capped");
+        assert_eq!(caps[2], None, "FIXed sigma must not be capped");
+    }
+
+    #[test]
+    fn ruv_sigma_caps_never_loosen_existing_upper() {
+        // If the model's own upper bound is tighter than log σ₀ + growth, the cap
+        // takes the tighter of the two — it can only ever tighten σ, never loosen.
+        let caps = compute_ruv_sigma_caps(true, None, &[0.0], &[1.0], &[false]);
+        assert_eq!(caps[0], Some(1.0));
+    }
+
+    // ---- #904: iiv_on_ruv eta re-centering ----
+
+    #[test]
+    fn recenter_ruv_eta_zeroes_mean_and_preserves_residual_variance() {
+        // η_RUV at index 1, with a non-zero mean; two etas per subject.
+        let mut etas = vec![vec![0.3, 0.8], vec![-0.1, -0.4], vec![0.2, 0.2]];
+        let kr = 1;
+        // Per-subject residual variance before: σ²·exp(2·η_RUV) (σ = sd = 0.2).
+        let sd0 = 0.2_f64;
+        let var_before: Vec<f64> = etas
+            .iter()
+            .map(|e| sd0 * sd0 * (2.0_f64 * e[kr]).exp())
+            .collect();
+        let mean_in = (0.8 - 0.4 + 0.2) / 3.0;
+
+        let mut log_sigma = vec![sd0.ln()];
+        let mut sigma_vals = vec![sd0];
+        let removed = recenter_ruv_eta(&mut etas, kr, &mut log_sigma, &mut sigma_vals, &[true]);
+
+        // Removed exactly the mean; η_RUV now zero-mean.
+        assert!((removed - mean_in).abs() < 1e-12);
+        let mean_after = etas.iter().map(|e| e[kr]).sum::<f64>() / 3.0;
+        assert!(mean_after.abs() < 1e-12);
+        // σ scaled by exp(mean).
+        assert!((sigma_vals[0] - sd0 * mean_in.exp()).abs() < 1e-12);
+        assert!((log_sigma[0] - (sd0.ln() + mean_in)).abs() < 1e-12);
+        // Each subject's residual variance is exactly unchanged (the invariance).
+        for (e, &v0) in etas.iter().zip(var_before.iter()) {
+            let v_after = sigma_vals[0] * sigma_vals[0] * (2.0_f64 * e[kr]).exp();
+            assert!(
+                (v_after - v0).abs() < 1e-12,
+                "residual variance moved: {v_after} vs {v0}"
+            );
+        }
+        // Non-RUV coordinate untouched.
+        assert_eq!(etas[0][0], 0.3);
+    }
+
+    #[test]
+    fn recenter_ruv_eta_noop_when_no_sigma_absorbs() {
+        // Every RUV σ FIXed (none absorbs) → η mean is left in place, σ untouched.
+        let mut etas = vec![vec![0.5], vec![-0.1]];
+        let mut log_sigma = vec![0.2_f64.ln()];
+        let mut sigma_vals = vec![0.2];
+        let removed = recenter_ruv_eta(&mut etas, 0, &mut log_sigma, &mut sigma_vals, &[false]);
+        assert_eq!(removed, 0.0);
+        assert_eq!(etas, vec![vec![0.5], vec![-0.1]]);
+        assert_eq!(sigma_vals, vec![0.2]);
+    }
+
+    // ---- #895: iiv_on_ruv omega-ridge cap ----
+
+    #[test]
+    fn ruv_omega_cap_none_without_ruv_or_when_fixed() {
+        let om = DMatrix::from_diagonal(&DVector::from_vec(vec![0.3, 0.2]));
+        // No iiv_on_ruv eta.
+        assert_eq!(compute_ruv_omega_cap(None, 2, &om, &[false, false]), None);
+        // RUV eta index out of range.
+        assert_eq!(
+            compute_ruv_omega_cap(Some(5), 2, &om, &[false, false]),
+            None
+        );
+        // RUV omega FIXed.
+        assert_eq!(compute_ruv_omega_cap(Some(0), 2, &om, &[true, false]), None);
+    }
+
+    #[test]
+    fn ruv_omega_cap_is_log_variance_plus_growth() {
+        let om = DMatrix::from_diagonal(&DVector::from_vec(vec![0.2977886, 0.2]));
+        let cap = compute_ruv_omega_cap(Some(0), 2, &om, &[false, false]).unwrap();
+        assert!((cap - (0.2977886_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH)).abs() < 1e-12);
+        // ≈ 20× the starting variance.
+        assert!((cap.exp() / 0.2977886 - SAEM_RUV_OMEGA_LN_GROWTH.exp()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_ruv_omega_cap_noop_below_cap() {
+        let mut om = DMatrix::from_row_slice(2, 2, &[0.3, 0.05, 0.05, 0.2]);
+        let before = om.clone();
+        // cap = exp(log(0.3)+3) ≈ 6.0, well above 0.3 → no change.
+        let clamped = apply_ruv_omega_cap(&mut om, 0, 0.3_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH);
+        assert!(!clamped);
+        assert_eq!(om, before);
+    }
+
+    #[test]
+    fn apply_ruv_omega_cap_preserves_correlation_and_pd() {
+        // ω_RUV runaway to 9.0, correlated with a second eta (var 0.2).
+        let cov = 0.9_f64; // corr = 0.9/sqrt(9*0.2) ≈ 0.671
+        let mut om = DMatrix::from_row_slice(2, 2, &[9.0, cov, cov, 0.2]);
+        let corr_before = om[(0, 1)] / (om[(0, 0)] * om[(1, 1)]).sqrt();
+        let log_cap = 0.2977886_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH; // ≈ log(5.98)
+        let clamped = apply_ruv_omega_cap(&mut om, 0, log_cap);
+        assert!(clamped);
+        // Diagonal pulled down to the cap.
+        assert!((om[(0, 0)] - log_cap.exp()).abs() < 1e-9);
+        // Correlation with the other eta preserved.
+        let corr_after = om[(0, 1)] / (om[(0, 0)] * om[(1, 1)]).sqrt();
+        assert!((corr_after - corr_before).abs() < 1e-9);
+        // Still symmetric and positive-definite (2×2: det > 0, diag > 0).
+        assert_eq!(om[(0, 1)], om[(1, 0)]);
+        let det = om[(0, 0)] * om[(1, 1)] - om[(0, 1)] * om[(1, 0)];
+        assert!(det > 0.0 && om[(0, 0)] > 0.0);
+    }
+
+    // ---- #895: MH mixing warning ----
+
+    #[test]
+    fn saem_mixing_warning_fires_only_when_stuck() {
+        // 0% acceptance over the post-burn-in window → warn.
+        assert!(saem_mixing_warning(0, 100_000).is_some());
+        // Just below the 1% threshold → warn.
+        assert!(saem_mixing_warning(50, 100_000).is_some());
+        // Healthy acceptance → silent.
+        assert!(saem_mixing_warning(8_000, 100_000).is_none());
+        // No proposals accumulated (e.g. burn-in ≥ n_iter) → silent, no div-by-0.
+        assert!(saem_mixing_warning(0, 0).is_none());
+    }
+
+    // ---- #895: block-kernel per-coordinate scaling ----
+
+    fn one_obs_subject() -> Subject {
+        use crate::types::DoseEvent;
+        use std::collections::HashMap;
+        Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![],
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }
+    }
+
+    #[test]
+    fn mh_steps_block_scale_none_equals_all_ones() {
+        // `None` must reproduce the plain chol(Ω)·z block move bit-for-bit, and an
+        // explicit all-ones scale must be identical to it — the multiplier is a
+        // no-op at 1.0, so non-FREM models are unaffected.
+        use crate::stats::likelihood::individual_nll;
+        use crate::types::SigmaVector;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let model = analytical_model(GradientMethod::Auto);
+        let subj = one_obs_subject();
+        let omega =
+            OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["ETA_CL".into(), "ETA_V".into()]);
+        let sigma = SigmaVector {
+            values: vec![0.1],
+            names: vec!["PROP".into()],
+        };
+        let theta = vec![1.0, 8.0];
+
+        let run = |scale: Option<&[f64]>| {
+            let mut eta = vec![0.2_f64, -0.1];
+            let nll0 = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma.values);
+            let mut rng = StdRng::seed_from_u64(7);
+            let mut scratch = EventPkParams::with_capacity_for(&subj);
+            let (acc, nll) = mh_steps(
+                &mut eta,
+                nll0,
+                &subj,
+                &model,
+                &theta,
+                &omega,
+                &sigma.values,
+                0.5,
+                scale,
+                &mut rng,
+                50,
+                &mut scratch,
+                None,
+            );
+            (eta, acc, nll)
+        };
+
+        let (eta_none, acc_none, nll_none) = run(None);
+        let (eta_ones, acc_ones, nll_ones) = run(Some(&[1.0, 1.0]));
+        assert_eq!(eta_none, eta_ones);
+        assert_eq!(acc_none, acc_ones);
+        assert_eq!(nll_none, nll_ones);
+    }
+
+    #[test]
+    fn mh_steps_block_scale_freezes_damped_coordinate() {
+        // A block scale of 0 on coordinate 1 means the joint proposal never moves
+        // that coordinate (its perturbation is multiplied by 0), while coordinate
+        // 0 is free to move — the mechanism that damps near-deterministic FREM
+        // covariate ETAs so the block kernel can still explore the PK block.
+        use crate::stats::likelihood::individual_nll;
+        use crate::types::SigmaVector;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let model = analytical_model(GradientMethod::Auto);
+        let subj = one_obs_subject();
+        let omega =
+            OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["ETA_CL".into(), "ETA_V".into()]);
+        let sigma = SigmaVector {
+            values: vec![0.1],
+            names: vec!["PROP".into()],
+        };
+        let theta = vec![1.0, 8.0];
+        let eta0 = vec![0.2_f64, -0.1];
+
+        let mut eta = eta0.clone();
+        let nll0 = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma.values);
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut scratch = EventPkParams::with_capacity_for(&subj);
+        mh_steps(
+            &mut eta,
+            nll0,
+            &subj,
+            &model,
+            &theta,
+            &omega,
+            &sigma.values,
+            0.8,
+            Some(&[1.0, 0.0]),
+            &mut rng,
+            100,
+            &mut scratch,
+            None,
+        );
+        // Coordinate 1 is frozen at its start; coordinate 0 has moved.
+        assert_eq!(
+            eta[1], eta0[1],
+            "coordinate with block scale 0 must not move"
+        );
+        assert_ne!(eta[0], eta0[0], "unclamped coordinate should have moved");
     }
 }

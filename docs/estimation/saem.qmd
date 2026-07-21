@@ -45,13 +45,15 @@ Two samplers are available:
 
 Two MH kernels run per subject per SAEM iteration (the mixture of Kuhn & Lavielle 2004):
 
-**Kernel 1 — block proposal**: run `n_mh_steps` symmetric random-walk steps $\eta_{\text{prop}} = \eta_{\text{current}} + \delta_i \cdot L \cdot z$, with $z \sim N(0, I)$ and $L = \text{chol}(\Omega)$. This mixes the joint scale efficiently.
+**Kernel 1 — block proposal**: run `n_mh_steps` symmetric random-walk steps $\eta_{\text{prop}} = \eta_{\text{current}} + \delta_i \cdot L \cdot z$, with $z \sim N(0, I)$ and $L = \text{chol}(\Omega)$. This mixes the joint scale efficiently. For **FREM** models the covariate ETAs are near-deterministic (their pseudo-observations pin them to a posterior SD of $\approx\sqrt{\text{EPSCOV}} \ll \sqrt{\Omega_{jj}}$), so a full-scale joint proposal for them is rejected every time and the *joint* acceptance collapses to 0%. Each covariate coordinate is therefore damped in the block move by a factor $\min(1, \sqrt{\text{EPSCOV}}/\sqrt{\Omega_{jj}})$, so the joint step still explores the correlated PK block while the componentwise sweep handles the covariate coordinates themselves. Ordinary (non-FREM) ETAs use a damping factor of exactly 1, i.e. the plain $\text{chol}(\Omega)\,z$ move (issue #895).
 
 **Kernel 2 — componentwise sweep**: for multi-η models, follow the block move with $\max(2, \lfloor \texttt{n\_mh\_steps} / n_\eta \rfloor)$ sweeps that perturb one coordinate at a time, $\eta_j' = \eta_j + \delta_i^{\text{cw}} \cdot \sqrt{\Omega_{jj}} \cdot z$, holding the others fixed. Because the block proposal is shaped by $\text{chol}(\Omega)$, once $\Omega$ drifts toward a high correlation the block move can only travel along that near-degenerate direction; the single-draw Ω M-step then feeds the correlation back into $\Omega$, and during the $\gamma=1$ exploration phase this compounds into a runaway collapse toward a **near rank-1 $\Omega$** (every off-diagonal correlation $\to \pm 1$, one variance $\to 0$). A componentwise move can always shift a single η independently of $\Omega$'s off-diagonals, so the sampled draws are not forced collinear. The kernel is skipped for single-η models (no off-diagonal to decorrelate).
 
 Both kernels are symmetric in $\eta$, so the proposal density cancels and the acceptance log-ratio is the difference of `individual_nll` values, which encodes the prior $N(0, \Omega)$ plus the observation likelihood.
 
 **Acceptance**: $\min(1, \exp(\text{NLL}_{\text{current}} - \text{NLL}_{\text{prop}}))$. Target acceptance rate: 40%.
+
+**Reported acceptance is combined.** The `mh_accept_rate` column in the optimizer trace (and the verbose banner) is the **combined block + componentwise** rate. Reporting the block kernel alone is misleading for FREM-scale $\Omega$: as above, the block move reads 0% acceptance even when the componentwise sweep is mixing the chain perfectly well. If the *combined* post-burn-in rate stays below 1%, the E-step genuinely is not mixing and SAEM appends a warning to `FitResult.warnings` — the sampled ETAs never moved, so the $\Omega/\sigma$ estimates are unreliable (issue #895).
 
 #### HMC (Hamiltonian Monte Carlo, `n_leapfrog > 0`)
 
@@ -316,6 +318,19 @@ On sparse data (few observations per subject) the variance components can collap
 ### Block Ω correlations near ±1 (rank-1 collapse)
 
 For a `block_omega` (correlated) random-effects block, a faulty E-step/M-step coupling can drive **every** off-diagonal correlation toward ±1 while one variance collapses toward zero — a near rank-1 Ω that FOCEI on the same data does not show. The mechanism is the block proposal (preconditioned by `chol(Ω)`) plus the single-draw Ω M-step feeding correlation back into Ω during the `γ=1` exploration phase. ferx guards this by default with two mechanisms — the **componentwise MH kernel** and the **damped Ω SA step** described above — so on a poorly-identified 2-cpt model the SAEM Ω now matches the FOCEI/NONMEM estimate (e.g. corr(CL,V1) ≈ 0.67, corr(V1,V2) ≈ 0.4) across seeds instead of collapsing to ≈0.99. If you still see inflated block correlations, raise `n_mh_steps` (this also raises the componentwise sweep count `n_mh_steps / n_eta`) and run several seeds.
+
+### IIV on residual error (`iiv_on_ruv`): σ × ω_RUV ridge
+
+With `iiv_on_ruv = ETA`, the residual is $Y = f + \varepsilon \exp(\eta_{\text{RUV}})$, so the residual variance is $\sigma^2 \exp(2\eta_{\text{RUV}})$. This form is invariant to $\eta_{\text{RUV}} \to \eta_{\text{RUV}} - c,\ \sigma \to \sigma\,e^{c}$ — $\sigma$ and a *shift* of $\eta_{\text{RUV}}$ are a degenerate pair. Unlike a mu-referenced structural $\eta$ (whose mean is folded into its typical value $\theta$ each M-step), $\eta_{\text{RUV}}$ has **no typical-value $\theta$**, so nothing absorbs its mean: it drifts along that degenerate direction, and because $\omega_{\text{RUV}}$ is estimated as $\overline{\eta_{\text{RUV}}^2}$ the drift injects a spurious $\text{mean}^2$ term that pumps $\sigma$ and $\omega_{\text{RUV}}$ **up together** — the runaway reported in issue #895 ($\omega_{\text{RUV}}$ toward ~49, $\sigma$ toward its e⁵ ceiling), worst on FREM models with an extreme $\Omega$-diagonal scale range.
+
+ferx fixes this by treating $\sigma$ as the residual-scale typical value: each iteration $\eta_{\text{RUV}}$ is **re-centred to zero mean**, absorbing the shift into $\sigma$ ($\eta_{\text{RUV}} \mathrel{-}= \overline{\eta_{\text{RUV}}}$, every RUV-scaled $\sigma \mathrel{\times}= e^{\overline{\eta_{\text{RUV}}}}$). Each subject's residual variance is exactly unchanged, so the likelihood is untouched, but $E[\eta_{\text{RUV}}]=0$ is restored and $\omega_{\text{RUV}}$ measures the true variance. On the 475-subject FREM reprex this converges to $\omega_{\text{RUV}} \approx 0.28$, $\sigma \approx 0.20$ from both a too-small and a too-large $\sigma$ start (NONMEM: 0.28 / 0.18), where it previously ran to $\omega_{\text{RUV}} \approx 49$. Re-centring is applied only when a free RUV-scaled $\sigma$ exists to absorb the shift (a FIXed $\sigma$ already pins the mean).
+
+Two growth caps remain as belt-and-braces backstops, both no-ops on a well-behaved fit:
+
+- **σ growth cap** — each free RUV-scaled residual $\sigma$ is capped at $\approx 20\times$ its starting SD (a post-M-step clamp).
+- **ω_RUV growth cap** — the RUV $\Omega$ variance is capped at $\approx 20\times$ its starting value, applied as a correlation-preserving rescale of the RUV row/column so a block $\Omega$ stays positive-definite.
+
+If either cap ever binds (it should not, now that the drift is removed), SAEM warns that the split is weakly identified and suggests fixing $\sigma$.
 
 ### Slow Convergence
 
