@@ -173,6 +173,15 @@ section of the SDLC for the versioning policy).
   (`tests/nonmem_dose_compartment_anchor.rs`). Per-compartment amounts in
   sdtab / `[derived]` are reported as `NaN` for these subjects rather than wrong, with the
   existing warning extended to explain why; predictions are exact.
+
+  One caveat worth knowing: rerouting is per *subject*, so a single dose into a
+  non-default compartment moves that subject's **other** doses onto the walk too. The
+  walk equilibrates a steady-state dose with a 50-cycle iterative pulse train where dose
+  superposition uses the exact periodic closed form, so an `SS` dose on such a subject
+  shifts by the truncation difference — up to 4.5e-3 relative on a 3-compartment model at
+  `II = 12` (3.7e-5 at `II = 24`, 2.7e-9 at `II = 48`), below 1e-7 on 1-/2-compartment
+  models. Not new behaviour — any subject with a time-varying covariate, an `EVID=3/4`
+  reset, or IOV already took the walk — but it now applies to more datasets.
 - **A steady-state dose with `CMT=0` no longer loses its accumulation on the analytical
   event-driven path** (#375). `CMT=0` is NONMEM's "default dose compartment", and every dose
   site resolves it to the model's first compartment — except the event-driven walk's

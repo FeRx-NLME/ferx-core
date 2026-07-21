@@ -8,8 +8,12 @@
 //!
 //! The control streams are one `$PROBLEM` per case, `ADVAN{1,2,3,4,11,12}` with
 //! `TRANS2`/`TRANS4`, differing only in the dose record's `CMT` (and `SS`/`II`
-//! or `RATE` where noted). They were run with `nmfe76`; the numbers below are
-//! transcribed from each run's `$TABLE` output.
+//! or `RATE` where noted). The control streams, their matched datasets, and the
+//! verbatim NONMEM output are committed under `nonmem_anchor/` as
+//! `dose_cmt_*.{ctl,csv}` and `nonmem_anchor/results/dose_cmt_*.{lst,tab}`, so
+//! every number below can be re-derived rather than taken on trust — they were
+//! re-run end-to-end on NONMEM 7.6.0 and reproduce at zero relative deviation.
+//! See `nonmem_anchor/README.md` for the case table.
 //!
 //! Two things are pinned here.
 //!
@@ -22,8 +26,7 @@
 //!    with ferx's **event-driven walk**. It disagrees sharply with the
 //!    dose-superposition path, which never reads `dose.cmt` and computes every
 //!    dose as going into the model's default route — by up to two orders of
-//!    magnitude — because it never reads `dose.cmt` and computes every dose as
-//!    going into the model's default route. Since #375 such a dose reroutes to
+//!    magnitude. Since #375 such a dose reroutes to
 //!    the walk, so **every case here asserts both paths** — each against NONMEM,
 //!    and against each other. That three-way agreement is the acceptance
 //!    criterion; before the fix the `[default dispatch]` arm failed.
@@ -104,13 +107,12 @@ fn preds_of(model: &CompiledModel, csv: &str) -> Vec<f64> {
         .collect()
 }
 
-/// The control streams print `PRED` with `FORMAT=,1PE17.10` (11 significant
-/// figures), so this is a strict anchor, not a loose one: at the default 5-figure
-/// `$TABLE` precision several of these cases sit right at the printing resolution
-/// and a slack tolerance would hide a real difference rather than reveal one.
-fn assert_matches_nonmem(got: &[f64], nonmem: &[f64], case: &str) {
-    assert_close(got, nonmem, 1e-9, case)
-}
+/// Default bound. The control streams print `PRED` with `FORMAT=,1PE17.10` (11
+/// significant figures), so this is a strict anchor, not a loose one: at the
+/// default 5-figure `$TABLE` precision several of these cases sit right at the
+/// printing resolution and a slack tolerance would hide a real difference rather
+/// than reveal one.
+const NONMEM_TOL: f64 = 1e-9;
 
 /// Assert **both** analytical paths reproduce NONMEM for the same dose row: the
 /// event-driven walk, and the plain dispatcher route. Before #375 the second one
@@ -135,20 +137,6 @@ fn assert_both_paths_match(
     assert_close(&plain, &walk, tol, &format!("{case} [paths agree]"));
 }
 
-/// 3-compartment **infusion** cases. NONMEM's own `ADVAN11`/`ADVAN12` forced
-/// response carries ~2e-6 relative error here, and it is NONMEM that is off, not
-/// ferx: the closed form was cross-checked against a 1e-12 RK45 solve of the
-/// *same* ODE system (`d/dt` written out explicitly, `ode_reltol = 1e-12`) and
-/// the two ferx paths agree to **1.8e-12**, while both differ from NONMEM by the
-/// same 2.15e-6. The bolus cases on the identical eigenvalues agree with NONMEM
-/// to <1e-8, so this is specific to its infusion forced response. The tolerance
-/// is therefore set by the *reference's* accuracy, not ferx's — and
-/// `three_cpt_oral_peripheral_infusion_matches_the_ode_twin` pins the exact
-/// oracle so this looser bound cannot hide a regression.
-fn assert_matches_nonmem_3cpt_infusion(got: &[f64], nonmem: &[f64], case: &str) {
-    assert_close(got, nonmem, NONMEM_3CPT_INFUSION_TOL, case)
-}
-
 /// Bound set by **NONMEM's** accuracy on these cases, not ferx's: the measured
 /// gap is 2.1e-6 on `ADVAN11 CMT=2` and 1.1e-5 on the smallest-magnitude case
 /// (`ADVAN12 CMT=4`, PRED ~1.6e-3). ferx's own agreement with an independent
@@ -157,14 +145,12 @@ fn assert_matches_nonmem_3cpt_infusion(got: &[f64], nonmem: &[f64], case: &str) 
 /// job is cross-tool corroboration; that file's job is precision.
 const NONMEM_3CPT_INFUSION_TOL: f64 = 3e-5;
 
-/// 3-compartment closed forms obtain their eigenvalues by solving a **cubic**;
-/// ferx and NONMEM use different root-finders, so the last couple of digits
-/// legitimately differ there. Still a strict anchor — 1e-8 relative on an
-/// 11-significant-figure reference — just not one that pretends two independent
-/// cubic solves agree to the ULP.
-fn assert_matches_nonmem_3cpt(got: &[f64], nonmem: &[f64], case: &str) {
-    assert_close(got, nonmem, 1e-8, case)
-}
+/// 3-compartment **bolus** cases. Those closed forms obtain their eigenvalues by
+/// solving a **cubic**; ferx and NONMEM use different root-finders, so the last
+/// couple of digits legitimately differ. Still a strict anchor — 1e-8 relative on
+/// an 11-significant-figure reference — just not one that pretends two
+/// independent cubic solves agree to the ULP.
+const NONMEM_3CPT_TOL: f64 = 1e-8;
 
 fn assert_close(got: &[f64], nonmem: &[f64], tol: f64, case: &str) {
     assert_eq!(got.len(), nonmem.len(), "{case}: row count");
@@ -237,7 +223,7 @@ fn ss_dose_cmt_zero_and_one_match_nonmem() {
             1,
             12.0,
             &NONMEM_SS,
-            1e-9,
+            NONMEM_TOL,
             &format!("ADVAN1 SS=1 CMT={cmt}"),
         );
     }
@@ -258,7 +244,7 @@ fn one_cpt_oral_bolus_into_central_matches_nonmem() {
         0,
         0.0,
         &[1.8096748361, 1.3406400921, 0.89865792823],
-        1e-9,
+        NONMEM_TOL,
         "ADVAN2 bolus CMT=2",
     );
 }
@@ -274,7 +260,7 @@ fn two_cpt_iv_bolus_into_peripheral_matches_nonmem() {
         0,
         0.0,
         &[0.068015673681, 0.20535408329, 0.29007691882],
-        1e-9,
+        NONMEM_TOL,
         "ADVAN3 bolus CMT=2",
     );
 }
@@ -290,7 +276,7 @@ fn two_cpt_oral_bolus_into_peripheral_matches_nonmem() {
         0,
         0.0,
         &[0.068015673681, 0.20535408329, 0.29007691882],
-        1e-9,
+        NONMEM_TOL,
         "ADVAN4 bolus CMT=3",
     );
 }
@@ -306,7 +292,7 @@ fn three_cpt_iv_bolus_into_peripheral2_matches_nonmem() {
         0,
         0.0,
         &[0.015193556553, 0.046937359706, 0.069431483504],
-        1e-8,
+        NONMEM_3CPT_TOL,
         "ADVAN11 bolus CMT=3",
     );
 }
@@ -322,7 +308,7 @@ fn three_cpt_oral_bolus_into_central_matches_nonmem() {
         0,
         0.0,
         &[1.6726602861, 0.99662213471, 0.53066189083],
-        1e-8,
+        NONMEM_3CPT_TOL,
         "ADVAN12 bolus CMT=2",
     );
 }
@@ -343,7 +329,7 @@ fn two_cpt_iv_infusion_into_peripheral_matches_nonmem() {
         0,
         0.0,
         &[0.0070275296315, 0.09332945504, 0.24115537856],
-        1e-9,
+        NONMEM_TOL,
         "ADVAN3 infusion CMT=2",
     );
 }
@@ -371,7 +357,7 @@ fn two_cpt_oral_infusion_into_peripheral_matches_nonmem() {
         0,
         0.0,
         &[0.0070275296315, 0.09332945504, 0.24115537856],
-        1e-9,
+        NONMEM_TOL,
         "ADVAN4 infusion CMT=3",
     );
 }
