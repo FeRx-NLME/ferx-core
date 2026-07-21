@@ -1,6 +1,7 @@
-//! Exact oracle for **infusion into an oral model's peripheral compartment**
-//! (#375) — the closed form versus a tight-tolerance RK45 solve of the *same*
-//! ODE system.
+//! Exact oracle for **infusion into a peripheral compartment** (#375) — the
+//! closed form versus a tight-tolerance RK45 solve of the *same* ODE system.
+//! Covers the oral models (the feature #375 added) and the 3-cpt **IV** models
+//! whose forced response the oral propagators delegate to.
 //!
 //! This is the primary correctness test for that feature, and it is deliberately
 //! independent of NONMEM: NONMEM's `ADVAN11`/`ADVAN12` forced response carries
@@ -299,5 +300,119 @@ fn ss_peripheral_bolus_matches_the_ode_twin() {
         &preds(TWO_CPT_ORAL_ODE, csv),
         1e-6,
         "two_cpt_oral SS peripheral bolus",
+    );
+}
+
+// ── the IV forced response the oral cases delegate to ────────────────────────
+
+const THREE_CPT_IV_CF: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVQ(3.0, 0.1, 50.0)
+  theta TVV2(80.0, 5.0, 500.0)
+  theta TVQ3(1.0, 0.1, 50.0)
+  theta TVV3(120.0, 5.0, 900.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+
+[structural_model]
+  pk three_cpt_iv(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+const THREE_CPT_IV_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVQ(3.0, 0.1, 50.0)
+  theta TVV2(80.0, 5.0, 500.0)
+  theta TVQ3(1.0, 0.1, 50.0)
+  theta TVV3(120.0, 5.0, 900.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+
+[structural_model]
+  ode(states=[central, periph1, periph2])
+
+[odes]
+  d/dt(central) = -(CL/V)*central - (Q/V)*central + (Q/V2)*periph1 - (Q3/V)*central + (Q3/V3)*periph2
+  d/dt(periph1) = (Q/V)*central - (Q/V2)*periph1
+  d/dt(periph2) = (Q3/V)*central - (Q3/V3)*periph2
+
+[scaling]
+  y = central / V
+
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+  ode_max_steps = 10000000
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// `three_cpt_iv`, infusion into each peripheral in turn — the **tight** oracle
+/// for the two cases `tests/nonmem_dose_compartment_anchor.rs` can only pin at
+/// `NONMEM_3CPT_INFUSION_TOL = 3e-5`.
+///
+/// Those two assertions previously had no independent tight guard: the oral
+/// peripheral infusions did (the tests above), and the IV ones — which exercise
+/// the *same* `propagate_three_cpt_core_g` forced response that the oral
+/// propagators delegate to — rested entirely on a cross-tool bound 3400× looser
+/// than the rest of that file, justified by prose about NONMEM's own accuracy.
+/// The parameters, dose amount/rate and observation times below are deliberately
+/// identical to that anchor's `three_cpt_iv` cases, so this pins exactly what the
+/// loose bound cannot rather than a neighbouring configuration.
+#[test]
+fn three_cpt_iv_peripheral_infusion_matches_the_ode_twin() {
+    for cmt in [2usize, 3] {
+        // AMT=100 at RATE=20 → a 5 h window; observations straddle its end.
+        let csv = format!(
+            "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,{cmt},20,1\n\
+             1,1,5.0,0,.,1,.,0\n1,4,4.0,0,.,1,.,0\n1,8,3.0,0,.,1,.,0\n"
+        );
+        assert_agree(
+            &preds(THREE_CPT_IV_CF, &csv),
+            &preds(THREE_CPT_IV_ODE, &csv),
+            1e-9,
+            &format!("three_cpt_iv infusion CMT={cmt}"),
+        );
+    }
+}
+
+/// The same system with **both** peripherals infused at once, so the two forced
+/// responses superpose. `propagate_three_cpt_core_g` takes `rate_periph1` and
+/// `rate_periph2` as separate arguments; a swap or a clobber between them would
+/// leave the single-channel tests above green.
+#[test]
+fn three_cpt_iv_both_peripherals_infused_matches_the_ode_twin() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+               1,0,.,1,100,2,20,1\n\
+               1,0,.,1,60,3,15,1\n\
+               1,1,5.0,0,.,1,.,0\n1,4,4.0,0,.,1,.,0\n1,8,3.0,0,.,1,.,0\n1,12,2.0,0,.,1,.,0\n";
+    assert_agree(
+        &preds(THREE_CPT_IV_CF, csv),
+        &preds(THREE_CPT_IV_ODE, csv),
+        1e-9,
+        "three_cpt_iv both peripherals infused",
     );
 }

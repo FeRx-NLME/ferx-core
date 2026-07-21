@@ -143,6 +143,13 @@ fn assert_both_paths_match(
 /// 1e-12 integration of the same system is ~1e-11 — see
 /// `tests/oral_peripheral_infusion.rs`, which is the tight oracle. This anchor's
 /// job is cross-tool corroboration; that file's job is precision.
+///
+/// **Both** the oral and the IV cases guarded by this constant have a 1e-9
+/// ODE-twin counterpart there, on identical parameters and dose schedules, so
+/// nothing rests on this bound alone. That was not always true: the IV pair had
+/// no tight guard until one was added, and a deliberately injected 9.4e-7 error
+/// in the shared `propagate_three_cpt_core_g` passed *this* assertion while
+/// failing the ODE twin — which is the margin this constant cannot see.
 const NONMEM_3CPT_INFUSION_TOL: f64 = 3e-5;
 
 /// 3-compartment **bolus** cases. Those closed forms obtain their eigenvalues by
