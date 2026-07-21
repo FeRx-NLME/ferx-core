@@ -10,10 +10,14 @@
 //! - Dose resolution (`resolve_subject_doses{,_with}`): the #324 single source of
 //!   truth for turning modeled-`RATE` (`RATE=-2` → modeled duration `D{cmt}`)
 //!   doses into concrete `Fixed` doses.
+//! - Exact periodic steady state (`periodic_ss_fixed_point_g`): the engine-neutral
+//!   `u_ss = (I − M)⁻¹·b` solve of a linear one-cycle map, shared by the ODE
+//!   input-rate path (#835) and the analytical event-driven walk (#908).
 //! - SS equilibration (`SS_EQUILIBRATION_CYCLES`, `SS_EQUILIBRATION_TOL`,
 //!   `ss_cycle_converged`, `SsStopTracker`, and the test-only cycle recorder):
-//!   the shared convergence policy the analytical, ODE, and sensitivity SS loops
-//!   all reuse so their troughs can't drift apart.
+//!   the truncated-pulse-train *fallback* policy, used when the exact solve
+//!   declines, shared by the analytical, ODE, and sensitivity SS loops so their
+//!   troughs can't drift apart.
 
 use crate::types::Subject;
 use std::borrow::Cow;
@@ -90,6 +94,111 @@ pub(crate) const SS_EQUILIBRATION_CYCLES: usize = 50;
 /// PK. Fast disposition (`λ·II ≈ 2`) converges in ~14 cycles; slow PK (`λ·II ≈ 0.1`) never
 /// trips it and runs the full [`SS_EQUILIBRATION_CYCLES`] — identical to the old behaviour.
 pub(crate) const SS_EQUILIBRATION_TOL: f64 = 1e-12;
+
+/// Exact periodic steady state of a **linear** one-cycle map, `u_ss = (I − M)⁻¹·b`, generic over
+/// the numeric type `T` — the engine-neutral replacement for iterating a truncated pulse train.
+///
+/// One dosing cycle of a linear disposition is an affine map `u ↦ M·u + b`, so its periodic fixed
+/// point has a closed form. The advancement is *injected* as two "one cycle from `u0`" closures —
+/// `advance_unforced` (disposition alone; builds the drift `z0` and the propagator columns of
+/// `M = e^{A·II}`) and `advance_forced` (disposition + the cycle's own dose; builds `b` and drives
+/// the linearity check). Each caller keeps its own propagation machinery while this body owns only
+/// the `T`-typed algebra: the `I − M` assembly, the
+/// [`solve_linear_system_g`](crate::sens::linsolve::solve_linear_system_g) solve, and the
+/// value-part linearity verification. Run over a dual `T` it carries `∂u_ss/∂(θ,η)` (and the 2nd
+/// order) through the solve automatically — the implicit-function derivative, with no
+/// hand-assembled `dM`/`db`.
+///
+/// Two callers, distinguished only by how much numerical noise their propagation carries:
+///
+/// * **ODE** steady-state-into-absorption (`ode::predictions::equilibrate_ss_input_rate_g`, #835)
+///   advances by RK45, so `reltol`/`abstol` are the solver's own and `vtol` below is scaled to
+///   them. Its disposition may be genuinely nonlinear, which the self-check detects.
+/// * **Analytical** event-driven SS (`pk::event_driven`, `sens::propagate`, #908) advances by the
+///   closed-form eigenmode propagators, which are exact — it passes `reltol = abstol = 0`, leaving
+///   `vtol = 1e-9·scale`, the pure floating-point rounding floor. Its disposition is *always*
+///   linear (constant-coefficient), so the self-check is a can't-happen assertion there rather
+///   than a real branch.
+///
+/// Returns `None` on a **nonlinear** map (the one-/two-cycle self-check fails), a singular `I − M`,
+/// or any non-finite intermediate. A singular `I − M` means some disposition eigenvalue is zero —
+/// a compartment that never empties — in which case no periodic steady state exists and the
+/// caller's capped pulse-train fallback (plus [`note_ss_nonconvergence_if_capped`]) is the right
+/// answer.
+pub(crate) fn periodic_ss_fixed_point_g<T, FUnf, FFor>(
+    n: usize,
+    ii: f64,
+    reltol: f64,
+    abstol: f64,
+    advance_unforced: FUnf,
+    advance_forced: FFor,
+) -> Option<Vec<T>>
+where
+    T: crate::sens::num::PkNum,
+    FUnf: Fn(&[T]) -> Option<Vec<T>>,
+    FFor: Fn(&[T]) -> Option<Vec<T>>,
+{
+    if !(ii > 0.0) || n == 0 {
+        return None;
+    }
+    let zero = vec![T::from_f64(0.0); n];
+    // Unforced zero-state drift (zero for a homogeneous RHS, non-zero for an affine one).
+    let z0 = advance_unforced(&zero)?;
+    // b: forced response over one cycle from a zero state (constant drift + the cycle's dose).
+    let b = advance_forced(&zero)?;
+    // I − M, row-major. Column i of M is the *homogeneous* one-cycle response of eᵢ with the
+    // drift z0 removed, so an affine disposition still yields the true linear propagator.
+    let mut i_minus_m = vec![T::from_f64(0.0); n * n];
+    for i in 0..n {
+        let mut ei = zero.clone();
+        ei[i] = T::from_f64(1.0);
+        let evolved = advance_unforced(&ei)?;
+        for r in 0..n {
+            let m_ri = evolved[r] - z0[r];
+            let delta = T::from_f64(if r == i { 1.0 } else { 0.0 });
+            i_minus_m[r * n + i] = delta - m_ri;
+        }
+    }
+    let u_ss = crate::sens::linsolve::solve_linear_system_g::<T>(&i_minus_m, &b, n)?;
+    if u_ss.iter().any(|x| !x.val().is_finite()) {
+        return None;
+    }
+    // Confirm linearity on the value part: one and two forced cycles from u_ss must both return
+    // u_ss (only an affine one-cycle map does). The tolerance is scaled to the caller's own
+    // accuracy so the fast path is not falsely abandoned at a loose `ode_reltol`; a genuinely
+    // nonlinear map diverges by O(scale) and is rejected. Two cycles (not one) rejects a weakly-
+    // nonlinear map whose true fixed point merely happens to sit within `vtol` after the first.
+    let scale = u_ss.iter().fold(1e-12_f64, |a, x| a.max(x.val().abs()));
+    // Verification tolerance, scaled to the caller's own accuracy. For the ODE caller the
+    // one-cycle residual of a genuinely *linear* map is not zero but a solver-noise floor: `b`
+    // (forced from a zero state) and the check below (forced from `u_ss`) integrate the same
+    // periodic `R_in` over *different* adaptive step sequences, so their forcing quadratures
+    // differ by O(reltol·scale). Empirically that floor is ≈ 45·reltol (relative) — above the
+    // original `32·reltol`, which therefore falsely declined even linear models at a tight
+    // `ode_reltol` (e.g. 1e-10), silently forcing the fallback iteration. `256·reltol` clears the
+    // floor with ~5× margin while still rejecting a genuinely nonlinear map, whose one-cycle
+    // residual is O(scale) — ~1e8·reltol, eight orders above this bound (see
+    // `ss_input_rate_nonlinear_disposition_falls_back_to_iteration`). The analytical caller passes
+    // `reltol = abstol = 0`, so the bound degenerates to the `1e-9·scale` rounding floor its exact
+    // propagators need — seven orders above their measured ~1e-16 residual and still eight orders
+    // below a nonlinear map's O(scale).
+    let vtol = (256.0 * reltol + 1e-9) * scale + 256.0 * abstol;
+    let within = |a: &[T], b: &[T]| {
+        a.iter()
+            .zip(b)
+            .all(|(c, u)| (c.val() - u.val()).abs() <= vtol)
+    };
+    let u_check = advance_forced(&u_ss)?;
+    if !within(&u_check, &u_ss) {
+        return None;
+    }
+    let u_check2 = advance_forced(&u_check)?;
+    if within(&u_check2, &u_ss) {
+        Some(u_ss)
+    } else {
+        None
+    }
+}
 
 /// Whether the SS-equilibration trough has converged between two successive cycles. Shared
 /// by the f64 predictor, the event-driven f64 loop, and the dual gradient path so every path
