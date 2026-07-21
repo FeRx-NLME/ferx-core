@@ -2831,7 +2831,15 @@ fn oral_peripheral_infusion_provider_matches_fd_of_production() {
             subject_sensitivities(m, s, theta, &eta).is_some(),
             "[{label}] must be served analytically, not by FD"
         );
-        check_full_provider_vs_fd(m, s, theta, &eta);
+        // `1e-3` rather than the harness default `1e-4`: on these cases the
+        // mixed `∂²f/∂η∂θ` FD is roundoff-dominated at `1e-4` and clears the
+        // (unchanged) `3e-3` bound by only 1.4%, which last-bit libm differences
+        // flip between platforms. The FD converges to the analytic value as the
+        // step is refined toward its optimum, so this is a better-conditioned
+        // reference, not a looser test — it tightens the observed agreement from
+        // ~3e-3 to 1.5e-4. See `check_full_provider_vs_fd_with_step` for the
+        // step-refinement study.
+        check_full_provider_vs_fd_with_step(m, s, theta, &eta, 1e-3);
     }
 }
 
@@ -2884,6 +2892,39 @@ fn provider_1cpt_reset_midinfusion_matches_production() {
 /// applies the matching `g = ln(f)` jet transform, so the same FD check covers
 /// the log-scale value, gradient, and Hessian.
 fn check_full_provider_vs_fd(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
+    check_full_provider_vs_fd_with_step(model, subject, theta, eta, 1e-4);
+}
+
+/// As [`check_full_provider_vs_fd`], with the **second-derivative** FD step as a
+/// parameter (the first-derivative steps stay at `1e-6`).
+///
+/// The second-derivative blocks use 4-point central differences, whose total
+/// error is `O(h²)` truncation plus `O(ε/h²)` roundoff — a U-curve with a
+/// problem-dependent optimum. The default `1e-4` sits comfortably inside the
+/// `3e-3` bound for the models this harness was written against, but it is *not*
+/// universally well-conditioned: on the 3-cpt oral peripheral-infusion cases the
+/// mixed `∂²f/∂η∂θ` entries are roundoff-dominated there. Measured worst
+/// assert-margin (1.0 == the assert fails) over every entry of both
+/// second-derivative blocks, `3cpt periph1 + depot bolus`:
+///
+/// | h        | 1e-2 | 3e-3  | 1e-3      | 3e-4  | 1e-4      | 3e-5 | 1e-5 |
+/// |----------|------|-------|-----------|-------|-----------|------|------|
+/// | margin   | 4.25 | 0.386 | **0.049** | 0.151 | **0.986** | 6.16 | 69.9 |
+///
+/// At `1e-4` that case clears the assert by 1.4% — close enough that last-bit
+/// `exp`/`ln` differences between platforms flip it (it passed on macOS and
+/// failed on the Linux CI runners). The FD converges *to* the analytic value as
+/// `h` is refined toward the optimum — the analytic kernel is the accurate party
+/// — so the fix is a better-conditioned reference, not a looser bound: at `1e-3`
+/// the same entry agrees to `1.5e-4` relative, a 20× margin under the unchanged
+/// `3e-3` tolerance.
+fn check_full_provider_vs_fd_with_step(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    heh: f64,
+) {
     let n_eta = model.n_eta;
     let n_theta = theta.len();
 
@@ -2895,7 +2936,6 @@ fn check_full_provider_vs_fd(model: &CompiledModel, subject: &Subject, theta: &[
     };
     let he = 1e-6; // first-derivative step
     let ht = 1e-6;
-    let heh = 1e-4; // second-derivative step (4-point central is roundoff-prone)
 
     for (j, obs) in sens.obs.iter().enumerate() {
         // value
