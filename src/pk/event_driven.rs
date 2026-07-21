@@ -314,10 +314,30 @@ fn state_layout(pk_model: PkModel) -> (usize, usize) {
 }
 
 /// Pre-equilibrate the event-driven analytical state to its SS value for
-/// an SS=1 dose. Same scheme as `ode/predictions.rs::equilibrate_ss_state`:
-/// reset state, then loop N cycles of (apply dose; propagate one II).
-/// The state after the loop is the "just-before-next-pulse" SS state;
+/// an SS=1 dose. The returned state is the "just-before-next-pulse" SS state;
 /// the caller applies the SS dose's own pulse through the normal flow.
+///
+/// **Exact, not truncated (#908).** One dosing cycle of these models is an affine map
+/// `u ↦ M·u + b` — the analytical disposition is always linear (constant-coefficient), and the
+/// dose enters additively — so the periodic steady state has the closed form
+/// `u_ss = (I − M)⁻¹·b`. `M`'s columns and `b` come from the *same* propagator the walk itself
+/// uses, injected into [`crate::dosing::periodic_ss_fixed_point_g`] as one-cycle closures, so no
+/// new formula is introduced. This agrees with the dose-superposition SS closed forms to f64
+/// precision (≤ 1e-12 relative on every walk-supported model, bit-identical on several) rather
+/// than to a truncation tolerance, and costs `n + 4` propagator calls plus one `n×n` solve
+/// (`n ≤ 4`) instead of up to [`SS_EQUILIBRATION_CYCLES`](crate::dosing::SS_EQUILIBRATION_CYCLES).
+///
+/// This replaced a truncated pulse train whose residual was `≈ exp(−50·λ_slow·II)`. That is
+/// negligible for fast PK but reached **30 %** on an ordinary long-half-life one-compartment
+/// model (`CL = 0.1`, `V = 50`, `II = 12`), and over 50 % on the deep peripheral *amounts* of
+/// slow 2-/3-compartment models — silently, because a subject is routed here (rather than to the
+/// exact superposition path) by something as incidental as a time-varying covariate, an
+/// `EVID=3/4` reset, IOV, or a dose into a non-default compartment.
+///
+/// The pulse train survives only as the fallback for a **singular** `I − M`, i.e. a disposition
+/// eigenvalue of zero (a compartment that never empties, e.g. `CL = 0`). No periodic steady state
+/// exists there, so the capped loop now also raises the #867 non-convergence warning instead of
+/// returning a silently-truncated state.
 ///
 /// `dose.ii > 0` and `dose.duration <= dose.ii` are required (callers
 /// already guard the first; overlapping infusions are rejected).
@@ -374,15 +394,62 @@ fn equilibrate_ss_state_event_driven(
         vec![0.0, dose.ii]
     };
 
-    // Constant params across all SS-equilibration cycles → one eigendata solve.
-    let mut eigen = crate::sens::propagate::EigenCacheG::default();
+    // Constant params across all SS-equilibration cycles → one eigendata solve. The `RefCell`
+    // lets the two `Fn` closures below share that one cache; a fresh cache per closure call
+    // would redo the eigenvalue solve `n + 4` times.
+    let eigen = std::cell::RefCell::new(crate::sens::propagate::EigenCacheG::default());
+
+    // One cycle from `u0`, forward from the pulse at phase 0. `forced` includes this cycle's own
+    // dose (the bolus jump, or the synthetic infusion window); unforced is the bare homogeneous
+    // disposition over the *same* bounds, which is what makes its columns the true monodromy `M`.
+    let advance = |u0: &[f64], forced: bool| -> Option<Vec<f64>> {
+        let mut s = u0.to_vec();
+        if forced && !is_inf {
+            // Bolus pulse: instantaneous amount jump (with F).
+            s[cmt_idx] += pk.bioavailable_amount(dose.amt);
+        }
+        let (doses, lagtimes): (&[DoseEvent], &[f64]) = if forced {
+            (&synthetic_dose, &synthetic_lagtimes)
+        } else {
+            (&[], &[])
+        };
+        propagate_with_bounds(
+            &mut s,
+            &bounds,
+            pk,
+            pk_model,
+            doses,
+            lagtimes,
+            f64::NEG_INFINITY,
+            &mut eigen.borrow_mut(),
+        );
+        Some(s)
+    };
+
+    // Exact periodic steady state. `reltol = abstol = 0`: the closed-form propagators carry no
+    // solver noise, so the helper's linearity self-check runs at its `1e-9·scale` rounding floor.
+    if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<f64, _, _>(
+        n_states,
+        dose.ii,
+        0.0,
+        0.0,
+        |u0| advance(u0, false),
+        |u0| advance(u0, true),
+    ) {
+        crate::dosing::record_ss_equilibration_cycles(1);
+        return u_ss;
+    }
+
+    // Fallback — only a singular `I − M` reaches here (a zero disposition eigenvalue, so no
+    // periodic steady state exists). Iterate the truncated pulse train as before and, unlike
+    // before, say so when it hits the cap (#867 warning, previously wired only on the ODE path).
     // Shared early stop (#519, #532 review #6/#11): same mixed atol/rtol criterion and scaffold
     // (`SsStopTracker`) as the ODE f64 path.
     let mut tracker = crate::dosing::SsStopTracker::default();
     let mut cycles_run = 0usize;
+    let mut early_stopped = false;
     for cycle in 0..crate::dosing::SS_EQUILIBRATION_CYCLES {
         if !is_inf {
-            // Bolus pulse: instantaneous amount jump (with F).
             state[cmt_idx] += pk.bioavailable_amount(dose.amt);
         }
         propagate_with_bounds(
@@ -393,14 +460,17 @@ fn equilibrate_ss_state_event_driven(
             &synthetic_dose,
             &synthetic_lagtimes,
             f64::NEG_INFINITY,
-            &mut eigen,
+            &mut eigen.borrow_mut(),
         );
         cycles_run = cycle + 1;
         if tracker.should_stop(cycle, &state) {
+            early_stopped = true;
             break;
         }
     }
     crate::dosing::record_ss_equilibration_cycles(cycles_run);
+    let (incr_prev, incr_last, incr_mag) = tracker.recent_increments();
+    crate::dosing::note_ss_nonconvergence_if_capped(early_stopped, incr_prev, incr_last, incr_mag);
 
     state
 }

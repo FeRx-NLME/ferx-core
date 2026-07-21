@@ -1143,6 +1143,20 @@ pub(crate) fn ss_dual_cycle_should_stop<T: PkNum>(
 /// `event_driven::equilibrate_ss_state_event_driven` for the 1-/2-cpt models;
 /// overlapping SS infusions (`T_inf > II`) return the empty state, matching
 /// production's reject.
+///
+/// **Exact, not truncated (#908)** — and it must flip in lockstep with the value walk. Solving
+/// `u_ss = (I − M)⁻¹·b` over a dual `T` yields the *implicit-function* derivative
+/// `∂u_ss/∂(θ,η) = (I − M)⁻¹·(∂b − ∂M·u_ss)` straight out of
+/// [`crate::sens::linsolve::solve_linear_system_g`], with no hand-assembled `dM`/`db`. That is a
+/// strictly better object than what the pulse train produced: the derivative of the *truncated*
+/// recursion (see [`ss_dual_cycle_should_stop`], which exists to keep those two truncations
+/// aligned). Were only one of the two walks converted, FOCE/FOCEI would differentiate a steady
+/// state it never predicted — the exact value/gradient mismatch that stalls the outer line search.
+///
+/// The **window duals** (`inf`, a modeled `RATE=-1/-2` dose's `(rate_bare, dur_bare)`) belong to
+/// the *forced* half only. `M` is the homogeneous monodromy: it carries `∂P/∂(θ,η)` through the
+/// dual disposition params, but the infusion window is inhomogeneous forcing and enters `b`
+/// alone. Threading it into the unforced call would corrupt the propagator.
 fn equilibrate_ss_g<T: PkNum>(
     pk_model: PkModel,
     pk: &PkDual<T>,
@@ -1186,8 +1200,53 @@ fn equilibrate_ss_g<T: PkNum>(
     } else {
         vec![0.0, dose.ii]
     };
-    // Shared early stop (#519, #532 review #11): the closed-form propagator equilibrates the
-    // same geometric train, so the same mixed atol/rtol stop applies here too.
+    // One cycle from `u0`. `forced` applies this cycle's own dose — the bolus jump, or the
+    // synthetic infusion window together with its modeled-window duals; unforced is the bare
+    // homogeneous disposition over the *same* bounds, whose columns are the monodromy `M`.
+    //
+    // The SS equilibration runs in the dose's own periodic frame (the synthetic pulse sits at
+    // t = 0), so its arrival is not a moving boundary: no lag duals. A subject that pairs SS with
+    // a lagtime declines to FD upstream (`ss_lagtime_walk_unsupported`).
+    let advance = |u0: &[T], forced: bool| -> Option<Vec<T>> {
+        let mut s = u0.to_vec();
+        if forced && !is_inf {
+            s[cmt_idx] = s[cmt_idx] + pk.f * T::from_f64(dose.amt);
+        }
+        let (doses, lag, inf_dual): (&[DoseEvent], &[f64], &[Option<(T, T)>]) = if forced {
+            (&synthetic_dose, &synthetic_lag, &synthetic_inf)
+        } else {
+            (&[], &[], &[])
+        };
+        propagate_bounds_g(
+            &mut s,
+            &bounds,
+            pk,
+            pk_model,
+            doses,
+            lag,
+            &[],
+            inf_dual,
+            f64::NEG_INFINITY,
+        );
+        Some(s)
+    };
+
+    // Exact periodic steady state, `reltol = abstol = 0` — see the value walk for why.
+    if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
+        n_states,
+        dose.ii,
+        0.0,
+        0.0,
+        |u0| advance(u0, false),
+        |u0| advance(u0, true),
+    ) {
+        crate::dosing::record_ss_equilibration_cycles(1);
+        return u_ss;
+    }
+
+    // Fallback for a singular `I − M` (no periodic steady state exists), mirroring the value
+    // walk's. Shared early stop (#519, #532 review #11): the closed-form propagator equilibrates
+    // the same geometric train, so the same mixed atol/rtol stop applies here too.
     let mut prev = vec![0.0_f64; n_states];
     let mut cur = vec![0.0_f64; n_states];
     let mut cycles_run = 0usize;
@@ -1202,9 +1261,6 @@ fn equilibrate_ss_g<T: PkNum>(
             pk_model,
             &synthetic_dose,
             &synthetic_lag,
-            // The SS equilibration runs in the dose's own periodic frame (the synthetic pulse
-            // sits at t = 0), so its arrival is not a moving boundary: no lag duals. A subject
-            // that pairs SS with a lagtime declines to FD upstream (`ss_lagtime_walk_unsupported`).
             &[],
             &synthetic_inf,
             f64::NEG_INFINITY,
