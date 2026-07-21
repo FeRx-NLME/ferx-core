@@ -4779,6 +4779,12 @@ pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subj
     }
     subject.has_tv_covariates()
         || subject_has_oral_infusion(model, subject)
+        // A dose the superposition dispatch cannot place — any bolus outside
+        // compartment 1, any infusion outside central (#375). Production reroutes
+        // exactly these subjects to the walk (`pk::compute_predictions*`), so the
+        // gradient must follow or FOCE/FOCEI would differentiate a different
+        // dosing history than it predicted. Same single source of truth.
+        || crate::pk::dose_needs_event_walk(model.pk_model, subject)
         || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
         // A modeled-`RATE=-1/-2` dose (`R{cmt}`/`D{cmt}`) resolves its rate/window
         // from PK params, so the infusion *end* is a moving boundary — the

@@ -1419,10 +1419,13 @@ impl PkModel {
     /// the **central** compartment for every model, plus the **peripheral**
     /// compartment(s) for the 2-/3-cpt IV models, and — since #400 — the oral
     /// **depot** (cmt 1), a zero-order release into the depot followed by
-    /// first-order `ka` absorption into central. Notably this still EXCLUDES oral
-    /// peripherals, which the closed forms cannot infuse into. A `D{cmt}` outside
-    /// this set is rejected at parse time rather than silently mis-routed (no-TV
-    /// path) or panicking (event-driven path).
+    /// first-order `ka` absorption into central, and — since #375 — the oral
+    /// models' **peripheral**(s) too (the oral propagators reuse the IV forced
+    /// response; nothing flows back into the depot). That makes the set
+    /// `1..=n_states` for all six walk-supported models; transit/IG stay `&[]`
+    /// (they have no walk, and reroute an infusion to their ODE twin). A
+    /// `D{cmt}` outside this set is rejected at parse time rather than silently
+    /// mis-routed (no-TV path) or panicking (event-driven path).
     pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
         self.topology().infusable_compartments()
     }
@@ -4675,14 +4678,17 @@ pub struct FitOptions {
     /// e.g. saturable protein binding, which admits a high-V/low-conc and a
     /// low-V/high-conc basin for the same data — can trap a single warm-started
     /// BFGS in the wrong basin, inflating that subject's objective. When `> 0`,
-    /// subjects on the event-driven path (system resets / time-varying
-    /// covariates, where this shows up) re-solve the EBE **on a cold start** from
-    /// `inner_restarts` Ω-scaled alternate seeds per random effect and keep the
-    /// lowest-objective mode; the outer loop's warm start then carries the chosen
-    /// basin forward, so the scan runs once per subject per fit (≈0 overhead).
-    /// Unimodal subjects are unaffected — an alternate seed that reconverges to
-    /// the same mode is not accepted — so `0` and the untriggered subjects stay
-    /// bit-identical.
+    /// a subject re-solves the EBE **on a cold start** from `inner_restarts`
+    /// Ω-scaled alternate seeds and keeps the lowest-objective mode; the outer
+    /// loop's warm start then carries the chosen basin forward, so the scan runs
+    /// once per subject per fit (≈0 overhead). Subjects on the event-driven path
+    /// (system resets / time-varying covariates) re-seed every random effect;
+    /// every other subject is probed per coordinate for a weakly-identified
+    /// (flat individual objective / high per-subject shrinkage) random effect and
+    /// re-seeds only those — the #891 case, where a distant lower posterior mode
+    /// hides from a single descent. Unimodal, well-identified subjects are
+    /// unaffected — an alternate seed that reconverges to the same mode is not
+    /// accepted — so `0` and the untriggered subjects stay bit-identical.
     pub inner_restarts: usize,
     /// Inner EBE-reconvergence tolerance used **only by the covariance step**
     /// (`[fit_options] cov_inner_tol`), decoupled from the fit's `inner_tol`. The
