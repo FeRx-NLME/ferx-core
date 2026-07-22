@@ -694,9 +694,41 @@ fn test_iov_occasion_dsl_matches_column_fit() {
         r_dsl.ofv,
         r_col.ofv,
     );
+    // The same bit-identity thesis extends to the per-occasion kappa EBEs: same
+    // subject data, same theta/Omega trajectory, same first-occ->g0/second-occ->g1
+    // group map, so every kappa component must match bit-for-bit. This is a
+    // *stricter* guard than the OFV check — a summed OFV can round-trip to the
+    // same bits while a per-kappa ULP diverges — so pin it exactly too.
     assert_eq!(r_col.ebe_kappas.len(), r_dsl.ebe_kappas.len());
-    for (a, b) in r_col.ebe_kappas.iter().zip(&r_dsl.ebe_kappas) {
-        assert_eq!(a.len(), b.len(), "same number of occasions per subject");
+    for (subj, (a, b)) in r_col.ebe_kappas.iter().zip(&r_dsl.ebe_kappas).enumerate() {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "subject {} must have the same number of occasions",
+            subj,
+        );
+        for (k, (ka, kb)) in a.iter().zip(b).enumerate() {
+            assert_eq!(
+                ka.len(),
+                kb.len(),
+                "subject {} occasion {} must have the same kappa dimension",
+                subj,
+                k,
+            );
+            for (j, (va, vb)) in ka.iter().zip(kb.iter()).enumerate() {
+                assert_eq!(
+                    va.to_bits(),
+                    vb.to_bits(),
+                    "subject {} occasion {} kappa[{}]: DSL EBE {} must be \
+                     bit-identical to column EBE {}",
+                    subj,
+                    k,
+                    j,
+                    vb,
+                    va,
+                );
+            }
+        }
     }
 }
 
