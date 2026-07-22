@@ -521,6 +521,16 @@ fn ss_equilibration_tail_warning(
     None
 }
 
+/// Serializes the tests that *read* the process-global SS non-convergence sink
+/// ([`take_ss_nonconvergence_warnings`], #867) so cargo's parallel harness can't have one test
+/// drain another's entry mid-read. Writers don't drain, so only readers need to coordinate.
+/// Lives here rather than beside any one test module because the sink is now shared by the ODE
+/// (`ode::predictions`) and analytical (`pk::event_driven`) fallbacks, which sit in different
+/// files but the *same* lib-test binary — a per-file guard would not serialize them against
+/// each other (#908).
+#[cfg(test)]
+pub(crate) static SS_WARN_SINK_READER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Drain and return the collected SS non-convergence warnings (#867). The `api` boundary calls
 /// this after its prediction pass and appends the result to `FitResult.warnings`. See
 /// [`ss_nonconvergence_sink`].

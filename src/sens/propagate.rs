@@ -1103,8 +1103,10 @@ fn obs_boundary_correction<T: PkNum>(
 /// refresh `cur` from the value parts (`PkNum::val`) of the dual state `u`, decide the stop on
 /// the *same* [`crate::dosing::ss_cycle_converged`] criterion the f64 predictor uses
 /// (from cycle 1 on), and roll `cur`→`prev` by swap — no per-cycle `O(n_states)` copy. Returns
-/// `true` to break. Used by both `equilibrate_ss_g` (here) and `equilibrate_ss_state_g` (the
-/// ODE provider) so the dual convergence logic lives in **one** place.
+/// `true` to break. Used by the ODE provider's `equilibrate_ss_state_g` and by
+/// `equilibrate_ss_g`'s singular-`I − M` fallback (here) so the dual convergence logic lives in
+/// **one** place. Since #908 the analytical walk reaches this only when no periodic steady state
+/// exists; its ordinary path is the exact `(I − M)⁻¹·b` solve, which has no cycles to stop.
 ///
 /// **Why decide on the value parts, not the derivative tails** (#532 review #2/#3): the goal is
 /// not a fully-converged sensitivity — it is a gradient *consistent with the value the optimizer
@@ -1852,6 +1854,33 @@ mod tests {
                 assert!(p >= 0.0, "case {ci} obs {j}: production conc negative");
             }
         }
+    }
+
+    /// **#908 dual fallback.** The gradient twin of
+    /// `pk::event_driven::tests::ss_equilibration_falls_back_when_no_steady_state_exists`. A
+    /// singular `I − M` — here `CL = 0`, so every disposition eigenvalue is zero and
+    /// `two_cpt_eigen_g` declines, leaving `M = I` — has no periodic steady state, so
+    /// `equilibrate_ss_g`'s exact solve must decline and its capped pulse-train fallback must
+    /// run. This proves the *dual* fallback still functions on genuinely-singular input; the
+    /// mutation check (forcing the fallback on non-singular input) only proves the two paths
+    /// disagree there, not that the fallback is correct where it is actually meant to fire.
+    #[test]
+    fn ss_equilibration_dual_falls_back_when_no_steady_state_exists() {
+        let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+        // CL = 0 ⇒ ke = 0 ⇒ `two_cpt_eigen_g` returns None ⇒ propagation is the identity.
+        let pkd = pk_dual_2cpt_f64(&pk_2cpt(0.0, 50.0, 3.0, 80.0, 0.0));
+        let trough = equilibrate_ss_g::<f64>(PkModel::TwoCptIv, &pkd, &dose, None);
+        assert_eq!(
+            crate::dosing::last_ss_equilibration_cycles(),
+            crate::dosing::SS_EQUILIBRATION_CYCLES,
+            "a singular I − M must decline the exact solve and run the full capped train"
+        );
+        // Nothing is ever eliminated, so the train is a plain sum of the per-cycle boluses.
+        approx::assert_relative_eq!(
+            trough[0],
+            crate::dosing::SS_EQUILIBRATION_CYCLES as f64 * 100.0,
+            max_relative = 1e-12
+        );
     }
 
     /// The 2-cpt walk's `Dual2` grad/Hessian (w.r.t. cl, v1) must match FD of the

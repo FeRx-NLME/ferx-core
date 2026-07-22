@@ -132,6 +132,37 @@ section of the SDLC for the versioning policy).
   overlapping an oral depot dose.
 
 ### Fixed
+- **Steady-state doses on the analytical event-driven path are now exact, not truncated**
+  (#908). A subject that cannot use dose superposition — because it has a time-varying
+  covariate, an `EVID=3/4` reset, IOV, or a dose into a non-default compartment — is served by
+  the event-driven walk, which equilibrated an `SS=1` dose by iterating a pulse train capped
+  at 50 cycles. The leftover was `≈ exp(−50 · λ_slow · II)`, negligible for typical PK but
+  **not** for slow drugs, and the early stop never fired there (it needs the per-cycle
+  increment to be negligible, which is exactly what a slow mode prevents). The walk now solves
+  the periodic steady state in closed form as `u_ss = (I − M)⁻¹·b`, the fixed point of the
+  affine one-cycle map, using the same propagators it already runs. It agrees with the
+  superposition closed forms to f64 precision (`≤ 1e-12` relative, bit-identical on several
+  models) rather than to a tolerance, so the two representations of one dataset agree by
+  construction. Measured error that this removes:
+
+  | model | `II` | was |
+  |---|---|---|
+  | `one_cpt_oral` (CL 0.1, V 50 — t½ ≈ 350 h) | 12 | **3.0e-1** |
+  | `two_cpt_iv` (Q 0.5, V2 500) — central | 12 | 1.0e-1 |
+  | `two_cpt_iv` (Q 0.5, V2 500) — peripheral amount | 12 | **5.8e-1** |
+  | `three_cpt_iv` (Q3 0.5, V3 400) — central | 12 | 8.2e-2 |
+  | `three_cpt_iv` (Q3 0.5, V3 400) — third-compartment amount | 12 | **5.2e-1** |
+  | `three_cpt_iv` (CL 5, V1 50, Q 3, V2 80, Q3 1, V3 120) | 24 | 2.3e-3 |
+
+  Compartment *amounts* — what `[derived]` and per-compartment sdtab columns report — were
+  affected considerably more than concentrations. **If you have results involving `SS=1` on
+  this path from an earlier version, regenerate them.** The gradient walk was converted in the
+  same change, so FOCE/FOCEI differentiates the steady state it actually predicts; over dual
+  numbers the same solve yields the exact implicit-function derivative. The truncated pulse
+  train remains only where no periodic steady state exists (a zero disposition rate constant,
+  e.g. `CL = 0`), and that case now raises the existing non-convergence warning instead of
+  returning a silently truncated state. The ODE path's ordinary bolus/infusion steady state
+  still expands a pulse train — see `docs/model-file/steady-state.qmd`.
 - **SAEM FREM / `iiv_on_ruv` mixing diagnostics and safeguards** (#895). The optimizer-trace
   `mh_accept_rate` (and the verbose banner) now reports the **combined** block + componentwise
   Metropolis-Hastings acceptance rate. Previously it showed only the block kernel, which reads a
@@ -205,33 +236,6 @@ section of the SDLC for the versioning policy).
   sdtab / `[derived]` are reported as `NaN` for these subjects rather than wrong, with the
   existing warning extended to explain why; the rerouted doses themselves are computed
   exactly (that is what the NONMEM anchors pin).
-
-  One caveat worth knowing, and it is not small for slow drugs. Rerouting is per
-  *subject*, so a single dose into a non-default compartment moves that subject's
-  **other** doses onto the walk too — and the walk equilibrates a steady-state dose with
-  a truncated 50-cycle pulse train, whereas dose superposition uses the exact periodic
-  closed form. An `SS` dose on such a subject therefore shifts by the truncation
-  remainder, which is roughly `exp(−50 · λ_slow · II)` where `λ_slow` is the slowest
-  disposition rate constant. It is negligible once `λ_slow · II ≳ 0.5` and can reach
-  **tens of percent** when it is not — on *any* compartment count, including
-  one-compartment models. Measured worst relative shift:
-
-  | model | `II` | shift |
-  |---|---|---|
-  | `three_cpt_iv` (CL 5, V1 50, Q 3, V2 80, Q3 1, V3 120 — the parameters these anchors use) | 12 | 6.0e-3 |
-  | same | 24 | 1.3e-4 |
-  | same | 6 | 3.8e-2 |
-  | `three_cpt_iv` with a deeper third compartment (Q3 0.5, V3 400) | 12 | 7.6e-2 |
-  | `two_cpt_iv` (CL 5, V1 50, Q 3, V2 80) | 12 | 1.9e-6 |
-  | `two_cpt_iv` (Q 0.5, V2 500) | 12 | 8.9e-2 |
-  | `one_cpt_oral` (CL 1, V 50) | 12 | 5.5e-6 |
-  | `one_cpt_oral` (CL 0.1, V 50 — t½ ≈ 350 h) | 12 | **3.0e-1** |
-
-  These are one model each, not bounds. Not new behaviour — any subject with a
-  time-varying covariate, an `EVID=3/4` reset, or IOV already took the walk — but it now
-  applies to more datasets. The walk's truncation is silent: no warning is emitted. See
-  `docs/model-file/steady-state.qmd`; #908 tracks replacing the pulse train with the exact
-  `(I − M)⁻¹·b` steady-state solve, which removes the truncation entirely.
 - **A steady-state dose with `CMT=0` no longer loses its accumulation on the analytical
   event-driven path** (#375). `CMT=0` is NONMEM's "default dose compartment", and every dose
   site resolves it to the model's first compartment — except the event-driven walk's
