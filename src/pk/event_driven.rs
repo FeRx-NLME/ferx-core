@@ -314,10 +314,30 @@ fn state_layout(pk_model: PkModel) -> (usize, usize) {
 }
 
 /// Pre-equilibrate the event-driven analytical state to its SS value for
-/// an SS=1 dose. Same scheme as `ode/predictions.rs::equilibrate_ss_state`:
-/// reset state, then loop N cycles of (apply dose; propagate one II).
-/// The state after the loop is the "just-before-next-pulse" SS state;
+/// an SS=1 dose. The returned state is the "just-before-next-pulse" SS state;
 /// the caller applies the SS dose's own pulse through the normal flow.
+///
+/// **Exact, not truncated (#908).** One dosing cycle of these models is an affine map
+/// `u ↦ M·u + b` — the analytical disposition is always linear (constant-coefficient), and the
+/// dose enters additively — so the periodic steady state has the closed form
+/// `u_ss = (I − M)⁻¹·b`. `M`'s columns and `b` come from the *same* propagator the walk itself
+/// uses, injected into [`crate::dosing::periodic_ss_fixed_point_g`] as one-cycle closures, so no
+/// new formula is introduced. This agrees with the dose-superposition SS closed forms to f64
+/// precision (≤ 1e-12 relative on every walk-supported model, bit-identical on several) rather
+/// than to a truncation tolerance, and costs `n + 4` propagator calls plus one `n×n` solve
+/// (`n ≤ 4`) instead of up to [`SS_EQUILIBRATION_CYCLES`](crate::dosing::SS_EQUILIBRATION_CYCLES).
+///
+/// This replaced a truncated pulse train whose residual was `≈ exp(−50·λ_slow·II)`. That is
+/// negligible for fast PK but reached **30 %** on an ordinary long-half-life one-compartment
+/// model (`CL = 0.1`, `V = 50`, `II = 12`), and over 50 % on the deep peripheral *amounts* of
+/// slow 2-/3-compartment models — silently, because a subject is routed here (rather than to the
+/// exact superposition path) by something as incidental as a time-varying covariate, an
+/// `EVID=3/4` reset, IOV, or a dose into a non-default compartment.
+///
+/// The pulse train survives only as the fallback for a **singular** `I − M`, i.e. a disposition
+/// eigenvalue of zero (a compartment that never empties, e.g. `CL = 0`). No periodic steady state
+/// exists there, so the capped loop now also raises the #867 non-convergence warning instead of
+/// returning a silently-truncated state.
 ///
 /// `dose.ii > 0` and `dose.duration <= dose.ii` are required (callers
 /// already guard the first; overlapping infusions are rejected).
@@ -374,15 +394,62 @@ fn equilibrate_ss_state_event_driven(
         vec![0.0, dose.ii]
     };
 
-    // Constant params across all SS-equilibration cycles → one eigendata solve.
-    let mut eigen = crate::sens::propagate::EigenCacheG::default();
+    // Constant params across all SS-equilibration cycles → one eigendata solve. The `RefCell`
+    // lets the two `Fn` closures below share that one cache; a fresh cache per closure call
+    // would redo the eigenvalue solve `n + 4` times.
+    let eigen = std::cell::RefCell::new(crate::sens::propagate::EigenCacheG::default());
+
+    // One cycle from `u0`, forward from the pulse at phase 0. `forced` includes this cycle's own
+    // dose (the bolus jump, or the synthetic infusion window); unforced is the bare homogeneous
+    // disposition over the *same* bounds, which is what makes its columns the true monodromy `M`.
+    let advance = |u0: &[f64], forced: bool| -> Option<Vec<f64>> {
+        let mut s = u0.to_vec();
+        if forced && !is_inf {
+            // Bolus pulse: instantaneous amount jump (with F).
+            s[cmt_idx] += pk.bioavailable_amount(dose.amt);
+        }
+        let (doses, lagtimes): (&[DoseEvent], &[f64]) = if forced {
+            (&synthetic_dose, &synthetic_lagtimes)
+        } else {
+            (&[], &[])
+        };
+        propagate_with_bounds(
+            &mut s,
+            &bounds,
+            pk,
+            pk_model,
+            doses,
+            lagtimes,
+            f64::NEG_INFINITY,
+            &mut eigen.borrow_mut(),
+        );
+        Some(s)
+    };
+
+    // Exact periodic steady state. `reltol = abstol = 0`: the closed-form propagators carry no
+    // solver noise, so the helper's linearity self-check runs at its `1e-9·scale` rounding floor.
+    if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<f64, _, _>(
+        n_states,
+        dose.ii,
+        0.0,
+        0.0,
+        |u0| advance(u0, false),
+        |u0| advance(u0, true),
+    ) {
+        crate::dosing::record_ss_equilibration_cycles(1);
+        return u_ss;
+    }
+
+    // Fallback — only a singular `I − M` reaches here (a zero disposition eigenvalue, so no
+    // periodic steady state exists). Iterate the truncated pulse train as before and, unlike
+    // before, say so when it hits the cap (#867 warning, previously wired only on the ODE path).
     // Shared early stop (#519, #532 review #6/#11): same mixed atol/rtol criterion and scaffold
     // (`SsStopTracker`) as the ODE f64 path.
     let mut tracker = crate::dosing::SsStopTracker::default();
     let mut cycles_run = 0usize;
+    let mut early_stopped = false;
     for cycle in 0..crate::dosing::SS_EQUILIBRATION_CYCLES {
         if !is_inf {
-            // Bolus pulse: instantaneous amount jump (with F).
             state[cmt_idx] += pk.bioavailable_amount(dose.amt);
         }
         propagate_with_bounds(
@@ -393,14 +460,17 @@ fn equilibrate_ss_state_event_driven(
             &synthetic_dose,
             &synthetic_lagtimes,
             f64::NEG_INFINITY,
-            &mut eigen,
+            &mut eigen.borrow_mut(),
         );
         cycles_run = cycle + 1;
         if tracker.should_stop(cycle, &state) {
+            early_stopped = true;
             break;
         }
     }
     crate::dosing::record_ss_equilibration_cycles(cycles_run);
+    let (incr_prev, incr_last, incr_mag) = tracker.recent_increments();
+    crate::dosing::note_ss_nonconvergence_if_capped(early_stopped, incr_prev, incr_last, incr_mag);
 
     state
 }
@@ -2094,9 +2164,10 @@ mod tests {
         // Steady-state companion to the test above. An SS (ss=1, II=24 h)
         // infusion into an oral model's central compartment must equilibrate
         // correctly — it shares `propagate_*_oral`, which previously dropped the
-        // input — not return ~0. Cross-path uses a looser tolerance because the
-        // event-driven path equilibrates SS with a finite cycle count vs the
-        // exact analytical SS closed form; the F-linearity check is exact.
+        // input — not return ~0. Since #908 the walk solves the periodic steady
+        // state exactly rather than truncating a 50-cycle train, so the cross-path
+        // agreement is at f64 precision; this tolerance was `2e-3` when the walk's
+        // finite cycle count was the limiting error.
         let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
         // SS infusion into central (cmt 2); dur = amt/rate = 4 h < II.
         let dose = DoseEvent::new(0.0, 100.0, 2, 25.0, true, 24.0);
@@ -2139,7 +2210,7 @@ mod tests {
                     e > 0.0,
                     "{label}: SS oral infusion should be >0 at obs {j} (was dropped before the fix)"
                 );
-                assert_relative_eq!(e, s, epsilon = 1e-9, max_relative = 2e-3);
+                assert_relative_eq!(e, s, epsilon = 1e-12, max_relative = 1e-12);
             }
 
             // F=0.4 reshapes the SS rate-defined infusion (#419): it holds the
@@ -2169,7 +2240,7 @@ mod tests {
                 assert_relative_eq!(*a_f, *a_s, max_relative = 1e-9);
             }
 
-            // Cross-path agreement at F≠1 (looser SS tolerance, as for F=1):
+            // Cross-path agreement at F≠1 (same f64-precision tolerance as F=1):
             // the SS equilibration path also applies F to the infusion rate, so
             // event-driven == superposition at F=0.4, guarding the SS path
             // against silently dropping F.
@@ -2178,7 +2249,7 @@ mod tests {
                 .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pkf))
                 .collect();
             for (a_f, s_f) in ed_f.iter().zip(sup_f.iter()) {
-                assert_relative_eq!(*a_f, *s_f, epsilon = 1e-9, max_relative = 2e-3);
+                assert_relative_eq!(*a_f, *s_f, epsilon = 1e-12, max_relative = 1e-12);
             }
         }
     }
@@ -2545,7 +2616,7 @@ mod tests {
         let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
         for (j, &t) in obs_times.iter().enumerate() {
             let expected = one_cpt_iv_bolus_ss(&dose, t, cl, v);
-            assert_relative_eq!(preds[j], expected, epsilon = 1e-9, max_relative = 1e-7);
+            assert_relative_eq!(preds[j], expected, epsilon = 1e-12, max_relative = 1e-12);
         }
     }
 
@@ -2567,7 +2638,7 @@ mod tests {
         let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
         for (j, &t) in obs_times.iter().enumerate() {
             let expected = one_cpt_infusion_ss(&dose, t, cl, v);
-            assert_relative_eq!(preds[j], expected, epsilon = 1e-9, max_relative = 1e-7);
+            assert_relative_eq!(preds[j], expected, epsilon = 1e-12, max_relative = 1e-12);
         }
     }
 
@@ -2596,7 +2667,7 @@ mod tests {
                 conc > 0.0,
                 "central amount must be positive at phase {phase}"
             );
-            assert_relative_eq!(conc, expected, epsilon = 1e-9, max_relative = 1e-7);
+            assert_relative_eq!(conc, expected, epsilon = 1e-12, max_relative = 1e-12);
         }
     }
 
@@ -2619,8 +2690,221 @@ mod tests {
         let preds = event_driven_predictions(PkModel::OneCptOral, &subj, &pk_dose, &pk_obs, &[]);
         for (j, &t) in obs_times.iter().enumerate() {
             let expected = one_cpt_oral_ss(&dose, t, cl, v, ka);
-            assert_relative_eq!(preds[j], expected, epsilon = 1e-9, max_relative = 1e-7);
+            assert_relative_eq!(preds[j], expected, epsilon = 1e-12, max_relative = 1e-12);
         }
+    }
+
+    /// **#908 oracle.** The walk's steady-state trough must equal the *exact* periodic
+    /// steady state — the dose-superposition SS closed forms — to f64 precision, on every
+    /// walk-supported model, including the slow-disposition cases where the pre-#908
+    /// 50-cycle pulse train was wrong by tens of percent.
+    ///
+    /// The trough is the pre-pulse state at phase `0⁻ ≡ II`, so `closed_form(II)` is the
+    /// reference; comparing there (rather than at an arbitrary observation) isolates the
+    /// equilibration from the forward walk that follows it.
+    ///
+    /// **Regression.** Restoring the pulse train makes the two `SLOW` one-compartment rows
+    /// miss by ~3.0e-1 — the walk had been returning a steady state a third too low for an
+    /// ordinary long-half-life drug. The slow 2-/3-cpt rows fail on the central compartment
+    /// too (~1.0e-1 / ~8.2e-2); their deep *peripheral* amounts, which no concentration
+    /// assertion sees, were off by more than half.
+    ///
+    /// The `cycles == 1` assertion is load-bearing: without it a silent fall back to the
+    /// pulse train on a *fast* row would still pass the value check, so the exact path could
+    /// stop being taken without any test noticing.
+    #[test]
+    fn ss_equilibration_matches_the_exact_periodic_closed_form() {
+        struct Case {
+            label: &'static str,
+            model: PkModel,
+            pk: PkParams,
+            dose: DoseEvent,
+            /// Closed-form **concentration** at phase `II`, from the superposition path.
+            expected_conc: f64,
+        }
+
+        let bolus = |ii: f64| DoseEvent::new(0.0, 100.0, 1, 0.0, true, ii);
+        let cases = vec![
+            {
+                let (cl, v, ii) = (5.0, 50.0, 12.0);
+                let d = bolus(ii);
+                Case {
+                    label: "1cpt IV bolus (fast)",
+                    model: PkModel::OneCptIv,
+                    pk: pk_one(cl, v),
+                    expected_conc: crate::pk::one_cpt_iv_bolus_ss(&d, ii, cl, v),
+                    dose: d,
+                }
+            },
+            {
+                // t½ ≈ 350 h against II = 12: λ_slow·II ≈ 0.024, so the old tail
+                // `exp(−50·λ_slow·II)` was ≈ 0.30.
+                let (cl, v, ii) = (0.1, 50.0, 12.0);
+                let d = bolus(ii);
+                Case {
+                    label: "1cpt IV bolus (SLOW, cl=0.1)",
+                    model: PkModel::OneCptIv,
+                    pk: pk_one(cl, v),
+                    expected_conc: crate::pk::one_cpt_iv_bolus_ss(&d, ii, cl, v),
+                    dose: d,
+                }
+            },
+            {
+                let (cl, v, ii) = (5.0, 80.0, 24.0);
+                let d = DoseEvent::new(0.0, 1000.0, 1, 250.0, true, ii); // 4 h infusion
+                Case {
+                    label: "1cpt IV infusion",
+                    model: PkModel::OneCptIv,
+                    pk: pk_one(cl, v),
+                    expected_conc: crate::pk::one_cpt_infusion_ss(&d, ii, cl, v),
+                    dose: d,
+                }
+            },
+            {
+                let (cl, v, ka, ii) = (2.0, 20.0, 1.5, 24.0);
+                let d = bolus(ii);
+                Case {
+                    label: "1cpt oral (fast)",
+                    model: PkModel::OneCptOral,
+                    pk: pk_one_oral(cl, v, ka),
+                    expected_conc: crate::pk::one_cpt_oral_ss(&d, ii, cl, v, ka),
+                    dose: d,
+                }
+            },
+            {
+                let (cl, v, ka, ii) = (0.1, 50.0, 1.0, 12.0);
+                let d = bolus(ii);
+                Case {
+                    label: "1cpt oral (SLOW, cl=0.1) — the 3.0e-1 case",
+                    model: PkModel::OneCptOral,
+                    pk: pk_one_oral(cl, v, ka),
+                    expected_conc: crate::pk::one_cpt_oral_ss(&d, ii, cl, v, ka),
+                    dose: d,
+                }
+            },
+            {
+                let (cl, v, q, v2, ii) = (5.0, 50.0, 0.5, 500.0, 12.0);
+                let d = bolus(ii);
+                Case {
+                    label: "2cpt IV bolus (SLOW deep peripheral, q=0.5 v2=500)",
+                    model: PkModel::TwoCptIv,
+                    pk: pk_two(cl, v, q, v2),
+                    expected_conc: crate::pk::two_cpt_iv_bolus_ss(&d, ii, cl, v, q, v2),
+                    dose: d,
+                }
+            },
+            {
+                let (cl, v, q, v2, ii) = (5.0, 50.0, 3.0, 80.0, 24.0);
+                let d = DoseEvent::new(0.0, 100.0, 1, 20.0, true, ii); // 5 h infusion
+                Case {
+                    label: "2cpt IV infusion",
+                    model: PkModel::TwoCptIv,
+                    pk: pk_two(cl, v, q, v2),
+                    expected_conc: crate::pk::two_cpt_infusion_ss(&d, ii, cl, v, q, v2),
+                    dose: d,
+                }
+            },
+            {
+                let (cl, v, q, v2, ka, ii) = (5.0, 50.0, 3.0, 80.0, 1.0, 24.0);
+                let d = bolus(ii);
+                Case {
+                    label: "2cpt oral",
+                    model: PkModel::TwoCptOral,
+                    pk: pk_two_oral(cl, v, q, v2, ka),
+                    expected_conc: crate::pk::two_cpt_oral_ss(&d, ii, cl, v, q, v2, ka),
+                    dose: d,
+                }
+            },
+            {
+                let (cl, v, q, v2, q3, v3, ii) = (5.0, 50.0, 3.0, 80.0, 0.5, 400.0, 12.0);
+                let d = bolus(ii);
+                Case {
+                    label: "3cpt IV bolus (SLOW third compartment, q3=0.5 v3=400)",
+                    model: PkModel::ThreeCptIv,
+                    pk: pk_three(cl, v, q, v2, q3, v3),
+                    expected_conc: crate::pk::three_cpt_iv_bolus_ss(&d, ii, cl, v, q, v2, q3, v3),
+                    dose: d,
+                }
+            },
+            {
+                let (cl, v, q, v2, q3, v3, ka, ii) = (3.0, 30.0, 2.0, 40.0, 0.8, 120.0, 1.2, 24.0);
+                let d = bolus(ii);
+                Case {
+                    label: "3cpt oral",
+                    model: PkModel::ThreeCptOral,
+                    pk: pk_three_oral(cl, v, q, v2, q3, v3, ka),
+                    expected_conc: crate::pk::three_cpt_oral_ss(&d, ii, cl, v, q, v2, q3, v3, ka),
+                    dose: d,
+                }
+            },
+        ];
+
+        for c in &cases {
+            let (_, central) = state_layout(c.model);
+            let trough = equilibrate_ss_state_event_driven(c.model, &c.pk, &c.dose);
+            assert_eq!(
+                crate::dosing::last_ss_equilibration_cycles(),
+                1,
+                "{}: a linear disposition must equilibrate through the exact (I − M)⁻¹·b \
+                 solve, not the pulse-train fallback",
+                c.label
+            );
+            let got = trough[central] / c.pk.v();
+            assert!(
+                got > 0.0,
+                "{}: trough concentration must be positive",
+                c.label
+            );
+            approx::assert_relative_eq!(got, c.expected_conc, max_relative = 1e-12);
+        }
+    }
+
+    /// **#908 fallback.** A singular `I − M` — some disposition eigenvalue is zero, so a
+    /// compartment never empties — admits no periodic steady state. The exact solve must
+    /// decline, the capped pulse train must run, and (unlike before #908, when the analytical
+    /// walk truncated silently) the #867 non-convergence warning must fire.
+    ///
+    /// Two independent routes to the same singularity, because they fail in different places:
+    /// `CL = 0` gives `ke = 0`, so the propagator itself is the identity; `Q = 0` makes
+    /// `two_cpt_eigen_g` decline and leaves the state untouched. Both yield `M = I`.
+    ///
+    /// Reachable from a Tier-1 unit test only because `PkParams` is built directly here —
+    /// model validation would reject either parameter set.
+    #[test]
+    fn ss_equilibration_falls_back_when_no_steady_state_exists() {
+        let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dosing::clear_ss_nonconvergence_warnings();
+
+        let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+        let n = crate::dosing::SS_EQUILIBRATION_CYCLES;
+        for (label, model, pk) in [
+            ("1cpt cl=0 (ke = 0)", PkModel::OneCptIv, pk_one(0.0, 50.0)),
+            (
+                "2cpt q=0 (eigen solve declines)",
+                PkModel::TwoCptIv,
+                pk_two(5.0, 50.0, 0.0, 80.0),
+            ),
+        ] {
+            let state = equilibrate_ss_state_event_driven(model, &pk, &dose);
+            assert_eq!(
+                crate::dosing::last_ss_equilibration_cycles(),
+                n,
+                "{label}: the exact solve must decline and the capped train must run"
+            );
+            // Nothing is ever eliminated, so the train is a plain sum of `n` doses.
+            approx::assert_relative_eq!(state[0], n as f64 * 100.0, max_relative = 1e-12);
+        }
+
+        let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+            "a model with no periodic steady state must surface a non-convergence warning \
+             from the analytical walk; got: {warnings:?}"
+        );
     }
 
     #[test]

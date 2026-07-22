@@ -67,6 +67,33 @@ fn model_src(structural: &str, params: &str, indiv: &str) -> String {
     )
 }
 
+/// The same fixture shape at a **slow** disposition (`CL = 0.1`, `V = 50` ⇒ t½ ≈ 347 h), for the
+/// `ss_slow_advan*` anchors (#908). `model_src` starts `TVCL` at 5.0 with a lower bound of 0.1, so
+/// the slow value needs its own `[parameters]` block rather than just a different initial estimate.
+fn slow_model_src(structural: &str, params: &str, indiv: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(0.1, 0.001, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+{params}
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+{indiv}
+
+[structural_model]
+  {structural}
+
+[error_model]
+  DV ~ proportional(PROP)
+"#
+    )
+}
+
 /// Predictions on the **event-driven walk**. The walk is selected by adding a
 /// `WT` column that varies across rows; the model never references `WT`, so no
 /// parameter value differs from the plain dataset — only the code path does.
@@ -180,6 +207,16 @@ fn one_cpt_oral() -> String {
         "  KA = TVKA",
     )
 }
+fn slow_one_cpt_iv() -> String {
+    slow_model_src("pk one_cpt_iv(cl=CL, v=V)", "", "")
+}
+fn slow_one_cpt_oral() -> String {
+    slow_model_src(
+        "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        "  theta TVKA(1.0, 0.01, 10.0)",
+        "  KA = TVKA",
+    )
+}
 fn two_cpt_iv() -> String {
     model_src(
         "pk two_cpt_iv(cl=CL, v=V, q=Q, v2=V2)",
@@ -234,6 +271,53 @@ fn ss_dose_cmt_zero_and_one_match_nonmem() {
             &format!("ADVAN1 SS=1 CMT={cmt}"),
         );
     }
+}
+
+/// #908: `SS=1` on a **slowly-accumulating** model — the regime the two anchors above cannot see.
+///
+/// There `CL = 5, V = 50` gives `λ·II = 1.2`, so the walk's old 50-cycle pulse train left a
+/// residual of `e^{−60} ≈ 1e-26` and the truncation was invisible. Here `CL = 0.1` (t½ ≈ 347 h at
+/// the same `II = 12`) gives `λ·II = 0.024`: the train held only 70.6 % of the true steady state,
+/// so the **walk read 29.4 % low** while dose superposition — which evaluates the exact periodic
+/// closed form — read correctly. The same dataset moves between those two representations for
+/// unrelated reasons, so that was a silent tens-of-percent shift.
+///
+/// NONMEM is the right arbiter because its `ADVAN` steady state *is* the exact closed form:
+/// `PRED` at `t = 0` for the IV case is `84.337333295`, which is `(100/50)/(1 − e^{−0.024})` to
+/// every printed digit. Both ferx paths must now land on it at `NONMEM_TOL`.
+///
+/// The oral twin is anchored too, not just the IV one, so the **depot's** own periodic state is
+/// covered — the walk equilibrates a two-compartment state there, and only the central one is
+/// observed.
+#[test]
+fn slow_accumulation_ss_matches_nonmem() {
+    // nonmem_anchor/results/ss_slow_advan1.tab (ADVAN1 TRANS2, CL=0.1, V=50, SS=1 II=12).
+    const NONMEM_SLOW_IV: [f64; 3] = [84.168827191, 83.665326241, 82.998673796];
+    assert_both_paths_match(
+        &slow_one_cpt_iv(),
+        1,
+        1,
+        0.0,
+        1,
+        12.0,
+        &NONMEM_SLOW_IV,
+        NONMEM_TOL,
+        "ADVAN1 SS=1 slow accumulation",
+    );
+
+    // nonmem_anchor/results/ss_slow_advan2.tab (ADVAN2 TRANS2, same CL/V, KA=1).
+    const NONMEM_SLOW_ORAL: [f64; 3] = [83.600264316, 83.796287313, 83.164331530];
+    assert_both_paths_match(
+        &slow_one_cpt_oral(),
+        1,
+        2,
+        0.0,
+        1,
+        12.0,
+        &NONMEM_SLOW_ORAL,
+        NONMEM_TOL,
+        "ADVAN2 SS=1 slow accumulation",
+    );
 }
 
 // ── 2. bolus into a non-default compartment, per model ───────────────────────

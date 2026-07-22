@@ -133,7 +133,7 @@ pub(crate) fn ss_equilibration_opts(opts: &OdeSolverOptions) -> OdeSolverOptions
 ///
 /// For a **linear** disposition that fixed point is a closed form —
 /// `u_ss = (I − M)⁻¹·b`, `M = e^{A·II}`, `b` one forced cycle from a zero state — costing
-/// `n_states + 3` ODE solves ([`equilibrate_ss_input_rate_fixed_point_g`]). For a **nonlinear**
+/// `n_states + 3` ODE solves ([`crate::dosing::periodic_ss_fixed_point_g`]). For a **nonlinear**
 /// disposition (its self-check declines) the same fixed point is found by an Anderson-accelerated
 /// iteration on the identical `P` ([`anderson_ss_fixed_point_g`]) — a bounded handful of one-cycle
 /// solves, unlike the plain pulse train's `O(1/(1−ρ))`. Delegates both to
@@ -193,95 +193,6 @@ fn equilibrate_ss_input_rate(
         |u0| advance(ode.rhs.as_ref(), u0),
         |u0| advance(&forced_rhs, u0),
     )
-}
-
-/// Numeric-generic core of [`equilibrate_ss_input_rate`], shared by the production
-/// `f64` predictor and the analytic-sensitivity walk (`T = Dual1/Dual2`, #835) so the fixed-point
-/// formula lives in exactly one place.
-///
-/// The ODE advancement is *injected* as two "one cycle from `u0`" closures — `advance_unforced`
-/// (disposition alone; builds the drift `z0` and the propagator columns of `M = e^{A·II}`) and
-/// `advance_forced` (disposition + periodic `R_in`; builds `b` and drives the linearity check).
-/// Each caller keeps its own solver and forcing assembly (production `solve_ode` +
-/// `wrap_rhs_with_forcings`; the dual walk `solve_ode_g::<T>` + `add_prepared_input_rate_forcing`),
-/// while this body owns only the `T`-typed algebra: the `I − M` assembly, the
-/// [`solve_linear_system_g`](crate::sens::linsolve::solve_linear_system_g) solve of
-/// `u_ss = (I − M)⁻¹·b`, and the value-part linearity verification. Run over a dual `T` it thus
-/// carries `∂u_ss/∂(θ,η)` (and the 2nd order) through the solve automatically — the implicit-
-/// function derivative, with no hand-assembled `dM`/`db`.
-///
-/// Returns `None` — the caller ([`equilibrate_ss_input_rate_g`]) then tries the Anderson solve —
-/// on a **nonlinear** disposition (the one-/two-cycle self-check fails), a singular `I − M`, or any
-/// non-finite intermediate. (Only when Anderson *also* declines does the pulse-train fallback run.)
-pub(crate) fn equilibrate_ss_input_rate_fixed_point_g<T, FUnf, FFor>(
-    n: usize,
-    ii: f64,
-    reltol: f64,
-    abstol: f64,
-    advance_unforced: FUnf,
-    advance_forced: FFor,
-) -> Option<Vec<T>>
-where
-    T: crate::sens::num::PkNum,
-    FUnf: Fn(&[T]) -> Option<Vec<T>>,
-    FFor: Fn(&[T]) -> Option<Vec<T>>,
-{
-    if !(ii > 0.0) || n == 0 {
-        return None;
-    }
-    let zero = vec![T::from_f64(0.0); n];
-    // Unforced zero-state drift (zero for a homogeneous RHS, non-zero for an affine one).
-    let z0 = advance_unforced(&zero)?;
-    // b: forced response over one cycle from a zero state (constant drift + periodic R_in).
-    let b = advance_forced(&zero)?;
-    // I − M, row-major. Column i of M is the *homogeneous* one-cycle response of eᵢ with the
-    // drift z0 removed, so an affine disposition still yields the true linear propagator.
-    let mut i_minus_m = vec![T::from_f64(0.0); n * n];
-    for i in 0..n {
-        let mut ei = zero.clone();
-        ei[i] = T::from_f64(1.0);
-        let evolved = advance_unforced(&ei)?;
-        for r in 0..n {
-            let m_ri = evolved[r] - z0[r];
-            let delta = T::from_f64(if r == i { 1.0 } else { 0.0 });
-            i_minus_m[r * n + i] = delta - m_ri;
-        }
-    }
-    let u_ss = crate::sens::linsolve::solve_linear_system_g::<T>(&i_minus_m, &b, n)?;
-    if u_ss.iter().any(|x| !x.val().is_finite()) {
-        return None;
-    }
-    // Confirm linearity on the value part: one and two forced cycles from u_ss must both return
-    // u_ss (only an affine one-cycle map does). The tolerance is scaled to the solver's own
-    // accuracy so the fast path is not falsely abandoned at a loose `ode_reltol`; a genuinely
-    // nonlinear map diverges by O(scale) and is rejected. Two cycles (not one) rejects a weakly-
-    // nonlinear map whose true fixed point merely happens to sit within `vtol` after the first.
-    let scale = u_ss.iter().fold(1e-12_f64, |a, x| a.max(x.val().abs()));
-    // Verification tolerance, scaled to the solver's own accuracy. The one-cycle residual of a
-    // genuinely *linear* map is not zero but a solver-noise floor: `b` (forced from a zero state)
-    // and the check below (forced from `u_ss`) integrate the same periodic `R_in` over *different*
-    // adaptive step sequences, so their forcing quadratures differ by O(reltol·scale). Empirically
-    // that floor is ≈ 45·reltol (relative) — above the original `32·reltol`, which therefore
-    // falsely declined even linear models at a tight `ode_reltol` (e.g. 1e-10), silently forcing
-    // the fallback iteration. `256·reltol` clears the floor with ~5× margin while still rejecting a
-    // genuinely nonlinear map, whose one-cycle residual is O(scale) — ~1e8·reltol, eight orders
-    // above this bound (see `ss_input_rate_nonlinear_disposition_falls_back_to_iteration`).
-    let vtol = (256.0 * reltol + 1e-9) * scale + 256.0 * abstol;
-    let within = |a: &[T], b: &[T]| {
-        a.iter()
-            .zip(b)
-            .all(|(c, u)| (c.val() - u.val()).abs() <= vtol)
-    };
-    let u_check = advance_forced(&u_ss)?;
-    if !within(&u_check, &u_ss) {
-        return None;
-    }
-    let u_check2 = advance_forced(&u_check)?;
-    if within(&u_check2, &u_ss) {
-        Some(u_ss)
-    } else {
-        None
-    }
 }
 
 /// Bounded iteration budget for the Anderson-accelerated nonlinear periodic-SS solve (#867).
@@ -543,7 +454,7 @@ fn anderson_combine<T: crate::sens::num::PkNum>(
 }
 
 /// Periodic steady-state trough for an SS-into-absorption dose, generic over `T` (#867). Tries the
-/// **linear** closed form [`equilibrate_ss_input_rate_fixed_point_g`] first (exact, one linear
+/// **linear** closed form [`crate::dosing::periodic_ss_fixed_point_g`] first (exact, one linear
 /// solve); on a nonlinear disposition — where its self-check declines — falls to the
 /// [Anderson-accelerated][`anderson_ss_fixed_point_g`] solve of the same `u = P(u)` fixed point.
 /// Both share the injected one-cycle propagators, so a caller assembles its solver/forcings once.
@@ -564,7 +475,7 @@ where
 {
     // `&F` still implements `Fn` when `F: Fn`, so borrowing lets the linear attempt and the
     // Anderson fallback share the same two closures without moving them.
-    if let Some(u_ss) = equilibrate_ss_input_rate_fixed_point_g::<T, _, _>(
+    if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
         n,
         ii,
         reltol,

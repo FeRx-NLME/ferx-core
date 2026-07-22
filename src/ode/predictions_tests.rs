@@ -5802,11 +5802,6 @@ fn adaptive_observe_expression_flows_through_driver() {
     );
 }
 
-/// Serializes the tests that *read* the process-global SS non-convergence sink
-/// (`take_ss_nonconvergence_warnings`, #867) so cargo's parallel harness can't have one test
-/// drain another's entry mid-read. Writers don't drain, so only readers need to coordinate.
-static SS_WARN_SINK_READER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// A 1-cpt Michaelis–Menten SS-absorption `OdeSpec` (`first_order(ka)` into MM elimination),
 /// with `Vmax`/`Km`/`ka` in the CL/V/slot-4 positions the tests set. Shared by the #867
 /// nonlinear-SS tests.
@@ -5987,7 +5982,7 @@ fn ss_input_rate_over_capacity_deep_saturation_declines() {
 /// the caller falls to the capped pulse train, and the non-convergence warning fires.
 #[test]
 fn ss_input_rate_no_steady_state_warns() {
-    let _guard = SS_WARN_SINK_READER_GUARD
+    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     crate::dosing::clear_ss_nonconvergence_warnings();
