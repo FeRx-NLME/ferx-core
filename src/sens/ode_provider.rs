@@ -3737,7 +3737,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
 /// The dose does not enter as an instantaneous bolus; it drives the compartment through the
 /// absorption kernel `R_in(tad)` (transit/igd/weibull/first_order). On a **linear** disposition
 /// the periodic steady state is the closed-form fixed point `u_ss = (I − M)⁻¹·b`, carried over `T`
-/// by [`equilibrate_ss_input_rate_fixed_point_g`](crate::ode::predictions::equilibrate_ss_input_rate_fixed_point_g)
+/// by [`periodic_ss_fixed_point_g`](crate::dosing::periodic_ss_fixed_point_g)
 /// so `∂u_ss/∂(θ,η[,κ])` (and the 2nd order) fall out of the linear solve — exact analytic parity
 /// with production's fast path, and bit-identical in value. A **nonlinear** disposition fails the
 /// fixed point's self-check, so [`equilibrate_ss_input_rate_g`](crate::ode::predictions::equilibrate_ss_input_rate_g)

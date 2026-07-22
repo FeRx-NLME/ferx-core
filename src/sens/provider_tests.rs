@@ -2025,8 +2025,11 @@ fn provider_modeled_duration_matches_ode_twin() {
 /// the moving infusion-end jet (`∂D1`) flows through the SS trough exactly as it does
 /// through the current pulse. `D1 ≈ 2.1 < II = 12`; obs straddle the window end within the
 /// SS interval (0.5, 1.5 inside; 3, 6, 11 after). Validated vs central FD of the production
-/// predictor (`compute_predictions_with_tv`, which resolves `D1` per evaluation and
-/// equilibrates the same SS train).
+/// predictor (`compute_predictions_with_tv`, which resolves `D1` per evaluation and reaches
+/// the same steady state). Since #908 both sides solve that steady state exactly rather than
+/// truncating a shared pulse train, so the window dual now rides the `(I − M)⁻¹·b` solve —
+/// the jet enters through `b`, the forced half of the cycle, never through the homogeneous
+/// propagator `M`.
 #[test]
 fn provider_modeled_duration_ss_matches_fd_of_production() {
     let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
@@ -9796,15 +9799,18 @@ const ONECPT_IV_TVCOV_SS: &str = r#"
 ///   (b) `CMT=0` and `CMT=1` must produce identical sensitivities, since they
 ///       denote the same compartment. Not redundant with (a): (a) compares the
 ///       gradient walk against a *value* walk that is a separate driver but shares
-///       the leaf kernel and the truncation policy, so a bug present in **both**
+///       the leaf kernel and the equilibration policy, so a bug present in **both**
 ///       walks is invisible to it and caught only here.
 ///
 /// Both were established by mutation rather than assumed: restoring the bail kills
 /// (a); restoring it in both walks is caught only by (b); zeroing any single
 /// derivative block of the trough jet is caught by (a). What neither catches is a
-/// change to the *shared* cycle budget (`SS_EQUILIBRATION_CYCLES`) — an 8-cycle
-/// budget moves both walks together and leaves this test green, so absolute
-/// steady-state accuracy rests on the separate NONMEM `ss_cmt0` anchor, not here.
+/// change to the *shared* equilibration policy — before #908 an 8-cycle pulse-train
+/// budget moved both walks together and left this test green. Absolute steady-state
+/// accuracy therefore rests elsewhere: on the NONMEM `ss_cmt0` anchor, and since #908
+/// on `ss_equilibration_matches_the_exact_periodic_closed_form`, which pins both walks
+/// against the superposition closed form. This test did, however, catch a revert of the
+/// *dual* walk alone to the pulse train — that asymmetry is exactly what (a) is for.
 #[test]
 fn ss_cmt_zero_gradient_equilibrates_like_the_default_compartment() {
     let m = parse_model_string(ONECPT_IV_TVCOV_SS).expect("parse");
@@ -9888,6 +9894,139 @@ fn ss_cmt_zero_gradient_equilibrates_like_the_default_compartment() {
         "SS must accumulate well above the single-dose curve (got {} vs {}); \
          if these are equal the equilibration was skipped and the test is vacuous",
         a.obs[0].f,
+        sd.obs[0].f
+    );
+}
+
+/// **#908 — the exact SS solve's derivative, where the solve is ill-conditioned.**
+///
+/// `equilibrate_ss_g` no longer iterates a pulse train: it solves `u_ss = (I − M)⁻¹·b` over the
+/// dual type, so the jets it returns are the *implicit-function* derivative
+/// `∂u_ss/∂p = (I − M)⁻¹·(∂b/∂p − ∂M/∂p·u_ss)` produced by `solve_linear_system_g`, not the
+/// derivative of a truncated recursion. Where that can go wrong is where `I − M` is nearly
+/// singular, since `cond(I − M) ≈ 1/(1 − e^{−λ_slow·II})` amplifies any error in the assembled
+/// `M` or `b`. Every other SS gradient test in this file is well-conditioned.
+///
+/// So drive `TVCL` to `0.01` (bound `0.001`): `ke ≈ 1.5e-3` against `II = 12` gives
+/// `λ_slow·II ≈ 0.018` and `cond ≈ 57`, versus `cond ≈ 4` for the sibling fixture above.
+///
+/// **Why this rolls its own finite differences instead of calling
+/// [`check_full_provider_vs_fd`].** At this operating point the mixed second derivative is a
+/// near-total cancellation — `∂²f/∂η_CL∂η_V ≈ −1.96e-2` against `f ≈ 6.25e2`, four to five
+/// orders — so the 4-point stencil subtracts values agreeing to ~12 digits and its roundoff
+/// floor `≈ eps·f/h²` swamps the answer at the shared harness's `h = 1e-4`. Measured against the
+/// analytic value, that stencil's relative error is:
+///
+/// | `h` | 1e-2 | 3e-3 | 1e-3 | 3e-4 | **1e-4** | 3e-5 | 1e-5 |
+/// |---|---|---|---|---|---|---|---|
+/// | rel. err | 8.2e-5 | **3.5e-7** | 4.8e-5 | 5.7e-4 | **5.1e-3** | 7.3e-2 | 7.2e-1 |
+///
+/// Truncation dominates to the left, roundoff to the right, and the harness's step sits on the
+/// wrong side of the minimum. The dominant element `∂²f/∂η_CL² = 6.2007e2` shows the same
+/// V-shape with its floor at `1.2e-8` (`h = 3e-4`). The FD *reference* is what fails here, not
+/// the analytic derivative — so this test pins the second derivatives at the measured optimum
+/// `h = 3e-3` and leaves first derivatives, which are well conditioned, at the usual step.
+///
+/// This is a *correctness* test for the new derivative, not a regression test for the change:
+/// under the old pulse train both sides were truncated and it would also have passed. The value
+/// regression lives in
+/// `pk::event_driven::tests::ss_equilibration_matches_the_exact_periodic_closed_form`; the
+/// value/gradient lockstep is enforced by `event_walk_g_3cpt_matches_production_f64` and the
+/// `CMT=0` test above, either of which fails if only one walk is reverted.
+#[test]
+fn ss_ill_conditioned_gradient_matches_fd_of_production() {
+    let m = parse_model_string(ONECPT_IV_TVCOV_SS).expect("parse");
+    // TVCL = 0.01 (vs 0.2 in the sibling): t½ ≈ 470 h against a 12 h dosing interval.
+    let theta = vec![0.01, 10.0, 0.75];
+    let eta = vec![0.15, -0.10];
+    let obs_times = [1.0, 3.0, 6.0, 11.0];
+    let obs_wts = [70.0, 80.0, 90.0, 100.0];
+
+    let mk = |doses: Vec<DoseEvent>| {
+        tvcov_subject(
+            doses,
+            &[85.0],
+            &obs_times,
+            &obs_wts,
+            Vec::new(),
+            Vec::new(),
+            &[],
+        )
+    };
+    let s = mk(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)]);
+    assert!(
+        s.has_tv_covariates() && subject_routes_to_event_walk(&m, &s),
+        "fixture must reach the event-driven sens walk, where `equilibrate_ss_g` lives"
+    );
+
+    let sens = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+    let pred = |e: &[f64], th: &[f64], j: usize| compute_predictions_with_tv(&m, &s, th, e)[j];
+    let n_eta = eta.len();
+
+    for (j, obs) in sens.obs.iter().enumerate() {
+        approx::assert_relative_eq!(obs.f, pred(&eta, &theta, j), max_relative = 1e-9);
+
+        // First derivatives: well conditioned, ordinary central differences.
+        let he = 1e-6;
+        for k in 0..n_eta {
+            let (mut ep, mut em) = (eta.clone(), eta.clone());
+            ep[k] += he;
+            em[k] -= he;
+            let g = (pred(&ep, &theta, j) - pred(&em, &theta, j)) / (2.0 * he);
+            approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 2e-4, epsilon = 1e-7);
+        }
+        for t in 0..theta.len() {
+            let step = 1e-6 * (1.0 + theta[t].abs());
+            let (mut tp, mut tm) = (theta.clone(), theta.clone());
+            tp[t] += step;
+            tm[t] -= step;
+            let g = (pred(&eta, &tp, j) - pred(&eta, &tm, j)) / (2.0 * step);
+            approx::assert_relative_eq!(obs.df_dtheta[t], g, max_relative = 2e-4, epsilon = 1e-7);
+        }
+
+        // Second derivatives at the measured stencil optimum (see the table above).
+        let hh = 3e-3;
+        for k in 0..n_eta {
+            for l in 0..n_eta {
+                let mut pp = eta.clone();
+                pp[k] += hh;
+                pp[l] += hh;
+                let mut pm = eta.clone();
+                pm[k] += hh;
+                pm[l] -= hh;
+                let mut mp = eta.clone();
+                mp[k] -= hh;
+                mp[l] += hh;
+                let mut mm = eta.clone();
+                mm[k] -= hh;
+                mm[l] -= hh;
+                let fd = (pred(&pp, &theta, j) - pred(&pm, &theta, j) - pred(&mp, &theta, j)
+                    + pred(&mm, &theta, j))
+                    / (4.0 * hh * hh);
+                approx::assert_relative_eq!(
+                    obs.d2f_deta2[k * n_eta + l],
+                    fd,
+                    max_relative = 1e-4,
+                    epsilon = 1e-7
+                );
+            }
+        }
+    }
+
+    // Guard against a vacuous pass: with almost no elimination the steady state must tower over
+    // the single-dose curve. If the equilibration were skipped, both the analytic and the FD side
+    // would be wrong the same way and every assertion above would still hold.
+    let sd = subject_sensitivities(
+        &m,
+        &mk(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)]),
+        &theta,
+        &eta,
+    )
+    .expect("supported");
+    assert!(
+        sens.obs[0].f > sd.obs[0].f * 20.0,
+        "a near-non-eliminating SS dose must accumulate far above one dose (got {} vs {})",
+        sens.obs[0].f,
         sd.obs[0].f
     );
 }

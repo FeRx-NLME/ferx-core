@@ -40,7 +40,7 @@ Every prediction path in ferx-core honours `SS=1`:
 | Path                                              | Where                                                                     | How                                                |
 | ------------------------------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------- |
 | Analytical (1-/2-/3-cpt, no TV covariates)        | `predict_concentration` in `src/pk/mod.rs`                                | Closed-form geometric-series                       |
-| Analytical (1-/2-/3-cpt, time-varying covariates) | `event_driven_predictions_with_schedule` in `src/pk/event_driven.rs`      | Numerical pulse expansion via the propagator       |
+| Analytical (1-/2-/3-cpt, time-varying covariates) | `event_driven_predictions_with_schedule` in `src/pk/event_driven.rs`      | Exact linear fixed point `(I − M)⁻¹·b`             |
 | ODE (`[odes]`-block models)                       | `ode_predictions` / `ode_predictions_event_driven` in `src/ode/predictions.rs` | Numerical pulse expansion via the RK45 solver |
 
 Both kinds of paths start from the same underlying identity — the
@@ -165,51 +165,90 @@ already-committed NONMEM PRED-only anchor for SS + `ALAG1` — see
 [Estimated lagtime](lagtime.qmd) — plus the local FD-vs-production and
 Hessian-vs-FD-of-gradient test suite.
 
-### Why `N = 50`?
+### Analytical event-driven path: the exact linear fixed point
 
-The truncation tail after `N` cycles is bounded by `exp(-N·λ_slow·II)`, where
-`λ_slow` is the **slowest** disposition rate constant. For typical PK
-(`λ_slow·II ≈ 2`, i.e. ~3 half-lives per dosing interval), `exp(-100) ≈ 4e-44` —
-well below any meaningful precision.
+A subject with a time-varying covariate, an `EVID=3/4` reset, IOV, or a dose into a
+non-default compartment cannot be served by dose superposition, so it is routed to
+the event-driven walk instead. That walk still faces an `SS=1` dose, but it does not
+have the superposition path's closed form to hand — it carries a compartment state
+forward through events.
 
-It is **not** always negligible, and the governing quantity is `λ_slow·II`, not the
-number of compartments. A one-compartment oral model with `CL = 0.1`, `V = 50`
-(t½ ≈ 350 h) dosed `II = 12` has `λ_slow·II ≈ 0.024`, giving `exp(-1.2) ≈ 0.30` — a
-**30 %** difference from the exact periodic steady state. A two-compartment model
-with a slow, deep peripheral (`Q = 0.5`, `V2 = 500`) reaches ~9 % at the same `II`.
-Both are measured, not estimated. As a rule of thumb the truncation is negligible
-once `λ_slow·II ≳ 0.5` and can reach tens of percent when it is not.
+It solves the steady state exactly all the same. One dosing cycle of a linear
+disposition is an affine map on the state vector,
 
-This matters only when a subject is served by the **pulse-train** path. The
-dose-superposition closed form uses the exact periodic solution and is unaffected;
-the event-driven walk and the ODE path use the pulse train. A subject is routed to
-the walk by a time-varying covariate, an `EVID=3/4` reset, IOV, or (since #375) a
-dose into a non-default compartment — so the same dataset can move between the two
-representations. **No warning is emitted** when the tail is significant.
+```
+u ↦ M·u + b
+```
+
+where `M` is the one-cycle propagator (the monodromy) and `b` the cycle's own dose
+response. The periodic steady state is its fixed point:
+
+```
+u_ss = (I − M)⁻¹·b
+```
+
+Both `M` (column by column, from the homogeneous response of each unit basis state)
+and `b` (the forced response from a zero state) come from one cycle of the *same*
+propagators the walk already uses, so no new closed form is introduced. The analytical
+models' disposition is always linear, so this always applies.
+
+The result agrees with the dose-superposition closed forms to f64 precision —
+`≤ 1e-12` relative on every supported model, bit-identical on several — rather than
+to a tolerance. The two representations of the same dataset therefore agree by
+construction.
+
+::: {.callout-note}
+## Through v0.2.0 this path truncated
+
+Until #908 the event-driven walk expanded a **pulse train** capped at 50 cycles, like
+the ODE path below, leaving a residual of `exp(-50·λ_slow·II)`. That is negligible for
+typical PK (`λ_slow·II ≈ 2` gives `exp(-100) ≈ 4e-44`) but not always: a
+one-compartment oral model with `CL = 0.1`, `V = 50` (t½ ≈ 350 h) at `II = 12` has
+`λ_slow·II ≈ 0.024` and was **30 %** below the true steady state. Deep peripheral
+*amounts* were worse — over 50 % on slow 2- and 3-compartment models. Since routing is
+per subject, adding one unrelated dose row could move a prediction by that much. If you
+have results from an earlier version involving `SS=1` on any of those paths, they are
+worth regenerating.
+:::
+
+The pulse train survives here only for a **singular** `I − M` — a zero disposition
+rate constant, i.e. a compartment that never empties (`CL = 0`). No periodic steady
+state exists then, and the capped loop now raises a non-convergence warning rather
+than returning a silently truncated state.
+
+### Why `N = 50` on the ODE path?
+
+The ODE path still expands the pulse train, because an `[odes]` RHS need not be linear.
+The truncation tail after `N` cycles is `≈ exp(-N·λ_slow·II)`, where `λ_slow` is the
+**slowest** disposition rate constant — the governing quantity is `λ_slow·II`, not the
+number of compartments. It is negligible once `λ_slow·II ≳ 0.5` and can reach tens of
+percent when it is not, with the same magnitudes quoted in the note above.
 
 ferx loops up to `N = 50` cycles with an early stop once the cycle-to-cycle change
 falls below `SS_EQUILIBRATION_TOL` (`1e-12` relative, `src/dosing.rs`) — added in
-#519/#532, so the loop is no longer unconditionally fixed-length. The early stop
-fires for fast PK; for the slow cases above it never trips and the full 50 cycles
-run, which is exactly when the residual tail is largest.
+#519/#532, so the loop is not unconditionally fixed-length. The early stop fires for
+fast PK; for slow PK it never trips and the full 50 cycles run, which is exactly when
+the residual tail is largest.
 
-If you need tighter accuracy for an unusually slow PK, the constant has a single
-definition: `SS_EQUILIBRATION_CYCLES` in `src/dosing.rs` (the analytical
-event-driven and ODE paths both use it).
+Two ODE sub-cases already avoid the truncation: a steady-state dose into a built-in
+absorption compartment solves the same linear `(I − M)⁻¹·b` fixed point (#835), falling
+back to an Anderson-accelerated iteration when the disposition is genuinely nonlinear
+(#867). Extending that to the ordinary ODE bolus and infusion is the remaining work.
+
+If you need tighter accuracy for an unusually slow PK on the ODE path, the constant has
+a single definition: `SS_EQUILIBRATION_CYCLES` in `src/dosing.rs`.
 
 ### Cost comparison
 
 | Path                | Per SS-dose cost                          | Notes |
 | ------------------- | ----------------------------------------- | ----- |
 | Analytical closed   | ~1 single-dose evaluation                 | Effectively free |
-| Event-driven pulse  | ~50× analytical propagator calls          | Still cheap; analytical propagator is fast |
+| Event-driven exact  | `n + 4` propagator calls + one `n×n` solve (`n ≤ 4`) | Exact, and cheaper than the 50-cycle train it replaced |
 | ODE pulse           | ~50× RK45 segment integrations            | Real cost — RK45 is the dominant per-prediction cost for ODE models, so SS doses cost ~50× more than non-SS doses |
 
 SS doses are typically rare (one per subject at the start of a
 maintenance regimen), so the absolute overhead per fit iteration is
-modest even for ODE models. If a benchmark shows SS equilibration as
-a hot spot, a tighter early-stop (loop until `||state - prev|| / ||state||
-< tol`) is the obvious follow-up — it would early-exit on fast PK.
+modest even for ODE models.
 
 ## DSL example
 
