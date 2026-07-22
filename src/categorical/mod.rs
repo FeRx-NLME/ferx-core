@@ -656,6 +656,11 @@ mod tests {
     /// The Bernoulli draw is exact at the degenerate ends and unbiased in between.
     /// `Open01` never yields 0 or 1, so `u < p` makes `p = 0` impossible and `p = 1`
     /// certain — the property that keeps a saturated predictor from flipping states.
+    ///
+    /// This validates the `Open01` + `u < p` primitive in isolation (a local closure);
+    /// that the *production* [`simulate_binary`] is actually wired to it — so an inverted
+    /// comparison is caught on the fast PR job, not only by the slow SSE — is pinned by
+    /// `production_binary_draw_frequency_tracks_p` in `tests/categorical_smoke.rs`.
     #[test]
     fn bernoulli_draw_is_exact_at_the_ends_and_calibrated_between() {
         use rand::SeedableRng;

@@ -4632,13 +4632,15 @@ pub struct FitResult {
     ///
     /// The checkpoint format does not round-trip per-record discrete-endpoint
     /// diagnostics (`SubjectResult::discrete_rows`), so a restored fit of a binary /
-    /// categorical model has none. This flag is the precise discriminator
-    /// [`crate::io::output::write_sdtab_csv`] needs to tell a restored binary fit
-    /// (rows genuinely dropped → refuse) from a live CTMM fit (never produces those
-    /// rows → allow) — the record variant alone cannot, since both are
-    /// [`ObsRecord::DiscreteState`]. Runtime-only: `#[serde(skip)]`, so no `.fitrx` /
-    /// JSON / ferx-r format change, and a live fit always carries `false`. Removed
-    /// once diagnostics round-trip (#911).
+    /// categorical model has none. This flag lets [`crate::io::output::write_sdtab_csv`]
+    /// refuse a restored fit whose model declares a binary endpoint (rows genuinely
+    /// dropped) while still writing a live fit. It must be paired with the model's
+    /// declared endpoints — parsed from [`Self::model_text`] — because the *reconstructed
+    /// population* is not a usable signal: `load_fit` re-reads the data with default
+    /// (Gaussian) routing, so binary DVs come back as continuous observations and no
+    /// [`ObsRecord::DiscreteState`] survives. Runtime-only: `#[serde(skip)]`, so no
+    /// `.fitrx` / JSON / ferx-r format change, and a live fit always carries `false`.
+    /// Removed once diagnostics round-trip (#911).
     #[serde(skip)]
     pub restored_from_checkpoint: bool,
 }

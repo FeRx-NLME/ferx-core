@@ -436,10 +436,16 @@ mod binary_smoke {
     /// A fit **restored from a `.fitrx` checkpoint** carries no per-record discrete
     /// diagnostics (the bundle doesn't round-trip them), so writing sdtab would emit a
     /// table silently missing every binary row. `write_sdtab_csv` refuses — keyed on the
-    /// `restored_from_checkpoint` flag, not the record variant (which a *live* CTMM fit
-    /// also carries, and which must still write; see `markov_smoke`).
+    /// `restored_from_checkpoint` flag **and the restored model's declared binary
+    /// endpoint** (`model_text`), NOT on discrete records in the reconstructed population.
+    /// That distinction is the whole point: `load_fit` re-reads the data with default
+    /// (Gaussian) routing, so a genuinely restored population carries *no* `DiscreteState`
+    /// records at all — an earlier pop-based guard therefore never fired on a real restore
+    /// and wrote a truncated table. A *live* CTMM fit (no binary endpoint) must still
+    /// write; see `markov_smoke`.
     #[test]
-    fn sdtab_refuses_a_restored_fit_missing_its_discrete_rows() {
+    fn sdtab_refuses_a_restored_binary_fit_missing_its_discrete_rows() {
+        use ferx_core::types::Population;
         let model = parse_model_string(MIXED_MODEL).unwrap();
         let pop = common::binary_pop(&sim_subjects(), 3);
         let mut res = fit(&model, &pop, &model.default_params, &smoke_opts()).expect("fit");
@@ -452,19 +458,71 @@ mod binary_smoke {
         ferx_core::io::output::write_sdtab_csv(&res, &pop, live.to_str().unwrap())
             .expect("a live binary fit must write sdtab");
 
-        // Simulate the restore: the flag flips and the diagnostics are gone.
+        // Simulate the restore faithfully: the flag flips, the diagnostics are gone, the
+        // model source is carried (as `load_fit` sets it) — and, critically, the
+        // reconstructed population carries NO discrete records (Gaussian routing). The
+        // guard must still refuse, so it cannot be relying on the population.
         res.restored_from_checkpoint = true;
+        res.model_text = Some(MIXED_MODEL.to_string());
         for sr in &mut res.subjects {
             sr.discrete_rows.clear();
         }
+        let no_discrete_pop = Population {
+            subjects: vec![],
+            covariate_names: vec![],
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
         let restored = dir.path().join("restored.csv");
-        let err = ferx_core::io::output::write_sdtab_csv(&res, &pop, restored.to_str().unwrap())
-            .expect_err("a restored fit over discrete data must be refused");
+        let err = ferx_core::io::output::write_sdtab_csv(
+            &res,
+            &no_discrete_pop,
+            restored.to_str().unwrap(),
+        )
+        .expect_err("a restored fit of a binary model must be refused even with no discrete rows in the pop");
         assert!(
             err.contains("restored") && err.contains("fitrx"),
             "message: {err}"
         );
         assert!(!restored.exists(), "no partial file may be left behind");
+
+        // No false positive: the same restored flag on a model with **no** binary endpoint
+        // (a plain Gaussian / CTMM fit, whose occupancy diagnostics are #820) must NOT be
+        // refused — `binary_cmts()` is binary-only, so the guard stays silent.
+        const GAUSSIAN_MODEL: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  sigma PROP ~ 0.05
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+        res.model_text = Some(GAUSSIAN_MODEL.to_string());
+        // Use the real (aligned) population here: the guard does not fire, so control
+        // reaches `sdtab`, which indexes `population.subjects` by `result.subjects` order.
+        let out = ferx_core::io::output::write_sdtab_csv(
+            &res,
+            &pop,
+            dir.path().join("gauss.csv").to_str().unwrap(),
+        );
+        // It may still Err for an unrelated reason (a binary fit has no Gaussian rows to
+        // write) — but it must never be the discrete-diagnostics refusal.
+        if let Err(e) = &out {
+            assert!(
+                !e.contains("restored from"),
+                "a restored non-binary fit must not hit the discrete-diagnostics refusal: {e}"
+            );
+        }
     }
 
     // ---- Slice 1b: sdtab diagnostics ---------------------------------------------------
@@ -808,6 +866,284 @@ mod binary_smoke {
         assert!(
             w.contains("3 record(s)"),
             "warning must count the records: {w}"
+        );
+    }
+
+    // ---- Slice 1b: gaps closed after the #900 review -----------------------------------
+
+    /// **Regression (#900 review).** A binary-only `--simulate` whose linear predictor is
+    /// NaN for the whole subject produces zero simulated rows, so `sims_by_id.get(id)`
+    /// missed and the per-subject loop `continue`d *past* the placeholder cleanup — every
+    /// template `state = 0` then reached `fit()` as a fabricated observed failure (the fit
+    /// even converged on it). The cleanup now runs on the zero-draw subject too, so the
+    /// placeholders are dropped rather than fitted.
+    ///
+    /// The NaN comes from `TH0 ^ 0.5` at a *negative* `TH0`: `powf` of a negative base with
+    /// a fractional exponent is NaN and the DSL evaluator does not guard `Op::Pow`
+    /// (`ln`/`sqrt`/`/` are guarded; `pow` is not). It needs no covariate, so a synthetic
+    /// `--simulate` subject (empty covariates) reaches it. Note `exp(TH0) - exp(TH0)` does
+    /// *not* work here — `x - x` folds to a finite `0`, giving real p = 0.5 draws, not NaN.
+    #[test]
+    fn binary_only_all_nan_simulate_drops_placeholders_not_fits_them() {
+        use ferx_core::types::ObsRecord;
+        let src = r"
+[parameters]
+  theta TH0(-1.0, -10.0, 10.0)
+
+[binary_model]
+  cmt   = 3
+  logit = TH0 ^ 0.5
+
+[simulation]
+  n_subjects = 4
+  times      = [0, 1, 2]
+
+[fit_options]
+  method  = focei
+  maxiter = 2
+";
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nanbin.ferx");
+        std::fs::write(&path, src).expect("write model");
+        // With every outcome un-drawable the design legitimately has nothing to fit; the
+        // bug produced a *successful* fit on fabricated zeros, so the only wrong outcome
+        // is a surviving `DiscreteState` placeholder.
+        if let Ok((_res, pop)) = ferx_core::run_model_simulate(path.to_str().unwrap()) {
+            let surviving = pop
+                .subjects
+                .iter()
+                .flat_map(|s| s.obs_records.iter())
+                .filter(|r| matches!(r, ObsRecord::DiscreteState { .. }))
+                .count();
+            assert_eq!(
+                surviving, 0,
+                "every NaN-skipped binary placeholder must be dropped, not fitted as an observed 0"
+            );
+        }
+    }
+
+    /// **The production draw direction, on the fast job.** The sampler draws `state = 1`
+    /// iff `u < p`; inverting it (`u > p`, i.e. drawing from `1 − p`) is the exact bug the
+    /// SSE exists to catch — but the SSE is `slow-tests`-gated and does not run per PR, and
+    /// the Tier-1 `bernoulli_draw_*` test asserts on a *local* re-implementation, not the
+    /// production `simulate_binary`. This drives the real `simulate` path at a known
+    /// `p = 0.8`, so an inverted comparison (frequency ≈ 0.2) fails here on every PR.
+    #[test]
+    fn production_binary_draw_frequency_tracks_p() {
+        use ferx_core::types::SimOutcome;
+        // logit = TH0 with TH0 = ln(0.8 / 0.2) ⇒ p = 0.8 at every record.
+        let src = r"
+[parameters]
+  theta TH0(1.3862943611198906, -10.0, 10.0)
+
+[binary_model]
+  cmt   = 3
+  logit = TH0
+";
+        let model = parse_model_string(src).unwrap();
+        let pop = common::binary_pop(&[(0.0, vec![(0.0, 0)])], 3);
+        let n = 4000;
+        let sims = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, n, 20260722);
+        assert_eq!(sims.len(), n, "one row per replicate draw");
+        let ones = sims
+            .iter()
+            .filter(|r| matches!(r.outcome, SimOutcome::Category { state: 1 }))
+            .count();
+        let freq = ones as f64 / sims.len() as f64;
+        // SE ≈ √(0.8·0.2/4000) ≈ 0.0063; 0.8 vs an inverted 0.2 is ~95 SE apart.
+        assert!(
+            (freq - 0.8).abs() < 0.03,
+            "p = 0.8 but realised frequency {freq}; an inverted `u < p` draws ~0.2"
+        );
+        assert!(
+            sims.iter().all(|r| (r.ipred - 0.8).abs() < 1e-9),
+            "ipred must carry p = 0.8"
+        );
+    }
+
+    /// **`raw_time` ≠ `time`.** The predictor runs on the engine's internal
+    /// (occasion-shifted) clock while every reported row carries the user's `raw_time` —
+    /// the reset-occasion case the field exists for. Every other test sets the two equal
+    /// and so cannot tell them apart; a mutation swapping `time` ↔ `raw_time` in
+    /// `for_each_binary_lp` passes the whole suite. Here `logit = THT · TIME` with internal
+    /// `time = 4.0` and user `raw_time = 1.0` pins both directions at once.
+    #[test]
+    fn binary_predict_uses_internal_time_and_reports_raw_time() {
+        use ferx_core::types::{ObsRecord, Population, Prediction};
+        let src = r"
+[parameters]
+  theta THT(1.0, -10.0, 10.0)
+
+[binary_model]
+  cmt   = 3
+  logit = THT * TIME
+";
+        let model = parse_model_string(src).unwrap();
+        let mut s = common::subject("1", vec![], vec![], vec![], vec![]);
+        s.obs_records = vec![ObsRecord::DiscreteState {
+            time: 4.0,     // internal (occasion-shifted) clock the predictor must use
+            raw_time: 1.0, // user clock every reported row must carry
+            state: 1,
+            cmt: 3,
+        }];
+        let pop = Population {
+            subjects: vec![s],
+            covariate_names: vec![],
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let preds = ferx_core::predict_categorical(&model, &pop, &model.default_params);
+        assert_eq!(preds.len(), 1);
+        assert_eq!(
+            preds[0].time, 1.0,
+            "reported time must be the user raw_time, not the internal clock"
+        );
+        let Prediction::CatProbs { ref probs } = preds[0].prediction else {
+            panic!("expected CatProbs");
+        };
+        let inv_logit = |x: f64| 1.0 / (1.0 + (-x).exp());
+        assert!(
+            (probs[1] - inv_logit(4.0)).abs() < 1e-9,
+            "predictor must evaluate at internal time 4.0 (p≈{:.3}), got {}",
+            inv_logit(4.0),
+            probs[1]
+        );
+        assert!(
+            (probs[1] - inv_logit(1.0)).abs() > 0.2,
+            "predictor must not have used raw_time 1.0 (p≈{:.3})",
+            inv_logit(1.0)
+        );
+    }
+
+    /// PRED is the population prediction at η = 0; IPRED conditions on the EBE η. The robust
+    /// pin that PRED is not accidentally computed at the EBE (a mutation the `∈ [0,1]` range
+    /// check in `binary_sdtab_emits_one_row_per_record` misses): sdtab's PRED must equal
+    /// `predict_categorical`, which is η = 0 *by contract*. This holds regardless of how far
+    /// the EBEs actually move — at `maxiter = 3` they barely do, so a magnitude test on
+    /// PRED − IPRED would be far too tight; matching the independent η = 0 predictor is
+    /// exact. IPRED is separately checked to *not* be bit-identical to PRED (it conditions
+    /// on a non-zero EBE), so the two are genuinely computed at different η.
+    #[test]
+    fn binary_sdtab_pred_is_population_typical_not_ebe() {
+        use ferx_core::io::output::sdtab;
+        use ferx_core::types::Prediction;
+        let model = parse_model_string(MIXED_MODEL).unwrap();
+        let pop = common::binary_pop(&sim_subjects(), 3);
+        let res = fit(&model, &pop, &model.default_params, &smoke_opts()).expect("fit");
+
+        // `predict_categorical` is η = 0 by construction; reconstruct the fitted params so
+        // it uses the same θ sdtab's PRED does.
+        let mut fitted = model.default_params.clone();
+        fitted.theta = res.theta.clone();
+        let preds = ferx_core::predict_categorical(&model, &pop, &fitted);
+
+        let cols = sdtab(&res, &pop);
+        let col = |name: &str| &cols.iter().find(|(n, _)| n == name).expect("column").1;
+        let pred = col("PRED");
+        let ipred = col("IPRED");
+        assert_eq!(pred.len(), preds.len(), "one PRED per binary record");
+
+        // PRED == the η = 0 predictor, row for row. A PRED computed at the EBE diverges here.
+        for (k, (&sdtab_pred, ep)) in pred.iter().zip(preds.iter()).enumerate() {
+            let Prediction::CatProbs { ref probs } = ep.prediction else {
+                panic!("expected CatProbs");
+            };
+            assert!(
+                (sdtab_pred - probs[1]).abs() < 1e-12,
+                "row {k}: sdtab PRED {sdtab_pred} must equal the η=0 predictor P(Y=1) {}",
+                probs[1]
+            );
+        }
+
+        // IPRED conditions on a non-zero EBE, so it is not bit-identical to PRED — the two
+        // are computed at different η (a mutation collapsing them makes the diff exactly 0).
+        assert!(
+            pred.iter().zip(ipred.iter()).any(|(p, i)| p != i),
+            "IPRED (EBE) must differ from PRED (η=0) for at least one record"
+        );
+    }
+
+    /// **Mixed Gaussian + binary coexistence.** A joint PK + `[binary_model]` model must
+    /// emit *both* row families from a single `simulate()` — the Gaussian emitter and
+    /// `simulate_binary` write into separate storage (`observations` vs `obs_records`), and
+    /// no test previously exercised them together. Covers the dual-emit seam in
+    /// `emit_subject_rows`.
+    #[test]
+    fn mixed_gaussian_and_binary_simulate_emits_both() {
+        use ferx_core::types::{DoseEvent, ObsRecord, Population, SimOutcome};
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TH0(0.5, -10.0, 10.0)
+  sigma PROP ~ 0.05
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[binary_model]
+  cmt   = 3
+  logit = TH0
+";
+        let model = parse_model_string(src).unwrap();
+        let mut s = common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![0.5, 1.0, 2.0], // Gaussian obs times on CMT 1
+            vec![0.0, 0.0, 0.0],
+            vec![1, 1, 1],
+        );
+        s.obs_records = vec![
+            ObsRecord::DiscreteState {
+                time: 0.5,
+                raw_time: 0.5,
+                state: 0,
+                cmt: 3,
+            },
+            ObsRecord::DiscreteState {
+                time: 2.0,
+                raw_time: 2.0,
+                state: 1,
+                cmt: 3,
+            },
+        ];
+        let pop = Population {
+            subjects: vec![s],
+            covariate_names: vec![],
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let rows = ferx_core::simulate(&model, &pop, &model.default_params, 1);
+        let n_cont = rows
+            .iter()
+            .filter(|r| matches!(r.outcome, SimOutcome::Continuous { .. }))
+            .count();
+        let n_cat = rows
+            .iter()
+            .filter(|r| matches!(r.outcome, SimOutcome::Category { .. }))
+            .count();
+        assert_eq!(n_cont, 3, "the 3 Gaussian rows must still emit");
+        assert_eq!(n_cat, 2, "the 2 binary rows must coexist, not be dropped");
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r.outcome, SimOutcome::Continuous { .. }) && r.cmt == 1),
+            "Gaussian rows on CMT 1"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r.outcome, SimOutcome::Category { .. }) && r.cmt == 3),
+            "binary rows on CMT 3"
         );
     }
 }

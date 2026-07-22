@@ -452,10 +452,15 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     }
 
     let mut population = template;
+    // A subject that produced *zero* simulated rows (a binary-only design whose
+    // linear predictor is NaN for every record — see the binary write-back below)
+    // still owns template `DiscreteState` placeholders that must be cleaned up, so
+    // the per-subject body has to run even with no draws. Binding to an empty slice
+    // (rather than `continue`-ing) lets the placeholder-dropping pass reach it; the
+    // Gaussian and TTE write-backs are self-guarding no-ops on an empty `sims`.
+    let no_sims: Vec<&SimulationResult> = Vec::new();
     for subject in &mut population.subjects {
-        let Some(sims) = sims_by_id.get(subject.id.as_str()) else {
-            continue;
-        };
+        let sims = sims_by_id.get(subject.id.as_str()).unwrap_or(&no_sims);
 
         // Gaussian write-back: only continuous outcomes map onto `observations`.
         // A TTE `Event` row would trip `continuous_value()`'s debug-assert, so
@@ -558,10 +563,13 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                         .push_back(state);
                 }
             }
-            // Runs unconditionally. Nesting this under `!drawn.is_empty()` meant a
-            // subject whose records were *all* NaN-skipped kept every placeholder — the
-            // exact fabricated-data outcome the removal exists to prevent, just for the
-            // all-NaN subject instead of the partial one.
+            // Runs unconditionally — and now genuinely so. Two gates once suppressed it:
+            // an inner `!drawn.is_empty()` (a partially-NaN subject kept its placeholders)
+            // and the outer per-subject `continue` on a `sims_by_id` miss (a *fully*
+            // NaN-skipped binary-only subject produces zero rows, so `sims_by_id.get`
+            // returned `None` and every placeholder reached `fit()` as a fabricated
+            // observed 0). The loop now binds an empty `sims` instead of `continue`-ing,
+            // so this drop reaches the all-NaN subject too.
             {
                 subject.obs_records.retain_mut(|rec| {
                     let crate::types::ObsRecord::DiscreteState {

@@ -1305,28 +1305,34 @@ pub fn write_sdtab_csv(
     // diagnostics — the bundle doesn't round-trip them (see `io::fitrx::parse_subjects`).
     // Writing anyway would emit a table silently missing every discrete-endpoint row
     // (header-only for a binary-only fit, since the columns exist but are zero-length, so
-    // the `cols.is_empty()` check below never fires). Refuse instead. The discriminator is
-    // `restored_from_checkpoint`, NOT "the population has discrete records": the latter is
-    // also true for a *live* CTMM fit, which legitimately produces no `discrete_rows`
-    // (occupancy diagnostics are #820) — keying on the record variant would reject every
-    // healthy CTMM fit. #911 removes this once diagnostics round-trip.
+    // the `cols.is_empty()` check below never fires). Refuse instead.
+    //
+    // The discriminator is `restored_from_checkpoint` AND "the restored model declares a
+    // binary endpoint" — NOT "the reconstructed population has discrete records". The
+    // population is not a usable signal: `load_fit` re-reads the bundled data through
+    // `read_nonmem_csv_mapped`, which uses the default (Gaussian) `ObsRouting`, so a binary
+    // DV comes back as an ordinary continuous observation and the population carries *no*
+    // `DiscreteState` records at all — keying on `obs_records` (as an earlier revision did)
+    // therefore never fired on a real restore, and its test only passed on a hand-built
+    // population that `load_fit` cannot produce. `model_text` *is* round-tripped, so parse
+    // it and ask the direct question: would a live fit of this model have produced
+    // `discrete_rows`? `binary_cmts()` is binary-only (not CTMM), so a restored CTMM fit —
+    // which legitimately produces no `discrete_rows` live or restored (occupancy is #820) —
+    // is correctly *allowed* through. #911 removes this once diagnostics round-trip.
     #[cfg(feature = "survival")]
     if result.restored_from_checkpoint {
-        let pop_has_discrete = population.subjects.iter().any(|s| {
-            s.obs_records.iter().any(|r| {
-                matches!(
-                    r,
-                    crate::types::ObsRecord::DiscreteState { .. }
-                        | crate::types::ObsRecord::Count { .. }
-                )
-            })
-        });
-        if pop_has_discrete {
+        let model_declares_binary = result
+            .model_text
+            .as_deref()
+            .and_then(|src| crate::parser::model_parser::parse_full_model(src).ok())
+            .is_some_and(|parsed| !parsed.model.binary_cmts().is_empty());
+        if model_declares_binary {
             return Err(
                 "refusing to write sdtab: this fit was restored from a `.fitrx` checkpoint, \
                  which does not round-trip per-record discrete-endpoint (binary / categorical) \
-                 diagnostics, and the dataset has discrete observations — so the table would be \
-                 silently missing every discrete row. Re-run the fit to write sdtab (#911)."
+                 diagnostics, and the model declares a [binary_model] endpoint — so the table \
+                 would be silently missing every discrete row. Re-run the fit to write sdtab \
+                 (#911)."
                     .to_string(),
             );
         }
