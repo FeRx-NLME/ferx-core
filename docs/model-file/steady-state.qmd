@@ -198,7 +198,7 @@ to a tolerance. The two representations of the same dataset therefore agree by
 construction.
 
 ::: {.callout-note}
-## Before v0.2.0 this path truncated
+## Through v0.2.0 this path truncated
 
 Until #908 the event-driven walk expanded a **pulse train** capped at 50 cycles, like
 the ODE path below, leaving a residual of `exp(-50·λ_slow·II)`. That is negligible for

@@ -1249,6 +1249,8 @@ fn equilibrate_ss_g<T: PkNum>(
     // Fallback for a singular `I − M` (no periodic steady state exists), mirroring the value
     // walk's. Shared early stop (#519, #532 review #11): the closed-form propagator equilibrates
     // the same geometric train, so the same mixed atol/rtol stop applies here too.
+    // No `note_ss_nonconvergence_if_capped` here: the value walk (`event_driven`) owns the #867
+    // cap warning, and the two walks co-run per subject, so warning here too would double-emit.
     let mut prev = vec![0.0_f64; n_states];
     let mut cur = vec![0.0_f64; n_states];
     let mut cycles_run = 0usize;
