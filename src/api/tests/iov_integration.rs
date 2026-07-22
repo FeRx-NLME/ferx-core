@@ -662,11 +662,37 @@ fn test_iov_occasion_dsl_matches_column_fit() {
     let r_dsl = fit(&model, &pop, &model.default_params, &opts_dsl)
         .expect("DSL-occasion fit should succeed");
 
+    // The two fits share model + population and differ only in how each
+    // subject's occasion partition is derived; both produce the identical
+    // partition (relabelled 0/1 vs 1/2 — see above), and the FOCE pipeline is
+    // bit-reproducible regardless of the thread schedule: the per-subject
+    // objective reduces in a fixed subject order (collect-then-serial-sum,
+    // #703) and the inner EBE loop is order-preserving. So the two OFVs are
+    // *bit-identical*, not merely close.
+    //
+    // Assert that exactly. col and dsl run in the same process on the same CPU,
+    // so this compares two values that shared every FP op sequence — it is a
+    // 0-vs-0 check that cannot be perturbed by parallel-reduction order or CPU
+    // load (the class of flakiness a loose tolerance would only paper over).
+    // If it ever fails, do NOT loosen it: a real regression has broken
+    // partition equivalence (independently pinned by the `apply_iov_occasion_*`
+    // derivation tests above) or leaked nondeterminism into estimation. The
+    // sibling `test_iov_ode_fit_matches_analytical_twin` compares two *different*
+    // numeric engines (ODE vs closed form) and rightly uses a basin tolerance;
+    // this test does not.
     assert!(
-        (r_col.ofv - r_dsl.ofv).abs() < 1e-6,
-        "DSL occasion rule OFV {} must match column OFV {}",
+        r_col.ofv.is_finite() && r_dsl.ofv.is_finite(),
+        "both OFVs must be finite (col={}, dsl={})",
+        r_col.ofv,
         r_dsl.ofv,
-        r_col.ofv
+    );
+    assert_eq!(
+        r_col.ofv.to_bits(),
+        r_dsl.ofv.to_bits(),
+        "DSL-occasion OFV {} must be bit-identical to column OFV {} \
+         (same partition + deterministic pipeline)",
+        r_dsl.ofv,
+        r_col.ofv,
     );
     assert_eq!(r_col.ebe_kappas.len(), r_dsl.ebe_kappas.len());
     for (a, b) in r_col.ebe_kappas.iter().zip(&r_dsl.ebe_kappas) {
