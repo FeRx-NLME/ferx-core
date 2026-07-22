@@ -516,10 +516,16 @@ fn equilibrate_ss_state(
     let n = ode.n_states;
     let mut u = vec![0.0; n];
 
-    if dose.ii <= 0.0 || dose.cmt == 0 {
+    if dose.ii <= 0.0 {
         return u;
     }
-    let cmt_idx = dose.cmt - 1;
+    // `CMT=0` equilibrates compartment 1 — NONMEM's default dose compartment —
+    // like every other dose site (#899). This used to bail out here and return
+    // an unequilibrated all-zero state, so an `SS=1` dose written `CMT=0`
+    // produced the *single-dose* curve on the ODE engine while the analytical
+    // engine (fixed in #375) produced the accumulated steady state. That was the
+    // cross-engine disagreement recorded in `CHANGELOG.md`; this closes it.
+    let cmt_idx = dose.cmt.saturating_sub(1);
     if cmt_idx >= n {
         return u;
     }
@@ -938,7 +944,12 @@ fn zero_order_dur_and_frac_for_dose(
         return None;
     }
     ode.input_rate.iter().find_map(|f| {
-        if f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt + 1 == dose.cmt {
+        // `f.cmt` is 0-based; match it against the dose's 0-based target index so a `CMT=0` dose
+        // (the default dose compartment == compartment 1) resolves its zero-order window instead of
+        // missing it. The bare `f.cmt + 1 == dose.cmt` this replaced never matched `CMT=0`, so the
+        // bolus was suppressed (`input_rate_consumes_cmt` normalises) yet no window opened — the
+        // mass was silently dropped (#899, #913 review).
+        if f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt == dose.cmt_idx() {
             match f.prepare(pk_params) {
                 PreparedInputRate::ZeroOrder { dur, .. } => {
                     Some((dur, f.frac(pk_params), f.route_lag(pk_params)))
@@ -1058,7 +1069,14 @@ fn gated_infusions(
         .iter()
         .filter_map(|&(di, t_start_inf, t_end_inf)| {
             let dose = &doses[di];
-            // dose.cmt is 1-based; CMT=0 means no compartment — ignore.
+            // Both arms are unreachable from a validated call since #899:
+            // `check_dose_compartments` rejects an infusion with `CMT=0` (the
+            // default dose compartment is defined for a bolus, not for a
+            // zero-order input — the analytical engine has rejected it since
+            // #375) and rejects `cmt > n_states` on ODE models. Kept because
+            // `gated_infusions` is also reachable from hand-built `OdeSpec`s
+            // that run no validation; dropping an infusion is preferable to
+            // panicking inside the integration loop.
             if dose.cmt == 0 {
                 return None;
             }
@@ -2099,7 +2117,19 @@ fn ode_predictions_with_extra_breaks_and_stats(
                 // built-in input-rate compartment (transit/etc.) is delivered as
                 // R_in over time by the wrapped RHS below — not as a bolus — so
                 // it's skipped here to avoid double-counting the dose.
-                let cmt_idx = dose.cmt - 1;
+                //
+                // `saturating_sub` maps `CMT=0` to compartment 1, NONMEM's
+                // default dose compartment, matching the analytical engine and
+                // the other ODE drivers (#899). It was a bare `- 1` until then,
+                // which underflowed on `CMT=0`: a debug build panicked with
+                // "attempt to subtract with overflow" and a release build
+                // wrapped to `usize::MAX`, failed the bound below, and dropped
+                // the dose in silence.
+                let cmt_idx = dose.cmt.saturating_sub(1);
+                // Unreachable from a validated call — `check_dose_compartments`
+                // rejects `cmt > n_states` on ODE models too since #899. Kept as
+                // a bound because `ode_predictions*` is also reachable from
+                // hand-built `OdeSpec`s (EKF, unit tests) that run no validation.
                 if cmt_idx < n {
                     u[cmt_idx] += dose_f_bio[i] * dose.amt;
                 }
@@ -4265,12 +4295,14 @@ pub fn ode_predictions_with_states(
                 }
                 if !is_real_infusion(dose) {
                     if !input_rate_consumes_cmt(ode, dose.cmt) {
-                        // dose.cmt is 1-based; CMT=0 means no compartment — ignore.
-                        if dose.cmt > 0 {
-                            let cmt = dose.cmt - 1;
-                            if cmt < n {
-                                u[cmt] += dose.amt * f;
-                            }
+                        // dose.cmt is 1-based; `CMT=0` is NONMEM's default dose
+                        // compartment and resolves to compartment 1, like every
+                        // other dose site on both engines (#899). This used to
+                        // skip the dose entirely, disagreeing with the two
+                        // event-driven drivers on the same dataset.
+                        let cmt = dose.cmt.saturating_sub(1);
+                        if cmt < n {
+                            u[cmt] += dose.amt * f;
                         }
                     }
                     // else: the dose feeds a built-in input-rate function
@@ -4560,12 +4592,12 @@ fn apply_segment_boundary(
             }
             if !is_real_infusion(dose) {
                 if !input_rate_consumes_cmt(ode, dose.cmt) {
-                    // dose.cmt is 1-based; CMT=0 means no compartment — ignore.
-                    if dose.cmt > 0 {
-                        let cmt = dose.cmt - 1;
-                        if cmt < n {
-                            u[cmt] += dose.amt * f;
-                        }
+                    // dose.cmt is 1-based; `CMT=0` is NONMEM's default dose
+                    // compartment and resolves to compartment 1, like every
+                    // other dose site on both engines (#899).
+                    let cmt = dose.cmt.saturating_sub(1);
+                    if cmt < n {
+                        u[cmt] += dose.amt * f;
                     }
                 }
                 // else: the dose feeds a built-in input-rate function

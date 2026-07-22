@@ -141,6 +141,15 @@ Infusion routing on the event-driven path:
 
 Every compartment of the six analytical disposition models is therefore infusable. What is still rejected is `CMT=0` on an infusion (NONMEM's *default dose compartment* is defined for a bolus, not for a zero-order input — name the compartment explicitly) and any `CMT` past the end of the model's state vector. Transit and inverse-Gaussian absorption models are dosed through the depot (`CMT=1`) only.
 
+### `CMT` on `[odes]` models
+
+Both rules above apply unchanged to a model defined with an `[odes]` block, reading the block's declared `states=[…]` list instead of a built-in model's compartment list:
+
+- **`CMT` is 1-based against the declared states.** `states=[depot, central]` accepts `CMT=1` (depot) and `CMT=2` (central); `CMT=3` is an error naming the declared states. Before #899 such a dose was **silently dropped** — the fit converged and reported a finite OFV having ignored it.
+- **`CMT=0` is NONMEM's default dose compartment** and resolves to the first declared state, exactly as on the analytical engine. An *infusion* with `CMT=0` is rejected, for the same reason as above.
+
+Unlike the analytical engine there is no infusable subset: every declared state accepts both a bolus and an infusion. A compartment fed by a built-in absorption function (`transit()`, `first_order()`, …) is the one exception to how the dose *arrives* — it is delivered as an input rate over time rather than as an instantaneous bolus — but it is dosed by naming its `CMT` like any other.
+
 ## Event Types (EVID)
 
 | EVID | Meaning |

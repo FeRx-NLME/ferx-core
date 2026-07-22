@@ -194,6 +194,12 @@ pub fn predict_survival(
     // silently applied at its baseline, so fail loudly instead (#741).
     assert_survival_tv_covariates(model, population);
 
+    // A joint PK-TTE hazard reads a PK prediction, so an unroutable dose silently
+    // changes the exposure the hazard sees. This entry point was the one member of
+    // the `predict`/`simulate` family missing the guard (#899); it is a no-op for a
+    // pure-TTE model, where nothing asks the PK predictor for a value.
+    assert_dose_compartments_supported(model, population);
+
     // The competing-risks CIF telescopes the all-cause survival drop, which
     // requires the grid in ascending time order; sort a local copy so the
     // per-cause `cif` and the `Σ_k F_k + S_all = 1` invariant are correct for any

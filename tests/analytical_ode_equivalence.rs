@@ -389,6 +389,43 @@ fn run_family(f: &Family) {
         ACCUM_RTOL,
     );
 
+    // -- `CMT=0`, NONMEM's default dose compartment (#899) -------------------
+    // Both engines must resolve `CMT=0` to compartment 1, so each of these must
+    // reproduce its `CMT=1` twin above exactly. Before #899 the ODE engine did
+    // three different things with it depending on which driver the subject took:
+    // the plain segment loop computed `0usize - 1` and underflowed (debug panic;
+    // release wrapped to `usize::MAX`, failed the bounds check, and dropped the
+    // dose in silence), the event-driven driver applied it to compartment 1, and
+    // the SS equilibration bailed out and returned the *single-dose* curve. The
+    // analytical engine was already right (#375), so this pair is what pins the
+    // ODE side to it — and transitively to NONMEM, which anchors the analytical
+    // `CMT=0` behaviour.
+    const DEFAULT_CMT: usize = 0;
+
+    assert_equiv(
+        &format!("{}/bolus_cmt0", f.label),
+        &an,
+        &ode,
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, DEFAULT_CMT, 0.0, false, 0.0)],
+            obs.clone(),
+            oc,
+        ),
+        RTOL,
+    );
+
+    assert_equiv(
+        &format!("{}/steady_state_cmt0", f.label),
+        &an,
+        &ode,
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, DEFAULT_CMT, 0.0, true, 24.0)],
+            vec![1.0, 4.0, 8.0, 12.0, 23.0],
+            oc,
+        ),
+        ACCUM_RTOL,
+    );
+
     // infusion: into central (cmt 1) for IV, into the depot (cmt 1) for oral.
     // The oral case (#400) is a zero-order release into the depot followed by
     // first-order `ka` absorption — its analytical closed form must match the

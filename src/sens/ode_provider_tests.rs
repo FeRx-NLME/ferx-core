@@ -801,6 +801,81 @@ const MM_SS_FIRST_ORDER: &str = r#"
   ode_abstol = 1e-11
 "#;
 
+// ── `CMT=0`, the default dose compartment, on the gradient path (#899) ──────────────
+//
+// `CMT=0` is NONMEM's default dose compartment and resolves to compartment 1 on both
+// engines. The gradient twins have to move with the value path or FOCEI differentiates a
+// different dosing history than it predicts — the exact failure #375 removed on the
+// analytical side. Before #899 the dual dose walk skipped `CMT=0` outright (`if d.cmt >= 1`,
+// on the false premise that the datareader rejected it upstream) and `equilibrate_ss_state_g`
+// bailed out of the SS equilibration, so the analytic gradient saw an undosed / unaccumulated
+// subject while production dosed it.
+//
+// Each test carries two teeth: `check_vs_production` is the standard `Dual2`-vs-FD parity
+// oracle on the `CMT=0` subject, and bit-equality with the `CMT=1` twin pins the *convention*
+// rather than merely the self-consistency of a wrong one.
+
+/// Every observation's value and both derivative blocks must be bit-identical between a
+/// dose written `CMT=0` and the same dose written `CMT=1`.
+fn assert_sens_identical(
+    model: &CompiledModel,
+    a: &Subject,
+    b: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) {
+    let sa = ode_subject_sensitivities(model, a, theta, eta).expect("supported");
+    let sb = ode_subject_sensitivities(model, b, theta, eta).expect("supported");
+    assert_eq!(sa.obs.len(), sb.obs.len(), "observation count differs");
+    assert!(!sa.obs.is_empty(), "no observations to compare");
+    for (j, (x, y)) in sa.obs.iter().zip(sb.obs.iter()).enumerate() {
+        assert_eq!(x.f, y.f, "obs {j}: value differs between CMT=0 and CMT=1");
+        assert_eq!(x.df_deta, y.df_deta, "obs {j}: ∂f/∂η differs");
+        assert_eq!(x.df_dtheta, y.df_dtheta, "obs {j}: ∂f/∂θ differs");
+    }
+    // Guard against the comparison passing vacuously on an all-zero curve.
+    assert!(
+        sa.obs.iter().any(|o| o.f.abs() > 0.0),
+        "reference curve should be non-trivial"
+    );
+}
+
+#[test]
+fn ode_provider_cmt_zero_bolus_matches_the_default_compartment_and_fd() {
+    let model = parse_model_string(TWOCPT_ODE).expect("parse");
+    let times = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0];
+    let theta = vec![4.0, 12.0, 2.0, 25.0];
+    let eta = vec![0.12, -0.08];
+
+    let subj_one = bolus_subject(&times);
+    let mut subj_zero = bolus_subject(&times);
+    subj_zero.doses = vec![DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0)];
+
+    check_vs_production(&model, &subj_zero, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subj_zero, &theta, &eta);
+    assert_sens_identical(&model, &subj_zero, &subj_one, &theta, &eta);
+}
+
+/// The steady-state twin: `equilibrate_ss_state_g` must equilibrate the default compartment
+/// like any other. Its `dose.cmt == 0` bail-out returned an unequilibrated all-zero trough,
+/// so an `SS=1` dose written `CMT=0` was differentiated as a *single* dose.
+#[test]
+fn ode_provider_cmt_zero_steady_state_matches_the_default_compartment_and_fd() {
+    let model = parse_model_string(TWOCPT_ODE).expect("parse");
+    let times = [1.0, 4.0, 8.0, 12.0, 23.0];
+    let theta = vec![4.0, 12.0, 2.0, 25.0];
+    let eta = vec![0.12, -0.08];
+
+    let mut subj_one = bolus_subject(&times);
+    subj_one.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)];
+    let mut subj_zero = bolus_subject(&times);
+    subj_zero.doses = vec![DoseEvent::new(0.0, 100.0, 0, 0.0, true, 24.0)];
+
+    check_vs_production(&model, &subj_zero, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subj_zero, &theta, &eta);
+    assert_sens_identical(&model, &subj_zero, &subj_one, &theta, &eta);
+}
+
 // SS bolus into compartment 1 with interval `ii`; slow KA (t½,abs ≈ II) so the absorption
 // tail spills across the interval — the carryover the SS trough must capture.
 fn ss_absorption_subject(times: &[f64], ii: f64) -> Subject {
@@ -833,6 +908,34 @@ fn ode_provider_ss_first_order_1cpt_matches_production() {
         1,
         "a linear disposition must equilibrate via the closed-form fixed point"
     );
+}
+
+/// Regression for the #913 review: an `SS=1` bolus written `CMT=0` into a **built-in absorption**
+/// compartment. The plain-disposition SS twin (`equilibrate_ss_state_g`) was already fixed for
+/// `CMT=0`, but the *absorption* SS twin (`equilibrate_ss_input_rate_state_g`) still bailed on
+/// `dose.cmt == 0` and returned the zero (unequilibrated) trough, while the f64 value path
+/// equilibrated it — a silent value≠gradient FOCEI error that the existing SS tests all missed by
+/// dosing `CMT=1`. `check_vs_production` is the Dual2-vs-FD teeth on the `CMT=0` subject;
+/// `assert_sens_identical` pins it bit-for-bit to the `CMT=1` twin (the convention, not just
+/// self-consistency).
+#[test]
+fn ode_provider_ss_first_order_cmt_zero_matches_the_default_compartment_and_fd() {
+    let model = parse_model_string(ONECPT_SS_FIRST_ORDER).expect("parse SS first_order");
+    let theta = vec![1.0, 20.0, 0.15];
+    let eta = vec![0.15];
+    let times = [0.5, 1.0, 2.0, 4.0, 6.0, 7.9];
+
+    let subj_one = ss_absorption_subject(&times, 8.0); // CMT=1
+    let mut subj_zero = ss_absorption_subject(&times, 8.0);
+    subj_zero.doses = vec![DoseEvent::new(0.0, 100.0, 0, 0.0, true, 8.0)]; // CMT=0
+
+    assert!(
+        ode_tvcov_supported(&model, &subj_zero),
+        "SS into a first_order absorption compartment is analytic (#835), CMT=0 included"
+    );
+    check_vs_production(&model, &subj_zero, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subj_zero, &theta, &eta);
+    assert_sens_identical(&model, &subj_zero, &subj_one, &theta, &eta);
 }
 
 #[test]

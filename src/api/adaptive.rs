@@ -337,10 +337,11 @@ where
     // the model is an analytic absorption closed form, which this ODE-only path rejects
     // up front — but is wired for parity and #702 base-regimen support.)
     first_error(&check_modeled_dose_rates(model, population))?;
-    // Parity-only today, like `check_absorption_closed_form_support` above: this
-    // path is ODE-only and `check_dose_compartments` is a no-op for ODE models.
-    // Wired so the chokepoint keeps one uniform contract if an analytical model
-    // ever reaches it (#375).
+    // Live for this ODE-only path since #899: `check_dose_compartments` runs the range rule
+    // (reject a dose `CMT` past the declared state count) and the `CMT=0`-infusion rule for ODE
+    // models, so an adaptive-dosing dataset with an out-of-range or `CMT=0`-infusion seed dose now
+    // returns a recoverable `Err` here instead of the engine silently dropping it. (It was a no-op
+    // for ODE models before #899 — do not "simplify" this call away as dead code.)
     first_error(&check_dose_compartments(model, population))?;
     if let Some(msg) = check_absorption_closed_form_support(model, population) {
         return Err(msg);

@@ -450,3 +450,260 @@ fn depot_readout_with_a_non_default_dose_compartment_is_rejected() {
     fit(&model, &good, &model.default_params, &FitOptions::default())
         .expect("a depot readout dosing the depot must stay accepted");
 }
+
+// ── the ODE engine (#899) ───────────────────────────────────────────────────
+//
+// The ODE half of everything above. Before #899 an out-of-range `CMT` fell through
+// `ode/predictions.rs`'s `if cmt_idx < n { … }` guards and was silently dropped —
+// `fit()` converged and reported a finite OFV having ignored the dose — because
+// `check_dose_compartments` returned early for ODE models by design.
+
+/// Two declared states, so `CMT=1` is the depot, `CMT=2` is central, and `CMT=3`
+/// is past the end. `maxiter = 0` keeps every `fit()` below evaluation-only (Tier 2).
+const ODE_TWO_STATE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  ode(states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL / V) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  maxiter = 0
+"#;
+
+const ODE_OBS_ROWS: &str = "1,1,5.0,0,.,2,.,0\n1,4,4.0,0,.,2,.,0\n1,8,3.0,0,.,2,.,0\n";
+
+/// A bolus into `cmt`, with observations read out by the Form C `[scaling]` line.
+fn ode_csv(cmt: usize) -> String {
+    format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,{cmt},0,1\n{ODE_OBS_ROWS}")
+}
+
+#[test]
+fn fit_rejects_an_ode_dose_past_the_declared_states() {
+    let model = model_of(ODE_TWO_STATE);
+    let pop = pop_of(&ode_csv(3));
+    let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("a dose past the declared states must be an Err, not a silent drop");
+    assert!(
+        err.contains("compartment 3") && err.contains("only 2 state(s)"),
+        "error should name the compartment and the declared state count: {err}"
+    );
+    assert!(
+        err.contains("depot") && err.contains("central"),
+        "error should name the declared states: {err}"
+    );
+}
+
+#[test]
+fn check_model_data_reports_the_out_of_range_ode_dose() {
+    let model = model_of(ODE_TWO_STATE);
+    let pop = pop_of(&ode_csv(3));
+    let diags = check_model_data(&model, &pop);
+    let d = diags
+        .iter()
+        .find(|d| d.code == "E_DOSE_CMT_OUT_OF_RANGE")
+        .unwrap_or_else(|| panic!("expected E_DOSE_CMT_OUT_OF_RANGE, got {diags:?}"));
+    assert_eq!(d.severity, Severity::Error);
+    assert_eq!(d.block.as_deref(), Some("odes"));
+    assert!(d.message.contains("subject 1"), "{}", d.message);
+    assert!(d.message.contains("time 0"), "{}", d.message);
+}
+
+#[test]
+#[should_panic(expected = "a dose into a compartment the model cannot deliver into")]
+fn predict_panics_on_an_ode_dose_past_the_declared_states() {
+    let model = model_of(ODE_TWO_STATE);
+    let pop = pop_of(&ode_csv(3));
+    let _ = predict(&model, &pop, &model.default_params);
+}
+
+/// Positive control — the check must not be over-broad. Every declared state is
+/// dosable, and dosing central directly (bypassing the depot) is a legitimate model.
+#[test]
+fn every_declared_ode_state_still_predicts() {
+    let model = model_of(ODE_TWO_STATE);
+    for cmt in 1..=2 {
+        let pop = pop_of(&ode_csv(cmt));
+        let preds = predict(&model, &pop, &model.default_params);
+        assert_eq!(preds.len(), 3, "cmt {cmt}");
+        assert!(
+            preds.iter().all(|p| p.pred.is_finite() && p.pred > 0.0),
+            "cmt {cmt} should predict a non-trivial curve, got {:?}",
+            preds.iter().map(|p| p.pred).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// End-to-end proof of the `CMT=0` convention: NONMEM's default dose compartment
+/// resolves to compartment 1, so this dataset must predict exactly like the one
+/// written `CMT=1`. Through `predict()` this used to reach the plain segment loop's
+/// `dose.cmt - 1`, which underflowed — debug panic, release silent drop.
+#[test]
+fn an_ode_cmt_zero_bolus_predicts_like_cmt_one() {
+    let model = model_of(ODE_TWO_STATE);
+    let zero = predict(&model, &pop_of(&ode_csv(0)), &model.default_params);
+    let one = predict(&model, &pop_of(&ode_csv(1)), &model.default_params);
+    assert_eq!(zero.len(), one.len());
+    assert!(
+        one.iter().all(|p| p.pred > 0.0),
+        "control must be non-trivial"
+    );
+    for (z, o) in zero.iter().zip(one.iter()) {
+        assert_eq!(
+            z.pred, o.pred,
+            "CMT=0 must dose the default compartment exactly like CMT=1"
+        );
+    }
+}
+
+/// Issue #899 point 3: an out-of-range `CMT` on an **observation** row is *not* the
+/// same problem, and needs no fix. A Form C `[scaling] y = <expr>` readout computes
+/// the observable from the state vector and never indexes by the observation's `CMT`,
+/// so a stray value is inert rather than silently zeroing a prediction. (The per-CMT
+/// readout — the only form that does index by it — is already covered up front by
+/// `check_per_cmt_scaling` / `check_per_cmt_error_model`.) Pinned so the claim is
+/// tested rather than asserted.
+#[test]
+fn an_out_of_range_observation_cmt_is_inert_on_a_form_c_readout() {
+    let model = model_of(ODE_TWO_STATE);
+    let stray_obs = "1,1,5.0,0,.,99,.,0\n1,4,4.0,0,.,99,.,0\n1,8,3.0,0,.,99,.,0\n";
+    let stray = pop_of(&format!(
+        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,0,1\n{stray_obs}"
+    ));
+    let normal = pop_of(&ode_csv(1));
+
+    let a = predict(&model, &stray, &model.default_params);
+    let b = predict(&model, &normal, &model.default_params);
+    assert_eq!(a.len(), b.len());
+    assert!(
+        b.iter().all(|p| p.pred > 0.0),
+        "control must be non-trivial"
+    );
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(
+            x.pred, y.pred,
+            "a Form C readout must ignore the observation's CMT entirely"
+        );
+    }
+}
+
+// ── the #913 review's CMT=0-into-absorption gaps ────────────────────────────
+//
+// A single declared state fed by a built-in zero_order(dur) release. `CMT=1` (or a
+// missing CMT, which defaults to 1) opens the zero-order window; `CMT=0` is the same
+// compartment and must behave identically. Before the review fix the value path matched
+// the forcing with `f.cmt + 1 == dose.cmt` (never true for CMT=0) while the bolus was
+// suppressed by `input_rate_consumes_cmt` (which normalises) — so a CMT=0 dose delivered
+// *no* mass at all: neither bolus nor window. `maxiter = 0` keeps the fits evaluation-only.
+const ODE_ZERO_ORDER: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(3.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  maxiter = 0
+"#;
+
+const ZO_OBS: &str = "1,1,5.0,0,.,1,.,0\n1,4,4.0,0,.,1,.,0\n1,8,3.0,0,.,1,.,0\n";
+
+/// B (value path): a `CMT=0` bolus into a zero_order absorption compartment must deliver the
+/// same mass — and predict identically — as the same dose written `CMT=1`.
+///
+/// The window's `(dur, frac)` is resolved by `zero_order_dur_and_frac_for_dose`, whose
+/// `f.cmt + 1 == dose.cmt` match returned `None` for `CMT=0`, so `zero_order_windows` skipped
+/// the dose and opened **no** window — while the bolus was already suppressed
+/// (`input_rate_consumes_cmt` normalises `CMT=0`). Net: no mass at all. This bites only the
+/// **event-driven** driver (a reset / time-varying covariate / IOV routes here); the plain
+/// segment loop happens to open the window through a different `saturating_sub` path, so a
+/// plain-dataset test would pass even with the bug present (confirmed by mutation). The
+/// `EVID=3` reset row below forces the event-driven driver; obs before the reset carry the
+/// live curve.
+#[test]
+fn an_ode_cmt_zero_dose_into_a_zero_order_compartment_predicts_like_cmt_one() {
+    let model = model_of(ODE_ZERO_ORDER);
+    // EVID=3 reset at t=6 → `has_resets` → event-driven driver.
+    let event_driven = |cmt: usize| {
+        pop_of(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+             1,0,.,1,100,{cmt},0,1\n1,1,5.0,0,.,1,.,0\n1,4,4.0,0,.,1,.,0\n\
+             1,6,.,3,.,.,.,1\n1,8,3.0,0,.,1,.,0\n"
+        ))
+    };
+    let zero = predict(&model, &event_driven(0), &model.default_params);
+    let one = predict(&model, &event_driven(1), &model.default_params);
+    assert_eq!(zero.len(), one.len());
+    // The pre-reset obs (t=1, t=4) must be a live zero-order curve on the CMT=1 control,
+    // else a dropped CMT=0 window would agree with it vacuously at all-zero.
+    assert!(
+        one.iter().take(2).all(|p| p.pred > 0.0),
+        "control (CMT=1) pre-reset curve must be non-trivial: {:?}",
+        one.iter().map(|p| p.pred).collect::<Vec<_>>()
+    );
+    for (z, o) in zero.iter().zip(one.iter()) {
+        assert_eq!(
+            z.pred, o.pred,
+            "CMT=0 zero-order dose must deliver the same mass as CMT=1 on the event-driven path"
+        );
+    }
+}
+
+/// C (validation gate): steady-state dosing into a zero_order absorption compartment is
+/// unsupported (`E_ABSORPTION_SS_ZERO_ORDER`). That rejection keyed on the raw `d.cmt`
+/// against a set of `f.cmt + 1`, so a `CMT=0` SS dose slipped the gate — landing on the
+/// event-driven zero-order drop above instead of a clean error. It must be rejected exactly
+/// like the `CMT=1` spelling.
+#[test]
+fn an_ode_cmt_zero_ss_zero_order_dose_is_rejected_not_silently_dropped() {
+    let model = model_of(ODE_ZERO_ORDER);
+    let ss_row = |cmt: usize| {
+        pop_of(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n1,0,.,1,100,{cmt},0,1,1,24\n{ZO_OBS}"
+        ))
+    };
+    for cmt in [0usize, 1] {
+        let diags = check_model_data(&model, &ss_row(cmt));
+        assert!(
+            diags.iter().any(|d| d.code == "E_ABSORPTION_SS_ZERO_ORDER"),
+            "SS zero-order dose CMT={cmt} must be rejected, not bypassed: {diags:?}"
+        );
+    }
+}

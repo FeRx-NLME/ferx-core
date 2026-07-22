@@ -1258,6 +1258,83 @@ fn dose_attr_map_resolves_indexed_then_bare_then_default() {
     assert_eq!(map.indexed_slot(DoseAttr::F, 1), None);
 }
 
+/// `CMT=0` is NONMEM's *default dose compartment* — compartment 1 — so it must
+/// resolve to the `F1` / `ALAG1` entry, not miss the indexed map (#899).
+///
+/// The silent failure this pins: a model declaring `F1 = 0.6` and no bare `F`
+/// leaves `PK_IDX_F` at `PkParams::default()`'s **1.0**, so a dose written
+/// `CMT=0` would be delivered at full amount — a 40% dose error with no error
+/// and no warning. It was the last site where `CMT=0` still meant something
+/// other than compartment 1 after the rest of #899 unified the dose routing.
+#[test]
+fn cmt_zero_resolves_dose_attributes_as_the_default_compartment() {
+    let mut params = [0.0f64; MAX_PK_PARAMS];
+    // No bare F declared: the slot keeps the 1.0 default, which is exactly what
+    // a missed lookup would silently return.
+    params[PK_IDX_F] = 1.0;
+    params[PK_IDX_LAGTIME] = 0.0;
+    params[9] = 0.6; // F1
+    params[10] = 0.75; // ALAG1
+
+    let mut map = DoseAttrMap::default();
+    map.insert(DoseAttr::F, 1, 9);
+    map.insert(DoseAttr::Lag, 1, 10);
+
+    // The bug: without the normalisation these returned the bare 1.0 / 0.0.
+    assert_eq!(map.f_bio(0, &params), 0.6, "CMT=0 must read F1, not bare F");
+    assert_eq!(
+        map.lagtime(0, &params),
+        0.75,
+        "CMT=0 must read ALAG1, not bare ALAG"
+    );
+    // …and identically to the same dose written CMT=1.
+    assert_eq!(map.f_bio(0, &params), map.f_bio(1, &params));
+    assert_eq!(map.lagtime(0, &params), map.lagtime(1, &params));
+
+    // The slot accessors agree, so `lag_slot` (which the sens walk differentiates
+    // through) picks the same parameter — otherwise the gradient would be taken
+    // with respect to the wrong slot.
+    assert_eq!(
+        map.indexed_slot(DoseAttr::F, 0),
+        map.indexed_slot(DoseAttr::F, 1)
+    );
+    assert_eq!(map.lag_slot(0), map.lag_slot(1));
+
+    // Not over-broad: a model with no compartment-1 entry still falls through to
+    // the bare slot for CMT=0, exactly as CMT=1 does.
+    let mut only_cmt2 = DoseAttrMap::default();
+    only_cmt2.insert(DoseAttr::F, 2, 9);
+    assert_eq!(only_cmt2.f_bio(0, &params), 1.0);
+    assert_eq!(only_cmt2.indexed_slot(DoseAttr::F, 0), None);
+}
+
+/// The canonical CMT-conversion accessors (#899, #912): `CMT=0` is the default dose
+/// compartment == compartment 1, so `cmt_idx()` (0-based state index) maps both 0 and 1 to
+/// 0, and `cmt_1based()` maps both to 1. Every dose-compartment comparison in the engines
+/// routes through these instead of open-coding `cmt - 1` (underflows on 0) or `cmt >= 1`
+/// (drops 0) — the scattering that produced the #913-review gaps.
+#[test]
+fn dose_cmt_accessors_resolve_cmt_zero_to_the_default_compartment() {
+    let d0 = DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0);
+    let d1 = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+    let d2 = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0);
+
+    // CMT=0 and CMT=1 are the same compartment on both bases.
+    assert_eq!(d0.cmt_idx(), 0);
+    assert_eq!(d1.cmt_idx(), 0);
+    assert_eq!(d0.cmt_1based(), 1);
+    assert_eq!(d1.cmt_1based(), 1);
+
+    // A genuine second compartment is unaffected (no clamping past 1).
+    assert_eq!(d2.cmt_idx(), 1);
+    assert_eq!(d2.cmt_1based(), 2);
+
+    // The two are exact complements for every dose.
+    for d in [&d0, &d1, &d2] {
+        assert_eq!(d.cmt_idx() + 1, d.cmt_1based());
+    }
+}
+
 #[test]
 fn dose_attr_from_indexed_name_recognizes_f_lag_duration_and_rate() {
     use DoseAttr::*;
