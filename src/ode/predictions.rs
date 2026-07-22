@@ -1033,7 +1033,12 @@ fn zero_order_dur_and_frac_for_dose(
         return None;
     }
     ode.input_rate.iter().find_map(|f| {
-        if f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt + 1 == dose.cmt {
+        // `f.cmt` is 0-based; match it against the dose's 0-based target index so a `CMT=0` dose
+        // (the default dose compartment == compartment 1) resolves its zero-order window instead of
+        // missing it. The bare `f.cmt + 1 == dose.cmt` this replaced never matched `CMT=0`, so the
+        // bolus was suppressed (`input_rate_consumes_cmt` normalises) yet no window opened — the
+        // mass was silently dropped (#899, #913 review).
+        if f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt == dose.cmt_idx() {
             match f.prepare(pk_params) {
                 PreparedInputRate::ZeroOrder { dur, .. } => {
                     Some((dur, f.frac(pk_params), f.route_lag(pk_params)))

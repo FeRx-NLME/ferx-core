@@ -910,6 +910,34 @@ fn ode_provider_ss_first_order_1cpt_matches_production() {
     );
 }
 
+/// Regression for the #913 review: an `SS=1` bolus written `CMT=0` into a **built-in absorption**
+/// compartment. The plain-disposition SS twin (`equilibrate_ss_state_g`) was already fixed for
+/// `CMT=0`, but the *absorption* SS twin (`equilibrate_ss_input_rate_state_g`) still bailed on
+/// `dose.cmt == 0` and returned the zero (unequilibrated) trough, while the f64 value path
+/// equilibrated it — a silent value≠gradient FOCEI error that the existing SS tests all missed by
+/// dosing `CMT=1`. `check_vs_production` is the Dual2-vs-FD teeth on the `CMT=0` subject;
+/// `assert_sens_identical` pins it bit-for-bit to the `CMT=1` twin (the convention, not just
+/// self-consistency).
+#[test]
+fn ode_provider_ss_first_order_cmt_zero_matches_the_default_compartment_and_fd() {
+    let model = parse_model_string(ONECPT_SS_FIRST_ORDER).expect("parse SS first_order");
+    let theta = vec![1.0, 20.0, 0.15];
+    let eta = vec![0.15];
+    let times = [0.5, 1.0, 2.0, 4.0, 6.0, 7.9];
+
+    let subj_one = ss_absorption_subject(&times, 8.0); // CMT=1
+    let mut subj_zero = ss_absorption_subject(&times, 8.0);
+    subj_zero.doses = vec![DoseEvent::new(0.0, 100.0, 0, 0.0, true, 8.0)]; // CMT=0
+
+    assert!(
+        ode_tvcov_supported(&model, &subj_zero),
+        "SS into a first_order absorption compartment is analytic (#835), CMT=0 included"
+    );
+    check_vs_production(&model, &subj_zero, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subj_zero, &theta, &eta);
+    assert_sens_identical(&model, &subj_zero, &subj_one, &theta, &eta);
+}
+
 #[test]
 fn ode_provider_ss_transit_1cpt_matches_production() {
     let model = parse_model_string(ONECPT_SS_TRANSIT).expect("parse SS transit");

@@ -605,3 +605,105 @@ fn an_out_of_range_observation_cmt_is_inert_on_a_form_c_readout() {
         );
     }
 }
+
+// ── the #913 review's CMT=0-into-absorption gaps ────────────────────────────
+//
+// A single declared state fed by a built-in zero_order(dur) release. `CMT=1` (or a
+// missing CMT, which defaults to 1) opens the zero-order window; `CMT=0` is the same
+// compartment and must behave identically. Before the review fix the value path matched
+// the forcing with `f.cmt + 1 == dose.cmt` (never true for CMT=0) while the bolus was
+// suppressed by `input_rate_consumes_cmt` (which normalises) — so a CMT=0 dose delivered
+// *no* mass at all: neither bolus nor window. `maxiter = 0` keeps the fits evaluation-only.
+const ODE_ZERO_ORDER: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(3.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  maxiter = 0
+"#;
+
+const ZO_OBS: &str = "1,1,5.0,0,.,1,.,0\n1,4,4.0,0,.,1,.,0\n1,8,3.0,0,.,1,.,0\n";
+
+/// B (value path): a `CMT=0` bolus into a zero_order absorption compartment must deliver the
+/// same mass — and predict identically — as the same dose written `CMT=1`.
+///
+/// The window's `(dur, frac)` is resolved by `zero_order_dur_and_frac_for_dose`, whose
+/// `f.cmt + 1 == dose.cmt` match returned `None` for `CMT=0`, so `zero_order_windows` skipped
+/// the dose and opened **no** window — while the bolus was already suppressed
+/// (`input_rate_consumes_cmt` normalises `CMT=0`). Net: no mass at all. This bites only the
+/// **event-driven** driver (a reset / time-varying covariate / IOV routes here); the plain
+/// segment loop happens to open the window through a different `saturating_sub` path, so a
+/// plain-dataset test would pass even with the bug present (confirmed by mutation). The
+/// `EVID=3` reset row below forces the event-driven driver; obs before the reset carry the
+/// live curve.
+#[test]
+fn an_ode_cmt_zero_dose_into_a_zero_order_compartment_predicts_like_cmt_one() {
+    let model = model_of(ODE_ZERO_ORDER);
+    // EVID=3 reset at t=6 → `has_resets` → event-driven driver.
+    let event_driven = |cmt: usize| {
+        pop_of(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+             1,0,.,1,100,{cmt},0,1\n1,1,5.0,0,.,1,.,0\n1,4,4.0,0,.,1,.,0\n\
+             1,6,.,3,.,.,.,1\n1,8,3.0,0,.,1,.,0\n"
+        ))
+    };
+    let zero = predict(&model, &event_driven(0), &model.default_params);
+    let one = predict(&model, &event_driven(1), &model.default_params);
+    assert_eq!(zero.len(), one.len());
+    // The pre-reset obs (t=1, t=4) must be a live zero-order curve on the CMT=1 control,
+    // else a dropped CMT=0 window would agree with it vacuously at all-zero.
+    assert!(
+        one.iter().take(2).all(|p| p.pred > 0.0),
+        "control (CMT=1) pre-reset curve must be non-trivial: {:?}",
+        one.iter().map(|p| p.pred).collect::<Vec<_>>()
+    );
+    for (z, o) in zero.iter().zip(one.iter()) {
+        assert_eq!(
+            z.pred, o.pred,
+            "CMT=0 zero-order dose must deliver the same mass as CMT=1 on the event-driven path"
+        );
+    }
+}
+
+/// C (validation gate): steady-state dosing into a zero_order absorption compartment is
+/// unsupported (`E_ABSORPTION_SS_ZERO_ORDER`). That rejection keyed on the raw `d.cmt`
+/// against a set of `f.cmt + 1`, so a `CMT=0` SS dose slipped the gate — landing on the
+/// event-driven zero-order drop above instead of a clean error. It must be rejected exactly
+/// like the `CMT=1` spelling.
+#[test]
+fn an_ode_cmt_zero_ss_zero_order_dose_is_rejected_not_silently_dropped() {
+    let model = model_of(ODE_ZERO_ORDER);
+    let ss_row = |cmt: usize| {
+        pop_of(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n1,0,.,1,100,{cmt},0,1,1,24\n{ZO_OBS}"
+        ))
+    };
+    for cmt in [0usize, 1] {
+        let diags = check_model_data(&model, &ss_row(cmt));
+        assert!(
+            diags.iter().any(|d| d.code == "E_ABSORPTION_SS_ZERO_ORDER"),
+            "SS zero-order dose CMT={cmt} must be rejected, not bypassed: {diags:?}"
+        );
+    }
+}

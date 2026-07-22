@@ -1308,6 +1308,33 @@ fn cmt_zero_resolves_dose_attributes_as_the_default_compartment() {
     assert_eq!(only_cmt2.indexed_slot(DoseAttr::F, 0), None);
 }
 
+/// The canonical CMT-conversion accessors (#899, #912): `CMT=0` is the default dose
+/// compartment == compartment 1, so `cmt_idx()` (0-based state index) maps both 0 and 1 to
+/// 0, and `cmt_1based()` maps both to 1. Every dose-compartment comparison in the engines
+/// routes through these instead of open-coding `cmt - 1` (underflows on 0) or `cmt >= 1`
+/// (drops 0) — the scattering that produced the #913-review gaps.
+#[test]
+fn dose_cmt_accessors_resolve_cmt_zero_to_the_default_compartment() {
+    let d0 = DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0);
+    let d1 = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+    let d2 = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0);
+
+    // CMT=0 and CMT=1 are the same compartment on both bases.
+    assert_eq!(d0.cmt_idx(), 0);
+    assert_eq!(d1.cmt_idx(), 0);
+    assert_eq!(d0.cmt_1based(), 1);
+    assert_eq!(d1.cmt_1based(), 1);
+
+    // A genuine second compartment is unaffected (no clamping past 1).
+    assert_eq!(d2.cmt_idx(), 1);
+    assert_eq!(d2.cmt_1based(), 2);
+
+    // The two are exact complements for every dose.
+    for d in [&d0, &d1, &d2] {
+        assert_eq!(d.cmt_idx() + 1, d.cmt_1based());
+    }
+}
+
 #[test]
 fn dose_attr_from_indexed_name_recognizes_f_lag_duration_and_rate() {
     use DoseAttr::*;

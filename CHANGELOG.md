@@ -161,9 +161,19 @@ section of the SDLC for the versioning policy).
   indexed lookup and silently fell back to the bare `F` / `ALAG` slot, which on a model declaring
   only `F1` means bioavailability defaulted to `1.0` and the dose was delivered at full amount.
   Predictions change for ODE datasets written with `CMT=0`, which previously got nothing (or
-  crashed). As on the analytical engine, an **infusion** with `CMT=0` is rejected rather than
-  remapped: the default dose compartment is defined for a bolus but not for a zero-order input.
-  This closes the cross-engine disagreement on `SS` + `CMT=0` noted under #375 below.
+  crashed). This unification reaches every dose-compartment comparison, not just the state-vector
+  index: a `CMT=0` dose into a built-in `zero_order` absorption compartment now opens its release
+  window on the event-driven driver (a reset / time-varying covariate / IOV) — it previously
+  matched neither the bolus nor the window there and delivered no mass at all; the steady-state
+  gradient of a `CMT=0` dose into a built-in absorption compartment now equilibrates like the value
+  path (it previously returned an un-accumulated trough, a silent value≠gradient FOCEI error); and
+  the "unsupported steady-state combination" rejections (`E_ABSORPTION_SS_ZERO_ORDER` /
+  `E_ABSORPTION_SS_LAG`) now fire for `CMT=0` instead of being bypassed. As on the analytical
+  engine, an **infusion** with `CMT=0` is rejected rather than remapped: the default dose compartment
+  is defined for a bolus but not for a zero-order input. This closes the cross-engine disagreement on
+  `SS` + `CMT=0` noted under #375 below. The `cmt → state index` (and its 1-based complement) is now a
+  single named accessor (`DoseEvent::cmt_idx` / `cmt_1based`, #912) so the convention lives in one
+  place rather than a dozen open-coded `cmt - 1` / `cmt >= 1` sites that drifted apart.
 - **SAEM FREM / `iiv_on_ruv` mixing diagnostics and safeguards** (#895). The optimizer-trace
   `mh_accept_rate` (and the verbose banner) now reports the **combined** block + componentwise
   Metropolis-Hastings acceptance rate. Previously it showed only the block kernel, which reads a

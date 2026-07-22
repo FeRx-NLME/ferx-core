@@ -575,7 +575,9 @@ fn zero_order_forcing_for_dose<'f, T: crate::sens::num::PkNum>(
     params: &[T],
 ) -> Option<(&'f crate::pk::absorption::InputRateForcing, T)> {
     let f = ode.input_rate.iter().find(|f| {
-        f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt + 1 == d.cmt
+        // 0-based match so a `CMT=0` dose resolves compartment 1's zero-order window (#899, #913
+        // review) — the gradient twin of the value-path fix in `zero_order_dur_and_frac_for_dose`.
+        f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt == d.cmt_idx()
     })?;
     let dur = match f.prepare_dual::<T>(params)? {
         crate::pk::absorption::PreparedInputRate::ZeroOrder { dur, .. } => dur,
@@ -3616,7 +3618,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     // (#899) — mirroring the f64 `equilibrate_ss_state`. The gradient twin must
     // move with the value path or FOCEI would differentiate a different dosing
     // history than it predicts.
-    let cmt_idx = dose.cmt.saturating_sub(1);
+    let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n_states {
         return u;
     }
@@ -3761,9 +3763,14 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
 ) -> Vec<T> {
     let n = n_states;
     let ii = dose.ii;
-    // `dose.cmt > n` (not `dose.cmt - 1 >= n`) — clippy-clean, and the `dose.cmt == 0` guard keeps
-    // the 1-based → 0-based conversion below from underflowing. Mirrors `equilibrate_ss_state_g`.
-    if ii <= 0.0 || dose.cmt == 0 || dose.cmt > n {
+    // `CMT=0` equilibrates compartment 1 — the default dose compartment — like the f64 twin
+    // `equilibrate_ss_input_rate` and the plain-disposition `equilibrate_ss_state_g` (#899). This
+    // previously bailed on `dose.cmt == 0` and returned the zero (unequilibrated) trough, so an
+    // `SS=1` bolus written `CMT=0` into a built-in-absorption compartment was *differentiated* as a
+    // single unaccumulated dose while production equilibrated it — a silent value≠gradient FOCEI
+    // error (#913 review). The body resolves the forcing via `d.cmt.saturating_sub(1)`, so `cmt=0`
+    // equilibrates identically to `cmt=1` once the early bail is gone.
+    if ii <= 0.0 || dose.cmt_idx() >= n {
         return vec![T::from_f64(0.0); n];
     }
     // Built-in absorption forcings prepared from THIS SS dose's snapshot (`params`), mirroring the

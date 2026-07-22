@@ -321,10 +321,15 @@ pub(crate) fn check_absorption_dosing(
         .filter(|f| f.kind == crate::pk::absorption::InputRateKind::ZeroOrder)
         .map(|f| f.cmt + 1)
         .collect();
+    // `cmt_1based()` throughout so a `CMT=0` dose (the default dose compartment == compartment 1)
+    // is scoped like `CMT=1` against these 1-based `f.cmt + 1` sets (#899, #913 review). The raw
+    // `d.cmt` this replaced left `CMT=0` bypassing the SS-unsupported gates, so an SS `CMT=0` dose
+    // into a zero-order / lagged absorption compartment skipped its clean rejection and fell
+    // through to the silent zero-order drop the same review fixed in `zero_order_dur_and_frac`.
     let has_ss_zero_order = population.subjects.iter().any(|s| {
         s.doses
             .iter()
-            .any(|d| d.ss && d.ii > 0.0 && zero_order_cmts.contains(&d.cmt))
+            .any(|d| d.ss && d.ii > 0.0 && zero_order_cmts.contains(&d.cmt_1based()))
     });
     // A per-route lag (`fn(..., lag=L)`, #856) lives on the forcing's `lag_slot`, NOT the
     // compartment-lag machinery, so `has_lagtime_on_cmt` does not see it — but the SS
@@ -345,8 +350,9 @@ pub(crate) fn check_absorption_dosing(
     let has_ss_lag = population.subjects.iter().any(|s| {
         s.doses.iter().any(|d| {
             d.ss && d.ii > 0.0
-                && cmts.contains(&d.cmt)
-                && (model.has_lagtime_on_cmt(d.cmt) || route_lag_cmts.contains(&d.cmt))
+                && cmts.contains(&d.cmt_1based())
+                && (model.has_lagtime_on_cmt(d.cmt_1based())
+                    || route_lag_cmts.contains(&d.cmt_1based()))
         })
     });
     if has_ss_zero_order {

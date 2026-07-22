@@ -232,6 +232,33 @@ impl DoseEvent {
         self.rate > 0.0 || !self.is_fixed()
     }
 
+    /// 0-based state-vector index for this dose's target compartment.
+    ///
+    /// `CMT` is 1-based, and `CMT=0` is NONMEM's *default dose compartment* —
+    /// compartment 1 — so both `CMT=0` and `CMT=1` map to index `0` (#899, #912).
+    /// This is the single named home for the `cmt → state index` conversion:
+    /// before it, ~a dozen sites open-coded `cmt - 1` (which underflows on
+    /// `CMT=0`), `cmt.saturating_sub(1)`, or `if cmt >= 1 { cmt - 1 }` (which
+    /// silently drops `CMT=0`), and they disagreed — the four-behaviour bug #899
+    /// set out to remove. Index a state vector, or match a 0-based
+    /// `InputRateForcing::cmt`, through this — never a bare `- 1`.
+    #[inline]
+    pub fn cmt_idx(&self) -> usize {
+        self.cmt.saturating_sub(1)
+    }
+
+    /// 1-based target compartment with `CMT=0` resolved to compartment 1 (#899).
+    ///
+    /// The 1-based complement of [`Self::cmt_idx`], for comparing against a
+    /// 1-based compartment number or a set of them (`f.cmt + 1`, `ALAG{n}`'s
+    /// index). `CMT=0` and `CMT=1` both return `1`. Use this — not the raw
+    /// `self.cmt` — whenever a `CMT=0` dose must be treated as compartment 1,
+    /// otherwise the default dose compartment silently misses the lookup.
+    #[inline]
+    pub fn cmt_1based(&self) -> usize {
+        self.cmt.max(1)
+    }
+
     /// True when this dose's `rate`/`duration` are concrete (data-driven), i.e.
     /// [`RateMode::Fixed`] — either an ordinary dose or one already passed through
     /// [`Self::resolve_rate`]. False for a still-modeled NONMEM coded `RATE`.
@@ -3224,12 +3251,16 @@ impl CompiledModel {
             return false;
         };
         subject.doses.iter().any(|d| {
+            // Match the forcing 0-based and probe the lagtime 1-based so a `CMT=0` dose (the
+            // default dose compartment == compartment 1) is scoped like `CMT=1` (#899, #913 review)
+            // — otherwise a `CMT=0` SS dose into a zero-order / lagged absorption compartment
+            // slips this out-of-scope guard and is silently mis-served.
             d.ss && d.ii > 0.0
                 && ode.input_rate.iter().any(|f| {
-                    f.cmt + 1 == d.cmt
+                    f.cmt == d.cmt_idx()
                         && (f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
                             || f.lag_slot.is_some()
-                            || self.has_lagtime_on_cmt(d.cmt))
+                            || self.has_lagtime_on_cmt(d.cmt_1based()))
                 })
         })
     }
