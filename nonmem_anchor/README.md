@@ -611,3 +611,32 @@ mv dose_cmt_*.lst dose_cmt_*.tab results/
 > transcribed into `tests/nonmem_dose_compartment_anchor.rs` reproduces at **zero**
 > relative deviation, so the committed anchors are re-derivable rather than
 > taken on trust.
+
+## Slow-accumulation steady-state anchors (#908)
+
+`ss_slow_advan1.ctl` / `ss_slow_advan2.ctl` — two evaluation-only runs pinning `SS=1` for a
+**slowly-accumulating** model, the regime the existing `ss_cmt0` / `ss_cmt1` anchors cannot see.
+Both use `CL = 0.1`, `V = 50` (t½ ≈ 347 h), `KA = 1` for the oral case, `AMT = 100` at `t = 0` with
+`SS=1 II=12`, and observations at `t = 1, 4, 8 h`.
+
+| case | ADVAN | what it pins |
+|------|-------|--------------|
+| `ss_slow_advan1` | 1 | 1-cpt IV, `λ·II = 0.024` — accumulation factor `1/(1 − e^{−0.024}) = 42.17` |
+| `ss_slow_advan2` | 2 | the oral twin, so the depot's own periodic state is anchored too |
+
+Why they exist: NONMEM's `ADVAN` steady state is the **exact** periodic closed form, so `PRED` at
+`t = 0` for `ss_slow_advan1` is `84.337333295 = (100/50)/(1 − e^{−0.024})` to every printed digit.
+ferx's analytical event-driven walk used to sum a truncated 50-cycle pulse train, which lands 29.4 %
+below that — invisible to `ss_cmt0` / `ss_cmt1` (`CL = 5`, where the truncation residual is `1e-26`).
+These two runs are what make the truncation observable cross-tool; `tests/nonmem_dose_compartment_anchor.rs`
+asserts the walk, the default dispatch, and NONMEM all agree at `1e-9`.
+
+### Run it
+
+```bash
+for f in ss_slow_advan*.ctl; do nmfe76 "$f" "${f%.ctl}.lst"; done
+mv ss_slow_advan*.lst ss_slow_advan*.tab results/
+```
+
+> **Run status — DONE (#908).** Both runs executed on NONMEM 7.6.0 via `nmfe76`;
+> `results/ss_slow_advan*.{lst,tab}` are the verbatim output of the committed `.ctl`.

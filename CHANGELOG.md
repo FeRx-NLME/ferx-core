@@ -162,7 +162,9 @@ section of the SDLC for the versioning policy).
   train remains only where no periodic steady state exists (a zero disposition rate constant,
   e.g. `CL = 0`), and that case now raises the existing non-convergence warning instead of
   returning a silently truncated state. The ODE path's ordinary bolus/infusion steady state
-  still expands a pulse train — see `docs/model-file/steady-state.qmd`.
+  still expands a pulse train (#914) — see `docs/model-file/steady-state.qmd`. Validated against
+  NONMEM 7.6.0 in the slow regime the fix targets — new `ss_slow_advan1`/`ss_slow_advan2` anchors
+  (`CL = 0.1`, t½ ≈ 347 h) that the pre-fix walk missed by 29 %.
 - **SAEM FREM / `iiv_on_ruv` mixing diagnostics and safeguards** (#895). The optimizer-trace
   `mh_accept_rate` (and the verbose banner) now reports the **combined** block + componentwise
   Metropolis-Hastings acceptance rate. Previously it showed only the block kernel, which reads a
