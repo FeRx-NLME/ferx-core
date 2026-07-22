@@ -846,6 +846,56 @@ fn transit_non_depot_dose_rejected() {
     );
 }
 
+/// `CMT=0` is NONMEM's *default dose compartment* — compartment 1, the depot — so it is
+/// **accepted** on the transit closed form and must predict identically to `CMT=1`, not be
+/// rejected as a non-depot compartment. The #913 review found `check_absorption_closed_form_support`
+/// keyed on the raw `dose.cmt != 1`, which rejects an explicit `CMT=0` (the data reader passes
+/// it through unchanged — only a *missing* CMT column defaults to 1). Both the closed form (which
+/// folds every dose through absorption regardless of `cmt`) and its ODE twin (`input_rate_consumes_cmt`
+/// resolves `CMT=0` and `CMT=1` to the same forcing via `saturating_sub(1)`) treat `CMT=0` exactly
+/// like `CMT=1`, so there is no cross-path disagreement to guard against. Contrast
+/// `transit_non_depot_dose_rejected` (CMT=2, a genuine non-depot target, still rejected). Reverting
+/// the `cmt_1based()` guard makes the `CMT=0` `predict()` panic.
+#[test]
+fn transit_cmt_zero_is_the_default_depot_not_rejected() {
+    let (an_src, _) = build_pair(false, false);
+    let model = parse_full_model(&an_src).expect("parses").model;
+    let obs = vec![1.0, 4.0, 8.0];
+    let depot = predict(
+        &model,
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs.clone(),
+        ),
+        &model.default_params,
+    );
+    let default_cmt = predict(
+        &model,
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0)],
+            obs.clone(),
+        ),
+        &model.default_params,
+    );
+    assert!(
+        depot.iter().any(|p| p.pred > 0.0),
+        "control must be non-trivial"
+    );
+    assert_eq!(default_cmt.len(), depot.len());
+    for (a, b) in default_cmt.iter().zip(depot.iter()) {
+        assert_eq!(
+            a.pred, b.pred,
+            "CMT=0 must predict like the CMT=1 depot dose"
+        );
+    }
+    // CMT=2 is a genuine non-depot target and stays rejected.
+    let central = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0);
+    assert!(
+        transit_fit_err(&population(vec![central], obs)).contains("non-depot"),
+        "CMT=2 must still be rejected as non-depot"
+    );
+}
+
 /// `ode_template one_cpt_transit(...)` desugars to the `transit()` forcing ODE
 /// (#386), so it must `predict()` identically to the analytic `pk` form. Covers the
 /// `ode_template` transit arm and pins the lowering to the closed form.

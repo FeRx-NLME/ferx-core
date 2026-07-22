@@ -1033,17 +1033,20 @@ pub(crate) fn check_absorption_closed_form_support(
             ));
         }
         for dose in &subject.doses {
-            if dose.cmt != 1 {
+            if dose.cmt_1based() != 1 {
                 // The closed form folds *every* dose through the absorption chain into
                 // central ignoring `dose.cmt` (the `sens/provider.rs` superposition loop),
-                // while the ODE twin honours the compartment — a `CMT≠1` dose there falls to
+                // while the ODE twin honours the compartment — a `CMT>1` dose there falls to
                 // the direct-bolus branch and lands in a disposition compartment, bypassing the
                 // transit/IG absorption the model asks for. Neither reading of a non-depot dose
                 // on an absorption model is well-defined: a subject on the closed form and one
                 // rerouted to the twin (TV-cov / `TIME` / IOV `n_kappa > 0`, #719) would
                 // disagree, and the twin's direct-bolus reading is not the intended transit
-                // input either. A closed-form absorption model only supports dosing the depot
-                // (`CMT=1`); reject anything else up front.
+                // input either. A closed-form absorption model only supports dosing the depot;
+                // reject anything else up front. `CMT=0` is NONMEM's *default dose compartment*
+                // — compartment 1, the depot — so it is accepted (both the closed form and its
+                // twin resolve it exactly like `CMT=1` via `saturating_sub(1)`, #899); only
+                // `CMT>=2` is a genuine non-depot target. `cmt_1based()` maps `CMT=0 -> 1`.
                 return Some(format!(
                     "{name} does not support dosing into a non-depot compartment (subject \
                      {}, CMT={}): the analytic absorption closed form routes every dose through \

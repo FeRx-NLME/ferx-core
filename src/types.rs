@@ -502,8 +502,11 @@ impl DoseAttrMap {
     /// back to the bare slot: on a model declaring `F1 = 0.6` and nothing else,
     /// `PkParams::default()` leaves `PK_IDX_F` at **1.0**, so the dose would be
     /// delivered at full amount with no error and no warning — the same silent
-    /// class #899 exists to remove, and the last site where `CMT=0` still meant
-    /// something other than compartment 1.
+    /// class #899 exists to remove, and the last *dose-application* site where a
+    /// `CMT=0` dose was silently mis-applied. (One validation gate lingered past
+    /// this: `check_absorption_closed_form_support` still *rejected* a `CMT=0`
+    /// dose on a closed-form absorption model as non-depot — a loud error, not a
+    /// silent mis-dose — corrected in the same spirit by the #913 review.)
     ///
     /// Analytical models are unaffected: per-compartment `F{cmt}`/`ALAG{cmt}` are
     /// ODE-only (`model_parser`, which rejects an unbound `F{cmt}` on a `pk(...)`

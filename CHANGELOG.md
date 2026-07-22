@@ -173,7 +173,13 @@ section of the SDLC for the versioning policy).
   is defined for a bolus but not for a zero-order input. This closes the cross-engine disagreement on
   `SS` + `CMT=0` noted under #375 below. The `cmt → state index` (and its 1-based complement) is now a
   single named accessor (`DoseEvent::cmt_idx` / `cmt_1based`, #912) so the convention lives in one
-  place rather than a dozen open-coded `cmt - 1` / `cmt >= 1` sites that drifted apart.
+  place rather than a dozen open-coded `cmt - 1` / `cmt >= 1` sites that drifted apart. The same
+  unification reaches the analytical **closed-form absorption** guard: a `CMT=0` dose on a
+  `one_cpt_transit` / `two_cpt_transit` / inverse-Gaussian model is now accepted as the depot
+  (compartment 1) and predicts identically to `CMT=1`, where it was previously rejected as a
+  "non-depot compartment" — the closed form folds every dose through absorption regardless of
+  `cmt`, and its ODE twin resolves `CMT=0` and `CMT=1` to the same forcing, so the two paths agree.
+  A genuine non-depot dose (`CMT>=2`) is still rejected.
 - **SAEM FREM / `iiv_on_ruv` mixing diagnostics and safeguards** (#895). The optimizer-trace
   `mh_accept_rate` (and the verbose banner) now reports the **combined** block + componentwise
   Metropolis-Hastings acceptance rate. Previously it showed only the block kernel, which reads a
