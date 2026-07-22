@@ -1301,6 +1301,37 @@ pub fn write_sdtab_csv(
     population: &Population,
     path: &str,
 ) -> Result<(), String> {
+    // A result restored from a `.fitrx` checkpoint carries no per-record discrete
+    // diagnostics — the bundle doesn't round-trip them (see `io::fitrx::parse_subjects`).
+    // Writing anyway would emit a table silently missing every discrete-endpoint row
+    // (header-only for a binary-only fit, since the columns exist but are zero-length, so
+    // the `cols.is_empty()` check below never fires). Refuse instead. The discriminator is
+    // `restored_from_checkpoint`, NOT "the population has discrete records": the latter is
+    // also true for a *live* CTMM fit, which legitimately produces no `discrete_rows`
+    // (occupancy diagnostics are #820) — keying on the record variant would reject every
+    // healthy CTMM fit. #911 removes this once diagnostics round-trip.
+    #[cfg(feature = "survival")]
+    if result.restored_from_checkpoint {
+        let pop_has_discrete = population.subjects.iter().any(|s| {
+            s.obs_records.iter().any(|r| {
+                matches!(
+                    r,
+                    crate::types::ObsRecord::DiscreteState { .. }
+                        | crate::types::ObsRecord::Count { .. }
+                )
+            })
+        });
+        if pop_has_discrete {
+            return Err(
+                "refusing to write sdtab: this fit was restored from a `.fitrx` checkpoint, \
+                 which does not round-trip per-record discrete-endpoint (binary / categorical) \
+                 diagnostics, and the dataset has discrete observations — so the table would be \
+                 silently missing every discrete row. Re-run the fit to write sdtab (#911)."
+                    .to_string(),
+            );
+        }
+    }
+
     let cols = sdtab(result, population);
     if cols.is_empty() {
         return Err("No data to write".to_string());
@@ -2184,6 +2215,7 @@ mod tests {
         let sigma_types = error_model.sigma_types();
         let n = sigma.len();
         FitResult {
+            restored_from_checkpoint: false,
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],
             method_wall_times_secs: vec![0.0],
@@ -2755,6 +2787,7 @@ mod tests {
     fn minimal_sdtab_result(subjects: Vec<SubjectResult>) -> FitResult {
         let sigma_types = ErrorModel::Proportional.sigma_types();
         FitResult {
+            restored_from_checkpoint: false,
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],
             method_wall_times_secs: vec![0.0],

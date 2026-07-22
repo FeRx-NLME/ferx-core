@@ -4627,6 +4627,20 @@ pub struct FitResult {
     /// `.fitrx` / ferx-r format change.
     #[serde(skip)]
     pub packed_estimate: Option<Vec<f64>>,
+    /// True when this result was reconstructed from a `.fitrx` checkpoint by
+    /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
+    ///
+    /// The checkpoint format does not round-trip per-record discrete-endpoint
+    /// diagnostics (`SubjectResult::discrete_rows`), so a restored fit of a binary /
+    /// categorical model has none. This flag is the precise discriminator
+    /// [`crate::io::output::write_sdtab_csv`] needs to tell a restored binary fit
+    /// (rows genuinely dropped → refuse) from a live CTMM fit (never produces those
+    /// rows → allow) — the record variant alone cannot, since both are
+    /// [`ObsRecord::DiscreteState`]. Runtime-only: `#[serde(skip)]`, so no `.fitrx` /
+    /// JSON / ferx-r format change, and a live fit always carries `false`. Removed
+    /// once diagnostics round-trip (#911).
+    #[serde(skip)]
+    pub restored_from_checkpoint: bool,
 }
 
 impl FitResult {

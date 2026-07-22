@@ -217,29 +217,35 @@ pub(crate) fn discrete_subject_nll(
     if subject.obs_records.is_empty() {
         return 0.0;
     }
-    let mut nll = 0.0;
-    // Hot path (FOCEI inner loop + the FD-Hessian stencil): with a single binary endpoint
-    // — every real model today — there is no ordering question and no reason to build the
-    // sorted CMT list, so read it straight out of the map. `binary_endpoints`' allocation
-    // is reserved for the multi-endpoint case, where deterministic summation order is what
-    // keeps the OFV from being ULP-nondeterministic across processes.
-    let cmts = model.binary_cmts();
-    if let [only] = cmts[..] {
-        if let Some(endpoint @ EndpointLikelihood::Binary { .. }) = model.endpoints.get(&only) {
-            let EndpointLikelihood::Binary { link, lp_fn, .. } = endpoint else {
-                unreachable!("matched Binary above")
-            };
+    // Hot path: `discrete_subject_nll` runs per subject per FOCEI inner iteration and per
+    // FD-Hessian stencil point, so it must not allocate. Find the binary endpoints by
+    // scanning the map directly — no `Vec`, no sort. With a single binary endpoint (every
+    // real model today) score it straight through; only a genuinely multi-endpoint model
+    // pays for `binary_endpoints`' sorted walk, whose determinism keeps the summed OFV
+    // reproducible across processes. (An earlier version wrote `let cmts = binary_cmts()`
+    // here, which allocated + sorted on every call — the exact cost this avoids.)
+    let mut binaries = model.endpoints.iter().filter_map(|(cmt, ep)| match ep {
+        EndpointLikelihood::Binary { link, lp_fn, .. } => Some((*cmt, link, lp_fn)),
+        _ => None,
+    });
+    match (binaries.next(), binaries.next()) {
+        (None, _) => return 0.0, // no binary endpoint
+        (Some((cmt, link, lp_fn)), None) => {
+            // Exactly one — no ordering question, so skip the sorted walk entirely.
             return binary_data_term(
                 *link,
                 lp_fn,
-                only,
+                cmt,
                 &subject.obs_records,
                 theta,
                 eta,
                 &subject.covariates,
             );
         }
+        _ => {} // two or more — fall through to the deterministic walk below
     }
+
+    let mut nll = 0.0;
     for (cmt, endpoint) in binary_endpoints(model) {
         // Binary today; a new discrete family (ordinal / Poisson / negative-binomial …) adds
         // its branch here — reached through this one function, so no likelihood dispatch site

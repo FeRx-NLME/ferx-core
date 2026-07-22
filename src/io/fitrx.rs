@@ -1668,6 +1668,7 @@ fn wire_to_fit_result(
     };
 
     Ok(FitResult {
+        restored_from_checkpoint: true,
         method,
         method_chain,
         method_wall_times_secs: w.method_wall_times_secs,
@@ -1885,6 +1886,7 @@ mod tests {
     fn minimal_fit_result() -> FitResult {
         let n_eta = 2;
         FitResult {
+            restored_from_checkpoint: false,
             method: EstimationMethod::FoceI,
             method_chain: vec![EstimationMethod::FoceI],
             method_wall_times_secs: vec![1.234],

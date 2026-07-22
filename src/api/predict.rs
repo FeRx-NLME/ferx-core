@@ -74,14 +74,21 @@ pub fn predict(
     // empty vec rather than an occupancy π(t). `simulate()`'s twin assert already
     // *claims* to cover predict() — it does not, because it sits in the simulate
     // chokepoint — so state the contract here too. Occupancy prediction is #820.
+    // Fail loud only when the call would otherwise return an *empty* vec because CTMM is
+    // the only thing to predict. The precise test is "are there continuous observations to
+    // predict at all" — i.e. does any subject have a non-empty `obs_times` grid — not
+    // "is sigma non-empty" (a CTMM-only model may still declare an `[error_model]`, so a
+    // non-empty sigma does not imply continuous rows) and not "is there a Gaussian
+    // endpoint" (`EndpointLikelihood::Gaussian` is never inserted into `endpoints` for a
+    // plain PK model, so that check would reject every healthy mixed PK + CTMM model). A
+    // mixed model with continuous data passes and returns its Gaussian rows; the CTMM rows
+    // are simply absent, exactly as a binary endpoint's are (occupancy prediction is #820).
     #[cfg(feature = "markov")]
     assert!(
-        !model.has_ctmm() || !model.default_params.sigma.values.is_empty(),
-        "predict() does not support a [markov_model] (CTMM) endpoint yet, and this model has no \
-         continuous endpoint either — so the call would return an empty vec rather than an \
-         occupancy π(t). State-occupancy prediction is a later slice (#820). (A model that *also* \
-         has a Gaussian endpoint is fine: it gets its continuous rows, and the CTMM rows are \
-         simply absent, exactly as a binary endpoint's are.)"
+        !model.has_ctmm() || population.subjects.iter().any(|s| !s.obs_times.is_empty()),
+        "predict() does not support a [markov_model] (CTMM) endpoint yet, and this population has \
+         no continuous observations either — so the call would return an empty vec rather than an \
+         occupancy π(t). State-occupancy prediction is a later slice (#820)."
     );
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];

@@ -328,6 +328,7 @@ mod tests {
     /// are filled with sensible defaults.
     fn fit_with_cov(template: &ModelParameters, cov: DMatrix<f64>) -> FitResult {
         FitResult {
+            restored_from_checkpoint: false,
             method: crate::types::EstimationMethod::FoceI,
             method_chain: vec![],
             method_wall_times_secs: vec![],

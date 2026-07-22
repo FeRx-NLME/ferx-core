@@ -433,6 +433,40 @@ mod binary_smoke {
         assert!(ferx_core::predict(&model, &pop, &model.default_params).is_empty());
     }
 
+    /// A fit **restored from a `.fitrx` checkpoint** carries no per-record discrete
+    /// diagnostics (the bundle doesn't round-trip them), so writing sdtab would emit a
+    /// table silently missing every binary row. `write_sdtab_csv` refuses — keyed on the
+    /// `restored_from_checkpoint` flag, not the record variant (which a *live* CTMM fit
+    /// also carries, and which must still write; see `markov_smoke`).
+    #[test]
+    fn sdtab_refuses_a_restored_fit_missing_its_discrete_rows() {
+        let model = parse_model_string(MIXED_MODEL).unwrap();
+        let pop = common::binary_pop(&sim_subjects(), 3);
+        let mut res = fit(&model, &pop, &model.default_params, &smoke_opts()).expect("fit");
+
+        // A live fit writes fine and carries real discrete rows.
+        assert!(!res.restored_from_checkpoint);
+        assert!(res.subjects.iter().any(|s| !s.discrete_rows.is_empty()));
+        let dir = tempfile::tempdir().expect("temp dir");
+        let live = dir.path().join("live.csv");
+        ferx_core::io::output::write_sdtab_csv(&res, &pop, live.to_str().unwrap())
+            .expect("a live binary fit must write sdtab");
+
+        // Simulate the restore: the flag flips and the diagnostics are gone.
+        res.restored_from_checkpoint = true;
+        for sr in &mut res.subjects {
+            sr.discrete_rows.clear();
+        }
+        let restored = dir.path().join("restored.csv");
+        let err = ferx_core::io::output::write_sdtab_csv(&res, &pop, restored.to_str().unwrap())
+            .expect_err("a restored fit over discrete data must be refused");
+        assert!(
+            err.contains("restored") && err.contains("fitrx"),
+            "message: {err}"
+        );
+        assert!(!restored.exists(), "no partial file may be left behind");
+    }
+
     // ---- Slice 1b: sdtab diagnostics ---------------------------------------------------
 
     /// A binary fit emits one sdtab row per binary record, with `IPRED` = `p`, `DV` the
