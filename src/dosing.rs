@@ -217,7 +217,9 @@ where
 /// the loop could never stop. Because the stop only fires once every compartment's increment
 /// is below f64-relative precision, the value has reached its fixed point and the elided cycles
 /// do not move it — predictions are unchanged to f64 precision, and gradients match a full
-/// budget to `< 1e-6` (see `ode_provider_ss_early_stop_matches_full_budget`).
+/// budget to `< 1e-6` (see `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`;
+/// after #914 a linear disposition takes the exact fixed point, so this early stop runs only on
+/// the nonlinear fallback).
 ///
 /// A **non-finite** (`NaN`/`Inf`) compartment means the integration blew up: never report
 /// convergence — don't early-exit and silently return a poisoned state; run the full cycle

@@ -60,6 +60,15 @@ section of the SDLC for the versioning policy).
   for any external code that constructs or exhaustively destructures these variants.
 
 ### Fixed
+- **Steady-state (`SS=1`) dosing on `[odes]` models is now exact for a linear disposition, and
+  warns instead of silently truncating on a nonlinear one** (#914). An ordinary ODE bolus or
+  infusion SS dose previously equilibrated by expanding a pulse train capped at 50 cycles, which
+  under-reported the steady state by tens of percent for a slow disposition (the same truncation
+  #908 removed from the analytical engine) — silently. A linear disposition now solves the exact
+  periodic fixed point `(I − M)⁻¹·b` directly (value and analytic FOCE/FOCEI gradient), so slow PK
+  is exact rather than low; a genuinely nonlinear RHS (e.g. Michaelis–Menten) still falls back to
+  the capped iteration but now surfaces a non-convergence warning when the cap is reached without
+  settling. Also faster: the linear case replaces ~50 RK45 cycles with a handful.
 - **`predict()` on a CTMM (`[markov_model]`) model now fails loud instead of silently returning
   no rows** (#759). The equivalent `simulate()` guard already existed and its message claimed to
   cover `predict()`, but it only ran on the simulate path. State-occupancy prediction `π(t)` is

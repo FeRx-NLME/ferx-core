@@ -3634,6 +3634,107 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
             &mut stack_cell.borrow_mut(),
         );
     };
+
+    // ---- #914 exact solve: closed-form periodic fixed point (linear disposition). ----
+    // The affine fixed point `u_ss = (I − M)⁻¹·b`, carried over the dual `T` so
+    // `∂u_ss/∂(θ,η[,κ])` (and the 2nd order) fall out of the linear solve — the exact analytic
+    // parity with the f64 `equilibrate_ss_state`, the input-rate twin (#835) and the analytical
+    // walk (#908). `advance_forced` integrates one cycle *with* the dose; `advance_unforced`
+    // integrates one `II` of disposition alone (the propagator `M`; the infusion's active and
+    // quiet windows share the same homogeneous propagator, so a full-`II` decay reconstructs it
+    // and the window length enters only through `b`). The moving active/quiet boundary carries
+    // `inf_window`'s jet via the same `inject_rate_saltation` the fallback loop uses
+    // (`dtinf = inf_window − t_inf_val`); its value part is zero, so the value map stays linear
+    // while the window sensitivity rides `b`. A nonlinear RHS fails the self-check and falls to
+    // the pulse train below (the f64 value walk owns the #867 warning — this twin must not
+    // double-count it, matching `equilibrate_ss_input_rate_state_g`).
+    let eq_opts = crate::ode::predictions::ss_equilibration_opts(opts);
+    let d1v: RefCell<Vec<Dual1<1>>> = RefCell::new(Vec::new());
+    let d1s: RefCell<Vec<Dual1<1>>> = RefCell::new(Vec::new());
+    let advance_unforced = |u0: &[T]| -> Option<Vec<T>> {
+        solve_ode_g(&bare_rhs, u0, (0.0, dose.ii), params, &[dose.ii], &eq_opts)
+            .last()
+            .map(|p| p.u.clone())
+    };
+    let advance_forced = |u0: &[T]| -> Option<Vec<T>> {
+        match inf {
+            Some((inf_rate, inf_window)) => {
+                let t_inf_val = inf_window.val();
+                if t_inf_val > dose.ii {
+                    return None; // overlapping pulses — no simple equilibration (→ fallback → zero)
+                }
+                let rate_forcing = inf_rate;
+                let rhs_active = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+                    bare_rhs(us, ps, t, du);
+                    if cmt_idx < du.len() {
+                        du[cmt_idx] = du[cmt_idx] + rate_forcing;
+                    }
+                };
+                let mut y = solve_ode_g(
+                    &rhs_active,
+                    u0,
+                    (0.0, t_inf_val),
+                    params,
+                    &[t_inf_val],
+                    &eq_opts,
+                )
+                .last()
+                .map(|p| p.u.clone())?;
+                // Boundary-shift saltation for the (possibly jet-carrying) window `inf_window`,
+                // identical to the fallback loop's per-cycle `inject_rate_saltation`.
+                let dtinf = inf_window - T::from_f64(t_inf_val);
+                inject_rate_saltation::<T>(
+                    &mut y,
+                    cmt_idx,
+                    rate_forcing,
+                    T::from_f64(0.0),
+                    dtinf,
+                    1.0,
+                    program,
+                    params,
+                    t_inf_val,
+                    0.0,
+                    0.0,
+                    &mut d1v.borrow_mut(),
+                    &mut d1s.borrow_mut(),
+                );
+                let quiet_val = dose.ii - t_inf_val;
+                if quiet_val > 0.0 {
+                    y = solve_ode_g(
+                        &bare_rhs,
+                        &y,
+                        (0.0, quiet_val),
+                        params,
+                        &[quiet_val],
+                        &eq_opts,
+                    )
+                    .last()
+                    .map(|p| p.u.clone())?;
+                }
+                Some(y)
+            }
+            None => {
+                let mut y = u0.to_vec();
+                y[cmt_idx] = y[cmt_idx] + f_bio * T::from_f64(dose.amt);
+                solve_ode_g(&bare_rhs, &y, (0.0, dose.ii), params, &[dose.ii], &eq_opts)
+                    .last()
+                    .map(|p| p.u.clone())
+            }
+        }
+    };
+    if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
+        n_states,
+        dose.ii,
+        eq_opts.reltol,
+        eq_opts.abstol,
+        advance_unforced,
+        advance_forced,
+    ) {
+        crate::dosing::record_ss_equilibration_cycles(1);
+        return u_ss;
+    }
+
+    // ---- Fallback: explicit pulse-train iteration (nonlinear disposition / singular `I − M`). ----
     if let Some((inf_rate, inf_window)) = inf {
         // SS infusion: each cycle is an active-rate window `[0, t_inf]` (the wrapped RHS
         // injects the mode-aware bioavailable forcing into the dosing compartment) followed

@@ -5080,34 +5080,159 @@ fn ss_cycle_converged_is_mixed_atol_rtol_on_increment() {
 }
 
 #[test]
-fn ss_equilibration_early_stop_fires_for_fast_pk() {
-    // #532 review #6: pin that the #519 early stop actually fires (the loose end-value
-    // tolerances would otherwise hide a broken stop). Use a tight integrator tol — the
-    // gradient context where the speedup matters.
+fn ss_linear_disposition_uses_exact_fixed_point() {
+    // #914: a LINEAR disposition now equilibrates via the exact closed-form fixed point
+    // `u_ss = (I − M)⁻¹·b` (one recorded cycle), for both fast and slow PK, rather than the
+    // up-to-50-cycle pulse train. The slow case is the payoff: the old train ran the full budget
+    // and truncated its geometric tail (~30% low here), while the exact solve nails the
+    // analytical steady state. (The #519 pulse-train early stop is now reachable only on the
+    // nonlinear fallback — see `ss_nonlinear_bolus_with_steady_state_uses_fallback`.)
     let mut ode = one_cpt_ode_spec();
     ode.solver_opts.reltol = 1e-10;
     ode.solver_opts.abstol = 1e-12;
-    let dose = DoseEvent::new(0.0, 1000.0, 1, 0.0, true, 12.0);
+    let ii = 12.0_f64;
+    let amt = 1000.0_f64;
+    let dose = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
 
-    // Fast disposition (ke = CL/V = 2.0, λ·II = 24): the trough converges in a few cycles,
-    // so the early stop fires well inside SS_EQUILIBRATION_CYCLES.
-    let fast = pk_one(20.0, 10.0);
-    let _ = equilibrate_ss_state(&ode, &fast.values, &dose, &ode.solver_opts);
-    let fast_cycles = crate::dosing::last_ss_equilibration_cycles();
+    // (cl, v) — "fast" (ke·II = 6, the old early stop fired) and "slow" (ke·II ≈ 0.024, the old
+    // full-budget truncation was ~30% low). The fast case is deliberately not *extreme*
+    // (ke·II ≫ 6): a near-total between-dose decay drives the trough toward the RK45 `abstol`
+    // floor, where relative precision is lost — an integration-noise artifact, not the fixed
+    // point being wrong (`ode_provider_ss_linear_bolus_uses_exact_solve` checks the gradient too).
+    for (cl, v, label) in [(5.0_f64, 10.0_f64, "fast"), (0.1_f64, 50.0_f64, "slow")] {
+        let pk = pk_one(cl, v);
+        let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts);
+        assert_eq!(
+            crate::dosing::last_ss_equilibration_cycles(),
+            1,
+            "{label} linear PK must equilibrate via the exact fixed point (one cycle)"
+        );
+        // Pre-pulse SS amount for a 1-cpt bolus: `F·amt·e^{−ke·II}/(1 − e^{−ke·II})` (F = 1).
+        // The state stores amount, so compare directly.
+        let ke = cl / v;
+        let expected = amt * (-ke * ii).exp() / (1.0 - (-ke * ii).exp());
+        assert_relative_eq!(trough[0], expected, max_relative = 1e-6);
+    }
+}
+
+/// 1-cpt Michaelis–Menten **disposition** (no absorption kernel), amount state:
+/// `dA/dt = −Vmax·A/(Km + A)`, Vmax in the CL slot, Km in the V slot. A plain bolus into this
+/// compartment is genuinely nonlinear, so the #914 exact fixed point's linearity self-check
+/// declines and the SS equilibration falls back to the capped pulse train (with the #867
+/// non-convergence warning when it can't converge). Distinct from `mm_ss_absorption_spec`, which
+/// also carries a `first_order` input rate and so exercises the input-rate branch instead.
+fn mm_disposition_spec() -> OdeSpec {
+    OdeSpec {
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let vmax = p[crate::types::PK_IDX_CL];
+            let km = p[crate::types::PK_IDX_V];
+            dy[0] = -vmax * y[0] / (km + y[0]);
+        }),
+        n_states: 1,
+        state_names: vec!["central".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: Vec::new(),
+        init_fn: None,
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+    }
+}
+
+/// Independent SS reference for a plain **bolus** into a (possibly nonlinear) disposition: run the
+/// pulse train `(add F·amt; integrate II)` from a zero state for `max_cycles` and return the
+/// pre-next-pulse trough. Uncapped (`max_cycles ≫ 50`), so for a disposition that admits a
+/// periodic steady state it is fully converged — the genuine SS the 50-cycle production fallback
+/// approximates. `F = 1`.
+fn bolus_ss_reference(ode: &OdeSpec, pk: &[f64], dose: &DoseEvent, max_cycles: usize) -> Vec<f64> {
+    let eq = ss_equilibration_opts(&ode.solver_opts);
+    let cmt = dose.cmt_idx();
+    let mut u = vec![0.0; ode.n_states];
+    for _ in 0..max_cycles {
+        u[cmt] += dose.amt;
+        if let Some(last) = solve_ode(&ode.rhs, &u, (0.0, dose.ii), pk, &[dose.ii], &eq).last() {
+            u.copy_from_slice(&last.u);
+        }
+    }
+    u
+}
+
+/// #914 gap 1 (nonlinear branch preserved): a Michaelis–Menten **disposition** that *admits* a
+/// periodic steady state (mean input `100/8 = 12.5 ≪ Vmax = 50`) fails the exact fixed point's
+/// linearity self-check and falls back to the capped pulse train — which, since it converges well
+/// inside the 50-cycle budget, reaches the true SS (matching an uncapped run-in) with **no**
+/// warning. Proves the exact-solve short-circuit does not swallow a genuinely nonlinear model.
+#[test]
+fn ss_nonlinear_bolus_with_steady_state_uses_fallback() {
+    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::dosing::clear_ss_nonconvergence_warnings();
+
+    let mut ode = mm_disposition_spec();
+    ode.solver_opts.reltol = 1e-10;
+    ode.solver_opts.abstol = 1e-12;
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 50.0; // Vmax
+    pk.values[crate::types::PK_IDX_V] = 30.0; // Km — the peak amount ≈ 100 ≫ Km, so genuinely nonlinear
+    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0);
+
+    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts);
+    let cycles = crate::dosing::last_ss_equilibration_cycles();
     assert!(
-        (2..SS_EQUILIBRATION_CYCLES).contains(&fast_cycles),
-        "fast PK should early-stop inside the budget, ran {fast_cycles}"
+        (2..SS_EQUILIBRATION_CYCLES).contains(&cycles),
+        "a nonlinear disposition must fall back to the pulse train and converge inside the budget, \
+         ran {cycles} cycles"
     );
+    let reference = bolus_ss_reference(&ode, &pk.values, &dose, 500);
+    assert_relative_eq!(trough[0], reference[0], max_relative = 1e-6);
+    assert!(
+        crate::dosing::take_ss_nonconvergence_warnings().is_empty(),
+        "a converging nonlinear SS must not warn"
+    );
+}
 
-    // Near-non-eliminating (ke ≈ 5e-4, λ·II ≈ 6e-3): never reaches the 1e-12 relative
-    // threshold in the budget → runs the full SS_EQUILIBRATION_CYCLES (this is the
-    // pre-existing slow-PK truncation, tracked separately — #532 review #12).
-    let slow = pk_one(0.05, 100.0);
-    let _ = equilibrate_ss_state(&ode, &slow.values, &dose, &ode.solver_opts);
-    let slow_cycles = crate::dosing::last_ss_equilibration_cycles();
+/// #914 gap 2 (the newly-wired warning): a Michaelis–Menten **disposition** dosed *above capacity*
+/// (mean input `50/8 = 6.25 > Vmax = 5`) has no periodic steady state, so the bolus fallback runs
+/// the full 50-cycle budget without converging and now surfaces the #867 non-convergence warning
+/// — previously silent for the ordinary bolus/infusion path (it was wired only into the
+/// input-rate branch). Predictions stay finite.
+#[test]
+fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
+    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::dosing::clear_ss_nonconvergence_warnings();
+
+    let ode = mm_disposition_spec();
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 5.0; // Vmax
+    pk.values[crate::types::PK_IDX_V] = 8.0; // Km
+    let ss = DoseEvent::new(0.0, 50.0, 1, 0.0, true, 8.0); // mean input 6.25 > Vmax 5
+
+    let trough = equilibrate_ss_state(&ode, &pk.values, &ss, &ode.solver_opts);
     assert_eq!(
-        slow_cycles, SS_EQUILIBRATION_CYCLES,
-        "slow PK should run the full budget, ran {slow_cycles}"
+        crate::dosing::last_ss_equilibration_cycles(),
+        SS_EQUILIBRATION_CYCLES,
+        "an over-capacity (no-SS) nonlinear disposition must run the full capped budget"
+    );
+    assert!(trough.iter().all(|x| x.is_finite()));
+
+    let subj = make_subject(vec![ss], vec![1.0, 4.0, 7.9]);
+    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+    assert!(
+        preds.iter().all(|p| p.is_finite()),
+        "predictions must stay finite: {preds:?}"
+    );
+    let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "an over-capacity bolus must surface a non-convergence warning; got: {warnings:?}"
     );
 }
 
