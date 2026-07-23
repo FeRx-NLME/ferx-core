@@ -57,7 +57,7 @@ pub(crate) use postfit::{
 };
 pub use predict::{predict, PredictionResult};
 #[cfg(feature = "survival")]
-pub use predict::{predict_survival, SurvivalPredictionResult};
+pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
 pub(crate) use run::{build_selection_filter_merged, log_transform_observations};
 pub use run::{
     read_population_for, resolve_data_path, run_from_file, run_model_simulate, run_model_with_data,

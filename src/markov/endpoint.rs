@@ -58,6 +58,7 @@ fn collect_state_obs(
             time,
             state,
             cmt: c,
+            ..
         } = r
         {
             if *c != cmt {
@@ -506,7 +507,12 @@ mod tests {
     }
 
     fn disc(time: f64, state: usize, cmt: usize) -> ObsRecord {
-        ObsRecord::DiscreteState { time, state, cmt }
+        ObsRecord::DiscreteState {
+            time,
+            raw_time: time,
+            state,
+            cmt,
+        }
     }
 
     /// NLL over a record slice with no covariates and no θ/η.

@@ -2153,6 +2153,7 @@ mod survival_smoke {
             1,
             ObsRecord::DiscreteState {
                 time: 7.0,
+                raw_time: 7.0,
                 state: 1,
                 cmt: 3,
             },
@@ -2192,6 +2193,7 @@ mod survival_smoke {
             0,
             ObsRecord::DiscreteState {
                 time: 5.0,
+                raw_time: 5.0,
                 state: 0,
                 cmt: 4,
             },
@@ -2237,6 +2239,7 @@ mod survival_smoke {
             0,
             ObsRecord::Count {
                 time: 12.0,
+                raw_time: 12.0,
                 count: 2,
                 cmt: 4,
             },

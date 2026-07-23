@@ -632,6 +632,16 @@ pub(crate) fn compute_subject_results(
                 extra_columns: vec![],
                 per_obs_tad: vec![],
                 compartment_states,
+                // Discrete-endpoint (binary) per-record diagnostics at this subject's
+                // EBE η (§8.8.5). Empty for every model without a binary endpoint, so
+                // existing output is untouched.
+                #[cfg(feature = "survival")]
+                discrete_rows: crate::categorical::binary_diagnostics(
+                    model,
+                    subject,
+                    &params.theta,
+                    eta.as_slice(),
+                ),
             }
         })
         .collect()

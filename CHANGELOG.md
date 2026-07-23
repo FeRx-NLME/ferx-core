@@ -28,6 +28,23 @@ section of the SDLC for the versioning policy).
   problems (e.g. the cyclophosphamide parent→metabolite fit, where additive variance
   seeded at 0.5 traps at ≈0.94 instead of the global optimum ≈1878). The initial estimate
   is never changed — the warning advises a larger start.
+- **Simulation and prediction for binary (`[binary_model]`) endpoints** (#760). `simulate()` now
+  draws a 0/1 outcome per binary observation record (previously it emitted **no rows at all** for
+  a binary endpoint, silently and without an error), and the new `predict_categorical()` returns
+  the category probabilities `P(Y = 0)` / `P(Y = 1)` per record — a probability vector, which the
+  scalar `predict()` cannot represent. `predict()` remains the Gaussian predictor and returns no
+  rows for a binary endpoint (see `Changed` below for the one behavioural change it did gain). A
+  `[simulation]` block driving a binary endpoint needs `times` (binary outcomes are observed on
+  the fixed grid), and `--simulate` stamps the drawn states onto the simulated population it then
+  fits.
+  Validated by a simulate → fit recovery (SSE) round trip on top of the existing R `glm` / NONMEM
+  fit anchors.
+- **sdtab diagnostics for binary endpoints** (#760). `{model}-sdtab.csv` now carries one row per
+  binary observation record — `DV` (observed 0/1), `PRED` (`P(Y=1)` at η=0), `IPRED` (at the EBE η)
+  and `IWRES` (standardized Pearson residual). `CWRES` is left blank, since the conditional
+  weighted residual is defined through the Gaussian residual-variance model that a Bernoulli
+  outcome does not have; columns undefined for a discrete record are likewise blank rather than
+  sentinel values. Previously a binary endpoint produced no diagnostic rows at all.
 - **Analytic sensitivities for steady-state dosing into a built-in absorption compartment**
   (#835). Fitting a model with an `SS=1` dose into a `first_order` / `transit` / `igd` /
   `weibull` absorption compartment now uses exact analytic FOCEI gradients — the closed-form
@@ -35,6 +52,18 @@ section of the SDLC for the versioning policy).
   differences, so these fits run at full analytic speed. Steady-state into a `zero_order`
   window, and steady-state combined with an absorption lagtime, remain out of scope (rejected
   with a clear error).
+
+### Changed
+- **`ObsRecord::DiscreteState` and `ObsRecord::Count` gained a `raw_time` field** (#760). Discrete
+  observations now carry the user's TIME alongside the engine's internal (occasion-shifted) clock,
+  so reported rows join back to the input CSV the way Gaussian rows always have. Source-breaking
+  for any external code that constructs or exhaustively destructures these variants.
+
+### Fixed
+- **`predict()` on a CTMM (`[markov_model]`) model now fails loud instead of silently returning
+  no rows** (#759). The equivalent `simulate()` guard already existed and its message claimed to
+  cover `predict()`, but it only ran on the simulate path. State-occupancy prediction `π(t)` is
+  still to come (#820).
 
 ### Performance
 - **Closed-form modified-release absorption** (#860). A static multi-route absorption model

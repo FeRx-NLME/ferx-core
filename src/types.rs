@@ -2221,9 +2221,26 @@ pub enum ObsRecord {
     /// Discrete-state observation: an integer category or Markov state index.
     /// Serves binary/ordinal (Track C) and DTMM/CTMM state observations
     /// (Track D); the CMT's declared endpoint disambiguates the meaning.
-    DiscreteState { time: f64, state: usize, cmt: usize },
+    /// Discrete-state (binary / categorical / Markov) observation. `time` is the
+    /// **internal** occasion-shifted clock the engine and likelihood run on;
+    /// `raw_time` is the TIME the input CSV carried, and is what every reported row
+    /// (sdtab, `simulate()`, `predict_categorical`) must use so output joins back to
+    /// the input and to covtab. They differ only for reset-delimited occasions.
+    DiscreteState {
+        time: f64,
+        raw_time: f64,
+        state: usize,
+        cmt: usize,
+    },
     /// Non-negative integer count observation (Poisson / negative-binomial, Track C).
-    Count { time: f64, count: u32, cmt: usize },
+    /// Carries both clocks for the same reason [`Self::DiscreteState`] does — reporting
+    /// must use `raw_time` or the rows cannot be joined back to the input.
+    Count {
+        time: f64,
+        raw_time: f64,
+        count: u32,
+        cmt: usize,
+    },
 }
 
 #[cfg(feature = "survival")]
@@ -2507,6 +2524,60 @@ impl SimOutcome {
             }
         }
     }
+}
+
+/// Prediction for one (subject, time, CMT) point — the predict-side analogue of
+/// [`SimOutcome`] (`plans/tte-survival-markov.md` §8.8.1).
+///
+/// A non-Gaussian endpoint's prediction is a **probability vector or a curve, never
+/// one scalar**, which is why the legacy [`crate::api::PredictionResult`] (`pred: f64`)
+/// cannot carry it. That struct is unchanged and still backs the Gaussian
+/// [`crate::predict`]; this enum backs the per-endpoint predictors
+/// ([`crate::api::predict_categorical`] today).
+///
+/// Only variants with a **live producer** are declared. The plan also sketches
+/// `Survival` and `Rate` arms; TTE prediction already ships as the richer
+/// [`crate::api::SurvivalPredictionResult`] (S/H/h + CIF + median/mean, more than a
+/// three-field variant would hold), and `Rate` waits on the Poisson/count slice —
+/// adding either before it can be produced would be an untestable dead arm.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Prediction {
+    /// Gaussian continuous prediction (the existing scalar path).
+    Continuous { pred: f64 },
+    /// Category probabilities `P(Y = k)`, indexed by the endpoint's own state
+    /// order. Binary uses `[1 − p, p]` so index == the observed 0/1 DV code.
+    /// CTMM occupancy `π(t)` reuses this variant (#820), indexed by generator
+    /// state; callers map back to DV codes through the endpoint's `state_codes`.
+    CatProbs { probs: Vec<f64> },
+}
+
+impl Prediction {
+    /// `P(Y = k)` for state index `k`, or `None` when this is not a categorical
+    /// prediction or `k` is out of range. Keeps callers from indexing `probs`
+    /// directly and panicking on a shape they did not check.
+    pub fn prob(&self, k: usize) -> Option<f64> {
+        match self {
+            Prediction::CatProbs { probs } => probs.get(k).copied(),
+            Prediction::Continuous { .. } => None,
+        }
+    }
+}
+
+/// A prediction attached to a specific endpoint CMT — the multi-endpoint analogue
+/// of [`crate::api::PredictionResult`], which has no CMT field because it predates
+/// per-CMT endpoints.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EndpointPredictionResult {
+    pub id: String,
+    /// CMT of the endpoint that produced this prediction.
+    pub cmt: usize,
+    /// Raw data TIME of the observation being predicted (matches sdtab / input).
+    pub time: f64,
+    /// Observed outcome at this record, when the dataset carries one — the 0/1 DV
+    /// for a binary endpoint. Paired here so a caller can form a residual without
+    /// re-joining against the input population.
+    pub observed: Option<f64>,
+    pub prediction: Prediction,
 }
 
 /// A compiled model ready for estimation
@@ -3556,6 +3627,33 @@ impl std::fmt::Debug for CompiledModel {
     }
 }
 
+/// One discrete-endpoint (binary) observation's post-fit diagnostics — the
+/// non-Gaussian analogue of a row of [`SubjectResult`]'s parallel `ipred`/`iwres`
+/// vectors (`plans/tte-survival-markov.md` §8.8.5).
+///
+/// Kept as its own row type rather than appended to those vectors because a discrete
+/// record is not on the Gaussian observation grid: it has no residual variance, no
+/// CWRES, and its `ipred` is a probability rather than a concentration. Every column
+/// the Gaussian rows carry but a discrete row cannot define is emitted as an empty
+/// sdtab cell.
+#[cfg(feature = "survival")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct DiscreteObsDiagnostic {
+    /// CMT of the endpoint that produced this record.
+    pub cmt: usize,
+    /// Raw data TIME (joins back to the input CSV).
+    pub time: f64,
+    /// Observed outcome (the 0/1 DV for a binary endpoint).
+    pub dv: f64,
+    /// Population prediction `P(Y = 1)` at η = 0.
+    pub pred: f64,
+    /// Individual prediction `P(Y = 1)` at the subject's EBE η.
+    pub ipred: f64,
+    /// Standardized (Pearson) residual `(y − p)/√(p(1−p))` at the EBE. NaN at a
+    /// degenerate `p ∈ {0,1}`, where it is undefined.
+    pub iwres: f64,
+}
+
 /// Per-subject estimation results
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SubjectResult {
@@ -3596,6 +3694,12 @@ pub struct SubjectResult {
     /// NaN in `[derived]`; see W_DERIVED_CMT_IOV_UNSUPPORTED / W_DERIVED_CMT_TV_ANALYTICAL).
     /// Scaling (`apply_scaling`, Form A/C) is never applied here — only `ipred` is scaled.
     pub compartment_states: Vec<Vec<f64>>,
+    /// Post-fit diagnostics for this subject's **discrete** (binary) endpoint records,
+    /// one entry per record (§8.8.5). Empty for models with no discrete endpoint, which
+    /// keeps every existing `FitResult` serialization byte-identical.
+    #[cfg(feature = "survival")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discrete_rows: Vec<DiscreteObsDiagnostic>,
 }
 
 /// Per-subject conditional distribution of the random effects, produced by the
@@ -4572,6 +4676,22 @@ pub struct FitResult {
     /// `.fitrx` / ferx-r format change.
     #[serde(skip)]
     pub packed_estimate: Option<Vec<f64>>,
+    /// True when this result was reconstructed from a `.fitrx` checkpoint by
+    /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
+    ///
+    /// The checkpoint format does not round-trip per-record discrete-endpoint
+    /// diagnostics (`SubjectResult::discrete_rows`), so a restored fit of a binary /
+    /// categorical model has none. This flag lets [`crate::io::output::write_sdtab_csv`]
+    /// refuse a restored fit whose model declares a binary endpoint (rows genuinely
+    /// dropped) while still writing a live fit. It must be paired with the model's
+    /// declared endpoints — parsed from [`Self::model_text`] — because the *reconstructed
+    /// population* is not a usable signal: `load_fit` re-reads the data with default
+    /// (Gaussian) routing, so binary DVs come back as continuous observations and no
+    /// [`ObsRecord::DiscreteState`] survives. Runtime-only: `#[serde(skip)]`, so no
+    /// `.fitrx` / JSON / ferx-r format change, and a live fit always carries `false`.
+    /// Removed once diagnostics round-trip (#911).
+    #[serde(skip)]
+    pub restored_from_checkpoint: bool,
 }
 
 impl FitResult {

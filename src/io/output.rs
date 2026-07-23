@@ -1052,10 +1052,20 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .iter()
         .any(|s| s.cens.iter().any(|&c| c != 0));
     let any_occ = population.subjects.iter().any(|s| !s.occasions.is_empty());
-    let any_multicmt = population
-        .subjects
-        .iter()
-        .any(|s| s.obs_cmts.iter().any(|&c| c != 1));
+    // Discrete (binary) rows always carry their endpoint's CMT, and that CMT is the
+    // only thing distinguishing them from the Gaussian rows they are appended after —
+    // so their presence forces the column on. Without this a binary-only fit (no
+    // Gaussian rows at all, hence no `obs_cmts`) would emit an sdtab with the endpoint
+    // CMT silently dropped.
+    #[cfg(feature = "survival")]
+    let any_discrete = result.subjects.iter().any(|s| !s.discrete_rows.is_empty());
+    #[cfg(not(feature = "survival"))]
+    let any_discrete = false;
+    let any_multicmt = any_discrete
+        || population
+            .subjects
+            .iter()
+            .any(|s| s.obs_cmts.iter().any(|&c| c != 1));
 
     let mut ids = Vec::with_capacity(n_total);
     let mut times = Vec::with_capacity(n_total);
@@ -1232,7 +1242,57 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         }
     }
 
+    #[cfg(feature = "survival")]
+    append_discrete_rows(&mut cols, result);
+
     cols
+}
+
+/// Append one sdtab row per discrete (binary) observation record, after the Gaussian
+/// rows (§8.8.5).
+///
+/// Every sdtab column above is built by its own independent pass over
+/// `result.subjects × sr.ipred.len()`, and [`write_sdtab_csv`] indexes each column by
+/// row — so a pass that forgot to extend would panic at write time. Rather than edit
+/// each pass (and risk missing one as columns are added later), this extends **whatever
+/// columns exist** in one place: a column it knows how to fill for a discrete record
+/// gets the value, everything else gets NaN, which the writer already renders as an
+/// empty cell. New columns therefore stay correct-by-default (blank on discrete rows)
+/// instead of silently truncating the table.
+///
+/// `CWRES` is deliberately blank: the conditional weighted residual is defined through
+/// the Gaussian residual-variance model, and there is none for a Bernoulli outcome.
+/// `IWRES` carries the standardized (Pearson) residual instead.
+#[cfg(feature = "survival")]
+fn append_discrete_rows(cols: &mut [(String, Vec<f64>)], result: &FitResult) {
+    let n_discrete: usize = result.subjects.iter().map(|s| s.discrete_rows.len()).sum();
+    if n_discrete == 0 {
+        return;
+    }
+    for (name, values) in cols.iter_mut() {
+        for (si, sr) in result.subjects.iter().enumerate() {
+            for row in &sr.discrete_rows {
+                values.push(match name.as_str() {
+                    "ID" => sr.id.parse::<f64>().unwrap_or(si as f64 + 1.0),
+                    "TIME" => row.time,
+                    "DV" => row.dv,
+                    "CMT" => row.cmt as f64,
+                    "PRED" => row.pred,
+                    "IPRED" => row.ipred,
+                    "IWRES" => row.iwres,
+                    "EBE_OFV" => sr.ofv_contribution,
+                    // `N_OBS` deliberately blank: `SubjectResult::n_obs` counts Gaussian
+                    // observations only, so a binary-only fit would write `N_OBS = 0` on
+                    // every row of a table plainly full of observations. Blank is honest;
+                    // 0 invites a reader to filter the dataset away.
+                    "N_OBS" => f64::NAN,
+                    // CWRES, CENS, OCC, NPDE, NPD, TAFD, TAD and any [derived] /
+                    // [output] column: undefined for a discrete record → blank cell.
+                    _ => f64::NAN,
+                });
+            }
+        }
+    }
 }
 
 /// Write SDTAB as a CSV file
@@ -1241,6 +1301,43 @@ pub fn write_sdtab_csv(
     population: &Population,
     path: &str,
 ) -> Result<(), String> {
+    // A result restored from a `.fitrx` checkpoint carries no per-record discrete
+    // diagnostics — the bundle doesn't round-trip them (see `io::fitrx::parse_subjects`).
+    // Writing anyway would emit a table silently missing every discrete-endpoint row
+    // (header-only for a binary-only fit, since the columns exist but are zero-length, so
+    // the `cols.is_empty()` check below never fires). Refuse instead.
+    //
+    // The discriminator is `restored_from_checkpoint` AND "the restored model declares a
+    // binary endpoint" — NOT "the reconstructed population has discrete records". The
+    // population is not a usable signal: `load_fit` re-reads the bundled data through
+    // `read_nonmem_csv_mapped`, which uses the default (Gaussian) `ObsRouting`, so a binary
+    // DV comes back as an ordinary continuous observation and the population carries *no*
+    // `DiscreteState` records at all — keying on `obs_records` (as an earlier revision did)
+    // therefore never fired on a real restore, and its test only passed on a hand-built
+    // population that `load_fit` cannot produce. `model_text` *is* round-tripped, so parse
+    // it and ask the direct question: would a live fit of this model have produced
+    // `discrete_rows`? `binary_cmts()` is binary-only (not CTMM), so a restored CTMM fit —
+    // which legitimately produces no `discrete_rows` live or restored (occupancy is #820) —
+    // is correctly *allowed* through. #911 removes this once diagnostics round-trip.
+    #[cfg(feature = "survival")]
+    if result.restored_from_checkpoint {
+        let model_declares_binary = result
+            .model_text
+            .as_deref()
+            .and_then(|src| crate::parser::model_parser::parse_full_model(src).ok())
+            .is_some_and(|parsed| !parsed.model.binary_cmts().is_empty());
+        if model_declares_binary {
+            return Err(
+                "refusing to write sdtab: this fit was restored from a `.fitrx` checkpoint, \
+                 which does not round-trip per-record discrete-endpoint (binary / categorical) \
+                 diagnostics, and the model declares a [binary_model] endpoint — so the table \
+                 would be silently missing every discrete row. Re-run the fit to write sdtab \
+                 (#911)."
+                    .to_string(),
+            );
+        }
+    }
+
     let cols = sdtab(result, population);
     if cols.is_empty() {
         return Err("No data to write".to_string());
@@ -2124,6 +2221,7 @@ mod tests {
         let sigma_types = error_model.sigma_types();
         let n = sigma.len();
         FitResult {
+            restored_from_checkpoint: false,
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],
             method_wall_times_secs: vec![0.0],
@@ -2568,6 +2666,8 @@ mod tests {
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
+            #[cfg(feature = "survival")]
+            discrete_rows: Vec::new(),
         }
     }
 
@@ -2693,6 +2793,7 @@ mod tests {
     fn minimal_sdtab_result(subjects: Vec<SubjectResult>) -> FitResult {
         let sigma_types = ErrorModel::Proportional.sigma_types();
         FitResult {
+            restored_from_checkpoint: false,
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],
             method_wall_times_secs: vec![0.0],
@@ -3057,6 +3158,8 @@ mod tests {
             extra_columns: Vec::new(),
             per_obs_tad: Vec::new(),
             compartment_states: Vec::new(),
+            #[cfg(feature = "survival")]
+            discrete_rows: Vec::new(),
         };
         let result = minimal_sdtab_result(vec![sr]);
         let population = Population {

@@ -1880,6 +1880,7 @@ fn fit_inner(
     };
 
     let mut fit_result = FitResult {
+        restored_from_checkpoint: false,
         method: final_method,
         method_chain: chain.clone(),
         method_wall_times_secs,

@@ -667,6 +667,23 @@ fn emit_subject_rows<R: rand::Rng>(
         results,
         warnings,
     );
+
+    // Binary / discrete-endpoint simulation path (#760 Slice 1b). Like the TTE path
+    // above, these rows live in `obs_records` and are invisible to the Gaussian
+    // emitter, so they need their own producer — without it a binary endpoint
+    // contributed zero rows to `simulate()` and raised no error.
+    #[cfg(feature = "survival")]
+    crate::categorical::simulate_binary(
+        model,
+        subject,
+        &params.theta,
+        eta_slice,
+        draw,
+        sim,
+        rng,
+        results,
+        warnings,
+    );
 }
 
 /// Draw the correlated residual vector for one subject's Gaussian observation

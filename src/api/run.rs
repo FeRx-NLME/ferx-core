@@ -289,6 +289,12 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     }
     let model_has_continuous = !parsed.model.default_params.sigma.values.is_empty();
     let model_has_tte = parsed.model.has_tte();
+    // Binary endpoints observe on the **fixed grid** (§8.8.2), so — like a continuous
+    // endpoint and unlike TTE — they need `times`, not a `horizon` (#760 Slice 1b).
+    #[cfg(feature = "survival")]
+    let binary_cmts: Vec<usize> = parsed.model.binary_cmts();
+    #[cfg(not(feature = "survival"))]
+    let binary_cmts: Vec<usize> = Vec::new();
     if sim_spec.obs_times.is_empty() {
         if model_has_continuous {
             return Err(
@@ -296,6 +302,15 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                  (residual-error) endpoint that needs observation times — add \
                  `times = [...]` (a joint PK + TTE design needs both `times` and a \
                  `horizon`)"
+                    .to_string(),
+            );
+        }
+        if !binary_cmts.is_empty() {
+            return Err(
+                "[simulation] has no `times`, but the model has a [binary_model] endpoint. \
+                 A binary outcome is observed on a fixed schedule, not located in time like \
+                 a TTE event, so it needs `times = [...]` (a `horizon` alone gives it nothing \
+                 to observe)"
                     .to_string(),
             );
         }
@@ -308,6 +323,18 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         }
     }
 
+    // The Gaussian observation grid exists only for a model that actually has a
+    // continuous endpoint. A binary-only (or TTE + binary) design also needs `times` —
+    // discrete outcomes are observed on the fixed grid — but materialising the grid as
+    // `observations`/`obs_cmts` would fabricate |times| phantom Gaussian rows on CMT 1,
+    // which `check_per_cmt_error_model` then rejects ("[error_model] has no entry for
+    // observed compartment(s) 1"). The binary rows live in `obs_records` instead, so a
+    // model with no residual error contributes an empty Gaussian grid.
+    let n_gauss = if model_has_continuous {
+        sim_spec.obs_times.len()
+    } else {
+        0
+    };
     // Build template population
     let subjects: Vec<Subject> = (1..=sim_spec.n_subjects)
         .map(|i| Subject {
@@ -320,17 +347,21 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                 false,
                 0.0,
             )],
-            obs_times: sim_spec.obs_times.clone(),
+            obs_times: if model_has_continuous {
+                sim_spec.obs_times.clone()
+            } else {
+                Vec::new()
+            },
             obs_raw_times: Vec::new(),
-            observations: vec![0.0; sim_spec.obs_times.len()],
-            obs_cmts: vec![1; sim_spec.obs_times.len()],
+            observations: vec![0.0; n_gauss],
+            obs_cmts: vec![1; n_gauss],
             covariates: HashMap::new(),
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
-            cens: vec![0; sim_spec.obs_times.len()],
+            cens: vec![0; n_gauss],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
@@ -351,6 +382,24 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                     entry_time: 0.0,
                     cmt,
                 })
+                // Binary template rows: one placeholder per (binary CMT × observation
+                // time), since a binary endpoint observes on the fixed grid. `state = 0`
+                // is a placeholder overwritten by the draw in the write-back below —
+                // the same template-then-realise shape the TTE rows above use (#522).
+                // Without these the sampler has no records to walk and `--simulate`
+                // emits zero binary rows (#760 Slice 1b).
+                .chain(binary_cmts.iter().flat_map(|&cmt| {
+                    sim_spec.obs_times.iter().map(move |&time| {
+                        crate::types::ObsRecord::DiscreteState {
+                            time,
+                            // Synthetic `[simulation]` subjects carry no resets, so the
+                            // internal and user clocks coincide.
+                            raw_time: time,
+                            state: 0,
+                            cmt,
+                        }
+                    })
+                }))
                 .collect(),
             // `obs_records` is unconditional since Phase 4.0, but the only records
             // this synthetic TTE subject carries are `Event`s (survival-gated); with
@@ -403,10 +452,15 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     }
 
     let mut population = template;
+    // A subject that produced *zero* simulated rows (a binary-only design whose
+    // linear predictor is NaN for every record — see the binary write-back below)
+    // still owns template `DiscreteState` placeholders that must be cleaned up, so
+    // the per-subject body has to run even with no draws. Binding to an empty slice
+    // (rather than `continue`-ing) lets the placeholder-dropping pass reach it; the
+    // Gaussian and TTE write-backs are self-guarding no-ops on an empty `sims`.
+    let no_sims: Vec<&SimulationResult> = Vec::new();
     for subject in &mut population.subjects {
-        let Some(sims) = sims_by_id.get(subject.id.as_str()) else {
-            continue;
-        };
+        let sims = sims_by_id.get(subject.id.as_str()).unwrap_or(&no_sims);
 
         // Gaussian write-back: only continuous outcomes map onto `observations`.
         // A TTE `Event` row would trip `continuous_value()`'s debug-assert, so
@@ -461,7 +515,94 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                 })
                 .collect();
             if !events.is_empty() {
-                subject.obs_records = events;
+                // Replace only the TTE rows. An earlier version assigned `events`
+                // wholesale, which silently destroyed the binary `DiscreteState`
+                // templates created above — so a joint TTE + binary `--simulate`
+                // emitted zero binary rows, reintroducing the very bug the binary
+                // producer exists to fix.
+                subject
+                    .obs_records
+                    .retain(|r| !matches!(r, crate::types::ObsRecord::Event { .. }));
+                subject.obs_records.splice(0..0, events);
+            }
+        }
+
+        // Binary write-back (#760 Slice 1b): stamp each simulated 0/1 outcome onto its
+        // template `DiscreteState` row, so the fitted dataset carries the drawn states
+        // rather than the all-zero placeholders. Unlike the TTE arm above this is an
+        // **in-place merge**, not a wholesale replace, so it composes with whatever
+        // records already exist instead of dropping them.
+        //
+        // Rows are paired per CMT in emission order: `simulate_binary` walks
+        // `obs_records` in order and pushes one row per record, and `sims` preserves
+        // that order, so the k-th `Category` row on a CMT is the k-th `DiscreteState`
+        // row on that CMT. A short `sims` list (records skipped for a NaN predictor —
+        // warned about at draw time) leaves the remaining templates untouched rather
+        // than shifting every later row onto the wrong record.
+        #[cfg(feature = "survival")]
+        {
+            // Pair each simulated draw with its template by identity `(cmt, raw_time)`,
+            // holding a queue per key so that duplicated `[simulation] times` (the parser
+            // permits `times = [0.5, 0.5, 2]`) each receive their own draw instead of
+            // collapsing onto one. A per-CMT queue alone would misalign after a skipped
+            // record; a bare map would drop a duplicate's draw. This does both.
+            //
+            // A template that receives **no** draw is removed, not left at its
+            // placeholder. `simulate_binary` skips a record whose predictor is NaN
+            // (warning at draw time), and a placeholder `state = 0` left behind would
+            // pass `validate_binary_states` and then be scored by the Bernoulli
+            // likelihood as a genuine observed failure — fabricated data, which is worse
+            // than the misalignment this replaced.
+            let mut drawn: HashMap<(usize, u64), std::collections::VecDeque<usize>> =
+                HashMap::new();
+            for s in sims {
+                if let crate::types::SimOutcome::Category { state } = s.outcome {
+                    drawn
+                        .entry((s.cmt, s.time.to_bits()))
+                        .or_default()
+                        .push_back(state);
+                }
+            }
+            // Runs unconditionally — and now genuinely so. Two gates once suppressed it:
+            // an inner `!drawn.is_empty()` (a partially-NaN subject kept its placeholders)
+            // and the outer per-subject `continue` on a `sims_by_id` miss (a *fully*
+            // NaN-skipped binary-only subject produces zero rows, so `sims_by_id.get`
+            // returned `None` and every placeholder reached `fit()` as a fabricated
+            // observed 0). The loop now binds an empty `sims` instead of `continue`-ing,
+            // so this drop reaches the all-NaN subject too.
+            {
+                subject.obs_records.retain_mut(|rec| {
+                    let crate::types::ObsRecord::DiscreteState {
+                        state,
+                        cmt,
+                        raw_time,
+                        ..
+                    } = rec
+                    else {
+                        return true; // not a discrete row — untouched
+                    };
+                    // Only this endpoint family's rows are ours to stamp or drop. A CTMM
+                    // `DiscreteState` row is also a discrete row, and matching it here
+                    // would silently delete it once CTMM simulation lands (#820) —
+                    // unreachable today only because CTMM `--simulate` is rejected
+                    // upstream, which is exactly the kind of latent data loss this PR
+                    // exists to remove.
+                    if !binary_cmts.contains(cmt) {
+                        return true;
+                    }
+                    match drawn
+                        .get_mut(&(*cmt, raw_time.to_bits()))
+                        .and_then(|q| q.pop_front())
+                    {
+                        Some(next) => {
+                            *state = next;
+                            true
+                        }
+                        // No draw for this record (NaN predictor): drop it rather than
+                        // fit its placeholder as an observed 0.
+                        None => false,
+                    }
+                });
             }
         }
     }
@@ -645,7 +786,11 @@ pub fn read_population_for(
     // set covers binary/categorical (#760) and CTMM (#759) endpoints, which share the
     // discrete-state plumbing.
     #[cfg(feature = "survival")]
-    let binary_cmts: std::collections::HashSet<usize> = {
+    // Binary **∪ CTMM** — every CMT whose integer DV routes to `ObsRecord::DiscreteState`.
+    // Deliberately not named `binary_cmts`: this function used to share that name with the
+    // binary-only `Vec` above, and the two are equal today only because CTMM `--simulate`
+    // is rejected upstream. When CTMM simulation lands (#820) they diverge.
+    let discrete_cmts: std::collections::HashSet<usize> = {
         let mut discrete: std::collections::HashSet<usize> =
             model.binary_cmts().into_iter().collect();
         #[cfg(feature = "markov")]
@@ -653,9 +798,9 @@ pub fn read_population_for(
         discrete
     };
     #[cfg(not(feature = "survival"))]
-    let binary_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let discrete_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    if tte_cmts.is_empty() && binary_cmts.is_empty() {
+    if tte_cmts.is_empty() && discrete_cmts.is_empty() {
         // Gaussian-only model: use the existing (faster) path without TTE overhead.
         match (covariate_decls, filter) {
             (Some(decls), Some(sel)) => {
@@ -713,7 +858,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
-                    &binary_cmts,
+                    &discrete_cmts,
                     column_map,
                 )?;
                 Ok((pop, Some(table)))
@@ -725,7 +870,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
-                    &binary_cmts,
+                    &discrete_cmts,
                     column_map,
                 )?;
                 Ok((pop, None))

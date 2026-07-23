@@ -28,6 +28,7 @@ mod ctmm_inner {
                 .iter()
                 .map(|&(time, state)| ObsRecord::DiscreteState {
                     time,
+                    raw_time: time,
                     state,
                     cmt: 5,
                 })

@@ -945,7 +945,9 @@ fn discrete_state_cmt_routes_integer_dv_into_obs_records() {
         .obs_records
         .iter()
         .map(|r| match r {
-            ObsRecord::DiscreteState { time, state, cmt } => {
+            ObsRecord::DiscreteState {
+                time, state, cmt, ..
+            } => {
                 assert_eq!(*cmt, 3);
                 (*time, *state)
             }
@@ -972,7 +974,9 @@ fn count_cmt_routes_nonneg_integer_dv_into_obs_records() {
         .obs_records
         .iter()
         .map(|r| match r {
-            ObsRecord::Count { time, count, cmt } => {
+            ObsRecord::Count {
+                time, count, cmt, ..
+            } => {
                 assert_eq!(*cmt, 4);
                 (*time, *count)
             }

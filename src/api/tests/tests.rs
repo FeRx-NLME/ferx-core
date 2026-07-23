@@ -390,6 +390,8 @@ fn make_subject(eta: Vec<f64>, iwres: Vec<f64>) -> SubjectResult {
         extra_columns: vec![],
         per_obs_tad: vec![],
         compartment_states: vec![],
+        #[cfg(feature = "survival")]
+        discrete_rows: Vec::new(),
     }
 }
 
