@@ -5888,7 +5888,16 @@ fn explicit_ss_run_in(
 ) -> (Vec<f64>, usize) {
     let prepared = prepare_input_rates(ode, pk);
     let doses: Vec<DoseEvent> = (0..max_cycles)
-        .map(|m| DoseEvent::new(m as f64 * dose.ii, dose.amt, dose.cmt, 0.0, false, 0.0))
+        .map(|m| {
+            DoseEvent::new(
+                m as f64 * dose.ii,
+                dose.amt,
+                dose.cmt_raw(),
+                0.0,
+                false,
+                0.0,
+            )
+        })
         .collect();
     let fbios = vec![1.0; max_cycles];
     let no_lag: [f64; 0] = [];

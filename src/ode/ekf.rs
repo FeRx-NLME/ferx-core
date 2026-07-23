@@ -199,7 +199,7 @@ pub fn solve_ekf(
     // back to the bare `F` slot. (The EKF path does not apply lagtime.)
     let dose_f_bio: Vec<f64> = doses
         .iter()
-        .map(|d| dose_attr_map.f_bio(d.cmt, pk_params_flat))
+        .map(|d| dose_attr_map.f_bio(d.cmt_raw(), pk_params_flat))
         .collect();
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -212,7 +212,7 @@ pub fn solve_ekf(
         // Apply bolus doses at t_start (infusions enter via the wrapped RHS).
         for (di, dose) in doses.iter().enumerate() {
             if (dose.time - t_start).abs() < 1e-12 && !is_real_infusion(dose) {
-                let cmt_idx = dose.cmt.saturating_sub(1);
+                let cmt_idx = dose.cmt_idx();
                 if cmt_idx < n {
                     u[cmt_idx] += dose_f_bio[di] * dose.amt;
                 }

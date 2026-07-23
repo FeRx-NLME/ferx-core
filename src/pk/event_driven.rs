@@ -361,7 +361,7 @@ fn equilibrate_ss_state_event_driven(
     // single-dose curve while superposition returned the correct
     // `(D/V)·e^{-kt}/(1−e^{-k·II})` (#375). Fall through so the default
     // compartment equilibrates like any other.
-    let cmt_idx = dose.cmt.saturating_sub(1);
+    let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n_states {
         return state;
     }
@@ -378,12 +378,7 @@ fn equilibrate_ss_state_event_driven(
     // bioavailability-reshaped `(rate, duration)` it already carries survive -
     // `::new` would recompute `duration = amt/rate` and drop `F` (#419).
     let synthetic_dose = if is_inf {
-        vec![DoseEvent {
-            time: 0.0,
-            ss: false,
-            ii: 0.0,
-            ..dose.clone()
-        }]
+        vec![dose.synthetic_cycle_dose()]
     } else {
         Vec::new()
     };
@@ -496,7 +491,7 @@ fn ss_state_at_phase_event_driven(
         return state;
     }
     let (n_states, _) = state_layout(pk_model);
-    let cmt_idx = dose.cmt.saturating_sub(1);
+    let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n_states {
         return state;
     }
@@ -507,12 +502,7 @@ fn ss_state_at_phase_event_driven(
         let t_inf = dose.duration;
         // Clone so the `F`-reshaped `(rate, duration)` survive (see
         // `equilibrate_ss_state_event_driven`; #419).
-        let synthetic_dose = vec![DoseEvent {
-            time: 0.0,
-            ss: false,
-            ii: 0.0,
-            ..dose.clone()
-        }];
+        let synthetic_dose = vec![dose.synthetic_cycle_dose()];
         let synthetic_lagtimes = vec![0.0];
         let bounds: Vec<f64> = if phase > t_inf {
             vec![0.0, t_inf, phase]
@@ -782,7 +772,7 @@ fn event_driven_predictions_with_schedule_impl(
                     // astra-testdata-simulator benchmark hits this: DAY/STIME
                     // make every subject look "TV", and predictions for
                     // high-dose subjects came out F× too small.
-                    let cmt_idx = d.cmt.saturating_sub(1);
+                    let cmt_idx = d.cmt_idx();
                     if cmt_idx < n_states {
                         state[cmt_idx] += pk_now.bioavailable_amount(d.amt);
                     } else {
@@ -796,7 +786,8 @@ fn event_driven_predictions_with_schedule_impl(
                             "event-driven PK: dose into compartment {} but model has \
                              {} states (cmt is 1-based) — should have been rejected by \
                              `check_dose_compartments`",
-                            d.cmt, n_states
+                            d.cmt_raw(),
+                            n_states
                         );
                     }
                 }
@@ -940,7 +931,7 @@ fn propagate_with_bounds(
             }
             if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
                 let r = d.rate;
-                match pk_model.topology().dose_channel(d.cmt) {
+                match pk_model.topology().dose_channel(d.cmt_raw()) {
                     Some(Channel::Central) => rate_central += r,
                     Some(Channel::Periph1) => rate_periph1 += r,
                     Some(Channel::Periph2) => rate_periph2 += r,
@@ -956,7 +947,8 @@ fn propagate_with_bounds(
                          for model {:?}. Supported: central for all models; depot (cmt 1) \
                          and peripheral(s) for oral models; periph1/2 for 2- and 3-cpt IV \
                          models — should have been rejected by `check_dose_compartments`.",
-                        d.cmt, pk_model
+                        d.cmt_raw(),
+                        pk_model
                     ),
                 }
             }

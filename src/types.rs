@@ -91,7 +91,14 @@ pub(crate) fn clamp_above_floor(x: f64, floor: f64) -> f64 {
 pub struct DoseEvent {
     pub time: f64,
     pub amt: f64,
-    pub cmt: usize,
+    /// 1-based target compartment as authored (`CMT`), with `CMT=0` meaning
+    /// NONMEM's *default dose compartment* (compartment 1). **Private on purpose**
+    /// (#912): read it through [`Self::cmt_idx`] (0-based state index),
+    /// [`Self::cmt_1based`] (1-based compartment, `0`→`1`), or [`Self::cmt_raw`]
+    /// (the literal authored value). Keeping the field private is what makes the
+    /// recurring `cmt - 1` underflow bug (#899) unrepresentable at the call site —
+    /// a bare `- 1` cannot be written against it.
+    cmt: usize,
     pub rate: f64,
     pub duration: f64,
     pub ss: bool,
@@ -259,6 +266,18 @@ impl DoseEvent {
         self.cmt.max(1)
     }
 
+    /// The literal authored `CMT`, `0` included — the escape hatch for the few
+    /// sites that need the raw value rather than a resolved index: detecting a
+    /// `CMT=0` dose (`d.cmt_raw() == 0`), echoing it in a diagnostic, or passing
+    /// it to a callee that performs its own `0`→`1` mapping (e.g.
+    /// [`DoseAttrMap::indexed_slot`], which does `cmt.max(1)` internally). Prefer
+    /// [`Self::cmt_idx`] or [`Self::cmt_1based`]; reach for this only when the
+    /// *unresolved* value is what you actually mean.
+    #[inline]
+    pub fn cmt_raw(&self) -> usize {
+        self.cmt
+    }
+
     /// True when this dose's `rate`/`duration` are concrete (data-driven), i.e.
     /// [`RateMode::Fixed`] — either an ordinary dose or one already passed through
     /// [`Self::resolve_rate`]. False for a still-modeled NONMEM coded `RATE`.
@@ -307,6 +326,23 @@ impl DoseEvent {
         DoseEvent {
             rate,
             duration,
+            ..self.clone()
+        }
+    }
+
+    /// A clone of this dose repositioned to the origin of a single steady-state
+    /// cycle: `time = 0`, with `ss`/`ii` cleared so the event-driven equilibration
+    /// walk replays it as an ordinary within-cycle dose. Preserves the
+    /// bioavailability-reshaped `(rate, duration)` this dose already carries —
+    /// unlike [`Self::new`], which would recompute `duration = amt/rate` and drop
+    /// `F` (#419). Lives here because it constructs a `DoseEvent` by functional
+    /// update, which the now-private `cmt` field forbids outside this
+    /// module (#912).
+    pub(crate) fn synthetic_cycle_dose(&self) -> DoseEvent {
+        DoseEvent {
+            time: 0.0,
+            ss: false,
+            ii: 0.0,
             ..self.clone()
         }
     }

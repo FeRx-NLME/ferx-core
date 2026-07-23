@@ -89,7 +89,11 @@ fn generate_iiv_on_ruv_anchor() {
             let _ = writeln!(
                 csv,
                 "{},{},.,1,{},{},{},1",
-                subj.id, d.time, d.amt, d.cmt, d.rate as i64
+                subj.id,
+                d.time,
+                d.amt,
+                d.cmt_raw(),
+                d.rate as i64
             );
         }
         for (&t, &dv) in subj.obs_times.iter().zip(subj.observations.iter()) {
