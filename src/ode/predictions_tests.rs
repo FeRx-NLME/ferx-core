@@ -5288,6 +5288,40 @@ fn ode_ss_infusion_matches_analytical_ss() {
     }
 }
 
+/// #914 regression, **infusion** side: the exact solve on a SLOW disposition. At `ke·II ≈ 0.03`
+/// the old 50-cycle pulse train truncated the SS trough ~22% low (`exp(−50·ke·II) ≈ 0.22`); the
+/// exact `(I − M)⁻¹·b` fixed point matches the analytical infusion SS closed form. The fast
+/// `ode_ss_infusion_matches_analytical_ss` above sits at `ke·II = 1.5`, where a 50-cycle residual
+/// is `exp(−75) ≈ 1e-33` — it passes on *both* old and new code and so cannot detect an
+/// infusion truncation-tail bug. This is the infusion analogue of the slow-bolus case in
+/// `ss_linear_disposition_uses_exact_fixed_point`, and it fails against the pre-#914 truncated
+/// train (the only PR-level truncation-sensitive infusion oracle — the `tests/` twin runs nightly).
+#[test]
+fn ode_ss_slow_infusion_matches_analytical_ss() {
+    use crate::pk::one_cpt_infusion_ss;
+    let cl = 0.1_f64;
+    let v = 80.0_f64; // ke = CL/V = 1.25e-3, ke·II = 0.03 → the pre-#914 train was ~22% low
+    let amt = 1000.0_f64;
+    let rate = 100.0_f64; // T_inf = 10 h < II
+    let ii = 24.0_f64;
+    // During-infusion, at the window end, post-infusion within the interval, and beyond it.
+    let obs_times = vec![2.0, 10.0, 12.0, 20.0, 30.0, 48.0];
+    let dose = DoseEvent::new(0.0, amt, 1, rate, true, ii);
+    let subj = make_subject(vec![dose.clone()], obs_times.clone());
+    let pk = pk_one(cl, v);
+    let mut ode = one_cpt_ode_spec();
+    // Tight solver tol so the forward walk tracks the exact analytical SS (the equilibration
+    // itself already runs at ss_equilibration_opts); the 22% truncation gap dwarfs this regardless.
+    ode.solver_opts.reltol = 1e-11;
+    ode.solver_opts.abstol = 1e-13;
+
+    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+    for (j, &t) in obs_times.iter().enumerate() {
+        let expected = one_cpt_infusion_ss(&dose, t, cl, v);
+        assert_relative_eq!(preds[j] / v, expected, epsilon = 1e-7, max_relative = 1e-6);
+    }
+}
+
 #[test]
 fn ode_ss_resets_prior_state() {
     // SS=1 semantics: at the SS dose time, prior compartment state is

@@ -3652,7 +3652,7 @@ fn ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget() {
         "forced-full must run the whole budget"
     );
     assert!(
-        (1..full_cycles).contains(&early_cycles),
+        (2..full_cycles).contains(&early_cycles),
         "the nonlinear fallback's early stop should run >1 and fewer cycles ({early_cycles}) than \
          the full budget ({full_cycles})"
     );
