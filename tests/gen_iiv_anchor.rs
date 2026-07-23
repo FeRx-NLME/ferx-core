@@ -92,7 +92,10 @@ fn generate_iiv_on_ruv_anchor() {
                 subj.id,
                 d.time,
                 d.amt,
-                d.cmt_raw(),
+                // 1-based target compartment for the NONMEM CSV (resolves a
+                // `CMT=0` default-dose sentinel to compartment 1, which is what
+                // NONMEM does with DEFDOSE anyway). `cmt_raw()` is crate-internal.
+                d.cmt_1based(),
                 d.rate as i64
             );
         }

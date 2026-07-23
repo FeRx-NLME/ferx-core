@@ -1369,6 +1369,17 @@ fn synthetic_cycle_dose_preserves_shape_and_clears_steady_state() {
     assert_eq!(cyc.rate, dose.rate);
     assert_eq!(cyc.duration, dose.duration);
     assert_eq!(cyc.is_infusion(), dose.is_infusion());
+    assert_eq!(cyc.rate_mode, dose.rate_mode);
+    assert_eq!(cyc.infusion_def, dose.infusion_def);
+
+    // `rate_mode` / `infusion_def` are carried through directly, not inferred from
+    // `is_infusion()` — assert on a *modeled* dose so the check is non-vacuous (the
+    // reshaped `Fixed` case above would pass even if they were hard-coded to
+    // `Fixed`/`RateDefined`, which is exactly what `DoseEvent::new` would do).
+    let modeled = DoseEvent::modeled(5.0, 100.0, 2, true, 12.0, RateMode::ModeledDuration);
+    let mcyc = modeled.synthetic_cycle_dose();
+    assert_eq!(mcyc.rate_mode, RateMode::ModeledDuration);
+    assert_eq!(mcyc.infusion_def, modeled.infusion_def);
 }
 
 #[test]

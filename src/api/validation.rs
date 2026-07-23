@@ -406,6 +406,15 @@ pub(crate) fn check_absorption_dosing(
     // (`check_absorption_closed_form_support`, which rejects `dose.ss && dose.is_infusion()` with no
     // `II` condition), so the same subject errors on both paths instead of one erroring and the
     // other silently mis-serving.
+    // `cmt_raw()` here (not `cmt_1based()` like the SS-*bolus* gates above) is the one
+    // raw-vs-1based choice in this file where it could matter — a `CMT=0` misses these
+    // 1-based `f.cmt + 1` sets. It is safe: both checks are `is_infusion()`-gated, and a
+    // meaningful (`AMT>0`) `CMT=0` infusion is already a hard error from
+    // `check_dose_compartments` (`E_DOSE_CMT_NOT_INFUSABLE` — `CMT=0` is a default *bolus*
+    // compartment, undefined for a zero-order input), so it never reaches a fit regardless
+    // of whether this gate also flags it; an `AMT=0` `CMT=0` infusion is inert. So
+    // `contains(&d.cmt_raw())` cannot miss a reachable case. (Behaviour-preserving: this
+    // was the pre-#912 raw `d.cmt`.)
     let has_ss_infusion = population.subjects.iter().any(|s| {
         s.doses
             .iter()

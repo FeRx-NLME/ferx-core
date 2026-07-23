@@ -273,8 +273,13 @@ impl DoseEvent {
     /// [`DoseAttrMap::indexed_slot`], which does `cmt.max(1)` internally). Prefer
     /// [`Self::cmt_idx`] or [`Self::cmt_1based`]; reach for this only when the
     /// *unresolved* value is what you actually mean.
+    ///
+    /// `pub(crate)` on purpose (#912 review): the raw value is the one that can be
+    /// mis-decremented (`cmt_raw() - 1` re-opens the underflow the private field
+    /// closes), so it is kept off the public surface where adversarial review does
+    /// not reach. The public read API is the two *resolved* accessors above.
     #[inline]
-    pub fn cmt_raw(&self) -> usize {
+    pub(crate) fn cmt_raw(&self) -> usize {
         self.cmt
     }
 
