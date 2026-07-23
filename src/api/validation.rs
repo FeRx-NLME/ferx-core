@@ -406,9 +406,11 @@ pub(crate) fn check_absorption_dosing(
     // (`check_absorption_closed_form_support`, which rejects `dose.ss && dose.is_infusion()` with no
     // `II` condition), so the same subject errors on both paths instead of one erroring and the
     // other silently mis-serving.
-    // `cmt_raw()` here (not `cmt_1based()` like the SS-*bolus* gates above) is the one
-    // raw-vs-1based choice in this file where it could matter — a `CMT=0` misses these
-    // 1-based `f.cmt + 1` sets. It is safe: both checks are `is_infusion()`-gated, and a
+    // `cmt_raw()` here (not `cmt_1based()` like the SS-*bolus* gates above): a `CMT=0`
+    // would miss these 1-based `f.cmt + 1` sets, so unlike most raw reads the accessor
+    // choice is load-bearing (the only other place it bites is `has_lagtime_on_cmt` below,
+    // where it is immaterial — that path is analytical-only and the indexed-lag branch is
+    // dead behind `ode_spec.is_some()`). It is safe: both checks are `is_infusion()`-gated, and a
     // meaningful (`AMT>0`) `CMT=0` infusion is already a hard error from
     // `check_dose_compartments` (`E_DOSE_CMT_NOT_INFUSABLE` — `CMT=0` is a default *bolus*
     // compartment, undefined for a zero-order input), so it never reaches a fit regardless
