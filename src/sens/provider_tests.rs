@@ -1678,6 +1678,101 @@ fn provider_iv_with_bioavailability_matches_production() {
     );
 }
 
+/// **#920 (surfaced in the #919 review): the steady-state sibling of the decline above.**
+///
+/// `equilibrate_ss_g` (the analytic SS trough on the event-driven sens walk) builds its
+/// synthetic per-cycle infusion with `DoseEvent::new(.., rate, ..)`, whose `duration =
+/// amt/rate` does **not** carry the #419 bioavailability-reshaped window `F·amt/rate` that
+/// the value walk's `synthetic_cycle_dose` preserves. That asymmetry is harmless only if a
+/// rate-defined infusion under `F ≠ 1` never reaches the analytic walk — and it does not:
+/// the same `has_bioavailability() && has_rate_defined_infusion()` gate that routes the
+/// non-SS case above to FD does not special-case SS, so the SS variant declines too.
+///
+/// This pins that. The model is TVCOV, so an SS dose otherwise routes to the event-driven
+/// walk where `equilibrate_ss_g` lives (the sibling `ss_ill_conditioned_gradient_matches_fd`
+/// exercises exactly that path with an SS bolus): the SS **bolus** here stays analytic,
+/// while the SS **rate-defined infusion** under `F` declines to FD on both providers. So
+/// `equilibrate_ss_g` never sees a non-bioavailable window, and its `DoseEvent::new` is safe.
+#[test]
+fn ss_rate_defined_infusion_under_f_declines_to_fd() {
+    const ONECPT_IV_TVCOV_SS_F: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVF(0.7, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  F  = TVF
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let m = parse_model_string(ONECPT_IV_TVCOV_SS_F).expect("parse");
+    assert!(
+        m.has_bioavailability(),
+        "model must declare F for the gate to apply"
+    );
+    let theta = vec![0.2, 10.0, 0.75, 0.7];
+    let eta = vec![0.1, -0.05];
+    let obs_times = [1.0, 3.0, 6.0, 11.0];
+    let obs_wts = [70.0, 80.0, 90.0, 100.0];
+    let mk = |doses: Vec<DoseEvent>| {
+        tvcov_subject(
+            doses,
+            &[85.0],
+            &obs_times,
+            &obs_wts,
+            Vec::new(),
+            Vec::new(),
+            &[],
+        )
+    };
+
+    // Control: an SS *bolus* on this TVCOV model stays analytic — it reaches the
+    // event-driven walk (`equilibrate_ss_g`), so the decline below is a property of the
+    // rate-defined infusion, not of the model failing to be analytic at all.
+    let ss_bolus = mk(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)]);
+    assert!(ss_bolus.doses[0].ss && !ss_bolus.has_rate_defined_infusion());
+    assert!(
+        subject_sensitivities(&m, &ss_bolus, &theta, &eta).is_some(),
+        "SS bolus under TVCOV+F must stay analytic (reaches equilibrate_ss_g)"
+    );
+
+    // #920: the SS rate-defined infusion under `F` declines to FD on both providers, so
+    // `equilibrate_ss_g` never runs with a non-bioavailable window.
+    let ss_infusion = mk(vec![DoseEvent::new(0.0, 100.0, 1, 25.0, true, 12.0)]);
+    assert!(ss_infusion.doses[0].ss && ss_infusion.has_rate_defined_infusion());
+    assert!(
+        subject_sensitivities(&m, &ss_infusion, &theta, &eta).is_none(),
+        "SS rate-defined infusion under F must decline to FD (#920), full provider"
+    );
+    assert!(
+        subject_eta_grad(&m, &ss_infusion, &theta, &eta).is_none(),
+        "SS rate-defined infusion under F must decline to FD (#920), light provider"
+    );
+
+    // Discriminator: the *same* SS rate-defined infusion on the F-free twin model stays
+    // analytic — so `equilibrate_ss_g` genuinely *does* serve SS rate-defined infusions
+    // (with `duration = amt/rate`, which is correct when `F = 1`), and the decline above
+    // is attributable to `F`, not to SS-infusion support being absent. This is what makes
+    // the `is_none()` assertions non-vacuous.
+    let m_no_f = parse_model_string(ONECPT_IV_TVCOV_SS).expect("parse no-F twin");
+    assert!(!m_no_f.has_bioavailability());
+    let ss_infusion_no_f = mk(vec![DoseEvent::new(0.0, 100.0, 1, 25.0, true, 12.0)]);
+    assert!(
+        subject_sensitivities(&m_no_f, &ss_infusion_no_f, &[0.2, 10.0, 0.75], &eta).is_some(),
+        "without F, the SS rate-defined infusion stays analytic (reaches equilibrate_ss_g)"
+    );
+}
+
 /// Regression: a modeled-duration dose (`RATE=-2` → `D{cmt}`) is read with
 /// unresolved `rate`/`duration` by the provider, so the analytic path must
 /// decline (→ FD) rather than optimize a bolus/zero-input surrogate.
