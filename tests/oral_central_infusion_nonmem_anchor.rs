@@ -142,9 +142,16 @@ fn preds_of(model: &CompiledModel, csv: &str) -> Vec<f64> {
 const OBS_T: [f64; 5] = [1.0, 3.0, 6.0, 10.0, 16.0];
 
 /// 1-cpt and 2-cpt closed forms both come from a 2×2-or-smaller system (no cubic
-/// root-finder to disagree on), so this is the same strict bound the sibling
-/// `nonmem_dose_compartment_anchor.rs` uses for its 1/2-cpt cases.
-const NONMEM_TOL: f64 = 1e-9;
+/// root-finder to disagree on), so ferx and NONMEM agree essentially exactly:
+/// the **measured** max relative gap across all four cases is ~2e-11 (1.98e-11
+/// on `ADVAN4`, at the last printed digit of the 11-significant-figure `$TABLE`
+/// reference). This bound is set just above that measured floor — tighter than
+/// the sibling `nonmem_dose_compartment_anchor.rs`'s 1e-9 because that file's
+/// 3-cpt cases carry a cubic root-finder these do not — so a real regression
+/// (which would move a digit far above 2e-11) cannot hide in slack, while the
+/// ~5× headroom keeps the reference's last-digit rounding from flaking. Probing
+/// at 1e-11 fails (the floor); 1e-10 passes all five.
+const NONMEM_TOL: f64 = 1e-10;
 
 fn assert_close(got: &[f64], nonmem: &[f64], tol: f64, case: &str) {
     assert_eq!(got.len(), nonmem.len(), "{case}: row count");
@@ -288,11 +295,14 @@ fn one_cpt_central_infusion_matches_closed_form_and_nonmem() {
             .map(|&t| iv_infusion_f_closed_form(t, 5.0, 50.0, 100.0, 25.0, tvf))
             .collect();
         // The committed NONMEM PRED reproduces the closed form (documents the
-        // depot-bypass reduction independently of NONMEM's solver).
+        // depot-bypass reduction independently of NONMEM's solver). The measured
+        // gap is ~1.6e-11 — both sides are pure 1-cpt closed forms with no
+        // root-finder — so this bound is the reference's last-printed-digit
+        // resolution, not slack that could hide a real divergence.
         assert_close(
             nonmem,
             &oracle,
-            1e-8,
+            NONMEM_TOL,
             &format!("NONMEM vs closed form F={tvf}"),
         );
         // ferx reproduces it too, on both analytical paths.
