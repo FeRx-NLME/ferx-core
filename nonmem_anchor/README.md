@@ -15,6 +15,7 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | **Steady-state absorption** | `SS=1` into `first_order(ka)` — [#719](https://github.com/FeRx-NLME/ferx-core/issues/719) gap 1 (`ADVAN2` exact analytic SS; `KA` slow so the absorption tail spans `II`) | `ss_first_order.ctl` | *(in `tests/ss_absorption_nonmem_anchor.rs`)* |
 | **Infusion into absorption** | `RATE>0` into `first_order(ka)` — [#719](https://github.com/FeRx-NLME/ferx-core/issues/719) gap 2 (`ADVAN2` native zero-order-into-depot = the kernel convolution `R_in_inf`) | `inf_first_order.ctl` | *(in `tests/infusion_absorption_nonmem_anchor.rs`)* |
 | **Dose compartment** | any `CMT` on the six analytical disposition models — [#375](https://github.com/FeRx-NLME/ferx-core/issues/375) (`ADVAN1/2/3/4/11/12`, `MAXEVAL=0`, `$TABLE FORMAT=,1PE17.10`) | `dose_cmt_*.ctl` (13) | *(in `tests/nonmem_dose_compartment_anchor.rs`)* |
+| **Oral central infusion** | `RATE>0` into an oral model's central `CMT=2` (depot bypass) at `F=1` and `F2=0.6` — [#376](https://github.com/FeRx-NLME/ferx-core/issues/376) (the #350 event-driven fix, directly anchored; the dose_cmt anchors cover oral infusion into the *peripheral* only) | `oral_central_inf_advan{2,4}_f{1,06}.ctl` (4) | *(in `tests/oral_central_infusion_nonmem_anchor.rs`)* |
 
 The transit control runs on `transit_oral.csv`; the IG and Weibull controls run
 on `igd_oral.csv` (the same data re-keyed to a 1-compartment layout — every record
