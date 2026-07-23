@@ -1939,7 +1939,7 @@ pub(crate) fn dose_needs_event_walk(pk_model: PkModel, subject: &Subject) -> boo
     let central_cmt = if pk_model.is_oral() { 2 } else { 1 };
     subject.doses.iter().any(|d| {
         // `CMT=0` == the default dose compartment == 1.
-        let cmt = if d.cmt == 0 { 1 } else { d.cmt };
+        let cmt = d.cmt_1based();
         if d.is_infusion() {
             cmt != central_cmt
         } else {

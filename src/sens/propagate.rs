@@ -927,7 +927,7 @@ fn active_rates_g<T: PkNum>(
                 Some((rate_bare, _)) => pk.f * rate_bare,
                 None => pk.f * T::from_f64(d.rate),
             };
-            match pk_model.topology().dose_channel(d.cmt) {
+            match pk_model.topology().dose_channel(d.cmt_raw()) {
                 Some(Channel::Central) => rate_central = rate_central + r,
                 Some(Channel::Periph1) => rate_periph1 = rate_periph1 + r,
                 Some(Channel::Periph2) => rate_periph2 = rate_periph2 + r,
@@ -942,7 +942,8 @@ fn active_rates_g<T: PkNum>(
                 None => panic!(
                     "sens PK walk: infusion into compartment {} not supported for model \
                      {:?} — should have been rejected by `check_dose_compartments`",
-                    d.cmt, pk_model
+                    d.cmt_raw(),
+                    pk_model
                 ),
             }
         }
@@ -1175,7 +1176,7 @@ fn equilibrate_ss_g<T: PkNum>(
     // `equilibrate_ss_state_event_driven`, whose identical `cmt == 0` bail
     // silently dropped an `SS=1` dose's accumulation (#375); the gradient must
     // equilibrate the same state the value does.
-    let cmt_idx = dose.cmt.saturating_sub(1);
+    let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n_states {
         return state;
     }
@@ -1185,7 +1186,12 @@ fn equilibrate_ss_g<T: PkNum>(
     }
     let synthetic_dose = if is_inf {
         vec![DoseEvent::new(
-            0.0, dose.amt, dose.cmt, dose.rate, false, 0.0,
+            0.0,
+            dose.amt,
+            dose.cmt_raw(),
+            dose.rate,
+            false,
+            0.0,
         )]
     } else {
         Vec::new()
@@ -1389,7 +1395,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     state = equilibrate_ss_g(pk_model, &pk_now, d, inf);
                 }
                 if d.rate <= 0.0 {
-                    let cmt_idx = d.cmt.saturating_sub(1);
+                    let cmt_idx = d.cmt_idx();
                     if cmt_idx < n_states {
                         state[cmt_idx] = state[cmt_idx] + pk_now.f * T::from_f64(d.amt);
                     } else {
@@ -1402,7 +1408,8 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                             "sens PK walk: dose into compartment {} but model has {} states \
                              (cmt is 1-based) — should have been rejected by \
                              `check_dose_compartments`",
-                            d.cmt, n_states
+                            d.cmt_raw(),
+                            n_states
                         );
                     }
                 }

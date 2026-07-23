@@ -322,7 +322,7 @@ pub fn transform_dataset_for_frem(
                 ".".to_string(),
                 "1".to_string(), // EVID
                 format!("{}", dose.amt),
-                format!("{}", dose.cmt),
+                format!("{}", dose.cmt_raw()),
                 // Reconstruct the RATE column from the dose's rate mode. NONMEM
                 // overloads RATE with negative sentinels for modeled infusions:
                 // RATE=-2 (ModeledDuration, D{cmt}) and RATE=-1 (ModeledRate,

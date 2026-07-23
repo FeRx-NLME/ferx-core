@@ -450,13 +450,10 @@ pub(crate) fn has_infusion_into_input_rate(model: &CompiledModel, subject: &Subj
         return false;
     };
     !ode.input_rate.is_empty()
-        && subject.doses.iter().any(|d| {
-            d.is_infusion()
-                && ode
-                    .input_rate
-                    .iter()
-                    .any(|f| f.cmt == d.cmt.saturating_sub(1))
-        })
+        && subject
+            .doses
+            .iter()
+            .any(|d| d.is_infusion() && ode.input_rate.iter().any(|f| f.cmt == d.cmt_idx()))
 }
 
 /// Per-subject scope gate, shared by the full (outer `Dual2`) and light (inner
@@ -608,10 +605,10 @@ pub(crate) fn modeled_slot_for(
     match d.rate_mode {
         crate::types::RateMode::Fixed => None,
         crate::types::RateMode::ModeledDuration => attr_map
-            .indexed_slot(crate::types::DoseAttr::Duration, d.cmt)
+            .indexed_slot(crate::types::DoseAttr::Duration, d.cmt_raw())
             .map(|s| (crate::types::RateMode::ModeledDuration, s)),
         crate::types::RateMode::ModeledRate => attr_map
-            .indexed_slot(crate::types::DoseAttr::Rate, d.cmt)
+            .indexed_slot(crate::types::DoseAttr::Rate, d.cmt_raw())
             .map(|s| (crate::types::RateMode::ModeledRate, s)),
     }
 }
@@ -1839,7 +1836,7 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
     let dose_f_bio: Vec<T> = subject
         .doses
         .iter()
-        .map(|d| params_dual[f_bio_slot(ode, d.cmt)])
+        .map(|d| params_dual[f_bio_slot(ode, d.cmt_raw())])
         .collect();
 
     // Dose-time anchors for TAFD/TAD (constants w.r.t. the parameters).
@@ -2263,7 +2260,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         .doses
         .iter()
         .zip(pk_at_dose.iter())
-        .map(|(d, p)| p[f_bio_slot(ode, d.cmt)])
+        .map(|(d, p)| p[f_bio_slot(ode, d.cmt_raw())])
         .collect();
     let first_dose_time = subject
         .doses
@@ -2295,7 +2292,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         subject
             .doses
             .iter()
-            .map(|d| attr_map.lag_slot(d.cmt))
+            .map(|d| attr_map.lag_slot(d.cmt_raw()))
             .collect()
     } else {
         Vec::new()
@@ -3807,7 +3804,12 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
     // A single local SS pulse at t = 0 drives the periodic `R_in` (its SS branch superposes the
     // infinite-past pulse tails) — the dual mirror of the f64 `wrap_rhs_with_forcings(local_ss)`.
     let local_ss = [crate::types::DoseEvent::new(
-        0.0, dose.amt, dose.cmt, 0.0, true, ii,
+        0.0,
+        dose.amt,
+        dose.cmt_raw(),
+        0.0,
+        true,
+        ii,
     )];
     let lag0 = [T::from_f64(0.0)];
     let fbio1 = [f_bio];
@@ -3854,7 +3856,9 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
     // f64 `equilibrate_ss_state` input-rate fallback). The dual jets ride the finite loop.
     let n_pulses = crate::dosing::SS_EQUILIBRATION_CYCLES;
     let local_doses: Vec<crate::types::DoseEvent> = (0..n_pulses)
-        .map(|m| crate::types::DoseEvent::new(m as f64 * ii, dose.amt, dose.cmt, 0.0, false, 0.0))
+        .map(|m| {
+            crate::types::DoseEvent::new(m as f64 * ii, dose.amt, dose.cmt_raw(), 0.0, false, 0.0)
+        })
         .collect();
     let lags = vec![T::from_f64(0.0); n_pulses];
     let fbios = vec![f_bio; n_pulses];
@@ -3984,7 +3988,7 @@ fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
     // premise that aliasing to index 0 would "silently dose compartment 0" (#642 review #1);
     // #375 settled the opposite convention on the analytical engine, and #899 brought the ODE
     // engine into line, so the no-op was the silent drop rather than the guard against one.
-    let cmt_idx = dose.cmt.saturating_sub(1);
+    let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n_states {
         return u;
     }
@@ -4303,7 +4307,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 // the rate-off at the shifted `w_end` (`K_ZO_END`), both carrying its jet.
                 let w_start = d.time + lag_val(k) + f.route_lag(&pk_at_dose[k]).val();
                 let w_end = w_start + dur.val();
-                Some((d.cmt.saturating_sub(1), rate, w_start, w_end, dur, k))
+                Some((d.cmt_idx(), rate, w_start, w_end, dur, k))
             })
             .collect()
     };
@@ -4371,7 +4375,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 continue;
             }
             for (k, d) in subject.doses.iter().enumerate() {
-                if d.amt > 0.0 && d.cmt.saturating_sub(1) == f.cmt {
+                if d.amt > 0.0 && d.cmt_idx() == f.cmt {
                     v.push((k, fi));
                 }
             }
@@ -4532,12 +4536,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 // `d.cmt < 1`: an infusion with `CMT=0` has no target and is rejected up
                 // front on both engines (#375 / #899) — see the `filter` in the saltation
                 // walk below. Unreachable from a validated call.
-                if !is_inf(d) || d.cmt < 1 {
+                if !is_inf(d) || d.cmt_raw() < 1 {
                     continue;
                 }
                 let iws = d.time + lag_val(k);
                 let iwe = iws + inf_window_len(k);
-                let ci = d.cmt - 1;
+                let ci = d.cmt_idx();
                 if ci < n_states && iws >= r_floor && iws <= t_ev + eps && iwe >= t_ev - eps {
                     v[ci] = v[ci] + inf_eff[k].0;
                 }
@@ -4663,7 +4667,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     // the datareader does *not* reject it, contrary to #472 #6 / #473 #3 —
                     // only a *missing* CMT column defaults to 1). Unreachable from a validated
                     // call, kept for hand-built specs that run no validation.
-                    .filter(|(_, d)| is_inf(d) && d.cmt >= 1)
+                    .filter(|(_, d)| is_inf(d) && d.cmt_raw() >= 1)
                     .filter(|(k, d)| {
                         // (Lagged) window start; an infusion before the most recent reset is
                         // off (#472 review #1) and the window tolerance is production's
@@ -4680,7 +4684,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     })
                     // Effective forcing `inf_eff[k].0` (mode-aware: `F·rate` for a
                     // duration-defined infusion, held `rate` for a rate-defined one) (#419).
-                    .map(|(k, d)| (d.cmt.saturating_sub(1), inf_eff[k].0))
+                    .map(|(k, d)| (d.cmt_idx(), inf_eff[k].0))
                     .collect()
             };
             // #486: zero-order windows fully containing this segment add their constant
@@ -4783,7 +4787,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     // populated only by the `K_SS_SEED` (SS+lagtime) branch, which is out of scope
                     // here (rejected upstream), so a non-lagged SS-absorption dose always lands in
                     // one of these `None` arms.
-                    None if has_input_rate && input_rate_consumes_cmt(ode, d.cmt) && !is_inf(d) => {
+                    None if has_input_rate
+                        && input_rate_consumes_cmt(ode, d.cmt_raw())
+                        && !is_inf(d) =>
+                    {
                         equilibrate_ss_input_rate_state_g::<T>(
                             program,
                             ode,
@@ -4813,9 +4820,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // it does not — a missing `CMT` column defaults to 1, but an explicitly written
             // `CMT=0` reaches here unchanged, and was silently dropped from the gradient.
             {
-                let cmt_idx = d.cmt.saturating_sub(1);
+                let cmt_idx = d.cmt_idx();
                 if cmt_idx < n_states {
-                    if has_input_rate && input_rate_consumes_cmt(ode, d.cmt) {
+                    if has_input_rate && input_rate_consumes_cmt(ode, d.cmt_raw()) {
                         // The dose feeds a built-in absorption forcing (`R_in`), not a
                         // bolus (#430) — its mass flows in continuously via
                         // `add_prepared_input_rate_forcing` in the RHS above, not as an
@@ -5146,7 +5153,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // `saturating_sub`: `CMT=0` is the default dose compartment, state index 0 (#899).
             // The former `d.cmt >= 1` gate dropped this onset jet for such a dose, which is a
             // *wrong gradient* rather than a visibly zero value.
-            let cmt_idx = d.cmt.saturating_sub(1);
+            let cmt_idx = d.cmt_idx();
             if cmt_idx < n_states {
                 let f = &ode.input_rate[fi];
                 // #880: read the onset kernel (`ka`/shape via `prep`), pathway `frac`, and the
@@ -5299,9 +5306,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // a wrong gradient rather than a visibly zero value.
             if (has_lagtime || is_rate_defined || is_modeled)
                 && d.time + lag_val(idx) >= reset_floor
-                && d.cmt.saturating_sub(1) < n_states
+                && d.cmt_idx() < n_states
             {
-                let cmt = d.cmt.saturating_sub(1);
+                let cmt = d.cmt_idx();
                 let dlag = if has_lagtime {
                     jet_only(pk_at_dose[idx][dose_lag_slot[idx]])
                 } else {
@@ -5662,7 +5669,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 let (f, dur) = zero_order_forcing_for_dose(ode, d, params_dual)?;
                 let frac = f.frac::<T>(params_dual);
                 let rate = dose_f_bio[k] * T::from_f64(d.amt) * frac / dur;
-                Some((d.cmt.saturating_sub(1), rate, d.time, dur))
+                Some((d.cmt_idx(), rate, d.time, dur))
             })
             .collect()
     } else {
@@ -5767,9 +5774,9 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         for (k, dose) in subject.doses.iter().enumerate() {
             if !dose.is_infusion()
                 && (dose.time - t_start).abs() < 1e-12
-                && !input_rate_consumes_cmt(ode, dose.cmt)
+                && !input_rate_consumes_cmt(ode, dose.cmt_raw())
             {
-                let cmt_idx = dose.cmt.saturating_sub(1);
+                let cmt_idx = dose.cmt_idx();
                 if cmt_idx < n_states {
                     u[cmt_idx] = u[cmt_idx] + dose_f_bio[k] * T::from_f64(dose.amt);
                 }
@@ -5858,11 +5865,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 .doses
                 .iter()
                 .enumerate()
-                .filter(|(_, d)| d.is_infusion() && d.cmt >= 1)
+                .filter(|(_, d)| d.is_infusion() && d.cmt_raw() >= 1)
                 .filter(|(_, d)| {
                     infusion_spans_segment(d.time, d.duration, t_start, t_end, reset_floor)
                 })
-                .map(|(k, d)| (d.cmt.saturating_sub(1), dose_f_bio[k] * T::from_f64(d.rate)))
+                .map(|(k, d)| (d.cmt_idx(), dose_f_bio[k] * T::from_f64(d.rate)))
                 .collect()
         };
 

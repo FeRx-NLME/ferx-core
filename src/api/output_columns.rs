@@ -221,7 +221,7 @@ pub(crate) fn compute_extra_output_columns(
                     match &model.ode_spec {
                         Some(ode) => ode
                             .dose_attr_map
-                            .lagtime(subject.doses[d].cmt, &pk_d.values),
+                            .lagtime(subject.doses[d].cmt_raw(), &pk_d.values),
                         None => pk_d.lagtime(),
                     }
                 })

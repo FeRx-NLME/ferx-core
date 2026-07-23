@@ -1329,10 +1329,57 @@ fn dose_cmt_accessors_resolve_cmt_zero_to_the_default_compartment() {
     assert_eq!(d2.cmt_idx(), 1);
     assert_eq!(d2.cmt_1based(), 2);
 
-    // The two are exact complements for every dose.
+    // `cmt_raw()` is the literal authored value, `0` included — the escape hatch
+    // that lets a site distinguish an authored `CMT=0` from `CMT=1` (the resolved
+    // accessors cannot).
+    assert_eq!(d0.cmt_raw(), 0);
+    assert_eq!(d1.cmt_raw(), 1);
+    assert_eq!(d2.cmt_raw(), 2);
+
+    // The two resolved accessors are exact complements, and both are pure
+    // functions of the raw value (#912: the field is private, these are the only
+    // ways to read it).
     for d in [&d0, &d1, &d2] {
         assert_eq!(d.cmt_idx() + 1, d.cmt_1based());
+        assert_eq!(d.cmt_idx(), d.cmt_raw().saturating_sub(1));
+        assert_eq!(d.cmt_1based(), d.cmt_raw().max(1));
     }
+}
+
+/// `synthetic_cycle_dose()` (#912/#419) repositions a dose to a single SS cycle's
+/// origin — `time = 0`, `ss`/`ii` cleared — while preserving the compartment and
+/// the bioavailability-reshaped `(rate, duration)` that a bare `DoseEvent::new`
+/// would recompute and drop. It is the replacement for the `..dose.clone()`
+/// struct-update the now-private `cmt` field forbids outside this module.
+#[test]
+fn synthetic_cycle_dose_preserves_shape_and_clears_steady_state() {
+    // An SS infusion into compartment 2, then F-reshaped so (rate, duration) no
+    // longer equal the raw amt/rate pair `::new` would derive.
+    let dose = DoseEvent::new(5.0, 100.0, 2, 25.0, true, 12.0).with_bioavailable_infusion(0.5);
+    let cyc = dose.synthetic_cycle_dose();
+
+    // Repositioned to the cycle origin.
+    assert_eq!(cyc.time, 0.0);
+    assert!(!cyc.ss);
+    assert_eq!(cyc.ii, 0.0);
+
+    // Compartment and the reshaped infusion shape survive verbatim.
+    assert_eq!(cyc.cmt_raw(), dose.cmt_raw());
+    assert_eq!(cyc.amt, dose.amt);
+    assert_eq!(cyc.rate, dose.rate);
+    assert_eq!(cyc.duration, dose.duration);
+    assert_eq!(cyc.is_infusion(), dose.is_infusion());
+    assert_eq!(cyc.rate_mode, dose.rate_mode);
+    assert_eq!(cyc.infusion_def, dose.infusion_def);
+
+    // `rate_mode` / `infusion_def` are carried through directly, not inferred from
+    // `is_infusion()` — assert on a *modeled* dose so the check is non-vacuous (the
+    // reshaped `Fixed` case above would pass even if they were hard-coded to
+    // `Fixed`/`RateDefined`, which is exactly what `DoseEvent::new` would do).
+    let modeled = DoseEvent::modeled(5.0, 100.0, 2, true, 12.0, RateMode::ModeledDuration);
+    let mcyc = modeled.synthetic_cycle_dose();
+    assert_eq!(mcyc.rate_mode, RateMode::ModeledDuration);
+    assert_eq!(mcyc.infusion_def, modeled.infusion_def);
 }
 
 #[test]

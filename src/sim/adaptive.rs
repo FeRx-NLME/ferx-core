@@ -1058,7 +1058,7 @@ mod tests {
             .expect("bolus yields a dose event");
         assert_eq!(de.time, 5.0);
         assert_eq!(de.amt, 100.0);
-        assert_eq!(de.cmt, 1);
+        assert_eq!(de.cmt_raw(), 1);
         assert_eq!(de.rate, 0.0);
         assert_eq!(de.duration, 0.0);
         assert!(!de.ss);
@@ -1074,7 +1074,7 @@ mod tests {
         }
         .to_dose_event(0.0)
         .expect("infusion yields a dose event");
-        assert_eq!(de.cmt, 2);
+        assert_eq!(de.cmt_raw(), 2);
         assert_eq!(de.rate, 25.0);
         // DoseEvent::new derives duration = amt / rate.
         assert_eq!(de.duration, 4.0);

@@ -406,15 +406,26 @@ pub(crate) fn check_absorption_dosing(
     // (`check_absorption_closed_form_support`, which rejects `dose.ss && dose.is_infusion()` with no
     // `II` condition), so the same subject errors on both paths instead of one erroring and the
     // other silently mis-serving.
+    // `cmt_raw()` here (not `cmt_1based()` like the SS-*bolus* gates above): a `CMT=0`
+    // would miss these 1-based `f.cmt + 1` sets, so unlike most raw reads the accessor
+    // choice is load-bearing (the only other place it bites is `has_lagtime_on_cmt` below,
+    // where it is immaterial — that path is analytical-only and the indexed-lag branch is
+    // dead behind `ode_spec.is_some()`). It is safe: both checks are `is_infusion()`-gated, and a
+    // meaningful (`AMT>0`) `CMT=0` infusion is already a hard error from
+    // `check_dose_compartments` (`E_DOSE_CMT_NOT_INFUSABLE` — `CMT=0` is a default *bolus*
+    // compartment, undefined for a zero-order input), so it never reaches a fit regardless
+    // of whether this gate also flags it; an `AMT=0` `CMT=0` infusion is inert. So
+    // `contains(&d.cmt_raw())` cannot miss a reachable case. (Behaviour-preserving: this
+    // was the pre-#912 raw `d.cmt`.)
     let has_ss_infusion = population.subjects.iter().any(|s| {
         s.doses
             .iter()
-            .any(|d| d.ss && d.is_infusion() && cmts.contains(&d.cmt))
+            .any(|d| d.ss && d.is_infusion() && cmts.contains(&d.cmt_raw()))
     });
     let has_infusion_zero_order = population.subjects.iter().any(|s| {
         s.doses
             .iter()
-            .any(|d| d.is_infusion() && zero_order_cmts.contains(&d.cmt))
+            .any(|d| d.is_infusion() && zero_order_cmts.contains(&d.cmt_raw()))
     });
     if has_ss_infusion {
         diags.push(
@@ -586,10 +597,10 @@ pub(crate) fn check_modeled_dose_rates(
                     (DoseAttr::Rate, "-1", "rate", "E_MODELED_RATE_NO_PARAM", "R")
                 }
             };
-            if !reported.insert((attr, dose.cmt)) {
+            if !reported.insert((attr, dose.cmt_raw())) {
                 continue;
             }
-            let cmt = dose.cmt;
+            let cmt = dose.cmt_raw();
             // A coded-`RATE` dose into compartment `cmt` requires a matching
             // `D{cmt}`/`R{cmt}` parameter so `resolve_rate` has a slot to read — for
             // BOTH engines. `active_dose_attr_map()` returns the engine-correct map
@@ -762,7 +773,7 @@ pub(crate) fn check_dose_compartments(
     for subject in &population.subjects {
         for dose in &subject.doses {
             let is_infusion = dose.is_infusion();
-            let cmt = dose.cmt;
+            let cmt = dose.cmt_raw();
             // **Range rule — every dose, whatever its amount.** Both walks
             // bound-check the compartment *before* the amount is read
             // (`event_driven::…impl`'s `if cmt_idx < n_states { … } else { panic! }`
@@ -1055,7 +1066,8 @@ pub(crate) fn check_absorption_closed_form_support(
                      into a disposition compartment, so the two paths would disagree. Dose the \
                      depot (CMT=1), or use an ODE absorption model for direct central/peripheral \
                      dosing.",
-                    subject.id, dose.cmt
+                    subject.id,
+                    dose.cmt_raw()
                 ));
             }
             if dose.ss && dose.is_infusion() {
@@ -1080,14 +1092,16 @@ pub(crate) fn check_absorption_closed_form_support(
                 // twin can't yet serve: a twin-less form, or a model with an absorption lagtime
                 // (the twin's SS+lagtime pre-arrival seed is still bolus-only — same scope as the
                 // ODE-path `E_ABSORPTION_SS_LAG`). `effective_for` performs the reroute.
-                if model.absorption_ode_equivalent.is_none() || model.has_lagtime_on_cmt(dose.cmt) {
+                if model.absorption_ode_equivalent.is_none()
+                    || model.has_lagtime_on_cmt(dose.cmt_raw())
+                {
                     return Some(format!(
                         "{name} does not support steady-state (SS) doses in this form (subject \
                          {}): SS reroutes to the ODE absorption twin, but this model has no twin \
                          {}. Use a non-SS multiple-dose schedule, or write the model as an ODE \
                          transit()/igd() forcing in [odes].",
                         subject.id,
-                        if model.has_lagtime_on_cmt(dose.cmt) {
+                        if model.has_lagtime_on_cmt(dose.cmt_raw()) {
                             "for the SS + lagtime combination (a follow-up)"
                         } else {
                             "(an unrecognised closed form)"
@@ -2089,7 +2103,7 @@ pub fn check_model_data_warnings(
         // but this warnings pass must stay panic-free if run on such a model rather
         // than hit `resolve_rate`'s slot `.expect`.
         let attr_map = model.active_dose_attr_map();
-        if attr_map.indexed_slot(attr, d.cmt).is_some() {
+        if attr_map.indexed_slot(attr, d.cmt_raw()).is_some() {
             // Initial-estimate warning pass: typical values at t=0.
             let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates, 0.0);
             d.resolve_rate(attr_map, &pk.values).duration
@@ -2177,15 +2191,15 @@ pub fn check_model_data_warnings(
                     RateMode::ModeledDuration => (DoseAttr::Duration, DoseEvent::DURATION_FLOOR),
                     RateMode::ModeledRate => (DoseAttr::Rate, DoseEvent::RATE_FLOOR),
                 };
-                if let Some(slot) = attr_map.indexed_slot(attr, d.cmt) {
+                if let Some(slot) = attr_map.indexed_slot(attr, d.cmt_raw()) {
                     let pk = pk_at_init.get_or_insert_with(|| {
                         // Initial-estimate warning pass: typical values at t=0.
                         (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates, 0.0)
                     });
                     if pk.values[slot] <= floor {
                         match attr {
-                            DoseAttr::Duration => nonpos_dur.insert(d.cmt),
-                            DoseAttr::Rate => nonpos_rate.insert(d.cmt),
+                            DoseAttr::Duration => nonpos_dur.insert(d.cmt_raw()),
+                            DoseAttr::Rate => nonpos_rate.insert(d.cmt_raw()),
                             DoseAttr::F | DoseAttr::Lag => unreachable!("only D/R reach here"),
                         };
                     }

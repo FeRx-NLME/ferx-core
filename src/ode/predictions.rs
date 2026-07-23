@@ -161,7 +161,7 @@ fn equilibrate_ss_input_rate(
     // the fixed-point verification, and the Anderson iteration's `P`. `prepared` is built once by
     // the caller (`equilibrate_ss_state`) and passed in so the fallback pulse-train iteration
     // doesn't redo the same prep on a `None` return.
-    let local_ss = [DoseEvent::new(0.0, dose.amt, dose.cmt, 0.0, true, ii)];
+    let local_ss = [DoseEvent::new(0.0, dose.amt, dose.cmt_raw(), 0.0, true, ii)];
     let local_f_bio = [f_bio];
     let no_lag: [f64; 0] = [];
     let no_zero: [(usize, f64); 0] = [];
@@ -525,7 +525,7 @@ fn equilibrate_ss_state(
     // produced the *single-dose* curve on the ODE engine while the analytical
     // engine (fixed in #375) produced the accumulated steady state. That was the
     // cross-engine disagreement recorded in `CHANGELOG.md`; this closes it.
-    let cmt_idx = dose.cmt.saturating_sub(1);
+    let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n {
         return u;
     }
@@ -535,7 +535,7 @@ fn equilibrate_ss_state(
     // infusion). Resolved per dose compartment (`Fn`; issue #369), falling back
     // to the bare `PK_IDX_F` slot. Matches the analytical path
     // (`equilibrate_ss_state_event_driven`).
-    let f_bio = ode.dose_attr_map.f_bio(dose.cmt, pk_params_flat);
+    let f_bio = ode.dose_attr_map.f_bio(dose.cmt_raw(), pk_params_flat);
 
     let is_inf = is_real_infusion(dose);
     // Mode-aware bioavailability (#419): a rate-defined infusion keeps its rate
@@ -560,7 +560,7 @@ fn equilibrate_ss_state(
     // `add_prepared_input_rate_forcing` periodic sum, which is disjoint from this trough. SS
     // *infusion* into an absorption compartment is out of scope here (gap 2, #719) — this
     // branch is bolus-record SS only.
-    if !is_inf && input_rate_consumes_cmt(ode, dose.cmt) {
+    if !is_inf && input_rate_consumes_cmt(ode, dose.cmt_raw()) {
         // Periodic-SS solve for the fixed point `u = P(u)` of the one-cycle map: a *linear*
         // disposition has the closed form `u_ss = (I − M)⁻¹ b` (a handful of solves); a *nonlinear*
         // one is found by an Anderson-accelerated iteration on the same `P`, also in a bounded
@@ -576,7 +576,16 @@ fn equilibrate_ss_state(
         }
         let n_pulses = SS_EQUILIBRATION_CYCLES;
         let local_doses: Vec<DoseEvent> = (0..n_pulses)
-            .map(|m| DoseEvent::new(m as f64 * dose.ii, dose.amt, dose.cmt, 0.0, false, 0.0))
+            .map(|m| {
+                DoseEvent::new(
+                    m as f64 * dose.ii,
+                    dose.amt,
+                    dose.cmt_raw(),
+                    0.0,
+                    false,
+                    0.0,
+                )
+            })
             .collect();
         let local_f_bio = vec![f_bio; n_pulses];
         let no_lag: [f64; 0] = [];
@@ -720,13 +729,13 @@ fn ss_state_at_phase(
     if phase <= 0.0 {
         return u;
     }
-    let cmt_idx = dose.cmt.saturating_sub(1);
+    let cmt_idx = dose.cmt_idx();
     if cmt_idx >= u.len() {
         return u;
     }
     // Bioavailability scales the amount entering the dosing compartment,
     // resolved per dose compartment (`Fn`; see `equilibrate_ss_state`).
-    let f_bio = ode.dose_attr_map.f_bio(dose.cmt, pk_params_flat);
+    let f_bio = ode.dose_attr_map.f_bio(dose.cmt_raw(), pk_params_flat);
 
     if is_real_infusion(dose) {
         // Mode-aware bioavailability (#419): see `equilibrate_ss_state`.
@@ -805,7 +814,7 @@ pub(crate) fn active_infusions(
             // `R_in_inf` (`add_prepared_input_rate_forcing`), NOT injected directly. Suppress the
             // plain `+rate` here so the mass is not double-counted. (`input_rate` is empty on the
             // EKF path and on models with no built-in absorption, so this is then a no-op.)
-            if input_rate.iter().any(|f| f.cmt == d.cmt.saturating_sub(1)) {
+            if input_rate.iter().any(|f| f.cmt == d.cmt_idx()) {
                 return None;
             }
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
@@ -820,7 +829,7 @@ pub(crate) fn active_infusions(
                 && start <= t_start + INFUSION_EPS
                 && end >= t_end - INFUSION_EPS
             {
-                Some((d.cmt.saturating_sub(1), rate_eff))
+                Some((d.cmt_idx(), rate_eff))
             } else {
                 None
             }
@@ -879,7 +888,7 @@ fn zero_order_windows(
         // fully inside or outside the window (#504 mass-exactness) under a route lag.
         let w_start = d.time + lag + route_lag;
         out.push((
-            d.cmt.saturating_sub(1),
+            d.cmt_idx(),
             f_bio * d.amt * frac / dur,
             w_start,
             w_start + dur,
@@ -1028,7 +1037,7 @@ fn push_route_lag_break_times(
     for forcing in ode.input_rate.iter().filter(|f| f.lag_slot.is_some()) {
         let route_lag = route_lag_of(forcing);
         for (k, d) in subject.doses.iter().enumerate() {
-            if d.amt > 0.0 && d.cmt.saturating_sub(1) == forcing.cmt {
+            if d.amt > 0.0 && d.cmt_idx() == forcing.cmt {
                 break_times.push(d.time + dose_lagtimes.get(k).copied().unwrap_or(0.0) + route_lag);
             }
         }
@@ -1077,10 +1086,10 @@ fn gated_infusions(
             // `gated_infusions` is also reachable from hand-built `OdeSpec`s
             // that run no validation; dropping an infusion is preferable to
             // panicking inside the integration loop.
-            if dose.cmt == 0 {
+            if dose.cmt_raw() == 0 {
                 return None;
             }
-            let cmt = dose.cmt - 1;
+            let cmt = dose.cmt_idx();
             if cmt >= n_states {
                 return None;
             }
@@ -1219,7 +1228,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
         let route_lag = forcing.route_lag(params);
         let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
-            if d.cmt.saturating_sub(1) != forcing.cmt {
+            if d.cmt_idx() != forcing.cmt {
                 continue;
             }
             // `dose_lagtimes[k]` (`T`, not `f64`) carries the exact `∂t_eff/∂lag = 1`
@@ -1514,12 +1523,12 @@ fn subject_dose_attrs(
     let dose_lagtimes: Vec<f64> = subject
         .doses
         .iter()
-        .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
+        .map(|d| ode.dose_attr_map.lagtime(d.cmt_raw(), pk_params_flat))
         .collect();
     let dose_f_bio: Vec<f64> = subject
         .doses
         .iter()
-        .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
+        .map(|d| ode.dose_attr_map.f_bio(d.cmt_raw(), pk_params_flat))
         .collect();
     (dose_lagtimes, dose_f_bio)
 }
@@ -2112,7 +2121,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
             if dose.ss && dose.ii > 0.0 {
                 u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
             }
-            if !is_real_infusion(dose) && !input_rate_consumes_cmt(ode, dose.cmt) {
+            if !is_real_infusion(dose) && !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
                 // dose.cmt is 1-based; state indices are 0-based. A dose into a
                 // built-in input-rate compartment (transit/etc.) is delivered as
                 // R_in over time by the wrapped RHS below — not as a bolus — so
@@ -2125,7 +2134,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
                 // "attempt to subtract with overflow" and a release build
                 // wrapped to `usize::MAX`, failed the bound below, and dropped
                 // the dose in silence.
-                let cmt_idx = dose.cmt.saturating_sub(1);
+                let cmt_idx = dose.cmt_idx();
                 // Unreachable from a validated call — `check_dose_compartments`
                 // rejects `cmt > n_states` on ODE models too since #899. Kept as
                 // a bound because `ode_predictions*` is also reachable from
@@ -3473,8 +3482,8 @@ fn adaptive_frozen_replay_tv(
             if (d.time - t_start).abs() >= 1e-12 {
                 continue;
             }
-            if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt) {
-                let cmt_idx = d.cmt.saturating_sub(1);
+            if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt_raw()) {
+                let cmt_idx = d.cmt_idx();
                 if cmt_idx < n {
                     u[cmt_idx] += dose_f[i] * d.amt;
                 }
@@ -3816,13 +3825,13 @@ pub fn ode_predictions_event_driven(
         .doses
         .iter()
         .zip(pk_at_dose.iter())
-        .map(|(d, p)| ode.dose_attr_map.lagtime(d.cmt, &p.values))
+        .map(|(d, p)| ode.dose_attr_map.lagtime(d.cmt_raw(), &p.values))
         .collect();
     let dose_f_bio: Vec<f64> = subject
         .doses
         .iter()
         .zip(pk_at_dose.iter())
-        .map(|(d, p)| ode.dose_attr_map.f_bio(d.cmt, &p.values))
+        .map(|(d, p)| ode.dose_attr_map.f_bio(d.cmt_raw(), &p.values))
         .collect();
     for (k, d) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[k];
@@ -3851,7 +3860,7 @@ pub fn ode_predictions_event_driven(
         // onset kink resolves exactly and a lagged zero-order window's START is
         // bracketed. No-op for unlagged forcings.
         for forcing in ode.input_rate.iter().filter(|f| f.lag_slot.is_some()) {
-            if d.amt > 0.0 && d.cmt.saturating_sub(1) == forcing.cmt {
+            if d.amt > 0.0 && d.cmt_idx() == forcing.cmt {
                 let route_lag = forcing.route_lag(&pk_at_dose[k].values);
                 timeline.push((d.time + lag + route_lag, Kind::InfusionEnd, k));
             }
@@ -4002,11 +4011,11 @@ pub fn ode_predictions_event_driven(
                 // [d.time, d.time + d.duration]. A dose into a built-in
                 // input-rate compartment (transit/etc.) is delivered as R_in
                 // over time by the wrapped RHS, so it's skipped here too.
-                if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt) {
-                    let cmt_idx = d.cmt.saturating_sub(1);
+                if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt_raw()) {
+                    let cmt_idx = d.cmt_idx();
                     if cmt_idx < n {
                         // Bioavailability resolved per dose compartment (`Fn`).
-                        u[cmt_idx] += ode.dose_attr_map.f_bio(d.cmt, &pk_now.values) * d.amt;
+                        u[cmt_idx] += ode.dose_attr_map.f_bio(d.cmt_raw(), &pk_now.values) * d.amt;
                     }
                 }
                 last_pk = pk_now;
@@ -4294,13 +4303,13 @@ pub fn ode_predictions_with_states(
                     u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
                 }
                 if !is_real_infusion(dose) {
-                    if !input_rate_consumes_cmt(ode, dose.cmt) {
+                    if !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
                         // dose.cmt is 1-based; `CMT=0` is NONMEM's default dose
                         // compartment and resolves to compartment 1, like every
                         // other dose site on both engines (#899). This used to
                         // skip the dose entirely, disagreeing with the two
                         // event-driven drivers on the same dataset.
-                        let cmt = dose.cmt.saturating_sub(1);
+                        let cmt = dose.cmt_idx();
                         if cmt < n {
                             u[cmt] += dose.amt * f;
                         }
@@ -4591,11 +4600,11 @@ fn apply_segment_boundary(
                 *u = equilibrate_ss_state(ode, pk_params_flat, dose, opts);
             }
             if !is_real_infusion(dose) {
-                if !input_rate_consumes_cmt(ode, dose.cmt) {
+                if !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
                     // dose.cmt is 1-based; `CMT=0` is NONMEM's default dose
                     // compartment and resolves to compartment 1, like every
                     // other dose site on both engines (#899).
-                    let cmt = dose.cmt.saturating_sub(1);
+                    let cmt = dose.cmt_idx();
                     if cmt < n {
                         u[cmt] += dose.amt * f;
                     }
