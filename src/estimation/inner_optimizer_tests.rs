@@ -140,6 +140,75 @@ mod ctmm_inner {
     }
 }
 
+/// #378 task B — the model-level report `build_info::gradient_method_inner` must match the
+/// per-subject route `find_ebe` actually runs for an **in-scope ODE** model. The live inner
+/// takes the light `Dual1` ODE η-gradient (`analytic_inner_grad_supported` → the `ode_spec`
+/// branch → `ode_inner_grad_supported`), but the report used to read the closed-form-only
+/// `analytic_inner_grad_supported_model` (false for every ODE model — no `tv_fn`) and
+/// mislabel it "finite differences". Pin report == route, exactly as the CTMM tests above
+/// pin theirs. (Mutation: reverting the ODE disjunct in `gradient_method_inner` makes the
+/// report `FiniteDifferences` while the route stays analytic, so the final assert fails.)
+#[test]
+fn in_scope_ode_reports_and_takes_the_analytic_inner_route() {
+    const ONECPT_IV_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model = crate::parser::model_parser::parse_model_string(ONECPT_IV_ODE).expect("parse");
+    // Fixture self-check: genuinely in ODE analytic scope (else the asserts pass vacuously).
+    assert!(
+        crate::sens::provider::ode_inner_grad_supported_model(&model),
+        "fixture must be an in-scope ODE model"
+    );
+
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![9.0, 8.0, 6.0, 3.0, 1.0],
+        obs_cmts: vec![1, 1, 1, 1, 1],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0, 0, 0, 0, 0],
+        occasions: Vec::new(),
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+
+    // Subject-level: what `find_ebe` actually runs.
+    assert!(
+        super::analytic_inner_grad_supported(&model, &subject),
+        "an in-scope plain-bolus ODE subject must take the analytic inner route"
+    );
+    // Model-level: what `build_info::gradient_method_inner` reports — must match the route.
+    assert_eq!(
+        crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, &model),
+        crate::build_info::GradientMethodKind::Analytic,
+        "the report must match the live analytic ODE inner route"
+    );
+}
+
 /// The M3 censored coefficient `∂/∂f[−logΦ((y−f)/√v)]` must equal a central
 /// finite difference of that data term — across additive (`dv_df = 0`) and
 /// f-dependent (`dv_df ≠ 0`, e.g. proportional/combined) variance, and across
