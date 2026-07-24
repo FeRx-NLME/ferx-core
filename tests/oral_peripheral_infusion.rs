@@ -282,7 +282,9 @@ fn ss_peripheral_infusion_matches_the_ode_twin() {
     assert_agree(
         &preds(TWO_CPT_ORAL_CF, csv),
         &preds(TWO_CPT_ORAL_ODE, csv),
-        1e-6,
+        // #914: the ODE SS is now the exact `(I − M)⁻¹·b` fixed point, matching the analytical
+        // closed form's exact SS to integration tolerance (was 1e-6 while the ODE truncated).
+        1e-8,
         "two_cpt_oral SS peripheral infusion",
     );
 }
@@ -298,7 +300,8 @@ fn ss_peripheral_bolus_matches_the_ode_twin() {
     assert_agree(
         &preds(TWO_CPT_ORAL_CF, csv),
         &preds(TWO_CPT_ORAL_ODE, csv),
-        1e-6,
+        // #914: ODE SS now exact (see the infusion twin above).
+        1e-8,
         "two_cpt_oral SS peripheral bolus",
     );
 }

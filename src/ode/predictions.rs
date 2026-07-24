@@ -492,11 +492,18 @@ where
 /// Pre-equilibrate the ODE state to its steady-state value for an SS=1
 /// dose with interval `dose.ii`. NONMEM SS=1 semantics: at the time of
 /// the SS dose, the compartments are loaded with the steady-state
-/// amounts from an infinite-past pulse train. No closed form is
-/// available for arbitrary ODE systems, so we numerically expand the
-/// train: starting from a zero state, simulate
-/// [`SS_EQUILIBRATION_CYCLES`] cycles of `(apply dose; integrate for II)`.
-/// The state after the loop equals the "just-before-next-pulse" SS state;
+/// amounts from an infinite-past pulse train.
+///
+/// For a **linear** disposition the periodic steady state is the exact affine
+/// fixed point `u_ss = (I − M)⁻¹·b` — the same closed form the analytical walk
+/// (#908) and the input-rate branch (#835) use — solved via
+/// [`periodic_ss_fixed_point_g`](crate::dosing::periodic_ss_fixed_point_g) in a
+/// handful of one-cycle integrations (#914). A **nonlinear** RHS
+/// (Michaelis–Menten, …) fails that solve's linearity self-check and falls back
+/// to numerically expanding the train: starting from a zero state, simulate
+/// [`SS_EQUILIBRATION_CYCLES`] cycles of `(apply dose; integrate for II)`, with a
+/// #867 non-convergence warning if the cap is hit without converging.
+/// Either way the returned state equals the "just-before-next-pulse" SS state;
 /// the caller then applies the SS dose itself through the normal flow,
 /// recovering the at-pulse SS amount.
 ///
@@ -634,11 +641,102 @@ fn equilibrate_ss_state(
         return u;
     }
 
-    // Early stop once the trough stops moving (#519): the shared tracker holds the previous
-    // cycle's state and, from cycle 1 on, breaks when the increment is below the mixed
-    // atol/rtol criterion (#532 review #6 — one scaffold across the f64 paths).
+    // #914: exact periodic steady state for a LINEAR disposition — the affine fixed point
+    // `u_ss = (I − M)⁻¹·b` the analytical walk (#908) and the input-rate branch (#835) already
+    // use, replacing the truncated pulse train below. `advance_forced` integrates one cycle
+    // *with* the dose (a bolus pulse, or an active-infusion window + quiet window);
+    // `advance_unforced` integrates one `II` of disposition alone — the propagator `M`. For an
+    // infusion the active and quiet windows share the same homogeneous propagator (the constant
+    // `+RATE` forcing has zero state-Jacobian), so a full-`II` unforced decay reconstructs `M`
+    // exactly — the window length enters only through `b`. A genuinely nonlinear RHS
+    // (Michaelis–Menten, …) fails the linearity self-check, returning `None` → the capped pulse
+    // train below, now with the #867 non-convergence warning wired in (gap 2). The exact solve
+    // integrates at the tightened `ss_equilibration_opts` tolerance (a handful of one-cycle
+    // solves, so it is cheap) and passes those tolerances to the linearity check, mirroring the
+    // input-rate path.
+    let eq_opts = ss_equilibration_opts(opts);
+    let advance_unforced = |u0: &[f64]| -> Option<Vec<f64>> {
+        solve_ode(
+            &ode.rhs,
+            u0,
+            (0.0, dose.ii),
+            pk_params_flat,
+            &[dose.ii],
+            &eq_opts,
+        )
+        .last()
+        .map(|p| p.u.clone())
+    };
+    let advance_forced = |u0: &[f64]| -> Option<Vec<f64>> {
+        if is_inf {
+            // Active-infusion window then quiet window — the same one-cycle body the fallback
+            // loop runs, as a pure function of `u0`.
+            let rate = inf_rate;
+            let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+                (ode.rhs)(y, p, t, dy);
+                if cmt_idx < dy.len() {
+                    dy[cmt_idx] += rate;
+                }
+            };
+            let mut y = solve_ode(
+                &wrapped_rhs,
+                u0,
+                (0.0, t_inf),
+                pk_params_flat,
+                &[t_inf],
+                &eq_opts,
+            )
+            .last()
+            .map(|p| p.u.clone())?;
+            let quiet = dose.ii - t_inf;
+            if quiet > 0.0 {
+                y = solve_ode(
+                    &ode.rhs,
+                    &y,
+                    (0.0, quiet),
+                    pk_params_flat,
+                    &[quiet],
+                    &eq_opts,
+                )
+                .last()
+                .map(|p| p.u.clone())?;
+            }
+            Some(y)
+        } else {
+            let mut y = u0.to_vec();
+            y[cmt_idx] += f_bio * dose.amt;
+            solve_ode(
+                &ode.rhs,
+                &y,
+                (0.0, dose.ii),
+                pk_params_flat,
+                &[dose.ii],
+                &eq_opts,
+            )
+            .last()
+            .map(|p| p.u.clone())
+        }
+    };
+    if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<f64, _, _>(
+        n,
+        dose.ii,
+        eq_opts.reltol,
+        eq_opts.abstol,
+        advance_unforced,
+        advance_forced,
+    ) {
+        record_ss_equilibration_cycles(1);
+        return u_ss;
+    }
+
+    // Nonlinear disposition (or singular `I − M`): fall back to the capped pulse train, at the
+    // model tolerance `opts` (not the tightened `eq_opts`), matching the prior behaviour and the
+    // input-rate fallback. Early stop once the trough stops moving (#519): the shared tracker
+    // holds the previous cycle's state and, from cycle 1 on, breaks when the increment is below
+    // the mixed atol/rtol criterion (#532 review #6 — one scaffold across the f64 paths).
     let mut tracker = SsStopTracker::default();
     let mut cycles_run = 0usize;
+    let mut early_stopped = false;
     for cycle in 0..SS_EQUILIBRATION_CYCLES {
         if is_inf {
             // Active-infusion window: wrapped RHS injects rate into the
@@ -695,10 +793,17 @@ fn equilibrate_ss_state(
         }
         cycles_run = cycle + 1;
         if tracker.should_stop(cycle, &u) {
+            early_stopped = true;
             break;
         }
     }
     record_ss_equilibration_cycles(cycles_run);
+    // Gap 2 (#914): a capped ordinary bolus/infusion equilibration was silent (the warning was
+    // wired only into the input-rate branch). Only a *nonlinear* disposition reaches this
+    // fallback — the linear closed form above returned early — so this is exactly the saturable
+    // heavy-accumulation / no-steady-state case #867 warns about.
+    let (incr_prev, incr_last, incr_mag) = tracker.recent_increments();
+    note_ss_nonconvergence_if_capped(early_stopped, incr_prev, incr_last, incr_mag);
 
     u
 }

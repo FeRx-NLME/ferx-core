@@ -1117,7 +1117,8 @@ fn obs_boundary_correction<T: PkNum>(
 /// line search. The variational recursion shares the value iteration's monodromy, so the
 /// derivative tails contract at the same geometric rate — but they lag the value by a constant
 /// few cycles, so a small tail (~`1e-8` on a stressed scale-separated model, see
-/// `ode_provider_ss_early_stop_matches_full_budget`) survives the value stop. That residual is
+/// `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`) survives the value stop.
+/// That residual is
 /// 3–4 orders below the `1e-3` gradient-validation tolerance and NONMEM's SE-matching precision,
 /// so the surviving gradient is faithful for every reported purpose; chasing it to zero would
 /// add a constant per-evaluation cost on the gradient hot path for no observable benefit. A

@@ -3372,25 +3372,16 @@ fn ode_provider_ss_bolus_matches_production() {
     check_hessian_vs_fd_of_grad(&model, &subject, &[1.0, 10.0], &[0.1]);
 }
 
-/// **Early-stop is value-preserving and gradient-faithful to well within validation
-/// precision** (#532 review #1/#2/#4). On a scale-separated 2-cpt SS=1 fit — small `V2` puts
-/// the peripheral compartment ~50× below central, the regime where a magnitude-only floor
-/// could short-circuit the stop — the early-stopped analytic sensitivities are compared
-/// against a *forced-full-budget* equilibration. The dual decides convergence on the value
-/// parts, so:
-///
-/// - **Predictions** match to f64 precision: the value has reached its fixed point, so the
-///   elided cycles do not move it.
-/// - **Gradients / Hessian blocks** match to `< 1e-6` relative (measured `~1e-8` on this
-///   stressed model). The derivative tails contract at the value's geometric rate but lag by
-///   a constant few cycles, so a small tail survives the value stop (#532 review #2). That
-///   tail is 3–4 orders below the `1e-3` FD gradient-validation tolerance, the `1e-9` ODE
-///   solver `reltol`, and NONMEM's ~`1e-5` SE-matching precision — i.e. invisible to every
-///   reported number, which is the precise sense in which SEs are "unchanged".
-///
-/// Running here also exercises the dual stop end-to-end (#532 review #5).
+/// **Linear bolus SS now uses the exact closed-form fixed point over the dual (#914).** A
+/// scale-separated 2-cpt linear disposition — small `V2` puts the peripheral compartment ~50×
+/// below central — equilibrates via `periodic_ss_fixed_point_g` (one recorded cycle) rather than
+/// the up-to-50-cycle pulse train, so its dual value + `∂/∂η` + `∂/∂θ` + both Hessian blocks must
+/// match the production predictor and its finite differences. (This test previously compared an
+/// early-stopped run against a forced-full-budget run; that comparison no longer applies to a
+/// linear model — the #519 pulse-train early stop is now nonlinear-only, covered by the
+/// input-rate MM tests `ode_provider_ss_absorption_nonlinear_*`.)
 #[test]
-fn ode_provider_ss_early_stop_matches_full_budget() {
+fn ode_provider_ss_linear_bolus_uses_exact_solve() {
     let model = parse_model_string(TWOCPT_ODE).expect("parse 2-cpt SS ODE");
     let mut subject = bolus_subject(&[1.0, 4.0, 8.0, 11.0, 20.0]);
     subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
@@ -3398,48 +3389,21 @@ fn ode_provider_ss_early_stop_matches_full_budget() {
         ode_tvcov_supported(&model, &subject),
         "SS bolus → analytic walk"
     );
-    // CL/V1 fast central; small V2 → a peripheral compartment ~50× below central (scale
-    // separation) whose slow mode still equilibrates inside the cycle budget.
     let theta = [4.0, 50.0, 8.0, 1.0];
     let eta = [0.1, 0.05];
 
-    let early = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
-    let early_cycles = crate::dosing::last_ss_equilibration_cycles();
-    let full = crate::dosing::with_full_ss_equilibration(|| {
-        ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported")
-    });
-    let full_cycles = crate::dosing::last_ss_equilibration_cycles();
-
-    // The dual stop must actually fire on this model, or the comparison is vacuous (#532 #5).
+    // Exact fixed point: one recorded cycle, not the pulse train.
+    let _ = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
     assert_eq!(
-        full_cycles,
-        crate::dosing::SS_EQUILIBRATION_CYCLES,
-        "forced-full must run the whole budget"
-    );
-    assert!(
-        early_cycles < full_cycles,
-        "early stop should run fewer cycles ({early_cycles}) than the full budget ({full_cycles})"
+        crate::dosing::last_ss_equilibration_cycles(),
+        1,
+        "a linear disposition must equilibrate via the closed-form fixed point (#914)"
     );
 
-    // Predictions: value reached its fixed point → preserved tightly.
-    for (e, f) in early.obs.iter().zip(&full.obs) {
-        approx::assert_relative_eq!(e.f, f.f, max_relative = 1e-9, epsilon = 1e-12);
-    }
-    // Gradients / Hessian blocks: the dropped derivative tail is below validation precision.
-    for (e, f) in early.obs.iter().zip(&full.obs) {
-        for (a, b) in e.df_deta.iter().zip(&f.df_deta) {
-            approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
-        }
-        for (a, b) in e.df_dtheta.iter().zip(&f.df_dtheta) {
-            approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
-        }
-        for (a, b) in e.d2f_deta2.iter().zip(&f.d2f_deta2) {
-            approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
-        }
-        for (a, b) in e.d2f_deta_dtheta.iter().zip(&f.d2f_deta_dtheta) {
-            approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
-        }
-    }
+    // Value + ∂/∂η + ∂/∂θ vs the production predictor, and both Hessian blocks vs FD-of-gradient
+    // — the Dual2-vs-FD parity CLAUDE.md requires for the new exact-solve sensitivity path.
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
 }
 
 // 1-cpt IV with a **TAD-dependent RHS** (`-(CL/V)·central·(1+0.02·TAD)`). Used to
@@ -3605,19 +3569,72 @@ fn ode_provider_ss_rate_defined_infusion_under_f_matches_production() {
     check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
 }
 
-/// **Early-stop stays gradient-faithful with the new per-cycle rate-off saltation**
-/// (#486, mirroring `ode_provider_ss_early_stop_matches_full_budget`): the (b) sub-case's
-/// per-cycle `inject_rate_saltation` call accumulates over however many cycles the SS
-/// loop runs, so an early-stopped run must still match a forced-full-budget run to well
-/// within FD-validation precision — not just for the value, but for the `F`-window
-/// saltation's gradient/Hessian contribution specifically.
+/// **Linear rate-defined infusion under `F` now uses the exact fixed point over the dual
+/// (#914).** The exact-solve `advance_forced` runs the *same* per-cycle `inject_rate_saltation`
+/// for the `F`-scaled active/quiet window the fallback loop did, so the `F`-window saltation's
+/// gradient **and** Hessian contribution is validated here — against the production predictor and
+/// its finite differences — exactly the concern of the early-stop test this replaces (#486/#642
+/// review #2). One recorded cycle confirms the exact path is taken.
 #[test]
-fn ode_provider_ss_rate_under_f_early_stop_matches_full_budget() {
+fn ode_provider_ss_rate_under_f_uses_exact_solve() {
     let model = parse_model_string(ONECPT_IV_F_ODE).expect("parse F ODE");
     let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 9.0]);
     subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 40.0, true, 12.0)];
     assert!(ode_tvcov_supported(&model, &subject), "SS + F → analytic");
     let theta = [1.0, 10.0, 0.7];
+    let eta = [0.1, 0.05];
+
+    let _ = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_cycles(),
+        1,
+        "a linear disposition must equilibrate via the closed-form fixed point (#914)"
+    );
+
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+}
+
+/// A **Michaelis–Menten disposition** (plain bolus, no absorption kernel): the #914 exact fixed
+/// point declines the nonlinear map and the dual walk falls back to the pulse-train iteration —
+/// the sole path that still exercises the #519/#532 dual early stop after #914 (a linear
+/// disposition now short-circuits to the closed form). This pins that early stop
+/// **gradient-faithful**: an early-stopped run must match a forced-full-budget run to well within
+/// FD-validation precision, and the analytic dual must match the production predictor + FD. (The
+/// linear analogue this replaces was `ode_provider_ss_early_stop_matches_full_budget`.)
+const MM_DISPOSITION_ODE: &str = r#"
+[parameters]
+  theta TVVMAX(50.0, 1.0, 500.0)
+  theta TVKM(30.0, 1.0, 500.0)
+  omega ETA_VMAX ~ 0.09
+  omega ETA_KM   ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  VMAX = TVVMAX * exp(ETA_VMAX)
+  KM   = TVKM   * exp(ETA_KM)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -VMAX * central / (KM + central)
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+#[test]
+fn ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget() {
+    let model = parse_model_string(MM_DISPOSITION_ODE).expect("parse MM disposition ODE");
+    let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 7.9]);
+    // Peak amount ≈ 100 ≫ KM ≈ 30 (genuinely nonlinear), mean input 100/8 = 12.5 ≪ VMAX = 50
+    // (admits a steady state and converges well inside the 50-cycle cap, so the early stop fires).
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0)];
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "SS bolus → analytic walk"
+    );
+    let theta = [50.0, 30.0];
     let eta = [0.1, 0.05];
 
     let early = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
@@ -3627,15 +3644,21 @@ fn ode_provider_ss_rate_under_f_early_stop_matches_full_budget() {
     });
     let full_cycles = crate::dosing::last_ss_equilibration_cycles();
 
+    // The nonlinear fallback (not the exact solve) must run, and its dual early stop must fire —
+    // else the comparison is vacuous. `> 1` rules out the single-cycle exact-solve short-circuit.
     assert_eq!(
         full_cycles,
         crate::dosing::SS_EQUILIBRATION_CYCLES,
         "forced-full must run the whole budget"
     );
     assert!(
-        early_cycles < full_cycles,
-        "early stop should run fewer cycles ({early_cycles}) than the full budget ({full_cycles})"
+        (2..full_cycles).contains(&early_cycles),
+        "the nonlinear fallback's early stop should run >1 and fewer cycles ({early_cycles}) than \
+         the full budget ({full_cycles})"
     );
+
+    // Value reached its fixed point → predictions preserved tightly; the dropped derivative tail
+    // is below FD-validation precision.
     for (e, f) in early.obs.iter().zip(&full.obs) {
         approx::assert_relative_eq!(e.f, f.f, max_relative = 1e-9, epsilon = 1e-12);
         for (a, b) in e.df_deta.iter().zip(&f.df_deta) {
@@ -3644,16 +3667,9 @@ fn ode_provider_ss_rate_under_f_early_stop_matches_full_budget() {
         for (a, b) in e.df_dtheta.iter().zip(&f.df_dtheta) {
             approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
         }
-        // The per-cycle rate-off saltation accumulates into the 2nd-order term across every
-        // cycle, so the Hessian blocks — not just the gradient — must survive early stop
-        // (this is what the docstring claims; #642 review #2).
-        for (a, b) in e.d2f_deta2.iter().zip(&f.d2f_deta2) {
-            approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
-        }
-        for (a, b) in e.d2f_deta_dtheta.iter().zip(&f.d2f_deta_dtheta) {
-            approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
-        }
     }
+    // Teeth: the fallback dual value + gradient must match the production predictor and its FD.
+    check_vs_production(&model, &subject, &theta, &eta);
 }
 
 /// **Modeled-duration dose × SS is now analytic (#486, PR3 sub-case (d) — cheapest,
