@@ -60,6 +60,16 @@ section of the SDLC for the versioning policy).
   for any external code that constructs or exhaustively destructures these variants.
 
 ### Fixed
+- **FOCE inner EBE recovery no longer discards a near-optimal partial for a worse fallback**
+  (#378). When a subject's individual objective is multimodal (e.g. a 3-cpt IV proportional
+  model with six IIV etas conditioned on ten points), the closed-form inner BFGS can reach the
+  conditional mode yet stall at a gradient norm just above `inner_tol`; the exact-path recovery
+  then restarted Nelder–Mead from η=0 and kept that (worse) basin, discarding the good BFGS
+  partial. The recovery now keeps the lower-objective of {BFGS partial, NM} on non-FREM models —
+  the guard the ODE inner path already used (#555) — so the closed-form and ODE forms converge to
+  the same EBE. This removes the ODE↔analytical FOCE **marginal** OFV divergence (up to ~18 OFV
+  units, platform-sensitive) that surfaced after the `inner_tol` tightening in #330. FREM keeps
+  its cold-restart re-centering unchanged.
 - **Steady-state (`SS=1`) dosing on `[odes]` models is now exact for a linear disposition, and
   warns instead of silently truncating on a nonlinear one** (#914). An ordinary ODE bolus or
   infusion SS dose previously equilibrated by expanding a pulse train capped at 50 cycles, which
