@@ -916,11 +916,29 @@ pub fn find_ebe(
             let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
             eta = best;
             (ok, true)
-        } else {
+        } else if model.frem_config.is_some() {
+            // FREM: the BFGS partial can be a *non-stationary*, merely-low-objective point (run
+            // out along a covariate pseudo-obs flat direction) that would mis-center the
+            // FREM/IMP proposal. Re-center with NM from η=0 and take it unconditionally — the
+            // prior-release behaviour for the exact path.
             let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
             eta = if warm { partial } else { cold };
             let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
             (nm_ok, true)
+        } else {
+            // Non-FREM exact objective (#378): a BFGS "failure" is often a *near-stationary*
+            // partial that merely could not reach a tightened `inner_tol` — on a multimodal
+            // subject the closed-form BFGS finds the *better* mode but stalls at a gradient norm
+            // just above `tol` (e.g. 3-cpt proportional subject-14: partial at the global mode,
+            // gnorm ≈ 2e-5 > tol 1e-5). Recovering with a cold NM then *discarded* that global
+            // partial for a worse local basin, and the tightened inner tol (#330: 1e-4→1e-5)
+            // flipped exactly this subject from "converged" to "failed→worse fallback" — the
+            // ODE↔analytical marginal-OFV divergence in #378. Keep the lower-objective of
+            // {partial, NM} instead, so a good partial is never traded for a worse NM basin —
+            // the same guard the ODE path already uses (#555).
+            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
+            eta = best;
+            (ok, true)
         }
     } else {
         (false, false)

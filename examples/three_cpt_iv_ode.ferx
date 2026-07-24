@@ -1,7 +1,11 @@
 # Three-compartment IV bolus PK model (ODE)
 #
-# ODE equivalent of three_cpt_iv.ferx. States held as amounts (mg); dose adds
-# directly to central. [scaling] converts central to concentration.
+# ODE equivalent of three_cpt_iv.ferx — a true sibling: same six IIV random
+# effects (CL, V1, Q2, V2, Q3, V3) and error model, so the two forms agree on the
+# FOCE *marginal* OFV, not just the eta=0 structural prediction. States held as
+# amounts (mg); dose adds directly to central. [scaling] converts central to
+# concentration. The tight ode_reltol keeps the RK45 conditional-mode solve in
+# lockstep with the analytical closed form.
 
 [parameters]
   theta TVCL(5.0,  0.1, 100.0)
@@ -13,16 +17,20 @@
 
   omega ETA_CL ~ 0.09
   omega ETA_V1 ~ 0.04
+  omega ETA_Q2 ~ 0.04
+  omega ETA_V2 ~ 0.04
+  omega ETA_Q3 ~ 0.04
+  omega ETA_V3 ~ 0.04
 
   sigma PROP_ERR ~ 0.04 (sd)
 
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
   V1 = TVV1 * exp(ETA_V1)
-  Q2 = TVQ2
-  V2 = TVV2
-  Q3 = TVQ3
-  V3 = TVV3
+  Q2 = TVQ2 * exp(ETA_Q2)
+  V2 = TVV2 * exp(ETA_V2)
+  Q3 = TVQ3 * exp(ETA_Q3)
+  V3 = TVV3 * exp(ETA_V3)
 
 [structural_model]
   ode(states=[central, peripheral1, peripheral2])
@@ -39,5 +47,7 @@
   DV ~ proportional(PROP_ERR)
 
 [fit_options]
-  method  = foce
-  maxiter = 300
+  method     = foce
+  maxiter    = 300
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
