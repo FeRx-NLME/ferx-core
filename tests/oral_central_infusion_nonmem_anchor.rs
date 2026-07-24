@@ -103,7 +103,22 @@ fn oral_model(cpt: usize, tvf: f64) -> String {
 
 /// Predictions on the **event-driven walk**, selected by a `WT` column that
 /// varies across rows. The model never references `WT`, so no parameter value
-/// differs from the plain dataset — only the code path does.
+/// differs from the plain dataset — only the code path does: the reader flags a
+/// varying non-model column as a covariate (`datareader.rs`), which makes
+/// `Subject::has_tv_covariates()` true, and `compute_predictions_with_tv`
+/// (`pk/mod.rs`) then routes an analytical + TV-covariate subject to
+/// `event_driven_predictions` (the walk) rather than the superposition closed
+/// form `plain_preds` uses.
+///
+/// That routing was confirmed empirically, not just read off the source: a
+/// temporary ×1.5 scale injected into the walk's sole funnel
+/// (`event_driven_predictions_run`) moved **only** this dataset — `walk_preds`
+/// read 1.5× the true curve while `plain_preds` stayed exactly 1.0×, proving the
+/// two go through different functions (the walk vs `predict_concentration`).
+/// Re-run that differential injection to re-verify if the dispatch in
+/// `compute_predictions_with_tv` is ever refactored — the F=1 walk value here is
+/// ~0.476 (> 0), so a walk that silently fell back to superposition would still
+/// pass this file, but a walk that regressed to the #350 ~0 curve would not.
 fn walk_preds(src: &str, rate: f64) -> Vec<f64> {
     let model: CompiledModel = parse_full_model(src).expect("model parses").model;
     let dose = format!("1,0,.,1,100,2,{rate},1,70");
