@@ -304,6 +304,42 @@ Two consequences worth knowing:
   do *not* feed the network are unaffected.
 
 `method = focei` uses a different gradient path and is unchanged.
+## Regularization (`nn_l2`, `nn_smooth`)
+
+Because an unregularized DCM can invent spurious covariate-driven
+variation — and the amount grows with network capacity (`[4]` <
+`[4,4]` ≈ `[8]`), showing up as sharp high-frequency wiggles in the
+learned covariate→modulator curves — two optional penalties are
+available. Both default to `0.0` (off, a strict no-op) and are set from
+`[fit_options]` (or `ferx_fit(settings = ...)`):
+
+- **`nn_l2`** — L2 weight decay, `nn_l2 · Σ wᵢ²` over the **weight**
+  matrices only (biases stay free). Shrinks every weight toward 0.
+- **`nn_smooth`** — smoothness/curvature penalty, `nn_smooth · Σ C²`,
+  where `C = f(x+h) − 2·f(x) + f(x−h)` is the finite-difference 2nd
+  derivative of each output along an input's marginal
+  partial-dependence curve (z-scored input space, other inputs at their
+  median). It penalizes *curvature*, so monotone slopes are free and
+  only the wiggles are punished.
+
+Both add to the objective the optimizer minimizes and carry matching
+analytic gradients (no autodiff — the smoothness term reuses the MLP's
+analytic Jacobian). They apply across the FOCE/FOCEI outer optimizers.
+
+The **reported** `fit$ofv` (and hence AIC/BIC) is the **unpenalized**
+−2·log-likelihood, so a regularized DCM stays directly comparable to an
+analytic-covariate model on information criteria; the penalty only
+shapes the optimization.
+
+```
+[fit_options]
+  method    = focei
+  nn_l2     = 1e-2   # weight decay
+  nn_smooth = 1e-1   # curvature / anti-wiggle
+```
+
+See [fit-options.qmd](fit-options.qmd#covariate-nn-regularization-nn_l2-nn_smooth)
+for the full reference.
 
 ## What's not yet wired
 

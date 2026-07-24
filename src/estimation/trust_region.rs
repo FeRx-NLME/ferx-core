@@ -40,6 +40,11 @@ struct FoceiProblem<'a> {
     bounds: PackedBounds,
     cached_etas: std::sync::Mutex<Vec<DVector<f64>>>,
     grad_cache: std::sync::Mutex<Option<GradCache>>,
+    /// Covariate-NN (DCM) regularizer. No-op when both λ are 0. Added to the
+    /// optimizer objective (`cost`/`ofv_fixed`) and gradient, not to the final
+    /// reported OFV, which reuses a clean `pop_nll_opts`.
+    #[cfg(feature = "nn")]
+    nn_reg: crate::nn::NnRegularizer,
 }
 
 impl FoceiProblem<'_> {
@@ -79,6 +84,9 @@ impl FoceiProblem<'_> {
             self.options,
         );
         let raw = 2.0 * nll;
+        // Penalized objective fed to the optimizer (unregularized fits unchanged).
+        #[cfg(feature = "nn")]
+        let raw = raw + self.nn_reg.penalty_value(&params.theta);
         if raw.is_finite() {
             raw
         } else {
@@ -219,6 +227,15 @@ impl Gradient for FoceiProblem<'_> {
             for k in 0..n {
                 g[k] += 2.0 * (gi[k] + ti[k]);
             }
+        }
+        // NN penalty gradient (identity-packed weights, unit scale → maps 1:1
+        // into packed space). The BHHH `hessian()` intentionally omits the
+        // penalty's curvature — it only approximates the model Hessian, and the
+        // located minimum is set by where this (penalized) gradient vanishes.
+        #[cfg(feature = "nn")]
+        {
+            let params = unpack_params(p, self.init_params);
+            self.nn_reg.add_packed_gradient(&params.theta, &mut g);
         }
         Ok(g)
     }
@@ -642,6 +659,9 @@ pub fn optimize_trust_region(
     let n_subj = population.subjects.len();
     let n_eta = model.n_eta;
 
+    #[cfg(feature = "nn")]
+    let nn_reg = crate::nn::NnRegularizer::build(model, population, options);
+
     let problem = FoceiProblem {
         model,
         population,
@@ -650,6 +670,8 @@ pub fn optimize_trust_region(
         bounds,
         cached_etas: std::sync::Mutex::new(vec![DVector::zeros(n_eta); n_subj]),
         grad_cache: std::sync::Mutex::new(None),
+        #[cfg(feature = "nn")]
+        nn_reg,
     };
 
     if options.verbose {
@@ -915,6 +937,8 @@ mod tests {
             bounds,
             cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(n_eta); n_subj]),
             grad_cache: std::sync::Mutex::new(None),
+            #[cfg(feature = "nn")]
+            nn_reg: crate::nn::NnRegularizer::build(&model, &population, &options),
         };
 
         // 1. Before cost(): cache is None.
@@ -1210,6 +1234,8 @@ mod tests {
                     population.subjects.len()
                 ]),
                 grad_cache: std::sync::Mutex::new(None),
+                #[cfg(feature = "nn")]
+                nn_reg: crate::nn::NnRegularizer::build(&model, &population, &options),
             };
 
             let analytic = fresh().gradient(&x).expect("gradient must evaluate");

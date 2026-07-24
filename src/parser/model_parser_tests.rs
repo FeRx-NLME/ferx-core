@@ -3431,6 +3431,26 @@ fn test_parse_inits_from_nca() {
 }
 
 #[test]
+fn test_parse_nn_regularization_lambdas() {
+    // Default: both off (0.0), a strict no-op for existing fits.
+    let d = FitOptions::default();
+    assert_eq!(d.nn_l2_lambda, 0.0);
+    assert_eq!(d.nn_smooth_lambda, 0.0);
+
+    // Settable from the [fit_options] block (same path as ferx_fit settings).
+    let opts =
+        parse_fit_options(&["nn_l2 = 1e-2".to_string(), "nn_smooth = 0.25".to_string()]).unwrap();
+    assert_eq!(opts.nn_l2_lambda, 1e-2);
+    assert_eq!(opts.nn_smooth_lambda, 0.25);
+
+    // Non-negativity guard: negative strengths are rejected.
+    assert!(parse_fit_options(&["nn_l2 = -1.0".to_string()]).is_err());
+    assert!(parse_fit_options(&["nn_smooth = -0.5".to_string()]).is_err());
+    // Non-numeric values are rejected.
+    assert!(parse_fit_options(&["nn_l2 = high".to_string()]).is_err());
+}
+
+#[test]
 fn test_parse_method_chain() {
     let opts = parse_fit_options(&["method = [saem, focei]".to_string()]).unwrap();
     assert_eq!(

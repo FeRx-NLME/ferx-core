@@ -27,7 +27,16 @@
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
 
-use crate::types::PkParams;
+use crate::types::{CompiledModel, FitOptions, PkParams, Population};
+
+/// Uniform grid step (in z-scored input units) for the smoothness/curvature
+/// penalty's marginal partial-dependence sweep. A quarter of a standard
+/// deviation resolves the wiggles the penalty targets without over-sampling.
+pub(crate) const NN_SMOOTH_GRID_STEP_Z: f64 = 0.25;
+
+/// Cap on the number of grid nodes swept per NN input, bounding the curvature
+/// penalty's cost for covariates with a very wide observed range.
+pub(crate) const NN_SMOOTH_GRID_MAX_NODES: usize = 65;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -487,6 +496,124 @@ impl MlpMapper {
         Ok(jac)
     }
 
+    /// Local flat-vector indices of the **weight-matrix** parameters, excluding
+    /// the bias entries. Within each layer `l`'s block
+    /// (`offsets[l-1]..offsets[l]`) the first `layers[l]·layers[l-1]` entries are
+    /// weights and the trailing `layers[l]` are biases (matches the row-major
+    /// `[W_l, b_l]` layout and the parser's `W_…`/`B_…` theta naming). Used by
+    /// the L2 (weight-decay) penalty, which shrinks weights but leaves biases
+    /// free.
+    pub fn weight_param_indices(&self) -> Vec<usize> {
+        let mut idx = Vec::new();
+        for l in 1..self.layers.len() {
+            let start = self.offsets[l - 1];
+            let n_w = self.layers[l] * self.layers[l - 1];
+            idx.extend(start..start + n_w);
+        }
+        idx
+    }
+
+    /// L2 (weight-decay) penalty value `lambda · Σ wᵢ²` over the **weight**
+    /// blocks only (biases excluded). `lambda == 0.0` returns `0.0` (no-op).
+    pub fn l2_weight_penalty_value(&self, weights: &[f64], lambda: f64) -> f64 {
+        if lambda == 0.0 {
+            return 0.0;
+        }
+        let mut s = 0.0;
+        for l in 1..self.layers.len() {
+            let start = self.offsets[l - 1];
+            let n_w = self.layers[l] * self.layers[l - 1];
+            for &w in &weights[start..start + n_w] {
+                s += w * w;
+            }
+        }
+        lambda * s
+    }
+
+    /// L2 penalty value and its gradient w.r.t. the flat weight vector.
+    /// `grad[i] = 2·lambda·wᵢ` on weight entries, `0` on bias entries.
+    /// `lambda == 0.0` returns `(0.0, zeros)` (strict no-op).
+    pub fn l2_weight_penalty(&self, weights: &[f64], lambda: f64) -> (f64, Vec<f64>) {
+        let mut grad = vec![0.0f64; self.n_params];
+        if lambda == 0.0 {
+            return (0.0, grad);
+        }
+        let mut s = 0.0;
+        for l in 1..self.layers.len() {
+            let start = self.offsets[l - 1];
+            let n_w = self.layers[l] * self.layers[l - 1];
+            for i in start..start + n_w {
+                s += weights[i] * weights[i];
+                grad[i] = 2.0 * lambda * weights[i];
+            }
+        }
+        (lambda * s, grad)
+    }
+
+    /// Smoothness (curvature) penalty value `lambda · Σ_grid Σ_output C²`, where
+    /// `C = f(x+h) − 2·f(x) + f(x−h)` is the finite-difference 2nd derivative of
+    /// each output along a marginal partial-dependence curve (see
+    /// [`CurvatureGrid`]). Forward passes only; `lambda == 0.0` or an empty grid
+    /// returns `0.0` (no-op).
+    pub fn curvature_penalty_value(
+        &self,
+        weights: &[f64],
+        grid: &CurvatureGrid,
+        lambda: f64,
+    ) -> f64 {
+        if lambda == 0.0 || grid.is_empty() {
+            return 0.0;
+        }
+        let mut s = 0.0;
+        for t in grid.triples() {
+            let ym = self.forward(&t[0], weights).expect("grid input shape ok");
+            let yc = self.forward(&t[1], weights).expect("grid input shape ok");
+            let yp = self.forward(&t[2], weights).expect("grid input shape ok");
+            for o in 0..ym.len() {
+                let c = yp[o] - 2.0 * yc[o] + ym[o];
+                s += c * c;
+            }
+        }
+        lambda * s
+    }
+
+    /// Smoothness (curvature) penalty value and its gradient w.r.t. the flat
+    /// weight vector. Reuses the analytic [`MlpMapper::jacobian`]:
+    /// `∂C/∂w = J(x+h) − 2·J(x) + J(x−h)`, so
+    /// `∂pen/∂w = Σ 2·lambda·C·(∂C/∂w)`. No autodiff needed. `lambda == 0.0` or
+    /// an empty grid returns `(0.0, zeros)` (strict no-op). The gradient touches
+    /// bias entries too (biases shift the curve), unlike the L2 term.
+    pub fn curvature_penalty(
+        &self,
+        weights: &[f64],
+        grid: &CurvatureGrid,
+        lambda: f64,
+    ) -> (f64, Vec<f64>) {
+        let mut grad = vec![0.0f64; self.n_params];
+        if lambda == 0.0 || grid.is_empty() {
+            return (0.0, grad);
+        }
+        let mut s = 0.0;
+        for t in grid.triples() {
+            let ym = self.forward(&t[0], weights).expect("grid input shape ok");
+            let yc = self.forward(&t[1], weights).expect("grid input shape ok");
+            let yp = self.forward(&t[2], weights).expect("grid input shape ok");
+            let jm = self.jacobian(&t[0], weights).expect("grid input shape ok");
+            let jc = self.jacobian(&t[1], weights).expect("grid input shape ok");
+            let jp = self.jacobian(&t[2], weights).expect("grid input shape ok");
+            for o in 0..ym.len() {
+                let c = yp[o] - 2.0 * yc[o] + ym[o];
+                s += c * c;
+                let two_lc = 2.0 * lambda * c;
+                for w in 0..self.n_params {
+                    let dc = jp[(o, w)] - 2.0 * jc[(o, w)] + jm[(o, w)];
+                    grad[w] += two_lc * dc;
+                }
+            }
+        }
+        (lambda * s, grad)
+    }
+
     /// Build an `(n_l × n_{l-1})` `DMatrix` from the layer-`l` weight block
     /// (1-indexed, `1..=L`). The flat weight vector is row-major while
     /// nalgebra's `DMatrix` is column-major, so this is a copy, not a
@@ -907,6 +1034,245 @@ pub struct CovariateNn {
     /// Index into `ModelParameters::theta` where this NN's weight block
     /// starts. The block has `mapper.n_weights()` contiguous entries.
     pub weights_offset: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Regularization — L2 (weight-decay) + smoothness (curvature)
+// ---------------------------------------------------------------------------
+
+/// A marginal partial-dependence grid for the smoothness/curvature penalty.
+///
+/// For each NN input in turn, the input is swept across its observed range in
+/// **z-scored** space (uniform step [`NN_SMOOTH_GRID_STEP_Z`]) while every other
+/// input is held at its median. Each interior node contributes a triple of
+/// **raw** input vectors `(x−h, x, x+h)` at which the penalty finite-differences
+/// the 2nd derivative `C = f(x+h) − 2·f(x) + f(x−h)`. The grid mirrors the
+/// partial-dependence curves used in downstream diagnostics, so the penalty
+/// smooths exactly what those plots show. Inputs are read raw by the NN, so the
+/// z-scored sweep is mapped back to raw values (`z·sd + mean`) here; the raw
+/// vectors are what feed [`MlpMapper::forward`] / [`MlpMapper::jacobian`].
+#[derive(Debug, Clone, Default)]
+pub struct CurvatureGrid {
+    /// Each entry is `[x_minus, x_center, x_plus]`, raw input vectors of length
+    /// `n_inputs`.
+    triples: Vec<[Vec<f64>; 3]>,
+}
+
+impl CurvatureGrid {
+    /// Build the grid from per-input observed values. `input_values[i]` is the
+    /// vector of observed values of NN input `i` (in the mapper's input order),
+    /// and `step_z` is the uniform grid step in z-scored units.
+    ///
+    /// An input with zero spread (constant covariate) or too narrow a range to
+    /// fit an interior triple contributes nothing. Returns an empty grid (a
+    /// no-op penalty) when no input yields a usable sweep.
+    pub fn build(input_values: &[Vec<f64>], step_z: f64) -> Self {
+        let n_in = input_values.len();
+        let mut triples = Vec::new();
+        if step_z <= 0.0 {
+            return Self { triples };
+        }
+        // Held-input centers (median) and per-axis mean/sd/min/max.
+        let mut medians = vec![0.0; n_in];
+        let mut means = vec![0.0; n_in];
+        let mut sds = vec![0.0; n_in];
+        let mut mins = vec![0.0; n_in];
+        let mut maxs = vec![0.0; n_in];
+        for (i, vals) in input_values.iter().enumerate() {
+            if vals.is_empty() {
+                continue;
+            }
+            let mut sorted = vals.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            medians[i] = median_of_sorted(&sorted);
+            let n = vals.len() as f64;
+            let mean = vals.iter().sum::<f64>() / n;
+            let var = vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+            means[i] = mean;
+            sds[i] = var.sqrt();
+            mins[i] = *sorted.first().expect("non-empty");
+            maxs[i] = *sorted.last().expect("non-empty");
+        }
+        for i in 0..n_in {
+            let sd = sds[i];
+            if sd <= 0.0 {
+                continue; // constant covariate — no curvature axis
+            }
+            let z_lo = (mins[i] - means[i]) / sd;
+            let z_hi = (maxs[i] - means[i]) / sd;
+            let span = z_hi - z_lo;
+            if span < 2.0 * step_z {
+                continue; // too narrow to form an interior triple
+            }
+            let n_nodes = ((span / step_z).floor() as usize + 1).min(NN_SMOOTH_GRID_MAX_NODES);
+            if n_nodes < 3 {
+                continue;
+            }
+            let raw_at = |z: f64| -> Vec<f64> {
+                let mut x = medians.clone();
+                x[i] = z * sd + means[i];
+                x
+            };
+            for g in 1..n_nodes - 1 {
+                let z_center = z_lo + step_z * g as f64;
+                triples.push([
+                    raw_at(z_center - step_z),
+                    raw_at(z_center),
+                    raw_at(z_center + step_z),
+                ]);
+            }
+        }
+        Self { triples }
+    }
+
+    /// The `(x−h, x, x+h)` triples of raw input vectors.
+    fn triples(&self) -> &[[Vec<f64>; 3]] {
+        &self.triples
+    }
+
+    /// Whether the grid contributes any curvature terms.
+    pub fn is_empty(&self) -> bool {
+        self.triples.is_empty()
+    }
+}
+
+fn median_of_sorted(sorted: &[f64]) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        0.5 * (sorted[n / 2 - 1] + sorted[n / 2])
+    }
+}
+
+/// Collect the observed values of each of a mapper's named inputs across the
+/// population's subject-static covariates, in the mapper's input order. Missing
+/// covariates are skipped (they never contribute a value), matching the
+/// forward-pass zero-fill only in that they don't distort the observed
+/// distribution used to build the grid.
+fn collect_input_values(mapper: &NamedMlpMapper, population: &Population) -> Vec<Vec<f64>> {
+    mapper
+        .input_names()
+        .iter()
+        .map(|name| {
+            population
+                .subjects
+                .iter()
+                .filter_map(|s| s.covariates.get(name).copied())
+                .collect()
+        })
+        .collect()
+}
+
+/// Per-network regularization state, built once before the optimize loop and
+/// shared (by reference) across every objective/gradient evaluation.
+///
+/// Holds a cheap clone of each NN's [`MlpMapper`], the theta offset of its
+/// weight block, and (when smoothness is on) its prebuilt [`CurvatureGrid`].
+/// Both penalties are strict no-ops when their λ is `0.0`, so an unregularized
+/// fit adds nothing.
+#[derive(Debug, Clone)]
+pub struct NnRegularizer {
+    l2_lambda: f64,
+    smooth_lambda: f64,
+    specs: Vec<NnRegSpec>,
+}
+
+#[derive(Debug, Clone)]
+struct NnRegSpec {
+    weights_offset: usize,
+    n_weights: usize,
+    mapper: MlpMapper,
+    grid: CurvatureGrid,
+}
+
+impl NnRegularizer {
+    /// Build the regularizer from the model's `[covariate_nn]` blocks and the
+    /// fit options' `nn_l2` / `nn_smooth` strengths. When both λ are `0.0` the
+    /// spec list is empty and every method is a no-op.
+    pub fn build(model: &CompiledModel, population: &Population, options: &FitOptions) -> Self {
+        let l2_lambda = options.nn_l2_lambda;
+        let smooth_lambda = options.nn_smooth_lambda;
+        let mut specs = Vec::new();
+        if l2_lambda > 0.0 || smooth_lambda > 0.0 {
+            for nn in &model.covariate_nns {
+                let mapper = nn.mapper.mlp().clone();
+                let n_weights = mapper.n_weights();
+                let grid = if smooth_lambda > 0.0 {
+                    CurvatureGrid::build(
+                        &collect_input_values(&nn.mapper, population),
+                        NN_SMOOTH_GRID_STEP_Z,
+                    )
+                } else {
+                    CurvatureGrid::default()
+                };
+                specs.push(NnRegSpec {
+                    weights_offset: nn.weights_offset,
+                    n_weights,
+                    mapper,
+                    grid,
+                });
+            }
+        }
+        Self {
+            l2_lambda,
+            smooth_lambda,
+            specs,
+        }
+    }
+
+    /// Whether any penalty term is active (non-zero λ and at least one NN).
+    pub fn is_active(&self) -> bool {
+        !self.specs.is_empty() && (self.l2_lambda > 0.0 || self.smooth_lambda > 0.0)
+    }
+
+    /// Additive penalty on the population objective: `Σ_nn (L2 + smoothness)`.
+    /// `theta` is the full (natural-space) theta vector; the NN weight blocks
+    /// are sliced out at each spec's offset. Returns `0.0` when inactive.
+    pub fn penalty_value(&self, theta: &[f64]) -> f64 {
+        let mut p = 0.0;
+        for spec in &self.specs {
+            let w = &theta[spec.weights_offset..spec.weights_offset + spec.n_weights];
+            if self.l2_lambda > 0.0 {
+                p += spec.mapper.l2_weight_penalty_value(w, self.l2_lambda);
+            }
+            if self.smooth_lambda > 0.0 {
+                p += spec
+                    .mapper
+                    .curvature_penalty_value(w, &spec.grid, self.smooth_lambda);
+            }
+        }
+        p
+    }
+
+    /// Add the penalty gradient into `grad` at the NN-weight coordinates. Both
+    /// penalties are separable and the NN weights are identity-packed with unit
+    /// optimizer scale, so the raw-weight gradient maps one-to-one into the
+    /// packed gradient `grad` (no Jacobian-of-scaling factor). No-op when
+    /// inactive.
+    pub fn add_packed_gradient(&self, theta: &[f64], grad: &mut [f64]) {
+        for spec in &self.specs {
+            let off = spec.weights_offset;
+            let w = &theta[off..off + spec.n_weights];
+            if self.l2_lambda > 0.0 {
+                let (_v, g) = spec.mapper.l2_weight_penalty(w, self.l2_lambda);
+                for (i, gi) in g.iter().enumerate() {
+                    grad[off + i] += gi;
+                }
+            }
+            if self.smooth_lambda > 0.0 {
+                let (_v, g) = spec
+                    .mapper
+                    .curvature_penalty(w, &spec.grid, self.smooth_lambda);
+                for (i, gi) in g.iter().enumerate() {
+                    grad[off + i] += gi;
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1882,173 @@ mod invert_tests {
             for (k, &v) in targets.iter().enumerate() {
                 assert_relative_eq!(y[k], v, max_relative = 1e-12);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Regularization: L2 (weight-decay) + smoothness (curvature)
+    // -----------------------------------------------------------------
+
+    /// Deterministic non-trivial weights, small magnitudes so tanh stays in a
+    /// smooth regime (clean finite-difference signal).
+    fn det_weights(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| 0.2 * (i as f64 * 0.7).sin() + 0.1 * (i as f64 * 1.3).cos())
+            .collect()
+    }
+
+    #[test]
+    fn weight_param_indices_excludes_biases() {
+        // 2→3→1: layer1 W=6 (0..6) b=3 (6..9); layer2 W=3 (9..12) b=1 (12).
+        let mlp = MlpMapper::new(vec![2, 3, 1], Activation::Tanh, Activation::Identity).unwrap();
+        assert_eq!(mlp.n_weights(), 13);
+        assert_eq!(
+            mlp.weight_param_indices(),
+            vec![0, 1, 2, 3, 4, 5, 9, 10, 11]
+        );
+    }
+
+    #[test]
+    fn l2_penalty_zero_lambda_is_noop() {
+        let mlp = MlpMapper::new(vec![2, 3, 1], Activation::Tanh, Activation::Softplus).unwrap();
+        let w = det_weights(mlp.n_weights());
+        assert_eq!(mlp.l2_weight_penalty_value(&w, 0.0), 0.0);
+        let (v, g) = mlp.l2_weight_penalty(&w, 0.0);
+        assert_eq!(v, 0.0);
+        assert!(g.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn l2_penalty_value_sums_weights_not_biases() {
+        let mlp = MlpMapper::new(vec![2, 3, 1], Activation::Tanh, Activation::Identity).unwrap();
+        let w = det_weights(mlp.n_weights());
+        let lambda = 0.37;
+        // Hand-sum over the weight indices only.
+        let expected: f64 = lambda
+            * mlp
+                .weight_param_indices()
+                .iter()
+                .map(|&i| w[i] * w[i])
+                .sum::<f64>();
+        assert_relative_eq!(
+            mlp.l2_weight_penalty_value(&w, lambda),
+            expected,
+            epsilon = 1e-12
+        );
+        // A large bias must not change the penalty (biases excluded).
+        let mut w_big_bias = w.clone();
+        w_big_bias[6] += 100.0; // a layer-1 bias index
+        assert_relative_eq!(
+            mlp.l2_weight_penalty_value(&w_big_bias, lambda),
+            expected,
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn l2_penalty_gradient_matches_central_fd() {
+        let mlp = MlpMapper::new(vec![2, 4, 3], Activation::Tanh, Activation::Softplus).unwrap();
+        let w = det_weights(mlp.n_weights());
+        let lambda = 0.53;
+        let (_v, g) = mlp.l2_weight_penalty(&w, lambda);
+        let eps = 1e-6;
+        let mut p = w.clone();
+        for j in 0..w.len() {
+            let saved = p[j];
+            p[j] = saved + eps;
+            let vp = mlp.l2_weight_penalty_value(&p, lambda);
+            p[j] = saved - eps;
+            let vm = mlp.l2_weight_penalty_value(&p, lambda);
+            p[j] = saved;
+            let fd = (vp - vm) / (2.0 * eps);
+            assert_relative_eq!(g[j], fd, epsilon = 1e-6, max_relative = 1e-5);
+        }
+    }
+
+    #[test]
+    fn curvature_grid_skips_constant_and_narrow_inputs() {
+        // Input 0 varies widely; input 1 is constant (sd=0 → no axis).
+        let vals = vec![
+            vec![50.0, 60.0, 70.0, 80.0, 90.0, 100.0],
+            vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        ];
+        let grid = CurvatureGrid::build(&vals, NN_SMOOTH_GRID_STEP_Z);
+        assert!(!grid.is_empty(), "wide input 0 must yield curvature nodes");
+        // Every triple must hold input 1 fixed at its median (1.0) and vary only
+        // input 0 across its three stencil points.
+        for t in grid.triples() {
+            assert_eq!(t[0].len(), 2);
+            assert_relative_eq!(t[0][1], 1.0, epsilon = 1e-12);
+            assert_relative_eq!(t[1][1], 1.0, epsilon = 1e-12);
+            assert_relative_eq!(t[2][1], 1.0, epsilon = 1e-12);
+            // Uniform stencil in raw space: center is the midpoint of ±h.
+            assert_relative_eq!(t[1][0], 0.5 * (t[0][0] + t[2][0]), epsilon = 1e-9);
+        }
+        // Both inputs constant → no curvature axis at all → empty grid (no-op).
+        let both_constant = vec![vec![5.0; 6], vec![1.0; 6]];
+        assert!(CurvatureGrid::build(&both_constant, NN_SMOOTH_GRID_STEP_Z).is_empty());
+        // A non-positive step is also a no-op.
+        assert!(CurvatureGrid::build(&vals, 0.0).is_empty());
+    }
+
+    #[test]
+    fn curvature_penalty_zero_lambda_is_noop() {
+        let mlp = MlpMapper::new(vec![2, 3, 2], Activation::Tanh, Activation::Softplus).unwrap();
+        let w = det_weights(mlp.n_weights());
+        let vals = vec![
+            vec![50.0, 60.0, 70.0, 80.0, 90.0, 100.0],
+            vec![30.0, 50.0, 70.0, 90.0, 110.0, 130.0],
+        ];
+        let grid = CurvatureGrid::build(&vals, NN_SMOOTH_GRID_STEP_Z);
+        assert!(!grid.is_empty());
+        assert_eq!(mlp.curvature_penalty_value(&w, &grid, 0.0), 0.0);
+        let (v, g) = mlp.curvature_penalty(&w, &grid, 0.0);
+        assert_eq!(v, 0.0);
+        assert!(g.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn curvature_penalty_zero_for_affine_network() {
+        // A single-layer identity net is affine in its inputs, so the 2nd
+        // difference C = f(x+h) − 2f(x) + f(x−h) is exactly 0 everywhere.
+        let mlp = MlpMapper::new(vec![2, 1], Activation::Identity, Activation::Identity).unwrap();
+        let w = det_weights(mlp.n_weights());
+        let vals = vec![
+            vec![50.0, 60.0, 70.0, 80.0, 90.0, 100.0],
+            vec![30.0, 50.0, 70.0, 90.0, 110.0, 130.0],
+        ];
+        let grid = CurvatureGrid::build(&vals, NN_SMOOTH_GRID_STEP_Z);
+        assert!(!grid.is_empty());
+        assert_relative_eq!(
+            mlp.curvature_penalty_value(&w, &grid, 1.0),
+            0.0,
+            epsilon = 1e-9
+        );
+    }
+
+    #[test]
+    fn curvature_penalty_gradient_matches_central_fd() {
+        let mlp = MlpMapper::new(vec![2, 4, 3], Activation::Tanh, Activation::Softplus).unwrap();
+        let w = det_weights(mlp.n_weights());
+        let vals = vec![
+            vec![50.0, 60.0, 70.0, 80.0, 90.0, 100.0],
+            vec![30.0, 50.0, 70.0, 90.0, 110.0, 130.0],
+        ];
+        let grid = CurvatureGrid::build(&vals, NN_SMOOTH_GRID_STEP_Z);
+        assert!(!grid.is_empty());
+        let lambda = 0.8;
+        let (_v, g) = mlp.curvature_penalty(&w, &grid, lambda);
+        let eps = 1e-6;
+        let mut p = w.clone();
+        for j in 0..w.len() {
+            let saved = p[j];
+            p[j] = saved + eps;
+            let vp = mlp.curvature_penalty_value(&p, &grid, lambda);
+            p[j] = saved - eps;
+            let vm = mlp.curvature_penalty_value(&p, &grid, lambda);
+            p[j] = saved;
+            let fd = (vp - vm) / (2.0 * eps);
+            assert_relative_eq!(g[j], fd, epsilon = 1e-6, max_relative = 1e-5);
         }
     }
 }

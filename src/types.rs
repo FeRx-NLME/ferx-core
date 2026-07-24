@@ -6242,6 +6242,22 @@ pub struct FitOptions {
     pub bayes_seed: Option<u64>,
     /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
     pub gn_lambda: f64,
+    /// L2 (weight-decay) regularization strength for `[covariate_nn]` weights
+    /// (NN-only). Adds `nn_l2_lambda · Σ wᵢ²` over the network **weight** blocks
+    /// (biases excluded) to the population objective the optimizer minimizes,
+    /// with the matching analytic gradient term. `0.0` (default) is a strict
+    /// no-op — existing fits stay byte-identical. Reported `ofv`/AIC/BIC remain
+    /// the unpenalized −2LL. Set via `[fit_options]` key `nn_l2`.
+    pub nn_l2_lambda: f64,
+    /// Smoothness (curvature) regularization strength for `[covariate_nn]`
+    /// outputs (NN-only). Penalizes the finite-difference 2nd derivative of each
+    /// output along each input's marginal partial-dependence curve (z-scored
+    /// input space, other inputs at median), adding `nn_smooth_lambda · Σ C²` to
+    /// the optimizer objective with its analytic gradient. Punishes wiggles,
+    /// leaving monotone slopes free. `0.0` (default) is a strict no-op. Reported
+    /// `ofv`/AIC/BIC remain the unpenalized −2LL. Set via `[fit_options]` key
+    /// `nn_smooth`.
+    pub nn_smooth_lambda: f64,
     // SIR options
     pub sir: bool,
     pub sir_samples: usize,
@@ -6877,6 +6893,8 @@ impl Default for FitOptions {
             gradient_method: GradientMethod::default(),
             reconverge_gradient_interval: 0,
             optimizer_trace: false,
+            nn_l2_lambda: 0.0,
+            nn_smooth_lambda: 0.0,
             scale_params: false,
             parameter_scaling: ParameterScaling::Auto,
             max_unconverged_frac: 0.1,

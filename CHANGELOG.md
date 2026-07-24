@@ -19,6 +19,20 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **Optional regularization for the covariate NN (`[covariate_nn]` / DCM)** via two
+  new `[fit_options]` keys, `nn_l2` and `nn_smooth` (both non-negative, default `0.0` =
+  off — a strict no-op that keeps existing fits byte-identical). `nn_l2` adds L2
+  weight-decay (`Σ wᵢ²`, weight matrices only, biases free); `nn_smooth` penalizes the
+  finite-difference 2nd derivative (curvature) of each output along every input's
+  marginal partial-dependence curve, damping the high-frequency wiggles a high-capacity
+  DCM invents on a null covariate structure. Both feed the optimizer a penalized
+  objective with matching analytic gradients (the smoothness term reuses the MLP's
+  analytic Jacobian — no autodiff) across the FOCE/FOCEI outer optimizers; the reported
+  `ofv`/AIC/BIC remain the unpenalized −2·log-likelihood so DCM-vs-analytic model
+  comparisons stay valid. Settable identically from the model file and
+  `ferx_fit(settings = list(nn_l2 = ..., nn_smooth = ...))`.
+
 ### Fixed
 - **`ode_method = auto` no longer keeps a stiff solve whose analytic derivatives have
   overflowed (#1204).** The escalation guard checked that every saved state was finite, but

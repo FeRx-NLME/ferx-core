@@ -969,6 +969,12 @@ fn run_global_presearch(
     let n_evals_cl = Arc::clone(&n_evals);
     let verbose = options.verbose;
 
+    // Covariate-NN (DCM) regularizer, built once from the observed covariate
+    // distribution + NN architecture. A strict no-op when both λ are 0, so the
+    // pre-search objective stays byte-identical for unregularized fits.
+    #[cfg(feature = "nn")]
+    let nn_reg = crate::nn::NnRegularizer::build(model, population, options);
+
     // Helper: evaluate the FOCE OFV at a single point in scaled space,
     // independent of any NLopt state. Used to compute the user's initial
     // OFV up-front (for the keep-best-of-(user, CRS2-LM) compare below).
@@ -990,6 +996,9 @@ fn run_global_presearch(
         );
         let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         let raw = 2.0 * nll;
+        // Penalized objective fed to the optimizer (unregularized fits unchanged).
+        #[cfg(feature = "nn")]
+        let raw = raw + nn_reg.penalty_value(&params.theta);
         let guarded = ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac);
         if !raw.is_finite() || guarded {
             1e20
@@ -1031,6 +1040,9 @@ fn run_global_presearch(
 
         let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         let raw_ofv = 2.0 * nll;
+        // Penalized objective fed to the optimizer (unregularized fits unchanged).
+        #[cfg(feature = "nn")]
+        let raw_ofv = raw_ofv + nn_reg.penalty_value(&params.theta);
 
         let ebe_guard =
             ebe_guard_rejects(&ebe_stats, n_subj, raw_ofv, options.max_unconverged_frac);
@@ -1415,6 +1427,13 @@ fn optimize_nlopt_once(
 
     let mut warnings = Vec::new();
 
+    // Covariate-NN (DCM) regularizer (L2 + smoothness). No-op when both λ are 0,
+    // so the penalized objective/gradient below stay byte-identical for
+    // unregularized fits. Reported OFV/AIC/BIC use the unpenalized −2LL
+    // (`final_ofv`), which is recomputed from a clean `pop_nll_opts` at the end.
+    #[cfg(feature = "nn")]
+    let nn_reg = crate::nn::NnRegularizer::build(model, population, options);
+
     // Per-element scale factors: present O(1) coordinates to NLopt.
     //
     // `compute_scale` normalises by |packed value|, which gives O(1)
@@ -1666,6 +1685,10 @@ fn optimize_nlopt_once(
             let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
             (ehs, hms, ebe_stats, kappas, 2.0 * nll)
         };
+        // Penalized objective fed to the optimizer (unregularized fits unchanged).
+        // The matching gradient term is added into `grad_raw` below.
+        #[cfg(feature = "nn")]
+        let raw_ofv = raw_ofv + nn_reg.penalty_value(&params.theta);
 
         // EBE convergence guard: reject step when too many subjects unconverged or any
         // subject was hard-rejected at its inner start.
@@ -1717,7 +1740,8 @@ fn optimize_nlopt_once(
                 // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
                 // Mixture (#977 Phase 4): analytic posterior-weighted gradient,
                 // FD fallback when out of analytic scope.
-                let grad_raw = if let Some(mev) = &mixeval {
+                #[allow(unused_mut)]
+                let mut grad_raw = if let Some(mev) = &mixeval {
                     crate::estimation::mixture::mixture_gradient(
                         model, population, &params, options, mev,
                     )
@@ -1745,6 +1769,12 @@ fn optimize_nlopt_once(
                         &mut state.n_grad_evals,
                     )
                 };
+                // Add the NN penalty gradient in packed-x space (NN weights are
+                // identity-packed with unit scale, so no Jacobian correction);
+                // the `* scale[k]` below then carries it to optimizer space,
+                // exactly matching the value penalty added to `raw_ofv`.
+                #[cfg(feature = "nn")]
+                nn_reg.add_packed_gradient(&params.theta, &mut grad_raw);
                 let mut sq = 0.0_f64;
                 for k in 0..g.len() {
                     let gi = if grad_raw[k].is_finite() {
@@ -2279,6 +2309,13 @@ fn optimize_bfgs(
     let mut warnings = Vec::new();
     let mut cached_etas: Vec<DVector<f64>> = vec![DVector::zeros(n_eta); n_subj];
 
+    // Covariate-NN (DCM) regularizer. No-op when both λ are 0. Penalty is added
+    // to the optimizer-facing `f_only`/`fdfg` values (and `fdfg`'s gradient) but
+    // NOT to `ofv_at_fixed`, which the final reported OFV reuses — so the
+    // reported OFV/AIC/BIC stay the unpenalized −2LL.
+    #[cfg(feature = "nn")]
+    let nn_reg = crate::nn::NnRegularizer::build(model, population, options);
+
     // Closures operating on unscaled real (log/Cholesky) space.
     let ofv_at_fixed = |x: &[f64],
                         eta_hats: &[DVector<f64>],
@@ -2306,6 +2343,9 @@ fn optimize_bfgs(
             options.inner_restarts,
         );
         let ofv = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
+        // Penalized objective fed to the optimizer (unregularized fits unchanged).
+        #[cfg(feature = "nn")]
+        let ofv = ofv + nn_reg.penalty_value(&params.theta);
         if ofv.is_finite() {
             ofv
         } else {
@@ -2332,7 +2372,8 @@ fn optimize_bfgs(
         );
         let ofv = ofv_at_fixed(x, &ehs, &hms, &kappas);
         // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x).
-        let g = population_gradient(
+        #[allow(unused_mut)]
+        let mut g = population_gradient(
             x,
             n_subj,
             init_params,
@@ -2345,6 +2386,15 @@ fn optimize_bfgs(
             options,
             grad_eval_idx,
         );
+        // Penalized value + matching gradient fed to the optimizer (unregularized
+        // fits unchanged). `ofv_at_fixed` above stays clean for final reporting.
+        #[allow(unused_mut)]
+        let mut ofv = ofv;
+        #[cfg(feature = "nn")]
+        {
+            ofv += nn_reg.penalty_value(&params.theta);
+            nn_reg.add_packed_gradient(&params.theta, &mut g);
+        }
         let f = if ofv.is_finite() { ofv } else { 1e20 };
         (f, g, ehs, hms)
     };

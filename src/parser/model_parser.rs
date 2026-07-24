@@ -7680,6 +7680,12 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         }
         "vi_seed" => opts.vi_seed = parse_u64_opt("vi_seed")?,
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
+        // Covariate-NN (DCM) regularization strengths. Non-negative; 0 = off
+        // (strict no-op — existing fits stay byte-identical). Settable from the
+        // `.ferx` [fit_options] block and from `ferx_fit(settings = list(...))`
+        // via this same path. See FitOptions::nn_l2_lambda / nn_smooth_lambda.
+        "nn_l2" => opts.nn_l2_lambda = parse_f64_min("nn_l2", 0.0)?,
+        "nn_smooth" => opts.nn_smooth_lambda = parse_f64_min("nn_smooth", 0.0)?,
         "sir" => opts.sir = parse_bool("sir")?,
         "sir_samples" => opts.sir_samples = parse_usize("sir_samples")?,
         "sir_resamples" => opts.sir_resamples = parse_usize("sir_resamples")?,
