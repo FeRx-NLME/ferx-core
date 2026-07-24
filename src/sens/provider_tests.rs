@@ -10125,3 +10125,55 @@ fn ss_ill_conditioned_gradient_matches_fd_of_production() {
         sd.obs[0].f
     );
 }
+
+/// #905 gradient gate: on an analytical model a subject with no Gaussian observation
+/// feeds the PK predictor nothing, so the value path declines it (NaN, no walk). The
+/// gradient router must decline in lockstep — otherwise FOCE/FOCEI enters the `sens`
+/// event-driven walk and hits the unroutable-dose `panic!` twin
+/// (`propagate::active_rates_g` / the bolus `cmt_idx` guard) on the very dose the
+/// value path skipped. This pins the gate directly: the subject genuinely *would*
+/// route there absent it (its `CMT=2` bolus makes `dose_needs_event_walk` true), so a
+/// reverted gate flips the second assertion (and would panic once the walk ran).
+#[cfg(feature = "survival")]
+#[test]
+fn tte_only_subject_declines_the_event_walk_gradient() {
+    const TTE_ONLY: &str = r#"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 5.0)
+  theta DUMMY_CL(1.0, 0.01, 100.0)
+  theta DUMMY_V(10.0, 0.1, 1000.0)
+  omega ETA_LAMBDA ~ 0.0
+  sigma SIGMA_DV ~ 0.1
+[individual_parameters]
+  LAMBDA = TVLAMBDA * exp(ETA_LAMBDA)
+  CL     = DUMMY_CL
+  V      = DUMMY_V
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(SIGMA_DV)
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = LAMBDA
+"#;
+    let model = parse_model_string(TTE_ONLY).expect("model parses");
+    // Only observation is the TTE event at CMT=2 (no Gaussian obs); the CMT=2 bolus
+    // is out of range for the 1-cpt placeholder.
+    let mut subj = oral_subject(&[5.0]);
+    subj.doses = vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)];
+    subj.obs_cmts = vec![2];
+
+    assert!(
+        crate::pk::dose_needs_event_walk(model.pk_model, &subj),
+        "precondition: the CMT=2 bolus makes this subject walk-bound"
+    );
+    assert!(
+        !crate::pk::subject_feeds_analytical_pk(&model, &subj),
+        "a subject whose only obs is a TTE endpoint feeds the analytical predictor nothing"
+    );
+    assert!(
+        !subject_routes_to_event_walk(&model, &subj),
+        "the #905 gate must keep a no-Gaussian-obs subject off the event-driven gradient walk"
+    );
+}

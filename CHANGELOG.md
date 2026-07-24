@@ -73,6 +73,14 @@ section of the SDLC for the versioning policy).
   no rows** (#759). The equivalent `simulate()` guard already existed and its message claimed to
   cover `predict()`, but it only ran on the simulate path. State-occupancy prediction `π(t)` is
   still to come (#820).
+- **A pure-TTE / pure-discrete population no longer panics on a `CMT ≥ 2` dose** (#905). Such a
+  population is exempt from dose-compartment validation — its `pk` line is a placeholder and the
+  TTE endpoint's `CMT` is routinely ≥ 2 — but the predictor still rerouted the dose onto the
+  event-driven walk, which aborted the process on the very dose the validator had declined to
+  check. The analytical predictor now declines in lockstep with the exemption: a subject with no
+  Gaussian observation returns `NaN` without entering the walk (value and FOCE/FOCEI gradient
+  paths alike), so `predict()`, `simulate()` and `fit()` stay panic-free on such a population
+  through both the endpoint-routed and model-blind loaders.
 
 ### Performance
 - **Closed-form modified-release absorption** (#860). A static multi-route absorption model

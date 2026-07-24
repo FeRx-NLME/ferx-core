@@ -861,6 +861,17 @@ pub fn predict_iov(
     kappas: &[Vec<f64>],
 ) -> Vec<f64> {
     use std::collections::HashMap;
+    // #905: the IOV value funnel is a structural peer of
+    // `compute_predictions_with_tv_into_with_schedule` and needs the same declination —
+    // an analytical subject with no Gaussian observation feeds the predictor nothing,
+    // and its dose compartment is exempt from `check_dose_compartments`, so the walk
+    // below (`event_driven_predictions`) would `panic!` on an unroutable dose nobody
+    // reads. Keyed on the primary `ode_spec` and computed before `effective_for`,
+    // exactly like the non-IOV gate. Returns NaN (empty when `obs_times` is empty — the
+    // endpoint-routed loader's case, which the walk's own `n_obs == 0` already handled).
+    if model.ode_spec.is_none() && !subject_feeds_analytical_pk(model, subject) {
+        return vec![f64::NAN; subject.obs_times.len()];
+    }
     // Closed-form transit/IG IOV reroutes to its `transit()`/`igd()` ODE twin (issue #719):
     // the per-dose superposition cannot carry drug across occasion boundaries (#104), but the
     // twin integrates it exactly (#663). A no-op for every other model (`effective_for` returns
@@ -1948,6 +1959,54 @@ pub(crate) fn dose_needs_event_walk(pk_model: PkModel, subject: &Subject) -> boo
     })
 }
 
+/// True when the analytical PK predictor must produce a value for this subject —
+/// it carries at least one Gaussian observation (an obs whose CMT is **not** a
+/// registered non-Gaussian endpoint) or a pk-only prediction time.
+///
+/// When this is `false` on an analytical (`ode_spec.is_none()`) model, nothing
+/// consumes the predictor's concentration-time output, so the event-driven walk
+/// can be skipped for the subject. Within that domain every consumer of the walk
+/// is a Gaussian observation:
+///   - A TTE hazard that reads a concentration is written `hazard = <expr>`, which
+///     the parser turns into a synthesised `__chz` ODE accumulator state
+///     (`prescan_ode_hazards`), forcing `ode_spec = Some`. So every hazard left on
+///     an analytical model is a closed-form `HazardSpec::Analytic`, whose
+///     parameters are a `Fn(θ, η, covariates)` — no concentration.
+///   - A binary/categorical linear predictor is a
+///     [`crate::types::LinearPredictorFn`] = `Fn(θ, η, covariates) -> f64`; it
+///     cannot read the concentration curve either.
+///   - A Gaussian PD/PK endpoint is *never* inserted into `endpoints`, so its obs
+///     CMT is absent from the map and keeps this `true`.
+///
+/// This is the per-subject source of truth shared with the dose-compartment
+/// validator: `validation::population_uses_analytical_pk` is `subjects.any(...)`
+/// of this predicate. The two compose — in a *live* population the validator still
+/// range-checks **every** dose (so a joint-model TTE-only subject's unroutable dose
+/// is rejected up front), while this per-subject gate additionally declines the
+/// walk for any subject the predictor would feed nothing, which is the case the
+/// exemption leaves unvalidated (#905).
+pub(crate) fn subject_feeds_analytical_pk(model: &CompiledModel, subject: &Subject) -> bool {
+    #[cfg(feature = "survival")]
+    {
+        // No non-Gaussian endpoints ⇒ every observation is Gaussian by construction.
+        if model.endpoints.is_empty() {
+            return true;
+        }
+        !subject.pk_only_times.is_empty()
+            || subject
+                .obs_cmts
+                .iter()
+                .any(|cmt| !model.endpoints.contains_key(cmt))
+    }
+    #[cfg(not(feature = "survival"))]
+    {
+        // Without the `survival` feature no non-Gaussian endpoint can be parsed, so
+        // every observation is Gaussian and the predictor is always live.
+        let _ = (model, subject);
+        true
+    }
+}
+
 /// Compute predictions using ODE integration.
 /// `pk_params_flat` is the flat parameter vector passed to the ODE RHS function.
 /// `theta` and `eta` are forwarded to `OdeSpec::output_fn` for Form C
@@ -2081,6 +2140,23 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     scratch: &mut EventPkParams,
     schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
+    // #905: on an analytical model, a subject with no Gaussian observation feeds the
+    // PK predictor nothing — every hazard left here is closed-form and no
+    // binary/CTMM linear predictor reads a concentration (see
+    // `subject_feeds_analytical_pk`). Such a subject's dose compartment is exempt
+    // from `check_dose_compartments`, so running the event-driven walk would hit the
+    // unroutable-dose `panic!` (`event_driven.rs`) on output nobody consumes. Decline
+    // with NaN — the house "no prediction available" value, the same result the
+    // normal endpoint-routed path reaches via an empty `obs_times` (`n_obs == 0`).
+    // Keyed on the primary `ode_spec`, matching the validator exemption, and judged
+    // before `effective_model_for_eval`: a transit model (primary `ode_spec` None,
+    // rerouted to its ODE twin below) is judged on the primary too. A plain transit PK
+    // subject carries Gaussian obs and is not gated; a transit-plus-TTE TTE-only
+    // subject is gated — correctly, it feeds the predictor nothing like any other
+    // no-Gaussian-obs subject.
+    if model.ode_spec.is_none() && !subject_feeds_analytical_pk(model, subject) {
+        return vec![f64::NAN; subject.obs_times.len()];
+    }
     // A `one_cpt_transit` subject that the closed form can't serve (TIME switch / TV
     // covariates) routes to the exact ODE `transit()` equivalent, which takes the ODE branch
     // below (that branch ignores the cached analytical `schedule`, so a stale one is
