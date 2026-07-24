@@ -1416,6 +1416,16 @@ pub fn subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
+    // #905: IOV twin of the non-IOV `subject_routes_to_event_walk` gate. An analytical
+    // subject with no Gaussian observation feeds the predictor nothing; declining here
+    // (→ the caller drops it to FD) keeps FOCE/FOCEI out of the IOV sens walk, whose
+    // dose-routing `panic!`s (`propagate::active_rates_g` / the bolus `cmt_idx` guard)
+    // are the same twins the value gate fences off. Routed TTE-only subjects never reach
+    // here (they carry `obs_records`, so the analytic-IOV gates already decline them);
+    // this fires only on the model-blind loader that put the TTE rows in `obs_times`.
+    if model.ode_spec.is_none() && !crate::pk::subject_feeds_analytical_pk(model, subject) {
+        return None;
+    }
     // Cheap, model/subject-only decline before any dual seeding (#822 review #9) — see
     // `subject_sensitivities_tvcov`. Harmless for the ODE-twin branch below: an ODE model has no
     // closed-form walk to decline for, and `ss_lagtime_walk_unsupported` is about that walk's
@@ -1793,6 +1803,14 @@ fn subject_eta_grad_iov_analytical(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    // #905: decline a no-Gaussian-observation analytical subject (→ FD), so the IOV
+    // inner gradient never enters the sens walk on the exempt subject's unroutable dose.
+    // This is the twin the model-blind loader reaches: `analytic_iov_inner`'s
+    // `!subject_has_survival_records` guard fails there (TTE rows sit in `obs_times`, not
+    // `obs_records`), so without this the walk panics at `propagate.rs` bolus/infusion.
+    if model.ode_spec.is_none() && !crate::pk::subject_feeds_analytical_pk(model, subject) {
+        return None;
+    }
     // Cheap decline before any dual seeding (#822 review #9) — see `subject_sensitivities_tvcov`.
     if ss_lagtime_walk_unsupported(model, subject) {
         return None;
@@ -4775,6 +4793,17 @@ pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subj
     // so a transit subject with time-varying covariates / a `TIME` switch stays analytic
     // (matching production), rather than silently zeroing or dropping to FD.
     if !crate::pk::event_driven::supports_event_driven(model.pk_model) {
+        return false;
+    }
+    // #905: mirror the value path's declination. A subject with no Gaussian
+    // observation on an analytical model feeds the predictor nothing, so
+    // `compute_predictions_with_tv_*` returns NaN without walking. The gradient must
+    // follow — otherwise FOCE/FOCEI would enter the event-driven walk (and its `sens`
+    // twin, `propagate::active_rates_g` and the bolus `cmt_idx` guard, both of which
+    // `panic!` on the very unroutable dose the value path just skipped). The Gaussian
+    // gradient of a subject with no Gaussian obs is an empty sum, so declining the
+    // walk loses nothing. Keyed on the primary `ode_spec`, matching the value gate.
+    if model.ode_spec.is_none() && !crate::pk::subject_feeds_analytical_pk(model, subject) {
         return false;
     }
     subject.has_tv_covariates()

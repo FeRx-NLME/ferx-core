@@ -76,6 +76,14 @@ fn pop_of(csv: &str) -> Population {
     read_nonmem_csv(f.path(), None, None).expect("dataset loads")
 }
 
+/// Like [`pop_of`] but reads `iov` as the occasion column (`Subject::occasions` /
+/// `dose_occasions`), so an IOV (`kappa`) model exercises the per-occasion funnels.
+#[cfg(feature = "survival")]
+fn pop_of_iov(csv: &str, iov: &str) -> Population {
+    let f = write_csv(csv);
+    read_nonmem_csv(f.path(), None, Some(iov)).expect("dataset loads")
+}
+
 const OBS_ROWS: &str = "1,1,5.0,0,.,2,.,0,70\n1,4,4.0,0,.,2,.,0,72\n1,8,3.0,0,.,2,.,0,74\n";
 
 /// `RATE>0` into CMT=3 — the oral **peripheral**. This is the original #375
@@ -341,6 +349,206 @@ fn a_tte_only_subject_of_a_pk_tte_dataset_is_still_validated() {
         diags.iter().any(|d| d.code == "E_DOSE_CMT_OUT_OF_RANGE"),
         "the TTE-only subject's out-of-range dose must still be caught: {diags:?}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  #905: the dose-compartment exemption skips the *check* for a pure-TTE population,
+//  but `dose_needs_event_walk` still reroutes a `CMT ≥ 2` dose onto the event-driven
+//  walk, whose out-of-range guard is a `panic!`. The fix makes the predictor decline
+//  in lockstep with the exemption: `subject_feeds_analytical_pk` is false for every
+//  subject of such a population, so the value path (`compute_predictions_with_tv_*`)
+//  and the gradient path (`subject_routes_to_event_walk`) both return without
+//  entering the walk. Verified through BOTH loaders — model-blind `read_nonmem_csv`
+//  (TTE rows land in `obs_times`, the walk would run) and endpoint-routed
+//  `read_population_for` (TTE rows land in `obs_records`, `obs_times` empty).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The committed form of the adversarial-review repro
+/// `pure_tte_subject_with_a_high_cmt_dose_still_predicts` (surfaced by PR #896).
+/// Model-blind load: the TTE event at `CMT=2` is read as a Gaussian observation into
+/// `obs_times`, and the `CMT=2` dose is out of range for the placeholder
+/// `one_cpt_iv`. Before #905 `predict()` panicked from deep in the event-driven walk
+/// ("dose into compartment 2 but model has 1 states"); now the predictor declines
+/// and reports `NaN` for the (non-Gaussian) row.
+#[cfg(feature = "survival")]
+#[test]
+fn pure_tte_high_cmt_dose_predicts_without_panicking_model_blind() {
+    let model = model_of(TTE_ONLY);
+    let pop = pop_of("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n");
+    // The obs row really is in the Gaussian grid on this loader — otherwise the test
+    // would pass vacuously (the panic needs `n_obs > 0`).
+    assert_eq!(
+        pop.subjects[0].obs_times,
+        vec![5.0],
+        "model-blind loader keeps the TTE row in obs_times (the reachable path)"
+    );
+    let preds = predict(&model, &pop, &model.default_params);
+    assert_eq!(preds.len(), 1);
+    assert!(
+        preds[0].pred.is_nan(),
+        "the analytical predictor declines a subject with no Gaussian obs, got {}",
+        preds[0].pred
+    );
+}
+
+/// `simulate()` on the same model-blind population must not panic either (it shares
+/// the value funnel). The drawn DV for the declined row is `NaN`; the contract under
+/// test is "no panic".
+#[cfg(feature = "survival")]
+#[test]
+fn pure_tte_high_cmt_dose_simulates_without_panicking_model_blind() {
+    let model = model_of(TTE_ONLY);
+    let pop = pop_of("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n");
+    let sim = simulate(&model, &pop, &model.default_params, 1);
+    // One row (the CMT=2 obs kept in the Gaussian grid), with a NaN individual
+    // prediction — the predictor declined it. The ban is on panics; this pins the
+    // decline so the test fails if the gate is reverted (the panic path).
+    assert_eq!(sim.len(), 1, "simulate returns one row without panicking");
+    assert!(
+        sim[0].ipred.is_nan(),
+        "declined ipred is NaN, got {}",
+        sim[0].ipred
+    );
+}
+
+/// `fit()` on the same model-blind population must not panic — the gradient path
+/// (`subject_routes_to_event_walk`) declines the event-driven walk in lockstep with
+/// the value path, avoiding the `sens::propagate` twin panic. The **contract under
+/// test is strictly "no panic"**: a model-blind load cannot fit the TTE data (it
+/// never reached `obs_records`, so there is no TTE term), and the outer FOCEI OFV is
+/// a degenerate `NaN` that the covariance step declines cleanly — but the process
+/// must not abort. A *correct* TTE fit requires the endpoint-routed loader. Kept fast
+/// (Tier 2): a single outer iteration, no convergence loop. Reverting either gate
+/// makes this panic in the event-driven walk, so the test fails.
+#[cfg(feature = "survival")]
+#[test]
+fn pure_tte_high_cmt_dose_fit_does_not_panic_model_blind() {
+    let model = model_of(TTE_ONLY);
+    let pop = pop_of("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n");
+    let opts = FitOptions {
+        outer_maxiter: 1,
+        ..FitOptions::default()
+    };
+    // A panic (either gate reverted → the walk runs on the out-of-range dose) fails
+    // the test; reaching the assertion means the run completed without aborting.
+    let _ = fit(&model, &pop, &model.default_params, &opts);
+}
+
+/// The endpoint-routed loader (`read_population_for`, the path `fit_from_files` uses)
+/// moves the `CMT=2` TTE event into `obs_records`, leaving `obs_times` empty — so the
+/// walk's `n_obs == 0` early-return already made this path safe, and it stays safe.
+/// This is the "reachable through both loaders" half of the #905 validation.
+#[cfg(feature = "survival")]
+#[test]
+fn pure_tte_high_cmt_dose_is_safe_through_the_routed_loader() {
+    let model = model_of(TTE_ONLY);
+    let csv = write_csv("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n");
+    let (pop, _) = ferx_core::api::read_population_for(
+        &model,
+        &None,
+        csv.path().to_str().expect("utf-8 path"),
+        None,
+        None,
+        None,
+        &[],
+    )
+    .expect("routed load succeeds");
+    assert!(
+        pop.subjects[0].obs_times.is_empty(),
+        "the TTE row is routed to obs_records, not the Gaussian grid"
+    );
+    let preds = predict(&model, &pop, &model.default_params);
+    assert!(
+        preds.is_empty(),
+        "no Gaussian rows remain to predict on the routed load: {preds:?}"
+    );
+}
+
+/// **Over-fire guard** (#905). The gate must NOT decline a subject that *does* carry a
+/// Gaussian observation, even on a model that also has a TTE endpoint — otherwise the
+/// fix would silently turn working PK predictions into `NaN`. This is the exact
+/// regression a one-CMT typo in `subject_feeds_analytical_pk` would introduce, and the
+/// decline tests above would not catch it (they assert `NaN`). Gaussian PK obs at
+/// CMT=1 (not the endpoint's CMT=2), in-range dose → finite prediction.
+#[cfg(feature = "survival")]
+#[test]
+fn a_gaussian_bearing_subject_on_a_tte_model_still_predicts_finite() {
+    let model = model_of(TTE_ONLY);
+    let pop = pop_of("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,1,1\n1,3,4.2,0,.,1,0\n");
+    let preds = predict(&model, &pop, &model.default_params);
+    assert_eq!(preds.len(), 1);
+    assert!(
+        preds[0].pred.is_finite() && preds[0].pred > 0.0,
+        "a subject with a Gaussian obs must not be declined by the #905 gate, got {}",
+        preds[0].pred
+    );
+}
+
+/// The IOV (`n_kappa > 0`) prediction and sensitivity funnels — `predict_iov` and the
+/// IOV analytic sensitivity providers — are structural peers of the non-IOV funnel and
+/// must decline the exempt subject in lockstep. Surfaced by the PR #924 adversarial
+/// review: the original fix gated only the non-IOV path, so an analytical IOV model
+/// still panicked in the walk (value: `event_driven.rs`; gradient: `sens/propagate.rs`).
+/// Same placeholder + TTE endpoint as `TTE_ONLY`, plus a per-occasion `kappa` on CL.
+#[cfg(feature = "survival")]
+const TTE_ONLY_IOV: &str = r#"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 5.0)
+  theta DUMMY_CL(1.0, 0.01, 100.0)
+  theta DUMMY_V(10.0, 0.1, 1000.0)
+  omega ETA_LAMBDA ~ 0.0
+  kappa KAPPA_CL ~ 0.01
+  sigma SIGMA_DV ~ 0.1
+
+[individual_parameters]
+  LAMBDA = TVLAMBDA * exp(ETA_LAMBDA)
+  CL     = DUMMY_CL * exp(KAPPA_CL)
+  V      = DUMMY_V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = LAMBDA
+"#;
+
+/// IOV value twin: `simulate()` routes to `predict_iov` when `n_kappa > 0`. Before the
+/// #924 IOV fix this panicked at `event_driven.rs:785` on the CMT=2 dose (no OCC needed
+/// — `predict_iov` runs with empty `kappas`).
+#[cfg(feature = "survival")]
+#[test]
+fn pure_tte_iov_high_cmt_dose_simulates_without_panicking() {
+    let model = model_of(TTE_ONLY_IOV);
+    assert_eq!(model.n_kappa, 1, "fixture must exercise the IOV funnel");
+    let pop = pop_of("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n");
+    let sim = simulate(&model, &pop, &model.default_params, 1);
+    assert_eq!(sim.len(), 1, "IOV simulate returns without panicking");
+}
+
+/// IOV gradient twin: with occasions populated (`OCC` + `iov_column`), `fit()` reaches
+/// the IOV inner analytic gradient (`subject_eta_grad_iov_analytical`), whose walk has
+/// the same dose-routing panic (`sens/propagate.rs:1408`). The existing
+/// `subject_has_survival_records` guard misses the model-blind load (TTE rows in
+/// `obs_times`, `obs_records` empty), so the #924 IOV gate is what fences it off. No
+/// panic is the contract; reverting either IOV gate makes this panic.
+#[cfg(feature = "survival")]
+#[test]
+fn pure_tte_iov_high_cmt_dose_fit_does_not_panic() {
+    let model = model_of(TTE_ONLY_IOV);
+    let pop = pop_of_iov(
+        "ID,TIME,DV,EVID,AMT,CMT,MDV,OCC\n1,0,.,1,100,2,1,1\n1,5,1,0,.,2,0,1\n",
+        "OCC",
+    );
+    let opts = FitOptions {
+        outer_maxiter: 1,
+        ..FitOptions::default()
+    };
+    let _ = fit(&model, &pop, &model.default_params, &opts);
 }
 
 /// A bolus into the same peripheral compartment is *not* rejected — the walk

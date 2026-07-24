@@ -641,37 +641,37 @@ pub(crate) fn check_modeled_dose_rates(
 /// placeholder's 1-compartment topology would reject a working model over dose
 /// records no PK code ever reads.
 ///
-/// Deliberately a **population**-level predicate, not a per-subject one. "This
-/// subject has no Gaussian observation" does **not** imply the PK path is
-/// skipped for it: the event-driven walk is driven by the subject's event
-/// schedule (doses and `EVID=2` times), and the FOCE/FOCEI sensitivity provider
-/// runs per subject regardless. A per-subject exemption would let a TTE-only
-/// subject *of a joint PK-TTE model* carry an unroutable infusion straight back
-/// into the panics this check exists to prevent — a routine pattern (an early
-/// dropout, or a TTE-only arm, that still has dose records).
+/// Deliberately a **population**-level gate on *whether the dose-compartment check
+/// runs at all*, not a per-subject one. If **any** subject asks the analytical
+/// predictor for a value, the check validates **every** dose in the dataset — so a
+/// TTE-only subject *of a joint PK-TTE model* (an early dropout, or a TTE-only arm,
+/// that still has dose records) has its unroutable infusion caught up front, rather
+/// than carried into the event-driven walk's `panic!`. Making *validation* per
+/// subject would reopen exactly that.
 ///
-/// Non-Gaussian endpoints are registered per CMT in `CompiledModel::endpoints`,
-/// so an observation CMT absent from that map is Gaussian. Without the
-/// `survival` feature no non-Gaussian endpoint can be parsed, so every
-/// observation is Gaussian by construction and this is always `true`.
+/// This is distinct from — and complementary to — the per-subject predictor gate
+/// (`subject_feeds_analytical_pk`, #905): validation is population-scoped so a live
+/// population is fully checked, while the predictor declines the walk per subject for
+/// any subject whose output is unused. In a live population the check already rejects
+/// a bad dose, so the predictor gate never has to; in an exempt population the check
+/// is skipped and the predictor gate is what keeps the walk unreached.
+///
+/// The per-subject truth (which observation CMTs are Gaussian, and the
+/// no-`survival`-feature short circuit) lives in [`crate::pk::subject_feeds_analytical_pk`];
+/// this is `any(...)` of it.
 fn population_uses_analytical_pk(model: &CompiledModel, population: &Population) -> bool {
-    #[cfg(feature = "survival")]
-    {
-        if model.endpoints.is_empty() {
-            return true;
-        }
-        population.subjects.iter().any(|s| {
-            !s.pk_only_times.is_empty()
-                || s.obs_cmts
-                    .iter()
-                    .any(|cmt| !model.endpoints.contains_key(cmt))
-        })
-    }
-    #[cfg(not(feature = "survival"))]
-    {
-        let _ = (model, population);
-        true
-    }
+    // Single source of truth with the predictor gate: `subject_feeds_analytical_pk`
+    // is the per-subject predicate, and this is `any(...)` of it. The two compose —
+    // this population-level test decides whether the dose-compartment check runs at
+    // all (a *live* population validates every dose, including a TTE-only subject's),
+    // while the per-subject gate declines the walk for a subject the analytical
+    // predictor would feed nothing (#905). See `subject_feeds_analytical_pk` for why
+    // "no Gaussian observation" implies "predictor output unused" on an analytical
+    // model.
+    population
+        .subjects
+        .iter()
+        .any(|s| crate::pk::subject_feeds_analytical_pk(model, s))
 }
 
 /// Every dose must name a compartment the **analytical** engine can actually
@@ -761,6 +761,18 @@ pub(crate) fn check_dose_compartments(
     // Nothing in this dataset asks the analytical predictor for a value — the
     // `pk` line is a pure-TTE / pure-discrete model's placeholder. See
     // `population_uses_analytical_pk` for why this is a population-level test.
+    //
+    // **This exemption is safe because the predictor declines in lockstep.** Skipping
+    // the dose-compartment check would be a landmine on its own: `dose_needs_event_walk`
+    // still reroutes a `CMT ≥ 2` dose onto the event-driven walk, whose out-of-range
+    // guard is a `panic!`. That was #905 — the check declined to validate a dose the
+    // walk then aborted on. The fix is the shared predicate: the same
+    // `subject_feeds_analytical_pk` that makes this population exempt also makes
+    // `compute_predictions_with_tv_*` (value) and `subject_routes_to_event_walk`
+    // (gradient) return a NaN/decline for every one of its subjects, so the walk is
+    // never reached. The exemption's safety no longer rests on the far-away
+    // `n_obs == 0` early return in a different module; it is the negation, per subject,
+    // of this very predicate.
     //
     // **Analytical models only.** An `[odes]` block is never a placeholder: a
     // hazard that reads an ODE state has the system integrated for it even when
