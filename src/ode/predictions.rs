@@ -2801,7 +2801,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // not yet supported together with time-varying covariates, IOV, or system resets:
     // each threads per-segment PK / per-occasion κ / state-zeroing that the base-dose
     // seeding and the frozen-replay verifier do not yet reproduce, so loud-fail rather
-    // than silently mis-integrate a delivered dose. (Follow-ups tracked under #702.)
+    // than silently mis-integrate a delivered dose. (Follow-ups: #930 time-varying
+    // covariates, #931 IOV, #932 system resets / EVID=4.)
     if !subject.doses.is_empty() && (tv || iov || subject.has_resets()) {
         // An IOV model sets BOTH `event_pk` (tv) and `eta_occ` (iov) — the occasion PK
         // rides the per-event snapshot — so name IOV first (the more specific cause).
