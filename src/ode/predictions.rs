@@ -29,6 +29,16 @@ use std::collections::HashMap;
 /// than hard-coding a parallel literal (#472 review [7]).
 pub(crate) const INFUSION_EPS: f64 = 1e-12;
 
+/// Tolerance for matching a break time to a system-reset time (EVID=3/4) in the
+/// adaptive-dosing driver and its frozen-replay engines (#716). Reset times are
+/// added to `break_times`, then the loop applies the reset at the break within this
+/// tolerance of a reset time — so a reset merged into a sub-`1e-15` neighbour by the
+/// break dedup is still applied at that representative break rather than dropped.
+/// Resets are coarse episode boundaries (never within `1e-12` of one another), so a
+/// tolerance match cannot alias two distinct resets. Same magnitude as
+/// [`INFUSION_EPS`] and the dose-time match used by these loops.
+const RESET_MATCH_TOL: f64 = 1e-12;
+
 /// `is_infusion()` only checks `rate > 0`, but a degenerate row with
 /// `rate > 0 && amt <= 0` (or NaN) yields `duration = amt/rate <= 0`
 /// (or NaN). Treating those as infusions would push an infusion-end
@@ -1832,6 +1842,14 @@ fn integrate_segment(
     subject: &Subject,
     dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
+    // Most-recent system-reset time (EVID=3/4) at or before `t_start`, or
+    // `f64::NEG_INFINITY` when none applies. Doses / infusions / zero-order
+    // windows started before it are turned off (the reset zeroed the
+    // compartments, so their still-arriving tails must stop too), mirroring
+    // `ode_predictions_event_driven`. The non-reset callers (`ode_predictions`
+    // and the reset-free dense/replay paths) pass `NEG_INFINITY`, so their
+    // forcing set is unchanged (#716).
+    reset_floor: f64,
     ext_params: &mut [f64],
     pk_params_flat: &[f64],
     theta: &[f64],
@@ -1872,9 +1890,12 @@ fn integrate_segment(
 
     // Integrate. If any infusions are active in this segment, wrap
     // the user RHS so it adds `+rate` to each infusion's compartment.
-    // The plain (non-event-driven) ODE path never sees reset subjects —
-    // the dispatcher routes those to `ode_predictions_event_driven` — so
-    // no reset floor applies here.
+    // `reset_floor` turns off infusions started before the most recent
+    // system reset (EVID=3/4). The plain dense path (`ode_predictions`) never
+    // sees reset subjects — the dispatcher routes those to
+    // `ode_predictions_event_driven` — and passes `NEG_INFINITY`, so its
+    // active set is unchanged; the reactive driver and its reset-aware replay
+    // pass a real floor (#716).
     let active = active_infusions(
         &ode.input_rate,
         &subject.doses,
@@ -1882,7 +1903,7 @@ fn integrate_segment(
         t_end,
         dose_lagtimes,
         dose_f_bio,
-        f64::NEG_INFINITY,
+        reset_floor,
     );
     // Zero-order absorption windows fully covering this segment (#504): constant
     // `F·amt/dur` injected like a spanning infusion. The dense path has a single
@@ -1892,7 +1913,7 @@ fn integrate_segment(
     let zo_windows = zero_order_windows(&subject.doses, dose_lagtimes, dose_f_bio, |_, d| {
         zero_order_dur_and_frac_for_dose(ode, d, pk_params_flat)
     });
-    let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, f64::NEG_INFINITY);
+    let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, reset_floor);
     // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
     // snapshot `ext_params` is constant across the integration (#322 #7).
     let prepared = prepare_input_rates(ode, ext_params);
@@ -1901,7 +1922,7 @@ fn integrate_segment(
         &subject.doses,
         dose_lagtimes,
         dose_f_bio,
-        f64::NEG_INFINITY,
+        reset_floor,
         &prepared,
         InfusionInput::Spanning(active),
         &zero_order,
@@ -2174,6 +2195,12 @@ fn ode_predictions_with_extra_breaks_and_stats(
     });
     push_zero_order_break_times(&mut break_times, &zo_windows);
     break_times.push(t_last);
+    // System-reset times (EVID=3/4): each is a segment boundary where the state
+    // zeros. Empty for every non-reset subject — so the dispatcher's reset-free
+    // callers (`ode_predictions` et al.) are byte-identical — and non-empty only
+    // on the reset-aware adaptive frozen-replay constant path (#716), which drives
+    // this engine with a reset-carrying static subject.
+    break_times.extend(subject.reset_times.iter().copied());
     // No-event break points (e.g. the reactive driver's decision times) — they
     // only re-segment the integration, never change state. Drop non-positive /
     // non-finite entries (0.0 is already present; the timeline starts at 0).
@@ -2186,6 +2213,17 @@ fn ode_predictions_with_extra_breaks_and_stats(
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
+    // Most-recent system-reset time; `NEG_INFINITY` until the first reset is
+    // crossed. Threaded into `integrate_segment` so infusions / zero-order windows
+    // opened before the reset stop contributing (mirrors `ode_predictions_event_driven`).
+    // Detected in the loop by matching a break against `reset_times` within
+    // `RESET_MATCH_TOL` (not an exact-bit lookup): `reset_times` are added to
+    // `break_times` above, so even one merged into a sub-1e-15 neighbour by the dedup is
+    // applied at that representative break rather than dropped. Empty `reset_times` (every
+    // non-adaptive caller — the dispatcher routes reset subjects elsewhere) makes this a
+    // no-op, so those paths stay byte-identical.
+    let mut reset_floor = f64::NEG_INFINITY;
+
     // Walk every break as a left boundary — bound `0..len`, not the old `0..len-1`
     // (#731) — so a dose / observation / CHZ landing on the final break is applied and
     // read post-dose, matching the reactive driver (`ode_predictions_adaptive_impl`)
@@ -2197,6 +2235,21 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // ever visited twice.
     for k in 0..break_times.len() {
         let t_start = break_times[k];
+
+        // System reset (EVID=3/4) at t_start: zero the compartments (or re-seed
+        // `init(state)=expr`) and record the reset time so infusions / zero-order
+        // windows opened earlier stop contributing. Applied BEFORE the dose passes
+        // and the observation read below, so a reset sorts ahead of a dose or obs
+        // at the same instant — the exact ordering `ode_predictions_event_driven`
+        // uses (Reset < Dose < Obs). No-op when the subject carries no resets.
+        if subject
+            .reset_times
+            .iter()
+            .any(|&rt| (rt - t_start).abs() < RESET_MATCH_TOL)
+        {
+            u = ode.initial_state(pk_params_flat);
+            reset_floor = t_start;
+        }
 
         // Apply dose effects at t_start in a single pass over the dose
         // list. Ordering inside the pass matters:
@@ -2313,6 +2366,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
                 subject,
                 &dose_lagtimes,
                 &dose_f_bio,
+                reset_floor,
                 &mut ext_params,
                 pk_params_flat,
                 theta,
@@ -2852,6 +2906,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
         break_times.extend(shadow.obs_times.iter().cloned());
         break_times.extend(shadow.pk_only_times.iter().cloned());
     }
+    // System-reset times (EVID=3/4, #716): each is a segment boundary where the
+    // state zeros. The base subject is dose-free, so an EVID=4 (reset+dose) row —
+    // which carries a dose — is already rejected by the dose-free precondition
+    // above; only pure EVID=3 resets reach here. Empty for a reset-free subject,
+    // so the bolus-only path stays byte-identical.
+    break_times.extend(subject.reset_times.iter().copied());
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
@@ -2881,6 +2941,42 @@ pub(crate) fn ode_predictions_adaptive_impl(
             ));
         }
     }
+
+    // #716: on the constant-covariate path (no tv guard above) decisions are still
+    // looked up by exact bits (`decision_index_of`). Adding reset times to `break_times`
+    // introduces a new collision source: a reset within 1e-15 of a decision could make
+    // the dedup keep the reset's representative and silently drop that decision. Guard it
+    // — the same exact-bit contract the tv guard enforces, scoped to the one lookup that
+    // matters here. No-op without resets, so the reset-free bolus path is unchanged.
+    if !tv && !subject.reset_times.is_empty() {
+        let surviving: std::collections::HashSet<u64> =
+            break_times.iter().map(|t| t.to_bits()).collect();
+        if let Some(t) = decision_times
+            .iter()
+            .copied()
+            .find(|t| !surviving.contains(&t.to_bits()))
+        {
+            return Err(format!(
+                "adaptive-dosing decision time {t} lies within 1e-15 of a system-reset (or other) \
+                 break time but is not bit-identical, so its decision lookup would be silently \
+                 dropped. Align decision and reset (EVID=3) times to identical values \
+                 (integer-valued time grids are unaffected)."
+            ));
+        }
+    }
+
+    // Running reset floor (`NEG_INFINITY` until the first reset is crossed), threaded
+    // into `integrate_segment` so controller-issued infusions / zero-order windows
+    // opened before a reset stop contributing — mirroring `ode_predictions_event_driven`.
+    // A reset is detected in the loop by matching a break against `reset_times` within
+    // the timeline tolerance (`RESET_MATCH_TOL`), NOT by an exact-bit lookup: `reset_times`
+    // are added to `break_times` above, and a reset merged into a sub-1e-15 neighbour by
+    // the dedup is then still applied at that representative break (correct to
+    // floating-point precision) rather than silently dropped. Resets are coarse episode
+    // boundaries, so a tolerance match cannot alias two distinct resets. (Decisions /
+    // observations still use exact-bit lookups — they key `HashMap`s — hence the #700
+    // survival guard above; resets need no such guard.)
+    let mut reset_floor = f64::NEG_INFINITY;
 
     let mut stopped = false;
 
@@ -2933,6 +3029,25 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 None
             },
         );
+
+        // System reset (EVID=3) at t_start (#716): zero the compartments (or
+        // re-seed `init(state)=expr`) and record the reset floor so infusions /
+        // zero-order windows opened before it stop contributing. Applied BEFORE
+        // the decision hook reads `u` and before the coincident observation is
+        // recorded, so a reset sorts ahead of a dose or obs at the same instant —
+        // the ordering `ode_predictions_event_driven` uses (Reset < Dose < Obs).
+        // Runs regardless of `stopped`, so a reset after a `Stop` still zeros the
+        // state for later observations. `pk_readout` is the LOCF PK there (the
+        // frozen snapshot on the constant path), so a covariate-dependent init is
+        // seeded correctly. No-op for a reset-free subject.
+        if subject
+            .reset_times
+            .iter()
+            .any(|&rt| (rt - t_start).abs() < RESET_MATCH_TOL)
+        {
+            u = ode.initial_state(pk_readout);
+            reset_floor = t_start;
+        }
 
         // --- Decision hook: observe (pre-dose trough) -> decide -> dose. ---
         if !stopped {
@@ -3278,6 +3393,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &shadow,
                 &dose_lagtimes,
                 &injected_f,
+                reset_floor,
                 &mut ext_params,
                 seg_pk_values,
                 theta,
@@ -3553,6 +3669,10 @@ fn adaptive_frozen_replay_tv(
     }
     break_times.extend(subject.obs_times.iter().cloned());
     break_times.extend(subject.pk_only_times.iter().cloned());
+    // System-reset times (EVID=3, #716): the same reset breaks the reactive driver
+    // added, so the replay zeros the state at the identical instants and stays
+    // aligned. Empty for a reset-free subject.
+    break_times.extend(subject.reset_times.iter().copied());
     break_times.extend(
         extra_breaks
             .iter()
@@ -3564,6 +3684,11 @@ fn adaptive_frozen_replay_tv(
     if break_times.len() < 2 {
         break_times.push(break_times[0]);
     }
+    // Running reset floor, mirroring the driver. Detected by the same
+    // `RESET_MATCH_TOL` tolerance match as the driver (resets are added to
+    // `break_times` above), so a reset merged into a sub-1e-15 neighbour is still
+    // applied at that representative break.
+    let mut reset_floor = f64::NEG_INFINITY;
 
     for k in 0..break_times.len() {
         let t_start = break_times[k];
@@ -3574,6 +3699,20 @@ fn adaptive_frozen_replay_tv(
         if let (Some(dp), Some(&g)) = (decision_pk, decision_index_of.get(&t_start.to_bits())) {
             last_pk = dp[g];
             last_occ = Some(g);
+        }
+
+        // System reset (EVID=3) at t_start (#716): zero the state (or re-seed
+        // `init(state)=expr` at the LOCF PK — the occasion snapshot just set above when
+        // the reset coincides with a decision) and record the reset floor — before the
+        // boluses and observation below, matching the driver's Reset < Dose < Obs
+        // ordering. No-op for a reset-free subject.
+        if subject
+            .reset_times
+            .iter()
+            .any(|&rt| (rt - t_start).abs() < RESET_MATCH_TOL)
+        {
+            u = ode.initial_state(&last_pk.values);
+            reset_floor = t_start;
         }
 
         // Apply boluses landing at t_start (lag 0) with their realized F — at EVERY
@@ -3646,6 +3785,7 @@ fn adaptive_frozen_replay_tv(
                 subject,
                 &dose_lagtimes,
                 dose_f,
+                reset_floor,
                 &mut ext_params,
                 &seg_pk.values,
                 theta,

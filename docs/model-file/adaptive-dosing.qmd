@@ -349,8 +349,13 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   the `TIME` built-in is covered the same way. *Caveat:* the `auc_target_attainment`
   metric is not yet computed per-event, so declaring `auc_target` on a
   time-varying-covariate subject is a typed error rather than a frozen-snapshot AUC.
-- **No system resets** — a subject with an EVID=3/4 reset event is rejected (the
-  reactive driver does not apply resets).
+- **System resets (EVID=3) are supported** — the reactive driver zeros the
+  compartments at each reset time (re-seeding any `init(state)=expr`) and turns off
+  controller-issued infusions opened before the reset, exactly as `predict()` /
+  `simulate()` do on the event-driven path; the frozen-replay verifier is
+  reset-aware, so the reset is honored *and* checked each run. (An EVID=4 reset+dose
+  row carries a dose, which the dose-free-base rule above rejects, so only pure
+  EVID=3 resets reach the adaptive path.)
 - **Inter-occasion variability (IOV) is supported** — a fresh occasion `kappa` is
   drawn per **decision window** (occasion = decision index) and threaded through the
   per-event PK, so occasion-to-occasion shifts in CL/V drive the trajectory, the

@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **System resets (EVID=3) in adaptive-dosing simulation** (#716). `simulate_adaptive()`
+  / `simulate_adaptive_from_spec()` now honor an EVID=3 reset carried by the base
+  subject: the reactive driver zeros the compartments at the reset time (re-seeding any
+  `init(state)=expr`) and turns off controller-issued infusions opened before it, exactly
+  as `predict()` / `simulate()` do, and the default-on frozen-replay verifier is
+  reset-aware so the reset is validated each run. Previously a reset subject was rejected
+  with a typed error. (An EVID=4 reset+dose row is still rejected by the dose-free-base
+  rule, so only pure EVID=3 resets reach the adaptive path.)
 - **Warning when a `combined` error model's additive initial estimate is negligibly
   small** (#847). A pre-fit check (`W_ADDITIVE_INIT_SCALE`) flags an additive SD start
   below 1% of the observation scale (median `|DV|`) on that endpoint. A near-zero
