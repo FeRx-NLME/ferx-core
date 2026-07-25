@@ -391,12 +391,18 @@ where
     // adaptive output — predictions, decisions, the dose ledger, `target_window` — is
     // fully per-event covariate-aware; only this one exposure metric is deferred.
     //
-    // System resets (EVID=3, #716) are the same class of gap: the signal-AUC pass
-    // (`adaptive_window_signal_aucs` → `ode_dense_solve_states`) seeds the state once
-    // and never zeros it at a reset, so a reset subject's exposure metric would be
-    // integrated as if the reset never happened — silently wrong. Every other adaptive
-    // output *is* reset-aware (the driver and the frozen-replay verifier), so only this
-    // one metric is deferred; reject `auc_target` here rather than report it wrong.
+    // System resets (EVID=3, #716) are deferred for a *different* reason — not a
+    // frozen snapshot. The dense solver itself IS reset-aware: `adaptive_window_signal_aucs`
+    // drives `ode_dense_solve_states` with the base subject's `reset_times`, and that
+    // solver breaks at each reset and re-seeds the state (`build_segment_break_times` +
+    // `apply_segment_boundary`), so a window entirely before or after a reset integrates
+    // exactly. The gap is the trapezoid: each inter-decision window is integrated on a
+    // *uniform* grid, and a reset is a state discontinuity at an arbitrary time, so the
+    // one window straddling it would need pre- and post-reset nodes (values at rt⁻ and rt⁺)
+    // to integrate the jump correctly — which the uniform grid does not carry. Rather than
+    // report that one window's AUC biased low, defer `auc_target` on reset subjects until
+    // the grid places nodes at reset instants. Every other adaptive output is reset-aware
+    // (the driver and the frozen-replay verifier).
     if auc_target.is_some()
         && (model.n_kappa > 0
             || population
@@ -406,12 +412,14 @@ where
     {
         return Err(
             "adaptive-dosing `auc_target` is not yet supported for time-varying-covariate, \
-             TIME-in-PK, IOV (`kappa`), or system-reset (EVID=3) subjects: its exposure metric \
-             integrates a dense grid from a single frozen PK snapshot and does not apply resets, \
-             which would be silently wrong when the PK changes across the horizon (a drifting \
-             covariate or a per-occasion κ) or the state is reset mid-horizon. Drop `auc_target` \
-             (all other outputs remain per-event / per-occasion / reset aware), or track \
-             #700/#701/#716 for a per-event, reset-aware AUC."
+             TIME-in-PK, IOV (`kappa`), or system-reset (EVID=3) subjects. For a drifting \
+             covariate or a per-occasion κ the exposure metric integrates its dense grid from a \
+             single frozen PK snapshot, which is silently wrong when the PK changes across the \
+             horizon. For a reset the dense solver *does* zero the state, but the per-window \
+             trapezoid grid carries no node at the reset instant, so the one window straddling \
+             the reset would integrate that discontinuity inaccurately. Drop `auc_target` (all \
+             other outputs remain per-event / per-occasion / reset aware), or track \
+             #700/#701/#716 for a per-event, reset-node-aware AUC."
                 .to_string(),
         );
     }

@@ -355,7 +355,10 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   `simulate()` do on the event-driven path; the frozen-replay verifier is
   reset-aware, so the reset is honored *and* checked each run. (An EVID=4 reset+dose
   row carries a dose, which the dose-free-base rule above rejects, so only pure
-  EVID=3 resets reach the adaptive path.)
+  EVID=3 resets reach the adaptive path.) *Caveat:* declaring `auc_target` on a reset
+  subject is a typed error — the exposure metric's uniform per-window trapezoid grid
+  has no node at the reset instant, so the one window straddling the reset would
+  integrate the state discontinuity inaccurately (every other output is reset-aware).
 - **Inter-occasion variability (IOV) is supported** — a fresh occasion `kappa` is
   drawn per **decision window** (occasion = decision index) and threaded through the
   per-event PK, so occasion-to-occasion shifts in CL/V drive the trajectory, the
