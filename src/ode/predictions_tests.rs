@@ -2088,6 +2088,124 @@ fn adaptive_base_regimen_plus_titration_matches_static_ode() {
     }
 }
 
+/// 1-cpt IV amount ODE with a per-compartment dose lagtime (`ALAG1`) at `lag_slot`. Used
+/// to exercise a base dose into a lagged compartment on the reactive path (#935).
+fn one_cpt_lag_spec(lag_slot: usize) -> OdeSpec {
+    let mut map = crate::types::DoseAttrMap::default();
+    map.insert(crate::types::DoseAttr::Lag, 1, lag_slot);
+    OdeSpec {
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ke = if v > 0.0 { cl / v } else { 0.0 };
+            dy[0] = -ke * y[0];
+        }),
+        n_states: 1,
+        state_names: vec!["central".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: map,
+        init_fn: None,
+    }
+}
+
+#[test]
+fn adaptive_base_dose_into_input_rate_compartment_matches_static_ode() {
+    // #935: a base dose into a built-in input-rate (first_order absorption) compartment is
+    // delivered as `R_in` over time, NOT as a bolus jump — exercising the reactive
+    // `input_rate_consumes_cmt` skip in `apply_prescheduled_boluses_at` on a genuine base
+    // run (previously covered only via the static-engine code motion). A Hold controller
+    // with the single decision on the integration start keeps the segmentation identical to
+    // `ode_predictions`, so the match is bit-exact.
+    let mut ode = first_order_one_cpt_spec();
+    ode.solver_opts.reltol = 1e-10;
+    ode.solver_opts.abstol = 1e-10;
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 1.0;
+    pk.values[crate::types::PK_IDX_V] = 20.0;
+    pk.values[4] = 0.5; // ka
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+    let decisions = [0.0];
+    let obs = vec![2.0, 12.0, 30.0];
+    let base = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+    let base_subj = make_subject(base.clone(), obs.clone());
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base_subj,
+        &decisions,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs with an input-rate base dose");
+    assert!(run.ledger.is_empty(), "Hold controller adds no doses");
+
+    let static_subj = make_subject(base, obs);
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subj);
+    assert_eq!(run.predictions.len(), static_preds.len());
+    for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+        assert_relative_eq!(*got, *want, max_relative = 1e-9);
+    }
+    // Non-vacuity: the input-rate base dose actually drives the compartment.
+    assert!(run.predictions.iter().any(|&p| p > 1.0));
+}
+
+#[test]
+fn adaptive_base_dose_with_lagtime_matches_static_ode() {
+    // #935: a base dose into a LAGGED compartment — its bolus lands at `dose.time + lag`, and
+    // the reactive `dose_lagtimes` / break placement / `apply_prescheduled_boluses_at` lag
+    // filter must reproduce `ode_predictions`. `ALAG1 = 5 h`; the single decision on the
+    // integration start keeps the segmentation identical (bit-exact). Base doses into lagged
+    // compartments are supported (they run the exact static machinery `predict()` uses) —
+    // unlike CONTROLLER doses into a lagged compartment, which are rejected at injection
+    // (`reject_unsupported_dose_compartment`) because the TAD-anchor/double-count subtleties
+    // bite only for a dose discovered mid-run, not a pre-resolved base dose.
+    let lag_slot = 8usize;
+    let ode = one_cpt_lag_spec(lag_slot);
+    let mut pk = pk_one(1.0, 10.0);
+    pk.values[lag_slot] = 5.0; // ALAG1 = 5 h
+    let decisions = [0.0];
+    let obs = vec![3.0, 8.0, 24.0]; // t=3 pre-lag (empty), t=8/24 post-lag
+    let base = vec![DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)];
+
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+    let base_subj = make_subject(base.clone(), obs.clone());
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base_subj,
+        &decisions,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs with a lagged base dose");
+    assert!(run.ledger.is_empty(), "Hold controller adds no doses");
+
+    let static_subj = make_subject(base, obs);
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subj);
+    for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+        assert_relative_eq!(*got, *want, max_relative = 1e-9);
+    }
+    // The lag is real: nothing has arrived at t=3 (pre-lag), the dose is present by t=8.
+    assert!(run.predictions[0].abs() < 1e-9, "pre-lag readout must be 0");
+    assert!(run.predictions[1] > 100.0, "post-lag dose must be present");
+}
+
 #[test]
 fn adaptive_base_regimen_with_reset_is_rejected_driver() {
     // #702 scope (driver level): tv/iov are off here (event_pk/eta_occ = None), but a base

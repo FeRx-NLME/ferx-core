@@ -1658,6 +1658,21 @@ fn earliest_dose_time(subject: &Subject) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
+/// Lower the reactive driver's TAFD anchor (`ext_params[MAX_PK_PARAMS]`) to `t` if `t`
+/// precedes the current anchor, or set it when none is (`NaN`). #934: a base regimen
+/// pre-seeds the anchor to the earliest *base* dose, but a controller dose scheduled
+/// *before* the earliest base dose is the true first dose — so the anchor must be
+/// `min(earliest base, first controller dose)`, matching the static frozen-replay
+/// verifier's `earliest_dose_time` over the merged (base ∪ ledger) list. Called at each
+/// realized controller dose; the ascending break walk means only the first can lower a
+/// finite base-dose seed.
+fn update_tafd_anchor(ext_params: &mut [f64], t: f64) {
+    let slot = &mut ext_params[crate::types::MAX_PK_PARAMS];
+    if !slot.is_finite() || t < *slot {
+        *slot = t;
+    }
+}
+
 /// Seed the extended-parameter array for the ODE RHS: slots `0..MAX_PK_PARAMS`
 /// hold the PK snapshot; slot `MAX_PK_PARAMS` carries the TAFD anchor (the first
 /// dose time, NaN when there are no doses so the RHS injects NaN rather than `-∞`);
@@ -2133,22 +2148,20 @@ fn collect_dose_break_times(
     push_zero_order_break_times(break_times, &zo_windows);
 }
 
-/// Apply every pre-scheduled dose landing at `t_start` to the state `u`, in the order
-/// the static engine uses: the SS+lagtime tail seed, SS equilibration, then the bolus
-/// amount jump (F·AMT). A real infusion (or a dose into a built-in input-rate
-/// compartment) adds nothing here — it is injected as a `+rate` derivative by
-/// `active_infusions` inside `integrate_segment`. Factored out of
-/// [`ode_predictions_with_extra_breaks_and_stats`] so the reactive driver's base
-/// regimen (#702) applies base doses identically (cf. #798 drift). `doses` /
-/// `dose_lagtimes` / `dose_f_bio` are parallel and cover only the pre-scheduled doses
-/// (the reactive driver passes the leading base-dose slice of its growing `shadow`).
-#[allow(clippy::too_many_arguments)] // each is a distinct slice of dose/PK context
-fn apply_prescheduled_doses_at(
+/// Re-seed the state `u` for every pre-scheduled **steady-state** dose landing at
+/// `t_start`: the SS+lagtime tail seed at the record time, then SS equilibration at the
+/// lag-shifted arrival. Both overwrite `u` (they represent "the state the patient is in",
+/// not an additive event). This is the half of the dose-application pass that establishes
+/// the *observed* reality — the SS trough — so the reactive driver (#933) runs it BEFORE
+/// the decision hook, letting the controller read the pre-dose SS trough. A non-SS (plain
+/// bolus / infusion) dose does nothing here. Split out of the combined
+/// [`apply_prescheduled_doses_at`] so the driver can interpose the decision hook between
+/// the state re-seed and the bolus jump ([`apply_prescheduled_boluses_at`]).
+fn reseed_prescheduled_states_at(
     u: &mut [f64],
     ode: &OdeSpec,
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
-    dose_f_bio: &[f64],
     pk_params_flat: &[f64],
     t_start: f64,
     opts: &OdeSolverOptions,
@@ -2175,6 +2188,29 @@ fn apply_prescheduled_doses_at(
         if dose.ss && dose.ii > 0.0 {
             u.copy_from_slice(&equilibrate_ss_state(ode, pk_params_flat, dose, opts));
         }
+    }
+}
+
+/// Apply the bolus amount jump (`F·AMT`) of every pre-scheduled dose landing at `t_start`,
+/// in dose-list order. A real infusion (or a dose into a built-in input-rate compartment)
+/// adds nothing here — it is injected as a `+rate` derivative by `active_infusions` inside
+/// `integrate_segment`; an SS dose's jump is applied here too (on top of the trough seeded
+/// by [`reseed_prescheduled_states_at`]). This is the *additive event* half of the pass, so
+/// the reactive driver (#933) runs it AFTER the decision hook, over the full growing
+/// `shadow` dose list — base then controller-injected — so every bolus at `t_start` is
+/// applied in one dose-list-ordered pass, matching the frozen-replay verifier bit-for-bit.
+fn apply_prescheduled_boluses_at(
+    u: &mut [f64],
+    ode: &OdeSpec,
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+    dose_f_bio: &[f64],
+    t_start: f64,
+) {
+    for (i, dose) in doses.iter().enumerate() {
+        if (dose.time + dose_lagtimes[i] - t_start).abs() >= 1e-12 {
+            continue;
+        }
         if !is_real_infusion(dose) && !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
             // dose.cmt is 1-based; state indices are 0-based. A dose into a built-in
             // input-rate compartment (transit/etc.) is delivered as R_in over time by
@@ -2188,6 +2224,33 @@ fn apply_prescheduled_doses_at(
             }
         }
     }
+}
+
+/// Apply every pre-scheduled dose landing at `t_start` to the state `u`, in the order the
+/// static engine uses: the SS+lagtime tail seed, SS equilibration, then the bolus amount
+/// jump (F·AMT) — i.e. [`reseed_prescheduled_states_at`] followed by
+/// [`apply_prescheduled_boluses_at`]. Factored out of
+/// [`ode_predictions_with_extra_breaks_and_stats`] so the static engine and the reactive
+/// driver's base regimen (#702) apply base doses identically (cf. #798 drift). `doses` /
+/// `dose_lagtimes` / `dose_f_bio` are parallel and cover only the pre-scheduled doses. The
+/// reactive driver calls the two halves separately (interposing the decision hook, #933);
+/// every other caller wants the combined pass. Behavior-preserving vs the original single
+/// loop for every real regimen — the only reorder is two distinct SS records at the *same*
+/// instant (clinically nonsensical: one cannot be at two steady states at once), which no
+/// dataset or test carries.
+#[allow(clippy::too_many_arguments)] // each is a distinct slice of dose/PK context
+fn apply_prescheduled_doses_at(
+    u: &mut [f64],
+    ode: &OdeSpec,
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+    dose_f_bio: &[f64],
+    pk_params_flat: &[f64],
+    t_start: f64,
+    opts: &OdeSolverOptions,
+) {
+    reseed_prescheduled_states_at(u, ode, doses, dose_lagtimes, pk_params_flat, t_start, opts);
+    apply_prescheduled_boluses_at(u, ode, doses, dose_lagtimes, dose_f_bio, t_start);
 }
 
 fn ode_predictions_with_extra_breaks_and_stats(
@@ -2904,8 +2967,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // Extended params: PK params + TAFD/TAD anchors. TAD is set per segment inside
     // `integrate_segment`. TAFD (slot MAX_PK_PARAMS) anchors at the earliest dose: a
     // pre-scheduled base dose when the regimen carries one (#702, mirroring the static
-    // engine's `earliest_dose_time` seed), else NaN — set lazily at the first controller
-    // dose below (the lazy-init leaves a finite base-dose TAFD untouched).
+    // engine's `earliest_dose_time` seed), else NaN. `update_tafd_anchor` then LOWERS it at
+    // each realized controller dose, so the anchor is `min(earliest base, first controller
+    // dose)` — the true global earliest, matching the verifier when a controller dose
+    // precedes the earliest base dose (#934; the ascending walk means only the first
+    // controller dose can lower a finite base seed).
     let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
     let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
     ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
@@ -3152,21 +3218,22 @@ pub(crate) fn ode_predictions_adaptive_impl(
             reset_floor = t_start;
         }
 
-        // #702: apply any pre-scheduled base dose landing at t_start — BEFORE the
-        // decision hook reads the pre-dose trough — via the same shared pass the static
-        // engine uses, so the controller observes the post-base-dose state and the driver
-        // stays bit-aligned with the frozen-replay verifier. `shadow.doses[..n_base]` is
-        // the base regimen; controller doses (appended after) are applied by the hook, so
-        // the ordering is base-then-injected — matching the verifier's merged dose list.
-        // No-op on the dose-free path; constant path only (`pk_params_flat` is the frozen
-        // snapshot, and a base × reset combo is rejected above so no reset intervenes).
+        // #702/#933: re-seed any pre-scheduled base *steady-state* state landing at
+        // t_start — SS equilibration + SS+lag tail — BEFORE the decision hook. The SS
+        // trough IS the observed pre-dose reality, so the controller reads it. A base
+        // dose's *bolus* jump (F·AMT) is NOT applied here: it is deferred to the shared
+        // bolus pass AFTER the hook, so a base bolus coincident with a decision is observed
+        // pre-dose (the true trough), symmetric with the controller's own doses (#933 —
+        // previously the base bolus landed here, before the hook, and the controller read
+        // the post-dose peak). No-op on the dose-free path and for non-SS base doses;
+        // constant path only (`pk_params_flat` is the frozen snapshot, and a base × reset
+        // combo is rejected above so no reset intervenes).
         if n_base > 0 {
-            apply_prescheduled_doses_at(
+            reseed_prescheduled_states_at(
                 &mut u,
                 ode,
                 &shadow.doses[..n_base],
                 &base_lagtimes,
-                &base_f_bio,
                 pk_params_flat,
                 t_start,
                 &ode.solver_opts,
@@ -3319,10 +3386,14 @@ pub(crate) fn ode_predictions_adaptive_impl(
                                 pk_readout,
                                 decision_index,
                             )?;
-                            u[cmt - 1] += f * amt;
-                            if !ext_params[crate::types::MAX_PK_PARAMS].is_finite() {
-                                ext_params[crate::types::MAX_PK_PARAMS] = t_start;
-                            }
+                            // The bolus jump `u[cmt-1] += f·amt` is NOT applied here; it is
+                            // deferred to the shared `apply_prescheduled_boluses_at` pass after
+                            // this hook, so every bolus at t_start — base then controller — is
+                            // applied in ONE dose-list-ordered pass (matching the frozen-replay
+                            // verifier's accumulation order bit-for-bit), and the controller read
+                            // the true pre-dose trough above (#933). Recording it in `shadow.doses`
+                            // + `injected_f` here is what that pass then applies.
+                            update_tafd_anchor(&mut ext_params, t_start);
                             shadow
                                 .doses
                                 .push(DoseEvent::new(t_start, amt, cmt, 0.0, false, 0.0));
@@ -3374,9 +3445,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             let dose = DoseEvent::new(t_start, amt, cmt, rate, false, 0.0);
                             let (_, dur_eff) = dose.bioavailable_infusion(f);
                             insert_break(&mut break_times, t_start + dur_eff);
-                            if !ext_params[crate::types::MAX_PK_PARAMS].is_finite() {
-                                ext_params[crate::types::MAX_PK_PARAMS] = t_start;
-                            }
+                            update_tafd_anchor(&mut ext_params, t_start);
                             shadow.doses.push(dose);
                             injected_f.push(f);
                             ledger.push(DoseLedgerEntry {
@@ -3429,6 +3498,30 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 });
             }
         }
+
+        // #702/#933: apply every bolus landing at t_start — base doses (slots `0..n_base`)
+        // then controller-injected (`n_base..`), in dose-list order — in ONE shared pass, so
+        // the reactive accumulation order matches the frozen-replay verifier's merged
+        // (base ∪ ledger) list bit-for-bit. The SS state was re-seeded before the hook; this
+        // adds the F·AMT jump for both plain and SS boluses. Runs regardless of `stopped`: a
+        // pre-scheduled base bolus past a controller `Stop` still lands — the base regimen is
+        // the patient's standing prescription, independent of the controller (the verifier
+        // replays it too; #702 Finding 4). `injected_f` is F parallel to `shadow.doses` (base
+        // F pre-seeded, injected F captured at injection); `dose_lagtimes` carries the base
+        // lagtimes then 0 for injected doses. On the dose-free path `shadow.doses` is empty
+        // until the first controller dose, so this is a no-op there and — once it fires —
+        // byte-identical to the in-hook `u[cmt-1] += f·amt` it replaces (same F·AMT, same
+        // dose-list order). `dose_lagtimes` is reused by `integrate_segment` below.
+        let mut dose_lagtimes: Vec<f64> = base_lagtimes.clone();
+        dose_lagtimes.resize(shadow.doses.len(), 0.0);
+        apply_prescheduled_boluses_at(
+            &mut u,
+            ode,
+            &shadow.doses,
+            &dose_lagtimes,
+            &injected_f,
+            t_start,
+        );
 
         // Record the observation exactly at t_start (post-dose), mirroring
         // `ode_predictions`' left-boundary recording.
@@ -3500,18 +3593,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     .copy_from_slice(&seg_pk.values[..crate::types::MAX_PK_PARAMS]);
             }
 
-            // Per-dose lagtimes for the segment. Base doses (indices `0..n_base`, #702)
-            // carry their resolved lagtime; controller-injected doses (`n_base..`) are
-            // lag-0 (a nonzero lag is rejected at injection). Dose F comes from
-            // `injected_f` — base F pre-seeded, injected F captured at injection time
-            // (LOCF PK) — so a later covariate change can't retroactively rescale a
-            // delivered dose. Infusions are delivered by `integrate_segment`'s
-            // `active_infusions` over any segment they fully span (the base + dynamic
-            // injected infusion-end breaks guarantee full containment). On the dose-free
-            // path this is all-zeros and `injected_f` empty, byte-identical to before.
-            let mut dose_lagtimes: Vec<f64> = base_lagtimes.clone();
-            dose_lagtimes.resize(shadow.doses.len(), 0.0);
-
+            // Per-dose lagtimes for the segment (computed once above for the bolus pass and
+            // reused here). Base doses (indices `0..n_base`, #702) carry their resolved
+            // lagtime; controller-injected doses (`n_base..`) are lag-0 (a nonzero lag is
+            // rejected at injection). Dose F comes from `injected_f` — base F pre-seeded,
+            // injected F captured at injection time (LOCF PK) — so a later covariate change
+            // can't retroactively rescale a delivered dose. Infusions are delivered by
+            // `integrate_segment`'s `active_infusions` over any segment they fully span (the
+            // base + dynamic injected infusion-end breaks guarantee full containment). On the
+            // dose-free path this is all-zeros and `injected_f` empty, byte-identical to before.
             integrate_segment(
                 ode,
                 &mut u,

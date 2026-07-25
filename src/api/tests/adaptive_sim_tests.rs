@@ -109,6 +109,30 @@ const ODE_TV_COV: &str = r#"
   DV ~ proportional(PROP)
 "#;
 
+// 1-cpt IV ODE whose RHS reads TAFD (time after first dose). The extra
+// `-1e-3·TAFD·central` decay makes the trajectory depend on the TAFD anchor, so a stale
+// anchor (e.g. earliest *base* dose instead of the true global earliest) integrates
+// different forcing and the frozen-replay verifier catches it. Used to pin #934: a
+// controller dose scheduled before the earliest base dose must lower the anchor.
+const ODE_TAFD: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central - 1e-3 * TAFD * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
 fn subj(id: &str, obs_times: Vec<f64>, doses: Vec<DoseEvent>) -> Subject {
     let n = obs_times.len();
     let n_dose = doses.len();
@@ -1105,6 +1129,164 @@ fn adaptive_base_regimen_with_reset_is_rejected() {
     assert!(
         err.contains("base regimen") && err.contains("system resets"),
         "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_dose_coincident_with_decision_is_observed_pre_dose() {
+    // #933: a base dose sharing a time with a decision must be observed PRE-dose (the
+    // trough), not post-dose (the peak). A rescue controller fires only when the monitored
+    // signal is below a cut that the pre-dose trough clears but the post-dose peak does not,
+    // so the realized ledger is the sole witness of which state the controller read. Base
+    // 500 mg at t=0 and t=24; the only decision is at t=24. At t=24 the pre-dose trough is
+    // 500·exp(-0.1·24) ≈ 45 (< 100 ⇒ rescue), the post-dose peak ≈ 545 (> 100 ⇒ hold).
+    // Before the fix the base bolus landed before the hook and no rescue fired.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+    let decisions = vec![24.0];
+    let obs = vec![24.0, 30.0, 54.0];
+    let base = vec![
+        DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 500.0, 1, 0.0, false, 0.0),
+    ];
+    let pop = population(vec![subj("1", obs.clone(), base.clone())]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        decision_times: decisions.clone(),
+        // Ipred monitor on the central compartment — the pre-dose readout the controller sees.
+        monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Ipred)],
+        ..Default::default()
+    };
+    // Rescue 999 mg if the observed central amount is below 100, else hold.
+    let make = || {
+        move |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("monitor A declared") < 100.0 {
+                vec![DoseAction::Bolus { amt: 999.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        }
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, make, &opts)
+        .expect("run passes the base-aware verifier");
+
+    // The witness: the rescue fired, so the controller read the pre-dose trough (≈45 < 100).
+    // Post-dose observation (the pre-fix bug) would have read ≈545 > 100 and held (empty ledger).
+    assert_eq!(
+        res.ledger.len(),
+        1,
+        "rescue must fire off the pre-dose trough"
+    );
+    assert_eq!(res.ledger[0].amt, 999.0);
+    assert_eq!(res.ledger[0].time, 24.0);
+
+    // Integrity: the trajectory still equals predict() on (base ∪ realized ledger). Decisions
+    // sit on the dose grid {0, 24}, so reactive and static segment identically (bit-exact).
+    let mut static_doses = base;
+    static_doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={}",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_regimen_controller_dose_before_base_anchors_tafd_globally() {
+    // #934: a controller dose scheduled BEFORE the earliest base dose is the true first dose,
+    // so TAFD must anchor at it — min(earliest base, first controller) — matching the static
+    // frozen-replay verifier's global earliest. ODE_TAFD's RHS reads TAFD, so a stale anchor
+    // (= earliest base, t=24) integrates different forcing than the verifier (t=0) and the
+    // default-on verifier errors. The controller doses 300 mg at the first decision (t=0),
+    // before the base 200 mg at t=24; decisions {0, 24} sit on the dose grid (bit-exact).
+    let model = parse_model_string(ODE_TAFD).expect("parse TAFD-reading ODE model");
+    let decisions = vec![0.0, 24.0];
+    let obs = vec![6.0, 30.0, 48.0];
+    let base = vec![DoseEvent::new(24.0, 200.0, 1, 0.0, false, 0.0)];
+    let pop = population(vec![subj("1", obs.clone(), base.clone())]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    // Dose once, at the first decision (t=0), then hold.
+    let make = || {
+        let mut fired = false;
+        move |_ctx: &ControllerCtx| {
+            if !fired {
+                fired = true;
+                vec![DoseAction::Bolus { amt: 300.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        }
+    };
+    // verify = true (default): Ok only if the reactive TAFD matches the verifier's global
+    // earliest. Without the fix, TAFD stays at 24 (earliest base) and the TAFD-forced
+    // trajectory diverges from the replay ⇒ Err.
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, make, &opts).expect(
+        "controller-dose-before-base run passes the base-aware verifier (TAFD anchored globally)",
+    );
+    assert_eq!(res.ledger.len(), 1, "one controller dose at t=0");
+    assert_eq!(res.ledger[0].time, 0.0);
+    assert!(
+        res.trajectories[0].ipred > 0.0,
+        "TAFD-forced trajectory is actually integrated"
+    );
+}
+
+#[test]
+fn adaptive_base_dose_after_controller_stop_still_lands() {
+    // #702 Finding 4: a pre-scheduled base dose scheduled PAST a controller `Stop` still
+    // lands — the base regimen is the patient's standing prescription, independent of the
+    // controller (and the frozen-replay verifier replays it too). The controller stops at the
+    // first decision (t=0); base doses at t=24 and t=48 must still be integrated, so the run
+    // equals predict() on the base regimen alone (the ledger is empty).
+    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+    let decisions = vec![0.0, 24.0];
+    let obs = vec![12.0, 30.0, 54.0];
+    let base = vec![
+        DoseEvent::new(24.0, 400.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(48.0, 400.0, 1, 0.0, false, 0.0),
+    ];
+    let pop = population(vec![subj("1", obs.clone(), base.clone())]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    // Stop immediately at the first decision.
+    let make = || move |_ctx: &ControllerCtx| vec![DoseAction::Stop];
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, make, &opts)
+        .expect("post-Stop base doses run and pass the verifier");
+    assert!(res.ledger.is_empty(), "controller Stopped, issued no doses");
+
+    // The base doses (incl. the two past the Stop) are integrated: equals predict() on base.
+    let static_pop = population(vec![subj("1", obs.clone(), base)]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (post-Stop base dose dropped?)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+    // Positive control: the t=48 base dose is visible at the t=54 observation (non-vacuous).
+    assert!(
+        res.trajectories[2].ipred > 100.0,
+        "the t=48 post-Stop base dose must be visible at t=54, got {}",
+        res.trajectories[2].ipred
     );
 }
 
