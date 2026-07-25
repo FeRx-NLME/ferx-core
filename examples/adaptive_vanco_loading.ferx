@@ -1,0 +1,59 @@
+# Adaptive (feedback) dosing — vancomycin LOADING DOSE + maintenance titration (#702)
+#
+# Demonstrates a pre-scheduled BASE REGIMEN (issue #702): the subject starts on a
+# fixed loading dose, and the [adaptive_dosing] controller then titrates the DAILY
+# MAINTENANCE dose on the measured trough — the real TDM / MIPD workflow.
+#
+# The loading dose is NOT in this file: it rides on the subject data
+# (tests/reference/vanco_loading_mrgsolve/vanco_loading_subject.csv carries a 1500 mg
+# bolus at t=0). The reactive driver integrates that pre-scheduled dose and the
+# controller augments it — a base subject that already carries doses used to be
+# rejected outright (#702 lifts that on constant-covariate, non-reset models).
+#
+# The decision schedule starts at t=24 (after the loading dose), so the day-1 trough
+# the controller sees is the decayed loading dose (~5.6 mg/L), not 0 — which is exactly
+# what makes this a meaningful test of the base-regimen path.
+#
+# Run with `simulate_adaptive_from_spec()` (not the plain forward `simulate()`). This
+# is validated against an external mrgsolve reference; see
+# tests/reference/vanco_loading_mrgsolve/ and tests/adaptive_vanco_loading_anchor.rs.
+#
+# Negligible IIV / no covariates: an effectively typical-value patient, so the realized
+# ladder is reproducible and bit-comparable to the mrgsolve run.
+
+[parameters]
+  theta TVCL(4.0,  0.1,  50.0)   # vancomycin clearance (L/h)
+  theta TVV(80.0,  5.0, 300.0)   # central volume (L); CENT/V is the concentration
+
+  # Negligible IIV: the engine requires at least one omega, so CL carries a vanishing
+  # variance. The patient is effectively typical-value and the ladder is reproducible.
+  omega ETA_CL ~ 1e-10
+
+  sigma ADD ~ 1.0                # nominal additive error; the latent `observe` signal
+                                 # is un-noised, so it never enters the dose decisions.
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[CENT])
+
+[odes]
+  d/dt(CENT) = -(CL / V) * CENT  # 1-cpt IV; the loading + maintenance boluses enter CENT
+
+[scaling]
+  y = CENT / V                   # observed/predicted endpoint: concentration (mg/L)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[adaptive_dosing]
+  observe       = CENT / V               # titrate on the latent trough concentration
+  at            = every 24 from 24 to 144 # daily MAINTENANCE decisions, after the load
+  start_dose    = 750                    # empiric maintenance start (mg): subtherapeutic
+  route         = bolus(cmt=1)           # maintenance boluses into the drug compartment
+  dose_bounds   = [250, 4000]            # mg
+  target_window = [10, 15]               # report % of days with trough in [10, 15] mg/L
+  when signal < 10 : increase 25%        # subtherapeutic trough -> raise the dose
+  when signal > 15 : decrease 25%        # supratherapeutic trough -> lower the dose

@@ -20,6 +20,24 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Pre-scheduled base regimen (loading dose) in adaptive-dosing simulation** (#702).
+  `simulate_adaptive()` / `simulate_adaptive_from_spec()` now accept a base subject that
+  already carries pre-scheduled doses — a loading / maintenance regimen, including a
+  steady-state (`SS=1`) dose — instead of requiring a dose-free subject: the driver
+  integrates the base regimen and the controller augments it at the decision schedule (the
+  real TDM / MIPD workflow of starting on a fixed regimen and titrating on measured levels).
+  The pre-scheduled doses reuse the same dose-resolution, break-timeline, and steady-state
+  machinery as `predict()` / `simulate()`, appear in the controller's dose `history`, and
+  are rebuilt alongside the realized ledger by the default-on frozen-replay verifier. A base
+  dose sharing a time with a decision is observed **pre-dose** (the trough), symmetric with
+  the controller's own doses (#933); the TAFD anchor is the true global earliest dose even
+  when a controller dose precedes the earliest base dose (#934); a base dose past a
+  controller `Stop` still lands (the base regimen is the patient's standing prescription);
+  and base doses into lagged / built-in input-rate (transit / zero-order absorption)
+  compartments are supported (#935). Supported on constant-covariate, non-reset models; a
+  base regimen combined with time-varying covariates, IOV, or system resets is a typed error
+  (each a #702 follow-up), never a silent mis-integration. Previously any base regimen was
+  rejected outright.
 - **System resets (EVID=3) in adaptive-dosing simulation** (#716). `simulate_adaptive()`
   / `simulate_adaptive_from_spec()` now honor an EVID=3 reset carried by the base
   subject: the reactive driver zeros the compartments at the reset time (re-seeding any
