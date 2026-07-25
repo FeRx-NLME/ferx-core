@@ -337,9 +337,17 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
 - **A non-empty decision schedule is required** — an empty `decision_times` never
   consults the controller, so it is rejected rather than run as a silent
   dose-free simulation.
-- **Dose-free base subjects** — the regimen is fully controller-driven; a subject
-  that already carries doses (including steady-state or loading regimens) is
-  rejected.
+- **Pre-scheduled base regimens are supported** (#702) — the base subject may carry a
+  loading / maintenance regimen, including a steady-state (`SS=1`) dose, which the driver
+  integrates and the controller augments at the decision schedule (the real TDM / MIPD
+  workflow: start on a fixed regimen, then titrate on measured levels). Base doses flow
+  through the same dose-resolution, break-timeline, and steady-state machinery as
+  `predict()` / `simulate()`, and they appear in the controller's dose `history`; the
+  frozen-replay verifier rebuilds the base regimen alongside the realized ledger, so the
+  pre-scheduled + reactive bookkeeping is checked bit-for-bit each run. *Scope:* supported
+  on constant-covariate, non-reset models — a base regimen combined with time-varying
+  covariates, IOV, or system resets (EVID=3/4) is a typed error (each a #702 follow-up),
+  never a silent mis-integration of a delivered dose.
 - **Time-varying covariates are supported** — the driver recomputes PK per
   event/segment from the covariate active in that segment (the NONMEM
   end-of-interval convention that `predict()` / `simulate()` use), so a covariate
@@ -354,8 +362,9 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   controller-issued infusions opened before the reset, exactly as `predict()` /
   `simulate()` do on the event-driven path; the frozen-replay verifier is
   reset-aware, so the reset is honored *and* checked each run. (An EVID=4 reset+dose
-  row carries a dose, which the dose-free-base rule above rejects, so only pure
-  EVID=3 resets reach the adaptive path.) *Caveat:* declaring `auc_target` on a reset
+  row carries a dose, so a reset-carrying subject with doses is rejected by the
+  base-regimen combo guard — base × reset is a #702 follow-up — and only pure EVID=3
+  resets on a dose-free base reach the adaptive path.) *Caveat:* declaring `auc_target` on a reset
   subject is a typed error — the exposure metric's uniform per-window trapezoid grid
   has no node at the reset instant, so the one window straddling the reset would
   integrate the state discontinuity inaccurately (every other output is reset-aware).

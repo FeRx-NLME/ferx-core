@@ -2007,14 +2007,100 @@ fn adaptive_dv_added_monitor_does_not_perturb_other_draw() {
 }
 
 #[test]
-fn adaptive_rejects_nonempty_base_subject() {
+fn adaptive_base_regimen_matches_static_ode() {
+    // #702 driver-level oracle: a base loading regimen with a Hold-all controller must
+    // reproduce `ode_predictions` on that regimen — the reactive driver seeds and
+    // integrates the pre-scheduled doses through the same static-engine helpers.
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(1.0, 10.0);
+    // Decisions on the loading-dose grid so the reactive driver and `ode_predictions`
+    // segment identically (bit-exact); an off-grid decision would add a break the static
+    // engine lacks, diverging by RK45 step noise (the frozen-replay verifier is the
+    // bit-exact check when decisions are off-grid).
+    let decisions = [0.0, 24.0];
+    let obs = vec![6.0, 30.0, 54.0];
+    let loading = vec![
+        DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 250.0, 1, 0.0, false, 0.0),
+    ];
+
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+    let base = make_subject(loading.clone(), obs.clone());
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base,
+        &decisions,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs with a base regimen");
+    assert!(run.ledger.is_empty(), "Hold controller adds no doses");
+
+    let static_subject = make_subject(loading, obs);
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+    assert_eq!(run.predictions.len(), static_preds.len());
+    for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+        assert_relative_eq!(*got, *want, max_relative = 1e-9);
+    }
+}
+
+#[test]
+fn adaptive_base_regimen_plus_titration_matches_static_ode() {
+    // #702: base loading dose + a fixed controller ≡ `ode_predictions` on (base ∪ ledger).
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(1.0, 10.0);
+    let decisions = [0.0, 24.0, 48.0];
+    let obs = vec![6.0, 30.0, 54.0];
+    let loading = vec![DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)];
+
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+    let base = make_subject(loading.clone(), obs.clone());
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base,
+        &decisions,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs");
+    assert_eq!(run.ledger.len(), 3);
+
+    let mut static_doses = loading;
+    static_doses.extend(
+        run.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let static_subject = make_subject(static_doses, obs);
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+    for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+        assert_relative_eq!(*got, *want, max_relative = 1e-9);
+    }
+}
+
+#[test]
+fn adaptive_base_regimen_with_reset_is_rejected_driver() {
+    // #702 scope (driver level): tv/iov are off here (event_pk/eta_occ = None), but a base
+    // regimen on a reset-carrying subject still hits the combo guard via `has_resets()` —
+    // never a silent integration that ignores the reset.
     let ode = one_cpt_ode_spec();
     let pk = pk_one(1.0, 10.0);
     let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
-    let base = make_subject(
+    let mut base = make_subject(
         vec![DoseEvent::new(0.0, 50.0, 1, 0.0, false, 0.0)],
         vec![1.0],
     );
+    base.reset_times = vec![12.0];
     let err = ode_predictions_adaptive(
         &ode,
         &pk.values,
@@ -2028,7 +2114,10 @@ fn adaptive_rejects_nonempty_base_subject() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("dose-free"), "got: {err}");
+    assert!(
+        err.contains("base regimen") && err.contains("system resets"),
+        "got: {err}"
+    );
 }
 
 #[test]
