@@ -961,6 +961,35 @@ pub(crate) fn ode_inner_grad_supported(model: &CompiledModel, subject: &Subject)
             || crate::sens::ode_provider::ode_tvcov_supported(model, subject))
 }
 
+/// Model-level umbrella for [`ode_inner_grad_supported`]: whether the light `Dual1`
+/// ODE inner η-gradient can serve the *best-case* subject of this model. Both
+/// per-subject gates ([`ode_subject_supported`], [`ode_tvcov_supported`]) require
+/// [`ode_analytical_supported`] as their subject-independent core, so a servable
+/// subject always exists when this holds — a plain-bolus, fixed-dose, no-TV-cov
+/// subject takes the static walk, and a lagtime / TV-cov / SS / modeled-dose subject
+/// routes to the event-driven walk. **Non-IOV only:** `ode_analytical_supported`
+/// requires `n_kappa == 0` (the ODE IOV inner is [`ode_iov_supported`]) and
+/// `ode_spec.is_some()` (false for every closed-form / endpoint-only model), so this
+/// never overlaps the closed-form or IOV report branches.
+///
+/// It deliberately does **not** fold in the escape hatches (`gradient = fd`, SDE,
+/// magnitude × `block_sigma`): the caller applies `analytic_inner_common_bail`. That
+/// bail is a superset of the hatches the live per-subject ODE branch in
+/// `analytic_inner_grad_supported` hand-inlines — its extra `log_transform && n_kappa
+/// > 0` clause — but the two coincide here because `ode_analytical_supported` forces
+/// `n_kappa == 0`, making that clause vacuous. Consumed (via the shared
+/// `inner_reports_analytic_model`) by `build_info::gradient_method_inner` to report
+/// the ODE inner route at model level without a per-subject scan — the inner analog of
+/// how [`sens_supported`] already lets the *outer* report recognize ODE (#378 task B).
+///
+/// [`ode_analytical_supported`]: crate::sens::ode_provider::ode_analytical_supported
+/// [`ode_subject_supported`]: crate::sens::ode_provider::ode_subject_supported
+/// [`ode_tvcov_supported`]: crate::sens::ode_provider::ode_tvcov_supported
+/// [`ode_iov_supported`]: crate::sens::ode_provider::ode_iov_supported
+pub(crate) fn ode_inner_grad_supported_model(model: &CompiledModel) -> bool {
+    ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model)
+}
+
 /// The per-observation `∂f/∂η` Jacobian (`n_obs × n_eta`, row-major) as a flat
 /// vector, or `None` when unsupported. Convenience for the inner loop, whose
 /// `h_matrix` is exactly this Jacobian at the converged η̂. Uses the light

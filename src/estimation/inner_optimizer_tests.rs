@@ -140,6 +140,159 @@ mod ctmm_inner {
     }
 }
 
+/// #378 task B — the model-level report `build_info::gradient_method_inner` must match the
+/// per-subject route `find_ebe` actually runs for an **in-scope ODE** model. The live inner
+/// takes the light `Dual1` ODE η-gradient (`analytic_inner_grad_supported` → the `ode_spec`
+/// branch → `ode_inner_grad_supported`), but the report used to read the closed-form-only
+/// `analytic_inner_grad_supported_model` (false for every ODE model — no `tv_fn`) and
+/// mislabel it "finite differences". Pin report == route, exactly as the CTMM tests above
+/// pin theirs. (Mutation: reverting the ODE disjunct in `gradient_method_inner` makes the
+/// report `FiniteDifferences` while the route stays analytic, so the final assert fails.)
+#[test]
+fn in_scope_ode_reports_and_takes_the_analytic_inner_route() {
+    const ONECPT_IV_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model = crate::parser::model_parser::parse_model_string(ONECPT_IV_ODE).expect("parse");
+    // Fixture self-check: genuinely in ODE analytic scope (else the asserts pass vacuously).
+    assert!(
+        crate::sens::provider::ode_inner_grad_supported_model(&model),
+        "fixture must be an in-scope ODE model"
+    );
+
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![9.0, 8.0, 6.0, 3.0, 1.0],
+        obs_cmts: vec![1, 1, 1, 1, 1],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0, 0, 0, 0, 0],
+        occasions: Vec::new(),
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+
+    // Subject-level: what `find_ebe` actually runs.
+    assert!(
+        super::analytic_inner_grad_supported(&model, &subject),
+        "an in-scope plain-bolus ODE subject must take the analytic inner route"
+    );
+    // Model-level: what `build_info::gradient_method_inner` reports — must match the route.
+    assert_eq!(
+        crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, &model),
+        crate::build_info::GradientMethodKind::Analytic,
+        "the report must match the live analytic ODE inner route"
+    );
+}
+
+/// #926 (review follow-up to #378 task B) — an in-scope ODE model whose ENTIRE population runs
+/// the FD inner must still emit the FD-fallback warning. `gradient_method_inner` reports
+/// "analytic" at the model level for such a model (best-case), so without the warning the
+/// persisted `fit.yaml` label would contradict the per-subject reality with nothing to
+/// reconcile it — exactly the closed-form all-FD case (TV-cov + LTBS) the warning already
+/// covers. This pins the shared `inner_reports_analytic_model` coupling between the report and
+/// the warning. Every subject here carries a modeled-duration dose with no `D{cmt}` slot, which
+/// the ODE provider declines to FD (the same trick `fd_fallback_warning_fires_only_for_mixed_
+/// population` uses). Mutation: reverting `fd_fallback_warning`'s `model_reports_analytic` to the
+/// old `analytic_inner_grad_supported_model` (false for ODE) makes this return `None` and fail.
+#[test]
+fn fd_fallback_warning_fires_for_all_fd_in_scope_ode_population() {
+    const IN_SCOPE_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model = crate::parser::model_parser::parse_model_string(IN_SCOPE_ODE).expect("parse");
+    // In-scope at the model level, so the headline reports analytic …
+    assert!(crate::sens::provider::ode_inner_grad_supported_model(
+        &model
+    ));
+    assert_eq!(
+        crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, &model),
+        crate::build_info::GradientMethodKind::Analytic,
+    );
+    let theta = &model.default_params.theta;
+    let zeros = vec![0.0; model.n_eta];
+    // … but a modeled-duration dose with no `D{cmt}` slot puts every subject on the FD inner.
+    let fd_subject = || {
+        let mut d = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        d.rate_mode = crate::types::RateMode::ModeledDuration;
+        Subject {
+            id: "1".into(),
+            doses: vec![d],
+            obs_times: vec![1.0, 4.0, 8.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 4.0, 1.0],
+            obs_cmts: vec![1, 1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0, 0],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }
+    };
+    // Confirm the FD-ness the warning counts (not a vacuous population).
+    assert!(
+        crate::sens::provider::subject_eta_grad(&model, &fd_subject(), theta, &zeros).is_none(),
+        "the modeled-duration-no-slot subject must run the FD inner"
+    );
+    let pop = Population {
+        subjects: vec![fd_subject(), fd_subject()],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let w = super::fd_fallback_warning(&model, &pop, theta)
+        .expect("all-FD in-scope ODE population must warn (report says analytic)");
+    assert!(w.contains("2 of 2"), "got: {w}");
+}
+
 /// The M3 censored coefficient `∂/∂f[−logΦ((y−f)/√v)]` must equal a central
 /// finite difference of that data term — across additive (`dv_df = 0`) and
 /// f-dependent (`dv_df ≠ 0`, e.g. proportional/combined) variance, and across
