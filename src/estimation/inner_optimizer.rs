@@ -312,12 +312,16 @@ pub(crate) fn fd_fallback_warning(
         .count();
     // Warn on a mixed population (some subjects fall back per-point), and also when
     // the *whole* population falls back while the model-level report claims analytic
-    // — e.g. TV-cov + LTBS, where `analytic_inner_grad_supported_model` (and hence
-    // `build_info::gradient_method_inner`) reports analytic but every subject's inner
-    // EBE gradient actually runs FD. Without this, that mislabel would go uncorrected
-    // (#381 review #9 / #665 review). A model that already reports FD and runs FD
-    // everywhere needs no warning.
-    let model_reports_analytic = analytic_inner_grad_supported_model(model);
+    // — e.g. TV-cov + LTBS on a closed-form model, or an in-scope ODE model whose every
+    // subject is out of the per-subject ODE scope (oral infusion into a built-in absorption
+    // compartment, a rate-defined infusion under `F ≠ 1`), where `gradient_method_inner`
+    // reports analytic but every subject's inner EBE gradient actually runs FD. Without
+    // this, that mislabel would go uncorrected (#381 review #9 / #665 review / #926). Read
+    // the report through the SAME `inner_reports_analytic_model` predicate
+    // `build_info::gradient_method_inner` uses, so the label and this warning cannot drift
+    // (the ODE route was missing from the old `analytic_inner_grad_supported_model` read).
+    // A model that already reports FD and runs FD everywhere needs no warning.
+    let model_reports_analytic = inner_reports_analytic_model(model);
     if n_fd > 0 && (n_fd < n_total || model_reports_analytic) {
         Some(format!(
             "{n_fd} of {n_total} subjects use finite-difference inner gradients \
@@ -1590,11 +1594,12 @@ pub fn profile_report() {
 /// the `g = ln(f)` jet transform (`subject_eta_grad` → `run_obs_eta`), so it serves plain LTBS
 /// analytically; the covariance step reconverges those EBEs at the tighter `cov_inner_tol`
 /// ([`FitOptions::effective_cov_inner_tol`]) so the `ln`-amplified EBE noise no longer corrupts
-/// the SEs. LTBS + η-dependent `ExpressionScale` stays a (narrower) common bail — its analytic
-/// scale+log Jacobian is unvalidated. The other LTBS inner paths the analytic kernels don't yet
-/// carry decline through their own gates — TV-cov (`subject_eta_grad_tvcov`) and closed-form IOV
-/// (`iov_analytical_supported`) — so removing the blanket bail only enables the validated plain
-/// path.
+/// the SEs. LTBS + η-dependent `ExpressionScale` is served analytically on the inner too now
+/// (the η-quotient then the `ln f` jet, `subject_eta_grad`; validated by
+/// `ltbs_plus_expression_scale_inner_matches_outer`), as is LTBS + TV-cov (the event-driven
+/// inner walk applies the same jet last). Only **LTBS × IOV** stays a common bail (the
+/// `log_transform && n_kappa > 0` clause below): the `Dual1` IOV inner walk carries no `ln`
+/// jet, so the closed-form OUTER IOV gradient serves LTBS but the inner EBE keeps FD.
 ///
 /// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the non-IOV
 /// analytical inner provider now carries the η-only quotient rule (`subject_eta_grad`
@@ -1730,6 +1735,34 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
         return false;
     }
     crate::sens::provider::analytical_supported(model)
+}
+
+/// Whether the inner (per-subject EBE) loop reports an **analytic** gradient at the model
+/// level — the union of the three in-scope routes, each gated by the shared escape hatches:
+///   - **closed-form / CTMM** — [`analytic_inner_grad_supported_model`];
+///   - **ODE non-IOV** — the light `Dual1` walk
+///     ([`ode_inner_grad_supported_model`](crate::sens::provider::ode_inner_grad_supported_model)),
+///     which the closed-form predicate misses (ODE models have no `tv_fn`). `n_kappa == 0`
+///     there, so `analytic_inner_common_bail` reduces to exactly the escape hatches the live
+///     ODE branch of [`analytic_inner_grad_supported`] applies (its `log_transform && n_kappa
+///     > 0` clause is vacuous);
+///   - **IOV** — the stacked-η walk
+///     ([`iov_sens_supported`](crate::sens::provider::iov_sens_supported) + `omega_iov`).
+///
+/// **Single source of truth** for both `build_info::gradient_method_inner` (the reported
+/// method) and [`fd_fallback_warning`]'s whole-population-FD guard, so the persisted
+/// `gradient_method_inner` label and the reconciling FD-fallback warning cannot drift as the
+/// analytic scope grows — the coupling PR #381 review #9 relies on, extended to the ODE route
+/// (#378 task B / #926). This is **best-case, model-level**: a per-subject FD fallback is
+/// caught separately by `fd_fallback_warning` (mixed populations) and, for an all-FD in-scope
+/// population, by that same warning *because* this predicate reports analytic.
+pub(crate) fn inner_reports_analytic_model(model: &CompiledModel) -> bool {
+    analytic_inner_grad_supported_model(model)
+        || (crate::sens::provider::ode_inner_grad_supported_model(model)
+            && !analytic_inner_common_bail(model))
+        || (crate::sens::provider::iov_sens_supported(model)
+            && model.default_params.omega_iov.is_some()
+            && !analytic_inner_common_bail(model))
 }
 
 /// Every `Ctmm` endpoint on the model carries a dual-evaluable generator program, i.e. its

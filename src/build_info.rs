@@ -54,52 +54,23 @@ impl GradientMethodKind {
 
 /// Gradient method used in the inner (per-subject EBE) loop.
 ///
-/// Coarse model-level mirror of the per-subject route in
-/// [`estimation::inner_optimizer::analytic_inner_grad_supported`]. The analytic
-/// η-gradient runs on one of three in-scope routes; this reports their union:
-///   - **closed-form** (`analytic_inner_grad_supported_model`): an analytical PK
-///     model (`tv_fn` populated) in the provider's scope — plain LTBS is served,
-///     LTBS + η-dependent `ExpressionScale` is not;
-///   - **ODE** (`ode_inner_grad_supported_model`): the light `Dual1` ODE walk (#410).
-///     The closed-form predicate misses it (ODE models have no `tv_fn`), so it is
-///     reported explicitly — the inner analog of how `sens_supported` already lets
-///     [`gradient_method_outer`] recognize ODE (#378 task B);
-///   - **IOV** (`iov_sens_supported` + `omega_iov`): the stacked-η IOV walk, which
-///     `analytic_inner_grad_supported_model` also misses (it requires `n_kappa == 0`).
-/// Each route is gated by the shared escape hatches (`gradient = fd`, SDE, …) via
-/// `analytic_inner_common_bail`. Otherwise FD.
+/// Best-case, model-level mirror of the per-subject route
+/// `estimation::inner_optimizer::analytic_inner_grad_supported` runs. The reported method is
+/// the union of the three in-scope inner routes — closed-form / CTMM, the light `Dual1` ODE
+/// walk (#410), and the stacked-η IOV walk — computed by the shared
+/// `inner_reports_analytic_model` predicate that `fd_fallback_warning` reads too, so the
+/// reported label and the FD-fallback warning cannot drift (#378 task B / #926). Otherwise
+/// FD. Before #926 this read a closed-form-only predicate and mislabeled every in-scope ODE
+/// model "finite differences".
 ///
-/// This is **best-case, model-level**: per-subject fallbacks — **TV-cov + LTBS**,
-/// where the event-driven inner walk declines LTBS so every such subject runs FD, and
-/// out-of-scope ODE subjects (steady-state, oral infusion, modeled-duration doses) —
-/// are reported by `gradient_route_summary` (banner) and `fd_fallback_warning`.
+/// Per-subject fallbacks are reported by `gradient_route_summary` (banner) and
+/// `fd_fallback_warning`: **TV-cov + LTBS** on a closed-form model (the event-driven inner
+/// walk declines LTBS, so every such subject runs FD), and out-of-scope ODE subjects (oral
+/// infusion into a built-in absorption compartment, a rate-defined infusion under `F ≠ 1`).
+/// Steady-state and modeled-duration doses are **analytic** on the ODE event-driven walk, not
+/// FD (#914 / #530).
 pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> GradientMethodKind {
-    // Report off the *same* model-level predicates `find_ebe` / `find_ebe_iov` consult, so
-    // the two can't diverge as scope grows (PR #381 review #9). Per-subject FD fallbacks
-    // (time-varying covariates, survival obs, out-of-scope ODE subjects) are reported
-    // separately by `gradient_route_summary` / `fd_fallback_warning`. Two routes the
-    // closed-form `analytic_inner_grad_supported_model` cannot see are reported explicitly,
-    // each the model-level mirror of a branch in the live `analytic_inner_grad_supported`:
-    //   - ODE (#378 task B): `analytic_inner_grad_supported_model` reads the closed-form
-    //     `analytical_supported`, which is `false` for every ODE model (no `tv_fn`), yet the
-    //     live inner runs the light `Dual1` ODE η-gradient. `ode_inner_grad_supported_model`
-    //     requires `n_kappa == 0`, so it is the non-IOV ODE umbrella, and
-    //     `analytic_inner_common_bail` supplies exactly the escape hatches the live ODE
-    //     branch applies (its LTBS×IOV clause is vacuous at `n_kappa == 0`).
-    //   - IOV: the stacked-η IOV walk runs when the model is in IOV scope and clears the
-    //     shared bails — `analytic_inner_grad_supported_model` returns `false` for every IOV
-    //     model (it requires `n_kappa == 0`), so this too is explicit (#466 review round 4 #1).
-    let analytic = crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(model)
-        || (crate::sens::provider::ode_inner_grad_supported_model(model)
-            && !crate::estimation::inner_optimizer::analytic_inner_common_bail(model))
-        || (crate::sens::provider::iov_sens_supported(model)
-            // Match the live IOV inner gate (`analytic_iov_inner`, inner_optimizer.rs):
-            // it also requires `omega_iov.is_some()`. `iov_sens_supported` can be true
-            // structurally for a non-IOV model, so without this the report would claim
-            // "Analytic" where the model actually has no IOV inner gradient at all.
-            && model.default_params.omega_iov.is_some()
-            && !crate::estimation::inner_optimizer::analytic_inner_common_bail(model));
-    if analytic {
+    if crate::estimation::inner_optimizer::inner_reports_analytic_model(model) {
         GradientMethodKind::Analytic
     } else {
         GradientMethodKind::FiniteDifferences
@@ -281,13 +252,29 @@ mod tests {
             crate::sens::provider::ode_inner_grad_supported_model(&m),
             "fixture must be an in-scope ODE model"
         );
-        for build in [&ad_build(), &ci_build()] {
-            assert_eq!(
-                gradient_method_inner(build, &m),
-                GradientMethodKind::Analytic,
-                "an in-scope ODE model runs — and must report — the analytic inner gradient"
-            );
-        }
+        // `gradient_method_inner` ignores the build arg, so one build is enough here.
+        assert_eq!(
+            gradient_method_inner(&ci_build(), &m),
+            GradientMethodKind::Analytic,
+            "an in-scope ODE model runs — and must report — the analytic inner gradient"
+        );
+    }
+
+    #[test]
+    fn inner_in_scope_ode_ltbs_returns_analytic() {
+        // The live ODE inner walk serves LTBS (#474): it shares `solve_ode_g` with the objective,
+        // so the analytic EBE is the objective's own minimum. `ode_analytical_supported` admits a
+        // plain-LTBS ODE model (scaling `None`), and `analytic_inner_common_bail`'s `log_transform
+        // && n_kappa > 0` clause is vacuous at `n_kappa == 0` — so the report must stay Analytic
+        // under LTBS, exercising exactly that vacuity. Mirrors the closed-form
+        // `inner_plain_ltbs_returns_analytic`.
+        let mut m = crate::parser::model_parser::parse_model_string(ONECPT_IV_ODE).expect("parse");
+        m.log_transform = true;
+        assert!(crate::sens::provider::ode_inner_grad_supported_model(&m));
+        assert_eq!(
+            gradient_method_inner(&ci_build(), &m),
+            GradientMethodKind::Analytic
+        );
     }
 
     #[test]

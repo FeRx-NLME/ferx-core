@@ -973,11 +973,14 @@ pub(crate) fn ode_inner_grad_supported(model: &CompiledModel, subject: &Subject)
 /// never overlaps the closed-form or IOV report branches.
 ///
 /// It deliberately does **not** fold in the escape hatches (`gradient = fd`, SDE,
-/// magnitude × `block_sigma`): the caller applies `analytic_inner_common_bail`,
-/// exactly as the live per-subject ODE branch in `analytic_inner_grad_supported`
-/// does. Consumed by `build_info::gradient_method_inner` to report the ODE inner
-/// route at model level without a per-subject scan (the inner analog of how
-/// [`sens_supported`] already lets the *outer* report recognize ODE — #378 task B).
+/// magnitude × `block_sigma`): the caller applies `analytic_inner_common_bail`. That
+/// bail is a superset of the hatches the live per-subject ODE branch in
+/// `analytic_inner_grad_supported` hand-inlines — its extra `log_transform && n_kappa
+/// > 0` clause — but the two coincide here because `ode_analytical_supported` forces
+/// `n_kappa == 0`, making that clause vacuous. Consumed (via the shared
+/// `inner_reports_analytic_model`) by `build_info::gradient_method_inner` to report
+/// the ODE inner route at model level without a per-subject scan — the inner analog of
+/// how [`sens_supported`] already lets the *outer* report recognize ODE (#378 task B).
 ///
 /// [`ode_analytical_supported`]: crate::sens::ode_provider::ode_analytical_supported
 /// [`ode_subject_supported`]: crate::sens::ode_provider::ode_subject_supported

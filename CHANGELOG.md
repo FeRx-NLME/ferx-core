@@ -71,14 +71,17 @@ section of the SDLC for the versioning policy).
   units, platform-sensitive) that surfaced after the `inner_tol` tightening in #330. FREM keeps
   its cold-restart re-centering unchanged.
 - **The reported inner-loop gradient method for `[odes]` models is no longer mislabeled "finite
-  differences"** (#378). `fit()` already runs the exact analytic inner η-gradient for an in-scope
-  ODE model (as it does for closed-form and IOV models), but the reported `gradient_method_inner`
-  — shown in the fit banner and `{model}-fit.yaml` — was derived from a closed-form-only predicate
-  and always read "finite differences" for ODE, even while the outer-loop report correctly read
-  "analytic". It now reports the analytic method for an in-scope ODE model, matching the outer
-  report and the route actually run; genuinely finite-differenced subjects (steady-state, oral
-  infusion, modeled-duration doses) are still surfaced by the route banner and the FD-fallback
-  warning. Reporting only — no estimate, OFV, or diagnostic changes.
+  differences"** (#926, follow-up to #378). `fit()` already runs the exact analytic inner
+  η-gradient for an in-scope ODE model (as it does for closed-form and IOV models), but the
+  reported `gradient_method_inner` — shown in the fit banner and `{model}-fit.yaml` — was derived
+  from a closed-form-only predicate and always read "finite differences" for ODE, even while the
+  outer-loop report correctly read "analytic". It now reports the analytic method for an in-scope
+  ODE model, matching the outer report and the route actually run. The report and the
+  FD-fallback warning now share one predicate, so an in-scope ODE model whose every subject is
+  genuinely finite-differenced (oral infusion into a built-in absorption compartment, or a
+  rate-defined infusion under `F ≠ 1`) is still surfaced by the route banner and the warning
+  rather than silently labeled analytic. Reporting only — no estimate, OFV, or diagnostic
+  changes.
 - **Steady-state (`SS=1`) dosing on `[odes]` models is now exact for a linear disposition, and
   warns instead of silently truncating on a nonlinear one** (#914). An ordinary ODE bolus or
   infusion SS dose previously equilibrated by expanding a pulse train capped at 50 cycles, which
