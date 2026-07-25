@@ -170,6 +170,210 @@ fn degenerate_oracle_matches_static_predict_bit_for_bit() {
     }
 }
 
+/// A one-shot infusion at the second decision (t=24), holding otherwise. Its
+/// window spans the mid-horizon reset so the reset-floor infusion turn-off is
+/// exercised (#716).
+fn infuse_at_second_decision() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
+    |ctx: &ControllerCtx| {
+        if ctx.decision_index == 1 {
+            vec![DoseAction::Infuse {
+                amt: 120.0,
+                cmt: 1,
+                rate: 5.0,
+            }]
+        } else {
+            vec![DoseAction::Hold]
+        }
+    }
+}
+
+#[test]
+fn adaptive_reset_matches_static_predict() {
+    // Degenerate oracle for system resets (#716): a fixed-dose controller over a
+    // dose-free base subject carrying a mid-horizon EVID=3 reset must reproduce the
+    // trusted static engine — `predict()`, which routes reset subjects to the
+    // reset-aware event-driven walker — on the same realized regimen. The model is
+    // η-invariant, so the adaptive IPRED equals the η=0 static PRED.
+    //
+    // The default-on frozen-replay verifier (now reset-aware) also runs, and its Ok
+    // is part of this assertion: a reset-blind verifier would compute the post-reset
+    // observation at t=42 as ~0 in the driver but ~18 in the replay and error out, so
+    // the `.expect` below fails unless BOTH the driver and the verifier honor the reset.
+    //
+    // Tolerance: `predict()` routes a reset subject to the event-driven engine
+    // (`solve_ode`), while the reactive driver integrates with `integrate_segment`
+    // (`solve_ode_dense`) — two independent integrators, so they agree to solver noise
+    // (~1e-6 relative), not to the bit. That independence is the value here: a reset
+    // dropped or mis-applied by the driver would move a prediction by O(dose) — tens of
+    // percent — which this rel-1e-4 bound catches easily, while the tight same-engine
+    // bookkeeping check is the auto-run frozen-replay verifier's job.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![0.0, 24.0, 48.0];
+    let obs = vec![6.0, 30.0, 42.0, 54.0];
+    let reset_at = 36.0;
+
+    let mut base = subj("1", obs.clone(), vec![]);
+    base.reset_times = vec![reset_at];
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("adaptive reset sim runs and passes the reset-aware verifier");
+    assert_eq!(res.ledger.len(), 3, "a bolus at every decision");
+
+    // Static reference: the realized doses pre-scheduled on a subject carrying the
+    // same reset, scored by predict() (η=0, event-driven, reset honored).
+    let static_doses: Vec<DoseEvent> = decisions
+        .iter()
+        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    let mut static_subject = subj("1", obs.clone(), static_doses);
+    static_subject.reset_times = vec![reset_at];
+    let static_pop = population(vec![static_subject]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+
+    assert_eq!(res.trajectories.len(), obs.len());
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (reset at {reset_at})",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_reset_zeros_state_positive_control() {
+    // Proof the reset actually zeros the compartments — so the degenerate oracle above
+    // is not vacuous (both engines agreeing on an *un*-reset trajectory). The same
+    // fixed-dose controller run with vs without a mid-horizon reset must diverge: with
+    // the reset at 36 and no dose between 24 and 48, the post-reset observation at 42
+    // reads exactly 0 (state zeroed, nothing re-entering); without it the 0 h and 24 h
+    // boluses persist (~18 amount units). Removing the driver's reset-zeroing makes the
+    // reset run read ~18 and trips the first assert.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![0.0, 24.0, 48.0];
+    let obs = vec![42.0];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+
+    let mut with_reset = subj("1", obs.clone(), vec![]);
+    with_reset.reset_times = vec![36.0];
+    let res_reset = simulate_adaptive(
+        &model,
+        &population(vec![with_reset]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect("reset run");
+
+    let no_reset = subj("1", obs.clone(), vec![]);
+    let res_noreset = simulate_adaptive(
+        &model,
+        &population(vec![no_reset]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect("no-reset run");
+
+    let y_reset = res_reset.trajectories[0].ipred;
+    let y_noreset = res_noreset.trajectories[0].ipred;
+    assert!(
+        y_reset.abs() < 1e-9,
+        "post-reset obs at t=42 must read ~0 (state zeroed at 36), got {y_reset}"
+    );
+    assert!(
+        y_noreset > 10.0,
+        "without the reset the 0 h + 24 h boluses persist at t=42 (~18), got {y_noreset}"
+    );
+}
+
+#[test]
+fn adaptive_reset_turns_off_spanning_infusion_matches_static_predict() {
+    // Degenerate oracle exercising the reset FLOOR on a controller-issued infusion
+    // (#716): an infusion issued at t=24 (window [24, 48]) spans the reset at t=36.
+    // The reset must both zero the state AND turn the infusion off from 36 on, exactly
+    // as the event-driven engine does (`active_infusions` honors `reset_floor`). So the
+    // post-reset observation at t=42 reads 0, and the whole trajectory matches predict()
+    // on the same pre-scheduled infusion + reset. If the reset floor were ignored, the
+    // infusion would keep delivering past 36 and t=42 would be materially positive.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![0.0, 24.0, 48.0];
+    let obs = vec![30.0, 42.0, 54.0];
+    let reset_at = 36.0;
+
+    let mut base = subj("1", obs.clone(), vec![]);
+    base.reset_times = vec![reset_at];
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(11),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        infuse_at_second_decision,
+        &opts,
+    )
+    .expect("adaptive reset+infusion sim runs and passes the reset-aware verifier");
+    assert_eq!(res.ledger.len(), 1, "exactly one infusion, at t=24");
+    assert!(res.ledger[0].rate > 0.0, "the realized dose is an infusion");
+
+    // Static reference: the realized infusion pre-scheduled on a subject carrying the
+    // same reset, scored by predict() (event-driven, reset floor turns the infusion off).
+    let e = &res.ledger[0];
+    let mut static_subject = subj(
+        "1",
+        obs.clone(),
+        vec![DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)],
+    );
+    static_subject.reset_times = vec![reset_at];
+    let preds = predict(
+        &model,
+        &population(vec![static_subject]),
+        &model.default_params,
+    );
+
+    assert_eq!(res.trajectories.len(), obs.len());
+    // Locate the t=42 (post-reset) trajectory and assert it washed out.
+    let y42 = res
+        .trajectories
+        .iter()
+        .find(|t| (t.time - 42.0).abs() < 1e-12)
+        .expect("t=42 trajectory row")
+        .ipred;
+    assert!(
+        y42.abs() < 1e-9,
+        "post-reset obs at t=42 must be ~0 (infusion turned off at 36), got {y42}"
+    );
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        // Cross-engine tolerance (event-driven `predict()` vs dense reactive driver),
+        // as in `adaptive_reset_matches_static_predict`.
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (reset+infusion)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
 #[test]
 fn adaptive_iov_matches_predict_iov_with_reconstructed_kappa() {
     // Full-stack IOV oracle (#701): run the reactive driver on a real IOV model
@@ -264,6 +468,163 @@ fn adaptive_iov_matches_predict_iov_with_reconstructed_kappa() {
             traj.time
         );
     }
+}
+
+#[test]
+fn adaptive_iov_reset_matches_predict_iov_and_zeros_state() {
+    // #716 × #701: the reset-aware path on the IOV frozen-replay engine
+    // (`adaptive_frozen_replay_tv`) — the third of the three reset sites, and the one
+    // no other test reaches. Every other reset test uses a constant model, and
+    // `subject_needs_per_event_pk` does NOT flag resets, so only an IOV (or
+    // TV-covariate) subject drives `event_pk = Some` and routes the verifier to this
+    // engine rather than the constant replay.
+    //
+    // Oracle: run the reactive driver on a real IOV model carrying a mid-horizon EVID=3
+    // reset, reconstruct the exact per-occasion κ, and confirm the trajectory equals
+    // `predict_iov` — which routes an ODE subject to the reset-aware event-driven walker
+    // (`ode_predictions_event_driven`) — on the realized doses PLUS the same reset. The
+    // default-on frozen-replay verifier also runs (driver vs `adaptive_frozen_replay_tv`),
+    // so its Ok is part of the assertion: a reset mis-applied on EITHER the driver or the
+    // IOV replay surfaces here, and `predict_iov` is an INDEPENDENT third engine so a bug
+    // shared by driver+replay cannot hide.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    assert!(model.n_kappa == 1 && model.n_eta == 1);
+    let decisions = vec![0.0, 24.0, 48.0, 72.0];
+    let obs = decisions.clone();
+    let reset_at = 36.0; // between decisions 24 and 48; no dose in (36, 48)
+    let seed = 20260725u64;
+
+    let mut base = subj("1", obs.clone(), vec![]);
+    base.reset_times = vec![reset_at];
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("adaptive IOV+reset sim runs and passes the reset-aware IOV verifier");
+    assert_eq!(res.ledger.len(), 4, "a bolus at every decision");
+
+    // Reconstruct BSV η and the per-occasion κ exactly as `run_adaptive_population` drew
+    // them (identical derivation to `adaptive_iov_matches_predict_iov_with_reconstructed_kappa`).
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let z_eta: Vec<f64> = (0..model.n_eta).map(|_| rng.sample(normal)).collect();
+    let eta_bsv: Vec<f64> = (&model.default_params.omega.chol
+        * nalgebra::DVector::from_column_slice(&z_eta))
+    .iter()
+    .copied()
+    .collect();
+    let omega_iov = model.default_params.omega_iov.as_ref().expect("omega_iov");
+    let base_seed = crate::sim::adaptive::subject_kappa_base_seed(seed, "1", 1);
+    let kappas: Vec<Vec<f64>> = (0..decisions.len())
+        .map(|g| {
+            let z: Vec<f64> = (0..model.n_kappa)
+                .map(|k| crate::sim::adaptive::kappa_standard_normal(base_seed, g, k))
+                .collect();
+            (&omega_iov.chol * nalgebra::DVector::from_column_slice(&z))
+                .iter()
+                .copied()
+                .collect()
+        })
+        .collect();
+    assert!(
+        kappas.iter().any(|k| k[0].abs() > 1e-6),
+        "the reconstructed κ must be genuinely nonzero, else the oracle is vacuous"
+    );
+
+    // Static reference: predict_iov on the realized doses + the SAME reset.
+    let static_doses: Vec<DoseEvent> = res
+        .ledger
+        .iter()
+        .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+        .collect();
+    let mut static_subject = subj("1", obs.clone(), static_doses);
+    static_subject.reset_times = vec![reset_at];
+    static_subject.occasions = obs
+        .iter()
+        .map(|&t| crate::pk::occasion_of(&decisions, t).expect("obs in a window") as u32)
+        .collect();
+    static_subject.dose_occasions = res
+        .ledger
+        .iter()
+        .map(|e| crate::pk::occasion_of(&decisions, e.time).expect("dose in a window") as u32)
+        .collect();
+    let preds = crate::pk::predict_iov(
+        &model,
+        &static_subject,
+        &model.default_params.theta,
+        &eta_bsv,
+        &kappas,
+    );
+
+    assert_eq!(res.trajectories.len(), preds.len());
+    for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+        // Event-driven `predict_iov` (`solve_ode`) vs the dense reactive driver
+        // (`solve_ode_dense`): agree to solver noise, not the bit. A dropped or
+        // mis-applied reset would move a post-reset prediction by O(dose).
+        assert!(
+            (traj.ipred - pred).abs() <= 1e-6 + 1e-6 * pred.abs(),
+            "adaptive IOV+reset IPRED {} != predict_iov {} at t={}",
+            traj.ipred,
+            pred,
+            traj.time
+        );
+    }
+
+    // Positive control (the reset is not vacuous): re-run without it, same seed, so the
+    // κ draws are identical and only the reset differs. At t=48 (post-reset; the 48 h
+    // bolus lands on both runs) the no-reset trajectory must read strictly higher, by the
+    // retained 0 h + 24 h exposure the reset would have zeroed at t=36.
+    let no_reset = subj("1", obs.clone(), vec![]);
+    let res_nr = simulate_adaptive(
+        &model,
+        &population(vec![no_reset]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect("no-reset IOV run");
+    let idx48 = obs.iter().position(|&t| t == 48.0).expect("t=48 obs");
+    let y_reset = res.trajectories[idx48].ipred;
+    let y_noreset = res_nr.trajectories[idx48].ipred;
+    assert!(
+        y_noreset - y_reset > 1.0,
+        "reset must drop the retained 0h+24h exposure at t=48: with-reset {y_reset}, \
+         no-reset {y_noreset}"
+    );
+}
+
+#[test]
+fn adaptive_reset_decision_collision_is_rejected() {
+    // #716 guard: adding reset times to `break_times` introduces a new dedup collision
+    // source — a decision within 1e-15 of a reset but NOT bit-identical would be merged
+    // away by the break dedup, silently dropping that decision's exact-bit lookup. The
+    // driver rejects it with a typed error instead. Build the collision with the two
+    // adjacent doubles around t=1 (ULP ≈ 2.2e-16, below the 1e-15 dedup tolerance): the
+    // reset at 1.0 sorts first, so the decision at `nextafter(1.0)` loses the dedup.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let reset_at = 1.0_f64;
+    let decision = f64::from_bits(reset_at.to_bits() + 1); // within 1e-15, not bit-equal
+    assert!(decision != reset_at && (decision - reset_at).abs() < 1e-15);
+
+    let mut base = subj("1", vec![2.0], vec![]);
+    base.reset_times = vec![reset_at];
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![decision],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("a decision within 1e-15 of a reset must be rejected, not silently dropped");
+    assert!(
+        err.contains("1e-15") && err.to_lowercase().contains("reset"),
+        "error should cite the 1e-15 reset/break collision: {err}"
+    );
 }
 
 #[test]
@@ -1183,6 +1544,43 @@ fn adaptive_auc_target_rejects_iov() {
     assert!(
         err.to_lowercase().contains("auc_target") && err.to_lowercase().contains("iov"),
         "error should cite auc_target + IOV: {err}"
+    );
+}
+
+#[test]
+fn adaptive_auc_target_rejects_reset() {
+    // #716: system resets are now honored by the driver and the frozen-replay
+    // verifier, but the exposure metric (`auc_target_attainment`) integrates a dense
+    // grid that does NOT apply resets, so declaring `auc_target` on a reset subject is
+    // a typed error rather than a silently un-reset AUC. The model is a plain ODE
+    // (no TV covariate, no IOV), so only the reset can trip this guard — pinning the
+    // reset branch specifically.
+    let mut parsed = parse_full_model(SPEC_DEGENERATE).expect("model + block parse");
+    parsed
+        .adaptive_dosing
+        .as_mut()
+        .expect("[adaptive_dosing]")
+        .auc_target = Some((400.0, 600.0));
+    let spec = parsed.adaptive_dosing.as_ref().unwrap();
+    let mut subject = subj("1", vec![24.0, 48.0], vec![]);
+    subject.reset_times = vec![36.0];
+    let pop = population(vec![subject]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        ..Default::default()
+    };
+    let err = simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        spec,
+        &opts,
+    )
+    .expect_err("auc_target on a reset subject must be rejected");
+    assert!(
+        err.to_lowercase().contains("auc_target") && err.to_lowercase().contains("reset"),
+        "error should cite auc_target + reset: {err}"
     );
 }
 
