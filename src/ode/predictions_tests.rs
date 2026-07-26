@@ -2207,35 +2207,52 @@ fn adaptive_base_dose_with_lagtime_matches_static_ode() {
 }
 
 #[test]
-fn adaptive_base_regimen_with_reset_is_rejected_driver() {
-    // #702 scope (driver level): tv/iov are off here (event_pk/eta_occ = None), but a base
-    // regimen on a reset-carrying subject still hits the combo guard via `has_resets()` —
-    // never a silent integration that ignores the reset.
+fn adaptive_base_regimen_with_reset_matches_static_ode_driver() {
+    // #932 driver-level oracle (constant covariates, tv/iov off): a base loading regimen on a
+    // reset-carrying subject now integrates — the reset zeros the state and lowers the reset
+    // floor — and must reproduce `ode_predictions` (itself reset-aware) on the realized
+    // (base ∪ ledger) regimen carrying the same reset. On-grid decisions keep the two engines'
+    // segmentation identical, so the match is bit-tight. (Base × reset UNDER a time-varying
+    // covariate / IOV — `event_pk`/`eta_occ` = Some — stays a typed error; that boundary is
+    // covered by `adaptive_base_regimen_with_reset_under_iov_is_rejected`.)
     let ode = one_cpt_ode_spec();
     let pk = pk_one(1.0, 10.0);
-    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
-    let mut base = make_subject(
-        vec![DoseEvent::new(0.0, 50.0, 1, 0.0, false, 0.0)],
-        vec![1.0],
-    );
-    base.reset_times = vec![12.0];
-    let err = ode_predictions_adaptive(
+    let decisions = [24.0];
+    let obs = vec![6.0, 18.0, 30.0];
+    let reset_at = 12.0;
+    let loading = vec![DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)];
+
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+    let mut base = make_subject(loading.clone(), obs.clone());
+    base.reset_times = vec![reset_at];
+    let run = ode_predictions_adaptive(
         &ode,
         &pk.values,
         &[],
         &[],
         &base,
-        &[0.0],
+        &decisions,
         &[],
         &mut controller,
         100,
         None,
     )
-    .unwrap_err();
-    assert!(
-        err.contains("base regimen") && err.contains("system resets"),
-        "got: {err}"
+    .expect("driver runs with a base regimen across a reset");
+    assert_eq!(run.ledger.len(), 1, "one controller bolus at t=24");
+
+    let mut static_doses = loading;
+    static_doses.extend(
+        run.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
     );
+    let mut static_subject = make_subject(static_doses, obs);
+    static_subject.reset_times = vec![reset_at];
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+    assert_eq!(run.predictions.len(), static_preds.len());
+    for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+        assert_relative_eq!(*got, *want, max_relative = 1e-9);
+    }
 }
 
 #[test]

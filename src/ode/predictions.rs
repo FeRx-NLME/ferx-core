@@ -2864,21 +2864,28 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let iov = eta_occ.is_some();
 
     // --- Preconditions (typed errors, never silent) ----------------------
-    // #702/#930/#931: a pre-scheduled base regimen (loading / maintenance dose) IS supported
-    // on the constant-covariate path (the controller augments it), on the time-varying-
-    // covariate path (#930), and — since #931 — under inter-occasion variability (each base
-    // dose's F resolved from its own occasion-κ / covariate snapshot just below). It is not
-    // yet supported together with system resets (#932 — state-zeroing across a base dose):
-    // that threads per-reset bookkeeping the base-dose seeding and the frozen-replay verifier
-    // do not yet reproduce, so loud-fail rather than silently mis-integrate a delivered dose.
-    // (An EVID=4 reset+dose row carries a dose, so a reset-carrying subject with base doses
-    // lands here rather than on the reset path — base × IOV × reset stays rejected too.)
-    if !subject.doses.is_empty() && subject.has_resets() {
+    // #702/#930/#931/#932: a pre-scheduled base regimen (loading / maintenance dose) IS
+    // supported on the constant-covariate path (the controller augments it), on the time-
+    // varying-covariate path (#930), and — since #931 — under inter-occasion variability (each
+    // base dose's F resolved from its own occasion-κ / covariate snapshot just below). Since
+    // #932 it composes with system resets (EVID=3/4) on the CONSTANT-covariate path: the reset
+    // zeros the state and lowers `reset_floor` (which already turns off base infusions opened
+    // before it — they live in `shadow.doses`, gated by `active_infusions`), and both the
+    // reset-aware static verifier (`ode_predictions_with_extra_breaks`) and the reference
+    // event-driven engine apply Reset < Dose identically, so the degenerate oracle holds.
+    // (An EVID=4 reset+dose row records BOTH a reset and a dose, so its dose is just a base
+    // dose landing at the reset instant — zeroed, then re-applied — reaching this path.)
+    //
+    // Base × reset UNDER a time-varying covariate or IOV (`tv`) stays a typed error: the
+    // per-event-PK replay (`adaptive_frozen_replay_tv`) is itself reset-aware, but its
+    // composition with a base regimen across a reset is not yet oracle-verified against the
+    // reference, so loud-fail rather than risk a silent mis-integration (a #932 follow-up).
+    if !subject.doses.is_empty() && subject.has_resets() && tv {
         return Err(
-            "ode_predictions_adaptive: a pre-scheduled base regimen is not yet supported \
-             together with system resets (EVID=3/4); issues #702/#930/#931 support a base \
-             regimen on constant-covariate, time-varying-covariate, and IOV models \
-             (non-reset) only"
+            "ode_predictions_adaptive: a pre-scheduled base regimen combined with system \
+             resets (EVID=3/4) is not yet supported under time-varying covariates or \
+             inter-occasion variability; #932 supports base × reset on the constant-covariate \
+             path only (time-varying-covariate / IOV base × reset is a follow-up)"
                 .to_string(),
         );
     }

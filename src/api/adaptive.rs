@@ -193,8 +193,11 @@ pub struct AdaptiveSimulationResult {
 /// - **Pre-scheduled base regimen (#702).** A subject MAY carry pre-scheduled doses
 ///   (a loading / maintenance regimen), which are integrated and augmented by the
 ///   controller. Supported on constant-covariate, time-varying-covariate (#930), and
-///   IOV (#931) models (non-reset); a base regimen combined with a system reset
-///   (EVID=3/4) is a typed error (#932). A steady-state / lagged / built-in-input-rate
+///   IOV (#931) models. Since #932 a base regimen also composes with system resets
+///   (EVID=3/4) on the constant-covariate path (the reset zeros the state and turns off a
+///   base infusion opened before it, and an EVID=4 reset+dose row's dose lands after its own
+///   reset); base × reset under a time-varying covariate or IOV is still a typed error (a
+///   #932 follow-up). A steady-state / lagged / built-in-input-rate
 ///   base dose is supported on the constant-covariate path (#719); under a time-varying
 ///   covariate or IOV those (and a modeled-`RATE` dose) are a typed error — a #930/#931
 ///   follow-up. A dose-free subject is the fully controller-driven special case.

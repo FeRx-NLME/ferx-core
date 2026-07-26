@@ -71,8 +71,23 @@ section of the SDLC for the versioning policy).
   `init(state)=expr`) and turns off controller-issued infusions opened before it, exactly
   as `predict()` / `simulate()` do, and the default-on frozen-replay verifier is
   reset-aware so the reset is validated each run. Previously a reset subject was rejected
-  with a typed error. (An EVID=4 reset+dose row is still rejected by the dose-free-base
-  rule, so only pure EVID=3 resets reach the adaptive path.)
+  with a typed error. (Initially only a pure EVID=3 reset on a **dose-free** base subject;
+  #932 below lifts that to a reset combined with a base regimen, including an EVID=4
+  reset+dose row.)
+- **Base regimen combined with a system reset (EVID=3 / EVID=4) in adaptive-dosing
+  simulation** (#932). `simulate_adaptive()` / `simulate_adaptive_from_spec()` now accept a
+  base subject that carries BOTH a pre-scheduled loading / maintenance regimen (#702) AND a
+  system reset — composing #716's reset machinery with #702's base-dose seeding on the
+  constant-covariate path. The reset zeros the compartments and turns off a base infusion
+  opened before it (the reset floor, previously applied only to controller-issued infusions),
+  and an EVID=4 reset+dose row's dose now reaches the adaptive path — landing after its own
+  reset (Reset < Dose) — instead of tripping the base-regimen guard. Validated by a degenerate
+  oracle (base regimen + mid-horizon EVID=3 + controller reproduces `predict()` on the realized
+  regimen carrying the same reset), a positive control (a base infusion spanning the reset is
+  turned off, so the oracle is not vacuous), an EVID=4 oracle, and a steady-state base × reset
+  oracle; the default-on frozen-replay verifier (reset- and base-aware) checks every run. Lifts
+  the #702/#716 `base × reset` restriction. Base × reset UNDER a time-varying covariate (#930)
+  or IOV (#931) remains a typed error — a #932 follow-up — never a silent mis-integration.
 - **Warning when a `combined` error model's additive initial estimate is negligibly
   small** (#847). A pre-fit check (`W_ADDITIVE_INIT_SCALE`) flags an additive SD start
   below 1% of the observation scale (median `|DV|`) on that endpoint. A near-zero
