@@ -2727,15 +2727,18 @@ fn eta_for<'a>(eta_occ: Option<&'a [Vec<f64>]>, eta: &'a [f64], occ: Option<usiz
 ///   monitor with `assay = None`, or on a compartment with no `[error_model]`, is
 ///   a typed error (never a fabricated σ). The all-`Ipred` path draws nothing, so
 ///   it is byte-identical regardless of `assay`.
-/// - **Pre-scheduled base regimen (#702).** The base subject MAY carry pre-scheduled
+/// - **Pre-scheduled base regimen (#702, #930).** The base subject MAY carry pre-scheduled
 ///   doses — a loading / maintenance regimen, including steady-state (`SS=1`) — which
 ///   are integrated and augmented by the controller's decisions. Base doses occupy the
 ///   leading `0..n_base` slots of the growing `shadow` dose list, are seeded through the
 ///   same static-engine break/apply helpers, and appear in the controller's
-///   `ctx.history`. Supported on constant-covariate, non-reset models only: a base
-///   regimen combined with time-varying covariates, IOV, or system resets is a typed
-///   error (each is a #702 follow-up). A dose-free base subject is the special case
-///   `n_base == 0` and is byte-identical to before.
+///   `ctx.history`. Supported on constant-covariate models, and (since #930) on
+///   time-varying-covariate models for plain bolus / infusion base doses — each base
+///   dose's F is resolved from its own covariate snapshot (`event_pk.dose[k]`). Still a
+///   typed error: a base regimen combined with IOV (#931) or system resets (#932), and —
+///   under a time-varying covariate — an SS / lagged / input-rate / modeled-rate base
+///   dose (a #930 follow-up). A dose-free base subject is the special case `n_base == 0`
+///   and is byte-identical to before.
 /// - **No lagged or input-rate (absorption) dosing.** Controller dosing into a
 ///   compartment with a dose lag time, or one fed by a built-in input-rate
 ///   function, is a typed error (the TAD-anchor and double-count subtleties are
@@ -2831,9 +2834,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // (`event_pk.obs[j]` / `event_pk.pk_only[m]`) instead of the frozen
     // `pk_params_flat`, and observation / pk-only times become segment breaks.
     // `None` ⇒ the constant-covariate path, byte-identical to before (`pk_params_flat`
-    // threads through every segment). The base subject is dose-free, so `event_pk.dose`
-    // is unused; controller-injected doses take their PK from the carried-forward
-    // (LOCF) snapshot at injection time.
+    // threads through every segment). `event_pk.dose[k]` carries each pre-scheduled base
+    // dose's per-dose PK — the covariate at its administration time — used to resolve that
+    // base dose's bioavailability F on the TV path (#930); empty on the dose-free path.
+    // Controller-injected doses take their PK from the carried-forward (LOCF) snapshot at
+    // injection time.
     event_pk: Option<&crate::pk::EventPkParams>,
     // Per-decision occasion PK + per-window eta for the IOV path (#701). `Some` ⇒
     // draw-time κ varies by decision window: `decision_pk[g]` is the PK at decision g
@@ -2859,27 +2864,26 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let iov = eta_occ.is_some();
 
     // --- Preconditions (typed errors, never silent) ----------------------
-    // #702: a pre-scheduled base regimen (loading / maintenance dose) IS supported on
-    // the constant-covariate, non-reset path below — the controller augments it. It is
-    // not yet supported together with time-varying covariates, IOV, or system resets:
-    // each threads per-segment PK / per-occasion κ / state-zeroing that the base-dose
-    // seeding and the frozen-replay verifier do not yet reproduce, so loud-fail rather
-    // than silently mis-integrate a delivered dose. (Follow-ups: #930 time-varying
-    // covariates, #931 IOV, #932 system resets / EVID=4.)
-    if !subject.doses.is_empty() && (tv || iov || subject.has_resets()) {
+    // #702/#930: a pre-scheduled base regimen (loading / maintenance dose) IS supported on
+    // the constant-covariate path — the controller augments it — AND, since #930, on the
+    // time-varying-covariate path (each base dose's F resolved from its own covariate
+    // snapshot just below). It is not yet supported together with IOV (#931 — per-occasion
+    // κ for a pre-scheduled dose) or system resets (#932 — state-zeroing across a base
+    // dose): each threads per-occasion κ / reset bookkeeping the base-dose seeding and the
+    // frozen-replay verifier do not yet reproduce, so loud-fail rather than silently
+    // mis-integrate a delivered dose.
+    if !subject.doses.is_empty() && (iov || subject.has_resets()) {
         // An IOV model sets BOTH `event_pk` (tv) and `eta_occ` (iov) — the occasion PK
         // rides the per-event snapshot — so name IOV first (the more specific cause).
         let combo = if iov {
             "inter-occasion variability (IOV)"
-        } else if tv {
-            "time-varying covariates"
         } else {
             "system resets (EVID=3/4)"
         };
         return Err(format!(
             "ode_predictions_adaptive: a pre-scheduled base regimen is not yet supported \
-             together with {combo}; issue #702 supports a base regimen on \
-             constant-covariate, non-reset models only"
+             together with {combo}; issues #702/#930 support a base regimen on constant- and \
+             time-varying-covariate models (non-IOV, non-reset) only"
         ));
     }
     if decision_times.len() > max_decisions {
@@ -2908,8 +2912,45 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // reaches here with base doses (the combo guard above rejects the rest), so a single
     // frozen `pk_params_flat` governs both the base doses and the controller's.
     let resolved_base = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
-    let (base_lagtimes, base_f_bio) = subject_dose_attrs(&resolved_base, ode, pk_params_flat);
+    let (base_lagtimes, mut base_f_bio) = subject_dose_attrs(&resolved_base, ode, pk_params_flat);
     let n_base = resolved_base.doses.len();
+
+    // #930: on the time-varying-covariate path, resolve each base dose's bioavailability F
+    // from its *own* covariate snapshot (`event_pk.dose[k]`, the covariate active at the
+    // dose's administration time) — symmetric with a controller-injected dose, whose F is
+    // fixed from the LOCF PK at injection — instead of the t=0 `pk_params_flat` the constant
+    // path uses. A base regimen only reaches here on the pure-TV path (base × IOV / reset is
+    // rejected above), so `event_pk.dose` is populated and parallel to the base doses.
+    //
+    // Scope: only a plain FIXED bolus / real-infusion base dose into a PLAIN compartment is
+    // supported under a time-varying covariate. A base dose that is steady-state, lagged, fed
+    // by a built-in input-rate (transit / zero-order absorption) function, or carries a modeled
+    // (coded) RATE additionally needs its per-dose SS / lag / input-rate / rate-resolution
+    // bookkeeping threaded through the hand-rolled TV frozen-replay engine, which #930 does not
+    // yet do — reject loudly (a narrower follow-up), never a silent covariate-frozen integration
+    // of the delivered dose. (`is_fixed` is tested on the *original* `subject.doses`, before the
+    // `resolve_subject_doses` above collapses a coded RATE to `Fixed`.) The default-on
+    // frozen-replay verifier is the backstop: even were one of these to slip the guard, the
+    // driver and replay would diverge and it would `Err` rather than return a wrong answer.
+    if tv && n_base > 0 {
+        let ev = event_pk.expect("tv ⇒ event_pk is Some");
+        for (k, dose) in resolved_base.doses.iter().enumerate() {
+            if !subject.doses[k].is_fixed()
+                || dose.ss
+                || base_lagtimes[k] != 0.0
+                || input_rate_consumes_cmt(ode, dose.cmt_raw())
+            {
+                return Err(format!(
+                    "ode_predictions_adaptive: a pre-scheduled base dose (index {k}) combined with \
+                     time-varying covariates must be a plain fixed bolus or infusion into a plain \
+                     compartment; steady-state, lagged, built-in input-rate (transit / zero-order \
+                     absorption), and modeled-RATE base doses under a time-varying covariate are a \
+                     #930 follow-up"
+                ));
+            }
+            base_f_bio[k] = ode.dose_attr_map.f_bio(dose.cmt_raw(), &ev.dose[k].values);
+        }
+    }
 
     // --- Running state ---------------------------------------------------
     let n_obs = subject.obs_times.len();
@@ -3065,11 +3106,14 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // guard (#702) above (base × reset is a follow-up). Empty for a reset-free subject,
     // so the bolus-only path stays byte-identical.
     break_times.extend(subject.reset_times.iter().copied());
-    // #702: fold in the pre-scheduled base regimen's breaks via the shared builder so the
+    // #702/#930: fold in the pre-scheduled base regimen's breaks via the shared builder so the
     // reactive segmentation matches the static engine's exactly (the frozen-replay oracle).
     // `shadow.doses` here is precisely the base regimen — controller doses are appended
-    // later, in the loop — so this passes only the base doses. No-op on the dose-free path;
-    // constant path only (base × TV/IOV/reset rejected above), so no per-event-PK interplay.
+    // later, in the loop — so this passes only the base doses. No-op on the dose-free path.
+    // Runs on the constant AND (since #930) the time-varying path: there the base doses'
+    // infusion-end breaks are computed from the covariate-resolved `base_f_bio` set above and
+    // fold in alongside the obs / pk-only covariate breaks (the dedup below merges any
+    // coincident times). base × IOV / reset stays rejected upstream.
     if n_base > 0 {
         collect_dose_break_times(
             &mut break_times,
@@ -3699,15 +3743,15 @@ pub(crate) fn verify_adaptive_frozen_replay(
     decision_times: &[f64],
     run: &AdaptiveRun,
 ) -> Result<(), String> {
-    // #702: keep the pre-scheduled base regimen (its SS / II / lagtime survive on
+    // #702/#930: keep the pre-scheduled base regimen (its SS / II / lagtime survive on
     // `base_subject.doses`) and APPEND the controller's realized doses from the ledger,
     // mirroring the reactive driver's `shadow` (base doses first, injected after). The
     // static engine resolves + applies both exactly as the driver did, so the replay
     // stays bit-aligned. On the dose-free path `base_subject.doses` is empty, so this is
-    // the prior ledger-only rebuild — byte-identical. A base regimen only reaches the
-    // constant path (`event_pk` is `None`); base × TV/IOV is rejected upstream, so the
-    // TV replay branch below never sees a non-empty base regimen (its per-dose F still
-    // comes from the ledger alone).
+    // the prior ledger-only rebuild — byte-identical. A base regimen reaches the constant
+    // path (`event_pk` is `None`) and, since #930, the time-varying path too; base × IOV /
+    // reset is still rejected upstream. On the TV branch the base doses' F is recomputed
+    // from each dose's own covariate snapshot (below), matching the driver.
     let mut static_subject = base_subject.clone();
     static_subject.doses.extend(
         run.ledger
@@ -3725,7 +3769,19 @@ pub(crate) fn verify_adaptive_frozen_replay(
     // constant path keeps the general single-snapshot engine.
     let static_preds = match event_pk {
         Some(ev) => {
-            let dose_f: Vec<f64> = run.ledger.iter().map(|e| e.f_applied).collect();
+            // #930: a base regimen can now ride the TV path. `static_subject.doses` is the
+            // base doses (indices `0..n_base`) followed by the ledger's injected doses, so
+            // `dose_f` must be the base doses' F — recomputed here from each base dose's own
+            // covariate snapshot (`ev.dose[k]`), identically to the driver — followed by the
+            // ledger's realized `f_applied`. On the dose-free base path the base slice is
+            // empty, so this is the prior ledger-only vector, byte-identical.
+            let mut dose_f: Vec<f64> = base_subject
+                .doses
+                .iter()
+                .enumerate()
+                .map(|(k, d)| ode.dose_attr_map.f_bio(d.cmt_raw(), &ev.dose[k].values))
+                .collect();
+            dose_f.extend(run.ledger.iter().map(|e| e.f_applied));
             adaptive_frozen_replay_tv(
                 ode,
                 ev,
@@ -3791,10 +3847,11 @@ pub(crate) fn verify_adaptive_frozen_replay(
 /// per-event PK and stay **bit-aligned**. Verifier-only; the constant-covariate
 /// path keeps the general single-snapshot [`ode_predictions_with_extra_breaks`].
 ///
-/// `dose_f[i]` is the realized bioavailability of ledger dose `i` (the driver's
-/// `f_applied`), so a delivered dose's F is taken as given rather than re-derived —
-/// F correctness is pinned separately by the degenerate oracle against
-/// `ode_predictions_event_driven`.
+/// `dose_f[i]` is the bioavailability of `subject.doses[i]`, parallel to that list:
+/// each pre-scheduled base dose's F (recomputed by the caller from the dose's own
+/// covariate snapshot, #930) followed by each ledger dose's realized `f_applied`. A
+/// delivered dose's F is taken as given rather than re-derived — F correctness is
+/// pinned separately by the degenerate oracle against `ode_predictions_event_driven`.
 ///
 /// IOV (#701): when `eta_occ` / `decision_pk` are `Some`, the replay threads the
 /// **same** per-window eta and per-decision occasion PK as the driver — occasion is
