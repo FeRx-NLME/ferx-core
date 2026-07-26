@@ -181,6 +181,60 @@ const ODE_TV_LAG: &str = r#"
   DV ~ proportional(PROP)
 "#;
 
+// Time-varying covariate on CL plus a built-in first-order absorption input rate feeding
+// `central` (the dosed compartment). A base dose into an input-rate-fed compartment under a
+// time-varying covariate is a #930 typed error — the depot / absorption bookkeeping is not
+// threaded through the hand-rolled TV frozen-replay engine yet. A single pathway (implicit
+// fraction 1) clears the parallel-absorption fraction-sum check, so the ONLY rejection is the
+// #930 input-rate arm of the base-dose guard.
+const ODE_TV_ABSORB: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * CRCL / 100.0
+  V  = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+// Time-varying covariate on CL plus a declared modeled-rate parameter `R1`, so a base dose
+// carrying a coded RATE=-1 (modeled infusion rate) is a VALID dose that actually reaches the
+// #930 base-dose guard — rather than being turned away earlier for a missing `R1`. Such a base
+// dose under a time-varying covariate is a #930 typed error: its rate-resolution bookkeeping
+// (RATE=-1/-2 → R1/D1 from the PK snapshot) is not threaded through the TV frozen-replay engine
+// yet. (This is also the one input that drives `resolve_subject_doses` down its owned/mutating
+// branch; the guard reads `is_fixed()` on the pre-resolution dose, so it still fires.)
+const ODE_TV_MRATE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * CRCL / 100.0
+  V  = TVV
+  R1 = 100.0
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
 fn subj(id: &str, obs_times: Vec<f64>, doses: Vec<DoseEvent>) -> Subject {
     let n = obs_times.len();
     let n_dose = doses.len();
@@ -1339,6 +1393,81 @@ fn adaptive_base_lagged_dose_with_tv_covariate_is_rejected() {
         .expect_err("lagged base dose × TV covariate must be rejected");
     assert!(
         err.contains("plain fixed bolus or infusion") && err.contains("lagged"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_modeled_rate_dose_with_tv_covariate_is_rejected() {
+    // #930 scope: a base dose carrying a MODELED (coded) RATE under a time-varying covariate is a
+    // typed error — the rate-resolution bookkeeping (RATE=-1/-2 → R1/D1 from the PK snapshot) is
+    // not threaded through the TV frozen-replay engine yet. The guard tests `is_fixed()` on the
+    // *original* dose, before `resolve_subject_doses` collapses a coded RATE to `Fixed`, so this
+    // is the arm only that pre-resolution check can trip. Plain central, no lag, not an
+    // input-rate compartment, so the modeled-RATE arm is the sole reason this rejects (mutation:
+    // drop the `!is_fixed()` arm and the dose is accepted → this `expect_err` fails).
+    let model = parse_model_string(ODE_TV_MRATE).expect("parse TV-cov + modeled-rate ODE model");
+    let mut s = subj(
+        "1",
+        vec![0.0, 24.0, 48.0],
+        vec![DoseEvent::modeled(
+            0.0,
+            1000.0,
+            1,
+            false,
+            0.0,
+            crate::types::RateMode::ModeledRate,
+        )],
+    );
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 90.0)]),
+        HashMap::from([("CRCL".to_string(), 80.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("modeled-RATE base dose × TV covariate must be rejected");
+    assert!(
+        err.contains("plain fixed bolus or infusion") && err.contains("modeled-RATE"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_input_rate_dose_with_tv_covariate_is_rejected() {
+    // #930 scope: a base dose into a compartment fed by a built-in input rate (here first-order
+    // absorption into `central`) under a time-varying covariate is a typed error — the depot /
+    // absorption bookkeeping is not threaded through the TV frozen-replay engine yet. The dose is
+    // a plain fixed bolus (not SS, not lagged, not modeled-RATE), so `input_rate_consumes_cmt` is
+    // the sole arm that rejects it (mutation: drop that arm and the dose is accepted).
+    let model = parse_model_string(ODE_TV_ABSORB).expect("parse TV-cov + absorption ODE model");
+    let mut s = subj(
+        "1",
+        vec![0.0, 24.0, 48.0],
+        vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+    );
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 90.0)]),
+        HashMap::from([("CRCL".to_string(), 80.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("input-rate base dose × TV covariate must be rejected");
+    assert!(
+        err.contains("plain fixed bolus or infusion") && err.contains("input-rate"),
         "got: {err}"
     );
 }

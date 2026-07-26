@@ -3106,11 +3106,14 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // guard (#702) above (base × reset is a follow-up). Empty for a reset-free subject,
     // so the bolus-only path stays byte-identical.
     break_times.extend(subject.reset_times.iter().copied());
-    // #702: fold in the pre-scheduled base regimen's breaks via the shared builder so the
+    // #702/#930: fold in the pre-scheduled base regimen's breaks via the shared builder so the
     // reactive segmentation matches the static engine's exactly (the frozen-replay oracle).
     // `shadow.doses` here is precisely the base regimen — controller doses are appended
-    // later, in the loop — so this passes only the base doses. No-op on the dose-free path;
-    // constant path only (base × TV/IOV/reset rejected above), so no per-event-PK interplay.
+    // later, in the loop — so this passes only the base doses. No-op on the dose-free path.
+    // Runs on the constant AND (since #930) the time-varying path: there the base doses'
+    // infusion-end breaks are computed from the covariate-resolved `base_f_bio` set above and
+    // fold in alongside the obs / pk-only covariate breaks (the dedup below merges any
+    // coincident times). base × IOV / reset stays rejected upstream.
     if n_base > 0 {
         collect_dose_break_times(
             &mut break_times,

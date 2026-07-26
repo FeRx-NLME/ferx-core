@@ -71,13 +71,6 @@ crcl <- c(120, 100, 85, 72, 62, 54, 48, 44, 41)
 stopifnot(length(crcl) == n_dec + 1)         # t = 0 plus the n_dec decision times
 cl_at <- TVCL * crcl / 100                    # cl_at[j] governs the segment ENDING at record j
 
-decay_day <- function(cent0, cl) {
-  seg <- as.data.frame(mod |>
-    param(CL = cl, V = V) |>
-    init(CENT = cent0) |>
-    mrgsim(start = 0, end = cycle_h, delta = cycle_h))
-  seg[nrow(seg), ]$CENT
-}
 bolus_day <- function(cent0, amt, cl) {
   seg <- as.data.frame(mod |>
     param(CL = cl, V = V) |>
