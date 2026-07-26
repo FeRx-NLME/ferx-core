@@ -917,16 +917,22 @@ fn slice_bits_eq(a: &[f64], b: &[f64]) -> bool {
     a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| f64_bits_eq(*x, *y))
 }
 
-/// Re-derive each per-record (obs / EVID=2 pk-only) PK snapshot **inline** — occasion
-/// via [`occasion_of`](crate::pk::occasion_of), PK via `pk_param_fn` at the record's
-/// own covariate — and bit-check it against the `event_pk` the driver used (#748).
+/// Re-derive each per-record (base dose / obs / EVID=2 pk-only) PK snapshot **inline** —
+/// occasion via [`occasion_of`](crate::pk::occasion_of), PK via `pk_param_fn` at the
+/// record's own covariate — and bit-check it against the `event_pk` the driver used
+/// (#748).
 ///
 /// This is an *independent second derivation*, NOT a re-call of
 /// `compute_event_pk_params_iov`: a wrong occasion grouping or per-record covariate the
 /// composite builder would introduce is caught here, not only a wrong array argument.
 /// `eta_occ_check` is the independently re-derived per-window eta (IOV); `None` ⇒ the
-/// non-IOV path, where every record uses the baseline `eta_slice`. The dose-free
-/// adaptive base subject carries no dose events, so `event_pk.dose` must stay empty.
+/// non-IOV path, where every record uses the baseline `eta_slice`. A pre-scheduled base
+/// regimen (#702) populates `event_pk.dose` — under a TV covariate (#930) or per-occasion
+/// κ (#931) — and each base dose's snapshot is re-derived here too: the driver AND the
+/// frozen-replay verifier both read `event_pk.dose[k]` for that dose's F, so a build-loop
+/// error there would be applied by both and the replay could not catch it. The dose-free
+/// base subject carries no dose events, so `event_pk.dose` stays empty and the loop is a
+/// no-op.
 fn check_event_pk_records(
     model: &CompiledModel,
     theta: &[f64],
@@ -955,6 +961,18 @@ fn check_event_pk_records(
             got.dose.len(),
             subject.doses.len()
         ));
+    }
+    for k in 0..subject.doses.len() {
+        let t = subject.doses[k].time;
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.dose_cov(k), t);
+        if !pk_bits_eq(&want, &got.dose[k]) {
+            return Err(format!(
+                "event_pk.dose[{k}] (base dose at t={t}) diverges from an independent \
+                 re-derivation — a wrong per-dose covariate or occasion κ in the per-event PK \
+                 builder, reused verbatim by the frozen-replay verifier, which cannot catch it \
+                 (#748)"
+            ));
+        }
     }
     if got.obs.len() != subject.obs_times.len() {
         return Err(format!(

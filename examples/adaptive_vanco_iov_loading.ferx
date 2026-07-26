@@ -1,0 +1,87 @@
+# Adaptive (feedback) dosing — vancomycin LOADING DOSE + maintenance titration
+# under inter-occasion variability (IOV) on clearance (epic #391 / #702 / #931)
+#
+# The #931 combination: a pre-scheduled BASE REGIMEN (a loading dose, #702) AND
+# inter-occasion variability on PK (#701). It merges two shipped examples —
+# adaptive_vanco_loading.ferx (the loading dose) and adaptive_vanco_iov.ferx (the
+# per-occasion κ on clearance) — into the one scenario each of them scoped out: a
+# base regimen under IOV. #702/#930 rejected that combination; #931 lifts it for
+# plain bolus / infusion base doses, resolving each base dose's bioavailability F
+# under the κ of the occasion (decision window) active at its administration time and
+# integrating it under the per-segment occasion PK.
+#
+# The loading dose is NOT in this file: it rides on the subject (a 1500 mg bolus at
+# t=0). The reactive driver integrates that pre-scheduled dose under the per-occasion
+# clearance and the controller titrates the daily maintenance dose on top of the
+# (now occasion-aware) trough.
+#
+# The decision schedule starts at t=24 (after the loading dose), so the day-1 trough
+# the controller sees is the decayed loading dose — decayed under occasion 0's
+# clearance (CL under κ₀, the end-of-interval value for the (0, 24] segment) — not 0.
+# Each day the patient's true CL jumps to a new per-occasion value, so drug clears
+# faster or slower and the controller must re-titrate off the trough it observes: the
+# occasion-varying κ genuinely drives the ladder on top of the base regimen.
+#
+# `auc_target` is deliberately absent: its exposure metric integrates a dense grid
+# from a single frozen PK snapshot, silently wrong when CL switches per occasion, so
+# it is a typed error for an IOV (`kappa`) subject (#701). `target_window` (the
+# pct-in-band trough metric) stays — it is a per-occasion-aware decision-grid summary.
+#
+# Run with `simulate_adaptive_from_spec()` (not the plain forward `simulate()`).
+# Validated dose-for-dose against an independent mrgsolve run (mrgsolve, not NONMEM,
+# is the feedback-dosing comparator): ferx's realized maintenance doses +
+# reconstructed per-occasion κ are injected into an occasion-indexed mrgsolve model
+# and the trough trajectory is compared dose-for-dose. See
+# tests/reference/vanco_iov_loading_mrgsolve/ and tests/adaptive_vanco_iov_loading_anchor.rs.
+#
+# Non-degenerate IOV: KAPPA_CL carries SD ~ 0.3 (variance 0.09), so the per-occasion κ
+# is genuinely nonzero and CL really switches per window — the anchor would be vacuous
+# with a vanishing κ. The between-subject ETA_CL is negligible (SD ~ 1e-5): the engine
+# requires at least one omega, but BSV is not the point here — the per-occasion κ is the
+# sole (intended) source of PK variation.
+#
+# See docs/model-file/adaptive-dosing.qmd for the block reference.
+
+[parameters]
+  theta TVCL(4.0,  0.1,  50.0)   # vancomycin clearance at κ = 0 (L/h)
+  theta TVV(80.0,  5.0, 300.0)   # central volume (L); CENT/V is the concentration
+
+  # Negligible between-subject variability: the engine requires at least one omega,
+  # so CL's BSV carries a vanishing variance (SD ~ 1e-5). The IOV κ below is the
+  # intended (and dominant) source of PK variation.
+  omega ETA_CL ~ 1e-10
+
+  # Inter-occasion variability on CL (#701): a fresh KAPPA_CL is drawn per decision
+  # window (occasion = decision index) from N(0, 0.09) — SD ~ 0.3, so CL swings by
+  # roughly +/-35% window to window. This is what the mrgsolve anchor injects.
+  kappa KAPPA_CL ~ 0.09
+
+  sigma ADD ~ 1.0                # nominal additive error (concentration); the latent
+                                 # `observe` signal is un-noised, so it never enters
+                                 # the dose decisions.
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)   # per-occasion κ switches clearance each window
+  V  = TVV
+
+[structural_model]
+  ode(states=[CENT])
+
+[odes]
+  d/dt(CENT) = -(CL / V) * CENT  # 1-cpt IV; the loading + maintenance boluses enter CENT
+
+[scaling]
+  y = CENT / V                   # observed/predicted endpoint: concentration (mg/L)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[adaptive_dosing]
+  observe       = CENT / V               # titrate on the latent trough concentration
+  at            = every 24 from 24 to 192 # daily MAINTENANCE decisions, after the load
+  start_dose    = 750                    # empiric maintenance start (mg): subtherapeutic
+  route         = bolus(cmt=1)           # maintenance boluses into the drug compartment
+  dose_bounds   = [250, 4000]            # mg
+  target_window = [10, 15]               # report % of days with trough in [10, 15] mg/L
+  when signal < 10 : increase 25%        # subtherapeutic trough -> raise the dose
+  when signal > 15 : decrease 25%        # supratherapeutic trough -> lower the dose

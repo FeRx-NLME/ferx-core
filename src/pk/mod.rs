@@ -735,12 +735,16 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// ([`occasion_of`]): `eta_occ[g]` for the window `g` containing the record, or
 /// `eta_baseline` (BSV η with κ = 0) before the first decision. This is the IOV
 /// analogue of [`predict_iov`]'s per-event occasion-κ selection, with occasion =
-/// decision window instead of the OCC column. Doses stay empty — the adaptive base
-/// subject is dose-free; controller-injected doses take their PK from the driver's
-/// per-decision snapshot. It composes with #700's time-varying covariates: each
-/// record's *covariate* snapshot (`obs_cov` / `pk_only_cov`) is used alongside its
-/// occasion eta, so a model with both a TV covariate and IOV κ is per-event correct
-/// in both.
+/// decision window instead of the OCC column. **Doses** are resolved the same way
+/// (#931): a pre-scheduled base dose (#702) carries the PK of the occasion (decision
+/// window) active at its administration time, so its bioavailability F resolves under
+/// that occasion's κ — symmetric with a controller-injected dose, whose F is fixed
+/// from the driver's per-decision LOCF snapshot at injection. On the (common) dose-free
+/// base subject `subject.doses` is empty, so `dose` stays empty and the result is
+/// byte-identical to the pre-#931 path. It composes with #700's time-varying
+/// covariates: each record's *covariate* snapshot (`dose_cov` / `obs_cov` /
+/// `pk_only_cov`) is used alongside its occasion eta, so a model with both a TV
+/// covariate and IOV κ is per-event correct in both.
 ///
 /// **pk-only (EVID=2) convention — deliberately different from [`predict_iov`].** Here
 /// a pk-only record takes the κ of the decision window containing its time (like any
@@ -766,6 +770,19 @@ pub(crate) fn compute_event_pk_params_iov(
             None => eta_baseline,
         }
     };
+    // Base doses (#702 × #931): each carries the occasion active at its administration
+    // time, so `f_bio` reads its bioavailability under that occasion's κ. Empty on the
+    // dose-free base subject (the common case) → byte-identical to the pre-#931 path.
+    for k in 0..subject.doses.len() {
+        let t = subject.doses[k].time;
+        out.dose.push(pk_params_at_time(
+            model,
+            theta,
+            eta_at(t),
+            subject.dose_cov(k),
+            t,
+        ));
+    }
     for j in 0..subject.obs_times.len() {
         let t = subject.obs_times[j];
         out.obs.push(pk_params_at_time(

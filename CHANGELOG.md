@@ -34,10 +34,10 @@ section of the SDLC for the versioning policy).
   when a controller dose precedes the earliest base dose (#934); a base dose past a
   controller `Stop` still lands (the base regimen is the patient's standing prescription);
   and base doses into lagged / built-in input-rate (transit / zero-order absorption)
-  compartments are supported (#935). Supported on constant-covariate, non-reset models; a
-  base regimen combined with time-varying covariates, IOV, or system resets is a typed error
-  (each a #702 follow-up), never a silent mis-integration. Previously any base regimen was
-  rejected outright.
+  compartments are supported (#935). Initially supported on constant-covariate, non-reset
+  models only; time-varying-covariate (#930), IOV (#931), and system-reset (#932) base
+  regimens are separate follow-ups (see below), never a silent mis-integration. Previously any
+  base regimen was rejected outright.
 - **Pre-scheduled base regimen under a time-varying covariate in adaptive-dosing
   simulation** (#930). `simulate_adaptive()` / `simulate_adaptive_from_spec()` now accept a
   base subject carrying a plain bolus / infusion loading (or maintenance) regimen together
@@ -50,7 +50,21 @@ section of the SDLC for the versioning policy).
   (`tests/reference/vanco_renal_loading_mrgsolve/`). Lifts the #702 `base × time-varying`
   restriction. Still a typed error under a time-varying covariate (a #930 follow-up): a
   steady-state, lagged, built-in input-rate, or modeled-`RATE` base dose; and a base regimen
-  combined with IOV (#931) or system resets (#932) remains rejected.
+  combined with system resets (#932) remains rejected (base × IOV is lifted by #931, below).
+- **Pre-scheduled base regimen under inter-occasion variability (IOV) in adaptive-dosing
+  simulation** (#931). `simulate_adaptive()` / `simulate_adaptive_from_spec()` now accept a
+  base subject carrying a plain bolus / infusion loading (or maintenance) regimen together
+  with **inter-occasion variability** (`kappa`): each base dose's bioavailability `F` (and any
+  other IOV-affected individual parameter) is resolved under the κ of the occasion — the
+  decision window (#701) active at the dose's administration time — symmetric with a
+  controller dose, whose `F` is fixed from the per-decision snapshot at injection, and the dose
+  is integrated under the per-segment occasion PK with the base-aware frozen-replay verifier
+  carrying that `F` so the run is checked bit-for-bit. Validated against the independent
+  `predict_iov` engine on a reconstructed per-occasion κ and dose-for-dose against an mrgsolve
+  loading-dose IOV run (`tests/reference/vanco_iov_loading_mrgsolve/`). Lifts the #702/#930
+  `base × IOV` restriction. Still a typed error under IOV (a #931 follow-up): a steady-state,
+  lagged, built-in input-rate, or modeled-`RATE` base dose; and a base regimen combined with
+  system resets (#932) remains rejected.
 - **System resets (EVID=3) in adaptive-dosing simulation** (#716). `simulate_adaptive()`
   / `simulate_adaptive_from_spec()` now honor an EVID=3 reset carried by the base
   subject: the reactive driver zeros the compartments at the reset time (re-seeding any
