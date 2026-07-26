@@ -2904,9 +2904,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // capture its per-dose lagtime / bioavailability, exactly as the static engine does.
     // On the (common) dose-free path `resolve_subject_doses` borrows `subject` unchanged,
     // `n_base == 0`, and both vectors are empty — so every base-regimen branch below is a
-    // no-op and the reactive path stays byte-identical. Only the constant, non-reset path
-    // reaches here with base doses (the combo guard above rejects the rest), so a single
-    // frozen `pk_params_flat` governs both the base doses and the controller's.
+    // no-op and the reactive path stays byte-identical. When base doses ARE present, only a
+    // base × reset subject is rejected upstream; the constant-covariate path governs both the
+    // base and controller doses with this single frozen `pk_params_flat`, while the
+    // per-event-PK path (a time-varying covariate #930 and/or IOV #931) overwrites each base
+    // dose's F per-occasion from `event_pk.dose[k]` in the block ~40 lines below.
     let resolved_base = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
     let (base_lagtimes, mut base_f_bio) = subject_dose_attrs(&resolved_base, ode, pk_params_flat);
     let n_base = resolved_base.doses.len();

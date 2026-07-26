@@ -1644,16 +1644,23 @@ fn adaptive_base_dose_f_under_iov_matches_closed_form() {
     let kappas = reconstruct_kappas(&model, seed, "1", decisions.len());
     let k0_f = kappas[0][0];
     let k1_f = kappas[1][0];
+    let f = 0.5 * k1_f.exp(); // F = TVF·exp(κ₁_F), the occasion-1 bioavailability
+                              // Non-vacuity guards tied to the closed-form band (rel tol ≈ 8e-4 below), NOT a bare 1e-6:
+                              // each mutation must move F well outside the band or the oracle would pass vacuously. The
+                              // frozen κ=0 mutation gives F=0.5; the wrong-occasion mutation gives 0.5·exp(κ₀_F). Require
+                              // a 10× margin so the oracle's teeth rest on the band, not on the pinned seed alone.
+    let rel_band = 8.0 * 1e-4;
     assert!(
-        k1_f.abs() > 1e-6,
-        "occasion-1 κ_F must be nonzero, else the frozen-κ=0 mutation is vacuous"
+        (f - 0.5).abs() / f > 10.0 * rel_band,
+        "occasion-1 κ_F={k1_f} too small: a frozen κ=0 (F=0.5) would fall within the \
+         closed-form band, making the oracle vacuous"
     );
     assert!(
-        (k1_f - k0_f).abs() > 1e-6,
-        "occasions 0 and 1 must differ, else the wrong-occasion mutation is vacuous"
+        (f - 0.5 * k0_f.exp()).abs() / f > 10.0 * rel_band,
+        "occasions 0/1 too close (κ₀_F={k0_f}, κ₁_F={k1_f}): the wrong-occasion \
+         F=0.5·exp(κ₀_F) would fall within the band, making the oracle vacuous"
     );
 
-    let f = 0.5 * k1_f.exp(); // F = TVF·exp(κ₁_F), the occasion-1 bioavailability
     let entered = f * 1000.0;
     let k = 0.1_f64; // CL/V = 5/50; ETA_CL ~ N(0, 1e-10) ≈ 0
     let expect = [entered * (-k * 12.0).exp(), entered * (-k * 24.0).exp()];
@@ -1717,6 +1724,172 @@ fn adaptive_base_ss_dose_with_iov_is_rejected() {
     assert!(
         err.contains("plain fixed bolus or infusion") && err.contains("steady-state"),
         "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_dose_f_before_first_decision_uses_baseline_kappa() {
+    // #931 convention (pins the pre-first-decision boundary raised in review): a base dose
+    // administered BEFORE the first decision has no open occasion window, so its bioavailability
+    // F resolves at the baseline κ = 0 — exactly like an observation before the first decision —
+    // NOT occasion 0's κ. F = TVF·exp(κ_F) with CL/V constant. A 1000-unit base bolus at t=0 with
+    // the first decision at t=24 is in the baseline window, so F = TVF·exp(0) = 0.5 and 500 units
+    // enter central; it decays at k = 0.1/h (CL constant, so the per-segment occasion never
+    // touches the trajectory here). Mutation pinned: resolving the dose at occasion 0's κ would
+    // give 0.5·exp(κ₀_F)·1000 ≠ 500.
+    let model = parse_model_string(ODE_IOV_F).expect("parse IOV-on-F ODE model");
+    let decisions = vec![24.0, 48.0]; // first decision at t=24; the dose at t=0 precedes it
+    let seed = 20260726u64;
+    let base_dose = DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0);
+    let s = subj("1", vec![12.0, 36.0], vec![base_dose]);
+    let pop = population(vec![s]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("pre-first-decision base dose F × IOV runs and passes the verifiers");
+    assert!(res.ledger.is_empty(), "controller holds");
+
+    // Occasion 0's κ must be far enough from baseline (0) that "baseline vs occasion 0" is
+    // distinguishable beyond the closed-form band (rel tol ≈ 8e-4).
+    let kappas = reconstruct_kappas(&model, seed, "1", decisions.len());
+    let k0_f = kappas[0][0];
+    assert!(
+        (k0_f.exp() - 1.0).abs() > 10.0 * 8.0 * 1e-4,
+        "occasion-0 κ_F={k0_f} too small to distinguish baseline from occasion 0"
+    );
+
+    let entered = 0.5 * 1000.0; // baseline κ = 0 → F = TVF·exp(0) = 0.5
+    let k = 0.1_f64;
+    // obs@12 is in the baseline window (12 < 24), obs@36 in occasion 0 — but CL is constant, so
+    // decay is k=0.1 throughout; only F is occasion-sensitive, and here it is baseline.
+    let expect = [entered * (-k * 12.0).exp(), entered * (-k * 36.0).exp()];
+    for (traj, want) in res.trajectories.iter().zip(expect.iter()) {
+        assert!(
+            (traj.ipred - want).abs() <= 8.0 * (1e-6 + 1e-4 * want),
+            "t={}: pre-first-decision base-dose F IPRED {} != closed form {want} (baseline F=0.5)",
+            traj.time,
+            traj.ipred
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_infusion_under_iov_matches_predict_iov() {
+    // #931: a base INFUSION (not just a bolus) under IOV — closes the review's coverage gap (the
+    // other IOV base tests all use boluses). κ on F reshapes the infusion's delivered amount per
+    // occasion, and the infusion window feeds through `active_infusions` reading the
+    // occasion-corrected F (a distinct delivery path from the bolus jump). Validated against the
+    // independent `predict_iov` engine, which handles F-reshaped infusions with per-dose occasion
+    // κ. Base infusion at t=0 (occasion 0), RATE=1000 over AMT=1000 (nominal 1 h, F-reshaped).
+    let model = parse_model_string(ODE_IOV_F).expect("parse IOV-on-F ODE model");
+    assert!(model.n_kappa == 1 && model.n_eta == 1);
+    let decisions = vec![0.0, 24.0, 48.0, 72.0];
+    // obs cover occasions 0..=3 in order so predict_iov's occasion→group index is identity (see
+    // `adaptive_base_loading_under_iov_matches_predict_iov` for the group-index alignment note).
+    let obs = vec![12.0, 24.0, 48.0, 72.0];
+    let seed = 20260726u64;
+    let base_inf = DoseEvent::new(0.0, 1000.0, 1, 1000.0, false, 0.0);
+    let pop = population(vec![subj("1", obs.clone(), vec![base_inf])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("base infusion × IOV runs and passes the default verifiers");
+    assert!(
+        res.ledger.is_empty(),
+        "controller holds — only the base infusion"
+    );
+
+    let eta_bsv = reconstruct_eta_bsv(&model, seed);
+    let kappas = reconstruct_kappas(&model, seed, "1", decisions.len());
+    assert!(
+        kappas.iter().any(|k| k[0].abs() > 1e-6),
+        "reconstructed κ must be nonzero"
+    );
+
+    let mut static_subject = subj(
+        "1",
+        obs.clone(),
+        vec![DoseEvent::new(0.0, 1000.0, 1, 1000.0, false, 0.0)],
+    );
+    static_subject.occasions = obs
+        .iter()
+        .map(|&t| crate::pk::occasion_of(&decisions, t).expect("obs in a window") as u32)
+        .collect();
+    static_subject.dose_occasions =
+        vec![crate::pk::occasion_of(&decisions, 0.0).expect("dose in a window") as u32];
+    let preds = crate::pk::predict_iov(
+        &model,
+        &static_subject,
+        &model.default_params.theta,
+        &eta_bsv,
+        &kappas,
+    );
+    assert_eq!(res.trajectories.len(), preds.len());
+    for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+        // The infusion integrates over its window in both engines; a small cross-structure RK45
+        // band (not 1e-9 as the bolus oracle uses) covers step-sequence differences, while a
+        // wrong occasion F (~%-level) is still caught by ~100×.
+        assert!(
+            (traj.ipred - pred).abs() <= 8.0 * (1e-6 + 1e-4 * pred.abs()),
+            "adaptive IOV base-infusion IPRED {} != predict_iov {} at t={}",
+            traj.ipred,
+            pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_multiple_doses_across_occasions_pass_verifiers() {
+    // #931: MULTIPLE base doses spanning different occasions — closes the review's coverage gap
+    // (every other IOV base test has n_base = 1). Exercises the index-parallel
+    // `event_pk.dose[k] ↔ resolved_base.doses[k]` alignment for k ≥ 2 across occasions: the
+    // default-on #748 snapshot check independently re-derives EACH base dose's occasion snapshot
+    // (k=0 in occasion 0, k=1 in occasion 1), and the default-on frozen-replay verifier
+    // bit-exact-checks the driver's two-dose integration against the static engine. κ on CL, so
+    // each base dose decays under its window's clearance. Base boluses at t=0 (occasion 0) and
+    // t=24 (occasion 1); observations sit off the dose times.
+    //
+    // Oracle note — why NOT `predict_iov` here: the adaptive driver assigns a segment's occasion
+    // from the last observation/EVID=2 record crossed (`segment_occ_at`, the #701 decision-window
+    // / end-of-interval convention — the clearance in effect *during* the segment, the physically
+    // faithful choice for real-time feedback). `predict_iov` follows the #104 OCC-column
+    // convention (the segment ending at a *dose* record uses that dose's occasion). The two agree
+    // when every segment ends at an observation (Test A, the mrgsolve anchor), but differ for a
+    // base dose at an occasion boundary with no coincident observation — as here — so `predict_iov`
+    // is not a valid oracle for this configuration. The driver's own verifiers are; the
+    // independent-engine multi-occasion check is the mrgsolve anchor. See
+    // `compute_event_pk_params_iov`'s docstring.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    let doses = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), // occasion 0
+        DoseEvent::new(24.0, 500.0, 1, 0.0, false, 0.0), // occasion 1 (at the decision boundary)
+    ];
+    let obs = vec![12.0, 36.0, 60.0]; // occasions 0, 1, 2 — none coincident with a dose
+    let pop = population(vec![subj("1", obs, doses)]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(20260726),
+        decision_times: vec![0.0, 24.0, 48.0, 72.0],
+        ..Default::default() // verify = true → frozen-replay + #748 per-dose snapshot checks run
+    };
+    // The `expect` IS the assertion: the default-on #748 per-dose re-derivation (both k=0 and k=1)
+    // and the bit-exact frozen replay of the two-dose trajectory must both pass.
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("two base doses across occasions run and pass the frozen-replay + #748 verifiers");
+    assert!(
+        res.ledger.is_empty(),
+        "controller holds — only the two base doses"
+    );
+    // Liveness: both base doses are integrated (every trough is a positive decayed amount).
+    assert!(
+        res.trajectories.iter().all(|t| t.ipred > 0.0),
+        "both base doses contribute a positive decayed trajectory"
     );
 }
 

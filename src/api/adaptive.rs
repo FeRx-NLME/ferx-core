@@ -191,10 +191,13 @@ pub struct AdaptiveSimulationResult {
 /// - **ODE model.** The reactive driver runs on the ODE engine; a model with no
 ///   `[odes]` block is rejected.
 /// - **Pre-scheduled base regimen (#702).** A subject MAY carry pre-scheduled doses
-///   (a loading / maintenance regimen, including steady-state), which are integrated
-///   and augmented by the controller. Supported on constant-covariate, non-reset
-///   models only — combined with time-varying covariates, IOV, or system resets it is
-///   a typed error. A dose-free subject is the fully controller-driven special case.
+///   (a loading / maintenance regimen), which are integrated and augmented by the
+///   controller. Supported on constant-covariate, time-varying-covariate (#930), and
+///   IOV (#931) models (non-reset); a base regimen combined with a system reset
+///   (EVID=3/4) is a typed error (#932). A steady-state / lagged / built-in-input-rate
+///   base dose is supported on the constant-covariate path (#719); under a time-varying
+///   covariate or IOV those (and a modeled-`RATE` dose) are a typed error — a #930/#931
+///   follow-up. A dose-free subject is the fully controller-driven special case.
 /// - **Ipred monitors only.** A `Dv` monitor is rejected (needs S1.5).
 /// - **Verification (default on).** Each run's realized ledger is replayed
 ///   through the static engine and checked against the reactive trajectory; a
