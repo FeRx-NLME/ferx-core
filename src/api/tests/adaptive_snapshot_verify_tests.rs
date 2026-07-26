@@ -88,6 +88,17 @@ fn tv_subject_with_pk_only() -> Subject {
     s
 }
 
+// `tv_subject` plus a pre-scheduled base dose at t=0 (its own covariate snapshot,
+// CRCL=100) — so `event_pk.dose` carries a per-dose snapshot (#931) and the inline
+// dose re-derivation branch of `check_event_pk_records` is exercised.
+fn tv_subject_with_dose() -> Subject {
+    let mut s = tv_subject();
+    s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    s.dose_covariates = vec![HashMap::from([("CRCL".to_string(), 100.0)])];
+    s.dose_occasions = vec![0];
+    s
+}
+
 /// Build the canonical IOV snapshots exactly as `run_adaptive_population` does —
 /// a third, independent orchestration used only to hand the check a *correct*
 /// build (accepted) and known-corrupt copies (rejected).
@@ -284,6 +295,57 @@ fn catches_corrupted_pk_only_snapshot() {
     )
     .expect_err("a corrupted pk_only snapshot must be rejected");
     assert!(err.contains("event_pk.pk_only[0]"), "names the slot: {err}");
+}
+
+#[test]
+fn catches_corrupted_dose_snapshot() {
+    // #931: a subject carrying a pre-scheduled BASE dose exercises the inline dose
+    // re-derivation branch. The driver AND the frozen-replay verifier both read
+    // `event_pk.dose[k]` for that dose's F, so a mis-built dose snapshot is applied by
+    // both and the replay cannot catch it — this #748 check is the backstop. A canonical
+    // build is accepted; a corrupted dose snapshot must be rejected by slot.
+    let model = parse_model_string(IOV_TVCOV).expect("parse");
+    let params = model.default_params.clone();
+    let subject = tv_subject_with_dose();
+    let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+    let decisions = vec![0.0, 12.0, 24.0];
+    let (eta_occ, decision_pk, mut event_pk) =
+        canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+    assert_eq!(
+        event_pk.dose.len(),
+        1,
+        "the base dose must yield a per-dose snapshot (#931)"
+    );
+    // Sanity: the canonical (correct) build passes before we corrupt it.
+    verify_adaptive_snapshots(
+        &model,
+        &params,
+        &subject,
+        &eta_slice,
+        &decisions,
+        SEED,
+        SIM,
+        Some(&eta_occ),
+        Some(&decision_pk),
+        Some(&event_pk),
+    )
+    .expect("a canonical base-dose build must pass");
+
+    event_pk.dose[0].values[0] += 1.0; // corrupt CL at the base dose
+    let err = verify_adaptive_snapshots(
+        &model,
+        &params,
+        &subject,
+        &eta_slice,
+        &decisions,
+        SEED,
+        SIM,
+        Some(&eta_occ),
+        Some(&decision_pk),
+        Some(&event_pk),
+    )
+    .expect_err("a corrupted dose snapshot must be rejected");
+    assert!(err.contains("event_pk.dose[0]"), "names the slot: {err}");
 }
 
 #[test]

@@ -355,15 +355,16 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   lagged / input-rate compartments are supported because they run the exact pre-resolved
   static machinery; *controller-issued* doses into those compartments are still rejected at
   injection, where the TAD-anchor bookkeeping for a dose discovered mid-run is a follow-up.)
-  *Scope:* supported on constant-covariate models, and — since #930 — on **time-varying-covariate
-  models** for a plain bolus / infusion base dose, whose bioavailability `F` is resolved from its
-  own covariate snapshot (the covariate active at the dose's administration time) and which is then
-  integrated under the per-segment PK, matching an independent mrgsolve renal-decline + loading run.
-  Still a typed error, never a silent mis-integration of a delivered dose: a base regimen combined
-  with IOV (#931) or system resets (EVID=3/4, #932), and — under a time-varying covariate — a
-  steady-state, lagged, built-in input-rate, or modeled-`RATE` base dose (a #930 follow-up whose
-  per-dose SS / lag / input-rate / rate-resolution bookkeeping the time-varying frozen-replay
-  engine does not yet reproduce).
+  *Scope:* supported on constant-covariate models, on **time-varying-covariate models** (since
+  #930), and on **IOV models** (since #931), for a plain bolus / infusion base dose, whose
+  bioavailability `F` is resolved from its own snapshot — the covariate active at, and (under IOV)
+  the occasion κ of, the dose's administration time (symmetric with a controller dose, whose `F` is
+  fixed at injection) — and which is then integrated under the per-segment PK, matching independent
+  mrgsolve loading-dose runs (renal-decline #930, per-occasion κ #931). Still a typed error, never a
+  silent mis-integration of a delivered dose: a base regimen combined with system resets (EVID=3/4,
+  #932), and — under a time-varying covariate or IOV — a steady-state, lagged, built-in input-rate,
+  or modeled-`RATE` base dose (a #930 / #931 follow-up whose per-dose SS / lag / input-rate /
+  rate-resolution bookkeeping the frozen-replay engine does not yet reproduce).
 - **Time-varying covariates are supported** — the driver recomputes PK per
   event/segment from the covariate active in that segment (the NONMEM
   end-of-interval convention that `predict()` / `simulate()` use), so a covariate
@@ -388,7 +389,10 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   drawn per **decision window** (occasion = decision index) and threaded through the
   per-event PK, so occasion-to-occasion shifts in CL/V drive the trajectory, the
   monitored signal, and every reactive dose; the frozen-replay verifier validates the
-  per-occasion bookkeeping, and it composes with time-varying covariates — the
+  per-occasion bookkeeping. A **pre-scheduled base regimen** (a loading dose) composes with
+  IOV (#931): each base dose's `F` resolves under the κ of the occasion active at its
+  administration time — see *Pre-scheduled base regimens* above. It also composes with
+  time-varying covariates — the
   composition (`CL = TVCL·(CRCL/100)·exp(η + κ)` under a declining covariate *and* a
   per-occasion κ) is cross-validated dose-for-dose against an independent **mrgsolve**
   run (`tests/reference/vanco_renal_iov_mrgsolve/`). `kappa` is

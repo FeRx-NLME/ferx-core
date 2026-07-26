@@ -735,12 +735,22 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// ([`occasion_of`]): `eta_occ[g]` for the window `g` containing the record, or
 /// `eta_baseline` (BSV η with κ = 0) before the first decision. This is the IOV
 /// analogue of [`predict_iov`]'s per-event occasion-κ selection, with occasion =
-/// decision window instead of the OCC column. Doses stay empty — the adaptive base
-/// subject is dose-free; controller-injected doses take their PK from the driver's
-/// per-decision snapshot. It composes with #700's time-varying covariates: each
-/// record's *covariate* snapshot (`obs_cov` / `pk_only_cov`) is used alongside its
-/// occasion eta, so a model with both a TV covariate and IOV κ is per-event correct
-/// in both.
+/// decision window instead of the OCC column. **Doses** are resolved the same way
+/// (#931): a pre-scheduled base dose (#702) carries the PK of the occasion (decision
+/// window) active at its administration time, so its bioavailability F resolves under
+/// that occasion's κ — symmetric with a controller-injected dose, whose F is fixed
+/// from the driver's per-decision LOCF snapshot at injection. A base dose administered
+/// **before the first decision** has no open window, so — like an observation before the
+/// first decision — it takes the baseline κ = 0 for its F; its disposition still flows
+/// through the per-segment occasion PK (the standard event-driven split of dose-time
+/// attributes from running clearance), so a loading dose given at t=0 with the first
+/// decision at t>0 is dosed at baseline F but decays under the first window's occasion.
+/// On the (common) dose-free
+/// base subject `subject.doses` is empty, so `dose` stays empty and the result is
+/// byte-identical to the pre-#931 path. It composes with #700's time-varying
+/// covariates: each record's *covariate* snapshot (`dose_cov` / `obs_cov` /
+/// `pk_only_cov`) is used alongside its occasion eta, so a model with both a TV
+/// covariate and IOV κ is per-event correct in both.
 ///
 /// **pk-only (EVID=2) convention — deliberately different from [`predict_iov`].** Here
 /// a pk-only record takes the κ of the decision window containing its time (like any
@@ -751,6 +761,20 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// `segment_occ_at` also uses [`occasion_of`], so materialiser and driver agree), but a
 /// future oracle that validates an adaptive IOV run *with EVID=2 rows* against
 /// `predict_iov` must account for this — they will disagree on the pk-only κ by design.
+///
+/// **Base dose at an occasion boundary — a second [`predict_iov`] divergence.** The
+/// driver assigns a *segment's* occasion from the last observation / EVID=2 record it
+/// crossed (`segment_occ_at`), i.e. the decision window active *during* the segment (the
+/// clearance in effect at that time — the physically faithful choice for real-time
+/// feedback, #701). `predict_iov` uses the #104 OCC end-of-interval rule: the segment
+/// ending at a *dose* record takes that dose's occasion. The two agree when every
+/// segment ends at an observation (the shipped anchor observes a trough at each decision),
+/// but differ for a base dose sitting at an occasion boundary with no coincident
+/// observation — the segment *before* that dose uses the prior window in the driver and
+/// the dose's window in `predict_iov`. An adaptive IOV oracle over such a configuration
+/// must validate against the driver's own frozen-replay verifier (bit-exact) or mrgsolve,
+/// not `predict_iov`. (This `dose` snapshot only fixes each dose's *F* at its
+/// administration occasion; the running disposition occasion is `segment_occ_at`'s job.)
 pub(crate) fn compute_event_pk_params_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -766,6 +790,19 @@ pub(crate) fn compute_event_pk_params_iov(
             None => eta_baseline,
         }
     };
+    // Base doses (#702 × #931): each carries the occasion active at its administration
+    // time, so `f_bio` reads its bioavailability under that occasion's κ. Empty on the
+    // dose-free base subject (the common case) → byte-identical to the pre-#931 path.
+    for k in 0..subject.doses.len() {
+        let t = subject.doses[k].time;
+        out.dose.push(pk_params_at_time(
+            model,
+            theta,
+            eta_at(t),
+            subject.dose_cov(k),
+            t,
+        ));
+    }
     for j in 0..subject.obs_times.len() {
         let t = subject.obs_times[j];
         out.obs.push(pk_params_at_time(
