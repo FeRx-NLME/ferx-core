@@ -38,6 +38,19 @@ section of the SDLC for the versioning policy).
   base regimen combined with time-varying covariates, IOV, or system resets is a typed error
   (each a #702 follow-up), never a silent mis-integration. Previously any base regimen was
   rejected outright.
+- **Pre-scheduled base regimen under a time-varying covariate in adaptive-dosing
+  simulation** (#930). `simulate_adaptive()` / `simulate_adaptive_from_spec()` now accept a
+  base subject carrying a plain bolus / infusion loading (or maintenance) regimen together
+  with a **time-varying covariate** (declining renal function, a `TIME`-driven parameter,
+  etc.): each base dose's bioavailability `F` is resolved from its own covariate snapshot
+  (the covariate active at the dose's administration time — symmetric with a controller dose,
+  whose `F` is fixed at injection) and the dose is integrated under the per-segment PK, with
+  the base-aware frozen-replay verifier carrying that `F` so the run is checked bit-for-bit.
+  Validated dose-for-dose against an independent mrgsolve renal-decline + loading-dose run
+  (`tests/reference/vanco_renal_loading_mrgsolve/`). Lifts the #702 `base × time-varying`
+  restriction. Still a typed error under a time-varying covariate (a #930 follow-up): a
+  steady-state, lagged, built-in input-rate, or modeled-`RATE` base dose; and a base regimen
+  combined with IOV (#931) or system resets (#932) remains rejected.
 - **System resets (EVID=3) in adaptive-dosing simulation** (#716). `simulate_adaptive()`
   / `simulate_adaptive_from_spec()` now honor an EVID=3 reset carried by the base
   subject: the reactive driver zeros the compartments at the reset time (re-seeding any

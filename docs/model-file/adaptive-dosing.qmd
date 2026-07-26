@@ -355,9 +355,15 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   lagged / input-rate compartments are supported because they run the exact pre-resolved
   static machinery; *controller-issued* doses into those compartments are still rejected at
   injection, where the TAD-anchor bookkeeping for a dose discovered mid-run is a follow-up.)
-  *Scope:* supported on constant-covariate, non-reset models — a base regimen combined with
-  time-varying covariates, IOV, or system resets (EVID=3/4) is a typed error (each a #702
-  follow-up), never a silent mis-integration of a delivered dose.
+  *Scope:* supported on constant-covariate models, and — since #930 — on **time-varying-covariate
+  models** for a plain bolus / infusion base dose, whose bioavailability `F` is resolved from its
+  own covariate snapshot (the covariate active at the dose's administration time) and which is then
+  integrated under the per-segment PK, matching an independent mrgsolve renal-decline + loading run.
+  Still a typed error, never a silent mis-integration of a delivered dose: a base regimen combined
+  with IOV (#931) or system resets (EVID=3/4, #932), and — under a time-varying covariate — a
+  steady-state, lagged, built-in input-rate, or modeled-`RATE` base dose (a #930 follow-up whose
+  per-dose SS / lag / input-rate / rate-resolution bookkeeping the time-varying frozen-replay
+  engine does not yet reproduce).
 - **Time-varying covariates are supported** — the driver recomputes PK per
   event/segment from the covariate active in that segment (the NONMEM
   end-of-interval convention that `predict()` / `simulate()` use), so a covariate
