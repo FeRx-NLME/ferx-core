@@ -2191,7 +2191,43 @@ fn adaptive_base_regimen_with_reset_under_iov_is_rejected() {
     )
     .expect_err("base × reset under IOV must be rejected");
     assert!(
-        err.contains("system resets") && err.contains("constant-covariate"),
+        err.contains("system resets") && err.contains("constant-covariate path only"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_regimen_with_reset_under_tv_covariate_is_rejected() {
+    // #932 scope boundary (the TV-covariate half, distinct from the IOV half above): base ×
+    // reset is supported on the constant-covariate path, but under a TIME-VARYING covariate it
+    // stays a typed error — the per-event-PK replay's reset+base composition is not yet oracle-
+    // verified. A plain bolus base dose under a TV covariate is otherwise supported (#930), so
+    // the reset is what trips the guard. This pins the `&& tv` boundary on the TV-cov path
+    // specifically: a regression to `&& iov` would silently ACCEPT this (iov=false, tv=true),
+    // routing it through the un-oracle-verified TV replay with every other test still green.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let mut s = subj(
+        "1",
+        vec![6.0, 30.0],
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], // plain bolus (supported under TV alone)
+    );
+    s.reset_times = vec![12.0];
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 80.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0, 24.0],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("base × reset under a time-varying covariate must be rejected");
+    assert!(
+        err.contains("system resets") && err.contains("constant-covariate path only"),
         "got: {err}"
     );
 }

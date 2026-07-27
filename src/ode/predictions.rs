@@ -2912,8 +2912,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // On the (common) dose-free path `resolve_subject_doses` borrows `subject` unchanged,
     // `n_base == 0`, and both vectors are empty — so every base-regimen branch below is a
     // no-op and the reactive path stays byte-identical. When base doses ARE present, only a
-    // base × reset subject is rejected upstream; the constant-covariate path governs both the
-    // base and controller doses with this single frozen `pk_params_flat`, while the
+    // base × reset subject UNDER a time-varying covariate / IOV is rejected upstream; the
+    // constant-covariate path governs both the base and controller doses with this single
+    // frozen `pk_params_flat`, while the
     // per-event-PK path (a time-varying covariate #930 and/or IOV #931) overwrites each base
     // dose's F per-occasion from `event_pk.dose[k]` in the block ~40 lines below.
     let resolved_base = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
@@ -3109,10 +3110,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
         break_times.extend(shadow.pk_only_times.iter().cloned());
     }
     // System-reset times (EVID=3/4, #716): each is a segment boundary where the state
-    // zeros. Only pure EVID=3 resets reach here — an EVID=4 (reset+dose) row carries a
-    // dose, so a reset-carrying subject with doses is rejected by the base-regimen combo
-    // guard (#702) above (base × reset is a follow-up). Empty for a reset-free subject,
-    // so the bolus-only path stays byte-identical.
+    // zeros. Since #932 a base regimen reaches here alongside its resets on the constant-
+    // covariate path — including an EVID=4 (reset+dose) row, whose dose is a base dose
+    // landing at the reset instant (Reset < Dose). Only base × reset UNDER a time-varying
+    // covariate / IOV is rejected by the guard above. Empty for a reset-free subject, so
+    // the bolus-only path stays byte-identical.
     break_times.extend(subject.reset_times.iter().copied());
     // #702/#930: fold in the pre-scheduled base regimen's breaks via the shared builder so the
     // reactive segmentation matches the static engine's exactly (the frozen-replay oracle).
@@ -3278,8 +3280,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
         // pre-dose (the true trough), symmetric with the controller's own doses (#933 —
         // previously the base bolus landed here, before the hook, and the controller read
         // the post-dose peak). No-op on the dose-free path and for non-SS base doses;
-        // constant path only (`pk_params_flat` is the frozen snapshot, and a base × reset
-        // combo is rejected above so no reset intervenes).
+        // constant path only (`pk_params_flat` is the frozen snapshot). Since #932 a reset MAY
+        // intervene on the constant path — it zeroed `u` earlier in this same break iteration
+        // (Reset < Dose). Correct regardless: this reseed fires only at an SS base dose's own
+        // landing time and `copy_from_slice`s the SS equilibrium/tail, re-establishing steady
+        // state independent of prior state, so a just-applied reset is correctly superseded; the
+        // static engine applies reset-then-reseed in the same order.
         if n_base > 0 {
             reseed_prescheduled_states_at(
                 &mut u,
@@ -3730,9 +3736,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
 /// the driver still breaks at them, so the realized ledger alone cannot
 /// reconstruct the segmentation.
 ///
-/// `base_subject` is the dose-free subject the run was driven from; its
-/// observation grid (and any covariates) carry over, only `doses` are replaced
-/// with the realized ledger. The ledger stores nominal `amt`/`rate`
+/// `base_subject` is the subject the run was driven from — its pre-scheduled base
+/// regimen (doses / reset_times, if any) survives on it (#702/#932); its observation
+/// grid (and any covariates) carry over, and the realized ledger doses are appended
+/// after the base doses. The ledger stores nominal `amt`/`rate`
 /// (pre-bioavailability), exactly as a `subject.doses` entry, so `F`/lag re-apply
 /// downstream identically.
 #[allow(clippy::too_many_arguments)]
