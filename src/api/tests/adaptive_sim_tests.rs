@@ -1894,25 +1894,340 @@ fn adaptive_base_multiple_doses_across_occasions_pass_verifiers() {
 }
 
 #[test]
-fn adaptive_base_regimen_with_reset_is_rejected() {
-    // #702 scope: base regimen × system reset (EVID=3/4) is a typed error. An EVID=4
-    // (reset+dose) subject carries doses, so it lands here rather than on the reset path.
-    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+fn adaptive_base_regimen_with_reset_matches_static_predict() {
+    // Degenerate oracle for #932: a pre-scheduled base regimen (a loading dose) combined
+    // with a mid-horizon EVID=3 system reset and a fixed-dose controller must reproduce the
+    // trusted static engine — `predict()`, which routes reset subjects to the reset-aware
+    // event-driven walker — on the realized (base ∪ controller) regimen carrying the same
+    // reset. The model is η-invariant, so the adaptive IPRED equals the η=0 static PRED.
+    //
+    // This composes #702's base-dose seeding with #716's reset machinery on the constant-
+    // covariate path: the base 500 mg at t=0 drives the pre-reset observations (t=6, t=30),
+    // the reset at t=36 zeros that mass (t=42 washes out), and the controller's 100 mg at
+    // t=48 drives the post-reset tail (t=54). The default-on frozen-replay verifier (reset-
+    // and base-aware) runs too, so its Ok is part of this assertion.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![24.0, 48.0];
+    let obs = vec![6.0, 30.0, 42.0, 54.0];
+    let reset_at = 36.0;
+    let base_dose = DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0);
+
+    let mut base = subj("1", obs.clone(), vec![base_dose.clone()]);
+    base.reset_times = vec![reset_at];
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("adaptive base+reset sim runs and passes the reset-aware verifier");
+    assert_eq!(
+        res.ledger.len(),
+        2,
+        "a controller bolus at each of the two decisions"
+    );
+
+    // Static reference: the base regimen + the realized controller doses pre-scheduled on a
+    // subject carrying the same reset, scored by predict() (η=0, event-driven, reset honored).
+    let mut static_doses = vec![base_dose];
+    static_doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let mut static_subject = subj("1", obs.clone(), static_doses);
+    static_subject.reset_times = vec![reset_at];
+    let preds = predict(
+        &model,
+        &population(vec![static_subject]),
+        &model.default_params,
+    );
+
+    assert_eq!(res.trajectories.len(), obs.len());
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (base 500@0, reset at {reset_at})",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_infusion_spanning_reset_is_turned_off() {
+    // Positive control for #932 (the issue's non-vacuity proof): a PRE-SCHEDULED base infusion
+    // spanning a reset must be turned OFF at the reset by the reset floor — exactly as it turns
+    // off a controller-issued infusion (#716). The same base infusion run with vs without the
+    // reset must diverge (so the degenerate oracle above is not two engines agreeing on an
+    // un-reset trajectory), and the with-reset run must still reproduce predict() on that base
+    // infusion carrying the reset.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![36.0]; // one late decision; the controller only holds
+    let obs = vec![6.0, 18.0, 30.0];
+    let reset_at = 12.0;
+    // Base infusion: 2400 units at rate 100/h ⇒ a 24 h window [0, 24] spanning the reset at 12.
+    let base_inf = DoseEvent::new(0.0, 2400.0, 1, 100.0, false, 0.0);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(5),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+
+    let mut with_reset = subj("1", obs.clone(), vec![base_inf.clone()]);
+    with_reset.reset_times = vec![reset_at];
+    let res = simulate_adaptive(
+        &model,
+        &population(vec![with_reset]),
+        &model.default_params,
+        1,
+        hold_all,
+        &opts,
+    )
+    .expect("base infusion + reset runs and passes the reset-aware verifier");
+    assert!(res.ledger.is_empty(), "the hold controller issues no doses");
+
+    // Non-vacuity: without the reset the infusion keeps delivering past 12, so t=18 is
+    // materially positive; with the reset it is turned off at 12 and the zeroed state stays ~0.
+    let no_reset = subj("1", obs.clone(), vec![base_inf.clone()]);
+    let res_no = simulate_adaptive(
+        &model,
+        &population(vec![no_reset]),
+        &model.default_params,
+        1,
+        hold_all,
+        &opts,
+    )
+    .expect("no-reset run");
+    let y18 = res
+        .trajectories
+        .iter()
+        .find(|x| (x.time - 18.0).abs() < 1e-12)
+        .expect("t=18 row (with reset)")
+        .ipred;
+    let y18_no = res_no
+        .trajectories
+        .iter()
+        .find(|x| (x.time - 18.0).abs() < 1e-12)
+        .expect("t=18 row (no reset)")
+        .ipred;
+    assert!(
+        y18_no > 10.0 && y18 < 1e-6,
+        "reset must turn the base infusion off: with-reset {y18} (want ~0) vs no-reset {y18_no} (want ≫0)"
+    );
+
+    // Oracle: the with-reset run reproduces predict() on the same base infusion + reset.
+    let mut static_subject = subj("1", obs.clone(), vec![base_inf]);
+    static_subject.reset_times = vec![reset_at];
+    let preds = predict(
+        &model,
+        &population(vec![static_subject]),
+        &model.default_params,
+    );
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (base infusion spanning reset)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_evid4_reset_plus_dose_matches_static_predict() {
+    // #932 EVID=4 (reset + dose): a data row that both zeros the state and administers a dose
+    // records BOTH a `reset_times` entry and a `doses` entry at the same instant, so its dose
+    // is a base dose landing exactly at the reset — zeroed first (Reset < Dose), then applied.
+    // Today that dose tripped the base-regimen combo guard before the reset was considered; it
+    // must now reach the adaptive path and reproduce predict() (which sorts Reset < Dose too).
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![24.0];
+    let obs = vec![6.0, 18.0, 30.0];
+    let reset_at = 12.0;
+    // A loading dose the reset wipes, plus the EVID=4 dose (300 mg at the reset instant).
+    let loading = DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0);
+    let evid4_dose = DoseEvent::new(reset_at, 300.0, 1, 0.0, false, 0.0);
+
+    let mut base = subj("1", obs.clone(), vec![loading.clone(), evid4_dose.clone()]);
+    base.reset_times = vec![reset_at];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    let res = simulate_adaptive(
+        &model,
+        &population(vec![base]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect("EVID=4 (reset+dose) reaches the adaptive path and passes the verifier");
+    assert_eq!(res.ledger.len(), 1, "one controller bolus at t=24");
+
+    // The EVID=4 dose survives its own reset: t=18 reads 300·exp(-0.1·6) ≈ 165, not ~0 (which
+    // a reset that also wiped its coincident dose would give).
+    let y18 = res
+        .trajectories
+        .iter()
+        .find(|x| (x.time - 18.0).abs() < 1e-12)
+        .expect("t=18 row")
+        .ipred;
+    assert!(
+        y18 > 100.0,
+        "the EVID=4 dose must land AFTER its coincident reset (t=18 ≈ 165), got {y18}"
+    );
+
+    let mut static_doses = vec![loading, evid4_dose];
+    static_doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let mut static_subject = subj("1", obs.clone(), static_doses);
+    static_subject.reset_times = vec![reset_at];
+    let preds = predict(
+        &model,
+        &population(vec![static_subject]),
+        &model.default_params,
+    );
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (EVID=4 reset+dose)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_ss_base_dose_with_reset_matches_static_predict() {
+    // #932 gate: a steady-state base dose (SS=1, II>0) pre-equilibrated at t=0, then wiped by a
+    // mid-horizon reset, must still reproduce predict() on the same (SS base ∪ ledger) regimen
+    // carrying the reset. Exercises `equilibrate_ss_state` seeding BEFORE the reset zeros it —
+    // the reset floor then keeps the equilibrated tail from re-contributing. (If this ever
+    // diverged, #932 would narrow to reject SS × reset; it holds, so SS base × reset is in.)
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![0.0, 24.0];
+    let obs = vec![1.0, 8.0, 20.0];
+    let reset_at = 12.0;
+    let ss = DoseEvent::new(0.0, 300.0, 1, 0.0, true, 24.0); // 300 mg q24h at steady state
+
+    let mut base = subj("1", obs.clone(), vec![ss.clone()]);
+    base.reset_times = vec![reset_at];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(9),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    let res = simulate_adaptive(
+        &model,
+        &population(vec![base]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect("SS base dose + reset runs and passes the reset-aware verifier");
+    assert_eq!(res.ledger.len(), 2, "a controller bolus at each decision");
+
+    let mut static_doses = vec![ss];
+    static_doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let mut static_subject = subj("1", obs.clone(), static_doses);
+    static_subject.reset_times = vec![reset_at];
+    let preds = predict(
+        &model,
+        &population(vec![static_subject]),
+        &model.default_params,
+    );
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (SS base dose × reset)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_regimen_with_reset_under_iov_is_rejected() {
+    // #932 scope boundary: base × reset is supported on the constant-covariate path, but under
+    // inter-occasion variability (or a time-varying covariate) it stays a typed error — the
+    // per-event-PK replay's reset+base composition is not yet oracle-verified, so it must
+    // loud-fail rather than risk a silent mis-integration (a #932 follow-up). IOV sets
+    // `event_pk`/`eta_occ` = Some, so the driver's `&& tv` guard fires.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
     let mut s = subj(
         "1",
         vec![6.0, 30.0],
         vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
     );
     s.reset_times = vec![12.0];
-    let pop = population(vec![s]);
     let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0, 24.0],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(
+        &model,
+        &population(vec![s]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect_err("base × reset under IOV must be rejected");
+    assert!(
+        err.contains("system resets") && err.contains("constant-covariate path only"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_regimen_with_reset_under_tv_covariate_is_rejected() {
+    // #932 scope boundary (the TV-covariate half, distinct from the IOV half above): base ×
+    // reset is supported on the constant-covariate path, but under a TIME-VARYING covariate it
+    // stays a typed error — the per-event-PK replay's reset+base composition is not yet oracle-
+    // verified. A plain bolus base dose under a TV covariate is otherwise supported (#930), so
+    // the reset is what trips the guard. This pins the `&& tv` boundary on the TV-cov path
+    // specifically: a regression to `&& iov` would silently ACCEPT this (iov=false, tv=true),
+    // routing it through the un-oracle-verified TV replay with every other test still green.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let mut s = subj(
+        "1",
+        vec![6.0, 30.0],
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], // plain bolus (supported under TV alone)
+    );
+    s.reset_times = vec![12.0];
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 80.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
         decision_times: vec![0.0, 24.0],
         ..Default::default()
     };
     let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
-        .expect_err("base regimen × reset must be rejected");
+        .expect_err("base × reset under a time-varying covariate must be rejected");
     assert!(
-        err.contains("base regimen") && err.contains("system resets"),
+        err.contains("system resets") && err.contains("constant-covariate path only"),
         "got: {err}"
     );
 }

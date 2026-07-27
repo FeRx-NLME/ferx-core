@@ -2864,21 +2864,28 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let iov = eta_occ.is_some();
 
     // --- Preconditions (typed errors, never silent) ----------------------
-    // #702/#930/#931: a pre-scheduled base regimen (loading / maintenance dose) IS supported
-    // on the constant-covariate path (the controller augments it), on the time-varying-
-    // covariate path (#930), and — since #931 — under inter-occasion variability (each base
-    // dose's F resolved from its own occasion-κ / covariate snapshot just below). It is not
-    // yet supported together with system resets (#932 — state-zeroing across a base dose):
-    // that threads per-reset bookkeeping the base-dose seeding and the frozen-replay verifier
-    // do not yet reproduce, so loud-fail rather than silently mis-integrate a delivered dose.
-    // (An EVID=4 reset+dose row carries a dose, so a reset-carrying subject with base doses
-    // lands here rather than on the reset path — base × IOV × reset stays rejected too.)
-    if !subject.doses.is_empty() && subject.has_resets() {
+    // #702/#930/#931/#932: a pre-scheduled base regimen (loading / maintenance dose) IS
+    // supported on the constant-covariate path (the controller augments it), on the time-
+    // varying-covariate path (#930), and — since #931 — under inter-occasion variability (each
+    // base dose's F resolved from its own occasion-κ / covariate snapshot just below). Since
+    // #932 it composes with system resets (EVID=3/4) on the CONSTANT-covariate path: the reset
+    // zeros the state and lowers `reset_floor` (which already turns off base infusions opened
+    // before it — they live in `shadow.doses`, gated by `active_infusions`), and both the
+    // reset-aware static verifier (`ode_predictions_with_extra_breaks`) and the reference
+    // event-driven engine apply Reset < Dose identically, so the degenerate oracle holds.
+    // (An EVID=4 reset+dose row records BOTH a reset and a dose, so its dose is just a base
+    // dose landing at the reset instant — zeroed, then re-applied — reaching this path.)
+    //
+    // Base × reset UNDER a time-varying covariate or IOV (`tv`) stays a typed error: the
+    // per-event-PK replay (`adaptive_frozen_replay_tv`) is itself reset-aware, but its
+    // composition with a base regimen across a reset is not yet oracle-verified against the
+    // reference, so loud-fail rather than risk a silent mis-integration (a #932 follow-up).
+    if !subject.doses.is_empty() && subject.has_resets() && tv {
         return Err(
-            "ode_predictions_adaptive: a pre-scheduled base regimen is not yet supported \
-             together with system resets (EVID=3/4); issues #702/#930/#931 support a base \
-             regimen on constant-covariate, time-varying-covariate, and IOV models \
-             (non-reset) only"
+            "ode_predictions_adaptive: a pre-scheduled base regimen combined with system \
+             resets (EVID=3/4) is not yet supported under time-varying covariates or \
+             inter-occasion variability; #932 supports base × reset on the constant-covariate \
+             path only (time-varying-covariate / IOV base × reset is a follow-up)"
                 .to_string(),
         );
     }
@@ -2905,8 +2912,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // On the (common) dose-free path `resolve_subject_doses` borrows `subject` unchanged,
     // `n_base == 0`, and both vectors are empty — so every base-regimen branch below is a
     // no-op and the reactive path stays byte-identical. When base doses ARE present, only a
-    // base × reset subject is rejected upstream; the constant-covariate path governs both the
-    // base and controller doses with this single frozen `pk_params_flat`, while the
+    // base × reset subject UNDER a time-varying covariate / IOV is rejected upstream; the
+    // constant-covariate path governs both the base and controller doses with this single
+    // frozen `pk_params_flat`, while the
     // per-event-PK path (a time-varying covariate #930 and/or IOV #931) overwrites each base
     // dose's F per-occasion from `event_pk.dose[k]` in the block ~40 lines below.
     let resolved_base = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
@@ -3102,10 +3110,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
         break_times.extend(shadow.pk_only_times.iter().cloned());
     }
     // System-reset times (EVID=3/4, #716): each is a segment boundary where the state
-    // zeros. Only pure EVID=3 resets reach here — an EVID=4 (reset+dose) row carries a
-    // dose, so a reset-carrying subject with doses is rejected by the base-regimen combo
-    // guard (#702) above (base × reset is a follow-up). Empty for a reset-free subject,
-    // so the bolus-only path stays byte-identical.
+    // zeros. Since #932 a base regimen reaches here alongside its resets on the constant-
+    // covariate path — including an EVID=4 (reset+dose) row, whose dose is a base dose
+    // landing at the reset instant (Reset < Dose). Only base × reset UNDER a time-varying
+    // covariate / IOV is rejected by the guard above. Empty for a reset-free subject, so
+    // the bolus-only path stays byte-identical.
     break_times.extend(subject.reset_times.iter().copied());
     // #702/#930: fold in the pre-scheduled base regimen's breaks via the shared builder so the
     // reactive segmentation matches the static engine's exactly (the frozen-replay oracle).
@@ -3271,8 +3280,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
         // pre-dose (the true trough), symmetric with the controller's own doses (#933 —
         // previously the base bolus landed here, before the hook, and the controller read
         // the post-dose peak). No-op on the dose-free path and for non-SS base doses;
-        // constant path only (`pk_params_flat` is the frozen snapshot, and a base × reset
-        // combo is rejected above so no reset intervenes).
+        // constant path only (`pk_params_flat` is the frozen snapshot). Since #932 a reset MAY
+        // intervene on the constant path — it zeroed `u` earlier in this same break iteration
+        // (Reset < Dose). Correct regardless: this reseed fires only at an SS base dose's own
+        // landing time and `copy_from_slice`s the SS equilibrium/tail, re-establishing steady
+        // state independent of prior state, so a just-applied reset is correctly superseded; the
+        // static engine applies reset-then-reseed in the same order.
         if n_base > 0 {
             reseed_prescheduled_states_at(
                 &mut u,
@@ -3723,9 +3736,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
 /// the driver still breaks at them, so the realized ledger alone cannot
 /// reconstruct the segmentation.
 ///
-/// `base_subject` is the dose-free subject the run was driven from; its
-/// observation grid (and any covariates) carry over, only `doses` are replaced
-/// with the realized ledger. The ledger stores nominal `amt`/`rate`
+/// `base_subject` is the subject the run was driven from — its pre-scheduled base
+/// regimen (doses / reset_times, if any) survives on it (#702/#932); its observation
+/// grid (and any covariates) carry over, and the realized ledger doses are appended
+/// after the base doses. The ledger stores nominal `amt`/`rate`
 /// (pre-bioavailability), exactly as a `subject.doses` entry, so `F`/lag re-apply
 /// downstream identically.
 #[allow(clippy::too_many_arguments)]

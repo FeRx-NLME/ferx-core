@@ -360,11 +360,15 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   bioavailability `F` is resolved from its own snapshot — the covariate active at, and (under IOV)
   the occasion κ of, the dose's administration time (symmetric with a controller dose, whose `F` is
   fixed at injection) — and which is then integrated under the per-segment PK, matching independent
-  mrgsolve loading-dose runs (renal-decline #930, per-occasion κ #931). Still a typed error, never a
-  silent mis-integration of a delivered dose: a base regimen combined with system resets (EVID=3/4,
-  #932), and — under a time-varying covariate or IOV — a steady-state, lagged, built-in input-rate,
-  or modeled-`RATE` base dose (a #930 / #931 follow-up whose per-dose SS / lag / input-rate /
-  rate-resolution bookkeeping the frozen-replay engine does not yet reproduce).
+  mrgsolve loading-dose runs (renal-decline #930, per-occasion κ #931). A base regimen also
+  **composes with system resets** (EVID=3/4) on the constant-covariate path (since #932): the reset
+  zeros the state and turns off a base infusion opened before it, and an EVID=4 reset+dose row's dose
+  lands after its own reset — see *System resets* below. Still a typed error, never a silent
+  mis-integration of a delivered dose: a base regimen combined with a system reset **under a
+  time-varying covariate or IOV** (a #932 follow-up), and — under a time-varying covariate or IOV — a
+  steady-state, lagged, built-in input-rate, or modeled-`RATE` base dose (a #930 / #931 follow-up
+  whose per-dose SS / lag / input-rate / rate-resolution bookkeeping the frozen-replay engine does
+  not yet reproduce).
 - **Time-varying covariates are supported** — the driver recomputes PK per
   event/segment from the covariate active in that segment (the NONMEM
   end-of-interval convention that `predict()` / `simulate()` use), so a covariate
@@ -378,10 +382,12 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   compartments at each reset time (re-seeding any `init(state)=expr`) and turns off
   controller-issued infusions opened before the reset, exactly as `predict()` /
   `simulate()` do on the event-driven path; the frozen-replay verifier is
-  reset-aware, so the reset is honored *and* checked each run. (An EVID=4 reset+dose
-  row carries a dose, so a reset-carrying subject with doses is rejected by the
-  base-regimen combo guard — base × reset is a #702 follow-up — and only pure EVID=3
-  resets on a dose-free base reach the adaptive path.) *Caveat:* declaring `auc_target` on a reset
+  reset-aware, so the reset is honored *and* checked each run. Since #932 a reset also composes with a
+  **pre-scheduled base regimen** on the constant-covariate path: it zeros the base regimen's state and
+  turns off a base infusion opened before it (the reset floor), and an **EVID=4** reset+dose row —
+  which records both a reset and a dose — reaches the adaptive path as a base dose landing *after* its
+  own reset (Reset < Dose), matching `predict()`. Base × reset under a time-varying covariate or IOV
+  stays a typed error (a #932 follow-up). *Caveat:* declaring `auc_target` on a reset
   subject is a typed error — the exposure metric's uniform per-window trapezoid grid
   has no node at the reset instant, so the one window straddling the reset would
   integrate the state discontinuity inaccurately (every other output is reset-aware).
