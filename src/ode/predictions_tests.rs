@@ -544,6 +544,77 @@ fn adaptive_window_signal_aucs_includes_mid_window_base_dose() {
     );
 }
 
+/// A base **infusion** or **steady-state** dose must reach the AUC pass with its full
+/// attributes — the fix keeps base doses via `clone`, never a `DoseEvent::new` rebuild
+/// (which would flatten `ss`/`ii`/`rate` to a plain `Fixed` bolus). This verifies that
+/// "correct by construction" claim directly, rather than trusting it: both are
+/// integrated by the same `ode_dense_solve_states` machinery `predict()` uses, so the
+/// window AUC matches the closed form, and — critically — differs from the same total
+/// dose given as a plain t=0 bolus. Closes the coverage gap PR #942's bolus-only
+/// oracles left.
+#[test]
+fn adaptive_window_signal_aucs_preserves_ss_and_infusion_base_attrs() {
+    let ode = one_cpt_ode_spec(); // readout = central amount, RHS = -ke·y
+    let pk = pk_one(10.0, 100.0); // ke = 0.1
+    let ke = 0.1_f64;
+    let decisions = [24.0, 48.0]; // one window [24, 48], well after the base dose at 0
+    let ledger = vec![ledger_bolus(24.0, 100.0, 1)];
+    let call = |sub: &Subject| {
+        adaptive_window_signal_aucs(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            sub,
+            &decisions,
+            &ledger,
+            None,
+            1,
+        )
+    };
+
+    // --- Infusion base dose: amt=200 delivered over 20 h (rate=10) at t=0. Because it
+    // is spread over [0,20] rather than dumped at t=0, more drug survives to t=24 than
+    // an equal t=0 bolus would leave. A(24) decays from the end-of-infusion amount
+    // (R/ke)(1 − e^{−20ke}); the window [24,48] is then smooth decay past the ctrl bolus.
+    let inf = make_subject(
+        vec![DoseEvent::new(0.0, 200.0, 1, 10.0, false, 0.0)],
+        vec![],
+    );
+    let a20 = (10.0 / ke) * (1.0 - (-ke * 20.0).exp());
+    let a24_inf = a20 * (-ke * 4.0).exp() + 100.0;
+    let want_inf = (a24_inf / ke) * (1.0 - (-ke * 24.0).exp());
+    assert_relative_eq!(call(&inf)[0], want_inf, max_relative = 1e-3);
+    // Non-vacuous: the SAME 200 units as a plain t=0 bolus give a materially smaller
+    // AUC (≈ −25%). Running the function on both proves it honors the infusion (does
+    // not flatten it), not just that two closed forms differ.
+    let bolus200 = make_subject(vec![DoseEvent::new(0.0, 200.0, 1, 0.0, false, 0.0)], vec![]);
+    assert!(
+        call(&inf)[0] > call(&bolus200)[0] * 1.2,
+        "infusion base dose flattened to a bolus: inf {} vs bolus {}",
+        call(&inf)[0],
+        call(&bolus200)[0]
+    );
+
+    // --- Steady-state bolus base dose: amt=100, II=6, ss=true at t=0. The post-dose
+    // amount is the SS peak D/(1 − e^{−ke·II}) (equilibrate_ss_state trough + the
+    // record's bolus); a single SS record does not re-pulse, so it then decays plainly.
+    let ss = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 6.0)], vec![]);
+    let peak = 100.0 / (1.0 - (-ke * 6.0).exp());
+    let a24_ss = peak * (-ke * 24.0).exp() + 100.0;
+    let want_ss = (a24_ss / ke) * (1.0 - (-ke * 24.0).exp());
+    assert_relative_eq!(call(&ss)[0], want_ss, max_relative = 1e-3);
+    // Non-vacuous: dropping `ss` (a plain 100 bolus at t=0) omits the SS priming and
+    // gives a smaller AUC (≈ −9%), so the SS attribute is genuinely acted upon.
+    let bolus100 = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![]);
+    assert!(
+        call(&ss)[0] > call(&bolus100)[0] * 1.05,
+        "SS base dose treated as a plain bolus: ss {} vs bolus {}",
+        call(&ss)[0],
+        call(&bolus100)[0]
+    );
+}
+
 /// Build the per-segment `obs_time -> indices` map the integrator uses.
 fn obs_index_map(obs_times: &[f64]) -> HashMap<u64, Vec<usize>> {
     let mut m: HashMap<u64, Vec<usize>> = HashMap::new();
