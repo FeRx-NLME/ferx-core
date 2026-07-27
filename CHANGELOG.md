@@ -113,6 +113,14 @@ section of the SDLC for the versioning policy).
   for any external code that constructs or exhaustively destructures these variants.
 
 ### Fixed
+- **Adaptive-dosing `auc_target` exposure metric now integrates the pre-scheduled base regimen**
+  (#940). The signal-AUC pass behind `auc_target_attainment` (#391 S2.5b) previously scored each
+  decision window on the controller's realized doses only, dropping any pre-scheduled base regimen
+  (#702 — a loading / maintenance dose), so on a base-regimen run the reported exposure — and hence
+  `auc_target_attainment` — was biased low. Each window now integrates the base regimen (a loading
+  dose before the window and a maintenance dose landing inside it) alongside the realized ledger,
+  matching `predict()` / `simulate()` on the combined regimen. Constant-covariate subjects only, as
+  before (time-varying-covariate / IOV / reset `auc_target` runs remain rejected).
 - **FOCE inner EBE recovery no longer discards a near-optimal partial for a worse fallback**
   (#378). When a subject's individual objective is multimodal (e.g. a 3-cpt IV proportional
   model with six IIV etas conditioned on ten points), the closed-form inner BFGS can reach the

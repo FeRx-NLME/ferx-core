@@ -53,7 +53,7 @@ with the run, never with a fitted model's parameters.
 | `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
 | `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. |
 | `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_time_in_window` outcome metric — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_time_in_window` unreported, rather than guessing a band from the rule thresholds. |
-| `auc_target` | | Exposure band `[low, high]` for the **area under the monitored signal** over each inter-decision window (e.g. vancomycin AUC₂₄ when decisions are daily), used **only** to report the `auc_target_attainment` outcome metric — like `target_window` it does **not** influence dosing. `low` must be `≥ 0`; `high` may be `inf`. Declaring it turns on a signal-AUC pass that re-integrates the realized doses on a dense grid; omit it to skip that pass and leave `auc_target_attainment` unreported. |
+| `auc_target` | | Exposure band `[low, high]` for the **area under the monitored signal** over each inter-decision window (e.g. vancomycin AUC₂₄ when decisions are daily), used **only** to report the `auc_target_attainment` outcome metric — like `target_window` it does **not** influence dosing. `low` must be `≥ 0`; `high` may be `inf`. Declaring it turns on a signal-AUC pass that re-integrates any pre-scheduled base regimen (#702) together with the realized controller doses on a dense grid; omit it to skip that pass and leave `auc_target_attainment` unreported. |
 | `with_assay_error` | signal¹ | Titrate on the **noised measurement** of a model output (named by `assay_cmt`) instead of a latent expression (default `false`). The signal's value comes from that output's `[scaling]` readout and its σ from that output's `[error_model]`, so the two are always on the same scale — there is no re-typed `observe` expression to mis-scale. Mutually exclusive with `observe`. |
 | `assay_cmt` | | The 1-based compartment of the model output measured under `with_assay_error` — its `[scaling]` readout is the signal value and its `[error_model]` σ the noise. **Required** with `with_assay_error`. |
 
@@ -345,7 +345,12 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   through the same dose-resolution, break-timeline, and steady-state machinery as
   `predict()` / `simulate()`, and they appear in the controller's dose `history`; the
   frozen-replay verifier rebuilds the base regimen alongside the realized ledger, so the
-  pre-scheduled + reactive bookkeeping is checked bit-for-bit each run.
+  pre-scheduled + reactive bookkeeping is checked bit-for-bit each run. The `auc_target`
+  exposure metric likewise integrates the base regimen: each window's AUC covers the base
+  doses — a loading dose before the first window and a maintenance dose landing inside a
+  window alike — not just the controller's, so `auc_target_attainment` is not biased low on a
+  base-regimen run (constant-covariate; the time-varying / IOV / reset `auc_target` caveats
+  below are unchanged).
   A base dose that **shares a time with a decision is observed pre-dose** (the trough),
   symmetric with the controller's own doses — the controller reads the level *before* the
   scheduled dose lands, then that dose is applied (#933); for a steady-state base dose the

@@ -4123,8 +4123,14 @@ const ADAPTIVE_AUC_PANELS: usize = 128;
 /// jump of ≈ ½·Δsignal·(window ⁄ panels) for an instantaneous (bolus) dose (an
 /// infusion delivers ≈0 at its start instant and is unaffected, but the convention
 /// must be correct for both). So each window is solved against a static subject that
-/// drops every dose after `a` — future doses cannot affect `[a, b]`, so this is
-/// exact — leaving `b` a plain pre-dose decay point.
+/// keeps only the doses **before** `b` (`time < b`), leaving `b` a plain pre-dose
+/// decay point. Controller doses sit on the decision grid (window edges), so for them
+/// `time < b` is exactly "at or before `a`" and the window is integrated exactly. A
+/// pre-scheduled base maintenance dose (#702) may instead land strictly inside
+/// `(a, b)`; it is kept — dropping it would under-count this window's exposure — and
+/// is integrated exactly for an infusion / absorption input (whose signal stays
+/// continuous), with only the same ≈ ½·Δsignal·(window ⁄ panels) node-placement error
+/// as above for the rarer instantaneous bolus into the monitored compartment.
 ///
 /// **Cost — `O(m²)`, deliberately.** This is one dense solve per window, and
 /// because [`ode_dense_solve_states`] always starts from `t = 0` (it cannot resume
@@ -4146,11 +4152,15 @@ const ADAPTIVE_AUC_PANELS: usize = 128;
 /// path), else the model's `monitor_cmt` readout (the `Dv` path's underlying
 /// latent — the AUC is always over the un-noised signal, never the assay draw).
 ///
-/// `base_subject` is the dose-free subject the run was driven from; only its doses
-/// are replaced (its covariates carry over). This pass uses a **single** PK snapshot
-/// (`pk_params_flat`), exact only for constant-covariate subjects — a time-varying
-/// (or TIME-in-PK) subject with an `auc_target` is rejected upstream in
-/// `run_adaptive_population` (#700), so it never reaches here.
+/// `base_subject` carries the run's covariates **and** any pre-scheduled base regimen
+/// (#702 — a loading / maintenance dose on `subject.doses`): each window is integrated
+/// against those base doses (kept via clone, so their `SS`/lagtime/infusion attributes
+/// carry over) plus the controller's realized ledger doses, restricted per the window
+/// composition below. On the dose-free path `base_subject.doses` is empty, so this is
+/// the prior ledger-only rebuild. This pass uses a **single** PK snapshot
+/// (`pk_params_flat`), exact only for constant-covariate subjects — a time-varying (or
+/// TIME-in-PK) or IOV subject with an `auc_target` is rejected upstream in
+/// `run_adaptive_population` (#700/#701), so it never reaches here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn adaptive_window_signal_aucs(
     ode: &OdeSpec,
@@ -4173,23 +4183,38 @@ pub(crate) fn adaptive_window_signal_aucs(
     let cov = &base_subject.covariates;
 
     // One closed window at a time (see "Window convention" above): integrate
-    // `[a, b]` against a static subject carrying only the doses at or before the
-    // window's left edge `a`, so the dose at the right edge `b` (the next window's)
-    // never folds into this window's endpoint.
+    // `[a, b]` against a static subject carrying the base regimen and ledger doses
+    // that can influence this window — everything before the right edge `b` (see the
+    // per-window composition below) — so the dose at `b` (the next window's) never
+    // folds into this window's endpoint.
     (0..m - 1)
         .map(|k| {
             let (a, b) = (decision_times[k], decision_times[k + 1]);
 
-            // Doses at or before `a` (nominal amt/rate; F/lag re-apply downstream
-            // exactly as for a scheduled dose). A dose exactly at `a` is THIS
-            // window's own dose and is kept; the `1e-9` only guards float equality
-            // at the boundary, far below any real decision spacing.
+            // Compose the window's static regimen exactly as
+            // [`verify_adaptive_frozen_replay`] does: the pre-scheduled base regimen
+            // (#702) — CLONED, so each base dose's `SS`/`II`/lagtime/modeled-`RATE`/
+            // infusion attributes survive (a `DoseEvent::new` rebuild would silently
+            // reset them to a plain `Fixed` bolus) — followed by the controller's
+            // realized ledger doses, then restricted to the doses that can influence
+            // this window. A dose strictly after the right edge `b` cannot affect
+            // `[a, b]` (causality); the dose *at* `b` is the next window's left-edge
+            // dose, whose post-dose jump would otherwise fold into this window's right
+            // endpoint ([`ode_dense_solve_states`] saves the post-dose state at a save
+            // point on a dose time). Both are dropped by `time < b`; doses at or before
+            // `a` (state setup) and any base maintenance dose strictly inside `(a, b)`
+            // are kept. Controller doses sit on the decision grid (= window edges), so
+            // for them `time < b` is byte-identical to the old `<= a` — the pure-
+            // controller path is unchanged; only a base regimen (previously dropped by
+            // the `sub.doses = ledger` overwrite) is now integrated. The `1e-9` guards
+            // float equality at `b`, far below any real decision spacing.
             let mut sub = base_subject.clone();
-            sub.doses = ledger
-                .iter()
-                .filter(|e| e.time <= a + 1e-9)
-                .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
-                .collect();
+            sub.doses.extend(
+                ledger
+                    .iter()
+                    .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+            );
+            sub.doses.retain(|d| d.time < b - 1e-9);
 
             // The window's own uniform sub-grid: `panels + 1` points, `grid[0] == a`
             // (post-dose) and `grid[panels] == b` (pre-dose decay).

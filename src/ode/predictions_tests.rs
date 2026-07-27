@@ -414,6 +414,136 @@ fn adaptive_window_signal_aucs_excludes_boundary_dose() {
     assert_relative_eq!(aucs[1], w1, max_relative = 1e-4);
 }
 
+/// Regression: the metrics-only signal-AUC pass must integrate the pre-scheduled
+/// **base regimen** (#702), not just the controller's realized ledger. The earlier
+/// `sub.doses = ledger` overwrite dropped any loading / maintenance dose carried on
+/// `base_subject.doses`, silently under-counting the exposure behind
+/// `auc_target_attainment`. Here a base IV loading bolus at t = 0 precedes the first
+/// decision window `[24, 48]`, so its decayed contribution to the post-dose amount at
+/// t = 24 must appear in that window's AUC.
+#[test]
+fn adaptive_window_signal_aucs_includes_base_loading_dose() {
+    let ode = one_cpt_ode_spec(); // readout = central amount, RHS = -ke·y
+    let pk = pk_one(10.0, 100.0); // ke = CL/V = 0.1
+    let (ke, d_base, d_ctrl) = (0.1_f64, 200.0_f64, 100.0_f64);
+
+    // Base regimen: a loading bolus at t=0, carried on the SUBJECT (not the ledger).
+    let with_base = make_subject(
+        vec![DoseEvent::new(0.0, d_base, 1, 0.0, false, 0.0)],
+        vec![],
+    );
+    // Controller decisions at 24, 48 ⇒ one window [24, 48]; a controller bolus at 24.
+    let ledger = vec![ledger_bolus(24.0, d_ctrl, 1)];
+    let decisions = [24.0, 48.0];
+
+    let aucs = adaptive_window_signal_aucs(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &with_base,
+        &decisions,
+        &ledger,
+        None,
+        1,
+    );
+    assert_eq!(aucs.len(), 1);
+
+    // Degenerate oracle: post-dose amount at 24⁺ is the base bolus decayed from t=0
+    // PLUS the fresh controller bolus, and the window then decays smoothly (no dose at
+    // 48), so the closed form is exact. A(24⁺) = D_base·e^{−24ke} + D_ctrl.
+    let a24 = d_base * (-ke * 24.0).exp() + d_ctrl;
+    let want = (a24 / ke) * (1.0 - (-ke * 24.0).exp());
+    assert_relative_eq!(aucs[0], want, max_relative = 1e-4);
+
+    // Positive control (non-vacuous): a dose-free base — the pre-fix behaviour, where
+    // only the ledger survived — leaves just the controller bolus and a materially
+    // smaller AUC. The base loading dose adds ≈ 18% here; assert the two differ well
+    // beyond any trapezoid / solver noise so the oracle above has real teeth.
+    let dose_free = make_subject(vec![], vec![]);
+    let without_base = adaptive_window_signal_aucs(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &dose_free,
+        &decisions,
+        &ledger,
+        None,
+        1,
+    );
+    let want_ctrl_only = (d_ctrl / ke) * (1.0 - (-ke * 24.0).exp());
+    assert_relative_eq!(without_base[0], want_ctrl_only, max_relative = 1e-4);
+    assert!(
+        aucs[0] > without_base[0] * 1.1,
+        "base loading dose not reflected: with-base {} vs ledger-only {}",
+        aucs[0],
+        without_base[0]
+    );
+}
+
+/// Regression: a base **maintenance** dose landing strictly INSIDE a decision window
+/// `(a, b)` — the common MIPD pattern of dosing more often than TDM sampling — must
+/// also be integrated (`time < b`, not `<= a`). Dropping it would under-count that
+/// window entirely. Here a base bolus at t = 12 sits inside the single window
+/// `[0, 24]`; the mutation `time <= a` (a = 0) would exclude it and collapse the
+/// with-base AUC onto the ledger-only value, which this test forbids.
+#[test]
+fn adaptive_window_signal_aucs_includes_mid_window_base_dose() {
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(10.0, 100.0); // ke = 0.1
+    let (ke, d_ctrl, d_mid) = (0.1_f64, 100.0_f64, 300.0_f64);
+
+    // Controller bolus at t=0 (decision at 0); base maintenance bolus at t=12.
+    let with_base = make_subject(
+        vec![DoseEvent::new(12.0, d_mid, 1, 0.0, false, 0.0)],
+        vec![],
+    );
+    let dose_free = make_subject(vec![], vec![]);
+    let ledger = vec![ledger_bolus(0.0, d_ctrl, 1)];
+    let decisions = [0.0, 24.0];
+
+    let call = |sub: &Subject| {
+        adaptive_window_signal_aucs(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            sub,
+            &decisions,
+            &ledger,
+            None,
+            1,
+        )
+    };
+    let with_ = call(&with_base);
+    let without = call(&dose_free);
+    assert_eq!(with_.len(), 1);
+
+    // Closed form, splitting at the mid-window bolus t=12:
+    //   ∫₀¹² D_ctrl·e^{−ke t} dt  +  ∫₁²²⁴ A(12⁺)·e^{−ke(t−12)} dt,
+    // with A(12⁺) = D_ctrl·e^{−12ke} + D_mid. The instantaneous bolus into the
+    // monitored compartment jumps the signal at an off-node instant, so the uniform
+    // 128-panel trapezoid carries the documented ≈ ½·Δ·(span⁄panels) node-placement
+    // bias (measured ≈ +0.94% here) — hence the looser band vs the smooth-decay cases
+    // above. The point is inclusion: dropping the base dose is a ~70% error, far
+    // outside this.
+    let a12_pre = d_ctrl * (-ke * 12.0).exp();
+    let a12_post = a12_pre + d_mid;
+    let seg = 1.0 - (-ke * 12.0).exp();
+    let want = (d_ctrl / ke) * seg + (a12_post / ke) * seg;
+    assert_relative_eq!(with_[0], want, max_relative = 2e-2);
+
+    // The mid-window base dose roughly triples this window's AUC; a `<= a` filter
+    // would drop it and make with == without. Demand a large, unambiguous gap.
+    assert!(
+        with_[0] > without[0] * 2.0,
+        "mid-window base dose not integrated: with-base {} vs ledger-only {}",
+        with_[0],
+        without[0]
+    );
+}
+
 /// Build the per-segment `obs_time -> indices` map the integrator uses.
 fn obs_index_map(obs_times: &[f64]) -> HashMap<u64, Vec<usize>> {
     let mut m: HashMap<u64, Vec<usize>> = HashMap::new();
