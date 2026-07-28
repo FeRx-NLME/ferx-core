@@ -181,6 +181,29 @@ section of the SDLC for the versioning policy).
   through both the endpoint-routed and model-blind loaders.
 
 ### Performance
+- **Exact analytic inner (EBE) gradients for log-transform-both-sides under inter-occasion
+  variability** (#486). Fitting a closed-form model that combines `log(DV) ~ additive(...)`
+  with `[iov]` now uses exact analytic sensitivities for the per-subject empirical-Bayes
+  gradient, not finite differences. The population (outer) gradient has been analytic for this
+  combination since #677; the inner loop had stayed on FD because the first-order IOV walk
+  carried no `ln` jet, which made LTBS × IOV the last combination whose two loops
+  differentiated by different means. Both now apply the same `g = ln(f)` transform last, after
+  the per-occasion output-scale quotient, so they differentiate the same `ln(f/s)` the
+  objective scores — including combined with an expression `obs_scale`. Estimates are
+  unchanged; the EBE search reaches the same modes with one provider evaluation per inner step
+  instead of `~2·n_eta` predictions. LTBS × IOV on `[odes]` models keeps the finite-difference
+  fallback on both loops, as before.
+- **Exact analytic gradients for a closed-form Form C readout that references a θ or η
+  directly** (#486). An analytical (1-/2-/3-cpt) model whose `[scaling] y = <expr>` readout
+  names a theta or eta directly — e.g. `y = central/V * TVSCALE + ETA_BASE`, a baseline or
+  scale factor that is not an `[individual_parameters]` entry — now takes the analytic
+  sensitivity path on both loops instead of falling back to finite differences. The parser
+  already desugared such a reference into a hidden individual parameter on the ODE path
+  (#631); that pass now runs for the closed-form engine too, where the hidden parameter draws
+  a free differentiable PK slot exactly like any other non-structural readout parameter
+  (`BMAX`/`KD`, #650). Predictions are unchanged — only the gradient moves off finite
+  differences. A model whose readout parameters overflow the slots its PK model leaves spare
+  keeps the FD fallback, with the existing parse warning, rather than failing to parse.
 - **Closed-form modified-release absorption** (#860). A static multi-route absorption model
   (parallel / mixed pathways #505, per-route lag #856 — one `[odes]` central compartment fed by a
   fraction-weighted superposition of `first_order` / `transit` / `igd` input-rate forcings into a

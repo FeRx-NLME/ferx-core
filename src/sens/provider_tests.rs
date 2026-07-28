@@ -3682,6 +3682,97 @@ fn form_c_binding_readout_provider_matches_fd() {
     }
 }
 
+/// A Form-C readout referencing θ/η **directly** — `y = central/V * TVSCALE + ETA_SC`, where
+/// `TVSCALE`/`ETA_SC` are a declared theta/omega used nowhere else — on the **closed-form**
+/// engine (#486).
+///
+/// The ODE engine has desugared a bare θ/η in the readout into a synthetic individual
+/// parameter since #631, so its direct-θ/η readouts are analytic; the closed-form engine
+/// simply never ran that pass (`collect_readout_theta_eta_synth` was gated on `is_ode`), so
+/// the bare `PushTheta`/`PushEta` ops survived into the readout bytecode, `dual_evaluable`
+/// stayed false, and every such subject dropped to FD. The desugaring is engine-agnostic —
+/// what differed is only where the synthetic parameter's PK slot comes from, which on the
+/// analytical engine is the spare region `allocate_readout_extra_slots` owns.
+///
+/// Pins the whole chain, not just the gate: the model must be in analytic scope, the θ and η
+/// the readout references directly must carry **non-zero** derivatives (a synthetic parameter
+/// that never reached `pk_var_slots` reads as a silent zero jet, not an error — the #652
+/// trap), and value + all first/second η/θ derivatives must match central FD of the
+/// readout-aware production predictor.
+const ONECPT_IV_DIRECT_THETA_ETA_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVSCALE(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_SC ~ 0.05
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V * TVSCALE + ETA_SC
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+#[test]
+fn form_c_direct_theta_eta_readout_closed_form_matches_fd() {
+    let m = parse_model_string(ONECPT_IV_DIRECT_THETA_ETA_READOUT).expect("parse direct-θ/η");
+    assert!(
+        analytical_supported(&m),
+        "a direct-θ/η closed-form readout is desugared and must stay analytic (#486)"
+    );
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 2.0, 6.0, 12.0],
+    );
+    let theta = [0.2, 10.0, 1.5];
+    let eta = [0.12, -0.08, 0.05];
+    check_full_provider_vs_fd(&m, &s, &theta, &eta);
+
+    let full = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+    // TVSCALE is θ index 2, ETA_SC is η index 2. Both reach the prediction ONLY through the
+    // readout, so if the desugaring did not give them a real differentiable slot these read
+    // exactly 0.0 while everything else still matches FD — the failure mode worth pinning.
+    let max_dtheta = full
+        .obs
+        .iter()
+        .map(|o| o.df_dtheta[2].abs())
+        .fold(0.0_f64, f64::max);
+    let max_deta = full
+        .obs
+        .iter()
+        .map(|o| o.df_deta[2].abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_dtheta > 1e-6,
+        "∂y/∂TVSCALE must be non-zero — the synthetic readout param needs a real PK slot"
+    );
+    assert!(
+        max_deta > 1e-6,
+        "∂y/∂ETA_SC must be non-zero — the synthetic readout param needs a real PK slot"
+    );
+
+    // The light inner η-gradient must agree with the full provider's η block, so the EBE
+    // loop and the population loop see the same readout derivative.
+    let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light supported");
+    assert_eq!(light.len(), full.obs.len());
+    for (lo, fo) in light.iter().zip(full.obs.iter()) {
+        for k in 0..m.n_eta {
+            approx::assert_relative_eq!(
+                lo.df_deta[k],
+                fo.df_deta[k],
+                max_relative = 1e-9,
+                epsilon = 1e-12
+            );
+        }
+    }
+}
+
 /// The fluconazole case: a readout gated on a **per-row** covariate (`FREE`)
 /// makes the subject a time-varying-covariate subject, so it routes to the
 /// event-walk provider. The readout is served analytically there too (#650):
