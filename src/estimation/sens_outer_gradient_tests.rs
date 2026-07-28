@@ -3747,7 +3747,7 @@ fn check_iov_outer_packed_matches_fd(
     }
 }
 
-/// LTBS × IOV routing assertions (outer analytic, inner FD) + FD parity via
+/// LTBS × IOV routing assertions (both loops analytic since #486) + FD parity via
 /// [`check_iov_outer_packed_matches_fd`] on the FOCEI path.
 fn check_ltbs_iov_outer_matches_fd(model: &CompiledModel, theta: &[f64]) {
     assert!(model.log_transform, "fixture must be LTBS");
@@ -3760,8 +3760,8 @@ fn check_ltbs_iov_outer_matches_fd(model: &CompiledModel, theta: &[f64]) {
         model
     ));
     assert!(
-        crate::estimation::inner_optimizer::analytic_inner_common_bail(model),
-        "LTBS × IOV inner EBE gradient must stay on FD"
+        !crate::estimation::inner_optimizer::analytic_inner_common_bail(model),
+        "LTBS × IOV inner EBE gradient is analytic too (#486) — inner and outer move together"
     );
     let subject = iov_subject_outer(model, theta);
     check_iov_outer_packed_matches_fd(model, theta, &subject, true);

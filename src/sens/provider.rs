@@ -973,11 +973,11 @@ pub(crate) fn ode_inner_grad_supported(model: &CompiledModel, subject: &Subject)
 /// never overlaps the closed-form or IOV report branches.
 ///
 /// It deliberately does **not** fold in the escape hatches (`gradient = fd`, SDE,
-/// magnitude × `block_sigma`): the caller applies `analytic_inner_common_bail`. That
-/// bail is a superset of the hatches the live per-subject ODE branch in
-/// `analytic_inner_grad_supported` hand-inlines — its extra `log_transform && n_kappa
-/// > 0` clause — but the two coincide here because `ode_analytical_supported` forces
-/// `n_kappa == 0`, making that clause vacuous. Consumed (via the shared
+/// magnitude × `block_sigma`): the caller applies `analytic_inner_common_bail`, whose
+/// hatches now coincide exactly with the ones the live per-subject ODE branch in
+/// `analytic_inner_grad_supported` hand-inlines (the `log_transform && n_kappa > 0`
+/// clause that used to make the bail a strict superset was dropped when the closed-form
+/// IOV inner learned the `ln` jet, #486). Consumed (via the shared
 /// `inner_reports_analytic_model`) by `build_info::gradient_method_inner` to report
 /// the ODE inner route at model level without a per-subject scan — the inner analog of
 /// how [`sens_supported`] already lets the *outer* report recognize ODE (#378 task B).
@@ -1324,9 +1324,9 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     // parity, mirroring the non-IOV `f_scaled = f/k`). LTBS composes with the OUTER gradient
     // now (#486): `subject_sensitivities_iov` applies the `ln(f)` jet LAST — after the in-walk
     // scale quotient — reproducing production's scale-then-log order `ln(f/s)` (`predict_iov`
-    // logs last, after `apply_scaling`). The inner IOV EBE gradient stays on FD for LTBS
-    // (`analytic_inner_common_bail`'s `log_transform && n_kappa > 0` clause), so this gate
-    // admits `log_transform` while only the outer θ/Ω/σ loop serves it.
+    // logs last, after `apply_scaling`). The inner IOV EBE gradient serves LTBS too as of #486
+    // (`run_obs_iov_eta` applies the same shared jet last), so this gate admits `log_transform`
+    // for both loops and `analytic_inner_common_bail` no longer carries an LTBS × IOV clause.
     match &model.scaling {
         ScalingSpec::None | ScalingSpec::ScalarScale(_) => {}
         ScalingSpec::ExpressionScale { deriv: Some(p), .. }
@@ -1513,7 +1513,8 @@ pub fn subject_sensitivities_iov(
     // readout / init impulse — so the outer θ/Ω/σ gradient matches production's scale-then-log
     // `ln(f/s)` (`predict_iov` logs last, after `apply_scaling`). Post-walk on the full stacked
     // jet, so it is dimension-generic over the κ axes; a no-op when `log_transform` is false.
-    // The inner IOV EBE gradient stays on FD for LTBS (`analytic_inner_common_bail`).
+    // `run_obs_iov_eta` applies the inner twin of this step last, so the IOV inner EBE gradient
+    // serves LTBS too (#486) — the two loops differentiate the same `ln(f/s)`.
     apply_ltbs_transform_outer(&mut sens, model.log_transform);
     Some(sens)
 }
@@ -2492,6 +2493,15 @@ fn run_obs_iov_eta<const N: usize>(
         scale_obs_sens(&mut out, k);
     }
 
+    // LTBS `g = ln(f)` LAST — after the per-occasion scale quotient — the inner twin of
+    // `subject_sensitivities_iov`'s `apply_ltbs_transform_outer`, so the EBE gradient and the
+    // outer θ/Ω/σ gradient differentiate the same `ln(f/s)` production computes (#486).
+    // The transform is a per-observation scalar quotient `∂g/∂x = (∂f/∂x)/f`, identical on
+    // every stacked axis, so it applies to the κ columns exactly as it does to η_bsv — there
+    // is nothing occasion-specific about it and no per-group jet is needed. A no-op when
+    // `log_transform` is false.
+    apply_ltbs_transform_inner(&mut out, model.log_transform);
+
     Some(out)
 }
 
@@ -2549,8 +2559,8 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // scale quotient — reproducing production's scale-then-log order `ln(f/s)` exactly (the
     // whole transform is post-walk on the closed-form path, unlike the ODE in-walk log). The
     // inner EBE gradient is served analytically here too (`subject_eta_grad_tvcov` applies the
-    // same `ln(f)` inner jet LAST, #673); LTBS × IOV is the only combination whose inner stays
-    // on FD (`analytic_inner_common_bail`'s `log_transform && n_kappa > 0` clause).
+    // same `ln(f)` inner jet LAST, #673); since #486 LTBS × IOV is served on the inner as well
+    // (`run_obs_iov_eta`), so no LTBS combination routes the inner to FD any more.
     if !scaling_supported(model) {
         return false;
     }
@@ -2993,8 +3003,8 @@ pub fn subject_sensitivities_tvcov(
     apply_event_walk_expression_scale_outer(&mut sens, model, subject, prog, theta, eta)?;
     // LTBS: transform the walked (and scaled) jet to `g = ln(f)` LAST, via the same shared
     // helper the dose-superposition outer uses — so the two paths cannot drift, and the
-    // scale-then-log order matches production `ln(f/s)` (#486). The inner EBE gradient stays
-    // on FD for LTBS (covariance stability), so there is no inner counterpart.
+    // scale-then-log order matches production `ln(f/s)` (#486). The inner counterpart is
+    // `apply_ltbs_transform_inner`, applied last by the matching inner walk (#673/#486).
     apply_ltbs_transform_outer(&mut sens, model.log_transform);
     // FREM covariate pseudo-observations are not PK rows at all — overwrite their jet.
     apply_frem_pseudo_obs_jet(&mut sens, model, subject, theta, eta);
@@ -5154,8 +5164,8 @@ fn apply_frem_pseudo_obs_jet(
 /// dose-superposition outer (`subject_sensitivities_impl`) and the TV-cov event-driven outer
 /// (`subject_sensitivities_tvcov`), so the two paths cannot drift (#486). Applied last, after
 /// any `ScalarScale`/`ExpressionScale` quotient, matching production's scale-then-log order.
-/// The inner EBE gradient stays on finite differences for LTBS (covariance-Hessian stability,
-/// `analytic_inner_common_bail`), so no inner counterpart exists.
+/// [`apply_ltbs_transform_inner`] is the first-order counterpart every inner walk applies at
+/// the same point, so the two loops differentiate the same `ln(f/s)` (#673/#486).
 fn apply_ltbs_transform_outer(sens: &mut SubjectSens, log_transform: bool) {
     if !log_transform {
         return;

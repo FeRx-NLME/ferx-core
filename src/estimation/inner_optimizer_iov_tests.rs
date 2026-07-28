@@ -913,6 +913,132 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
     }
 }
 
+/// LTBS × IOV closed-form **inner** EBE gradient vs central FD of its own objective (#486).
+///
+/// This is the cell that closed the last inner/outer scope split: the outer IOV gradient has
+/// served LTBS since #677, but the `Dual1` inner walk had no `ln` jet, so `find_ebe_iov`
+/// reconverged on finite differences. `run_obs_iov_eta` now applies the shared
+/// `apply_ltbs_transform_inner` last — after the per-occasion scale quotient — so the EBE
+/// gradient differentiates the same `ln(f/s)` the objective scores.
+///
+/// Run over BOTH fixtures because the ordering is the part that can silently go wrong:
+///   * plain LTBS × IOV — the bare `∂ln f/∂x = (∂f/∂x)/f` jet over the stacked `[η_bsv, κ]`;
+///   * LTBS × IOV × `ExpressionScale` — pins **scale-then-log** (`ln(f/s)`, production's
+///     order). Applying the jet before the quotient instead still yields a plausible
+///     gradient — it is just the gradient of `ln(f)/s`, a different function — and FD of the
+///     real objective is what catches it.
+///
+/// The κ columns need no special treatment (the transform is one per-observation scalar
+/// quotient, identical on every stacked axis), and that is exactly what this asserts: FD
+/// parity is checked on every stacked coordinate, κ blocks included.
+#[test]
+fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
+    use crate::parser::model_parser::parse_model_string;
+    let fixture = |scaling_block: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  \
+             sigma ADD_ERR ~ 0.2 (sd)\n[individual_parameters]\n  \
+             CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n{scaling_block}\
+             [error_model]\n  log(DV) ~ additive(ADD_ERR)\n[fit_options]\n  method = focei\n  \
+             iov_column = OCC\n"
+        )
+    };
+    for (label, scaling_block) in [
+        ("plain LTBS", ""),
+        ("LTBS + obs_scale", "[scaling]\n  obs_scale = 1000 / V\n"),
+    ] {
+        let model = parse_model_string(&fixture(scaling_block)).expect("parse LTBS IOV fixture");
+        assert!(model.log_transform, "{label}: fixture must be LTBS");
+        // Routing first: a scope gap must fail loudly here rather than quietly FD-ing and
+        // leaving the parity check below to pass against a gradient nobody ran.
+        assert!(
+            crate::sens::provider::iov_analytical_supported(&model),
+            "{label}: must be on the analytic closed-form IOV path"
+        );
+        assert!(
+            !analytic_inner_common_bail(&model),
+            "{label}: the analytic INNER must not be bailed (#486)"
+        );
+
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.8, 0.6, 0.4, 0.7, 0.5, 0.3],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 6],
+            occasions: vec![1, 1, 1, 2, 2, 2],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        let params = model.default_params.clone();
+        let n_eta = model.n_eta;
+        let n_kappa = model.n_kappa;
+        let k = iov_occasion_groups(&subject).len();
+        let n_stacked = n_eta + k * n_kappa;
+        let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+        // Off-zero on every coordinate, and distinct per κ block, so a transform applied to
+        // the wrong occasion's jet cannot cancel.
+        let stacked = vec![0.10, -0.05, 0.08, -0.12];
+        assert_eq!(stacked.len(), n_stacked);
+
+        let g = analytic_eta_nll_gradient_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &stacked,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            n_eta,
+            n_kappa,
+            k,
+            None,
+        )
+        .expect("analytic IOV inner gradient");
+
+        let nll = |s: &[f64]| -> f64 {
+            let eta_t = &s[..n_eta];
+            let kappas: Vec<Vec<f64>> = (0..k)
+                .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+                .collect();
+            individual_nll_iov(
+                &model,
+                &subject,
+                &params.theta,
+                eta_t,
+                &kappas,
+                &params.omega,
+                Some(omega_iov),
+                &params.sigma.values,
+            )
+        };
+        for p in 0..n_stacked {
+            let h = 1e-6 * (1.0 + stacked[p].abs());
+            let mut sp = stacked.clone();
+            sp[p] += h;
+            let mut sm = stacked.clone();
+            sm[p] -= h;
+            let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
+            approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
+        }
+    }
+}
+
 // ----- #555 shared fixtures (two_cpt_oral_cov, η+covariate `obs_scale = V1`) -----
 
 /// Analytical + ODE twin of the ferx-r `two_cpt_oral_cov` model (5 η, `obs_scale = V1`
@@ -1924,20 +2050,22 @@ fn iov_inner_honours_common_bails() {
     assert!(!analytic_inner_common_bail(&model));
     model.bloq_method = crate::types::BloqMethod::Drop;
     model.residual_error_eta = None;
-    // LTBS × IOV now takes the FD *inner* gradient via `analytic_inner_common_bail`'s
-    // `log_transform && n_kappa > 0` clause (#486): the closed-form OUTER IOV gradient
-    // serves LTBS (so `iov_analytical_supported` admits `log_transform`), but the Dual1
-    // inner walk carries no `ln` jet, so the inner stays on FD. This model is ODE-based,
-    // so its *outer* IOV gate (`ode_iov_supported`) still declines LTBS independently —
-    // `iov_sens_supported` is false here for a different reason (the ODE path).
+    // LTBS is no longer a common bail at any κ count (#486): the closed-form IOV inner walk
+    // applies the `ln` jet last (`run_obs_iov_eta`), matching its outer twin. This model is
+    // **ODE**-based, though, and the ODE IOV path is a different story — `ode_iov_supported`
+    // declines `log_transform` outright (its walk applies LTBS in PK-param space *before* the
+    // η/θ/κ chain, so the production scale-then-log order can't be rebuilt post-walk). So the
+    // decline for an ODE IOV LTBS model must come from the support gate, NOT from the common
+    // bail. Pin both halves: dropping the bail clause must not have opened an analytic inner
+    // for a model whose outer still declines (that split is exactly what the scope rule forbids).
     model.log_transform = true;
     assert!(
-        analytic_inner_common_bail(&model),
-        "LTBS × IOV declines the analytic inner via the common bail (#486)"
+        !analytic_inner_common_bail(&model),
+        "LTBS is no longer a common bail — the closed-form IOV inner serves it (#486)"
     );
     assert!(
         !crate::sens::provider::iov_sens_supported(&model),
-        "ODE IOV + LTBS still routes to FD via the ODE IOV support gate"
+        "ODE IOV + LTBS still routes to FD via the ODE IOV support gate — the sole decline now"
     );
     model.log_transform = false;
 
@@ -1995,16 +2123,17 @@ fn iov_inner_honours_common_bails() {
     );
     let mut iov_scaled_cf_ltbs = iov_scaled_cf;
     iov_scaled_cf_ltbs.log_transform = true;
-    // Closed-form IOV + obs_scale + LTBS: the OUTER gradient is served now (#486 — the
-    // `ln(f)` jet applied after the in-walk scale quotient), so `iov_sens_supported` is
-    // true; the inner EBE gradient still declines via `analytic_inner_common_bail`.
+    // Closed-form IOV + obs_scale + LTBS is served on BOTH loops now (#486): each applies the
+    // `ln(f)` jet after its own per-occasion scale quotient, so the EBE and the θ/Ω/σ gradient
+    // differentiate the same `ln(f/s)`. Pin the pair together — an analytic outer against an FD
+    // inner is the scope split the provider forbids, so these two must move as one.
     assert!(
         crate::sens::provider::iov_sens_supported(&iov_scaled_cf_ltbs),
         "closed-form IOV + obs_scale + LTBS is served on the OUTER gradient (#486)"
     );
     assert!(
-        analytic_inner_common_bail(&iov_scaled_cf_ltbs),
-        "closed-form IOV + obs_scale + LTBS still declines the analytic inner"
+        !analytic_inner_common_bail(&iov_scaled_cf_ltbs),
+        "closed-form IOV + obs_scale + LTBS is served on the INNER gradient too (#486)"
     );
 }
 

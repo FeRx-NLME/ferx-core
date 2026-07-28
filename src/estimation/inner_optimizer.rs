@@ -1597,9 +1597,12 @@ pub fn profile_report() {
 /// the SEs. LTBS + η-dependent `ExpressionScale` is served analytically on the inner too now
 /// (the η-quotient then the `ln f` jet, `subject_eta_grad`; validated by
 /// `ltbs_plus_expression_scale_inner_matches_outer`), as is LTBS + TV-cov (the event-driven
-/// inner walk applies the same jet last). Only **LTBS × IOV** stays a common bail (the
-/// `log_transform && n_kappa > 0` clause below): the `Dual1` IOV inner walk carries no `ln`
-/// jet, so the closed-form OUTER IOV gradient serves LTBS but the inner EBE keeps FD.
+/// inner walk applies the same jet last). **LTBS × IOV** is analytic on the inner too as of
+/// #486: `run_obs_iov_eta` applies the same shared `apply_ltbs_transform_inner` jet last, after
+/// the per-occasion scale quotient — the transform is a per-observation scalar quotient
+/// (`∂g/∂x = (∂f/∂x)/f`) identical on every stacked axis, so the κ columns need nothing the
+/// η_bsv columns do not. So `log_transform` is no longer a common bail at any κ count, and the
+/// closed-form inner and outer IOV loops now differentiate the same `ln(f/s)`.
 ///
 /// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the non-IOV
 /// analytical inner provider now carries the η-only quotient rule (`subject_eta_grad`
@@ -1618,15 +1621,12 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
         || matches!(model.gradient_method, GradientMethod::Fd)
         || model.is_sde()
-        // LTBS is served analytically on the inner loop now — plain, × `ExpressionScale`
-        // (the η-quotient then the `ln f` jet, `subject_eta_grad`), and × TV-cov (the
-        // event-driven inner walk applies the same jet LAST). LTBS × IOV, however, stays on
-        // the FD inner: the closed-form OUTER IOV gradient now serves LTBS (the `ln(f)` jet in
-        // `subject_sensitivities_iov`, #486), so `iov_analytical_supported` admits
-        // `log_transform` — but `run_obs_iov_eta` (the Dual1 inner walk) carries no `ln` jet,
-        // so decline the inner here to keep the EBE reconvergence on FD (the IOV twin of how
-        // plain/TV-cov LTBS is served on the inner but IOV is not).
-        || (model.log_transform && model.n_kappa > 0)
+        // LTBS is served analytically on the inner loop for every combination now — plain,
+        // × `ExpressionScale` (the η-quotient then the `ln f` jet, `subject_eta_grad`),
+        // × TV-cov (the event-driven inner walk applies the same jet LAST), and × IOV
+        // (`run_obs_iov_eta` applies it last over the stacked axes, #486). So there is no
+        // `log_transform` clause here: the closed-form inner and outer IOV gradients now
+        // differentiate the same `ln(f/s)`, closing the last inner/outer scope split.
         // Correlated residual error (`block_sigma`) is now served analytically by the
         // dense-R inner gradient (`dense_residual_inner_gradient`, #627), so it is no
         // longer a blanket bail. (An eta-dependent `ExpressionScale` is NOT a bail either.)

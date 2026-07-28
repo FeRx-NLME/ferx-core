@@ -4100,8 +4100,8 @@ fn provider_ltbs_matches_production() {
 /// transform LAST, after scaling — the same helper the dose-superposition outer uses).
 /// Validated over plain LTBS and LTBS + an `ExpressionScale` `obs_scale = 1000/V` divisor
 /// (production's scale-then-log order `ln(f/s)` is reproduced post-walk) against central
-/// FD of the log-scale production predictor. The inner EBE gradient stays on FD for LTBS
-/// (covariance stability), asserted below.
+/// FD of the log-scale production predictor. The inner EBE gradient applies the same jet
+/// (#673), so both loops differentiate the same `ln(f/s)`.
 #[test]
 fn ltbs_tvcov_outer_matches_production() {
     let ltbs = |src: &str| {
@@ -6424,9 +6424,9 @@ fn iov_analytical_expr_scale_supported_and_gated() {
         "closed-form IOV + ExpressionScale obs_scale must be on the analytic path (#486)"
     );
     assert!(analytic_outer_gradient_available(&model));
-    // + LTBS is served on the OUTER gradient now (#486): `subject_sensitivities_iov`
-    // applies the `ln(f)` jet after the in-walk scale quotient, reproducing `ln(f/s)`.
-    // (The inner EBE gradient still declines via `analytic_inner_common_bail`.)
+    // + LTBS is served on BOTH loops now (#486): `subject_sensitivities_iov` and
+    // `run_obs_iov_eta` each apply the `ln(f)` jet after their own scale quotient,
+    // reproducing `ln(f/s)`.
     let mut ltbs = parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse");
     ltbs.log_transform = true;
     assert!(
