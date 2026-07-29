@@ -121,7 +121,7 @@ pub enum OdeMethod {
     /// for a fit that is accuracy-limited rather than stability-limited, where step count
     /// scales as `tol^(−1/p)` and order is what pays. Worth it at tight tolerances
     /// (`ode_reltol ≤ 1e-8`); at loose ones RK45's cheaper steps win. See
-    /// [`crate::ode::verner`].
+    /// [`crate::ode::explicit_rk`].
     Vern7,
 }
 
@@ -298,7 +298,10 @@ pub(crate) trait Stepper<T: PkNum> {
 pub(crate) fn make_stepper<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn Stepper<T>> {
     match method {
         OdeMethod::Rk45 => Box::new(Rk45Stepper::new(n)),
-        OdeMethod::Vern7 => Box::new(super::verner::Vern7Stepper::new(n)),
+        OdeMethod::Vern7 => Box::new(super::explicit_rk::ErkStepper::new(
+            n,
+            &super::explicit_rk::VERN7,
+        )),
         stiff => Box::new(super::rosenbrock::RosStepper::new(n, stiff)),
     }
 }

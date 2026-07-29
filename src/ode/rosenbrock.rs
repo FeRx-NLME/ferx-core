@@ -764,7 +764,7 @@ impl<T: PkNum> RosStepper<T> {
         match self.method {
             OdeMethod::Rodas4 => Some(&RODAS4),
             OdeMethod::Rodas5P => Some(&RODAS5P),
-            OdeMethod::Rosenbrock23 | OdeMethod::Rk45 | OdeMethod::Vern7 => None,
+            _ => None,
         }
     }
 }
