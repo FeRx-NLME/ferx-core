@@ -1552,9 +1552,13 @@ fn third_order_sensitivities_layouts_and_values() {
         }
     }
     // The stencil above collapses to a 2nd difference in η₀ times a 1st in η₁.
+    // Spelled through a named indexer rather than the literal `(0*n+0)*n+1`: the whole point
+    // of this test is the row-major layout, so the index arithmetic should read as
+    // `[a][b][c]` and not as an expression clippy can (correctly) call always-zero.
+    let idx3 = |a: usize, b: usize, c: usize| (a * n_eta + b) * n_eta + c;
     for (j, o) in cov.obs.iter().enumerate() {
         let reference = acc[j] / (8.0 * h * h * h);
-        let got = o.d3f_deta3[(0 * n_eta + 0) * n_eta + 1];
+        let got = o.d3f_deta3[idx3(0, 0, 1)];
         assert!(
             (reference - got).abs() < 5e-3 * scale.max(got.abs()),
             "obs {j}: d3f_deta3[0,0,1] = {got} vs f64 triple-difference {reference}"

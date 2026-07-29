@@ -225,13 +225,16 @@ section of the SDLC for the versioning policy).
   objective. The finite-difference stencil evaluated the objective `~2·n_free²` times, each
   re-solving every subject's inner loop, and amplified error as `1/h²`; the analytic route
   costs `2N+1` sensitivity evaluations per subject (`N = n_theta + n_eta`) with **no inner
-  re-solve**, and has no `fd_hessian_step` to tune. Measured on warfarin: agreement with the
+  re-solve** beyond the single reconvergence at the converged point, and has no
+  `fd_hessian_step` to tune. Measured on warfarin: agreement with the
   reconverged finite difference to `8.2e-5`, at 3.0× the speed per subject. Out-of-scope models
   (ODE, LTBS, IOV, M3/BLOQ censoring, expression scaling, Form-C readouts, `iiv_on_ruv`,
-  correlated or custom-magnitude residuals, time-varying covariates) keep the finite-difference
-  covariance unchanged — it is correct for all of them — and a single out-of-scope subject drops
-  the whole population back to it rather than mixing two approximations in one matrix. Set
-  `analytic_cov_hessian = false` in `[fit_options]` to force finite differences.
+  correlated or custom-magnitude residuals, time-varying covariates, FREM, covariate-selected
+  error models, non-Gaussian endpoints, `method = laplace`/`agq`, and `gradient = fd`) keep the
+  finite-difference covariance unchanged — it is correct for all of them — and a single
+  out-of-scope subject drops the whole population back to it rather than mixing two
+  approximations in one matrix. Set `analytic_cov_hessian = false` in `[fit_options]` to force
+  finite differences.
 
 - **Exact analytic inner (EBE) gradients for log-transform-both-sides under inter-occasion
   variability** (#486). Fitting a closed-form model that combines `log(DV) ~ additive(...)`

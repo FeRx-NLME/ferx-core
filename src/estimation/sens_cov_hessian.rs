@@ -1033,7 +1033,12 @@ fn foce0_sigma(model: &CompiledModel, cmts: &[usize], f0: &[f64], sigma: &[f64])
 /// `(gradient, hessian)` pair; both share the SB setup. `None` outside scope or on
 /// a BLOQ-censored subject (FOCE M3 censoring is a separate path). The moving-mode
 /// (`η̂`-response) terms are added by the caller — this is the frozen part.
-#[allow(clippy::type_complexity, dead_code)]
+// Reachable only from this module's tests, which pin it against a frozen-mode FD
+// reference. Said with `#[cfg(test)]` rather than by suppressing `dead_code`, so a future
+// production caller disappearing is a compile error here instead of a silent allow (PR #953
+// review, lower-priority items).
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
 fn foce_sb_fixed_natural(
     model: &CompiledModel,
     subject: &Subject,
@@ -1731,7 +1736,7 @@ mod tests {
     use crate::parser::model_parser::parse_model_string;
     use crate::sens::provider::{subject_sensitivities, subject_sensitivities_cov};
     use crate::types::{
-        BloqMethod, CompiledModel, DoseEvent, ModelParameters, OmegaMatrix, Subject,
+        BloqMethod, CompiledModel, DoseEvent, GradientMethod, ModelParameters, OmegaMatrix, Subject,
     };
     use std::collections::HashMap;
 
@@ -1822,8 +1827,9 @@ mod tests {
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_l2: Vec::new(),
-            obs_records: vec![],
-            #[cfg(feature = "survival")]
+            // Declared unconditionally since Phase 4.0 — the `#[cfg(feature = "survival")]`
+            // duplicate this fixture carried over from the ported branch broke
+            // `--features survival` with E0062 (PR #953 review finding 6).
             obs_records: vec![],
         };
         let eta_ref = [0.12, -0.08, 0.2];
@@ -2755,5 +2761,56 @@ mod tests {
         subj_cens.cens[3] = 1;
         assert!(subject_packed_cov_hessian(&model, &subj_cens, &params, &x, &eta).is_none());
         assert!(subject_packed_cov_hessian_foce(&model, &subj_cens, &params, &x, &eta).is_none());
+        model.bloq_method = BloqMethod::Drop;
+
+        // ── PR #953 review: clauses added after the gate was found narrower than the
+        // objective it replaces. Each is a *silent* wrong-number failure if it declines to
+        // decline — the assembly returns a plausible, finite, positive-definite Hessian —
+        // so each gets its own assertion rather than trusting the list is complete.
+
+        // `gradient = fd` is the user's opt-out from analytic sensitivities (finding 9).
+        model.gradient_method = GradientMethod::Fd;
+        assert!(subject_packed_cov_hessian(&model, &subject, &params, &x, &eta).is_none());
+        assert!(subject_packed_cov_hessian_foce(&model, &subject, &params, &x, &eta).is_none());
+        model.gradient_method = GradientMethod::Auto;
+
+        // FREM: covariate pseudo-observation rows need `EPSCOV²` via `build_frem_r_override`,
+        // which this assembly does not consult — it would score them with the PK error model
+        // and report wrong SEs for exactly the covariate ω block (finding 2, the covariance
+        // twin of PR #844).
+        model.frem_config = Some(crate::types::FremConfig {
+            fremtype_to_indices: HashMap::new(),
+            covariate_sigma_index: 0,
+        });
+        assert!(subject_packed_cov_hessian(&model, &subject, &params, &x, &eta).is_none());
+        assert!(subject_packed_cov_hessian_foce(&model, &subject, &params, &x, &eta).is_none());
+        model.frem_config = None;
+
+        // A `Selected` spec keys endpoints by covariate branch, not by the CMT column the
+        // assembly reads — every row would be scored against branch 1's sigma (finding 3).
+        let saved_spec = std::mem::replace(
+            &mut model.error_spec,
+            crate::types::ErrorSpec::Selected {
+                selector: crate::types::ErrorSelector {
+                    eval: Box::new(|_| 0),
+                    branch_labels: vec!["else".to_string()],
+                },
+                endpoints: HashMap::new(),
+            },
+        );
+        assert!(subject_packed_cov_hessian(&model, &subject, &params, &x, &eta).is_none());
+        assert!(subject_packed_cov_hessian_foce(&model, &subject, &params, &x, &eta).is_none());
+        model.error_spec = saved_spec;
+
+        // Back in scope once every flip is undone — otherwise the assertions above could all
+        // be passing for some unrelated reason introduced between them.
+        assert!(subject_packed_cov_hessian(&model, &subject, &params, &x, &eta).is_some());
+        assert!(subject_packed_cov_hessian_foce(&model, &subject, &params, &x, &eta).is_some());
+
+        // Not covered here: `has_non_gaussian()` (finding 4) is unconditionally `false`
+        // without the `survival` feature, so the clause cannot be exercised from a default
+        // build — it mirrors `analytic_outer_gradient_available`'s own clause, which has the
+        // same limitation. The flip-flop reroute (finding 5) is likewise parameter-dependent
+        // and lives in `subject_sensitivities_cov`, not in a model-level field.
     }
 }

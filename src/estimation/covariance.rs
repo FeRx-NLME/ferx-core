@@ -496,18 +496,36 @@ fn analytic_cov_hessian(
     use crate::estimation::sens_cov_hessian::{
         subject_packed_cov_hessian, subject_packed_cov_hessian_foce,
     };
+    // The objective this assembly differentiates is the FOCE/FOCEI marginal. When
+    // `agq_nodes()` is `Some` — `method = laplace` at any node count, or `method = focei`
+    // with `n_agq > 1` — the fit minimised the AGQ marginal instead, under an anchor that
+    // may not even be H̃ (`HessianAnchor::Exact` for Laplace), and with a quadrature
+    // correction this assembly has no term for. `pop_nll_opts` exists precisely so no
+    // production site reports "standard errors for a likelihood it never optimised"; the
+    // analytic path bypasses that helper, so it must repeat its dispatch condition here
+    // (PR #953 review finding 1).
+    if options.agq_nodes().is_some() {
+        return None;
+    }
     // IOV is out of scope: the assembly is written over the η-only random-effect block, not
-    // the stacked `[η, κ]` one.
-    if population
-        .subjects
-        .iter()
-        .any(|s| !s.dose_occasions.is_empty() && model.n_kappa > 0)
-    {
+    // the stacked `[η, κ]` one. `subject_sensitivities_cov` declines `n_kappa > 0` itself,
+    // so this is a fast population-level exit, not the load-bearing check.
+    if model.n_kappa > 0 {
         return None;
     }
     let n = x_hat.len();
     let mut acc = DMatrix::<f64>::zeros(n, n);
     for (subject, eta_hat) in population.subjects.iter().zip(eta_hats.iter()) {
+        // Cooperative cancel. The FD stencil checks on every perturbed point; this loop is
+        // `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs) assembly per
+        // subject, and for the default `covariance_method = r` there is no later checkpoint
+        // — so without this, the Ctrl-C affordance `saem.rs` advertises before the
+        // covariance step (#893) was inoperative. Returning `None` alone would drop into
+        // the *more* expensive FD stencil; the caller re-checks the flag and reports
+        // cancelled instead (PR #953 review finding 10).
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return None;
+        }
         let h = if options.interaction {
             subject_packed_cov_hessian(model, subject, template, x_hat, eta_hat.as_slice())
         } else {
@@ -627,7 +645,27 @@ pub(crate) fn compute_covariance(
         2.0 * foce_nll
     };
 
-    let base_ofv = ofv(x_hat);
+    // Reconverge once at `x_hat` and keep the result. Both consumers need it: the base OFV
+    // for the FD stencil, and — as of #953 review finding 8 — the analytic path's η̂.
+    //
+    // The analytic assembly is derived under stationarity (`∂lᵢ/∂η|_η̂ = 0`): both the M2
+    // envelope term `−M_ξᵀH⁻¹M_ζ` and the `inner_eta_responses` chain assume it. Feeding it
+    // the modes converged during the fit at `inner_tol` would make `cov_inner_tol` a silent
+    // no-op on this path, so a user who fits loose and then sets `cov_inner_tol = 1e-10`
+    // for trustworthy SEs would get bit-identical contaminated numbers with no diagnostic.
+    // Reconverging here costs one population inner solve — the thing the FD stencil pays
+    // `~2·n_free²` times.
+    let (base_params, base_eta_hats, base_h_matrices, base_kappas) = reconverge_point(x_hat);
+    let base_ofv = 2.0
+        * pop_nll_opts(
+            model,
+            population,
+            &base_params,
+            &base_eta_hats,
+            &base_h_matrices,
+            &base_kappas,
+            options,
+        );
     if !base_ofv.is_finite() {
         // Diagnose: check Omega conditioning to distinguish Omega collapse from
         // a model-evaluation overflow/underflow.
@@ -690,10 +728,17 @@ pub(crate) fn compute_covariance(
     // nothing — most of the cost it exists to remove, and a claim of "no inner re-solve" that
     // the code did not honour.
     let analytic_hess: Option<DMatrix<f64>> = if options.analytic_cov_hessian {
-        analytic_cov_hessian(model, population, template, x_hat, eta_hats, options)
+        // `base_eta_hats`, not `eta_hats` — the modes reconverged at `cov_inner_tol`, which
+        // is what the stationarity assumption in the assembly needs (see above).
+        analytic_cov_hessian(model, population, template, x_hat, &base_eta_hats, options)
     } else {
         None
     };
+    // A cancel during the analytic loop surfaces as `None`; without this the fallback would
+    // start the *more* expensive FD stencil instead of stopping.
+    if analytic_hess.is_none() && crate::cancel::is_cancelled(&options.cancel) {
+        return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
+    }
 
     // Adaptively select the FD step: halve up to 8× until all free-parameter
     // diagonal stencils are finite. Most models use the initial step; halving

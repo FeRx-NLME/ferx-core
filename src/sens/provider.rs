@@ -4228,7 +4228,33 @@ pub fn subject_sensitivities_cov(
     // plausible, wrong Hessian, i.e. wrong standard errors with no symptom. So the scope is
     // asserted positively here and kept deliberately narrow; everything else keeps the
     // finite-difference covariance, which is correct for all of them.
+    //
+    // The clauses below are aligned with the exclusions `analytic_outer_gradient_available`
+    // and `pop_nll_opts` already encode, rather than derived independently — PR #953 review
+    // findings 2/4/5/9 were all the same mistake, a gate written from scratch that then
+    // disagreed with the two predicates that had already enumerated this scope.
     if !analytical_supported(model)
+        // `gradient = fd` is the user's opt-out from analytic sensitivities. It is the
+        // first clause of `analytic_outer_gradient_available` for the same reason: someone
+        // who hit a bad `Dual2` result and set this must not still receive a covariance
+        // R-matrix built from third-order differences of those same jets.
+        || matches!(model.gradient_method, GradientMethod::Fd)
+        // Non-Gaussian data terms (TTE / discrete / CTMM) fold their likelihood *and* an
+        // FD η-Hessian into `hrh`/`log|H̃|` inside `foce_subject_nll`. The Gaussian `sens/`
+        // assembly cannot express either, so it would silently omit the survival/discrete
+        // information — over-optimistic SEs. Same clause, same reason, as the outer gradient.
+        || model.has_non_gaussian()
+        // FREM substitutes `EPSCOV²` on covariate pseudo-observation rows via
+        // `build_frem_r_override` and suppresses `mult_row`/`ruv` there. This assembly calls
+        // `error_spec.variance_at` / `dvar_df` directly, so it would score those rows with
+        // the PK error model — wrong SEs for exactly the covariate ω block a FREM run
+        // exists to estimate. The gradient twin of this was PR #844.
+        || model.frem_config.is_some()
+        // A `Selected` spec keys endpoints by covariate branch, decoupled from the CMT
+        // column (which is typically all-1 on an analytical single-endpoint model). The
+        // assembly reads `subject.obs_cmts` directly rather than `ErrorSpec::obs_keys`, so
+        // every row would be scored against branch 1's sigma.
+        || matches!(model.error_spec, crate::types::ErrorSpec::Selected { .. })
         || model.log_transform
         || model.n_kappa > 0
         || !matches!(model.scaling, ScalingSpec::None)
@@ -4244,6 +4270,29 @@ pub fn subject_sensitivities_cov(
             .as_ref()
             .is_none_or(|p| !prog_covers_required_pk_slots(model, p))
     {
+        return None;
+    }
+
+    // `subject_routes_to_event_walk` above is **not** the whole routing story, and this is
+    // the second reroute it does not see. `subject_sensitivities` calls
+    // `effective_model_for_eval`, which sends a transit/IG subject to its
+    // `absorption_ode_equivalent` whenever `absorption_flip_flop_at` holds — a
+    // *parameter-dependent* decision the model-level gate cannot make. On that route the
+    // differenced quantity is an adaptive-step RK45 solution, not a machine-precision
+    // closed form: the controller changes its step sequence discontinuously under the
+    // `h ≈ ε^(1/3)·(1+|x|) ≈ 6e-6` perturbation used here, so the difference would divide
+    // integrator noise (~`ode_reltol`) by `1.2e-5` and return the third-order tensors as
+    // noise. The `ε^(1/3)` step is only justified because the differenced quantity is
+    // exact; where that premise fails, decline (PR #953 review finding 5).
+    //
+    // Checked at every evaluated point, not just the base one — a subject sitting on the
+    // flip-flop boundary can be closed-form at `x` and rerouted at `x ± h`.
+    let closed_form_at = |t: &[f64], e: &[f64]| -> bool {
+        crate::pk::effective_model_for_eval(model, subject, t, e)
+            .ode_spec
+            .is_none()
+    };
+    if !closed_form_at(theta, eta) {
         return None;
     }
 
@@ -4274,6 +4323,9 @@ pub fn subject_sensitivities_cov(
             em[k] -= h;
             h
         };
+        if !closed_form_at(&tp, &ep) || !closed_form_at(&tm, &em) {
+            return None;
+        }
         plus.push(subject_sensitivities(model, subject, &tp, &ep)?);
         minus.push(subject_sensitivities(model, subject, &tm, &em)?);
         steps.push(h);
