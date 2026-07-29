@@ -3682,6 +3682,326 @@ fn form_c_binding_readout_provider_matches_fd() {
     }
 }
 
+/// A Form-C readout referencing θ/η **directly** — `y = central/V * TVSCALE + ETA_SC`, where
+/// `TVSCALE`/`ETA_SC` are a declared theta/omega used nowhere else — on the **closed-form**
+/// engine (#486).
+///
+/// The ODE engine has desugared a bare θ/η in the readout into a synthetic individual
+/// parameter since #631, so its direct-θ/η readouts are analytic; the closed-form engine
+/// simply never ran that pass (`collect_readout_theta_eta_synth` was gated on `is_ode`), so
+/// the bare `PushTheta`/`PushEta` ops survived into the readout bytecode, `dual_evaluable`
+/// stayed false, and every such subject dropped to FD. The desugaring is engine-agnostic —
+/// what differed is only where the synthetic parameter's PK slot comes from, which on the
+/// analytical engine is the spare region `allocate_readout_extra_slots` owns.
+///
+/// Pins the whole chain, not just the gate: the model must be in analytic scope, the θ and η
+/// the readout references directly must carry **non-zero** derivatives (a synthetic parameter
+/// that never reached `pk_var_slots` reads as a silent zero jet, not an error — the #652
+/// trap), and value + all first/second η/θ derivatives must match central FD of the
+/// readout-aware production predictor.
+const ONECPT_IV_DIRECT_THETA_ETA_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVSCALE(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_SC ~ 0.05
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V * TVSCALE + ETA_SC
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+#[test]
+fn form_c_direct_theta_eta_readout_closed_form_matches_fd() {
+    let m = parse_model_string(ONECPT_IV_DIRECT_THETA_ETA_READOUT).expect("parse direct-θ/η");
+    assert!(
+        analytical_supported(&m),
+        "a direct-θ/η closed-form readout is desugared and must stay analytic (#486)"
+    );
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 2.0, 6.0, 12.0],
+    );
+    let theta = [0.2, 10.0, 1.5];
+    let eta = [0.12, -0.08, 0.05];
+    check_full_provider_vs_fd(&m, &s, &theta, &eta);
+
+    let full = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+    // TVSCALE is θ index 2, ETA_SC is η index 2. Both reach the prediction ONLY through the
+    // readout, so if the desugaring did not give them a real differentiable slot these read
+    // exactly 0.0 while everything else still matches FD — the failure mode worth pinning.
+    let max_dtheta = full
+        .obs
+        .iter()
+        .map(|o| o.df_dtheta[2].abs())
+        .fold(0.0_f64, f64::max);
+    let max_deta = full
+        .obs
+        .iter()
+        .map(|o| o.df_deta[2].abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_dtheta > 1e-6,
+        "∂y/∂TVSCALE must be non-zero — the synthetic readout param needs a real PK slot"
+    );
+    assert!(
+        max_deta > 1e-6,
+        "∂y/∂ETA_SC must be non-zero — the synthetic readout param needs a real PK slot"
+    );
+
+    // The light inner η-gradient must agree with the full provider's η block, so the EBE
+    // loop and the population loop see the same readout derivative.
+    let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light supported");
+    assert_eq!(light.len(), full.obs.len());
+    for (lo, fo) in light.iter().zip(full.obs.iter()) {
+        for k in 0..m.n_eta {
+            approx::assert_relative_eq!(
+                lo.df_deta[k],
+                fo.df_deta[k],
+                max_relative = 1e-9,
+                epsilon = 1e-12
+            );
+        }
+    }
+}
+
+/// A readout whose accepted parameters push the differentiated-slot count past the
+/// closed-form dispatch tables must report **FD**, not "analytic" (PR #950 review #2).
+///
+/// `analytical_supported_core` checks that every slot *maps* via `slot_to_dim` but never
+/// bounded how many there are, while `subject_sensitivities` / `subject_eta_grad` dispatch
+/// through `const_dispatch!(slots.len(); 1..=9)`. So a model that claimed enough spare slots
+/// reported "analytic" through `build_info::gradient_method{,_inner}` and then fell through
+/// the `_ => None` arm on *every* subject, running the whole fit on finite differences at
+/// ~10× the cost with the persisted label saying otherwise.
+///
+/// The fixture reaches 10 through the #486 path specifically: `three_cpt_oral` binds 8
+/// structural slots (cl, v, q, v2, q3, v3, ka, f), and the two synthetic parameters for the
+/// readout's direct `TVOFF` / `ETA_OFF` take the only two free ones (`N`, `MTT`). The
+/// assertions are ordered gate-then-route so the test fails loudly if the two ever disagree
+/// again in either direction.
+const THREECPT_ORAL_READOUT_SLOT_OVERFLOW: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 10.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVQ3(0.3, 0.001, 10.0)
+  theta TVV3(30.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVF(0.9, 0.01, 1.0)
+  theta TVOFF(0.1, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.05
+  omega ETA_OFF ~ 0.02
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  Q  = TVQ
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA * exp(ETA_KA)
+  F  = TVF
+[structural_model]
+  pk three_cpt_oral(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3, ka=KA, f=F)
+[scaling]
+  y = central / V + TVOFF + ETA_OFF
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+#[test]
+fn readout_slot_overflow_reports_fd_not_analytic() {
+    let m = parse_model_string(THREECPT_ORAL_READOUT_SLOT_OVERFLOW).expect("parse slot-overflow");
+    let n_slots = m
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("program")
+        .pk_slots()
+        .len();
+    // Guard the premise: if a future layout change stops overflowing, this test would
+    // silently stop testing anything.
+    assert!(
+        n_slots > super::MAX_CLOSED_FORM_SLOTS,
+        "fixture must exceed the dispatch tables to be a regression test; got {n_slots} slots"
+    );
+    assert!(
+        !analytical_supported(&m),
+        "a model wider than the closed-form dispatch tables must report FD, not analytic"
+    );
+    // The route the label now matches: both providers decline every subject.
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 2.0, 6.0, 12.0],
+    );
+    let theta = [0.2, 10.0, 0.5, 20.0, 0.3, 30.0, 1.0, 0.9, 0.1];
+    let eta = [0.1, -0.05, 0.08, 0.03];
+    assert!(
+        subject_sensitivities(&m, &s, &theta, &eta).is_none(),
+        "the outer provider falls through const_dispatch's `_ => None` at this width"
+    );
+    assert!(
+        subject_eta_grad(&m, &s, &theta, &eta).is_none(),
+        "the inner provider falls through const_dispatch's `_ => None` at this width"
+    );
+}
+
+/// Synthetic readout parameters must not escape into anything user-facing (PR #950 review
+/// #3/#4). The desugaring appends `__ferx_ro_th{i} = THETA(i)` / `__ferx_ro_eta{k} = ETA(k)`
+/// to `[individual_parameters]`, which puts them in front of every consumer of that list.
+///
+/// Two leaks are pinned here because both produce output the user cannot act on:
+///   * `eta_param_info` — a bare `Expression::Eta(k)` matches none of `classify_expr`'s
+///     patterns, so it fell to the `Custom` arm and reached `FitResult.eta_param_info` (hence
+///     ferx-r's parameter table) under a parser-internal name. A `Custom` entry additionally
+///     flips `resolve_param_derivs` / `subject_eta_grad`'s "all LogNormal" fallback to `None`,
+///     dropping the model to FD whenever the program path is unavailable.
+///   * the mu-referencing warning — `detect_mu_refs` has no pattern for a bare `Eta`, so the
+///     synthetic landed in the "not mu-referenced" list and the user was advised to rewrite
+///     a parameter that does not exist in their model file.
+///
+/// Both predate #486 on the ODE engine (which has appended these since #631, and
+/// `classify_indiv_params` runs after both append sites); extending the desugaring to the
+/// closed-form engine doubled the exposure, so the filters go in here.
+#[test]
+fn synthetic_readout_params_stay_out_of_user_facing_output() {
+    for (label, src) in [
+        ("closed-form", ONECPT_IV_DIRECT_THETA_ETA_READOUT),
+        ("ode", ONECPT_ODE_DIRECT_THETA_ETA_READOUT),
+    ] {
+        let m = parse_model_string(src).expect("parse direct-θ/η");
+        // Premise: the desugaring actually ran, so the assertions below are not vacuous.
+        assert!(
+            m.indiv_param_names
+                .iter()
+                .any(|n| crate::parser::model_parser::is_synthetic_readout_param(n)),
+            "[{label}] fixture must desugar a direct θ/η into a synthetic parameter"
+        );
+        assert!(
+            !m.eta_param_info.iter().any(|e| {
+                crate::parser::model_parser::is_synthetic_readout_param(&e.individual_param_name)
+            }),
+            "[{label}] a parser-internal parameter must not reach FitResult.eta_param_info"
+        );
+        if let Some(w) = crate::api::saem_non_mu_referenced_individual_params_warning(&m) {
+            assert!(
+                !w.contains("__ferx_ro_"),
+                "[{label}] the mu-referencing warning must not name a parameter the user \
+                 never wrote; got: {w}"
+            );
+        }
+    }
+}
+
+/// ODE twin of [`ONECPT_IV_DIRECT_THETA_ETA_READOUT`], for the leak test above: the ODE
+/// engine has desugared direct θ/η readouts since #631, so both engines must filter.
+const ONECPT_ODE_DIRECT_THETA_ETA_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVSCALE(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_SC ~ 0.05
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode_template one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V * TVSCALE + ETA_SC
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The analytical engine's **synthetic-slot overflow** branch: when the spare region cannot
+/// seat every direct θ/η the readout names, all of them are dropped, the readout keeps the
+/// pre-#486 FD fallback, and the parse warning says so (PR #950 review #5/#10).
+///
+/// Three things are pinned, because each fails differently:
+///   * the accepted set is empty — no `__ferx_ro_*` parameter is appended;
+///   * dropping them really does leave `dual_evaluable = false`, so `analytical_supported`
+///     reports FD. If it did not, the model would take the analytic path with the bare
+///     `PushTheta`/`PushEta` ops still in the readout bytecode and return a **zero jet** on
+///     those axes — a wrong gradient reported as analytic, not a fallback;
+///   * the warning quotes the *analytical* pool (2 free slots here — `N` and `MTT`), not
+///     `MAX_PK_PARAMS`. Quoting 128 to a user whose model has 2 misstates their headroom by
+///     an order of magnitude and makes the suggested remedy unactionable.
+const THREECPT_ORAL_READOUT_SYNTH_DROPPED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 10.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVQ3(0.3, 0.001, 10.0)
+  theta TVV3(30.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVF(0.9, 0.01, 1.0)
+  theta TVOFF(0.1, 0.001, 10.0)
+  theta TVSLP(1.2, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.05
+  omega ETA_OFF ~ 0.02
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  Q  = TVQ
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA * exp(ETA_KA)
+  F  = TVF
+[structural_model]
+  pk three_cpt_oral(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3, ka=KA, f=F)
+[scaling]
+  y = central / V * TVSLP + TVOFF + ETA_OFF
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+#[test]
+fn readout_synth_overflow_drops_to_fd_with_engine_correct_note() {
+    let m = parse_model_string(THREECPT_ORAL_READOUT_SYNTH_DROPPED).expect("parse synth-overflow");
+    // Three distinct direct θ/η (TVSLP, TVOFF, ETA_OFF) into a 2-slot pool.
+    assert!(
+        !m.indiv_param_names
+            .iter()
+            .any(|n| crate::parser::model_parser::is_synthetic_readout_param(n)),
+        "an overflowing synthetic set must be dropped whole, not partially appended"
+    );
+    assert!(
+        !analytical_supported(&m),
+        "dropping the synthetics must leave the readout non-dual-evaluable so the model \
+         reports FD — otherwise those axes return a silent zero jet"
+    );
+    // Not the generic #650 "this readout falls back to FD" notice — the #486 sizing note,
+    // which is the one that quotes a slot count.
+    let note = m
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("more PK slot(s)"))
+        .expect("the FD-fallback sizing note must be surfaced to the user");
+    assert!(
+        note.contains("needs 1 more PK slot(s) than the 2-slot layout has free"),
+        "the note must quote the analytical spare pool, not MAX_PK_PARAMS; got: {note}"
+    );
+}
+
 /// The fluconazole case: a readout gated on a **per-row** covariate (`FREE`)
 /// makes the subject a time-varying-covariate subject, so it routes to the
 /// event-walk provider. The readout is served analytically there too (#650):
@@ -4100,8 +4420,8 @@ fn provider_ltbs_matches_production() {
 /// transform LAST, after scaling — the same helper the dose-superposition outer uses).
 /// Validated over plain LTBS and LTBS + an `ExpressionScale` `obs_scale = 1000/V` divisor
 /// (production's scale-then-log order `ln(f/s)` is reproduced post-walk) against central
-/// FD of the log-scale production predictor. The inner EBE gradient stays on FD for LTBS
-/// (covariance stability), asserted below.
+/// FD of the log-scale production predictor. The inner EBE gradient applies the same jet
+/// (#673), so both loops differentiate the same `ln(f/s)`.
 #[test]
 fn ltbs_tvcov_outer_matches_production() {
     let ltbs = |src: &str| {
@@ -6424,9 +6744,9 @@ fn iov_analytical_expr_scale_supported_and_gated() {
         "closed-form IOV + ExpressionScale obs_scale must be on the analytic path (#486)"
     );
     assert!(analytic_outer_gradient_available(&model));
-    // + LTBS is served on the OUTER gradient now (#486): `subject_sensitivities_iov`
-    // applies the `ln(f)` jet after the in-walk scale quotient, reproducing `ln(f/s)`.
-    // (The inner EBE gradient still declines via `analytic_inner_common_bail`.)
+    // + LTBS is served on BOTH loops now (#486): `subject_sensitivities_iov` and
+    // `run_obs_iov_eta` each apply the `ln(f)` jet after their own scale quotient,
+    // reproducing `ln(f/s)`.
     let mut ltbs = parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse");
     ltbs.log_transform = true;
     assert!(

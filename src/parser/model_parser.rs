@@ -819,6 +819,20 @@ fn classify_indiv_params(
     for s in stmts {
         match s {
             Statement::Assign(param_name, expr) => {
+                // Parser-internal readout parameters (#486) are not user parameterisations and
+                // must not produce an `EtaParamInfo`. `__ferx_ro_eta{k} = ETA(k)` is a bare
+                // `Expression::Eta`, which `classify_expr` has no pattern for, so it would fall
+                // to the `Custom` arm below and surface in `FitResult.eta_param_info` (hence
+                // ferx-r's parameter table) under a name the user never wrote. Worse, a single
+                // `Custom` entry flips `resolve_param_derivs` / `subject_eta_grad`'s
+                // "all LogNormal" fallback to `None`, dropping the whole model to FD whenever
+                // the program path is unavailable. Applies to both engines: the ODE half of
+                // this desugaring has appended such statements since #631, and
+                // `classify_indiv_params` runs after both append sites (PR #950 review #4).
+                if is_synthetic_readout_param(param_name) {
+                    continue;
+                }
+
                 if let Some(c) = classify_expr(expr, n_theta) {
                     apply_class(
                         c,
@@ -1285,13 +1299,15 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // (which all consume `indiv_var_names` / `indiv_stmts`) so the synthetic params
     // get slots, values, and partials like any individual parameter. Only `y`
     // readouts are scanned; `obs_scale` θ/η stays with `ScaleDerivProgram`.
-    let mut readout_synth_params: Vec<ReadoutSynthParam> = if is_ode {
-        match blocks.get("scaling") {
-            Some(lines) => collect_readout_theta_eta_synth(lines, &theta_names, &eta_names)?,
-            None => Vec::new(),
-        }
-    } else {
-        Vec::new()
+    // Collected for BOTH engines (#486). The two differ only in *where the slots come from*:
+    // an ODE model routes every individual parameter through `ode_param_slots` (available a
+    // few lines below), so its synthetics are sized and appended here; an analytical model
+    // draws from the small spare region `allocate_readout_extra_slots` owns, and neither
+    // `pk_model` nor `pk_param_map` exists yet at this point — so the analytical append is
+    // deferred to that allocator (still before `build_pk_param_fn`, the real constraint).
+    let mut readout_synth_params: Vec<ReadoutSynthParam> = match blocks.get("scaling") {
+        Some(lines) => collect_readout_theta_eta_synth(lines, &theta_names, &eta_names)?,
+        None => Vec::new(),
     };
     // #486 — the `__ferx_ro_` (Form-C readout) and `__ferx_pktime_` (direct `pk(...=TIME)`
     // mapping) prefixes are reserved for synthetic individual parameters. Reject a
@@ -1325,32 +1341,20 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // the synthetics would overflow, keep the readout on the FD fallback (its prior
     // behaviour) instead of erroring, and note it.
     let mut readout_fd_fallback_note: Option<String> = None;
-    if !readout_synth_params.is_empty() {
-        let free = ode_free_slot_count(&indiv_var_names);
-        if readout_synth_params.len() > free {
-            let short = readout_synth_params.len() - free;
-            readout_fd_fallback_note = Some(format!(
-                "[scaling] y: a direct THETA/ETA reference in the readout needs {short} more PK \
-                 slot(s) than the {}-slot layout has free; the readout falls back to \
-                 finite-difference sensitivities. For analytic sensitivities, free up {short} \
-                 individual-parameter slot(s).",
-                crate::types::MAX_PK_PARAMS,
-            ));
-            readout_synth_params.clear();
+    if is_ode {
+        if !readout_synth_params.is_empty() {
+            let free = ode_free_slot_count(&indiv_var_names);
+            if readout_synth_params.len() > free {
+                readout_fd_fallback_note = Some(readout_synth_fd_note(
+                    readout_synth_params.len() - free,
+                    crate::types::MAX_PK_PARAMS,
+                ));
+                readout_synth_params.clear();
+            }
         }
-    }
-    for s in &readout_synth_params {
-        // The synthetic name carries the reserved `__ferx_ro_` prefix (rejected for
-        // user params by the guard above) and is BTreeSet-deduped, so it cannot
-        // collide; append it as a trailing individual parameter (value = θ_i / η_k,
-        // ∂p/∂θ_i = 1 / ∂p/∂η_k = 1).
-        indiv_var_names.push(s.name.clone());
-        let rhs = if s.is_eta {
-            Expression::Eta(s.idx)
-        } else {
-            Expression::Theta(s.idx)
-        };
-        indiv_stmts.push(Statement::Assign(s.name.clone(), rhs));
+        for s in &readout_synth_params {
+            append_readout_synth_param(s, &mut indiv_var_names, &mut indiv_stmts);
+        }
     }
 
     // The error rule (#322 Phase 0b): an ODE-only absorption input-rate function
@@ -1688,7 +1692,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // for ODE models and for models without such a readout.
     let structural_vars: std::collections::HashSet<String> =
         pk_param_map.values().cloned().collect();
-    let readout_extra_slots = allocate_readout_extra_slots(
+    let readout_alloc = allocate_readout_extra_slots(
         blocks.get("scaling"),
         &theta_names,
         &eta_names,
@@ -1697,7 +1701,25 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &analytical_modeled_slots,
         pk_model,
         is_ode,
+        &readout_synth_params,
     )?;
+    let readout_extra_slots = readout_alloc.slots;
+    // #486: the analytical half of the direct-θ/η readout desugaring. The ODE path appended
+    // its synthetics far upstream (its slot map was already known there); the analytical path
+    // could not size them until now, so it appends the accepted ones here — still before
+    // `build_pk_param_fn` below, which is what actually consumes `indiv_var_names`/`indiv_stmts`.
+    // Dropping the rest keeps `readout_synth_params` in step with the slots that exist, so
+    // `parse_scaling_block`'s rewrite only rewrites θ/η it can actually resolve; anything left
+    // bare keeps `dual_evaluable = false` and the readout falls back to FD, as before #486.
+    if !is_ode {
+        for s in &readout_alloc.accepted_synths {
+            append_readout_synth_param(s, &mut indiv_var_names, &mut indiv_stmts);
+        }
+        readout_synth_params = readout_alloc.accepted_synths;
+        if let Some(note) = readout_alloc.fd_note {
+            readout_fd_fallback_note = Some(note);
+        }
+    }
 
     let (pk_param_fn, referenced_covariates, mut indiv_param_partials, indiv_param_program) =
         build_pk_param_fn(
@@ -12014,13 +12036,16 @@ fn split_scaling_entry(trimmed: &str) -> Result<(&str, &str), String> {
     Ok((trimmed[..split_at].trim(), trimmed[split_at + 1..].trim()))
 }
 
-/// Scan a `[scaling]` block's `y = ...` readout entries for bare `THETA(i)` / `ETA(k)`
-/// references and synthesize one individual parameter per distinct reference (#486).
-/// Only `y` (Form-C readout) entries are scanned — `obs_scale` θ/η is differentiated
-/// separately by `ScaleDerivProgram`. Identifiers other than θ/η (states, individual
-/// parameters) parse as permissive covariate references here and are ignored; we only
-/// collect the θ/η axes. Returns the synthetic descriptors in a stable
-/// (θ-then-η, ascending index) order.
+/// Outcome of [`allocate_readout_extra_slots`]: the `(indiv param name, PK slot)` pairs the
+/// analytic Form-C readout needs, plus — for the analytical engine only — which synthetic
+/// θ/η parameters (#486) actually got a slot and, if they did not, the FD-fallback note.
+#[derive(Default)]
+struct ReadoutExtraSlots {
+    slots: Vec<(String, usize)>,
+    accepted_synths: Vec<ReadoutSynthParam>,
+    fd_note: Option<String>,
+}
+
 /// Allocate free `PkParams` slots to the **non-structural** individual parameters
 /// an analytic Form C readout references (#650), making them first-class
 /// differentiable parameters: `pk_param_fn` writes each value into its slot and the
@@ -12050,12 +12075,13 @@ fn allocate_readout_extra_slots(
     modeled_slots: &[(String, usize)],
     pk_model: PkModel,
     is_ode: bool,
-) -> Result<Vec<(String, usize)>, String> {
+    synth_params: &[ReadoutSynthParam],
+) -> Result<ReadoutExtraSlots, String> {
     if is_ode {
-        return Ok(Vec::new());
+        return Ok(ReadoutExtraSlots::default());
     }
     let Some(lines) = scaling_lines else {
-        return Ok(Vec::new());
+        return Ok(ReadoutExtraSlots::default());
     };
     let indiv_set: std::collections::HashSet<&str> =
         indiv_var_names.iter().map(|s| s.as_str()).collect();
@@ -12086,13 +12112,19 @@ fn allocate_readout_extra_slots(
             }
         });
     }
-    if referenced.is_empty() {
-        return Ok(Vec::new());
+    if referenced.is_empty() && synth_params.is_empty() {
+        return Ok(ReadoutExtraSlots::default());
     }
     let used: std::collections::HashSet<usize> = modeled_slots.iter().map(|&(_, s)| s).collect();
     let mut free: Vec<usize> = (0..=crate::types::PK_IDX_MTT)
         .filter(|&s| !pk_model.consumes_pk_slot(s) && !used.contains(&s))
         .collect();
+    // The pool THIS engine draws from, for the FD-fallback note. Not `MAX_PK_PARAMS`: the
+    // analytical allocator is confined to the differentiable spare region, so quoting the
+    // ODE layout would misstate the user's headroom tenfold (PR #950 review #5).
+    let layout_slots = free.len();
+    // Text-referenced parameters have priority and keep their pre-#486 hard failure: the user
+    // named them, so silently dropping the readout's analytic path would be the wrong answer.
     if referenced.len() > free.len() {
         return Err(format!(
             "[scaling] y: the analytic readout references {} non-structural individual \
@@ -12104,10 +12136,76 @@ fn allocate_readout_extra_slots(
             free.len(),
         ));
     }
-    free.truncate(referenced.len());
-    Ok(referenced.into_iter().zip(free).collect())
+    let remaining = free.split_off(referenced.len());
+    let mut slots: Vec<(String, usize)> = referenced.into_iter().zip(free).collect();
+    // Synthetic θ/η parameters are best-effort, mirroring the ODE sizing policy: a model that
+    // parsed before #486 (where a direct θ/η in the readout took no slot at all) must not start
+    // failing now, so an overflow drops them and the readout keeps its FD fallback.
+    let mut accepted_synths: Vec<ReadoutSynthParam> = Vec::new();
+    let mut fd_note: Option<String> = None;
+    if synth_params.len() > remaining.len() {
+        fd_note = Some(readout_synth_fd_note(
+            synth_params.len() - remaining.len(),
+            layout_slots,
+        ));
+    } else {
+        for (s, slot) in synth_params.iter().zip(remaining) {
+            slots.push((s.name.clone(), slot));
+            accepted_synths.push(s.clone());
+        }
+    }
+    Ok(ReadoutExtraSlots {
+        slots,
+        accepted_synths,
+        fd_note,
+    })
 }
 
+/// The documented FD-fallback warning when `short` synthetic readout parameters (#486) do
+/// not fit the PK-slot layout. Shared by the ODE and analytical sizing sites so the two
+/// cannot word the same condition differently.
+///
+/// `layout_slots` is the size of the pool the **calling engine** actually draws from, and the
+/// two differ by an order of magnitude: an ODE model allocates from the full
+/// [`MAX_PK_PARAMS`](crate::types::MAX_PK_PARAMS) (128) layout, while the analytical engine
+/// draws only from the differentiable spare region `0..=PK_IDX_MTT` minus the slots the closed
+/// form consumes — at most 11, typically 4–7. It is a parameter rather than a hard-coded
+/// constant because quoting the ODE figure in a warning the analytical allocator emitted told
+/// the user to free slots out of a layout their model never used (PR #950 review #5).
+fn readout_synth_fd_note(short: usize, layout_slots: usize) -> String {
+    format!(
+        "[scaling] y: a direct THETA/ETA reference in the readout needs {short} more PK \
+         slot(s) than the {layout_slots}-slot layout has free; the readout falls back to \
+         finite-difference sensitivities. For analytic sensitivities, free up {short} \
+         individual-parameter slot(s)."
+    )
+}
+
+/// Append one synthetic readout parameter as a trailing individual parameter
+/// (value = `θ_i` / `η_k`, so `∂p/∂θ_i = 1` / `∂p/∂η_k = 1`). The synthetic name carries the
+/// reserved `__ferx_ro_` prefix (rejected for user params upstream) and is BTreeSet-deduped,
+/// so it cannot collide. Shared by the ODE site and the analytical (deferred) one.
+fn append_readout_synth_param(
+    s: &ReadoutSynthParam,
+    indiv_var_names: &mut Vec<String>,
+    indiv_stmts: &mut Vec<Statement>,
+) {
+    indiv_var_names.push(s.name.clone());
+    let rhs = if s.is_eta {
+        Expression::Eta(s.idx)
+    } else {
+        Expression::Theta(s.idx)
+    };
+    indiv_stmts.push(Statement::Assign(s.name.clone(), rhs));
+}
+
+/// Scan a `[scaling]` block's `y = ...` readout entries for bare `THETA(i)` / `ETA(k)`
+/// references and synthesize one individual parameter per distinct reference (#486).
+/// Only `y` (Form-C readout) entries are scanned — `obs_scale` θ/η is differentiated
+/// separately by `ScaleDerivProgram`. Identifiers other than θ/η (states, individual
+/// parameters) parse as permissive covariate references here and are ignored; we only
+/// collect the θ/η axes. Returns the synthetic descriptors in a stable
+/// (θ-then-η, ascending index) order.
 fn collect_readout_theta_eta_synth(
     scaling_lines: &[String],
     theta_names: &[String],

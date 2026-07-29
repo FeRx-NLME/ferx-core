@@ -67,7 +67,7 @@ fn effective_cov_inner_tol_resolution() {
 }
 
 /// `effective_inner_tol` tightens the fit's inner tolerance to at most 1e-6 for the
-/// closed-form non-IOV LTBS path (reproducible flat-direction SEs), leaves other
+/// closed-form LTBS path (reproducible flat-direction SEs), leaves other
 /// models untouched, never loosens an already-tighter setting, and — crucially —
 /// honours an explicit user `inner_tol` (`user_set_keys`).
 #[test]
