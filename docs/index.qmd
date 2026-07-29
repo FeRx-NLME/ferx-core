@@ -9,7 +9,7 @@ ferx-core is a high-performance Nonlinear Mixed Effects (NLME) modeling engine w
 - **Gauss-Newton (BHHH)** -- Fast outer optimizer with Levenberg-Marquardt damping, plus a GN+FOCEI hybrid
 - **Importance Sampling (IMP) and SIR** -- For exact likelihood estimation and posterior sampling
 - **Analytical PK solutions** -- Built-in one-, two-, and three-compartment models (IV bolus, oral, infusion) with numerical stability guarantees
-- **ODE solver** -- Dormand-Prince RK45 adaptive integrator for custom kinetic models (e.g. Michaelis-Menten)
+- **ODE solver** -- Dormand-Prince RK45 adaptive integrator for custom kinetic models (e.g. Michaelis-Menten), plus Rosenbrock (`rodas4` / `rodas5p` / `rosenbrock23`) steppers for stiff systems
 - **SDE / diffusion models** -- Extended Kalman Filter path for stochastic differential equations via the `[diffusion]` block
 - **Analytic sensitivities** -- Hand-rolled `Dual2` forward sensitivities for fast, exact FOCE/FOCEI and HMC gradients
 - **Multiple error models** -- Additive, proportional, combined, and log-transform-both-sides (LTBS); per-CMT multi-endpoint models for joint PK/PD

@@ -149,7 +149,7 @@ A one-compartment oral model with saturable (Michaelis-Menten) elimination:
 
 ## Solver Details
 
-ferx-core uses a Dormand-Prince RK45 adaptive solver:
+ferx-core integrates with an adaptive Dormand-Prince RK45 solver by default:
 
 | Setting | Value |
 |---------|-------|
@@ -161,6 +161,103 @@ ferx-core uses a Dormand-Prince RK45 adaptive solver:
 | Minimum step size | 1e-12 |
 
 The solver automatically adapts step sizes based on local error estimates.
+
+### Stiff systems
+
+An explicit method like RK45 is *stability*-limited on a stiff system: it keeps shrinking
+the step to stay stable, not to meet your tolerance. The symptom is a fit that crawls, or an
+integration that silently exhausts `ode_max_steps` and freeze-pads the remainder of the
+segment. Stiffness in PK/PD models typically comes from a wide separation of time scales:
+
+- fast reversible binding on top of slow elimination (TMDD and quasi-equilibrium models);
+- Michaelis-Menten elimination with `KM` far below the observed concentrations;
+- long transit chains with a large `KTR`;
+- QSP / systems-pharmacology cascades mixing minute- and week-scale states.
+
+Set `ode_method` in `[fit_options]` to pick a different stepper:
+
+| `ode_method` | Order | Stages | Stiff? | Use for |
+|---|---|---|---|---|
+| `rk45` (default) | 5(4) | 7 | no | the general-purpose choice; fastest at default tolerances |
+| `vern7` (alias `verner7`) | 7(6) | 10 | no | **accuracy**-limited fits at tight tolerances (`ode_reltol` ≤ 1e-8) |
+| `rosenbrock23` (aliases `ros23`, `ode23s`) | 2(3) | 3 | yes | crude tolerances, rough right-hand sides |
+| `rodas4` | 4(3) | 6 | yes | the stiff workhorse at typical tolerances (1e-6 – 1e-9) |
+| `rodas5p` | 5(4) | 8 | yes | stiff systems at tight tolerances (`ode_reltol` ≤ 1e-9) |
+
+Note the two different axes. The Rosenbrock methods buy **stability**; `vern7` buys **order**.
+Which one helps depends on what is capping your step size, and picking the wrong one costs
+time without buying accuracy — see below.
+
+```
+[fit_options]
+  ode_method = rodas5p
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+```
+
+A stiff step is more expensive than an explicit one — it builds a finite-difference Jacobian
+(`n + 1` extra right-hand-side evaluations) and factorizes an `n × n` matrix once per step —
+so on a non-stiff one- to three-compartment model RK45 remains faster. Switch only when
+stiffness, not accuracy, is what is capping the step size.
+
+#### Which regime am I in?
+
+This matters, because a stiff solver does **not** speed up a fit that is merely *accurate*-
+limited. Run your model and look at the solver's step counts:
+
+- **Stability-limited (stiff).** Steps are tiny regardless of `ode_reltol`, and the
+  integration hits its minimum step or exhausts `ode_max_steps`. A stiff method is the fix,
+  and the win is large.
+- **Accuracy-limited.** Almost every step is accepted, nothing is min-step clamped, and
+  tightening `ode_reltol` is what drives the step count up. A stiff method will not help; what
+  helps is a *higher-order* method, or a looser tolerance if the model can afford it.
+
+The Savic transit anchor (`tests/transit_nonmem_anchor.rs`) at NONMEM-equivalent accuracy
+(`ode_reltol = ode_abstol = 1e-9`) is a measured example of the second regime — 97 % of steps
+accepted, zero min-step clamps — and the methods behave exactly as that diagnosis predicts:
+
+| `ode_method` | accepted steps | rejected | min-step clamped | wall-clock |
+|---|---|---|---|---|
+| `rk45` | 3 940 | 120 | 0 | 30.1 ms |
+| **`vern7`** | **1 420** | 140 | 0 | **20.9 ms** |
+| `rodas5p` | 4 060 | 180 | 0 | 79.7 ms |
+| `rodas4` | 16 200 | 120 | 0 | 272.2 ms |
+| `rosenbrock23` | 85 180 | 120 | 0 | 633.2 ms |
+
+`vern7` takes 2.8× fewer steps and is ~1.4× faster: higher order is what an accuracy-limited
+fit rewards. `rodas5p` takes the *same* number of steps as `rk45` and is 2.6× slower, because
+each step now buys a Jacobian and a factorization the fit does not need — and the lower-order
+stiff methods are worse still, ordered exactly as their convergence orders predict.
+
+The crossover is real, so do not switch blindly: on the same model at **default** tolerances
+`vern7` is ~1.7× *slower* than `rk45` (740 → 520 steps, but 10 stages per step instead of 6),
+because there is no accuracy pressure for its extra order to relieve. Tight tolerance →
+`vern7`; stability-limited → a Rosenbrock method; otherwise stay on `rk45`.
+
+::: {.callout-note}
+## In-step readouts under `vern7`
+Features that read state *between* solver steps — a joint PK-TTE hazard at event times, a CTMM
+occupancy grid, adaptive-dosing monitors — use each method's continuous extension. `vern7`
+interpolates with a cubic Hermite (its own continuous extension needs three extra stages), so
+those readouts are 3rd-order accurate even though its steps are 7th-order accurate. For a model
+that leans on in-step readouts at very tight tolerance, `rk45` or `rodas5p` interpolate closer
+to their own step accuracy.
+:::
+
+These methods are *linearly implicit*: one Jacobian and one matrix factorization per step,
+with no Newton iteration. That is also what lets ferx's analytic sensitivities
+(`∂ŷ/∂θ`, `∂ŷ/∂η`) run through the identical stepper, so switching methods does not move you
+off the analytic-gradient path.
+
+The stiff methods are full peers of `rk45`: every feature works with every method. Each
+method carries its own *continuous extension* (the polynomial that reconstructs the state
+between two solver steps), which is what the rest of the engine reads state through — the
+cumulative hazard at event times in a joint PK-TTE fit, a CTMM occupancy grid, `[output]`
+state columns, adaptive-dosing monitors, and time-to-event simulation, which locates the
+hazard crossing inside a step. Analytic sensitivities run through the same steppers too. So
+non-Gaussian endpoints, feedback dosing and TTE simulation all work under `rodas5p` exactly as
+they do under `rk45`, and asking for an interpolated readout never changes the trajectory it
+is read from.
 
 ## Dose Handling
 

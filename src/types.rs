@@ -2904,6 +2904,7 @@ struct TwinSolverOpts {
     reltol: f64,
     abstol: f64,
     max_steps: usize,
+    method: crate::ode::OdeMethod,
 }
 
 /// A lazily-built ODE representation of an analytical absorption model that carries one (a
@@ -2947,6 +2948,7 @@ impl AbsorptionOdeEquivalent {
                 ode.solver_opts.reltol = ov.reltol;
                 ode.solver_opts.abstol = ov.abstol;
                 ode.solver_opts.max_steps = ov.max_steps;
+                ode.solver_opts.method = ov.method;
             }
             Box::new(built)
         })
@@ -2961,6 +2963,7 @@ impl AbsorptionOdeEquivalent {
             reltol: opts.ode_reltol,
             abstol: opts.ode_abstol,
             max_steps: opts.ode_max_steps,
+            method: opts.ode_method,
         });
         if let Some(built) = self.built.get_mut() {
             // The twin is itself an ODE model, so this stamps its `ode_spec.solver_opts`; it
@@ -3098,6 +3101,7 @@ impl CompiledModel {
             ode.solver_opts.reltol = opts.ode_reltol;
             ode.solver_opts.abstol = opts.ode_abstol;
             ode.solver_opts.max_steps = opts.ode_max_steps;
+            ode.solver_opts.method = opts.ode_method;
         }
         // Also carry the call-time tolerances into the absorption ODE twin (#814). A
         // closed-form transit/IG primary is analytic — the block above is a no-op — but its
@@ -4940,6 +4944,13 @@ pub struct FitOptions {
     /// `ode_reltol` exhausts the step budget on stiff multi-compartment
     /// segments. See [`FitOptions::ode_reltol`].
     pub ode_max_steps: usize,
+    /// ODE stepper (`[fit_options] ode_method`). Default
+    /// [`Rk45`](crate::ode::OdeMethod::Rk45) — the explicit Dormand-Prince method every
+    /// existing fit uses. The alternatives (`rosenbrock23`, `rodas4`, `rodas5p`) are
+    /// linearly-implicit stiff methods; see [`crate::ode::OdeMethod`] for when they pay and
+    /// which integration paths honour them. Copied onto `OdeSpec::solver_opts` via
+    /// [`CompiledModel::sync_ode_solver_opts`], alongside the tolerances.
+    pub ode_method: crate::ode::OdeMethod,
     pub run_covariance_step: bool,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
@@ -5442,6 +5453,7 @@ impl Default for FitOptions {
             ode_reltol: 1e-4,
             ode_abstol: 1e-6,
             ode_max_steps: 10_000,
+            ode_method: crate::ode::OdeMethod::Rk45,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
@@ -6050,7 +6062,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "inits_from_nca",
         "frem_predictions",
         "frem_sigma",
-        // RK45 ODE-solver knobs: applied to the integrator at parse time via
+        // ODE-solver knobs: applied to the integrator at parse time via
         // `sync_ode_solver_opts` (gated on the model being an ODE model, not on
         // the estimation method), so they are framework-level — every method
         // that integrates an ODE model honours them. Listing them here keeps
@@ -6058,6 +6070,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "ode_reltol",
         "ode_abstol",
         "ode_max_steps",
+        "ode_method",
         // Checkpoint / restart (#755): the periodic resume-point writer is driven
         // by the fit runner independent of the estimation method, so these are
         // framework-level — every method honours them.

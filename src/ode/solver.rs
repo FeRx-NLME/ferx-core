@@ -1,8 +1,26 @@
-//! Adaptive Runge-Kutta ODE solver (Dormand-Prince / RK45).
+//! Adaptive ODE integration: the [`Stepper`] abstraction, the explicit Dormand-Prince RK45
+//! stepper (the default method), and the drivers every consumer integrates through.
 //!
-//! This is the same family as Julia's Tsit5() — a 5th-order explicit RK method
-//! with embedded 4th-order error estimate for adaptive step control.
-//! Optimized for PK ODE systems (2-5 states, smooth dynamics).
+//! RK45 is the same family as Julia's `Tsit5()` — a 5th-order explicit Runge-Kutta method with
+//! an embedded 4th-order error estimate for adaptive step control, optimized here for PK ODE
+//! systems (2–20 states, smooth dynamics). The stiff [`OdeMethod`] alternatives live in
+//! [`super::rosenbrock`].
+//!
+//! # Shape of the module
+//!
+//! A **method** implements [`Stepper`]: attempt a step, score it, and evaluate its own
+//! continuous extension inside it. A **driver** owns everything else — the step-size
+//! controller, the `saveat` contract, the `min_dt` force-accept, the divergence break, soft
+//! sampling, event root-finding, statistics — and is written once, generically, over both the
+//! stepper and the state scalar `T: PkNum`.
+//!
+//! That split is what keeps the methods at parity: a consumer written against a driver gets
+//! every method, and a method implementing [`Stepper`] gets every consumer. The two live
+//! drivers are [`integrate_dense_g`] (saves + in-step reads; behind [`solve_ode`],
+//! [`solve_ode_dense`] and [`solve_ode_g`]) and [`solve_ode_until_threshold`] (event-time
+//! root-finding). [`make_stepper`] is the single place a method name selects an implementation.
+
+use crate::sens::num::PkNum;
 
 /// Dormand-Prince RK45 coefficients (Butcher tableau)
 const A2: f64 = 1.0 / 5.0;
@@ -49,7 +67,7 @@ const E7: f64 = -1.0 / 40.0;
 /// truncating it would freeze-pad the remaining save points with finite (but wrong) values
 /// that the likelihood would silently accept, so those are left to run to `max_steps` as
 /// before (#603 review #4).
-const MAX_CONSECUTIVE_MIN_STEP_CLAMPS: usize = 64;
+pub(crate) const MAX_CONSECUTIVE_MIN_STEP_CLAMPS: usize = 64;
 
 /// Step-shrink factor applied when the local error estimate is non-finite (NaN/∞). The
 /// trajectory is diverging, so shrink toward `min_dt` instead of falling into the
@@ -60,6 +78,79 @@ const NONFINITE_ERR_SHRINK_FACTOR: f64 = 0.2;
 /// `rhs(u, params, t) -> du/dt`  where u and du are `&[f64]` of length n_states.
 pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
 
+/// Which stepper integrates the `[odes]` block (`[fit_options] ode_method`).
+///
+/// The default is the explicit [`Rk45`](OdeMethod::Rk45); the three Rosenbrock entries are
+/// **linearly implicit** and exist for stiff systems — fast binding / TMDD-style
+/// quasi-equilibrium, Michaelis-Menten with `Km ≪ C`, long transit chains, QSP cascades —
+/// where an explicit method is stability-limited and grinds down to `min_dt` (visible as
+/// [`OdeSolverStats::min_step_clamped_steps`]) instead of being accuracy-limited.
+///
+/// Cost per step differs sharply, so this is not a free upgrade: RK45 takes 6 `f` evaluations
+/// (FSAL), while a Rosenbrock step takes `n + 1` extra evaluations for the finite-difference
+/// Jacobian and `∂f/∂t` plus an `O(n³)` factorization. On a non-stiff 1–3 compartment model
+/// RK45 stays the faster choice; the Rosenbrock methods win only where stiffness, not
+/// accuracy, is what caps the step.
+///
+/// Honoured by every `saveat` integration — predictions, the FOCE/FOCEI objective,
+/// steady-state equilibration and the analytic-sensitivity walk — dispatched centrally in
+/// [`solve_ode_dense`] (the sole owner of the f64 stepping loop) and [`solve_ode_g`].
+///
+/// Every method is a full peer: each implements [`Stepper`] — including its own continuous
+/// extension — and every consumer is written once against that trait. Dense `saveat` saves,
+/// in-step soft sampling (joint PK-TTE cumulative hazard, CTMM occupancy, adaptive-dosing
+/// monitors), event-time root-finding and the analytic-sensitivity path therefore work for
+/// all methods, with no per-method or per-feature wiring, and a method added later inherits
+/// the whole set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OdeMethod {
+    /// Explicit Dormand-Prince RK45 (default) — see the module docs.
+    #[default]
+    Rk45,
+    /// `ode23s`: 3-stage, order 2(3), L-stable. Cheapest stiff option; use at crude
+    /// tolerances or when the right-hand side is rough.
+    Rosenbrock23,
+    /// Rodas4: 6-stage, order 4(3), L-stable and stiffly accurate. The stiff workhorse at
+    /// typical PK tolerances.
+    Rodas4,
+    /// Rodas5P: 8-stage, order 5(4), L-stable and stiffly accurate. Best at tight tolerances
+    /// (`ode_reltol ≤ 1e-9`), the regime where an ODE-form OFV has to match the analytical
+    /// one.
+    Rodas5P,
+    /// Verner 7(6): 10-stage explicit, order 7. **Not** a stiff method — the high-order option
+    /// for a fit that is accuracy-limited rather than stability-limited, where step count
+    /// scales as `tol^(−1/p)` and order is what pays. Worth it at tight tolerances
+    /// (`ode_reltol ≤ 1e-8`); at loose ones RK45's cheaper steps win. See
+    /// [`crate::ode::verner`].
+    Vern7,
+}
+
+impl OdeMethod {
+    /// Parse the `[fit_options] ode_method` token (case-insensitive). Aliases: `ros23` /
+    /// `ode23s` for [`Rosenbrock23`](OdeMethod::Rosenbrock23).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "rk45" | "dopri5" => Some(OdeMethod::Rk45),
+            "rosenbrock23" | "ros23" | "ode23s" => Some(OdeMethod::Rosenbrock23),
+            "rodas4" => Some(OdeMethod::Rodas4),
+            "rodas5p" | "rodas5" => Some(OdeMethod::Rodas5P),
+            "vern7" | "verner7" => Some(OdeMethod::Vern7),
+            _ => None,
+        }
+    }
+
+    /// Canonical token, for banners / round-tripping into a reconstructed model source.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OdeMethod::Rk45 => "rk45",
+            OdeMethod::Rosenbrock23 => "rosenbrock23",
+            OdeMethod::Rodas4 => "rodas4",
+            OdeMethod::Rodas5P => "rodas5p",
+            OdeMethod::Vern7 => "vern7",
+        }
+    }
+}
+
 /// ODE solver options
 #[derive(Debug, Clone, Copy)]
 pub struct OdeSolverOptions {
@@ -68,6 +159,9 @@ pub struct OdeSolverOptions {
     pub max_steps: usize,
     pub initial_dt: f64,
     pub min_dt: f64,
+    /// Stepper to use. Default [`OdeMethod::Rk45`]; see [`OdeMethod`] for when a stiff
+    /// method pays and which paths honour it.
+    pub method: OdeMethod,
 }
 
 impl Default for OdeSolverOptions {
@@ -78,6 +172,7 @@ impl Default for OdeSolverOptions {
             max_steps: 10000,
             initial_dt: 0.1,
             min_dt: 1e-12,
+            method: OdeMethod::Rk45,
         }
     }
 }
@@ -124,7 +219,7 @@ impl OdeSolverStats {
     /// `!(err_norm <= 1.0)` so a non-finite `err_norm` (a diverging RHS pinned
     /// at `min_dt`) still counts as a min-step clamp rather than a clean accept.
     #[inline]
-    fn record(&mut self, accepted: bool, err_norm: f64, dt_eff: f64, min_dt: f64) {
+    pub(crate) fn record(&mut self, accepted: bool, err_norm: f64, dt_eff: f64, min_dt: f64) {
         self.attempted_steps += 1;
         if accepted {
             self.accepted_steps += 1;
@@ -137,79 +232,280 @@ impl OdeSolverStats {
     }
 }
 
-/// Integrate an ODE system from t_start to t_end, saving at specified times.
+/// The one thing a method has to provide; everything else about integrating is shared.
 ///
-/// Returns solution at each saveat time.
-pub fn solve_ode(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u0: &[f64],
-    t_span: (f64, f64),
-    params: &[f64],
-    saveat: &[f64],
-    opts: &OdeSolverOptions,
-) -> Vec<SolPoint> {
-    solve_ode_with_stats(rhs, u0, t_span, params, saveat, opts, None)
+/// A stepper owns its stage workspace and knows how to (a) attempt a step and score it, and
+/// (b) evaluate its own **continuous extension** inside that step. The drivers below own the
+/// step-size controller, the `saveat` contract, the `min_dt` force-accept, the divergence
+/// break, soft sampling, event root-finding and the statistics — none of which is written per
+/// method. A new consumer written against this trait therefore works with every method at
+/// once, and a new method implementing it works with every consumer at once.
+///
+/// **Every comparison a driver makes reads [`PkNum::val`] only**, so at `T = Dual2` the
+/// derivative rides a step sequence fixed by the value part — the property the analytic
+/// FOCE/FOCEI gradient depends on.
+pub(crate) trait Stepper<T: PkNum> {
+    /// Attempt a step of size `dt` from `(t, u)` and return the value-only RMS error norm
+    /// (`≤ 1` means "meets tolerance"), or `f64::INFINITY` when the attempt could not be
+    /// scored at all. On return [`u_new`](Stepper::u_new) and
+    /// [`interpolate_component`](Stepper::interpolate_component) describe this attempt.
+    fn attempt(
+        &mut self,
+        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        u: &[T],
+        params: &[T],
+        t: f64,
+        dt: f64,
+        opts: &OdeSolverOptions,
+    ) -> f64;
+
+    /// Proposed state at `t + dt` for the last attempt.
+    fn u_new(&self) -> &[T];
+
+    /// Continuous extension of the last attempt: component `i` of the state at `t + θ·dt`,
+    /// for `θ ∈ [0, 1]`. Must return `u_old[i]` at `θ = 0` and `u_new()[i]` at `θ = 1`, so
+    /// interpolated reads agree with saved states at every step boundary.
+    ///
+    /// Reads only data the attempt already committed, so calling it cannot change the step
+    /// sequence — a soft-sampling caller does not perturb the trajectory it samples.
+    fn interpolate_component(&self, theta: f64, u_old: &[T], dt: f64, i: usize) -> T;
+
+    /// Hook fired once the driver commits a step (RK45 carries `k7` into the next `k1`).
+    fn on_accept(&mut self);
+
+    /// I-controller exponent `1/(p̂+1)` for this method's embedded pair.
+    fn err_exp(&self) -> f64;
+
+    /// Tell the stepper whether a caller will read *inside* steps, before integration starts.
+    ///
+    /// Methods whose end-of-step derivative is a by-product (FSAL RK45) or whose continuous
+    /// extension is built from stage increments (Rosenbrock) ignore this — their interpolant is
+    /// free. A method that must pay an extra evaluation to interpolate (Verner 7(6)) uses it to
+    /// skip that cost on the `saveat`-only path, which is nearly every call.
+    fn set_dense_required(&mut self, _yes: bool) {}
+
+    /// Whether the last attempt produced a usable [`u_new`](Stepper::u_new). False only when
+    /// the step could not be formed at all (a singular Rosenbrock `W`), where even the
+    /// `min_dt` force-accept must not fire because it would commit garbage.
+    fn attempt_usable(&self) -> bool;
 }
 
-/// [`solve_ode`] with optional adaptive-step instrumentation.
+/// Build the stepper for `method`, sized for an `n`-state system.
 ///
-/// The counters are intentionally local to this integration segment. Higher
-/// layers that split by dose/observation boundaries can aggregate across calls
-/// to classify a full subject or fit.
-///
-/// Thin wrapper over [`solve_ode_dense`] with no soft-sampling (`interp_at`
-/// empty) — the soft-sampling loop is then never entered, so the returned hard
-/// saves are bit-identical to the historical stepper.
-pub fn solve_ode_with_stats(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u0: &[f64],
-    t_span: (f64, f64),
-    params: &[f64],
-    saveat: &[f64],
-    opts: &OdeSolverOptions,
-    stats: Option<&mut OdeSolverStats>,
-) -> Vec<SolPoint> {
-    solve_ode_dense(rhs, u0, t_span, params, saveat, &[], opts, stats).0
+/// This is the **only** place a method name selects an implementation. Consumers take a
+/// `&mut dyn Stepper<T>`; the dynamic call happens once per step attempt, against `n + 1`
+/// right-hand-side evaluations and an `O(n³)` factorization, so it does not register.
+pub(crate) fn make_stepper<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn Stepper<T>> {
+    match method {
+        OdeMethod::Rk45 => Box::new(Rk45Stepper::new(n)),
+        OdeMethod::Vern7 => Box::new(super::verner::Vern7Stepper::new(n)),
+        stiff => Box::new(super::rosenbrock::RosStepper::new(n, stiff)),
+    }
 }
 
-/// Core Dormand–Prince RK45 stepper with **dense soft-sampling**.
+/// Cubic Hermite interpolation across one accepted step, generic over the state scalar.
+/// `s ∈ [0, 1]` is the normalized position, `h` the step length, `(y0, d0)` / `(y1, d1)` the
+/// value and derivative at the step's start and end — the FSAL `k1` / `k7` slots.
+#[inline]
+pub(crate) fn hermite_g<T: PkNum>(s: f64, h: f64, y0: T, d0: T, y1: T, d1: T) -> T {
+    let s2 = s * s;
+    let s3 = s2 * s;
+    y0 * T::from_f64(2.0 * s3 - 3.0 * s2 + 1.0)
+        + d0 * T::from_f64((s3 - 2.0 * s2 + s) * h)
+        + y1 * T::from_f64(-2.0 * s3 + 3.0 * s2)
+        + d1 * T::from_f64((s3 - s2) * h)
+}
+
+/// Explicit Dormand-Prince RK45 (the default method) as a [`Stepper`].
 ///
-/// Returns `(hard, soft)`. `hard` holds the state at every `saveat` time — each
-/// clamps the step to land on it, preserving the historical adaptive step
-/// sequence. `soft` holds the **full state at every `interp_at` time**, obtained
-/// by in-step cubic Hermite interpolation that reads the FSAL stage derivatives of
-/// the step already accepted and so does **not** perturb the step sequence — the
-/// whole point of #570: read a cumulative-hazard state at event times off the
-/// Gaussian solve without changing the Gaussian predictions.
+/// FSAL (First Same As Last): `k7` of an accepted step is evaluated at the same `(u, t)` the
+/// next step's `k1` would use, so [`on_accept`](Stepper::on_accept) swaps them and saves one
+/// right-hand-side evaluation per accepted step (~1 of 7 stages, ≈9% of FOCEI ODE wall time).
+/// After a *rejected* step `(u, t)` has not moved, so `k1` stays valid too; the first attempt
+/// has no prior `k1`, hence `have_k1`.
+struct Rk45Stepper<T> {
+    n: usize,
+    k1: Vec<T>,
+    k2: Vec<T>,
+    k3: Vec<T>,
+    k4: Vec<T>,
+    k5: Vec<T>,
+    k6: Vec<T>,
+    k7: Vec<T>,
+    u_tmp: Vec<T>,
+    u5: Vec<T>,
+    have_k1: bool,
+}
+
+impl<T: PkNum> Rk45Stepper<T> {
+    fn new(n: usize) -> Self {
+        let z = T::from_f64(0.0);
+        Self {
+            n,
+            k1: vec![z; n],
+            k2: vec![z; n],
+            k3: vec![z; n],
+            k4: vec![z; n],
+            k5: vec![z; n],
+            k6: vec![z; n],
+            k7: vec![z; n],
+            u_tmp: vec![z; n],
+            u5: vec![z; n],
+            have_k1: false,
+        }
+    }
+}
+
+impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
+    // The stage loops walk `u` alongside seven stage vectors at once; zipping them would
+    // obscure the Butcher tableau they transcribe — and the exact association of these
+    // expressions is what keeps `T = f64` bit-identical to the pre-refactor loop.
+    #[allow(clippy::needless_range_loop)]
+    fn attempt(
+        &mut self,
+        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        u: &[T],
+        params: &[T],
+        t: f64,
+        dt_eff: f64,
+        opts: &OdeSolverOptions,
+    ) -> f64 {
+        let n = self.n;
+        // The Butcher combinations keep the exact association of the original f64 loop
+        // (`dt·(B31·k1 + B32·k2)`, not `(dt·B31)·k1 + …`), so instantiating at `T = f64`
+        // reproduces the historical trajectory bit for bit.
+        if !self.have_k1 {
+            rhs(u, params, t, &mut self.k1);
+            self.have_k1 = true;
+        }
+        let h = T::from_f64(dt_eff);
+
+        for i in 0..n {
+            self.u_tmp[i] = u[i] + T::from_f64(dt_eff * B21) * self.k1[i];
+        }
+        rhs(&self.u_tmp, params, t + A2 * dt_eff, &mut self.k2);
+
+        for i in 0..n {
+            self.u_tmp[i] =
+                u[i] + h * (T::from_f64(B31) * self.k1[i] + T::from_f64(B32) * self.k2[i]);
+        }
+        rhs(&self.u_tmp, params, t + A3 * dt_eff, &mut self.k3);
+
+        for i in 0..n {
+            self.u_tmp[i] = u[i]
+                + h * (T::from_f64(B41) * self.k1[i]
+                    + T::from_f64(B42) * self.k2[i]
+                    + T::from_f64(B43) * self.k3[i]);
+        }
+        rhs(&self.u_tmp, params, t + A4 * dt_eff, &mut self.k4);
+
+        for i in 0..n {
+            self.u_tmp[i] = u[i]
+                + h * (T::from_f64(B51) * self.k1[i]
+                    + T::from_f64(B52) * self.k2[i]
+                    + T::from_f64(B53) * self.k3[i]
+                    + T::from_f64(B54) * self.k4[i]);
+        }
+        rhs(&self.u_tmp, params, t + A5 * dt_eff, &mut self.k5);
+
+        for i in 0..n {
+            self.u_tmp[i] = u[i]
+                + h * (T::from_f64(B61) * self.k1[i]
+                    + T::from_f64(B62) * self.k2[i]
+                    + T::from_f64(B63) * self.k3[i]
+                    + T::from_f64(B64) * self.k4[i]
+                    + T::from_f64(B65) * self.k5[i]);
+        }
+        rhs(&self.u_tmp, params, t + dt_eff, &mut self.k6);
+
+        // 5th-order solution.
+        for i in 0..n {
+            self.u5[i] = u[i]
+                + h * (T::from_f64(B71) * self.k1[i]
+                    + T::from_f64(B73) * self.k3[i]
+                    + T::from_f64(B74) * self.k4[i]
+                    + T::from_f64(B75) * self.k5[i]
+                    + T::from_f64(B76) * self.k6[i]);
+        }
+
+        // Error estimate (5th − 4th). Computed on values only — the step sequence must not
+        // depend on derivative components.
+        rhs(&self.u5, params, t + dt_eff, &mut self.k7);
+        let mut err_norm = 0.0;
+        for i in 0..n {
+            let err_i = dt_eff
+                * (E1 * self.k1[i].val()
+                    + E3 * self.k3[i].val()
+                    + E4 * self.k4[i].val()
+                    + E5 * self.k5[i].val()
+                    + E6 * self.k6[i].val()
+                    + E7 * self.k7[i].val());
+            let scale = scale_tol(opts.abstol, opts.reltol, self.u5[i].val(), u[i].val());
+            err_norm += (err_i / scale) * (err_i / scale);
+        }
+        (err_norm / n as f64).sqrt()
+    }
+
+    fn u_new(&self) -> &[T] {
+        &self.u5
+    }
+
+    fn interpolate_component(&self, theta: f64, u_old: &[T], dt: f64, i: usize) -> T {
+        hermite_g(theta, dt, u_old[i], self.k1[i], self.u5[i], self.k7[i])
+    }
+
+    fn on_accept(&mut self) {
+        // `k7` (at the accepted end point) becomes the next step's `k1`; it is dead otherwise.
+        std::mem::swap(&mut self.k1, &mut self.k7);
+    }
+
+    fn err_exp(&self) -> f64 {
+        // 0.20 — I-controller exponent for the 5(4) pair.
+        1.0 / 5.0
+    }
+
+    fn attempt_usable(&self) -> bool {
+        true
+    }
+}
+
+/// The shared adaptive driver: integrate `t_span`, saving the state at every `saveat` time and
+/// the **interpolated** state at every `interp_at` time, with whatever [`Stepper`] is handed in.
 ///
-/// `interp_at` must be sorted ascending; each point is interpolated within the
-/// accepted step whose half-open span `(t, t+dt]` contains it (a point coinciding
-/// with a `saveat`/step boundary lands at `s = 1`, the exact saved state). Any
-/// point left unreached when the span ends — or in the zero-width-span early
-/// return — is filled with the final state, mirroring the `saveat` fill so the two
-/// outputs stay length-consistent (`soft.len() == interp_at.len()`).
+/// `saveat` times clamp the step so the solver lands on them exactly; `interp_at` times are read
+/// *inside* the accepted step that spans them, through the method's continuous extension, so
+/// requesting them cannot change the step sequence or the `saveat` values. Both grids must be
+/// sorted ascending; unreached times are filled with the final state, keeping
+/// `hard.len() == saveat.len()` and `soft.len() == interp_at.len()`.
 ///
-/// This is the single owner of the f64 stepping loop; [`solve_ode`] /
-/// [`solve_ode_with_stats`] are the `interp_at = &[]` wrappers.
+/// NOTE: a Gustafsson PI step-size controller was tested and rejected here. While it lowers
+/// the raw step-rejection rate and integrates faster, the factor's dependence on `err_{n-1}`
+/// makes accept/reject decisions more sensitive to small parameter perturbations. That raises
+/// the differential noise floor of the trajectory as a function of θ, which the FOCEI FD
+/// gradient cannot tolerate — BFGS line search stalled at OFV ≈ -1290 on the dense-Emax PKPD
+/// benchmark vs the true -1747 with the I-controller. The pure I-controller below is memoryless
+/// and gives a clean FD signal. Any future revisit should condition PI on a non-FD gradient
+/// route (analytical / analytic-sensitivity).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn solve_ode_dense(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u0: &[f64],
+fn integrate_dense_g<T: PkNum>(
+    stepper: &mut dyn Stepper<T>,
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u0: &[T],
     t_span: (f64, f64),
-    params: &[f64],
+    params: &[T],
     saveat: &[f64],
     interp_at: &[f64],
     opts: &OdeSolverOptions,
     mut stats: Option<&mut OdeSolverStats>,
-) -> (Vec<SolPoint>, Vec<SolPoint>) {
+) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     let n = u0.len();
     let (t0, tf) = t_span;
 
     if (tf - t0).abs() < 1e-15 {
-        let at = |times: &[f64]| -> Vec<SolPoint> {
+        let at = |times: &[f64]| -> Vec<SolPointG<T>> {
             times
                 .iter()
-                .map(|&t| SolPoint { t, u: u0.to_vec() })
+                .map(|&t| SolPointG { t, u: u0.to_vec() })
                 .collect()
         };
         return (at(saveat), at(interp_at));
@@ -219,142 +515,68 @@ pub(crate) fn solve_ode_dense(
     let mut t = t0;
     let mut dt = opts.initial_dt.min((tf - t0) / 10.0).max(opts.min_dt);
 
-    // Pre-allocate stage vectors
-    let mut k1 = vec![0.0; n];
-    let mut k2 = vec![0.0; n];
-    let mut k3 = vec![0.0; n];
-    let mut k4 = vec![0.0; n];
-    let mut k5 = vec![0.0; n];
-    let mut k6 = vec![0.0; n];
-    let mut k7 = vec![0.0; n];
-    let mut u_tmp = vec![0.0; n];
-    let mut u5 = vec![0.0; n];
-
-    let mut results: Vec<SolPoint> = Vec::with_capacity(saveat.len());
+    let mut results: Vec<SolPointG<T>> = Vec::with_capacity(saveat.len());
     let mut save_idx = 0;
-    // Soft (Hermite-interpolated) samples — empty/no-op on the wrapper hot path.
-    let mut interp_results: Vec<SolPoint> = Vec::with_capacity(interp_at.len());
+    let mut interp_results: Vec<SolPointG<T>> = Vec::with_capacity(interp_at.len());
     let mut interp_idx = 0;
-
-    // FSAL (First Same As Last): in DP-RK45, k7 of an accepted step is evaluated
-    // at the same (u, t) the next step's k1 would use. We carry it across via a
-    // k1/k7 swap, eliminating one rhs eval per accepted step (~1 of 7 stages).
-    // After a rejected step (u, t) doesn't move so k1 stays valid too; first
-    // iteration has no prior k1, hence `have_k1`. ≈9% wall reduction on
-    // FOCEI ODE fits with bit-identical outputs (FSAL only reuses a value that
-    // would otherwise be recomputed identically).
-    let mut have_k1 = false;
-
-    // NOTE: a Gustafsson PI step-size controller was tested and rejected here.
-    // While it lowers raw step-rejection rate and integrates faster, the
-    // factor's dependence on err_{n-1} makes accept/reject decisions more
-    // sensitive to small parameter perturbations. That raises the differential
-    // noise floor of the trajectory as a function of θ, which the FOCEI FD
-    // gradient cannot tolerate — BFGS line search stalled at OFV ≈ -1290 on
-    // the dense-Emax PKPD benchmark vs the true -1747 with the I-controller.
-    // The pure I-controller below is memoryless and gives a clean FD signal.
-    // Any future revisit should condition PI on a non-FD gradient route
-    // (analytical / analytic-sensitivity).
-    const I_EXP: f64 = 1.0 / 5.0; // 0.20 — I-controller exponent for order p=5
     let mut consecutive_min_step_clamps = 0usize;
+    stepper.set_dense_required(!interp_at.is_empty());
+    let err_exp = stepper.err_exp();
 
     for _step in 0..opts.max_steps {
         if t >= tf - 1e-15 {
             break;
         }
 
-        // Don't overshoot tf or next saveat
+        // Don't overshoot tf or the next saveat.
         let mut dt_eff = dt.min(tf - t);
         if save_idx < saveat.len() && t + dt_eff > saveat[save_idx] + 1e-15 {
             dt_eff = (saveat[save_idx] - t).max(opts.min_dt);
         }
 
-        // RK45 stages — k1 may be carried from previous step via FSAL.
-        if !have_k1 {
-            rhs(&u, params, t, &mut k1);
-            have_k1 = true;
+        let err_norm = stepper.attempt(rhs, &u, params, t, dt_eff, opts);
+        let usable = stepper.attempt_usable();
+
+        // An unusable attempt at `min_dt` is unrecoverable: the step cannot be shrunk further
+        // and there is no `u_new` to force-accept. Stop and let the tail freeze-pad, the same
+        // outcome a trajectory that diverges at `min_dt` gets.
+        if !usable && dt_eff <= opts.min_dt {
+            if let Some(s) = stats.as_deref_mut() {
+                s.record(false, err_norm, dt_eff, opts.min_dt);
+            }
+            break;
         }
 
-        for i in 0..n {
-            u_tmp[i] = u[i] + dt_eff * B21 * k1[i];
-        }
-        rhs(&u_tmp, params, t + A2 * dt_eff, &mut k2);
-
-        for i in 0..n {
-            u_tmp[i] = u[i] + dt_eff * (B31 * k1[i] + B32 * k2[i]);
-        }
-        rhs(&u_tmp, params, t + A3 * dt_eff, &mut k3);
-
-        for i in 0..n {
-            u_tmp[i] = u[i] + dt_eff * (B41 * k1[i] + B42 * k2[i] + B43 * k3[i]);
-        }
-        rhs(&u_tmp, params, t + A4 * dt_eff, &mut k4);
-
-        for i in 0..n {
-            u_tmp[i] = u[i] + dt_eff * (B51 * k1[i] + B52 * k2[i] + B53 * k3[i] + B54 * k4[i]);
-        }
-        rhs(&u_tmp, params, t + A5 * dt_eff, &mut k5);
-
-        for i in 0..n {
-            u_tmp[i] = u[i]
-                + dt_eff * (B61 * k1[i] + B62 * k2[i] + B63 * k3[i] + B64 * k4[i] + B65 * k5[i]);
-        }
-        rhs(&u_tmp, params, t + dt_eff, &mut k6);
-
-        // 5th-order solution
-        for i in 0..n {
-            u5[i] = u[i]
-                + dt_eff * (B71 * k1[i] + B73 * k3[i] + B74 * k4[i] + B75 * k5[i] + B76 * k6[i]);
-        }
-
-        // Error estimate
-        rhs(&u5, params, t + dt_eff, &mut k7);
-
-        let mut err_norm = 0.0;
-        for i in 0..n {
-            let err_i = dt_eff
-                * (E1 * k1[i] + E3 * k3[i] + E4 * k4[i] + E5 * k5[i] + E6 * k6[i] + E7 * k7[i]);
-            let scale = scale_tol(opts.abstol, opts.reltol, u5[i], u[i]);
-            err_norm += (err_i / scale) * (err_i / scale);
-        }
-        err_norm = (err_norm / n as f64).sqrt();
-
-        let accepted = err_norm <= 1.0 || dt_eff <= opts.min_dt;
+        let accepted = usable && (err_norm <= 1.0 || dt_eff <= opts.min_dt);
         // Only a force-accept at `min_dt` with a *non-finite* error counts toward the
-        // pathological-divergence break (#603 review #4); a finite-but-stiff clamp is left
-        // to run rather than freeze-padded into a silently-accepted wrong trajectory.
+        // pathological-divergence break (#603 review #4); a finite-but-stiff clamp is left to
+        // run rather than freeze-padded into a silently-accepted wrong trajectory.
         let nonfinite_min_step = accepted && dt_eff <= opts.min_dt && !err_norm.is_finite();
         if let Some(s) = stats.as_deref_mut() {
             s.record(accepted, err_norm, dt_eff, opts.min_dt);
         }
+
         if accepted {
-            // Dense soft-sampling: interpolate the full state at every `interp_at`
-            // time lying in this just-accepted step's half-open span `(t, t+dt_eff]`,
-            // using the FSAL derivatives (`k1` at the step start, `k7` at the end)
-            // *before* the swap and `u <- u5` advance below consume them. This only
-            // reads already-committed step data, so it cannot affect the step
-            // sequence; the loop is a no-op (`interp_at` empty) on the wrapper path.
+            // Soft sampling: read every `interp_at` time in this just-accepted step's
+            // half-open span `(t, t+dt_eff]` off the method's continuous extension, *before*
+            // `u` advances and the stepper recycles its stages. This only reads committed
+            // step data, so it cannot affect the step sequence.
             while interp_idx < interp_at.len() && interp_at[interp_idx] <= t + dt_eff + 1e-12 {
                 let ti = interp_at[interp_idx];
-                let s = ((ti - t) / dt_eff).clamp(0.0, 1.0);
-                let ui: Vec<f64> = (0..n)
-                    .map(|j| hermite_scalar(s, dt_eff, u[j], k1[j], u5[j], k7[j]))
+                let theta = ((ti - t) / dt_eff).clamp(0.0, 1.0);
+                let ui: Vec<T> = (0..n)
+                    .map(|j| stepper.interpolate_component(theta, &u, dt_eff, j))
                     .collect();
-                interp_results.push(SolPoint { t: ti, u: ui });
+                interp_results.push(SolPointG { t: ti, u: ui });
                 interp_idx += 1;
             }
 
-            // Accept step
             t += dt_eff;
-            u.copy_from_slice(&u5);
+            u.copy_from_slice(stepper.u_new());
+            stepper.on_accept();
 
-            // FSAL: k7 at (u_new, t_new) IS the next step's k1 — swap into k1.
-            // Safe because k7 is dead from this point onward in this iteration.
-            std::mem::swap(&mut k1, &mut k7);
-
-            // Save at requested times
             while save_idx < saveat.len() && (t - saveat[save_idx]).abs() < 1e-12 {
-                results.push(SolPoint {
+                results.push(SolPointG {
                     t: saveat[save_idx],
                     u: u.clone(),
                 });
@@ -370,15 +592,14 @@ pub(crate) fn solve_ode_dense(
                 consecutive_min_step_clamps = 0;
             }
         }
-        // On reject: (u, t) is unchanged, so the existing k1 is still rhs(u, t)
-        // for the next attempt; nothing to do.
+        // On reject: (u, t) is unchanged, so the stepper's carried state stays valid.
 
-        // Adapt step size (memoryless I-controller — see note above).
+        // Adapt the step (memoryless I-controller — see the note above).
         let safety = 0.9;
         let factor = if !err_norm.is_finite() {
             NONFINITE_ERR_SHRINK_FACTOR
         } else if err_norm > 1e-15 {
-            safety * err_norm.powf(-I_EXP)
+            safety * err_norm.powf(-err_exp)
         } else {
             5.0
         };
@@ -386,18 +607,16 @@ pub(crate) fn solve_ode_dense(
         dt = dt.max(opts.min_dt);
     }
 
-    // Fill any remaining saveat points with last state
+    // Fill any remaining saveat / interp times with the last state.
     while save_idx < saveat.len() {
-        results.push(SolPoint {
+        results.push(SolPointG {
             t: saveat[save_idx],
             u: u.clone(),
         });
         save_idx += 1;
     }
-    // Same for any soft-sample times the span ended before reaching (e.g. a
-    // pathological-divergence break) — keeps `soft.len() == interp_at.len()`.
     while interp_idx < interp_at.len() {
-        interp_results.push(SolPoint {
+        interp_results.push(SolPointG {
             t: interp_at[interp_idx],
             u: u.clone(),
         });
@@ -405,6 +624,70 @@ pub(crate) fn solve_ode_dense(
     }
 
     (results, interp_results)
+}
+
+/// Integrate an ODE system from `t_start` to `t_end`, returning the state at each `saveat`
+/// time. Uses whichever stepper [`OdeSolverOptions::method`] selects.
+pub fn solve_ode(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u0: &[f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+) -> Vec<SolPoint> {
+    solve_ode_with_stats(rhs, u0, t_span, params, saveat, opts, None)
+}
+
+/// [`solve_ode`] with optional adaptive-step instrumentation.
+///
+/// The counters are intentionally local to this integration segment. Higher layers that split
+/// by dose/observation boundaries can aggregate across calls to classify a full subject or fit.
+pub fn solve_ode_with_stats(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u0: &[f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+    stats: Option<&mut OdeSolverStats>,
+) -> Vec<SolPoint> {
+    solve_ode_dense(rhs, u0, t_span, params, saveat, &[], opts, stats).0
+}
+
+/// [`solve_ode`] with **dense soft-sampling**: `(hard, soft)` where `hard` is the state at each
+/// `saveat` time and `soft` the interpolated state at each `interp_at` time.
+///
+/// The soft channel reads inside an already-accepted step (#570), so a joint PK-TTE fit's
+/// Gaussian predictions are identical whether or not the hazard readout is requested — for
+/// every method, since the interpolation comes from the [`Stepper`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_ode_dense(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u0: &[f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    saveat: &[f64],
+    interp_at: &[f64],
+    opts: &OdeSolverOptions,
+    stats: Option<&mut OdeSolverStats>,
+) -> (Vec<SolPoint>, Vec<SolPoint>) {
+    let mut stepper = make_stepper::<f64>(u0.len(), opts.method);
+    let (hard, soft) = integrate_dense_g(
+        stepper.as_mut(),
+        rhs,
+        u0,
+        t_span,
+        params,
+        saveat,
+        interp_at,
+        opts,
+        stats,
+    );
+    let to_points = |v: Vec<SolPointG<f64>>| -> Vec<SolPoint> {
+        v.into_iter().map(|p| SolPoint { t: p.t, u: p.u }).collect()
+    };
+    (to_points(hard), to_points(soft))
 }
 
 /// Outcome of [`solve_ode_until_threshold`] over a single integration span.
@@ -433,42 +716,17 @@ pub enum ThresholdCrossing {
     Failed(String),
 }
 
-/// Cubic Hermite interpolation of one state component across a single accepted
-/// DP-RK45 step. `s ∈ [0, 1]` is the normalized position within the step, `h` the
-/// step length, `(y0, d0)` / `(y1, d1)` the value and derivative at the step's
-/// start and end — the FSAL `k1` / `k7` stage slots. Shared by the in-step
-/// crossing localization in [`solve_ode_until_threshold`] and the dense
-/// soft-sampling in [`solve_ode_dense`], so the interpolant exists in exactly one
-/// place.
-#[inline]
-fn hermite_scalar(s: f64, h: f64, y0: f64, d0: f64, y1: f64, d1: f64) -> f64 {
-    let s2 = s * s;
-    let s3 = s2 * s;
-    (2.0 * s3 - 3.0 * s2 + 1.0) * y0
-        + (s3 - 2.0 * s2 + s) * h * d0
-        + (-2.0 * s3 + 3.0 * s2) * y1
-        + (s3 - s2) * h * d1
-}
-
 /// Integrate `rhs` over `t_span`, **halting at the first time `u[monitor]` reaches
-/// `threshold`** — a one-sided upward crossing, for a monitored state expected to
-/// be monotone non-decreasing (a cumulative-hazard accumulator `dCHZ/dt = h ≥ 0`).
+/// `threshold`** — a one-sided upward crossing, for a monitored state expected to be monotone
+/// non-decreasing (a cumulative-hazard accumulator `dCHZ/dt = h ≥ 0`).
 ///
-/// `u` is the state at `t_span.0` on entry and is advanced **in place** to the
-/// state at `t_span.1` on [`ReachedEnd`](ThresholdCrossing::ReachedEnd) (so a
-/// segmented caller can carry it into the next dose segment); on `Crossed` /
-/// `Failed` its final value is unspecified.
+/// `u` is the state at `t_span.0` on entry and is advanced **in place** to the state at
+/// `t_span.1` on [`ReachedEnd`](ThresholdCrossing::ReachedEnd) (so a segmented caller can carry
+/// it into the next dose segment); on `Crossed` / `Failed` its contents are unspecified.
 ///
-/// Localization within the crossing step is **bracketed bisection on the cubic
-/// Hermite interpolant** of the monitored component (the step endpoints plus the
-/// FSAL stage derivatives `k1`, `k7`) — *not* Newton, because a Hermite cubic can
-/// overshoot even when the true trajectory is monotone, whereas the accepted step
-/// already proves the bracket `y0 < threshold ≤ y1`, on which bisection is
-/// unconditionally robust.
-///
-/// This is a **separate** stepper from [`solve_ode_with_stats`] (rather than a
-/// flag on it) so the FOCEI hot path stays bit-identical; the Butcher constants
-/// are shared module-level items, so only the stepping loop is restated.
+/// The crossing is localized *inside* the step that brackets it, by bisecting the stepper's own
+/// continuous extension — so this works for every [`OdeMethod`], and a method added later needs
+/// no changes here.
 pub fn solve_ode_until_threshold(
     rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
     u: &mut [f64],
@@ -478,12 +736,11 @@ pub fn solve_ode_until_threshold(
     monitor: usize,
     threshold: f64,
 ) -> ThresholdCrossing {
-    let n = u.len();
     let (t0, tf) = t_span;
 
-    // Already at/above threshold at the span start (e.g. threshold ≈ 0 from u≈1,
-    // or a non-zero initial accumulator). Catch before stepping so the loop's
-    // crossing test can assume `y0 < threshold`.
+    // Already at/above threshold at the span start (e.g. threshold ≈ 0 from u≈1, or a non-zero
+    // initial accumulator). Catch before stepping so the loop's crossing test can assume
+    // `y0 < threshold`.
     if u[monitor] >= threshold {
         return ThresholdCrossing::Crossed(t0);
     }
@@ -491,25 +748,12 @@ pub fn solve_ode_until_threshold(
         return ThresholdCrossing::ReachedEnd;
     }
 
+    let mut stepper = make_stepper::<f64>(u.len(), opts.method);
+    // This driver localizes the crossing inside a step, so it always interpolates.
+    stepper.set_dense_required(true);
+    let err_exp = stepper.err_exp();
     let mut t = t0;
     let mut dt = opts.initial_dt.min((tf - t0) / 10.0).max(opts.min_dt);
-
-    let mut k1 = vec![0.0; n];
-    let mut k2 = vec![0.0; n];
-    let mut k3 = vec![0.0; n];
-    let mut k4 = vec![0.0; n];
-    let mut k5 = vec![0.0; n];
-    let mut k6 = vec![0.0; n];
-    let mut k7 = vec![0.0; n];
-    let mut u_tmp = vec![0.0; n];
-    let mut u5 = vec![0.0; n];
-
-    // FSAL + memoryless I-controller, identical to `solve_ode_with_stats` (see the
-    // step-control notes there); no `saveat` clamp here — this stepper saves
-    // nothing, it only watches `monitor`, so its step sequence is not perturbed by
-    // observation times.
-    let mut have_k1 = false;
-    const I_EXP: f64 = 1.0 / 5.0;
 
     for _step in 0..opts.max_steps {
         if t >= tf - 1e-15 {
@@ -517,55 +761,19 @@ pub fn solve_ode_until_threshold(
         }
 
         let dt_eff = dt.min(tf - t);
+        let err_norm = stepper.attempt(rhs, u, params, t, dt_eff, opts);
+        let usable = stepper.attempt_usable();
+        if !usable && dt_eff <= opts.min_dt {
+            return ThresholdCrossing::Failed(format!(
+                "the step at t={t:.6} could not be formed even at min_dt \
+                 (singular Jacobian system)"
+            ));
+        }
 
-        if !have_k1 {
-            rhs(u, params, t, &mut k1);
-            have_k1 = true;
-        }
-        for i in 0..n {
-            u_tmp[i] = u[i] + dt_eff * B21 * k1[i];
-        }
-        rhs(&u_tmp, params, t + A2 * dt_eff, &mut k2);
-        for i in 0..n {
-            u_tmp[i] = u[i] + dt_eff * (B31 * k1[i] + B32 * k2[i]);
-        }
-        rhs(&u_tmp, params, t + A3 * dt_eff, &mut k3);
-        for i in 0..n {
-            u_tmp[i] = u[i] + dt_eff * (B41 * k1[i] + B42 * k2[i] + B43 * k3[i]);
-        }
-        rhs(&u_tmp, params, t + A4 * dt_eff, &mut k4);
-        for i in 0..n {
-            u_tmp[i] = u[i] + dt_eff * (B51 * k1[i] + B52 * k2[i] + B53 * k3[i] + B54 * k4[i]);
-        }
-        rhs(&u_tmp, params, t + A5 * dt_eff, &mut k5);
-        for i in 0..n {
-            u_tmp[i] = u[i]
-                + dt_eff * (B61 * k1[i] + B62 * k2[i] + B63 * k3[i] + B64 * k4[i] + B65 * k5[i]);
-        }
-        rhs(&u_tmp, params, t + dt_eff, &mut k6);
-        for i in 0..n {
-            u5[i] = u[i]
-                + dt_eff * (B71 * k1[i] + B73 * k3[i] + B74 * k4[i] + B75 * k5[i] + B76 * k6[i]);
-        }
-        rhs(&u5, params, t + dt_eff, &mut k7);
-
-        let mut err_norm = 0.0;
-        for i in 0..n {
-            let err_i = dt_eff
-                * (E1 * k1[i] + E3 * k3[i] + E4 * k4[i] + E5 * k5[i] + E6 * k6[i] + E7 * k7[i]);
-            let scale = scale_tol(opts.abstol, opts.reltol, u5[i], u[i]);
-            err_norm += (err_i / scale) * (err_i / scale);
-        }
-        err_norm = (err_norm / n as f64).sqrt();
-
-        let accepted = err_norm <= 1.0 || dt_eff <= opts.min_dt;
+        let accepted = usable && (err_norm <= 1.0 || dt_eff <= opts.min_dt);
         if accepted {
-            // Monitored value + derivative at the step's start (y0,d0) and end
-            // (y1,d1) — captured before the FSAL swap and the `u <- u5` advance.
             let y0 = u[monitor];
-            let d0 = k1[monitor];
-            let y1 = u5[monitor];
-            let d1 = k7[monitor];
+            let y1 = stepper.u_new()[monitor];
 
             if !y1.is_finite() {
                 return ThresholdCrossing::Failed(format!(
@@ -573,8 +781,8 @@ pub fn solve_ode_until_threshold(
                     t + dt_eff
                 ));
             }
-            // Scale-aware monotonicity floor: a real negative rate produces a
-            // decrease ≫ this; only round-off sits below it.
+            // Scale-aware monotonicity floor: a real negative rate produces a decrease ≫ this;
+            // only round-off sits below it.
             let mono_tol = scale_tol(opts.abstol, opts.reltol, y0, y1);
             if y1 < y0 - mono_tol {
                 return ThresholdCrossing::Failed(format!(
@@ -585,37 +793,35 @@ pub fn solve_ode_until_threshold(
             }
 
             if y1 >= threshold {
-                // Crossing in (t, t+dt_eff]; bisect the Hermite cubic on the bracket
-                // the accepted step proves (y0 < threshold ≤ y1). 64 halvings drives
-                // the bracket below machine precision of the step — cubic evals only.
-                let h = dt_eff;
-                let hermite = |s: f64| hermite_scalar(s, h, y0, d0, y1, d1);
+                // Crossing in (t, t+dt_eff]; bisect the step's continuous extension on the
+                // bracket the accepted step proves (y0 < threshold ≤ y1). 64 halvings drives
+                // the bracket below machine precision of the step — interpolant evals only.
                 let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
                 for _ in 0..64 {
                     let mid = 0.5 * (lo + hi);
-                    if hermite(mid) < threshold {
+                    if stepper.interpolate_component(mid, u, dt_eff, monitor) < threshold {
                         lo = mid;
                     } else {
                         hi = mid;
                     }
                 }
-                return ThresholdCrossing::Crossed(t + 0.5 * (lo + hi) * h);
+                return ThresholdCrossing::Crossed(t + 0.5 * (lo + hi) * dt_eff);
             }
 
             t += dt_eff;
-            u.copy_from_slice(&u5);
-            std::mem::swap(&mut k1, &mut k7);
+            u.copy_from_slice(stepper.u_new());
+            stepper.on_accept();
         }
 
         let safety = 0.9;
-        // Finite-error branch is identical to `solve_ode_with_stats`; a *non-finite*
-        // err_norm (diverging / NaN RHS) shrinks toward `min_dt` instead of growing,
-        // so the step is force-accepted at `min_dt` and the non-finite guard above
+        // Finite-error branch is identical to the dense driver; a *non-finite* err_norm
+        // (diverging / NaN RHS, or an unusable attempt) shrinks toward `min_dt` instead of
+        // growing, so the step is force-accepted at `min_dt` and the non-finite guard above
         // fires with a clear cause rather than silently burning the step budget.
         let factor = if !err_norm.is_finite() {
-            0.2
+            NONFINITE_ERR_SHRINK_FACTOR
         } else if err_norm > 1e-15 {
-            safety * err_norm.powf(-I_EXP)
+            safety * err_norm.powf(-err_exp)
         } else {
             5.0
         };
@@ -635,17 +841,15 @@ pub struct SolPointG<T> {
     pub u: Vec<T>,
 }
 
-/// [`solve_ode`] generic over the state scalar `T: PkNum`, for the analytic
-/// PK-parameter sensitivity path (`T = Dual2<N>`): the same Dormand-Prince
-/// stepper, but every Butcher combination is a `T` operation so the dual numbers
-/// carry `∂u/∂p` and `∂²u/∂p²` through the integration. `params` holds the PK
-/// parameters seeded as dual variables.
+/// [`solve_ode`] generic over the state scalar `T: PkNum`, for the analytic PK-parameter
+/// sensitivity path (`T = Dual2<N>`): the *same* stepper and the *same* driver as the scalar
+/// path, instantiated at a dual number so the jets carry `∂u/∂p` and `∂²u/∂p²` through the
+/// integration. `params` holds the PK parameters seeded as dual variables.
 ///
-/// **Step-size control reads `.val()` only** — the accept/reject decision and
-/// `dt` adaptation depend on values, never on derivatives, so the derivative
-/// flows through a *fixed* step sequence. (Adapting on a derivative norm would
-/// make the sensitivity inconsistent with the prediction.) This is the
-/// derivative-carrying sibling of [`solve_ode`]; the f64 path is left untouched.
+/// **Step-size control reads `.val()` only** — the accept/reject decision and `dt` adaptation
+/// depend on values, never on derivatives, so the derivative flows through a *fixed* step
+/// sequence. (Adapting on a derivative norm would make the sensitivity inconsistent with the
+/// prediction.)
 pub fn solve_ode_g<T: crate::sens::num::PkNum>(
     rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
     u0: &[T],
@@ -658,10 +862,6 @@ pub fn solve_ode_g<T: crate::sens::num::PkNum>(
 }
 
 /// [`solve_ode_g`] with optional adaptive-step instrumentation.
-///
-/// Stats are computed from value-only error control, matching the production
-/// sensitivity path: derivative components never influence accept/reject or
-/// step-size decisions.
 pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
     rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
     u0: &[T],
@@ -669,183 +869,38 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
     params: &[T],
     saveat: &[f64],
     opts: &OdeSolverOptions,
-    mut stats: Option<&mut OdeSolverStats>,
+    stats: Option<&mut OdeSolverStats>,
 ) -> Vec<SolPointG<T>> {
-    let n = u0.len();
-    let (t0, tf) = t_span;
-    let zero = T::from_f64(0.0);
+    solve_ode_g_dense(rhs, u0, t_span, params, saveat, &[], opts, stats).0
+}
 
-    if (tf - t0).abs() < 1e-15 {
-        return saveat
-            .iter()
-            .map(|&t| SolPointG { t, u: u0.to_vec() })
-            .collect();
-    }
-
-    let mut u = u0.to_vec();
-    let mut t = t0;
-    let mut dt = opts.initial_dt.min((tf - t0) / 10.0).max(opts.min_dt);
-
-    let mut k1 = vec![zero; n];
-    let mut k2 = vec![zero; n];
-    let mut k3 = vec![zero; n];
-    let mut k4 = vec![zero; n];
-    let mut k5 = vec![zero; n];
-    let mut k6 = vec![zero; n];
-    let mut k7 = vec![zero; n];
-    let mut u_tmp = vec![zero; n];
-    let mut u5 = vec![zero; n];
-
-    let mut results: Vec<SolPointG<T>> = Vec::with_capacity(saveat.len());
-    let mut save_idx = 0;
-    let mut have_k1 = false;
-    const I_EXP: f64 = 1.0 / 5.0;
-    let mut consecutive_min_step_clamps = 0usize;
-
-    // Scalar-weighted combination `u[i] + dt·Σ wⱼ·kⱼ[i]` lifted to `T`.
-    let comb = |base: T, dt_eff: f64, terms: &[(f64, T)]| -> T {
-        let mut acc = base;
-        for &(w, kij) in terms {
-            acc = acc + kij * T::from_f64(dt_eff * w);
-        }
-        acc
-    };
-
-    for _step in 0..opts.max_steps {
-        if t >= tf - 1e-15 {
-            break;
-        }
-
-        let mut dt_eff = dt.min(tf - t);
-        if save_idx < saveat.len() && t + dt_eff > saveat[save_idx] + 1e-15 {
-            dt_eff = (saveat[save_idx] - t).max(opts.min_dt);
-        }
-
-        if !have_k1 {
-            rhs(&u, params, t, &mut k1);
-            have_k1 = true;
-        }
-
-        for i in 0..n {
-            u_tmp[i] = comb(u[i], dt_eff, &[(B21, k1[i])]);
-        }
-        rhs(&u_tmp, params, t + A2 * dt_eff, &mut k2);
-
-        for i in 0..n {
-            u_tmp[i] = comb(u[i], dt_eff, &[(B31, k1[i]), (B32, k2[i])]);
-        }
-        rhs(&u_tmp, params, t + A3 * dt_eff, &mut k3);
-
-        for i in 0..n {
-            u_tmp[i] = comb(u[i], dt_eff, &[(B41, k1[i]), (B42, k2[i]), (B43, k3[i])]);
-        }
-        rhs(&u_tmp, params, t + A4 * dt_eff, &mut k4);
-
-        for i in 0..n {
-            u_tmp[i] = comb(
-                u[i],
-                dt_eff,
-                &[(B51, k1[i]), (B52, k2[i]), (B53, k3[i]), (B54, k4[i])],
-            );
-        }
-        rhs(&u_tmp, params, t + A5 * dt_eff, &mut k5);
-
-        for i in 0..n {
-            u_tmp[i] = comb(
-                u[i],
-                dt_eff,
-                &[
-                    (B61, k1[i]),
-                    (B62, k2[i]),
-                    (B63, k3[i]),
-                    (B64, k4[i]),
-                    (B65, k5[i]),
-                ],
-            );
-        }
-        rhs(&u_tmp, params, t + dt_eff, &mut k6);
-
-        for i in 0..n {
-            u5[i] = comb(
-                u[i],
-                dt_eff,
-                &[
-                    (B71, k1[i]),
-                    (B73, k3[i]),
-                    (B74, k4[i]),
-                    (B75, k5[i]),
-                    (B76, k6[i]),
-                ],
-            );
-        }
-
-        rhs(&u5, params, t + dt_eff, &mut k7);
-
-        // Error norm on values only (step control must not see derivatives).
-        let mut err_norm = 0.0;
-        for i in 0..n {
-            let err_i = dt_eff
-                * (E1 * k1[i].val()
-                    + E3 * k3[i].val()
-                    + E4 * k4[i].val()
-                    + E5 * k5[i].val()
-                    + E6 * k6[i].val()
-                    + E7 * k7[i].val());
-            let scale = scale_tol(opts.abstol, opts.reltol, u5[i].val(), u[i].val());
-            err_norm += (err_i / scale) * (err_i / scale);
-        }
-        err_norm = (err_norm / n as f64).sqrt();
-
-        let accepted = err_norm <= 1.0 || dt_eff <= opts.min_dt;
-        // Mirror the scalar path: only a non-finite force-accept at `min_dt` counts toward
-        // the pathological-divergence break (#603 review #4).
-        let nonfinite_min_step = accepted && dt_eff <= opts.min_dt && !err_norm.is_finite();
-        if let Some(s) = stats.as_deref_mut() {
-            s.record(accepted, err_norm, dt_eff, opts.min_dt);
-        }
-        if accepted {
-            t += dt_eff;
-            u.copy_from_slice(&u5);
-            std::mem::swap(&mut k1, &mut k7);
-            while save_idx < saveat.len() && (t - saveat[save_idx]).abs() < 1e-12 {
-                results.push(SolPointG {
-                    t: saveat[save_idx],
-                    u: u.clone(),
-                });
-                save_idx += 1;
-            }
-
-            if nonfinite_min_step {
-                consecutive_min_step_clamps += 1;
-                if consecutive_min_step_clamps >= MAX_CONSECUTIVE_MIN_STEP_CLAMPS {
-                    break;
-                }
-            } else {
-                consecutive_min_step_clamps = 0;
-            }
-        }
-
-        let safety = 0.9;
-        let factor = if !err_norm.is_finite() {
-            NONFINITE_ERR_SHRINK_FACTOR
-        } else if err_norm > 1e-15 {
-            safety * err_norm.powf(-I_EXP)
-        } else {
-            5.0
-        };
-        dt = dt_eff * factor.clamp(0.2, 5.0);
-        dt = dt.max(opts.min_dt);
-    }
-
-    while save_idx < saveat.len() {
-        results.push(SolPointG {
-            t: saveat[save_idx],
-            u: u.clone(),
-        });
-        save_idx += 1;
-    }
-
-    results
+/// [`solve_ode_g`] with dense soft-sampling — the sensitivity-carrying twin of
+/// [`solve_ode_dense`]. Available for every method because the interpolation comes from the
+/// [`Stepper`], so an analytic-gradient consumer that needs an in-step readout (a hazard state
+/// at an event time, say) has one to call.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u0: &[T],
+    t_span: (f64, f64),
+    params: &[T],
+    saveat: &[f64],
+    interp_at: &[f64],
+    opts: &OdeSolverOptions,
+    stats: Option<&mut OdeSolverStats>,
+) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
+    let mut stepper = make_stepper::<T>(u0.len(), opts.method);
+    integrate_dense_g(
+        stepper.as_mut(),
+        rhs,
+        u0,
+        t_span,
+        params,
+        saveat,
+        interp_at,
+        opts,
+        stats,
+    )
 }
 
 #[cfg(test)]
@@ -1354,6 +1409,7 @@ mod tests {
             max_steps: 10_000,
             abstol: 1e-12,
             reltol: 1e-12,
+            ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
         let result = solve_ode_with_stats(
@@ -1391,6 +1447,7 @@ mod tests {
             max_steps: 200,
             abstol: 1e-12,
             reltol: 1e-12,
+            ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
         let result = solve_ode_with_stats(
@@ -1426,6 +1483,7 @@ mod tests {
             max_steps: 200,
             abstol: 1e-12,
             reltol: 1e-12,
+            ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
         let result = solve_ode_g_with_stats(
@@ -1456,6 +1514,7 @@ mod tests {
             max_steps: 10_000,
             abstol: 1e-12,
             reltol: 1e-12,
+            ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
         let result = solve_ode_g_with_stats(
