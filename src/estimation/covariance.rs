@@ -516,7 +516,16 @@ fn analytic_cov_hessian(
         if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
             return None;
         }
-        acc += h;
+        // ×2 — the OFV convention, and the one place this can be silently wrong.
+        //
+        // `subject_packed_cov_hessian` is the second derivative of `subject_packed_gradient`,
+        // which is `∂Fᵢ/∂x` with `OFV = 2·Σᵢ Fᵢ` (see `population_gradient_sens`'s
+        // `grad[k] += 2.0 * gi[k]`). The stencil this replaces differences `2·pop_nll`, so
+        // `hess` here must be `∂²OFV/∂x²`, and the caller's `covariance = 2·H⁻¹` assumes it.
+        // Summing the per-subject Hessians unscaled yields exactly half of that, which inflates
+        // every standard error by √2 — with no other symptom, since the matrix stays symmetric,
+        // positive-definite and plausibly sized.
+        acc += 2.0 * h;
     }
     Some(acc)
 }

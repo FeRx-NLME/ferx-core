@@ -2606,6 +2606,109 @@ mod tests {
         assert!(ta < tf, "analytic ({ta:.4}s) should beat FD ({tf:.4}s)");
     }
 
+    /// End-to-end through `compute_covariance`: the analytic route must reproduce the
+    /// finite-difference stencil it replaces — **including the OFV scale factor**.
+    ///
+    /// Every other test in this module validates the per-subject assembly against a finite
+    /// difference of its own gradient, which is scale-blind: `subject_packed_cov_hessian`
+    /// returns `∂²Fᵢ/∂x²`, but `compute_covariance` consumes `∂²OFV/∂x²` with `OFV = 2·Σᵢ Fᵢ`
+    /// (see `population_gradient_sens`'s `grad[k] += 2.0 * gi[k]`), and its
+    /// `covariance = 2·H⁻¹` assumes that convention. Summing per-subject Hessians unscaled
+    /// therefore yields half the right matrix and inflates every standard error by √2 — with
+    /// **no other symptom**, since the result stays symmetric, positive-definite and
+    /// plausibly sized. Exactly the factor-of-2 class of #209.
+    ///
+    /// Nothing else covers the population helper or the `compute_covariance` dispatch at all,
+    /// so this is the only test that exercises the wiring rather than the mathematics.
+    #[test]
+    fn analytic_cov_matches_the_fd_stencil_through_compute_covariance() {
+        use crate::estimation::covariance::{compute_covariance, CovarianceStepResult};
+        use crate::types::{FitOptions, Population};
+
+        let model = parse_model_string(WARFARIN).expect("parse");
+        let theta = vec![0.2, 10.0, 1.5];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0];
+        let subjects: Vec<Subject> = (0..4)
+            .map(|k| {
+                let mut s = warfarin_subject(&model, &theta, &times);
+                s.id = format!("{k}");
+                s
+            })
+            .collect();
+        let eta_hats: Vec<DVector<f64>> = subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+        let n_subj = subjects.len();
+        let population = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let x_hat = pack_params(&params);
+        let h_mats = vec![DMatrix::zeros(model.n_eta, model.n_eta); n_subj];
+        let kappas = vec![vec![]; n_subj];
+
+        let run = |analytic: bool| -> DMatrix<f64> {
+            let mut opts = FitOptions {
+                analytic_cov_hessian: analytic,
+                ..FitOptions::default()
+            };
+            opts.verbose = false;
+            match compute_covariance(
+                &x_hat,
+                &params,
+                &model,
+                &population,
+                &eta_hats,
+                &h_mats,
+                &kappas,
+                &opts,
+            ) {
+                CovarianceStepResult::Success(o) => o.matrix,
+                other => panic!(
+                    "covariance step must succeed (analytic = {analytic}); got {}",
+                    match other {
+                        CovarianceStepResult::Unusable(m) => m,
+                        CovarianceStepResult::FailedNonPd { reason, .. } => reason,
+                        _ => unreachable!(),
+                    }
+                ),
+            }
+        };
+
+        let cov_fd = run(false);
+        let cov_an = run(true);
+
+        // Standard errors are what a user sees, so compare those rather than raw entries.
+        let se = |c: &DMatrix<f64>| -> Vec<f64> {
+            (0..c.nrows()).map(|i| c[(i, i)].max(0.0).sqrt()).collect()
+        };
+        let (se_fd, se_an) = (se(&cov_fd), se(&cov_an));
+        let worst = se_fd
+            .iter()
+            .zip(se_an.iter())
+            .filter(|(f, _)| **f > 1e-12)
+            .fold(0.0f64, |m, (f, a)| m.max(((a - f) / f).abs()));
+
+        assert!(
+            worst < 0.05,
+            "analytic SEs must match the FD stencil to 5%: worst relative Δ {worst:.3e}\n\
+             fd = {se_fd:?}\nan = {se_an:?}"
+        );
+        // A √2 (41%) discrepancy is the specific failure this guards; assert it is nowhere near.
+        assert!(
+            worst < 0.2,
+            "SE ratio looks like an OFV scale-factor error (√2 ≈ 0.41): {worst:.3e}"
+        );
+    }
+
     /// Safety gate: the per-subject analytic covariance Hessian (both FOCEI and
     /// FOCE entry points) must return `None` for out-of-derivation-scope models, so
     /// `compute_covariance` drops the whole population back to the finite-difference
