@@ -1978,6 +1978,7 @@ fn run_subject<const N: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            ..Default::default()
         });
     }
 
@@ -2100,6 +2101,7 @@ fn run_subject_mixed<const NA: usize, const N: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            ..Default::default()
         });
     }
 
@@ -2905,6 +2907,7 @@ fn run_subject_iov<const M: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            ..Default::default()
         });
     }
     // Apply the `ExpressionScale` quotient per observation, using the observation's

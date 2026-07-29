@@ -218,6 +218,24 @@ section of the SDLC for the versioning policy).
   estimators still use **different** Hessians — that is what distinguishes them — and only the
   computation is now shared. Models outside the analytic sensitivity scope (TTE, categorical)
   keep the finite-difference path.
+
+- **Exact analytic covariance R-matrix for FOCE/FOCEI** (#436). Standard errors on in-scope
+  models are now the exact second derivative of the marginal the outer loop minimises,
+  assembled from third-order sensitivities, instead of a second difference of the reconverged
+  objective. The finite-difference stencil evaluated the objective `~2·n_free²` times, each
+  re-solving every subject's inner loop, and amplified error as `1/h²`; the analytic route
+  costs `2N+1` sensitivity evaluations per subject (`N = n_theta + n_eta`) with **no inner
+  re-solve** beyond the single reconvergence at the converged point, and has no
+  `fd_hessian_step` to tune. Measured on warfarin: agreement with the
+  reconverged finite difference to `8.2e-5`, at 3.0× the speed per subject. Out-of-scope models
+  (ODE, LTBS, IOV, M3/BLOQ censoring, expression scaling, Form-C readouts, `iiv_on_ruv`,
+  correlated or custom-magnitude residuals, time-varying covariates, FREM, covariate-selected
+  error models, non-Gaussian endpoints, `method = laplace`/`agq`, and `gradient = fd`) keep the
+  finite-difference covariance unchanged — it is correct for all of them — and a single
+  out-of-scope subject drops the whole population back to it rather than mixing two
+  approximations in one matrix. Set `analytic_cov_hessian = false` in `[fit_options]` to force
+  finite differences.
+
 - **Exact analytic inner (EBE) gradients for log-transform-both-sides under inter-occasion
   variability** (#486). Fitting a closed-form model that combines `log(DV) ~ additive(...)`
   with `[iov]` now uses exact analytic sensitivities for the per-subject empirical-Bayes
