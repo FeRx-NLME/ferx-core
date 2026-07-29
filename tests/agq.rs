@@ -474,10 +474,17 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
     // gate: `grid_response_correction` supplies the `∂Φ/∂H·dH/dx` term that the fixed-node
     // score omits, and at n = 1 that term is the entire difference (a 26% error without it).
     //
-    // Measured: 2.0e-5 at n = 1, 1.5e-6 at n = 3, 2.1e-7 at n = 7 — the gradient is exact to
-    // the reference's own precision. (An earlier revision of this test used a 1e-5 FD step and
-    // read 1.6e-3; that was the *reference's* noise, not the gradient's error — see the step
+    // Measured: 6.5e-8 at n = 1, 2.8e-9 at n = 3, 1.8e-9 at n = 7 — the gradient is exact well
+    // past the reference's own precision. (An earlier revision of this test used a 1e-5 FD step
+    // and read 1.6e-3; that was the *reference's* noise, not the gradient's error — see the step
     // comment above. Do not "restore" the smaller step.)
+    //
+    // Those numbers were 2.0e-5 / 1.5e-6 / 2.1e-7 before the anchor and the grid-response term
+    // went analytic: the old path finite-differenced `Φ` in `x` while `H` was *itself* a finite
+    // difference, so an FD-of-an-FD sat under every value. Both layers are gone — `H` is
+    // `score_core`'s exact `h_inner`, and the node response contracts each node's analytic
+    // `∂nll/∂b` against a displacement differenced from the cheap *exact* `x ↦ (log|Σ⁻¹|, bⱼ)`
+    // map — leaving ~2-3 orders of magnitude.
     //
     // The 1e-4 bound also pins `AGQ_GRID_FD_STEP`: at 1e-2 this test fails outright, because
     // the grid-response term is truncation-dominated and a "safe" large step puts the θ
@@ -495,6 +502,16 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
     assert!(
         rel_errs[3] < rel_errs[0],
         "accuracy should improve with node count: {rel_errs:?}"
+    );
+    // A second, tighter bound at n = 1 that the **pre-analytic** path could not have met: it
+    // measured 2.0e-5 there, 300x above this. Deliberately left ~15x above the 6.5e-8 actually
+    // observed, so it pins the analytic anchor + analytic node response against silent
+    // regression to an FD-of-an-FD without being tight enough to flake on reference noise.
+    assert!(
+        rel_errs[0] < 1e-6,
+        "n_agq=1 must stay at analytic-anchor accuracy (was 2.0e-5 on the FD path), \
+         got {:.3e}",
+        rel_errs[0]
     );
 }
 

@@ -202,6 +202,22 @@ section of the SDLC for the versioning policy).
   through both the endpoint-routed and model-blind loaders.
 
 ### Performance
+- **`method = laplace` gradients are far more accurate, and its objective is faster.** The
+  posterior Hessian that scales the quadrature grid is now taken analytically — it is the exact
+  conditional `∂²nll/∂b²` the shared sensitivity sweep already assembles — instead of being
+  rebuilt by a `2d²+1` per-subject finite-difference sweep. The grid-response term of the
+  gradient likewise stopped re-sweeping the whole quadrature grid once per parameter: each
+  node's analytic `∂nll/∂b` is computed once and contracted against a node displacement
+  differenced from a cheap exact linear-algebra map. Between them these removed a
+  finite-difference *of* a finite-difference, and the gradient's agreement with a reconverged
+  finite difference of the objective improved by two to three orders of magnitude (warfarin:
+  `2.0e-5` → `6.5e-8` relative at `n_agq = 1`, `2.1e-7` → `1.8e-9` at `n_agq = 7`). The Hessian
+  change also speeds up every objective evaluation, and therefore the covariance step, which
+  evaluates it `~2·n_free²` times. Laplace OFVs and standard errors shift very slightly, since
+  the exact Hessian replaces an approximated one. `method = focei` is unaffected: the two
+  estimators still use **different** Hessians — that is what distinguishes them — and only the
+  computation is now shared. Models outside the analytic sensitivity scope (TTE, categorical)
+  keep the finite-difference path.
 - **Exact analytic inner (EBE) gradients for log-transform-both-sides under inter-occasion
   variability** (#486). Fitting a closed-form model that combines `log(DV) ~ additive(...)`
   with `[iov]` now uses exact analytic sensitivities for the per-subject empirical-Bayes
