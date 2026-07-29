@@ -12,6 +12,7 @@ pub mod run_covariance;
 pub mod run_sir;
 pub mod saem;
 pub mod saem_conddist;
+pub mod sens_cov_hessian;
 pub mod sens_outer_gradient;
 pub mod sir;
 pub mod trace;

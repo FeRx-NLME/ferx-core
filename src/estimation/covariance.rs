@@ -474,6 +474,53 @@ pub(crate) fn assemble_score_cross_product(
 /// The estimator assembled from the Hessian `R` is selected by
 /// [`FitOptions::covariance_method`] — `R⁻¹` (default), the score cross-product
 /// `S⁻¹`, or the sandwich `R⁻¹SR⁻¹` (see [`assemble_score_cross_product`]).
+/// The exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, or `None` when
+/// **any** subject is outside the analytic scope.
+///
+/// All-or-nothing on purpose. Mixing an analytic block for some subjects with a
+/// finite-difference block for others would produce a matrix that is neither, and the
+/// resulting SEs would be silently method-dependent per subject. The finite-difference
+/// stencil is correct for everything, so it is the honest fallback.
+///
+/// Serial over subjects, reduced in subject order, so the result cannot depend on thread
+/// count — matching how the FD stencil and the outer gradient reduce (#703). The covariance
+/// step runs once per fit, so the per-subject assembly is not on any hot path.
+fn analytic_cov_hessian(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x_hat: &[f64],
+    eta_hats: &[DVector<f64>],
+    options: &FitOptions,
+) -> Option<DMatrix<f64>> {
+    use crate::estimation::sens_cov_hessian::{
+        subject_packed_cov_hessian, subject_packed_cov_hessian_foce,
+    };
+    // IOV is out of scope: the assembly is written over the η-only random-effect block, not
+    // the stacked `[η, κ]` one.
+    if population
+        .subjects
+        .iter()
+        .any(|s| !s.dose_occasions.is_empty() && model.n_kappa > 0)
+    {
+        return None;
+    }
+    let n = x_hat.len();
+    let mut acc = DMatrix::<f64>::zeros(n, n);
+    for (subject, eta_hat) in population.subjects.iter().zip(eta_hats.iter()) {
+        let h = if options.interaction {
+            subject_packed_cov_hessian(model, subject, template, x_hat, eta_hat.as_slice())
+        } else {
+            subject_packed_cov_hessian_foce(model, subject, template, x_hat, eta_hat.as_slice())
+        }?;
+        if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        acc += h;
+    }
+    Some(acc)
+}
+
 pub(crate) fn compute_covariance(
     x_hat: &[f64],
     template: &ModelParameters,
@@ -648,6 +695,30 @@ pub(crate) fn compute_covariance(
     let mut fd_diag_nan: HashSet<usize> = HashSet::new();
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
+    // ── Analytic R-matrix (#436), attempted before the FD stencil ────────────────
+    //
+    // The exact observed information from third-order sensitivities, assembled per
+    // subject and summed. All-or-nothing: a single subject outside the analytic
+    // scope drops the whole population back to the finite-difference stencil below,
+    // because a Hessian half-assembled from two different approximations would be
+    // neither.
+    //
+    // This is not the stencil #639 removed. That one finite-differenced a gradient
+    // that held `a = ∂f/∂η` fixed — an envelope approximation, which is why it
+    // biased weakly-identified structural SEs. This is the exact second derivative
+    // of the same marginal the outer loop minimises.
+    let analytic_hess: Option<DMatrix<f64>> = if options.analytic_cov_hessian {
+        analytic_cov_hessian(model, population, template, x_hat, eta_hats, options)
+    } else {
+        None
+    };
+    if let Some(h) = analytic_hess.as_ref() {
+        hess.copy_from(h);
+        if options.verbose {
+            eprintln!("  [covariance] analytic R-matrix (third-order sensitivities, #436)");
+        }
+    }
+    if analytic_hess.is_none()
     // Reconverged-OFV second-difference Hessian (3-point diagonal, 4-point
     // off-diagonal), reconverging the EBEs at each perturbed point. The sole
     // covariance R stencil: it recomputes the marginal curvature end-to-end

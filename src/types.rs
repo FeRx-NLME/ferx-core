@@ -4947,6 +4947,13 @@ pub struct FitOptions {
     /// automatically (up to 8×) if a diagonal stencil comes back non-finite, so
     /// manual tuning is rarely needed for overflow; decrease (e.g. `1e-3`) for
     /// smoother OFV surfaces where FD noise is the main concern.
+    /// When `true` (the default) and the model is in analytic-covariance scope, the
+    /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
+    /// (#436), assembled from third-order sensitivities instead of second-differencing the
+    /// reconverged objective. Out-of-scope models fall back to the finite-difference stencil
+    /// regardless — it is correct for everything — so this key only ever chooses between two
+    /// routes to the same quantity. Set `false` to force finite differences.
+    pub analytic_cov_hessian: bool,
     pub fd_hessian_step: f64,
     /// What to do when the FD Hessian is non-positive-definite.
     /// Default [`CovarianceFallback::None`] leaves the covariance step as failed.
@@ -5446,6 +5453,7 @@ impl Default for FitOptions {
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
+            analytic_cov_hessian: true,
             interaction: true,
             verbose: true,
             // `Auto` resolves per model (see `Optimizer::resolve_auto`): the
@@ -6020,6 +6028,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "covariance",
         "covariance_method",
         "covariance_fallback",
+        "analytic_cov_hessian",
         "fd_hessian_step",
         "verbose",
         "sir",

@@ -1438,6 +1438,148 @@ const THREECPT_ORAL: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
+/// Third-order sensitivities (#436) — the blocks the analytic covariance Hessian consumes.
+///
+/// `subject_sensitivities_cov` differences the **exact** `Dual2` jet along each `(θ, η)` axis,
+/// so the arithmetic is easy; what is easy to get *wrong* is the row-major index layout of
+/// four differently-shaped tensors. A transposed slice still produces plausible finite
+/// numbers, and would surface only as subtly wrong standard errors. So this pins the layouts
+/// three independent ways rather than trusting one comparison:
+///
+/// 1. **Full symmetry of `∂³f/∂η³`.** A smooth `f` has a totally symmetric third derivative,
+///    so `d3f_deta3[k,l,m]` must be invariant under all six permutations. This catches any
+///    stride error in the `n_eta³` layout on its own.
+/// 2. **An independent route to `∂³f/∂η²∂θ`.** The shipped code reaches it by differencing
+///    `∂²f/∂η²` along `θ`; here it is recomputed by differencing `∂²f/∂η∂θ` along `η`. Both
+///    are first differences of exact quantities but touch *different* blocks of the jet and
+///    different axes, so agreement pins the cross-block indexing.
+/// 3. **A pure `f64` anchor.** One entry of each tensor against a triple central difference of
+///    `compute_predictions_with_tv` — the production predictor, with no duals involved at all.
+///    Loosest tolerance of the three (a triple difference amplifies round-off by `h³`), but it
+///    is the only check that does not reuse the `Dual2` machinery under test.
+#[test]
+fn third_order_sensitivities_layouts_and_values() {
+    let m = parse_model_string(ONECPT_IV_2ETA).expect("parse");
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 2.0, 6.0, 12.0],
+    );
+    let theta = [0.25, 11.0];
+    let eta = [0.13, -0.09];
+    let (n_theta, n_eta) = (theta.len(), eta.len());
+
+    let cov = subject_sensitivities_cov(&m, &s, &theta, &eta).expect("in scope");
+    assert_eq!(cov.obs.len(), s.obs_times.len());
+
+    // The base blocks must be untouched by the cov wrapper.
+    let base = subject_sensitivities(&m, &s, &theta, &eta).expect("in scope");
+    for (c, b) in cov.obs.iter().zip(base.obs.iter()) {
+        assert_eq!(c.f, b.f, "cov wrapper must not perturb the base jet");
+        assert_eq!(c.df_deta, b.df_deta);
+        assert_eq!(c.d2f_deta2, b.d2f_deta2);
+    }
+
+    // The largest |∂³f/∂η³| entry sets the scale; a relative tolerance against a
+    // near-zero entry would be meaningless.
+    let scale = cov
+        .obs
+        .iter()
+        .flat_map(|o| o.d3f_deta3.iter())
+        .fold(1e-12f64, |a, v| a.max(v.abs()));
+
+    for (j, o) in cov.obs.iter().enumerate() {
+        assert_eq!(o.d3f_deta3.len(), n_eta * n_eta * n_eta);
+        assert_eq!(o.d3f_deta2_dtheta.len(), n_eta * n_eta * n_theta);
+        assert_eq!(o.d3f_deta_dtheta2.len(), n_eta * n_theta * n_theta);
+        assert_eq!(o.d2f_dtheta2.len(), n_theta * n_theta);
+
+        // (1) total symmetry of the η³ tensor
+        let g3 = |k: usize, l: usize, mm: usize| o.d3f_deta3[(k * n_eta + l) * n_eta + mm];
+        for k in 0..n_eta {
+            for l in 0..n_eta {
+                for mm in 0..n_eta {
+                    for &(a, b, c) in &[(l, k, mm), (k, mm, l), (mm, l, k), (l, mm, k), (mm, k, l)]
+                    {
+                        assert!(
+                            (g3(k, l, mm) - g3(a, b, c)).abs() < 1e-6 * scale,
+                            "obs {j}: d3f_deta3 not symmetric at [{k},{l},{mm}] vs [{a},{b},{c}]: \
+                             {} vs {}",
+                            g3(k, l, mm),
+                            g3(a, b, c)
+                        );
+                    }
+                }
+            }
+        }
+
+        // (2) ∂³f/∂η_k∂η_l∂θ_mm, recomputed by differencing ∂²f/∂η∂θ along η_l instead.
+        for l in 0..n_eta {
+            let h = f64::EPSILON.cbrt() * (1.0 + eta[l].abs());
+            let (mut ep, mut em) = (eta.to_vec(), eta.to_vec());
+            ep[l] += h;
+            em[l] -= h;
+            let p = subject_sensitivities(&m, &s, &theta, &ep).expect("in scope");
+            let q = subject_sensitivities(&m, &s, &theta, &em).expect("in scope");
+            for k in 0..n_eta {
+                for mm in 0..n_theta {
+                    let alt = (p.obs[j].d2f_deta_dtheta[k * n_theta + mm]
+                        - q.obs[j].d2f_deta_dtheta[k * n_theta + mm])
+                        / (2.0 * h);
+                    let got = o.d3f_deta2_dtheta[(k * n_eta + l) * n_theta + mm];
+                    assert!(
+                        (alt - got).abs() < 1e-5 * scale.max(alt.abs()),
+                        "obs {j}: d3f_deta2_dtheta[{k},{l},{mm}] = {got} but the \
+                         ∂²f/∂η∂θ route gives {alt}"
+                    );
+                }
+            }
+        }
+    }
+
+    // (3) pure-f64 anchor: ∂³f/∂η_0²∂η_1 by a triple central difference of the predictor.
+    let f64_at = |e: &[f64]| compute_predictions_with_tv(&m, &s, &theta, e);
+    let h = 1e-3;
+    let mut acc = vec![0.0f64; s.obs_times.len()];
+    for (sa, ca) in [(1.0, 1.0), (-1.0, -1.0)] {
+        for (sb, cb) in [(1.0, 1.0), (-1.0, -1.0)] {
+            for (sc, cc) in [(1.0, 1.0), (-1.0, -1.0)] {
+                let e = [eta[0] + (sa + sb) * h, eta[1] + sc * h];
+                let w = ca * cb * cc;
+                for (a, v) in acc.iter_mut().zip(f64_at(&e).iter()) {
+                    *a += w * v;
+                }
+            }
+        }
+    }
+    // The stencil above collapses to a 2nd difference in η₀ times a 1st in η₁.
+    for (j, o) in cov.obs.iter().enumerate() {
+        let reference = acc[j] / (8.0 * h * h * h);
+        let got = o.d3f_deta3[(0 * n_eta + 0) * n_eta + 1];
+        assert!(
+            (reference - got).abs() < 5e-3 * scale.max(got.abs()),
+            "obs {j}: d3f_deta3[0,0,1] = {got} vs f64 triple-difference {reference}"
+        );
+    }
+}
+
+/// Minimal 2-η / 2-θ closed form for the third-order tests — small enough that the
+/// `(n_eta³, n_eta²·n_theta, n_eta·n_theta²)` layouts are all distinct shapes.
+const ONECPT_IV_2ETA: &str = r#"
+[parameters]
+  theta TVCL(0.25, 0.001, 10.0)
+  theta TVV(11.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
 fn subject_with_dose(dose: DoseEvent, times: &[f64]) -> Subject {
     let n = times.len();
     Subject {

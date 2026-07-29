@@ -45,7 +45,7 @@ use crate::types::{
 
 /// Exact sensitivities of one observation w.r.t. η and θ. Hessian-shaped fields
 /// are stored row-major (`[k*n + l]`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ObsSens {
     pub f: f64,
     /// `∂f/∂η_k`, length `n_eta`.
@@ -56,6 +56,18 @@ pub struct ObsSens {
     pub df_dtheta: Vec<f64>,
     /// `∂²f/∂η_k∂θ_m`, row-major `n_eta × n_theta`.
     pub d2f_deta_dtheta: Vec<f64>,
+    // ── Covariance-only third-order blocks (#436) ────────────────────────────
+    // Empty on the ordinary gradient path — only [`subject_sensitivities_cov`]
+    // fills them, and only for the covariance step, which runs once per fit. An
+    // empty `Vec` does not allocate, so carrying them costs the hot path nothing.
+    /// `∂²f/∂θ_m∂θ_n`, row-major `n_theta × n_theta`.
+    pub d2f_dtheta2: Vec<f64>,
+    /// `∂³f/∂η_k∂η_l∂η_m`, row-major `n_eta³`.
+    pub d3f_deta3: Vec<f64>,
+    /// `∂³f/∂η_k∂η_l∂θ_m`, row-major `n_eta·n_eta·n_theta`.
+    pub d3f_deta2_dtheta: Vec<f64>,
+    /// `∂³f/∂η_k∂θ_m∂θ_n`, row-major `n_eta·n_theta·n_theta`.
+    pub d3f_deta_dtheta2: Vec<f64>,
 }
 
 /// All observations' sensitivities for one subject, parallel to
@@ -105,6 +117,7 @@ pub(crate) fn obs_sens_from_dual2<const M: usize>(
         d2f_deta2,
         df_dtheta,
         d2f_deta_dtheta,
+        ..Default::default()
     }
 }
 
@@ -2128,6 +2141,7 @@ fn run_obs_iov<const M: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            ..Default::default()
         });
     }
 
@@ -4157,6 +4171,163 @@ pub fn subject_sensitivities(
     r
 }
 
+/// Relative step for differencing the **exact** second-order jet to reach third order.
+///
+/// `ε^(1/3) ≈ 6.06e-6` is the textbook optimum for a central first difference: truncation
+/// falls as `h²` and round-off grows as `ε/h`, so they balance at the cube root. That optimum
+/// is only *available* because the differenced quantity is exact to machine precision — the
+/// classic reason to avoid this trick, differencing something that is itself a finite
+/// difference, does not apply to a `Dual2` jet.
+fn third_order_fd_step(x: f64) -> f64 {
+    f64::EPSILON.cbrt() * (1.0 + x.abs())
+}
+
+/// Third-order sensitivities for the analytic covariance Hessian (#436), obtained by
+/// **finite-differencing the exact `Dual2` second-order jet** along each `(θ, η)` axis.
+///
+/// Returns the same per-observation `(f, ∂f/∂η, ∂²f/∂η², ∂f/∂θ, ∂²f/∂η∂θ)` as
+/// [`subject_sensitivities`] — untouched, straight from the base evaluation — plus the
+/// covariance-only blocks `∂²f/∂θ²`, `∂³f/∂η³`, `∂³f/∂η²∂θ` and `∂³f/∂η∂θ²`.
+///
+/// # Why finite differences here, and why that is not a step backwards
+///
+/// The observed information needs one derivative more than the outer gradient, and the
+/// provider stops at second order. Two ways to close that: exact third-order sensitivity
+/// equations (a `Dual3` type and a third-order kernel through every closed form), or
+/// differencing the exact second-order jet. This is the latter.
+///
+/// The distinction that matters is **what** is being differenced. The covariance stencil this
+/// replaces takes a *second* difference of the reconverged OFV: error amplifies as `ε/h²`, and
+/// each of its `~2·n_free²` points re-solves every subject's inner loop. Here a *single*
+/// central difference is taken of a quantity that is exact to machine precision, so error
+/// amplifies as `ε/h` at worst, and the cost is `2N+1` provider evaluations per subject
+/// (`N = n_theta + n_eta`) with **no inner re-solve** — the covariance step runs once per fit,
+/// so this is arithmetic, not a loop over the optimiser.
+///
+/// Because `Dual2` carries every `(θ, η)` axis simultaneously, differencing along one axis and
+/// reading the *whole* exact second-order block yields every third-order slice containing that
+/// axis at once. Hence one uniform loop rather than four.
+///
+/// `∂²f/∂θ²` comes from the same sweep (differencing `∂f/∂θ`) rather than from the base jet.
+/// The `Dual2` walk does compute it — `obs_sens_from_dual2` discards the θ-θ block because the
+/// FOCEI gradient never reads it — so keeping it would be exact and marginally better; that is
+/// an optimisation, not a correctness matter, and it would mean touching the hot-path scatter.
+///
+/// `None` whenever [`subject_sensitivities`] declines at the base point or at any perturbed
+/// point; the caller then keeps the finite-difference-of-OFV stencil for that subject.
+pub fn subject_sensitivities_cov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<SubjectSens> {
+    // Scope gate. This is **not** redundant with `subject_sensitivities` returning `Some`:
+    // that predicate has grown well past the covariance assembly's derivation (LTBS since
+    // #665/#673, expression scaling, Form-C readouts, IOV, the event-driven walk). Handing
+    // the Gaussian-only assembly a jet from any of those would not fail — it would return a
+    // plausible, wrong Hessian, i.e. wrong standard errors with no symptom. So the scope is
+    // asserted positively here and kept deliberately narrow; everything else keeps the
+    // finite-difference covariance, which is correct for all of them.
+    if !analytical_supported(model)
+        || model.log_transform
+        || model.n_kappa > 0
+        || !matches!(model.scaling, ScalingSpec::None)
+        || model.analytic_readout.is_some()
+        || !model.analytical_init.is_empty()
+        || model.residual_error_eta.is_some()
+        || !model.residual_correlations.is_empty()
+        || model.has_custom_ruv_magnitude()
+        || subject_routes_to_event_walk(model, subject)
+        || model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .is_none_or(|p| !prog_covers_required_pk_slots(model, p))
+    {
+        return None;
+    }
+
+    let n_theta = theta.len();
+    let n_eta = eta.len();
+    let n_axes = n_theta + n_eta;
+
+    let mut base = subject_sensitivities(model, subject, theta, eta)?;
+    let n_obs = base.obs.len();
+
+    // One central pair per (θ, η) axis. Axis `c < n_theta` is `θ_c`; `c >= n_theta` is
+    // `η_{c-n_theta}` — the same layout the `Dual2` seeding uses.
+    let mut plus: Vec<SubjectSens> = Vec::with_capacity(n_axes);
+    let mut minus: Vec<SubjectSens> = Vec::with_capacity(n_axes);
+    let mut steps: Vec<f64> = Vec::with_capacity(n_axes);
+    for c in 0..n_axes {
+        let (mut tp, mut ep) = (theta.to_vec(), eta.to_vec());
+        let (mut tm, mut em) = (theta.to_vec(), eta.to_vec());
+        let h = if c < n_theta {
+            let h = third_order_fd_step(theta[c]);
+            tp[c] += h;
+            tm[c] -= h;
+            h
+        } else {
+            let k = c - n_theta;
+            let h = third_order_fd_step(eta[k]);
+            ep[k] += h;
+            em[k] -= h;
+            h
+        };
+        plus.push(subject_sensitivities(model, subject, &tp, &ep)?);
+        minus.push(subject_sensitivities(model, subject, &tm, &em)?);
+        steps.push(h);
+    }
+
+    for j in 0..n_obs {
+        let mut d2f_dtheta2 = vec![0.0f64; n_theta * n_theta];
+        let mut d3f_deta3 = vec![0.0f64; n_eta * n_eta * n_eta];
+        let mut d3f_deta2_dtheta = vec![0.0f64; n_eta * n_eta * n_theta];
+        let mut d3f_deta_dtheta2 = vec![0.0f64; n_eta * n_theta * n_theta];
+
+        for c in 0..n_axes {
+            let (p, m, h2) = (&plus[c].obs[j], &minus[c].obs[j], 2.0 * steps[c]);
+            let d = |a: f64, b: f64| (a - b) / h2;
+
+            if c < n_theta {
+                // ∂/∂θ_c of the exact first- and second-order blocks.
+                for mm in 0..n_theta {
+                    d2f_dtheta2[mm * n_theta + c] = d(p.df_dtheta[mm], m.df_dtheta[mm]);
+                }
+                for k in 0..n_eta {
+                    for l in 0..n_eta {
+                        d3f_deta2_dtheta[(k * n_eta + l) * n_theta + c] =
+                            d(p.d2f_deta2[k * n_eta + l], m.d2f_deta2[k * n_eta + l]);
+                    }
+                    for mm in 0..n_theta {
+                        d3f_deta_dtheta2[(k * n_theta + mm) * n_theta + c] = d(
+                            p.d2f_deta_dtheta[k * n_theta + mm],
+                            m.d2f_deta_dtheta[k * n_theta + mm],
+                        );
+                    }
+                }
+            } else {
+                // ∂/∂η_c of the exact η-η block.
+                let cm = c - n_theta;
+                for k in 0..n_eta {
+                    for l in 0..n_eta {
+                        d3f_deta3[(k * n_eta + l) * n_eta + cm] =
+                            d(p.d2f_deta2[k * n_eta + l], m.d2f_deta2[k * n_eta + l]);
+                    }
+                }
+            }
+        }
+
+        let o = &mut base.obs[j];
+        o.d2f_dtheta2 = d2f_dtheta2;
+        o.d3f_deta3 = d3f_deta3;
+        o.d3f_deta2_dtheta = d3f_deta2_dtheta;
+        o.d3f_deta_dtheta2 = d3f_deta_dtheta2;
+    }
+
+    Some(base)
+}
+
 /// Apply an `ExpressionScale` divisor `s(θ, η)` to a subject's already-computed
 /// jet in place: `scaled_f = f / s`. The scale's own value, `∂s/∂(θ,η)` and
 /// Hessian come from the differentiable scale program evaluated over `Dual2<M>`
@@ -5444,6 +5615,7 @@ fn run_obs<const N: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            ..Default::default()
         });
     }
     out
