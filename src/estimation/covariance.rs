@@ -683,10 +683,27 @@ pub(crate) fn compute_covariance(
 
     let f0 = base_ofv;
 
+    // The analytic attempt is made **before** `select_fd_step`, not after. That step probes
+    // `2·n_free` perturbed points, each of which reconverges every subject's inner loop, purely
+    // to size a finite-difference step the analytic route never uses. Running it first would
+    // have left the analytic path paying `2·n_free` reconverged population objectives for
+    // nothing — most of the cost it exists to remove, and a claim of "no inner re-solve" that
+    // the code did not honour.
+    let analytic_hess: Option<DMatrix<f64>> = if options.analytic_cov_hessian {
+        analytic_cov_hessian(model, population, template, x_hat, eta_hats, options)
+    } else {
+        None
+    };
+
     // Adaptively select the FD step: halve up to 8× until all free-parameter
     // diagonal stencils are finite. Most models use the initial step; halving
     // only kicks in when the OFV overflows at the default perturbation size.
-    let (eps, n_halvings) = select_fd_step(x_hat, &free_idx, initial_eps, f0, &ofv);
+    // Skipped entirely when the analytic Hessian is available.
+    let (eps, n_halvings) = if analytic_hess.is_some() {
+        (initial_eps, 0)
+    } else {
+        select_fd_step(x_hat, &free_idx, initial_eps, f0, &ofv)
+    };
     if options.verbose && n_halvings > 0 {
         eprintln!(
             "  [covariance] Adaptive FD step: reduced {:.3e} → {:.3e} ({} halving{})",
@@ -716,11 +733,6 @@ pub(crate) fn compute_covariance(
     // that held `a = ∂f/∂η` fixed — an envelope approximation, which is why it
     // biased weakly-identified structural SEs. This is the exact second derivative
     // of the same marginal the outer loop minimises.
-    let analytic_hess: Option<DMatrix<f64>> = if options.analytic_cov_hessian {
-        analytic_cov_hessian(model, population, template, x_hat, eta_hats, options)
-    } else {
-        None
-    };
     if let Some(h) = analytic_hess.as_ref() {
         hess.copy_from(h);
         if options.verbose {

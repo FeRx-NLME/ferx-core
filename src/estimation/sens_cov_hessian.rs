@@ -2683,6 +2683,21 @@ mod tests {
             }
         };
 
+        // Premise: the analytic route must actually be *taken*. If the scope gate declined,
+        // `compute_covariance` would fall back to the same FD stencil and this test would
+        // compare FD against FD — passing while proving nothing. Assert it at the source.
+        assert!(
+            population
+                .subjects
+                .iter()
+                .zip(eta_hats.iter())
+                .all(
+                    |(s, e)| subject_packed_cov_hessian(&model, s, &params, &x_hat, e.as_slice())
+                        .is_some()
+                ),
+            "fixture must be in analytic scope, else this test compares FD against itself"
+        );
+
         let cov_fd = run(false);
         let cov_an = run(true);
 
