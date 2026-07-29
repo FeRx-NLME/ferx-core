@@ -218,21 +218,27 @@ accepted, zero min-step clamps — and the methods behave exactly as that diagno
 
 | `ode_method` | accepted steps | rejected | min-step clamped | wall-clock |
 |---|---|---|---|---|
-| `rk45` | 3 940 | 120 | 0 | 30.1 ms |
-| **`vern7`** | **1 420** | 140 | 0 | **20.9 ms** |
-| `rodas5p` | 4 060 | 180 | 0 | 79.7 ms |
-| `rodas4` | 16 200 | 120 | 0 | 272.2 ms |
-| `rosenbrock23` | 85 180 | 120 | 0 | 633.2 ms |
+| `rk45` | 3 940 | 120 | 0 | 3.9 ms |
+| **`vern7`** | **1 420** | 140 | 0 | **1.7 ms** |
+| `rodas5p` | 4 060 | 180 | 0 | 5.8 ms |
+| `rodas4` | 16 200 | 120 | 0 | 17.6 ms |
+| `rosenbrock23` | 85 180 | 120 | 0 | 62.4 ms |
 
-`vern7` takes 2.8× fewer steps and is ~1.4× faster: higher order is what an accuracy-limited
-fit rewards. `rodas5p` takes the *same* number of steps as `rk45` and is 2.6× slower, because
+`vern7` takes 2.8× fewer steps and is ~2.3× faster: higher order is what an accuracy-limited
+fit rewards. `rodas5p` takes the *same* number of steps as `rk45` and is ~1.5× slower, because
 each step now buys a Jacobian and a factorization the fit does not need — and the lower-order
-stiff methods are worse still, ordered exactly as their convergence orders predict.
+stiff methods are worse still (4.5× and 16×), ordered exactly as their convergence orders
+predict.
 
 The crossover is real, so do not switch blindly: on the same model at **default** tolerances
-`vern7` is ~1.7× *slower* than `rk45` (740 → 520 steps, but 10 stages per step instead of 6),
+`vern7` is ~1.4× *slower* than `rk45` (740 → 520 steps, but 10 stages per step instead of 6),
 because there is no accuracy pressure for its extra order to relieve. Tight tolerance →
 `vern7`; stability-limited → a Rosenbrock method; otherwise stay on `rk45`.
+
+Read the step counts, not the milliseconds. Step counts are a deterministic property of the
+method and the model — the ones above reproduce exactly, run to run and machine to machine.
+The timings are medians of five runs of an optimized build on one machine and move by tens of
+percent between runs; they are here to show the *ordering*, not as a benchmark to reproduce.
 
 ::: {.callout-note}
 ## In-step readouts under `vern7`

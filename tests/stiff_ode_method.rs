@@ -103,6 +103,16 @@ fn rosenbrock_methods_reproduce_the_brute_force_rk45_trajectory() {
         "reference predictions must be finite and positive: {reference:?}"
     );
 
+    // First: is the brute-force RK45 reference itself right? Checked against the closed form,
+    // because if it is not, every comparison below is meaningless.
+    for (t, p) in &reference {
+        let e = exact_conc(*t);
+        assert!(
+            (p - e).abs() <= 1e-8 + 1e-6 * e.abs(),
+            "RK45 reference at t={t}: {p:.10} vs closed form {e:.10}"
+        );
+    }
+
     // Each stiff method at a tolerance appropriate to its order, on the *default* step
     // budget — the point being that they need no budget inflation at all.
     for (method, reltol, abstol, rtol) in [
@@ -114,7 +124,22 @@ fn rosenbrock_methods_reproduce_the_brute_force_rk45_trajectory() {
             format!("  ode_method = {method}\n  ode_reltol = {reltol}\n  ode_abstol = {abstol}\n");
         let got = predictions(&opts, &pop);
         assert_eq!(got.len(), reference.len(), "[{method}] prediction count");
+        println!("\n=== {method} vs closed form ===");
         for ((t, p), (_, r)) in got.iter().zip(reference.iter()) {
+            let e = exact_conc(*t);
+            println!(
+                "  t={t:6.2}  ferx {p:.10}  exact {e:.10}  rel {:.2e}",
+                (p - e).abs() / e.abs()
+            );
+            // Against the closed form — mathematics, not a sibling integrator.
+            let tol_exact = 1e-9 + rtol * e.abs();
+            assert!(
+                (p - e).abs() <= tol_exact,
+                "[{method}] t={t:.2}: PRED {p:.9} vs closed form {e:.9} \
+                 (|diff| {:.2e} > tol {tol_exact:.2e})",
+                (p - e).abs()
+            );
+            // …and against the brute-force RK45 run, so a regression in either surfaces.
             let tol = 1e-9 + rtol * r.abs();
             assert!(
                 (p - r).abs() <= tol,

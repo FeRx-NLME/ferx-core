@@ -38,7 +38,7 @@ section of the SDLC for the versioning policy).
   For **order**: `vern7` (Verner 7(6), 10 stages, explicit), for fits that are *accuracy*-limited
   rather than stability-limited — where step count scales as `tol^(−1/p)` and a stiff method
   buys nothing. On the Savic transit NONMEM anchor at `TOL=9`-equivalent accuracy it takes 2.8×
-  fewer steps than `rk45` and is ~1.4× faster; at default tolerances it is ~1.7× slower, so it
+  fewer steps than `rk45` and is ~2.3× faster; at default tolerances it is ~1.4× slower, so it
   is a tight-tolerance tool rather than a blanket upgrade. Its in-step readouts interpolate with
   a cubic Hermite (3rd-order) rather than a matching continuous extension — documented under
   [ODE Models](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#stiff-systems).

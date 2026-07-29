@@ -34,6 +34,16 @@ fn order_rhs(u: &[f64], _p: &[f64], t: f64, du: &mut [f64]) {
     du[1] = ORDER_MU * (u[1] - t * t) + 2.0 * t + 0.05 * (u[0].powi(3) - t.sin().powi(3));
 }
 
+/// The same problem with mild rates. The stiff constants above force small steps on an
+/// explicit method, and at small `h` the *step's* own error is below the interpolant's, so an
+/// interpolation measurement there measures the step instead. Relaxing λ lets `h` be large
+/// enough for the continuous extension's error to dominate — which is what
+/// [`observed_interpolant_order`] needs to see.
+fn mild_rhs(u: &[f64], _p: &[f64], t: f64, du: &mut [f64]) {
+    du[0] = -2.0 * (u[0] - t.sin()) + t.cos() + 0.1 * (u[1] * u[1] - t.powi(4));
+    du[1] = -1.0 * (u[1] - t * t) + 2.0 * t + 0.05 * (u[0].powi(3) - t.sin().powi(3));
+}
+
 fn order_exact(t: f64) -> [f64; 2] {
     [t.sin(), t * t]
 }
@@ -87,7 +97,79 @@ fn observed_order(method: OdeMethod, coarse: usize, refinements: usize) -> f64 {
         total += (prev / err).log2();
         prev = err;
     }
-    total / refinements as f64
+    let order = total / refinements as f64;
+    println!(
+        "observed order  {method:?}: {order:.3}  (from n = {coarse}, {refinements} refinements)"
+    );
+    order
+}
+
+/// **Local** interpolation error of a method's continuous extension: take one step from an
+/// *exact* initial condition, read the interpolant at the step midpoint, and compare with the
+/// exact solution there. Starting from the exact solution isolates the interpolant — the
+/// trajectory carries no accumulated error to mask it.
+fn interpolant_local_error(method: OdeMethod, h: f64) -> f64 {
+    let mut stepper = crate::ode::solver::make_stepper::<f64>(2, method);
+    stepper.set_dense_required(true);
+    let opts = OdeSolverOptions {
+        abstol: 1e-14,
+        reltol: 1e-12,
+        method,
+        ..Default::default()
+    };
+    // Start away from t = 0 so the problem's non-autonomous terms are active.
+    let t0 = 0.3;
+    let u = order_exact(t0).to_vec();
+    stepper.attempt(&mild_rhs, &u, &[], t0, h, &opts);
+    let mid = order_exact(t0 + 0.5 * h);
+    (0..2).fold(0.0_f64, |acc, i| {
+        acc.max((stepper.interpolate_component(0.5, &u, h, i) - mid[i]).abs())
+    })
+}
+
+/// Measured order of the **continuous extension**, the analogue of [`observed_order`] for the
+/// interpolant rather than the step.
+///
+/// This is what actually pins the Rodas dense-output `H` blocks. Endpoint continuity does not:
+/// `Θ = 0 → y₀` and `Θ = 1 → y₁` hold structurally for *any* `H` whatsoever, so a test that
+/// only checks the ends would pass with the coefficients deleted.
+fn observed_interpolant_order(method: OdeMethod, coarse: f64, refinements: usize) -> f64 {
+    let mut h = coarse;
+    let mut prev = interpolant_local_error(method, h);
+    let mut total = 0.0;
+    for _ in 0..refinements {
+        h *= 0.5;
+        let err = interpolant_local_error(method, h);
+        total += (prev / err).log2();
+        prev = err;
+    }
+    let order = total / refinements as f64;
+    println!("interpolant order  {method:?}: {order:.3}  (local error at h = {coarse} → {h})");
+    order
+}
+
+/// The continuous extensions must earn their coefficients. A Rodas `H` block with a mistyped
+/// digit still interpolates *exactly* at both step ends — that is structural — but its order
+/// inside the step collapses, which is what this measures.
+#[test]
+fn interpolant_orders_pin_the_dense_output_blocks() {
+    // Hermite (RK45, Vern7) is a cubic through two values and two derivatives: local order 4.
+    for method in [OdeMethod::Rk45, OdeMethod::Vern7] {
+        let order = observed_interpolant_order(method, 0.8, 3);
+        assert!(
+            (3.0..5.0).contains(&order),
+            "{method:?} Hermite interpolant order {order:.2} outside [3.0, 5.0]"
+        );
+    }
+    // The Rodas continuous extensions are built from their own `H` blocks; a wrong digit drops
+    // these well below 3.
+    for method in [OdeMethod::Rodas4, OdeMethod::Rodas5P] {
+        let order = observed_interpolant_order(method, 0.8, 3);
+        assert!(
+            order > 3.0,
+            "{method:?} dense-output order {order:.2} is too low — check its `h` block"
+        );
+    }
 }
 
 /// Rodas4 must converge at ~4th order. A transcription error in `a`, `c`, `α`, `d` or `γ`
@@ -166,10 +248,11 @@ fn vern7_converges_at_seventh_order() {
     // *explicit*: at coarser steps `|λh|` leaves its stability region and the run diverges,
     // which is the very distinction this method exists to make — it buys order, not stability.
     // Two refinements only, because an order-7 method reaches round-off almost immediately.
+    // Measures 7.69 on this problem; the band is set around that rather than left wide.
     let order = observed_order(OdeMethod::Vern7, 60, 2);
     assert!(
-        (5.5..7.8).contains(&order),
-        "Vern7 observed order {order:.2} outside [5.5, 7.8]"
+        (6.5..8.2).contains(&order),
+        "Vern7 observed order {order:.2} outside [6.5, 8.2]"
     );
     // At a step size where RK45 is still far off, the higher order must already show: this is
     // the accuracy-per-step advantage the tight-tolerance regime buys.
@@ -179,6 +262,52 @@ fn vern7_converges_at_seventh_order() {
         err7 < err45,
         "Vern7 ({err7:.3e}) should beat RK45 ({err45:.3e}) per step at h=0.04"
     );
+}
+
+/// **Structural** verification of the transcribed Rosenbrock tableaus, independent of any
+/// trajectory.
+///
+/// A Rosenbrock method is usually *published* as `(α_ij, Γ_ij, b_i)` but *implemented* in the
+/// transformed form this module stores, `A = α·Γ⁻¹` and `C = diag(1/γ) − Γ⁻¹`. Inverting that
+/// relation recovers the mathematical tableau from the implementation one, and the recovered
+/// tableau has to satisfy the two definitions that fix the stage times and the `f_t` weights:
+///
+/// ```text
+/// Σ_j α_ij = α_i  (the stage time)      Σ_j Γ_ij = γ_i  (the `h·γ_i·f_t` coefficient)
+/// ```
+///
+/// Both are checked here without inverting anything: `Γ·1` is the solution of `Γ⁻¹ x = 1`, and
+/// `Γ⁻¹ = diag(1/γ) − C` is lower triangular, so one forward substitution gives `x = Γ·1`.
+/// Then `x` must equal `d`, and `A·x` must equal `alpha`.
+///
+/// This is what a measured convergence order cannot do: order is a property of the *whole*
+/// method, so a compensating pair of errors could in principle survive it, and a coefficient
+/// the test problem barely excites might not move it. This binds `a`, `c`, `alpha`, `d` and
+/// `gamma` to each other elementwise — a single mistyped digit in any of the five breaks it by
+/// many orders of magnitude.
+#[test]
+fn rosenbrock_tableaus_satisfy_their_defining_identities() {
+    for (name, tab) in [("Rodas4", &RODAS4), ("Rodas5P", &RODAS5P)] {
+        let s = tab.stages;
+        // Γ⁻¹ = diag(1/γ) − C, lower triangular. Solve Γ⁻¹ x = 1 for x = Γ·1.
+        let mut x = vec![0.0_f64; s];
+        for i in 0..s {
+            let mut rhs = 1.0;
+            for j in 0..i {
+                rhs -= -tab.c[i][j] * x[j]; // Γ⁻¹[i][j] = −C[i][j] off the diagonal
+            }
+            x[i] = rhs / (1.0 / tab.gamma);
+        }
+
+        for i in 0..s {
+            // Σ_j Γ_ij == γ_i (stored as `d`).
+            assert_relative_eq!(x[i], tab.d[i], epsilon = 1e-13);
+            // Σ_j α_ij == α_i (stored as `alpha`), with α = A·Γ so Σ_j α_ij = (A·x)_i.
+            let ax: f64 = (0..s).map(|j| tab.a[i][j] * x[j]).sum();
+            assert_relative_eq!(ax, tab.alpha[i], epsilon = 1e-13);
+        }
+        println!("{name}: stage-time and γ_i identities hold for all {s} stages");
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -447,8 +576,14 @@ fn soft_sampling_does_not_perturb_the_step_sequence() {
         // are 7th-order accurate, so at tight tolerance its (larger) steps leave a visibly
         // bigger in-step error. That is a documented trade, not a defect — see
         // `crate::ode::verner`.
+        // Vern7's continuous extension is the same cubic Hermite as RK45's and measures the
+        // same order (`interpolant_orders_pin_the_dense_output_blocks`: 4.3 vs 4.9). What
+        // differs is step *size* — at this tolerance Vern7 takes 2.8× fewer, so the same
+        // relative position inside a step is a larger absolute distance, and its in-step error
+        // lands near 1e-6 where the others sit below 1e-7. Bound set just above measured, not
+        // waved through.
         let interp_tol = match method {
-            OdeMethod::Vern7 => 1e-3,
+            OdeMethod::Vern7 => 1e-5,
             _ => 1e-6,
         };
         for (s, e) in soft_tight.iter().zip(landed.iter()) {
