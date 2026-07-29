@@ -128,6 +128,27 @@ section of the SDLC for the versioning policy).
   for any external code that constructs or exhaustively destructures these variants.
 
 ### Fixed
+- **Standard errors for closed-form LTBS models under IOV** (#486). The tighter inner-EBE
+  tolerances that log-transform-both-sides models take for the fit and covariance steps
+  (`LTBS_FIT_INNER_TOL` / `LTBS_COV_INNER_TOL`, #665) were previously skipped whenever the
+  model also carried `[iov]`, on the grounds that LTBS × IOV ran its inner loop on finite
+  differences. Now that this combination takes the analytic `ln(f)` inner gradient, it carries
+  the same tolerance sensitivity as any other closed-form LTBS model, so it takes the same
+  tightened tolerances. Without this a fit would return quietly inflated standard errors —
+  the same mechanism measured at roughly 65% on warfarin theta SEs — with point estimates
+  unchanged, so nothing looked wrong. Set `cov_inner_tol` / `inner_tol` explicitly to override.
+- **Parser-internal readout parameters no longer surface in warnings or diagnostics** (#486).
+  A `[scaling] y = ...` readout that names a theta or eta directly is desugared into a hidden
+  individual parameter. That hidden parameter could reach the "individual parameter(s) not
+  mu-referenced" warning (advising the user to rewrite a parameter absent from their model
+  file) and the eta/parameter metadata carried in `FitResult`, where it appeared under its
+  internal `__ferx_ro_*` name with a `Custom` parameterisation. Both now filter it out, as the
+  other consumers of that list already did. Present on `[odes]` models since #631.
+- **FD-fallback warning for an oversized readout quotes the right slot budget** (#486). When a
+  direct theta/eta readout cannot be given PK slots, the resulting parse warning reported the
+  128-slot ODE layout even for analytical models, whose spare region holds at most about 11
+  slots and typically 4–7 — overstating the user's headroom by an order of magnitude and
+  making the suggested remedy unactionable. It now quotes the pool the model actually draws from.
 - **Adaptive-dosing `auc_target` exposure metric now integrates the pre-scheduled base regimen**
   (#940). The signal-AUC pass behind `auc_target_attainment` (#391 S2.5b) previously scored each
   decision window on the controller's realized doses only, dropping any pre-scheduled base regimen
@@ -204,6 +225,14 @@ section of the SDLC for the versioning policy).
   (`BMAX`/`KD`, #650). Predictions are unchanged — only the gradient moves off finite
   differences. A model whose readout parameters overflow the slots its PK model leaves spare
   keeps the FD fallback, with the existing parse warning, rather than failing to parse.
+- **Honest `gradient_method` reporting when a readout outgrows the closed-form dispatch
+  tables** (#486). A closed-form model whose differentiated PK-slot count exceeds the width
+  the sensitivity providers instantiate now reports `fd` instead of `analytic`. Previously the
+  scope check verified that every slot was differentiable but never how many there were, so
+  such a model was labelled analytic and then fell back to finite differences on every
+  subject — the persisted label disagreed with the route actually taken. No estimates or
+  standard errors change (those fits were already running on FD); only the reported and
+  persisted gradient method does.
 - **Closed-form modified-release absorption** (#860). A static multi-route absorption model
   (parallel / mixed pathways #505, per-route lag #856 — one `[odes]` central compartment fed by a
   fraction-weighted superposition of `first_order` / `transit` / `igd` input-rate forcings into a

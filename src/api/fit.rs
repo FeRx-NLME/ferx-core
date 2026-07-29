@@ -658,6 +658,16 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
         if eta_idx < 0 {
             continue;
         }
+        // Skip parser-internal readout parameters (#486). A `[scaling] y = ... + ETA(k)`
+        // readout is desugared into `__ferx_ro_eta{k} = ETA(k)`, which `detect_mu_refs` has
+        // no pattern for — so it lands here and the user is told to mu-reference a parameter
+        // that does not appear in their model file and that they cannot act on. Matches the
+        // four sibling consumers of this list (`output_columns.rs`, `validation.rs` ×2,
+        // `model_parser.rs`), all of which already filter (PR #950 review #3).
+        if crate::parser::model_parser::is_synthetic_readout_param(param_name) {
+            continue;
+        }
+
         let Some(eta_name) = model.eta_names.get(eta_idx as usize) else {
             continue;
         };

@@ -961,6 +961,18 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
             !analytic_inner_common_bail(&model),
             "{label}: the analytic INNER must not be bailed (#486)"
         );
+        // The tolerance predicate must move WITH the bail, not independently (PR #950
+        // review #1). `uses_closed_form_ltbs_inner` is the sole input to
+        // `effective_inner_tol` / `effective_cov_inner_tol`; while it carried an
+        // `n_kappa == 0` carve-out — justified only by the bail that just disappeared —
+        // this model ran the analytic ln-jet inner (with its ~1e-9
+        // provider-vs-`compute_predictions` gap) while the fit AND covariance steps stayed
+        // at the loose default, quietly inflating SEs with unchanged point estimates.
+        assert!(
+            model.uses_closed_form_ltbs_inner(),
+            "{label}: a model whose inner runs the analytic ln-jet must also take the \
+             tightened LTBS fit/covariance tolerances"
+        );
 
         let subject = Subject {
             id: "1".into(),

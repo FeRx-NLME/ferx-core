@@ -1157,8 +1157,8 @@ fn find_ebe_iov(
     // via `subject_eta_grad_iov`.
     // Mirror the non-IOV inner bails (#466 review #1/#2/#3): the IOV `Dual2`/`Dual1`
     // kernels share the same limitations, so route to the FD inner loop when the model
-    // hits a common bail (escape hatch, `gradient = fd`, SDE, LTBS, or IIV on residual
-    // error) or the subject carries survival/TTE records (whose hazard term the analytic
+    // hits a common bail (escape hatch, `gradient = fd`, SDE, or magnitude × correlated
+    // residual) or the subject carries survival/TTE records (whose hazard term the analytic
     // IOV gradient omits). An η-dependent `ExpressionScale` `obs_scale` is no longer a
     // common bail (#486 made the non-IOV inner serve it analytically). For IOV it is
     // now served analytically too (#575): `ode_iov_supported` admits a non-LTBS
@@ -1167,9 +1167,12 @@ fn find_ebe_iov(
     // (`apply_expression_scale_iov`). A constant `ScalarScale` divisor is now analytic under
     // IOV on both engines (#486 parity — closed-form `run_obs_iov{,_eta}` divide the jet by
     // `k`; the ODE readout `apply_output_transform` already divides `p/k` in-walk over the
-    // stacked dual). LTBS still routes IOV to FD via `analytic_inner_common_bail`
-    // (`log_transform`). Without these guards a joint IOV + `iiv_on_ruv` / IOV + TTE /
-    // `gradient = fd` fit would converge EBEs against an incomplete gradient.
+    // stacked dual). **LTBS × IOV is analytic here too as of #486** — `run_obs_iov_eta`
+    // applies the shared `ln` jet last over the stacked axes, so `log_transform` is no
+    // longer a common bail at any κ count. ODE-IOV × LTBS still routes to FD, but via
+    // `iov_sens_supported` (`ode_iov_supported` declines `log_transform` independently),
+    // not via the bail. Without these guards a joint IOV + TTE / `gradient = fd` fit would
+    // converge EBEs against an incomplete gradient.
     let analytic_iov_inner = crate::sens::provider::iov_sens_supported(model)
         && omega_iov_ref.is_some()
         && !analytic_inner_common_bail(model)
@@ -1742,10 +1745,9 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
 ///   - **closed-form / CTMM** — [`analytic_inner_grad_supported_model`];
 ///   - **ODE non-IOV** — the light `Dual1` walk
 ///     ([`ode_inner_grad_supported_model`](crate::sens::provider::ode_inner_grad_supported_model)),
-///     which the closed-form predicate misses (ODE models have no `tv_fn`). `n_kappa == 0`
-///     there, so `analytic_inner_common_bail` reduces to exactly the escape hatches the live
-///     ODE branch of [`analytic_inner_grad_supported`] applies (its `log_transform && n_kappa
-///     > 0` clause is vacuous);
+///     which the closed-form predicate misses (ODE models have no `tv_fn`). The live ODE
+///     branch of [`analytic_inner_grad_supported`] now *delegates* to
+///     `analytic_inner_common_bail` rather than re-listing it, so the two cannot drift;
 ///   - **IOV** — the stacked-η walk
 ///     ([`iov_sens_supported`](crate::sens::provider::iov_sens_supported) + `omega_iov`).
 ///
@@ -1842,19 +1844,17 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
         // The ODE inner path does NOT bail on LTBS or `ExpressionScale`: the `Dual1` ODE
         // walk shares `solve_ode_g` with the objective, so ODE-LTBS takes the analytic
         // inner gradient (#474). Only the escape hatch / `gradient = fd` / SDE /
-        // magnitude-×-`block_sigma` cases revert here.
-        if no_analytic_inner_forced()
-            || matches!(model.gradient_method, GradientMethod::Fd)
-            || model.is_sde()
-            // Correlated residual (`block_sigma`, #627) now served analytically: the
-            // dense-R inner gradient reuses the Dual1 walk's per-obs `∂f/∂η`, so no bail.
-            // Custom residual-error magnitude (#484) alone stays analytic (#576/#486 —
-            // `residual_inner_obs` threads the η-independent per-obs multiplier through
-            // both the closed-form and Dual1 ODE inner paths). Only the *combination*
-            // with a correlated residual bails: the dense-R inner kernel does not carry
-            // the magnitude's θ-dependence — matching `analytic_inner_common_bail`.
-            || (model.has_custom_ruv_magnitude() && !model.residual_correlations.is_empty())
-        {
+        // magnitude-×-`block_sigma` cases revert here — which is now exactly
+        // `analytic_inner_common_bail`, so delegate instead of re-listing it.
+        //
+        // The hand-inlined copy that used to live here was justified by the shared bail
+        // being a strict superset: it also carried `log_transform && n_kappa > 0`, which
+        // the ODE branch had to skip. #486 deleted that clause, so the two lists coincide;
+        // keeping both would mean the next escape hatch added to the documented single
+        // source of truth silently would not apply to ODE inner subjects, which would then
+        // keep claiming an analytic inner the provider declines — the inner/outer route
+        // split this whole change set exists to close (PR #950 review #8).
+        if analytic_inner_common_bail(model) {
             return false;
         }
         return crate::sens::provider::ode_inner_grad_supported(model, subject);

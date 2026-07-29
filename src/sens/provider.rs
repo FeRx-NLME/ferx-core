@@ -522,6 +522,38 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
         // Every individual-parameter slot must be one we differentiate; a slot outside
         // `slot_to_dim`'s map (e.g. a modeled-dose `D{cmt}`/`R{cmt}` slot) routes to FD.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
+        && closed_form_slot_count_supported(model)
+}
+
+/// Widest differentiated-slot count the closed-form dispatch tables instantiate. Both the
+/// outer ([`subject_sensitivities`] → `run_obs`) and inner ([`subject_eta_grad`] →
+/// `run_obs_grad`) tables enumerate `1..=9`; a wider model falls through their `_ => None`
+/// arm. **Keep these three in step** — raising this constant without adding the matching
+/// `const_dispatch!` arms would re-open the misreport below.
+const MAX_CLOSED_FORM_SLOTS: usize = 9;
+
+/// Whether the model's differentiated-slot count fits the closed-form dispatch tables.
+///
+/// Without this the count is unbounded: `analytical_supported_core` checks only that every
+/// slot *maps* via `slot_to_dim`, never how many there are. A readout that claims several
+/// spare slots (`allocate_readout_extra_slots` — text-referenced parameters, and synthetic
+/// direct θ/η as of #486) can push `pk_slots()` past 9 on top of the structural set, so
+/// `analytical_supported` returned `true`, `build_info::gradient_method{,_inner}` persisted
+/// "analytic", and then *every* subject fell through `const_dispatch!`'s `_ => None` to
+/// finite differences at ~10× the cost — precisely the "claim analytic then FD every
+/// subject" drift that `analytic_readout_dual_supported` exists to prevent (#637). Declining
+/// here changes no numbers (those subjects already ran on FD); it makes the reported method
+/// match the route (PR #950 review #2).
+///
+/// Bounds the **program** slot list, which is what the readout allocator grows and what the
+/// providers dispatch on when the program path is live. The `lognormal_param_derivatives`
+/// fallback (`model.pk_indices`) is unchanged from before #486 and left alone here.
+fn closed_form_slot_count_supported(model: &CompiledModel) -> bool {
+    model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .is_none_or(|prog| prog.pk_slots_ref().len() <= MAX_CLOSED_FORM_SLOTS)
 }
 
 /// Whether an analytic Form C readout (`[scaling] y = <expr>`, #650), if present,
@@ -3334,7 +3366,7 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     // is applied LAST below (after the init impulse and scale quotient), mirroring the outer
     // TV-cov path (`subject_sensitivities_tvcov` → `apply_ltbs_transform_outer`). Reproduces
     // production's scale-then-log order; the covariance step reconverges these EBEs at the
-    // tighter `cov_inner_tol` (closed-form non-IOV LTBS), so the SEs stay clean.
+    // tighter `cov_inner_tol` (closed-form LTBS, IOV included since #486), so the SEs stay clean.
     // Analytic Form C readout (#650): served analytically on the event-walk when it
     // fits the structural `PkDual` slots (matches the outer gate); otherwise FD.
     if model.analytic_readout.is_some() && !readout_tvcov_supported(model) {

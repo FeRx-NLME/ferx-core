@@ -3114,14 +3114,23 @@ impl CompiledModel {
         self.diffusion_theta_start.is_some()
     }
 
-    /// True for the **closed-form, non-IOV LTBS** path — the only path that runs the
-    /// analytic `g = ln(f)` *inner* EBE gradient whose ~1e-9 provider-vs-predictor
-    /// gap makes the covariance step tolerance-sensitive (PR #665). ODE-LTBS shares
-    /// `solve_ode_g` with the objective (no gap) and LTBS + IOV routes the inner loop
-    /// to FD, so neither needs the tightened fit/covariance tolerances. Used by
-    /// [`FitOptions::effective_inner_tol`] / [`FitOptions::effective_cov_inner_tol`].
+    /// True for the **closed-form LTBS** path — the one that runs the analytic
+    /// `g = ln(f)` *inner* EBE gradient whose ~1e-9 provider-vs-predictor gap makes the
+    /// covariance step tolerance-sensitive (PR #665). ODE-LTBS shares `solve_ode_g` with
+    /// the objective (no gap), so it does not need the tightened fit/covariance
+    /// tolerances. Used by [`FitOptions::effective_inner_tol`] /
+    /// [`FitOptions::effective_cov_inner_tol`].
+    ///
+    /// **IOV is included as of #486.** The `n_kappa == 0` carve-out that used to sit here
+    /// was justified solely by LTBS × IOV routing its inner loop to FD — which
+    /// `analytic_inner_common_bail` no longer does, since `run_obs_iov_eta` now applies
+    /// the same `ln` jet over the stacked axes. A κ-carrying closed-form LTBS model
+    /// therefore runs the *same* analytic ln-jet inner gradient, carries the *same* gap,
+    /// and needs the same tolerances; leaving it out would have produced quietly inflated
+    /// standard errors with unchanged point estimates. This predicate must move with
+    /// `analytic_inner_common_bail`'s `log_transform` scope, not independently of it.
     pub fn uses_closed_form_ltbs_inner(&self) -> bool {
-        self.log_transform && self.ode_spec.is_none() && self.n_kappa == 0
+        self.log_transform && self.ode_spec.is_none()
     }
 
     /// Returns true when the model has a time-to-event (`[event_model]`)
@@ -5858,23 +5867,24 @@ impl FitOptions {
         }
     }
 
-    /// Covariance-step inner EBE-reconvergence tolerance that **closed-form,
-    /// non-IOV LTBS** models tighten to when `cov_inner_tol` is unset. The
+    /// Covariance-step inner EBE-reconvergence tolerance that **closed-form LTBS**
+    /// models tighten to when `cov_inner_tol` is unset. The
     /// covariance R-matrix reconverges EBEs under the `g = ln(f)` wrap, which
     /// amplifies a loosely-converged EBE into the Hessian and inflates the standard
     /// errors (empirically ~65% on warfarin θ SEs at the `1e-5` default; correct at
-    /// `≤ 1e-8`). This is applied **only for the closed-form, non-IOV LTBS** path
-    /// that actually runs the analytic `ln(f)` inner gradient: blanket-tightening the
-    /// covariance step over-converges some ill-conditioned inner Hessians (e.g. IOV
-    /// block-Ω) into an indefinite covariance, and ODE-LTBS shares `solve_ode_g` so
-    /// it has no such gap. Set `cov_inner_tol` explicitly to opt any other model in
-    /// (e.g. the #654 M3 + IOV case).
+    /// `≤ 1e-8`). This is applied **only for the closed-form LTBS** path that actually
+    /// runs the analytic `ln(f)` inner gradient (including under IOV as of #486 — see
+    /// [`CompiledModel::uses_closed_form_ltbs_inner`]): blanket-tightening the covariance
+    /// step over-converges some ill-conditioned inner Hessians into an indefinite
+    /// covariance, and ODE-LTBS shares `solve_ode_g` so it has no such gap. Set
+    /// `cov_inner_tol` explicitly to opt any other model in (e.g. the #654 M3 + IOV case,
+    /// which is not LTBS).
     pub const LTBS_COV_INNER_TOL: f64 = 1e-8;
 
     /// Effective inner EBE-reconvergence tolerance for the covariance step: an
     /// explicit `cov_inner_tol` when set; otherwise the fit's `inner_tol`, tightened
     /// to at most [`LTBS_COV_INNER_TOL`](Self::LTBS_COV_INNER_TOL) only when
-    /// `ltbs_closed_form` (the closed-form, non-IOV LTBS path — see
+    /// `ltbs_closed_form` (the closed-form LTBS path, IOV included — see
     /// [`CompiledModel::uses_closed_form_ltbs_inner`]). Every other model keeps
     /// `inner_tol`, so its SEs are byte-identical.
     pub fn effective_cov_inner_tol(&self, ltbs_closed_form: bool) -> f64 {
@@ -5887,21 +5897,22 @@ impl FitOptions {
         })
     }
 
-    /// Ceiling the fit's inner EBE tolerance is tightened to for **closed-form,
-    /// non-IOV LTBS** models. That path's analytic `g = ln(f)` inner gradient makes
+    /// Ceiling the fit's inner EBE tolerance is tightened to for **closed-form LTBS**
+    /// models. That path's analytic `g = ln(f)` inner gradient makes
     /// the marginal surface slightly noisier (the ~1e-9 provider-vs-
     /// `compute_predictions` gap), so at the loose default the outer optimiser lands
     /// nondeterministically on flat Ω directions and the standard errors of
     /// weakly-identified variances become process-dependent. Converging the fit's
     /// inner loop to at least `1e-6` pins the flat directions; the covariance step
     /// then reconverges tighter still ([`effective_cov_inner_tol`](Self::effective_cov_inner_tol)).
-    /// ODE-LTBS (shares `solve_ode_g`, no gap) and LTBS + IOV (FD inner) do not need
-    /// this and are left at `inner_tol`.
+    /// ODE-LTBS (shares `solve_ode_g`, no gap) does not need this and is left at
+    /// `inner_tol`. LTBS + IOV *is* included as of #486, when its inner loop stopped
+    /// routing to FD.
     pub const LTBS_FIT_INNER_TOL: f64 = 1e-6;
 
     /// Effective **fit** inner EBE tolerance for this model: the fit's `inner_tol`,
     /// tightened to at most [`LTBS_FIT_INNER_TOL`](Self::LTBS_FIT_INNER_TOL) for the
-    /// closed-form, non-IOV LTBS path (`ltbs_closed_form`) **unless the user set
+    /// closed-form LTBS path (`ltbs_closed_form`, IOV included) **unless the user set
     /// `inner_tol` explicitly** — an explicit tolerance (e.g. the documented
     /// accuracy-for-speed `inner_tol = 1e-4`) is always honoured. A fit already
     /// tighter than the ceiling keeps its own value; every other model is unaffected.
