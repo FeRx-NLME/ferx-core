@@ -2313,7 +2313,7 @@ fn dense_residual_inner_gradient(
 /// the non-IOV inner (`analytic_eta_nll_gradient_with_schedule`) — see its doc for
 /// why this is a caller-supplied parameter rather than computed here.
 #[allow(clippy::too_many_arguments)]
-fn analytic_eta_nll_gradient_iov(
+pub(crate) fn analytic_eta_nll_gradient_iov(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
