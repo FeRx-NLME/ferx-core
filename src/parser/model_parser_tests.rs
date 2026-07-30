@@ -2800,6 +2800,149 @@ fn test_ode_solver_keys_do_not_warn() {
 }
 
 #[test]
+fn test_cov_inner_tol_does_not_warn() {
+    // `cov_inner_tol` decouples the covariance step's EBE-reconvergence tolerance
+    // from `inner_tol`. The covariance step is method-independent, so the key is
+    // framework-level. Regression: it had a working `apply_fit_option` arm and a
+    // `fit-options.qmd` entry while appearing in *neither* advertised key list, so
+    // `unsupported_keys_warnings` reported that a value it had just applied would
+    // be ignored — the same shape as the ODE-solver and checkpoint bugs above.
+    for method in ["focei", "foce", "laplace", "saem", "imp", "gn"] {
+        let opts = parse_fit_options(&[
+            format!("method = {method}"),
+            "cov_inner_tol = 1e-11".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            opts.cov_inner_tol,
+            Some(1e-11),
+            "method={method} did not apply it"
+        );
+        assert!(
+            opts.unsupported_keys_warnings().is_empty(),
+            "method={method} spuriously warned on cov_inner_tol: {:?}",
+            opts.unsupported_keys_warnings()
+        );
+    }
+}
+
+/// The reverse of [`every_advertised_fit_option_key_has_an_apply_fit_option_arm`].
+///
+/// That test walks advertised → arm, which catches a key documented but not wired.
+/// It cannot catch the opposite: a key that *is* wired but advertised nowhere. Such
+/// a key works perfectly, then draws a "not used by method … will be ignored"
+/// warning for a value the parser applied — which is how `cov_inner_tol` shipped.
+///
+/// The arm keys are read out of this crate's own source with `include_str!`, so a
+/// newly added arm is covered without anyone remembering to list it here.
+#[test]
+fn every_apply_fit_option_arm_is_advertised_or_deliberately_exempt() {
+    use crate::types::{framework_keys, method_specific_keys, EstimationMethod};
+
+    // Keys that legitimately have an arm but no advertisement, because they never
+    // reach `user_set_keys` and so can never trigger the warning: the
+    // `[data_selection]` keys return early by design (they are data filters, not
+    // estimation options). `method`/`methods` select the chain itself.
+    const EXEMPT: &[&str] = &["ignore", "accept", "ignore_subjects", "method", "methods"];
+
+    // Walked line-wise rather than by byte offset: `str::lines()` strips a trailing
+    // `\r`, so this is line-ending agnostic. Searching for a literal "\n}\n" is not —
+    // on a CRLF checkout it never matches, the body silently becomes the rest of the
+    // file, and the scraper picks up arms from unrelated functions.
+    let src = include_str!("model_parser.rs");
+    let mut body: Vec<&str> = Vec::new();
+    let mut inside = false;
+    for line in src.lines() {
+        if !inside {
+            inside = line.contains("fn apply_fit_option");
+            continue;
+        }
+        // The function ends at the first `}` in column 0.
+        if line == "}" {
+            break;
+        }
+        body.push(line);
+    }
+    assert!(
+        !body.is_empty(),
+        "could not locate `fn apply_fit_option` — repair this guard rather than deleting it"
+    );
+
+    // Match-arm heads of the *key* match, e.g. `        "key" => {` or
+    // `        "a" | "b" => ...`.
+    //
+    // The indent must be **exactly** `KEY_ARM_INDENT`. A `>=` test also matches the
+    // nested `match value.to_lowercase()` arms that parse enum-valued options, which
+    // would scrape `"auto"`, `"rsr"`, `"bobyqa"`, `"true"`, `"0"` … as though they
+    // were option keys — 162 apparent keys instead of 101, and 43 bogus failures.
+    const KEY_ARM_INDENT: usize = 8;
+    let mut arm_keys: Vec<String> = Vec::new();
+    for line in body {
+        let t = line.trim_start();
+        if line.len() - t.len() != KEY_ARM_INDENT {
+            continue;
+        }
+        if !t.starts_with('"') || !t.contains("=>") {
+            continue;
+        }
+        let Some(head) = t.split("=>").next() else {
+            continue;
+        };
+        // Only a chain of string literals separated by `|` is an arm head we trust.
+        let looks_like_head = head.split('|').all(|p| {
+            let p = p.trim();
+            p.starts_with('"') && p.ends_with('"') && p.len() > 2
+        });
+        if !looks_like_head {
+            continue;
+        }
+        for part in head.split('|') {
+            arm_keys.push(part.trim().trim_matches('"').to_string());
+        }
+    }
+    // Over-matching is self-detecting: a scraped non-key is unadvertised and fails the
+    // assertion below (that is how the `>= 8` bug surfaced). Under-matching is the
+    // silent mode — an empty set passes trivially — so it needs its own floor.
+    assert!(
+        arm_keys.len() > 80,
+        "extracted only {} arm keys, so this guard has stopped matching and is now \
+         vacuous. Repair the scraper rather than deleting the test.",
+        arm_keys.len()
+    );
+
+    let mut advertised: std::collections::BTreeSet<&'static str> =
+        framework_keys().iter().copied().collect();
+    for m in [
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+        EstimationMethod::FoceGn,
+        EstimationMethod::FoceGnHybrid,
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Impmap,
+        EstimationMethod::Bayes,
+        EstimationMethod::Laplace,
+    ] {
+        advertised.extend(method_specific_keys(m).iter().copied());
+    }
+
+    let mut unadvertised: Vec<String> = arm_keys
+        .into_iter()
+        .filter(|k| !advertised.contains(k.as_str()) && !EXEMPT.contains(&k.as_str()))
+        .collect();
+    unadvertised.sort();
+    unadvertised.dedup();
+
+    assert!(
+        unadvertised.is_empty(),
+        "fit-option key(s) with an `apply_fit_option` arm but absent from \
+         `framework_keys()` and every `method_specific_keys()` arm: {unadvertised:?}. \
+         These are applied and then reported as ignored. Add each to the right key \
+         list, or to EXEMPT above if it never records `user_set_keys`."
+    );
+}
+
+#[test]
 fn test_checkpoint_keys_parse_and_do_not_warn() {
     // checkpoint / checkpoint_interval_secs drive the resume-point writer,
     // which is method-independent (#755) — framework-level, so they must

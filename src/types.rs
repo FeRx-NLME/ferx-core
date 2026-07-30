@@ -4966,7 +4966,11 @@ pub struct FitOptions {
     /// routes to the same quantity. Set `false` to force finite differences.
     pub analytic_cov_hessian: bool,
     pub fd_hessian_step: f64,
-    /// What to do when the FD Hessian is non-positive-definite.
+    /// What to do when the covariance Hessian is non-positive-definite.
+    ///
+    /// Not FD-specific despite the historical wording elsewhere: the non-PD branch runs on
+    /// whichever `R` was assembled, so it applies equally to the exact analytic R-matrix
+    /// (see [`analytic_cov_hessian`](Self::analytic_cov_hessian)).
     /// Default [`CovarianceFallback::None`] leaves the covariance step as failed.
     /// [`CovarianceFallback::Sir`] runs SIR with a fallback proposal covariance
     /// built from the rectified (`|eigenvalue|`) Hessian, inflated 4×.
@@ -6042,6 +6046,12 @@ pub fn framework_keys() -> &'static [&'static str] {
         "covariance_fallback",
         "analytic_cov_hessian",
         "fd_hessian_step",
+        // Consumed by the covariance step, which every method can run, so it belongs
+        // here rather than in any `method_specific_keys` arm. It had a working
+        // `apply_fit_option` arm while appearing in neither list, so
+        // `unsupported_keys_warnings` announced that a value it *had* applied would
+        // be ignored.
+        "cov_inner_tol",
         "verbose",
         "sir",
         "sir_samples",

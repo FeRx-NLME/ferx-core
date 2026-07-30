@@ -159,6 +159,22 @@ section of the SDLC for the versioning policy).
   for any external code that constructs or exhaustively destructures these variants.
 
 ### Fixed
+- **`cov_inner_tol` no longer warns that it was ignored while being applied.** The key had a
+  working `apply_fit_option` arm and a documented entry but appeared in neither
+  `framework_keys()` nor any `method_specific_keys()` arm, so setting it produced
+  `fit option 'cov_inner_tol' is not used by method 'FOCEI' and will be ignored` for a value
+  the parser did apply. It is now advertised at framework level, where it belongs — the
+  covariance step is method-independent. A new reverse guard test (`apply_fit_option` arm →
+  advertised) closes the direction the existing key-list guard could not see; the old one only
+  walked advertised → arm, which is why this and the earlier `analytic_cov_hessian` gap both
+  reached a release.
+- **`global_maxeval`'s documented default was wrong** — `fit-options.qmd` gave
+  `200 * (n_params + 1)`, but the auto budget is `30 * (n + 1)`. The docs also now state that
+  `0` means *auto*, not *disabled* (whether the pre-search runs is `global_search`).
+- **The non-positive-definite covariance wording is no longer finite-difference-specific.** The
+  fallback branch runs on whichever `R` was assembled, so it applies to the exact analytic
+  R-matrix as well — which is the default for in-scope models since #436, making it the common
+  case rather than an edge one.
 - **Standard errors for closed-form LTBS models under IOV** (#486). The tighter inner-EBE
   tolerances that log-transform-both-sides models take for the fit and covariance steps
   (`LTBS_FIT_INNER_TOL` / `LTBS_COV_INNER_TOL`, #665) were previously skipped whenever the
