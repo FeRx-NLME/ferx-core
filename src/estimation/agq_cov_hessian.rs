@@ -103,8 +103,9 @@
 //! which is exactly the structure of [`crate::estimation::sens_cov_hessian`]: the fixed-`b`
 //! Hessian, minus the M2 envelope term `−M_ξᵀH⁻¹M_ζ`, plus the log-determinant curvature.
 //! The derivation therefore reduces to the covariance that shipped in #436 — the strongest
-//! available check on it, and the reason `agq_cov_hessian_reduces_to_focei_at_one_node` is the
-//! first test in this module rather than an afterthought.
+//! available check on it. `agq_cov_hessian_reduces_to_focei_at_one_node` will be the first test
+//! written against the assembly (step 5 below), before the multi-node path is trusted at all;
+//! it does not exist yet, because the assembly does not.
 //!
 //! # The jitter is not optional
 //!
