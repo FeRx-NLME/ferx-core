@@ -177,3 +177,108 @@ fn savic_transit_1e9_rk45_stats_are_accepted_step_dominated() {
         "Savic transit at 1e-9 should not be min-step clamped; stats = {stats:?}"
     );
 }
+
+/// The #387 solver-decision gate, part 2: the *same* anchor under every available
+/// `ode_method`, at NONMEM-equivalent accuracy and at the loose defaults.
+///
+/// #387 asks that a method be chosen from a measured regime rather than from the assumption
+/// that a slow ODE fit must be stability-limited. Part 1
+/// ([`savic_transit_1e9_rk45_stats_are_accepted_step_dominated`]) establishes that this fit is
+/// **accuracy-limited**: RK45 accepts nearly every step and is never min-step clamped. This
+/// test carries that conclusion over to the stiff methods — they integrate the same anchor to
+/// the same predictions without clamping, but they do *not* rescue a fit that was never
+/// stability-limited in the first place. The Rosenbrock steppers are for the loose-tolerance
+/// stiff regime (fast binding / TMDD, see `tests/stiff_ode_method.rs`), not for this one.
+///
+/// Run with `--nocapture` to see the per-method step counts and wall-clock — that printout is
+/// the instrumentation output #387 asks to have on record.
+#[test]
+fn savic_transit_solver_regime_across_ode_methods() {
+    use ferx_core::ode::OdeMethod;
+    use std::time::Instant;
+
+    let theta = [5.453, 55.759, 0.950, 0.966, 3.128];
+
+    for (label, reltol, abstol) in [
+        ("1e-9 (NONMEM TOL=9)", 1e-9, 1e-9),
+        ("defaults", 1e-4, 1e-6),
+    ] {
+        let mut baseline: Option<Vec<f64>> = None;
+        println!("\n=== Savic transit anchor @ {label} ===");
+        println!(
+            "{:<14} {:>9} {:>9} {:>9} {:>9} {:>10}",
+            "method", "attempt", "accept", "reject", "clamped", "ms"
+        );
+
+        for method in [
+            OdeMethod::Rk45,
+            OdeMethod::Vern7,
+            OdeMethod::Rosenbrock23,
+            OdeMethod::Rodas4,
+            OdeMethod::Rodas5P,
+        ] {
+            let mut model = parse_full_model(MODEL_SRC)
+                .expect("Savic transit model must parse")
+                .model;
+            let pop = read_nonmem_csv(Path::new("data/transit_oral.csv"), None, None)
+                .expect("transit_oral data must load");
+            {
+                let ode = model.ode_spec.as_mut().expect("must be ODE-based");
+                ode.solver_opts.reltol = reltol;
+                ode.solver_opts.abstol = abstol;
+                ode.solver_opts.method = method;
+            }
+            let eta = vec![0.0; model.n_eta];
+
+            let mut stats = OdeSolverStats::default();
+            let mut preds: Vec<f64> = Vec::new();
+            let t0 = Instant::now();
+            for subject in &pop.subjects {
+                let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
+                let (pred, s) = ode_predictions_with_solver_stats(
+                    model.ode_spec.as_ref().unwrap(),
+                    &pk.values,
+                    &theta,
+                    &eta,
+                    subject,
+                );
+                preds.extend_from_slice(&pred);
+                stats.attempted_steps += s.attempted_steps;
+                stats.accepted_steps += s.accepted_steps;
+                stats.rejected_steps += s.rejected_steps;
+                stats.min_step_clamped_steps += s.min_step_clamped_steps;
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+
+            println!(
+                "{:<14} {:>9} {:>9} {:>9} {:>9} {:>10.1}",
+                format!("{method:?}"),
+                stats.attempted_steps,
+                stats.accepted_steps,
+                stats.rejected_steps,
+                stats.min_step_clamped_steps,
+                ms
+            );
+
+            // No method is stability-throttled on this anchor — that is the #387 finding.
+            assert_eq!(
+                stats.min_step_clamped_steps, 0,
+                "{method:?} @ {label} hit min_dt on an accuracy-limited fit; stats = {stats:?}"
+            );
+            // Every method must integrate the anchor to the same predictions.
+            match &baseline {
+                None => baseline = Some(preds),
+                Some(b) => {
+                    assert_eq!(preds.len(), b.len(), "{method:?} @ {label}");
+                    for (p, r) in preds.iter().zip(b.iter()) {
+                        let tol = 1e-6 + 1e-3 * r.abs();
+                        assert!(
+                            (p - r).abs() <= tol,
+                            "{method:?} @ {label}: PRED {p:.9} vs RK45 {r:.9}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

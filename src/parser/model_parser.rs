@@ -6078,6 +6078,15 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.ode_max_steps = v;
         }
+        "ode_method" => {
+            opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
+                format!(
+                    "fit option `ode_method`: unknown value `{value}` — expected one of \
+                     rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, verner7, \
+                     ros23, ode23s, rodas5)"
+                )
+            })?;
+        }
         "covariance" => opts.run_covariance_step = parse_bool("covariance")?,
         "analytic_cov_hessian" => opts.analytic_cov_hessian = parse_bool("analytic_cov_hessian")?,
         "covariance_fallback" => {

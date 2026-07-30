@@ -9,6 +9,11 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 pub trait PkNum:
     Copy
+    // Every implementor is a plain numeric value type (`f64`, `Dual1`, `Dual2`, `DualMixed`)
+    // that borrows nothing, so `'static` costs nothing and lets a `PkNum` be boxed behind a
+    // trait object — how `crate::ode::solver::make_stepper` hands the shared integration
+    // drivers whichever stepper the method selects.
+    + 'static
     + Add<Output = Self>
     + Sub<Output = Self>
     + Mul<Output = Self>

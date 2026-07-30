@@ -2248,6 +2248,40 @@ fn test_apply_fit_option_ode_solver_tolerances() {
 }
 
 #[test]
+fn test_apply_fit_option_ode_method() {
+    use crate::ode::OdeMethod;
+    let mut opts = FitOptions::default();
+    // The engine default is the explicit stepper — an existing fit is unaffected.
+    assert_eq!(opts.ode_method, OdeMethod::Rk45);
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "ode_method", "rodas5p"),
+        Ok(true)
+    );
+    assert_eq!(opts.ode_method, OdeMethod::Rodas5P);
+    assert_eq!(
+        apply_fit_option(&mut opts, "ode_method", "ode23s"),
+        Ok(true)
+    );
+    assert_eq!(opts.ode_method, OdeMethod::Rosenbrock23);
+    assert_eq!(
+        apply_fit_option(&mut opts, "ode_method", "Rodas4"),
+        Ok(true)
+    );
+    assert_eq!(opts.ode_method, OdeMethod::Rodas4);
+
+    // An unknown stepper is an error, not a silent fallback to RK45 (which would run the
+    // stiff model on the method the user was trying to get away from).
+    let err = apply_fit_option(&mut opts, "ode_method", "lsoda").unwrap_err();
+    assert!(err.contains("ode_method"), "unexpected message: {err}");
+    assert_eq!(
+        opts.ode_method,
+        OdeMethod::Rodas4,
+        "failed apply must not mutate"
+    );
+}
+
+#[test]
 fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
     // [fit_options] ODE solver tolerances must be baked onto
     // OdeSpec.solver_opts by the parser (via sync_ode_solver_opts) so the
@@ -2278,15 +2312,26 @@ fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
     assert_eq!(s.abstol, 1e-6);
     assert_eq!(s.max_steps, 10_000);
 
+    assert_eq!(s.method, crate::ode::OdeMethod::Rk45);
+
     // Override via [fit_options].
     let with_opts = format!(
-            "{base}\n[fit_options]\n  ode_reltol = 1e-9\n  ode_abstol = 1e-11\n  ode_max_steps = 50000\n"
+            "{base}\n[fit_options]\n  ode_reltol = 1e-9\n  ode_abstol = 1e-11\n  ode_max_steps = 50000\n  ode_method = rodas4\n"
         );
     let p = parse_full_model(&with_opts).unwrap();
     let s2 = p.model.ode_spec.as_ref().unwrap().solver_opts;
     assert_eq!(s2.reltol, 1e-9);
     assert_eq!(s2.abstol, 1e-11);
     assert_eq!(s2.max_steps, 50_000);
+    // `ode_method` rides the same sync, so `predict()` — which gets no fit options — also
+    // integrates with the requested stepper.
+    assert_eq!(s2.method, crate::ode::OdeMethod::Rodas4);
+    // …and it is framework-level, so it must not be flagged as an ignored key.
+    assert!(!p
+        .fit_options
+        .unsupported_keys_warnings()
+        .iter()
+        .any(|w| w.contains("ode_method")));
 }
 
 #[test]

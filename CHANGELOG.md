@@ -20,6 +20,37 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **New ODE steppers via `[fit_options] ode_method`,** on two independent axes. For
+  **stability**: the linearly implicit Rosenbrock methods `rosenbrock23` (order 2, aliases
+  `ros23`/`ode23s`), `rodas4` (order 4) and `rodas5p` (order 5). These are stable at the step size the tolerance needs on **stiff**
+  systems (fast reversible binding / TMDD, Michaelis-Menten with `KM` far below observed
+  concentrations, long transit chains, QSP cascades), where the explicit method is
+  stability-limited and either crawls or exhausts `ode_max_steps`. Analytic sensitivities run
+  through the identical stepper, so switching does not move a model off the analytic-gradient
+  path. `rk45` remains the default, and on the `f64` prediction path existing fits are
+  bit-identical. The one deliberate exception is the generic (`Dual2`) analytic-sensitivity
+  path: RK45's stage combinations previously existed as two separate transcriptions that were
+  *not* bit-identical to each other — the `f64` driver associated them as `u + h·(b₁k₁ + b₂k₂)`
+  while the generic one accumulated `((u + k₁·(h·b₁)) + k₂·(h·b₂))`. Unifying them onto the
+  `f64` association shifts the sensitivity path's trajectory in the last bits, which the outer
+  line search can amplify; it also means the gradient is now taken along exactly the trajectory
+  the predictor reports, which it was not before. The stiff methods are full peers — each carries its own continuous extension,
+  so every feature that reads ODE state between solver steps works with every method:
+  non-Gaussian endpoints (TTE / categorical / CTMM), time-to-event simulation, adaptive /
+  feedback dosing, `[output]` state columns and the analytic-sensitivity path. Internally the
+  three integration drivers (dense saves, soft sampling, event-time root-finding) are now
+  written once against a `Stepper` abstraction rather than per method.
+
+  For **order**: `vern7` (Verner 7(6), 10 stages, explicit), for fits that are *accuracy*-limited
+  rather than stability-limited — where step count scales as `tol^(−1/p)` and a stiff method
+  buys nothing. On the Savic transit NONMEM anchor at `TOL=9`-equivalent accuracy it takes 2.8×
+  fewer steps than `rk45` and is ~2.3× faster; at default tolerances it is ~1.4× slower, so it
+  is a tight-tolerance tool rather than a blanket upgrade. Its in-step readouts interpolate with
+  a cubic Hermite (3rd-order) rather than a matching continuous extension — documented under
+  [ODE Models](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#stiff-systems).
+
+  `docs/model-file/ode-models.qmd` now carries a measured "which regime am I in?" table so the
+  choice is made from solver statistics rather than guesswork.
 - **Pre-scheduled base regimen (loading dose) in adaptive-dosing simulation** (#702).
   `simulate_adaptive()` / `simulate_adaptive_from_spec()` now accept a base subject that
   already carries pre-scheduled doses — a loading / maintenance regimen, including a

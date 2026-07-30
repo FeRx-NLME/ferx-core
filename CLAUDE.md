@@ -146,7 +146,8 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | `api/` | Public API split into a thin `mod.rs` facade + domain submodules: `fit.rs` (`fit`/`fit_inner`), `run.rs` (file/data entrypoints), `simulate.rs`, `adaptive.rs`, `predict.rs`, `postfit.rs` (covariance/SE/shrinkage/warnings), `output_columns.rs`, `pool.rs` (thread pool), `validation.rs` (model/data checks — `check_model_data`, `validate_model_file`, absorption/dosing/survival asserts). `mod.rs` re-exports everything so `crate::api::*` paths and the crate-root `pub use api::{..}` are unchanged |
 | `parser/model_parser.rs` | Parses `.ferx` model DSL into `CompiledModel` with closures |
 | `pk/` | Analytical 1-cpt and 2-cpt PK solutions (IV, oral, infusion) with superposition |
-| `ode/solver.rs` | Dormand-Prince RK45 adaptive ODE solver |
+| `ode/solver.rs` | `Stepper` abstraction + shared integration drivers; the Dormand-Prince RK45 stepper (default method) |
+| `ode/rosenbrock.rs` | Linearly implicit Rosenbrock steppers (`rosenbrock23`/`rodas4`/`rodas5p`) for stiff systems — same `Stepper` trait, so every feature works with every method |
 | `ode/predictions.rs` | ODE-based predictions with dose event handling |
 | `dosing.rs` | Neutral dose-resolution (`resolve_subject_doses`, #324) + SS-equilibration policy (`SS_EQUILIBRATION_CYCLES`, `SsStopTracker`) — the single home shared by pk/ode/sens |
 | `estimation/gauss_newton.rs` | Gauss-Newton (BHHH) optimizer with LM damping; pure GN and GN+FOCEI hybrid |
