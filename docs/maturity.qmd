@@ -60,6 +60,7 @@ visible at the point of use:
 | BLOQ / censored observations (M3) | **beta** | [BLOQ](model-file/bloq.qmd) |
 | ODE models (Dormand-Prince RK45) | **beta** | [ODE Models](model-file/ode-models.qmd) |
 | Stiff ODE steppers (`ode_method` = Rosenbrock23 / Rodas4 / Rodas5P) | **experimental** | [Stiff systems](model-file/ode-models.qmd#stiff-systems) |
+| High-order ODE stepper (`ode_method` = Vern7) | **experimental** | [Choosing a method](model-file/ode-models.qmd#stiff-systems) |
 | Built-in absorption models (transit / inverse-Gaussian / Weibull) | **beta** | [Absorption](model-file/absorption.qmd) |
 | Scaling | **beta** | [Scaling](model-file/scaling.qmd) |
 | Data selection | **beta** | [Data Selection](model-file/data-selection.qmd) |

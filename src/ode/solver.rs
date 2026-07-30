@@ -92,6 +92,16 @@ pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
 /// RK45 stays the faster choice; the Rosenbrock methods win only where stiffness, not
 /// accuracy, is what caps the step.
 ///
+/// `n` there is the size of the system being integrated, which is **not** always the `[odes]`
+/// state count. A CTMM endpoint integrates the occupancy system `dP/dt = P·Q(t)`
+/// ([`crate::markov::ctmm_inhomogeneous_transition_with_opts`]), whose state is the flattened
+/// `s × s` transition matrix — so an `s`-state chain makes this an `s²`-state integration, and
+/// a Rosenbrock method there builds an `s² × s²` Jacobian per step attempt. That is the right
+/// behaviour for a chain whose transition rates are widely separated (the occupancy solve is
+/// then genuinely stiff, which is why the intensity guard above it already talks about one),
+/// but it is pure overhead for the usual well-scaled chain — so choose `ode_method` on a CTMM
+/// model with the `s²` cost in mind, not the `[odes]` one.
+///
 /// Honoured by every `saveat` integration — predictions, the FOCE/FOCEI objective,
 /// steady-state equilibration and the analytic-sensitivity walk — dispatched centrally in
 /// [`solve_ode_dense`] (the sole owner of the f64 stepping loop) and [`solve_ode_g`].
@@ -202,14 +212,26 @@ pub struct OdeSolverStats {
     pub attempted_steps: usize,
     /// Attempts that advanced `(t, u)`.
     ///
-    /// Includes [`min_step_clamped_steps`](Self::min_step_clamped_steps), because
-    /// the current RK45 policy accepts at `min_dt` to guarantee progress.
+    /// Overlaps [`min_step_clamped_steps`](Self::min_step_clamped_steps) but does not
+    /// contain it: an explicit method force-accepts at `min_dt` to guarantee progress, so
+    /// those clamps are counted here too, while a linearly implicit method that cannot form
+    /// a step at all is counted as a clamp *and* a rejection.
     pub accepted_steps: usize,
-    /// Attempts rejected by the local-error test.
+    /// Attempts rejected by the local-error test, plus the unusable-`W` abandonments
+    /// described on [`min_step_clamped_steps`](Self::min_step_clamped_steps).
     pub rejected_steps: usize,
-    /// Accepted attempts that failed the local-error test (`!(err_norm <= 1)`,
-    /// which also catches a non-finite `err_norm`) yet advanced because
-    /// `dt_eff <= min_dt`.
+    /// Attempts the solver could not resolve at `min_dt` — the "I am stability-limited"
+    /// signal, and the counter the `ode_method` documentation tells users to read.
+    ///
+    /// Two shapes reach it, and both must, or the diagnostic reads clean for exactly the
+    /// failure it exists to surface:
+    ///
+    /// * an **explicit** method whose step failed the local-error test (`!(err_norm <= 1)`,
+    ///   which also catches a non-finite `err_norm`) yet advanced anyway because
+    ///   `dt_eff <= min_dt`; and
+    /// * a **linearly implicit** method whose `W = I/(γh) − J` was singular at `min_dt`, so
+    ///   no `u_new` existed to force-accept and the driver had to stop. The remaining
+    ///   `saveat` points are then freeze-padded with the last state — finite, but wrong.
     pub min_step_clamped_steps: usize,
 }
 
@@ -229,6 +251,19 @@ impl OdeSolverStats {
         } else {
             self.rejected_steps += 1;
         }
+    }
+
+    /// Record an attempt that produced no usable step at `min_dt` (a singular Rosenbrock
+    /// `W`), after which the driver stops and freeze-pads the tail.
+    ///
+    /// This is a rejection — nothing advanced — but it is *also* a min-step clamp, and
+    /// counting it only as the former is what would let a stalled-and-frozen integration
+    /// present the same clean stats block as a healthy one.
+    #[inline]
+    pub(crate) fn record_min_step_failure(&mut self) {
+        self.attempted_steps += 1;
+        self.rejected_steps += 1;
+        self.min_step_clamped_steps += 1;
     }
 }
 
@@ -295,6 +330,9 @@ pub(crate) trait Stepper<T: PkNum> {
 /// This is the **only** place a method name selects an implementation. Consumers take a
 /// `&mut dyn Stepper<T>`; the dynamic call happens once per step attempt, against `n + 1`
 /// right-hand-side evaluations and an `O(n³)` factorization, so it does not register.
+/// Every arm is spelled out rather than ending in a catch-all: adding an [`OdeMethod`] should
+/// fail to compile here (and in the three sibling matches in [`super::rosenbrock`]) rather
+/// than route silently into the Rosenbrock stepper and panic inside a fit's worker thread.
 pub(crate) fn make_stepper<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn Stepper<T>> {
     match method {
         OdeMethod::Rk45 => Box::new(Rk45Stepper::new(n)),
@@ -302,7 +340,9 @@ pub(crate) fn make_stepper<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn Ste
             n,
             &super::explicit_rk::VERN7,
         )),
-        stiff => Box::new(super::rosenbrock::RosStepper::new(n, stiff)),
+        stiff @ (OdeMethod::Rosenbrock23 | OdeMethod::Rodas4 | OdeMethod::Rodas5P) => {
+            Box::new(super::rosenbrock::RosStepper::new(n, stiff))
+        }
     }
 }
 
@@ -377,6 +417,13 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
         // The Butcher combinations keep the exact association of the original f64 loop
         // (`dt·(B31·k1 + B32·k2)`, not `(dt·B31)·k1 + …`), so instantiating at `T = f64`
         // reproduces the historical trajectory bit for bit.
+        //
+        // The *generic* path is a deliberate last-bit change: RK45 used to exist as two
+        // transcriptions that disagreed here, the f64 loop associating as above and the
+        // generic one accumulating `((u + k1·(dt·B31)) + k2·(dt·B32))` term by term. Only
+        // one of the two could survive being written once, and the predictor's is the one
+        // worth keeping — the analytic sensitivities are now differentiating exactly the
+        // trajectory `predict()` reports rather than one a few ULP away from it.
         if !self.have_k1 {
             rhs(u, params, t, &mut self.k1);
             self.have_k1 = true;
@@ -543,9 +590,14 @@ fn integrate_dense_g<T: PkNum>(
         // An unusable attempt at `min_dt` is unrecoverable: the step cannot be shrunk further
         // and there is no `u_new` to force-accept. Stop and let the tail freeze-pad, the same
         // outcome a trajectory that diverges at `min_dt` gets.
+        //
+        // Recorded as a min-step *clamp*, not a plain rejection. The freeze-padded tail below
+        // is finite and plausible, so the stats block is the only place this failure is
+        // visible at all — and `min_step_clamped_steps` is precisely the counter the
+        // `ode_method` docs send users to when a fit looks stability-limited.
         if !usable && dt_eff <= opts.min_dt {
             if let Some(s) = stats.as_deref_mut() {
-                s.record(false, err_norm, dt_eff, opts.min_dt);
+                s.record_min_step_failure();
             }
             break;
         }

@@ -27,8 +27,14 @@ section of the SDLC for the versioning policy).
   concentrations, long transit chains, QSP cascades), where the explicit method is
   stability-limited and either crawls or exhausts `ode_max_steps`. Analytic sensitivities run
   through the identical stepper, so switching does not move a model off the analytic-gradient
-  path. Default behaviour is unchanged: `rk45` remains the default and existing fits are
-  bit-identical. The stiff methods are full peers — each carries its own continuous extension,
+  path. `rk45` remains the default, and on the `f64` prediction path existing fits are
+  bit-identical. The one deliberate exception is the generic (`Dual2`) analytic-sensitivity
+  path: RK45's stage combinations previously existed as two separate transcriptions that were
+  *not* bit-identical to each other — the `f64` driver associated them as `u + h·(b₁k₁ + b₂k₂)`
+  while the generic one accumulated `((u + k₁·(h·b₁)) + k₂·(h·b₂))`. Unifying them onto the
+  `f64` association shifts the sensitivity path's trajectory in the last bits, which the outer
+  line search can amplify; it also means the gradient is now taken along exactly the trajectory
+  the predictor reports, which it was not before. The stiff methods are full peers — each carries its own continuous extension,
   so every feature that reads ODE state between solver steps works with every method:
   non-Gaussian endpoints (TTE / categorical / CTMM), time-to-event simulation, adaptive /
   feedback dosing, `[output]` state columns and the analytic-sensitivity path. Internally the

@@ -6081,8 +6081,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "ode_method" => {
             opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
                 format!(
-                    "fit option `ode_method`: unknown value `{value}` — expected \
-                     rk45/rosenbrock23/rodas4/rodas5p"
+                    "fit option `ode_method`: unknown value `{value}` — expected one of \
+                     rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, verner7, \
+                     ros23, ode23s, rodas5)"
                 )
             })?;
         }

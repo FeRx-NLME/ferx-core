@@ -23,12 +23,53 @@ fn obs_times() -> Vec<f64> {
     vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]
 }
 
+// The model's constants live here rather than as literals in the `.ferx` source below, so the
+// closed form and the model that is actually integrated cannot drift apart.
+const CL: f64 = 3.0;
+const V: f64 = 20.0;
+const KON: f64 = 1.0e4;
+const KOFF: f64 = 1.0e3;
+const DOSE: f64 = 100.0;
+
+/// The exact scaled prediction `central(t) / V`, in closed form.
+///
+/// The system is linear with a constant coefficient matrix, so `u(t) = exp(A·t)·u₀` with
+///
+/// ```text
+///     ⎡ −CL/V − KON   KOFF ⎤
+/// A = ⎢                    ⎥,   u₀ = (DOSE, 0)
+///     ⎣  KON         −KOFF ⎦
+/// ```
+///
+/// For a 2×2 matrix `exp(A·t)` is Sylvester's formula
+/// `(e^{λ₁t}(A − λ₂I) − e^{λ₂t}(A − λ₁I)) / (λ₁ − λ₂)`; `u₀` has only a first component, so
+/// only the `(0,0)` entry is ever needed.
+///
+/// The two eigenvalues are deliberately **not** both taken from the quadratic formula. Here
+/// `tr = −11000.15` and `det = 150`, so the small root computed as `(tr + √(tr² − 4·det))/2`
+/// subtracts two numbers agreeing in their first five digits — and that root is precisely the
+/// one governing the elimination tail this test measures out to 24 h. The large root is
+/// cancellation-free (both terms carry `tr`'s sign), and the small one then follows from
+/// `λ₁·λ₂ = det`, which is exact.
+fn exact_conc(t: f64) -> f64 {
+    let (a, b) = (-(CL / V) - KON, KOFF);
+    let (c, d) = (KON, -KOFF);
+    let (tr, det) = (a + d, a * d - b * c);
+
+    let lambda_big = 0.5 * (tr - (tr * tr - 4.0 * det).sqrt());
+    let lambda_small = det / lambda_big;
+
+    let (l1, l2) = (lambda_small, lambda_big);
+    let e00 = ((l1 * t).exp() * (a - l2) - (l2 * t).exp() * (a - l1)) / (l1 - l2);
+    DOSE * e00 / V
+}
+
 fn stiff_population() -> Population {
     let times = obs_times();
     let n = times.len();
     let subject: Subject = common::subject(
         "1",
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
         times,
         vec![0.0; n],
         vec![1; n],
@@ -49,10 +90,10 @@ fn stiff_model_src(fit_options: &str) -> String {
     format!(
         r#"
 [parameters]
-  theta TVCL(3.0, 0.01, 100.0)
-  theta TVV(20.0, 0.1, 1000.0)
-  theta TVKON(1.0e4, 1.0, 1.0e7)
-  theta TVKOFF(1.0e3, 1.0, 1.0e7)
+  theta TVCL({CL:?}, 0.01, 100.0)
+  theta TVV({V:?}, 0.1, 1000.0)
+  theta TVKON({KON:?}, 1.0, 1.0e7)
+  theta TVKOFF({KOFF:?}, 1.0, 1.0e7)
   omega ETA_CL ~ 0.09
   sigma PROP_ERR ~ 0.04
 [individual_parameters]

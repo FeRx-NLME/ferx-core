@@ -208,6 +208,13 @@ limited. Run your model and look at the solver's step counts:
 - **Stability-limited (stiff).** Steps are tiny regardless of `ode_reltol`, and the
   integration hits its minimum step or exhausts `ode_max_steps`. A stiff method is the fix,
   and the win is large.
+
+  A **non-zero min-step count is the one number worth checking after switching, too.** If a
+  Rosenbrock method cannot form a step at all at the minimum step size — a singular
+  `W = I/(γh) − J`, which a badly scaled or discontinuous right-hand side can produce — the
+  integration stops there and pads the remaining output times with the last state it reached.
+  Those predictions are finite and look perfectly ordinary; the min-step count is the only
+  place that failure is reported.
 - **Accuracy-limited.** Almost every step is accepted, nothing is min-step clamped, and
   tightening `ode_reltol` is what drives the step count up. A stiff method will not help; what
   helps is a *higher-order* method, or a looser tolerance if the model can afford it.

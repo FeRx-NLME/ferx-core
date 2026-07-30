@@ -461,7 +461,11 @@ fn method_gamma(method: OdeMethod) -> f64 {
         OdeMethod::Rosenbrock23 => ROS23_GAMMA,
         OdeMethod::Rodas4 => RODAS4.gamma,
         OdeMethod::Rodas5P => RODAS5P.gamma,
-        other => unreachable!("{other:?} does not use the Rosenbrock stepper"),
+        // Spelled out, not a catch-all: a newly added `OdeMethod` must fail to compile
+        // here rather than reach this panic from inside a fit's worker thread.
+        other @ (OdeMethod::Rk45 | OdeMethod::Vern7) => {
+            unreachable!("{other:?} does not use the Rosenbrock stepper")
+        }
     }
 }
 
@@ -471,7 +475,9 @@ fn method_err_exp(method: OdeMethod) -> f64 {
         OdeMethod::Rosenbrock23 => ROS23_ERR_EXP,
         OdeMethod::Rodas4 => RODAS4.err_exp,
         OdeMethod::Rodas5P => RODAS5P.err_exp,
-        other => unreachable!("{other:?} does not use the Rosenbrock stepper"),
+        other @ (OdeMethod::Rk45 | OdeMethod::Vern7) => {
+            unreachable!("{other:?} does not use the Rosenbrock stepper")
+        }
     }
 }
 
@@ -535,22 +541,27 @@ impl<T: PkNum> RosWorkspace<T> {
         }
     }
 
-    /// `f(u,t)`, `J = ∂f/∂u`, `f_t = ∂f/∂t`, then `W = I/(γh) − J` factored in place.
+    /// `f(u,t)`, `J = ∂f/∂u` and `f_t = ∂f/∂t` at the step start — the `1 + n + 1` extra
+    /// right-hand-side evaluations a Rosenbrock step costs on top of its stages.
+    ///
+    /// Deliberately **not** fused with [`factor_w`](Self::factor_w): all three depend only on
+    /// `(u, t)`, and a rejected step leaves `(u, t)` exactly where they were. Recomputing them
+    /// for the retry would reproduce the same numbers bit for bit at full price, so the caller
+    /// keeps them and re-runs only the factorization, which is the one piece `dt` enters.
+    /// `rodas.f` and `OrdinaryDiffEq.jl` both hold `J` across rejections for the same reason.
     ///
     /// `J` and `f_t` are forward differences with Hairer's `rodas.f` perturbation
     /// `δ = √(ε·max(1e-5, |x|))`. Differentiating the FD quotient is exactly what the dual
     /// instantiation does, so the sensitivities stay consistent with the step actually taken
     /// (the alternative — an exact `J` for the value part and an FD one for the jet — would
     /// not be).
-    fn build_and_factor_w(
+    fn refresh_jacobian(
         &mut self,
         rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
         u: &[T],
         params: &[T],
         t: f64,
-        dt: f64,
-        gamma: f64,
-    ) -> Result<(), StepFailure> {
+    ) {
         let n = self.n;
         rhs(u, params, t, &mut self.f0);
 
@@ -571,7 +582,14 @@ impl<T: PkNum> RosWorkspace<T> {
         for i in 0..n {
             self.ft[i] = (self.f_tmp[i] - self.f0[i]) * inv;
         }
+    }
 
+    /// `W = I/(γh) − J`, factored in place over the `J` [`refresh_jacobian`] left behind.
+    ///
+    /// This is the part that genuinely depends on `dt`, so it re-runs on every attempt —
+    /// an `O(n³)` factorization, but no right-hand-side evaluations at all.
+    fn factor_w(&mut self, dt: f64, gamma: f64) -> Result<(), StepFailure> {
+        let n = self.n;
         let inv_gamma_h = T::from_f64(1.0 / (gamma * dt));
         for idx in 0..n * n {
             self.w[idx] = -self.jac[idx];
@@ -740,6 +758,12 @@ pub(crate) struct RosStepper<T> {
     method: OdeMethod,
     /// Whether the last attempt produced a usable `u_new` (false only on a singular `W`).
     usable: bool,
+    /// Whether `ws.f0` / `ws.jac` / `ws.ft` still describe the current `(u, t)`.
+    ///
+    /// Set once they are built and cleared in [`on_accept`](super::solver::Stepper::on_accept),
+    /// which is the only event that moves `(u, t)`. A *rejected* attempt changes `dt` alone,
+    /// so the retry reuses them and pays for the factorization only.
+    jac_valid: bool,
 }
 
 impl<T: PkNum> RosStepper<T> {
@@ -749,12 +773,15 @@ impl<T: PkNum> RosStepper<T> {
             OdeMethod::Rosenbrock23 => 2,
             OdeMethod::Rodas4 => RODAS4.stages,
             OdeMethod::Rodas5P => RODAS5P.stages,
-            other => unreachable!("{other:?} does not use the Rosenbrock stepper"),
+            other @ (OdeMethod::Rk45 | OdeMethod::Vern7) => {
+                unreachable!("{other:?} does not use the Rosenbrock stepper")
+            }
         };
         Self {
             ws: RosWorkspace::new(n, stages),
             method,
             usable: false,
+            jac_valid: false,
         }
     }
 
@@ -780,11 +807,13 @@ impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
         opts: &OdeSolverOptions,
     ) -> f64 {
         let gamma = method_gamma(self.method);
-        if self
-            .ws
-            .build_and_factor_w(rhs, u, params, t, dt, gamma)
-            .is_err()
-        {
+        // `(u, t)` only moves on an accepted step, so after a rejection `f0`, `J` and `f_t`
+        // are still the ones this step start needs — see `RosWorkspace::refresh_jacobian`.
+        if !self.jac_valid {
+            self.ws.refresh_jacobian(rhs, u, params, t);
+            self.jac_valid = true;
+        }
+        if self.ws.factor_w(dt, gamma).is_err() {
             // Singular `W`: no stage could be solved, so there is no `u_new` to score or to
             // force-accept. The driver shrinks `dt`, or gives up at `min_dt`.
             self.usable = false;
@@ -795,7 +824,9 @@ impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
             OdeMethod::Rosenbrock23 => self.ws.ros23_stages(rhs, u, params, t, dt),
             OdeMethod::Rodas4 => self.ws.rodas_stages(rhs, u, params, t, dt, &RODAS4),
             OdeMethod::Rodas5P => self.ws.rodas_stages(rhs, u, params, t, dt, &RODAS5P),
-            other => unreachable!("{other:?} does not use the Rosenbrock stepper"),
+            other @ (OdeMethod::Rk45 | OdeMethod::Vern7) => {
+                unreachable!("{other:?} does not use the Rosenbrock stepper")
+            }
         }
         self.ws.err_norm(u, opts)
     }
@@ -821,7 +852,10 @@ impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
         }
     }
 
-    fn on_accept(&mut self) {}
+    fn on_accept(&mut self) {
+        // `(u, t)` has moved, so the cached `f0` / `J` / `f_t` describe the previous step.
+        self.jac_valid = false;
+    }
 
     fn err_exp(&self) -> f64 {
         method_err_exp(self.method)

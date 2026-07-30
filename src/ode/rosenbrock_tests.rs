@@ -1039,3 +1039,139 @@ fn method_tokens_parse_and_round_trip() {
         assert_eq!(OdeMethod::parse(m.as_str()), Some(m));
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Review #952: the stall diagnostic, and the two evaluation-count invariants
+// ---------------------------------------------------------------------------------------
+
+/// A right-hand side that is `NaN` everywhere, so `J` is `NaN`, `W = I/(γh) − J` fails to
+/// factor, and no step can ever be formed at any `dt`.
+fn nan_rhs(_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]) {
+    du[0] = f64::NAN;
+}
+
+/// A Rosenbrock integration that stalls — `W` unusable even at `min_dt` — must say so in
+/// [`OdeSolverStats::min_step_clamped_steps`].
+///
+/// This is the failure mode with no other tell. The driver stops and freeze-pads the
+/// remaining `saveat` points with the last state, so the returned trajectory is finite,
+/// positive and entirely plausible; the stats block is the only place the stall is visible,
+/// and `min_step_clamped_steps` is the counter the `ode_method` docs send users to. Counting
+/// the stall as a plain rejection (as it once was) left a stalled run presenting the same
+/// clean `min_step_clamped_steps == 0` a healthy one does.
+#[test]
+fn a_stalled_rosenbrock_step_reports_a_min_step_clamp() {
+    for method in [
+        OdeMethod::Rosenbrock23,
+        OdeMethod::Rodas4,
+        OdeMethod::Rodas5P,
+    ] {
+        let mut stats = OdeSolverStats::default();
+        let saveat = [0.5, 1.0];
+        let got = solve_ode_with_stats(
+            &nan_rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &saveat,
+            &OdeSolverOptions {
+                method,
+                ..Default::default()
+            },
+            Some(&mut stats),
+        );
+
+        // The tail is padded, not dropped — which is exactly why the stats have to speak.
+        assert_eq!(got.len(), saveat.len(), "[{method:?}] saveat count");
+        assert!(
+            stats.min_step_clamped_steps > 0,
+            "[{method:?}] a stall that freeze-pads the tail must be visible in \
+             min_step_clamped_steps, got {stats:?}"
+        );
+    }
+}
+
+/// Counting harness: wrap a right-hand side and tally how many times it is evaluated.
+fn counting_rhs<'a>(
+    calls: &'a std::cell::Cell<usize>,
+) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
+    move |u: &[f64], p: &[f64], t: f64, du: &mut [f64]| {
+        calls.set(calls.get() + 1);
+        order_rhs(u, p, t, du);
+    }
+}
+
+/// A **rejected** Rosenbrock step must not re-derive `f0`, `J` and `f_t`.
+///
+/// A rejection leaves `(u, t)` exactly where they were and changes only `dt`, so those
+/// `1 + n + 1` evaluations would reproduce the same numbers at full price — `rodas.f` and
+/// `OrdinaryDiffEq.jl` both hold `J` across a retry. Only the `1/(γh)` diagonal and the LU
+/// genuinely depend on `dt`.
+#[test]
+fn a_rejected_step_reuses_the_jacobian() {
+    const N: usize = 2;
+    for method in [
+        OdeMethod::Rosenbrock23,
+        OdeMethod::Rodas4,
+        OdeMethod::Rodas5P,
+    ] {
+        let calls = std::cell::Cell::new(0usize);
+        let rhs = counting_rhs(&calls);
+        let mut stepper = crate::ode::solver::make_stepper::<f64>(N, method);
+        let opts = OdeSolverOptions {
+            method,
+            ..Default::default()
+        };
+        let u = order_exact(0.3).to_vec();
+
+        stepper.attempt(&rhs, &u, &[], 0.3, 1e-3, &opts);
+        let first = calls.replace(0);
+
+        // Same `(u, t)`, smaller `dt` — precisely a rejected step's retry. No `on_accept`.
+        stepper.attempt(&rhs, &u, &[], 0.3, 5e-4, &opts);
+        let retry = calls.get();
+
+        assert_eq!(
+            first - retry,
+            N + 2,
+            "[{method:?}] a retry should save exactly the f0 + {N}-column J + f_t \
+             evaluations ({} → {retry})",
+            first
+        );
+    }
+}
+
+/// On the dense path a non-FSAL pair must carry its end derivative into the next step.
+///
+/// `f(u_new, t + h)` is bought for the interpolant, and `(u_new, t + h)` *is* the next step's
+/// `(u, t)` — so re-deriving it costs one extra `f` on every accepted step of every in-step
+/// readout (TTE hazards, CTMM occupancy, adaptive-dosing monitors, `[output]` columns). For
+/// Vern7 that is 11 evaluations per step instead of 10.
+#[test]
+fn vern7_carries_its_end_derivative_across_an_accepted_dense_step() {
+    let calls = std::cell::Cell::new(0usize);
+    let rhs = counting_rhs(&calls);
+    let mut stepper = crate::ode::solver::make_stepper::<f64>(2, OdeMethod::Vern7);
+    stepper.set_dense_required(true);
+    let opts = OdeSolverOptions {
+        method: OdeMethod::Vern7,
+        ..Default::default()
+    };
+
+    let mut u = order_exact(0.3).to_vec();
+    stepper.attempt(&rhs, &u, &[], 0.3, 1e-3, &opts);
+    let first = calls.replace(0);
+    u.copy_from_slice(stepper.u_new());
+    stepper.on_accept();
+
+    stepper.attempt(&rhs, &u, &[], 0.301, 1e-3, &opts);
+    let second = calls.get();
+
+    // 10 stages + the end derivative on the first step; the second inherits its `k1`.
+    assert_eq!(first, 11, "first dense step: 10 stages + f_end");
+    assert_eq!(
+        second, 10,
+        "the accepted step's f_end is the next step's k1, so the second step must not \
+         re-evaluate it"
+    );
+}

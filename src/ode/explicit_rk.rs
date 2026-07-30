@@ -352,6 +352,14 @@ impl<T: PkNum> Stepper<T> for ErkStepper<T> {
             // The last stage is `f` at the accepted end point — exactly the next step's first.
             let last = self.tab.stages - 1;
             self.ks.swap(0, last);
+        } else if self.dense_required {
+            // A non-FSAL pair on the dense path already bought `f(u_new, t + h)` for the
+            // interpolant, and `(u_new, t + h)` *is* the next step's `(u, t)` — so that
+            // evaluation is the next `k1`, and re-deriving it would make every accepted step
+            // on this path cost one extra `f` (11 instead of 10 for Vern7). The driver reads
+            // the interpolant before calling this, so `f_end` is free to move.
+            self.ks[0].copy_from_slice(&self.f_end);
+            self.have_k1 = true;
         } else {
             // `(u, t)` moved and nothing was evaluated there, so `ks[0]` is stale.
             self.have_k1 = false;
