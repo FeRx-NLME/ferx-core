@@ -190,13 +190,52 @@
 //! every subject. So the saving is `O(n_free²) → O(1)` in the number of grid sweeps, which is
 //! the quantity that actually hurts as `n_agq` grows.
 
-// Remaining steps, in the order the derivation needs them. Each lands with its own FD parity
-// test before the next builds on it, per the repo's analytic-sensitivity rule — a wrong
-// sensitivity here compiles and runs silently.
-//   2. `H̃_k` as explicit matrices, vs FD of `score_core(...).htilde` with the mode moved
-//   3. `b̂_kl`, vs FD of `subject_eta_dx`
-//   4. `M_k`, `M_kl` from `S_k`, `S_kl`
-//   5. terms (A), (B), (C) and the packed assembly
+// # Implementation route — revised after nlmixr2est#787
+//
+// nlmixr2est ships this (`est = "agq"`, `covType = "analytic"`) as
+//
+//     R_i = ld + E_π[Φ_pq] − Cov_π(Φ_p, Φ_q)
+//
+// which is the three-term result above, independently derived: `ld` is (A), `E_π[Φ_pq]` is (C),
+// `Cov_π` is (B). The framing there is better than the one used to derive it here, and it
+// deletes the largest piece of planned work:
+//
+//   > The AGQ objective is the FOCEi objective with **one term swapped**: the data half becomes
+//   > `−log(Σ_k a_k)` over the quadrature nodes; the `log|Ht|`, Omega and tbs terms are
+//   > **unchanged**.
+//
+// So `ld` is the FOCEI log-determinant half **reused verbatim**. There is no need to build `H̃_k`
+// and `H̃_kl` as explicit matrices for term (A) — which would have meant factoring `∂p/∂σ` and
+// `∂Ω⁻¹/∂x_k` out of `sigma_block`/`omega_block`, both of which currently form only contractions.
+//
+// ferx already has the seam. `sens_cov_hessian` splits the FOCEI Hessian exactly this way:
+//
+//   * `subject_cov_hessian_m2_natural` → `∂²Φ/∂ξ∂ζ|_η̂ − M_ξᵀH⁻¹M_ζ` — the **data half**,
+//     mode response included. This is the piece AGQ replaces.
+//   * the M3 block → the Hessian of `½log|H̃|`. This is `ld`, and it carries over unchanged.
+//
+// The correspondence is exact rather than approximate: `Φ_p` is the per-node *total* score
+// `u_{j,k}` (mode movement included), so at one node `E_π[Φ_pq]` collapses to
+// `∂²Φ/∂ξ∂ζ − M_ξᵀH⁻¹M_ζ` — literally `subject_cov_hessian_m2_natural` — and `Cov_π` vanishes.
+// That is the same `n_agq = 1` reduction derived above, arrived at from the assembly side.
+//
+// Remaining steps, each landing behind its own FD parity test before the next builds on it (the
+// repo's analytic-sensitivity rule — a wrong sensitivity here compiles and runs silently):
+//
+//   2. Per-node `Φ_p` and `Φ_pq` at `b_j`, reusing `score_core_at` (#951) for `H_j` and
+//      `mixed_eta_theta` for `M_j`.
+//   3. `b̂_kl`, from differentiating `∇_b nll(b̂(x); x) = 0` twice; vs FD of `subject_eta_dx`.
+//   4. `M_k`, `M_kl` — Cholesky-factor derivatives from `S_k`, `S_kl`. Still needed: the node
+//      placement depends on them even though `ld` does not. nlmixr2est#787 verifies its
+//      equivalent (`d2Ginv`) to 1e-9 and Clairaut-symmetric to 9e-19; match that.
+//   5. Assemble `ld + E_π[Φ_pq] − Cov_π`, gate on `hessian_anchor() == GaussNewton` plus #953's
+//      scope, and wire into `compute_covariance`.
+//
+// A `√2` caution from the sibling PR nlmixr2est#785 ("AGQ quadrature node scaling converges to
+// the wrong limit"): the `√2` must be carried through the node placement, the log-weight untilt
+// **and** the `dGinv`/`d2Ginv` node-displacement terms in lockstep. The `n_agq = 1` identity test
+// cannot see an error here — its node is `z = 0`, so `√2` drops out — so step 4 needs a
+// multi-node check of its own.
 
 use nalgebra::DMatrix;
 
