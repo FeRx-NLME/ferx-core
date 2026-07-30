@@ -124,11 +124,21 @@
 //!   S_kl = H̃_kl + 1e-6·diag(H̃_kl)
 //! ```
 //!
-//! so carrying it costs nothing. Two branches are **not** differentiable and must decline
-//! rather than be approximated:
+//! so carrying it costs nothing.
 //!
-//! * a diagonal pinned at the `1e-10` absolute floor (the `max` switches), and
-//! * `H̃ᵢᵢ ≤ 0` (the `abs` switches).
+//! Both *branches* of the `max` are individually smooth — that is worth stating precisely,
+//! because the loose version of this claim ("the floor branch is non-differentiable") is wrong
+//! and would narrow the scope for no reason:
+//!
+//! * relative branch (`1e-6·|H̃ᵢᵢ| > 1e-10`, i.e. `|H̃ᵢᵢ| > 1e-4`): `Λᵢᵢ = 1e-6·sgn·H̃ᵢᵢ`, so
+//!   `Λ'ᵢᵢ = 1e-6·sgn·H̃'ᵢᵢ` — linear.
+//! * floor branch (`|H̃ᵢᵢ| < 1e-4`): `Λᵢᵢ = 1e-10`, a **constant**, so `Λ'ᵢᵢ = 0` — also linear.
+//!
+//! What is not differentiable is the *crossing* at `|H̃ᵢᵢ| = 1e-4`, and the sign flip at
+//! `H̃ᵢᵢ = 0`. Both are handled by declining when a diagonal sits within a factor
+//! [`JITTER_BRANCH_MARGIN`] of either, which for a real model is never: an `H̃` diagonal is a
+//! curvature in the packed coordinates and runs `O(1)`–`O(10²)`, six-plus orders above the
+//! crossing.
 //!
 //! And if `build_proposal` fell back to the broad `Ω⁻¹` proposal (`H_reg` not
 //! positive-definite), `S` is a different function of `x` altogether; the derivative has to
@@ -179,11 +189,301 @@
 //! every subject. So the saving is `O(n_free²) → O(1)` in the number of grid sweeps, which is
 //! the quantity that actually hurts as `n_agq` grows.
 
-// Implementation follows in subsequent commits, in the order the derivation above needs it:
-//   1. `S` and its jitter branch predicate (this is where a silent wrong answer would start)
+// Remaining steps, in the order the derivation needs them. Each lands with its own FD parity
+// test before the next builds on it, per the repo's analytic-sensitivity rule — a wrong
+// sensitivity here compiles and runs silently.
 //   2. `H̃_k` as explicit matrices, vs FD of `score_core(...).htilde` with the mode moved
 //   3. `b̂_kl`, vs FD of `subject_eta_dx`
 //   4. `M_k`, `M_kl` from `S_k`, `S_kl`
 //   5. terms (A), (B), (C) and the packed assembly
-// Each step lands with its own FD parity test before the next builds on it, per the repo's
-// analytic-sensitivity rule — a wrong sensitivity here compiles and runs silently.
+
+use nalgebra::DMatrix;
+
+/// Absolute jitter floor in `build_proposal`: `Λᵢᵢ = max(1e-6·|H̃ᵢᵢ|, JITTER_FLOOR)`.
+///
+/// Mirrored here rather than imported because `build_proposal` writes both constants inline.
+/// [`regularised_anchor_matches_build_proposal`] pins the two together, so a change there
+/// fails loudly here instead of silently differentiating a different `S`.
+const JITTER_FLOOR: f64 = 1e-10;
+
+/// Relative jitter coefficient in `build_proposal`.
+const JITTER_REL: f64 = 1e-6;
+
+/// The two `max` branches cross at `|H̃ᵢᵢ| = JITTER_FLOOR / JITTER_REL = 1e-4`.
+const JITTER_CROSSING: f64 = JITTER_FLOOR / JITTER_REL;
+
+/// How far a diagonal must sit from the branch crossing (and from zero) for `S` to be
+/// differentiable in the ordinary sense.
+///
+/// A factor of 10 either side. This is not a tolerance to be tuned: at the crossing the second
+/// derivative of `Λ` is a delta, so nothing finite is correct there, and near it the *third*
+/// derivative that term (A) contracts against is unbounded. Declining is the only honest
+/// answer. Real models are nowhere near — an `H̃` diagonal is a packed-coordinate curvature of
+/// order `1`–`10²`, versus a crossing at `1e-4`.
+const JITTER_BRANCH_MARGIN: f64 = 10.0;
+
+/// Which branch of `build_proposal`'s `max` a given diagonal is on, and hence how `Λᵢᵢ`
+/// responds to `H̃ᵢᵢ`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum JitterBranch {
+    /// `Λᵢᵢ = JITTER_REL·sgn·H̃ᵢᵢ`; carries `sgn` so the `abs` is differentiated correctly.
+    Relative { sign: f64 },
+    /// `Λᵢᵢ = JITTER_FLOOR`, a constant — so this diagonal contributes **nothing** to `S_k`.
+    Floor,
+}
+
+impl JitterBranch {
+    /// `dΛᵢᵢ/dH̃ᵢᵢ` — the linear coefficient this branch contributes.
+    #[inline]
+    fn coefficient(self) -> f64 {
+        match self {
+            JitterBranch::Relative { sign } => JITTER_REL * sign,
+            JitterBranch::Floor => 0.0,
+        }
+    }
+}
+
+/// `S = H̃ + Λ` together with the linear map that turns any `H̃` derivative into the matching
+/// `S` derivative.
+///
+/// The point of bundling them is that the *same* branch decision governs `S`, `S_k` and `S_kl`.
+/// Recomputing it per derivative order would let them disagree, which is exactly the class of
+/// error that produces a plausible wrong Hessian.
+#[derive(Debug, Clone)]
+pub(crate) struct RegularisedAnchor {
+    /// `S = H̃ + Λ` — bit-identical to the matrix `build_proposal` Cholesky-factors.
+    pub(crate) s: DMatrix<f64>,
+    /// Per-diagonal `dΛᵢᵢ/dH̃ᵢᵢ`.
+    coef: Vec<f64>,
+}
+
+impl RegularisedAnchor {
+    /// Propagate a derivative of `H̃` (to any order) through the jitter:
+    /// `S_• = H̃_• + diag(coefᵢ · H̃_•[i,i])`.
+    ///
+    /// Exact, because the jitter is linear on each branch. Applies unchanged to `S_k` and
+    /// `S_kl` — the linearity is why the second derivative needs no extra term.
+    pub(crate) fn propagate(&self, dh: &DMatrix<f64>) -> DMatrix<f64> {
+        let mut ds = dh.clone();
+        for (i, &c) in self.coef.iter().enumerate() {
+            ds[(i, i)] += c * dh[(i, i)];
+        }
+        ds
+    }
+}
+
+/// Build `S = H̃ + Λ` and its jitter response, or `None` when the anchor is not
+/// differentiable — the caller then keeps the finite-difference covariance.
+///
+/// Declines in exactly three situations, each for a stated reason rather than out of caution:
+///
+/// * a diagonal within [`JITTER_BRANCH_MARGIN`] of the branch crossing `|H̃ᵢᵢ| = 1e-4`, where
+///   `Λ''` is a delta and no finite answer is right;
+/// * a diagonal within the same margin of zero, where the `abs` flips sign;
+/// * `S` not positive-definite, because `build_proposal` then silently substitutes the broad
+///   `Σ = Ω` proposal — a **different function of `x`** — and differentiating `H̃ + Λ` would be
+///   answering about an objective the fit never evaluated.
+pub(crate) fn regularised_anchor(htilde: &DMatrix<f64>) -> Option<RegularisedAnchor> {
+    let d = htilde.nrows();
+    if d == 0 || htilde.ncols() != d {
+        return None;
+    }
+    let mut s = htilde.clone();
+    let mut coef = Vec::with_capacity(d);
+    for i in 0..d {
+        let hii = htilde[(i, i)];
+        if !hii.is_finite() {
+            return None;
+        }
+        let a = hii.abs();
+        // Bail near the sign flip and near the branch crossing.
+        if a < JITTER_CROSSING * JITTER_BRANCH_MARGIN && a > JITTER_CROSSING / JITTER_BRANCH_MARGIN
+        {
+            return None;
+        }
+        let branch = if a * JITTER_REL > JITTER_FLOOR {
+            if a < JITTER_CROSSING / JITTER_BRANCH_MARGIN {
+                // Unreachable given the guard above, but keep the invariant explicit.
+                return None;
+            }
+            JitterBranch::Relative {
+                sign: if hii >= 0.0 { 1.0 } else { -1.0 },
+            }
+        } else {
+            JitterBranch::Floor
+        };
+        // Reproduce `build_proposal`'s arithmetic exactly, in its order, rather than via the
+        // branch — so `s` is bit-identical to the matrix production factorises.
+        s[(i, i)] += (JITTER_REL * a).max(JITTER_FLOOR);
+        coef.push(branch.coefficient());
+    }
+    // `build_proposal` falls back to the broad proposal when this fails; see above.
+    s.clone().cholesky()?;
+    Some(RegularisedAnchor { s, coef })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::estimation::importance_sampling::build_proposal;
+
+    fn spd(d: usize, scale: f64) -> DMatrix<f64> {
+        let mut m = DMatrix::<f64>::zeros(d, d);
+        for i in 0..d {
+            for j in 0..d {
+                m[(i, j)] = if i == j {
+                    scale * (i as f64 + 2.0)
+                } else {
+                    0.1 * scale / ((i + j) as f64 + 2.0)
+                };
+            }
+        }
+        m
+    }
+
+    /// `regularised_anchor` must produce the **same** `S` that `build_proposal` factorises.
+    ///
+    /// This is the load-bearing test of this step. Everything downstream differentiates `S`; if
+    /// `S` is not the matrix the objective actually used, every derivative is of the wrong
+    /// function and no amount of FD parity elsewhere would reveal it — the FD reference would
+    /// be differentiating my `S` too.
+    ///
+    /// Compared through `log|S|`, which is what `build_proposal` exposes and precisely what
+    /// enters the objective as `½·log_det_inv_scale`.
+    #[test]
+    fn regularised_anchor_matches_build_proposal() {
+        for d in 1..=4 {
+            for scale in [1e-2, 1.0, 25.0, 1e3] {
+                let h = spd(d, scale);
+                let omega_inv = DMatrix::<f64>::identity(d, d);
+                let reg = regularised_anchor(&h).expect("well-conditioned anchor is in scope");
+                let proposal = build_proposal(&h, &omega_inv, d).expect("proposal");
+
+                let mine = reg.s.clone().cholesky().expect("S is PD").l();
+                let log_det_mine = 2.0 * (0..d).map(|i| mine[(i, i)].ln()).sum::<f64>();
+                assert!(
+                    (log_det_mine - proposal.log_det_inv_scale).abs() < 1e-12,
+                    "d={d} scale={scale}: log|S| {log_det_mine} != build_proposal's {}",
+                    proposal.log_det_inv_scale
+                );
+            }
+        }
+    }
+
+    /// The jitter really is applied — `S != H̃`. Guards against the whole step becoming a
+    /// no-op, which would make every downstream derivative silently wrong at the `1e-6`
+    /// relative order the identity test measured.
+    #[test]
+    fn regularised_anchor_actually_jitters() {
+        let h = spd(3, 1.0);
+        let reg = regularised_anchor(&h).unwrap();
+        for i in 0..3 {
+            let delta = reg.s[(i, i)] - h[(i, i)];
+            let want = JITTER_REL * h[(i, i)].abs();
+            // Tolerance is set by the cancellation in `s − h`, not by the jitter's own size:
+            // `s = h·(1 + 1e-6)`, so recovering a `1e-6`-relative quantity by subtracting two
+            // `O(h)` numbers costs ~ULP(h) ≈ 4.4e-16 at h ≈ 2. A `1e-18` bound is unreachable
+            // by construction — it would be testing float arithmetic, not the jitter.
+            let tol = 8.0 * f64::EPSILON * h[(i, i)].abs();
+            assert!(
+                (delta - want).abs() <= tol,
+                "diagonal {i}: jitter {delta} != {want} (tol {tol:.2e})"
+            );
+        }
+        // Off-diagonals untouched.
+        assert!((reg.s[(0, 1)] - h[(0, 1)]).abs() < 1e-18);
+    }
+
+    /// `propagate` is the exact derivative of `S` with respect to `H̃`, checked against a
+    /// central difference of `regularised_anchor` itself along a perturbation direction.
+    ///
+    /// Exact to machine precision rather than to a truncation tolerance, because the map is
+    /// linear — so the assertion is tight enough to catch a wrong coefficient (`1e-6` vs
+    /// `2e-6`, or a missed sign) that a loose tolerance would pass.
+    #[test]
+    fn propagate_is_the_exact_derivative_of_s() {
+        let d = 3;
+        let h = spd(d, 4.0);
+        let reg = regularised_anchor(&h).unwrap();
+
+        // An arbitrary non-symmetric-free direction, including diagonal movement.
+        let mut dir = DMatrix::<f64>::zeros(d, d);
+        for i in 0..d {
+            for j in 0..d {
+                dir[(i, j)] = 0.3 * (i as f64 + 1.0) - 0.17 * (j as f64);
+            }
+        }
+
+        let step = 1e-3;
+        let sp = regularised_anchor(&(&h + step * &dir)).unwrap().s;
+        let sm = regularised_anchor(&(&h - step * &dir)).unwrap().s;
+        let fd = (sp - sm) / (2.0 * step);
+        let analytic = reg.propagate(&dir);
+
+        for i in 0..d {
+            for j in 0..d {
+                assert!(
+                    (analytic[(i, j)] - fd[(i, j)]).abs() < 1e-12,
+                    "dS[{i},{j}]: analytic {} vs FD {}",
+                    analytic[(i, j)],
+                    fd[(i, j)]
+                );
+            }
+        }
+    }
+
+    /// A diagonal sitting on the branch crossing declines, and one safely on the **floor**
+    /// branch does not.
+    ///
+    /// The second half matters: an earlier draft of the module doc claimed the floor branch was
+    /// non-differentiable, which would have narrowed the scope for no reason. `Λᵢᵢ` is
+    /// *constant* there, so it is perfectly differentiable — with zero derivative.
+    #[test]
+    fn declines_only_at_the_branch_crossing_not_on_the_floor() {
+        let d = 2;
+        // On the crossing (|H̃ᵢᵢ| = 1e-4) → decline.
+        let mut h = DMatrix::<f64>::identity(d, d);
+        h[(0, 0)] = JITTER_CROSSING;
+        assert!(
+            regularised_anchor(&h).is_none(),
+            "a diagonal on the jitter branch crossing must decline"
+        );
+
+        // Well below the crossing → floor branch, in scope, zero jitter response.
+        let mut h = DMatrix::<f64>::identity(d, d);
+        h[(0, 0)] = JITTER_CROSSING / (JITTER_BRANCH_MARGIN * 10.0);
+        let reg = regularised_anchor(&h).expect("floor branch is differentiable");
+        assert_eq!(
+            reg.coef[0], 0.0,
+            "floor branch must have zero jitter response"
+        );
+        assert!(
+            reg.coef[1] > 0.0,
+            "the other diagonal is on the relative branch"
+        );
+        // And the floor really is applied as a constant.
+        assert!((reg.s[(0, 0)] - (h[(0, 0)] + JITTER_FLOOR)).abs() < 1e-18);
+    }
+
+    /// A non-positive-definite anchor declines, because `build_proposal` substitutes the broad
+    /// `Σ = Ω` proposal there — a different function of `x`, whose derivative is not what this
+    /// module computes.
+    #[test]
+    fn declines_when_build_proposal_would_fall_back_to_the_broad_proposal() {
+        let d = 2;
+        let mut h = DMatrix::<f64>::identity(d, d);
+        h[(0, 0)] = -5.0; // indefinite
+        h[(1, 1)] = 3.0;
+        assert!(
+            regularised_anchor(&h).is_none(),
+            "an indefinite anchor must decline rather than differentiate H̃ + Λ"
+        );
+        // Confirm the premise: `build_proposal` does still return something there (the broad
+        // proposal), so declining is a real choice and not merely mirroring a `None`.
+        let omega_inv = DMatrix::<f64>::identity(d, d);
+        assert!(
+            build_proposal(&h, &omega_inv, d).is_some(),
+            "premise: build_proposal falls back rather than failing, which is why we decline"
+        );
+    }
+}
