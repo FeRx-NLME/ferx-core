@@ -2661,9 +2661,10 @@ mod tests {
         let h_mats = vec![DMatrix::zeros(model.n_eta, model.n_eta); n_subj];
         let kappas = vec![vec![]; n_subj];
 
-        let run = |analytic: bool| -> DMatrix<f64> {
+        let run = |analytic: bool, interaction: bool| -> DMatrix<f64> {
             let mut opts = FitOptions {
                 analytic_cov_hessian: analytic,
+                interaction,
                 ..FitOptions::default()
             };
             opts.verbose = false;
@@ -2679,7 +2680,8 @@ mod tests {
             ) {
                 CovarianceStepResult::Success(o) => o.matrix,
                 other => panic!(
-                    "covariance step must succeed (analytic = {analytic}); got {}",
+                    "covariance step must succeed (analytic = {analytic}, \
+                     interaction = {interaction}); got {}",
                     match other {
                         CovarianceStepResult::Unusable(m) => m,
                         CovarianceStepResult::FailedNonPd { reason, .. } => reason,
@@ -2689,45 +2691,56 @@ mod tests {
             }
         };
 
-        // Premise: the analytic route must actually be *taken*. If the scope gate declined,
-        // `compute_covariance` would fall back to the same FD stencil and this test would
-        // compare FD against FD — passing while proving nothing. Assert it at the source.
-        assert!(
-            population
-                .subjects
-                .iter()
-                .zip(eta_hats.iter())
-                .all(
-                    |(s, e)| subject_packed_cov_hessian(&model, s, &params, &x_hat, e.as_slice())
-                        .is_some()
-                ),
-            "fixture must be in analytic scope, else this test compares FD against itself"
-        );
-
-        let cov_fd = run(false);
-        let cov_an = run(true);
+        // Premise: the analytic route must actually be *taken*, on BOTH entry points. If the
+        // scope gate declined, `compute_covariance` would fall back to the same FD stencil and
+        // this test would compare FD against FD — passing while proving nothing. Asserted at
+        // the source, per estimator, because the two assemblies gate independently (the FOCE
+        // one additionally needs an in-scope third-order sweep at η = 0).
+        for (s, e) in population.subjects.iter().zip(eta_hats.iter()) {
+            assert!(
+                subject_packed_cov_hessian(&model, s, &params, &x_hat, e.as_slice()).is_some(),
+                "fixture must be in FOCEI analytic scope, else this compares FD against itself"
+            );
+            assert!(
+                subject_packed_cov_hessian_foce(&model, s, &params, &x_hat, e.as_slice()).is_some(),
+                "fixture must be in FOCE analytic scope, else this compares FD against itself"
+            );
+        }
 
         // Standard errors are what a user sees, so compare those rather than raw entries.
         let se = |c: &DMatrix<f64>| -> Vec<f64> {
             (0..c.nrows()).map(|i| c[(i, i)].max(0.0).sqrt()).collect()
         };
-        let (se_fd, se_an) = (se(&cov_fd), se(&cov_an));
-        let worst = se_fd
-            .iter()
-            .zip(se_an.iter())
-            .filter(|(f, _)| **f > 1e-12)
-            .fold(0.0f64, |m, (f, a)| m.max(((a - f) / f).abs()));
 
-        assert!(
-            worst < 0.05,
-            "analytic SEs must match the FD stencil to 5%: worst relative Δ {worst:.3e}\n\
-             fd = {se_fd:?}\nan = {se_an:?}"
-        );
-        // A √2 (41%) discrepancy is the specific failure this guards; assert it is nowhere near.
-        assert!(
-            worst < 0.2,
-            "SE ratio looks like an OFV scale-factor error (√2 ≈ 0.41): {worst:.3e}"
-        );
+        // Both estimators, because the analytic route dispatches on `options.interaction` into
+        // two *different* marginals — FOCEI's Almquist–Laplace `Φ + ½log|H̃|` and FOCE's
+        // Sheiner–Beal `(y−f₀)ᵀR̃⁻¹(y−f₀) + log|R̃|`. Running only the default (`interaction =
+        // true`) left the FOCE arm of that dispatch, and the OFV `×2` scaling applied to the
+        // FOCE assembly, unexercised end-to-end — which is precisely the untested-wiring shape
+        // that produced the √2 SE inflation on the FOCEI side.
+        for interaction in [true, false] {
+            let label = if interaction { "FOCEI" } else { "FOCE" };
+            let (se_fd, se_an) = (se(&run(false, interaction)), se(&run(true, interaction)));
+            let worst = se_fd
+                .iter()
+                .zip(se_an.iter())
+                .filter(|(f, _)| **f > 1e-12)
+                .fold(0.0f64, |m, (f, a)| m.max(((a - f) / f).abs()));
+
+            // A √2 (41%) discrepancy is the specific failure this guards. Checked before the
+            // tighter bound so a scale error reports as a scale error rather than as generic
+            // disagreement.
+            assert!(
+                worst < 0.2,
+                "{label}: SE ratio looks like an OFV scale-factor error (√2 ≈ 0.41): \
+                 {worst:.3e}\nfd = {se_fd:?}\nan = {se_an:?}"
+            );
+            assert!(
+                worst < 0.05,
+                "{label}: analytic SEs must match the FD stencil to 5%: worst relative Δ \
+                 {worst:.3e}\nfd = {se_fd:?}\nan = {se_an:?}"
+            );
+        }
     }
 
     /// Safety gate: the per-subject analytic covariance Hessian (both FOCEI and
