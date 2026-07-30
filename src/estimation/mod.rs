@@ -1,4 +1,5 @@
 pub mod agq;
+pub mod agq_cov_hessian;
 pub mod bayes;
 pub(crate) mod covariance;
 pub mod gauss_newton;
