@@ -2718,6 +2718,64 @@ fn test_unsupported_warning_omits_framework_keys() {
     assert!(w.contains("Method-specific options"), "got: {w}");
 }
 
+/// Every advertised fit-option key must actually be reachable from a `.ferx` file.
+///
+/// `framework_keys()` / `method_specific_keys()` are what the "unsupported option" warning
+/// and the wrapper docs advertise; `apply_fit_option` is what the block parser dispatches
+/// on, and its `_ => Ok(false)` arm turns anything it does not recognise into a hard
+/// ``unknown key`` parse error. Nothing tied the two together, so `analytic_cov_hessian`
+/// shipped in the first list and not the second: the documented escape hatch back to the
+/// finite-difference covariance aborted the fit at parse time and was reachable only from
+/// Rust (PR #953 review finding 7).
+///
+/// Keys are string-typed, so the test tries a small battery of values and only requires
+/// that *some* value is accepted — enough to prove the arm exists without duplicating each
+/// key's value grammar here.
+#[test]
+fn every_advertised_fit_option_key_has_an_apply_fit_option_arm() {
+    use crate::types::{framework_keys, method_specific_keys, EstimationMethod};
+
+    // Values chosen to cover the parser's shapes: bool, integer, float, enum-ish, free text.
+    const CANDIDATES: &[&str] = &[
+        "true", "1", "0.5", "1e-3", "auto", "column", "", "r", "none", "focei",
+    ];
+
+    let mut keys: Vec<&'static str> = framework_keys().to_vec();
+    for m in [
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+        EstimationMethod::FoceGn,
+        EstimationMethod::FoceGnHybrid,
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Impmap,
+        EstimationMethod::Bayes,
+        EstimationMethod::Laplace,
+    ] {
+        keys.extend(method_specific_keys(m).iter().copied());
+    }
+    keys.sort_unstable();
+    keys.dedup();
+
+    let mut unreachable: Vec<&str> = Vec::new();
+    for key in keys {
+        let recognised = CANDIDATES.iter().any(|v| {
+            let mut opts = FitOptions::default();
+            // `Ok(true)` = dispatched. `Err` also proves the arm exists (the value was
+            // rejected by *that key's* parser); only `Ok(false)` means no arm at all.
+            !matches!(apply_fit_option(&mut opts, key, v), Ok(false))
+        });
+        if !recognised {
+            unreachable.push(key);
+        }
+    }
+    assert!(
+        unreachable.is_empty(),
+        "advertised fit-option key(s) with no `apply_fit_option` arm — setting these in a \
+         `.ferx` file is a hard parse error: {unreachable:?}"
+    );
+}
+
 #[test]
 fn test_ode_solver_keys_do_not_warn() {
     // ode_reltol/ode_abstol/ode_max_steps configure the RK45 integrator (any

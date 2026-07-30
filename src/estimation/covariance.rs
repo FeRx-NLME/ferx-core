@@ -474,6 +474,80 @@ pub(crate) fn assemble_score_cross_product(
 /// The estimator assembled from the Hessian `R` is selected by
 /// [`FitOptions::covariance_method`] — `R⁻¹` (default), the score cross-product
 /// `S⁻¹`, or the sandwich `R⁻¹SR⁻¹` (see [`assemble_score_cross_product`]).
+/// The exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, or `None` when
+/// **any** subject is outside the analytic scope.
+///
+/// All-or-nothing on purpose. Mixing an analytic block for some subjects with a
+/// finite-difference block for others would produce a matrix that is neither, and the
+/// resulting SEs would be silently method-dependent per subject. The finite-difference
+/// stencil is correct for everything, so it is the honest fallback.
+///
+/// Serial over subjects, reduced in subject order, so the result cannot depend on thread
+/// count — matching how the FD stencil and the outer gradient reduce (#703). The covariance
+/// step runs once per fit, so the per-subject assembly is not on any hot path.
+fn analytic_cov_hessian(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x_hat: &[f64],
+    eta_hats: &[DVector<f64>],
+    options: &FitOptions,
+) -> Option<DMatrix<f64>> {
+    use crate::estimation::sens_cov_hessian::{
+        subject_packed_cov_hessian, subject_packed_cov_hessian_foce,
+    };
+    // The objective this assembly differentiates is the FOCE/FOCEI marginal. When
+    // `agq_nodes()` is `Some` — `method = laplace` at any node count, or `method = focei`
+    // with `n_agq > 1` — the fit minimised the AGQ marginal instead, under an anchor that
+    // may not even be H̃ (`HessianAnchor::Exact` for Laplace), and with a quadrature
+    // correction this assembly has no term for. `pop_nll_opts` exists precisely so no
+    // production site reports "standard errors for a likelihood it never optimised"; the
+    // analytic path bypasses that helper, so it must repeat its dispatch condition here
+    // (PR #953 review finding 1).
+    if options.agq_nodes().is_some() {
+        return None;
+    }
+    // IOV is out of scope: the assembly is written over the η-only random-effect block, not
+    // the stacked `[η, κ]` one. `subject_sensitivities_cov` declines `n_kappa > 0` itself,
+    // so this is a fast population-level exit, not the load-bearing check.
+    if model.n_kappa > 0 {
+        return None;
+    }
+    let n = x_hat.len();
+    let mut acc = DMatrix::<f64>::zeros(n, n);
+    for (subject, eta_hat) in population.subjects.iter().zip(eta_hats.iter()) {
+        // Cooperative cancel. The FD stencil checks on every perturbed point; this loop is
+        // `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs) assembly per
+        // subject, and for the default `covariance_method = r` there is no later checkpoint
+        // — so without this, the Ctrl-C affordance `saem.rs` advertises before the
+        // covariance step (#893) was inoperative. Returning `None` alone would drop into
+        // the *more* expensive FD stencil; the caller re-checks the flag and reports
+        // cancelled instead (PR #953 review finding 10).
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return None;
+        }
+        let h = if options.interaction {
+            subject_packed_cov_hessian(model, subject, template, x_hat, eta_hat.as_slice())
+        } else {
+            subject_packed_cov_hessian_foce(model, subject, template, x_hat, eta_hat.as_slice())
+        }?;
+        if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        // ×2 — the OFV convention, and the one place this can be silently wrong.
+        //
+        // `subject_packed_cov_hessian` is the second derivative of `subject_packed_gradient`,
+        // which is `∂Fᵢ/∂x` with `OFV = 2·Σᵢ Fᵢ` (see `population_gradient_sens`'s
+        // `grad[k] += 2.0 * gi[k]`). The stencil this replaces differences `2·pop_nll`, so
+        // `hess` here must be `∂²OFV/∂x²`, and the caller's `covariance = 2·H⁻¹` assumes it.
+        // Summing the per-subject Hessians unscaled yields exactly half of that, which inflates
+        // every standard error by √2 — with no other symptom, since the matrix stays symmetric,
+        // positive-definite and plausibly sized.
+        acc += 2.0 * h;
+    }
+    Some(acc)
+}
+
 pub(crate) fn compute_covariance(
     x_hat: &[f64],
     template: &ModelParameters,
@@ -571,7 +645,27 @@ pub(crate) fn compute_covariance(
         2.0 * foce_nll
     };
 
-    let base_ofv = ofv(x_hat);
+    // Reconverge once at `x_hat` and keep the result. Both consumers need it: the base OFV
+    // for the FD stencil, and — as of #953 review finding 8 — the analytic path's η̂.
+    //
+    // The analytic assembly is derived under stationarity (`∂lᵢ/∂η|_η̂ = 0`): both the M2
+    // envelope term `−M_ξᵀH⁻¹M_ζ` and the `inner_eta_responses` chain assume it. Feeding it
+    // the modes converged during the fit at `inner_tol` would make `cov_inner_tol` a silent
+    // no-op on this path, so a user who fits loose and then sets `cov_inner_tol = 1e-10`
+    // for trustworthy SEs would get bit-identical contaminated numbers with no diagnostic.
+    // Reconverging here costs one population inner solve — the thing the FD stencil pays
+    // `~2·n_free²` times.
+    let (base_params, base_eta_hats, base_h_matrices, base_kappas) = reconverge_point(x_hat);
+    let base_ofv = 2.0
+        * pop_nll_opts(
+            model,
+            population,
+            &base_params,
+            &base_eta_hats,
+            &base_h_matrices,
+            &base_kappas,
+            options,
+        );
     if !base_ofv.is_finite() {
         // Diagnose: check Omega conditioning to distinguish Omega collapse from
         // a model-evaluation overflow/underflow.
@@ -627,10 +721,34 @@ pub(crate) fn compute_covariance(
 
     let f0 = base_ofv;
 
+    // The analytic attempt is made **before** `select_fd_step`, not after. That step probes
+    // `2·n_free` perturbed points, each of which reconverges every subject's inner loop, purely
+    // to size a finite-difference step the analytic route never uses. Running it first would
+    // have left the analytic path paying `2·n_free` reconverged population objectives for
+    // nothing — most of the cost it exists to remove, and a claim of "no inner re-solve" that
+    // the code did not honour.
+    let analytic_hess: Option<DMatrix<f64>> = if options.analytic_cov_hessian {
+        // `base_eta_hats`, not `eta_hats` — the modes reconverged at `cov_inner_tol`, which
+        // is what the stationarity assumption in the assembly needs (see above).
+        analytic_cov_hessian(model, population, template, x_hat, &base_eta_hats, options)
+    } else {
+        None
+    };
+    // A cancel during the analytic loop surfaces as `None`; without this the fallback would
+    // start the *more* expensive FD stencil instead of stopping.
+    if analytic_hess.is_none() && crate::cancel::is_cancelled(&options.cancel) {
+        return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
+    }
+
     // Adaptively select the FD step: halve up to 8× until all free-parameter
     // diagonal stencils are finite. Most models use the initial step; halving
     // only kicks in when the OFV overflows at the default perturbation size.
-    let (eps, n_halvings) = select_fd_step(x_hat, &free_idx, initial_eps, f0, &ofv);
+    // Skipped entirely when the analytic Hessian is available.
+    let (eps, n_halvings) = if analytic_hess.is_some() {
+        (initial_eps, 0)
+    } else {
+        select_fd_step(x_hat, &free_idx, initial_eps, f0, &ofv)
+    };
     if options.verbose && n_halvings > 0 {
         eprintln!(
             "  [covariance] Adaptive FD step: reduced {:.3e} → {:.3e} ({} halving{})",
@@ -648,6 +766,25 @@ pub(crate) fn compute_covariance(
     let mut fd_diag_nan: HashSet<usize> = HashSet::new();
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
+    // ── Analytic R-matrix (#436), attempted before the FD stencil ────────────────
+    //
+    // The exact observed information from third-order sensitivities, assembled per
+    // subject and summed. All-or-nothing: a single subject outside the analytic
+    // scope drops the whole population back to the finite-difference stencil below,
+    // because a Hessian half-assembled from two different approximations would be
+    // neither.
+    //
+    // This is not the stencil #639 removed. That one finite-differenced a gradient
+    // that held `a = ∂f/∂η` fixed — an envelope approximation, which is why it
+    // biased weakly-identified structural SEs. This is the exact second derivative
+    // of the same marginal the outer loop minimises.
+    if let Some(h) = analytic_hess.as_ref() {
+        hess.copy_from(h);
+        if options.verbose {
+            eprintln!("  [covariance] analytic R-matrix (third-order sensitivities, #436)");
+        }
+    }
+    if analytic_hess.is_none()
     // Reconverged-OFV second-difference Hessian (3-point diagonal, 4-point
     // off-diagonal), reconverging the EBEs at each perturbed point. The sole
     // covariance R stencil: it recomputes the marginal curvature end-to-end

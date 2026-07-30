@@ -404,14 +404,26 @@ The fit output reports which route ran.
 
 ### Where AGQ stops
 
-AGQ's gradient is exact but **finite-difference-limited**: the grid-response term
-and the posterior Hessian are both central differences, so it carries a noise floor
-(~1e-4 relative). It therefore cannot drive `|g|` arbitrarily low the way an
-analytic-to-machine-precision gradient can.
+AGQ's gradient is exact but still **finite-difference-limited**, though far less so
+than it was. The posterior Hessian is now analytic — the exact conditional
+`∂²nll/∂b²` assembled by the same sensitivity sweep FOCEI's own gradient uses — and
+the grid-response term contracts each node's analytic `∂nll/∂b` against a node
+displacement differenced from a cheap *exact* linear-algebra map. What remains
+finite-differenced is `dH/dx`, which would need a third derivative (`∂³nll/∂η²∂θ`)
+to close.
+
+Removing the previous finite-difference-of-a-finite-difference dropped the noise
+floor by two to three orders of magnitude — measured against a reconverged
+finite-difference of the objective on warfarin, `6.5e-8` relative at `n_agq = 1` and
+`1.8e-9` at `n_agq = 7`, where the same test read `2.0e-5` and `2.1e-7` before. At
+that level the finite-difference *reference* is the inaccurate side, not the gradient.
 
 So AGQ stops on the **objective-change** criterion (`outer_ftol`, default 1e-6) and
 the step-size criterion (`outer_xtol`), not on a gradient norm. That is where its
-objective actually settles.
+objective actually settles. This is deliberately **unchanged** by the accuracy gain
+above: whether the tighter floor now makes a gradient-norm stop reachable is a
+separate question, and re-tuning a convergence criterion is not something to fold
+into a gradient change.
 
 This matters more than it sounds. FOCE/FOCEI are given a `1e-12` stop, which they can
 reach; giving the same to AGQ makes it *unreachable*, and an unreachable stop is not

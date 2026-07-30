@@ -6088,6 +6088,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             })?;
         }
         "covariance" => opts.run_covariance_step = parse_bool("covariance")?,
+        "analytic_cov_hessian" => opts.analytic_cov_hessian = parse_bool("analytic_cov_hessian")?,
         "covariance_fallback" => {
             opts.covariance_fallback = match value.to_lowercase().as_str() {
                 "none" => crate::types::CovarianceFallback::None,
