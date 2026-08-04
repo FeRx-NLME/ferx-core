@@ -159,6 +159,17 @@ section of the SDLC for the versioning policy).
   for any external code that constructs or exhaustively destructures these variants.
 
 ### Fixed
+- **Gradient-path-dependent FOCE/FOCEI objective on proportional-error models with a
+  near-zero prediction** (#958). The residual-variance floor (`MIN_VARIANCE`, which clamps
+  `(f·σ)²` so a vanishing prediction cannot produce a zero variance) was applied to the
+  variance but **not** to its analytic derivatives `∂R/∂f` / `∂²R/∂f²`. On a row whose
+  prediction is driven to ~0 (e.g. drug fully eliminated at a late sample) the variance is
+  clamped and locally constant in `f`, so its true derivatives are 0, but the accessors
+  returned the raw `2·f·σ²` / `2·σ²`. That made the analytic inner-EBE gradient disagree with
+  the finite-difference objective it minimises, so `gradient = auto` (analytic) and
+  `gradient = fd` could converge to different empirical-Bayes modes and report different
+  objective values (hence different ΔOFV/ΔAIC) for the same model at the same estimates. The
+  variance-derivative accessors are now floor-aware, restoring analytic ↔ FD agreement.
 - **Standard errors for closed-form LTBS models under IOV** (#486). The tighter inner-EBE
   tolerances that log-transform-both-sides models take for the fit and covariance steps
   (`LTBS_FIT_INNER_TOL` / `LTBS_COV_INNER_TOL`, #665) were previously skipped whenever the

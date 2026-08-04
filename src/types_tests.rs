@@ -1115,11 +1115,15 @@ fn d2var_df2_scaled_scales_by_mprop_squared() {
     // reproduces the unscaled value; additive stays 0 at any mult.
     let combined = ErrorSpec::Single(ErrorModel::Combined);
     let sigma = [0.3, 2.0];
-    let base = combined.d2var_df2(1, &sigma);
-    assert!((combined.d2var_df2_scaled(1, &sigma, &[3.0, 1.0]) - base * 9.0).abs() < 1e-12);
-    assert!((combined.d2var_df2_scaled(1, &sigma, &[1.0, 1.0]) - base).abs() < 1e-12);
+    // A prediction well away from 0: the combined variance `(f·σ₁)² + σ₂²`
+    // stays far above the `MIN_VARIANCE` floor, so `d2var_df2` returns the raw
+    // `2·σ₁²` and the m² scaling below is unaffected by the floor gate (#958).
+    let f = 5.0;
+    let base = combined.d2var_df2(1, f, &sigma);
+    assert!((combined.d2var_df2_scaled(1, f, &sigma, &[3.0, 1.0]) - base * 9.0).abs() < 1e-12);
+    assert!((combined.d2var_df2_scaled(1, f, &sigma, &[1.0, 1.0]) - base).abs() < 1e-12);
     assert_eq!(
-        ErrorSpec::Single(ErrorModel::Additive).d2var_df2_scaled(1, &[0.5], &[4.0]),
+        ErrorSpec::Single(ErrorModel::Additive).d2var_df2_scaled(1, f, &[0.5], &[4.0]),
         0.0
     );
 }

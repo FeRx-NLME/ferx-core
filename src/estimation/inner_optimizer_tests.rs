@@ -464,6 +464,95 @@ fn analytic_inner_gradient_m3_matches_fd_on_warfarin_bloq() {
     }
 }
 
+/// #958, as reported: a two-state target-binding ODE with a **parameter-
+/// dependent initial condition** (`init(RTOT) = RBASE`) and a `sqrt` binding
+/// quadratic in the RHS, observed at two endpoints under proportional error.
+/// The analytic ODE inner η-gradient must match a central FD of `individual_nll`
+/// at a non-zero η that pushes the drug endpoint's late sample into the
+/// variance floor. This is the exact scenario the issue bisected to; the raw
+/// four-cell design isolates it to `init(θ)` + `sqrt`, but the mechanism is the
+/// floor-unaware `∂R/∂f`, so the reproduction is the analytic-vs-FD inner
+/// gradient here (the prediction sensitivities themselves were never wrong).
+#[test]
+fn analytic_inner_gradient_ode_init_theta_sqrt_matches_fd() {
+    use std::cell::RefCell;
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta KEL(0.05,0.001,10)\n  theta VC(5,0.5,100)\n  theta RBASE(20,1,400)\n  theta KINT(0.2,0.001,20)\n  theta KDEG(0.02,0.0001,5)\n  theta KM(10,0.1,1000)\n  omega IIV_KEL   ~ 0.09\n  omega IIV_RBASE ~ 0.09\n  sigma PROP_DRUG ~ 0.15 (sd)\n  sigma PROP_TGT  ~ 0.15 (sd)\n[individual_parameters]\n  KEL   = KEL * exp(IIV_KEL)\n  RBASE = RBASE * exp(IIV_RBASE)\n  VC    = VC\n  KINT  = KINT\n  KDEG  = KDEG\n  KM    = KM\n  KSYN  = RBASE * KDEG\n[structural_model]\n  ode(states=[CENT, RTOT])\n[odes]\n  init(RTOT) = RBASE\n  ct = CENT / VC\n  bb = ct - RTOT - KM\n  cf = 0.5 * (bb + sqrt(bb*bb + 4*KM*ct))\n  fb = cf / (KM + cf)\n  d/dt(CENT) = -KEL * cf * VC - KINT * fb * RTOT * VC\n  d/dt(RTOT) =  KSYN - KDEG * RTOT - KINT * fb * RTOT\n[scaling]\n  y[CMT=1] = CENT / VC\n  y[CMT=2] = RTOT\n[error_model]\n  CMT=1: DV ~ proportional(PROP_DRUG)\n  CMT=2: DV ~ proportional(PROP_TGT)\n[fit_options]\n  method     = focei\n  ode_reltol = 1e-9\n  ode_abstol = 1e-9\n",
+    )
+    .expect("parse binding-quadratic ODE with parameter-dependent init");
+
+    // Drug (CMT 1) at 4 times incl. a far-tail sample where drug ~ 0 (floored
+    // proportional variance), then total target (CMT 2) at the same times.
+    let tms = [1.0, 7.0, 28.0, 120.0];
+    let mut obs_times = Vec::new();
+    let mut obs_cmts = Vec::new();
+    for &t in &tms {
+        obs_times.push(t);
+        obs_cmts.push(1usize);
+    }
+    for &t in &tms {
+        obs_times.push(t);
+        obs_cmts.push(2usize);
+    }
+    let n = obs_times.len();
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 300.0, 1, 0.0, false, 0.0)],
+        obs_times,
+        obs_raw_times: Vec::new(),
+        // Rough noise-free-ish values; exact magnitudes are immaterial — the
+        // analytic gradient is checked against FD of the objective on the SAME
+        // data, so the assertion is a self-consistency (gradient-path) check.
+        observations: vec![
+            30.0, 5.0, 0.5, 0.0, // drug
+            16.0, 10.0, 6.0, 15.0, // target
+        ],
+        obs_cmts,
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0; n],
+        occasions: vec![1; n],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+
+    let theta = &model.default_params.theta;
+    let omega = &model.default_params.omega;
+    let sigma = &model.default_params.sigma.values;
+    let eta = vec![0.5, -0.15];
+
+    // Precondition: the drug tail sample really does hit the variance floor.
+    let preds = crate::pk::compute_predictions_with_tv(&model, &subject, theta, &eta);
+    assert!(
+        model.residual_variance_at(1, preds[3], sigma) <= 1e-12,
+        "drug tail prediction {} must drive its proportional variance to the floor",
+        preds[3]
+    );
+
+    let analytic = analytic_eta_nll_gradient(&model, &subject, theta, &eta, omega, sigma)
+        .expect("analytic ODE inner gradient must be supported");
+    let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(&subject));
+    let obj = |e: &[f64]| -> f64 {
+        let mut s = scratch.borrow_mut();
+        individual_nll_into_with_schedule(&model, &subject, theta, e, omega, sigma, &mut s, None)
+    };
+    let fd = gradient_fd(&obj, &eta, model.n_eta);
+    for k in 0..model.n_eta {
+        assert!(
+            (analytic[k] - fd[k]).abs() < 1e-3 * (1.0 + fd[k].abs()),
+            "η[{k}]: analytic {} vs FD {}",
+            analytic[k],
+            fd[k]
+        );
+    }
+}
+
 /// Closed-form `iiv_on_ruv` + M3 BLOQ (#4c): the analytic non-IOV inner
 /// η-gradient must match central FD of `individual_nll`, exercising the censored
 /// `η_ruv` data column `h·z` and the `exp(2·η_ruv)` variance scaling on the
