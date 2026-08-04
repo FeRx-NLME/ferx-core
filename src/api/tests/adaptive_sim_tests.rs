@@ -87,6 +87,181 @@ const ANALYTICAL: &str = r#"
   DV ~ proportional(PROP)
 "#;
 
+// Time-varying-covariate ODE twin (model only, no [adaptive_dosing] block) — CL reads
+// CRCL, so a subject with per-observation covariates is a TV-cov subject. Used to assert
+// a base regimen × TV covariate is rejected (#702 scope).
+const ODE_TV_COV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * CRCL / 100.0
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+// 1-cpt IV ODE whose RHS reads TAFD (time after first dose). The extra
+// `-1e-3·TAFD·central` decay makes the trajectory depend on the TAFD anchor, so a stale
+// anchor (e.g. earliest *base* dose instead of the true global earliest) integrates
+// different forcing and the frozen-replay verifier catches it. Used to pin #934: a
+// controller dose scheduled before the earliest base dose must lower the anchor.
+const ODE_TAFD: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central - 1e-3 * TAFD * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+// Time-varying covariate on BIOAVAILABILITY (not CL): F reads CRCL, so a base dose given
+// where CRCL != the t=0 baseline gets a different F — the case #930's per-dose F resolution
+// must handle. CL/V are constant, so the *only* per-event effect is on each dose's F. The
+// declared `omega` is unused (CL = TVCL), so a drawn η never perturbs the closed form.
+const ODE_TV_F: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVF(0.8, 0.01, 1.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+  F  = TVF * CRCL / 100.0
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+// Inter-occasion variability on BIOAVAILABILITY (not CL): F carries a per-occasion κ, so a
+// base dose given in a decision window enters with THAT window's F — the case #931's per-dose
+// occasion-F resolution must handle. CL/V are effectively constant (`ETA_CL ~ N(0, 1e-10)`),
+// so the only per-occasion effect is on each dose's F, giving a clean closed form. `TVF = 0.5`
+// keeps F = 0.5·exp(κ_F) < 1 (physical) across the drawn κ.
+const ODE_IOV_F: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVF(0.5, 0.01, 1.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_F ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF * exp(KAPPA_F)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+// Time-varying covariate on CL plus a fixed dose lag time (`LAGTIME`, the reserved ODE
+// name → PK_IDX_LAGTIME). A *lagged* base dose under a time-varying covariate is a #930
+// typed error (the hand-rolled TV frozen-replay engine carries no base lag yet).
+const ODE_TV_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL      = TVCL * CRCL / 100.0
+  V       = TVV
+  LAGTIME = 2.0
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+// Time-varying covariate on CL plus a built-in first-order absorption input rate feeding
+// `central` (the dosed compartment). A base dose into an input-rate-fed compartment under a
+// time-varying covariate is a #930 typed error — the depot / absorption bookkeeping is not
+// threaded through the hand-rolled TV frozen-replay engine yet. A single pathway (implicit
+// fraction 1) clears the parallel-absorption fraction-sum check, so the ONLY rejection is the
+// #930 input-rate arm of the base-dose guard.
+const ODE_TV_ABSORB: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * CRCL / 100.0
+  V  = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+// Time-varying covariate on CL plus a declared modeled-rate parameter `R1`, so a base dose
+// carrying a coded RATE=-1 (modeled infusion rate) is a VALID dose that actually reaches the
+// #930 base-dose guard — rather than being turned away earlier for a missing `R1`. Such a base
+// dose under a time-varying covariate is a #930 typed error: its rate-resolution bookkeeping
+// (RATE=-1/-2 → R1/D1 from the PK snapshot) is not threaded through the TV frozen-replay engine
+// yet. (This is also the one input that drives `resolve_subject_doses` down its owned/mutating
+// branch; the guard reads `is_fixed()` on the pre-resolution dose, so it still fires.)
+const ODE_TV_MRATE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * CRCL / 100.0
+  V  = TVV
+  R1 = 100.0
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
 fn subj(id: &str, obs_times: Vec<f64>, doses: Vec<DoseEvent>) -> Subject {
     let n = obs_times.len();
     let n_dose = doses.len();
@@ -129,6 +304,12 @@ fn fixed_bolus() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
     |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
 }
 
+/// A controller that never doses — `Hold` at every decision. Proves a pre-scheduled
+/// base regimen (#702) is integrated on its own, with the controller adding nothing.
+fn hold_all() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
+    |_ctx: &ControllerCtx| vec![DoseAction::Hold]
+}
+
 #[test]
 fn degenerate_oracle_matches_static_predict_bit_for_bit() {
     // A controller that doses at every decision must reproduce the static
@@ -163,6 +344,210 @@ fn degenerate_oracle_matches_static_predict_bit_for_bit() {
         assert!(
             (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
             "adaptive IPRED {} != static predict {} at t={}",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+/// A one-shot infusion at the second decision (t=24), holding otherwise. Its
+/// window spans the mid-horizon reset so the reset-floor infusion turn-off is
+/// exercised (#716).
+fn infuse_at_second_decision() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
+    |ctx: &ControllerCtx| {
+        if ctx.decision_index == 1 {
+            vec![DoseAction::Infuse {
+                amt: 120.0,
+                cmt: 1,
+                rate: 5.0,
+            }]
+        } else {
+            vec![DoseAction::Hold]
+        }
+    }
+}
+
+#[test]
+fn adaptive_reset_matches_static_predict() {
+    // Degenerate oracle for system resets (#716): a fixed-dose controller over a
+    // dose-free base subject carrying a mid-horizon EVID=3 reset must reproduce the
+    // trusted static engine — `predict()`, which routes reset subjects to the
+    // reset-aware event-driven walker — on the same realized regimen. The model is
+    // η-invariant, so the adaptive IPRED equals the η=0 static PRED.
+    //
+    // The default-on frozen-replay verifier (now reset-aware) also runs, and its Ok
+    // is part of this assertion: a reset-blind verifier would compute the post-reset
+    // observation at t=42 as ~0 in the driver but ~18 in the replay and error out, so
+    // the `.expect` below fails unless BOTH the driver and the verifier honor the reset.
+    //
+    // Tolerance: `predict()` routes a reset subject to the event-driven engine
+    // (`solve_ode`), while the reactive driver integrates with `integrate_segment`
+    // (`solve_ode_dense`) — two independent integrators, so they agree to solver noise
+    // (~1e-6 relative), not to the bit. That independence is the value here: a reset
+    // dropped or mis-applied by the driver would move a prediction by O(dose) — tens of
+    // percent — which this rel-1e-4 bound catches easily, while the tight same-engine
+    // bookkeeping check is the auto-run frozen-replay verifier's job.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![0.0, 24.0, 48.0];
+    let obs = vec![6.0, 30.0, 42.0, 54.0];
+    let reset_at = 36.0;
+
+    let mut base = subj("1", obs.clone(), vec![]);
+    base.reset_times = vec![reset_at];
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("adaptive reset sim runs and passes the reset-aware verifier");
+    assert_eq!(res.ledger.len(), 3, "a bolus at every decision");
+
+    // Static reference: the realized doses pre-scheduled on a subject carrying the
+    // same reset, scored by predict() (η=0, event-driven, reset honored).
+    let static_doses: Vec<DoseEvent> = decisions
+        .iter()
+        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    let mut static_subject = subj("1", obs.clone(), static_doses);
+    static_subject.reset_times = vec![reset_at];
+    let static_pop = population(vec![static_subject]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+
+    assert_eq!(res.trajectories.len(), obs.len());
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (reset at {reset_at})",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_reset_zeros_state_positive_control() {
+    // Proof the reset actually zeros the compartments — so the degenerate oracle above
+    // is not vacuous (both engines agreeing on an *un*-reset trajectory). The same
+    // fixed-dose controller run with vs without a mid-horizon reset must diverge: with
+    // the reset at 36 and no dose between 24 and 48, the post-reset observation at 42
+    // reads exactly 0 (state zeroed, nothing re-entering); without it the 0 h and 24 h
+    // boluses persist (~18 amount units). Removing the driver's reset-zeroing makes the
+    // reset run read ~18 and trips the first assert.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![0.0, 24.0, 48.0];
+    let obs = vec![42.0];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+
+    let mut with_reset = subj("1", obs.clone(), vec![]);
+    with_reset.reset_times = vec![36.0];
+    let res_reset = simulate_adaptive(
+        &model,
+        &population(vec![with_reset]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect("reset run");
+
+    let no_reset = subj("1", obs.clone(), vec![]);
+    let res_noreset = simulate_adaptive(
+        &model,
+        &population(vec![no_reset]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect("no-reset run");
+
+    let y_reset = res_reset.trajectories[0].ipred;
+    let y_noreset = res_noreset.trajectories[0].ipred;
+    assert!(
+        y_reset.abs() < 1e-9,
+        "post-reset obs at t=42 must read ~0 (state zeroed at 36), got {y_reset}"
+    );
+    assert!(
+        y_noreset > 10.0,
+        "without the reset the 0 h + 24 h boluses persist at t=42 (~18), got {y_noreset}"
+    );
+}
+
+#[test]
+fn adaptive_reset_turns_off_spanning_infusion_matches_static_predict() {
+    // Degenerate oracle exercising the reset FLOOR on a controller-issued infusion
+    // (#716): an infusion issued at t=24 (window [24, 48]) spans the reset at t=36.
+    // The reset must both zero the state AND turn the infusion off from 36 on, exactly
+    // as the event-driven engine does (`active_infusions` honors `reset_floor`). So the
+    // post-reset observation at t=42 reads 0, and the whole trajectory matches predict()
+    // on the same pre-scheduled infusion + reset. If the reset floor were ignored, the
+    // infusion would keep delivering past 36 and t=42 would be materially positive.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![0.0, 24.0, 48.0];
+    let obs = vec![30.0, 42.0, 54.0];
+    let reset_at = 36.0;
+
+    let mut base = subj("1", obs.clone(), vec![]);
+    base.reset_times = vec![reset_at];
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(11),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        infuse_at_second_decision,
+        &opts,
+    )
+    .expect("adaptive reset+infusion sim runs and passes the reset-aware verifier");
+    assert_eq!(res.ledger.len(), 1, "exactly one infusion, at t=24");
+    assert!(res.ledger[0].rate > 0.0, "the realized dose is an infusion");
+
+    // Static reference: the realized infusion pre-scheduled on a subject carrying the
+    // same reset, scored by predict() (event-driven, reset floor turns the infusion off).
+    let e = &res.ledger[0];
+    let mut static_subject = subj(
+        "1",
+        obs.clone(),
+        vec![DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)],
+    );
+    static_subject.reset_times = vec![reset_at];
+    let preds = predict(
+        &model,
+        &population(vec![static_subject]),
+        &model.default_params,
+    );
+
+    assert_eq!(res.trajectories.len(), obs.len());
+    // Locate the t=42 (post-reset) trajectory and assert it washed out.
+    let y42 = res
+        .trajectories
+        .iter()
+        .find(|t| (t.time - 42.0).abs() < 1e-12)
+        .expect("t=42 trajectory row")
+        .ipred;
+    assert!(
+        y42.abs() < 1e-9,
+        "post-reset obs at t=42 must be ~0 (infusion turned off at 36), got {y42}"
+    );
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        // Cross-engine tolerance (event-driven `predict()` vs dense reactive driver),
+        // as in `adaptive_reset_matches_static_predict`.
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (reset+infusion)",
             traj.ipred,
             pred.pred,
             traj.time
@@ -264,6 +649,163 @@ fn adaptive_iov_matches_predict_iov_with_reconstructed_kappa() {
             traj.time
         );
     }
+}
+
+#[test]
+fn adaptive_iov_reset_matches_predict_iov_and_zeros_state() {
+    // #716 × #701: the reset-aware path on the IOV frozen-replay engine
+    // (`adaptive_frozen_replay_tv`) — the third of the three reset sites, and the one
+    // no other test reaches. Every other reset test uses a constant model, and
+    // `subject_needs_per_event_pk` does NOT flag resets, so only an IOV (or
+    // TV-covariate) subject drives `event_pk = Some` and routes the verifier to this
+    // engine rather than the constant replay.
+    //
+    // Oracle: run the reactive driver on a real IOV model carrying a mid-horizon EVID=3
+    // reset, reconstruct the exact per-occasion κ, and confirm the trajectory equals
+    // `predict_iov` — which routes an ODE subject to the reset-aware event-driven walker
+    // (`ode_predictions_event_driven`) — on the realized doses PLUS the same reset. The
+    // default-on frozen-replay verifier also runs (driver vs `adaptive_frozen_replay_tv`),
+    // so its Ok is part of the assertion: a reset mis-applied on EITHER the driver or the
+    // IOV replay surfaces here, and `predict_iov` is an INDEPENDENT third engine so a bug
+    // shared by driver+replay cannot hide.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    assert!(model.n_kappa == 1 && model.n_eta == 1);
+    let decisions = vec![0.0, 24.0, 48.0, 72.0];
+    let obs = decisions.clone();
+    let reset_at = 36.0; // between decisions 24 and 48; no dose in (36, 48)
+    let seed = 20260725u64;
+
+    let mut base = subj("1", obs.clone(), vec![]);
+    base.reset_times = vec![reset_at];
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("adaptive IOV+reset sim runs and passes the reset-aware IOV verifier");
+    assert_eq!(res.ledger.len(), 4, "a bolus at every decision");
+
+    // Reconstruct BSV η and the per-occasion κ exactly as `run_adaptive_population` drew
+    // them (identical derivation to `adaptive_iov_matches_predict_iov_with_reconstructed_kappa`).
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let z_eta: Vec<f64> = (0..model.n_eta).map(|_| rng.sample(normal)).collect();
+    let eta_bsv: Vec<f64> = (&model.default_params.omega.chol
+        * nalgebra::DVector::from_column_slice(&z_eta))
+    .iter()
+    .copied()
+    .collect();
+    let omega_iov = model.default_params.omega_iov.as_ref().expect("omega_iov");
+    let base_seed = crate::sim::adaptive::subject_kappa_base_seed(seed, "1", 1);
+    let kappas: Vec<Vec<f64>> = (0..decisions.len())
+        .map(|g| {
+            let z: Vec<f64> = (0..model.n_kappa)
+                .map(|k| crate::sim::adaptive::kappa_standard_normal(base_seed, g, k))
+                .collect();
+            (&omega_iov.chol * nalgebra::DVector::from_column_slice(&z))
+                .iter()
+                .copied()
+                .collect()
+        })
+        .collect();
+    assert!(
+        kappas.iter().any(|k| k[0].abs() > 1e-6),
+        "the reconstructed κ must be genuinely nonzero, else the oracle is vacuous"
+    );
+
+    // Static reference: predict_iov on the realized doses + the SAME reset.
+    let static_doses: Vec<DoseEvent> = res
+        .ledger
+        .iter()
+        .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+        .collect();
+    let mut static_subject = subj("1", obs.clone(), static_doses);
+    static_subject.reset_times = vec![reset_at];
+    static_subject.occasions = obs
+        .iter()
+        .map(|&t| crate::pk::occasion_of(&decisions, t).expect("obs in a window") as u32)
+        .collect();
+    static_subject.dose_occasions = res
+        .ledger
+        .iter()
+        .map(|e| crate::pk::occasion_of(&decisions, e.time).expect("dose in a window") as u32)
+        .collect();
+    let preds = crate::pk::predict_iov(
+        &model,
+        &static_subject,
+        &model.default_params.theta,
+        &eta_bsv,
+        &kappas,
+    );
+
+    assert_eq!(res.trajectories.len(), preds.len());
+    for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+        // Event-driven `predict_iov` (`solve_ode`) vs the dense reactive driver
+        // (`solve_ode_dense`): agree to solver noise, not the bit. A dropped or
+        // mis-applied reset would move a post-reset prediction by O(dose).
+        assert!(
+            (traj.ipred - pred).abs() <= 1e-6 + 1e-6 * pred.abs(),
+            "adaptive IOV+reset IPRED {} != predict_iov {} at t={}",
+            traj.ipred,
+            pred,
+            traj.time
+        );
+    }
+
+    // Positive control (the reset is not vacuous): re-run without it, same seed, so the
+    // κ draws are identical and only the reset differs. At t=48 (post-reset; the 48 h
+    // bolus lands on both runs) the no-reset trajectory must read strictly higher, by the
+    // retained 0 h + 24 h exposure the reset would have zeroed at t=36.
+    let no_reset = subj("1", obs.clone(), vec![]);
+    let res_nr = simulate_adaptive(
+        &model,
+        &population(vec![no_reset]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect("no-reset IOV run");
+    let idx48 = obs.iter().position(|&t| t == 48.0).expect("t=48 obs");
+    let y_reset = res.trajectories[idx48].ipred;
+    let y_noreset = res_nr.trajectories[idx48].ipred;
+    assert!(
+        y_noreset - y_reset > 1.0,
+        "reset must drop the retained 0h+24h exposure at t=48: with-reset {y_reset}, \
+         no-reset {y_noreset}"
+    );
+}
+
+#[test]
+fn adaptive_reset_decision_collision_is_rejected() {
+    // #716 guard: adding reset times to `break_times` introduces a new dedup collision
+    // source — a decision within 1e-15 of a reset but NOT bit-identical would be merged
+    // away by the break dedup, silently dropping that decision's exact-bit lookup. The
+    // driver rejects it with a typed error instead. Build the collision with the two
+    // adjacent doubles around t=1 (ULP ≈ 2.2e-16, below the 1e-15 dedup tolerance): the
+    // reset at 1.0 sorts first, so the decision at `nextafter(1.0)` loses the dedup.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let reset_at = 1.0_f64;
+    let decision = f64::from_bits(reset_at.to_bits() + 1); // within 1e-15, not bit-equal
+    assert!(decision != reset_at && (decision - reset_at).abs() < 1e-15);
+
+    let mut base = subj("1", vec![2.0], vec![]);
+    base.reset_times = vec![reset_at];
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![decision],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("a decision within 1e-15 of a reset must be rejected, not silently dropped");
+    assert!(
+        err.contains("1e-15") && err.to_lowercase().contains("reset"),
+        "error should cite the 1e-15 reset/break collision: {err}"
+    );
 }
 
 #[test]
@@ -428,23 +970,1424 @@ fn rejects_empty_decision_schedule() {
 }
 
 #[test]
-fn rejects_subject_with_prescheduled_doses() {
-    // The regimen is controller-driven; a subject that already carries doses
-    // is a typed error (forwarded from the driver), never a silent merge.
-    let model = parse_model_string(ODE_NO_IIV).expect("parse");
-    let dosed = subj(
-        "1",
-        vec![6.0],
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-    );
-    let pop = population(vec![dosed]);
+fn adaptive_loading_dose_only_matches_static_predict() {
+    // #702 degenerate oracle: a base loading regimen with a controller that never doses
+    // (Hold at every decision) must reproduce predict() on the loading regimen alone —
+    // the pre-scheduled doses are integrated, the controller adds nothing. The default-on
+    // frozen-replay verifier (now base-aware) also runs, and its Ok is part of this
+    // assertion: a verifier that dropped the base regimen would diverge and error.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    // Decisions coincide with the loading-dose times, so the reactive driver and predict()
+    // build the identical segmentation and agree bit-for-bit (a decision landing off the
+    // dose grid would add a break predict() lacks, diverging by RK45 step noise ~1e-5 —
+    // still caught bit-exactly by the on-by-default frozen-replay verifier, which feeds the
+    // decision times to both engines; the realistic off-grid maintenance schedule is what
+    // the mrgsolve loading-dose anchor exercises).
+    let decisions = vec![0.0, 24.0];
+    let obs = vec![6.0, 30.0, 54.0];
+    let loading = vec![
+        DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 250.0, 1, 0.0, false, 0.0),
+    ];
+
+    let pop = population(vec![subj("1", obs.clone(), loading.clone())]);
     let opts = AdaptiveSimulateOptions {
-        decision_times: vec![0.0],
+        seed: Some(3),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("base-regimen adaptive sim runs and passes the base-aware verifier");
+    assert!(res.ledger.is_empty(), "controller issues no doses (Hold)");
+
+    // Static reference: the loading regimen alone, scored by predict() (η=0, IPRED).
+    let static_pop = population(vec![subj("1", obs.clone(), loading)]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+
+    assert_eq!(res.trajectories.len(), obs.len());
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={}",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_loading_dose_changes_trajectory_positive_control() {
+    // Proof the base regimen is actually integrated (the oracle above is not vacuously
+    // matching two dose-free runs): the same Hold-all controller with vs without a loading
+    // dose must diverge — with the 500 mg loading dose the first observation is hundreds of
+    // units; without it (dose-free + Hold) every prediction is 0.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+    let decisions = vec![0.0, 24.0, 48.0];
+    let obs = vec![6.0, 30.0, 54.0];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+
+    let with_load = population(vec![subj(
+        "1",
+        obs.clone(),
+        vec![DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)],
+    )]);
+    let r_load = simulate_adaptive(
+        &model,
+        &with_load,
+        &model.default_params,
+        1,
+        hold_all,
+        &opts,
+    )
+    .expect("loading-dose run");
+
+    let no_dose = population(vec![subj("1", obs.clone(), vec![])]);
+    let r_none = simulate_adaptive(&model, &no_dose, &model.default_params, 1, hold_all, &opts)
+        .expect("dose-free run");
+
+    assert!(
+        r_load.trajectories[0].ipred > 100.0,
+        "loading dose must be visible at t=6, got {}",
+        r_load.trajectories[0].ipred
+    );
+    assert_eq!(
+        r_none.trajectories[0].ipred, 0.0,
+        "dose-free Hold: nothing in the system"
+    );
+}
+
+#[test]
+fn adaptive_loading_dose_plus_titration_matches_static_predict() {
+    // #702: a base loading dose augmented by a fixed-dose controller must reproduce
+    // predict() on (loading regimen ∪ realized ledger). State-independent dosing, so the
+    // base-dose-then-decision ordering at t=0 (base 500 applied, then the decision's 100)
+    // is unambiguous and the union is exactly what both engines integrate.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![0.0, 24.0, 48.0];
+    let obs = vec![6.0, 30.0, 54.0];
+    let loading = vec![DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)];
+
+    let pop = population(vec![subj("1", obs.clone(), loading.clone())]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(5),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("base+titration adaptive sim runs and passes the verifier");
+    assert_eq!(res.ledger.len(), 3, "a controller bolus at every decision");
+
+    // Static reference: loading regimen + the realized controller doses.
+    let mut static_doses = loading.clone();
+    static_doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={}",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_ss_base_dose_matches_static_predict() {
+    // #702 steady-state: a base SS=1 (II>0) maintenance dose pre-equilibrates the
+    // compartment, then a fixed controller augments it. Must reproduce predict() on the
+    // same (SS base ∪ ledger) regimen — exercising `equilibrate_ss_state` through the
+    // shared apply/verifier path. The base-aware frozen-replay verifier also runs.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+    let decisions = vec![0.0, 24.0];
+    let obs = vec![1.0, 12.0, 30.0];
+    // SS dose: 300 mg q24h at steady state, seeded at t=0.
+    let ss = DoseEvent::new(0.0, 300.0, 1, 0.0, true, 24.0);
+    let pop = population(vec![subj("1", obs.clone(), vec![ss.clone()])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(9),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("SS base + titration runs and passes the verifier");
+    assert_eq!(res.ledger.len(), 2);
+
+    let mut static_doses = vec![ss];
+    static_doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (SS base dose)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_infusion_matches_static_predict() {
+    // #702: a pre-scheduled zero-order infusion (base regimen) delivered over its window,
+    // augmented by a fixed bolus controller. Must reproduce predict() on (base ∪ ledger),
+    // exercising base-infusion break placement + `active_infusions` on the reactive path.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+    let decisions = vec![0.0, 24.0];
+    let obs = vec![1.0, 6.0, 30.0];
+    // 200 mg infused over 4 h (rate 50) starting at t=0.
+    let inf = DoseEvent::new(0.0, 200.0, 1, 50.0, false, 0.0);
+    let pop = population(vec![subj("1", obs.clone(), vec![inf.clone()])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(11),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("base infusion + titration runs and passes the verifier");
+
+    let mut static_doses = vec![inf];
+    static_doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (base infusion)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_loading_under_tv_covariate_matches_closed_form() {
+    // #930: a pre-scheduled loading dose integrated under a *time-varying* covariate. CL reads
+    // a declining CRCL, so each segment's decay uses the covariate at the segment's END (NONMEM
+    // end-of-interval, #700) — and the base loading dose rides that per-segment PK. Independent
+    // hand-checked closed form (NOT the frozen-replay twin): a 1000-unit bolus at t=0 decays
+    // over two 24 h segments with k = CL/V = (5·CRCL/100)/50. With CRCL = 50 on both
+    // post-baseline records, k = 0.05/h in each segment, so the trajectory is a double
+    // exponential. The default-on base-aware frozen-replay verifier also runs (its Ok is part
+    // of the assertion). Mutation: freezing the segment PK at the t=0 CRCL=100 would give
+    // k=0.1 and a far smaller trajectory (301 → 90 vs 91 → 8).
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let mut s = subj(
+        "1",
+        vec![0.0, 24.0, 48.0],
+        vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+    );
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 50.0)]),
+        HashMap::from([("CRCL".to_string(), 50.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("base loading × TV covariate runs and passes the base-aware verifier");
+    assert!(
+        res.ledger.is_empty(),
+        "controller holds — the loading dose is the only dose"
+    );
+
+    // k = CL/V = (5·50/100)/50 = 0.05 /h in each 24 h segment (end-of-interval CRCL = 50).
+    let decay = (-0.05_f64 * 24.0).exp();
+    let expect = [1000.0, 1000.0 * decay, 1000.0 * decay * decay];
+    // RK45 vs the analytic closed form: bound by a small multiple of the solver's own error
+    // control (default reltol 1e-4 / abstol 1e-6), the same 8× idiom the frozen-replay verifier
+    // uses — ~1e4× tighter than the 70% trajectory shift a covariate-frozen base dose would give.
+    for (traj, want) in res.trajectories.iter().zip(expect.iter()) {
+        assert!(
+            (traj.ipred - want).abs() <= 8.0 * (1e-6 + 1e-4 * want),
+            "t={}: base loading IPRED {} != closed form {want} (per-segment CL under TV)",
+            traj.time,
+            traj.ipred
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_dose_f_under_tv_covariate_matches_closed_form() {
+    // #930: the base dose's bioavailability F is resolved from ITS OWN covariate snapshot, not
+    // the t=0 baseline — the crux of base × TV. F = TVF·CRCL/100 with CL/V constant. A 1000-unit
+    // base bolus lands at t=24 where CRCL=60, so F = 0.8·60/100 = 0.48 and 480 units enter the
+    // central compartment (a stale t=0 F=0.8 would inject 800 — the mutation this pins). It then
+    // decays over 24 h at k = CL/V = 0.1/h. Independent hand-checked closed form.
+    let model = parse_model_string(ODE_TV_F).expect("parse TV-F ODE model");
+    let mut s = subj(
+        "1",
+        vec![0.0, 24.0, 48.0],
+        vec![DoseEvent::new(24.0, 1000.0, 1, 0.0, false, 0.0)],
+    );
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 60.0)]),
+        HashMap::from([("CRCL".to_string(), 60.0)]),
+    ];
+    // The dose row carries its own covariate (CRCL = 60 at t = 24) — the snapshot F resolves at.
+    s.dose_covariates = vec![HashMap::from([("CRCL".to_string(), 60.0)])];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(9),
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("base dose F × TV covariate runs and passes the verifier");
+    assert!(res.ledger.is_empty(), "controller holds");
+
+    let entered = (0.8 * 60.0 / 100.0) * 1000.0; // F(t=24)·amt = 0.48·1000 = 480
+    let decay = (-0.1_f64 * 24.0).exp(); // k = CL/V = 5/50
+    let expect = [0.0, entered, entered * decay];
+    // t=24 (post-dose) is exact f64 (F·amt, no integration); t=48 carries one 24 h RK45 decay,
+    // bounded by 8× the solver's error control (default reltol 1e-4). The stale-F mutation this
+    // pins (F=0.8 → 800 not 480) is 67% off — vastly outside this band.
+    for (traj, want) in res.trajectories.iter().zip(expect.iter()) {
+        assert!(
+            (traj.ipred - want).abs() <= 8.0 * (1e-6 + 1e-4 * want),
+            "t={}: base-dose-F IPRED {} != closed form {want} (per-dose F under TV)",
+            traj.time,
+            traj.ipred
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_infusion_under_tv_covariate_matches_closed_form() {
+    // #930: a base *infusion* (not just a bolus) integrated under a time-varying covariate.
+    // A 1 h zero-order infusion (rate 500 → 500 mg) into CENT, then decay, with CL reading a
+    // declining CRCL. The infusion window (0, 1] ends at the t=1 record (CRCL=100 → k=0.1/h),
+    // so during infusion A(1) = (rate/k)(1−e^{−k}) = 5000·(1−e^{−0.1}) = 475.813. It then
+    // decays under CRCL=60 (k=0.06/h): A(24) = A(1)·e^{−0.06·23}, A(48) = A(24)·e^{−0.06·24}.
+    // Independent hand-checked closed form — the infusion analogue of the bolus oracles, so a
+    // mis-carried base-infusion F / window under a covariate would miss it.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let mut s = subj(
+        "1",
+        vec![1.0, 24.0, 48.0],
+        vec![DoseEvent::new(0.0, 500.0, 1, 500.0, false, 0.0)], // rate 500 → 1 h infusion
+    );
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]), // t=1: governs the infusion window
+        HashMap::from([("CRCL".to_string(), 60.0)]),  // t=24
+        HashMap::from([("CRCL".to_string(), 60.0)]),  // t=48
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(13),
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("base infusion × TV covariate runs and passes the base-aware verifier");
+    assert!(
+        res.ledger.is_empty(),
+        "controller holds — the base infusion is the only dose"
+    );
+
+    let a1 = (500.0 / 0.1) * (1.0 - (-0.1_f64).exp()); // end of the 1 h infusion, k = 0.1
+    let a24 = a1 * (-0.06_f64 * 23.0).exp(); // decay under CRCL=60 (k = 0.06)
+    let a48 = a24 * (-0.06_f64 * 24.0).exp();
+    let expect = [a1, a24, a48];
+    for (traj, want) in res.trajectories.iter().zip(expect.iter()) {
+        assert!(
+            (traj.ipred - want).abs() <= 8.0 * (1e-6 + 1e-4 * want),
+            "t={}: base-infusion IPRED {} != closed form {want} (infusion under per-segment TV CL)",
+            traj.time,
+            traj.ipred
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_loading_plus_titration_under_tv_covariate_passes_verifier() {
+    // #930: a base loading dose augmented by a controller under a time-varying covariate. The
+    // controller doses at every decision (state-independent), so base ∪ realized ledger
+    // integrate under per-segment PK and the base-aware TV frozen-replay verifier (default-on,
+    // now carrying the base dose's F in `dose_f`) must accept the run — exercising the
+    // `verify_adaptive_frozen_replay` TV branch with a non-empty base slice.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let mut s = subj(
+        "1",
+        vec![0.0, 24.0, 48.0],
+        vec![DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)],
+    );
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 70.0)]),
+        HashMap::from([("CRCL".to_string(), 50.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(11),
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("base + titration × TV runs and passes the base-aware verifier");
+    assert_eq!(res.ledger.len(), 3, "a controller bolus at every decision");
+}
+
+#[test]
+fn adaptive_base_ss_dose_with_tv_covariate_is_rejected() {
+    // #930 scope: a steady-state base dose under a time-varying covariate is a typed error (SS
+    // equilibration needs per-dose PK threaded through the TV frozen-replay engine — a
+    // follow-up), never a silent covariate-frozen SS seed.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let mut s = subj(
+        "1",
+        vec![6.0, 30.0, 54.0],
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)], // SS=1, II=24
+    );
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 90.0)]),
+        HashMap::from([("CRCL".to_string(), 80.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        decision_times: vec![0.0, 24.0, 48.0],
         ..Default::default()
     };
     let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
-        .expect_err("pre-dosed subject must be rejected");
-    assert!(err.contains("dose-free"), "got: {err}");
+        .expect_err("SS base dose × TV covariate must be rejected");
+    assert!(
+        err.contains("plain fixed bolus or infusion") && err.contains("steady-state"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_lagged_dose_with_tv_covariate_is_rejected() {
+    // #930 scope: a lagged base dose under a time-varying covariate is a typed error (the TV
+    // frozen-replay engine carries no base lag yet), never a silently un-lagged integration.
+    let model = parse_model_string(ODE_TV_LAG).expect("parse TV-cov + lag ODE model");
+    let mut s = subj(
+        "1",
+        vec![6.0, 30.0, 54.0],
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+    );
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 90.0)]),
+        HashMap::from([("CRCL".to_string(), 80.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("lagged base dose × TV covariate must be rejected");
+    assert!(
+        err.contains("plain fixed bolus or infusion") && err.contains("lagged"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_modeled_rate_dose_with_tv_covariate_is_rejected() {
+    // #930 scope: a base dose carrying a MODELED (coded) RATE under a time-varying covariate is a
+    // typed error — the rate-resolution bookkeeping (RATE=-1/-2 → R1/D1 from the PK snapshot) is
+    // not threaded through the TV frozen-replay engine yet. The guard tests `is_fixed()` on the
+    // *original* dose, before `resolve_subject_doses` collapses a coded RATE to `Fixed`, so this
+    // is the arm only that pre-resolution check can trip. Plain central, no lag, not an
+    // input-rate compartment, so the modeled-RATE arm is the sole reason this rejects (mutation:
+    // drop the `!is_fixed()` arm and the dose is accepted → this `expect_err` fails).
+    let model = parse_model_string(ODE_TV_MRATE).expect("parse TV-cov + modeled-rate ODE model");
+    let mut s = subj(
+        "1",
+        vec![0.0, 24.0, 48.0],
+        vec![DoseEvent::modeled(
+            0.0,
+            1000.0,
+            1,
+            false,
+            0.0,
+            crate::types::RateMode::ModeledRate,
+        )],
+    );
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 90.0)]),
+        HashMap::from([("CRCL".to_string(), 80.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("modeled-RATE base dose × TV covariate must be rejected");
+    assert!(
+        err.contains("plain fixed bolus or infusion") && err.contains("modeled-RATE"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_input_rate_dose_with_tv_covariate_is_rejected() {
+    // #930 scope: a base dose into a compartment fed by a built-in input rate (here first-order
+    // absorption into `central`) under a time-varying covariate is a typed error — the depot /
+    // absorption bookkeeping is not threaded through the TV frozen-replay engine yet. The dose is
+    // a plain fixed bolus (not SS, not lagged, not modeled-RATE), so `input_rate_consumes_cmt` is
+    // the sole arm that rejects it (mutation: drop that arm and the dose is accepted).
+    let model = parse_model_string(ODE_TV_ABSORB).expect("parse TV-cov + absorption ODE model");
+    let mut s = subj(
+        "1",
+        vec![0.0, 24.0, 48.0],
+        vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+    );
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 90.0)]),
+        HashMap::from([("CRCL".to_string(), 80.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("input-rate base dose × TV covariate must be rejected");
+    assert!(
+        err.contains("plain fixed bolus or infusion") && err.contains("input-rate"),
+        "got: {err}"
+    );
+}
+
+/// Reconstruct the exact BSV η a seeded single-subject `simulate_adaptive` run drew for
+/// (sim 1, subject `id`): the seeded `StdRng`, one N(0,1) per η, then Ω's Cholesky. With
+/// `seed` set the assay/κ streams don't touch this rng, so the η draw is its only consumer —
+/// reproducible here. Mirrors `run_adaptive_population`'s BSV draw.
+fn reconstruct_eta_bsv(model: &CompiledModel, seed: u64) -> Vec<f64> {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let z_eta: Vec<f64> = (0..model.n_eta).map(|_| rng.sample(normal)).collect();
+    (&model.default_params.omega.chol * nalgebra::DVector::from_column_slice(&z_eta))
+        .iter()
+        .copied()
+        .collect()
+}
+
+/// Reconstruct the exact per-occasion κ a seeded run drew for (subject `id`, sim 1):
+/// `κ_g = chol(Ω_IOV)·z`, `z` keyed by (occasion, component) on the dedicated substream —
+/// the same derivation `run_adaptive_population` and `verify_adaptive_snapshots` use. Returns
+/// one κ vector per decision window (`n_occ` = `decision_times.len()`).
+fn reconstruct_kappas(model: &CompiledModel, seed: u64, id: &str, n_occ: usize) -> Vec<Vec<f64>> {
+    let omega_iov = model.default_params.omega_iov.as_ref().expect("omega_iov");
+    let base = crate::sim::adaptive::subject_kappa_base_seed(seed, id, 1);
+    (0..n_occ)
+        .map(|g| {
+            let z: Vec<f64> = (0..model.n_kappa)
+                .map(|k| crate::sim::adaptive::kappa_standard_normal(base, g, k))
+                .collect();
+            (&omega_iov.chol * nalgebra::DVector::from_column_slice(&z))
+                .iter()
+                .copied()
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn adaptive_base_loading_under_iov_matches_predict_iov() {
+    // #931: the full-stack reconstruction oracle the issue names. A pre-scheduled base loading
+    // dose integrated under per-occasion κ must equal `predict_iov` — an INDEPENDENT engine — on
+    // the same dose with occasion = decision window. κ is on CL here, so the base dose decays
+    // under each window's own clearance (the base-dose analogue of the controller-dose oracle
+    // `adaptive_iov_matches_predict_iov`). A build-loop error in the base dose's occasion PK
+    // would be applied by both the driver and the frozen-replay verifier; `predict_iov` is a
+    // third engine that shares neither, so it catches it. The default-on frozen-replay + #748
+    // snapshot verifiers also run — their `Ok` is part of the assertion.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    assert!(model.n_kappa == 1 && model.n_eta == 1);
+    let decisions = vec![0.0, 24.0, 48.0, 72.0];
+    // Base 1000-unit loading bolus at t=0 (occasion 0). Observe at t=12 (in occasion 0, so the
+    // base dose's own-occasion decay is seen) and after each later decision, but NOT at t=0,
+    // where a base dose coincident with an observation raises a pre/post-dose readout question
+    // orthogonal to this oracle (the driver observes the trough, #933). The observation grid
+    // covers occasions 0..=3 in order, so `predict_iov`'s occasion→group index (obs order, then
+    // dose-only occasions; `iov_occasion_groups`) matches the reconstructed κ's occasion-id
+    // order — the dose's occasion 0 is a group index 0, not appended last.
+    let obs = vec![12.0, 24.0, 48.0, 72.0];
+    let seed = 20260726u64;
+    let base_dose = DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0);
+    let pop = population(vec![subj("1", obs.clone(), vec![base_dose])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true → frozen-replay + #748 snapshot checks run
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("adaptive IOV base-loading sim runs and passes the default verifiers");
+    assert!(
+        res.ledger.is_empty(),
+        "controller holds — only the base loading dose"
+    );
+
+    let eta_bsv = reconstruct_eta_bsv(&model, seed);
+    let kappas = reconstruct_kappas(&model, seed, "1", decisions.len());
+    assert!(
+        kappas.iter().any(|k| k[0].abs() > 1e-6),
+        "the reconstructed κ must be genuinely nonzero, else the oracle is vacuous"
+    );
+
+    // Static reference: predict_iov on the base loading dose with occasion = decision window.
+    let mut static_subject = subj(
+        "1",
+        obs.clone(),
+        vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+    );
+    static_subject.occasions = obs
+        .iter()
+        .map(|&t| crate::pk::occasion_of(&decisions, t).expect("obs in a window") as u32)
+        .collect();
+    static_subject.dose_occasions =
+        vec![crate::pk::occasion_of(&decisions, 0.0).expect("dose in a window") as u32];
+    let preds = crate::pk::predict_iov(
+        &model,
+        &static_subject,
+        &model.default_params.theta,
+        &eta_bsv,
+        &kappas,
+    );
+
+    assert_eq!(res.trajectories.len(), preds.len());
+    for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred).abs() <= 1e-9 + 1e-9 * pred.abs(),
+            "adaptive IOV base-loading IPRED {} != predict_iov {} at t={}",
+            traj.ipred,
+            pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_dose_f_under_iov_matches_closed_form() {
+    // #931: the crux of base × IOV — a base dose's bioavailability F resolves under the κ of the
+    // occasion (decision window) it lands in, NOT the frozen t=0 baseline (κ=0) and NOT another
+    // occasion's κ. F = TVF·exp(κ_F) with CL/V constant, so the only per-occasion effect is on F.
+    // A 1000-unit base bolus lands at t=24 which — with decisions at [0, 24] — is occasion 1, so
+    // F = 0.5·exp(κ₁_F) and F·1000 units enter central; it then decays at k = CL/V = 0.1/h. Two
+    // independent mutations are pinned: a frozen κ=0 gives F = 0.5 → 500 units, and the WRONG
+    // occasion (κ₀) gives 0.5·exp(κ₀_F)·1000 — both distinct from the correct κ₁ value. The
+    // default-on frozen-replay + #748 snapshot verifiers also run.
+    let model = parse_model_string(ODE_IOV_F).expect("parse IOV-on-F ODE model");
+    assert!(model.n_kappa == 1 && model.n_eta == 1);
+    let decisions = vec![0.0, 24.0];
+    let seed = 20260726u64;
+    // Base 1000-unit bolus at t=24 (occasion 1); observe at 36 and 48 (both occasion 1, after the
+    // dose — no observation coincides with the dose, sidestepping the pre/post-dose readout).
+    let base_dose = DoseEvent::new(24.0, 1000.0, 1, 0.0, false, 0.0);
+    let s = subj("1", vec![36.0, 48.0], vec![base_dose]);
+    let pop = population(vec![s]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("base dose F × IOV runs and passes the verifiers");
+    assert!(
+        res.ledger.is_empty(),
+        "controller holds — the base dose is the only dose"
+    );
+
+    // Reconstruct the exact per-occasion κ_F; occasion 1 governs the dose at t=24.
+    let kappas = reconstruct_kappas(&model, seed, "1", decisions.len());
+    let k0_f = kappas[0][0];
+    let k1_f = kappas[1][0];
+    let f = 0.5 * k1_f.exp(); // F = TVF·exp(κ₁_F), the occasion-1 bioavailability
+                              // Non-vacuity guards tied to the closed-form band (rel tol ≈ 8e-4 below), NOT a bare 1e-6:
+                              // each mutation must move F well outside the band or the oracle would pass vacuously. The
+                              // frozen κ=0 mutation gives F=0.5; the wrong-occasion mutation gives 0.5·exp(κ₀_F). Require
+                              // a 10× margin so the oracle's teeth rest on the band, not on the pinned seed alone.
+    let rel_band = 8.0 * 1e-4;
+    assert!(
+        (f - 0.5).abs() / f > 10.0 * rel_band,
+        "occasion-1 κ_F={k1_f} too small: a frozen κ=0 (F=0.5) would fall within the \
+         closed-form band, making the oracle vacuous"
+    );
+    assert!(
+        (f - 0.5 * k0_f.exp()).abs() / f > 10.0 * rel_band,
+        "occasions 0/1 too close (κ₀_F={k0_f}, κ₁_F={k1_f}): the wrong-occasion \
+         F=0.5·exp(κ₀_F) would fall within the band, making the oracle vacuous"
+    );
+
+    let entered = f * 1000.0;
+    let k = 0.1_f64; // CL/V = 5/50; ETA_CL ~ N(0, 1e-10) ≈ 0
+    let expect = [entered * (-k * 12.0).exp(), entered * (-k * 24.0).exp()];
+    // t=36/48 each carry RK45 decay from the t=24 admin, bounded by 8× the solver's error
+    // control. The κ=0 mutation (F=0.5 → 500 vs 0.5·exp(κ₁)) is far outside this band.
+    for (traj, want) in res.trajectories.iter().zip(expect.iter()) {
+        assert!(
+            (traj.ipred - want).abs() <= 8.0 * (1e-6 + 1e-4 * want),
+            "t={}: base-dose-F-under-IOV IPRED {} != closed form {want} (F = 0.5·exp(κ₁))",
+            traj.time,
+            traj.ipred
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_loading_plus_titration_under_iov_passes_verifier() {
+    // #931: a base loading dose augmented by a controller under IOV. The controller doses at
+    // every decision, so base ∪ realized ledger integrate under per-occasion κ, and the
+    // base-aware IOV frozen-replay verifier (default-on, `adaptive_frozen_replay_tv` threading
+    // `eta_occ`) plus the #748 snapshot check must accept the run — the bit-exact backstop for
+    // base × IOV with reactive doses. Observations sit OFF the decision grid, so the driver and
+    // the replay must agree segment-for-segment, not merely at the decisions.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    let base_dose = DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0);
+    let s = subj("1", vec![12.0, 36.0, 60.0], vec![base_dose]);
+    let pop = population(vec![s]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: vec![0.0, 24.0, 48.0],
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("base + titration × IOV runs and passes the base-aware IOV verifiers");
+    assert_eq!(res.ledger.len(), 3, "a controller bolus at every decision");
+}
+
+#[test]
+fn adaptive_base_ss_dose_with_iov_is_rejected() {
+    // #931 scope: a steady-state base dose under IOV is a typed error — SS equilibration needs
+    // per-occasion κ threaded through the frozen-replay engine (a follow-up), never a silent
+    // κ=0 SS seed. Proves the IOV path (event_pk = Some, so `tv` is true) reaches the SAME
+    // base-dose scope guard the TV path does. The four rejection arms themselves (SS / lag /
+    // input-rate / modeled-RATE) are pinned per-arm by the #930 TV tests; this confirms the IOV
+    // routing into that shared guard, so an SS base dose under IOV can never slip to a silent
+    // frozen-κ integration.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    let s = subj(
+        "1",
+        vec![6.0, 30.0],
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)], // SS=1, II=24
+    );
+    let pop = population(vec![s]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0, 24.0],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("SS base dose × IOV must be rejected");
+    assert!(
+        err.contains("plain fixed bolus or infusion") && err.contains("steady-state"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_dose_f_before_first_decision_uses_baseline_kappa() {
+    // #931 convention (pins the pre-first-decision boundary raised in review): a base dose
+    // administered BEFORE the first decision has no open occasion window, so its bioavailability
+    // F resolves at the baseline κ = 0 — exactly like an observation before the first decision —
+    // NOT occasion 0's κ. F = TVF·exp(κ_F) with CL/V constant. A 1000-unit base bolus at t=0 with
+    // the first decision at t=24 is in the baseline window, so F = TVF·exp(0) = 0.5 and 500 units
+    // enter central; it decays at k = 0.1/h (CL constant, so the per-segment occasion never
+    // touches the trajectory here). Mutation pinned: resolving the dose at occasion 0's κ would
+    // give 0.5·exp(κ₀_F)·1000 ≠ 500.
+    let model = parse_model_string(ODE_IOV_F).expect("parse IOV-on-F ODE model");
+    let decisions = vec![24.0, 48.0]; // first decision at t=24; the dose at t=0 precedes it
+    let seed = 20260726u64;
+    let base_dose = DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0);
+    let s = subj("1", vec![12.0, 36.0], vec![base_dose]);
+    let pop = population(vec![s]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("pre-first-decision base dose F × IOV runs and passes the verifiers");
+    assert!(res.ledger.is_empty(), "controller holds");
+
+    // Occasion 0's κ must be far enough from baseline (0) that "baseline vs occasion 0" is
+    // distinguishable beyond the closed-form band (rel tol ≈ 8e-4).
+    let kappas = reconstruct_kappas(&model, seed, "1", decisions.len());
+    let k0_f = kappas[0][0];
+    assert!(
+        (k0_f.exp() - 1.0).abs() > 10.0 * 8.0 * 1e-4,
+        "occasion-0 κ_F={k0_f} too small to distinguish baseline from occasion 0"
+    );
+
+    let entered = 0.5 * 1000.0; // baseline κ = 0 → F = TVF·exp(0) = 0.5
+    let k = 0.1_f64;
+    // obs@12 is in the baseline window (12 < 24), obs@36 in occasion 0 — but CL is constant, so
+    // decay is k=0.1 throughout; only F is occasion-sensitive, and here it is baseline.
+    let expect = [entered * (-k * 12.0).exp(), entered * (-k * 36.0).exp()];
+    for (traj, want) in res.trajectories.iter().zip(expect.iter()) {
+        assert!(
+            (traj.ipred - want).abs() <= 8.0 * (1e-6 + 1e-4 * want),
+            "t={}: pre-first-decision base-dose F IPRED {} != closed form {want} (baseline F=0.5)",
+            traj.time,
+            traj.ipred
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_infusion_under_iov_matches_predict_iov() {
+    // #931: a base INFUSION (not just a bolus) under IOV — closes the review's coverage gap (the
+    // other IOV base tests all use boluses). κ on F reshapes the infusion's delivered amount per
+    // occasion, and the infusion window feeds through `active_infusions` reading the
+    // occasion-corrected F (a distinct delivery path from the bolus jump). Validated against the
+    // independent `predict_iov` engine, which handles F-reshaped infusions with per-dose occasion
+    // κ. Base infusion at t=0 (occasion 0), RATE=1000 over AMT=1000 (nominal 1 h, F-reshaped).
+    let model = parse_model_string(ODE_IOV_F).expect("parse IOV-on-F ODE model");
+    assert!(model.n_kappa == 1 && model.n_eta == 1);
+    let decisions = vec![0.0, 24.0, 48.0, 72.0];
+    // obs cover occasions 0..=3 in order so predict_iov's occasion→group index is identity (see
+    // `adaptive_base_loading_under_iov_matches_predict_iov` for the group-index alignment note).
+    let obs = vec![12.0, 24.0, 48.0, 72.0];
+    let seed = 20260726u64;
+    let base_inf = DoseEvent::new(0.0, 1000.0, 1, 1000.0, false, 0.0);
+    let pop = population(vec![subj("1", obs.clone(), vec![base_inf])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("base infusion × IOV runs and passes the default verifiers");
+    assert!(
+        res.ledger.is_empty(),
+        "controller holds — only the base infusion"
+    );
+
+    let eta_bsv = reconstruct_eta_bsv(&model, seed);
+    let kappas = reconstruct_kappas(&model, seed, "1", decisions.len());
+    assert!(
+        kappas.iter().any(|k| k[0].abs() > 1e-6),
+        "reconstructed κ must be nonzero"
+    );
+
+    let mut static_subject = subj(
+        "1",
+        obs.clone(),
+        vec![DoseEvent::new(0.0, 1000.0, 1, 1000.0, false, 0.0)],
+    );
+    static_subject.occasions = obs
+        .iter()
+        .map(|&t| crate::pk::occasion_of(&decisions, t).expect("obs in a window") as u32)
+        .collect();
+    static_subject.dose_occasions =
+        vec![crate::pk::occasion_of(&decisions, 0.0).expect("dose in a window") as u32];
+    let preds = crate::pk::predict_iov(
+        &model,
+        &static_subject,
+        &model.default_params.theta,
+        &eta_bsv,
+        &kappas,
+    );
+    assert_eq!(res.trajectories.len(), preds.len());
+    for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+        // The infusion integrates over its window in both engines; a small cross-structure RK45
+        // band (not 1e-9 as the bolus oracle uses) covers step-sequence differences, while a
+        // wrong occasion F (~%-level) is still caught by ~100×.
+        assert!(
+            (traj.ipred - pred).abs() <= 8.0 * (1e-6 + 1e-4 * pred.abs()),
+            "adaptive IOV base-infusion IPRED {} != predict_iov {} at t={}",
+            traj.ipred,
+            pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_multiple_doses_across_occasions_pass_verifiers() {
+    // #931: MULTIPLE base doses spanning different occasions — closes the review's coverage gap
+    // (every other IOV base test has n_base = 1). Exercises the index-parallel
+    // `event_pk.dose[k] ↔ resolved_base.doses[k]` alignment for k ≥ 2 across occasions: the
+    // default-on #748 snapshot check independently re-derives EACH base dose's occasion snapshot
+    // (k=0 in occasion 0, k=1 in occasion 1), and the default-on frozen-replay verifier
+    // bit-exact-checks the driver's two-dose integration against the static engine. κ on CL, so
+    // each base dose decays under its window's clearance. Base boluses at t=0 (occasion 0) and
+    // t=24 (occasion 1); observations sit off the dose times.
+    //
+    // Oracle note — why NOT `predict_iov` here: the adaptive driver assigns a segment's occasion
+    // from the last observation/EVID=2 record crossed (`segment_occ_at`, the #701 decision-window
+    // / end-of-interval convention — the clearance in effect *during* the segment, the physically
+    // faithful choice for real-time feedback). `predict_iov` follows the #104 OCC-column
+    // convention (the segment ending at a *dose* record uses that dose's occasion). The two agree
+    // when every segment ends at an observation (Test A, the mrgsolve anchor), but differ for a
+    // base dose at an occasion boundary with no coincident observation — as here — so `predict_iov`
+    // is not a valid oracle for this configuration. The driver's own verifiers are; the
+    // independent-engine multi-occasion check is the mrgsolve anchor. See
+    // `compute_event_pk_params_iov`'s docstring.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    let doses = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), // occasion 0
+        DoseEvent::new(24.0, 500.0, 1, 0.0, false, 0.0), // occasion 1 (at the decision boundary)
+    ];
+    let obs = vec![12.0, 36.0, 60.0]; // occasions 0, 1, 2 — none coincident with a dose
+    let pop = population(vec![subj("1", obs, doses)]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(20260726),
+        decision_times: vec![0.0, 24.0, 48.0, 72.0],
+        ..Default::default() // verify = true → frozen-replay + #748 per-dose snapshot checks run
+    };
+    // The `expect` IS the assertion: the default-on #748 per-dose re-derivation (both k=0 and k=1)
+    // and the bit-exact frozen replay of the two-dose trajectory must both pass.
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("two base doses across occasions run and pass the frozen-replay + #748 verifiers");
+    assert!(
+        res.ledger.is_empty(),
+        "controller holds — only the two base doses"
+    );
+    // Liveness: both base doses are integrated (every trough is a positive decayed amount).
+    assert!(
+        res.trajectories.iter().all(|t| t.ipred > 0.0),
+        "both base doses contribute a positive decayed trajectory"
+    );
+}
+
+#[test]
+fn adaptive_base_regimen_with_reset_matches_static_predict() {
+    // Degenerate oracle for #932: a pre-scheduled base regimen (a loading dose) combined
+    // with a mid-horizon EVID=3 system reset and a fixed-dose controller must reproduce the
+    // trusted static engine — `predict()`, which routes reset subjects to the reset-aware
+    // event-driven walker — on the realized (base ∪ controller) regimen carrying the same
+    // reset. The model is η-invariant, so the adaptive IPRED equals the η=0 static PRED.
+    //
+    // This composes #702's base-dose seeding with #716's reset machinery on the constant-
+    // covariate path: the base 500 mg at t=0 drives the pre-reset observations (t=6, t=30),
+    // the reset at t=36 zeros that mass (t=42 washes out), and the controller's 100 mg at
+    // t=48 drives the post-reset tail (t=54). The default-on frozen-replay verifier (reset-
+    // and base-aware) runs too, so its Ok is part of this assertion.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![24.0, 48.0];
+    let obs = vec![6.0, 30.0, 42.0, 54.0];
+    let reset_at = 36.0;
+    let base_dose = DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0);
+
+    let mut base = subj("1", obs.clone(), vec![base_dose.clone()]);
+    base.reset_times = vec![reset_at];
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("adaptive base+reset sim runs and passes the reset-aware verifier");
+    assert_eq!(
+        res.ledger.len(),
+        2,
+        "a controller bolus at each of the two decisions"
+    );
+
+    // Static reference: the base regimen + the realized controller doses pre-scheduled on a
+    // subject carrying the same reset, scored by predict() (η=0, event-driven, reset honored).
+    let mut static_doses = vec![base_dose];
+    static_doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let mut static_subject = subj("1", obs.clone(), static_doses);
+    static_subject.reset_times = vec![reset_at];
+    let preds = predict(
+        &model,
+        &population(vec![static_subject]),
+        &model.default_params,
+    );
+
+    assert_eq!(res.trajectories.len(), obs.len());
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (base 500@0, reset at {reset_at})",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_infusion_spanning_reset_is_turned_off() {
+    // Positive control for #932 (the issue's non-vacuity proof): a PRE-SCHEDULED base infusion
+    // spanning a reset must be turned OFF at the reset by the reset floor — exactly as it turns
+    // off a controller-issued infusion (#716). The same base infusion run with vs without the
+    // reset must diverge (so the degenerate oracle above is not two engines agreeing on an
+    // un-reset trajectory), and the with-reset run must still reproduce predict() on that base
+    // infusion carrying the reset.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![36.0]; // one late decision; the controller only holds
+    let obs = vec![6.0, 18.0, 30.0];
+    let reset_at = 12.0;
+    // Base infusion: 2400 units at rate 100/h ⇒ a 24 h window [0, 24] spanning the reset at 12.
+    let base_inf = DoseEvent::new(0.0, 2400.0, 1, 100.0, false, 0.0);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(5),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+
+    let mut with_reset = subj("1", obs.clone(), vec![base_inf.clone()]);
+    with_reset.reset_times = vec![reset_at];
+    let res = simulate_adaptive(
+        &model,
+        &population(vec![with_reset]),
+        &model.default_params,
+        1,
+        hold_all,
+        &opts,
+    )
+    .expect("base infusion + reset runs and passes the reset-aware verifier");
+    assert!(res.ledger.is_empty(), "the hold controller issues no doses");
+
+    // Non-vacuity: without the reset the infusion keeps delivering past 12, so t=18 is
+    // materially positive; with the reset it is turned off at 12 and the zeroed state stays ~0.
+    let no_reset = subj("1", obs.clone(), vec![base_inf.clone()]);
+    let res_no = simulate_adaptive(
+        &model,
+        &population(vec![no_reset]),
+        &model.default_params,
+        1,
+        hold_all,
+        &opts,
+    )
+    .expect("no-reset run");
+    let y18 = res
+        .trajectories
+        .iter()
+        .find(|x| (x.time - 18.0).abs() < 1e-12)
+        .expect("t=18 row (with reset)")
+        .ipred;
+    let y18_no = res_no
+        .trajectories
+        .iter()
+        .find(|x| (x.time - 18.0).abs() < 1e-12)
+        .expect("t=18 row (no reset)")
+        .ipred;
+    assert!(
+        y18_no > 10.0 && y18 < 1e-6,
+        "reset must turn the base infusion off: with-reset {y18} (want ~0) vs no-reset {y18_no} (want ≫0)"
+    );
+
+    // Oracle: the with-reset run reproduces predict() on the same base infusion + reset.
+    let mut static_subject = subj("1", obs.clone(), vec![base_inf]);
+    static_subject.reset_times = vec![reset_at];
+    let preds = predict(
+        &model,
+        &population(vec![static_subject]),
+        &model.default_params,
+    );
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (base infusion spanning reset)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_evid4_reset_plus_dose_matches_static_predict() {
+    // #932 EVID=4 (reset + dose): a data row that both zeros the state and administers a dose
+    // records BOTH a `reset_times` entry and a `doses` entry at the same instant, so its dose
+    // is a base dose landing exactly at the reset — zeroed first (Reset < Dose), then applied.
+    // Today that dose tripped the base-regimen combo guard before the reset was considered; it
+    // must now reach the adaptive path and reproduce predict() (which sorts Reset < Dose too).
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![24.0];
+    let obs = vec![6.0, 18.0, 30.0];
+    let reset_at = 12.0;
+    // A loading dose the reset wipes, plus the EVID=4 dose (300 mg at the reset instant).
+    let loading = DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0);
+    let evid4_dose = DoseEvent::new(reset_at, 300.0, 1, 0.0, false, 0.0);
+
+    let mut base = subj("1", obs.clone(), vec![loading.clone(), evid4_dose.clone()]);
+    base.reset_times = vec![reset_at];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    let res = simulate_adaptive(
+        &model,
+        &population(vec![base]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect("EVID=4 (reset+dose) reaches the adaptive path and passes the verifier");
+    assert_eq!(res.ledger.len(), 1, "one controller bolus at t=24");
+
+    // The EVID=4 dose survives its own reset: t=18 reads 300·exp(-0.1·6) ≈ 165, not ~0 (which
+    // a reset that also wiped its coincident dose would give).
+    let y18 = res
+        .trajectories
+        .iter()
+        .find(|x| (x.time - 18.0).abs() < 1e-12)
+        .expect("t=18 row")
+        .ipred;
+    assert!(
+        y18 > 100.0,
+        "the EVID=4 dose must land AFTER its coincident reset (t=18 ≈ 165), got {y18}"
+    );
+
+    let mut static_doses = vec![loading, evid4_dose];
+    static_doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let mut static_subject = subj("1", obs.clone(), static_doses);
+    static_subject.reset_times = vec![reset_at];
+    let preds = predict(
+        &model,
+        &population(vec![static_subject]),
+        &model.default_params,
+    );
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (EVID=4 reset+dose)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_ss_base_dose_with_reset_matches_static_predict() {
+    // #932 gate: a steady-state base dose (SS=1, II>0) pre-equilibrated at t=0, then wiped by a
+    // mid-horizon reset, must still reproduce predict() on the same (SS base ∪ ledger) regimen
+    // carrying the reset. Exercises `equilibrate_ss_state` seeding BEFORE the reset zeros it —
+    // the reset floor then keeps the equilibrated tail from re-contributing. (If this ever
+    // diverged, #932 would narrow to reject SS × reset; it holds, so SS base × reset is in.)
+    let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let decisions = vec![0.0, 24.0];
+    let obs = vec![1.0, 8.0, 20.0];
+    let reset_at = 12.0;
+    let ss = DoseEvent::new(0.0, 300.0, 1, 0.0, true, 24.0); // 300 mg q24h at steady state
+
+    let mut base = subj("1", obs.clone(), vec![ss.clone()]);
+    base.reset_times = vec![reset_at];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(9),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    let res = simulate_adaptive(
+        &model,
+        &population(vec![base]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect("SS base dose + reset runs and passes the reset-aware verifier");
+    assert_eq!(res.ledger.len(), 2, "a controller bolus at each decision");
+
+    let mut static_doses = vec![ss];
+    static_doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let mut static_subject = subj("1", obs.clone(), static_doses);
+    static_subject.reset_times = vec![reset_at];
+    let preds = predict(
+        &model,
+        &population(vec![static_subject]),
+        &model.default_params,
+    );
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (SS base dose × reset)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_regimen_with_reset_under_iov_is_rejected() {
+    // #932 scope boundary: base × reset is supported on the constant-covariate path, but under
+    // inter-occasion variability (or a time-varying covariate) it stays a typed error — the
+    // per-event-PK replay's reset+base composition is not yet oracle-verified, so it must
+    // loud-fail rather than risk a silent mis-integration (a #932 follow-up). IOV sets
+    // `event_pk`/`eta_occ` = Some, so the driver's `&& tv` guard fires.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    let mut s = subj(
+        "1",
+        vec![6.0, 30.0],
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+    );
+    s.reset_times = vec![12.0];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0, 24.0],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(
+        &model,
+        &population(vec![s]),
+        &model.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect_err("base × reset under IOV must be rejected");
+    assert!(
+        err.contains("system resets") && err.contains("constant-covariate path only"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_regimen_with_reset_under_tv_covariate_is_rejected() {
+    // #932 scope boundary (the TV-covariate half, distinct from the IOV half above): base ×
+    // reset is supported on the constant-covariate path, but under a TIME-VARYING covariate it
+    // stays a typed error — the per-event-PK replay's reset+base composition is not yet oracle-
+    // verified. A plain bolus base dose under a TV covariate is otherwise supported (#930), so
+    // the reset is what trips the guard. This pins the `&& tv` boundary on the TV-cov path
+    // specifically: a regression to `&& iov` would silently ACCEPT this (iov=false, tv=true),
+    // routing it through the un-oracle-verified TV replay with every other test still green.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let mut s = subj(
+        "1",
+        vec![6.0, 30.0],
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], // plain bolus (supported under TV alone)
+    );
+    s.reset_times = vec![12.0];
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 80.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0, 24.0],
+        ..Default::default()
+    };
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("base × reset under a time-varying covariate must be rejected");
+    assert!(
+        err.contains("system resets") && err.contains("constant-covariate path only"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn adaptive_base_dose_coincident_with_decision_is_observed_pre_dose() {
+    // #933: a base dose sharing a time with a decision must be observed PRE-dose (the
+    // trough), not post-dose (the peak). A rescue controller fires only when the monitored
+    // signal is below a cut that the pre-dose trough clears but the post-dose peak does not,
+    // so the realized ledger is the sole witness of which state the controller read. Base
+    // 500 mg at t=0 and t=24; the only decision is at t=24. At t=24 the pre-dose trough is
+    // 500·exp(-0.1·24) ≈ 45 (< 100 ⇒ rescue), the post-dose peak ≈ 545 (> 100 ⇒ hold).
+    // Before the fix the base bolus landed before the hook and no rescue fired.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+    let decisions = vec![24.0];
+    let obs = vec![24.0, 30.0, 54.0];
+    let base = vec![
+        DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 500.0, 1, 0.0, false, 0.0),
+    ];
+    let pop = population(vec![subj("1", obs.clone(), base.clone())]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        decision_times: decisions.clone(),
+        // Ipred monitor on the central compartment — the pre-dose readout the controller sees.
+        monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Ipred)],
+        ..Default::default()
+    };
+    // Rescue 999 mg if the observed central amount is below 100, else hold.
+    let make = || {
+        move |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("monitor A declared") < 100.0 {
+                vec![DoseAction::Bolus { amt: 999.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        }
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, make, &opts)
+        .expect("run passes the base-aware verifier");
+
+    // The witness: the rescue fired, so the controller read the pre-dose trough (≈45 < 100).
+    // Post-dose observation (the pre-fix bug) would have read ≈545 > 100 and held (empty ledger).
+    assert_eq!(
+        res.ledger.len(),
+        1,
+        "rescue must fire off the pre-dose trough"
+    );
+    assert_eq!(res.ledger[0].amt, 999.0);
+    assert_eq!(res.ledger[0].time, 24.0);
+
+    // Integrity: the trajectory still equals predict() on (base ∪ realized ledger). Decisions
+    // sit on the dose grid {0, 24}, so reactive and static segment identically (bit-exact).
+    let mut static_doses = base;
+    static_doses.extend(
+        res.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let static_pop = population(vec![subj("1", obs.clone(), static_doses)]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={}",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_regimen_controller_dose_before_base_anchors_tafd_globally() {
+    // #934: a controller dose scheduled BEFORE the earliest base dose is the true first dose,
+    // so TAFD must anchor at it — min(earliest base, first controller) — matching the static
+    // frozen-replay verifier's global earliest. ODE_TAFD's RHS reads TAFD, so a stale anchor
+    // (= earliest base, t=24) integrates different forcing than the verifier (t=0) and the
+    // default-on verifier errors. The controller doses 300 mg at the first decision (t=0),
+    // before the base 200 mg at t=24; decisions {0, 24} sit on the dose grid (bit-exact).
+    let model = parse_model_string(ODE_TAFD).expect("parse TAFD-reading ODE model");
+    let decisions = vec![0.0, 24.0];
+    let obs = vec![6.0, 30.0, 48.0];
+    let base = vec![DoseEvent::new(24.0, 200.0, 1, 0.0, false, 0.0)];
+    let pop = population(vec![subj("1", obs.clone(), base.clone())]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    // Dose once, at the first decision (t=0), then hold.
+    let make = || {
+        let mut fired = false;
+        move |_ctx: &ControllerCtx| {
+            if !fired {
+                fired = true;
+                vec![DoseAction::Bolus { amt: 300.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        }
+    };
+    // verify = true (default): Ok only if the reactive TAFD matches the verifier's global
+    // earliest. Without the fix, TAFD stays at 24 (earliest base) and the TAFD-forced
+    // trajectory diverges from the replay ⇒ Err.
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, make, &opts).expect(
+        "controller-dose-before-base run passes the base-aware verifier (TAFD anchored globally)",
+    );
+    assert_eq!(res.ledger.len(), 1, "one controller dose at t=0");
+    assert_eq!(res.ledger[0].time, 0.0);
+    assert!(
+        res.trajectories[0].ipred > 0.0,
+        "TAFD-forced trajectory is actually integrated"
+    );
+}
+
+#[test]
+fn adaptive_base_dose_after_controller_stop_still_lands() {
+    // #702 Finding 4: a pre-scheduled base dose scheduled PAST a controller `Stop` still
+    // lands — the base regimen is the patient's standing prescription, independent of the
+    // controller (and the frozen-replay verifier replays it too). The controller stops at the
+    // first decision (t=0); base doses at t=24 and t=48 must still be integrated, so the run
+    // equals predict() on the base regimen alone (the ledger is empty).
+    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+    let decisions = vec![0.0, 24.0];
+    let obs = vec![12.0, 30.0, 54.0];
+    let base = vec![
+        DoseEvent::new(24.0, 400.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(48.0, 400.0, 1, 0.0, false, 0.0),
+    ];
+    let pop = population(vec![subj("1", obs.clone(), base.clone())]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions.clone(),
+        ..Default::default()
+    };
+    // Stop immediately at the first decision.
+    let make = || move |_ctx: &ControllerCtx| vec![DoseAction::Stop];
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, make, &opts)
+        .expect("post-Stop base doses run and pass the verifier");
+    assert!(res.ledger.is_empty(), "controller Stopped, issued no doses");
+
+    // The base doses (incl. the two past the Stop) are integrated: equals predict() on base.
+    let static_pop = population(vec![subj("1", obs.clone(), base)]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-9 + 1e-9 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={} (post-Stop base dose dropped?)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+    // Positive control: the t=48 base dose is visible at the t=54 observation (non-vacuous).
+    assert!(
+        res.trajectories[2].ipred > 100.0,
+        "the t=48 post-Stop base dose must be visible at t=54, got {}",
+        res.trajectories[2].ipred
+    );
 }
 
 #[test]
@@ -1183,6 +3126,43 @@ fn adaptive_auc_target_rejects_iov() {
     assert!(
         err.to_lowercase().contains("auc_target") && err.to_lowercase().contains("iov"),
         "error should cite auc_target + IOV: {err}"
+    );
+}
+
+#[test]
+fn adaptive_auc_target_rejects_reset() {
+    // #716: system resets are now honored by the driver and the frozen-replay
+    // verifier, but the exposure metric (`auc_target_attainment`) integrates a dense
+    // grid that does NOT apply resets, so declaring `auc_target` on a reset subject is
+    // a typed error rather than a silently un-reset AUC. The model is a plain ODE
+    // (no TV covariate, no IOV), so only the reset can trip this guard — pinning the
+    // reset branch specifically.
+    let mut parsed = parse_full_model(SPEC_DEGENERATE).expect("model + block parse");
+    parsed
+        .adaptive_dosing
+        .as_mut()
+        .expect("[adaptive_dosing]")
+        .auc_target = Some((400.0, 600.0));
+    let spec = parsed.adaptive_dosing.as_ref().unwrap();
+    let mut subject = subj("1", vec![24.0, 48.0], vec![]);
+    subject.reset_times = vec![36.0];
+    let pop = population(vec![subject]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        ..Default::default()
+    };
+    let err = simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        spec,
+        &opts,
+    )
+    .expect_err("auc_target on a reset subject must be rejected");
+    assert!(
+        err.to_lowercase().contains("auc_target") && err.to_lowercase().contains("reset"),
+        "error should cite auc_target + reset: {err}"
     );
 }
 

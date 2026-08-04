@@ -58,11 +58,10 @@ pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Resul
 }
 
 /// Reject the model / data combinations the reactive driver cannot yet simulate
-/// *faithfully*. The adaptive path never applies a reset or carries process noise,
-/// so a system reset (EVID=3/4) or an SDE `[diffusion]` model would each be
-/// **silently** wrong — a violation of the "never a silent wrong answer" contract
-/// this module promises. Until each is properly supported (#391 follow-ups), reject
-/// it with a typed error. Both public entry points funnel through
+/// *faithfully*. The adaptive path carries no process noise, so an SDE `[diffusion]`
+/// model would be **silently** wrong — a violation of the "never a silent wrong
+/// answer" contract this module promises. Until it is properly supported (#717),
+/// reject it with a typed error. Both public entry points funnel through
 /// `run_adaptive_population`, so guarding there covers `simulate_adaptive` and
 /// `simulate_adaptive_from_spec`.
 ///
@@ -70,10 +69,13 @@ pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Resul
 /// the driver recomputes PK per event/segment from the covariate active in that
 /// segment (#700). Inter-occasion variability (IOV / `kappa`) is **no longer**
 /// rejected either: a fresh κ is drawn per decision window and threaded through the
-/// per-segment eta (#701), with occasion = decision index.
+/// per-segment eta (#701), with occasion = decision index. System-reset events
+/// (EVID=3) are **no longer** rejected: the reactive driver now zeros the
+/// compartments at each reset and turns off infusions opened before it, and the
+/// frozen-replay verifier is reset-aware, so the reset is honored and checked (#716).
 pub(crate) fn reject_unsupported_adaptive(
     model: &CompiledModel,
-    population: &Population,
+    _population: &Population,
 ) -> Result<(), String> {
     if model.is_sde() {
         return Err(
@@ -83,18 +85,9 @@ pub(crate) fn reject_unsupported_adaptive(
                 .to_string(),
         );
     }
-    // Time-varying covariates (and `TIME`-in-PK) are now supported via per-event PK
-    // recomputation in the reactive driver (#700); they are no longer rejected here.
-    for subject in &population.subjects {
-        if subject.has_resets() {
-            return Err(format!(
-                "adaptive-dosing simulation does not support system-reset events (EVID=3/4) \
-                 (subject '{}'): the reactive driver never applies the reset, so the compartment \
-                 state would silently fail to zero. Remove reset rows for adaptive runs.",
-                subject.id
-            ));
-        }
-    }
+    // Time-varying covariates (and `TIME`-in-PK, #700), IOV (#701), and system-reset
+    // events (EVID=3, #716) are all now supported by the reactive driver and are no
+    // longer rejected here.
     Ok(())
 }
 
@@ -197,9 +190,17 @@ pub struct AdaptiveSimulationResult {
 ///   consults the controller (a silent dose-free run) and is rejected.
 /// - **ODE model.** The reactive driver runs on the ODE engine; a model with no
 ///   `[odes]` block is rejected.
-/// - **Dose-free subjects.** The regimen is controller-driven; a subject that
-///   already carries `doses` is rejected (augmenting a pre-scheduled regimen is a
-///   later step).
+/// - **Pre-scheduled base regimen (#702).** A subject MAY carry pre-scheduled doses
+///   (a loading / maintenance regimen), which are integrated and augmented by the
+///   controller. Supported on constant-covariate, time-varying-covariate (#930), and
+///   IOV (#931) models. Since #932 a base regimen also composes with system resets
+///   (EVID=3/4) on the constant-covariate path (the reset zeros the state and turns off a
+///   base infusion opened before it, and an EVID=4 reset+dose row's dose lands after its own
+///   reset); base × reset under a time-varying covariate or IOV is still a typed error (a
+///   #932 follow-up). A steady-state / lagged / built-in-input-rate
+///   base dose is supported on the constant-covariate path (#719); under a time-varying
+///   covariate or IOV those (and a modeled-`RATE` dose) are a typed error — a #930/#931
+///   follow-up. A dose-free subject is the fully controller-driven special case.
 /// - **Ipred monitors only.** A `Dv` monitor is rejected (needs S1.5).
 /// - **Verification (default on).** Each run's realized ledger is replayed
 ///   through the static engine and checked against the reactive trajectory; a
@@ -316,9 +317,10 @@ where
     F: Fn() -> C,
     C: FnMut(&ControllerCtx) -> crate::sim::adaptive::ControllerDecision,
 {
-    // Reject model/data the reactive driver cannot faithfully simulate (IOV,
-    // time-varying covariates, resets, SDE) with a typed error — never a silent
-    // wrong answer (#391). Both public entry points funnel through here.
+    // Reject model/data the reactive driver cannot faithfully simulate (SDE) with a
+    // typed error — never a silent wrong answer (#391). IOV, time-varying covariates,
+    // and system resets are now supported (#700/#701/#716). Both public entry points
+    // funnel through here.
     reject_unsupported_adaptive(model, population)?;
 
     // #721: the reactive path skipped the shared dose-precondition guards that
@@ -337,6 +339,12 @@ where
     // the model is an analytic absorption closed form, which this ODE-only path rejects
     // up front — but is wired for parity and #702 base-regimen support.)
     first_error(&check_modeled_dose_rates(model, population))?;
+    // Live for this ODE-only path since #899: `check_dose_compartments` runs the range rule
+    // (reject a dose `CMT` past the declared state count) and the `CMT=0`-infusion rule for ODE
+    // models, so an adaptive-dosing dataset with an out-of-range or `CMT=0`-infusion seed dose now
+    // returns a recoverable `Err` here instead of the engine silently dropping it. (It was a no-op
+    // for ODE models before #899 — do not "simplify" this call away as dead code.)
+    first_error(&check_dose_compartments(model, population))?;
     if let Some(msg) = check_absorption_closed_form_support(model, population) {
         return Err(msg);
     }
@@ -390,20 +398,36 @@ where
     // combination loudly (#700) rather than report a wrong metric. Every other
     // adaptive output — predictions, decisions, the dose ledger, `target_window` — is
     // fully per-event covariate-aware; only this one exposure metric is deferred.
+    //
+    // System resets (EVID=3, #716) are deferred for a *different* reason — not a
+    // frozen snapshot. The dense solver itself IS reset-aware: `adaptive_window_signal_aucs`
+    // drives `ode_dense_solve_states` with the base subject's `reset_times`, and that
+    // solver breaks at each reset and re-seeds the state (`build_segment_break_times` +
+    // `apply_segment_boundary`), so a window entirely before or after a reset integrates
+    // exactly. The gap is the trapezoid: each inter-decision window is integrated on a
+    // *uniform* grid, and a reset is a state discontinuity at an arbitrary time, so the
+    // one window straddling it would need pre- and post-reset nodes (values at rt⁻ and rt⁺)
+    // to integrate the jump correctly — which the uniform grid does not carry. Rather than
+    // report that one window's AUC biased low, defer `auc_target` on reset subjects until
+    // the grid places nodes at reset instants. Every other adaptive output is reset-aware
+    // (the driver and the frozen-replay verifier).
     if auc_target.is_some()
         && (model.n_kappa > 0
             || population
                 .subjects
                 .iter()
-                .any(|s| crate::pk::subject_needs_per_event_pk(model, s)))
+                .any(|s| crate::pk::subject_needs_per_event_pk(model, s) || s.has_resets()))
     {
         return Err(
             "adaptive-dosing `auc_target` is not yet supported for time-varying-covariate, \
-             TIME-in-PK, or IOV (`kappa`) subjects: its exposure metric integrates a dense grid \
-             from a single frozen PK snapshot, which would be silently wrong when the PK changes \
-             across the horizon (a drifting covariate or a per-occasion κ). Drop `auc_target` (all \
-             other outputs remain per-event / per-occasion aware), or track #700/#701 for a \
-             per-event AUC."
+             TIME-in-PK, IOV (`kappa`), or system-reset (EVID=3) subjects. For a drifting \
+             covariate or a per-occasion κ the exposure metric integrates its dense grid from a \
+             single frozen PK snapshot, which is silently wrong when the PK changes across the \
+             horizon. For a reset the dense solver *does* zero the state, but the per-window \
+             trapezoid grid carries no node at the reset instant, so the one window straddling \
+             the reset would integrate that discontinuity inaccurately. Drop `auc_target` (all \
+             other outputs remain per-event / per-occasion / reset aware), or track \
+             #700/#701/#716 for a per-event, reset-node-aware AUC."
                 .to_string(),
         );
     }
@@ -899,16 +923,22 @@ fn slice_bits_eq(a: &[f64], b: &[f64]) -> bool {
     a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| f64_bits_eq(*x, *y))
 }
 
-/// Re-derive each per-record (obs / EVID=2 pk-only) PK snapshot **inline** — occasion
-/// via [`occasion_of`](crate::pk::occasion_of), PK via `pk_param_fn` at the record's
-/// own covariate — and bit-check it against the `event_pk` the driver used (#748).
+/// Re-derive each per-record (base dose / obs / EVID=2 pk-only) PK snapshot **inline** —
+/// occasion via [`occasion_of`](crate::pk::occasion_of), PK via `pk_param_fn` at the
+/// record's own covariate — and bit-check it against the `event_pk` the driver used
+/// (#748).
 ///
 /// This is an *independent second derivation*, NOT a re-call of
 /// `compute_event_pk_params_iov`: a wrong occasion grouping or per-record covariate the
 /// composite builder would introduce is caught here, not only a wrong array argument.
 /// `eta_occ_check` is the independently re-derived per-window eta (IOV); `None` ⇒ the
-/// non-IOV path, where every record uses the baseline `eta_slice`. The dose-free
-/// adaptive base subject carries no dose events, so `event_pk.dose` must stay empty.
+/// non-IOV path, where every record uses the baseline `eta_slice`. A pre-scheduled base
+/// regimen (#702) populates `event_pk.dose` — under a TV covariate (#930) or per-occasion
+/// κ (#931) — and each base dose's snapshot is re-derived here too: the driver AND the
+/// frozen-replay verifier both read `event_pk.dose[k]` for that dose's F, so a build-loop
+/// error there would be applied by both and the replay could not catch it. The dose-free
+/// base subject carries no dose events, so `event_pk.dose` stays empty and the loop is a
+/// no-op.
 fn check_event_pk_records(
     model: &CompiledModel,
     theta: &[f64],
@@ -937,6 +967,18 @@ fn check_event_pk_records(
             got.dose.len(),
             subject.doses.len()
         ));
+    }
+    for k in 0..subject.doses.len() {
+        let t = subject.doses[k].time;
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.dose_cov(k), t);
+        if !pk_bits_eq(&want, &got.dose[k]) {
+            return Err(format!(
+                "event_pk.dose[{k}] (base dose at t={t}) diverges from an independent \
+                 re-derivation — a wrong per-dose covariate or occasion κ in the per-event PK \
+                 builder, reused verbatim by the frozen-replay verifier, which cannot catch it \
+                 (#748)"
+            ));
+        }
     }
     if got.obs.len() != subject.obs_times.len() {
         return Err(format!(

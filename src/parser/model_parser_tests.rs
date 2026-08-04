@@ -2248,6 +2248,40 @@ fn test_apply_fit_option_ode_solver_tolerances() {
 }
 
 #[test]
+fn test_apply_fit_option_ode_method() {
+    use crate::ode::OdeMethod;
+    let mut opts = FitOptions::default();
+    // The engine default is the explicit stepper — an existing fit is unaffected.
+    assert_eq!(opts.ode_method, OdeMethod::Rk45);
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "ode_method", "rodas5p"),
+        Ok(true)
+    );
+    assert_eq!(opts.ode_method, OdeMethod::Rodas5P);
+    assert_eq!(
+        apply_fit_option(&mut opts, "ode_method", "ode23s"),
+        Ok(true)
+    );
+    assert_eq!(opts.ode_method, OdeMethod::Rosenbrock23);
+    assert_eq!(
+        apply_fit_option(&mut opts, "ode_method", "Rodas4"),
+        Ok(true)
+    );
+    assert_eq!(opts.ode_method, OdeMethod::Rodas4);
+
+    // An unknown stepper is an error, not a silent fallback to RK45 (which would run the
+    // stiff model on the method the user was trying to get away from).
+    let err = apply_fit_option(&mut opts, "ode_method", "lsoda").unwrap_err();
+    assert!(err.contains("ode_method"), "unexpected message: {err}");
+    assert_eq!(
+        opts.ode_method,
+        OdeMethod::Rodas4,
+        "failed apply must not mutate"
+    );
+}
+
+#[test]
 fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
     // [fit_options] ODE solver tolerances must be baked onto
     // OdeSpec.solver_opts by the parser (via sync_ode_solver_opts) so the
@@ -2278,15 +2312,26 @@ fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
     assert_eq!(s.abstol, 1e-6);
     assert_eq!(s.max_steps, 10_000);
 
+    assert_eq!(s.method, crate::ode::OdeMethod::Rk45);
+
     // Override via [fit_options].
     let with_opts = format!(
-            "{base}\n[fit_options]\n  ode_reltol = 1e-9\n  ode_abstol = 1e-11\n  ode_max_steps = 50000\n"
+            "{base}\n[fit_options]\n  ode_reltol = 1e-9\n  ode_abstol = 1e-11\n  ode_max_steps = 50000\n  ode_method = rodas4\n"
         );
     let p = parse_full_model(&with_opts).unwrap();
     let s2 = p.model.ode_spec.as_ref().unwrap().solver_opts;
     assert_eq!(s2.reltol, 1e-9);
     assert_eq!(s2.abstol, 1e-11);
     assert_eq!(s2.max_steps, 50_000);
+    // `ode_method` rides the same sync, so `predict()` — which gets no fit options — also
+    // integrates with the requested stepper.
+    assert_eq!(s2.method, crate::ode::OdeMethod::Rodas4);
+    // …and it is framework-level, so it must not be flagged as an ignored key.
+    assert!(!p
+        .fit_options
+        .unsupported_keys_warnings()
+        .iter()
+        .any(|w| w.contains("ode_method")));
 }
 
 #[test]
@@ -2671,6 +2716,64 @@ fn test_unsupported_warning_omits_framework_keys() {
     }
     // And it uses the new phrasing, not the old "Available options".
     assert!(w.contains("Method-specific options"), "got: {w}");
+}
+
+/// Every advertised fit-option key must actually be reachable from a `.ferx` file.
+///
+/// `framework_keys()` / `method_specific_keys()` are what the "unsupported option" warning
+/// and the wrapper docs advertise; `apply_fit_option` is what the block parser dispatches
+/// on, and its `_ => Ok(false)` arm turns anything it does not recognise into a hard
+/// ``unknown key`` parse error. Nothing tied the two together, so `analytic_cov_hessian`
+/// shipped in the first list and not the second: the documented escape hatch back to the
+/// finite-difference covariance aborted the fit at parse time and was reachable only from
+/// Rust (PR #953 review finding 7).
+///
+/// Keys are string-typed, so the test tries a small battery of values and only requires
+/// that *some* value is accepted — enough to prove the arm exists without duplicating each
+/// key's value grammar here.
+#[test]
+fn every_advertised_fit_option_key_has_an_apply_fit_option_arm() {
+    use crate::types::{framework_keys, method_specific_keys, EstimationMethod};
+
+    // Values chosen to cover the parser's shapes: bool, integer, float, enum-ish, free text.
+    const CANDIDATES: &[&str] = &[
+        "true", "1", "0.5", "1e-3", "auto", "column", "", "r", "none", "focei",
+    ];
+
+    let mut keys: Vec<&'static str> = framework_keys().to_vec();
+    for m in [
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+        EstimationMethod::FoceGn,
+        EstimationMethod::FoceGnHybrid,
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Impmap,
+        EstimationMethod::Bayes,
+        EstimationMethod::Laplace,
+    ] {
+        keys.extend(method_specific_keys(m).iter().copied());
+    }
+    keys.sort_unstable();
+    keys.dedup();
+
+    let mut unreachable: Vec<&str> = Vec::new();
+    for key in keys {
+        let recognised = CANDIDATES.iter().any(|v| {
+            let mut opts = FitOptions::default();
+            // `Ok(true)` = dispatched. `Err` also proves the arm exists (the value was
+            // rejected by *that key's* parser); only `Ok(false)` means no arm at all.
+            !matches!(apply_fit_option(&mut opts, key, v), Ok(false))
+        });
+        if !recognised {
+            unreachable.push(key);
+        }
+    }
+    assert!(
+        unreachable.is_empty(),
+        "advertised fit-option key(s) with no `apply_fit_option` arm — setting these in a \
+         `.ferx` file is a hard parse error: {unreachable:?}"
+    );
 }
 
 #[test]
@@ -12310,11 +12413,13 @@ fn analytical_modeled_duration_into_oral_depot_parses() {
 }
 
 #[test]
-fn analytical_modeled_duration_into_oral_peripheral_is_rejected() {
-    // `D3` on a `two_cpt_oral` model targets a PERIPHERAL (cmt 3), which the
-    // analytical oral closed forms still cannot infuse into (infusable =
-    // {1 depot, 2 central}). It must be a loud parse error pointing at
-    // `ode(...)` — not silently routed or a runtime panic (#400).
+fn analytical_modeled_duration_into_oral_peripheral_parses() {
+    // `D3` on a `two_cpt_oral` model targets a PERIPHERAL (cmt 3). Since #375 the
+    // analytical oral closed forms CAN infuse a peripheral — the oral propagators
+    // reuse the 2-cpt IV forced response, since nothing flows back into the depot
+    // — so `infusable = {1 depot, 2 central, 3 peripheral}` and this must parse.
+    // (It was a loud parse error before #375, when the oral propagators had no
+    // peripheral forcing term; see #400 for the depot case.)
     let src = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
@@ -12340,12 +12445,43 @@ fn analytical_modeled_duration_into_oral_peripheral_is_rejected() {
 [error_model]
   DV ~ proportional(PROP)
 "#;
+    parse_full_model(src).expect("D3 (oral peripheral) is infusable since #375");
+}
+
+/// …but a `D{cmt}` past the end of the state vector is still a loud parse error.
+#[test]
+fn analytical_modeled_duration_beyond_oral_state_count_is_rejected() {
+    let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 1.0, 500.0)
+  theta TVQ(5.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVD4(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+  D4 = TVD4
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
     let err = parse_full_model(src)
         .err()
-        .expect("D3 (oral peripheral) on an analytical oral model must error");
+        .expect("D4 on a 3-state oral model must error");
     assert!(
-        err.contains("compartment 3") && err.contains("D3") && err.contains("ode("),
-        "error must name the compartment, the param, and point to ode(...): {err}"
+        err.contains("compartment 4") && err.contains("D4"),
+        "error should name the offending slot: {err}"
     );
 }
 

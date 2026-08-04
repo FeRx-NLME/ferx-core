@@ -137,7 +137,18 @@ The analytic `Dual2` gradient path is event-driven for all analytical models; ti
 Infusion routing on the event-driven path:
 
 - **IV models**: central infusion (cmt=1) for all 1/2/3-cpt; **peripheral infusion** for 2-cpt (cmt=2) and 3-cpt (cmt=2 → periph1, cmt=3 → periph2). Steady-state amounts per channel are computed by linear superposition over the channels.
-- **Oral models**: central infusion (cmt=2) is supported; peripheral infusion is rare clinically and still panics with a clear message (tracked as a follow-up).
+- **Oral models**: depot infusion (cmt=1, a zero-order release then first-order `KA` absorption), central infusion (cmt=2, depot-bypassing), and — since #375 — **peripheral infusion** (cmt=3 on `two_cpt_oral`; cmt=3 → periph1, cmt=4 → periph2 on `three_cpt_oral`). The oral propagators reuse the IV forced response: nothing flows back into the depot, so a rate into a peripheral drives exactly the central/peripheral sub-system the IV model has.
+
+Every compartment of the six analytical disposition models is therefore infusable. What is still rejected is `CMT=0` on an infusion (NONMEM's *default dose compartment* is defined for a bolus, not for a zero-order input — name the compartment explicitly) and any `CMT` past the end of the model's state vector. Transit and inverse-Gaussian absorption models are dosed through the depot (`CMT=1`) only.
+
+### `CMT` on `[odes]` models
+
+Both rules above apply unchanged to a model defined with an `[odes]` block, reading the block's declared `states=[…]` list instead of a built-in model's compartment list:
+
+- **`CMT` is 1-based against the declared states.** `states=[depot, central]` accepts `CMT=1` (depot) and `CMT=2` (central); `CMT=3` is an error naming the declared states. Before #899 such a dose was **silently dropped** — the fit converged and reported a finite OFV having ignored it.
+- **`CMT=0` is NONMEM's default dose compartment** and resolves to the first declared state, exactly as on the analytical engine. An *infusion* with `CMT=0` is rejected, for the same reason as above.
+
+Unlike the analytical engine there is no infusable subset: every declared state accepts both a bolus and an infusion. A compartment fed by a built-in absorption function (`transit()`, `first_order()`, …) is the one exception to how the dose *arrives* — it is delivered as an input rate over time rather than as an instantaneous bolus — but it is dosed by naming its `CMT` like any other.
 
 ## Event Types (EVID)
 
@@ -322,8 +333,9 @@ is a depot-bypassing infusion straight into central. Both stay on the closed-for
 analytical engine — no `ode(...)` block needed. (Compartment amounts in
 `sdtab`/`[derived]` are not available for analytical depot-zero-order subjects;
 the predictions themselves are exact — use an `ode(...)` model if you need the
-per-compartment amounts.) Infusion into an oral **peripheral** compartment is
-still unsupported and needs an `ode(...)` model.
+per-compartment amounts.) `D3` on a `two_cpt_oral` model (and `D3`/`D4` on
+`three_cpt_oral`) infuses a **peripheral** compartment, also on the closed-form
+engine since #375.
 
 `RATE = -1` makes the infusion **rate** a model parameter: declare an individual
 parameter `R{cmt}` (`R1` for a dose into compartment 1, etc.) and ferx infuses

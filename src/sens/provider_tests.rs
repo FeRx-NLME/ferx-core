@@ -1438,6 +1438,152 @@ const THREECPT_ORAL: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
+/// Third-order sensitivities (#436) — the blocks the analytic covariance Hessian consumes.
+///
+/// `subject_sensitivities_cov` differences the **exact** `Dual2` jet along each `(θ, η)` axis,
+/// so the arithmetic is easy; what is easy to get *wrong* is the row-major index layout of
+/// four differently-shaped tensors. A transposed slice still produces plausible finite
+/// numbers, and would surface only as subtly wrong standard errors. So this pins the layouts
+/// three independent ways rather than trusting one comparison:
+///
+/// 1. **Full symmetry of `∂³f/∂η³`.** A smooth `f` has a totally symmetric third derivative,
+///    so `d3f_deta3[k,l,m]` must be invariant under all six permutations. This catches any
+///    stride error in the `n_eta³` layout on its own.
+/// 2. **An independent route to `∂³f/∂η²∂θ`.** The shipped code reaches it by differencing
+///    `∂²f/∂η²` along `θ`; here it is recomputed by differencing `∂²f/∂η∂θ` along `η`. Both
+///    are first differences of exact quantities but touch *different* blocks of the jet and
+///    different axes, so agreement pins the cross-block indexing.
+/// 3. **A pure `f64` anchor.** One entry of each tensor against a triple central difference of
+///    `compute_predictions_with_tv` — the production predictor, with no duals involved at all.
+///    Loosest tolerance of the three (a triple difference amplifies round-off by `h³`), but it
+///    is the only check that does not reuse the `Dual2` machinery under test.
+#[test]
+fn third_order_sensitivities_layouts_and_values() {
+    let m = parse_model_string(ONECPT_IV_2ETA).expect("parse");
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 2.0, 6.0, 12.0],
+    );
+    let theta = [0.25, 11.0];
+    let eta = [0.13, -0.09];
+    let (n_theta, n_eta) = (theta.len(), eta.len());
+
+    let cov = subject_sensitivities_cov(&m, &s, &theta, &eta).expect("in scope");
+    assert_eq!(cov.obs.len(), s.obs_times.len());
+
+    // The base blocks must be untouched by the cov wrapper.
+    let base = subject_sensitivities(&m, &s, &theta, &eta).expect("in scope");
+    for (c, b) in cov.obs.iter().zip(base.obs.iter()) {
+        assert_eq!(c.f, b.f, "cov wrapper must not perturb the base jet");
+        assert_eq!(c.df_deta, b.df_deta);
+        assert_eq!(c.d2f_deta2, b.d2f_deta2);
+    }
+
+    // The largest |∂³f/∂η³| entry sets the scale; a relative tolerance against a
+    // near-zero entry would be meaningless.
+    let scale = cov
+        .obs
+        .iter()
+        .flat_map(|o| o.d3f_deta3.iter())
+        .fold(1e-12f64, |a, v| a.max(v.abs()));
+
+    for (j, o) in cov.obs.iter().enumerate() {
+        assert_eq!(o.d3f_deta3.len(), n_eta * n_eta * n_eta);
+        assert_eq!(o.d3f_deta2_dtheta.len(), n_eta * n_eta * n_theta);
+        assert_eq!(o.d3f_deta_dtheta2.len(), n_eta * n_theta * n_theta);
+        assert_eq!(o.d2f_dtheta2.len(), n_theta * n_theta);
+
+        // (1) total symmetry of the η³ tensor
+        let g3 = |k: usize, l: usize, mm: usize| o.d3f_deta3[(k * n_eta + l) * n_eta + mm];
+        for k in 0..n_eta {
+            for l in 0..n_eta {
+                for mm in 0..n_eta {
+                    for &(a, b, c) in &[(l, k, mm), (k, mm, l), (mm, l, k), (l, mm, k), (mm, k, l)]
+                    {
+                        assert!(
+                            (g3(k, l, mm) - g3(a, b, c)).abs() < 1e-6 * scale,
+                            "obs {j}: d3f_deta3 not symmetric at [{k},{l},{mm}] vs [{a},{b},{c}]: \
+                             {} vs {}",
+                            g3(k, l, mm),
+                            g3(a, b, c)
+                        );
+                    }
+                }
+            }
+        }
+
+        // (2) ∂³f/∂η_k∂η_l∂θ_mm, recomputed by differencing ∂²f/∂η∂θ along η_l instead.
+        for l in 0..n_eta {
+            let h = f64::EPSILON.cbrt() * (1.0 + eta[l].abs());
+            let (mut ep, mut em) = (eta.to_vec(), eta.to_vec());
+            ep[l] += h;
+            em[l] -= h;
+            let p = subject_sensitivities(&m, &s, &theta, &ep).expect("in scope");
+            let q = subject_sensitivities(&m, &s, &theta, &em).expect("in scope");
+            for k in 0..n_eta {
+                for mm in 0..n_theta {
+                    let alt = (p.obs[j].d2f_deta_dtheta[k * n_theta + mm]
+                        - q.obs[j].d2f_deta_dtheta[k * n_theta + mm])
+                        / (2.0 * h);
+                    let got = o.d3f_deta2_dtheta[(k * n_eta + l) * n_theta + mm];
+                    assert!(
+                        (alt - got).abs() < 1e-5 * scale.max(alt.abs()),
+                        "obs {j}: d3f_deta2_dtheta[{k},{l},{mm}] = {got} but the \
+                         ∂²f/∂η∂θ route gives {alt}"
+                    );
+                }
+            }
+        }
+    }
+
+    // (3) pure-f64 anchor: ∂³f/∂η_0²∂η_1 by a triple central difference of the predictor.
+    let f64_at = |e: &[f64]| compute_predictions_with_tv(&m, &s, &theta, e);
+    let h = 1e-3;
+    let mut acc = vec![0.0f64; s.obs_times.len()];
+    for (sa, ca) in [(1.0, 1.0), (-1.0, -1.0)] {
+        for (sb, cb) in [(1.0, 1.0), (-1.0, -1.0)] {
+            for (sc, cc) in [(1.0, 1.0), (-1.0, -1.0)] {
+                let e = [eta[0] + (sa + sb) * h, eta[1] + sc * h];
+                let w = ca * cb * cc;
+                for (a, v) in acc.iter_mut().zip(f64_at(&e).iter()) {
+                    *a += w * v;
+                }
+            }
+        }
+    }
+    // The stencil above collapses to a 2nd difference in η₀ times a 1st in η₁.
+    // Spelled through a named indexer rather than the literal `(0*n+0)*n+1`: the whole point
+    // of this test is the row-major layout, so the index arithmetic should read as
+    // `[a][b][c]` and not as an expression clippy can (correctly) call always-zero.
+    let idx3 = |a: usize, b: usize, c: usize| (a * n_eta + b) * n_eta + c;
+    for (j, o) in cov.obs.iter().enumerate() {
+        let reference = acc[j] / (8.0 * h * h * h);
+        let got = o.d3f_deta3[idx3(0, 0, 1)];
+        assert!(
+            (reference - got).abs() < 5e-3 * scale.max(got.abs()),
+            "obs {j}: d3f_deta3[0,0,1] = {got} vs f64 triple-difference {reference}"
+        );
+    }
+}
+
+/// Minimal 2-η / 2-θ closed form for the third-order tests — small enough that the
+/// `(n_eta³, n_eta²·n_theta, n_eta·n_theta²)` layouts are all distinct shapes.
+const ONECPT_IV_2ETA: &str = r#"
+[parameters]
+  theta TVCL(0.25, 0.001, 10.0)
+  theta TVV(11.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
 fn subject_with_dose(dose: DoseEvent, times: &[f64]) -> Subject {
     let n = times.len();
     Subject {
@@ -1675,6 +1821,101 @@ fn provider_iv_with_bioavailability_matches_production() {
     assert!(
         subject_eta_grad(&m, &infusion, &theta, &eta).is_none(),
         "F≠1 rate-defined infusion must decline to FD (light provider, #419)"
+    );
+}
+
+/// **#920 (surfaced in the #919 review): the steady-state sibling of the decline above.**
+///
+/// `equilibrate_ss_g` (the analytic SS trough on the event-driven sens walk) builds its
+/// synthetic per-cycle infusion with `DoseEvent::new(.., rate, ..)`, whose `duration =
+/// amt/rate` does **not** carry the #419 bioavailability-reshaped window `F·amt/rate` that
+/// the value walk's `synthetic_cycle_dose` preserves. That asymmetry is harmless only if a
+/// rate-defined infusion under `F ≠ 1` never reaches the analytic walk — and it does not:
+/// the same `has_bioavailability() && has_rate_defined_infusion()` gate that routes the
+/// non-SS case above to FD does not special-case SS, so the SS variant declines too.
+///
+/// This pins that. The model is TVCOV, so an SS dose otherwise routes to the event-driven
+/// walk where `equilibrate_ss_g` lives (the sibling `ss_ill_conditioned_gradient_matches_fd`
+/// exercises exactly that path with an SS bolus): the SS **bolus** here stays analytic,
+/// while the SS **rate-defined infusion** under `F` declines to FD on both providers. So
+/// `equilibrate_ss_g` never sees a non-bioavailable window, and its `DoseEvent::new` is safe.
+#[test]
+fn ss_rate_defined_infusion_under_f_declines_to_fd() {
+    const ONECPT_IV_TVCOV_SS_F: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVF(0.7, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  F  = TVF
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let m = parse_model_string(ONECPT_IV_TVCOV_SS_F).expect("parse");
+    assert!(
+        m.has_bioavailability(),
+        "model must declare F for the gate to apply"
+    );
+    let theta = vec![0.2, 10.0, 0.75, 0.7];
+    let eta = vec![0.1, -0.05];
+    let obs_times = [1.0, 3.0, 6.0, 11.0];
+    let obs_wts = [70.0, 80.0, 90.0, 100.0];
+    let mk = |doses: Vec<DoseEvent>| {
+        tvcov_subject(
+            doses,
+            &[85.0],
+            &obs_times,
+            &obs_wts,
+            Vec::new(),
+            Vec::new(),
+            &[],
+        )
+    };
+
+    // Control: an SS *bolus* on this TVCOV model stays analytic — it reaches the
+    // event-driven walk (`equilibrate_ss_g`), so the decline below is a property of the
+    // rate-defined infusion, not of the model failing to be analytic at all.
+    let ss_bolus = mk(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)]);
+    assert!(ss_bolus.doses[0].ss && !ss_bolus.has_rate_defined_infusion());
+    assert!(
+        subject_sensitivities(&m, &ss_bolus, &theta, &eta).is_some(),
+        "SS bolus under TVCOV+F must stay analytic (reaches equilibrate_ss_g)"
+    );
+
+    // #920: the SS rate-defined infusion under `F` declines to FD on both providers, so
+    // `equilibrate_ss_g` never runs with a non-bioavailable window.
+    let ss_infusion = mk(vec![DoseEvent::new(0.0, 100.0, 1, 25.0, true, 12.0)]);
+    assert!(ss_infusion.doses[0].ss && ss_infusion.has_rate_defined_infusion());
+    assert!(
+        subject_sensitivities(&m, &ss_infusion, &theta, &eta).is_none(),
+        "SS rate-defined infusion under F must decline to FD (#920), full provider"
+    );
+    assert!(
+        subject_eta_grad(&m, &ss_infusion, &theta, &eta).is_none(),
+        "SS rate-defined infusion under F must decline to FD (#920), light provider"
+    );
+
+    // Discriminator: the *same* SS rate-defined infusion on the F-free twin model stays
+    // analytic — so `equilibrate_ss_g` genuinely *does* serve SS rate-defined infusions
+    // (with `duration = amt/rate`, which is correct when `F = 1`), and the decline above
+    // is attributable to `F`, not to SS-infusion support being absent. This is what makes
+    // the `is_none()` assertions non-vacuous.
+    let m_no_f = parse_model_string(ONECPT_IV_TVCOV_SS).expect("parse no-F twin");
+    assert!(!m_no_f.has_bioavailability());
+    let ss_infusion_no_f = mk(vec![DoseEvent::new(0.0, 100.0, 1, 25.0, true, 12.0)]);
+    assert!(
+        subject_sensitivities(&m_no_f, &ss_infusion_no_f, &[0.2, 10.0, 0.75], &eta).is_some(),
+        "without F, the SS rate-defined infusion stays analytic (reaches equilibrate_ss_g)"
     );
 }
 
@@ -2025,8 +2266,11 @@ fn provider_modeled_duration_matches_ode_twin() {
 /// the moving infusion-end jet (`∂D1`) flows through the SS trough exactly as it does
 /// through the current pulse. `D1 ≈ 2.1 < II = 12`; obs straddle the window end within the
 /// SS interval (0.5, 1.5 inside; 3, 6, 11 after). Validated vs central FD of the production
-/// predictor (`compute_predictions_with_tv`, which resolves `D1` per evaluation and
-/// equilibrates the same SS train).
+/// predictor (`compute_predictions_with_tv`, which resolves `D1` per evaluation and reaches
+/// the same steady state). Since #908 both sides solve that steady state exactly rather than
+/// truncating a shared pulse train, so the window dual now rides the `(I − M)⁻¹·b` solve —
+/// the jet enters through `b`, the forced half of the cycle, never through the homogeneous
+/// propagator `M`.
 #[test]
 fn provider_modeled_duration_ss_matches_fd_of_production() {
     let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
@@ -2730,6 +2974,119 @@ fn oral_infusion_provider_matches_fd_of_production() {
     }
 }
 
+/// #375 gradient oracle: an infusion into an **oral model's peripheral**
+/// (`two_cpt_oral` cmt 3, `three_cpt_oral` cmt 3/4) is a brand-new forcing term
+/// on the analytic sensitivity path — `propagate_{two,three}_cpt_oral_core_g`
+/// delegate it to the IV core. The value path is pinned against an ODE twin
+/// (`tests/oral_peripheral_infusion.rs`), but the **`Dual2` gradient** has no
+/// second copy of the formula to disagree with it, so it must be asserted
+/// against central FD of the `T = f64` production predictor (CLAUDE.md's
+/// `Dual2`-vs-FD rule).
+///
+/// Cases exercise, in order: peripheral alone; peripheral **overlapping an
+/// absorbing depot dose** (the reduction is only valid if the depot's
+/// contribution is counted exactly once); **central + peripheral simultaneously
+/// active** (the combined-rate steady state in the IV core); and both 3-cpt
+/// peripherals.
+#[test]
+fn oral_peripheral_infusion_provider_matches_fd_of_production() {
+    let times = [1.0, 3.0, 5.0, 7.0, 10.0, 24.0];
+    let two_theta = vec![10.0, 50.0, 15.0, 100.0, 1.0];
+    let three_theta = vec![5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 1.5];
+    let eta = vec![0.1, -0.05, 0.08];
+    let cases: Vec<(&str, CompiledModel, Subject, Vec<f64>)> = vec![
+        // 2-cpt oral: infusion into the peripheral (cmt 3) only. amt 1000 at
+        // rate 125 → an 8 h window, so obs straddle it.
+        (
+            "2cpt periph only",
+            parse_model_string(TWOCPT_ORAL).expect("parse 2cpt oral"),
+            subject_with_dose(DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0), &times),
+            two_theta.clone(),
+        ),
+        // …plus an oral depot bolus landing *inside* the infusion window, so the
+        // depot's Bateman term and the peripheral forced response superpose.
+        (
+            "2cpt periph + depot bolus mid-window",
+            parse_model_string(TWOCPT_ORAL).expect("parse 2cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0),
+                    DoseEvent::new(2.0, 500.0, 1, 0.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            two_theta.clone(),
+        ),
+        // Central AND peripheral infusion simultaneously active (the `||` guard's
+        // combined branch: one must not clobber the other).
+        (
+            "2cpt central + periph simultaneous",
+            parse_model_string(TWOCPT_ORAL).expect("parse 2cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0),
+                    DoseEvent::new(1.0, 600.0, 2, 100.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            two_theta.clone(),
+        ),
+        // 3-cpt oral, peripheral-1 (cmt 3) + a depot bolus.
+        (
+            "3cpt periph1 + depot bolus",
+            parse_model_string(THREECPT_ORAL).expect("parse 3cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 3, 125.0, false, 0.0),
+                    DoseEvent::new(2.0, 500.0, 1, 0.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            three_theta.clone(),
+        ),
+        // 3-cpt oral, peripheral-2 (cmt 4) — the `rate_periph2` channel.
+        (
+            "3cpt periph2 + depot bolus",
+            parse_model_string(THREECPT_ORAL).expect("parse 3cpt oral"),
+            subject_with_doses_and_resets(
+                vec![
+                    DoseEvent::new(0.0, 1000.0, 4, 125.0, false, 0.0),
+                    DoseEvent::new(2.0, 500.0, 1, 0.0, false, 0.0),
+                ],
+                &times,
+                Vec::new(),
+            ),
+            three_theta.clone(),
+        ),
+    ];
+    for (label, m, s, theta) in &cases {
+        assert!(
+            crate::pk::dose_needs_event_walk(m.pk_model, s),
+            "[{label}] fixture must route to the event walk"
+        );
+        assert!(
+            subject_routes_to_event_walk(m, s),
+            "[{label}] the gradient must follow production onto the walk"
+        );
+        assert!(
+            subject_sensitivities(m, s, theta, &eta).is_some(),
+            "[{label}] must be served analytically, not by FD"
+        );
+        // `1e-3` rather than the harness default `1e-4`: on these cases the
+        // mixed `∂²f/∂η∂θ` FD is roundoff-dominated at `1e-4` and clears the
+        // (unchanged) `3e-3` bound by only 1.4%, which last-bit libm differences
+        // flip between platforms. The FD converges to the analytic value as the
+        // step is refined toward its optimum, so this is a better-conditioned
+        // reference, not a looser test — it tightens the observed agreement from
+        // ~3e-3 to 1.5e-4. See `check_full_provider_vs_fd_with_step` for the
+        // step-refinement study.
+        check_full_provider_vs_fd_with_step(m, s, theta, &eta, 1e-3);
+    }
+}
+
 /// Two infusion occasions on a 3-cpt IV model separated by an EVID=4 reset:
 /// occasion-2 observations must rebuild from zero (no occasion-1 carryover).
 /// The provider's reset-segment superposition must reproduce the production
@@ -2779,6 +3136,39 @@ fn provider_1cpt_reset_midinfusion_matches_production() {
 /// applies the matching `g = ln(f)` jet transform, so the same FD check covers
 /// the log-scale value, gradient, and Hessian.
 fn check_full_provider_vs_fd(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
+    check_full_provider_vs_fd_with_step(model, subject, theta, eta, 1e-4);
+}
+
+/// As [`check_full_provider_vs_fd`], with the **second-derivative** FD step as a
+/// parameter (the first-derivative steps stay at `1e-6`).
+///
+/// The second-derivative blocks use 4-point central differences, whose total
+/// error is `O(h²)` truncation plus `O(ε/h²)` roundoff — a U-curve with a
+/// problem-dependent optimum. The default `1e-4` sits comfortably inside the
+/// `3e-3` bound for the models this harness was written against, but it is *not*
+/// universally well-conditioned: on the 3-cpt oral peripheral-infusion cases the
+/// mixed `∂²f/∂η∂θ` entries are roundoff-dominated there. Measured worst
+/// assert-margin (1.0 == the assert fails) over every entry of both
+/// second-derivative blocks, `3cpt periph1 + depot bolus`:
+///
+/// | h        | 1e-2 | 3e-3  | 1e-3      | 3e-4  | 1e-4      | 3e-5 | 1e-5 |
+/// |----------|------|-------|-----------|-------|-----------|------|------|
+/// | margin   | 4.25 | 0.386 | **0.049** | 0.151 | **0.986** | 6.16 | 69.9 |
+///
+/// At `1e-4` that case clears the assert by 1.4% — close enough that last-bit
+/// `exp`/`ln` differences between platforms flip it (it passed on macOS and
+/// failed on the Linux CI runners). The FD converges *to* the analytic value as
+/// `h` is refined toward the optimum — the analytic kernel is the accurate party
+/// — so the fix is a better-conditioned reference, not a looser bound: at `1e-3`
+/// the same entry agrees to `1.5e-4` relative, a 20× margin under the unchanged
+/// `3e-3` tolerance.
+fn check_full_provider_vs_fd_with_step(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    heh: f64,
+) {
     let n_eta = model.n_eta;
     let n_theta = theta.len();
 
@@ -2790,7 +3180,6 @@ fn check_full_provider_vs_fd(model: &CompiledModel, subject: &Subject, theta: &[
     };
     let he = 1e-6; // first-derivative step
     let ht = 1e-6;
-    let heh = 1e-4; // second-derivative step (4-point central is roundoff-prone)
 
     for (j, obs) in sens.obs.iter().enumerate() {
         // value
@@ -3439,6 +3828,326 @@ fn form_c_binding_readout_provider_matches_fd() {
     }
 }
 
+/// A Form-C readout referencing θ/η **directly** — `y = central/V * TVSCALE + ETA_SC`, where
+/// `TVSCALE`/`ETA_SC` are a declared theta/omega used nowhere else — on the **closed-form**
+/// engine (#486).
+///
+/// The ODE engine has desugared a bare θ/η in the readout into a synthetic individual
+/// parameter since #631, so its direct-θ/η readouts are analytic; the closed-form engine
+/// simply never ran that pass (`collect_readout_theta_eta_synth` was gated on `is_ode`), so
+/// the bare `PushTheta`/`PushEta` ops survived into the readout bytecode, `dual_evaluable`
+/// stayed false, and every such subject dropped to FD. The desugaring is engine-agnostic —
+/// what differed is only where the synthetic parameter's PK slot comes from, which on the
+/// analytical engine is the spare region `allocate_readout_extra_slots` owns.
+///
+/// Pins the whole chain, not just the gate: the model must be in analytic scope, the θ and η
+/// the readout references directly must carry **non-zero** derivatives (a synthetic parameter
+/// that never reached `pk_var_slots` reads as a silent zero jet, not an error — the #652
+/// trap), and value + all first/second η/θ derivatives must match central FD of the
+/// readout-aware production predictor.
+const ONECPT_IV_DIRECT_THETA_ETA_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVSCALE(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_SC ~ 0.05
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V * TVSCALE + ETA_SC
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+#[test]
+fn form_c_direct_theta_eta_readout_closed_form_matches_fd() {
+    let m = parse_model_string(ONECPT_IV_DIRECT_THETA_ETA_READOUT).expect("parse direct-θ/η");
+    assert!(
+        analytical_supported(&m),
+        "a direct-θ/η closed-form readout is desugared and must stay analytic (#486)"
+    );
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 2.0, 6.0, 12.0],
+    );
+    let theta = [0.2, 10.0, 1.5];
+    let eta = [0.12, -0.08, 0.05];
+    check_full_provider_vs_fd(&m, &s, &theta, &eta);
+
+    let full = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+    // TVSCALE is θ index 2, ETA_SC is η index 2. Both reach the prediction ONLY through the
+    // readout, so if the desugaring did not give them a real differentiable slot these read
+    // exactly 0.0 while everything else still matches FD — the failure mode worth pinning.
+    let max_dtheta = full
+        .obs
+        .iter()
+        .map(|o| o.df_dtheta[2].abs())
+        .fold(0.0_f64, f64::max);
+    let max_deta = full
+        .obs
+        .iter()
+        .map(|o| o.df_deta[2].abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_dtheta > 1e-6,
+        "∂y/∂TVSCALE must be non-zero — the synthetic readout param needs a real PK slot"
+    );
+    assert!(
+        max_deta > 1e-6,
+        "∂y/∂ETA_SC must be non-zero — the synthetic readout param needs a real PK slot"
+    );
+
+    // The light inner η-gradient must agree with the full provider's η block, so the EBE
+    // loop and the population loop see the same readout derivative.
+    let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light supported");
+    assert_eq!(light.len(), full.obs.len());
+    for (lo, fo) in light.iter().zip(full.obs.iter()) {
+        for k in 0..m.n_eta {
+            approx::assert_relative_eq!(
+                lo.df_deta[k],
+                fo.df_deta[k],
+                max_relative = 1e-9,
+                epsilon = 1e-12
+            );
+        }
+    }
+}
+
+/// A readout whose accepted parameters push the differentiated-slot count past the
+/// closed-form dispatch tables must report **FD**, not "analytic" (PR #950 review #2).
+///
+/// `analytical_supported_core` checks that every slot *maps* via `slot_to_dim` but never
+/// bounded how many there are, while `subject_sensitivities` / `subject_eta_grad` dispatch
+/// through `const_dispatch!(slots.len(); 1..=9)`. So a model that claimed enough spare slots
+/// reported "analytic" through `build_info::gradient_method{,_inner}` and then fell through
+/// the `_ => None` arm on *every* subject, running the whole fit on finite differences at
+/// ~10× the cost with the persisted label saying otherwise.
+///
+/// The fixture reaches 10 through the #486 path specifically: `three_cpt_oral` binds 8
+/// structural slots (cl, v, q, v2, q3, v3, ka, f), and the two synthetic parameters for the
+/// readout's direct `TVOFF` / `ETA_OFF` take the only two free ones (`N`, `MTT`). The
+/// assertions are ordered gate-then-route so the test fails loudly if the two ever disagree
+/// again in either direction.
+const THREECPT_ORAL_READOUT_SLOT_OVERFLOW: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 10.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVQ3(0.3, 0.001, 10.0)
+  theta TVV3(30.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVF(0.9, 0.01, 1.0)
+  theta TVOFF(0.1, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.05
+  omega ETA_OFF ~ 0.02
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  Q  = TVQ
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA * exp(ETA_KA)
+  F  = TVF
+[structural_model]
+  pk three_cpt_oral(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3, ka=KA, f=F)
+[scaling]
+  y = central / V + TVOFF + ETA_OFF
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+#[test]
+fn readout_slot_overflow_reports_fd_not_analytic() {
+    let m = parse_model_string(THREECPT_ORAL_READOUT_SLOT_OVERFLOW).expect("parse slot-overflow");
+    let n_slots = m
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("program")
+        .pk_slots()
+        .len();
+    // Guard the premise: if a future layout change stops overflowing, this test would
+    // silently stop testing anything.
+    assert!(
+        n_slots > super::MAX_CLOSED_FORM_SLOTS,
+        "fixture must exceed the dispatch tables to be a regression test; got {n_slots} slots"
+    );
+    assert!(
+        !analytical_supported(&m),
+        "a model wider than the closed-form dispatch tables must report FD, not analytic"
+    );
+    // The route the label now matches: both providers decline every subject.
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 2.0, 6.0, 12.0],
+    );
+    let theta = [0.2, 10.0, 0.5, 20.0, 0.3, 30.0, 1.0, 0.9, 0.1];
+    let eta = [0.1, -0.05, 0.08, 0.03];
+    assert!(
+        subject_sensitivities(&m, &s, &theta, &eta).is_none(),
+        "the outer provider falls through const_dispatch's `_ => None` at this width"
+    );
+    assert!(
+        subject_eta_grad(&m, &s, &theta, &eta).is_none(),
+        "the inner provider falls through const_dispatch's `_ => None` at this width"
+    );
+}
+
+/// Synthetic readout parameters must not escape into anything user-facing (PR #950 review
+/// #3/#4). The desugaring appends `__ferx_ro_th{i} = THETA(i)` / `__ferx_ro_eta{k} = ETA(k)`
+/// to `[individual_parameters]`, which puts them in front of every consumer of that list.
+///
+/// Two leaks are pinned here because both produce output the user cannot act on:
+///   * `eta_param_info` — a bare `Expression::Eta(k)` matches none of `classify_expr`'s
+///     patterns, so it fell to the `Custom` arm and reached `FitResult.eta_param_info` (hence
+///     ferx-r's parameter table) under a parser-internal name. A `Custom` entry additionally
+///     flips `resolve_param_derivs` / `subject_eta_grad`'s "all LogNormal" fallback to `None`,
+///     dropping the model to FD whenever the program path is unavailable.
+///   * the mu-referencing warning — `detect_mu_refs` has no pattern for a bare `Eta`, so the
+///     synthetic landed in the "not mu-referenced" list and the user was advised to rewrite
+///     a parameter that does not exist in their model file.
+///
+/// Both predate #486 on the ODE engine (which has appended these since #631, and
+/// `classify_indiv_params` runs after both append sites); extending the desugaring to the
+/// closed-form engine doubled the exposure, so the filters go in here.
+#[test]
+fn synthetic_readout_params_stay_out_of_user_facing_output() {
+    for (label, src) in [
+        ("closed-form", ONECPT_IV_DIRECT_THETA_ETA_READOUT),
+        ("ode", ONECPT_ODE_DIRECT_THETA_ETA_READOUT),
+    ] {
+        let m = parse_model_string(src).expect("parse direct-θ/η");
+        // Premise: the desugaring actually ran, so the assertions below are not vacuous.
+        assert!(
+            m.indiv_param_names
+                .iter()
+                .any(|n| crate::parser::model_parser::is_synthetic_readout_param(n)),
+            "[{label}] fixture must desugar a direct θ/η into a synthetic parameter"
+        );
+        assert!(
+            !m.eta_param_info.iter().any(|e| {
+                crate::parser::model_parser::is_synthetic_readout_param(&e.individual_param_name)
+            }),
+            "[{label}] a parser-internal parameter must not reach FitResult.eta_param_info"
+        );
+        if let Some(w) = crate::api::saem_non_mu_referenced_individual_params_warning(&m) {
+            assert!(
+                !w.contains("__ferx_ro_"),
+                "[{label}] the mu-referencing warning must not name a parameter the user \
+                 never wrote; got: {w}"
+            );
+        }
+    }
+}
+
+/// ODE twin of [`ONECPT_IV_DIRECT_THETA_ETA_READOUT`], for the leak test above: the ODE
+/// engine has desugared direct θ/η readouts since #631, so both engines must filter.
+const ONECPT_ODE_DIRECT_THETA_ETA_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVSCALE(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_SC ~ 0.05
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode_template one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V * TVSCALE + ETA_SC
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The analytical engine's **synthetic-slot overflow** branch: when the spare region cannot
+/// seat every direct θ/η the readout names, all of them are dropped, the readout keeps the
+/// pre-#486 FD fallback, and the parse warning says so (PR #950 review #5/#10).
+///
+/// Three things are pinned, because each fails differently:
+///   * the accepted set is empty — no `__ferx_ro_*` parameter is appended;
+///   * dropping them really does leave `dual_evaluable = false`, so `analytical_supported`
+///     reports FD. If it did not, the model would take the analytic path with the bare
+///     `PushTheta`/`PushEta` ops still in the readout bytecode and return a **zero jet** on
+///     those axes — a wrong gradient reported as analytic, not a fallback;
+///   * the warning quotes the *analytical* pool (2 free slots here — `N` and `MTT`), not
+///     `MAX_PK_PARAMS`. Quoting 128 to a user whose model has 2 misstates their headroom by
+///     an order of magnitude and makes the suggested remedy unactionable.
+const THREECPT_ORAL_READOUT_SYNTH_DROPPED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 10.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVQ3(0.3, 0.001, 10.0)
+  theta TVV3(30.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVF(0.9, 0.01, 1.0)
+  theta TVOFF(0.1, 0.001, 10.0)
+  theta TVSLP(1.2, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.05
+  omega ETA_OFF ~ 0.02
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  Q  = TVQ
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA * exp(ETA_KA)
+  F  = TVF
+[structural_model]
+  pk three_cpt_oral(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3, ka=KA, f=F)
+[scaling]
+  y = central / V * TVSLP + TVOFF + ETA_OFF
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+#[test]
+fn readout_synth_overflow_drops_to_fd_with_engine_correct_note() {
+    let m = parse_model_string(THREECPT_ORAL_READOUT_SYNTH_DROPPED).expect("parse synth-overflow");
+    // Three distinct direct θ/η (TVSLP, TVOFF, ETA_OFF) into a 2-slot pool.
+    assert!(
+        !m.indiv_param_names
+            .iter()
+            .any(|n| crate::parser::model_parser::is_synthetic_readout_param(n)),
+        "an overflowing synthetic set must be dropped whole, not partially appended"
+    );
+    assert!(
+        !analytical_supported(&m),
+        "dropping the synthetics must leave the readout non-dual-evaluable so the model \
+         reports FD — otherwise those axes return a silent zero jet"
+    );
+    // Not the generic #650 "this readout falls back to FD" notice — the #486 sizing note,
+    // which is the one that quotes a slot count.
+    let note = m
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("more PK slot(s)"))
+        .expect("the FD-fallback sizing note must be surfaced to the user");
+    assert!(
+        note.contains("needs 1 more PK slot(s) than the 2-slot layout has free"),
+        "the note must quote the analytical spare pool, not MAX_PK_PARAMS; got: {note}"
+    );
+}
+
 /// The fluconazole case: a readout gated on a **per-row** covariate (`FREE`)
 /// makes the subject a time-varying-covariate subject, so it routes to the
 /// event-walk provider. The readout is served analytically there too (#650):
@@ -3857,8 +4566,8 @@ fn provider_ltbs_matches_production() {
 /// transform LAST, after scaling — the same helper the dose-superposition outer uses).
 /// Validated over plain LTBS and LTBS + an `ExpressionScale` `obs_scale = 1000/V` divisor
 /// (production's scale-then-log order `ln(f/s)` is reproduced post-walk) against central
-/// FD of the log-scale production predictor. The inner EBE gradient stays on FD for LTBS
-/// (covariance stability), asserted below.
+/// FD of the log-scale production predictor. The inner EBE gradient applies the same jet
+/// (#673), so both loops differentiate the same `ln(f/s)`.
 #[test]
 fn ltbs_tvcov_outer_matches_production() {
     let ltbs = |src: &str| {
@@ -6181,9 +6890,9 @@ fn iov_analytical_expr_scale_supported_and_gated() {
         "closed-form IOV + ExpressionScale obs_scale must be on the analytic path (#486)"
     );
     assert!(analytic_outer_gradient_available(&model));
-    // + LTBS is served on the OUTER gradient now (#486): `subject_sensitivities_iov`
-    // applies the `ln(f)` jet after the in-walk scale quotient, reproducing `ln(f/s)`.
-    // (The inner EBE gradient still declines via `analytic_inner_common_bail`.)
+    // + LTBS is served on BOTH loops now (#486): `subject_sensitivities_iov` and
+    // `run_obs_iov_eta` each apply the `ln(f)` jet after their own scale quotient,
+    // reproducing `ln(f/s)`.
     let mut ltbs = parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse");
     ltbs.log_transform = true;
     assert!(
@@ -9604,5 +10313,333 @@ fn iov_tvcov_3cpt_matches_fd_of_predict_iov() {
         &subject,
         &[0.2, 10.0, 0.5, 20.0, 0.3, 50.0, 1.5, 0.75],
         &[0.12, -0.08, 0.20, 0.05, -0.10],
+    );
+}
+
+const ONECPT_IV_TVCOV_SS: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// **The gradient twin of the SS `CMT=0` fix** (#375).
+///
+/// `CMT=0` is NONMEM's *default dose compartment*. #375 fixed the **value** walk
+/// (`equilibrate_ss_state_event_driven`), which had bailed out early on it and
+/// returned an unequilibrated all-zero state — the single-dose curve instead of
+/// the accumulated steady state. The same early return existed in the **gradient**
+/// walk (`equilibrate_ss_g`) and was fixed alongside it, but nothing exercised it:
+/// mutation testing showed that restoring `|| dose.cmt == 0` there left the entire
+/// suite green. That is the dangerous half — a gradient that equilibrates
+/// differently from the value it accompanies makes FOCE/FOCEI differentiate a
+/// dosing history that was never predicted.
+///
+/// `equilibrate_ss_g` is reachable only from the event-driven sensitivity walk, so
+/// the subject needs a TV covariate to be routed there (an SS `CMT=0` dose alone
+/// stays on dose superposition, which is `cmt`-blind and equilibrates correctly by
+/// accident). Two independent checks:
+///
+///   (a) the full provider matches central FD of the **production** predictor,
+///       which does equilibrate `CMT=0`. This is what actually kills the original
+///       bug — it fires on the value assert (analytic 10.77 vs production 40.62,
+///       the ratio being the lost accumulation factor `1/(1 − e^{−k·II})`), and it
+///       also catches a corrupted θ-, η- or Hessian-block of the trough jet.
+///   (b) `CMT=0` and `CMT=1` must produce identical sensitivities, since they
+///       denote the same compartment. Not redundant with (a): (a) compares the
+///       gradient walk against a *value* walk that is a separate driver but shares
+///       the leaf kernel and the equilibration policy, so a bug present in **both**
+///       walks is invisible to it and caught only here.
+///
+/// Both were established by mutation rather than assumed: restoring the bail kills
+/// (a); restoring it in both walks is caught only by (b); zeroing any single
+/// derivative block of the trough jet is caught by (a). What neither catches is a
+/// change to the *shared* equilibration policy — before #908 an 8-cycle pulse-train
+/// budget moved both walks together and left this test green. Absolute steady-state
+/// accuracy therefore rests elsewhere: on the NONMEM `ss_cmt0` anchor, and since #908
+/// on `ss_equilibration_matches_the_exact_periodic_closed_form`, which pins both walks
+/// against the superposition closed form. This test did, however, catch a revert of the
+/// *dual* walk alone to the pulse train — that asymmetry is exactly what (a) is for.
+#[test]
+fn ss_cmt_zero_gradient_equilibrates_like_the_default_compartment() {
+    let m = parse_model_string(ONECPT_IV_TVCOV_SS).expect("parse");
+    let theta = vec![0.2, 10.0, 0.75];
+    let eta = vec![0.15, -0.10];
+    let obs_times = [1.0, 3.0, 6.0, 11.0];
+    let obs_wts = [70.0, 80.0, 90.0, 100.0];
+
+    let mk = |cmt: usize| {
+        tvcov_subject(
+            vec![DoseEvent::new(0.0, 100.0, cmt, 0.0, true, 12.0)],
+            // Deliberately **not** the reference weight. At `WT = 70` the covariate
+            // term `(WT/70)^THETA_WT` is identically 1 with an identically-zero jet,
+            // so `THETA_WT`'s axis is dead inside `equilibrate_ss_g` and a mutation
+            // zeroing only that axis survives the whole suite. Off-reference makes
+            // the covariate-θ path live.
+            &[85.0],
+            &obs_times,
+            &obs_wts,
+            Vec::new(),
+            Vec::new(),
+            &[],
+        )
+    };
+    let s0 = mk(0);
+    let s1 = mk(1);
+
+    assert!(
+        s0.has_tv_covariates() && subject_routes_to_event_walk(&m, &s0),
+        "fixture must reach the event-driven sens walk, where `equilibrate_ss_g` lives"
+    );
+
+    // (a) analytic vs FD of production.
+    check_full_provider_vs_fd(&m, &s0, &theta, &eta);
+
+    // (b) CMT=0 and CMT=1 denote the same compartment — sensitivities must be
+    // identical, not merely close.
+    let a = subject_sensitivities(&m, &s0, &theta, &eta).expect("cmt 0 supported");
+    let b = subject_sensitivities(&m, &s1, &theta, &eta).expect("cmt 1 supported");
+
+    // Every θ axis must be live inside the equilibration, or a mutation that
+    // corrupts only a dead one passes unnoticed. `THETA_WT` (index 2) is the one
+    // at risk: it enters as `(WT/70)^THETA_WT`, so at the reference weight its jet
+    // is identically zero and the axis is untested. Guards the `&[85.0]` above
+    // against silently reverting to `70.0`.
+    for (i, o) in a.obs.iter().enumerate() {
+        for (k, g) in o.df_dtheta.iter().enumerate() {
+            assert!(
+                *g != 0.0,
+                "obs {i}: df_dtheta[{k}] is exactly zero — that θ axis is dead in this \
+                 fixture, so nothing here tests it (is the dose covariate back at the \
+                 reference weight?)"
+            );
+        }
+    }
+    assert_eq!(a.obs.len(), b.obs.len());
+    for (i, (o0, o1)) in a.obs.iter().zip(b.obs.iter()).enumerate() {
+        assert_eq!(o0.f, o1.f, "obs {i}: value differs between CMT=0 and CMT=1");
+        assert_eq!(o0.df_deta, o1.df_deta, "obs {i}: df_deta differs");
+        assert_eq!(o0.df_dtheta, o1.df_dtheta, "obs {i}: df_dtheta differs");
+        assert_eq!(o0.d2f_deta2, o1.d2f_deta2, "obs {i}: d2f_deta2 differs");
+        assert_eq!(
+            o0.d2f_deta_dtheta, o1.d2f_deta_dtheta,
+            "obs {i}: d2f_deta_dtheta differs"
+        );
+    }
+    // Guard against a vacuous pass: an SS dose must actually accumulate above the
+    // single-dose curve, so the equilibration is doing something.
+    let single = tvcov_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[70.0],
+        &obs_times,
+        &obs_wts,
+        Vec::new(),
+        Vec::new(),
+        &[],
+    );
+    let sd = subject_sensitivities(&m, &single, &theta, &eta).expect("single-dose supported");
+    assert!(
+        a.obs[0].f > sd.obs[0].f * 1.05,
+        "SS must accumulate well above the single-dose curve (got {} vs {}); \
+         if these are equal the equilibration was skipped and the test is vacuous",
+        a.obs[0].f,
+        sd.obs[0].f
+    );
+}
+
+/// **#908 — the exact SS solve's derivative, where the solve is ill-conditioned.**
+///
+/// `equilibrate_ss_g` no longer iterates a pulse train: it solves `u_ss = (I − M)⁻¹·b` over the
+/// dual type, so the jets it returns are the *implicit-function* derivative
+/// `∂u_ss/∂p = (I − M)⁻¹·(∂b/∂p − ∂M/∂p·u_ss)` produced by `solve_linear_system_g`, not the
+/// derivative of a truncated recursion. Where that can go wrong is where `I − M` is nearly
+/// singular, since `cond(I − M) ≈ 1/(1 − e^{−λ_slow·II})` amplifies any error in the assembled
+/// `M` or `b`. Every other SS gradient test in this file is well-conditioned.
+///
+/// So drive `TVCL` to `0.01` (bound `0.001`): `ke ≈ 1.5e-3` against `II = 12` gives
+/// `λ_slow·II ≈ 0.018` and `cond ≈ 57`, versus `cond ≈ 4` for the sibling fixture above.
+///
+/// **Why this rolls its own finite differences instead of calling
+/// [`check_full_provider_vs_fd`].** At this operating point the mixed second derivative is a
+/// near-total cancellation — `∂²f/∂η_CL∂η_V ≈ −1.96e-2` against `f ≈ 6.25e2`, four to five
+/// orders — so the 4-point stencil subtracts values agreeing to ~12 digits and its roundoff
+/// floor `≈ eps·f/h²` swamps the answer at the shared harness's `h = 1e-4`. Measured against the
+/// analytic value, that stencil's relative error is:
+///
+/// | `h` | 1e-2 | 3e-3 | 1e-3 | 3e-4 | **1e-4** | 3e-5 | 1e-5 |
+/// |---|---|---|---|---|---|---|---|
+/// | rel. err | 8.2e-5 | **3.5e-7** | 4.8e-5 | 5.7e-4 | **5.1e-3** | 7.3e-2 | 7.2e-1 |
+///
+/// Truncation dominates to the left, roundoff to the right, and the harness's step sits on the
+/// wrong side of the minimum. The dominant element `∂²f/∂η_CL² = 6.2007e2` shows the same
+/// V-shape with its floor at `1.2e-8` (`h = 3e-4`). The FD *reference* is what fails here, not
+/// the analytic derivative — so this test pins the second derivatives at the measured optimum
+/// `h = 3e-3` and leaves first derivatives, which are well conditioned, at the usual step.
+///
+/// This is a *correctness* test for the new derivative, not a regression test for the change:
+/// under the old pulse train both sides were truncated and it would also have passed. The value
+/// regression lives in
+/// `pk::event_driven::tests::ss_equilibration_matches_the_exact_periodic_closed_form`; the
+/// value/gradient lockstep is enforced by `event_walk_g_3cpt_matches_production_f64` and the
+/// `CMT=0` test above, either of which fails if only one walk is reverted.
+#[test]
+fn ss_ill_conditioned_gradient_matches_fd_of_production() {
+    let m = parse_model_string(ONECPT_IV_TVCOV_SS).expect("parse");
+    // TVCL = 0.01 (vs 0.2 in the sibling): t½ ≈ 470 h against a 12 h dosing interval.
+    let theta = vec![0.01, 10.0, 0.75];
+    let eta = vec![0.15, -0.10];
+    let obs_times = [1.0, 3.0, 6.0, 11.0];
+    let obs_wts = [70.0, 80.0, 90.0, 100.0];
+
+    let mk = |doses: Vec<DoseEvent>| {
+        tvcov_subject(
+            doses,
+            &[85.0],
+            &obs_times,
+            &obs_wts,
+            Vec::new(),
+            Vec::new(),
+            &[],
+        )
+    };
+    let s = mk(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)]);
+    assert!(
+        s.has_tv_covariates() && subject_routes_to_event_walk(&m, &s),
+        "fixture must reach the event-driven sens walk, where `equilibrate_ss_g` lives"
+    );
+
+    let sens = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+    let pred = |e: &[f64], th: &[f64], j: usize| compute_predictions_with_tv(&m, &s, th, e)[j];
+    let n_eta = eta.len();
+
+    for (j, obs) in sens.obs.iter().enumerate() {
+        approx::assert_relative_eq!(obs.f, pred(&eta, &theta, j), max_relative = 1e-9);
+
+        // First derivatives: well conditioned, ordinary central differences.
+        let he = 1e-6;
+        for k in 0..n_eta {
+            let (mut ep, mut em) = (eta.clone(), eta.clone());
+            ep[k] += he;
+            em[k] -= he;
+            let g = (pred(&ep, &theta, j) - pred(&em, &theta, j)) / (2.0 * he);
+            approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 2e-4, epsilon = 1e-7);
+        }
+        for t in 0..theta.len() {
+            let step = 1e-6 * (1.0 + theta[t].abs());
+            let (mut tp, mut tm) = (theta.clone(), theta.clone());
+            tp[t] += step;
+            tm[t] -= step;
+            let g = (pred(&eta, &tp, j) - pred(&eta, &tm, j)) / (2.0 * step);
+            approx::assert_relative_eq!(obs.df_dtheta[t], g, max_relative = 2e-4, epsilon = 1e-7);
+        }
+
+        // Second derivatives at the measured stencil optimum (see the table above).
+        let hh = 3e-3;
+        for k in 0..n_eta {
+            for l in 0..n_eta {
+                let mut pp = eta.clone();
+                pp[k] += hh;
+                pp[l] += hh;
+                let mut pm = eta.clone();
+                pm[k] += hh;
+                pm[l] -= hh;
+                let mut mp = eta.clone();
+                mp[k] -= hh;
+                mp[l] += hh;
+                let mut mm = eta.clone();
+                mm[k] -= hh;
+                mm[l] -= hh;
+                let fd = (pred(&pp, &theta, j) - pred(&pm, &theta, j) - pred(&mp, &theta, j)
+                    + pred(&mm, &theta, j))
+                    / (4.0 * hh * hh);
+                approx::assert_relative_eq!(
+                    obs.d2f_deta2[k * n_eta + l],
+                    fd,
+                    max_relative = 1e-4,
+                    epsilon = 1e-7
+                );
+            }
+        }
+    }
+
+    // Guard against a vacuous pass: with almost no elimination the steady state must tower over
+    // the single-dose curve. If the equilibration were skipped, both the analytic and the FD side
+    // would be wrong the same way and every assertion above would still hold.
+    let sd = subject_sensitivities(
+        &m,
+        &mk(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)]),
+        &theta,
+        &eta,
+    )
+    .expect("supported");
+    assert!(
+        sens.obs[0].f > sd.obs[0].f * 20.0,
+        "a near-non-eliminating SS dose must accumulate far above one dose (got {} vs {})",
+        sens.obs[0].f,
+        sd.obs[0].f
+    );
+}
+
+/// #905 gradient gate: on an analytical model a subject with no Gaussian observation
+/// feeds the PK predictor nothing, so the value path declines it (NaN, no walk). The
+/// gradient router must decline in lockstep — otherwise FOCE/FOCEI enters the `sens`
+/// event-driven walk and hits the unroutable-dose `panic!` twin
+/// (`propagate::active_rates_g` / the bolus `cmt_idx` guard) on the very dose the
+/// value path skipped. This pins the gate directly: the subject genuinely *would*
+/// route there absent it (its `CMT=2` bolus makes `dose_needs_event_walk` true), so a
+/// reverted gate flips the second assertion (and would panic once the walk ran).
+#[cfg(feature = "survival")]
+#[test]
+fn tte_only_subject_declines_the_event_walk_gradient() {
+    const TTE_ONLY: &str = r#"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 5.0)
+  theta DUMMY_CL(1.0, 0.01, 100.0)
+  theta DUMMY_V(10.0, 0.1, 1000.0)
+  omega ETA_LAMBDA ~ 0.0
+  sigma SIGMA_DV ~ 0.1
+[individual_parameters]
+  LAMBDA = TVLAMBDA * exp(ETA_LAMBDA)
+  CL     = DUMMY_CL
+  V      = DUMMY_V
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(SIGMA_DV)
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = LAMBDA
+"#;
+    let model = parse_model_string(TTE_ONLY).expect("model parses");
+    // Only observation is the TTE event at CMT=2 (no Gaussian obs); the CMT=2 bolus
+    // is out of range for the 1-cpt placeholder.
+    let mut subj = oral_subject(&[5.0]);
+    subj.doses = vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)];
+    subj.obs_cmts = vec![2];
+
+    assert!(
+        crate::pk::dose_needs_event_walk(model.pk_model, &subj),
+        "precondition: the CMT=2 bolus makes this subject walk-bound"
+    );
+    assert!(
+        !crate::pk::subject_feeds_analytical_pk(&model, &subj),
+        "a subject whose only obs is a TTE endpoint feeds the analytical predictor nothing"
+    );
+    assert!(
+        !subject_routes_to_event_walk(&model, &subj),
+        "the #905 gate must keep a no-Gaussian-obs subject off the event-driven gradient walk"
     );
 }

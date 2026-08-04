@@ -28,6 +28,7 @@ mod ctmm_inner {
                 .iter()
                 .map(|&(time, state)| ObsRecord::DiscreteState {
                     time,
+                    raw_time: time,
                     state,
                     cmt: 5,
                 })
@@ -137,6 +138,159 @@ mod ctmm_inner {
             );
         }
     }
+}
+
+/// #378 task B — the model-level report `build_info::gradient_method_inner` must match the
+/// per-subject route `find_ebe` actually runs for an **in-scope ODE** model. The live inner
+/// takes the light `Dual1` ODE η-gradient (`analytic_inner_grad_supported` → the `ode_spec`
+/// branch → `ode_inner_grad_supported`), but the report used to read the closed-form-only
+/// `analytic_inner_grad_supported_model` (false for every ODE model — no `tv_fn`) and
+/// mislabel it "finite differences". Pin report == route, exactly as the CTMM tests above
+/// pin theirs. (Mutation: reverting the ODE disjunct in `gradient_method_inner` makes the
+/// report `FiniteDifferences` while the route stays analytic, so the final assert fails.)
+#[test]
+fn in_scope_ode_reports_and_takes_the_analytic_inner_route() {
+    const ONECPT_IV_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model = crate::parser::model_parser::parse_model_string(ONECPT_IV_ODE).expect("parse");
+    // Fixture self-check: genuinely in ODE analytic scope (else the asserts pass vacuously).
+    assert!(
+        crate::sens::provider::ode_inner_grad_supported_model(&model),
+        "fixture must be an in-scope ODE model"
+    );
+
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![9.0, 8.0, 6.0, 3.0, 1.0],
+        obs_cmts: vec![1, 1, 1, 1, 1],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0, 0, 0, 0, 0],
+        occasions: Vec::new(),
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+
+    // Subject-level: what `find_ebe` actually runs.
+    assert!(
+        super::analytic_inner_grad_supported(&model, &subject),
+        "an in-scope plain-bolus ODE subject must take the analytic inner route"
+    );
+    // Model-level: what `build_info::gradient_method_inner` reports — must match the route.
+    assert_eq!(
+        crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, &model),
+        crate::build_info::GradientMethodKind::Analytic,
+        "the report must match the live analytic ODE inner route"
+    );
+}
+
+/// #926 (review follow-up to #378 task B) — an in-scope ODE model whose ENTIRE population runs
+/// the FD inner must still emit the FD-fallback warning. `gradient_method_inner` reports
+/// "analytic" at the model level for such a model (best-case), so without the warning the
+/// persisted `fit.yaml` label would contradict the per-subject reality with nothing to
+/// reconcile it — exactly the closed-form all-FD case (TV-cov + LTBS) the warning already
+/// covers. This pins the shared `inner_reports_analytic_model` coupling between the report and
+/// the warning. Every subject here carries a modeled-duration dose with no `D{cmt}` slot, which
+/// the ODE provider declines to FD (the same trick `fd_fallback_warning_fires_only_for_mixed_
+/// population` uses). Mutation: reverting `fd_fallback_warning`'s `model_reports_analytic` to the
+/// old `analytic_inner_grad_supported_model` (false for ODE) makes this return `None` and fail.
+#[test]
+fn fd_fallback_warning_fires_for_all_fd_in_scope_ode_population() {
+    const IN_SCOPE_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model = crate::parser::model_parser::parse_model_string(IN_SCOPE_ODE).expect("parse");
+    // In-scope at the model level, so the headline reports analytic …
+    assert!(crate::sens::provider::ode_inner_grad_supported_model(
+        &model
+    ));
+    assert_eq!(
+        crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, &model),
+        crate::build_info::GradientMethodKind::Analytic,
+    );
+    let theta = &model.default_params.theta;
+    let zeros = vec![0.0; model.n_eta];
+    // … but a modeled-duration dose with no `D{cmt}` slot puts every subject on the FD inner.
+    let fd_subject = || {
+        let mut d = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        d.rate_mode = crate::types::RateMode::ModeledDuration;
+        Subject {
+            id: "1".into(),
+            doses: vec![d],
+            obs_times: vec![1.0, 4.0, 8.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 4.0, 1.0],
+            obs_cmts: vec![1, 1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0, 0],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }
+    };
+    // Confirm the FD-ness the warning counts (not a vacuous population).
+    assert!(
+        crate::sens::provider::subject_eta_grad(&model, &fd_subject(), theta, &zeros).is_none(),
+        "the modeled-duration-no-slot subject must run the FD inner"
+    );
+    let pop = Population {
+        subjects: vec![fd_subject(), fd_subject()],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let w = super::fd_fallback_warning(&model, &pop, theta)
+        .expect("all-FD in-scope ODE population must warn (report says analytic)");
+    assert!(w.contains("2 of 2"), "got: {w}");
 }
 
 /// The M3 censored coefficient `∂/∂f[−logΦ((y−f)/√v)]` must equal a central
@@ -980,4 +1134,111 @@ fn test_nelder_mead_nan_objective_does_not_panic() {
         x.iter().all(|v| v.is_finite()),
         "Nelder-Mead must leave the point finite, got {x:?}"
     );
+}
+
+// ── #891: weakly-identified-coordinate detector for the guarded multi-start ──
+
+/// The flatness probe flags a coordinate whose individual objective is flat
+/// (data adds no curvature beyond the prior — the #891 weakly-identified case)
+/// and leaves a sharply-curved, well-informed coordinate unscanned. Both share
+/// the same prior (Ω = I ⇒ prior curvature 1.0), so the only difference is the
+/// data curvature the probe measures.
+#[test]
+fn weakly_identified_coords_flags_flat_not_sharp() {
+    use crate::types::OmegaMatrix;
+    let omega = OmegaMatrix::from_diagonal(&[1.0, 1.0], vec!["SHARP".into(), "FLAT".into()]);
+    // obj already carries the prior term, so these coefficients are the *total*
+    // posterior curvature: coord 0 is sharply informed (10 ≫ 2·prior), coord 1
+    // carries prior curvature only (1.0 < 2·prior ⇒ weakly identified).
+    let obj = |e: &[f64]| -> f64 { 0.5 * 10.0 * e[0] * e[0] + 0.5 * 1.0 * e[1] * e[1] };
+    let eta = vec![0.0, 0.0];
+    let nll = obj(&eta);
+    let flags = weakly_identified_coords(&obj, &eta, nll, &omega, 2);
+    assert_eq!(
+        flags,
+        vec![false, true],
+        "sharp coordinate must be skipped, flat coordinate must be scanned"
+    );
+}
+
+/// A fixed (zero-variance) effect can't move, so it is never scanned even when
+/// flat; and a non-finite objective at the mode disables the probe entirely
+/// (returns all-false) rather than dividing by a bogus curvature.
+#[test]
+fn weakly_identified_coords_skips_fixed_and_nonfinite() {
+    use crate::types::OmegaMatrix;
+    let omega = OmegaMatrix::from_diagonal(&[0.0, 1.0], vec!["FIXED".into(), "FLAT".into()]);
+    let flat = |e: &[f64]| -> f64 { 0.5 * e[1] * e[1] };
+    let eta = vec![0.0, 0.0];
+    // Fixed coord 0 skipped despite flat objective; flat free coord 1 flagged.
+    let flags = weakly_identified_coords(&flat, &eta, flat(&eta), &omega, 2);
+    assert_eq!(flags, vec![false, true]);
+    // Non-finite objective at the mode → probe declines (all-false), no scan.
+    let flags_bad = weakly_identified_coords(&flat, &eta, f64::INFINITY, &omega, 2);
+    assert_eq!(flags_bad, vec![false, false]);
+}
+
+/// No-regression: a well-identified, unimodal subject (no resets / TV-covariates)
+/// must return a bit-identical EBE with the guarded multi-start on
+/// (`inner_restarts = 3`) and off (`inner_restarts = 0`). The #891 probe may scan
+/// weakly-informed coordinates, but every alternate seed reconverges to the same
+/// basin and is rejected by the `+1e-9` improvement guard, so the returned η̂ and
+/// its objective are unchanged — the added cost buys no spurious mode change.
+#[test]
+fn inner_restarts_bit_identical_on_wellidentified_subject() {
+    use crate::types::{DoseEvent, Subject};
+    use std::collections::HashMap;
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n",
+    )
+    .expect("parse one_cpt_oral model");
+
+    // Six informative observations across the profile ⇒ all etas well identified.
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![8.0, 12.0, 10.0, 6.0, 3.0, 1.5],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0; 6],
+        occasions: Vec::new(),
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    assert!(
+        !subject.has_resets() && !subject.has_tv_covariates(),
+        "test premise: subject must exercise the #891 (non reset/TV) probe path"
+    );
+
+    let params = &model.default_params;
+    let off = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 0);
+    let on = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 3);
+
+    // Bit-identical is the exact contract, not mere closeness: for a unimodal
+    // subject no alternate seed beats the improvement guard (`cand_nll + 1e-9 <
+    // nll`), so `eta`/`nll` are never reassigned — `on` returns the very same
+    // f64s the base solve produced. The two solves are deterministic (pure
+    // objective, no RNG), so assert exact equality.
+    assert!(off.nll.is_finite() && on.nll.is_finite());
+    assert_eq!(
+        on.nll, off.nll,
+        "objective must be bit-identical on a unimodal subject: on {} vs off {}",
+        on.nll, off.nll
+    );
+    for k in 0..model.n_eta {
+        assert_eq!(
+            on.eta[k], off.eta[k],
+            "η[{k}] must be bit-identical on a unimodal subject: on {} vs off {}",
+            on.eta[k], off.eta[k]
+        );
+    }
 }

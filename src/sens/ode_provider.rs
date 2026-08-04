@@ -450,13 +450,10 @@ pub(crate) fn has_infusion_into_input_rate(model: &CompiledModel, subject: &Subj
         return false;
     };
     !ode.input_rate.is_empty()
-        && subject.doses.iter().any(|d| {
-            d.is_infusion()
-                && ode
-                    .input_rate
-                    .iter()
-                    .any(|f| f.cmt == d.cmt.saturating_sub(1))
-        })
+        && subject
+            .doses
+            .iter()
+            .any(|d| d.is_infusion() && ode.input_rate.iter().any(|f| f.cmt == d.cmt_idx()))
 }
 
 /// Per-subject scope gate, shared by the full (outer `Dual2`) and light (inner
@@ -575,7 +572,9 @@ fn zero_order_forcing_for_dose<'f, T: crate::sens::num::PkNum>(
     params: &[T],
 ) -> Option<(&'f crate::pk::absorption::InputRateForcing, T)> {
     let f = ode.input_rate.iter().find(|f| {
-        f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt + 1 == d.cmt
+        // 0-based match so a `CMT=0` dose resolves compartment 1's zero-order window (#899, #913
+        // review) — the gradient twin of the value-path fix in `zero_order_dur_and_frac_for_dose`.
+        f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt == d.cmt_idx()
     })?;
     let dur = match f.prepare_dual::<T>(params)? {
         crate::pk::absorption::PreparedInputRate::ZeroOrder { dur, .. } => dur,
@@ -606,10 +605,10 @@ pub(crate) fn modeled_slot_for(
     match d.rate_mode {
         crate::types::RateMode::Fixed => None,
         crate::types::RateMode::ModeledDuration => attr_map
-            .indexed_slot(crate::types::DoseAttr::Duration, d.cmt)
+            .indexed_slot(crate::types::DoseAttr::Duration, d.cmt_raw())
             .map(|s| (crate::types::RateMode::ModeledDuration, s)),
         crate::types::RateMode::ModeledRate => attr_map
-            .indexed_slot(crate::types::DoseAttr::Rate, d.cmt)
+            .indexed_slot(crate::types::DoseAttr::Rate, d.cmt_raw())
             .map(|s| (crate::types::RateMode::ModeledRate, s)),
     }
 }
@@ -1837,7 +1836,7 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
     let dose_f_bio: Vec<T> = subject
         .doses
         .iter()
-        .map(|d| params_dual[f_bio_slot(ode, d.cmt)])
+        .map(|d| params_dual[f_bio_slot(ode, d.cmt_raw())])
         .collect();
 
     // Dose-time anchors for TAFD/TAD (constants w.r.t. the parameters).
@@ -1979,6 +1978,7 @@ fn run_subject<const N: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            ..Default::default()
         });
     }
 
@@ -2101,6 +2101,7 @@ fn run_subject_mixed<const NA: usize, const N: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            ..Default::default()
         });
     }
 
@@ -2261,7 +2262,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         .doses
         .iter()
         .zip(pk_at_dose.iter())
-        .map(|(d, p)| p[f_bio_slot(ode, d.cmt)])
+        .map(|(d, p)| p[f_bio_slot(ode, d.cmt_raw())])
         .collect();
     let first_dose_time = subject
         .doses
@@ -2293,7 +2294,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         subject
             .doses
             .iter()
-            .map(|d| attr_map.lag_slot(d.cmt))
+            .map(|d| attr_map.lag_slot(d.cmt_raw()))
             .collect()
     } else {
         Vec::new()
@@ -2906,6 +2907,7 @@ fn run_subject_iov<const M: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            ..Default::default()
         });
     }
     // Apply the `ExpressionScale` quotient per observation, using the observation's
@@ -3609,10 +3611,14 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     d1_stack: &mut Vec<Dual1<1>>,
 ) -> Vec<T> {
     let mut u = vec![T::from_f64(0.0); n_states];
-    if dose.ii <= 0.0 || dose.cmt == 0 {
+    if dose.ii <= 0.0 {
         return u;
     }
-    let cmt_idx = dose.cmt - 1;
+    // `CMT=0` equilibrates compartment 1 — NONMEM's default dose compartment
+    // (#899) — mirroring the f64 `equilibrate_ss_state`. The gradient twin must
+    // move with the value path or FOCEI would differentiate a different dosing
+    // history than it predicts.
+    let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n_states {
         return u;
     }
@@ -3631,6 +3637,107 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
             &mut stack_cell.borrow_mut(),
         );
     };
+
+    // ---- #914 exact solve: closed-form periodic fixed point (linear disposition). ----
+    // The affine fixed point `u_ss = (I − M)⁻¹·b`, carried over the dual `T` so
+    // `∂u_ss/∂(θ,η[,κ])` (and the 2nd order) fall out of the linear solve — the exact analytic
+    // parity with the f64 `equilibrate_ss_state`, the input-rate twin (#835) and the analytical
+    // walk (#908). `advance_forced` integrates one cycle *with* the dose; `advance_unforced`
+    // integrates one `II` of disposition alone (the propagator `M`; the infusion's active and
+    // quiet windows share the same homogeneous propagator, so a full-`II` decay reconstructs it
+    // and the window length enters only through `b`). The moving active/quiet boundary carries
+    // `inf_window`'s jet via the same `inject_rate_saltation` the fallback loop uses
+    // (`dtinf = inf_window − t_inf_val`); its value part is zero, so the value map stays linear
+    // while the window sensitivity rides `b`. A nonlinear RHS fails the self-check and falls to
+    // the pulse train below (the f64 value walk owns the #867 warning — this twin must not
+    // double-count it, matching `equilibrate_ss_input_rate_state_g`).
+    let eq_opts = crate::ode::predictions::ss_equilibration_opts(opts);
+    let d1v: RefCell<Vec<Dual1<1>>> = RefCell::new(Vec::new());
+    let d1s: RefCell<Vec<Dual1<1>>> = RefCell::new(Vec::new());
+    let advance_unforced = |u0: &[T]| -> Option<Vec<T>> {
+        solve_ode_g(&bare_rhs, u0, (0.0, dose.ii), params, &[dose.ii], &eq_opts)
+            .last()
+            .map(|p| p.u.clone())
+    };
+    let advance_forced = |u0: &[T]| -> Option<Vec<T>> {
+        match inf {
+            Some((inf_rate, inf_window)) => {
+                let t_inf_val = inf_window.val();
+                if t_inf_val > dose.ii {
+                    return None; // overlapping pulses — no simple equilibration (→ fallback → zero)
+                }
+                let rate_forcing = inf_rate;
+                let rhs_active = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+                    bare_rhs(us, ps, t, du);
+                    if cmt_idx < du.len() {
+                        du[cmt_idx] = du[cmt_idx] + rate_forcing;
+                    }
+                };
+                let mut y = solve_ode_g(
+                    &rhs_active,
+                    u0,
+                    (0.0, t_inf_val),
+                    params,
+                    &[t_inf_val],
+                    &eq_opts,
+                )
+                .last()
+                .map(|p| p.u.clone())?;
+                // Boundary-shift saltation for the (possibly jet-carrying) window `inf_window`,
+                // identical to the fallback loop's per-cycle `inject_rate_saltation`.
+                let dtinf = inf_window - T::from_f64(t_inf_val);
+                inject_rate_saltation::<T>(
+                    &mut y,
+                    cmt_idx,
+                    rate_forcing,
+                    T::from_f64(0.0),
+                    dtinf,
+                    1.0,
+                    program,
+                    params,
+                    t_inf_val,
+                    0.0,
+                    0.0,
+                    &mut d1v.borrow_mut(),
+                    &mut d1s.borrow_mut(),
+                );
+                let quiet_val = dose.ii - t_inf_val;
+                if quiet_val > 0.0 {
+                    y = solve_ode_g(
+                        &bare_rhs,
+                        &y,
+                        (0.0, quiet_val),
+                        params,
+                        &[quiet_val],
+                        &eq_opts,
+                    )
+                    .last()
+                    .map(|p| p.u.clone())?;
+                }
+                Some(y)
+            }
+            None => {
+                let mut y = u0.to_vec();
+                y[cmt_idx] = y[cmt_idx] + f_bio * T::from_f64(dose.amt);
+                solve_ode_g(&bare_rhs, &y, (0.0, dose.ii), params, &[dose.ii], &eq_opts)
+                    .last()
+                    .map(|p| p.u.clone())
+            }
+        }
+    };
+    if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
+        n_states,
+        dose.ii,
+        eq_opts.reltol,
+        eq_opts.abstol,
+        advance_unforced,
+        advance_forced,
+    ) {
+        crate::dosing::record_ss_equilibration_cycles(1);
+        return u_ss;
+    }
+
+    // ---- Fallback: explicit pulse-train iteration (nonlinear disposition / singular `I − M`). ----
     if let Some((inf_rate, inf_window)) = inf {
         // SS infusion: each cycle is an active-rate window `[0, t_inf]` (the wrapped RHS
         // injects the mode-aware bioavailable forcing into the dosing compartment) followed
@@ -3731,7 +3838,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
 /// The dose does not enter as an instantaneous bolus; it drives the compartment through the
 /// absorption kernel `R_in(tad)` (transit/igd/weibull/first_order). On a **linear** disposition
 /// the periodic steady state is the closed-form fixed point `u_ss = (I − M)⁻¹·b`, carried over `T`
-/// by [`equilibrate_ss_input_rate_fixed_point_g`](crate::ode::predictions::equilibrate_ss_input_rate_fixed_point_g)
+/// by [`periodic_ss_fixed_point_g`](crate::dosing::periodic_ss_fixed_point_g)
 /// so `∂u_ss/∂(θ,η[,κ])` (and the 2nd order) fall out of the linear solve — exact analytic parity
 /// with production's fast path, and bit-identical in value. A **nonlinear** disposition fails the
 /// fixed point's self-check, so [`equilibrate_ss_input_rate_g`](crate::ode::predictions::equilibrate_ss_input_rate_g)
@@ -3757,9 +3864,14 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
 ) -> Vec<T> {
     let n = n_states;
     let ii = dose.ii;
-    // `dose.cmt > n` (not `dose.cmt - 1 >= n`) — clippy-clean, and the `dose.cmt == 0` guard keeps
-    // the 1-based → 0-based conversion below from underflowing. Mirrors `equilibrate_ss_state_g`.
-    if ii <= 0.0 || dose.cmt == 0 || dose.cmt > n {
+    // `CMT=0` equilibrates compartment 1 — the default dose compartment — like the f64 twin
+    // `equilibrate_ss_input_rate` and the plain-disposition `equilibrate_ss_state_g` (#899). This
+    // previously bailed on `dose.cmt == 0` and returned the zero (unequilibrated) trough, so an
+    // `SS=1` bolus written `CMT=0` into a built-in-absorption compartment was *differentiated* as a
+    // single unaccumulated dose while production equilibrated it — a silent value≠gradient FOCEI
+    // error (#913 review). The body resolves the forcing via `d.cmt.saturating_sub(1)`, so `cmt=0`
+    // equilibrates identically to `cmt=1` once the early bail is gone.
+    if ii <= 0.0 || dose.cmt_idx() >= n {
         return vec![T::from_f64(0.0); n];
     }
     // Built-in absorption forcings prepared from THIS SS dose's snapshot (`params`), mirroring the
@@ -3796,7 +3908,12 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
     // A single local SS pulse at t = 0 drives the periodic `R_in` (its SS branch superposes the
     // infinite-past pulse tails) — the dual mirror of the f64 `wrap_rhs_with_forcings(local_ss)`.
     let local_ss = [crate::types::DoseEvent::new(
-        0.0, dose.amt, dose.cmt, 0.0, true, ii,
+        0.0,
+        dose.amt,
+        dose.cmt_raw(),
+        0.0,
+        true,
+        ii,
     )];
     let lag0 = [T::from_f64(0.0)];
     let fbio1 = [f_bio];
@@ -3843,7 +3960,9 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
     // f64 `equilibrate_ss_state` input-rate fallback). The dual jets ride the finite loop.
     let n_pulses = crate::dosing::SS_EQUILIBRATION_CYCLES;
     let local_doses: Vec<crate::types::DoseEvent> = (0..n_pulses)
-        .map(|m| crate::types::DoseEvent::new(m as f64 * ii, dose.amt, dose.cmt, 0.0, false, 0.0))
+        .map(|m| {
+            crate::types::DoseEvent::new(m as f64 * ii, dose.amt, dose.cmt_raw(), 0.0, false, 0.0)
+        })
         .collect();
     let lags = vec![T::from_f64(0.0); n_pulses];
     let fbios = vec![f_bio; n_pulses];
@@ -3967,13 +4086,13 @@ fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
     if phase_val <= 0.0 {
         return u;
     }
-    // CMT is 1-based; a malformed `CMT=0` must no-op (return the trough unchanged), matching
-    // `equilibrate_ss_state_g`'s own `dose.cmt == 0` zero-guard. `saturating_sub(1)` would
-    // instead alias it to the valid index 0 and silently dose compartment 0 (#642 review #1).
-    if dose.cmt == 0 {
-        return u;
-    }
-    let cmt_idx = dose.cmt - 1;
+    // CMT is 1-based, and `CMT=0` is NONMEM's *default dose compartment* — state index 0 —
+    // not a malformed value. `saturating_sub(1)` is therefore the correct mapping, matching
+    // `equilibrate_ss_state_g` and the f64 path (#899). This previously no-op'd on the
+    // premise that aliasing to index 0 would "silently dose compartment 0" (#642 review #1);
+    // #375 settled the opposite convention on the analytical engine, and #899 brought the ODE
+    // engine into line, so the no-op was the silent drop rather than the guard against one.
+    let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n_states {
         return u;
     }
@@ -4292,7 +4411,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 // the rate-off at the shifted `w_end` (`K_ZO_END`), both carrying its jet.
                 let w_start = d.time + lag_val(k) + f.route_lag(&pk_at_dose[k]).val();
                 let w_end = w_start + dur.val();
-                Some((d.cmt.saturating_sub(1), rate, w_start, w_end, dur, k))
+                Some((d.cmt_idx(), rate, w_start, w_end, dur, k))
             })
             .collect()
     };
@@ -4360,7 +4479,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 continue;
             }
             for (k, d) in subject.doses.iter().enumerate() {
-                if d.amt > 0.0 && d.cmt.saturating_sub(1) == f.cmt {
+                if d.amt > 0.0 && d.cmt_idx() == f.cmt {
                     v.push((k, fi));
                 }
             }
@@ -4518,12 +4637,15 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         // Infusions active or ending at `t_ev` (mode-aware effective forcing `inf_eff[k].0`).
         if has_any_infusion {
             for (k, d) in subject.doses.iter().enumerate() {
-                if !is_inf(d) || d.cmt < 1 {
+                // `d.cmt < 1`: an infusion with `CMT=0` has no target and is rejected up
+                // front on both engines (#375 / #899) — see the `filter` in the saltation
+                // walk below. Unreachable from a validated call.
+                if !is_inf(d) || d.cmt_raw() < 1 {
                     continue;
                 }
                 let iws = d.time + lag_val(k);
                 let iwe = iws + inf_window_len(k);
-                let ci = d.cmt - 1;
+                let ci = d.cmt_idx();
                 if ci < n_states && iws >= r_floor && iws <= t_ev + eps && iwe >= t_ev - eps {
                     v[ci] = v[ci] + inf_eff[k].0;
                 }
@@ -4643,10 +4765,13 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     .doses
                     .iter()
                     .enumerate()
-                    // `d.cmt >= 1`: a malformed `CMT=0` infusion must not saturate to
-                    // compartment 0 and force the wrong state, matching the dose-application
-                    // guard (the datareader rejects `CMT=0` upstream) (#472 #6 / #473 #3).
-                    .filter(|(_, d)| is_inf(d) && d.cmt >= 1)
+                    // `d.cmt >= 1`: an infusion with `CMT=0` has no target — the default dose
+                    // compartment is defined for a bolus but not for a zero-order input, so
+                    // both engines reject it up front (analytical since #375, ODE since #899;
+                    // the datareader does *not* reject it, contrary to #472 #6 / #473 #3 —
+                    // only a *missing* CMT column defaults to 1). Unreachable from a validated
+                    // call, kept for hand-built specs that run no validation.
+                    .filter(|(_, d)| is_inf(d) && d.cmt_raw() >= 1)
                     .filter(|(k, d)| {
                         // (Lagged) window start; an infusion before the most recent reset is
                         // off (#472 review #1) and the window tolerance is production's
@@ -4663,7 +4788,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     })
                     // Effective forcing `inf_eff[k].0` (mode-aware: `F·rate` for a
                     // duration-defined infusion, held `rate` for a rate-defined one) (#419).
-                    .map(|(k, d)| (d.cmt.saturating_sub(1), inf_eff[k].0))
+                    .map(|(k, d)| (d.cmt_idx(), inf_eff[k].0))
                     .collect()
             };
             // #486: zero-order windows fully containing this segment add their constant
@@ -4766,7 +4891,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     // populated only by the `K_SS_SEED` (SS+lagtime) branch, which is out of scope
                     // here (rejected upstream), so a non-lagged SS-absorption dose always lands in
                     // one of these `None` arms.
-                    None if has_input_rate && input_rate_consumes_cmt(ode, d.cmt) && !is_inf(d) => {
+                    None if has_input_rate
+                        && input_rate_consumes_cmt(ode, d.cmt_raw())
+                        && !is_inf(d) =>
+                    {
                         equilibrate_ss_input_rate_state_g::<T>(
                             program,
                             ode,
@@ -4790,12 +4918,15 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     ),
                 };
             }
-            // CMT is 1-based; a malformed `CMT=0` must not silently dose compartment
-            // 0 (the datareader rejects it upstream) (#449 review #8).
-            if d.cmt >= 1 {
-                let cmt_idx = d.cmt - 1;
+            // CMT is 1-based, and `CMT=0` is NONMEM's *default dose compartment*, which
+            // resolves to state index 0 on both engines (#899). The `d.cmt >= 1` skip this
+            // replaces rested on the datareader rejecting `CMT=0` upstream (#449 review #8);
+            // it does not — a missing `CMT` column defaults to 1, but an explicitly written
+            // `CMT=0` reaches here unchanged, and was silently dropped from the gradient.
+            {
+                let cmt_idx = d.cmt_idx();
                 if cmt_idx < n_states {
-                    if has_input_rate && input_rate_consumes_cmt(ode, d.cmt) {
+                    if has_input_rate && input_rate_consumes_cmt(ode, d.cmt_raw()) {
                         // The dose feeds a built-in absorption forcing (`R_in`), not a
                         // bolus (#430) — its mass flows in continuously via
                         // `add_prepared_input_rate_forcing` in the RHS above, not as an
@@ -5123,8 +5254,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // matching rate-off carrying the same `lag_route` jet at `K_ZO_END` (#859 Slice 2).
             let (dose_idx, fi) = route_onsets[idx];
             let d = &subject.doses[dose_idx];
-            if d.cmt >= 1 && d.cmt - 1 < n_states {
-                let cmt_idx = d.cmt - 1;
+            // `saturating_sub`: `CMT=0` is the default dose compartment, state index 0 (#899).
+            // The former `d.cmt >= 1` gate dropped this onset jet for such a dose, which is a
+            // *wrong gradient* rather than a visibly zero value.
+            let cmt_idx = d.cmt_idx();
+            if cmt_idx < n_states {
                 let f = &ode.input_rate[fi];
                 // #880: read the onset kernel (`ka`/shape via `prep`), pathway `frac`, and the
                 // post-side Jacobian from the POST-ARRIVAL segment snapshot — the record ending
@@ -5271,12 +5405,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // #530: a modeled-duration dose's window end `t+dur` moves with `D` (the `dtinf`
             // jet below carries `∂/∂D`); a modeled-rate dose is already `is_rate_defined`.
             let is_modeled = modeled_at(idx).is_some();
+            // `saturating_sub`: `CMT=0` is the default dose compartment, state index 0 (#899).
+            // The former `d.cmt >= 1` gate dropped this saltation term for such a dose — again
+            // a wrong gradient rather than a visibly zero value.
             if (has_lagtime || is_rate_defined || is_modeled)
                 && d.time + lag_val(idx) >= reset_floor
-                && d.cmt >= 1
-                && d.cmt - 1 < n_states
+                && d.cmt_idx() < n_states
             {
-                let cmt = d.cmt - 1;
+                let cmt = d.cmt_idx();
                 let dlag = if has_lagtime {
                     jet_only(pk_at_dose[idx][dose_lag_slot[idx]])
                 } else {
@@ -5637,7 +5773,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 let (f, dur) = zero_order_forcing_for_dose(ode, d, params_dual)?;
                 let frac = f.frac::<T>(params_dual);
                 let rate = dose_f_bio[k] * T::from_f64(d.amt) * frac / dur;
-                Some((d.cmt.saturating_sub(1), rate, d.time, dur))
+                Some((d.cmt_idx(), rate, d.time, dur))
             })
             .collect()
     } else {
@@ -5731,18 +5867,20 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             reset_floor = t_start;
         }
 
-        // Apply bolus doses (non-infusions) at t_start: u[cmt] += F·amt. CMT is 1-based;
-        // a malformed `CMT=0` must not silently dose compartment 0 (#449 #8). A compartment
-        // fed by a built-in absorption input rate is skipped here — the dose feeds R_in
-        // (the forcing in the RHS below), not a bolus (#430). `F` is per dose compartment
-        // via `dose_f_bio[k]` (#486).
+        // Apply bolus doses (non-infusions) at t_start: u[cmt] += F·amt. CMT is 1-based, and
+        // `CMT=0` is NONMEM's default dose compartment — state index 0 — on both engines
+        // (#899). The `dose.cmt >= 1` skip this replaces rested on the datareader rejecting
+        // `CMT=0` upstream (#449 #8); it does not, so the analytic gradient saw an *undosed*
+        // subject while production dosed it — `f = 0` against a production `PRED` of ~7.8 on
+        // the 2-cpt parity fixture. A compartment fed by a built-in absorption input rate is
+        // skipped here — the dose feeds R_in (the forcing in the RHS below), not a bolus
+        // (#430). `F` is per dose compartment via `dose_f_bio[k]` (#486).
         for (k, dose) in subject.doses.iter().enumerate() {
             if !dose.is_infusion()
                 && (dose.time - t_start).abs() < 1e-12
-                && dose.cmt >= 1
-                && !input_rate_consumes_cmt(ode, dose.cmt)
+                && !input_rate_consumes_cmt(ode, dose.cmt_raw())
             {
-                let cmt_idx = dose.cmt - 1;
+                let cmt_idx = dose.cmt_idx();
                 if cmt_idx < n_states {
                     u[cmt_idx] = u[cmt_idx] + dose_f_bio[k] * T::from_f64(dose.amt);
                 }
@@ -5831,11 +5969,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 .doses
                 .iter()
                 .enumerate()
-                .filter(|(_, d)| d.is_infusion() && d.cmt >= 1)
+                .filter(|(_, d)| d.is_infusion() && d.cmt_raw() >= 1)
                 .filter(|(_, d)| {
                     infusion_spans_segment(d.time, d.duration, t_start, t_end, reset_floor)
                 })
-                .map(|(k, d)| (d.cmt.saturating_sub(1), dose_f_bio[k] * T::from_f64(d.rate)))
+                .map(|(k, d)| (d.cmt_idx(), dose_f_bio[k] * T::from_f64(d.rate)))
                 .collect()
         };
 

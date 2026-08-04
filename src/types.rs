@@ -91,7 +91,14 @@ pub(crate) fn clamp_above_floor(x: f64, floor: f64) -> f64 {
 pub struct DoseEvent {
     pub time: f64,
     pub amt: f64,
-    pub cmt: usize,
+    /// 1-based target compartment as authored (`CMT`), with `CMT=0` meaning
+    /// NONMEM's *default dose compartment* (compartment 1). **Private on purpose**
+    /// (#912): read it through [`Self::cmt_idx`] (0-based state index),
+    /// [`Self::cmt_1based`] (1-based compartment, `0`→`1`), or [`Self::cmt_raw`]
+    /// (the literal authored value). Keeping the field private is what makes the
+    /// recurring `cmt - 1` underflow bug (#899) unrepresentable at the call site —
+    /// a bare `- 1` cannot be written against it.
+    cmt: usize,
     pub rate: f64,
     pub duration: f64,
     pub ss: bool,
@@ -232,6 +239,50 @@ impl DoseEvent {
         self.rate > 0.0 || !self.is_fixed()
     }
 
+    /// 0-based state-vector index for this dose's target compartment.
+    ///
+    /// `CMT` is 1-based, and `CMT=0` is NONMEM's *default dose compartment* —
+    /// compartment 1 — so both `CMT=0` and `CMT=1` map to index `0` (#899, #912).
+    /// This is the single named home for the `cmt → state index` conversion:
+    /// before it, ~a dozen sites open-coded `cmt - 1` (which underflows on
+    /// `CMT=0`), `cmt.saturating_sub(1)`, or `if cmt >= 1 { cmt - 1 }` (which
+    /// silently drops `CMT=0`), and they disagreed — the four-behaviour bug #899
+    /// set out to remove. Index a state vector, or match a 0-based
+    /// `InputRateForcing::cmt`, through this — never a bare `- 1`.
+    #[inline]
+    pub fn cmt_idx(&self) -> usize {
+        self.cmt.saturating_sub(1)
+    }
+
+    /// 1-based target compartment with `CMT=0` resolved to compartment 1 (#899).
+    ///
+    /// The 1-based complement of [`Self::cmt_idx`], for comparing against a
+    /// 1-based compartment number or a set of them (`f.cmt + 1`, `ALAG{n}`'s
+    /// index). `CMT=0` and `CMT=1` both return `1`. Use this — not the raw
+    /// `self.cmt` — whenever a `CMT=0` dose must be treated as compartment 1,
+    /// otherwise the default dose compartment silently misses the lookup.
+    #[inline]
+    pub fn cmt_1based(&self) -> usize {
+        self.cmt.max(1)
+    }
+
+    /// The literal authored `CMT`, `0` included — the escape hatch for the few
+    /// sites that need the raw value rather than a resolved index: detecting a
+    /// `CMT=0` dose (`d.cmt_raw() == 0`), echoing it in a diagnostic, or passing
+    /// it to a callee that performs its own `0`→`1` mapping (e.g.
+    /// [`DoseAttrMap::indexed_slot`], which does `cmt.max(1)` internally). Prefer
+    /// [`Self::cmt_idx`] or [`Self::cmt_1based`]; reach for this only when the
+    /// *unresolved* value is what you actually mean.
+    ///
+    /// `pub(crate)` on purpose (#912 review): the raw value is the one that can be
+    /// mis-decremented (`cmt_raw() - 1` re-opens the underflow the private field
+    /// closes), so it is kept off the public surface where adversarial review does
+    /// not reach. The public read API is the two *resolved* accessors above.
+    #[inline]
+    pub(crate) fn cmt_raw(&self) -> usize {
+        self.cmt
+    }
+
     /// True when this dose's `rate`/`duration` are concrete (data-driven), i.e.
     /// [`RateMode::Fixed`] — either an ordinary dose or one already passed through
     /// [`Self::resolve_rate`]. False for a still-modeled NONMEM coded `RATE`.
@@ -280,6 +331,23 @@ impl DoseEvent {
         DoseEvent {
             rate,
             duration,
+            ..self.clone()
+        }
+    }
+
+    /// A clone of this dose repositioned to the origin of a single steady-state
+    /// cycle: `time = 0`, with `ss`/`ii` cleared so the event-driven equilibration
+    /// walk replays it as an ordinary within-cycle dose. Preserves the
+    /// bioavailability-reshaped `(rate, duration)` this dose already carries —
+    /// unlike [`Self::new`], which would recompute `duration = amt/rate` and drop
+    /// `F` (#419). Lives here because it constructs a `DoseEvent` by functional
+    /// update, which the now-private `cmt` field forbids outside this
+    /// module (#912).
+    pub(crate) fn synthetic_cycle_dose(&self) -> DoseEvent {
+        DoseEvent {
+            time: 0.0,
+            ss: false,
+            ii: 0.0,
             ..self.clone()
         }
     }
@@ -468,8 +536,26 @@ impl DoseAttrMap {
 
     /// The PkParams slot holding `attr` for compartment `cmt`, if the model
     /// declared a compartment-indexed parameter for it.
+    ///
+    /// `cmt` is 1-based, and `CMT=0` — NONMEM's *default dose compartment* — is
+    /// compartment 1, so it resolves to the `{attr}1` entry (#899). Without the
+    /// `max(1)` a dose written `CMT=0` misses the indexed map and silently falls
+    /// back to the bare slot: on a model declaring `F1 = 0.6` and nothing else,
+    /// `PkParams::default()` leaves `PK_IDX_F` at **1.0**, so the dose would be
+    /// delivered at full amount with no error and no warning — the same silent
+    /// class #899 exists to remove, and the last *dose-application* site where a
+    /// `CMT=0` dose was silently mis-applied. (One validation gate lingered past
+    /// this: `check_absorption_closed_form_support` still *rejected* a `CMT=0`
+    /// dose on a closed-form absorption model as non-depot — a loud error, not a
+    /// silent mis-dose — corrected in the same spirit by the #913 review.)
+    ///
+    /// Analytical models are unaffected: per-compartment `F{cmt}`/`ALAG{cmt}` are
+    /// ODE-only (`model_parser`, which rejects an unbound `F{cmt}` on a `pk(...)`
+    /// model outright), so their `indexed` map holds only `D{cmt}`/`R{cmt}` — and
+    /// a `CMT=0` modeled-`RATE` dose is an infusion by `DoseEvent::is_infusion`,
+    /// which `check_dose_compartments` rejects on both engines.
     pub fn indexed_slot(&self, attr: DoseAttr, cmt: usize) -> Option<usize> {
-        self.indexed.get(&(attr, cmt)).copied()
+        self.indexed.get(&(attr, cmt.max(1))).copied()
     }
 
     /// Whether any compartment-indexed entry for `attr` is declared (e.g. `F1`/`F2`
@@ -1419,10 +1505,13 @@ impl PkModel {
     /// the **central** compartment for every model, plus the **peripheral**
     /// compartment(s) for the 2-/3-cpt IV models, and — since #400 — the oral
     /// **depot** (cmt 1), a zero-order release into the depot followed by
-    /// first-order `ka` absorption into central. Notably this still EXCLUDES oral
-    /// peripherals, which the closed forms cannot infuse into. A `D{cmt}` outside
-    /// this set is rejected at parse time rather than silently mis-routed (no-TV
-    /// path) or panicking (event-driven path).
+    /// first-order `ka` absorption into central, and — since #375 — the oral
+    /// models' **peripheral**(s) too (the oral propagators reuse the IV forced
+    /// response; nothing flows back into the depot). That makes the set
+    /// `1..=n_states` for all six walk-supported models; transit/IG stay `&[]`
+    /// (they have no walk, and reroute an infusion to their ODE twin). A
+    /// `D{cmt}` outside this set is rejected at parse time rather than silently
+    /// mis-routed (no-TV path) or panicking (event-driven path).
     pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
         self.topology().infusable_compartments()
     }
@@ -2173,9 +2262,26 @@ pub enum ObsRecord {
     /// Discrete-state observation: an integer category or Markov state index.
     /// Serves binary/ordinal (Track C) and DTMM/CTMM state observations
     /// (Track D); the CMT's declared endpoint disambiguates the meaning.
-    DiscreteState { time: f64, state: usize, cmt: usize },
+    /// Discrete-state (binary / categorical / Markov) observation. `time` is the
+    /// **internal** occasion-shifted clock the engine and likelihood run on;
+    /// `raw_time` is the TIME the input CSV carried, and is what every reported row
+    /// (sdtab, `simulate()`, `predict_categorical`) must use so output joins back to
+    /// the input and to covtab. They differ only for reset-delimited occasions.
+    DiscreteState {
+        time: f64,
+        raw_time: f64,
+        state: usize,
+        cmt: usize,
+    },
     /// Non-negative integer count observation (Poisson / negative-binomial, Track C).
-    Count { time: f64, count: u32, cmt: usize },
+    /// Carries both clocks for the same reason [`Self::DiscreteState`] does — reporting
+    /// must use `raw_time` or the rows cannot be joined back to the input.
+    Count {
+        time: f64,
+        raw_time: f64,
+        count: u32,
+        cmt: usize,
+    },
 }
 
 #[cfg(feature = "survival")]
@@ -2461,6 +2567,60 @@ impl SimOutcome {
     }
 }
 
+/// Prediction for one (subject, time, CMT) point — the predict-side analogue of
+/// [`SimOutcome`] (`plans/tte-survival-markov.md` §8.8.1).
+///
+/// A non-Gaussian endpoint's prediction is a **probability vector or a curve, never
+/// one scalar**, which is why the legacy [`crate::api::PredictionResult`] (`pred: f64`)
+/// cannot carry it. That struct is unchanged and still backs the Gaussian
+/// [`crate::predict`]; this enum backs the per-endpoint predictors
+/// ([`crate::api::predict_categorical`] today).
+///
+/// Only variants with a **live producer** are declared. The plan also sketches
+/// `Survival` and `Rate` arms; TTE prediction already ships as the richer
+/// [`crate::api::SurvivalPredictionResult`] (S/H/h + CIF + median/mean, more than a
+/// three-field variant would hold), and `Rate` waits on the Poisson/count slice —
+/// adding either before it can be produced would be an untestable dead arm.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Prediction {
+    /// Gaussian continuous prediction (the existing scalar path).
+    Continuous { pred: f64 },
+    /// Category probabilities `P(Y = k)`, indexed by the endpoint's own state
+    /// order. Binary uses `[1 − p, p]` so index == the observed 0/1 DV code.
+    /// CTMM occupancy `π(t)` reuses this variant (#820), indexed by generator
+    /// state; callers map back to DV codes through the endpoint's `state_codes`.
+    CatProbs { probs: Vec<f64> },
+}
+
+impl Prediction {
+    /// `P(Y = k)` for state index `k`, or `None` when this is not a categorical
+    /// prediction or `k` is out of range. Keeps callers from indexing `probs`
+    /// directly and panicking on a shape they did not check.
+    pub fn prob(&self, k: usize) -> Option<f64> {
+        match self {
+            Prediction::CatProbs { probs } => probs.get(k).copied(),
+            Prediction::Continuous { .. } => None,
+        }
+    }
+}
+
+/// A prediction attached to a specific endpoint CMT — the multi-endpoint analogue
+/// of [`crate::api::PredictionResult`], which has no CMT field because it predates
+/// per-CMT endpoints.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EndpointPredictionResult {
+    pub id: String,
+    /// CMT of the endpoint that produced this prediction.
+    pub cmt: usize,
+    /// Raw data TIME of the observation being predicted (matches sdtab / input).
+    pub time: f64,
+    /// Observed outcome at this record, when the dataset carries one — the 0/1 DV
+    /// for a binary endpoint. Paired here so a caller can form a residual without
+    /// re-joining against the input population.
+    pub observed: Option<f64>,
+    pub prediction: Prediction,
+}
+
 /// A compiled model ready for estimation
 pub struct CompiledModel {
     pub name: String,
@@ -2744,6 +2904,7 @@ struct TwinSolverOpts {
     reltol: f64,
     abstol: f64,
     max_steps: usize,
+    method: crate::ode::OdeMethod,
 }
 
 /// A lazily-built ODE representation of an analytical absorption model that carries one (a
@@ -2787,6 +2948,7 @@ impl AbsorptionOdeEquivalent {
                 ode.solver_opts.reltol = ov.reltol;
                 ode.solver_opts.abstol = ov.abstol;
                 ode.solver_opts.max_steps = ov.max_steps;
+                ode.solver_opts.method = ov.method;
             }
             Box::new(built)
         })
@@ -2801,6 +2963,7 @@ impl AbsorptionOdeEquivalent {
             reltol: opts.ode_reltol,
             abstol: opts.ode_abstol,
             max_steps: opts.ode_max_steps,
+            method: opts.ode_method,
         });
         if let Some(built) = self.built.get_mut() {
             // The twin is itself an ODE model, so this stamps its `ode_spec.solver_opts`; it
@@ -2938,6 +3101,7 @@ impl CompiledModel {
             ode.solver_opts.reltol = opts.ode_reltol;
             ode.solver_opts.abstol = opts.ode_abstol;
             ode.solver_opts.max_steps = opts.ode_max_steps;
+            ode.solver_opts.method = opts.ode_method;
         }
         // Also carry the call-time tolerances into the absorption ODE twin (#814). A
         // closed-form transit/IG primary is analytic — the block above is a no-op — but its
@@ -2954,14 +3118,23 @@ impl CompiledModel {
         self.diffusion_theta_start.is_some()
     }
 
-    /// True for the **closed-form, non-IOV LTBS** path — the only path that runs the
-    /// analytic `g = ln(f)` *inner* EBE gradient whose ~1e-9 provider-vs-predictor
-    /// gap makes the covariance step tolerance-sensitive (PR #665). ODE-LTBS shares
-    /// `solve_ode_g` with the objective (no gap) and LTBS + IOV routes the inner loop
-    /// to FD, so neither needs the tightened fit/covariance tolerances. Used by
-    /// [`FitOptions::effective_inner_tol`] / [`FitOptions::effective_cov_inner_tol`].
+    /// True for the **closed-form LTBS** path — the one that runs the analytic
+    /// `g = ln(f)` *inner* EBE gradient whose ~1e-9 provider-vs-predictor gap makes the
+    /// covariance step tolerance-sensitive (PR #665). ODE-LTBS shares `solve_ode_g` with
+    /// the objective (no gap), so it does not need the tightened fit/covariance
+    /// tolerances. Used by [`FitOptions::effective_inner_tol`] /
+    /// [`FitOptions::effective_cov_inner_tol`].
+    ///
+    /// **IOV is included as of #486.** The `n_kappa == 0` carve-out that used to sit here
+    /// was justified solely by LTBS × IOV routing its inner loop to FD — which
+    /// `analytic_inner_common_bail` no longer does, since `run_obs_iov_eta` now applies
+    /// the same `ln` jet over the stacked axes. A κ-carrying closed-form LTBS model
+    /// therefore runs the *same* analytic ln-jet inner gradient, carries the *same* gap,
+    /// and needs the same tolerances; leaving it out would have produced quietly inflated
+    /// standard errors with unchanged point estimates. This predicate must move with
+    /// `analytic_inner_common_bail`'s `log_transform` scope, not independently of it.
     pub fn uses_closed_form_ltbs_inner(&self) -> bool {
-        self.log_transform && self.ode_spec.is_none() && self.n_kappa == 0
+        self.log_transform && self.ode_spec.is_none()
     }
 
     /// Returns true when the model has a time-to-event (`[event_model]`)
@@ -3206,12 +3379,16 @@ impl CompiledModel {
             return false;
         };
         subject.doses.iter().any(|d| {
+            // Match the forcing 0-based and probe the lagtime 1-based so a `CMT=0` dose (the
+            // default dose compartment == compartment 1) is scoped like `CMT=1` (#899, #913 review)
+            // — otherwise a `CMT=0` SS dose into a zero-order / lagged absorption compartment
+            // slips this out-of-scope guard and is silently mis-served.
             d.ss && d.ii > 0.0
                 && ode.input_rate.iter().any(|f| {
-                    f.cmt + 1 == d.cmt
+                    f.cmt == d.cmt_idx()
                         && (f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
                             || f.lag_slot.is_some()
-                            || self.has_lagtime_on_cmt(d.cmt))
+                            || self.has_lagtime_on_cmt(d.cmt_1based()))
                 })
         })
     }
@@ -3504,6 +3681,33 @@ impl std::fmt::Debug for CompiledModel {
     }
 }
 
+/// One discrete-endpoint (binary) observation's post-fit diagnostics — the
+/// non-Gaussian analogue of a row of [`SubjectResult`]'s parallel `ipred`/`iwres`
+/// vectors (`plans/tte-survival-markov.md` §8.8.5).
+///
+/// Kept as its own row type rather than appended to those vectors because a discrete
+/// record is not on the Gaussian observation grid: it has no residual variance, no
+/// CWRES, and its `ipred` is a probability rather than a concentration. Every column
+/// the Gaussian rows carry but a discrete row cannot define is emitted as an empty
+/// sdtab cell.
+#[cfg(feature = "survival")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct DiscreteObsDiagnostic {
+    /// CMT of the endpoint that produced this record.
+    pub cmt: usize,
+    /// Raw data TIME (joins back to the input CSV).
+    pub time: f64,
+    /// Observed outcome (the 0/1 DV for a binary endpoint).
+    pub dv: f64,
+    /// Population prediction `P(Y = 1)` at η = 0.
+    pub pred: f64,
+    /// Individual prediction `P(Y = 1)` at the subject's EBE η.
+    pub ipred: f64,
+    /// Standardized (Pearson) residual `(y − p)/√(p(1−p))` at the EBE. NaN at a
+    /// degenerate `p ∈ {0,1}`, where it is undefined.
+    pub iwres: f64,
+}
+
 /// Per-subject estimation results
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SubjectResult {
@@ -3544,6 +3748,12 @@ pub struct SubjectResult {
     /// NaN in `[derived]`; see W_DERIVED_CMT_IOV_UNSUPPORTED / W_DERIVED_CMT_TV_ANALYTICAL).
     /// Scaling (`apply_scaling`, Form A/C) is never applied here — only `ipred` is scaled.
     pub compartment_states: Vec<Vec<f64>>,
+    /// Post-fit diagnostics for this subject's **discrete** (binary) endpoint records,
+    /// one entry per record (§8.8.5). Empty for models with no discrete endpoint, which
+    /// keeps every existing `FitResult` serialization byte-identical.
+    #[cfg(feature = "survival")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discrete_rows: Vec<DiscreteObsDiagnostic>,
 }
 
 /// Per-subject conditional distribution of the random effects, produced by the
@@ -4520,6 +4730,22 @@ pub struct FitResult {
     /// `.fitrx` / ferx-r format change.
     #[serde(skip)]
     pub packed_estimate: Option<Vec<f64>>,
+    /// True when this result was reconstructed from a `.fitrx` checkpoint by
+    /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
+    ///
+    /// The checkpoint format does not round-trip per-record discrete-endpoint
+    /// diagnostics (`SubjectResult::discrete_rows`), so a restored fit of a binary /
+    /// categorical model has none. This flag lets [`crate::io::output::write_sdtab_csv`]
+    /// refuse a restored fit whose model declares a binary endpoint (rows genuinely
+    /// dropped) while still writing a live fit. It must be paired with the model's
+    /// declared endpoints — parsed from [`Self::model_text`] — because the *reconstructed
+    /// population* is not a usable signal: `load_fit` re-reads the data with default
+    /// (Gaussian) routing, so binary DVs come back as continuous observations and no
+    /// [`ObsRecord::DiscreteState`] survives. Runtime-only: `#[serde(skip)]`, so no
+    /// `.fitrx` / JSON / ferx-r format change, and a live fit always carries `false`.
+    /// Removed once diagnostics round-trip (#911).
+    #[serde(skip)]
+    pub restored_from_checkpoint: bool,
 }
 
 impl FitResult {
@@ -4675,14 +4901,17 @@ pub struct FitOptions {
     /// e.g. saturable protein binding, which admits a high-V/low-conc and a
     /// low-V/high-conc basin for the same data — can trap a single warm-started
     /// BFGS in the wrong basin, inflating that subject's objective. When `> 0`,
-    /// subjects on the event-driven path (system resets / time-varying
-    /// covariates, where this shows up) re-solve the EBE **on a cold start** from
-    /// `inner_restarts` Ω-scaled alternate seeds per random effect and keep the
-    /// lowest-objective mode; the outer loop's warm start then carries the chosen
-    /// basin forward, so the scan runs once per subject per fit (≈0 overhead).
-    /// Unimodal subjects are unaffected — an alternate seed that reconverges to
-    /// the same mode is not accepted — so `0` and the untriggered subjects stay
-    /// bit-identical.
+    /// a subject re-solves the EBE **on a cold start** from `inner_restarts`
+    /// Ω-scaled alternate seeds and keeps the lowest-objective mode; the outer
+    /// loop's warm start then carries the chosen basin forward, so the scan runs
+    /// once per subject per fit (≈0 overhead). Subjects on the event-driven path
+    /// (system resets / time-varying covariates) re-seed every random effect;
+    /// every other subject is probed per coordinate for a weakly-identified
+    /// (flat individual objective / high per-subject shrinkage) random effect and
+    /// re-seeds only those — the #891 case, where a distant lower posterior mode
+    /// hides from a single descent. Unimodal, well-identified subjects are
+    /// unaffected — an alternate seed that reconverges to the same mode is not
+    /// accepted — so `0` and the untriggered subjects stay bit-identical.
     pub inner_restarts: usize,
     /// Inner EBE-reconvergence tolerance used **only by the covariance step**
     /// (`[fit_options] cov_inner_tol`), decoupled from the fit's `inner_tol`. The
@@ -4715,6 +4944,13 @@ pub struct FitOptions {
     /// `ode_reltol` exhausts the step budget on stiff multi-compartment
     /// segments. See [`FitOptions::ode_reltol`].
     pub ode_max_steps: usize,
+    /// ODE stepper (`[fit_options] ode_method`). Default
+    /// [`Rk45`](crate::ode::OdeMethod::Rk45) — the explicit Dormand-Prince method every
+    /// existing fit uses. The alternatives (`rosenbrock23`, `rodas4`, `rodas5p`) are
+    /// linearly-implicit stiff methods; see [`crate::ode::OdeMethod`] for when they pay and
+    /// which integration paths honour them. Copied onto `OdeSpec::solver_opts` via
+    /// [`CompiledModel::sync_ode_solver_opts`], alongside the tolerances.
+    pub ode_method: crate::ode::OdeMethod,
     pub run_covariance_step: bool,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
@@ -4722,6 +4958,13 @@ pub struct FitOptions {
     /// automatically (up to 8×) if a diagonal stencil comes back non-finite, so
     /// manual tuning is rarely needed for overflow; decrease (e.g. `1e-3`) for
     /// smoother OFV surfaces where FD noise is the main concern.
+    /// When `true` (the default) and the model is in analytic-covariance scope, the
+    /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
+    /// (#436), assembled from third-order sensitivities instead of second-differencing the
+    /// reconverged objective. Out-of-scope models fall back to the finite-difference stencil
+    /// regardless — it is correct for everything — so this key only ever chooses between two
+    /// routes to the same quantity. Set `false` to force finite differences.
+    pub analytic_cov_hessian: bool,
     pub fd_hessian_step: f64,
     /// What to do when the FD Hessian is non-positive-definite.
     /// Default [`CovarianceFallback::None`] leaves the covariance step as failed.
@@ -5217,10 +5460,12 @@ impl Default for FitOptions {
             ode_reltol: 1e-4,
             ode_abstol: 1e-6,
             ode_max_steps: 10_000,
+            ode_method: crate::ode::OdeMethod::Rk45,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
+            analytic_cov_hessian: true,
             interaction: true,
             verbose: true,
             // `Auto` resolves per model (see `Optimizer::resolve_auto`): the
@@ -5642,23 +5887,24 @@ impl FitOptions {
         }
     }
 
-    /// Covariance-step inner EBE-reconvergence tolerance that **closed-form,
-    /// non-IOV LTBS** models tighten to when `cov_inner_tol` is unset. The
+    /// Covariance-step inner EBE-reconvergence tolerance that **closed-form LTBS**
+    /// models tighten to when `cov_inner_tol` is unset. The
     /// covariance R-matrix reconverges EBEs under the `g = ln(f)` wrap, which
     /// amplifies a loosely-converged EBE into the Hessian and inflates the standard
     /// errors (empirically ~65% on warfarin θ SEs at the `1e-5` default; correct at
-    /// `≤ 1e-8`). This is applied **only for the closed-form, non-IOV LTBS** path
-    /// that actually runs the analytic `ln(f)` inner gradient: blanket-tightening the
-    /// covariance step over-converges some ill-conditioned inner Hessians (e.g. IOV
-    /// block-Ω) into an indefinite covariance, and ODE-LTBS shares `solve_ode_g` so
-    /// it has no such gap. Set `cov_inner_tol` explicitly to opt any other model in
-    /// (e.g. the #654 M3 + IOV case).
+    /// `≤ 1e-8`). This is applied **only for the closed-form LTBS** path that actually
+    /// runs the analytic `ln(f)` inner gradient (including under IOV as of #486 — see
+    /// [`CompiledModel::uses_closed_form_ltbs_inner`]): blanket-tightening the covariance
+    /// step over-converges some ill-conditioned inner Hessians into an indefinite
+    /// covariance, and ODE-LTBS shares `solve_ode_g` so it has no such gap. Set
+    /// `cov_inner_tol` explicitly to opt any other model in (e.g. the #654 M3 + IOV case,
+    /// which is not LTBS).
     pub const LTBS_COV_INNER_TOL: f64 = 1e-8;
 
     /// Effective inner EBE-reconvergence tolerance for the covariance step: an
     /// explicit `cov_inner_tol` when set; otherwise the fit's `inner_tol`, tightened
     /// to at most [`LTBS_COV_INNER_TOL`](Self::LTBS_COV_INNER_TOL) only when
-    /// `ltbs_closed_form` (the closed-form, non-IOV LTBS path — see
+    /// `ltbs_closed_form` (the closed-form LTBS path, IOV included — see
     /// [`CompiledModel::uses_closed_form_ltbs_inner`]). Every other model keeps
     /// `inner_tol`, so its SEs are byte-identical.
     pub fn effective_cov_inner_tol(&self, ltbs_closed_form: bool) -> f64 {
@@ -5671,21 +5917,22 @@ impl FitOptions {
         })
     }
 
-    /// Ceiling the fit's inner EBE tolerance is tightened to for **closed-form,
-    /// non-IOV LTBS** models. That path's analytic `g = ln(f)` inner gradient makes
+    /// Ceiling the fit's inner EBE tolerance is tightened to for **closed-form LTBS**
+    /// models. That path's analytic `g = ln(f)` inner gradient makes
     /// the marginal surface slightly noisier (the ~1e-9 provider-vs-
     /// `compute_predictions` gap), so at the loose default the outer optimiser lands
     /// nondeterministically on flat Ω directions and the standard errors of
     /// weakly-identified variances become process-dependent. Converging the fit's
     /// inner loop to at least `1e-6` pins the flat directions; the covariance step
     /// then reconverges tighter still ([`effective_cov_inner_tol`](Self::effective_cov_inner_tol)).
-    /// ODE-LTBS (shares `solve_ode_g`, no gap) and LTBS + IOV (FD inner) do not need
-    /// this and are left at `inner_tol`.
+    /// ODE-LTBS (shares `solve_ode_g`, no gap) does not need this and is left at
+    /// `inner_tol`. LTBS + IOV *is* included as of #486, when its inner loop stopped
+    /// routing to FD.
     pub const LTBS_FIT_INNER_TOL: f64 = 1e-6;
 
     /// Effective **fit** inner EBE tolerance for this model: the fit's `inner_tol`,
     /// tightened to at most [`LTBS_FIT_INNER_TOL`](Self::LTBS_FIT_INNER_TOL) for the
-    /// closed-form, non-IOV LTBS path (`ltbs_closed_form`) **unless the user set
+    /// closed-form LTBS path (`ltbs_closed_form`, IOV included) **unless the user set
     /// `inner_tol` explicitly** — an explicit tolerance (e.g. the documented
     /// accuracy-for-speed `inner_tol = 1e-4`) is always honoured. A fit already
     /// tighter than the ceiling keeps its own value; every other model is unaffected.
@@ -5793,6 +6040,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "covariance",
         "covariance_method",
         "covariance_fallback",
+        "analytic_cov_hessian",
         "fd_hessian_step",
         "verbose",
         "sir",
@@ -5823,7 +6071,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "inits_from_nca",
         "frem_predictions",
         "frem_sigma",
-        // RK45 ODE-solver knobs: applied to the integrator at parse time via
+        // ODE-solver knobs: applied to the integrator at parse time via
         // `sync_ode_solver_opts` (gated on the model being an ODE model, not on
         // the estimation method), so they are framework-level — every method
         // that integrates an ODE model honours them. Listing them here keeps
@@ -5831,6 +6079,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "ode_reltol",
         "ode_abstol",
         "ode_max_steps",
+        "ode_method",
         // Checkpoint / restart (#755): the periodic resume-point writer is driven
         // by the fit runner independent of the estimation method, so these are
         // framework-level — every method honours them.

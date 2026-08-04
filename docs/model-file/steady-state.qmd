@@ -40,8 +40,8 @@ Every prediction path in ferx-core honours `SS=1`:
 | Path                                              | Where                                                                     | How                                                |
 | ------------------------------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------- |
 | Analytical (1-/2-/3-cpt, no TV covariates)        | `predict_concentration` in `src/pk/mod.rs`                                | Closed-form geometric-series                       |
-| Analytical (1-/2-/3-cpt, time-varying covariates) | `event_driven_predictions_with_schedule` in `src/pk/event_driven.rs`      | Numerical pulse expansion via the propagator       |
-| ODE (`[odes]`-block models)                       | `ode_predictions` / `ode_predictions_event_driven` in `src/ode/predictions.rs` | Numerical pulse expansion via the RK45 solver |
+| Analytical (1-/2-/3-cpt, time-varying covariates) | `event_driven_predictions_with_schedule` in `src/pk/event_driven.rs`      | Exact linear fixed point `(I − M)⁻¹·b`             |
+| ODE (`[odes]`-block models)                       | `ode_predictions` / `ode_predictions_event_driven` in `src/ode/predictions.rs` | Exact linear fixed point `(I − M)⁻¹·b`; nonlinear RHS falls back to numerical pulse expansion |
 
 Both kinds of paths start from the same underlying identity — the
 choice between them is a question of whether the geometric series has
@@ -64,55 +64,57 @@ formula plus one extra division per eigenvalue. For oral models when
 `KA ≈ λ` the closed form needs the L'Hopital limit; ferx handles that
 case automatically.
 
-### ODE path: brute-force pulse expansion
+### ODE path: exact fixed point, with a numerical fallback
 
-An `[odes]`-block model is an arbitrary user-defined RHS. There is no
-general eigenstructure to exploit — `dy/dt = f(y, p, t)` can be
-non-linear (Michaelis-Menten elimination), time-varying, or both, so
-no closed form exists for the steady-state state in general.
+An `[odes]`-block model is an arbitrary user-defined RHS. `dy/dt = f(y, p, t)`
+can be non-linear (Michaelis-Menten elimination), so no *general* closed form
+exists — but the common case is a **linear** disposition, and there the periodic
+steady state has the same exact fixed point the analytical event-driven path
+uses. `equilibrate_ss_state` (#914) therefore tries that first:
 
-Instead, ferx evaluates the geometric series *numerically* before the
-SS dose is applied. The algorithm in `equilibrate_ss_state` is exactly
-what its name says — brute-force pulse expansion:
+1. **Reset** the compartment state to zero. NONMEM `SS=1` semantics say
+   prior dynamics are discarded at the SS dose, so anything earlier in the
+   timeline is overwritten here.
+2. **Exact solve.** One dosing cycle of a linear disposition is an affine
+   map `u ↦ M·u + b`, so its periodic fixed point is `u_ss = (I − M)⁻¹·b`.
+   Two injected "one cycle from `u`" propagators build `M` (disposition
+   alone, over one `II`) and `b` (disposition **plus** the cycle's own
+   dose — an added bolus, or an active-infusion window followed by a quiet
+   window). This is `crate::dosing::periodic_ss_fixed_point_g`, shared with
+   the analytical walk (#908) and the built-in-absorption branch (#835), and
+   costs a handful of one-cycle integrations plus one `n×n` solve — no
+   truncation, so a slow disposition is exact rather than tens of percent low.
+3. **Nonlinear fallback.** If the RHS is genuinely nonlinear the affine
+   self-check declines, and ferx falls back to expanding the pulse train
+   numerically — loop up to `N = 50` cycles of `(apply the dose; integrate
+   the rest of the cycle)` — with a non-convergence warning if the cap is
+   hit without settling (see below).
+4. Either way the compartment state equals the "just-before-the-next-pulse"
+   steady state; normal-timeline handling resumes and the SS dose's own pulse
+   is applied through the standard bolus/infusion path, taking the state from
+   pre-pulse to at-pulse SS.
 
-1. **Reset** the compartment state to zero. NONMEM `SS=1` semantics
-   say prior dynamics are discarded at the SS dose, so anything that
-   happened earlier in the timeline is overwritten here.
-2. **Loop `N = 50` cycles**:
-   - **Apply the dose** for one cycle:
-     - For a bolus, add `AMT` (with bioavailability `F1` applied) to
-       the dose's compartment.
-     - For an infusion, integrate for `T_inf = AMT/RATE` with a
-       wrapped RHS that adds `+RATE` to the dose's compartment.
-   - **Propagate** the ODE forward by the remainder of the cycle (`II`
-     for boluses, `II - T_inf` for infusions). Same RK45 solver as the
-     normal timeline, same tolerances, same wrapped-infusion mechanics.
-3. After the loop, the compartment state equals the "just-before-the-
-   next-pulse" steady-state amount.
-4. Normal-timeline handling resumes — the SS dose's own pulse is
-   applied through the standard bolus/infusion code path, taking the
-   state from pre-pulse to at-pulse SS.
-
-The result is mathematically equivalent to the analytical closed form
-in the linear case (and is unit-tested against it — see
-`ode_ss_iv_bolus_matches_analytical_ss` in `src/ode/predictions.rs`
-for the 1-cpt cross-check). For non-linear PK, the same scheme still
-produces a self-consistent steady-state state under the model's own
-dynamics; just be aware that for systems that *don't* have a true
-periodic steady state (e.g. zero-order elimination at saturation),
-the iteration may not converge to anything meaningful and SS=1 isn't
-really applicable.
+The exact solve is unit-tested against the analytical closed form (see
+`ss_linear_disposition_uses_exact_fixed_point` and
+`ode_ss_iv_bolus_matches_analytical_ss` in `src/ode/predictions.rs`) and its
+dual sensitivities against finite differences
+(`ode_provider_ss_linear_bolus_uses_exact_solve`). For a non-linear disposition
+that *doesn't* have a true periodic steady state (e.g. dosing a saturable
+Michaelis-Menten elimination above its capacity), the fallback iteration cannot
+converge and SS=1 isn't really applicable — the warning below fires.
 
 ### Analytic gradient during `fit()`
 
 During estimation, SS=1 `[odes]` dosing gets an **exact analytic FOCE/FOCEI gradient**
-(outer θ/Ω/σ and inner EBE), not finite differences. Because the `N`-cycle expansion above
-is *finite and explicit*, running it over the dual type propagates `∂(steady state)/∂(θ,η)`
-directly — `equilibrate_ss_state_g` is the dual counterpart of `equilibrate_ss_state` and
-the analytic trough is the exact derivative of the predictor's trough (result-neutral,
-validated against the production predictor + finite differences, including the 2nd-order
-Hessian blocks used for covariance/SEs). Both SS **bolus** and SS **infusion** are covered,
-and SS composes with time-varying covariates, IOV, and EVID 3/4 resets.
+(outer θ/Ω/σ and inner EBE), not finite differences. `equilibrate_ss_state_g` is the dual
+counterpart of `equilibrate_ss_state`: on the linear exact solve the derivative
+`∂(steady state)/∂(θ,η)` falls out of the `(I − M)⁻¹·b` linear solve directly (the
+implicit-function derivative, with no hand-assembled `dM`/`db`), and on the nonlinear fallback
+the *finite and explicit* pulse train propagates it cycle by cycle. Either way the analytic
+trough is the exact derivative of the predictor's trough (result-neutral, validated against
+the production predictor + finite differences, including the 2nd-order Hessian blocks used for
+covariance/SEs). Both SS **bolus** and SS **infusion** are covered, and SS composes with
+time-varying covariates, IOV, and EVID 3/4 resets.
 
 This also covers the dosing forms below (all closed by #486):
 
@@ -165,35 +167,89 @@ already-committed NONMEM PRED-only anchor for SS + `ALAG1` — see
 [Estimated lagtime](lagtime.qmd) — plus the local FD-vs-production and
 Hessian-vs-FD-of-gradient test suite.
 
-### Why `N = 50`?
+### Analytical event-driven path: the exact linear fixed point
 
-The truncation tail after `N` cycles is bounded by `exp(-N·λ·II)` for
-each disposition rate `λ`. For typical PK
-(`λ·II ≈ 2`, i.e. ~3 half-lives per dosing interval),
-`exp(-100) ≈ 4e-44` — well below any meaningful precision. For very
-slow PK (`λ·II = 0.1`, ~14 half-lives total over the 50 cycles),
-`exp(-5) ≈ 7e-3` — the slowest realistic case. ferx uses fixed
-`N = 50` rather than adaptive convergence checking because (a) the
-bound is conservative and (b) skipping the convergence check keeps
-the hot path branch-free.
+A subject with a time-varying covariate, an `EVID=3/4` reset, IOV, or a dose into a
+non-default compartment cannot be served by dose superposition, so it is routed to
+the event-driven walk instead. That walk still faces an `SS=1` dose, but it does not
+have the superposition path's closed form to hand — it carries a compartment state
+forward through events.
 
-If you need tighter accuracy for an unusually slow PK, the constant has a single
-definition: `SS_EQUILIBRATION_CYCLES` in `src/dosing.rs` (the analytical
-event-driven and ODE paths both use it).
+It solves the steady state exactly all the same. One dosing cycle of a linear
+disposition is an affine map on the state vector,
+
+```
+u ↦ M·u + b
+```
+
+where `M` is the one-cycle propagator (the monodromy) and `b` the cycle's own dose
+response. The periodic steady state is its fixed point:
+
+```
+u_ss = (I − M)⁻¹·b
+```
+
+Both `M` (column by column, from the homogeneous response of each unit basis state)
+and `b` (the forced response from a zero state) come from one cycle of the *same*
+propagators the walk already uses, so no new closed form is introduced. The analytical
+models' disposition is always linear, so this always applies.
+
+The result agrees with the dose-superposition closed forms to f64 precision —
+`≤ 1e-12` relative on every supported model, bit-identical on several — rather than
+to a tolerance. The two representations of the same dataset therefore agree by
+construction.
+
+::: {.callout-note}
+## Through v0.2.0 this path truncated
+
+Until #908 the event-driven walk expanded a **pulse train** capped at 50 cycles, as the
+ODE path did until #914, leaving a residual of `exp(-50·λ_slow·II)`. That is negligible for
+typical PK (`λ_slow·II ≈ 2` gives `exp(-100) ≈ 4e-44`) but not always: a
+one-compartment oral model with `CL = 0.1`, `V = 50` (t½ ≈ 350 h) at `II = 12` has
+`λ_slow·II ≈ 0.024` and was **30 %** below the true steady state. Deep peripheral
+*amounts* were worse — over 50 % on slow 2- and 3-compartment models. Since routing is
+per subject, adding one unrelated dose row could move a prediction by that much. If you
+have results from an earlier version involving `SS=1` on any of those paths, they are
+worth regenerating.
+:::
+
+The pulse train survives here only for a **singular** `I − M` — a zero disposition
+rate constant, i.e. a compartment that never empties (`CL = 0`). No periodic steady
+state exists then, and the capped loop now raises a non-convergence warning rather
+than returning a silently truncated state.
+
+### When does the ODE path still expand the pulse train?
+
+Only for a **nonlinear** disposition. A linear one — the overwhelmingly common case —
+takes the exact `(I − M)⁻¹·b` fixed point (#914) and never iterates; a saturable
+(Michaelis-Menten) or otherwise nonlinear RHS fails the affine self-check and falls back
+to the pulse train, exactly as the built-in-absorption branch falls back to an
+Anderson-accelerated iteration on a nonlinear disposition (#835/#867).
+
+On that fallback the truncation tail after `N` cycles is `≈ exp(-N·λ_slow·II)`, where
+`λ_slow` is the **slowest** effective disposition rate constant — the governing quantity is
+`λ_slow·II`, not the number of compartments. ferx loops up to `N = 50` cycles with an early
+stop once the cycle-to-cycle change falls below `SS_EQUILIBRATION_TOL` (`1e-12` relative,
+`src/dosing.rs`, #519/#532). If the cap is reached without converging — a slowly-accumulating
+nonlinear disposition, or one dosed above its elimination capacity so no periodic steady state
+exists at all — the returned trough may be materially below the true SS, so ferx surfaces a
+**non-convergence warning** in `FitResult.warnings` / `SimulationOutput.warnings` rather than
+returning a silently truncated state (#867, extended to the ordinary bolus/infusion path by
+#914). If you need tighter accuracy for an unusually slow *nonlinear* PK, the cap has a single
+definition: `SS_EQUILIBRATION_CYCLES` in `src/dosing.rs`.
 
 ### Cost comparison
 
 | Path                | Per SS-dose cost                          | Notes |
 | ------------------- | ----------------------------------------- | ----- |
 | Analytical closed   | ~1 single-dose evaluation                 | Effectively free |
-| Event-driven pulse  | ~50× analytical propagator calls          | Still cheap; analytical propagator is fast |
-| ODE pulse           | ~50× RK45 segment integrations            | Real cost — RK45 is the dominant per-prediction cost for ODE models, so SS doses cost ~50× more than non-SS doses |
+| Event-driven exact  | `n + 4` propagator calls + one `n×n` solve (`n ≤ 4`) | Exact, and cheaper than the 50-cycle train it replaced |
+| ODE exact (linear)  | `~n + 2` RK45 one-cycle integrations + one `n×n` solve | Exact (#914); replaces the ~50× pulse train for the common linear disposition |
+| ODE pulse (nonlinear fallback) | ≤ 50× RK45 segment integrations | Only when the RHS is nonlinear; early-stops for fast PK, warns if the cap is hit |
 
 SS doses are typically rare (one per subject at the start of a
 maintenance regimen), so the absolute overhead per fit iteration is
-modest even for ODE models. If a benchmark shows SS equilibration as
-a hot spot, an adaptive `N` (loop until `||state - prev|| / ||state||
-< tol`) is the obvious follow-up — it would early-exit on fast PK.
+modest even for ODE models.
 
 ## DSL example
 

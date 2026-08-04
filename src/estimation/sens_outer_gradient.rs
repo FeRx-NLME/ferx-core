@@ -372,22 +372,22 @@ fn censored_sigma_m_terms(
 
 /// Shared per-subject quantities the θ/Ω/Σ gradient blocks all consume, built
 /// once from the provider sensitivities at the EBE.
-struct Prep {
-    n_eta: usize,
-    n_obs: usize,
-    et: Vec<ErrTerms>,
+pub(crate) struct Prep {
+    pub(crate) n_eta: usize,
+    pub(crate) n_obs: usize,
+    pub(crate) et: Vec<ErrTerms>,
     /// `Ω⁻¹` (copied so blocks don't borrow `params`).
-    omega_inv: DMatrix<f64>,
+    pub(crate) omega_inv: DMatrix<f64>,
     /// `H̃⁻¹` (first-order FOCEI Hessian inverse).
-    htilde_inv: DMatrix<f64>,
+    pub(crate) htilde_inv: DMatrix<f64>,
     /// `H⁻¹` for the **true** inner Hessian `H = ∂²lᵢ/∂η²` (Eq. 46 denominator).
-    h_inner_inv: DMatrix<f64>,
+    pub(crate) h_inner_inv: DMatrix<f64>,
     /// `wⱼ = H̃⁻¹aⱼ`.
-    w: Vec<DVector<f64>>,
+    pub(crate) w: Vec<DVector<f64>>,
     /// `qⱼ = aⱼᵀ H̃⁻¹ aⱼ`.
-    q: Vec<f64>,
+    pub(crate) q: Vec<f64>,
     /// Exact `∂log|H̃|/∂η` (a-fixed part + `∂²f/∂η²` curvature).
-    g_eta: Vec<f64>,
+    pub(crate) g_eta: Vec<f64>,
     // Per-observation M3-censored flag lives on `et[j].censored` (single source).
     // Censored rows enter `H` (true inner Hessian), the data gradient, AND `H̃`/`log|H̃|`
     // at FOCEI order (`p = g2`, `β = dg2/df`; residual-eta `C·z`/`C·m`) — consistently with
@@ -397,31 +397,31 @@ struct Prep {
     /// the variance terms `r`/`d` in `et` already carry that factor, and the
     /// `η_ruv` row/col of `H̃`/`H` plus its `log|H̃|` derivatives are assembled
     /// from the per-observation `g_ruv`/`gp_ruv` scalars below.
-    ruv: Option<usize>,
+    pub(crate) ruv: Option<usize>,
     /// `gⱼ = (∂Rⱼ/∂fⱼ)/Rⱼ = dⱼ/Rⱼ` per observation (scale-invariant) — the
     /// residual-eta `c̃` cross coupling `H̃[ruv,l] = Σⱼ gⱼ a_{jl}`. Empty when no
     /// `ruv`.
-    g_ruv: Vec<f64>,
+    pub(crate) g_ruv: Vec<f64>,
     /// `g'ⱼ = ∂gⱼ/∂fⱼ = d2ⱼ/Rⱼ − (dⱼ/Rⱼ)²` per observation (scale-invariant) — the
     /// `f`-derivative of the `c̃` coupling, needed for `∂log|H̃|/∂θ` and `/∂η`.
     /// Empty when no `ruv`.
-    gp_ruv: Vec<f64>,
+    pub(crate) gp_ruv: Vec<f64>,
     /// `exp(2·η̂_ruv)` (1.0 when no `ruv`) — the residual-variance scale, used to
     /// lift the σ-block's central-FD `∂R/∂σ` / `∂d/∂σ` (taken on the *unscaled*
     /// error functions) onto the scaled variance.
-    ruv_scale: f64,
+    pub(crate) ruv_scale: f64,
     /// Total `f`-derivatives (through `v(f)`) of the censored residual-eta `H̃`
     /// coefficients `C·z` / `C·m` per observation (0 on quantified rows). Computed
     /// once in `prepare` (FD of the kernel) and reused by `theta_block`'s censored
     /// residual-eta `log|H̃|` θ-derivative. Empty when no `ruv`.
-    cens_dcz_df: Vec<f64>,
-    cens_dcm_df: Vec<f64>,
+    pub(crate) cens_dcz_df: Vec<f64>,
+    pub(crate) cens_dcm_df: Vec<f64>,
     /// Custom / time-varying residual-magnitude (#484/#576) `[obs][sigma-slot]`
     /// multiplier matrix, or `None` when no magnitude is active. Computed once
     /// here; `sigma_block` reuses it instead of recomputing `model.ruv_obs_mult`
     /// (which re-walks every magnitude expression per observation) a second time
     /// for the same subject/θ (#486 review).
-    mult: Option<Vec<Vec<f64>>>,
+    pub(crate) mult: Option<Vec<Vec<f64>>>,
 }
 
 /// Residual-eta coupling `κⱼ = ∂(1−ε²/R)/∂f = 2ε/R + ε²d/R²` — the `f`-derivative
@@ -568,7 +568,7 @@ fn corr_residual_rd_at_sigma(
     (rv, dv)
 }
 
-fn prepare(
+pub(crate) fn prepare(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
@@ -3122,7 +3122,7 @@ pub fn predict_warm_etas(
 /// residual-eta row is `M[ruv,m] = Σⱼ κⱼ bⱼₘ`, `κⱼ = ∂(1−ε²/R)/∂f = 2ε/R + ε²d/R²`
 /// (the `f`-derivative of the residual-eta data gradient; `a_{ruv}=B_{ruv}=0`, so
 /// the main loop leaves that row at zero).
-fn mixed_eta_theta(
+pub(crate) fn mixed_eta_theta(
     obs: &[ObsSens],
     et: &[ErrTerms],
     n_eta: usize,
@@ -3154,3 +3154,24 @@ fn mixed_eta_theta(
 #[cfg(test)]
 #[path = "sens_outer_gradient_tests.rs"]
 mod tests;
+
+/// The full per-subject FOCEI **natural** gradient `[∂Fᵢ/∂θ, ∂Fᵢ/∂Ω, ∂Fᵢ/∂σ]` — θ, then the
+/// free Ω entries in `pack_params` lower-triangle order, then σ.
+///
+/// Built from an already-computed `prep`/`sens` so the analytic covariance Hessian
+/// ([`crate::estimation::sens_cov_hessian`]) can pair it with the natural Hessian without
+/// recomputing the sensitivities. Same three blocks as the public per-axis gradients, so the
+/// gradient the Hessian is paired with is the one the outer loop actually descends.
+pub(crate) fn subject_natural_gradient(
+    prep: &Prep,
+    sens: &SubjectSens,
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+) -> Vec<f64> {
+    let mut g = theta_block(prep, sens, params.theta.len());
+    g.extend(omega_block(prep, params, eta_hat));
+    g.extend(sigma_block(prep, model, subject, params, sens));
+    g
+}

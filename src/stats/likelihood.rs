@@ -541,6 +541,22 @@ pub fn individual_nll_into_with_schedule(
         }
     } else {
         for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
+            // #905: never score a non-Gaussian-endpoint observation as Gaussian. On
+            // the endpoint-routed load path (`read_population_for`) these rows live in
+            // `obs_records`, so this is a no-op; on a model-blind `read_nonmem_csv`
+            // load they sit in the Gaussian Vecs with a NaN `f_pred` (the analytical
+            // predictor declined them, #905) and must be skipped — a `y - NaN`
+            // residual would otherwise poison the whole subject's NLL. Guarded on the
+            // empty-endpoints common case so plain PK models pay nothing.
+            #[cfg(feature = "survival")]
+            if !model.endpoints.is_empty()
+                && subject
+                    .obs_cmts
+                    .get(j)
+                    .is_some_and(|c| model.endpoints.contains_key(c))
+            {
+                continue;
+            }
             // FREM dispatch: covariate pseudo-observations use theta+eta as
             // prediction and a near-zero additive sigma.
             let fremtype_val = subject.fremtype.get(j).copied().unwrap_or(0);
@@ -722,6 +738,20 @@ pub(crate) fn obs_nll_subject_from_preds(
         }
     } else {
         for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
+            // #905: a non-Gaussian-endpoint observation must never be scored as
+            // Gaussian — the SAEM M-step / IS twin of the skip in
+            // `individual_nll_into_with_schedule`. No-op on the endpoint-routed path
+            // (those rows live in `obs_records`); on a model-blind load it keeps a NaN
+            // `f` (the declined predictor) out of the sum. Guarded on empty-endpoints.
+            #[cfg(feature = "survival")]
+            if !model.endpoints.is_empty()
+                && subject
+                    .obs_cmts
+                    .get(j)
+                    .is_some_and(|c| model.endpoints.contains_key(c))
+            {
+                continue;
+            }
             let frem_var = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
             // FREM covariate pseudo-observations predict a covariate *value* (any
             // real: centered/standardized/log-scale covariates are routinely ≤ 0),

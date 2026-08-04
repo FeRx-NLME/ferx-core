@@ -358,17 +358,22 @@ fn evaluate_at_initial_params(
     clamp_to_bounds(&mut x, &bounds);
     let params = unpack_params(&x, init_params);
     let n_subj = population.subjects.len();
-    let n_eta = model.n_eta;
 
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    let cold_etas = vec![DVector::zeros(n_eta); n_subj];
+    // Genuine cold start: an eval-only run has no warm EBE history, so pass
+    // `None` (not `Some(zeros)`). Both seed the inner search at η = 0, but `None`
+    // is what marks this as a cold start to the guarded multi-start inner EBE
+    // (`inner_restarts`), so a subject with a multimodal individual posterior —
+    // system resets / TV-covariates, or a weakly-identified random effect (#891)
+    // — is re-seeded here instead of silently reporting a sub-optimal mode. This
+    // is the scenario #891's evidence is drawn from (NONMEM `MAXEVAL=0`).
     let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm(
         model,
         population,
         &params,
         options.inner_maxiter,
         options.inner_tol,
-        Some(&cold_etas),
+        None,
         Some(&mu_k),
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,

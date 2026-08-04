@@ -1033,6 +1033,13 @@ fn parse_subjects(
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
+            // The .fitrx checkpoint format carries only the Gaussian per-observation
+            // vectors (`predictions.csv`), so a restored result has **no** discrete
+            // rows and nothing recomputes them — `sdtab()` on a restored binary fit
+            // emits no discrete rows, unlike the live run's own sdtab. Round-tripping
+            // them belongs with the checkpoint format, not here (#897 follow-up).
+            #[cfg(feature = "survival")]
+            discrete_rows: Vec::new(),
         });
     }
 
@@ -1661,6 +1668,7 @@ fn wire_to_fit_result(
     };
 
     Ok(FitResult {
+        restored_from_checkpoint: true,
         method,
         method_chain,
         method_wall_times_secs: w.method_wall_times_secs,
@@ -1836,6 +1844,8 @@ mod tests {
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
+            #[cfg(feature = "survival")]
+            discrete_rows: Vec::new(),
         }
     }
 
@@ -1876,6 +1886,7 @@ mod tests {
     fn minimal_fit_result() -> FitResult {
         let n_eta = 2;
         FitResult {
+            restored_from_checkpoint: false,
             method: EstimationMethod::FoceI,
             method_chain: vec![EstimationMethod::FoceI],
             method_wall_times_secs: vec![1.234],
@@ -2118,6 +2129,30 @@ mod tests {
         assert_eq!(loaded.model_source, "model source\n");
         assert!(loaded.population.is_none());
         assert_eq!(loaded.manifest.format_version, FORMAT_VERSION);
+    }
+
+    /// The `restored_from_checkpoint` flag is set by `load_fit` and only by `load_fit`.
+    /// This is the *wiring* test: a live fit carries `false`, a saved-then-loaded fit
+    /// carries `true`. Without it, the flag could silently fail to be set (wrong literal,
+    /// bypassed path) and `write_sdtab_csv`'s restore guard would never fire on a real
+    /// restored fit — the guard's own test sets the flag by hand and cannot catch that.
+    #[test]
+    fn restored_flag_is_set_only_by_load_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.fitrx");
+        let r = minimal_fit_result();
+        assert!(
+            !r.restored_from_checkpoint,
+            "a freshly built fit must not be marked restored"
+        );
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit(&path).unwrap();
+        assert!(
+            loaded.fit.restored_from_checkpoint,
+            "load_fit must mark the reconstructed result as restored"
+        );
     }
 
     #[test]

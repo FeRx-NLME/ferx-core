@@ -58,4 +58,4 @@ pub use suggest_start::{inits_from_nca, NcaInit, SuggestedStart};
 pub use types::*;
 
 #[cfg(feature = "survival")]
-pub use api::{predict_survival, SurvivalPredictionResult};
+pub use api::{predict_categorical, predict_survival, SurvivalPredictionResult};

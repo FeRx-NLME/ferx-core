@@ -45,7 +45,7 @@ use crate::types::{
 
 /// Exact sensitivities of one observation w.r.t. η and θ. Hessian-shaped fields
 /// are stored row-major (`[k*n + l]`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ObsSens {
     pub f: f64,
     /// `∂f/∂η_k`, length `n_eta`.
@@ -56,6 +56,18 @@ pub struct ObsSens {
     pub df_dtheta: Vec<f64>,
     /// `∂²f/∂η_k∂θ_m`, row-major `n_eta × n_theta`.
     pub d2f_deta_dtheta: Vec<f64>,
+    // ── Covariance-only third-order blocks (#436) ────────────────────────────
+    // Empty on the ordinary gradient path — only [`subject_sensitivities_cov`]
+    // fills them, and only for the covariance step, which runs once per fit. An
+    // empty `Vec` does not allocate, so carrying them costs the hot path nothing.
+    /// `∂²f/∂θ_m∂θ_n`, row-major `n_theta × n_theta`.
+    pub d2f_dtheta2: Vec<f64>,
+    /// `∂³f/∂η_k∂η_l∂η_m`, row-major `n_eta³`.
+    pub d3f_deta3: Vec<f64>,
+    /// `∂³f/∂η_k∂η_l∂θ_m`, row-major `n_eta·n_eta·n_theta`.
+    pub d3f_deta2_dtheta: Vec<f64>,
+    /// `∂³f/∂η_k∂θ_m∂θ_n`, row-major `n_eta·n_theta·n_theta`.
+    pub d3f_deta_dtheta2: Vec<f64>,
 }
 
 /// All observations' sensitivities for one subject, parallel to
@@ -105,6 +117,7 @@ pub(crate) fn obs_sens_from_dual2<const M: usize>(
         d2f_deta2,
         df_dtheta,
         d2f_deta_dtheta,
+        ..Default::default()
     }
 }
 
@@ -522,6 +535,38 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
         // Every individual-parameter slot must be one we differentiate; a slot outside
         // `slot_to_dim`'s map (e.g. a modeled-dose `D{cmt}`/`R{cmt}` slot) routes to FD.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
+        && closed_form_slot_count_supported(model)
+}
+
+/// Widest differentiated-slot count the closed-form dispatch tables instantiate. Both the
+/// outer ([`subject_sensitivities`] → `run_obs`) and inner ([`subject_eta_grad`] →
+/// `run_obs_grad`) tables enumerate `1..=9`; a wider model falls through their `_ => None`
+/// arm. **Keep these three in step** — raising this constant without adding the matching
+/// `const_dispatch!` arms would re-open the misreport below.
+const MAX_CLOSED_FORM_SLOTS: usize = 9;
+
+/// Whether the model's differentiated-slot count fits the closed-form dispatch tables.
+///
+/// Without this the count is unbounded: `analytical_supported_core` checks only that every
+/// slot *maps* via `slot_to_dim`, never how many there are. A readout that claims several
+/// spare slots (`allocate_readout_extra_slots` — text-referenced parameters, and synthetic
+/// direct θ/η as of #486) can push `pk_slots()` past 9 on top of the structural set, so
+/// `analytical_supported` returned `true`, `build_info::gradient_method{,_inner}` persisted
+/// "analytic", and then *every* subject fell through `const_dispatch!`'s `_ => None` to
+/// finite differences at ~10× the cost — precisely the "claim analytic then FD every
+/// subject" drift that `analytic_readout_dual_supported` exists to prevent (#637). Declining
+/// here changes no numbers (those subjects already ran on FD); it makes the reported method
+/// match the route (PR #950 review #2).
+///
+/// Bounds the **program** slot list, which is what the readout allocator grows and what the
+/// providers dispatch on when the program path is live. The `lognormal_param_derivatives`
+/// fallback (`model.pk_indices`) is unchanged from before #486 and left alone here.
+fn closed_form_slot_count_supported(model: &CompiledModel) -> bool {
+    model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .is_none_or(|prog| prog.pk_slots_ref().len() <= MAX_CLOSED_FORM_SLOTS)
 }
 
 /// Whether an analytic Form C readout (`[scaling] y = <expr>`, #650), if present,
@@ -961,6 +1006,35 @@ pub(crate) fn ode_inner_grad_supported(model: &CompiledModel, subject: &Subject)
             || crate::sens::ode_provider::ode_tvcov_supported(model, subject))
 }
 
+/// Model-level umbrella for [`ode_inner_grad_supported`]: whether the light `Dual1`
+/// ODE inner η-gradient can serve the *best-case* subject of this model. Both
+/// per-subject gates ([`ode_subject_supported`], [`ode_tvcov_supported`]) require
+/// [`ode_analytical_supported`] as their subject-independent core, so a servable
+/// subject always exists when this holds — a plain-bolus, fixed-dose, no-TV-cov
+/// subject takes the static walk, and a lagtime / TV-cov / SS / modeled-dose subject
+/// routes to the event-driven walk. **Non-IOV only:** `ode_analytical_supported`
+/// requires `n_kappa == 0` (the ODE IOV inner is [`ode_iov_supported`]) and
+/// `ode_spec.is_some()` (false for every closed-form / endpoint-only model), so this
+/// never overlaps the closed-form or IOV report branches.
+///
+/// It deliberately does **not** fold in the escape hatches (`gradient = fd`, SDE,
+/// magnitude × `block_sigma`): the caller applies `analytic_inner_common_bail`, whose
+/// hatches now coincide exactly with the ones the live per-subject ODE branch in
+/// `analytic_inner_grad_supported` hand-inlines (the `log_transform && n_kappa > 0`
+/// clause that used to make the bail a strict superset was dropped when the closed-form
+/// IOV inner learned the `ln` jet, #486). Consumed (via the shared
+/// `inner_reports_analytic_model`) by `build_info::gradient_method_inner` to report
+/// the ODE inner route at model level without a per-subject scan — the inner analog of
+/// how [`sens_supported`] already lets the *outer* report recognize ODE (#378 task B).
+///
+/// [`ode_analytical_supported`]: crate::sens::ode_provider::ode_analytical_supported
+/// [`ode_subject_supported`]: crate::sens::ode_provider::ode_subject_supported
+/// [`ode_tvcov_supported`]: crate::sens::ode_provider::ode_tvcov_supported
+/// [`ode_iov_supported`]: crate::sens::ode_provider::ode_iov_supported
+pub(crate) fn ode_inner_grad_supported_model(model: &CompiledModel) -> bool {
+    ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model)
+}
+
 /// The per-observation `∂f/∂η` Jacobian (`n_obs × n_eta`, row-major) as a flat
 /// vector, or `None` when unsupported. Convenience for the inner loop, whose
 /// `h_matrix` is exactly this Jacobian at the converged η̂. Uses the light
@@ -1295,9 +1369,9 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     // parity, mirroring the non-IOV `f_scaled = f/k`). LTBS composes with the OUTER gradient
     // now (#486): `subject_sensitivities_iov` applies the `ln(f)` jet LAST — after the in-walk
     // scale quotient — reproducing production's scale-then-log order `ln(f/s)` (`predict_iov`
-    // logs last, after `apply_scaling`). The inner IOV EBE gradient stays on FD for LTBS
-    // (`analytic_inner_common_bail`'s `log_transform && n_kappa > 0` clause), so this gate
-    // admits `log_transform` while only the outer θ/Ω/σ loop serves it.
+    // logs last, after `apply_scaling`). The inner IOV EBE gradient serves LTBS too as of #486
+    // (`run_obs_iov_eta` applies the same shared jet last), so this gate admits `log_transform`
+    // for both loops and `analytic_inner_common_bail` no longer carries an LTBS × IOV clause.
     match &model.scaling {
         ScalingSpec::None | ScalingSpec::ScalarScale(_) => {}
         ScalingSpec::ExpressionScale { deriv: Some(p), .. }
@@ -1416,6 +1490,16 @@ pub fn subject_sensitivities_iov(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<SubjectSens> {
+    // #905: IOV twin of the non-IOV `subject_routes_to_event_walk` gate. An analytical
+    // subject with no Gaussian observation feeds the predictor nothing; declining here
+    // (→ the caller drops it to FD) keeps FOCE/FOCEI out of the IOV sens walk, whose
+    // dose-routing `panic!`s (`propagate::active_rates_g` / the bolus `cmt_idx` guard)
+    // are the same twins the value gate fences off. Routed TTE-only subjects never reach
+    // here (they carry `obs_records`, so the analytic-IOV gates already decline them);
+    // this fires only on the model-blind loader that put the TTE rows in `obs_times`.
+    if model.ode_spec.is_none() && !crate::pk::subject_feeds_analytical_pk(model, subject) {
+        return None;
+    }
     // Cheap, model/subject-only decline before any dual seeding (#822 review #9) — see
     // `subject_sensitivities_tvcov`. Harmless for the ODE-twin branch below: an ODE model has no
     // closed-form walk to decline for, and `ss_lagtime_walk_unsupported` is about that walk's
@@ -1474,7 +1558,8 @@ pub fn subject_sensitivities_iov(
     // readout / init impulse — so the outer θ/Ω/σ gradient matches production's scale-then-log
     // `ln(f/s)` (`predict_iov` logs last, after `apply_scaling`). Post-walk on the full stacked
     // jet, so it is dimension-generic over the κ axes; a no-op when `log_transform` is false.
-    // The inner IOV EBE gradient stays on FD for LTBS (`analytic_inner_common_bail`).
+    // `run_obs_iov_eta` applies the inner twin of this step last, so the IOV inner EBE gradient
+    // serves LTBS too (#486) — the two loops differentiate the same `ln(f/s)`.
     apply_ltbs_transform_outer(&mut sens, model.log_transform);
     Some(sens)
 }
@@ -1793,6 +1878,14 @@ fn subject_eta_grad_iov_analytical(
     theta: &[f64],
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
+    // #905: decline a no-Gaussian-observation analytical subject (→ FD), so the IOV
+    // inner gradient never enters the sens walk on the exempt subject's unroutable dose.
+    // This is the twin the model-blind loader reaches: `analytic_iov_inner`'s
+    // `!subject_has_survival_records` guard fails there (TTE rows sit in `obs_times`, not
+    // `obs_records`), so without this the walk panics at `propagate.rs` bolus/infusion.
+    if model.ode_spec.is_none() && !crate::pk::subject_feeds_analytical_pk(model, subject) {
+        return None;
+    }
     // Cheap decline before any dual seeding (#822 review #9) — see `subject_sensitivities_tvcov`.
     if ss_lagtime_walk_unsupported(model, subject) {
         return None;
@@ -2048,6 +2141,7 @@ fn run_obs_iov<const M: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            ..Default::default()
         });
     }
 
@@ -2445,6 +2539,15 @@ fn run_obs_iov_eta<const N: usize>(
         scale_obs_sens(&mut out, k);
     }
 
+    // LTBS `g = ln(f)` LAST — after the per-occasion scale quotient — the inner twin of
+    // `subject_sensitivities_iov`'s `apply_ltbs_transform_outer`, so the EBE gradient and the
+    // outer θ/Ω/σ gradient differentiate the same `ln(f/s)` production computes (#486).
+    // The transform is a per-observation scalar quotient `∂g/∂x = (∂f/∂x)/f`, identical on
+    // every stacked axis, so it applies to the κ columns exactly as it does to η_bsv — there
+    // is nothing occasion-specific about it and no per-group jet is needed. A no-op when
+    // `log_transform` is false.
+    apply_ltbs_transform_inner(&mut out, model.log_transform);
+
     Some(out)
 }
 
@@ -2502,8 +2605,8 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // scale quotient — reproducing production's scale-then-log order `ln(f/s)` exactly (the
     // whole transform is post-walk on the closed-form path, unlike the ODE in-walk log). The
     // inner EBE gradient is served analytically here too (`subject_eta_grad_tvcov` applies the
-    // same `ln(f)` inner jet LAST, #673); LTBS × IOV is the only combination whose inner stays
-    // on FD (`analytic_inner_common_bail`'s `log_transform && n_kappa > 0` clause).
+    // same `ln(f)` inner jet LAST, #673); since #486 LTBS × IOV is served on the inner as well
+    // (`run_obs_iov_eta`), so no LTBS combination routes the inner to FD any more.
     if !scaling_supported(model) {
         return false;
     }
@@ -2946,8 +3049,8 @@ pub fn subject_sensitivities_tvcov(
     apply_event_walk_expression_scale_outer(&mut sens, model, subject, prog, theta, eta)?;
     // LTBS: transform the walked (and scaled) jet to `g = ln(f)` LAST, via the same shared
     // helper the dose-superposition outer uses — so the two paths cannot drift, and the
-    // scale-then-log order matches production `ln(f/s)` (#486). The inner EBE gradient stays
-    // on FD for LTBS (covariance stability), so there is no inner counterpart.
+    // scale-then-log order matches production `ln(f/s)` (#486). The inner counterpart is
+    // `apply_ltbs_transform_inner`, applied last by the matching inner walk (#673/#486).
     apply_ltbs_transform_outer(&mut sens, model.log_transform);
     // FREM covariate pseudo-observations are not PK rows at all — overwrite their jet.
     apply_frem_pseudo_obs_jet(&mut sens, model, subject, theta, eta);
@@ -3277,7 +3380,7 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     // is applied LAST below (after the init impulse and scale quotient), mirroring the outer
     // TV-cov path (`subject_sensitivities_tvcov` → `apply_ltbs_transform_outer`). Reproduces
     // production's scale-then-log order; the covariance step reconverges these EBEs at the
-    // tighter `cov_inner_tol` (closed-form non-IOV LTBS), so the SEs stay clean.
+    // tighter `cov_inner_tol` (closed-form LTBS, IOV included since #486), so the SEs stay clean.
     // Analytic Form C readout (#650): served analytically on the event-walk when it
     // fits the structural `PkDual` slots (matches the outer gate); otherwise FD.
     if model.analytic_readout.is_some() && !readout_tvcov_supported(model) {
@@ -4068,6 +4171,215 @@ pub fn subject_sensitivities(
     r
 }
 
+/// Relative step for differencing the **exact** second-order jet to reach third order.
+///
+/// `ε^(1/3) ≈ 6.06e-6` is the textbook optimum for a central first difference: truncation
+/// falls as `h²` and round-off grows as `ε/h`, so they balance at the cube root. That optimum
+/// is only *available* because the differenced quantity is exact to machine precision — the
+/// classic reason to avoid this trick, differencing something that is itself a finite
+/// difference, does not apply to a `Dual2` jet.
+fn third_order_fd_step(x: f64) -> f64 {
+    f64::EPSILON.cbrt() * (1.0 + x.abs())
+}
+
+/// Third-order sensitivities for the analytic covariance Hessian (#436), obtained by
+/// **finite-differencing the exact `Dual2` second-order jet** along each `(θ, η)` axis.
+///
+/// Returns the same per-observation `(f, ∂f/∂η, ∂²f/∂η², ∂f/∂θ, ∂²f/∂η∂θ)` as
+/// [`subject_sensitivities`] — untouched, straight from the base evaluation — plus the
+/// covariance-only blocks `∂²f/∂θ²`, `∂³f/∂η³`, `∂³f/∂η²∂θ` and `∂³f/∂η∂θ²`.
+///
+/// # Why finite differences here, and why that is not a step backwards
+///
+/// The observed information needs one derivative more than the outer gradient, and the
+/// provider stops at second order. Two ways to close that: exact third-order sensitivity
+/// equations (a `Dual3` type and a third-order kernel through every closed form), or
+/// differencing the exact second-order jet. This is the latter.
+///
+/// The distinction that matters is **what** is being differenced. The covariance stencil this
+/// replaces takes a *second* difference of the reconverged OFV: error amplifies as `ε/h²`, and
+/// each of its `~2·n_free²` points re-solves every subject's inner loop. Here a *single*
+/// central difference is taken of a quantity that is exact to machine precision, so error
+/// amplifies as `ε/h` at worst, and the cost is `2N+1` provider evaluations per subject
+/// (`N = n_theta + n_eta`) with **no inner re-solve** — the covariance step runs once per fit,
+/// so this is arithmetic, not a loop over the optimiser.
+///
+/// Because `Dual2` carries every `(θ, η)` axis simultaneously, differencing along one axis and
+/// reading the *whole* exact second-order block yields every third-order slice containing that
+/// axis at once. Hence one uniform loop rather than four.
+///
+/// `∂²f/∂θ²` comes from the same sweep (differencing `∂f/∂θ`) rather than from the base jet.
+/// The `Dual2` walk does compute it — `obs_sens_from_dual2` discards the θ-θ block because the
+/// FOCEI gradient never reads it — so keeping it would be exact and marginally better; that is
+/// an optimisation, not a correctness matter, and it would mean touching the hot-path scatter.
+///
+/// `None` whenever [`subject_sensitivities`] declines at the base point or at any perturbed
+/// point; the caller then keeps the finite-difference-of-OFV stencil for that subject.
+pub fn subject_sensitivities_cov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<SubjectSens> {
+    // Scope gate. This is **not** redundant with `subject_sensitivities` returning `Some`:
+    // that predicate has grown well past the covariance assembly's derivation (LTBS since
+    // #665/#673, expression scaling, Form-C readouts, IOV, the event-driven walk). Handing
+    // the Gaussian-only assembly a jet from any of those would not fail — it would return a
+    // plausible, wrong Hessian, i.e. wrong standard errors with no symptom. So the scope is
+    // asserted positively here and kept deliberately narrow; everything else keeps the
+    // finite-difference covariance, which is correct for all of them.
+    //
+    // The clauses below are aligned with the exclusions `analytic_outer_gradient_available`
+    // and `pop_nll_opts` already encode, rather than derived independently — PR #953 review
+    // findings 2/4/5/9 were all the same mistake, a gate written from scratch that then
+    // disagreed with the two predicates that had already enumerated this scope.
+    if !analytical_supported(model)
+        // `gradient = fd` is the user's opt-out from analytic sensitivities. It is the
+        // first clause of `analytic_outer_gradient_available` for the same reason: someone
+        // who hit a bad `Dual2` result and set this must not still receive a covariance
+        // R-matrix built from third-order differences of those same jets.
+        || matches!(model.gradient_method, GradientMethod::Fd)
+        // Non-Gaussian data terms (TTE / discrete / CTMM) fold their likelihood *and* an
+        // FD η-Hessian into `hrh`/`log|H̃|` inside `foce_subject_nll`. The Gaussian `sens/`
+        // assembly cannot express either, so it would silently omit the survival/discrete
+        // information — over-optimistic SEs. Same clause, same reason, as the outer gradient.
+        || model.has_non_gaussian()
+        // FREM substitutes `EPSCOV²` on covariate pseudo-observation rows via
+        // `build_frem_r_override` and suppresses `mult_row`/`ruv` there. This assembly calls
+        // `error_spec.variance_at` / `dvar_df` directly, so it would score those rows with
+        // the PK error model — wrong SEs for exactly the covariate ω block a FREM run
+        // exists to estimate. The gradient twin of this was PR #844.
+        || model.frem_config.is_some()
+        // A `Selected` spec keys endpoints by covariate branch, decoupled from the CMT
+        // column (which is typically all-1 on an analytical single-endpoint model). The
+        // assembly reads `subject.obs_cmts` directly rather than `ErrorSpec::obs_keys`, so
+        // every row would be scored against branch 1's sigma.
+        || matches!(model.error_spec, crate::types::ErrorSpec::Selected { .. })
+        || model.log_transform
+        || model.n_kappa > 0
+        || !matches!(model.scaling, ScalingSpec::None)
+        || model.analytic_readout.is_some()
+        || !model.analytical_init.is_empty()
+        || model.residual_error_eta.is_some()
+        || !model.residual_correlations.is_empty()
+        || model.has_custom_ruv_magnitude()
+        || subject_routes_to_event_walk(model, subject)
+        || model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .is_none_or(|p| !prog_covers_required_pk_slots(model, p))
+    {
+        return None;
+    }
+
+    // `subject_routes_to_event_walk` above is **not** the whole routing story, and this is
+    // the second reroute it does not see. `subject_sensitivities` calls
+    // `effective_model_for_eval`, which sends a transit/IG subject to its
+    // `absorption_ode_equivalent` whenever `absorption_flip_flop_at` holds — a
+    // *parameter-dependent* decision the model-level gate cannot make. On that route the
+    // differenced quantity is an adaptive-step RK45 solution, not a machine-precision
+    // closed form: the controller changes its step sequence discontinuously under the
+    // `h ≈ ε^(1/3)·(1+|x|) ≈ 6e-6` perturbation used here, so the difference would divide
+    // integrator noise (~`ode_reltol`) by `1.2e-5` and return the third-order tensors as
+    // noise. The `ε^(1/3)` step is only justified because the differenced quantity is
+    // exact; where that premise fails, decline (PR #953 review finding 5).
+    //
+    // Checked at every evaluated point, not just the base one — a subject sitting on the
+    // flip-flop boundary can be closed-form at `x` and rerouted at `x ± h`.
+    let closed_form_at = |t: &[f64], e: &[f64]| -> bool {
+        crate::pk::effective_model_for_eval(model, subject, t, e)
+            .ode_spec
+            .is_none()
+    };
+    if !closed_form_at(theta, eta) {
+        return None;
+    }
+
+    let n_theta = theta.len();
+    let n_eta = eta.len();
+    let n_axes = n_theta + n_eta;
+
+    let mut base = subject_sensitivities(model, subject, theta, eta)?;
+    let n_obs = base.obs.len();
+
+    // One central pair per (θ, η) axis. Axis `c < n_theta` is `θ_c`; `c >= n_theta` is
+    // `η_{c-n_theta}` — the same layout the `Dual2` seeding uses.
+    let mut plus: Vec<SubjectSens> = Vec::with_capacity(n_axes);
+    let mut minus: Vec<SubjectSens> = Vec::with_capacity(n_axes);
+    let mut steps: Vec<f64> = Vec::with_capacity(n_axes);
+    for c in 0..n_axes {
+        let (mut tp, mut ep) = (theta.to_vec(), eta.to_vec());
+        let (mut tm, mut em) = (theta.to_vec(), eta.to_vec());
+        let h = if c < n_theta {
+            let h = third_order_fd_step(theta[c]);
+            tp[c] += h;
+            tm[c] -= h;
+            h
+        } else {
+            let k = c - n_theta;
+            let h = third_order_fd_step(eta[k]);
+            ep[k] += h;
+            em[k] -= h;
+            h
+        };
+        if !closed_form_at(&tp, &ep) || !closed_form_at(&tm, &em) {
+            return None;
+        }
+        plus.push(subject_sensitivities(model, subject, &tp, &ep)?);
+        minus.push(subject_sensitivities(model, subject, &tm, &em)?);
+        steps.push(h);
+    }
+
+    for j in 0..n_obs {
+        let mut d2f_dtheta2 = vec![0.0f64; n_theta * n_theta];
+        let mut d3f_deta3 = vec![0.0f64; n_eta * n_eta * n_eta];
+        let mut d3f_deta2_dtheta = vec![0.0f64; n_eta * n_eta * n_theta];
+        let mut d3f_deta_dtheta2 = vec![0.0f64; n_eta * n_theta * n_theta];
+
+        for c in 0..n_axes {
+            let (p, m, h2) = (&plus[c].obs[j], &minus[c].obs[j], 2.0 * steps[c]);
+            let d = |a: f64, b: f64| (a - b) / h2;
+
+            if c < n_theta {
+                // ∂/∂θ_c of the exact first- and second-order blocks.
+                for mm in 0..n_theta {
+                    d2f_dtheta2[mm * n_theta + c] = d(p.df_dtheta[mm], m.df_dtheta[mm]);
+                }
+                for k in 0..n_eta {
+                    for l in 0..n_eta {
+                        d3f_deta2_dtheta[(k * n_eta + l) * n_theta + c] =
+                            d(p.d2f_deta2[k * n_eta + l], m.d2f_deta2[k * n_eta + l]);
+                    }
+                    for mm in 0..n_theta {
+                        d3f_deta_dtheta2[(k * n_theta + mm) * n_theta + c] = d(
+                            p.d2f_deta_dtheta[k * n_theta + mm],
+                            m.d2f_deta_dtheta[k * n_theta + mm],
+                        );
+                    }
+                }
+            } else {
+                // ∂/∂η_c of the exact η-η block.
+                let cm = c - n_theta;
+                for k in 0..n_eta {
+                    for l in 0..n_eta {
+                        d3f_deta3[(k * n_eta + l) * n_eta + cm] =
+                            d(p.d2f_deta2[k * n_eta + l], m.d2f_deta2[k * n_eta + l]);
+                    }
+                }
+            }
+        }
+
+        let o = &mut base.obs[j];
+        o.d2f_dtheta2 = d2f_dtheta2;
+        o.d3f_deta3 = d3f_deta3;
+        o.d3f_deta2_dtheta = d3f_deta2_dtheta;
+        o.d3f_deta_dtheta2 = d3f_deta_dtheta2;
+    }
+
+    Some(base)
+}
+
 /// Apply an `ExpressionScale` divisor `s(θ, η)` to a subject's already-computed
 /// jet in place: `scaled_f = f / s`. The scale's own value, `∂s/∂(θ,η)` and
 /// Hessian come from the differentiable scale program evaluated over `Dual2<M>`
@@ -4777,8 +5089,25 @@ pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subj
     if !crate::pk::event_driven::supports_event_driven(model.pk_model) {
         return false;
     }
+    // #905: mirror the value path's declination. A subject with no Gaussian
+    // observation on an analytical model feeds the predictor nothing, so
+    // `compute_predictions_with_tv_*` returns NaN without walking. The gradient must
+    // follow — otherwise FOCE/FOCEI would enter the event-driven walk (and its `sens`
+    // twin, `propagate::active_rates_g` and the bolus `cmt_idx` guard, both of which
+    // `panic!` on the very unroutable dose the value path just skipped). The Gaussian
+    // gradient of a subject with no Gaussian obs is an empty sum, so declining the
+    // walk loses nothing. Keyed on the primary `ode_spec`, matching the value gate.
+    if model.ode_spec.is_none() && !crate::pk::subject_feeds_analytical_pk(model, subject) {
+        return false;
+    }
     subject.has_tv_covariates()
         || subject_has_oral_infusion(model, subject)
+        // A dose the superposition dispatch cannot place — any bolus outside
+        // compartment 1, any infusion outside central (#375). Production reroutes
+        // exactly these subjects to the walk (`pk::compute_predictions*`), so the
+        // gradient must follow or FOCE/FOCEI would differentiate a different
+        // dosing history than it predicted. Same single source of truth.
+        || crate::pk::dose_needs_event_walk(model.pk_model, subject)
         || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
         // A modeled-`RATE=-1/-2` dose (`R{cmt}`/`D{cmt}`) resolves its rate/window
         // from PK params, so the infusion *end* is a moving boundary — the
@@ -5090,8 +5419,8 @@ fn apply_frem_pseudo_obs_jet(
 /// dose-superposition outer (`subject_sensitivities_impl`) and the TV-cov event-driven outer
 /// (`subject_sensitivities_tvcov`), so the two paths cannot drift (#486). Applied last, after
 /// any `ScalarScale`/`ExpressionScale` quotient, matching production's scale-then-log order.
-/// The inner EBE gradient stays on finite differences for LTBS (covariance-Hessian stability,
-/// `analytic_inner_common_bail`), so no inner counterpart exists.
+/// [`apply_ltbs_transform_inner`] is the first-order counterpart every inner walk applies at
+/// the same point, so the two loops differentiate the same `ln(f/s)` (#673/#486).
 fn apply_ltbs_transform_outer(sens: &mut SubjectSens, log_transform: bool) {
     if !log_transform {
         return;
@@ -5338,6 +5667,7 @@ fn run_obs<const N: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            ..Default::default()
         });
     }
     out

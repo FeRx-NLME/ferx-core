@@ -41,6 +41,13 @@ use std::time::Instant;
 /// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
 /// callers that obtained `population` via [`read_nonmem_csv`] should inspect
 /// `population.warnings` before calling this function.
+///
+/// **Gaussian rows only.** Non-Gaussian endpoints keep their own entry points, because
+/// their prediction is not a scalar concentration: TTE → [`predict_survival`], binary →
+/// [`predict_categorical`]. A model whose only endpoint is non-Gaussian therefore gets an
+/// empty vec here — call the matching predictor instead. (CTMM has no predictor at all
+/// yet, so a CTMM model with *no* continuous endpoint is rejected fail-loud below rather
+/// than returning empty; a mixed continuous + CTMM model still gets its Gaussian rows.)
 pub fn predict(
     model: &CompiledModel,
     population: &Population,
@@ -50,6 +57,10 @@ pub fn predict(
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
+    // …and that every dose names a compartment the analytical engine can route
+    // it into, so an unroutable infusion errors here with subject/time context
+    // instead of panicking deep inside the event-driven walk (#375).
+    assert_dose_compartments_supported(model, population);
     assert_absorption_closed_form_support(model, population);
     assert_absorption_flip_flop_no_twin(model, population, &params.theta);
     // A time-varying covariate on a survival hazard would be silently frozen — panic
@@ -58,6 +69,27 @@ pub fn predict(
     assert_survival_tv_covariates(model, population);
     assert_analytic_readout_support(model, population);
     assert_absorption_dosing_supported(model, population);
+    // CTMM (#759) has no prediction path: its records live in `obs_records`, which the
+    // Gaussian loop below never visits, so a CTMM-only model would silently return an
+    // empty vec rather than an occupancy π(t). `simulate()`'s twin assert already
+    // *claims* to cover predict() — it does not, because it sits in the simulate
+    // chokepoint — so state the contract here too. Occupancy prediction is #820.
+    // Fail loud only when the call would otherwise return an *empty* vec because CTMM is
+    // the only thing to predict. The precise test is "are there continuous observations to
+    // predict at all" — i.e. does any subject have a non-empty `obs_times` grid — not
+    // "is sigma non-empty" (a CTMM-only model may still declare an `[error_model]`, so a
+    // non-empty sigma does not imply continuous rows) and not "is there a Gaussian
+    // endpoint" (`EndpointLikelihood::Gaussian` is never inserted into `endpoints` for a
+    // plain PK model, so that check would reject every healthy mixed PK + CTMM model). A
+    // mixed model with continuous data passes and returns its Gaussian rows; the CTMM rows
+    // are simply absent, exactly as a binary endpoint's are (occupancy prediction is #820).
+    #[cfg(feature = "markov")]
+    assert!(
+        !model.has_ctmm() || population.subjects.iter().any(|s| !s.obs_times.is_empty()),
+        "predict() does not support a [markov_model] (CTMM) endpoint yet, and this population has \
+         no continuous observations either — so the call would return an empty vec rather than an \
+         occupancy π(t). State-occupancy prediction is a later slice (#820)."
+    );
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
@@ -89,6 +121,36 @@ pub struct PredictionResult {
     pub id: String,
     pub time: f64,
     pub pred: f64,
+}
+
+/// Category probabilities for every binary-endpoint record in the population
+/// (#760 Slice 1b) — the categorical analogue of [`predict_survival`].
+///
+/// [`predict`] cannot serve this: its [`PredictionResult`] carries a single `f64`,
+/// and a categorical prediction is a probability vector (§8.8.1). It is a separate
+/// entry point rather than a change to `predict`'s return type so the existing
+/// Gaussian signature — which the R wrapper binds — stays untouched.
+///
+/// Predictions are at `η = 0` (the population-typical subject), matching [`predict`]'s
+/// own convention; the EBE-conditioned per-subject values are an sdtab concern.
+/// Returns an empty vec for a model with no `Binary` endpoint.
+#[cfg(feature = "survival")]
+pub fn predict_categorical(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Vec<EndpointPredictionResult> {
+    // Same guard `predict()` and `fit()` apply: a time-varying covariate on the linear
+    // predictor would be silently frozen at its baseline value, since `LinearPredictorFn`
+    // takes no time argument (#741). Without this, `predict_categorical` was the one
+    // public entry point that returned quietly-wrong probabilities.
+    assert_survival_tv_covariates(model, population);
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    let mut results = Vec::new();
+    for subject in &population.subjects {
+        crate::categorical::predict_binary(model, subject, &params.theta, &zero_eta, &mut results);
+    }
+    results
 }
 
 /// Survival function prediction for one (subject, time) grid point.
@@ -189,6 +251,12 @@ pub fn predict_survival(
     // baseline covariate snapshot — a time-varying covariate on the hazard would be
     // silently applied at its baseline, so fail loudly instead (#741).
     assert_survival_tv_covariates(model, population);
+
+    // A joint PK-TTE hazard reads a PK prediction, so an unroutable dose silently
+    // changes the exposure the hazard sees. This entry point was the one member of
+    // the `predict`/`simulate` family missing the guard (#899); it is a no-op for a
+    // pure-TTE model, where nothing asks the PK predictor for a value.
+    assert_dose_compartments_supported(model, population);
 
     // The competing-risks CIF telescopes the all-cause survival drop, which
     // requires the grid in ascending time order; sort a local copy so the

@@ -171,10 +171,9 @@ fn adaptive_rejects_selected_error_model() {
 }
 
 // --- Adaptive-dosing "no silent wrong answer" guards (#391) --------------
-// The reactive driver integrates from a single baseline PK snapshot (BSV
-// only, kappas zeroed), so IOV / time-varying covariates / resets / SDE
-// would each be silently wrong. Each must be a typed error, not a silent
-// number. See `reject_unsupported_adaptive`.
+// The reactive driver now supports IOV (#701), time-varying covariates (#700),
+// and system resets (#716); only an SDE `[diffusion]` model remains unsupported
+// and must be a typed error, not a silent number. See `reject_unsupported_adaptive`.
 
 const PLAIN_ADAPTIVE_MODEL: &str = r"
 [parameters]
@@ -350,17 +349,20 @@ fn adaptive_accepts_pk_only_covariate_subject() {
 }
 
 #[test]
-fn adaptive_rejects_reset_subject() {
+fn adaptive_accepts_reset_subject() {
     use crate::parser::model_parser::parse_model_string;
+    // System resets (EVID=3) are now supported (#716): the reactive driver zeros
+    // the compartments at each reset time and turns off infusions opened before it,
+    // and the frozen-replay verifier is reset-aware, so the guard no longer rejects
+    // them. Correctness of the reset itself is pinned by the driver-level oracle
+    // `adaptive_reset_matches_static_predict` in adaptive_sim_tests.rs.
     let model = parse_model_string(PLAIN_ADAPTIVE_MODEL).expect("plain model parses");
     let mut subject = adaptive_base_subject();
     subject.reset_times = vec![48.0];
     assert!(subject.has_resets());
-    let err = reject_unsupported_adaptive(&model, &adaptive_pop(subject))
-        .expect_err("a subject with system resets must be rejected");
     assert!(
-        err.to_lowercase().contains("reset"),
-        "error should cite system resets: {err}"
+        reject_unsupported_adaptive(&model, &adaptive_pop(subject)).is_ok(),
+        "a subject with system resets must now be accepted (#716)"
     );
 }
 
@@ -390,6 +392,8 @@ fn make_subject(eta: Vec<f64>, iwres: Vec<f64>) -> SubjectResult {
         extra_columns: vec![],
         per_obs_tad: vec![],
         compartment_states: vec![],
+        #[cfg(feature = "survival")]
+        discrete_rows: Vec::new(),
     }
 }
 

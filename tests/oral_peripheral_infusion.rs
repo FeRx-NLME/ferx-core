@@ -1,0 +1,421 @@
+//! Exact oracle for **infusion into a peripheral compartment** (#375) — the
+//! closed form versus a tight-tolerance RK45 solve of the *same* ODE system.
+//! Covers the oral models (the feature #375 added) and the 3-cpt **IV** models
+//! whose forced response the oral propagators delegate to.
+//!
+//! This is the primary correctness test for that feature, and it is deliberately
+//! independent of NONMEM: NONMEM's `ADVAN11`/`ADVAN12` forced response carries
+//! ~2e-6 relative error on these cases (see
+//! `tests/nonmem_dose_compartment_anchor.rs`, where that is measured), so it
+//! cannot pin the closed form tighter than that. Writing the same system out as
+//! explicit `[odes]` and integrating it to `ode_reltol = 1e-12` can, and does —
+//! to ~1e-11.
+//!
+//! Why the oral peripheral needs no new closed form: nothing flows back into the
+//! depot, so a constant rate into a peripheral drives exactly the
+//! central/peripheral sub-system that the IV model has. The oral propagator
+//! superposes that IV forced response onto its own homogeneous evolution. These
+//! tests are what verify that reduction rather than assuming it.
+
+use ferx_core::parser::model_parser::parse_full_model;
+use ferx_core::{predict, read_nonmem_csv, Population};
+use std::io::Write;
+use tempfile::NamedTempFile;
+
+fn pop_of(csv: &str) -> Population {
+    let mut f = NamedTempFile::new().expect("temp file");
+    write!(f, "{csv}").expect("write");
+    f.flush().expect("flush");
+    read_nonmem_csv(f.path(), None, None).expect("dataset loads")
+}
+
+fn preds(src: &str, csv: &str) -> Vec<f64> {
+    let m = parse_full_model(src).expect("model parses").model;
+    predict(&m, &pop_of(csv), &m.default_params)
+        .into_iter()
+        .map(|p| p.pred)
+        .collect()
+}
+
+const TWO_CPT_ORAL_CF: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVQ(3.0, 0.1, 50.0)
+  theta TVV2(80.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v=V, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+const TWO_CPT_ORAL_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVQ(3.0, 0.1, 50.0)
+  theta TVV2(80.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+
+[structural_model]
+  ode(states=[depot, central, periph])
+
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) = KA*depot - (CL/V)*central - (Q/V)*central + (Q/V2)*periph
+  d/dt(periph)  = (Q/V)*central - (Q/V2)*periph
+
+[scaling]
+  y = central / V
+
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+  ode_max_steps = 10000000
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+const THREE_CPT_ORAL_CF: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVQ(3.0, 0.1, 50.0)
+  theta TVV2(80.0, 5.0, 500.0)
+  theta TVQ3(1.0, 0.1, 50.0)
+  theta TVV3(120.0, 5.0, 900.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA
+
+[structural_model]
+  pk three_cpt_oral(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+const THREE_CPT_ORAL_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVQ(3.0, 0.1, 50.0)
+  theta TVV2(80.0, 5.0, 500.0)
+  theta TVQ3(1.0, 0.1, 50.0)
+  theta TVV3(120.0, 5.0, 900.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA
+
+[structural_model]
+  ode(states=[depot, central, periph1, periph2])
+
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) = KA*depot - (CL/V)*central - (Q/V)*central + (Q/V2)*periph1 - (Q3/V)*central + (Q3/V3)*periph2
+  d/dt(periph1) = (Q/V)*central - (Q/V2)*periph1
+  d/dt(periph2) = (Q3/V)*central - (Q3/V3)*periph2
+
+[scaling]
+  y = central / V
+
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+  ode_max_steps = 10000000
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+fn assert_agree(cf: &[f64], ode: &[f64], tol: f64, case: &str) {
+    assert_eq!(cf.len(), ode.len(), "{case}: row count");
+    assert!(
+        ode.iter().all(|x| x.is_finite() && *x > 0.0),
+        "{case}: ODE reference must be non-trivial, got {ode:?}"
+    );
+    for (j, (&c, &o)) in cf.iter().zip(ode).enumerate() {
+        let rel = (c - o).abs() / o.abs();
+        assert!(
+            rel < tol,
+            "{case} obs {j}: closed form {c:.14} vs ODE {o:.14} (rel {rel:.2e})"
+        );
+    }
+}
+
+/// `two_cpt_oral`, infusion into CMT=3 (the peripheral), observed in central.
+#[test]
+fn two_cpt_oral_peripheral_infusion_matches_the_ode_twin() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,3,20,1\n\
+               1,1,5.0,0,.,2,.,0\n1,4,4.0,0,.,2,.,0\n1,8,3.0,0,.,2,.,0\n1,12,2.0,0,.,2,.,0\n";
+    assert_agree(
+        &preds(TWO_CPT_ORAL_CF, csv),
+        &preds(TWO_CPT_ORAL_ODE, csv),
+        1e-9,
+        "two_cpt_oral infusion CMT=3",
+    );
+}
+
+/// `three_cpt_oral`, infusion into each peripheral in turn.
+#[test]
+fn three_cpt_oral_peripheral_infusion_matches_the_ode_twin() {
+    for cmt in [3usize, 4] {
+        let csv = format!(
+            "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,{cmt},20,1\n\
+             1,1,5.0,0,.,2,.,0\n1,4,4.0,0,.,2,.,0\n1,8,3.0,0,.,2,.,0\n1,12,2.0,0,.,2,.,0\n"
+        );
+        assert_agree(
+            &preds(THREE_CPT_ORAL_CF, &csv),
+            &preds(THREE_CPT_ORAL_ODE, &csv),
+            1e-9,
+            &format!("three_cpt_oral infusion CMT={cmt}"),
+        );
+    }
+}
+
+/// The interesting combination: a peripheral infusion **and** an oral depot dose
+/// on the same subject, so the depot's homogeneous evolution and the peripheral
+/// forced response superpose. A reduction that only held with an empty depot
+/// would pass the tests above and fail here.
+#[test]
+fn peripheral_infusion_plus_oral_dose_matches_the_ode_twin() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+               1,0,.,1,100,3,20,1\n\
+               1,2,.,1,200,1,0,1\n\
+               1,1,5.0,0,.,2,.,0\n1,4,4.0,0,.,2,.,0\n1,8,3.0,0,.,2,.,0\n1,12,2.0,0,.,2,.,0\n";
+    assert_agree(
+        &preds(TWO_CPT_ORAL_CF, csv),
+        &preds(TWO_CPT_ORAL_ODE, csv),
+        1e-9,
+        "two_cpt_oral peripheral infusion + depot dose",
+    );
+}
+
+/// …and the 3-cpt version, with a depot dose landing *during* the infusion
+/// window so both forcings are simultaneously active.
+#[test]
+fn three_cpt_peripheral_infusion_overlapping_oral_dose_matches_the_ode_twin() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+               1,0,.,1,100,3,20,1\n\
+               1,2,.,1,200,1,0,1\n\
+               1,1,5.0,0,.,2,.,0\n1,3,4.5,0,.,2,.,0\n1,4,4.0,0,.,2,.,0\n\
+               1,8,3.0,0,.,2,.,0\n1,12,2.0,0,.,2,.,0\n";
+    assert_agree(
+        &preds(THREE_CPT_ORAL_CF, csv),
+        &preds(THREE_CPT_ORAL_ODE, csv),
+        1e-9,
+        "three_cpt_oral peripheral infusion + overlapping depot dose",
+    );
+}
+
+/// A **central AND peripheral infusion simultaneously active**. The oral
+/// propagator makes one delegated call carrying both rates, so the IV core's
+/// combined steady state (`A_c = (R_c+R_p)/k10`,
+/// `A_p = (k12·R_c + (k10+k12)·R_p)/(k21·k10)`) is what decides whether one
+/// clobbers the other. Every other test drives exactly one channel, so this is
+/// the only one that can see a clobber.
+#[test]
+fn simultaneous_central_and_peripheral_infusion_matches_the_ode_twin() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+               1,0,.,1,100,3,20,1\n\
+               1,1,.,1,120,2,30,1\n\
+               1,2,4.5,0,.,2,.,0\n1,4,4.0,0,.,2,.,0\n1,6,3.5,0,.,2,.,0\n\
+               1,8,3.0,0,.,2,.,0\n1,12,2.0,0,.,2,.,0\n";
+    assert_agree(
+        &preds(TWO_CPT_ORAL_CF, csv),
+        &preds(TWO_CPT_ORAL_ODE, csv),
+        1e-9,
+        "two_cpt_oral central + peripheral infusion overlapping",
+    );
+}
+
+/// **Steady state** into an oral peripheral (`SS=1`, `II=24`, window 5 h). The
+/// walk's `equilibrate_ss_state_event_driven` runs the synthetic pulse through
+/// the same routing table, so the peripheral channel has to survive the
+/// equilibration loop as well as the ordinary walk.
+#[test]
+fn ss_peripheral_infusion_matches_the_ode_twin() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
+               1,0,.,1,100,3,20,1,1,24\n\
+               1,1,5.0,0,.,2,.,0,.,.\n1,4,4.0,0,.,2,.,0,.,.\n\
+               1,8,3.0,0,.,2,.,0,.,.\n1,20,2.0,0,.,2,.,0,.,.\n";
+    assert_agree(
+        &preds(TWO_CPT_ORAL_CF, csv),
+        &preds(TWO_CPT_ORAL_ODE, csv),
+        // #914: the ODE SS is now the exact `(I − M)⁻¹·b` fixed point, matching the analytical
+        // closed form's exact SS to integration tolerance (was 1e-6 while the ODE truncated).
+        1e-8,
+        "two_cpt_oral SS peripheral infusion",
+    );
+}
+
+/// Steady-state **bolus** into an oral peripheral — the other half of the SS
+/// routing (`state[cmt_idx] += F·amt` inside the equilibration loop).
+#[test]
+fn ss_peripheral_bolus_matches_the_ode_twin() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
+               1,0,.,1,100,3,.,1,1,24\n\
+               1,1,5.0,0,.,2,.,0,.,.\n1,4,4.0,0,.,2,.,0,.,.\n\
+               1,8,3.0,0,.,2,.,0,.,.\n1,20,2.0,0,.,2,.,0,.,.\n";
+    assert_agree(
+        &preds(TWO_CPT_ORAL_CF, csv),
+        &preds(TWO_CPT_ORAL_ODE, csv),
+        // #914: ODE SS now exact (see the infusion twin above).
+        1e-8,
+        "two_cpt_oral SS peripheral bolus",
+    );
+}
+
+// ── the IV forced response the oral cases delegate to ────────────────────────
+
+const THREE_CPT_IV_CF: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVQ(3.0, 0.1, 50.0)
+  theta TVV2(80.0, 5.0, 500.0)
+  theta TVQ3(1.0, 0.1, 50.0)
+  theta TVV3(120.0, 5.0, 900.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+
+[structural_model]
+  pk three_cpt_iv(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+const THREE_CPT_IV_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVQ(3.0, 0.1, 50.0)
+  theta TVV2(80.0, 5.0, 500.0)
+  theta TVQ3(1.0, 0.1, 50.0)
+  theta TVV3(120.0, 5.0, 900.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+
+[structural_model]
+  ode(states=[central, periph1, periph2])
+
+[odes]
+  d/dt(central) = -(CL/V)*central - (Q/V)*central + (Q/V2)*periph1 - (Q3/V)*central + (Q3/V3)*periph2
+  d/dt(periph1) = (Q/V)*central - (Q/V2)*periph1
+  d/dt(periph2) = (Q3/V)*central - (Q3/V3)*periph2
+
+[scaling]
+  y = central / V
+
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+  ode_max_steps = 10000000
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// `three_cpt_iv`, infusion into each peripheral in turn — the **tight** oracle
+/// for the two cases `tests/nonmem_dose_compartment_anchor.rs` can only pin at
+/// `NONMEM_3CPT_INFUSION_TOL = 3e-5`.
+///
+/// Those two assertions previously had no independent tight guard: the oral
+/// peripheral infusions did (the tests above), and the IV ones — which exercise
+/// the *same* `propagate_three_cpt_core_g` forced response that the oral
+/// propagators delegate to — rested entirely on a cross-tool bound 3400× looser
+/// than the rest of that file, justified by prose about NONMEM's own accuracy.
+/// The parameters, dose amount/rate and observation times below are deliberately
+/// identical to that anchor's `three_cpt_iv` cases, so this pins exactly what the
+/// loose bound cannot rather than a neighbouring configuration.
+#[test]
+fn three_cpt_iv_peripheral_infusion_matches_the_ode_twin() {
+    for cmt in [2usize, 3] {
+        // AMT=100 at RATE=20 → a 5 h window; observations straddle its end.
+        let csv = format!(
+            "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,{cmt},20,1\n\
+             1,1,5.0,0,.,1,.,0\n1,4,4.0,0,.,1,.,0\n1,8,3.0,0,.,1,.,0\n"
+        );
+        assert_agree(
+            &preds(THREE_CPT_IV_CF, &csv),
+            &preds(THREE_CPT_IV_ODE, &csv),
+            1e-9,
+            &format!("three_cpt_iv infusion CMT={cmt}"),
+        );
+    }
+}
+
+/// The same system with **both** peripherals infused at once, so the two forced
+/// responses superpose. `propagate_three_cpt_core_g` takes `rate_periph1` and
+/// `rate_periph2` as separate arguments; a swap or a clobber between them would
+/// leave the single-channel tests above green.
+#[test]
+fn three_cpt_iv_both_peripherals_infused_matches_the_ode_twin() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+               1,0,.,1,100,2,20,1\n\
+               1,0,.,1,60,3,15,1\n\
+               1,1,5.0,0,.,1,.,0\n1,4,4.0,0,.,1,.,0\n1,8,3.0,0,.,1,.,0\n1,12,2.0,0,.,1,.,0\n";
+    assert_agree(
+        &preds(THREE_CPT_IV_CF, csv),
+        &preds(THREE_CPT_IV_ODE, csv),
+        1e-9,
+        "three_cpt_iv both peripherals infused",
+    );
+}

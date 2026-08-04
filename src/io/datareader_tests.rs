@@ -497,7 +497,7 @@ fn coded_rate_minus_one_on_dose_row_loads_as_modeled_rate() {
     let dose = &pop.subjects[0].doses[0];
     assert_eq!(dose.rate_mode, RateMode::ModeledRate);
     assert_eq!(dose.amt, 100.0);
-    assert_eq!(dose.cmt, 1);
+    assert_eq!(dose.cmt_raw(), 1);
     assert!(
         dose.is_infusion() && !dose.is_fixed(),
         "modeled, not a bolus"
@@ -533,7 +533,7 @@ fn addl_expansion_preserves_coded_rate_mode() {
             "dose {k} modeled, not a bolus"
         );
         assert_eq!(d.amt, 100.0);
-        assert_eq!(d.cmt, 1);
+        assert_eq!(d.cmt_raw(), 1);
     }
     // Additional doses land at time + k*II.
     assert_eq!(doses[1].time, 24.0);
@@ -567,7 +567,7 @@ fn addl_expansion_preserves_modeled_rate() {
             "dose {k} modeled, not a bolus"
         );
         assert_eq!(d.amt, 100.0);
-        assert_eq!(d.cmt, 1);
+        assert_eq!(d.cmt_raw(), 1);
     }
     assert_eq!(doses[1].time, 24.0);
     assert_eq!(doses[2].time, 48.0);
@@ -945,7 +945,9 @@ fn discrete_state_cmt_routes_integer_dv_into_obs_records() {
         .obs_records
         .iter()
         .map(|r| match r {
-            ObsRecord::DiscreteState { time, state, cmt } => {
+            ObsRecord::DiscreteState {
+                time, state, cmt, ..
+            } => {
                 assert_eq!(*cmt, 3);
                 (*time, *state)
             }
@@ -972,7 +974,9 @@ fn count_cmt_routes_nonneg_integer_dv_into_obs_records() {
         .obs_records
         .iter()
         .map(|r| match r {
-            ObsRecord::Count { time, count, cmt } => {
+            ObsRecord::Count {
+                time, count, cmt, ..
+            } => {
                 assert_eq!(*cmt, 4);
                 (*time, *count)
             }

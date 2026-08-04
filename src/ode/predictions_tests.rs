@@ -414,6 +414,207 @@ fn adaptive_window_signal_aucs_excludes_boundary_dose() {
     assert_relative_eq!(aucs[1], w1, max_relative = 1e-4);
 }
 
+/// Regression: the metrics-only signal-AUC pass must integrate the pre-scheduled
+/// **base regimen** (#702), not just the controller's realized ledger. The earlier
+/// `sub.doses = ledger` overwrite dropped any loading / maintenance dose carried on
+/// `base_subject.doses`, silently under-counting the exposure behind
+/// `auc_target_attainment`. Here a base IV loading bolus at t = 0 precedes the first
+/// decision window `[24, 48]`, so its decayed contribution to the post-dose amount at
+/// t = 24 must appear in that window's AUC.
+#[test]
+fn adaptive_window_signal_aucs_includes_base_loading_dose() {
+    let ode = one_cpt_ode_spec(); // readout = central amount, RHS = -ke·y
+    let pk = pk_one(10.0, 100.0); // ke = CL/V = 0.1
+    let (ke, d_base, d_ctrl) = (0.1_f64, 200.0_f64, 100.0_f64);
+
+    // Base regimen: a loading bolus at t=0, carried on the SUBJECT (not the ledger).
+    let with_base = make_subject(
+        vec![DoseEvent::new(0.0, d_base, 1, 0.0, false, 0.0)],
+        vec![],
+    );
+    // Controller decisions at 24, 48 ⇒ one window [24, 48]; a controller bolus at 24.
+    let ledger = vec![ledger_bolus(24.0, d_ctrl, 1)];
+    let decisions = [24.0, 48.0];
+
+    let aucs = adaptive_window_signal_aucs(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &with_base,
+        &decisions,
+        &ledger,
+        None,
+        1,
+    );
+    assert_eq!(aucs.len(), 1);
+
+    // Degenerate oracle: post-dose amount at 24⁺ is the base bolus decayed from t=0
+    // PLUS the fresh controller bolus, and the window then decays smoothly (no dose at
+    // 48), so the closed form is exact. A(24⁺) = D_base·e^{−24ke} + D_ctrl.
+    let a24 = d_base * (-ke * 24.0).exp() + d_ctrl;
+    let want = (a24 / ke) * (1.0 - (-ke * 24.0).exp());
+    assert_relative_eq!(aucs[0], want, max_relative = 1e-4);
+
+    // Positive control (non-vacuous): a dose-free base — the pre-fix behaviour, where
+    // only the ledger survived — leaves just the controller bolus and a materially
+    // smaller AUC. The base loading dose adds ≈ 18% here; assert the two differ well
+    // beyond any trapezoid / solver noise so the oracle above has real teeth.
+    let dose_free = make_subject(vec![], vec![]);
+    let without_base = adaptive_window_signal_aucs(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &dose_free,
+        &decisions,
+        &ledger,
+        None,
+        1,
+    );
+    let want_ctrl_only = (d_ctrl / ke) * (1.0 - (-ke * 24.0).exp());
+    assert_relative_eq!(without_base[0], want_ctrl_only, max_relative = 1e-4);
+    assert!(
+        aucs[0] > without_base[0] * 1.1,
+        "base loading dose not reflected: with-base {} vs ledger-only {}",
+        aucs[0],
+        without_base[0]
+    );
+}
+
+/// Regression: a base **maintenance** dose landing strictly INSIDE a decision window
+/// `(a, b)` — the common MIPD pattern of dosing more often than TDM sampling — must
+/// also be integrated (`time < b`, not `<= a`). Dropping it would under-count that
+/// window entirely. Here a base bolus at t = 12 sits inside the single window
+/// `[0, 24]`; the mutation `time <= a` (a = 0) would exclude it and collapse the
+/// with-base AUC onto the ledger-only value, which this test forbids.
+#[test]
+fn adaptive_window_signal_aucs_includes_mid_window_base_dose() {
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(10.0, 100.0); // ke = 0.1
+    let (ke, d_ctrl, d_mid) = (0.1_f64, 100.0_f64, 300.0_f64);
+
+    // Controller bolus at t=0 (decision at 0); base maintenance bolus at t=12.
+    let with_base = make_subject(
+        vec![DoseEvent::new(12.0, d_mid, 1, 0.0, false, 0.0)],
+        vec![],
+    );
+    let dose_free = make_subject(vec![], vec![]);
+    let ledger = vec![ledger_bolus(0.0, d_ctrl, 1)];
+    let decisions = [0.0, 24.0];
+
+    let call = |sub: &Subject| {
+        adaptive_window_signal_aucs(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            sub,
+            &decisions,
+            &ledger,
+            None,
+            1,
+        )
+    };
+    let with_ = call(&with_base);
+    let without = call(&dose_free);
+    assert_eq!(with_.len(), 1);
+
+    // Closed form, splitting at the mid-window bolus t=12:
+    //   ∫₀¹² D_ctrl·e^{−ke t} dt  +  ∫₁²²⁴ A(12⁺)·e^{−ke(t−12)} dt,
+    // with A(12⁺) = D_ctrl·e^{−12ke} + D_mid. The instantaneous bolus into the
+    // monitored compartment jumps the signal at an off-node instant, so the uniform
+    // 128-panel trapezoid carries the documented ≈ ½·Δ·(span⁄panels) node-placement
+    // bias (measured ≈ +0.94% here) — hence the looser band vs the smooth-decay cases
+    // above. The point is inclusion: dropping the base dose is a ~70% error, far
+    // outside this.
+    let a12_pre = d_ctrl * (-ke * 12.0).exp();
+    let a12_post = a12_pre + d_mid;
+    let seg = 1.0 - (-ke * 12.0).exp();
+    let want = (d_ctrl / ke) * seg + (a12_post / ke) * seg;
+    assert_relative_eq!(with_[0], want, max_relative = 2e-2);
+
+    // The mid-window base dose roughly triples this window's AUC; a `<= a` filter
+    // would drop it and make with == without. Demand a large, unambiguous gap.
+    assert!(
+        with_[0] > without[0] * 2.0,
+        "mid-window base dose not integrated: with-base {} vs ledger-only {}",
+        with_[0],
+        without[0]
+    );
+}
+
+/// A base **infusion** or **steady-state** dose must reach the AUC pass with its full
+/// attributes — the fix keeps base doses via `clone`, never a `DoseEvent::new` rebuild
+/// (which would flatten `ss`/`ii`/`rate` to a plain `Fixed` bolus). This verifies that
+/// "correct by construction" claim directly, rather than trusting it: both are
+/// integrated by the same `ode_dense_solve_states` machinery `predict()` uses, so the
+/// window AUC matches the closed form, and — critically — differs from the same total
+/// dose given as a plain t=0 bolus. Closes the coverage gap PR #942's bolus-only
+/// oracles left.
+#[test]
+fn adaptive_window_signal_aucs_preserves_ss_and_infusion_base_attrs() {
+    let ode = one_cpt_ode_spec(); // readout = central amount, RHS = -ke·y
+    let pk = pk_one(10.0, 100.0); // ke = 0.1
+    let ke = 0.1_f64;
+    let decisions = [24.0, 48.0]; // one window [24, 48], well after the base dose at 0
+    let ledger = vec![ledger_bolus(24.0, 100.0, 1)];
+    let call = |sub: &Subject| {
+        adaptive_window_signal_aucs(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            sub,
+            &decisions,
+            &ledger,
+            None,
+            1,
+        )
+    };
+
+    // --- Infusion base dose: amt=200 delivered over 20 h (rate=10) at t=0. Because it
+    // is spread over [0,20] rather than dumped at t=0, more drug survives to t=24 than
+    // an equal t=0 bolus would leave. A(24) decays from the end-of-infusion amount
+    // (R/ke)(1 − e^{−20ke}); the window [24,48] is then smooth decay past the ctrl bolus.
+    let inf = make_subject(
+        vec![DoseEvent::new(0.0, 200.0, 1, 10.0, false, 0.0)],
+        vec![],
+    );
+    let a20 = (10.0 / ke) * (1.0 - (-ke * 20.0).exp());
+    let a24_inf = a20 * (-ke * 4.0).exp() + 100.0;
+    let want_inf = (a24_inf / ke) * (1.0 - (-ke * 24.0).exp());
+    assert_relative_eq!(call(&inf)[0], want_inf, max_relative = 1e-3);
+    // Non-vacuous: the SAME 200 units as a plain t=0 bolus give a materially smaller
+    // AUC (≈ −25%). Running the function on both proves it honors the infusion (does
+    // not flatten it), not just that two closed forms differ.
+    let bolus200 = make_subject(vec![DoseEvent::new(0.0, 200.0, 1, 0.0, false, 0.0)], vec![]);
+    assert!(
+        call(&inf)[0] > call(&bolus200)[0] * 1.2,
+        "infusion base dose flattened to a bolus: inf {} vs bolus {}",
+        call(&inf)[0],
+        call(&bolus200)[0]
+    );
+
+    // --- Steady-state bolus base dose: amt=100, II=6, ss=true at t=0. The post-dose
+    // amount is the SS peak D/(1 − e^{−ke·II}) (equilibrate_ss_state trough + the
+    // record's bolus); a single SS record does not re-pulse, so it then decays plainly.
+    let ss = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 6.0)], vec![]);
+    let peak = 100.0 / (1.0 - (-ke * 6.0).exp());
+    let a24_ss = peak * (-ke * 24.0).exp() + 100.0;
+    let want_ss = (a24_ss / ke) * (1.0 - (-ke * 24.0).exp());
+    assert_relative_eq!(call(&ss)[0], want_ss, max_relative = 1e-3);
+    // Non-vacuous: dropping `ss` (a plain 100 bolus at t=0) omits the SS priming and
+    // gives a smaller AUC (≈ −9%), so the SS attribute is genuinely acted upon.
+    let bolus100 = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![]);
+    assert!(
+        call(&ss)[0] > call(&bolus100)[0] * 1.05,
+        "SS base dose treated as a plain bolus: ss {} vs bolus {}",
+        call(&ss)[0],
+        call(&bolus100)[0]
+    );
+}
+
 /// Build the per-segment `obs_time -> indices` map the integrator uses.
 fn obs_index_map(obs_times: &[f64]) -> HashMap<u64, Vec<usize>> {
     let mut m: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -446,6 +647,7 @@ fn integrate_segment_zero_length_is_a_noop() {
         &subject,
         &[],
         &[],
+        f64::NEG_INFINITY,
         &mut ext_params,
         &pk.values,
         &[],
@@ -485,6 +687,7 @@ fn integrate_segment_advances_state_and_records_obs() {
         &subject,
         &[],
         &[],
+        f64::NEG_INFINITY,
         &mut ext_params,
         &pk.values,
         &[],
@@ -2005,28 +2208,252 @@ fn adaptive_dv_added_monitor_does_not_perturb_other_draw() {
 }
 
 #[test]
-fn adaptive_rejects_nonempty_base_subject() {
+fn adaptive_base_regimen_matches_static_ode() {
+    // #702 driver-level oracle: a base loading regimen with a Hold-all controller must
+    // reproduce `ode_predictions` on that regimen — the reactive driver seeds and
+    // integrates the pre-scheduled doses through the same static-engine helpers.
     let ode = one_cpt_ode_spec();
     let pk = pk_one(1.0, 10.0);
+    // Decisions on the loading-dose grid so the reactive driver and `ode_predictions`
+    // segment identically (bit-exact); an off-grid decision would add a break the static
+    // engine lacks, diverging by RK45 step noise (the frozen-replay verifier is the
+    // bit-exact check when decisions are off-grid).
+    let decisions = [0.0, 24.0];
+    let obs = vec![6.0, 30.0, 54.0];
+    let loading = vec![
+        DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 250.0, 1, 0.0, false, 0.0),
+    ];
+
     let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
-    let base = make_subject(
-        vec![DoseEvent::new(0.0, 50.0, 1, 0.0, false, 0.0)],
-        vec![1.0],
-    );
-    let err = ode_predictions_adaptive(
+    let base = make_subject(loading.clone(), obs.clone());
+    let run = ode_predictions_adaptive(
         &ode,
         &pk.values,
         &[],
         &[],
         &base,
-        &[0.0],
+        &decisions,
         &[],
         &mut controller,
         100,
         None,
     )
-    .unwrap_err();
-    assert!(err.contains("dose-free"), "got: {err}");
+    .expect("driver runs with a base regimen");
+    assert!(run.ledger.is_empty(), "Hold controller adds no doses");
+
+    let static_subject = make_subject(loading, obs);
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+    assert_eq!(run.predictions.len(), static_preds.len());
+    for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+        assert_relative_eq!(*got, *want, max_relative = 1e-9);
+    }
+}
+
+#[test]
+fn adaptive_base_regimen_plus_titration_matches_static_ode() {
+    // #702: base loading dose + a fixed controller ≡ `ode_predictions` on (base ∪ ledger).
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(1.0, 10.0);
+    let decisions = [0.0, 24.0, 48.0];
+    let obs = vec![6.0, 30.0, 54.0];
+    let loading = vec![DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)];
+
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+    let base = make_subject(loading.clone(), obs.clone());
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base,
+        &decisions,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs");
+    assert_eq!(run.ledger.len(), 3);
+
+    let mut static_doses = loading;
+    static_doses.extend(
+        run.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let static_subject = make_subject(static_doses, obs);
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+    for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+        assert_relative_eq!(*got, *want, max_relative = 1e-9);
+    }
+}
+
+/// 1-cpt IV amount ODE with a per-compartment dose lagtime (`ALAG1`) at `lag_slot`. Used
+/// to exercise a base dose into a lagged compartment on the reactive path (#935).
+fn one_cpt_lag_spec(lag_slot: usize) -> OdeSpec {
+    let mut map = crate::types::DoseAttrMap::default();
+    map.insert(crate::types::DoseAttr::Lag, 1, lag_slot);
+    OdeSpec {
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ke = if v > 0.0 { cl / v } else { 0.0 };
+            dy[0] = -ke * y[0];
+        }),
+        n_states: 1,
+        state_names: vec!["central".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: map,
+        init_fn: None,
+    }
+}
+
+#[test]
+fn adaptive_base_dose_into_input_rate_compartment_matches_static_ode() {
+    // #935: a base dose into a built-in input-rate (first_order absorption) compartment is
+    // delivered as `R_in` over time, NOT as a bolus jump — exercising the reactive
+    // `input_rate_consumes_cmt` skip in `apply_prescheduled_boluses_at` on a genuine base
+    // run (previously covered only via the static-engine code motion). A Hold controller
+    // with the single decision on the integration start keeps the segmentation identical to
+    // `ode_predictions`, so the match is bit-exact.
+    let mut ode = first_order_one_cpt_spec();
+    ode.solver_opts.reltol = 1e-10;
+    ode.solver_opts.abstol = 1e-10;
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 1.0;
+    pk.values[crate::types::PK_IDX_V] = 20.0;
+    pk.values[4] = 0.5; // ka
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+    let decisions = [0.0];
+    let obs = vec![2.0, 12.0, 30.0];
+    let base = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+    let base_subj = make_subject(base.clone(), obs.clone());
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base_subj,
+        &decisions,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs with an input-rate base dose");
+    assert!(run.ledger.is_empty(), "Hold controller adds no doses");
+
+    let static_subj = make_subject(base, obs);
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subj);
+    assert_eq!(run.predictions.len(), static_preds.len());
+    for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+        assert_relative_eq!(*got, *want, max_relative = 1e-9);
+    }
+    // Non-vacuity: the input-rate base dose actually drives the compartment.
+    assert!(run.predictions.iter().any(|&p| p > 1.0));
+}
+
+#[test]
+fn adaptive_base_dose_with_lagtime_matches_static_ode() {
+    // #935: a base dose into a LAGGED compartment — its bolus lands at `dose.time + lag`, and
+    // the reactive `dose_lagtimes` / break placement / `apply_prescheduled_boluses_at` lag
+    // filter must reproduce `ode_predictions`. `ALAG1 = 5 h`; the single decision on the
+    // integration start keeps the segmentation identical (bit-exact). Base doses into lagged
+    // compartments are supported (they run the exact static machinery `predict()` uses) —
+    // unlike CONTROLLER doses into a lagged compartment, which are rejected at injection
+    // (`reject_unsupported_dose_compartment`) because the TAD-anchor/double-count subtleties
+    // bite only for a dose discovered mid-run, not a pre-resolved base dose.
+    let lag_slot = 8usize;
+    let ode = one_cpt_lag_spec(lag_slot);
+    let mut pk = pk_one(1.0, 10.0);
+    pk.values[lag_slot] = 5.0; // ALAG1 = 5 h
+    let decisions = [0.0];
+    let obs = vec![3.0, 8.0, 24.0]; // t=3 pre-lag (empty), t=8/24 post-lag
+    let base = vec![DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)];
+
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+    let base_subj = make_subject(base.clone(), obs.clone());
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base_subj,
+        &decisions,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs with a lagged base dose");
+    assert!(run.ledger.is_empty(), "Hold controller adds no doses");
+
+    let static_subj = make_subject(base, obs);
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subj);
+    for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+        assert_relative_eq!(*got, *want, max_relative = 1e-9);
+    }
+    // The lag is real: nothing has arrived at t=3 (pre-lag), the dose is present by t=8.
+    assert!(run.predictions[0].abs() < 1e-9, "pre-lag readout must be 0");
+    assert!(run.predictions[1] > 100.0, "post-lag dose must be present");
+}
+
+#[test]
+fn adaptive_base_regimen_with_reset_matches_static_ode_driver() {
+    // #932 driver-level oracle (constant covariates, tv/iov off): a base loading regimen on a
+    // reset-carrying subject now integrates — the reset zeros the state and lowers the reset
+    // floor — and must reproduce `ode_predictions` (itself reset-aware) on the realized
+    // (base ∪ ledger) regimen carrying the same reset. On-grid decisions keep the two engines'
+    // segmentation identical, so the match is bit-tight. (Base × reset UNDER a time-varying
+    // covariate / IOV — `event_pk`/`eta_occ` = Some — stays a typed error; that boundary is
+    // covered by `adaptive_base_regimen_with_reset_under_iov_is_rejected`.)
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(1.0, 10.0);
+    let decisions = [24.0];
+    let obs = vec![6.0, 18.0, 30.0];
+    let reset_at = 12.0;
+    let loading = vec![DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)];
+
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+    let mut base = make_subject(loading.clone(), obs.clone());
+    base.reset_times = vec![reset_at];
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base,
+        &decisions,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs with a base regimen across a reset");
+    assert_eq!(run.ledger.len(), 1, "one controller bolus at t=24");
+
+    let mut static_doses = loading;
+    static_doses.extend(
+        run.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let mut static_subject = make_subject(static_doses, obs);
+    static_subject.reset_times = vec![reset_at];
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+    assert_eq!(run.predictions.len(), static_preds.len());
+    for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+        assert_relative_eq!(*got, *want, max_relative = 1e-9);
+    }
 }
 
 #[test]
@@ -3104,6 +3531,7 @@ fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
         &subject,
         &[0.0],
         &[1.0],
+        f64::NEG_INFINITY,
         &mut ext_params,
         &pk.values,
         &[],
@@ -5080,34 +5508,159 @@ fn ss_cycle_converged_is_mixed_atol_rtol_on_increment() {
 }
 
 #[test]
-fn ss_equilibration_early_stop_fires_for_fast_pk() {
-    // #532 review #6: pin that the #519 early stop actually fires (the loose end-value
-    // tolerances would otherwise hide a broken stop). Use a tight integrator tol — the
-    // gradient context where the speedup matters.
+fn ss_linear_disposition_uses_exact_fixed_point() {
+    // #914: a LINEAR disposition now equilibrates via the exact closed-form fixed point
+    // `u_ss = (I − M)⁻¹·b` (one recorded cycle), for both fast and slow PK, rather than the
+    // up-to-50-cycle pulse train. The slow case is the payoff: the old train ran the full budget
+    // and truncated its geometric tail (~30% low here), while the exact solve nails the
+    // analytical steady state. (The #519 pulse-train early stop is now reachable only on the
+    // nonlinear fallback — see `ss_nonlinear_bolus_with_steady_state_uses_fallback`.)
     let mut ode = one_cpt_ode_spec();
     ode.solver_opts.reltol = 1e-10;
     ode.solver_opts.abstol = 1e-12;
-    let dose = DoseEvent::new(0.0, 1000.0, 1, 0.0, true, 12.0);
+    let ii = 12.0_f64;
+    let amt = 1000.0_f64;
+    let dose = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
 
-    // Fast disposition (ke = CL/V = 2.0, λ·II = 24): the trough converges in a few cycles,
-    // so the early stop fires well inside SS_EQUILIBRATION_CYCLES.
-    let fast = pk_one(20.0, 10.0);
-    let _ = equilibrate_ss_state(&ode, &fast.values, &dose, &ode.solver_opts);
-    let fast_cycles = crate::dosing::last_ss_equilibration_cycles();
+    // (cl, v) — "fast" (ke·II = 6, the old early stop fired) and "slow" (ke·II ≈ 0.024, the old
+    // full-budget truncation was ~30% low). The fast case is deliberately not *extreme*
+    // (ke·II ≫ 6): a near-total between-dose decay drives the trough toward the RK45 `abstol`
+    // floor, where relative precision is lost — an integration-noise artifact, not the fixed
+    // point being wrong (`ode_provider_ss_linear_bolus_uses_exact_solve` checks the gradient too).
+    for (cl, v, label) in [(5.0_f64, 10.0_f64, "fast"), (0.1_f64, 50.0_f64, "slow")] {
+        let pk = pk_one(cl, v);
+        let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts);
+        assert_eq!(
+            crate::dosing::last_ss_equilibration_cycles(),
+            1,
+            "{label} linear PK must equilibrate via the exact fixed point (one cycle)"
+        );
+        // Pre-pulse SS amount for a 1-cpt bolus: `F·amt·e^{−ke·II}/(1 − e^{−ke·II})` (F = 1).
+        // The state stores amount, so compare directly.
+        let ke = cl / v;
+        let expected = amt * (-ke * ii).exp() / (1.0 - (-ke * ii).exp());
+        assert_relative_eq!(trough[0], expected, max_relative = 1e-6);
+    }
+}
+
+/// 1-cpt Michaelis–Menten **disposition** (no absorption kernel), amount state:
+/// `dA/dt = −Vmax·A/(Km + A)`, Vmax in the CL slot, Km in the V slot. A plain bolus into this
+/// compartment is genuinely nonlinear, so the #914 exact fixed point's linearity self-check
+/// declines and the SS equilibration falls back to the capped pulse train (with the #867
+/// non-convergence warning when it can't converge). Distinct from `mm_ss_absorption_spec`, which
+/// also carries a `first_order` input rate and so exercises the input-rate branch instead.
+fn mm_disposition_spec() -> OdeSpec {
+    OdeSpec {
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let vmax = p[crate::types::PK_IDX_CL];
+            let km = p[crate::types::PK_IDX_V];
+            dy[0] = -vmax * y[0] / (km + y[0]);
+        }),
+        n_states: 1,
+        state_names: vec!["central".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: Vec::new(),
+        init_fn: None,
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+    }
+}
+
+/// Independent SS reference for a plain **bolus** into a (possibly nonlinear) disposition: run the
+/// pulse train `(add F·amt; integrate II)` from a zero state for `max_cycles` and return the
+/// pre-next-pulse trough. Uncapped (`max_cycles ≫ 50`), so for a disposition that admits a
+/// periodic steady state it is fully converged — the genuine SS the 50-cycle production fallback
+/// approximates. `F = 1`.
+fn bolus_ss_reference(ode: &OdeSpec, pk: &[f64], dose: &DoseEvent, max_cycles: usize) -> Vec<f64> {
+    let eq = ss_equilibration_opts(&ode.solver_opts);
+    let cmt = dose.cmt_idx();
+    let mut u = vec![0.0; ode.n_states];
+    for _ in 0..max_cycles {
+        u[cmt] += dose.amt;
+        if let Some(last) = solve_ode(&ode.rhs, &u, (0.0, dose.ii), pk, &[dose.ii], &eq).last() {
+            u.copy_from_slice(&last.u);
+        }
+    }
+    u
+}
+
+/// #914 gap 1 (nonlinear branch preserved): a Michaelis–Menten **disposition** that *admits* a
+/// periodic steady state (mean input `100/8 = 12.5 ≪ Vmax = 50`) fails the exact fixed point's
+/// linearity self-check and falls back to the capped pulse train — which, since it converges well
+/// inside the 50-cycle budget, reaches the true SS (matching an uncapped run-in) with **no**
+/// warning. Proves the exact-solve short-circuit does not swallow a genuinely nonlinear model.
+#[test]
+fn ss_nonlinear_bolus_with_steady_state_uses_fallback() {
+    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::dosing::clear_ss_nonconvergence_warnings();
+
+    let mut ode = mm_disposition_spec();
+    ode.solver_opts.reltol = 1e-10;
+    ode.solver_opts.abstol = 1e-12;
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 50.0; // Vmax
+    pk.values[crate::types::PK_IDX_V] = 30.0; // Km — the peak amount ≈ 100 ≫ Km, so genuinely nonlinear
+    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0);
+
+    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts);
+    let cycles = crate::dosing::last_ss_equilibration_cycles();
     assert!(
-        (2..SS_EQUILIBRATION_CYCLES).contains(&fast_cycles),
-        "fast PK should early-stop inside the budget, ran {fast_cycles}"
+        (2..SS_EQUILIBRATION_CYCLES).contains(&cycles),
+        "a nonlinear disposition must fall back to the pulse train and converge inside the budget, \
+         ran {cycles} cycles"
     );
+    let reference = bolus_ss_reference(&ode, &pk.values, &dose, 500);
+    assert_relative_eq!(trough[0], reference[0], max_relative = 1e-6);
+    assert!(
+        crate::dosing::take_ss_nonconvergence_warnings().is_empty(),
+        "a converging nonlinear SS must not warn"
+    );
+}
 
-    // Near-non-eliminating (ke ≈ 5e-4, λ·II ≈ 6e-3): never reaches the 1e-12 relative
-    // threshold in the budget → runs the full SS_EQUILIBRATION_CYCLES (this is the
-    // pre-existing slow-PK truncation, tracked separately — #532 review #12).
-    let slow = pk_one(0.05, 100.0);
-    let _ = equilibrate_ss_state(&ode, &slow.values, &dose, &ode.solver_opts);
-    let slow_cycles = crate::dosing::last_ss_equilibration_cycles();
+/// #914 gap 2 (the newly-wired warning): a Michaelis–Menten **disposition** dosed *above capacity*
+/// (mean input `50/8 = 6.25 > Vmax = 5`) has no periodic steady state, so the bolus fallback runs
+/// the full 50-cycle budget without converging and now surfaces the #867 non-convergence warning
+/// — previously silent for the ordinary bolus/infusion path (it was wired only into the
+/// input-rate branch). Predictions stay finite.
+#[test]
+fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
+    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::dosing::clear_ss_nonconvergence_warnings();
+
+    let ode = mm_disposition_spec();
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 5.0; // Vmax
+    pk.values[crate::types::PK_IDX_V] = 8.0; // Km
+    let ss = DoseEvent::new(0.0, 50.0, 1, 0.0, true, 8.0); // mean input 6.25 > Vmax 5
+
+    let trough = equilibrate_ss_state(&ode, &pk.values, &ss, &ode.solver_opts);
     assert_eq!(
-        slow_cycles, SS_EQUILIBRATION_CYCLES,
-        "slow PK should run the full budget, ran {slow_cycles}"
+        crate::dosing::last_ss_equilibration_cycles(),
+        SS_EQUILIBRATION_CYCLES,
+        "an over-capacity (no-SS) nonlinear disposition must run the full capped budget"
+    );
+    assert!(trough.iter().all(|x| x.is_finite()));
+
+    let subj = make_subject(vec![ss], vec![1.0, 4.0, 7.9]);
+    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+    assert!(
+        preds.iter().all(|p| p.is_finite()),
+        "predictions must stay finite: {preds:?}"
+    );
+    let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+        "an over-capacity bolus must surface a non-convergence warning; got: {warnings:?}"
     );
 }
 
@@ -5160,6 +5713,40 @@ fn ode_ss_infusion_matches_analytical_ss() {
     for (j, &t) in obs_times.iter().enumerate() {
         let expected = one_cpt_infusion_ss(&dose, t, cl, v);
         assert_relative_eq!(preds[j] / v, expected, epsilon = 1e-6, max_relative = 1e-4);
+    }
+}
+
+/// #914 regression, **infusion** side: the exact solve on a SLOW disposition. At `ke·II ≈ 0.03`
+/// the old 50-cycle pulse train truncated the SS trough ~22% low (`exp(−50·ke·II) ≈ 0.22`); the
+/// exact `(I − M)⁻¹·b` fixed point matches the analytical infusion SS closed form. The fast
+/// `ode_ss_infusion_matches_analytical_ss` above sits at `ke·II = 1.5`, where a 50-cycle residual
+/// is `exp(−75) ≈ 1e-33` — it passes on *both* old and new code and so cannot detect an
+/// infusion truncation-tail bug. This is the infusion analogue of the slow-bolus case in
+/// `ss_linear_disposition_uses_exact_fixed_point`, and it fails against the pre-#914 truncated
+/// train (the only PR-level truncation-sensitive infusion oracle — the `tests/` twin runs nightly).
+#[test]
+fn ode_ss_slow_infusion_matches_analytical_ss() {
+    use crate::pk::one_cpt_infusion_ss;
+    let cl = 0.1_f64;
+    let v = 80.0_f64; // ke = CL/V = 1.25e-3, ke·II = 0.03 → the pre-#914 train was ~22% low
+    let amt = 1000.0_f64;
+    let rate = 100.0_f64; // T_inf = 10 h < II
+    let ii = 24.0_f64;
+    // During-infusion, at the window end, post-infusion within the interval, and beyond it.
+    let obs_times = vec![2.0, 10.0, 12.0, 20.0, 30.0, 48.0];
+    let dose = DoseEvent::new(0.0, amt, 1, rate, true, ii);
+    let subj = make_subject(vec![dose.clone()], obs_times.clone());
+    let pk = pk_one(cl, v);
+    let mut ode = one_cpt_ode_spec();
+    // Tight solver tol so the forward walk tracks the exact analytical SS (the equilibration
+    // itself already runs at ss_equilibration_opts); the 22% truncation gap dwarfs this regardless.
+    ode.solver_opts.reltol = 1e-11;
+    ode.solver_opts.abstol = 1e-13;
+
+    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+    for (j, &t) in obs_times.iter().enumerate() {
+        let expected = one_cpt_infusion_ss(&dose, t, cl, v);
+        assert_relative_eq!(preds[j] / v, expected, epsilon = 1e-7, max_relative = 1e-6);
     }
 }
 
@@ -5614,19 +6201,21 @@ fn ode_with_states_applies_dose_on_last_observation() {
     );
 }
 
-/// Bug regression: CMT out-of-range (CMT=0 or CMT > n_states) must be
-/// ignored by both new functions, matching ode_predictions behaviour.
-/// Before the fix, saturating_sub(1).min(n-1) applied the dose to
-/// compartment 0 or the last compartment instead.
+/// Bug regression: a CMT past the end of the state vector must be ignored by
+/// both new functions, matching `ode_predictions` behaviour. Before the original
+/// fix, `saturating_sub(1).min(n-1)` applied the dose to the *last* compartment
+/// instead. (Rejecting it up front is `check_dose_compartments`' job since #899;
+/// this pins the engine-level fallback, which these `pub fn`s still need because
+/// they are reachable from hand-built `OdeSpec`s that run no validation.)
 #[test]
 fn ode_with_states_ignores_out_of_range_cmt() {
     let cl = 5.0_f64;
     let v = 80.0_f64;
     let ode = one_cpt_ode_spec();
     let pk = pk_one(cl, v);
-    // CMT=0 — out-of-range for a 1-state ODE (states are CMT 1).
     let dose_valid = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
-    let dose_oor = DoseEvent::new(0.0, 999.0, 0, 0.0, false, 0.0); // CMT=0
+    // CMT=2 — past the end of a 1-state ODE (its only state is CMT 1).
+    let dose_oor = DoseEvent::new(0.0, 999.0, 2, 0.0, false, 0.0);
     let obs_times = vec![4.0, 12.0];
 
     let subj_ref = make_subject(vec![dose_valid.clone()], obs_times.clone());
@@ -5637,11 +6226,50 @@ fn ode_with_states_ignores_out_of_range_cmt() {
     for j in 0..obs_times.len() {
         assert!(
             approx::relative_eq!(preds_ref[j], preds_oor[j], max_relative = 1e-9),
-            "obs {j}: CMT=0 dose was applied (got {}) instead of being ignored (expected {})",
+            "obs {j}: out-of-range dose was applied (got {}) instead of being ignored \
+             (expected {})",
             preds_oor[j],
             preds_ref[j]
         );
     }
+}
+
+/// `CMT=0` is **not** out of range — it is NONMEM's default dose compartment and
+/// resolves to compartment 1 (#899). This function used to skip it outright,
+/// while `ode_predictions_event_driven` on the identical dataset applied it to
+/// compartment 1 and the plain `ode_predictions` segment loop underflowed
+/// (debug panic / release silent drop). All three now agree, so a `CMT=0` dose
+/// must be indistinguishable from the same dose written `CMT=1`.
+#[test]
+fn ode_with_states_applies_cmt_zero_to_the_default_compartment() {
+    let cl = 5.0_f64;
+    let v = 80.0_f64;
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(cl, v);
+    let obs_times = vec![4.0, 12.0];
+
+    let subj_one = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times.clone(),
+    );
+    let subj_zero = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0)],
+        obs_times.clone(),
+    );
+
+    let (preds_one, _) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subj_one);
+    let (preds_zero, _) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subj_zero);
+    for j in 0..obs_times.len() {
+        assert!(
+            approx::relative_eq!(preds_one[j], preds_zero[j], max_relative = 1e-12),
+            "obs {j}: CMT=0 should dose the default compartment like CMT=1 \
+             (got {} vs {})",
+            preds_zero[j],
+            preds_one[j]
+        );
+    }
+    // Guard against the assertion passing vacuously on an all-zero curve.
+    assert!(preds_one[0] > 0.0, "reference curve should be non-trivial");
 }
 
 /// Bug regression: TAD for SS doses must be computed with rem_euclid so it
@@ -5802,11 +6430,6 @@ fn adaptive_observe_expression_flows_through_driver() {
     );
 }
 
-/// Serializes the tests that *read* the process-global SS non-convergence sink
-/// (`take_ss_nonconvergence_warnings`, #867) so cargo's parallel harness can't have one test
-/// drain another's entry mid-read. Writers don't drain, so only readers need to coordinate.
-static SS_WARN_SINK_READER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// A 1-cpt Michaelis–Menten SS-absorption `OdeSpec` (`first_order(ka)` into MM elimination),
 /// with `Vmax`/`Km`/`ka` in the CL/V/slot-4 positions the tests set. Shared by the #867
 /// nonlinear-SS tests.
@@ -5852,7 +6475,16 @@ fn explicit_ss_run_in(
 ) -> (Vec<f64>, usize) {
     let prepared = prepare_input_rates(ode, pk);
     let doses: Vec<DoseEvent> = (0..max_cycles)
-        .map(|m| DoseEvent::new(m as f64 * dose.ii, dose.amt, dose.cmt, 0.0, false, 0.0))
+        .map(|m| {
+            DoseEvent::new(
+                m as f64 * dose.ii,
+                dose.amt,
+                dose.cmt_raw(),
+                0.0,
+                false,
+                0.0,
+            )
+        })
         .collect();
     let fbios = vec![1.0; max_cycles];
     let no_lag: [f64; 0] = [];
@@ -5987,7 +6619,7 @@ fn ss_input_rate_over_capacity_deep_saturation_declines() {
 /// the caller falls to the capped pulse train, and the non-convergence warning fires.
 #[test]
 fn ss_input_rate_no_steady_state_warns() {
-    let _guard = SS_WARN_SINK_READER_GUARD
+    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     crate::dosing::clear_ss_nonconvergence_warnings();

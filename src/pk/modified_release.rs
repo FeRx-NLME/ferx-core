@@ -590,11 +590,7 @@ pub(crate) fn mr_scope<'a>(
     // compartment (`predictions.rs`: `d.cmt-1 != forcing.cmt → continue`). A dose
     // into any other compartment is a bolus the superposition does not represent,
     // so decline it. (`dose.cmt` is 1-based; `disp.central` is a 0-based state.)
-    if subject
-        .doses
-        .iter()
-        .any(|d| d.cmt.saturating_sub(1) != disp.central)
-    {
+    if subject.doses.iter().any(|d| d.cmt_idx() != disp.central) {
         return None;
     }
     let dp = recover_disp_params_g::<f64>(spec, &disp, &pk.values, &subject.covariates)?;

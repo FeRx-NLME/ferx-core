@@ -53,7 +53,7 @@ with the run, never with a fitted model's parameters.
 | `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
 | `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. |
 | `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_time_in_window` outcome metric — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_time_in_window` unreported, rather than guessing a band from the rule thresholds. |
-| `auc_target` | | Exposure band `[low, high]` for the **area under the monitored signal** over each inter-decision window (e.g. vancomycin AUC₂₄ when decisions are daily), used **only** to report the `auc_target_attainment` outcome metric — like `target_window` it does **not** influence dosing. `low` must be `≥ 0`; `high` may be `inf`. Declaring it turns on a signal-AUC pass that re-integrates the realized doses on a dense grid; omit it to skip that pass and leave `auc_target_attainment` unreported. |
+| `auc_target` | | Exposure band `[low, high]` for the **area under the monitored signal** over each inter-decision window (e.g. vancomycin AUC₂₄ when decisions are daily), used **only** to report the `auc_target_attainment` outcome metric — like `target_window` it does **not** influence dosing. `low` must be `≥ 0`; `high` may be `inf`. Declaring it turns on a signal-AUC pass that re-integrates any pre-scheduled base regimen (#702) together with the realized controller doses on a dense grid; omit it to skip that pass and leave `auc_target_attainment` unreported. |
 | `with_assay_error` | signal¹ | Titrate on the **noised measurement** of a model output (named by `assay_cmt`) instead of a latent expression (default `false`). The signal's value comes from that output's `[scaling]` readout and its σ from that output's `[error_model]`, so the two are always on the same scale — there is no re-typed `observe` expression to mis-scale. Mutually exclusive with `observe`. |
 | `assay_cmt` | | The 1-based compartment of the model output measured under `with_assay_error` — its `[scaling]` readout is the signal value and its `[error_model]` σ the noise. **Required** with `with_assay_error`. |
 
@@ -116,7 +116,7 @@ declared *monitor* — and returns a list of [`DoseAction`]s:
 | `Bolus { amt, cmt }` | Instantaneous dose into 1-based compartment `cmt`. |
 | `Infuse { amt, cmt, rate }` | Zero-order infusion; duration is `amt / rate`. |
 | `Hold` | Skip this decision — no dose now, the regimen continues. |
-| `Stop` | Discontinue all **future** dosing. An infusion already in flight runs to its scheduled end. |
+| `Stop` | Discontinue all **future controller** dosing. An infusion already in flight runs to its scheduled end, and a pre-scheduled base regimen (#702) keeps dosing — `Stop` ends the controller's augmentation, not the patient's standing prescription. |
 
 A `Stop` must be the final action in a decision's list; issuing work after a
 `Stop` is a typed error, not a silently dropped dose.
@@ -337,9 +337,43 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
 - **A non-empty decision schedule is required** — an empty `decision_times` never
   consults the controller, so it is rejected rather than run as a silent
   dose-free simulation.
-- **Dose-free base subjects** — the regimen is fully controller-driven; a subject
-  that already carries doses (including steady-state or loading regimens) is
-  rejected.
+- **Pre-scheduled base regimens are supported** (#702) — the base subject may carry a
+  loading / maintenance regimen, including a steady-state (`SS=1`) dose and doses into
+  lagged or built-in input-rate (transit / zero-order absorption) compartments, which the
+  driver integrates and the controller augments at the decision schedule (the real TDM /
+  MIPD workflow: start on a fixed regimen, then titrate on measured levels). Base doses flow
+  through the same dose-resolution, break-timeline, and steady-state machinery as
+  `predict()` / `simulate()`, and they appear in the controller's dose `history`; the
+  frozen-replay verifier rebuilds the base regimen alongside the realized ledger, so the
+  pre-scheduled + reactive bookkeeping is checked bit-for-bit each run. The `auc_target`
+  exposure metric likewise integrates the base regimen: each window's AUC covers the base
+  doses — a loading dose before the first window and a maintenance dose landing inside a
+  window alike — not just the controller's, so `auc_target_attainment` is not biased low on a
+  base-regimen run (constant-covariate; the time-varying / IOV / reset `auc_target` caveats
+  below are unchanged).
+  A base dose that **shares a time with a decision is observed pre-dose** (the trough),
+  symmetric with the controller's own doses — the controller reads the level *before* the
+  scheduled dose lands, then that dose is applied (#933); for a steady-state base dose the
+  pre-dose readout is the steady-state trough. A base dose scheduled **past a controller
+  `Stop` still lands** — the base regimen is the patient's standing prescription, which the
+  controller discontinues its *own* augmentation of but does not cancel. (Base doses into
+  lagged / input-rate compartments are supported because they run the exact pre-resolved
+  static machinery; *controller-issued* doses into those compartments are still rejected at
+  injection, where the TAD-anchor bookkeeping for a dose discovered mid-run is a follow-up.)
+  *Scope:* supported on constant-covariate models, on **time-varying-covariate models** (since
+  #930), and on **IOV models** (since #931), for a plain bolus / infusion base dose, whose
+  bioavailability `F` is resolved from its own snapshot — the covariate active at, and (under IOV)
+  the occasion κ of, the dose's administration time (symmetric with a controller dose, whose `F` is
+  fixed at injection) — and which is then integrated under the per-segment PK, matching independent
+  mrgsolve loading-dose runs (renal-decline #930, per-occasion κ #931). A base regimen also
+  **composes with system resets** (EVID=3/4) on the constant-covariate path (since #932): the reset
+  zeros the state and turns off a base infusion opened before it, and an EVID=4 reset+dose row's dose
+  lands after its own reset — see *System resets* below. Still a typed error, never a silent
+  mis-integration of a delivered dose: a base regimen combined with a system reset **under a
+  time-varying covariate or IOV** (a #932 follow-up), and — under a time-varying covariate or IOV — a
+  steady-state, lagged, built-in input-rate, or modeled-`RATE` base dose (a #930 / #931 follow-up
+  whose per-dose SS / lag / input-rate / rate-resolution bookkeeping the frozen-replay engine does
+  not yet reproduce).
 - **Time-varying covariates are supported** — the driver recomputes PK per
   event/segment from the covariate active in that segment (the NONMEM
   end-of-interval convention that `predict()` / `simulate()` use), so a covariate
@@ -349,13 +383,27 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   the `TIME` built-in is covered the same way. *Caveat:* the `auc_target_attainment`
   metric is not yet computed per-event, so declaring `auc_target` on a
   time-varying-covariate subject is a typed error rather than a frozen-snapshot AUC.
-- **No system resets** — a subject with an EVID=3/4 reset event is rejected (the
-  reactive driver does not apply resets).
+- **System resets (EVID=3) are supported** — the reactive driver zeros the
+  compartments at each reset time (re-seeding any `init(state)=expr`) and turns off
+  controller-issued infusions opened before the reset, exactly as `predict()` /
+  `simulate()` do on the event-driven path; the frozen-replay verifier is
+  reset-aware, so the reset is honored *and* checked each run. Since #932 a reset also composes with a
+  **pre-scheduled base regimen** on the constant-covariate path: it zeros the base regimen's state and
+  turns off a base infusion opened before it (the reset floor), and an **EVID=4** reset+dose row —
+  which records both a reset and a dose — reaches the adaptive path as a base dose landing *after* its
+  own reset (Reset < Dose), matching `predict()`. Base × reset under a time-varying covariate or IOV
+  stays a typed error (a #932 follow-up). *Caveat:* declaring `auc_target` on a reset
+  subject is a typed error — the exposure metric's uniform per-window trapezoid grid
+  has no node at the reset instant, so the one window straddling the reset would
+  integrate the state discontinuity inaccurately (every other output is reset-aware).
 - **Inter-occasion variability (IOV) is supported** — a fresh occasion `kappa` is
   drawn per **decision window** (occasion = decision index) and threaded through the
   per-event PK, so occasion-to-occasion shifts in CL/V drive the trajectory, the
   monitored signal, and every reactive dose; the frozen-replay verifier validates the
-  per-occasion bookkeeping, and it composes with time-varying covariates — the
+  per-occasion bookkeeping. A **pre-scheduled base regimen** (a loading dose) composes with
+  IOV (#931): each base dose's `F` resolves under the κ of the occasion active at its
+  administration time — see *Pre-scheduled base regimens* above. It also composes with
+  time-varying covariates — the
   composition (`CL = TVCL·(CRCL/100)·exp(η + κ)` under a declining covariate *and* a
   per-occasion κ) is cross-validated dose-for-dose against an independent **mrgsolve**
   run (`tests/reference/vanco_renal_iov_mrgsolve/`). `kappa` is

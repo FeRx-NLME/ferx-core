@@ -605,6 +605,45 @@ fn ig_non_depot_dose_rejected() {
     );
 }
 
+/// `CMT=0` is NONMEM's *default dose compartment* — compartment 1, the depot — so it is accepted
+/// on the IG closed form and predicts identically to `CMT=1`, not rejected as a non-depot
+/// compartment (#913 review; the shared `check_absorption_closed_form_support` guard keyed on the
+/// raw `dose.cmt != 1`, which rejected an explicit `CMT=0`). Contrast `ig_non_depot_dose_rejected`
+/// (CMT=2, still rejected).
+#[test]
+fn ig_cmt_zero_is_the_default_depot_not_rejected() {
+    let (an_src, _) = build_pair_1cpt(false, false);
+    let model = parse_full_model(&an_src).expect("IG model parses").model;
+    let obs = vec![1.0, 4.0, 8.0];
+    let depot = predict(
+        &model,
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs.clone(),
+        ),
+        &model.default_params,
+    );
+    let default_cmt = predict(
+        &model,
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0)],
+            obs.clone(),
+        ),
+        &model.default_params,
+    );
+    assert!(
+        depot.iter().any(|p| p.pred > 0.0),
+        "control must be non-trivial"
+    );
+    assert_eq!(default_cmt.len(), depot.len());
+    for (a, b) in default_cmt.iter().zip(depot.iter()) {
+        assert_eq!(
+            a.pred, b.pred,
+            "CMT=0 must predict like the CMT=1 depot dose"
+        );
+    }
+}
+
 // ── IOV (#719): the analytic IG closed form now serves inter-occasion variability by routing
 //    IOV subjects to its `igd()` ODE twin, which integrates cross-occasion dose carryover (#104)
 //    exactly and is the #486/#663-validated analytic IOV path. Mirrors the transit IOV tests. ──

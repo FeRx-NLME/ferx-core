@@ -20,6 +20,130 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **New ODE steppers via `[fit_options] ode_method`,** on two independent axes. For
+  **stability**: the linearly implicit Rosenbrock methods `rosenbrock23` (order 2, aliases
+  `ros23`/`ode23s`), `rodas4` (order 4) and `rodas5p` (order 5). These are stable at the step size the tolerance needs on **stiff**
+  systems (fast reversible binding / TMDD, Michaelis-Menten with `KM` far below observed
+  concentrations, long transit chains, QSP cascades), where the explicit method is
+  stability-limited and either crawls or exhausts `ode_max_steps`. Analytic sensitivities run
+  through the identical stepper, so switching does not move a model off the analytic-gradient
+  path. `rk45` remains the default, and on the `f64` prediction path existing fits are
+  bit-identical. The one deliberate exception is the generic (`Dual2`) analytic-sensitivity
+  path: RK45's stage combinations previously existed as two separate transcriptions that were
+  *not* bit-identical to each other — the `f64` driver associated them as `u + h·(b₁k₁ + b₂k₂)`
+  while the generic one accumulated `((u + k₁·(h·b₁)) + k₂·(h·b₂))`. Unifying them onto the
+  `f64` association shifts the sensitivity path's trajectory in the last bits, which the outer
+  line search can amplify; it also means the gradient is now taken along exactly the trajectory
+  the predictor reports, which it was not before. The stiff methods are full peers — each carries its own continuous extension,
+  so every feature that reads ODE state between solver steps works with every method:
+  non-Gaussian endpoints (TTE / categorical / CTMM), time-to-event simulation, adaptive /
+  feedback dosing, `[output]` state columns and the analytic-sensitivity path. Internally the
+  three integration drivers (dense saves, soft sampling, event-time root-finding) are now
+  written once against a `Stepper` abstraction rather than per method.
+
+  For **order**: `vern7` (Verner 7(6), 10 stages, explicit), for fits that are *accuracy*-limited
+  rather than stability-limited — where step count scales as `tol^(−1/p)` and a stiff method
+  buys nothing. On the Savic transit NONMEM anchor at `TOL=9`-equivalent accuracy it takes 2.8×
+  fewer steps than `rk45` and is ~2.3× faster; at default tolerances it is ~1.4× slower, so it
+  is a tight-tolerance tool rather than a blanket upgrade. Its in-step readouts interpolate with
+  a cubic Hermite (3rd-order) rather than a matching continuous extension — documented under
+  [ODE Models](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#stiff-systems).
+
+  `docs/model-file/ode-models.qmd` now carries a measured "which regime am I in?" table so the
+  choice is made from solver statistics rather than guesswork.
+- **Pre-scheduled base regimen (loading dose) in adaptive-dosing simulation** (#702).
+  `simulate_adaptive()` / `simulate_adaptive_from_spec()` now accept a base subject that
+  already carries pre-scheduled doses — a loading / maintenance regimen, including a
+  steady-state (`SS=1`) dose — instead of requiring a dose-free subject: the driver
+  integrates the base regimen and the controller augments it at the decision schedule (the
+  real TDM / MIPD workflow of starting on a fixed regimen and titrating on measured levels).
+  The pre-scheduled doses reuse the same dose-resolution, break-timeline, and steady-state
+  machinery as `predict()` / `simulate()`, appear in the controller's dose `history`, and
+  are rebuilt alongside the realized ledger by the default-on frozen-replay verifier. A base
+  dose sharing a time with a decision is observed **pre-dose** (the trough), symmetric with
+  the controller's own doses (#933); the TAFD anchor is the true global earliest dose even
+  when a controller dose precedes the earliest base dose (#934); a base dose past a
+  controller `Stop` still lands (the base regimen is the patient's standing prescription);
+  and base doses into lagged / built-in input-rate (transit / zero-order absorption)
+  compartments are supported (#935). Initially supported on constant-covariate, non-reset
+  models only; time-varying-covariate (#930), IOV (#931), and system-reset (#932) base
+  regimens are separate follow-ups (see below), never a silent mis-integration. Previously any
+  base regimen was rejected outright.
+- **Pre-scheduled base regimen under a time-varying covariate in adaptive-dosing
+  simulation** (#930). `simulate_adaptive()` / `simulate_adaptive_from_spec()` now accept a
+  base subject carrying a plain bolus / infusion loading (or maintenance) regimen together
+  with a **time-varying covariate** (declining renal function, a `TIME`-driven parameter,
+  etc.): each base dose's bioavailability `F` is resolved from its own covariate snapshot
+  (the covariate active at the dose's administration time — symmetric with a controller dose,
+  whose `F` is fixed at injection) and the dose is integrated under the per-segment PK, with
+  the base-aware frozen-replay verifier carrying that `F` so the run is checked bit-for-bit.
+  Validated dose-for-dose against an independent mrgsolve renal-decline + loading-dose run
+  (`tests/reference/vanco_renal_loading_mrgsolve/`). Lifts the #702 `base × time-varying`
+  restriction. Still a typed error under a time-varying covariate (a #930 follow-up): a
+  steady-state, lagged, built-in input-rate, or modeled-`RATE` base dose; and a base regimen
+  combined with system resets (#932) remains rejected (base × IOV is lifted by #931, below).
+- **Pre-scheduled base regimen under inter-occasion variability (IOV) in adaptive-dosing
+  simulation** (#931). `simulate_adaptive()` / `simulate_adaptive_from_spec()` now accept a
+  base subject carrying a plain bolus / infusion loading (or maintenance) regimen together
+  with **inter-occasion variability** (`kappa`): each base dose's bioavailability `F` (and any
+  other IOV-affected individual parameter) is resolved under the κ of the occasion — the
+  decision window (#701) active at the dose's administration time — symmetric with a
+  controller dose, whose `F` is fixed from the per-decision snapshot at injection, and the dose
+  is integrated under the per-segment occasion PK with the base-aware frozen-replay verifier
+  carrying that `F` so the run is checked bit-for-bit. Validated against the independent
+  `predict_iov` engine on a reconstructed per-occasion κ and dose-for-dose against an mrgsolve
+  loading-dose IOV run (`tests/reference/vanco_iov_loading_mrgsolve/`). Lifts the #702/#930
+  `base × IOV` restriction. Still a typed error under IOV (a #931 follow-up): a steady-state,
+  lagged, built-in input-rate, or modeled-`RATE` base dose; and a base regimen combined with
+  system resets (#932) remains rejected.
+- **System resets (EVID=3) in adaptive-dosing simulation** (#716). `simulate_adaptive()`
+  / `simulate_adaptive_from_spec()` now honor an EVID=3 reset carried by the base
+  subject: the reactive driver zeros the compartments at the reset time (re-seeding any
+  `init(state)=expr`) and turns off controller-issued infusions opened before it, exactly
+  as `predict()` / `simulate()` do, and the default-on frozen-replay verifier is
+  reset-aware so the reset is validated each run. Previously a reset subject was rejected
+  with a typed error. (Initially only a pure EVID=3 reset on a **dose-free** base subject;
+  #932 below lifts that to a reset combined with a base regimen, including an EVID=4
+  reset+dose row.)
+- **Base regimen combined with a system reset (EVID=3 / EVID=4) in adaptive-dosing
+  simulation** (#932). `simulate_adaptive()` / `simulate_adaptive_from_spec()` now accept a
+  base subject that carries BOTH a pre-scheduled loading / maintenance regimen (#702) AND a
+  system reset — composing #716's reset machinery with #702's base-dose seeding on the
+  constant-covariate path. The reset zeros the compartments and turns off a base infusion
+  opened before it (the reset floor, previously applied only to controller-issued infusions),
+  and an EVID=4 reset+dose row's dose now reaches the adaptive path — landing after its own
+  reset (Reset < Dose) — instead of tripping the base-regimen guard. Validated by a degenerate
+  oracle (base regimen + mid-horizon EVID=3 + controller reproduces `predict()` on the realized
+  regimen carrying the same reset), a positive control (a base infusion spanning the reset is
+  turned off, so the oracle is not vacuous), an EVID=4 oracle, and a steady-state base × reset
+  oracle; the default-on frozen-replay verifier (reset- and base-aware) checks every run. Lifts
+  the #702/#716 `base × reset` restriction. Base × reset UNDER a time-varying covariate (#930)
+  or IOV (#931) remains a typed error — a #932 follow-up — never a silent mis-integration.
+- **Warning when a `combined` error model's additive initial estimate is negligibly
+  small** (#847). A pre-fit check (`W_ADDITIVE_INIT_SCALE`) flags an additive SD start
+  below 1% of the observation scale (median `|DV|`) on that endpoint. A near-zero
+  additive start can trap the fit in a local minimum where the additive term collapses
+  and the proportional term inflates — the worse basin on multimodal / over-parameterised
+  problems (e.g. the cyclophosphamide parent→metabolite fit, where additive variance
+  seeded at 0.5 traps at ≈0.94 instead of the global optimum ≈1878). The initial estimate
+  is never changed — the warning advises a larger start.
+- **Simulation and prediction for binary (`[binary_model]`) endpoints** (#760). `simulate()` now
+  draws a 0/1 outcome per binary observation record (previously it emitted **no rows at all** for
+  a binary endpoint, silently and without an error), and the new `predict_categorical()` returns
+  the category probabilities `P(Y = 0)` / `P(Y = 1)` per record — a probability vector, which the
+  scalar `predict()` cannot represent. `predict()` remains the Gaussian predictor and returns no
+  rows for a binary endpoint (see `Changed` below for the one behavioural change it did gain). A
+  `[simulation]` block driving a binary endpoint needs `times` (binary outcomes are observed on
+  the fixed grid), and `--simulate` stamps the drawn states onto the simulated population it then
+  fits.
+  Validated by a simulate → fit recovery (SSE) round trip on top of the existing R `glm` / NONMEM
+  fit anchors.
+- **sdtab diagnostics for binary endpoints** (#760). `{model}-sdtab.csv` now carries one row per
+  binary observation record — `DV` (observed 0/1), `PRED` (`P(Y=1)` at η=0), `IPRED` (at the EBE η)
+  and `IWRES` (standardized Pearson residual). `CWRES` is left blank, since the conditional
+  weighted residual is defined through the Gaussian residual-variance model that a Bernoulli
+  outcome does not have; columns undefined for a discrete record are likewise blank rather than
+  sentinel values. Previously a binary endpoint produced no diagnostic rows at all.
 - **Analytic sensitivities for steady-state dosing into a built-in absorption compartment**
   (#835). Fitting a model with an `SS=1` dose into a `first_order` / `transit` / `igd` /
   `weibull` absorption compartment now uses exact analytic FOCEI gradients — the closed-form
@@ -28,7 +152,152 @@ section of the SDLC for the versioning policy).
   window, and steady-state combined with an absorption lagtime, remain out of scope (rejected
   with a clear error).
 
+### Changed
+- **`ObsRecord::DiscreteState` and `ObsRecord::Count` gained a `raw_time` field** (#760). Discrete
+  observations now carry the user's TIME alongside the engine's internal (occasion-shifted) clock,
+  so reported rows join back to the input CSV the way Gaussian rows always have. Source-breaking
+  for any external code that constructs or exhaustively destructures these variants.
+
+### Fixed
+- **Standard errors for closed-form LTBS models under IOV** (#486). The tighter inner-EBE
+  tolerances that log-transform-both-sides models take for the fit and covariance steps
+  (`LTBS_FIT_INNER_TOL` / `LTBS_COV_INNER_TOL`, #665) were previously skipped whenever the
+  model also carried `[iov]`, on the grounds that LTBS × IOV ran its inner loop on finite
+  differences. Now that this combination takes the analytic `ln(f)` inner gradient, it carries
+  the same tolerance sensitivity as any other closed-form LTBS model, so it takes the same
+  tightened tolerances. Without this a fit would return quietly inflated standard errors —
+  the same mechanism measured at roughly 65% on warfarin theta SEs — with point estimates
+  unchanged, so nothing looked wrong. Set `cov_inner_tol` / `inner_tol` explicitly to override.
+- **Parser-internal readout parameters no longer surface in warnings or diagnostics** (#486).
+  A `[scaling] y = ...` readout that names a theta or eta directly is desugared into a hidden
+  individual parameter. That hidden parameter could reach the "individual parameter(s) not
+  mu-referenced" warning (advising the user to rewrite a parameter absent from their model
+  file) and the eta/parameter metadata carried in `FitResult`, where it appeared under its
+  internal `__ferx_ro_*` name with a `Custom` parameterisation. Both now filter it out, as the
+  other consumers of that list already did. Present on `[odes]` models since #631.
+- **FD-fallback warning for an oversized readout quotes the right slot budget** (#486). When a
+  direct theta/eta readout cannot be given PK slots, the resulting parse warning reported the
+  128-slot ODE layout even for analytical models, whose spare region holds at most about 11
+  slots and typically 4–7 — overstating the user's headroom by an order of magnitude and
+  making the suggested remedy unactionable. It now quotes the pool the model actually draws from.
+- **Adaptive-dosing `auc_target` exposure metric now integrates the pre-scheduled base regimen**
+  (#940). The signal-AUC pass behind `auc_target_attainment` (#391 S2.5b) previously scored each
+  decision window on the controller's realized doses only, dropping any pre-scheduled base regimen
+  (#702 — a loading / maintenance dose), so on a base-regimen run the reported exposure — and hence
+  `auc_target_attainment` — was biased low. Each window now integrates the base regimen (a loading
+  dose before the window and a maintenance dose landing inside it) alongside the realized ledger,
+  matching `predict()` / `simulate()` on the combined regimen. Constant-covariate subjects only, as
+  before (time-varying-covariate / IOV / reset `auc_target` runs remain rejected).
+- **FOCE inner EBE recovery no longer discards a near-optimal partial for a worse fallback**
+  (#378). When a subject's individual objective is multimodal (e.g. a 3-cpt IV proportional
+  model with six IIV etas conditioned on ten points), the closed-form inner BFGS can reach the
+  conditional mode yet stall at a gradient norm just above `inner_tol`; the exact-path recovery
+  then restarted Nelder–Mead from η=0 and kept that (worse) basin, discarding the good BFGS
+  partial. The recovery now keeps the lower-objective of {BFGS partial, NM} on non-FREM models —
+  the guard the ODE inner path already used (#555) — so the closed-form and ODE forms converge to
+  the same EBE. This removes the ODE↔analytical FOCE **marginal** OFV divergence (up to ~18 OFV
+  units, platform-sensitive) that surfaced after the `inner_tol` tightening in #330. FREM keeps
+  its cold-restart re-centering unchanged.
+- **The reported inner-loop gradient method for `[odes]` models is no longer mislabeled "finite
+  differences"** (#926, follow-up to #378). `fit()` already runs the exact analytic inner
+  η-gradient for an in-scope ODE model (as it does for closed-form and IOV models), but the
+  reported `gradient_method_inner` — shown in the fit banner and `{model}-fit.yaml` — was derived
+  from a closed-form-only predicate and always read "finite differences" for ODE, even while the
+  outer-loop report correctly read "analytic". It now reports the analytic method for an in-scope
+  ODE model, matching the outer report and the route actually run. The report and the
+  FD-fallback warning now share one predicate, so an in-scope ODE model whose every subject is
+  genuinely finite-differenced (oral infusion into a built-in absorption compartment, or a
+  rate-defined infusion under `F ≠ 1`) is still surfaced by the route banner and the warning
+  rather than silently labeled analytic. Reporting only — no estimate, OFV, or diagnostic
+  changes.
+- **Steady-state (`SS=1`) dosing on `[odes]` models is now exact for a linear disposition, and
+  warns instead of silently truncating on a nonlinear one** (#914). An ordinary ODE bolus or
+  infusion SS dose previously equilibrated by expanding a pulse train capped at 50 cycles, which
+  under-reported the steady state by tens of percent for a slow disposition (the same truncation
+  #908 removed from the analytical engine) — silently. A linear disposition now solves the exact
+  periodic fixed point `(I − M)⁻¹·b` directly (value and analytic FOCE/FOCEI gradient), so slow PK
+  is exact rather than low; a genuinely nonlinear RHS (e.g. Michaelis–Menten) still falls back to
+  the capped iteration but now surfaces a non-convergence warning when the cap is reached without
+  settling. Also faster: the linear case replaces ~50 RK45 cycles with a handful.
+- **`predict()` on a CTMM (`[markov_model]`) model now fails loud instead of silently returning
+  no rows** (#759). The equivalent `simulate()` guard already existed and its message claimed to
+  cover `predict()`, but it only ran on the simulate path. State-occupancy prediction `π(t)` is
+  still to come (#820).
+- **A pure-TTE / pure-discrete population no longer panics on a `CMT ≥ 2` dose** (#905). Such a
+  population is exempt from dose-compartment validation — its `pk` line is a placeholder and the
+  TTE endpoint's `CMT` is routinely ≥ 2 — but the predictor still rerouted the dose onto the
+  event-driven walk, which aborted the process on the very dose the validator had declined to
+  check. The analytical predictor now declines in lockstep with the exemption: a subject with no
+  Gaussian observation returns `NaN` without entering the walk (value and FOCE/FOCEI gradient
+  paths alike), so `predict()`, `simulate()` and `fit()` stay panic-free on such a population
+  through both the endpoint-routed and model-blind loaders.
+
 ### Performance
+- **`method = laplace` gradients are far more accurate, and its objective is faster.** The
+  posterior Hessian that scales the quadrature grid is now taken analytically — it is the exact
+  conditional `∂²nll/∂b²` the shared sensitivity sweep already assembles — instead of being
+  rebuilt by a `2d²+1` per-subject finite-difference sweep. The grid-response term of the
+  gradient likewise stopped re-sweeping the whole quadrature grid once per parameter: each
+  node's analytic `∂nll/∂b` is computed once and contracted against a node displacement
+  differenced from a cheap exact linear-algebra map. Between them these removed a
+  finite-difference *of* a finite-difference, and the gradient's agreement with a reconverged
+  finite difference of the objective improved by two to three orders of magnitude (warfarin:
+  `2.0e-5` → `6.5e-8` relative at `n_agq = 1`, `2.1e-7` → `1.8e-9` at `n_agq = 7`). The Hessian
+  change also speeds up every objective evaluation, and therefore the covariance step, which
+  evaluates it `~2·n_free²` times. Laplace OFVs and standard errors shift very slightly, since
+  the exact Hessian replaces an approximated one. `method = focei` is unaffected: the two
+  estimators still use **different** Hessians — that is what distinguishes them — and only the
+  computation is now shared. Models outside the analytic sensitivity scope (TTE, categorical)
+  keep the finite-difference path.
+
+- **Exact analytic covariance R-matrix for FOCE/FOCEI** (#436). Standard errors on in-scope
+  models are now the exact second derivative of the marginal the outer loop minimises,
+  assembled from third-order sensitivities, instead of a second difference of the reconverged
+  objective. The finite-difference stencil evaluated the objective `~2·n_free²` times, each
+  re-solving every subject's inner loop, and amplified error as `1/h²`; the analytic route
+  costs `2N+1` sensitivity evaluations per subject (`N = n_theta + n_eta`) with **no inner
+  re-solve** beyond the single reconvergence at the converged point, and has no
+  `fd_hessian_step` to tune. Measured on warfarin: agreement with the
+  reconverged finite difference to `8.2e-5`, at 3.0× the speed per subject. Out-of-scope models
+  (ODE, LTBS, IOV, M3/BLOQ censoring, expression scaling, Form-C readouts, `iiv_on_ruv`,
+  correlated or custom-magnitude residuals, time-varying covariates, FREM, covariate-selected
+  error models, non-Gaussian endpoints, `method = laplace`/`agq`, and `gradient = fd`) keep the
+  finite-difference covariance unchanged — it is correct for all of them — and a single
+  out-of-scope subject drops the whole population back to it rather than mixing two
+  approximations in one matrix. Set `analytic_cov_hessian = false` in `[fit_options]` to force
+  finite differences.
+
+- **Exact analytic inner (EBE) gradients for log-transform-both-sides under inter-occasion
+  variability** (#486). Fitting a closed-form model that combines `log(DV) ~ additive(...)`
+  with `[iov]` now uses exact analytic sensitivities for the per-subject empirical-Bayes
+  gradient, not finite differences. The population (outer) gradient has been analytic for this
+  combination since #677; the inner loop had stayed on FD because the first-order IOV walk
+  carried no `ln` jet, which made LTBS × IOV the last combination whose two loops
+  differentiated by different means. Both now apply the same `g = ln(f)` transform last, after
+  the per-occasion output-scale quotient, so they differentiate the same `ln(f/s)` the
+  objective scores — including combined with an expression `obs_scale`. Estimates are
+  unchanged; the EBE search reaches the same modes with one provider evaluation per inner step
+  instead of `~2·n_eta` predictions. LTBS × IOV on `[odes]` models keeps the finite-difference
+  fallback on both loops, as before.
+- **Exact analytic gradients for a closed-form Form C readout that references a θ or η
+  directly** (#486). An analytical (1-/2-/3-cpt) model whose `[scaling] y = <expr>` readout
+  names a theta or eta directly — e.g. `y = central/V * TVSCALE + ETA_BASE`, a baseline or
+  scale factor that is not an `[individual_parameters]` entry — now takes the analytic
+  sensitivity path on both loops instead of falling back to finite differences. The parser
+  already desugared such a reference into a hidden individual parameter on the ODE path
+  (#631); that pass now runs for the closed-form engine too, where the hidden parameter draws
+  a free differentiable PK slot exactly like any other non-structural readout parameter
+  (`BMAX`/`KD`, #650). Predictions are unchanged — only the gradient moves off finite
+  differences. A model whose readout parameters overflow the slots its PK model leaves spare
+  keeps the FD fallback, with the existing parse warning, rather than failing to parse.
+- **Honest `gradient_method` reporting when a readout outgrows the closed-form dispatch
+  tables** (#486). A closed-form model whose differentiated PK-slot count exceeds the width
+  the sensitivity providers instantiate now reports `fd` instead of `analytic`. Previously the
+  scope check verified that every slot was differentiable but never how many there were, so
+  such a model was labelled analytic and then fell back to finite differences on every
+  subject — the persisted label disagreed with the route actually taken. No estimates or
+  standard errors change (those fits were already running on FD); only the reported and
+  persisted gradient method does.
 - **Closed-form modified-release absorption** (#860). A static multi-route absorption model
   (parallel / mixed pathways #505, per-route lag #856 — one `[odes]` central compartment fed by a
   fraction-weighted superposition of `first_order` / `transit` / `igd` input-rate forcings into a
@@ -106,6 +375,23 @@ section of the SDLC for the versioning policy).
   negligible cost near the optimum. FOCE/FOCEI are unchanged (their Gauss-Newton `log|H̃|`
   is forgiving of a loose mode).
 
+### Added
+- **Infusion into an oral model's peripheral compartment on the analytical engine** (#375).
+  `two_cpt_oral` (`CMT=3`) and `three_cpt_oral` (`CMT=3`/`CMT=4`) previously rejected a
+  positive `RATE` — and, before that, crashed on one — because the oral closed-form
+  propagators had no peripheral forcing term where the IV ones did. They need no new closed
+  form: nothing flows back into the depot, so a rate into a peripheral drives exactly the
+  central/peripheral sub-system the IV model has, and the oral propagator superposes that
+  same forced response onto its own homogeneous evolution. Combined with the bolus change
+  below, **every compartment of the six analytical disposition models now accepts both a
+  bolus and an infusion**, alone or together. (The transit and inverse-Gaussian absorption
+  models are unchanged — they are dosed through the depot, `CMT=1`, only.) Validated
+  against NONMEM 7.6.0 `ADVAN4`/`ADVAN12` and —
+  more tightly than NONMEM can express, since its own forced response carries ~2e-6 here —
+  against a `1e-12` integration of the same system written out as explicit `[odes]`, which
+  agrees to ~1e-11 (`tests/oral_peripheral_infusion.rs`), including a peripheral infusion
+  overlapping an oral depot dose.
+
 ### Fixed
 - **Analytic-gradient fits no longer report `converged = false` at a plateaued optimum**
   (#751). The default analytic-gradient NLopt L-BFGS drives the OFV flat to ~8 significant
@@ -120,6 +406,87 @@ section of the SDLC for the versioning policy).
   step that overshoots and leaves the fit pinned at its initial estimates, one still
   descending when it stopped, or an unreproducible warm-start "optimum" — keeps
   `converged = false`, so real non-convergence is never masked.
+- **A dose into a compartment an `[odes]` model does not declare is now an error, not a
+  silent drop** (#899). On the ODE engine every dose-application site was an unguarded
+  `if cmt_idx < n { … }` with no `else`, and nothing upstream rejected an out-of-range
+  `CMT`: the data reader has no model, and the analytical dose-compartment check returned
+  early for ODE models. A typo'd `CMT` therefore produced a fit that **converged and
+  reported a finite OFV having ignored the dose entirely** — no error, no warning. Such
+  doses are now rejected up front, naming the subject, time, and the states the `[odes]`
+  block declares; `fit()` returns an error and `predict()`/`simulate()` fail with the same
+  message, matching every other dose precondition. This is the ODE half of the analytical
+  fix in #375. `predict_survival()` — the one member of the `predict`/`simulate` family
+  that was missing the guard — now enforces it too, so an unroutable dose can no longer
+  silently change the exposure a joint PK-TTE hazard reads.
+- **`CMT=0` means the same thing on both engines** (#899). `CMT=0` is NONMEM's *default
+  dose compartment* and resolves to compartment 1. The analytical engine has done this
+  consistently since #375; the ODE engine did **four** different things with it depending
+  on which driver a subject happened to take. The plain dataset path computed `0 − 1` on an
+  unsigned index and underflowed — a debug build panicked with "attempt to subtract with
+  overflow", a release build wrapped to `usize::MAX`, failed the bounds check, and dropped
+  the dose in silence. The event-driven driver (taken when a subject has a time-varying
+  covariate, an `EVID=3/4` reset, or IOV) applied it to compartment 1. The steady-state
+  equilibration bailed out and returned the *single-dose* curve. The remaining sites — the
+  infusion channel list, the `_with_states` driver, the segment-boundary walk, and the
+  `sens/` gradient twins — skipped the dose outright. So the same dataset could get three
+  different answers, and a fit could differentiate a different dosing history than it
+  predicted. Every site now resolves `CMT=0` to compartment 1 — including **compartment-indexed
+  dose attributes**: a dose written `CMT=0` now reads `F1` / `ALAG1` where before it missed the
+  indexed lookup and silently fell back to the bare `F` / `ALAG` slot, which on a model declaring
+  only `F1` means bioavailability defaulted to `1.0` and the dose was delivered at full amount.
+  Predictions change for ODE datasets written with `CMT=0`, which previously got nothing (or
+  crashed). This unification reaches every dose-compartment comparison, not just the state-vector
+  index: a `CMT=0` dose into a built-in `zero_order` absorption compartment now opens its release
+  window on the event-driven driver (a reset / time-varying covariate / IOV) — it previously
+  matched neither the bolus nor the window there and delivered no mass at all; the steady-state
+  gradient of a `CMT=0` dose into a built-in absorption compartment now equilibrates like the value
+  path (it previously returned an un-accumulated trough, a silent value≠gradient FOCEI error); and
+  the "unsupported steady-state combination" rejections (`E_ABSORPTION_SS_ZERO_ORDER` /
+  `E_ABSORPTION_SS_LAG`) now fire for `CMT=0` instead of being bypassed. As on the analytical
+  engine, an **infusion** with `CMT=0` is rejected rather than remapped: the default dose compartment
+  is defined for a bolus but not for a zero-order input. This closes the cross-engine disagreement on
+  `SS` + `CMT=0` noted under #375 below. The `cmt → state index` (and its 1-based complement) is now a
+  single named accessor (`DoseEvent::cmt_idx` / `cmt_1based`, #912) so the convention lives in one
+  place rather than a dozen open-coded `cmt - 1` / `cmt >= 1` sites that drifted apart. The same
+  unification reaches the analytical **closed-form absorption** guard: a `CMT=0` dose on a
+  `one_cpt_transit` / `two_cpt_transit` / inverse-Gaussian model is now accepted as the depot
+  (compartment 1) and predicts identically to `CMT=1`, where it was previously rejected as a
+  "non-depot compartment" — the closed form folds every dose through absorption regardless of
+  `cmt`, and its ODE twin resolves `CMT=0` and `CMT=1` to the same forcing, so the two paths agree.
+  A genuine non-depot dose (`CMT>=2`) is still rejected.
+- **Steady-state doses on the analytical event-driven path are now exact, not truncated**
+  (#908). A subject that cannot use dose superposition — because it has a time-varying
+  covariate, an `EVID=3/4` reset, IOV, or a dose into a non-default compartment — is served by
+  the event-driven walk, which equilibrated an `SS=1` dose by iterating a pulse train capped
+  at 50 cycles. The leftover was `≈ exp(−50 · λ_slow · II)`, negligible for typical PK but
+  **not** for slow drugs, and the early stop never fired there (it needs the per-cycle
+  increment to be negligible, which is exactly what a slow mode prevents). The walk now solves
+  the periodic steady state in closed form as `u_ss = (I − M)⁻¹·b`, the fixed point of the
+  affine one-cycle map, using the same propagators it already runs. It agrees with the
+  superposition closed forms to f64 precision (`≤ 1e-12` relative, bit-identical on several
+  models) rather than to a tolerance, so the two representations of one dataset agree by
+  construction. Measured error that this removes:
+
+  | model | `II` | was |
+  |---|---|---|
+  | `one_cpt_oral` (CL 0.1, V 50 — t½ ≈ 350 h) | 12 | **3.0e-1** |
+  | `two_cpt_iv` (Q 0.5, V2 500) — central | 12 | 1.0e-1 |
+  | `two_cpt_iv` (Q 0.5, V2 500) — peripheral amount | 12 | **5.8e-1** |
+  | `three_cpt_iv` (Q3 0.5, V3 400) — central | 12 | 8.2e-2 |
+  | `three_cpt_iv` (Q3 0.5, V3 400) — third-compartment amount | 12 | **5.2e-1** |
+  | `three_cpt_iv` (CL 5, V1 50, Q 3, V2 80, Q3 1, V3 120) | 24 | 2.3e-3 |
+
+  Compartment *amounts* — what `[derived]` and per-compartment sdtab columns report — were
+  affected considerably more than concentrations. **If you have results involving `SS=1` on
+  this path from an earlier version, regenerate them.** The gradient walk was converted in the
+  same change, so FOCE/FOCEI differentiates the steady state it actually predicts; over dual
+  numbers the same solve yields the exact implicit-function derivative. The truncated pulse
+  train remains only where no periodic steady state exists (a zero disposition rate constant,
+  e.g. `CL = 0`), and that case now raises the existing non-convergence warning instead of
+  returning a silently truncated state. The ODE path's ordinary bolus/infusion steady state
+  still expands a pulse train (#914) — see `docs/model-file/steady-state.qmd`. Validated against
+  NONMEM 7.6.0 in the slow regime the fix targets — new `ss_slow_advan1`/`ss_slow_advan2` anchors
+  (`CL = 0.1`, t½ ≈ 347 h) that the pre-fix walk missed by 29 %.
 - **SAEM FREM / `iiv_on_ruv` mixing diagnostics and safeguards** (#895). The optimizer-trace
   `mh_accept_rate` (and the verbose banner) now reports the **combined** block + componentwise
   Metropolis-Hastings acceptance rate. Previously it showed only the block kernel, which reads a
@@ -140,6 +507,95 @@ section of the SDLC for the versioning policy).
   this converges to ω_RUV ≈ 0.28 / σ ≈ 0.20 from both a too-small and a too-large σ start (NONMEM:
   0.28 / 0.18). Belt-and-braces σ and ω_RUV growth caps (each ≈ 20× the starting value; the Ω cap
   is a correlation-preserving rescale) remain as no-op backstops, warning if they ever bind.
+- **Guarded multi-start inner EBE now covers weakly-identified random effects** (#891). The
+  per-subject EBE search (`inner_restarts`, default `1`) previously re-seeded only subjects with
+  system resets or time-varying covariates. It now also detects a **weakly-identified coordinate**
+  — a random effect whose individual objective is flat (the data adds less curvature than the
+  prior, i.e. high per-subject shrinkage) — and re-seeds just that coordinate on the cold start,
+  so a distant lower posterior mode is no longer silently missed (e.g. a poorly-identified `V1` in
+  a saturable-clearance fluconazole model). The flatness check is a two-point finite difference per
+  coordinate; well-identified subjects are unchanged and pay only that probe. The guarded
+  multi-start now also runs on an **evaluation-only** fit (`maxiter = 0`, NONMEM `MAXEVAL=0`),
+  which previously seeded the inner EBE from `η = 0` but was not recognised as a cold start, so
+  the reported per-subject EBEs and objective now reflect the recovered modes.
+- **An analytic `[scaling]` readout that references the oral `depot` is rejected when the
+  data dose a non-default compartment, instead of silently corrupting the objective**
+  (#375). The depot amount behind a Form C readout is reconstructed by dose superposition,
+  which never reads the dose's `CMT` — so a bolus written `CMT=2` on a `one_cpt_oral` model
+  was reconstructed as if it had been absorbed through the depot, adding a phantom depot
+  amount to `PRED` and therefore to the OFV. Measured on `y = (central + depot)/V`: OFV
+  188.37 where an explicit `[odes]` twin of the same model gives 1761.47 (the same model
+  with the dose at `CMT=1` agrees with the twin exactly). This joins the existing
+  reset-based rejection in `check_analytic_readout_support`, with the same remedy —
+  reference only `central`, or use an `ode(...)` model.
+- **A `[derived]` integral over `compartments[i]` no longer returns a wrong finite value
+  for a subject dosing a non-default compartment** (#375). The per-observation compartment
+  columns correctly degrade to `NaN` for those subjects, and the emitted warning says so —
+  but the separate dense-grid reconstruction used by `integral(...)` still used the older,
+  narrower predicate and fell through to the compartment-blind superposition helper. In the
+  same sdtab row, `compartments[1]` read `NaN` while `integral(compartments[1], 0→24)` read
+  19.17 against a true 31.13. Both paths now use the same predicate.
+- **A zero-amount dose with an out-of-range `CMT` is rejected instead of aborting the
+  process** (#375). The dose-compartment check skipped `AMT=0` rows entirely, on the
+  reasoning that a zero bolus is a no-op — but both prediction walks bound-check the
+  compartment *before* the amount is read, so such a row still panicked. It is reachable
+  from ordinary NONMEM data: an `EVID=4` reset row written with `AMT=0` and a stale `CMT`.
+  `ferx check` reported the dataset clean and `fit()` then aborted. The range rule now
+  applies to every dose regardless of amount; the zero-amount exemption is kept only for the
+  infusion routing rule, where `duration = AMT/RATE = 0` genuinely means nothing is
+  delivered.
+- **A dose into a non-default compartment is now computed in that compartment on the
+  analytical engine** (#375). The closed-form dose-superposition path never read the dose's
+  `CMT`: it chose the formula from the *model*, so it placed every bolus in compartment 1
+  (the depot of an oral model, central of an IV one) and every infusion into central,
+  whatever the data said. A bolus into an IV model's peripheral, or into an oral model's
+  central compartment (an IV loading dose against an oral maintenance model), was therefore
+  computed in the wrong compartment — silently, with a finite OFV and no warning, and
+  disagreeing with NONMEM by up to two orders of magnitude on a 3-compartment model. Which
+  answer you got depended only on whether the subject happened to carry a time-varying
+  covariate, an `EVID=3/4` reset, or IOV, since those route to the event-driven walk, which
+  places doses correctly. Such doses now route to that walk on every dataset, so both paths
+  agree and both match NONMEM. Validated against NONMEM 7.6.0 `ADVAN1/2/3/4/11/12`
+  (`tests/nonmem_dose_compartment_anchor.rs`). Per-compartment amounts in
+  sdtab / `[derived]` are reported as `NaN` for these subjects rather than wrong, with the
+  existing warning extended to explain why; the rerouted doses themselves are computed
+  exactly (that is what the NONMEM anchors pin).
+- **A steady-state dose with `CMT=0` no longer loses its accumulation on the analytical
+  event-driven path** (#375). `CMT=0` is NONMEM's "default dose compartment", and every dose
+  site resolves it to the model's first compartment — except the event-driven walk's
+  steady-state equilibration, which bailed out early on `CMT=0` and returned an unequilibrated
+  (all-zero) starting state. An `SS=1` dose written with `CMT=0` therefore produced the
+  *single-dose* curve instead of the accumulated steady state whenever the subject took that
+  path (a time-varying covariate, an `EVID=3/4` reset, or IOV), while the same dataset without
+  those features returned the correct steady state from the superposition path — a silent
+  ~30 % under-prediction on a one-compartment example, with no warning. Both the value walk and
+  the gradient walk now equilibrate the default compartment like any other, matching the
+  closed form `(D/V)·e^{−kt}/(1−e^{−k·II})`. Predictions change only for `SS` doses written
+  with `CMT=0`. (The ODE engine bailed on `SS` with `CMT=0` for a while longer, so an
+  analytical model and its explicit `[odes]` twin disagreed on that combination; #899 above
+  brought the ODE engine into line and closed that gap.)
+- **An infusion into a compartment the analytical model cannot deliver into is now an error,
+  not a crash** (#375). A positive `RATE` into a compartment outside the model's infusable set
+  — an oral model's peripheral (`CMT=3` on `two_cpt_oral`), which the `Added` entry above now
+  makes work, or a `CMT` the model does not have at all — used to abort the
+  process from deep inside the event-driven prediction walk whenever the subject also had a
+  time-varying covariate, an `EVID=3/4` reset, or IOV. Nothing validated a *fixed* `RATE`
+  against the model's topology: the data reader has no model, and the parse-time check only
+  fires for a declared `D{cmt}`/`R{cmt}`. Such doses are now rejected up front, naming the
+  subject, time, and the compartments the model *can* infuse — `fit()` returns an error, and
+  `predict()`/`simulate()` fail with the same message, matching every other dose precondition.
+  An out-of-range dose compartment (`CMT` past the end of the model's compartment list) is
+  rejected the same way. This also removes a silent disagreement between the three analytical
+  paths on the same dataset: the dose-superposition path used to route the infusion into the
+  central compartment regardless of `CMT`, and the gradient (sensitivity) walk used to drop it
+  entirely — so a fit could have differentiated a different dosing history than it predicted.
+  One behaviour change worth calling out: an infusion with `CMT=0` is now **rejected**. On an
+  IV model that previously fitted, since superposition delivers into central, which is what
+  `CMT=0` means — so this is a deliberate tightening, not a bug fix: `CMT=0` is NONMEM's
+  *default dose compartment*, well defined for a bolus but not for a zero-order input, and
+  leaving it implicit hid which compartment was being infused. Write the compartment
+  explicitly. A **bolus** with `CMT=0` is unchanged (every path agrees it means compartment 1),
+  as is `SS` with `CMT=0` after the fix above.
 - **Analytic FOCEI sensitivities for IIV on an absorption lag feeding a `first_order` forcing**
   (#880). Fixes to the rate-on onset of a built-in `first_order` (Bateman) input-rate forcing
   whose arrival is a moving boundary — a compartment lagtime (`ALAG1`/`LAGTIME`) **or** a

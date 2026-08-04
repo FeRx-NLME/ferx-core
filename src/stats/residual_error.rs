@@ -2419,6 +2419,8 @@ mod tests {
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
+            #[cfg(feature = "survival")]
+            discrete_rows: Vec::new(),
         }
     }
 

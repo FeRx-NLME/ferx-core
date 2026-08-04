@@ -136,6 +136,8 @@ fn sr_iov(n_obs: usize) -> SubjectResult {
         extra_columns: Vec::new(),
         per_obs_tad: Vec::new(),
         compartment_states: Vec::new(),
+        #[cfg(feature = "survival")]
+        discrete_rows: Vec::new(),
     }
 }
 
@@ -961,5 +963,118 @@ fn tad_lag_uses_dose_covariate_not_obs() {
              the obs covariate (LAGCOV=5) would push arrival to @5.0 (after the obs) → NaN. \
              Got {}",
         tad[0]
+    );
+}
+
+/// #847: `check_model_data_warnings` flags a combined error model whose
+/// **additive** SD initial estimate is negligible relative to the data scale
+/// (median |DV|) on that endpoint — the pre-fit guard against the additive-
+/// collapse local minimum. Exercises the endpoint-enumeration + observation-
+/// gathering plumbing (the median/threshold decision is unit-tested separately
+/// in `additive_init_scale_tests`).
+fn combined_endpoint_model() -> CompiledModel {
+    let mut m = minimal_iov_model(vec![]);
+    m.error_spec = ErrorSpec::PerCmt(HashMap::from([(
+        1,
+        crate::types::EndpointError {
+            error_model: ErrorModel::Combined,
+            sigma_idx: vec![0, 1], // [proportional, additive]
+        },
+    )]));
+    m.error_model = ErrorModel::Combined;
+    m.n_epsilon = 2;
+    m.default_params.sigma = SigmaVector {
+        values: vec![0.2, 0.5], // additive SD 0.5 ≪ 1% of median |DV| (2.0)
+        names: vec!["PROP".into(), "ADD".into()],
+    };
+    m.default_params.sigma_fixed = vec![false, false];
+    m
+}
+
+fn subject_with_obs(cmt: usize, dvs: Vec<f64>) -> Subject {
+    let n = dvs.len();
+    Subject {
+        fremtype: Vec::new(),
+        id: "S1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: (0..n).map(|i| (i + 1) as f64).collect(),
+        obs_raw_times: (0..n).map(|i| (i + 1) as f64).collect(),
+        observations: dvs,
+        obs_cmts: vec![cmt; n],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0; n],
+        occasions: vec![1; n],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1],
+        obs_records: vec![],
+    }
+}
+
+#[test]
+fn additive_init_scale_warns_end_to_end() {
+    let model = combined_endpoint_model();
+    // median |DV| = 200 → 1% threshold = 2.0; additive SD init 0.5 < 2.0 → warn.
+    let pop = population_of(subject_with_obs(1, vec![100.0, 200.0, 300.0]));
+    let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+    let d = diags
+        .iter()
+        .find(|d| d.code == "W_ADDITIVE_INIT_SCALE")
+        .expect("negligible additive init on a combined endpoint must warn");
+    assert!(d.message.contains("CMT=1"), "message: {}", d.message);
+    assert!(d.message.contains("ADD"), "message: {}", d.message);
+}
+
+#[test]
+fn additive_init_scale_silent_when_well_scaled() {
+    let mut model = combined_endpoint_model();
+    // Bump additive SD to 40 (far above 1% of 200) → no warning.
+    model.default_params.sigma.values[1] = 40.0;
+    let pop = population_of(subject_with_obs(1, vec![100.0, 200.0, 300.0]));
+    let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+    assert!(
+        !diags.iter().any(|d| d.code == "W_ADDITIVE_INIT_SCALE"),
+        "a data-scaled additive init must not warn"
+    );
+}
+
+/// #847 (Copilot review): `ErrorSpec::Selected` dispatch keys are covariate
+/// **branch indices**, not CMTs — the warning must label them `endpoint={k}`,
+/// not `CMT={k}`. A single-branch selector routes every observation to key 0.
+#[test]
+fn additive_init_scale_selected_labels_endpoint_not_cmt() {
+    let mut model = combined_endpoint_model();
+    model.error_spec = ErrorSpec::Selected {
+        selector: crate::types::ErrorSelector {
+            eval: Box::new(|_cov| 0), // one branch → key 0 for every obs
+            branch_labels: vec!["all".into()],
+        },
+        endpoints: HashMap::from([(
+            0,
+            crate::types::EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![0, 1],
+            },
+        )]),
+    };
+    let pop = population_of(subject_with_obs(1, vec![100.0, 200.0, 300.0]));
+    let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+    let d = diags
+        .iter()
+        .find(|d| d.code == "W_ADDITIVE_INIT_SCALE")
+        .expect("negligible additive init on a Selected combined endpoint must warn");
+    assert!(
+        d.message.contains("endpoint=0"),
+        "Selected key must be labelled endpoint=, got: {}",
+        d.message
+    );
+    assert!(
+        !d.message.contains("CMT="),
+        "Selected key must not be mislabelled CMT=, got: {}",
+        d.message
     );
 }

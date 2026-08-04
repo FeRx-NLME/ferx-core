@@ -132,6 +132,7 @@ pub fn check_model_data_rule(
     diags.extend(check_iov_occasions(model, population, iov_rule));
     diags.extend(check_absorption_dosing(model, population));
     diags.extend(check_modeled_dose_rates(model, population));
+    diags.extend(check_dose_compartments(model, population));
     diags.extend(validate_output_columns(model, population));
     diags
 }
@@ -320,10 +321,15 @@ pub(crate) fn check_absorption_dosing(
         .filter(|f| f.kind == crate::pk::absorption::InputRateKind::ZeroOrder)
         .map(|f| f.cmt + 1)
         .collect();
+    // `cmt_1based()` throughout so a `CMT=0` dose (the default dose compartment == compartment 1)
+    // is scoped like `CMT=1` against these 1-based `f.cmt + 1` sets (#899, #913 review). The raw
+    // `d.cmt` this replaced left `CMT=0` bypassing the SS-unsupported gates, so an SS `CMT=0` dose
+    // into a zero-order / lagged absorption compartment skipped its clean rejection and fell
+    // through to the silent zero-order drop the same review fixed in `zero_order_dur_and_frac`.
     let has_ss_zero_order = population.subjects.iter().any(|s| {
         s.doses
             .iter()
-            .any(|d| d.ss && d.ii > 0.0 && zero_order_cmts.contains(&d.cmt))
+            .any(|d| d.ss && d.ii > 0.0 && zero_order_cmts.contains(&d.cmt_1based()))
     });
     // A per-route lag (`fn(..., lag=L)`, #856) lives on the forcing's `lag_slot`, NOT the
     // compartment-lag machinery, so `has_lagtime_on_cmt` does not see it — but the SS
@@ -344,8 +350,9 @@ pub(crate) fn check_absorption_dosing(
     let has_ss_lag = population.subjects.iter().any(|s| {
         s.doses.iter().any(|d| {
             d.ss && d.ii > 0.0
-                && cmts.contains(&d.cmt)
-                && (model.has_lagtime_on_cmt(d.cmt) || route_lag_cmts.contains(&d.cmt))
+                && cmts.contains(&d.cmt_1based())
+                && (model.has_lagtime_on_cmt(d.cmt_1based())
+                    || route_lag_cmts.contains(&d.cmt_1based()))
         })
     });
     if has_ss_zero_order {
@@ -399,15 +406,26 @@ pub(crate) fn check_absorption_dosing(
     // (`check_absorption_closed_form_support`, which rejects `dose.ss && dose.is_infusion()` with no
     // `II` condition), so the same subject errors on both paths instead of one erroring and the
     // other silently mis-serving.
+    // `cmt_raw()` here (not `cmt_1based()` like the SS-*bolus* gates above): a `CMT=0`
+    // would miss these 1-based `f.cmt + 1` sets, so unlike most raw reads the accessor
+    // choice is load-bearing (the only other place it bites is `has_lagtime_on_cmt` below,
+    // where it is immaterial — that path is analytical-only and the indexed-lag branch is
+    // dead behind `ode_spec.is_some()`). It is safe: both checks are `is_infusion()`-gated, and a
+    // meaningful (`AMT>0`) `CMT=0` infusion is already a hard error from
+    // `check_dose_compartments` (`E_DOSE_CMT_NOT_INFUSABLE` — `CMT=0` is a default *bolus*
+    // compartment, undefined for a zero-order input), so it never reaches a fit regardless
+    // of whether this gate also flags it; an `AMT=0` `CMT=0` infusion is inert. So
+    // `contains(&d.cmt_raw())` cannot miss a reachable case. (Behaviour-preserving: this
+    // was the pre-#912 raw `d.cmt`.)
     let has_ss_infusion = population.subjects.iter().any(|s| {
         s.doses
             .iter()
-            .any(|d| d.ss && d.is_infusion() && cmts.contains(&d.cmt))
+            .any(|d| d.ss && d.is_infusion() && cmts.contains(&d.cmt_raw()))
     });
     let has_infusion_zero_order = population.subjects.iter().any(|s| {
         s.doses
             .iter()
-            .any(|d| d.is_infusion() && zero_order_cmts.contains(&d.cmt))
+            .any(|d| d.is_infusion() && zero_order_cmts.contains(&d.cmt_raw()))
     });
     if has_ss_infusion {
         diags.push(
@@ -579,10 +597,10 @@ pub(crate) fn check_modeled_dose_rates(
                     (DoseAttr::Rate, "-1", "rate", "E_MODELED_RATE_NO_PARAM", "R")
                 }
             };
-            if !reported.insert((attr, dose.cmt)) {
+            if !reported.insert((attr, dose.cmt_raw())) {
                 continue;
             }
-            let cmt = dose.cmt;
+            let cmt = dose.cmt_raw();
             // A coded-`RATE` dose into compartment `cmt` requires a matching
             // `D{cmt}`/`R{cmt}` parameter so `resolve_rate` has a slot to read — for
             // BOTH engines. `active_dose_attr_map()` returns the engine-correct map
@@ -611,6 +629,311 @@ pub(crate) fn check_modeled_dose_rates(
         }
     }
     diags
+}
+
+/// Whether **anything in this dataset** asks the analytical PK predictor for a
+/// value — any Gaussian observation, or any `EVID=2` PK-only request.
+///
+/// This exists for one narrow case: a pure-TTE / pure-discrete model still needs
+/// a `[structural_model]` line, and the idiom is a **placeholder** `one_cpt_iv`
+/// with dummy `CL`/`V` (the parser supplies exactly that when the block is
+/// absent, `model_parser.rs`). Validating dose compartments against that
+/// placeholder's 1-compartment topology would reject a working model over dose
+/// records no PK code ever reads.
+///
+/// Deliberately a **population**-level gate on *whether the dose-compartment check
+/// runs at all*, not a per-subject one. If **any** subject asks the analytical
+/// predictor for a value, the check validates **every** dose in the dataset — so a
+/// TTE-only subject *of a joint PK-TTE model* (an early dropout, or a TTE-only arm,
+/// that still has dose records) has its unroutable infusion caught up front, rather
+/// than carried into the event-driven walk's `panic!`. Making *validation* per
+/// subject would reopen exactly that.
+///
+/// This is distinct from — and complementary to — the per-subject predictor gate
+/// (`subject_feeds_analytical_pk`, #905): validation is population-scoped so a live
+/// population is fully checked, while the predictor declines the walk per subject for
+/// any subject whose output is unused. In a live population the check already rejects
+/// a bad dose, so the predictor gate never has to; in an exempt population the check
+/// is skipped and the predictor gate is what keeps the walk unreached.
+///
+/// The per-subject truth (which observation CMTs are Gaussian, and the
+/// no-`survival`-feature short circuit) lives in [`crate::pk::subject_feeds_analytical_pk`];
+/// this is `any(...)` of it.
+fn population_uses_analytical_pk(model: &CompiledModel, population: &Population) -> bool {
+    // Single source of truth with the predictor gate: `subject_feeds_analytical_pk`
+    // is the per-subject predicate, and this is `any(...)` of it. The two compose —
+    // this population-level test decides whether the dose-compartment check runs at
+    // all (a *live* population validates every dose, including a TTE-only subject's),
+    // while the per-subject gate declines the walk for a subject the analytical
+    // predictor would feed nothing (#905). See `subject_feeds_analytical_pk` for why
+    // "no Gaussian observation" implies "predictor output unused" on an analytical
+    // model.
+    population
+        .subjects
+        .iter()
+        .any(|s| crate::pk::subject_feeds_analytical_pk(model, s))
+}
+
+/// Every dose must name a compartment the **analytical** engine can actually
+/// deliver it into (#375). The datareader cannot make this call — it has no
+/// model — and the parse-time infusable check
+/// (`model_parser`, [`PkModel::infusable_compartments`]) only fires for a
+/// *declared* `D{cmt}`/`R{cmt}`, so an explicit positive `RATE` (or an
+/// out-of-range bolus `CMT`) read straight from the dataset reached the
+/// predictors unvalidated. The three analytical paths then disagreed on it:
+/// the dose-superposition path never reads `dose.cmt` and silently routed the
+/// infusion into central, the event-driven walk `panic!`ed, and the `sens`
+/// gradient walk silently dropped the infusion. Rejecting up front removes that
+/// disagreement **for the doses it rejects**, and keeps the prediction hot path
+/// panic-free.
+///
+/// This check alone does **not** make the paths agree — it only removes the
+/// doses that have no target at all. Agreement for the doses it *accepts* comes
+/// from [`crate::pk::dose_needs_event_walk`], which reroutes every dose the
+/// superposition dispatch cannot place (it never reads `dose.cmt`, so it would
+/// compute the dose as going into the model's default route — the depot for an
+/// oral model, central for an IV one) to the event-driven walk, which places it
+/// correctly and is NONMEM-anchored. The two are complements and must be read
+/// together: this one rejects the unroutable, that one routes the rest.
+///
+/// Two rules, both 1-based like NONMEM's `CMT`:
+///   - **Range — every dose, whatever its amount.** `cmt` must not exceed the
+///     model's state count. This is deliberately *not* skipped for `AMT=0`:
+///     both walks bound-check the compartment before the amount is read, so an
+///     inert row with an out-of-range `CMT` panics exactly like a real dose.
+///     `CMT=0` is left alone — every path treats it as NONMEM's "default dose
+///     compartment" (the walk via `saturating_sub(1)`, `dose_needs_event_walk`
+///     by mapping it to 1, the superposition path by ignoring `cmt`), so it is
+///     consistent, not a silent mis-route.
+///   - **Routing — infusions that actually deliver.** The compartment must be
+///     in [`PkModel::infusable_compartments`] — central for every model, the
+///     oral depot since #400, the peripheral(s) of the 2-/3-cpt IV models, and
+///     — since #375 — the oral models' peripheral(s) too (the oral propagators
+///     reuse the IV forced response; nothing flows back into the depot). That
+///     makes the set `1..=n_states` for all six walk-supported models, so with
+///     the range rule claimed first the only value this rule can still reject
+///     is `CMT=0`, which has no meaning for a zero-order input. A zero-amount
+///     infusion is exempt (`duration = AMT/RATE = 0`, so no path opens a rate
+///     window). Checked only for the six event-walk models: `dose_channel` *is*
+///     the walk's routing table, and a transit/IG subject never takes that walk
+///     — an infusion reroutes it to the model's ODE twin
+///     (`CompiledModel::effective_for`, #719 gap 2), which addresses
+///     compartments directly. Applying this table to them would reject a
+///     supported model.
+///
+/// **ODE models take the range rule but not the routing rule** (#899).
+/// `ode/predictions.rs` indexes the state vector directly, so every compartment
+/// the `[odes]` block declares is addressable and the `infusable_compartments`
+/// table has no ODE analogue — but "declares" is the operative word. A `CMT`
+/// past the end of the declared state vector used to fall through that engine's
+/// `if cmt_idx < n { … }` guards and be **silently dropped**: the fit converged,
+/// reported a finite OFV, and quietly ignored the dose. So the range rule runs
+/// for both engines, reading `OdeSpec::n_states` instead of a `PkModel`
+/// topology, and names the declared `state_names` in the message. `CMT=0`
+/// splits the same way on both engines: accepted for a **bolus** (it is the
+/// default dose compartment, which every dose site resolves to compartment 1)
+/// and rejected for an **infusion** (a zero-order input has no such default).
+///
+/// Reported once per `(kind, compartment)` so a dataset with many offending
+/// rows yields one actionable error per cause, matching
+/// [`check_modeled_dose_rates`].
+pub(crate) fn check_dose_compartments(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    let pk_model = model.pk_model;
+    let topology = pk_model.topology();
+    let name = pk_model.canonical_name();
+    // Range-rule input, per engine (#899). The ODE engine indexes its state
+    // vector directly, so its bound is the `[odes]` block's declared state
+    // count — a `PkModel` topology says nothing about it (`model.pk_model` is
+    // still populated on an ODE model, and is *not* the model being solved).
+    // The routing rule below stays analytical-only.
+    let ode_spec = model.ode_spec.as_ref();
+    let n_states = match ode_spec {
+        Some(spec) => spec.n_states,
+        None => topology.state_layout().0,
+    };
+    let mut diags = Vec::new();
+    // De-dup by (is_infusion, compartment): an infusion and a bolus into the
+    // same bad compartment are independent causes and are reported separately.
+    let mut reported: std::collections::HashSet<(bool, usize)> = std::collections::HashSet::new();
+    // Nothing in this dataset asks the analytical predictor for a value — the
+    // `pk` line is a pure-TTE / pure-discrete model's placeholder. See
+    // `population_uses_analytical_pk` for why this is a population-level test.
+    //
+    // **This exemption is safe because the predictor declines in lockstep.** Skipping
+    // the dose-compartment check would be a landmine on its own: `dose_needs_event_walk`
+    // still reroutes a `CMT ≥ 2` dose onto the event-driven walk, whose out-of-range
+    // guard is a `panic!`. That was #905 — the check declined to validate a dose the
+    // walk then aborted on. The fix is the shared predicate: the same
+    // `subject_feeds_analytical_pk` that makes this population exempt also makes
+    // `compute_predictions_with_tv_*` (value) and `subject_routes_to_event_walk`
+    // (gradient) return a NaN/decline for every one of its subjects, so the walk is
+    // never reached. The exemption's safety no longer rests on the far-away
+    // `n_obs == 0` early return in a different module; it is the negation, per subject,
+    // of this very predicate.
+    //
+    // **Analytical models only.** An `[odes]` block is never a placeholder: a
+    // hazard that reads an ODE state has the system integrated for it even when
+    // the dataset carries no PK observation at all, so the exemption that is
+    // sound for a dummy `pk` line would re-open the silent drop for exactly the
+    // TTE-only-plus-ODE-PK model where it is hardest to notice (#899).
+    if ode_spec.is_none() && !population_uses_analytical_pk(model, population) {
+        return diags;
+    }
+    for subject in &population.subjects {
+        for dose in &subject.doses {
+            let is_infusion = dose.is_infusion();
+            let cmt = dose.cmt_raw();
+            // **Range rule — every dose, whatever its amount.** Both walks
+            // bound-check the compartment *before* the amount is read
+            // (`event_driven::…impl`'s `if cmt_idx < n_states { … } else { panic! }`
+            // and its `sens::propagate` twin), so an `AMT=0` row with an
+            // out-of-range `CMT` reaches the panic exactly like a real dose —
+            // and since #375 routes any `cmt != 1` bolus to the walk, it now
+            // gets there. Exempting zero-amount doses here (as an earlier
+            // revision did, on the incorrect premise that the bolus branch just
+            // "adds `F·0`") re-opened that panic for a NONMEM-idiomatic
+            // `EVID=4, AMT=0` reset row carrying a stale `CMT`.
+            //
+            // Transit/IG skip the routing rule below but are still 2-/3-state
+            // models, so this also stops an out-of-range infusion on them from
+            // passing validation and being silently dropped by the ODE twin's
+            // bounds check.
+            if cmt > n_states {
+                if reported.insert((is_infusion, cmt)) {
+                    // Same code and shape on both engines; only the source of
+                    // the compartment list differs, and the block named in the
+                    // message is the one the user would edit to add a state.
+                    let diag = match ode_spec {
+                        Some(spec) => Diagnostic::error(
+                            "E_DOSE_CMT_OUT_OF_RANGE",
+                            format!(
+                                "subject {}, time {}: dose into compartment {cmt}, but the \
+                                 `[odes]` block declares only {n_states} state(s) \
+                                 (CMT is 1-based: {:?}).",
+                                subject.id, dose.time, spec.state_names,
+                            ),
+                        )
+                        .with_block("odes"),
+                        None => Diagnostic::error(
+                            "E_DOSE_CMT_OUT_OF_RANGE",
+                            format!(
+                                "subject {}, time {}: dose into compartment {cmt}, but the \
+                                 analytical `{name}` model has only {n_states} compartment(s) \
+                                 (CMT is 1-based: {:?}).",
+                                subject.id, dose.time, topology.compartment_names,
+                            ),
+                        )
+                        .with_block("structural_model"),
+                    };
+                    diags.push(diag);
+                }
+                continue;
+            }
+            // **Routing rule — infusions that actually deliver.** Unlike the
+            // range rule, the zero-amount exemption is sound here: an `AMT=0`
+            // infusion has `duration = AMT/RATE = 0`, and the walk's infusion
+            // branch requires `duration > 0`, so no path ever opens a rate
+            // window for it. Rejecting a whole fit over an inert row would be
+            // stricter than the failure being fixed. (`is_infusion()` is
+            // `rate > 0 || !is_fixed()`, deliberately broader than the walk's
+            // `rate > 0 && duration > 0`; this is where the two reconcile.)
+            if !is_infusion || dose.amt == 0.0 {
+                continue;
+            }
+            // **ODE engine (#899): the `CMT=0` half of the routing rule carries
+            // over, the infusable-subset half does not.** An in-range ODE dose is
+            // delivered by indexing the state vector, or — for a compartment fed
+            // by a built-in absorption function — as an `R_in` forcing over time
+            // (`input_rate_consumes_cmt`, a legitimate skip of the bolus branch,
+            // not a drop). Every declared state therefore accepts both a bolus
+            // and a zero-order input, and there is no ODE analogue of
+            // `PkModel::infusable_compartments` to consult. `CMT=0` is the one
+            // value that still has no target: it is NONMEM's default dose
+            // *compartment*, defined for a bolus (where both engines resolve it
+            // to compartment 1) but not for a zero-order input. The analytical
+            // engine rejects it, so rejecting it here keeps the two engines'
+            // answer to the same dataset identical — the whole point of #899.
+            if let Some(spec) = ode_spec {
+                if cmt == 0 && reported.insert((is_infusion, cmt)) {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_DOSE_CMT_NOT_INFUSABLE",
+                            format!(
+                                "subject {}, time {}: infusion into compartment 0. `CMT=0` is \
+                                 NONMEM's *default dose compartment*, which is defined for a \
+                                 bolus but not for a zero-order input — name the target \
+                                 compartment explicitly (1-based: {:?}).",
+                                subject.id, dose.time, spec.state_names,
+                            ),
+                        )
+                        .with_block("odes"),
+                    );
+                }
+                continue;
+            }
+            // Transit/IG (`event_walk_supported == false`) never take the walk
+            // this routing table belongs to — an infusion reroutes them to their
+            // ODE twin (#719 gap 2), which addresses compartments directly.
+            // Rejecting here would break a supported model.
+            //
+            // Caveat, tracked as #910: that twin does *not* preserve this model's
+            // `CMT` numbering — it drops the depot (absorption becomes a forcing
+            // term), so its state count is one lower and every compartment shifts
+            // down by one. `CMT=2` on a `one_cpt_transit` therefore passes the
+            // range rule above (2 <= n_states 2) and is out of range on the twin
+            // that actually solves it. The range rule cannot catch it: the
+            // primary carries `ode_spec: None`, and the twin's spec is built
+            // lazily inside `effective_for`, after validation has run.
+            if !topology.event_walk_supported {
+                continue;
+            }
+            // For a walk-supported model `infusable` *equals* the walk's routing
+            // table (pinned by `topology_fields_are_internally_consistent`), so
+            // this is exactly the set `dose_channel` can route. Since #375 that
+            // set is `1..=n_states` for all six of them, and `cmt > n_states` is
+            // already claimed above — so the only value that reaches this arm is
+            // `CMT=0`, which has no meaning for an infusion (see the message).
+            if !pk_model.infusable_compartments().contains(&cmt)
+                && reported.insert((is_infusion, cmt))
+            {
+                diags.push(
+                    Diagnostic::error(
+                        "E_DOSE_CMT_NOT_INFUSABLE",
+                        format!(
+                            "subject {}, time {}: infusion into compartment {cmt}, but the \
+                             analytical `{name}` model can only infuse into compartment(s) \
+                             {:?}. `CMT=0` is NONMEM's *default dose compartment*, which is \
+                             defined for a bolus but not for a zero-order input — name the \
+                             target compartment explicitly (1-based: {:?}).",
+                            subject.id,
+                            dose.time,
+                            pk_model.infusable_compartments(),
+                            topology.compartment_names,
+                        ),
+                    )
+                    .with_block("structural_model"),
+                );
+            }
+        }
+    }
+    diags
+}
+
+/// Precondition shared by [`predict`] and the `simulate*` family: every dose
+/// must name a compartment the analytical engine can deliver it into (#375) —
+/// the `predict()`/`simulate()` twin of [`check_dose_compartments`], which
+/// `fit()` reaches through [`check_model_data`]. Without it these entry points
+/// reach the event-driven walk's routing `match` with an unroutable
+/// compartment, which used to `panic!` from deep inside the prediction loop
+/// with no subject/time context.
+pub(crate) fn assert_dose_compartments_supported(model: &CompiledModel, population: &Population) {
+    panic_if_unsupported(
+        first_error(&check_dose_compartments(model, population)).err(),
+        "a dose into a compartment the model cannot deliver into",
+    );
 }
 
 /// Precondition shared by [`predict`] and the `simulate*` family: every
@@ -733,17 +1056,20 @@ pub(crate) fn check_absorption_closed_form_support(
             ));
         }
         for dose in &subject.doses {
-            if dose.cmt != 1 {
+            if dose.cmt_1based() != 1 {
                 // The closed form folds *every* dose through the absorption chain into
                 // central ignoring `dose.cmt` (the `sens/provider.rs` superposition loop),
-                // while the ODE twin honours the compartment — a `CMT≠1` dose there falls to
+                // while the ODE twin honours the compartment — a `CMT>1` dose there falls to
                 // the direct-bolus branch and lands in a disposition compartment, bypassing the
                 // transit/IG absorption the model asks for. Neither reading of a non-depot dose
                 // on an absorption model is well-defined: a subject on the closed form and one
                 // rerouted to the twin (TV-cov / `TIME` / IOV `n_kappa > 0`, #719) would
                 // disagree, and the twin's direct-bolus reading is not the intended transit
-                // input either. A closed-form absorption model only supports dosing the depot
-                // (`CMT=1`); reject anything else up front.
+                // input either. A closed-form absorption model only supports dosing the depot;
+                // reject anything else up front. `CMT=0` is NONMEM's *default dose compartment*
+                // — compartment 1, the depot — so it is accepted (both the closed form and its
+                // twin resolve it exactly like `CMT=1` via `saturating_sub(1)`, #899); only
+                // `CMT>=2` is a genuine non-depot target. `cmt_1based()` maps `CMT=0 -> 1`.
                 return Some(format!(
                     "{name} does not support dosing into a non-depot compartment (subject \
                      {}, CMT={}): the analytic absorption closed form routes every dose through \
@@ -752,7 +1078,8 @@ pub(crate) fn check_absorption_closed_form_support(
                      into a disposition compartment, so the two paths would disagree. Dose the \
                      depot (CMT=1), or use an ODE absorption model for direct central/peripheral \
                      dosing.",
-                    subject.id, dose.cmt
+                    subject.id,
+                    dose.cmt_raw()
                 ));
             }
             if dose.ss && dose.is_infusion() {
@@ -777,14 +1104,16 @@ pub(crate) fn check_absorption_closed_form_support(
                 // twin can't yet serve: a twin-less form, or a model with an absorption lagtime
                 // (the twin's SS+lagtime pre-arrival seed is still bolus-only — same scope as the
                 // ODE-path `E_ABSORPTION_SS_LAG`). `effective_for` performs the reroute.
-                if model.absorption_ode_equivalent.is_none() || model.has_lagtime_on_cmt(dose.cmt) {
+                if model.absorption_ode_equivalent.is_none()
+                    || model.has_lagtime_on_cmt(dose.cmt_raw())
+                {
                     return Some(format!(
                         "{name} does not support steady-state (SS) doses in this form (subject \
                          {}): SS reroutes to the ODE absorption twin, but this model has no twin \
                          {}. Use a non-SS multiple-dose schedule, or write the model as an ODE \
                          transit()/igd() forcing in [odes].",
                         subject.id,
-                        if model.has_lagtime_on_cmt(dose.cmt) {
+                        if model.has_lagtime_on_cmt(dose.cmt_raw()) {
                             "for the SS + lagtime combination (a follow-up)"
                         } else {
                             "(an unrecognised closed form)"
@@ -1120,13 +1449,32 @@ pub(crate) fn assert_survival_tv_covariates(model: &CompiledModel, population: &
 }
 
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
-/// the oral **depot** amount on a subject carrying an EVID=3/4 reset.
+/// the oral **depot** amount on a subject whose dose history dose superposition
+/// cannot reconstruct — an EVID=3/4 reset, or a dose the superposition state
+/// helper cannot place (#375).
 ///
-/// The depot amount is reconstructed by dose superposition (`apply_analytic_readout`),
-/// which is invalid across a reset — the closed form cannot restart the accumulation,
-/// so the readout would silently see a zero depot after the reset and mis-predict.
+/// `apply_analytic_readout` reconstructs the depot amount with
+/// [`crate::pk::analytical_state_at_times`], and both failure modes make that
+/// reconstruction wrong in a way that reaches `PRED` — and therefore the **OFV**,
+/// not just a diagnostic column:
+///
+///  - a **reset** zeroes the compartments mid-record, which is not a sum of
+///    independent dose responses, so the readout would see a zero depot after
+///    the reset;
+///  - a **non-default dose compartment** is invisible to `single_dose_states`,
+///    which never reads `dose.cmt` and places every bolus in compartment 1 and
+///    every infusion in central. A bolus written `CMT=2` on a `one_cpt_oral`
+///    model is therefore reconstructed as if it had been absorbed through the
+///    depot, adding a phantom depot amount. Measured on
+///    `[scaling] y = (central + depot)/V`: OFV 188.37 against an ODE twin's
+///    1761.47, where the same model with the dose at `CMT=1` agrees with the
+///    twin exactly.
+///
+/// The `ipred` path itself is correct for these subjects (it reroutes to the
+/// event-driven walk, `dose_needs_event_walk`), but that walk has no states
+/// variant for the readout to read, so there is nothing to fall back to.
 /// Rather than return a subtly wrong `PRED`/OFV, fail loudly and point at an ODE
-/// model (which integrates the depot state across resets). A `central`-only readout
+/// model (which integrates the depot state directly). A `central`-only readout
 /// is unaffected. Returns `None` for the common no-readout / IV / central-only case.
 pub(crate) fn check_analytic_readout_support(
     model: &CompiledModel,
@@ -1145,6 +1493,20 @@ pub(crate) fn check_analytic_readout_support(
                  across a reset. Reference only the `central` amount, or use an ODE model \
                  (`ode(states=[depot, central])`) which integrates the depot across resets. \
                  See issue #650.",
+                subject.id
+            ));
+        }
+        if crate::pk::dose_needs_event_walk(model.pk_model, subject) {
+            return Some(format!(
+                "[scaling] y: an analytic Form C readout that references the oral `depot` \
+                 amount is not supported on a subject dosing a non-default compartment \
+                 (subject {}): the depot amount is reconstructed by dose superposition, \
+                 which places every bolus in compartment 1 and every infusion in central \
+                 regardless of `CMT`, so a dose elsewhere would contribute a phantom depot \
+                 amount to `PRED` (and to the objective). Reference only the `central` \
+                 amount, dose the default compartment, or use an ODE model \
+                 (`ode(states=[depot, central])`) which addresses compartments directly. \
+                 See issue #375.",
                 subject.id
             ));
         }
@@ -1753,7 +2115,7 @@ pub fn check_model_data_warnings(
         // but this warnings pass must stay panic-free if run on such a model rather
         // than hit `resolve_rate`'s slot `.expect`.
         let attr_map = model.active_dose_attr_map();
-        if attr_map.indexed_slot(attr, d.cmt).is_some() {
+        if attr_map.indexed_slot(attr, d.cmt_raw()).is_some() {
             // Initial-estimate warning pass: typical values at t=0.
             let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates, 0.0);
             d.resolve_rate(attr_map, &pk.values).duration
@@ -1841,15 +2203,15 @@ pub fn check_model_data_warnings(
                     RateMode::ModeledDuration => (DoseAttr::Duration, DoseEvent::DURATION_FLOOR),
                     RateMode::ModeledRate => (DoseAttr::Rate, DoseEvent::RATE_FLOOR),
                 };
-                if let Some(slot) = attr_map.indexed_slot(attr, d.cmt) {
+                if let Some(slot) = attr_map.indexed_slot(attr, d.cmt_raw()) {
                     let pk = pk_at_init.get_or_insert_with(|| {
                         // Initial-estimate warning pass: typical values at t=0.
                         (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates, 0.0)
                     });
                     if pk.values[slot] <= floor {
                         match attr {
-                            DoseAttr::Duration => nonpos_dur.insert(d.cmt),
-                            DoseAttr::Rate => nonpos_rate.insert(d.cmt),
+                            DoseAttr::Duration => nonpos_dur.insert(d.cmt_raw()),
+                            DoseAttr::Rate => nonpos_rate.insert(d.cmt_raw()),
                             DoseAttr::F | DoseAttr::Lag => unreachable!("only D/R reach here"),
                         };
                     }
@@ -2166,8 +2528,161 @@ pub fn check_model_data_warnings(
         }
     }
 
+    diags.extend(additive_init_scale_warnings(model, population, init_params));
+
     diags
 }
+
+/// Warn when a `combined` error model's **additive** SD initial estimate is
+/// negligible relative to the scale of the observations it covers.
+///
+/// With a combined variance `Var(f) = (f·σ_prop)² + σ_add²`, an additive init
+/// orders of magnitude below the data starts the fit in a near-pure-proportional
+/// regime where low-magnitude observations receive enormous `1/Var` weight. On
+/// multimodal / over-parameterised problems the optimizer can then settle in a
+/// local minimum where the additive term stays collapsed (σ_add ≈ 0) and the
+/// proportional term inflates — the *worse* basin. The cyclophosphamide
+/// parent→metabolite fit is the canonical case: additive variance seeded at 0.5
+/// traps at ≈0.94, whereas the global optimum is ≈1878 (~50 OFV points better);
+/// both ferx and NONMEM miss it from that start, Pumas found it.
+///
+/// This is a **pre-fit heuristic on the initial estimate only** — it never
+/// changes the value (per the warn-only design), it advises a larger start.
+/// The threshold is deliberately conservative (additive SD below 1% of the data
+/// scale): a genuinely small-but-intended additive floor of a few % of the data
+/// does not trip it; only an essentially-zero start does.
+fn additive_init_scale_warnings(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    use crate::types::{EndpointError, ErrorModel, ErrorSpec, SigmaType};
+    use std::collections::HashMap;
+
+    let mut diags = Vec::new();
+
+    // (additive global sigma index, endpoint dispatch key or None for `Single`,
+    // scope label). For `Combined` the additive sigma is the 2nd sigma
+    // (residual_variance uses sigma[0]=prop, sigma[1]=add); for `Single` the
+    // global sigma vector is in that order, for `PerCmt`/`Selected` the
+    // endpoint's `sigma_idx[1]`. `PerCmt` keys are 1-based CMTs; `Selected` keys
+    // are 0-based covariate-branch indices — labelled `endpoint=` not `CMT=` so
+    // the message doesn't misname a branch as a compartment.
+    let mut combined_endpoints: Vec<(usize, Option<usize>, String)> = Vec::new();
+    let mut push_endpoints = |map: &HashMap<usize, EndpointError>, label: &str| {
+        for (&key, ee) in map {
+            if ee.error_model == ErrorModel::Combined {
+                if let Some(pos) = ee
+                    .error_model
+                    .sigma_types()
+                    .iter()
+                    .position(|t| *t == SigmaType::Additive)
+                {
+                    if let Some(&idx) = ee.sigma_idx.get(pos) {
+                        combined_endpoints.push((idx, Some(key), format!("{label}={key}")));
+                    }
+                }
+            }
+        }
+    };
+    match &model.error_spec {
+        ErrorSpec::Single(ErrorModel::Combined) => {
+            combined_endpoints.push((1, None, "all observations".to_string()))
+        }
+        ErrorSpec::Single(_) => {}
+        ErrorSpec::PerCmt(map) => push_endpoints(map, "CMT"),
+        ErrorSpec::Selected { endpoints, .. } => push_endpoints(endpoints, "endpoint"),
+    }
+    // Deterministic order: HashMap iteration (PerCmt/Selected) is unordered.
+    combined_endpoints.sort_unstable();
+
+    for (add_idx, key, scope) in combined_endpoints {
+        let Some(&add_sd_init) = init_params.sigma.values.get(add_idx) else {
+            continue;
+        };
+        // |DV| of the observations this endpoint covers.
+        let mut mags: Vec<f64> = Vec::new();
+        for subject in &population.subjects {
+            for (j, &obs) in subject.observations.iter().enumerate() {
+                let covered = match key {
+                    None => true,
+                    Some(k) => model.error_spec.obs_key(subject, j) == k,
+                };
+                if covered {
+                    let v = obs.abs();
+                    if v.is_finite() {
+                        mags.push(v);
+                    }
+                }
+            }
+        }
+        let sigma_name = init_params
+            .sigma
+            .names
+            .get(add_idx)
+            .cloned()
+            .unwrap_or_else(|| format!("SIGMA({})", add_idx + 1));
+        if let Some(d) = additive_init_scale_check(&scope, &sigma_name, add_sd_init, &mut mags) {
+            diags.push(d);
+        }
+    }
+
+    diags
+}
+
+/// Pure decision for [`additive_init_scale_warnings`]: given one combined
+/// endpoint's additive SD initial estimate and the `|DV|` magnitudes of the
+/// observations it covers, return a warning iff the additive start is negligible
+/// (below [`NEGLIGIBLE_ADD_FRACTION`]) relative to the data scale (median `|DV|`).
+///
+/// `mags` is taken by `&mut` because it is sorted in place to find the median;
+/// the caller does not reuse it afterwards. Returns `None` for an empty/all-zero
+/// data scale (nothing to compare against) or a non-negligible additive start.
+fn additive_init_scale_check(
+    scope: &str,
+    sigma_name: &str,
+    add_sd_init: f64,
+    mags: &mut [f64],
+) -> Option<Diagnostic> {
+    if mags.is_empty() {
+        return None;
+    }
+    mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = mags.len() / 2;
+    let data_scale = if mags.len() % 2 == 1 {
+        mags[mid]
+    } else {
+        0.5 * (mags[mid - 1] + mags[mid])
+    };
+    if data_scale <= 0.0 || add_sd_init >= NEGLIGIBLE_ADD_FRACTION * data_scale {
+        return None;
+    }
+    Some(Diagnostic::warning(
+        "W_ADDITIVE_INIT_SCALE",
+        format!(
+            "Combined error model on {scope}: additive SD initial estimate \
+             '{sigma_name}' = {add_sd_init:.4} is negligible (< {pct:.0}%) \
+             relative to the data scale (median |DV| = {data_scale:.4}). A \
+             near-zero additive start can trap the fit in a local minimum where \
+             the additive term collapses and the proportional term inflates — \
+             the worse basin on multimodal problems. If the fit converges with \
+             this additive variance near zero, retry from a larger additive \
+             initial estimate (e.g. SD ≈ {suggest:.4}, ~10% of the data scale \
+             — median |DV| / 10).",
+            pct = NEGLIGIBLE_ADD_FRACTION * 100.0,
+            suggest = 0.1 * data_scale,
+        ),
+    ))
+}
+
+/// Additive SD init counts as "negligible" below this fraction of the data scale
+/// (median `|DV|`) — deliberately conservative so a genuinely small-but-intended
+/// additive floor of a few % of the data does not trip the warning.
+const NEGLIGIBLE_ADD_FRACTION: f64 = 0.01;
+
+#[cfg(test)]
+#[path = "tests/additive_init_scale_tests.rs"]
+mod additive_init_scale_tests;
 
 /// Feature-presence (data-independent) *warning*-level checks for experimental
 /// features (issue #175). Stochastic differential equations and neural-network

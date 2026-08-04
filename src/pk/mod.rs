@@ -735,12 +735,22 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// ([`occasion_of`]): `eta_occ[g]` for the window `g` containing the record, or
 /// `eta_baseline` (BSV η with κ = 0) before the first decision. This is the IOV
 /// analogue of [`predict_iov`]'s per-event occasion-κ selection, with occasion =
-/// decision window instead of the OCC column. Doses stay empty — the adaptive base
-/// subject is dose-free; controller-injected doses take their PK from the driver's
-/// per-decision snapshot. It composes with #700's time-varying covariates: each
-/// record's *covariate* snapshot (`obs_cov` / `pk_only_cov`) is used alongside its
-/// occasion eta, so a model with both a TV covariate and IOV κ is per-event correct
-/// in both.
+/// decision window instead of the OCC column. **Doses** are resolved the same way
+/// (#931): a pre-scheduled base dose (#702) carries the PK of the occasion (decision
+/// window) active at its administration time, so its bioavailability F resolves under
+/// that occasion's κ — symmetric with a controller-injected dose, whose F is fixed
+/// from the driver's per-decision LOCF snapshot at injection. A base dose administered
+/// **before the first decision** has no open window, so — like an observation before the
+/// first decision — it takes the baseline κ = 0 for its F; its disposition still flows
+/// through the per-segment occasion PK (the standard event-driven split of dose-time
+/// attributes from running clearance), so a loading dose given at t=0 with the first
+/// decision at t>0 is dosed at baseline F but decays under the first window's occasion.
+/// On the (common) dose-free
+/// base subject `subject.doses` is empty, so `dose` stays empty and the result is
+/// byte-identical to the pre-#931 path. It composes with #700's time-varying
+/// covariates: each record's *covariate* snapshot (`dose_cov` / `obs_cov` /
+/// `pk_only_cov`) is used alongside its occasion eta, so a model with both a TV
+/// covariate and IOV κ is per-event correct in both.
 ///
 /// **pk-only (EVID=2) convention — deliberately different from [`predict_iov`].** Here
 /// a pk-only record takes the κ of the decision window containing its time (like any
@@ -751,6 +761,20 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// `segment_occ_at` also uses [`occasion_of`], so materialiser and driver agree), but a
 /// future oracle that validates an adaptive IOV run *with EVID=2 rows* against
 /// `predict_iov` must account for this — they will disagree on the pk-only κ by design.
+///
+/// **Base dose at an occasion boundary — a second [`predict_iov`] divergence.** The
+/// driver assigns a *segment's* occasion from the last observation / EVID=2 record it
+/// crossed (`segment_occ_at`), i.e. the decision window active *during* the segment (the
+/// clearance in effect at that time — the physically faithful choice for real-time
+/// feedback, #701). `predict_iov` uses the #104 OCC end-of-interval rule: the segment
+/// ending at a *dose* record takes that dose's occasion. The two agree when every
+/// segment ends at an observation (the shipped anchor observes a trough at each decision),
+/// but differ for a base dose sitting at an occasion boundary with no coincident
+/// observation — the segment *before* that dose uses the prior window in the driver and
+/// the dose's window in `predict_iov`. An adaptive IOV oracle over such a configuration
+/// must validate against the driver's own frozen-replay verifier (bit-exact) or mrgsolve,
+/// not `predict_iov`. (This `dose` snapshot only fixes each dose's *F* at its
+/// administration occasion; the running disposition occasion is `segment_occ_at`'s job.)
 pub(crate) fn compute_event_pk_params_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -766,6 +790,19 @@ pub(crate) fn compute_event_pk_params_iov(
             None => eta_baseline,
         }
     };
+    // Base doses (#702 × #931): each carries the occasion active at its administration
+    // time, so `f_bio` reads its bioavailability under that occasion's κ. Empty on the
+    // dose-free base subject (the common case) → byte-identical to the pre-#931 path.
+    for k in 0..subject.doses.len() {
+        let t = subject.doses[k].time;
+        out.dose.push(pk_params_at_time(
+            model,
+            theta,
+            eta_at(t),
+            subject.dose_cov(k),
+            t,
+        ));
+    }
     for j in 0..subject.obs_times.len() {
         let t = subject.obs_times[j];
         out.obs.push(pk_params_at_time(
@@ -861,6 +898,17 @@ pub fn predict_iov(
     kappas: &[Vec<f64>],
 ) -> Vec<f64> {
     use std::collections::HashMap;
+    // #905: the IOV value funnel is a structural peer of
+    // `compute_predictions_with_tv_into_with_schedule` and needs the same declination —
+    // an analytical subject with no Gaussian observation feeds the predictor nothing,
+    // and its dose compartment is exempt from `check_dose_compartments`, so the walk
+    // below (`event_driven_predictions`) would `panic!` on an unroutable dose nobody
+    // reads. Keyed on the primary `ode_spec` and computed before `effective_for`,
+    // exactly like the non-IOV gate. Returns NaN (empty when `obs_times` is empty — the
+    // endpoint-routed loader's case, which the walk's own `n_obs == 0` already handled).
+    if model.ode_spec.is_none() && !subject_feeds_analytical_pk(model, subject) {
+        return vec![f64::NAN; subject.obs_times.len()];
+    }
     // Closed-form transit/IG IOV reroutes to its `transit()`/`igd()` ODE twin (issue #719):
     // the per-dose superposition cannot carry drug across occasion boundaries (#104), but the
     // twin integrates it exactly (#663). A no-op for every other model (`effective_for` returns
@@ -1808,15 +1856,18 @@ pub fn compute_predictions_with_states(
                 model.active_dose_attr_map(),
                 &pk.values,
             );
-            if has_oral_depot_infusion(model.pk_model, &resolved) {
-                // The superposition state helper (`single_dose_states`) models an
-                // oral infusion as a depot-bypassing input into central, so it
-                // cannot express a zero-order input into the **depot** (#400) —
-                // it would report silently-wrong compartment amounts. The
-                // event-driven path (used for `ipred` above) has no states
-                // variant yet, so return outer-empty → NaN compartments, matching
-                // the reset/TV-analytical convention. ipred stays correct;
-                // sdtab/`[derived]` compartment amounts degrade to NaN.
+            if dose_needs_event_walk(model.pk_model, &resolved) {
+                // `single_dose_states` shares `single_dose_concentration`'s
+                // cmt-blindness: it models an oral infusion as a depot-bypassing
+                // input into central (so it cannot express a zero-order input
+                // into the **depot**, #400) and every bolus as going into
+                // compartment 1 — so for any dose outside those it would report
+                // silently-wrong compartment amounts. `ipred` above is correct
+                // either way (it reroutes to the event-driven walk), but that
+                // path has no states variant yet, so return outer-empty → NaN
+                // compartments, matching the reset/TV-analytical convention.
+                // sdtab/`[derived]` compartment amounts degrade to NaN rather
+                // than being wrong (#375).
                 vec![]
             } else {
                 predict_all_states(model.pk_model, &resolved, &pk)
@@ -1861,7 +1912,11 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
     // have no depot-infusion form, so a `D{depot}` infusion would be silently
     // mishandled. The event-driven propagator implements the depot zero-order
     // forced response, so route depot-infusion subjects there too.
-    if (subject.has_resets() || has_oral_depot_infusion(pk_model, subject))
+    // `dose_needs_event_walk` subsumes the depot-infusion case above and extends
+    // it to every dose whose compartment superposition cannot express — any
+    // bolus outside compartment 1, and any infusion outside central. NONMEM
+    // agrees with the walk on all of them (#375).
+    if (subject.has_resets() || dose_needs_event_walk(pk_model, subject))
         && event_driven::supports_event_driven(pk_model)
     {
         let pk_dose = vec![*pk_params; subject.doses.len()];
@@ -1882,25 +1937,111 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
         .collect()
 }
 
-/// Whether `subject` has a zero-order infusion into the **depot** (cmt 1) of an
-/// oral model (#400) — a dose into compartment 1 of `one_cpt_oral` /
-/// `two_cpt_oral` / `three_cpt_oral` that [`DoseEvent::is_infusion`] reports as
-/// an infusion (an explicit positive `RATE`, or a still-modeled `RATE=-2` `D1`).
+/// True when any dose targets a compartment the **dose-superposition** dispatch
+/// cannot express, so the subject must be served by the event-driven walk.
 ///
-/// Such doses have no closed form in the superposition path (which models the
-/// oral depot as bolus-only), so the dispatcher routes them through the
-/// event-driven propagator instead, and their per-compartment states degrade to
-/// NaN. IV models and oral **central** infusions (cmt 2, handled by the
-/// depot-bypass IV formula) return `false`.
+/// [`single_dose_concentration`] never reads `dose.cmt`. It branches only on
+/// `is_infusion()` and then picks the closed form from the *model*, which fixes
+/// where the dose lands:
 ///
-/// Uses `is_infusion()` rather than `rate > 0` so the predicate gives the same
-/// answer on the **raw** subject (modeled `RATE=-2` doses still read `rate == 0`)
-/// and the **resolved** subject (where it reduces to `rate > 0`). This is the
-/// single source of truth shared by the prediction dispatch, the compartment-
-/// state degradation, and the `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL`
-/// warning — so the three can never disagree about which subjects are affected.
-pub(crate) fn has_oral_depot_infusion(pk_model: PkModel, subject: &Subject) -> bool {
-    pk_model.is_oral() && subject.doses.iter().any(|d| d.cmt == 1 && d.is_infusion())
+/// - a **bolus** takes the model's own form — an oral model absorbs it through
+///   the depot, an IV model injects it into central. Either way that is
+///   compartment **1**, so any bolus into compartment ≥ 2 is computed in the
+///   wrong compartment.
+/// - an **infusion** takes the IV infusion form, which delivers into
+///   **central** — compartment 2 for an oral model (the documented depot-bypass,
+///   #350), compartment 1 for an IV model. Any other target is wrong: the oral
+///   **depot** (#400, previously the only case handled, by the since-removed
+///   `has_oral_depot_infusion`) and every **peripheral**.
+///
+/// `CMT=0` is NONMEM's default dose compartment and resolves to compartment 1,
+/// so it is treated as such here.
+///
+/// The event-driven walk applies each dose to its actual compartment and is
+/// **NONMEM-anchored for exactly these cases** — `ADVAN2` central bolus,
+/// `ADVAN3`/`ADVAN4` peripheral bolus, `ADVAN11` peripheral-2 bolus, `ADVAN12`
+/// central bolus, and an `ADVAN3` peripheral infusion all match to <1e-8
+/// relative (`tests/nonmem_dose_compartment_anchor.rs`), while superposition
+/// disagrees with NONMEM by up to two orders of magnitude. Rerouting is
+/// therefore a correction, not a preference (#375).
+///
+/// **Single source of truth.** This is the *only* predicate deciding which
+/// subjects superposition cannot serve, and every consumer must use it: the
+/// prediction dispatch (`compute_predictions`), the compartment-state
+/// degradation (`compute_predictions_with_states`), the dense `[derived]` grid
+/// states (`api::output_columns`), the analytic Form-C readout gate
+/// (`check_analytic_readout_support`), the `sens` gradient router
+/// (`provider::subject_routes_to_event_walk`), and the
+/// `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` warning. It replaced the
+/// narrower `has_oral_depot_infusion` (which handled only the #400 depot case);
+/// leaving one consumer on the old predicate is exactly how a `[derived]` grid
+/// integral came to report a confident wrong number while the adjacent per-obs
+/// column was NaN.
+pub(crate) fn dose_needs_event_walk(pk_model: PkModel, subject: &Subject) -> bool {
+    // Transit/IG cannot be state-propagated, so there is no walk to route to.
+    // They reject non-depot doses up front instead (`check_absorption_dosing` /
+    // `check_absorption_closed_form_support`).
+    if !event_driven::supports_event_driven(pk_model) {
+        return false;
+    }
+    let central_cmt = if pk_model.is_oral() { 2 } else { 1 };
+    subject.doses.iter().any(|d| {
+        // `CMT=0` == the default dose compartment == 1.
+        let cmt = d.cmt_1based();
+        if d.is_infusion() {
+            cmt != central_cmt
+        } else {
+            cmt != 1
+        }
+    })
+}
+
+/// True when the analytical PK predictor must produce a value for this subject —
+/// it carries at least one Gaussian observation (an obs whose CMT is **not** a
+/// registered non-Gaussian endpoint) or a pk-only prediction time.
+///
+/// When this is `false` on an analytical (`ode_spec.is_none()`) model, nothing
+/// consumes the predictor's concentration-time output, so the event-driven walk
+/// can be skipped for the subject. Within that domain every consumer of the walk
+/// is a Gaussian observation:
+///   - A TTE hazard that reads a concentration is written `hazard = <expr>`, which
+///     the parser turns into a synthesised `__chz` ODE accumulator state
+///     (`prescan_ode_hazards`), forcing `ode_spec = Some`. So every hazard left on
+///     an analytical model is a closed-form `HazardSpec::Analytic`, whose
+///     parameters are a `Fn(θ, η, covariates)` — no concentration.
+///   - A binary/categorical linear predictor is a
+///     [`crate::types::LinearPredictorFn`] = `Fn(θ, η, covariates) -> f64`; it
+///     cannot read the concentration curve either.
+///   - A Gaussian PD/PK endpoint is *never* inserted into `endpoints`, so its obs
+///     CMT is absent from the map and keeps this `true`.
+///
+/// This is the per-subject source of truth shared with the dose-compartment
+/// validator: `validation::population_uses_analytical_pk` is `subjects.any(...)`
+/// of this predicate. The two compose — in a *live* population the validator still
+/// range-checks **every** dose (so a joint-model TTE-only subject's unroutable dose
+/// is rejected up front), while this per-subject gate additionally declines the
+/// walk for any subject the predictor would feed nothing, which is the case the
+/// exemption leaves unvalidated (#905).
+pub(crate) fn subject_feeds_analytical_pk(model: &CompiledModel, subject: &Subject) -> bool {
+    #[cfg(feature = "survival")]
+    {
+        // No non-Gaussian endpoints ⇒ every observation is Gaussian by construction.
+        if model.endpoints.is_empty() {
+            return true;
+        }
+        !subject.pk_only_times.is_empty()
+            || subject
+                .obs_cmts
+                .iter()
+                .any(|cmt| !model.endpoints.contains_key(cmt))
+    }
+    #[cfg(not(feature = "survival"))]
+    {
+        // Without the `survival` feature no non-Gaussian endpoint can be parsed, so
+        // every observation is Gaussian and the predictor is always live.
+        let _ = (model, subject);
+        true
+    }
 }
 
 /// Compute predictions using ODE integration.
@@ -2036,6 +2177,23 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     scratch: &mut EventPkParams,
     schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
+    // #905: on an analytical model, a subject with no Gaussian observation feeds the
+    // PK predictor nothing — every hazard left here is closed-form and no
+    // binary/CTMM linear predictor reads a concentration (see
+    // `subject_feeds_analytical_pk`). Such a subject's dose compartment is exempt
+    // from `check_dose_compartments`, so running the event-driven walk would hit the
+    // unroutable-dose `panic!` (`event_driven.rs`) on output nobody consumes. Decline
+    // with NaN — the house "no prediction available" value, the same result the
+    // normal endpoint-routed path reaches via an empty `obs_times` (`n_obs == 0`).
+    // Keyed on the primary `ode_spec`, matching the validator exemption, and judged
+    // before `effective_model_for_eval`: a transit model (primary `ode_spec` None,
+    // rerouted to its ODE twin below) is judged on the primary too. A plain transit PK
+    // subject carries Gaussian obs and is not gated; a transit-plus-TTE TTE-only
+    // subject is gated — correctly, it feeds the predictor nothing like any other
+    // no-Gaussian-obs subject.
+    if model.ode_spec.is_none() && !subject_feeds_analytical_pk(model, subject) {
+        return vec![f64::NAN; subject.obs_times.len()];
+    }
     // A `one_cpt_transit` subject that the closed form can't serve (TIME switch / TV
     // covariates) routes to the exact ODE `transit()` equivalent, which takes the ODE branch
     // below (that branch ignores the cached analytical `schedule`, so a stale one is

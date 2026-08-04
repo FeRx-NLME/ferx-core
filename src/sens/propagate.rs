@@ -224,6 +224,7 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     e: &TwoCptEigen<T>,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
     rate_depot: T,
 ) {
     let (alpha, beta, k10, k12, k21) = (e.alpha, e.beta, e.k10, e.k12, e.k21);
@@ -273,13 +274,22 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     state[1] = h_c_dt + cap_a * e_ka;
     state[2] = h_p_dt + cap_b * e_ka;
 
-    // Constant infusion into central (depot bypass): forced response of the 2-cpt
-    // IV propagator from a zero initial state. `rate_central` is structurally 0 or
-    // positive (never crossing during differentiation), so the `.val()` guard is
-    // derivative-safe and just skips the no-infusion intervals.
-    if rate_central.val() > 0.0 {
+    // Constant infusion into central (depot bypass) and/or into the **peripheral**
+    // (#375): forced response of the 2-cpt IV propagator from a zero initial state.
+    //
+    // Both reduce to the same delegation because the depot is decoupled from the
+    // disposition sub-system in the inflow direction — nothing flows *back* into
+    // the depot — so a rate into central or peripheral drives exactly the
+    // central/peripheral pair an IV model has, and the system is linear, so the
+    // forced response superposes onto the homogeneous evolution above. The oral
+    // peripheral therefore needs no new closed form: it *is* the IV one.
+    //
+    // `rate_*` are structurally 0 or positive (never crossing during
+    // differentiation), so the `.val()` guards are derivative-safe and just skip
+    // the no-infusion intervals.
+    if rate_central.val() > 0.0 || rate_periph1.val() > 0.0 {
         let mut inflow = [T::from_f64(0.0), T::from_f64(0.0)];
-        propagate_two_cpt_core_g(&mut inflow, dt, e, rate_central, T::from_f64(0.0));
+        propagate_two_cpt_core_g(&mut inflow, dt, e, rate_central, rate_periph1);
         state[1] = state[1] + inflow[0];
         state[2] = state[2] + inflow[1];
     }
@@ -299,7 +309,15 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
         };
         let d_ss = rate_depot / ka;
         let mut xss = [d_ss, c_ss, p_ss];
-        propagate_two_cpt_oral_core_g(&mut xss, dt, e, ka, T::from_f64(0.0), T::from_f64(0.0));
+        propagate_two_cpt_oral_core_g(
+            &mut xss,
+            dt,
+            e,
+            ka,
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+        );
         state[0] = state[0] + (d_ss - xss[0]);
         state[1] = state[1] + (c_ss - xss[1]);
         state[2] = state[2] + (p_ss - xss[2]);
@@ -317,13 +335,14 @@ pub fn propagate_two_cpt_oral_g<T: PkNum>(
     v2: T,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
     rate_depot: T,
 ) {
     if ka.val() <= 0.0 {
         return;
     }
     if let Some(e) = two_cpt_eigen_g(cl, v1, q, v2) {
-        propagate_two_cpt_oral_core_g(state, dt, &e, ka, rate_central, rate_depot);
+        propagate_two_cpt_oral_core_g(state, dt, &e, ka, rate_central, rate_periph1, rate_depot);
     }
 }
 
@@ -501,6 +520,8 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     e: &ThreeCptEigen<T>,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
+    rate_periph2: T,
     rate_depot: T,
 ) {
     let (alpha, beta, gamma, k10, k12, k13, k21, k31) =
@@ -536,19 +557,16 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     state[2] = p1a + p1b + p1g + cap_b * e_ka;
     state[3] = p2a + p2b + p2g + cap_c * e_ka;
 
-    // Constant infusion into central (depot bypass): forced response of the 3-cpt
-    // IV propagator from a zero initial state. `.val()` guard is derivative-safe
-    // (`rate_central` is structurally 0 or positive).
-    if rate_central.val() > 0.0 {
+    // Constant infusion into central (depot bypass) and/or into either
+    // **peripheral** (#375): forced response of the 3-cpt IV propagator from a
+    // zero initial state. The depot takes no inflow from the disposition
+    // sub-system, so a rate into central or a peripheral drives exactly the
+    // three-state system an IV model has — the oral peripherals reuse the IV
+    // closed form rather than needing a new one. `.val()` guards are
+    // derivative-safe (each rate is structurally 0 or positive).
+    if rate_central.val() > 0.0 || rate_periph1.val() > 0.0 || rate_periph2.val() > 0.0 {
         let mut inflow = [T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0)];
-        propagate_three_cpt_core_g(
-            &mut inflow,
-            dt,
-            e,
-            rate_central,
-            T::from_f64(0.0),
-            T::from_f64(0.0),
-        );
+        propagate_three_cpt_core_g(&mut inflow, dt, e, rate_central, rate_periph1, rate_periph2);
         state[1] = state[1] + inflow[0];
         state[2] = state[2] + inflow[1];
         state[3] = state[3] + inflow[2];
@@ -571,7 +589,16 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
         };
         let d_ss = rate_depot / ka;
         let mut xss = [d_ss, c_ss, p1_ss, p2_ss];
-        propagate_three_cpt_oral_core_g(&mut xss, dt, e, ka, T::from_f64(0.0), T::from_f64(0.0));
+        propagate_three_cpt_oral_core_g(
+            &mut xss,
+            dt,
+            e,
+            ka,
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+            T::from_f64(0.0),
+        );
         state[0] = state[0] + (d_ss - xss[0]);
         state[1] = state[1] + (c_ss - xss[1]);
         state[2] = state[2] + (p1_ss - xss[2]);
@@ -592,13 +619,24 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
     v3: T,
     ka: T,
     rate_central: T,
+    rate_periph1: T,
+    rate_periph2: T,
     rate_depot: T,
 ) {
     if ka.val() <= 0.0 {
         return;
     }
     if let Some(e) = three_cpt_eigen_g(cl, v1, q2, v2, q3, v3) {
-        propagate_three_cpt_oral_core_g(state, dt, &e, ka, rate_central, rate_depot);
+        propagate_three_cpt_oral_core_g(
+            state,
+            dt,
+            &e,
+            ka,
+            rate_central,
+            rate_periph1,
+            rate_periph2,
+            rate_depot,
+        );
     }
 }
 
@@ -889,12 +927,24 @@ fn active_rates_g<T: PkNum>(
                 Some((rate_bare, _)) => pk.f * rate_bare,
                 None => pk.f * T::from_f64(d.rate),
             };
-            match pk_model.topology().dose_channel(d.cmt) {
+            match pk_model.topology().dose_channel(d.cmt_raw()) {
                 Some(Channel::Central) => rate_central = rate_central + r,
                 Some(Channel::Periph1) => rate_periph1 = rate_periph1 + r,
                 Some(Channel::Periph2) => rate_periph2 = rate_periph2 + r,
                 Some(Channel::Depot) => rate_depot = rate_depot + r,
-                None => {}
+                // Unreachable from a validated call — `check_dose_compartments`
+                // (#375) rejects an unroutable infusion before any prediction. The
+                // old silent `{}` was worse than the value walk's `panic!` twin in
+                // `pk::event_driven::propagate_with_bounds`: it dropped the
+                // infusion from the *gradient* only, so FOCE/FOCEI would have
+                // differentiated a different dosing history than it predicted.
+                // Fail the same way the value walk does instead.
+                None => panic!(
+                    "sens PK walk: infusion into compartment {} not supported for model \
+                     {:?} — should have been rejected by `check_dose_compartments`",
+                    d.cmt_raw(),
+                    pk_model
+                ),
             }
         }
     }
@@ -951,6 +1001,7 @@ fn apply_step_g<T: PkNum>(
                 pk.v2,
                 pk.ka,
                 rate_central,
+                rate_periph1,
                 rate_depot,
             ),
             PkModel::ThreeCptIv => propagate_three_cpt_g(
@@ -977,6 +1028,8 @@ fn apply_step_g<T: PkNum>(
                 pk.v3,
                 pk.ka,
                 rate_central,
+                rate_periph1,
+                rate_periph2,
                 rate_depot,
             ),
         }
@@ -1051,8 +1104,10 @@ fn obs_boundary_correction<T: PkNum>(
 /// refresh `cur` from the value parts (`PkNum::val`) of the dual state `u`, decide the stop on
 /// the *same* [`crate::dosing::ss_cycle_converged`] criterion the f64 predictor uses
 /// (from cycle 1 on), and roll `cur`→`prev` by swap — no per-cycle `O(n_states)` copy. Returns
-/// `true` to break. Used by both `equilibrate_ss_g` (here) and `equilibrate_ss_state_g` (the
-/// ODE provider) so the dual convergence logic lives in **one** place.
+/// `true` to break. Used by the ODE provider's `equilibrate_ss_state_g` and by
+/// `equilibrate_ss_g`'s singular-`I − M` fallback (here) so the dual convergence logic lives in
+/// **one** place. Since #908 the analytical walk reaches this only when no periodic steady state
+/// exists; its ordinary path is the exact `(I − M)⁻¹·b` solve, which has no cycles to stop.
 ///
 /// **Why decide on the value parts, not the derivative tails** (#532 review #2/#3): the goal is
 /// not a fully-converged sensitivity — it is a gradient *consistent with the value the optimizer
@@ -1062,7 +1117,8 @@ fn obs_boundary_correction<T: PkNum>(
 /// line search. The variational recursion shares the value iteration's monodromy, so the
 /// derivative tails contract at the same geometric rate — but they lag the value by a constant
 /// few cycles, so a small tail (~`1e-8` on a stressed scale-separated model, see
-/// `ode_provider_ss_early_stop_matches_full_budget`) survives the value stop. That residual is
+/// `ode_provider_ss_nonlinear_fallback_early_stop_matches_full_budget`) survives the value stop.
+/// That residual is
 /// 3–4 orders below the `1e-3` gradient-validation tolerance and NONMEM's SE-matching precision,
 /// so the surviving gradient is faithful for every reported purpose; chasing it to zero would
 /// add a constant per-evaluation cost on the gradient hot path for no observable benefit. A
@@ -1091,6 +1147,20 @@ pub(crate) fn ss_dual_cycle_should_stop<T: PkNum>(
 /// `event_driven::equilibrate_ss_state_event_driven` for the 1-/2-cpt models;
 /// overlapping SS infusions (`T_inf > II`) return the empty state, matching
 /// production's reject.
+///
+/// **Exact, not truncated (#908)** — and it must flip in lockstep with the value walk. Solving
+/// `u_ss = (I − M)⁻¹·b` over a dual `T` yields the *implicit-function* derivative
+/// `∂u_ss/∂(θ,η) = (I − M)⁻¹·(∂b − ∂M·u_ss)` straight out of
+/// [`crate::sens::linsolve::solve_linear_system_g`], with no hand-assembled `dM`/`db`. That is a
+/// strictly better object than what the pulse train produced: the derivative of the *truncated*
+/// recursion (see [`ss_dual_cycle_should_stop`], which exists to keep those two truncations
+/// aligned). Were only one of the two walks converted, FOCE/FOCEI would differentiate a steady
+/// state it never predicted — the exact value/gradient mismatch that stalls the outer line search.
+///
+/// The **window duals** (`inf`, a modeled `RATE=-1/-2` dose's `(rate_bare, dur_bare)`) belong to
+/// the *forced* half only. `M` is the homogeneous monodromy: it carries `∂P/∂(θ,η)` through the
+/// dual disposition params, but the infusion window is inhomogeneous forcing and enters `b`
+/// alone. Threading it into the unforced call would corrupt the propagator.
 fn equilibrate_ss_g<T: PkNum>(
     pk_model: PkModel,
     pk: &PkDual<T>,
@@ -1099,10 +1169,15 @@ fn equilibrate_ss_g<T: PkNum>(
 ) -> Vec<T> {
     let (n_states, _) = state_layout_g(pk_model);
     let mut state = vec![T::from_f64(0.0); n_states];
-    if dose.ii <= 0.0 || dose.cmt == 0 {
+    if dose.ii <= 0.0 {
         return state;
     }
-    let cmt_idx = dose.cmt.saturating_sub(1);
+    // `CMT=0` = NONMEM's default dose compartment — resolved by
+    // `saturating_sub(1)` like every other dose site. Mirrors the value walk's
+    // `equilibrate_ss_state_event_driven`, whose identical `cmt == 0` bail
+    // silently dropped an `SS=1` dose's accumulation (#375); the gradient must
+    // equilibrate the same state the value does.
+    let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n_states {
         return state;
     }
@@ -1112,7 +1187,12 @@ fn equilibrate_ss_g<T: PkNum>(
     }
     let synthetic_dose = if is_inf {
         vec![DoseEvent::new(
-            0.0, dose.amt, dose.cmt, dose.rate, false, 0.0,
+            0.0,
+            dose.amt,
+            dose.cmt_raw(),
+            dose.rate,
+            false,
+            0.0,
         )]
     } else {
         Vec::new()
@@ -1129,8 +1209,55 @@ fn equilibrate_ss_g<T: PkNum>(
     } else {
         vec![0.0, dose.ii]
     };
-    // Shared early stop (#519, #532 review #11): the closed-form propagator equilibrates the
-    // same geometric train, so the same mixed atol/rtol stop applies here too.
+    // One cycle from `u0`. `forced` applies this cycle's own dose — the bolus jump, or the
+    // synthetic infusion window together with its modeled-window duals; unforced is the bare
+    // homogeneous disposition over the *same* bounds, whose columns are the monodromy `M`.
+    //
+    // The SS equilibration runs in the dose's own periodic frame (the synthetic pulse sits at
+    // t = 0), so its arrival is not a moving boundary: no lag duals. A subject that pairs SS with
+    // a lagtime declines to FD upstream (`ss_lagtime_walk_unsupported`).
+    let advance = |u0: &[T], forced: bool| -> Option<Vec<T>> {
+        let mut s = u0.to_vec();
+        if forced && !is_inf {
+            s[cmt_idx] = s[cmt_idx] + pk.f * T::from_f64(dose.amt);
+        }
+        let (doses, lag, inf_dual): (&[DoseEvent], &[f64], &[Option<(T, T)>]) = if forced {
+            (&synthetic_dose, &synthetic_lag, &synthetic_inf)
+        } else {
+            (&[], &[], &[])
+        };
+        propagate_bounds_g(
+            &mut s,
+            &bounds,
+            pk,
+            pk_model,
+            doses,
+            lag,
+            &[],
+            inf_dual,
+            f64::NEG_INFINITY,
+        );
+        Some(s)
+    };
+
+    // Exact periodic steady state, `reltol = abstol = 0` — see the value walk for why.
+    if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
+        n_states,
+        dose.ii,
+        0.0,
+        0.0,
+        |u0| advance(u0, false),
+        |u0| advance(u0, true),
+    ) {
+        crate::dosing::record_ss_equilibration_cycles(1);
+        return u_ss;
+    }
+
+    // Fallback for a singular `I − M` (no periodic steady state exists), mirroring the value
+    // walk's. Shared early stop (#519, #532 review #11): the closed-form propagator equilibrates
+    // the same geometric train, so the same mixed atol/rtol stop applies here too.
+    // No `note_ss_nonconvergence_if_capped` here: the value walk (`event_driven`) owns the #867
+    // cap warning, and the two walks co-run per subject, so warning here too would double-emit.
     let mut prev = vec![0.0_f64; n_states];
     let mut cur = vec![0.0_f64; n_states];
     let mut cycles_run = 0usize;
@@ -1145,9 +1272,6 @@ fn equilibrate_ss_g<T: PkNum>(
             pk_model,
             &synthetic_dose,
             &synthetic_lag,
-            // The SS equilibration runs in the dose's own periodic frame (the synthetic pulse
-            // sits at t = 0), so its arrival is not a moving boundary: no lag duals. A subject
-            // that pairs SS with a lagtime declines to FD upstream (`ss_lagtime_walk_unsupported`).
             &[],
             &synthetic_inf,
             f64::NEG_INFINITY,
@@ -1272,9 +1396,22 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     state = equilibrate_ss_g(pk_model, &pk_now, d, inf);
                 }
                 if d.rate <= 0.0 {
-                    let cmt_idx = d.cmt.saturating_sub(1);
+                    let cmt_idx = d.cmt_idx();
                     if cmt_idx < n_states {
                         state[cmt_idx] = state[cmt_idx] + pk_now.f * T::from_f64(d.amt);
+                    } else {
+                        // Unreachable from a validated call — `check_dose_compartments`
+                        // (#375) rejects `cmt > n_states` up front. Kept as a defensive
+                        // guard that matches the value walk's twin in
+                        // `pk::event_driven`: silently dropping the dose here would
+                        // differentiate a different dosing history than was predicted.
+                        panic!(
+                            "sens PK walk: dose into compartment {} but model has {} states \
+                             (cmt is 1-based) — should have been rejected by \
+                             `check_dose_compartments`",
+                            d.cmt_raw(),
+                            n_states
+                        );
                     }
                 }
             }
@@ -1543,6 +1680,38 @@ mod tests {
         }
     }
 
+    /// #375: `active_rates_g` used to answer an unroutable infusion with a silent
+    /// `None => {}`, dropping the dose from the **gradient** while the production
+    /// value walk (`pk::event_driven::propagate_with_bounds`) panicked on the same
+    /// input — so had the value path been made lenient, FOCE/FOCEI would have
+    /// differentiated a different dosing history than it predicted. Both walks now
+    /// fail the same way; `check_dose_compartments` makes this unreachable from a
+    /// validated call, and this test is the direct-call proof that the guard is
+    /// still there.
+    #[test]
+    #[should_panic(expected = "infusion into compartment 2 not supported")]
+    fn sens_walk_panics_on_an_unroutable_infusion_like_the_value_walk() {
+        // `one_cpt_iv` has a single compartment, so cmt 2 has no rate channel.
+        let dose = DoseEvent::new(0.0, 100.0, 2, 20.0, false, 0.0);
+        let subject = make_subject(vec![dose], vec![1.0, 4.0]);
+        let pk = pk_full(5.0, 50.0, 1.0);
+        let schedule = EventSchedule::for_subject(
+            &subject,
+            PkModel::OneCptIv,
+            &subject.doses,
+            &[pk.lagtime()],
+        );
+        let pk_g = one_cpt_pk_f64(&pk);
+        let _ = event_driven_sens_one_cpt_g::<f64>(
+            false,
+            &subject,
+            &schedule,
+            &[pk_g],
+            &vec![pk_g; 2],
+            &[],
+        );
+    }
+
     /// The `f64` instantiation of the full event walk must reproduce the
     /// production event-driven predictions bit-for-bit across dose kinds — bolus,
     /// infusion, oral, and steady state — so the IOV/TV-cov sensitivity walk is the
@@ -1695,6 +1864,33 @@ mod tests {
                 assert!(p >= 0.0, "case {ci} obs {j}: production conc negative");
             }
         }
+    }
+
+    /// **#908 dual fallback.** The gradient twin of
+    /// `pk::event_driven::tests::ss_equilibration_falls_back_when_no_steady_state_exists`. A
+    /// singular `I − M` — here `CL = 0`, so every disposition eigenvalue is zero and
+    /// `two_cpt_eigen_g` declines, leaving `M = I` — has no periodic steady state, so
+    /// `equilibrate_ss_g`'s exact solve must decline and its capped pulse-train fallback must
+    /// run. This proves the *dual* fallback still functions on genuinely-singular input; the
+    /// mutation check (forcing the fallback on non-singular input) only proves the two paths
+    /// disagree there, not that the fallback is correct where it is actually meant to fire.
+    #[test]
+    fn ss_equilibration_dual_falls_back_when_no_steady_state_exists() {
+        let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+        // CL = 0 ⇒ ke = 0 ⇒ `two_cpt_eigen_g` returns None ⇒ propagation is the identity.
+        let pkd = pk_dual_2cpt_f64(&pk_2cpt(0.0, 50.0, 3.0, 80.0, 0.0));
+        let trough = equilibrate_ss_g::<f64>(PkModel::TwoCptIv, &pkd, &dose, None);
+        assert_eq!(
+            crate::dosing::last_ss_equilibration_cycles(),
+            crate::dosing::SS_EQUILIBRATION_CYCLES,
+            "a singular I − M must decline the exact solve and run the full capped train"
+        );
+        // Nothing is ever eliminated, so the train is a plain sum of the per-cycle boluses.
+        approx::assert_relative_eq!(
+            trough[0],
+            crate::dosing::SS_EQUILIBRATION_CYCLES as f64 * 100.0,
+            max_relative = 1e-12
+        );
     }
 
     /// The 2-cpt walk's `Dual2` grad/Hessian (w.r.t. cl, v1) must match FD of the

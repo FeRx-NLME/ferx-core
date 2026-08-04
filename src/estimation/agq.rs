@@ -344,18 +344,62 @@ fn fd_posterior_hessian(
     h
 }
 
+/// Both anchor Hessians, from **one** [`score_core`](crate::estimation::sens_outer_gradient::score_core)
+/// sweep. That function already assembles both matrices from a single provider evaluation:
+///
+/// * `htilde` = `H̃ = Ω⁻¹ + Σⱼ pⱼaⱼaⱼᵀ` — the first-order (Almquist) FOCEI Hessian; and
+/// * `h_inner` = `Ω⁻¹ + Σⱼ (∂²Lⱼ/∂f² aⱼaⱼᵀ + ∂Lⱼ/∂f Aⱼ)` — the **exact** conditional Hessian
+///   `∂²nll/∂b²`, which additionally carries the `∂²f/∂b²` term Gauss-Newton drops.
+///
+/// `None` when the model is outside the provider's scope, or `score_core` declines this
+/// subject at runtime (off-diagonal correlated residual, magnitude × M3-censored).
+fn score_core_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    stack: &Stack,
+    b_hat: &[f64],
+) -> Option<crate::estimation::sens_outer_gradient::ScoreCore> {
+    // The jet is the stacked (η, κ) one under IOV, so this serves both regimes.
+    let sens = if stack.is_iov() {
+        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b_hat)?
+    } else {
+        crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b_hat)?
+    };
+    crate::estimation::sens_outer_gradient::score_core(
+        model,
+        subject,
+        params,
+        &sens,
+        stack.d(),
+        &stack.omega_joint_inv,
+        b_hat,
+        model.residual_error_eta,
+    )
+}
+
 /// The Hessian that scales the quadrature grid and enters `½log|H|`, per the anchor.
 ///
-/// * [`HessianAnchor::Exact`] → the exact conditional Hessian `∂²nll/∂b²`
-///   ([`fd_posterior_hessian`]). This is Laplace / adaptive GH quadrature.
-/// * [`HessianAnchor::GaussNewton`] → the Almquist `H̃ = Ω⁻¹ + Σ pⱼaⱼaⱼᵀ`, taken directly
-///   from [`sens_outer_gradient::score_core`] — the *same* Hessian FOCEI's own objective and
-///   gradient use, so `focei` with `n_agq > 1` is a genuine quadrature refinement of FOCEI.
+/// * [`HessianAnchor::Exact`] → the exact conditional Hessian `∂²nll/∂b²`. This is
+///   Laplace / adaptive GH quadrature. Taken **analytically** from `score_core`'s `h_inner`
+///   where the provider reaches, and from the `2d²+1`-evaluation
+///   [`fd_posterior_hessian`] sweep only outside it (TTE, categorical, and the two
+///   per-subject `score_core` declines) — where FD is the only thing that works, since the
+///   likelihood has no `PkNum` twin.
+/// * [`HessianAnchor::GaussNewton`] → the Almquist `H̃`, the *same* Hessian FOCEI's own
+///   objective and gradient use, so `focei` with `n_agq > 1` is a genuine quadrature
+///   refinement of FOCEI.
 ///
-/// Returns `None` when the anchor Hessian cannot be formed: an indefinite exact FD Hessian, or
-/// a Gauss-Newton anchor on a model outside the sensitivity provider's scope (the caller then
+/// **The two anchors stay different matrices — that is the estimator distinction.** Sharing
+/// `score_core` unifies the *computation*, not the result: `laplace, n_agq = 1` is NONMEM
+/// `LAPLACIAN INTER` and `focei, n_agq = 1` is plain FOCEI, and it is exactly the anchor that
+/// separates them. Reading `htilde` here for `Exact` would silently turn Laplace into FOCEI
+/// while it kept reporting Laplace OFVs.
+///
+/// Returns `None` when a Gauss-Newton anchor is out of the provider's scope (the caller then
 /// yields the NLL sentinel, and `api::check_model_options` rejects `focei, n_agq > 1` outside
-/// that scope up front so this does not surprise a fit at runtime).
+/// that scope up front so this does not surprise a fit at runtime). The `Exact` arm always
+/// yields a matrix, falling back to FD.
 fn anchor_hessian(
     anchor: HessianAnchor,
     model: &CompiledModel,
@@ -367,33 +411,22 @@ fn anchor_hessian(
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> Option<DMatrix<f64>> {
     match anchor {
-        HessianAnchor::Exact => Some(fd_posterior_hessian(
-            model, subject, params, stack, b_hat, scratch, schedule,
-        )),
+        HessianAnchor::Exact => {
+            // Gate on the **model-level** predicate before attempting the provider: an
+            // out-of-scope model (TTE, categorical — precisely the ones quadrature exists
+            // for) would otherwise pay a doomed `subject_sensitivities` + `score_core` call
+            // on every evaluation before falling back.
+            if analytic_score_supported(model) {
+                if let Some(core) = score_core_at(model, subject, params, stack, b_hat) {
+                    return Some(core.h_inner);
+                }
+            }
+            Some(fd_posterior_hessian(
+                model, subject, params, stack, b_hat, scratch, schedule,
+            ))
+        }
         HessianAnchor::GaussNewton => {
-            // `H̃ = Ω⁻¹ + Σ pⱼ aⱼaⱼᵀ`, exactly what `score_core` assembles for FOCEI. The jet
-            // is the stacked (η, κ) one under IOV, so this serves both regimes.
-            let sens = if stack.is_iov() {
-                crate::sens::provider::subject_sensitivities_iov(
-                    model,
-                    subject,
-                    &params.theta,
-                    b_hat,
-                )?
-            } else {
-                crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b_hat)?
-            };
-            let core = crate::estimation::sens_outer_gradient::score_core(
-                model,
-                subject,
-                params,
-                &sens,
-                stack.d(),
-                &stack.omega_joint_inv,
-                b_hat,
-                model.residual_error_eta,
-            )?;
-            Some(core.htilde)
+            Some(score_core_at(model, subject, params, stack, b_hat)?.htilde)
         }
     }
 }
@@ -1039,12 +1072,36 @@ fn accumulate_fixed_eta_packed_gradient(
 ///
 /// A fully analytic `dH/dx` would need `∂³nll/∂η²∂θ`; the provider stops at `∂²f/∂η∂θ`, so
 /// this third order is finite-differenced. `analytic_gradient_matches_fd_at_every_node_count`
-/// measures the result against a finite-difference of the real objective: 0.17% at n = 1,
-/// 0.0006% at n = 7 — the FD reference's own noise floor.
+/// measures the result against a finite-difference of the real objective.
 ///
 /// At `n_agq = 1` the grid objective collapses to `½·log|H|` (the single node sits at η̂), so
 /// this reduces to `½·d log|H|/dx` — precisely the Laplace log-determinant term FOCE/FOCEI
 /// carry analytically.
+///
+/// # The node-response term is analytic, not a grid re-sweep
+///
+/// Writing `Φ = ½log|Σ⁻¹| − logΣⱼexp(tⱼ)` with `tⱼ = log wⱼ + ‖zⱼ‖² − nll(bⱼ; x₀)` and
+/// `bⱼ(x) = b̂(x) + √2·Σ^{1/2}(H(x))·zⱼ`, the exact derivative separates:
+///
+/// ```text
+///   dΦ/dx_k = ½·d log|Σ⁻¹|/dx_k  +  Σⱼ softmaxⱼ · ⟨ ∂nll/∂b|_{bⱼ} , dbⱼ/dx_k ⟩
+/// ```
+///
+/// because `nll` is held at `x₀` — only the node *positions* move. Two consequences:
+///
+/// * `∂nll/∂b|_{bⱼ}` is the **inner EBE gradient**, one call per node, and it does not depend
+///   on `k` — so it is computed **once** and reused across every packed coordinate.
+/// * `x ↦ (log|Σ⁻¹|, bⱼ)` is a cheap *analytic* map (a Cholesky and `d` back-solves per node,
+///   no likelihood), so finite-differencing **it** costs no predictions at all.
+///
+/// That replaces `2·n_free · G` likelihood evaluations with `G` gradient evaluations plus
+/// `2·n_free` Hessian rebuilds — the dominant cost at `n_agq > 1`, where `G = n_agq^d` grows
+/// as a tensor product (243 nodes at `d = 5, n = 3`). It also removes the *only* place the
+/// old code differenced a **finite-differenced** quantity in `x`: with the analytic `h_inner`
+/// anchor, `H` is exact and the remaining FD is of an exact function.
+///
+/// Falls back to the previous `phi_grid` re-sweep when the per-node gradient is out of the
+/// provider's scope (TTE, categorical, …) — the same all-or-nothing boundary the anchor uses.
 #[allow(clippy::too_many_arguments)]
 fn grid_response_correction(
     model: &CompiledModel,
@@ -1057,6 +1114,8 @@ fn grid_response_correction(
     b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
+    bs: &[Vec<f64>],
+    softmax: &[f64],
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
     out: &mut [f64],
@@ -1076,13 +1135,28 @@ fn grid_response_correction(
         model, subject, params, template, stack, x, b_hat, scratch, schedule,
     )?;
 
+    // `∂nll/∂b` at every base node — the node-response factor. Independent of `k`, so this is
+    // the whole per-node likelihood cost of the correction, paid once instead of `2·n_free`
+    // times. `None` if any node is out of the inner provider's scope; the loop then takes the
+    // `phi_grid` re-sweep for every coordinate (all-or-nothing, matching the anchor).
+    // Hoisted once for the whole sweep — see `node_nll_gradient`.
+    let mult = model.ruv_obs_mult(subject, &params.theta);
+    let node_grads: Option<Vec<Vec<f64>>> = bs
+        .iter()
+        .map(|b| node_nll_gradient(model, subject, params, stack, b, schedule, mult.as_deref()))
+        .collect();
+
+    let d = stack.d();
+    let mut z = vec![0.0f64; d];
+    let (mut off_p, mut off_m) = (vec![0.0f64; d], vec![0.0f64; d]);
+
     for k in 0..x.len() {
         if fixed[k] {
             continue;
         }
-        // `H` is itself a finite-difference quantity, so its own error floor is amplified by
-        // 1/step here. The step must stay well above sqrt(that floor); 1e-3 is calibrated by
-        // `analytic_gradient_matches_fd_at_every_node_count`.
+        // Truncation-dominated: `Φ` differences `log|H|`, which curves sharply in the packed
+        // coordinates, so the step wants to be *small* (see `AGQ_GRID_FD_STEP`). With the
+        // analytic `h_inner` anchor there is no FD error floor underneath it to trade against.
         let step = AGQ_GRID_FD_STEP * (1.0 + x[k].abs());
         let mut xp = x.to_vec();
         let mut xm = x.to_vec();
@@ -1112,41 +1186,143 @@ fn grid_response_correction(
         // `nll` stays at the ORIGINAL params — the direct x-dependence is already covered
         // analytically by the fixed-η score — but the grid (centre and scale) is the
         // perturbed one, which is exactly the response term we are after.
-        let phip = phi_grid(
-            model,
-            subject,
-            params,
-            stack,
-            &ep,
-            nodes,
-            log_weights,
-            &hp,
-            &sp.omega_joint_inv,
-            scratch,
-            schedule,
-        );
-        let phim = phi_grid(
-            model,
-            subject,
-            params,
-            stack,
-            &em,
-            nodes,
-            log_weights,
-            &hm,
-            &sm.omega_joint_inv,
-            scratch,
-            schedule,
-        );
-        let (Some(phip), Some(phim)) = (phip, phim) else {
-            continue; // a degenerate perturbed Hessian contributes no correction
+        let r = match &node_grads {
+            // Analytic node response: difference only the cheap `x ↦ (log|Σ⁻¹|, bⱼ)` map and
+            // contract each node's displacement with its own `∂nll/∂b`. No likelihood
+            // evaluations inside this loop at all.
+            Some(gs) => {
+                let (Some(prop_p), Some(prop_m)) = (
+                    build_proposal(&hp, &sp.omega_joint_inv, d),
+                    build_proposal(&hm, &sm.omega_joint_inv, d),
+                ) else {
+                    continue; // degenerate perturbed Hessian contributes no correction
+                };
+                let mut acc =
+                    0.5 * (prop_p.log_det_inv_scale - prop_m.log_det_inv_scale) / (2.0 * step);
+                for (j, g) in gs.iter().enumerate() {
+                    if softmax[j] == 0.0 {
+                        continue; // underflowed node — contributes nothing
+                    }
+                    grid_z_at(j, nodes, d, &mut z);
+                    prop_p.apply_l_sigma(&z, &mut off_p, std::f64::consts::SQRT_2);
+                    prop_m.apply_l_sigma(&z, &mut off_m, std::f64::consts::SQRT_2);
+                    let mut dot = 0.0;
+                    for i in 0..d {
+                        // dbⱼ/dx_k = db̂/dx_k + √2·d(Σ^{1/2})/dx_k · zⱼ, both differenced here.
+                        let dbj = ((ep[i] + off_p[i]) - (em[i] + off_m[i])) / (2.0 * step);
+                        dot += g[i] * dbj;
+                    }
+                    acc += softmax[j] * dot;
+                }
+                acc
+            }
+            // Out of the inner provider's scope: difference the grid objective itself.
+            None => {
+                let phip = phi_grid(
+                    model,
+                    subject,
+                    params,
+                    stack,
+                    &ep,
+                    nodes,
+                    log_weights,
+                    &hp,
+                    &sp.omega_joint_inv,
+                    scratch,
+                    schedule,
+                );
+                let phim = phi_grid(
+                    model,
+                    subject,
+                    params,
+                    stack,
+                    &em,
+                    nodes,
+                    log_weights,
+                    &hm,
+                    &sm.omega_joint_inv,
+                    scratch,
+                    schedule,
+                );
+                let (Some(phip), Some(phim)) = (phip, phim) else {
+                    continue; // a degenerate perturbed Hessian contributes no correction
+                };
+                (phip - phim) / (2.0 * step)
+            }
         };
-        let r = (phip - phim) / (2.0 * step);
         if r.is_finite() {
             out[k] += r;
         }
     }
     Some(())
+}
+
+/// `zⱼ` for tensor-grid node `j`, reconstructed from its mixed-radix index.
+///
+/// [`agq_nodes_and_terms`] enumerates the grid with a mixed-radix counter whose **digit 0
+/// increments fastest**, so node `j` has `idx[k] = (j / nᵏ) mod n`. Recomputing it here (rather
+/// than storing every `zⱼ`) keeps the grid-response term allocation-free at `MAX_AGQ_GRID`
+/// nodes. `grid_z_at_matches_the_sweep_enumeration` pins the two orderings together — they
+/// must not drift, or each node's displacement would be contracted with another node's
+/// gradient.
+#[inline]
+fn grid_z_at(j: usize, nodes: &[f64], d: usize, out: &mut [f64]) {
+    let n = nodes.len();
+    let mut rem = j;
+    for slot in out.iter_mut().take(d) {
+        *slot = nodes[rem % n];
+        rem /= n;
+    }
+}
+
+/// `∂nll/∂b` at one quadrature node — the **inner EBE gradient**, which is exactly the
+/// derivative the node-response term contracts against.
+///
+/// This is the same entry point the inner loop minimises with, so the gradient and the `nll`
+/// [`Stack::nll_at`] scores are consistent by construction rather than by a second derivation.
+/// `None` outside the provider's scope; the caller then falls back to the grid re-sweep.
+///
+/// `schedule` and `mult` are **hoisted by the caller** and threaded through, because this runs
+/// once per quadrature node — up to [`MAX_AGQ_GRID`] times per subject. The bare
+/// `analytic_eta_nll_gradient` rebuilds the `EventSchedule` and recomputes the residual-magnitude
+/// multiplier on every call, which is per-call setup the inner BFGS loop already learned to
+/// hoist (#449 re-review #6); paying it per node made the sweep several times its own cost.
+fn node_nll_gradient(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    stack: &Stack,
+    b: &[f64],
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    mult: Option<&[Vec<f64>]>,
+) -> Option<Vec<f64>> {
+    if stack.is_iov() {
+        let iov = params.omega_iov.as_ref()?;
+        crate::estimation::inner_optimizer::analytic_eta_nll_gradient_iov(
+            model,
+            subject,
+            &params.theta,
+            b,
+            &params.omega,
+            iov,
+            &params.sigma.values,
+            stack.n_eta,
+            stack.n_kappa,
+            stack.n_occ,
+            mult,
+        )
+    } else {
+        crate::estimation::inner_optimizer::analytic_eta_nll_gradient_with_schedule(
+            model,
+            subject,
+            &params.theta,
+            b,
+            &params.omega,
+            &params.sigma.values,
+            schedule,
+            mult,
+        )
+    }
 }
 
 /// `dη̂/dx` — how the EBE mode moves with the population parameters, per packed coordinate.
@@ -1339,8 +1515,12 @@ fn agq_subject_packed_gradient(
         return None;
     }
 
-    for (b_j, &t) in bs.iter().zip(terms.iter()) {
-        let w = (t - lse).exp();
+    // Posterior (softmax) weights, materialised once: the fixed-node score averages against
+    // them here, and the grid-response term contracts each node's displacement against the
+    // same values — so both differentiate the grid the objective actually evaluated.
+    let softmax: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
+
+    for (b_j, &w) in bs.iter().zip(softmax.iter()) {
         if w == 0.0 {
             continue; // exp underflow — contributes nothing to the average
         }
@@ -1360,6 +1540,8 @@ fn agq_subject_packed_gradient(
         b_hat,
         nodes,
         log_weights,
+        &bs,
+        &softmax,
         &mut scratch,
         schedule.as_ref(),
         out,
@@ -1842,6 +2024,46 @@ mod tests {
                 analytic_score_supported_model(&model),
                 "{label} must take the analytic score path"
             );
+        }
+    }
+
+    /// [`grid_z_at`] must reproduce **exactly** the node ordering [`agq_nodes_and_terms`]
+    /// sweeps.
+    ///
+    /// The grid-response term contracts node `j`'s displacement against node `j`'s stored
+    /// `∂nll/∂b` and node `j`'s softmax weight. If the two enumerations ever drift, every node
+    /// would be paired with *another* node's gradient — each individually valid, so the result
+    /// stays finite and plausible while being a wrong gradient. That is exactly the failure
+    /// class this module's "share one sweep" rule exists to prevent, and reconstructing `zⱼ`
+    /// from the index (rather than storing it) is the one place the rule is enforced by
+    /// agreement rather than by construction. Hence this test.
+    #[test]
+    fn grid_z_at_matches_the_sweep_enumeration() {
+        for (n, d) in [(1usize, 1usize), (3, 1), (2, 3), (3, 4), (5, 2), (4, 3)] {
+            let (nodes, _w) = gauss_hermite(n);
+            // The mixed-radix counter from `agq_nodes_and_terms`, digit 0 fastest.
+            let mut idx = vec![0usize; d];
+            let mut j = 0usize;
+            let mut got = vec![0.0f64; d];
+            loop {
+                let expect: Vec<f64> = (0..d).map(|k| nodes[idx[k]]).collect();
+                grid_z_at(j, &nodes, d, &mut got);
+                assert_eq!(got, expect, "n={n} d={d}: node {j} z-vector");
+                j += 1;
+                let mut k = 0;
+                while k < d {
+                    idx[k] += 1;
+                    if idx[k] < n {
+                        break;
+                    }
+                    idx[k] = 0;
+                    k += 1;
+                }
+                if k == d {
+                    break;
+                }
+            }
+            assert_eq!(j, grid_size(n, d), "n={n} d={d}: swept node count");
         }
     }
 
