@@ -2670,6 +2670,10 @@ fn non_convergence_reports_directly_without_second_optimization() {
 // once its line search can no longer beat an already-flat OFV) as convergence.
 // It must accept a genuine plateau and reject a real early stall.
 
+// Signature: (total_evals, last_sig_eval, first_feasible_eval, best_seen, final).
+// `first_feasible_eval` is 1 in the common case (eval 1 is feasible); the
+// guard-rejected-first-eval cases below set it to 2.
+
 #[test]
 fn plateau_with_flat_tail_and_consistent_ofv_is_converged() {
     // Long flat tail (npde/schnider shape): last significant improvement was many
@@ -2677,6 +2681,7 @@ fn plateau_with_flat_tail_and_consistent_ofv_is_converged() {
     assert!(failure_is_converged_plateau(
         44, // total evals
         36, // last significant improvement → flat tail of 8 (≥ 5)
+        1,  // first feasible eval
         Some(-286.004247),
         -286.004205, // ties best-seen to ~4e-5
     ));
@@ -2686,11 +2691,12 @@ fn plateau_with_flat_tail_and_consistent_ofv_is_converged() {
 fn short_descending_tail_is_not_converged() {
     // SS-oral shape: the fit quits after ~5 evals still plunging — the last
     // improvement is the final eval, so there is no flat tail at all.
-    assert!(!failure_is_converged_plateau(5, 5, Some(83.26), 83.26));
+    assert!(!failure_is_converged_plateau(5, 5, 1, Some(83.26), 83.26));
     // Even one eval short of the minimum flat tail must stay unconverged.
     assert!(!failure_is_converged_plateau(
         10,
         10 - (PLATEAU_MIN_FLAT_EVALS - 1),
+        1,
         Some(-100.0),
         -100.0,
     ));
@@ -2701,14 +2707,26 @@ fn plateau_but_inconsistent_cold_restart_is_not_converged() {
     // SS-oral warm-start artifact: the OFV trace could look flat, yet the cold
     // inner-loop restart lands far worse (best-seen 83.3 vs final 121.4) — the
     // "optimum" was an EBE warm-start artifact, so it is rejected.
-    assert!(!failure_is_converged_plateau(50, 40, Some(83.26), 121.36));
+    assert!(!failure_is_converged_plateau(
+        50,
+        40,
+        1,
+        Some(83.26),
+        121.36
+    ));
 }
 
 #[test]
 fn plateau_with_better_cold_restart_is_converged() {
     // A cold restart that ties or *improves* on best-seen is a valid minimum —
     // only the materially-worse direction signals an artifact.
-    assert!(failure_is_converged_plateau(50, 40, Some(-286.0), -286.5));
+    assert!(failure_is_converged_plateau(
+        50,
+        40,
+        1,
+        Some(-286.0),
+        -286.5
+    ));
 }
 
 #[test]
@@ -2717,6 +2735,7 @@ fn plateau_check_reaches_min_flat_tail_boundary() {
     assert!(failure_is_converged_plateau(
         20,
         20 - PLATEAU_MIN_FLAT_EVALS,
+        1,
         Some(1.0),
         1.0,
     ));
@@ -2726,25 +2745,50 @@ fn plateau_check_reaches_min_flat_tail_boundary() {
 fn plateau_check_handles_missing_best_seen() {
     // No best-seen point recorded → consistency cannot fail; the plateau length
     // alone decides.
-    assert!(failure_is_converged_plateau(30, 10, None, -50.0));
-    assert!(!failure_is_converged_plateau(3, 3, None, -50.0));
+    assert!(failure_is_converged_plateau(30, 10, 1, None, -50.0));
+    assert!(!failure_is_converged_plateau(3, 3, 1, None, -50.0));
 }
 
 #[test]
 fn stuck_at_initial_estimate_is_not_converged() {
     // NLopt L-BFGS whose first step overshoots and whose line search fails at
     // eval 1 (warfarin FOCEI): the only significant improvement is the initial
-    // eval registering OFV₀, so `last_sig_improvement_eval == 1`. The objective
-    // is then flat for the remaining line-search probes (a long flat tail) and
-    // self-consistent (the fit never left the initial point), but it never
-    // descended — it must NOT be reported as converged.
+    // feasible eval registering OFV₀, so `last_sig_eval == first_feasible_eval`.
+    // The objective is then flat for the remaining line-search probes (a long
+    // flat tail) and self-consistent (the fit never left the initial point), but
+    // it never descended — it must NOT be reported as converged.
     assert!(!failure_is_converged_plateau(
         12,
+        1,
         1,
         Some(-250.838),
         -250.838
     ));
     // A single flat run from eval 0 with no best-seen recorded is likewise not a
     // converged plateau.
-    assert!(!failure_is_converged_plateau(20, 1, None, -250.838));
+    assert!(!failure_is_converged_plateau(20, 1, 1, None, -250.838));
+}
+
+#[test]
+fn guard_rejected_first_eval_does_not_fake_progress() {
+    // #751 regression: initial estimates marginally violate the EBE guard, so
+    // eval 1 is guard-penalised and never recorded. Eval 2 is the *first feasible*
+    // point — it only establishes the baseline objective, so `last_sig_eval ==
+    // first_feasible_eval == 2`. A long guard-frozen flat tail and a consistent
+    // cold restart then follow, but the fit never actually descended past a real
+    // objective. Keying `made_progress` off the first feasible eval (not the
+    // literal count `>= 2`) keeps this `converged = false`; the old
+    // `last_sig_eval >= 2` test would have wrongly accepted it.
+    assert!(!failure_is_converged_plateau(20, 2, 2, Some(83.26), 83.26));
+    // Never any feasible eval at all (`first_feasible_eval == 0`): not converged.
+    assert!(!failure_is_converged_plateau(20, 0, 0, None, 1e20));
+}
+
+#[test]
+fn genuine_progress_after_guarded_start_is_converged() {
+    // Same guard-rejected eval 1 (first feasible = 2), but the fit then genuinely
+    // descends: a significant improvement lands at eval 5, strictly after the
+    // baseline, followed by a flat tail of 15. That is real progress-then-plateau
+    // and must be accepted.
+    assert!(failure_is_converged_plateau(20, 5, 2, Some(-286.0), -286.0));
 }

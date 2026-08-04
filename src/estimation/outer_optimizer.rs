@@ -1058,14 +1058,20 @@ const PLATEAU_CONSISTENCY_REL_TOL: f64 = 1e-3;
 
 /// Classify a bare NLopt `Failure`/`ForcedStop` as convergence-at-a-plateau
 /// (issue #751). Returns `true` only when all three hold:
-///   - **progress**: the last significant OFV improvement was on an eval *after*
-///     the initial one (`last_sig_improvement_eval >= 2`). Eval 1 always
-///     registers the very first objective value (INF → OFV₀), so a fit whose
-///     last significant improvement sits at eval 1 never descended at all — it
-///     stalled at the start (NLopt's L-BFGS first step overshoots and its line
-///     search fails at eval 1 on e.g. warfarin FOCEI, leaving the fit pinned at
-///     the initial estimates). That is a failed start, not a converged plateau,
-///     even though the objective is then "flat" for the remaining probes;
+///   - **progress**: the last significant OFV improvement landed on an eval
+///     *strictly after* the first feasible one (`last_sig_improvement_eval >
+///     first_feasible_eval`, with `first_feasible_eval > 0` meaning at least one
+///     unguarded point was seen). The first feasible eval merely establishes the
+///     baseline objective (INF → OFV₀); a fit whose last significant improvement
+///     is that same eval never descended at all — it stalled at the start
+///     (NLopt's L-BFGS first step overshoots and its line search fails on e.g.
+///     warfarin FOCEI, leaving the fit pinned at the initial estimates). Keying
+///     off the first *feasible* eval (not the literal count `>= 2`) is what
+///     stops a guard-rejected eval 1 from faking progress: when eval 1 is
+///     guard-penalised and eval 2 is the first feasible point, `first_feasible`
+///     is 2, so a "significant improvement" at eval 2 is the baseline, not
+///     descent. That is a failed start, not a converged plateau, even though the
+///     objective is then "flat" for the remaining probes;
 ///   - **plateau**: the flat tail (evals since the last improvement above
 ///     `PLATEAU_OFV_THRESHOLD`, = `total_evals − last_sig_improvement_eval`) is
 ///     at least `PLATEAU_MIN_FLAT_EVALS` — a genuine mid-descent stall has none;
@@ -1078,10 +1084,11 @@ const PLATEAU_CONSISTENCY_REL_TOL: f64 = 1e-3;
 fn failure_is_converged_plateau(
     total_evals: usize,
     last_sig_improvement_eval: usize,
+    first_feasible_eval: usize,
     best_seen_ofv: Option<f64>,
     final_ofv: f64,
 ) -> bool {
-    let made_progress = last_sig_improvement_eval >= 2;
+    let made_progress = first_feasible_eval > 0 && last_sig_improvement_eval > first_feasible_eval;
     let flat_tail = total_evals.saturating_sub(last_sig_improvement_eval);
     let plateaued = flat_tail >= PLATEAU_MIN_FLAT_EVALS;
     let consistent = best_seen_ofv
@@ -1213,13 +1220,20 @@ fn optimize_nlopt(
     let last_gradient: Arc<Mutex<Option<Vec<f64>>>> = Arc::new(Mutex::new(None));
     let last_gradient_cl = Arc::clone(&last_gradient);
 
-    // Externalised OFV-plateau tracker (`best_ofv_at_last_sig`, `eval_index`) —
-    // the last eval at which the best OFV improved by more than
-    // `PLATEAU_OFV_THRESHOLD`. Distinct from (and independent of) the stagnation
-    // guard's own bookkeeping so it works even when the guard is disabled. Read
-    // after `optimize()` to tell a plateaued optimum (many flat tail evals) from
-    // a genuine early stall — see the convergence-classification block (#751).
-    let plateau_tracker: Arc<Mutex<(f64, usize)>> = Arc::new(Mutex::new((f64::INFINITY, 0)));
+    // Externalised OFV-plateau tracker over *feasible* (unguarded) evals only:
+    // `(baseline_ofv, last_sig_eval, first_feasible_eval)`. `last_sig_eval` is the
+    // eval at which the feasible best OFV last improved by more than
+    // `PLATEAU_OFV_THRESHOLD` over `baseline_ofv`; `first_feasible_eval` is the
+    // first eval that was not guard-rejected. Guarded evals are ignored so a
+    // guard-penalty value (which pollutes `state.best_ofv`) can never seed a fake
+    // "improvement" — the first feasible eval only establishes the baseline, and
+    // real progress must land on a *later* feasible eval (#751). Distinct from
+    // (and independent of) the stagnation guard's own bookkeeping so it works
+    // even when that guard is disabled. Read after `optimize()` to tell a
+    // plateaued optimum (many flat tail evals) from a genuine early stall — see
+    // the convergence-classification block.
+    let plateau_tracker: Arc<Mutex<(f64, usize, usize)>> =
+        Arc::new(Mutex::new((f64::INFINITY, 0, 0)));
     let plateau_tracker_cl = Arc::clone(&plateau_tracker);
 
     // EBE stats accumulator: tracks worst unconverged count and total fallbacks.
@@ -1407,15 +1421,25 @@ fn optimize_nlopt(
                 eprintln!("Eval {:>4}: OFV = {:.6}", state.n_evals, ofv);
             }
         }
-        // Record the eval at which the best OFV last improved *significantly*
-        // (> `PLATEAU_OFV_THRESHOLD`). The gap between this and the final eval
-        // count is the length of the flat tail — the plateau signal read after
-        // `optimize()` (#751). Independent of the stagnation guard so it is
-        // populated even when that guard is off.
-        {
+        // Record the eval at which the *feasible* best OFV last improved
+        // significantly (> `PLATEAU_OFV_THRESHOLD` below the last recorded
+        // baseline). The gap between this and the final eval count is the length
+        // of the flat tail — the plateau signal read after `optimize()` (#751).
+        // Guarded evals are skipped entirely: their `guard_penalty_value` leaks
+        // into `state.best_ofv`, so counting them would let a guard→feasible
+        // transition masquerade as descent. The first feasible eval sets the
+        // baseline (and `first_feasible_eval`); genuine progress must land on a
+        // later feasible eval. Independent of the stagnation guard so it is
+        // populated even when that guard is off. `ofv == raw_ofv` here (unguarded).
+        if !guarded {
             let mut pt = plateau_tracker_cl.lock().unwrap();
-            if pt.0 - state.best_ofv > PLATEAU_OFV_THRESHOLD {
-                *pt = (state.best_ofv, state.n_evals);
+            if pt.2 == 0 {
+                // First feasible eval: establish the baseline objective. Not
+                // "progress" — `last_sig_eval == first_feasible_eval` here.
+                *pt = (ofv, state.n_evals, state.n_evals);
+            } else if pt.0 - ofv > PLATEAU_OFV_THRESHOLD {
+                pt.0 = ofv;
+                pt.1 = state.n_evals;
             }
         }
         // `best_seen` tracks the global minimum across the whole run so the
@@ -1724,16 +1748,27 @@ fn optimize_nlopt(
     // never papers over non-convergence.
     if stationarity_check_pending {
         let total_evals = n_evals_outer.load(Ordering::Relaxed);
-        let (_, last_sig_eval) = *plateau_tracker.lock().unwrap();
-        if failure_is_converged_plateau(total_evals, last_sig_eval, best_seen_ofv, final_ofv) {
+        let (_, last_sig_eval, first_feasible_eval) = *plateau_tracker.lock().unwrap();
+        if failure_is_converged_plateau(
+            total_evals,
+            last_sig_eval,
+            first_feasible_eval,
+            best_seen_ofv,
+            final_ofv,
+        ) {
             converged = true;
         }
         if options.verbose {
             let flat_tail = total_evals.saturating_sub(last_sig_eval);
             eprintln!(
-                "Plateau check: flat_tail = {} evals (min {}), best-seen {:?} vs \
-                 final {:.6} → converged = {}",
-                flat_tail, PLATEAU_MIN_FLAT_EVALS, best_seen_ofv, final_ofv, converged,
+                "Plateau check: flat_tail = {} evals (min {}), first_feasible = {}, \
+                 best-seen {:?} vs final {:.6} → converged = {}",
+                flat_tail,
+                PLATEAU_MIN_FLAT_EVALS,
+                first_feasible_eval,
+                best_seen_ofv,
+                final_ofv,
+                converged,
             );
         }
     }

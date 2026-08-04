@@ -102,13 +102,15 @@ fn covariance_rsr_assembles_finite_ses_fast() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: full FOCEI fit ×3 for covariance_method R/S/RSR; opt in with --features slow-tests"
-)]
-#[ignore = "temporarily disabled — blocked on #960: FD-of-OFV covariance Hessian is \
-            knife-edge at the warfarin FOCEI optimum (SE(TVCL) 0.0071↔121 on a ~3e-5 θ \
-            shift). Re-enable when #436 (analytic Hessian) or #520 (FD-step robustness) lands."]
+// Unconditionally ignored (single attribute so no `unused_attributes` and no
+// stale "slow" skip reason): a slow full-FOCEI-fit ×3 test that is also blocked
+// on #960. Re-enable (restoring the `#[cfg_attr(not(feature = "slow-tests"),
+// ignore)]` slow gate) when #436 (analytic Hessian) or #520 (FD-step robustness)
+// lands.
+#[ignore = "temporarily disabled — blocked on #960 (also a slow full-fit ×3 test): \
+            FD-of-OFV covariance Hessian is knife-edge at the warfarin FOCEI optimum \
+            (SE(TVCL) 0.0071↔121 on a ~3e-5 θ shift). Re-enable when #436 (analytic \
+            Hessian) or #520 (FD-step robustness) lands."]
 fn covariance_methods_produce_consistent_ses_on_warfarin() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
     assert!(
@@ -177,21 +179,22 @@ fn covariance_methods_produce_consistent_ses_on_warfarin() {
 /// held to 15%. A factor-of-2 error in the score scale would push the `s` SEs
 /// ~29–41% off systematically — well outside these bands (issue #266 note).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow + NONMEM-anchored FOCEI s/rsr covariance SE cross-check (#266/#335): opt in with --features slow-tests"
-)]
-// Re-enabled (#335): the `s` (pure cross-product) estimator is a 10-subject
-// outer-product and is inherently noisier (20% band). The RSR sandwich `R⁻¹SR⁻¹`
-// draws its `R` from the reconverged-OFV second-difference stencil (the sole R
-// path since #639). That stencil is only well-conditioned at a true stationary
-// point, so this fixture relies on the default `Auto` optimizer (→ analytic-
-// gradient NLopt L-BFGS) converging; the earlier `covariance_ofv_hessian = false`
-// override that routed this anchor onto the now-removed analytical-gradient
-// stencil is gone.
-#[ignore = "temporarily disabled — blocked on #960: FD-of-OFV covariance Hessian is \
-            knife-edge at the warfarin FOCEI optimum (SE(TVCL) 0.0071↔121 on a ~3e-5 θ \
-            shift). Re-enable when #436 (analytic Hessian) or #520 (FD-step robustness) lands."]
+// The `s` (pure cross-product) estimator is a 10-subject outer-product and is
+// inherently noisier (20% band). The RSR sandwich `R⁻¹SR⁻¹` draws its `R` from
+// the reconverged-OFV second-difference stencil (the sole R path since #639).
+// That stencil is only well-conditioned at a true stationary point, so this
+// fixture relies on the default `Auto` optimizer (→ analytic-gradient NLopt
+// L-BFGS) converging.
+//
+// Unconditionally ignored (single attribute so no `unused_attributes` and no
+// stale "slow" skip reason): a slow NONMEM-anchored s/rsr cross-check (#266/#335)
+// that is also blocked on #960. Re-enable (restoring the `#[cfg_attr(not(feature
+// = "slow-tests"), ignore)]` slow gate) when #436 (analytic Hessian) or #520
+// (FD-step robustness) lands.
+#[ignore = "temporarily disabled — blocked on #960 (also a slow NONMEM-anchored \
+            s/rsr cross-check, #266/#335): FD-of-OFV covariance Hessian is knife-edge \
+            at the warfarin FOCEI optimum (SE(TVCL) 0.0071↔121 on a ~3e-5 θ shift). \
+            Re-enable when #436 (analytic Hessian) or #520 (FD-step robustness) lands."]
 fn covariance_se_matches_nonmem_s_rsr() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
     assert!(
