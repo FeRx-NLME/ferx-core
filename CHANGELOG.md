@@ -393,6 +393,19 @@ section of the SDLC for the versioning policy).
   overlapping an oral depot dose.
 
 ### Fixed
+- **Analytic-gradient fits no longer report `converged = false` at a plateaued optimum**
+  (#751). The default analytic-gradient NLopt L-BFGS drives the OFV flat to ~8 significant
+  figures and then returns a bare `NLOPT_FAILURE` — its line search can no longer beat an
+  objective already at the noise floor. That terminal status was taken at face value, so a
+  finished fit was mislabelled non-converged, the "Outer optimization did not converge"
+  warning fired spuriously, and the covariance step ran flagged as off-stationary. A bare
+  `Failure`/`ForcedStop` is now reclassified as converged only when the fit actually
+  descended past its initial estimates, the OFV trace has plateaued (a flat tail of evals
+  with no meaningful improvement), **and** the restored best point is self-consistent (a
+  cold inner-loop restart reproduces the best-seen OFV). A genuine early stall — a first
+  step that overshoots and leaves the fit pinned at its initial estimates, one still
+  descending when it stopped, or an unreproducible warm-start "optimum" — keeps
+  `converged = false`, so real non-convergence is never masked.
 - **A dose into a compartment an `[odes]` model does not declare is now an error, not a
   silent drop** (#899). On the ODE engine every dose-application site was an unguarded
   `if cmt_idx < n { … }` with no `else`, and nothing upstream rejected an out-of-range
