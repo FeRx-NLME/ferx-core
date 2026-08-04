@@ -18,12 +18,23 @@
 //! can dominate the M-step. It does not necessarily restore a high raw ESS, but
 //! it keeps the population estimates identifiable — which is what this test pins.
 //!
-//! The contrast below is decisive and deterministic: with the legacy sampler
-//! (`alpha = 0`) the recovered V/CL run away to ~16× their true values; with the
-//! default mixture they land within a few percent. Data is simulated from the
-//! model (fixed seed) so the test is self-contained; the quantitative NONMEM
-//! comparison (`run14`, SAEM→IMP, OFV −249.23) lives with the cross-repo
-//! `ferx-testdata/thioguanine_mmc` model and is reported in the PR.
+//! What this pins now: the mixture fit recovers TVV/TVCL near the truth with a
+//! finite OFV and IS −2logL — the IMP phase does not walk the population
+//! parameters to nonsense. Data is simulated from the model (fixed seed) so the
+//! test is self-contained; the quantitative NONMEM comparison (`run14`,
+//! SAEM→IMP, OFV −249.23) lives with the cross-repo `ferx-testdata/thioguanine_mmc`
+//! model and is reported in the PR.
+//!
+//! Historical note: this test used to assert a decisive mixture-vs-legacy
+//! *contrast* — with `alpha = 0` the recovered V/CL ran away to ~16× truth
+//! (OFV ≈ 1e35), with the mixture they landed within a few percent. That runaway
+//! is no longer reproducible on this fixture: the legacy single-proposal sampler
+//! now finds essentially the same estimate as the mixture (V ≈ 24.4 vs the
+//! mixture's 24.5, both against truth 20), because the collapse is prevented
+//! upstream. The contrast assertions were therefore removed; what remains guards
+//! that neither sampler diverges. Restoring genuine discrimination coverage for
+//! `imp_defensive_alpha` is tracked in #961; the fast branch-coverage smoke test
+//! is `importance_sampling_api::imp_defensive_mixture_runs_for_both_alpha_branches`.
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::types::{DoseEvent, Population, SimOutcome};
@@ -187,22 +198,21 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
         imp.minus2_log_likelihood
     );
 
-    // Legacy single-proposal sampler (alpha = 0) on identical data: the M-step is
-    // hijacked by the collapsed-weight baseline subjects and V/CL run away. This
-    // is the behaviour the fix removes; asserting it makes the test a genuine
-    // regression rather than a smoke test.
+    // Legacy single-proposal sampler (alpha = 0) on identical data. Historically
+    // its weights collapsed on the weakly-identified-V baseline subjects and V/CL
+    // ran away to the bounds (OFV ≈ 1e35) — the behaviour the mixture was added to
+    // fix. That runaway is no longer reproducible on this fixture (the collapse is
+    // prevented upstream; see the module docs and #961), so we no longer assert a
+    // mixture-vs-legacy contrast. What still guards #528 is that the legacy sampler
+    // also keeps the IMP phase finite and bounded — a future regression that
+    // reintroduced the runaway (V → the 500 bound, non-finite OFV) would trip this.
     let no_mix = fit(&model, &pop, &model.default_params, &saem_imp_opts(0.0))
-        .expect("legacy imp still returns a (bad) fit");
+        .expect("legacy imp still returns a fit");
     let v0 = no_mix.theta[1];
     assert!(
-        v0 > 2.0 * TRUE_V,
-        "legacy sampler is expected to blow V up (>2× truth); got {v0} — if this \
-         fails the synthetic data no longer reproduces the collapse and the test \
-         above is no longer guarding the fix"
-    );
-    // The mixture must be a large, unambiguous improvement on the recovered V.
-    assert!(
-        (v - TRUE_V).abs() < (v0 - TRUE_V).abs() / 3.0,
-        "defensive mixture should recover V far better than legacy: mix {v} vs legacy {v0}"
+        no_mix.ofv.is_finite() && v0.is_finite() && v0 < 5.0 * TRUE_V,
+        "legacy IMP must not walk the population parameters away (#528 / #961): \
+         V = {v0}, OFV = {}",
+        no_mix.ofv
     );
 }

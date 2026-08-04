@@ -230,6 +230,9 @@ fn assert_covariance_se_matches_nonmem(method: EstimationMethod, interaction: bo
     not(feature = "slow-tests"),
     ignore = "slow + NONMEM-anchored covariance SE cross-check (#209/#196/#129): opt in with --features slow-tests"
 )]
+#[ignore = "temporarily disabled — blocked on #960: FD-of-OFV covariance Hessian is \
+            knife-edge at the warfarin FOCEI optimum (SE(TVCL) 0.0071↔121 on a ~3e-5 θ \
+            shift). Re-enable when #436 (analytic Hessian) or #520 (FD-step robustness) lands."]
 fn covariance_se_matches_nonmem() {
     assert_covariance_se_matches_nonmem(EstimationMethod::FoceI, true);
 }

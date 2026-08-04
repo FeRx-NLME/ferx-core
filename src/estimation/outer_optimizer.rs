@@ -1034,6 +1034,61 @@ fn resolve_outer_ftol(is_non_gaussian: bool, is_ode: bool, override_ftol: Option
     })
 }
 
+/// Absolute OFV improvement below which a step counts as "no significant
+/// progress" for the plateau tracker. Matches the stagnation guard's
+/// `STAGNATION_THRESHOLD` (both key off the ~1e-3 FOCE EBE-loop precision).
+const PLATEAU_OFV_THRESHOLD: f64 = 1e-3;
+
+/// Minimum number of consecutive flat tail evals (no improvement above
+/// `PLATEAU_OFV_THRESHOLD`) for a bare NLopt `Failure`/`ForcedStop` to be
+/// reclassified as convergence-at-a-plateau (issue #751). A genuine early stall
+/// (e.g. the SS-oral fit quits after ~5 evals still plunging) never accumulates
+/// a flat tail and stays `converged=false`. Chosen below the shortest observed
+/// good-fit tail (npde ≈ 8, schnider ≈ 19) yet well above the zero-length tail
+/// of a real stall.
+const PLATEAU_MIN_FLAT_EVALS: usize = 5;
+
+/// Relative tolerance for the best-seen ↔ final-inner-loop OFV self-consistency
+/// guard. A converged fit's EBE fixpoint is reproducible: re-running the inner
+/// loop cold at the restored best point returns the same OFV the optimizer saw
+/// warm-started. A large positive gap (the SS-oral fit: best-seen 83.3 vs cold
+/// 121.4) means the "optimum" was a warm-start artifact — not converged — so it
+/// is rejected even if the OFV trace looked flat.
+const PLATEAU_CONSISTENCY_REL_TOL: f64 = 1e-3;
+
+/// Classify a bare NLopt `Failure`/`ForcedStop` as convergence-at-a-plateau
+/// (issue #751). Returns `true` only when all three hold:
+///   - **progress**: the last significant OFV improvement was on an eval *after*
+///     the initial one (`last_sig_improvement_eval >= 2`). Eval 1 always
+///     registers the very first objective value (INF → OFV₀), so a fit whose
+///     last significant improvement sits at eval 1 never descended at all — it
+///     stalled at the start (NLopt's L-BFGS first step overshoots and its line
+///     search fails at eval 1 on e.g. warfarin FOCEI, leaving the fit pinned at
+///     the initial estimates). That is a failed start, not a converged plateau,
+///     even though the objective is then "flat" for the remaining probes;
+///   - **plateau**: the flat tail (evals since the last improvement above
+///     `PLATEAU_OFV_THRESHOLD`, = `total_evals − last_sig_improvement_eval`) is
+///     at least `PLATEAU_MIN_FLAT_EVALS` — a genuine mid-descent stall has none;
+///     and
+///   - **consistency**: the cold-restart `final_ofv` is not materially *worse*
+///     than `best_seen_ofv` (a large positive gap exposes a warm-start-only
+///     "optimum"). A cold restart that ties or improves is fine.
+/// Pulled out as a pure fn so the decision is unit-testable without driving a
+/// full NLopt fit.
+fn failure_is_converged_plateau(
+    total_evals: usize,
+    last_sig_improvement_eval: usize,
+    best_seen_ofv: Option<f64>,
+    final_ofv: f64,
+) -> bool {
+    let made_progress = last_sig_improvement_eval >= 2;
+    let flat_tail = total_evals.saturating_sub(last_sig_improvement_eval);
+    let plateaued = flat_tail >= PLATEAU_MIN_FLAT_EVALS;
+    let consistent = best_seen_ofv
+        .is_none_or(|best| final_ofv <= best + PLATEAU_CONSISTENCY_REL_TOL * (1.0 + best.abs()));
+    made_progress && plateaued && consistent
+}
+
 fn optimize_nlopt(
     model: &CompiledModel,
     population: &Population,
@@ -1157,6 +1212,15 @@ fn optimize_nlopt(
 
     let last_gradient: Arc<Mutex<Option<Vec<f64>>>> = Arc::new(Mutex::new(None));
     let last_gradient_cl = Arc::clone(&last_gradient);
+
+    // Externalised OFV-plateau tracker (`best_ofv_at_last_sig`, `eval_index`) —
+    // the last eval at which the best OFV improved by more than
+    // `PLATEAU_OFV_THRESHOLD`. Distinct from (and independent of) the stagnation
+    // guard's own bookkeeping so it works even when the guard is disabled. Read
+    // after `optimize()` to tell a plateaued optimum (many flat tail evals) from
+    // a genuine early stall — see the convergence-classification block (#751).
+    let plateau_tracker: Arc<Mutex<(f64, usize)>> = Arc::new(Mutex::new((f64::INFINITY, 0)));
+    let plateau_tracker_cl = Arc::clone(&plateau_tracker);
 
     // EBE stats accumulator: tracks worst unconverged count and total fallbacks.
     #[derive(Default)]
@@ -1343,6 +1407,17 @@ fn optimize_nlopt(
                 eprintln!("Eval {:>4}: OFV = {:.6}", state.n_evals, ofv);
             }
         }
+        // Record the eval at which the best OFV last improved *significantly*
+        // (> `PLATEAU_OFV_THRESHOLD`). The gap between this and the final eval
+        // count is the length of the flat tail — the plateau signal read after
+        // `optimize()` (#751). Independent of the stagnation guard so it is
+        // populated even when that guard is off.
+        {
+            let mut pt = plateau_tracker_cl.lock().unwrap();
+            if pt.0 - state.best_ofv > PLATEAU_OFV_THRESHOLD {
+                *pt = (state.best_ofv, state.n_evals);
+            }
+        }
         // `best_seen` tracks the global minimum across the whole run so the
         // final restore (issue #59) lands on the true best point, even when the
         // optimizer drifts away from it before terminating.
@@ -1508,7 +1583,14 @@ fn optimize_nlopt(
     // non-convergence: it gets its own warning ("increase maxiter") rather than
     // the generic "did not converge" message.
     let mut max_eval_reached = false;
-    let converged = match &result {
+    // A bare NLopt `Failure`/`ForcedStop` is ambiguous: it is returned both by a
+    // genuine mid-descent stall *and* by the analytic-gradient L-BFGS default
+    // (#639) settling onto a plateaued optimum whose ∇ has dropped below the
+    // floor its line search can beat. We defer that verdict — see
+    // `stationarity_check_pending` — and resolve it against the honest gradient
+    // at the restored best point, below.
+    let mut stationarity_check_pending = false;
+    let mut converged = match &result {
         Ok((status, _)) => {
             if options.verbose {
                 eprintln!("NLopt finished: {:?}", status);
@@ -1526,7 +1608,14 @@ fn optimize_nlopt(
             if options.verbose {
                 eprintln!("NLopt stopped: {:?}", fail);
             }
-            matches!(fail, nlopt::FailState::RoundoffLimited)
+            match fail {
+                nlopt::FailState::RoundoffLimited => true,
+                nlopt::FailState::Failure | nlopt::FailState::ForcedStop => {
+                    stationarity_check_pending = true;
+                    false
+                }
+                _ => false,
+            }
         }
     };
 
@@ -1557,9 +1646,11 @@ fn optimize_nlopt(
     // gradient and the optimizer can drift off the true minimum before
     // termination. Replacing `x0` with the best-seen xs guarantees the
     // final inner loop and covariance step run at the actual minimum.
+    let mut best_seen_ofv: Option<f64> = None;
     if let Some((best_xs, best_ofv)) = best_seen.lock().unwrap().clone() {
         if best_xs.len() == n {
             x0.copy_from_slice(&best_xs);
+            best_seen_ofv = Some(best_ofv);
             if options.verbose {
                 eprintln!(
                     "Restored best-seen point (OFV = {:.6}) for final inner loop \
@@ -1604,6 +1695,47 @@ fn optimize_nlopt(
 
     if options.verbose {
         eprintln!("Final OFV = {:.6}", final_ofv);
+    }
+
+    // Resolve a deferred `Failure`/`ForcedStop` verdict (see
+    // `stationarity_check_pending`). NLopt's analytic-gradient L-BFGS default
+    // (#639) returns a bare `NLOPT_FAILURE` *at* a plateaued optimum — its line
+    // search can no longer beat an OFV already flat to ~8 significant figures —
+    // and the raw enum then libels a finished fit as `converged=false`. That
+    // both fails the honest convergence tests and tags the point non-stationary
+    // right before the FD-of-OFV covariance step, whose R-matrix is only
+    // well-conditioned at a true minimum (issue #751).
+    //
+    // The analytic gradient norm is *not* a usable stationarity proxy here: at
+    // these genuine optima it still reads O(1) (npde ≈ 1.8, schnider ≈ 0.05)
+    // because the best-point EBEs the outer gradient reuses differ slightly from
+    // the cold-restart `final_ehs`, and because weakly-identified directions
+    // carry a large scaled ∂OFV/∂x at a flat OFV. Decide on the OFV trace
+    // instead — the quantity that actually defines convergence for a noisy FOCE
+    // objective:
+    //   (a) plateau — the best OFV has not improved by more than
+    //       `PLATEAU_OFV_THRESHOLD` for at least `PLATEAU_MIN_FLAT_EVALS` evals
+    //       (a real stall, e.g. SS-oral quitting after ~5 evals still plunging,
+    //       has no flat tail); and
+    //   (b) self-consistency — re-running the inner loop cold at the restored
+    //       best point reproduces the best-seen OFV (the SS-oral stall's
+    //       best-seen 83.3 vs cold 121.4 exposes a warm-start artifact).
+    // Both must hold; a genuine mid-descent stall fails at least one, so this
+    // never papers over non-convergence.
+    if stationarity_check_pending {
+        let total_evals = n_evals_outer.load(Ordering::Relaxed);
+        let (_, last_sig_eval) = *plateau_tracker.lock().unwrap();
+        if failure_is_converged_plateau(total_evals, last_sig_eval, best_seen_ofv, final_ofv) {
+            converged = true;
+        }
+        if options.verbose {
+            let flat_tail = total_evals.saturating_sub(last_sig_eval);
+            eprintln!(
+                "Plateau check: flat_tail = {} evals (min {}), best-seen {:?} vs \
+                 final {:.6} → converged = {}",
+                flat_tail, PLATEAU_MIN_FLAT_EVALS, best_seen_ofv, final_ofv, converged,
+            );
+        }
     }
 
     // Covariance step (skip if user cancelled — it's expensive and the result
