@@ -300,6 +300,16 @@ impl ErrorSpec {
         if self.variance_at(cmt, f, sigma) <= MIN_VARIANCE {
             return 0.0;
         }
+        self.dvar_df_raw(cmt, f, sigma)
+    }
+
+    /// Raw (unfloored) `∂v/∂f` — the closed-form proportional slope before the
+    /// `MIN_VARIANCE` floor gate. Both floored entry points share it so the
+    /// closed form lives once: [`dvar_df`](Self::dvar_df) gates it on the
+    /// unscaled `variance_at`, while [`dvar_df_scaled`](Self::dvar_df_scaled)
+    /// gates it on the *scaled* variance it actually pairs with. Returns 0 for
+    /// additive endpoints and for an unregistered `PerCmt` cmt.
+    fn dvar_df_raw(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
         let (em, prop_sigma) = match self {
             ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
             ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
@@ -354,7 +364,19 @@ impl ErrorSpec {
             return 0.0;
         };
         let m = mult.get(prop_slot).copied().unwrap_or(1.0);
-        self.dvar_df(cmt, f, sigma) * m * m
+        // Gate the floor on the *scaled* variance this derivative pairs with —
+        // `variance_at_scaled` folds the magnitude `m` into the loading *before*
+        // clamping, exactly as `residual_rd`/`residual_rd2` compute the R that
+        // consumes this slope. Gating on the unscaled `variance_at` (via
+        // `dvar_df`) puts the floor boundary at a different `f` whenever `m ≠ 1`,
+        // so the objective sees a live variance while the analytic slope reads 0
+        // (or vice-versa) — the #958 analytic-vs-FD gradient mismatch, on the
+        // #484 magnitude path. `&[]`: correlations force FD upstream (diagonal-R
+        // only here), matching the `residual_rd` call.
+        if self.variance_at_scaled(cmt, f, sigma, &[], mult) <= MIN_VARIANCE {
+            return 0.0;
+        }
+        self.dvar_df_raw(cmt, f, sigma) * m * m
     }
 
     /// `d²(residual variance)/d(prediction f)²` for one observation at `cmt`.
@@ -375,6 +397,15 @@ impl ErrorSpec {
         if self.variance_at(cmt, f, sigma) <= MIN_VARIANCE {
             return 0.0;
         }
+        self.d2var_df2_raw(cmt, sigma)
+    }
+
+    /// Raw (unfloored) `∂²v/∂f²` — the constant proportional curvature before the
+    /// `MIN_VARIANCE` floor gate. Shared by [`d2var_df2`](Self::d2var_df2) (gated
+    /// on the unscaled variance) and [`d2var_df2_scaled`](Self::d2var_df2_scaled)
+    /// (gated on the scaled variance it pairs with). `f`-independent, so it takes
+    /// no `f`. Returns 0 for additive endpoints and an unregistered `PerCmt` cmt.
+    fn d2var_df2_raw(&self, cmt: usize, sigma: &[f64]) -> f64 {
         let (em, prop_sigma) = match self {
             ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
             ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
@@ -418,7 +449,15 @@ impl ErrorSpec {
             return 0.0;
         };
         let m = mult.get(prop_slot).copied().unwrap_or(1.0);
-        self.d2var_df2(cmt, f, sigma) * m * m
+        // Floor on the scaled variance this curvature is the second derivative
+        // of — same reasoning as `dvar_df_scaled`. Gating on the unscaled
+        // `variance_at` (via `d2var_df2`) leaves the M3 covariance Hessian a
+        // spurious `2·m²·σ²` where the scaled variance is floored constant,
+        // biasing the standard errors on the #484 magnitude path.
+        if self.variance_at_scaled(cmt, f, sigma, &[], mult) <= MIN_VARIANCE {
+            return 0.0;
+        }
+        self.d2var_df2_raw(cmt, sigma) * m * m
     }
 
     /// `d(residual variance)/d(log σ_k)` for one observation at `cmt`, where
@@ -2332,6 +2371,79 @@ mod tests {
             + spec.variance_at(1, f - h, &sigma))
             / (h * h);
         assert_relative_eq!(spec.d2var_df2(1, f, &sigma), fd2, max_relative = 1e-4);
+    }
+
+    /// #958 scope gap on the #484 custom-magnitude path: the `_scaled` derivative
+    /// accessors must gate the `MIN_VARIANCE` floor on the *scaled* variance they
+    /// pair with (`variance_at_scaled`), not the unscaled `variance_at`. With a
+    /// magnitude multiplier `m ≠ 1` the two floor at different predictions, so a
+    /// unscaled gate zeroed the analytic slope on a band where the objective's
+    /// variance is still live — reviving the analytic-vs-FD gradient mismatch.
+    #[test]
+    fn dvar_df_scaled_floor_gates_on_scaled_variance() {
+        let spec = ErrorSpec::Single(ErrorModel::Proportional);
+        let sigma = [0.15];
+        let mult = [100.0]; // m = 100 on the proportional sigma slot
+        let corr: [ResidualCorrelation; 0] = [];
+
+        // Band where the UNSCALED variance is floored but the SCALED variance is
+        // still live: 1e-6/(m·σ) < f < 1e-6/σ, i.e. 6.7e-8 < f < 6.7e-6.
+        let f_band = 1e-6_f64;
+        assert!(
+            spec.variance_at(1, f_band, &sigma) <= MIN_VARIANCE,
+            "precondition: unscaled variance is floored here"
+        );
+        assert!(
+            spec.variance_at_scaled(1, f_band, &sigma, &corr, &mult) > MIN_VARIANCE,
+            "precondition: scaled variance (m=100) is above the floor here"
+        );
+        // The old unscaled gate returned 0 here; the derivative must instead be
+        // the live scaled slope, matching central FD of `variance_at_scaled`.
+        assert_ne!(
+            spec.dvar_df_scaled(1, f_band, &sigma, &mult),
+            0.0,
+            "∂v/∂f must be live where the SCALED variance is above the floor"
+        );
+        let h = 1e-8;
+        let fd1 = (spec.variance_at_scaled(1, f_band + h, &sigma, &corr, &mult)
+            - spec.variance_at_scaled(1, f_band - h, &sigma, &corr, &mult))
+            / (2.0 * h);
+        assert_relative_eq!(
+            spec.dvar_df_scaled(1, f_band, &sigma, &mult),
+            fd1,
+            max_relative = 1e-5
+        );
+        let fd2 = (spec.variance_at_scaled(1, f_band + h, &sigma, &corr, &mult)
+            - 2.0 * spec.variance_at_scaled(1, f_band, &sigma, &corr, &mult)
+            + spec.variance_at_scaled(1, f_band - h, &sigma, &corr, &mult))
+            / (h * h);
+        assert_relative_eq!(
+            spec.d2var_df2_scaled(1, f_band, &sigma, &mult),
+            fd2,
+            max_relative = 1e-3
+        );
+
+        // Below the SCALED floor both derivatives are 0 (variance locally flat).
+        let f_floored = 1e-9_f64;
+        assert!(
+            spec.variance_at_scaled(1, f_floored, &sigma, &corr, &mult) <= MIN_VARIANCE,
+            "precondition: scaled variance is floored here"
+        );
+        assert_eq!(spec.dvar_df_scaled(1, f_floored, &sigma, &mult), 0.0);
+        assert_eq!(spec.d2var_df2_scaled(1, f_floored, &sigma, &mult), 0.0);
+
+        // Well above the floor the scaled forms equal the raw m²-scaled values.
+        let f_hi = 10.0_f64;
+        assert_relative_eq!(
+            spec.dvar_df_scaled(1, f_hi, &sigma, &mult),
+            2.0 * f_hi * (100.0 * 0.15) * (100.0 * 0.15),
+            max_relative = 1e-12
+        );
+        assert_relative_eq!(
+            spec.d2var_df2_scaled(1, f_hi, &sigma, &mult),
+            2.0 * (100.0 * 0.15) * (100.0 * 0.15),
+            max_relative = 1e-12
+        );
     }
 
     #[test]
