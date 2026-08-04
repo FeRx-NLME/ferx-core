@@ -987,7 +987,7 @@ pub(crate) fn score_core(
             let kern_at = |ff: f64| -> (f64, f64, f64) {
                 let rr_ = model.error_spec.variance_at(cmt, ff, sigma) * ruv_scale;
                 let dd = model.error_spec.dvar_df(cmt, ff, sigma) * ruv_scale;
-                let dd2 = model.error_spec.d2var_df2(cmt, sigma) * ruv_scale;
+                let dd2 = model.error_spec.d2var_df2(cmt, ff, sigma) * ruv_scale;
                 let (_g1, g2, cz, cm) = m3_censored_outer(y, ff, rr_, dd, dd2, cens);
                 (g2, cz, cm)
             };
@@ -1214,7 +1214,7 @@ fn prepare_stacked(
             let kern_scaled = |ff: f64, ss: f64| -> (f64, f64, f64) {
                 let r = model.error_spec.variance_at(cmt, ff, sigma) * ss;
                 let d = model.error_spec.dvar_df(cmt, ff, sigma) * ss;
-                let d2 = model.error_spec.d2var_df2(cmt, sigma) * ss;
+                let d2 = model.error_spec.d2var_df2(cmt, ff, sigma) * ss;
                 let (_g1, g2, cz, cm) = m3_censored_outer(y, ff, r, d, d2, cens);
                 (g2, cz, cm)
             };
@@ -1614,7 +1614,7 @@ fn sigma_block(
                 let kern_at = |sa: &[f64]| -> (f64, f64, f64) {
                     let r = model.error_spec.variance_at(cmt, f, sa) * prep.ruv_scale;
                     let d = model.error_spec.dvar_df(cmt, f, sa) * prep.ruv_scale;
-                    let d2 = model.error_spec.d2var_df2(cmt, sa) * prep.ruv_scale;
+                    let d2 = model.error_spec.d2var_df2(cmt, f, sa) * prep.ruv_scale;
                     let (_g1, g2, cz, cm) = m3_censored_outer(y, f, r, d, d2, prep.et[j].cens_sign);
                     (g2, cz, cm)
                 };

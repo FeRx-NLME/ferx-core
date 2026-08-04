@@ -273,12 +273,12 @@ fn precise_ebe(model: &CompiledModel, subject: &Subject, params: &ModelParameter
                 (None, Some(m)) => (
                     model.error_spec.variance_at_scaled(cmt, f, sigma, &[], m),
                     model.error_spec.dvar_df_scaled(cmt, f, sigma, m),
-                    model.error_spec.d2var_df2_scaled(cmt, sigma, m),
+                    model.error_spec.d2var_df2_scaled(cmt, f, sigma, m),
                 ),
                 (None, None) => (
                     model.error_spec.variance_at(cmt, f, sigma),
                     model.error_spec.dvar_df(cmt, f, sigma),
-                    model.error_spec.d2var_df2(cmt, sigma),
+                    model.error_spec.d2var_df2(cmt, f, sigma),
                 ),
             };
             let y = subject.observations[j];
@@ -634,12 +634,12 @@ fn precise_ebe_ruv(model: &CompiledModel, subject: &Subject, params: &ModelParam
                 Some(mr) => (
                     model.error_spec.variance_at_scaled(cmt, f, sigma, &[], mr) * s,
                     model.error_spec.dvar_df_scaled(cmt, f, sigma, mr) * s,
-                    model.error_spec.d2var_df2_scaled(cmt, sigma, mr) * s,
+                    model.error_spec.d2var_df2_scaled(cmt, f, sigma, mr) * s,
                 ),
                 None => (
                     model.error_spec.variance_at(cmt, f, sigma) * s,
                     model.error_spec.dvar_df(cmt, f, sigma) * s,
-                    model.error_spec.d2var_df2(cmt, sigma) * s,
+                    model.error_spec.d2var_df2(cmt, f, sigma) * s,
                 ),
             };
             let y = subject.observations[j];
@@ -3260,12 +3260,12 @@ fn precise_ebe_iov(
                 Some(m) => (
                     model.error_spec.variance_at_scaled(cmt, f, sigma, &[], m) * ruv_scale,
                     model.error_spec.dvar_df_scaled(cmt, f, sigma, m) * ruv_scale,
-                    model.error_spec.d2var_df2_scaled(cmt, sigma, m) * ruv_scale,
+                    model.error_spec.d2var_df2_scaled(cmt, f, sigma, m) * ruv_scale,
                 ),
                 None => (
                     model.error_spec.variance_at(cmt, f, sigma) * ruv_scale,
                     model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale,
-                    model.error_spec.d2var_df2(cmt, sigma) * ruv_scale,
+                    model.error_spec.d2var_df2(cmt, f, sigma) * ruv_scale,
                 ),
             };
             let y = subject.observations[j];

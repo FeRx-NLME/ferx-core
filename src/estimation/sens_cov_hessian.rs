@@ -53,8 +53,11 @@ fn sigma_fd_step(sigma_k: f64) -> f64 {
 /// Closed-form error-model scalars and their first **and second** `f`-derivatives
 /// at one observation, built from `R`, `d = ∂R/∂f`, `d2 = ∂²R/∂f²`, `eps = y − f`.
 /// Assumes `∂³R/∂f³ = 0`, which is exact for the additive / proportional /
-/// combined error models (`d2var_df2` is `f`-independent — a constant `2σ²` for
-/// the proportional part, `0` for additive). `α`, `α'`, `β`, `p` reproduce
+/// combined error models away from the variance floor: `d2var_df2` is a
+/// constant `2σ²` for the proportional part (`0` for additive), except where
+/// `variance_at` clamps to `MIN_VARIANCE`, on which flat side `d2var_df2`
+/// returns `0` (#958) — still a locally-constant `∂²R/∂f²`, so `∂³R/∂f³ = 0`
+/// holds. `α`, `α'`, `β`, `p` reproduce
 /// [`super::sens_outer_gradient::err_terms`]; `α''`, `β'` are the new third-order
 /// pieces the M3 covariance Hessian contracts against `∂³f/∂η³` etc.
 struct ErrD2 {
@@ -406,7 +409,7 @@ fn m3_sigma_derivs(
         let f = sens.obs[j].f;
         let r = model.error_spec.variance_at(cmt, f, sig);
         let d = model.error_spec.dvar_df(cmt, f, sig);
-        let d2 = model.error_spec.d2var_df2(cmt, sig);
+        let d2 = model.error_spec.d2var_df2(cmt, f, sig);
         let eps = subject.observations[j] - f;
         err_d2(r, d, d2, eps)
     };
@@ -548,7 +551,7 @@ fn inner_eta_responses(
             let f = sens.obs[j].f;
             let r = model.error_spec.variance_at(cmt, f, &params.sigma.values);
             let d = model.error_spec.dvar_df(cmt, f, &params.sigma.values);
-            let d2 = model.error_spec.d2var_df2(cmt, &params.sigma.values);
+            let d2 = model.error_spec.d2var_df2(cmt, f, &params.sigma.values);
             err_d2(r, d, d2, subject.observations[j] - f)
         })
         .collect();
@@ -756,7 +759,7 @@ pub(crate) fn subject_cov_hessian_m3_natural(
             let f = sens.obs[j].f;
             let r = model.error_spec.variance_at(cmt, f, &params.sigma.values);
             let d = model.error_spec.dvar_df(cmt, f, &params.sigma.values);
-            let d2 = model.error_spec.d2var_df2(cmt, &params.sigma.values);
+            let d2 = model.error_spec.d2var_df2(cmt, f, &params.sigma.values);
             let eps = subject.observations[j] - f;
             err_d2(r, d, d2, eps)
         })
@@ -1090,7 +1093,7 @@ fn foce_sb_fixed_natural(
         }
         r0[i] = r;
         d0[i] = model.error_spec.dvar_df(cmts[i], f0act, sigma);
-        d20[i] = model.error_spec.d2var_df2(cmts[i], sigma);
+        d20[i] = model.error_spec.d2var_df2(cmts[i], f0act, sigma);
     }
     let mut rtilde = &jmat * omega * jmat.transpose();
     for i in 0..nq {
@@ -1319,7 +1322,7 @@ fn subject_cov_hessian_foce_natural(
         }
         r0[i] = r;
         d0[i] = model.error_spec.dvar_df(cmts[i], f0act, sigma);
-        d20[i] = model.error_spec.d2var_df2(cmts[i], sigma);
+        d20[i] = model.error_spec.d2var_df2(cmts[i], f0act, sigma);
     }
     let mut rtilde = &jmat * omega * jmat.transpose();
     for i in 0..nq {
@@ -1855,7 +1858,7 @@ mod tests {
                 let cmt = subject.obs_cmts[j];
                 let r = model.error_spec.variance_at(cmt, f, sigma);
                 let d = model.error_spec.dvar_df(cmt, f, sigma);
-                let d2 = model.error_spec.d2var_df2(cmt, sigma);
+                let d2 = model.error_spec.d2var_df2(cmt, f, sigma);
                 let eps = subject.observations[j] - f;
                 // inner gradient ½α·a, true Hessian ½(α' a aᵀ + α A).
                 let inv_r = 1.0 / r;

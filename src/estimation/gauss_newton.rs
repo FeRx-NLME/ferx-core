@@ -1151,8 +1151,9 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     let d_vec: Vec<f64> = (0..n_obs)
         .map(|j| error_spec.dvar_df(err_keys[j], ipreds[j], sigma_values))
         .collect();
-    // ∂²R/∂f² per observation. f-independent for additive/proportional/combined
-    // (0 for additive, 2·σ_prop² otherwise), but the *per-CMT* value can differ
+    // ∂²R/∂f² per observation. Constant for additive/proportional/combined
+    // (0 for additive, 2·σ_prop² otherwise) except where the variance floor
+    // clamps it to 0 (#958), but the *per-CMT* value can differ
     // across observations: e.g. an Emax PK/PD model with proportional error on
     // PK (CMT=2) and additive on PD (CMT=3) needs `d2 = 2·σ_prop²` at PK obs
     // and `d2 = 0` at PD obs. Dispatch through `error_spec.d2var_df2` so the
@@ -1160,7 +1161,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     // the cmt argument and returns the scalar value uniformly. The β_j chain
     // at line ~1095 then reads `d2_vec[j]` per obs.
     let d2_vec: Vec<f64> = (0..n_obs)
-        .map(|j| error_spec.d2var_df2(err_keys[j], sigma_values))
+        .map(|j| error_spec.d2var_df2(err_keys[j], ipreds[j], sigma_values))
         .collect();
 
     // Conditional Hessian H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.

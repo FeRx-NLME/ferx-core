@@ -283,6 +283,23 @@ impl ErrorSpec {
     /// first sigma for both `Proportional` and `Combined`). `Single` ignores
     /// `cmt`; `PerCmt` dispatches on the endpoint registered for `cmt`.
     pub fn dvar_df(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
+        // Floor-aware derivative: `variance_at` clamps the raw variance to
+        // `MIN_VARIANCE` (`v.max(MIN_VARIANCE)`), so on the clamped side the
+        // variance is locally *constant* in `f` and its true `∂v/∂f` is 0 — not
+        // the raw `2·f·σ²`. Returning the raw slope where the floor is active
+        // makes every analytic path that consumes `∂R/∂f` (the inner-EBE
+        // gradient's `coef`, the FOCEI Laplace `c̃` term, the outer θ-gradient)
+        // disagree with the finite-difference objective, which sees the clamped
+        // function. This bites a proportional-error row whose prediction is
+        // driven to ~0 (drug fully eliminated) — the analytic inner gradient
+        // then leads the EBE search to a different mode than FD, and the FOCEI
+        // objective becomes gradient-path-dependent (#958). `variance_at`
+        // returns exactly `MIN_VARIANCE` iff the raw variance was clamped; a
+        // `NaN` (unregistered `PerCmt` cmt) fails the comparison and falls
+        // through to the `None` arm below, which already returns 0.
+        if self.variance_at(cmt, f, sigma) <= MIN_VARIANCE {
+            return 0.0;
+        }
         let (em, prop_sigma) = match self {
             ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
             ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
@@ -349,7 +366,15 @@ impl ErrorSpec {
     /// for `cmt`. Used by the Almquist Laplace FOCEI gradient's θ-axis β_j
     /// chain — keeping the per-CMT routing here lets the same closed-form
     /// gradient handle multi-endpoint models without changing the call site.
-    pub fn d2var_df2(&self, cmt: usize, sigma: &[f64]) -> f64 {
+    ///
+    /// Floor-aware in `f` for the same reason as [`dvar_df`](Self::dvar_df):
+    /// where `variance_at` clamps the raw variance to `MIN_VARIANCE`, the
+    /// clamped variance is locally constant in `f`, so `∂²v/∂f² = 0` — not the
+    /// raw `2·σ²` (#958).
+    pub fn d2var_df2(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
+        if self.variance_at(cmt, f, sigma) <= MIN_VARIANCE {
+            return 0.0;
+        }
         let (em, prop_sigma) = match self {
             ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
             ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
@@ -388,12 +413,12 @@ impl ErrorSpec {
     /// [`dvar_df_scaled`]: ErrorSpec::dvar_df_scaled
     /// [`dvar_df`]: ErrorSpec::dvar_df
     /// [`d2var_df2`]: ErrorSpec::d2var_df2
-    pub fn d2var_df2_scaled(&self, cmt: usize, sigma: &[f64], mult: &[f64]) -> f64 {
+    pub fn d2var_df2_scaled(&self, cmt: usize, f: f64, sigma: &[f64], mult: &[f64]) -> f64 {
         let Some(prop_slot) = self.prop_sigma_slot(cmt) else {
             return 0.0;
         };
         let m = mult.get(prop_slot).copied().unwrap_or(1.0);
-        self.d2var_df2(cmt, sigma) * m * m
+        self.d2var_df2(cmt, f, sigma) * m * m
     }
 
     /// `d(residual variance)/d(log σ_k)` for one observation at `cmt`, where
@@ -2260,6 +2285,55 @@ mod tests {
         assert_relative_eq!(v, MIN_VARIANCE, epsilon = 1e-20);
     }
 
+    /// #958: `variance_at` clamps the raw variance to `MIN_VARIANCE`, so on the
+    /// clamped side the variance is *constant* in `f` and its exact `∂v/∂f` /
+    /// `∂²v/∂f²` are both 0. The derivative accessors must reflect that clamp —
+    /// returning the raw `2·f·σ²` / `2·σ²` there would make every analytic path
+    /// that consumes `∂R/∂f` (inner-EBE gradient, FOCEI Laplace `c̃`, outer
+    /// θ-gradient, covariance) disagree with the finite-difference objective,
+    /// which sees the clamped function. Concretely a proportional-error row
+    /// whose prediction is driven to ~0 (drug fully eliminated) made the FOCEI
+    /// objective gradient-path-dependent.
+    #[test]
+    fn dvar_df_and_d2var_df2_are_floor_aware() {
+        let spec = ErrorSpec::Single(ErrorModel::Proportional);
+        let sigma = [0.15];
+        // Prediction small enough that (f·σ)² < MIN_VARIANCE → variance clamped.
+        let f_floored = 1e-6_f64; // (1e-6·0.15)² = 2.25e-14 < 1e-12
+        assert!(
+            spec.variance_at(1, f_floored, &sigma) <= MIN_VARIANCE,
+            "precondition: variance must be clamped at this prediction"
+        );
+        assert_eq!(
+            spec.dvar_df(1, f_floored, &sigma),
+            0.0,
+            "∂v/∂f must be 0 where the variance floor is active"
+        );
+        assert_eq!(
+            spec.d2var_df2(1, f_floored, &sigma),
+            0.0,
+            "∂²v/∂f² must be 0 where the variance floor is active"
+        );
+
+        // Above the floor, the derivatives are the raw proportional values and
+        // must match central finite differences of `variance_at` itself.
+        let f = 10.0_f64; // (10·0.15)² = 2.25 ≫ MIN_VARIANCE
+        assert!(spec.variance_at(1, f, &sigma) > MIN_VARIANCE);
+        let h = 1e-4;
+        let fd1 =
+            (spec.variance_at(1, f + h, &sigma) - spec.variance_at(1, f - h, &sigma)) / (2.0 * h);
+        assert_relative_eq!(spec.dvar_df(1, f, &sigma), fd1, max_relative = 1e-6);
+        assert_relative_eq!(
+            spec.dvar_df(1, f, &sigma),
+            2.0 * f * 0.15 * 0.15,
+            epsilon = 1e-12
+        );
+        let fd2 = (spec.variance_at(1, f + h, &sigma) - 2.0 * spec.variance_at(1, f, &sigma)
+            + spec.variance_at(1, f - h, &sigma))
+            / (h * h);
+        assert_relative_eq!(spec.d2var_df2(1, f, &sigma), fd2, max_relative = 1e-4);
+    }
+
     #[test]
     fn test_iwres_perfect_prediction() {
         let r = iwres(10.0, 10.0, ErrorModel::Additive, &[1.0]);
@@ -2524,12 +2598,12 @@ pub(crate) fn residual_rd2(
         Some(m) => (
             es.variance_at_scaled(cmt, f, sigma, &[], m),
             es.dvar_df_scaled(cmt, f, sigma, m),
-            es.d2var_df2_scaled(cmt, sigma, m),
+            es.d2var_df2_scaled(cmt, f, sigma, m),
         ),
         None => (
             es.variance_at(cmt, f, sigma),
             es.dvar_df(cmt, f, sigma),
-            es.d2var_df2(cmt, sigma),
+            es.d2var_df2(cmt, f, sigma),
         ),
     }
 }
