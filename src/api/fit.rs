@@ -1026,6 +1026,18 @@ fn fit_inner(
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
+    // Warning-severity option diagnostics. `check_model_options` is consumed twice on
+    // purpose: `first_error` above aborts the fit on an incompatibility, and this
+    // collects the findings that are worth saying but not worth refusing (an option
+    // *combination* the user may well have chosen deliberately). Without this they
+    // would surface only under `ferx check`.
+    for d in check_model_options(model, options)
+        .into_iter()
+        .filter(|d| d.severity != crate::diagnostics::Severity::Error)
+    {
+        accumulated_warnings.push(d.message);
+    }
+
     // Data-dependent warnings: malformed steady-state rows, EVID=3/4 resets
     // under an SDE model, and a negative typical-value lag time. Extracted into
     // `check_model_data_warnings` so `ferx check` reports the same findings;

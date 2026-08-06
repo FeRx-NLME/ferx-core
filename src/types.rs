@@ -4426,6 +4426,12 @@ pub struct ViResult {
     pub family: String,
     /// Monte-Carlo draws per subject per iteration.
     pub n_mc_samples: usize,
+    /// Which KL route actually ran (`analytic` / `mc`). Reported rather than echoed
+    /// from the option because a family with no closed form falls back.
+    pub kl: String,
+    /// Subjects whose KL was sampled despite `vi_kl = analytic`. Non-zero means the
+    /// family has no closed form; the estimator is still unbiased, just noisier.
+    pub n_kl_fallback_subjects: usize,
     /// Per-iteration `−2 × ELBO`, for convergence plots.
     pub elbo_trace: Vec<f64>,
     /// Per-subject variational posterior means — VI's analogue of the EBEs, and
@@ -5665,6 +5671,8 @@ pub struct FitOptions {
     pub vi_avg_last: Option<usize>,
     /// How `∂/∂η` is obtained. Default [`ViEtaGrad::Auto`].
     pub vi_eta_grad: ViEtaGrad,
+    /// How the KL half of the ELBO is evaluated. Default [`ViKl::Analytic`].
+    pub vi_kl: ViKl,
     /// Whether to evaluate a genuine marginal likelihood at the converged VI
     /// estimate, and which. Default [`ViFinalOfv::None`] — see that type for why
     /// the ELBO is not written to `ofv`.
@@ -6091,6 +6099,7 @@ impl Default for FitOptions {
             vi_omega_update: ViOmegaUpdate::default(),
             vi_avg_last: None,
             vi_eta_grad: ViEtaGrad::default(),
+            vi_kl: ViKl::default(),
             vi_final_ofv: ViFinalOfv::default(),
             vi_seed: None,
             imp_samples: 1000,
@@ -6516,6 +6525,38 @@ pub enum ViEtaGrad {
     Fd,
 }
 
+/// How the `KL(q ‖ N(0, Ω))` half of the ELBO is evaluated.
+///
+/// This is a **variance** choice, not an accuracy one: both routes estimate the same
+/// objective, and [`ViKl::Mc`] is unbiased. But the analytic KL removes the whole
+/// term from the Monte-Carlo estimator, which is what lets `Ω` be taken in closed
+/// form and is why it is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ViKl {
+    /// Closed-form KL and its exact derivatives, so only the data term is sampled.
+    /// The default, and the reason this implementation does not show the `Ω`
+    /// instability Janssen et al. report.
+    ///
+    /// Requires the variational family to *have* a closed form. Every family
+    /// shipped today does; one that does not falls back to [`ViKl::Mc`] with a
+    /// warning rather than failing.
+    #[default]
+    Analytic,
+    /// Estimate `E_q[log q(η) − log p(η | Ω)]` by Monte Carlo from the same draws
+    /// the data term uses, with the path-derivative ("sticking the landing",
+    /// Roeder et al. 2017) gradient estimator.
+    ///
+    /// Two uses. It is what a variational family with no closed-form KL — a
+    /// mixture, a normalizing flow — will need, and it reproduces Janssen et al.,
+    /// who sample the whole ELBO. It is also a diagnostic: it cross-checks the
+    /// analytic KL against a route that shares none of its algebra, the same way
+    /// [`ViEtaGrad::Fd`] cross-checks the analytic `∂/∂η`.
+    ///
+    /// Expect a noisier trace and, with `vi_omega_update = adam`, a noisier `Ω`.
+    /// Raise `vi_mc_samples` to compensate.
+    Mc,
+}
+
 impl FitOptions {
     /// Returns the sequence of methods to execute. If `methods` is non-empty it
     /// is returned as-is; otherwise a single-element chain wrapping `method`.
@@ -6928,6 +6969,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "vi_omega_update",
             "vi_avg_last",
             "vi_eta_grad",
+            "vi_kl",
             "vi_final_ofv",
             "vi_seed",
         ],

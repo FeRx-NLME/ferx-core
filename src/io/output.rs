@@ -2096,6 +2096,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  family: {}", v.family).map_err(|e| e.to_string())?;
         writeln!(f, "  n_iterations: {}", v.n_iterations).map_err(|e| e.to_string())?;
         writeln!(f, "  n_mc_samples: {}", v.n_mc_samples).map_err(|e| e.to_string())?;
+        writeln!(f, "  kl: {}", v.kl).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_kl_fallback_subjects: {}", v.n_kl_fallback_subjects)
+            .map_err(|e| e.to_string())?;
         writeln!(f, "  converged: {}", v.converged).map_err(|e| e.to_string())?;
         writeln!(f, "  n_fd_subjects: {}", v.n_fd_subjects).map_err(|e| e.to_string())?;
         writeln!(f, "  elbo_trace:").map_err(|e| e.to_string())?;

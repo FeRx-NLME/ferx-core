@@ -79,14 +79,18 @@ pub trait VariationalFamily: Send + Sync {
     /// several Monte-Carlo draws can call it once per draw.
     fn chain_to_phi(&self, phi: &[f64], eps: &[f64], g_eta: &[f64], out: &mut [f64]);
 
-    /// Closed-form `KL(q_φ ‖ N(0, Ω))`, or `None` when this family has none — in
-    /// which case the caller must fall back to the Monte-Carlo KL path.
+    /// Closed-form `KL(q_φ ‖ N(0, Ω))`, or `None` when this family has none.
+    ///
+    /// `None` is a supported answer, not an error: the caller falls back to the
+    /// Monte-Carlo KL path ([`super::elbo`]) and reports having done so. A family
+    /// with an intractable KL — a mixture, a normalizing flow — therefore only has
+    /// to implement [`Self::log_density`].
     fn kl_to_normal(&self, phi: &[f64], omega: &OmegaMatrix) -> Option<KlTerm>;
 
     /// `log q_φ(η)` and `∂ log q_φ(η) / ∂η`.
     ///
-    /// Only the Monte-Carlo-KL path needs this; the analytic-KL path never
-    /// evaluates the variational density.
+    /// Only the Monte-Carlo-KL path (`vi_kl = mc`, or a family with no closed form)
+    /// needs this; the analytic-KL path never evaluates the variational density.
     fn log_density(&self, phi: &[f64], eta: &[f64]) -> (f64, Vec<f64>);
 
     /// Posterior mean and covariance implied by `φ`.

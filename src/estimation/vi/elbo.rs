@@ -7,6 +7,10 @@
 //!              └──── Monte Carlo, `n_mc_samples` draws ────┘  └─ closed form ─┘
 //! ```
 //!
+//! Under `vi_kl = mc` the second term is estimated from the same draws instead, as
+//! `E_q[log q(η) − log p(η|Ω)]` — see [`mc_kl_draw`], and note that its `φ` gradient
+//! is then a path derivative rather than the derivative of the reported value.
+//!
 //! Everything here works with **`−ELBO`**, so the quantity is a thing to
 //! *minimize*, consistent with every other objective in the crate, and can be
 //! handed straight to [`super::adam::AdamState::step`].
@@ -47,6 +51,9 @@ use super::family::VariationalFamily;
 /// [`crate::types::ViEtaGrad`], which is where the user-facing option lives.
 pub use crate::types::ViEtaGrad as EtaGradMode;
 
+/// How the KL half is evaluated. Re-exported from [`crate::types::ViKl`].
+pub use crate::types::ViKl as KlMode;
+
 /// Everything the ELBO evaluation needs that does not change between iterations.
 #[derive(Debug, Clone)]
 pub struct ElboConfig {
@@ -55,6 +62,8 @@ pub struct ElboConfig {
     pub n_mc_samples: usize,
     /// How to differentiate the data term with respect to `η`.
     pub eta_grad: EtaGradMode,
+    /// How to evaluate the KL half.
+    pub kl: KlMode,
     /// Base seed for the common random numbers.
     pub seed: u64,
 }
@@ -64,6 +73,7 @@ impl Default for ElboConfig {
         Self {
             n_mc_samples: 3,
             eta_grad: EtaGradMode::default(),
+            kl: KlMode::default(),
             seed: 0,
         }
     }
@@ -178,9 +188,16 @@ pub struct ElboEval {
     /// using the closed-form `Ω` update simply ignores it.
     pub grad_x: Vec<f64>,
     /// `∂(−ELBO)/∂φᵢ`, one entry per subject.
+    ///
+    /// Under `vi_kl = mc` this is the **path-derivative** gradient, which is not the
+    /// finite difference of [`Self::neg_elbo`] — see [`mc_kl_draw`].
     pub grad_phi: Vec<Vec<f64>>,
     /// Subjects whose `∂/∂η` came from finite differences this evaluation.
     pub n_fd_subjects: usize,
+    /// Subjects whose KL was sampled *despite* `vi_kl = analytic`, because the
+    /// variational family has no closed form. Always 0 for the families shipped
+    /// today; non-zero only for a family added later that lacks one.
+    pub n_kl_fallback_subjects: usize,
 }
 
 /// Per-subject partial results, folded by the caller.
@@ -193,6 +210,9 @@ struct SubjectTerms {
     /// `∂KL/∂Ω` as a dense symmetric matrix.
     d_omega: DMatrix<f64>,
     used_fd: bool,
+    /// `vi_kl = analytic` was asked for but this family had no closed form, so the
+    /// KL was sampled instead.
+    kl_fell_back: bool,
 }
 
 /// Deterministic `ε` for one `(iteration, subject, sample)` triple.
@@ -274,6 +294,76 @@ fn eta_data_grad(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Monte-Carlo KL
+// ---------------------------------------------------------------------------
+
+/// One draw's contribution to the Monte-Carlo KL estimate, `log q_φ(η) − log p(η|Ω)`,
+/// plus the derivatives the caller folds in.
+struct McKlDraw {
+    /// The integrand itself. Its expectation over `q` is exactly
+    /// `KL(q ‖ N(0, Ω))` — both densities are fully normalized, so their
+    /// `−(d/2)·log 2π` terms cancel and the estimate is on the same additive
+    /// footing as the closed form. Individual draws can be negative; only the
+    /// mean is a divergence.
+    integrand: f64,
+    /// `∂/∂η` of the integrand, `∇_η log q(η) + Ω⁻¹η`.
+    ///
+    /// Deliberately shaped to be **added to the data term's `∂/∂η`** so one
+    /// `chain_to_phi` covers both. Chaining only this pathwise part — and dropping
+    /// the direct `∂ log q_φ(η)/∂φ` score term that a total derivative would also
+    /// carry — *is* the path-derivative / "sticking the landing" estimator.
+    d_eta: Vec<f64>,
+    /// `∂/∂Ω` of the integrand: `½(Ω⁻¹ − Ω⁻¹ηηᵀΩ⁻¹)`, from `½log|Ω|` and
+    /// `½ηᵀΩ⁻¹η` respectively.
+    ///
+    /// Unlike the `φ` gradient this one has nothing dropped — `Ω` does not appear
+    /// in `q` — so it is the exact derivative of the reported value, and it
+    /// averages to the closed form's `∂KL/∂Ω` because `E_q[ηηᵀ] = S + μμᵀ`. The
+    /// closed-form `Ω` update therefore stays valid under this route; it is only
+    /// noisier.
+    d_omega: DMatrix<f64>,
+}
+
+/// Evaluate the Monte-Carlo KL integrand and its derivatives at one draw.
+///
+/// # Why the `φ` gradient is not the derivative of the value
+///
+/// The path-derivative estimator drops `∂ log q_φ(η)/∂φ` at fixed `η`. That term has
+/// zero expectation under `q` (it is a score function), so the estimator stays
+/// unbiased, and dropping it *reduces* variance — decisively so near the optimum,
+/// where it is the only surviving noise. It also makes the KL gradient vanish
+/// identically, draw by draw, when `q = N(0, Ω)`: there `∇_η log q + Ω⁻¹η ≡ 0`.
+///
+/// The consequence to keep in mind: under this route `∂(−ELBO)/∂φ` is **not** the
+/// finite difference of `−ELBO`, and a parity test asserting so would fail by
+/// design. The `θ`, `σ` and `Ω` blocks are unaffected and remain exactly FD-checkable
+/// — see `mc_kl_grad_x_matches_fd_but_phi_is_path_derivative`.
+fn mc_kl_draw(
+    family: &dyn VariationalFamily,
+    phi: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+) -> McKlDraw {
+    let d = eta.len();
+    let eta_v = DVector::from_column_slice(eta);
+    let oinv_eta = &omega.inv * &eta_v;
+
+    let (log_q, d_log_q) = family.log_density(phi, eta);
+    // −log p(η | Ω) = ½(ηᵀΩ⁻¹η + log|Ω| + d·log 2π)
+    let neg_log_p =
+        0.5 * (eta_v.dot(&oinv_eta) + omega.log_det + (d as f64) * std::f64::consts::TAU.ln());
+
+    let d_eta = (0..d).map(|k| d_log_q[k] + oinv_eta[k]).collect();
+    let d_omega = (&omega.inv - &oinv_eta * oinv_eta.transpose()) * 0.5;
+
+    McKlDraw {
+        integrand: log_q + neg_log_p,
+        d_eta,
+        d_omega,
+    }
+}
+
 /// Packed-space bounds marking FIXed coordinates, in the `[log θ | log σ]` layout
 /// `obs_nll_subject_grad` expects. A FIXed coordinate gets `lower == upper`, which
 /// makes it contribute zero *and* skips its finite-difference evaluation.
@@ -305,6 +395,34 @@ fn theta_sigma_masks(template: &ModelParameters) -> (Vec<bool>, Vec<f64>, Vec<f6
 /// is `log L_ii`, contributing a further factor of `L_ii`. The iteration order
 /// matches `pack_params` exactly (and collapses to the diagonal when `Ω` is
 /// declared diagonal).
+///
+/// # Which coordinates are left at zero
+///
+/// Two kinds of slot are not estimated parameters and so get no gradient, matching
+/// [`crate::estimation::parameterization::omega_structural_zero_mask`] and
+/// [`crate::estimation::parameterization::packed_fixed_mask`] respectively:
+///
+/// * **Structural zeros.** In a mixed `block_omega (ETA_CL, ETA_V)` + `omega ETA_KA`
+///   Ω, the cross-block entries are not parameters at all — the model says that
+///   covariance does not exist. Their `∂KL/∂Ω` is nonzero all the same (perturbing
+///   `Ω` there *does* change the KL), so without this skip `vi_omega_update = adam`
+///   would happily estimate a covariance the model declared absent.
+/// * **FIXed etas**, under the `fi || fj` rule: an off-diagonal is fixed when
+///   *either* of its etas is, because a fixed eta pins its whole row and column.
+///
+/// Leaving the gradient at zero is sufficient to pin the coordinate — Adam's step
+/// for a zero gradient is exactly zero — and for a structural zero it holds in `Ω`
+/// space too, not just in `L`: the Cholesky factor of a matrix that is
+/// block-diagonal under permutation is zero wherever the matrix is (each recursion
+/// term needs an index sharing a block with both `i` and `j`), so a slot that
+/// starts at `0.0` and never moves reconstructs `Ω[i,j] = Σₖ L[i,k]·L[j,k]` as
+/// exactly `0.0`.
+///
+/// A FIXed *off-diagonal* is only pinned as well as the Cholesky parameterization
+/// allows: `Ω[i,j]` also depends on row `j` of `L`, which is free when `ETA_j` is.
+/// That is the same limitation FOCE/FOCEI's packed vector has. The default
+/// `vi_omega_update = closed_form` route does not inherit it — [`closed_form_omega`]
+/// restores FIXed entries in `Ω` space directly, where the restoration is exact.
 fn chain_omega_grad(
     d_omega: &DMatrix<f64>,
     omega: &OmegaMatrix,
@@ -313,9 +431,9 @@ fn chain_omega_grad(
 ) {
     let n_eta = omega.dim();
     let dl = (d_omega * &omega.chol) * 2.0;
+    let is_fixed = |k: usize| template.omega_fixed.get(k).copied().unwrap_or(false);
     for (slot, (i, j)) in lower_tri_iter(n_eta, template.omega.diagonal).enumerate() {
-        let fixed = template.omega_fixed.get(i).copied().unwrap_or(false);
-        if fixed {
+        if !template.omega.free_mask[(i, j)] || is_fixed(i) || is_fixed(j) {
             continue;
         }
         let chain = if i == j { omega.chol[(i, i)] } else { 1.0 };
@@ -349,6 +467,18 @@ fn subject_terms(
     let mut grad_theta_sigma = vec![0.0; n_theta + n_sigma];
     let mut grad_phi = vec![0.0; family.n_params()];
     let mut used_fd = false;
+
+    // Resolve the KL route *before* the draw loop: the closed form is a property of
+    // the family, not of the draw, so probing it once keeps the loop branch-free and
+    // makes "asked for analytic, had to sample" a single decision to report.
+    let closed_form = match cfg.kl {
+        KlMode::Analytic => family.kl_to_normal(phi, &params.omega),
+        KlMode::Mc => None,
+    };
+    let kl_fell_back = cfg.kl == KlMode::Analytic && closed_form.is_none();
+    let sampling_kl = closed_form.is_none();
+    let mut kl_value = 0.0;
+    let mut kl_d_omega = DMatrix::<f64>::zeros(d, d);
 
     for sample in 0..s {
         let eps = crn_eps(cfg.seed, iter, subject_idx, sample, d);
@@ -394,29 +524,43 @@ fn subject_terms(
             }
             used_fd = true;
         }
-        let scaled: Vec<f64> = g_eta.iter().map(|g| g * inv_s).collect();
+
+        // The KL's `∂/∂η` rides along with the data term's through the *same*
+        // reparameterization chain — that is the whole economy of the path-derivative
+        // estimator, and why sampling the KL costs one density evaluation per draw
+        // rather than a second gradient pass.
+        let mut g_total = g_eta;
+        if sampling_kl {
+            let draw = mc_kl_draw(family, phi, &eta, &params.omega);
+            kl_value += inv_s * draw.integrand;
+            kl_d_omega += draw.d_omega * inv_s;
+            for (acc, g) in g_total.iter_mut().zip(draw.d_eta.iter()) {
+                *acc += g;
+            }
+        }
+
+        let scaled: Vec<f64> = g_total.iter().map(|g| g * inv_s).collect();
         family.chain_to_phi(phi, &eps, &scaled, &mut grad_phi);
     }
 
-    // KL term — closed form, no sampling.
-    let kl = family.kl_to_normal(phi, &params.omega).ok_or_else(|| {
-        format!(
-            "subject {}: variational family '{}' has no closed-form KL",
-            subject.id,
-            family.label()
-        )
-    })?;
-    for (acc, g) in grad_phi.iter_mut().zip(kl.d_phi.iter()) {
-        *acc += g;
+    // Closed form: the value and both derivatives come back exactly, with no
+    // contribution from the draw loop above.
+    if let Some(kl) = closed_form {
+        kl_value = kl.value;
+        kl_d_omega = kl.d_omega;
+        for (acc, g) in grad_phi.iter_mut().zip(kl.d_phi.iter()) {
+            *acc += g;
+        }
     }
 
     Ok(SubjectTerms {
         data_nll,
-        kl: kl.value,
+        kl: kl_value,
         grad_theta_sigma,
         grad_phi,
-        d_omega: kl.d_omega,
+        d_omega: kl_d_omega,
         used_fd,
+        kl_fell_back,
     })
 }
 
@@ -463,6 +607,7 @@ pub fn population_neg_elbo(
         grad_x: vec![0.0; layout.total()],
         grad_phi: Vec::with_capacity(population.subjects.len()),
         n_fd_subjects: 0,
+        n_kl_fallback_subjects: 0,
     };
 
     for terms in per_subj {
@@ -484,6 +629,9 @@ pub fn population_neg_elbo(
         eval.grad_phi.push(t.grad_phi);
         if t.used_fd {
             eval.n_fd_subjects += 1;
+        }
+        if t.kl_fell_back {
+            eval.n_kl_fallback_subjects += 1;
         }
     }
 
@@ -517,15 +665,30 @@ pub fn closed_form_omega(
         acc /= phis.len() as f64;
     }
 
-    // Structural zeros stay zero; FIXed diagonals keep their declared value.
+    // Structural zeros stay zero: `Σᵢ(Sᵢ + μᵢμᵢᵀ)` is always dense, so a mixed
+    // `block_omega` + diagonal Ω would otherwise pick up sampling correlation in
+    // cross-block entries the model says do not exist.
     for i in 0..d {
         for j in 0..d {
             if !template.omega.free_mask[(i, j)] {
                 acc[(i, j)] = 0.0;
             }
         }
-        if template.omega_fixed.get(i).copied().unwrap_or(false) {
-            acc[(i, i)] = template.omega.matrix[(i, i)];
+    }
+    // Then FIXed etas keep their whole declared row and column, under the same
+    // `fi || fj` rule `packed_fixed_mask` uses — a FIXed eta pins its covariances
+    // with every other eta, not just its own variance. Restoring in `Ω` space (as
+    // SAEM's Ω update does) rather than in Cholesky coordinates makes this exact:
+    // holding `L[i,·]` fixed would not hold `Ω[i,j]` fixed, since that also depends
+    // on the free row `L[j,·]`. Applied after the structural zeroing, though the
+    // order is immaterial — a structurally-absent entry is zero in the template too.
+    for i in 0..d {
+        for j in 0..d {
+            let fi = template.omega_fixed.get(i).copied().unwrap_or(false);
+            let fj = template.omega_fixed.get(j).copied().unwrap_or(false);
+            if fi || fj {
+                acc[(i, j)] = template.omega.matrix[(i, j)];
+            }
         }
     }
     crate::estimation::saem::floor_omega_diagonal(

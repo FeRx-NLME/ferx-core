@@ -3,12 +3,17 @@
 //! Structure of one iteration:
 //!
 //! 1. Evaluate `−ELBO` and its gradients ([`population_neg_elbo`]).
-//! 2. Adam-step the packed population vector `x` and every subject's `φᵢ`.
+//! 2. Adam-step the packed population vector `x` and every subject's `φᵢ`, then
+//!    project `x` back into the declared parameter box ([`compute_bounds`]).
 //! 3. Replace `Ω` with its closed-form maximizer (unless `vi_omega_update = adam`).
 //! 4. Once inside the averaging window, fold `x` and `{φᵢ}` into a Polyak mean.
 //!
 //! There is no inner loop and no EBE solve: `φ` persists across iterations the way
 //! an EBE warm-start does, but is optimized rather than re-solved.
+//!
+//! Afterwards: one warm-started inner-loop pass for the conditional modes and `H`,
+//! an optional Laplace OFV, and the ordinary FD-of-OFV covariance step at the VI
+//! estimate — so a VI fit reports standard errors like any other method.
 //!
 //! # Why the full budget always runs
 //!
@@ -21,7 +26,9 @@ use nalgebra::DVector;
 
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
-use crate::estimation::parameterization::{compute_mu_k, pack_params, unpack_params};
+use crate::estimation::parameterization::{
+    clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params,
+};
 use crate::types::{
     CompiledModel, FitOptions, ModelParameters, Population, ViFamily, ViFinalOfv, ViOmegaUpdate,
     ViResult,
@@ -61,6 +68,28 @@ pub fn trace_has_settled(trace: &[f64], window: usize, rel_tol: f64) -> bool {
         return false;
     }
     (prior - recent).abs() <= rel_tol * (1.0 + recent.abs())
+}
+
+/// The `vi_kl = analytic` fallback warning, or `None` when nothing fell back.
+///
+/// Split out so the message is unit-testable without a variational family that lacks
+/// a closed-form KL: every family shipped today has one, so `build_family` cannot
+/// produce the condition and it is otherwise reachable only by driving `φ` to a
+/// degenerate Cholesky factor. Mirrors `should_run_sir_fallback`, split out for the
+/// same reason (#264).
+pub(crate) fn kl_fallback_warning(
+    n_fell_back: usize,
+    n_subjects: usize,
+    family: &str,
+) -> Option<String> {
+    (n_fell_back > 0).then(|| {
+        format!(
+            "VI: vi_kl = analytic was requested but variational family '{family}' has no \
+             closed-form KL, so the KL was estimated by Monte Carlo for {n_fell_back} of \
+             {n_subjects} subjects. The estimator is unbiased but noisier; raise \
+             vi_mc_samples, or set vi_kl = mc to silence this."
+        )
+    })
 }
 
 fn build_family(kind: ViFamily, n_eta: usize) -> Box<dyn VariationalFamily> {
@@ -158,6 +187,7 @@ pub fn run_vi(
     let cfg = ElboConfig {
         n_mc_samples: options.vi_mc_samples.max(1),
         eta_grad: options.vi_eta_grad,
+        kl: options.vi_kl,
         seed: options.vi_seed.unwrap_or(DEFAULT_VI_SEED),
     };
     let adam_cfg = AdamConfig {
@@ -165,9 +195,19 @@ pub fn run_vi(
         ..Default::default()
     };
 
+    // The same packed box every other estimator optimizes inside: `θ` from the
+    // model file's declared bounds, and the `Ω`/`σ` runaway guards. Adam knows
+    // nothing about the box NLopt is handed for FOCE/FOCEI, and unlike SAEM's
+    // M-step VI has no optimizer to hand it to — so `θ (1.0, 0.1, 10.0)` is
+    // enforced by projecting `x` after each step, or it is not enforced at all.
+    let bounds = compute_bounds(init_params);
+
     // Start q at the prior and Θ at the model file's initial estimates: no
-    // randomization, so the fit is reproducible by default.
+    // randomization, so the fit is reproducible by default. The initial estimates
+    // are projected too, so `x` is inside the box from the first evaluation
+    // onwards rather than only after the first step.
     let mut x = pack_params(init_params);
+    clamp_to_bounds(&mut x, &bounds);
     let mut phis: Vec<Vec<f64>> = (0..n_subjects)
         .map(|_| family.init(&init_params.omega))
         .collect();
@@ -185,6 +225,7 @@ pub fn run_vi(
     let mut warnings: Vec<String> = Vec::new();
     let mut trace: Vec<f64> = Vec::with_capacity(n_iters);
     let mut n_fd_subjects = 0usize;
+    let mut n_kl_fallback_subjects = 0usize;
     let verbose = options.verbose;
 
     for iter in 0..n_iters {
@@ -203,6 +244,7 @@ pub fn run_vi(
         // fit improves, so a trace reads the way every other objective here does.
         trace.push(2.0 * eval.neg_elbo);
         n_fd_subjects = eval.n_fd_subjects;
+        n_kl_fallback_subjects = eval.n_kl_fallback_subjects;
 
         if !eval.neg_elbo.is_finite() {
             return Err(format!(
@@ -221,6 +263,20 @@ pub fn run_vi(
             }
         }
         adam_x.step(&mut x, &grad_x, &adam_cfg);
+        // Project *before* the closed-form Ω is written below, not after. The two
+        // blocks want different treatment: `θ`/`σ` are stepped by Adam and need the
+        // box, whereas a closed-form `Ω` is already a valid covariance by
+        // construction (`floor_omega_diagonal`), and clipping it would leave `x`'s
+        // Ω block disagreeing with the `final_params.omega` computed from the same
+        // maximizer. Under `vi_omega_update = adam` the Ω block *is* an Adam step,
+        // and this is where it picks up the same runaway guard FOCE/FOCEI gives it.
+        //
+        // Adam's moments are deliberately not reset when a coordinate hits a bound:
+        // a gradient that keeps pushing outward accumulates in `m`, so the
+        // coordinate lags slightly before leaving the bound once the gradient
+        // reverses. That is the ordinary trade-off of projected Adam, and preferable
+        // to discarding the curvature estimate whenever a coordinate touches an edge.
+        clamp_to_bounds(&mut x, &bounds);
 
         for (i, phi) in phis.iter_mut().enumerate() {
             adam_phi[i].step(phi, &eval.grad_phi[i], &adam_cfg);
@@ -247,8 +303,12 @@ pub fn run_vi(
         }
     }
 
-    // The reported estimate is the Polyak mean, not the last iterate.
-    let x_final = avg_x.mean().unwrap_or_else(|| x.clone());
+    // The reported estimate is the Polyak mean, not the last iterate. Averaging
+    // projected iterates of a convex box cannot leave it, so this clamp only
+    // absorbs the rounding of the mean itself — but it makes "the reported θ is
+    // inside its declared bounds" hold unconditionally rather than by argument.
+    let mut x_final = avg_x.mean().unwrap_or_else(|| x.clone());
+    clamp_to_bounds(&mut x_final, &bounds);
     let phis_final: Vec<Vec<f64>> = avg_phi
         .iter()
         .zip(phis.iter())
@@ -330,6 +390,9 @@ pub fn run_vi(
              but much slower than it needs to be."
         ));
     }
+    if let Some(w) = kl_fallback_warning(n_kl_fallback_subjects, n_subjects, family.label()) {
+        warnings.push(w);
+    }
 
     // The ELBO is a lower bound, so it is never reported as the OFV. See
     // `ViFinalOfv` for why, and for how to obtain a real marginal likelihood.
@@ -360,6 +423,41 @@ pub fn run_vi(
         }
     };
 
+    // ---- Covariance step ----
+    //
+    // The same FD-of-OFV Hessian every other estimator uses, evaluated at the VI
+    // estimate with the EBEs and `H` already converged above — so it is a *Laplace*
+    // covariance at the VI point, directly comparable with the one a FOCE/FOCEI or
+    // SAEM fit reports. Deliberately **not** built from `vi.eta_covs`: those are
+    // per-subject *posterior* variances, and variational posteriors are known to
+    // understate them, so they are not a route to population standard errors.
+    //
+    // It runs independently of `vi_final_ofv`: the covariance is the curvature of
+    // the Laplace objective, not of the ELBO, so it is well-defined even when the
+    // reported `ofv` is deliberately left `NaN`. `run_covariance_step` gates itself
+    // on `options.run_covariance_step`, which `fit_inner` clears on every
+    // non-terminal stage of a chain — so a `methods = vi, focei` run pays for it
+    // once, at the end.
+    let packed_final = pack_params(&final_params);
+    let cov_out = crate::estimation::covariance::run_covariance_step(
+        &packed_final,
+        &final_params,
+        model,
+        population,
+        &eta_hats,
+        &h_matrices,
+        &kappas,
+        options,
+        verbose.then_some("Running covariance step..."),
+    );
+    let crate::estimation::covariance::CovStepOutcome {
+        matrix: covariance_matrix,
+        wall_time_secs: covariance_wall_time_secs,
+        warnings: cov_warnings,
+        sir_fallback_proposal,
+    } = cov_out;
+    warnings.extend(cov_warnings);
+
     let vi_result = ViResult {
         neg_two_elbo: 2.0 * final_eval.neg_elbo,
         data_term: final_eval.data_term,
@@ -368,6 +466,15 @@ pub fn run_vi(
         converged,
         family: family.label().to_string(),
         n_mc_samples: cfg.n_mc_samples,
+        // What actually ran, not what was asked for: a family with no closed-form KL
+        // is sampled even under `vi_kl = analytic`.
+        kl: if n_kl_fallback_subjects > 0 || options.vi_kl == crate::types::ViKl::Mc {
+            "mc"
+        } else {
+            "analytic"
+        }
+        .to_string(),
+        n_kl_fallback_subjects,
         elbo_trace: trace,
         eta_means,
         eta_covs,
@@ -382,8 +489,8 @@ pub fn run_vi(
         eta_hats,
         h_matrices,
         kappas,
-        covariance_matrix: None,
-        covariance_wall_time_secs: 0.0,
+        covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
@@ -391,11 +498,14 @@ pub fn run_vi(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
-        sir_fallback_proposal: None,
+        sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
-        packed_estimate: None,
+        // The exact packed vector the covariance step above ran at, so a later
+        // standalone `run_covariance` reproduces it bit-for-bit instead of
+        // re-deriving `chol(Ω)` from `L·Lᵀ` (#816 follow-up).
+        packed_estimate: Some(packed_final),
         vi: Some(vi_result),
         mixture_posteriors: None,
     })

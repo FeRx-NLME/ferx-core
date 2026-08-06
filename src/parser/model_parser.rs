@@ -6987,6 +6987,13 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             }
         }
+        "vi_kl" => {
+            opts.vi_kl = match value.trim().to_lowercase().as_str() {
+                "analytic" | "closed_form" => crate::types::ViKl::Analytic,
+                "mc" | "monte_carlo" => crate::types::ViKl::Mc,
+                other => return Err(format!("vi_kl must be `analytic` or `mc`, got `{other}`")),
+            }
+        }
         "vi_final_ofv" => {
             opts.vi_final_ofv = match value.trim().to_lowercase().as_str() {
                 "none" => crate::types::ViFinalOfv::None,

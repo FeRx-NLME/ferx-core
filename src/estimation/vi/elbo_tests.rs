@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::estimation::parameterization::pack_params;
-use crate::estimation::vi::family::{FullRank, MeanField};
+use crate::estimation::vi::family::{FullRank, KlTerm, MeanField};
 use crate::types::test_helpers::analytical_model;
 use crate::types::{DoseEvent, GradientMethod, Population, Subject};
 use std::collections::HashMap;
@@ -44,8 +44,12 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
     )
     .expect("closed-form 1-cpt IV fixture parses");
     let params = model.default_params.clone();
+    (model, two_subject_population(1.0), params)
+}
 
-    let make = |id: &str, scale: f64| Subject {
+/// Three concentration observations after a single bolus, scaled per subject.
+fn subject(id: &str, scale: f64) -> Subject {
+    Subject {
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0],
@@ -64,17 +68,65 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
         dose_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
-    };
+    }
+}
 
-    let population = Population {
-        subjects: vec![make("1", 1.0), make("2", 1.2)],
+fn two_subject_population(scale: f64) -> Population {
+    Population {
+        subjects: vec![subject("1", scale), subject("2", 1.2 * scale)],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-    };
-    (model, population, params)
+    }
+}
+
+/// As [`fixture`], but with a **mixed** `block_omega` + standalone-eta `Ω` — the
+/// shape `examples/warfarin_block_omega.ferx` uses.
+///
+/// `Ω` is `3 × 3` and declared non-diagonal, so `pack_params` carries the full
+/// lower triangle: `(0,0) (1,0) (2,0) (1,1) (2,1) (2,2)` in column-major order.
+/// The `ETA_KA` row is *not* in the `(ETA_CL, ETA_V)` block, so slots 2 and 4 —
+/// `(2,0)` and `(2,1)` — are **structural zeros**: they occupy packed coordinates
+/// but are not parameters. Nothing else in the VI test suite exercises them.
+fn mixed_omega_fixture() -> (CompiledModel, Population, ModelParameters) {
+    let model = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("mixed block + diagonal omega fixture parses");
+    let params = model.default_params.clone();
+    (model, two_subject_population(1.0), params)
+}
+
+/// Packed `Ω`-block slots of a mixed 3-eta `Ω` that are structural zeros, i.e.
+/// `(2,0)` and `(2,1)` in `pack_params`' column-major lower-triangle order.
+fn structural_zero_slots(template: &ModelParameters) -> Vec<usize> {
+    let n_eta = template.omega.dim();
+    crate::estimation::parameterization::lower_tri_iter(n_eta, template.omega.diagonal)
+        .enumerate()
+        .filter(|&(_, (i, j))| !template.omega.free_mask[(i, j)])
+        .map(|(slot, _)| slot)
+        .collect()
 }
 
 /// Deterministic, non-trivial `φ` per subject — off the prior so nothing is
@@ -95,6 +147,7 @@ fn cfg_seeded() -> ElboConfig {
     ElboConfig {
         n_mc_samples: 3,
         eta_grad: EtaGradMode::Auto,
+        kl: KlMode::Analytic,
         seed: 12345,
     }
 }
@@ -486,6 +539,158 @@ fn closed_form_omega_zeroes_the_omega_gradient() {
     }
 }
 
+/// A mixed `block_omega` + standalone-eta `Ω` must get **no gradient** in its
+/// structural-zero slots, and correct gradients everywhere else.
+///
+/// The two halves matter equally. `∂KL/∂Ω` at a cross-block entry is emphatically
+/// *not* zero — perturbing `Ω` there does change the KL, which the FD assertion
+/// below pins — so the zero has to come from `chain_omega_grad` deliberately
+/// skipping a non-parameter. Without that skip `vi_omega_update = adam` estimates a
+/// covariance the model declared absent, silently and with no error anywhere.
+#[test]
+fn structural_zero_omega_slots_get_no_gradient() {
+    let (model, population, params) = mixed_omega_fixture();
+    let family = FullRank::new(model.n_eta);
+    let phis = perturbed_phis(&family, &params.omega, 2);
+    let x = pack_params(&params);
+    let cfg = cfg_seeded();
+    let layout = PackedLayout::new(&params);
+    let zeros = structural_zero_slots(&params);
+    assert_eq!(
+        zeros,
+        vec![2, 4],
+        "fixture must have (2,0) and (2,1) absent"
+    );
+
+    let e = population_neg_elbo(&model, &population, &params, &x, &family, &phis, &cfg, 4).unwrap();
+
+    for &slot in &zeros {
+        let i = layout.omega_start() + slot;
+        assert_eq!(
+            e.grad_x[i], 0.0,
+            "structural-zero Ω slot {slot} must get no gradient"
+        );
+        // ... and it is a deliberate skip, not an accident of this Ω: the objective
+        // really does respond to that coordinate.
+        let fd = fd_of_neg_elbo_wrt_x(&model, &population, &params, &x, &family, &phis, &cfg, 4, i);
+        assert!(
+            fd.abs() > 1e-6,
+            "test is vacuous: FD at structural-zero slot {slot} is already ~0 ({fd:.3e})"
+        );
+    }
+
+    // Every *free* Ω coordinate still matches FD, so the skip is surgical.
+    for (slot, (i, j)) in
+        crate::estimation::parameterization::lower_tri_iter(model.n_eta, params.omega.diagonal)
+            .enumerate()
+    {
+        if zeros.contains(&slot) {
+            continue;
+        }
+        let idx = layout.omega_start() + slot;
+        let want = fd_of_neg_elbo_wrt_x(
+            &model,
+            &population,
+            &params,
+            &x,
+            &family,
+            &phis,
+            &cfg,
+            4,
+            idx,
+        );
+        let got = e.grad_x[idx];
+        assert!(
+            (got - want).abs() / want.abs().max(1.0) < 1e-6,
+            "free Ω slot {slot} = ({i},{j}): got {got:.9e}, fd {want:.9e}"
+        );
+    }
+}
+
+/// A FIXed eta pins its whole row and column of `Ω`, not just its own variance —
+/// the `fi || fj` rule [`crate::estimation::parameterization::packed_fixed_mask`]
+/// uses. So an off-diagonal inside a block whose partner eta is FIXed gets no
+/// gradient either.
+#[test]
+fn fixed_eta_zeroes_its_whole_omega_row_and_column() {
+    let (model, population, mut params) = mixed_omega_fixture();
+    // FIX ETA_V, the *second* member of the (ETA_CL, ETA_V) block: the (1,0)
+    // off-diagonal is then fixed through its column index, which the previous
+    // row-index-only test would have missed.
+    params.omega_fixed = vec![false, true, false];
+
+    let family = FullRank::new(model.n_eta);
+    let phis = perturbed_phis(&family, &params.omega, 2);
+    let e = population_neg_elbo(
+        &model,
+        &population,
+        &params,
+        &pack_params(&params),
+        &family,
+        &phis,
+        &cfg_seeded(),
+        6,
+    )
+    .unwrap();
+
+    let layout = PackedLayout::new(&params);
+    for (slot, (i, j)) in
+        crate::estimation::parameterization::lower_tri_iter(model.n_eta, params.omega.diagonal)
+            .enumerate()
+    {
+        let touches_fixed = i == 1 || j == 1;
+        let got = e.grad_x[layout.omega_start() + slot];
+        if touches_fixed {
+            assert_eq!(
+                got, 0.0,
+                "Ω({i},{j}) touches FIXed ETA_V but got a gradient"
+            );
+        } else if params.omega.free_mask[(i, j)] {
+            assert!(got != 0.0, "free Ω({i},{j}) lost its gradient");
+        }
+    }
+}
+
+/// The closed-form `Ω` keeps a mixed `Ω`'s structure and restores a FIXed eta's
+/// whole declared row and column.
+#[test]
+fn closed_form_omega_respects_block_structure_and_fixed_rows() {
+    let (_, _, mut params) = mixed_omega_fixture();
+    params.omega_fixed = vec![false, true, false];
+    let declared = params.omega.matrix.clone();
+
+    let family = FullRank::new(3);
+    let phis = perturbed_phis(&family, &params.omega, 4);
+    let out = closed_form_omega(&family, &phis, &params);
+
+    for i in 0..3 {
+        for j in 0..3 {
+            if !params.omega.free_mask[(i, j)] {
+                assert_eq!(
+                    out.matrix[(i, j)],
+                    0.0,
+                    "cross-block Ω({i},{j}) must stay a structural zero"
+                );
+            } else if i == 1 || j == 1 {
+                assert_eq!(
+                    out.matrix[(i, j)].to_bits(),
+                    declared[(i, j)].to_bits(),
+                    "Ω({i},{j}) touches FIXed ETA_V and must keep its declared value"
+                );
+            }
+        }
+    }
+    // The free block entries did move.
+    assert!(
+        (out.matrix[(0, 0)] - declared[(0, 0)]).abs() > 1e-9,
+        "the free ETA_CL variance should have been updated"
+    );
+    assert!(
+        (out.matrix[(2, 2)] - declared[(2, 2)]).abs() > 1e-9,
+        "the free ETA_KA variance should have been updated"
+    );
+}
+
 /// Structural zeros and FIXed diagonals survive the closed-form update.
 #[test]
 fn closed_form_omega_respects_structure() {
@@ -618,6 +823,355 @@ fn eta_grad_probe_agrees_with_evaluation_and_falls_back_loudly() {
     )
     .expect_err("vi_eta_grad = analytic must error on an out-of-scope model");
     assert!(err.contains("analytic"), "unhelpful error: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// Monte-Carlo KL (`vi_kl = mc`)
+// ---------------------------------------------------------------------------
+
+/// `FullRank` with its closed-form KL hidden, standing in for a family that has
+/// none — a Gaussian mixture, a normalizing flow. Every family shipped today *does*
+/// have one, so this stub is the only way to exercise the `vi_kl = analytic`
+/// fallback, which is the extension point the Monte-Carlo path exists to serve.
+struct NoClosedFormKl(FullRank);
+
+impl VariationalFamily for NoClosedFormKl {
+    fn n_eta(&self) -> usize {
+        self.0.n_eta()
+    }
+    fn n_params(&self) -> usize {
+        self.0.n_params()
+    }
+    fn label(&self) -> &'static str {
+        "no_closed_form"
+    }
+    fn init(&self, omega: &OmegaMatrix) -> Vec<f64> {
+        self.0.init(omega)
+    }
+    fn sample(&self, phi: &[f64], eps: &[f64]) -> Vec<f64> {
+        self.0.sample(phi, eps)
+    }
+    fn chain_to_phi(&self, phi: &[f64], eps: &[f64], g_eta: &[f64], out: &mut [f64]) {
+        self.0.chain_to_phi(phi, eps, g_eta, out)
+    }
+    fn kl_to_normal(&self, _phi: &[f64], _omega: &OmegaMatrix) -> Option<KlTerm> {
+        None
+    }
+    fn log_density(&self, phi: &[f64], eta: &[f64]) -> (f64, Vec<f64>) {
+        self.0.log_density(phi, eta)
+    }
+    fn moments(&self, phi: &[f64]) -> (DVector<f64>, DMatrix<f64>) {
+        self.0.moments(phi)
+    }
+}
+
+/// All three halves of the Monte-Carlo KL — value, `∂/∂φ` and `∂/∂Ω` — must converge
+/// to the closed form they replace.
+///
+/// Driven at the **kernel** level rather than through `population_neg_elbo`, for two
+/// reasons. It isolates the new algebra from the data term entirely, so a failure
+/// localizes; and pure density algebra is cheap enough to average 200k draws, which
+/// a Monte-Carlo agreement test needs and a full ELBO evaluation could not afford in
+/// Tier 1.
+///
+/// The `∂/∂φ` half is the load-bearing assertion: it is the path-derivative
+/// estimator, which is unbiased but *not* the derivative of any single draw's value,
+/// so convergence-in-mean to the analytic gradient is the only statement available —
+/// and the right one, since the analytic gradient is itself pinned against FD by
+/// `kl_d_phi_matches_fd`.
+#[test]
+fn mc_kl_kernel_converges_to_the_closed_form() {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, StandardNormal};
+
+    let (_, _, params) = fixture();
+    let d = params.omega.dim();
+    let family = FullRank::new(d);
+    // Off the prior, so nothing is evaluated at a stationary point where the KL and
+    // its derivatives are all trivially zero.
+    let phi = perturbed_phis(&family, &params.omega, 1).remove(0);
+    let closed = family
+        .kl_to_normal(&phi, &params.omega)
+        .expect("FullRank has a closed form");
+
+    let n = 200_000;
+    let mut rng = StdRng::seed_from_u64(4242);
+    let mut value = 0.0;
+    let mut d_phi = vec![0.0; family.n_params()];
+    let mut d_omega = DMatrix::<f64>::zeros(d, d);
+    let inv_n = 1.0 / n as f64;
+
+    for _ in 0..n {
+        let eps: Vec<f64> = (0..d).map(|_| StandardNormal.sample(&mut rng)).collect();
+        let eta = family.sample(&phi, &eps);
+        let draw = mc_kl_draw(&family, &phi, &eta, &params.omega);
+
+        value += inv_n * draw.integrand;
+        d_omega += draw.d_omega * inv_n;
+        // Same chaining the ELBO assembly does: the path-derivative gradient is the
+        // reparameterization Jacobian applied to `∂/∂η` of the integrand.
+        let scaled: Vec<f64> = draw.d_eta.iter().map(|g| g * inv_n).collect();
+        family.chain_to_phi(&phi, &eps, &scaled, &mut d_phi);
+    }
+
+    // Monte-Carlo error at 200k draws; the point is agreement, not precision.
+    assert!(
+        (value - closed.value).abs() < 5e-3,
+        "MC KL value {value:.6} vs closed form {:.6}",
+        closed.value
+    );
+    for (i, (&got, &want)) in d_phi.iter().zip(closed.d_phi.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 0.02 * (1.0 + want.abs()),
+            "path-derivative ∂KL/∂φ[{i}]: mc {got:.6}, closed form {want:.6}"
+        );
+    }
+    for i in 0..d {
+        for j in 0..d {
+            let (got, want) = (d_omega[(i, j)], closed.d_omega[(i, j)]);
+            assert!(
+                (got - want).abs() < 0.02 * (1.0 + want.abs()),
+                "MC ∂KL/∂Ω[{i},{j}]: {got:.6} vs closed form {want:.6}"
+            );
+        }
+    }
+}
+
+/// The "sticking the landing" property, exactly rather than in expectation: at
+/// `φ = init(Ω)` the variational posterior *is* the prior, so
+/// `∇_η log q + Ω⁻¹η ≡ 0` for every draw and the KL contributes nothing to the
+/// gradient.
+///
+/// So at that point the two routes must produce **identical** `φ` gradients — the
+/// analytic KL's `d_phi` is also zero there — and identical values. This pins the
+/// MC kernel's sign and scale without any Monte-Carlo tolerance, which the
+/// convergence test above cannot.
+#[test]
+fn mc_and_analytic_agree_exactly_at_the_prior() {
+    let (model, population, params) = fixture();
+    let family = FullRank::new(model.n_eta);
+    let phis: Vec<Vec<f64>> = (0..2).map(|_| family.init(&params.omega)).collect();
+    let x = pack_params(&params);
+
+    let eval = |kl| {
+        population_neg_elbo(
+            &model,
+            &population,
+            &params,
+            &x,
+            &family,
+            &phis,
+            &ElboConfig { kl, ..cfg_seeded() },
+            3,
+        )
+        .unwrap()
+    };
+    let analytic = eval(KlMode::Analytic);
+    let mc = eval(KlMode::Mc);
+
+    assert!(
+        analytic.kl_term.abs() < 1e-9 && mc.kl_term.abs() < 1e-9,
+        "both routes should report a zero KL at the prior: analytic {}, mc {}",
+        analytic.kl_term,
+        mc.kl_term
+    );
+    for (s, (ga, gm)) in analytic.grad_phi.iter().zip(mc.grad_phi.iter()).enumerate() {
+        for (i, (a, m)) in ga.iter().zip(gm.iter()).enumerate() {
+            assert!(
+                (a - m).abs() < 1e-9 * (1.0 + a.abs()),
+                "at the prior the KL contributes nothing, so φ[{s}][{i}] must agree: \
+                 analytic {a:.9e}, mc {m:.9e}"
+            );
+        }
+    }
+    // The data term is driven by the same common random numbers either way.
+    assert_eq!(analytic.data_term.to_bits(), mc.data_term.to_bits());
+}
+
+/// Under `vi_kl = mc` the **`x`** gradient stays exactly FD-checkable — including the
+/// `Ω` block, whose MC derivative has nothing dropped — while the **`φ`** gradient
+/// deliberately does not match FD, because it is a path derivative.
+///
+/// Both halves are asserted. The first is the ordinary parity requirement. The second
+/// guards the documentation: if someone "fixed" `mc_kl_draw` by adding the score term
+/// back, `φ` would start matching FD and this test would fail, which is the point —
+/// that change would silently raise the gradient variance the estimator exists to
+/// avoid.
+#[test]
+fn mc_kl_grad_x_matches_fd_but_phi_is_path_derivative() {
+    let (model, population, params) = fixture();
+    let family = FullRank::new(model.n_eta);
+    let phis = perturbed_phis(&family, &params.omega, 2);
+    let x = pack_params(&params);
+    let cfg = ElboConfig {
+        kl: KlMode::Mc,
+        ..cfg_seeded()
+    };
+    let iter = 11;
+    let layout = PackedLayout::new(&params);
+
+    let e =
+        population_neg_elbo(&model, &population, &params, &x, &family, &phis, &cfg, iter).unwrap();
+
+    for (i, &got) in e.grad_x.iter().enumerate() {
+        let want = fd_of_neg_elbo_wrt_x(
+            &model,
+            &population,
+            &params,
+            &x,
+            &family,
+            &phis,
+            &cfg,
+            iter,
+            i,
+        );
+        // The θ block inherits `obs_nll_subject_grad`'s forward-FD truncation, as in
+        // `neg_elbo_gradient_matches_central_fd`; σ and Ω are analytic.
+        let tol = if i < layout.n_theta { 2e-3 } else { 1e-6 };
+        assert!(
+            (got - want).abs() / want.abs().max(1.0) < tol,
+            "mc-KL ∂(−ELBO)/∂x[{i}]: got {got:.9e}, fd {want:.9e}"
+        );
+    }
+
+    // And the φ gradient is a path derivative: it must differ from FD somewhere.
+    let mut max_rel_gap = 0.0f64;
+    for (s, gphi) in e.grad_phi.iter().enumerate() {
+        for (i, &got) in gphi.iter().enumerate() {
+            let want = fd_of_neg_elbo_wrt_phi(
+                &model,
+                &population,
+                &params,
+                &x,
+                &family,
+                &phis,
+                &cfg,
+                iter,
+                s,
+                i,
+            );
+            max_rel_gap = max_rel_gap.max((got - want).abs() / want.abs().max(1.0));
+        }
+    }
+    assert!(
+        max_rel_gap > 1e-4,
+        "the path-derivative estimator drops the score term, so φ must NOT match FD \
+         (max relative gap {max_rel_gap:.3e}); if this fires, mc_kl_draw has started \
+         computing a total derivative and the variance argument in its docs no longer holds"
+    );
+}
+
+/// A family with no closed-form KL falls back to sampling instead of failing — the
+/// behaviour [`VariationalFamily::kl_to_normal`]'s contract promises — and the
+/// fallback is reported rather than silent.
+///
+/// The fallback must also be the *same* code path as the explicit option, so the stub
+/// under `vi_kl = analytic` is asserted bit-identical to real `FullRank` under
+/// `vi_kl = mc`: same draws, same kernel, same numbers.
+#[test]
+fn family_without_a_closed_form_kl_falls_back_to_sampling() {
+    let (model, population, params) = fixture();
+    let stub = NoClosedFormKl(FullRank::new(model.n_eta));
+    let real = FullRank::new(model.n_eta);
+    let phis = perturbed_phis(&real, &params.omega, 2);
+    let x = pack_params(&params);
+
+    let fell_back = population_neg_elbo(
+        &model,
+        &population,
+        &params,
+        &x,
+        &stub,
+        &phis,
+        &ElboConfig {
+            kl: KlMode::Analytic,
+            ..cfg_seeded()
+        },
+        5,
+    )
+    .expect("a family without a closed-form KL must fall back, not fail");
+    assert_eq!(
+        fell_back.n_kl_fallback_subjects, 2,
+        "every subject's fallback must be reported"
+    );
+
+    let explicit = population_neg_elbo(
+        &model,
+        &population,
+        &params,
+        &x,
+        &real,
+        &phis,
+        &ElboConfig {
+            kl: KlMode::Mc,
+            ..cfg_seeded()
+        },
+        5,
+    )
+    .unwrap();
+    assert_eq!(
+        explicit.n_kl_fallback_subjects, 0,
+        "asking for mc outright is not a fallback"
+    );
+
+    assert_eq!(fell_back.neg_elbo.to_bits(), explicit.neg_elbo.to_bits());
+    assert_eq!(fell_back.kl_term.to_bits(), explicit.kl_term.to_bits());
+    for (a, b) in fell_back.grad_x.iter().zip(explicit.grad_x.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits());
+    }
+    for (ga, gb) in fell_back.grad_phi.iter().zip(explicit.grad_phi.iter()) {
+        for (a, b) in ga.iter().zip(gb.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+}
+
+/// With enough draws the two routes agree on the objective itself, and the data half
+/// is bit-identical either way — the switch moves only the KL.
+#[test]
+fn mc_and_analytic_kl_agree_on_the_objective() {
+    let (model, population, params) = fixture();
+    let family = FullRank::new(model.n_eta);
+    let phis = perturbed_phis(&family, &params.omega, 2);
+    let x = pack_params(&params);
+
+    let eval = |kl, s| {
+        population_neg_elbo(
+            &model,
+            &population,
+            &params,
+            &x,
+            &family,
+            &phis,
+            &ElboConfig {
+                kl,
+                n_mc_samples: s,
+                ..cfg_seeded()
+            },
+            9,
+        )
+        .unwrap()
+    };
+
+    let analytic = eval(KlMode::Analytic, 4000);
+    let mc = eval(KlMode::Mc, 4000);
+
+    assert_eq!(
+        analytic.data_term.to_bits(),
+        mc.data_term.to_bits(),
+        "the data half must not depend on the KL route"
+    );
+    assert!(
+        (analytic.kl_term - mc.kl_term).abs() < 0.02 * (1.0 + analytic.kl_term.abs()),
+        "kl_term: analytic {:.6}, mc {:.6}",
+        analytic.kl_term,
+        mc.kl_term
+    );
+    assert!(
+        analytic.kl_term > 0.0,
+        "a KL away from the prior is positive"
+    );
 }
 
 /// IOV is rejected outright — the variational family would have to cover

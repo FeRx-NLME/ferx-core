@@ -2245,6 +2245,32 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+        // `vi_kl = mc` + `vi_omega_update = adam` is the *only* combination in which
+        // nothing anchors Ω: the closed form is gone, and the gradient replacing it is
+        // now sampled rather than exact. Each option alone is fine — with `adam` under
+        // the analytic KL, ∂KL/∂Ω is exact; with `mc` under the closed form, Ω never
+        // enters the stochastic optimization at all. Together they reproduce precisely
+        // the setup whose Ω instability Janssen et al. report (their Fig. 3), so it is
+        // worth saying so rather than letting a user rediscover it. A warning and not
+        // an error: reproducing the published behaviour is a legitimate thing to ask
+        // for, and it is the reason both options exist.
+        if options.vi_kl == crate::types::ViKl::Mc
+            && options.vi_omega_update == crate::types::ViOmegaUpdate::Adam
+        {
+            diags.push(
+                Diagnostic::warning(
+                    "W_VI_OMEGA_UNANCHORED",
+                    "vi_kl = mc with vi_omega_update = adam leaves Omega driven entirely by a \
+                     Monte-Carlo gradient: the closed-form maximizer is disabled and the \
+                     gradient that replaces it is now sampled rather than exact. This is the \
+                     configuration Janssen et al. (2024) report Omega fluctuating badly in. \
+                     Expect a noisy Omega trace and possible non-convergence. Keep \
+                     vi_omega_update = closed_form (still exact in expectation under a sampled \
+                     KL), or raise vi_mc_samples substantially.",
+                )
+                .with_block("fit_options"),
+            );
+        }
     }
 
     // SDE ([diffusion]) is incompatible with SAEM, with the Gauss-Newton
@@ -3314,6 +3340,10 @@ mod residual_magnitude_tests;
 #[cfg(test)]
 #[path = "tests/kappa_weight_tests.rs"]
 mod kappa_weight_tests;
+
+#[cfg(test)]
+#[path = "tests/vi_option_tests.rs"]
+mod vi_option_tests;
 
 /// Feature-presence (data-independent) *warning*-level checks for experimental
 /// features (issue #175). Stochastic differential equations and neural-network

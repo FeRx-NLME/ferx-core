@@ -3,7 +3,7 @@
 use super::*;
 use crate::types::{
     BloqMethod, DoseEvent, EstimationMethod, GradientMethod, Subject, ViEtaGrad, ViFamily,
-    ViFinalOfv, ViOmegaUpdate,
+    ViFinalOfv, ViKl, ViOmegaUpdate,
 };
 use std::collections::HashMap;
 
@@ -63,6 +63,38 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
         exclusions: None,
         warnings: vec![],
     };
+    (model, population, params)
+}
+
+/// As [`fixture`], but with a **mixed** `block_omega` + standalone-eta `Ω` — the
+/// shape `examples/warfarin_block_omega.ferx` uses. The `ETA_KA` row is outside the
+/// `(ETA_CL, ETA_V)` block, so `Ω(2,0)` and `Ω(2,1)` are structural zeros.
+fn mixed_omega_fixture() -> (CompiledModel, Population, ModelParameters) {
+    let model = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("mixed omega fixture parses");
+    let params = model.default_params.clone();
+    let (_, population, _) = fixture();
     (model, population, params)
 }
 
@@ -330,6 +362,259 @@ fn fixed_parameters_do_not_move() {
     assert!(
         out.params.theta[0] != params.theta[0],
         "the free theta should still have been estimated"
+    );
+}
+
+/// A declared `θ` box must hold.
+///
+/// Adam is unconstrained, so the box is enforced only by the projection in
+/// `run_vi`; without it a bound is *silently* ignored, which is worse than
+/// refusing it. The box below is positioned to exclude wherever the free fit
+/// actually goes, so the constraint is genuinely active rather than incidentally
+/// satisfied — and the free estimate is asserted to lie outside it, which is what
+/// makes this a regression test rather than a tautology.
+#[test]
+fn declared_theta_bounds_are_enforced() {
+    let (model, population, params) = fixture();
+
+    let free = run_vi(&model, &population, &params, &opts(60))
+        .unwrap()
+        .params
+        .theta[0];
+    assert!(
+        (free - params.theta[0]).abs() > 1e-6,
+        "the free fit must move TVCL for this test to constrain anything (got {free})"
+    );
+
+    // A box containing the initial estimate but not `free`, on whichever side of
+    // the init the free fit did not travel toward.
+    let midpoint = 0.5 * (free + params.theta[0]);
+    let (lo, hi) = if free < params.theta[0] {
+        (midpoint, 10.0)
+    } else {
+        (0.1, midpoint)
+    };
+
+    let mut bounded = params.clone();
+    bounded.theta_lower[0] = lo;
+    bounded.theta_upper[0] = hi;
+    let got = run_vi(&model, &population, &bounded, &opts(60))
+        .unwrap()
+        .params
+        .theta[0];
+
+    // ULP-scale slack: the box is enforced in *packed* space, exactly as it is for
+    // FOCE/FOCEI, so `x` is clamped to `ln(lo)` and `exp(ln(lo))` need not be
+    // bit-identical to `lo`. Snapping the natural-scale value instead would make VI
+    // behave differently from every other estimator. This is still ~4 orders tighter
+    // than the pre-fix escape (a few percent of the bound).
+    let slack = |b: f64| 1e-12 * (1.0 + b.abs());
+    assert!(
+        got >= lo - slack(lo) && got <= hi + slack(hi),
+        "TVCL = {got} escaped its declared bounds [{lo}, {hi}]"
+    );
+    assert!(
+        free < lo || free > hi,
+        "test is vacuous: the unbounded estimate {free} is already inside [{lo}, {hi}]"
+    );
+}
+
+/// The covariance step runs at the VI estimate, so a VI fit reports standard
+/// errors like every other method instead of a `FAILED` covariance status.
+///
+/// It is the ordinary FD-of-OFV Hessian — a *Laplace* covariance at the VI point —
+/// not anything derived from `vi.eta_covs`, which are per-subject posterior
+/// variances that variational families are known to understate.
+#[test]
+fn covariance_step_runs_at_the_vi_estimate() {
+    let (model, population, params) = fixture();
+    let mut o = opts(40);
+    o.run_covariance_step = true;
+    o.vi_final_ofv = ViFinalOfv::Laplace;
+
+    let out = run_vi(&model, &population, &params, &o).unwrap();
+    let cov = out
+        .covariance_matrix
+        .as_ref()
+        .expect("VI must run the covariance step");
+
+    let n = crate::estimation::parameterization::pack_params(&out.params).len();
+    assert_eq!(cov.nrows(), n, "covariance is packed-parameter sized");
+    assert_eq!(cov.ncols(), n);
+    for i in 0..n {
+        assert!(cov[(i, i)] >= 0.0, "negative variance at [{i},{i}]");
+        for j in 0..n {
+            assert!(
+                (cov[(i, j)] - cov[(j, i)]).abs() <= 1e-10 * (1.0 + cov[(i, j)].abs()),
+                "covariance must be symmetric at [{i},{j}]"
+            );
+        }
+    }
+    assert!(out.covariance_wall_time_secs > 0.0, "cov time not recorded");
+
+    // The exact packed vector the step ran at, so a standalone `run_covariance`
+    // reproduces it rather than re-deriving `chol(Ω)` from `L·Lᵀ`.
+    assert_eq!(
+        out.packed_estimate.as_deref(),
+        Some(crate::estimation::parameterization::pack_params(&out.params).as_slice()),
+        "packed_estimate must be the vector the covariance step used"
+    );
+}
+
+/// And the step honours its gate: `fit_inner` clears `run_covariance_step` on every
+/// non-terminal stage of a chain, so a `methods = vi, focei` run must not pay for a
+/// covariance matrix twice.
+#[test]
+fn covariance_step_is_skipped_when_not_requested() {
+    let (model, population, params) = fixture();
+    let mut o = opts(20);
+    o.run_covariance_step = false;
+
+    let out = run_vi(&model, &population, &params, &o).unwrap();
+    assert!(out.covariance_matrix.is_none());
+    assert_eq!(out.covariance_wall_time_secs, 0.0);
+}
+
+/// `vi_kl = mc` runs end to end, reports which route it took, and lands in the same
+/// neighbourhood as the analytic KL.
+///
+/// The two are not expected to agree closely — the whole point of the default is that
+/// sampling the KL is noisier — but a gross disagreement would mean the Monte-Carlo
+/// kernel has the wrong sign or scale somewhere.
+#[test]
+fn mc_kl_route_runs_and_reports_itself() {
+    let (model, population, params) = fixture();
+
+    let analytic = run_vi(&model, &population, &params, &opts(80)).unwrap();
+    assert_eq!(analytic.vi.as_ref().unwrap().kl, "analytic");
+
+    let mut o = opts(80);
+    o.vi_kl = ViKl::Mc;
+    // The KL is sampled here, so give the estimator more draws than the default.
+    o.vi_mc_samples = 8;
+    let mc = run_vi(&model, &population, &params, &o).unwrap();
+    let vi = mc.vi.as_ref().unwrap();
+
+    assert_eq!(vi.kl, "mc", "the route actually taken must be reported");
+    assert_eq!(
+        vi.n_kl_fallback_subjects, 0,
+        "asking for mc outright is not a fallback"
+    );
+    assert!(vi.neg_two_elbo.is_finite());
+    assert!(
+        !mc.warnings.iter().any(|w| w.contains("no closed-form KL")),
+        "no fallback warning should fire when mc was requested: {:?}",
+        mc.warnings
+    );
+
+    // The objective still descends.
+    let mean = |s: &[f64]| s.iter().sum::<f64>() / s.len() as f64;
+    assert!(
+        mean(&vi.elbo_trace[70..]) < mean(&vi.elbo_trace[..10]),
+        "the mc-KL objective should still decrease"
+    );
+
+    for k in 0..2 {
+        let (a, m) = (analytic.params.theta[k], mc.params.theta[k]);
+        assert!(
+            (a - m).abs() / a.abs().max(1e-6) < 0.5,
+            "theta[{k}]: analytic {a:.6}, mc {m:.6} — routes disagree grossly"
+        );
+    }
+    for k in 0..2 {
+        let (a, m) = (
+            analytic.params.omega.matrix[(k, k)],
+            mc.params.omega.matrix[(k, k)],
+        );
+        assert!(m > 0.0, "omega[{k},{k}] must stay positive under mc-KL");
+        assert!(
+            (a - m).abs() / a.abs().max(1e-6) < 1.0,
+            "omega[{k},{k}]: analytic {a:.6}, mc {m:.6}"
+        );
+    }
+}
+
+/// The fallback warning fires only when a family actually had no closed form, and
+/// names the option that silences it.
+#[test]
+fn kl_fallback_warning_reports_only_a_real_fallback() {
+    assert!(kl_fallback_warning(0, 10, "full_rank").is_none());
+
+    let w = kl_fallback_warning(3, 10, "some_flow").expect("a real fallback must warn");
+    assert!(w.contains("some_flow"), "the family should be named: {w}");
+    assert!(w.contains('3') && w.contains("10"), "counts missing: {w}");
+    assert!(
+        w.contains("vi_kl = mc"),
+        "the warning should name the option that silences it: {w}"
+    );
+}
+
+/// A mixed `block_omega` + standalone-eta `Ω` keeps its declared structure through a
+/// whole fit, under **both** `Ω` update routes.
+///
+/// The two routes reach it differently and both need checking. `closed_form` masks
+/// `Ω` in `Ω` space every iteration. `adam` relies on the gradient skip in
+/// `chain_omega_grad` plus a fact about the parameterization: the Cholesky factor of
+/// a matrix that is block-diagonal under permutation is itself zero wherever the
+/// matrix is, so a packed slot that starts at `0.0` and is never stepped
+/// reconstructs `Ω[i,j] = Σₖ L[i,k]·L[j,k]` as *exactly* `0.0`. Hence the
+/// bit-equality assertion rather than a tolerance — a tolerance would hide a slot
+/// that had drifted a little.
+#[test]
+fn mixed_omega_keeps_its_structural_zeros_through_a_fit() {
+    for route in [ViOmegaUpdate::ClosedForm, ViOmegaUpdate::Adam] {
+        let (model, population, params) = mixed_omega_fixture();
+        let mut o = opts(60);
+        o.vi_omega_update = route;
+
+        let out = run_vi(&model, &population, &params, &o).unwrap();
+        let om = &out.params.omega.matrix;
+
+        for (i, j) in [(2usize, 0usize), (2, 1), (0, 2), (1, 2)] {
+            assert_eq!(
+                om[(i, j)],
+                0.0,
+                "{route:?}: Ω({i},{j}) is a structural zero but came back {}",
+                om[(i, j)]
+            );
+        }
+        // The within-block covariance is a real parameter and must still be estimated.
+        assert!(
+            om[(1, 0)] != 0.0,
+            "{route:?}: the (ETA_CL, ETA_V) block covariance was not estimated"
+        );
+        assert!(
+            (om[(1, 0)] - om[(0, 1)]).abs() < 1e-15,
+            "{route:?}: Ω must stay symmetric"
+        );
+        for k in 0..3 {
+            assert!(om[(k, k)] > 0.0, "{route:?}: Ω({k},{k}) must stay positive");
+        }
+    }
+}
+
+/// A FIXed eta inside a block keeps its whole declared row and column through a fit
+/// on the default (closed-form) route, where the restoration is exact.
+#[test]
+fn fixed_eta_in_a_block_keeps_its_declared_row() {
+    let (model, population, mut params) = mixed_omega_fixture();
+    params.omega_fixed = vec![false, true, false];
+    let declared = params.omega.matrix.clone();
+
+    let out = run_vi(&model, &population, &params, &opts(50)).unwrap();
+    let om = &out.params.omega.matrix;
+
+    for k in 0..3 {
+        assert_eq!(
+            om[(1, k)].to_bits(),
+            declared[(1, k)].to_bits(),
+            "Ω(1,{k}) touches FIXed ETA_V and must keep its declared value"
+        );
+        assert_eq!(om[(k, 1)].to_bits(), declared[(k, 1)].to_bits());
+    }
+    assert!(
+        (om[(0, 0)] - declared[(0, 0)]).abs() > 1e-9,
+        "the free ETA_CL variance should still have been estimated"
     );
 }
 

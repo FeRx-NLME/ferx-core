@@ -265,8 +265,10 @@ fn chain_to_phi_accumulates() {
 
 /// The closed-form KL must equal a Monte-Carlo estimate of
 /// `E_q[log q(η) − log p(η|Ω)]`. This cross-checks the analytic KL against the
-/// family's own `log_density` and the prior — the two halves of the default and
-/// fallback paths must agree, or the `vi_kl` switch would change the objective.
+/// family's own `log_density` and the prior — the two halves of the `vi_kl` routes
+/// must agree, or the switch would change the objective rather than only its
+/// variance. The same identity is checked at the ELBO level, with derivatives, by
+/// `elbo_tests::mc_kl_kernel_converges_to_the_closed_form`.
 #[test]
 fn closed_form_kl_matches_monte_carlo() {
     use rand::rngs::StdRng;

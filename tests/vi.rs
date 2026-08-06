@@ -81,7 +81,7 @@ fn vi_options_parse_from_the_model_file() {
         "{WARFARIN_SRC}\n[fit_options]\n  method = vi\n  vi_iters = 5\n  \
          vi_mc_samples = 2\n  vi_lr = 0.02\n  vi_family = mean_field\n  \
          vi_omega_update = adam\n  vi_avg_last = 3\n  vi_eta_grad = fd\n  \
-         vi_final_ofv = laplace\n  vi_seed = 42\n"
+         vi_kl = mc\n  vi_final_ofv = laplace\n  vi_seed = 42\n"
     );
     let parsed = parse_full_model(&src).expect("the vi_* keys parse");
     let o = &parsed.fit_options;
@@ -93,6 +93,7 @@ fn vi_options_parse_from_the_model_file() {
     assert_eq!(o.vi_omega_update, ferx_core::ViOmegaUpdate::Adam);
     assert_eq!(o.vi_avg_last, Some(3));
     assert_eq!(o.vi_eta_grad, ferx_core::ViEtaGrad::Fd);
+    assert_eq!(o.vi_kl, ferx_core::ViKl::Mc);
     assert_eq!(o.vi_final_ofv, ViFinalOfv::Laplace);
     assert_eq!(o.vi_seed, Some(42));
 }
@@ -119,6 +120,14 @@ fn unknown_vi_option_values_are_rejected_with_a_useful_message() {
     assert!(
         err.contains("imp_eval_only"),
         "the error should point at the chain that does give an IS likelihood, got: {err}"
+    );
+
+    let err = parse_err(&format!(
+        "{WARFARIN_SRC}\n[fit_options]\n  method = vi\n  vi_kl = laplace\n"
+    ));
+    assert!(
+        err.contains("analytic") && err.contains("mc"),
+        "the error should name the valid values, got: {err}"
     );
 }
 
@@ -192,6 +201,140 @@ fn mean_field_family_runs_end_to_end() {
     assert_eq!(vi.family, "mean_field");
     // A diagonal posterior has no off-diagonal covariance to report.
     assert_eq!(vi.eta_covs[0][0][1], 0.0);
+}
+
+/// `vi_kl = mc` is reachable through the public API and reports the route it took.
+///
+/// Both routes estimate the same objective, so the fitted `θ` should be close; the
+/// Monte-Carlo KL is only noisier. See `src/estimation/vi/elbo_tests.rs` for the
+/// kernel-level convergence and gradient checks.
+#[test]
+fn mc_kl_route_runs_end_to_end() {
+    let (model, population) = (warfarin_model(), warfarin_data());
+
+    let analytic = run(&model, &population, &vi_opts(10));
+    assert_eq!(analytic.vi.as_ref().unwrap().kl, "analytic");
+
+    let mut opts = vi_opts(10);
+    opts.vi_kl = ferx_core::ViKl::Mc;
+    opts.vi_mc_samples = 8;
+    let result = run(&model, &population, &opts);
+    let vi = result.vi.as_ref().expect("FitResult::vi populated");
+
+    assert_eq!(vi.kl, "mc");
+    assert_eq!(vi.n_kl_fallback_subjects, 0);
+    assert!(vi.neg_two_elbo.is_finite());
+    assert!(result.theta.iter().all(|t| t.is_finite() && *t > 0.0));
+    for k in 0..3 {
+        assert!(result.omega[(k, k)] > 0.0);
+    }
+}
+
+/// Combining `vi_kl = mc` with `vi_omega_update = adam` warns, and the warning reaches
+/// `FitResult$warnings` rather than only `ferx check`.
+///
+/// That plumbing is the substance of this test: `fit_inner` consumes
+/// `check_model_options` through `first_error`, which discards warning-severity
+/// diagnostics, so a warning-only check needs the second collecting pass to be visible
+/// at all. It must also *not* block the fit — this is the published configuration.
+#[test]
+fn mc_kl_with_adam_omega_warns_but_still_fits() {
+    let (model, population) = (warfarin_model(), warfarin_data());
+    let mut opts = vi_opts(10);
+    opts.vi_kl = ferx_core::ViKl::Mc;
+    opts.vi_omega_update = ferx_core::ViOmegaUpdate::Adam;
+
+    let result = run(&model, &population, &opts);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("vi_kl = mc") && w.contains("vi_omega_update = adam")),
+        "the unanchored-Omega warning must reach FitResult; warnings were {:?}",
+        result.warnings
+    );
+    // A warning, not a refusal: the fit ran and Omega is still usable.
+    assert!(result.vi.is_some());
+    for k in 0..3 {
+        assert!(result.omega[(k, k)] > 0.0);
+    }
+
+    // The default pair is silent.
+    let quiet = run(&model, &population, &vi_opts(10));
+    assert!(
+        !quiet
+            .warnings
+            .iter()
+            .any(|w| w.contains("vi_omega_update = adam")),
+        "the default configuration must not warn; warnings were {:?}",
+        quiet.warnings
+    );
+}
+
+/// A VI fit reports standard errors and a `Computed` covariance status, like every
+/// other method — the covariance step runs at the VI estimate.
+///
+/// Only the public boundary can check this: `covariance_status` is resolved in
+/// `fit_inner` from `run_covariance_step && matrix.is_some()`, so an estimator that
+/// silently skipped the step would surface here as `Failed` with no SEs.
+#[test]
+fn covariance_step_produces_standard_errors() {
+    let (model, population) = (warfarin_model(), warfarin_data());
+    let mut opts = vi_opts(10);
+    opts.run_covariance_step = true;
+
+    let result = run(&model, &population, &opts);
+    assert_eq!(
+        result.covariance_status,
+        ferx_core::CovarianceStatus::Computed,
+        "VI must run the covariance step; warnings were {:?}",
+        result.warnings
+    );
+    let se = result
+        .se_theta
+        .as_ref()
+        .expect("a computed covariance must yield theta SEs");
+    assert_eq!(se.len(), 3);
+    assert!(
+        se.iter().all(|s| s.is_finite() && *s > 0.0),
+        "SEs must be finite and positive, got {se:?}"
+    );
+    // The ELBO contract is unaffected: SEs come from the Laplace covariance, so a
+    // NaN OFV and a computed covariance coexist.
+    assert!(result.ofv.is_nan());
+}
+
+/// Declared `θ` bounds hold through the public API. Adam is unconstrained, so
+/// without the projection in `run_vi` the box would be silently ignored.
+///
+/// The comparison carries a ULP-scale tolerance because the box is enforced in
+/// *packed* space, exactly as it is for FOCE/FOCEI: `x` is clamped to `ln(lower)`
+/// and `unpack_params` reports `exp(ln(lower))`, which is not bit-identical to
+/// `lower`. Snapping the natural-scale value instead would make VI behave
+/// differently from every other estimator. The tolerance is ~4 orders tighter than
+/// the pre-fix escape (3% of the bound), so it still catches an unenforced box.
+#[test]
+fn declared_theta_bounds_hold_through_the_api() {
+    let population = warfarin_data();
+
+    // The free estimate first, then a box that excludes it.
+    let free = run(&warfarin_model(), &population, &vi_opts(40)).theta[0];
+    let src = WARFARIN_SRC.replace(
+        "theta TVCL(0.13, 0.001, 10.0)",
+        &format!("theta TVCL(0.13, {:.10}, 10.0)", 0.5 * (free + 0.13)),
+    );
+    let bounded = parse_model_string(&src).expect("bounded model parses");
+    let lower = bounded.default_params.theta_lower[0];
+    assert!(
+        free < lower,
+        "test is vacuous: free TVCL {free} is not below the new lower bound {lower}"
+    );
+
+    let got = run(&bounded, &population, &vi_opts(40)).theta[0];
+    assert!(
+        got >= lower - 1e-12 * (1.0 + lower.abs()),
+        "TVCL = {got} escaped its declared lower bound {lower}"
+    );
 }
 
 // ---------------------------------------------------------------------------

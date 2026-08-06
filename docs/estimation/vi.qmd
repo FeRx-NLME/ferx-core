@@ -107,6 +107,7 @@ All keys go in `[fit_options]`.
 | `vi_omega_update` | `closed_form` | `closed_form` or `adam` |
 | `vi_avg_last` | final 25% | Polyak averaging window (iterations) |
 | `vi_eta_grad` | `auto` | `auto`, `analytic`, or `fd` |
+| `vi_kl` | `analytic` | `analytic` or `mc` — how the KL half is evaluated |
 | `vi_final_ofv` | `none` | `none` or `laplace` |
 | `vi_seed` | fixed default | Seed for the common random numbers |
 
@@ -116,6 +117,41 @@ All keys go in `[fit_options]`.
 fits a diagonal covariance: `O(d)` parameters per subject rather than `O(d²)`, so it is
 preferable once `n_eta` is large — at the cost of a looser bound whenever the true posterior
 is correlated, which for CL/V it almost always is.
+
+### The KL half: `vi_kl`
+
+By default the `KL(q ‖ N(0, Ω))` term is taken in closed form, so only the data term is
+sampled. `vi_kl = mc` estimates it from the same draws instead, as
+`E_q[log q(η) − log p(η | Ω)]`.
+
+Both estimate the same objective and `mc` is unbiased, so this is a **variance** choice, not
+an accuracy one. Three reasons it exists:
+
+- It reproduces Janssen et al., who sample the whole ELBO.
+- It is what a variational family with no closed-form KL — a mixture, a normalizing flow —
+  will need. Such a family falls back to it automatically, with a warning, rather than
+  failing; `FitResult$vi$kl` reports which route actually ran and
+  `n_kl_fallback_subjects` how many subjects fell back.
+- It cross-checks the analytic KL against a route sharing none of its algebra, the same way
+  `vi_eta_grad = fd` cross-checks the analytic `∂/∂η`.
+
+Expect a noisier ELBO trace; raise `vi_mc_samples` to compensate. Keep
+`vi_omega_update = closed_form`, which stays valid under a sampled KL because the sampled
+`∂KL/∂Ω` has the closed form as its expectation.
+
+Combining `vi_kl = mc` with `vi_omega_update = adam` is the one configuration in which nothing
+exact anchors `Ω` — the closed-form maximizer is off and the gradient replacing it is sampled —
+and it warns (`W_VI_OMEGA_UNANCHORED`). Either option alone is fine: under the analytic KL the
+`Ω` gradient is exact, and under the closed form `Ω` never enters the stochastic optimization
+at all. It is a warning rather than an error because that pair is precisely what Janssen et al.
+run, so reproducing their result is a legitimate reason to ask for it — expect the `Ω`
+fluctuation their Fig. 3 shows.
+
+The gradient uses the path-derivative ("sticking the landing", Roeder et al. 2017) estimator,
+which drops a score term with zero expectation. That lowers variance — decisively so near the
+optimum, where it is the only remaining noise — and makes the KL gradient vanish exactly when
+`q` equals the prior. One consequence worth knowing if you are reading the code: under
+`vi_kl = mc` the reported `φ` gradient is deliberately not the derivative of the reported ELBO.
 
 ### Why there is no convergence tolerance
 
@@ -138,12 +174,47 @@ Random draws come from a seed derived deterministically from
 reproducible regardless of thread count. `q` starts at the prior and `θ` at the model file's
 initial estimates — no random initialization.
 
+### Parameter bounds
+
+Declared bounds are respected. `theta TVCL(0.13, 0.001, 10.0)` constrains a VI fit exactly as
+it constrains a FOCE/FOCEI or SAEM fit: Adam is unconstrained, so each step is followed by a
+projection back into the box, and `Ω`/`σ` pick up the same runaway guards the other estimators
+get. A `θ` that ends up pinned against a bound raises the usual boundary warning.
+
+Bounds are enforced in the same transformed space the optimizer works in (log for a
+sign-constrained `θ`), so a reported estimate sitting *on* a bound can differ from the declared
+value in the last significant digit — the same behaviour as every other method.
+
+### Ω structure
+
+A `block_omega` declaration is honoured. In a mixed `Ω` —
+
+``` ferx
+block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+omega ETA_KA ~ 0.30
+```
+
+— the `ETA_KA`/`ETA_CL` and `ETA_KA`/`ETA_V` covariances are not parameters, and VI leaves them
+at exactly zero rather than letting them pick up sampling correlation. Both `vi_omega_update`
+routes preserve this: the closed-form maximizer masks `Ω` directly, and the Adam route simply
+gets no gradient at those coordinates. A `FIX`ed random effect likewise keeps its whole declared
+row and column of `Ω`, not just its own variance.
+
 ## Standard errors
 
 Variational posteriors are known to **understate** posterior variance relative to MCMC, which
 Janssen et al. flag as a limitation of the approach. So `FitResult$vi$eta_covs` is for
-individual-level reporting and shrinkage, not for population standard errors. Those come from
-the ordinary covariance step, evaluated at the VI estimate, exactly as for any other method.
+individual-level reporting and shrinkage, and is **not** the route to population standard
+errors.
+
+Those come from the ordinary covariance step — the same FD-of-OFV Hessian every other method
+uses — run at the VI estimate on the EBEs and `H` from VI's final inner-loop pass. It is
+therefore a *Laplace* covariance at the VI point, directly comparable with the one a FOCE/FOCEI
+or SAEM fit reports, and `covariance_status` / `se_theta` behave exactly as they do elsewhere.
+It runs independently of `vi_final_ofv`: the covariance is the curvature of the Laplace
+objective, not of the ELBO, so a fit can legitimately report standard errors while leaving
+`ofv` as `NaN`. Set `run_covariance_step = false` to skip it; in a chain such as
+`methods = vi, focei` it runs once, on the final stage.
 
 ## Unsupported models
 

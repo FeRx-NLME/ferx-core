@@ -33,24 +33,23 @@
 //! approximations.* J Pharmacokinet Pharmacodyn (2024) 51:797–808.
 //! <https://doi.org/10.1007/s10928-024-09931-w>
 //!
-//! Two deliberate departures from their implementation:
+//! Two deliberate departures from their implementation, both defaults rather than
+//! the only option:
 //!
 //! 1. They estimate the whole ELBO by Monte Carlo, including the `log p(η)` and
-//!    `log q` terms. We take the KL analytically (above).
+//!    `log q` terms. We take the KL analytically (above). `vi_kl = mc` selects
+//!    their estimator — see [`elbo::mc_kl_draw`] — which is what a variational
+//!    family with no closed-form KL will need, and a way to cross-check the
+//!    analytic one.
 //! 2. Consequently `Ω` need not be stepped by the optimizer at all — under the
 //!    analytic KL its ELBO-maximizing value is exactly `(1/N)Σᵢ(Sᵢ + μᵢμᵢᵀ)`.
 //!    Their Fig. 3 shows `Ω` fluctuating badly during optimization; this removes
-//!    that failure mode by construction.
+//!    that failure mode by construction. (The same closed form stays valid under
+//!    `vi_kl = mc`, where it is the stationary point in expectation.)
 //!
 //! What we keep from them: the full-rank Gaussian family, and the path-derivative
-//! ("sticking the landing", Roeder et al. 2017) gradient estimator for the
-//! fallback Monte-Carlo-KL path.
-//!
-//! # Status
-//!
-//! Building bottom-up. Present: the variational families ([`family`]) and the
-//! stochastic optimizer ([`adam`]). Still to come: ELBO assembly, `run_vi`, and
-//! the `EstimationMethod::Vi` wiring.
+//! ("sticking the landing", Roeder et al. 2017) gradient estimator on the
+//! Monte-Carlo-KL path.
 
 pub mod adam;
 pub mod elbo;
@@ -60,7 +59,7 @@ pub mod run;
 pub use adam::{AdamConfig, AdamState, PolyakAverager};
 pub use elbo::{
     analytic_eta_grad_available, closed_form_omega, population_neg_elbo,
-    unsupported_data_term_reason, ElboConfig, ElboEval, EtaGradMode, PackedLayout,
+    unsupported_data_term_reason, ElboConfig, ElboEval, EtaGradMode, KlMode, PackedLayout,
 };
 pub use family::{FullRank, KlTerm, MeanField, VariationalFamily};
 pub use run::run_vi;

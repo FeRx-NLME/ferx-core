@@ -729,7 +729,13 @@ section of the SDLC for the versioning policy).
   in closed form rather than by Monte Carlo, and Ω is then updated by its exact maximizer
   rather than by gradient descent, which removes the Ω instability that paper reports.
   Tunable via `vi_iters`, `vi_mc_samples`, `vi_lr`, `vi_family`, `vi_omega_update`,
-  `vi_avg_last`, `vi_eta_grad` and `vi_seed`. **Note that the ELBO is a lower bound, not a
+  `vi_avg_last`, `vi_eta_grad`, `vi_kl` and `vi_seed`. `vi_kl = mc` selects the
+  Monte-Carlo KL — unbiased but noisier, what a variational family with no closed-form KL
+  requires, and a cross-check of the analytic one. Declared parameter bounds
+  (`theta TVCL(0.13, 0.001, 10.0)`), `block_omega` structure and `FIX` all behave as they do for
+  the other estimators, and standard errors come from the ordinary covariance step run at the VI
+  estimate, so `covariance_status` / `se_theta` are populated as usual. **Note that the ELBO is
+  a lower bound, not a
   likelihood:** `ofv` is `NaN` by default rather than being filled with a number that is not
   comparable to a FOCE/SAEM OFV. Set `vi_final_ofv = laplace`, or chain `methods = vi, imp`
   with `imp_eval_only = true`, to evaluate a genuine marginal likelihood at the VI estimate.
