@@ -2213,6 +2213,40 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // VI's scope limits are about the *objective*, not the gradient: its data term
+    // is the fixed-η observation NLL, which omits non-Gaussian endpoint rows and
+    // has no κ channel. Both would be silently wrong rather than merely slow, so
+    // they are refused up front rather than caught at run time.
+    if chain.iter().any(|&m| m == EstimationMethod::Vi) {
+        if let Some(reason) = crate::estimation::vi::unsupported_data_term_reason(model) {
+            diags.push(
+                Diagnostic::error("E_VI_MODEL_UNSUPPORTED", &reason).with_block("fit_options"),
+            );
+        }
+        if model.is_sde() {
+            diags.push(
+                Diagnostic::error(
+                    "E_VI_MODEL_UNSUPPORTED",
+                    "method = vi is not compatible with a [diffusion] block: the EKF \
+                     likelihood is not the fixed-eta observation NLL that VI's data term \
+                     evaluates. Use method = foce or method = focei.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        if options.n_agq > 1 {
+            diags.push(
+                Diagnostic::error(
+                    "E_VI_NAGQ_UNSUPPORTED",
+                    "n_agq applies to method = laplace / focei quadrature, not to method = vi, \
+                     which integrates over its variational posterior rather than a \
+                     Gauss-Hermite grid. Remove n_agq, or chain `methods = vi, laplace`.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
     // SDE ([diffusion]) is incompatible with SAEM, with the Gauss-Newton
     // methods, and with the analytic-sensitivity gradient path (EKF estimation
     // requires FD-FOCE/FOCEI).

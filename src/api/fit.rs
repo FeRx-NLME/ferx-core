@@ -1104,6 +1104,10 @@ fn fit_inner(
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
+    // A VI stage's result must survive later stages of a chain: `methods = vi, imp`
+    // is the *recommended* way to finish a VI fit, and reading `vi` off only the
+    // final stage would silently discard it exactly when it was used correctly.
+    let mut vi_result: Option<crate::types::ViResult> = None;
     // Per-stage convergence wall time, parallel to `chain`/`method_chain`
     // (#713). Excludes the covariance step, which is timed separately below
     // and only ever runs on the last estimating stage.
@@ -1338,6 +1342,7 @@ fn fit_inner(
                     cond_dist: None,
                     packed_estimate: None,
                     mixture_posteriors: None,
+                    vi: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -1455,6 +1460,9 @@ fn fit_inner(
             EstimationMethod::Bayes => {
                 crate::estimation::bayes::run_bayes(model, population, &stage_params, &stage_opts)?
             }
+            EstimationMethod::Vi => {
+                crate::estimation::vi::run_vi(model, population, &stage_params, &stage_opts)?
+            }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
 
@@ -1462,6 +1470,10 @@ fn fit_inner(
         method_wall_times_secs
             .push((stage_start.elapsed().as_secs_f64() - stage_cov_secs).max(0.0));
         covariance_wall_time_secs += stage_cov_secs;
+
+        if stage_result.vi.is_some() {
+            vi_result = stage_result.vi.clone();
+        }
 
         stage_params = stage_result.params.clone();
         total_iterations += stage_result.n_iterations;
@@ -2092,6 +2104,7 @@ fn fit_inner(
         importance_sampling: is_result,
         impmap_trace: result.impmap_trace.clone(),
         bayes: result.bayes.clone(),
+        vi: vi_result.clone(),
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),

@@ -203,6 +203,16 @@ method = saem
 ```
 Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP optimization for random effects. More robust to local minima; recommended for complex models with many random effects.
 
+### VI
+```
+method = vi
+```
+**Variational inference.** Instead of profiling the random effects out at their mode (FOCE) or sampling them (SAEM), VI fits a tractable posterior `q(η)` per subject and optimizes its parameters jointly with θ/Ω/Σ by maximizing the evidence lower bound. There is no inner loop.
+
+Suits deep compartment models (`[covariate_nn]`), models where the FOCE inner loop is unstable, and cases where you want a per-subject posterior *covariance* without paying for a Hessian — VI produces one as a by-product.
+
+**Its objective is a lower bound, not a likelihood.** `ofv` is `NaN` after a VI fit by default rather than being filled with a number that is not comparable to a FOCE or SAEM OFV. Set `vi_final_ofv = laplace`, or chain `methods = vi, imp` with `imp_eval_only = true`, to evaluate a genuine marginal likelihood at the VI estimate. IOV and non-Gaussian endpoints are not supported. See the [VI page](../estimation/vi.qmd).
+
 ## AGQ-Specific Options
 
 | Key | Default | Description |
@@ -225,6 +235,22 @@ Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP op
 | `conddist_nsamp` | `200` | Retained MCMC draws per subject in the conditional-distribution pass. Larger tightens the mean/SD estimates at linear cost. Production diagnostics want values in the thousands. Only used when `conddist = true`. |
 | `conddist_burnin` | `20` | Burn-in draws discarded before accumulation, to forget the EBE-mode warm start. Only used when `conddist = true`. |
 | `conddist_keep_samples` | `false` | Retain the raw per-subject draws (written to `{model}-conddist-samples.csv`), not just the mean/SD. Only used when `conddist = true`. |
+
+## VI-Specific Options
+
+Only used when `method = vi`. See the [VI page](../estimation/vi.qmd).
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `vi_iters` | `1000` | Adam iterations ("epochs"). VI always runs its full budget: the objective is a Monte-Carlo estimate, so a per-iteration improvement test would stop on noise rather than on convergence. Control cost here and inspect `vi$elbo_trace` to see whether it was enough. |
+| `vi_mc_samples` | `3` | Monte-Carlo draws per subject per iteration. `1` is often enough and roughly triples throughput. |
+| `vi_lr` | `0.05` | Adam learning rate. Lower it if the trace oscillates. |
+| `vi_family` | `full_rank` | `full_rank` fits a full posterior covariance per subject; `mean_field` fits a diagonal one — `O(d)` rather than `O(d²)` parameters, so preferable once `n_eta` is large, at the cost of a looser bound when the posterior is correlated (for CL/V it usually is). |
+| `vi_omega_update` | `closed_form` | `closed_form` sets Ω to its exact ELBO maximizer each iteration, keeping it out of the stochastic optimization entirely; `adam` steps it by gradient descent, reproducing the published behaviour. |
+| `vi_avg_last` | final 25% | Polyak averaging window, in iterations. The reported estimate is the mean over the final window — the last iterate of a stochastic optimizer is a draw carrying its final step's full gradient noise. |
+| `vi_eta_grad` | `auto` | `auto` uses the analytic `Dual2` η-gradient where available and central finite differences where not; `analytic` errors instead of degrading; `fd` forces finite differences (diagnostic). `vi$n_fd_subjects` reports how many subjects took the slow path. |
+| `vi_final_ofv` | `none` | `none` leaves `ofv` as `NaN` — the ELBO is a lower bound, not a `−2 log L`, and is not comparable with a FOCE/SAEM OFV. `laplace` reconverges EBEs at the VI estimate and reports the FOCE objective, which is. For an importance-sampling `−2 log L`, chain `methods = vi, imp` with `imp_eval_only = true`. |
+| `vi_seed` | `20240704` | Seed for the common random numbers. Draws are derived from `(seed, iteration, subject, sample)`, so a fit is reproducible regardless of thread count. |
 
 ## SIR (Sampling Importance Resampling)
 

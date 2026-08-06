@@ -91,6 +91,7 @@ website:
           - estimation/frem.qmd
           - estimation/impmap.qmd
           - estimation/bayes.qmd
+          - estimation/vi.qmd
           - estimation/optimizers.qmd
           - estimation/tte.qmd
           - estimation/categorical.qmd

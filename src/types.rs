@@ -4393,6 +4393,59 @@ pub struct PosteriorSummary {
     pub mcse: f64,
 }
 
+/// Result of a variational-inference fit (`EstimationMethod::Vi`). Surfaced on
+/// [`FitResult::vi`].
+///
+/// # The ELBO is not an OFV
+///
+/// [`neg_two_elbo`](Self::neg_two_elbo) is `−2 ×` a *lower bound* on the log
+/// marginal likelihood. It is comparable between VI fits of the same data with
+/// the same variational family, and **not** comparable with a FOCE/FOCEI/SAEM
+/// OFV, with a `−2 log L`, or across families — a richer family raises the bound
+/// without the model fitting any better. Use [`FitOptions::vi_final_ofv`], or a
+/// `methods = vi, imp` chain, to obtain a genuine marginal likelihood.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct ViResult {
+    /// `−2 × ELBO` at the reported (Polyak-averaged) estimate. Scaled by `−2` so
+    /// it moves in the same direction as an OFV; see the type docs for why it is
+    /// nonetheless not one.
+    pub neg_two_elbo: f64,
+    /// The `Σᵢ E_q[−log p(yᵢ|η)]` half of `−ELBO`, unscaled.
+    pub data_term: f64,
+    /// The `Σᵢ KL(qᵢ ‖ N(0,Ω))` half of `−ELBO`, unscaled. Grows as the
+    /// variational posteriors move away from the population prior.
+    pub kl_term: f64,
+    /// Adam iterations run.
+    pub n_iterations: usize,
+    /// Whether the objective had settled by the end of the run, judged on a
+    /// **moving average** of the ELBO rather than a single-iteration change (the
+    /// objective is a Monte-Carlo estimate, so per-iteration deltas are noise).
+    /// Diagnostic only: VI always runs its full `vi_iters` budget.
+    pub converged: bool,
+    /// Variational family used (`full_rank` / `mean_field`).
+    pub family: String,
+    /// Monte-Carlo draws per subject per iteration.
+    pub n_mc_samples: usize,
+    /// Per-iteration `−2 × ELBO`, for convergence plots.
+    pub elbo_trace: Vec<f64>,
+    /// Per-subject variational posterior means — VI's analogue of the EBEs, and
+    /// what is reported as `eta_hat`.
+    pub eta_means: Vec<Vec<f64>>,
+    /// Per-subject variational posterior covariances, row-major.
+    ///
+    /// A by-product of the fit rather than an extra computation: VI gets each
+    /// subject's posterior uncertainty for free where FOCE/Laplace need a Hessian.
+    /// Note the known caveat — variational posteriors tend to *understate*
+    /// posterior variance relative to MCMC — so these are for individual-level
+    /// reporting and shrinkage, not for population standard errors, which come
+    /// from the ordinary covariance step.
+    pub eta_covs: Vec<Vec<Vec<f64>>>,
+    /// Subjects whose `∂/∂η` used finite differences rather than the analytic
+    /// provider. Non-zero means the fit was much slower than it needed to be, not
+    /// that it was wrong.
+    pub n_fd_subjects: usize,
+}
+
 /// Result of a full MCMC Bayesian fit (`EstimationMethod::Bayes`). Surfaced on
 /// [`FitResult::bayes`]. Carries posterior summaries + convergence diagnostics
 /// instead of a single point estimate; the optimizer-style fields on
@@ -4924,6 +4977,10 @@ pub struct FitResult {
     /// Full MCMC Bayesian result. `Some` when `method = bayes` was run;
     /// carries posterior summaries + convergence diagnostics. See [`BayesResult`].
     pub bayes: Option<BayesResult>,
+    /// Variational-inference result. `Some` when `method = vi` was run; carries
+    /// the ELBO (which is **not** an OFV — see [`ViResult`]) and the per-subject
+    /// variational posteriors.
+    pub vi: Option<ViResult>,
     // IOV results (present when kappa declarations exist in the model)
     #[serde(with = "crate::serde_nalgebra::option_dmatrix")]
     pub omega_iov: Option<DMatrix<f64>>,
@@ -5579,6 +5636,42 @@ pub struct FitOptions {
     /// Capped by [`crate::estimation::agq::MAX_AGQ_NODES`], with the *grid* additionally
     /// capped by [`crate::estimation::agq::MAX_AGQ_GRID`].
     pub n_agq: usize,
+
+    // ---- Variational inference (`method = vi`) ----
+    /// Adam iterations ("epochs"). Default 1000. VI runs its full budget rather
+    /// than stopping early: the ELBO is a Monte-Carlo estimate, so a
+    /// single-iteration improvement test would stop on noise. `FitResult::vi`
+    /// reports whether the objective had in fact settled.
+    pub vi_iters: usize,
+    /// Monte-Carlo draws per subject per iteration. Default 3, following Janssen
+    /// et al.; their supplementary Table 2 finds 1 loses no accuracy at roughly
+    /// three times the throughput.
+    pub vi_mc_samples: usize,
+    /// Adam learning rate. Default 0.05. Janssen et al. use 0.1, dropping to 0.01
+    /// when unstable; the lower default here reflects that the closed-form `Ω`
+    /// update removes their main source of instability.
+    pub vi_lr: f64,
+    /// Variational family. Default [`ViFamily::FullRank`].
+    pub vi_family: ViFamily,
+    /// How `Ω` is updated. Default [`ViOmegaUpdate::ClosedForm`].
+    pub vi_omega_update: ViOmegaUpdate,
+    /// Polyak averaging window: how many trailing iterations to average for the
+    /// reported estimate. `None` averages the final 25%.
+    ///
+    /// Not optional in spirit — the last iterate of a stochastic optimizer is a
+    /// draw carrying the full gradient noise of its final step, so reporting it
+    /// unaveraged would make two runs of the same fit disagree by more than the
+    /// estimator's actual accuracy.
+    pub vi_avg_last: Option<usize>,
+    /// How `∂/∂η` is obtained. Default [`ViEtaGrad::Auto`].
+    pub vi_eta_grad: ViEtaGrad,
+    /// Whether to evaluate a genuine marginal likelihood at the converged VI
+    /// estimate, and which. Default [`ViFinalOfv::None`] — see that type for why
+    /// the ELBO is not written to `ofv`.
+    pub vi_final_ofv: ViFinalOfv,
+    /// Seed for the common random numbers. `None` uses a fixed default, so runs
+    /// are reproducible across invocations.
+    pub vi_seed: Option<u64>,
     /// Number of importance samples per subject. Default 1000. Recommended
     /// 2000–5000 for publication-quality MC SE (cost scales linearly).
     pub imp_samples: usize,
@@ -5991,6 +6084,15 @@ impl Default for FitOptions {
             sir_keep_samples: false,
             sir_df: 5.0,
             n_agq: 1,
+            vi_iters: 1000,
+            vi_mc_samples: 3,
+            vi_lr: 0.05,
+            vi_family: ViFamily::default(),
+            vi_omega_update: ViOmegaUpdate::default(),
+            vi_avg_last: None,
+            vi_eta_grad: ViEtaGrad::default(),
+            vi_final_ofv: ViFinalOfv::default(),
+            vi_seed: None,
             imp_samples: 1000,
             imp_proposal_df: 5.0,
             imp_seed: None,
@@ -6290,6 +6392,25 @@ pub enum EstimationMethod {
     /// (There is no separate `Agq` method: adaptive quadrature *is* `Laplace` with
     /// `n_agq > 1`. The old `method = agq` token is rejected by the parser with a note.)
     Laplace,
+    /// **Variational inference** — Janssen et al. (2024), generalised.
+    ///
+    /// A third way to marginalize `η`, alongside profiling it out at its mode
+    /// (FOCE/Laplace) and sampling it (SAEM/IMP): posit a tractable posterior
+    /// `q_φᵢ(η)` per subject and optimize `{φᵢ}` *jointly* with `θ, Ω, Σ` by
+    /// maximizing the evidence lower bound. There is no inner loop — `φ` carries
+    /// across iterations the way an EBE warm-start does, but is never re-solved.
+    ///
+    /// Suited to models where the fixed-effects part is highly flexible (deep
+    /// compartment models / `[covariate_nn]`), where FOCE's inner optimization is
+    /// unstable, or where a per-subject posterior *covariance* is wanted without
+    /// paying for a Hessian — VI produces one as a by-product.
+    ///
+    /// **Its objective is a lower bound, not a likelihood.** `FitResult::ofv` is
+    /// therefore `NaN` unless [`FitOptions::vi_final_ofv`] asks for a genuine
+    /// marginal likelihood at the VI estimate. See `FitResult::vi` for the ELBO
+    /// itself. Does not support IOV or non-Gaussian endpoints; see
+    /// [`crate::estimation::vi::elbo::unsupported_data_term_reason`].
+    Vi,
 }
 
 /// Which Hessian scales the Gauss–Hermite grid (and enters the `½log|H|` term).
@@ -6321,8 +6442,78 @@ impl EstimationMethod {
             EstimationMethod::Impmap => "IMPMAP",
             EstimationMethod::Bayes => "BAYES",
             EstimationMethod::Laplace => "LAPLACE",
+            EstimationMethod::Vi => "VI",
         }
     }
+}
+
+/// Which variational family approximates each subject's random-effect posterior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ViFamily {
+    /// Full-rank Gaussian `N(μ, LLᵀ)`. The default, and what Janssen et al. use:
+    /// it represents posterior correlation between random effects (CL/V almost
+    /// always has some), which a diagonal posterior cannot.
+    #[default]
+    FullRank,
+    /// Diagonal Gaussian. `O(d)` rather than `O(d²)` parameters per subject, so
+    /// preferable once `n_eta` is large — at the cost of a looser bound whenever
+    /// the true posterior is correlated.
+    MeanField,
+}
+
+/// How `Ω` is updated each iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ViOmegaUpdate {
+    /// `Ω* = (1/N) Σᵢ (Sᵢ + μᵢμᵢᵀ)` — the **exact** maximizer of the ELBO in `Ω`
+    /// under the analytic KL, so `Ω` never enters the stochastic optimization at
+    /// all. The default. Janssen et al. step `Ω` by gradient descent and report it
+    /// fluctuating badly during training (their Fig. 3); this removes that failure
+    /// mode by construction rather than by tuning.
+    #[default]
+    ClosedForm,
+    /// Step `Ω` with Adam alongside `θ` and `Σ`. Provided for comparison against
+    /// the published behaviour, and as an escape hatch should the closed form ever
+    /// prove unsuitable for a structured `Ω`.
+    Adam,
+}
+
+/// Which marginal likelihood, if any, to evaluate at the converged VI estimate.
+///
+/// The ELBO is a *lower bound*: not comparable with a FOCE OFV, not comparable
+/// across models with different variational families, and not a `−2 log L`. So it
+/// is never written to `FitResult::ofv`. This option asks for a real one instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ViFinalOfv {
+    /// Leave `FitResult::ofv` as `NaN` and warn. The default: no number at all is
+    /// safer than a number that looks like an OFV and is not one.
+    #[default]
+    None,
+    /// Reconverge EBEs at the VI estimate and report the Laplace/FOCE objective —
+    /// the same `2·pop_nll` SAEM reports, so it is directly comparable with a
+    /// FOCE/FOCEI fit of the same data. Cheap and deterministic.
+    ///
+    /// For an importance-sampling `−2 log L` instead, chain the stages:
+    /// `methods = vi, imp` with `imp_eval_only = true`, which consumes VI's
+    /// parameters, EBEs and Hessians and additionally reports the IS diagnostics.
+    Laplace,
+}
+
+/// How `∂/∂η` of the VI data term is obtained.
+///
+/// The analytic `Dual2` provider covers considerably more than the outer
+/// sensitivity path does — ODE models, `iiv_on_ruv`, steady-state doses and reset
+/// events are all served — so the finite-difference fallback is rare in practice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ViEtaGrad {
+    /// Analytic where the provider serves the subject, central finite differences
+    /// where it declines. Always correct; degrades only in speed.
+    #[default]
+    Auto,
+    /// Analytic only — fail rather than silently drop to a much slower path.
+    Analytic,
+    /// Finite differences everywhere. Diagnostic: bisects a suspected
+    /// analytic-gradient bug against a path sharing none of its code.
+    Fd,
 }
 
 impl FitOptions {
@@ -6724,6 +6915,21 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "bayes_chains",
             "bayes_thin",
             "bayes_seed",
+        ],
+        EstimationMethod::Vi => &[
+            // `inner_maxiter` / `inner_tol` are meaningful only for the optional
+            // `vi_final_ofv = laplace` EBE reconvergence — VI itself has no inner loop.
+            "inner_maxiter",
+            "inner_tol",
+            "vi_iters",
+            "vi_mc_samples",
+            "vi_lr",
+            "vi_family",
+            "vi_omega_update",
+            "vi_avg_last",
+            "vi_eta_grad",
+            "vi_final_ofv",
+            "vi_seed",
         ],
     }
 }

@@ -383,6 +383,7 @@ str_enum_map!(EstimationMethod, "method", method_to_str(EstimationMethod), metho
     Bayes => "bayes",
     // `agq` was removed (#251); it was unreleased, so no persisted bundle carries it.
     Laplace => "laplace",
+    Vi => "vi",
 });
 
 str_enum_map!(ErrorModel, "error_model", error_model_to_str(ErrorModel), error_model_from_str, {
@@ -1811,6 +1812,9 @@ fn wire_to_fit_result(
         importance_sampling: None,
         impmap_trace: None,
         bayes: None,
+        // .fitrx v1 does not serialise the variational posteriors; re-run
+        // `method = vi` if the consumer needs them.
+        vi: None,
         omega_iov,
         kappa_names,
         kappa_fixed,
@@ -2054,6 +2058,7 @@ mod tests {
             importance_sampling: None,
             impmap_trace: None,
             bayes: None,
+            vi: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],

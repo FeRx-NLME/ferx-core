@@ -6466,6 +6466,12 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         Ok(EstimationMethod::Foce)
     } else if val == "bayes" || val == "bayesian" || val == "mcmc" {
         Ok(EstimationMethod::Bayes)
+    } else if val == "vi" {
+        // Exactly one spelling. Deliberately *not* accepting `advi`: this is not
+        // automatic differentiation variational inference — the model is not
+        // differentiated wholesale, it uses the same hand-written `Dual2`
+        // sensitivities FOCE does.
+        Ok(EstimationMethod::Vi)
     } else {
         Err(format!("unknown estimation method: `{}`", token.trim()))
     }
@@ -6919,6 +6925,82 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "bayes_chains" => opts.bayes_chains = parse_usize("bayes_chains")?,
         "bayes_thin" => opts.bayes_thin = parse_usize("bayes_thin")?,
         "bayes_seed" => opts.bayes_seed = parse_u64_opt("bayes_seed")?,
+        "vi_iters" => {
+            let v = parse_usize("vi_iters")?;
+            if v < 1 {
+                return Err("vi_iters must be >= 1".to_string());
+            }
+            opts.vi_iters = v;
+        }
+        "vi_mc_samples" => {
+            let v = parse_usize("vi_mc_samples")?;
+            if v < 1 {
+                return Err("vi_mc_samples must be >= 1".to_string());
+            }
+            opts.vi_mc_samples = v;
+        }
+        "vi_lr" => {
+            let v = parse_f64("vi_lr")?;
+            if !(v > 0.0) {
+                return Err(format!("vi_lr must be > 0, got {v}"));
+            }
+            opts.vi_lr = v;
+        }
+        "vi_family" => {
+            opts.vi_family = match value.trim().to_lowercase().as_str() {
+                "full_rank" | "fullrank" => crate::types::ViFamily::FullRank,
+                "mean_field" | "meanfield" | "diagonal" => crate::types::ViFamily::MeanField,
+                other => {
+                    return Err(format!(
+                        "vi_family must be `full_rank` or `mean_field`, got `{other}`"
+                    ))
+                }
+            }
+        }
+        "vi_omega_update" => {
+            opts.vi_omega_update = match value.trim().to_lowercase().as_str() {
+                "closed_form" | "closedform" => crate::types::ViOmegaUpdate::ClosedForm,
+                "adam" => crate::types::ViOmegaUpdate::Adam,
+                other => {
+                    return Err(format!(
+                        "vi_omega_update must be `closed_form` or `adam`, got `{other}`"
+                    ))
+                }
+            }
+        }
+        "vi_avg_last" => {
+            let v = parse_usize("vi_avg_last")?;
+            if v < 1 {
+                return Err("vi_avg_last must be >= 1".to_string());
+            }
+            opts.vi_avg_last = Some(v);
+        }
+        "vi_eta_grad" => {
+            opts.vi_eta_grad = match value.trim().to_lowercase().as_str() {
+                "auto" => crate::types::ViEtaGrad::Auto,
+                "analytic" => crate::types::ViEtaGrad::Analytic,
+                "fd" => crate::types::ViEtaGrad::Fd,
+                other => {
+                    return Err(format!(
+                        "vi_eta_grad must be `auto`, `analytic`, or `fd`, got `{other}`"
+                    ))
+                }
+            }
+        }
+        "vi_final_ofv" => {
+            opts.vi_final_ofv = match value.trim().to_lowercase().as_str() {
+                "none" => crate::types::ViFinalOfv::None,
+                "laplace" => crate::types::ViFinalOfv::Laplace,
+                other => {
+                    return Err(format!(
+                        "vi_final_ofv must be `none` or `laplace`, got `{other}`. For an \
+                         importance-sampling −2 log L, chain `methods = vi, imp` with \
+                         `imp_eval_only = true`."
+                    ))
+                }
+            }
+        }
+        "vi_seed" => opts.vi_seed = parse_u64_opt("vi_seed")?,
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
         "sir" => opts.sir = parse_bool("sir")?,
         "sir_samples" => opts.sir_samples = parse_usize("sir_samples")?,

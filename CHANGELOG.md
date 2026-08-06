@@ -718,6 +718,23 @@ section of the SDLC for the versioning policy).
 ## [0.3.0] - 2026-08-07
 
 ### Added
+- **Variational inference (`[fit_options] method = vi`)** — a third way to marginalize the
+  random effects, alongside profiling them out at their mode (FOCE/Laplace) and sampling them
+  (SAEM/IMP). VI fits a tractable posterior `q(η)` per subject and optimizes its parameters
+  jointly with θ/Ω/Σ by maximizing the evidence lower bound, with no inner loop. It suits
+  models whose fixed-effects part is highly flexible (deep compartment models), cases where
+  FOCE's inner optimization is unstable, and anyone who wants a per-subject posterior
+  *covariance* without paying for a Hessian — VI produces one as a by-product, reported on
+  `FitResult$vi`. Following Janssen et al. (2024), with two departures: the KL term is taken
+  in closed form rather than by Monte Carlo, and Ω is then updated by its exact maximizer
+  rather than by gradient descent, which removes the Ω instability that paper reports.
+  Tunable via `vi_iters`, `vi_mc_samples`, `vi_lr`, `vi_family`, `vi_omega_update`,
+  `vi_avg_last`, `vi_eta_grad` and `vi_seed`. **Note that the ELBO is a lower bound, not a
+  likelihood:** `ofv` is `NaN` by default rather than being filled with a number that is not
+  comparable to a FOCE/SAEM OFV. Set `vi_final_ofv = laplace`, or chain `methods = vi, imp`
+  with `imp_eval_only = true`, to evaluate a genuine marginal likelihood at the VI estimate.
+  IOV and non-Gaussian endpoints (TTE / categorical) are not supported and are refused with
+  an actionable message.
 - **New ODE steppers via `[fit_options] ode_method`,** on two independent axes. For
   **stability**: the linearly implicit Rosenbrock methods `rosenbrock23` (order 2, aliases
   `ros23`/`ode23s`), `rodas4` (order 4) and `rodas5p` (order 5). These are stable at the step size the tolerance needs on **stiff**

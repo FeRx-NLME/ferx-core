@@ -2075,6 +2075,35 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    // VI section. The ELBO is reported here rather than as the OFV because it is a
+    // lower bound — see `ViResult`. `elbo_trace` is emitted in full: judging whether
+    // a stochastic optimizer has settled needs the trace, not a final value.
+    if let Some(ref v) = result.vi {
+        writeln!(f, "\nvi:").map_err(|e| e.to_string())?;
+        writeln!(
+            f,
+            "  # -2*ELBO is a bound on -2 log L, NOT an OFV: it is not"
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(
+            f,
+            "  # comparable with a FOCE/SAEM objective or across families."
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(f, "  neg_two_elbo: {:.6}", v.neg_two_elbo).map_err(|e| e.to_string())?;
+        writeln!(f, "  data_term: {:.6}", v.data_term).map_err(|e| e.to_string())?;
+        writeln!(f, "  kl_term: {:.6}", v.kl_term).map_err(|e| e.to_string())?;
+        writeln!(f, "  family: {}", v.family).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_iterations: {}", v.n_iterations).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_mc_samples: {}", v.n_mc_samples).map_err(|e| e.to_string())?;
+        writeln!(f, "  converged: {}", v.converged).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_fd_subjects: {}", v.n_fd_subjects).map_err(|e| e.to_string())?;
+        writeln!(f, "  elbo_trace:").map_err(|e| e.to_string())?;
+        for t in &v.elbo_trace {
+            writeln!(f, "    - {:.6}", t).map_err(|e| e.to_string())?;
+        }
+    }
+
     // SIR section
     if let Some(ess) = result.sir_ess {
         writeln!(f, "\nsir:").map_err(|e| e.to_string())?;
@@ -2315,6 +2344,7 @@ mod tests {
             importance_sampling: None,
             impmap_trace: None,
             bayes: None,
+            vi: None,
             omega_iov: None,
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),
@@ -2891,6 +2921,7 @@ mod tests {
             importance_sampling: None,
             impmap_trace: None,
             bayes: None,
+            vi: None,
             omega_iov: None,
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),
