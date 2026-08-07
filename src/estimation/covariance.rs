@@ -504,9 +504,27 @@ fn analytic_cov_hessian(
     // production site reports "standard errors for a likelihood it never optimised"; the
     // analytic path bypasses that helper, so it must repeat its dispatch condition here
     // (PR #953 review finding 1).
-    if options.agq_nodes().is_some() {
-        return None;
-    }
+    //
+    // #251 narrows this: `method = focei` with `n_agq > 1` **is** served, by
+    // `agq_cov_hessian`, which differentiates the quadrature marginal itself. The split is on
+    // the *anchor*, not on `agq_nodes()`:
+    //
+    //   * `HessianAnchor::GaussNewton` (FOCEI) — `H̃ = Ω⁻¹ + Σ pⱼaⱼaⱼᵀ` is built from first
+    //     derivatives of `f`, so `∂²H̃/∂x²` needs third-order sensitivities, which
+    //     `subject_sensitivities_cov` already provides.
+    //   * `HessianAnchor::Exact` (Laplace, at any node count) — `H = ∂²nll/∂b²` already carries
+    //     `∂²f/∂η²`, so its second derivative needs **fourth** order. Nothing computes those, so
+    //     Laplace keeps the FD covariance. Keying this off `agq_nodes()` instead of the anchor
+    //     would report `H̃`-derived SEs for a fit anchored on `H` — the same class of error the
+    //     bail was added for.
+    let agq = if options.agq_nodes().is_some() {
+        if options.hessian_anchor() != HessianAnchor::GaussNewton {
+            return None;
+        }
+        options.agq_nodes()
+    } else {
+        None
+    };
     // IOV is out of scope: the assembly is written over the η-only random-effect block, not
     // the stacked `[η, κ]` one. `subject_sensitivities_cov` declines `n_kappa > 0` itself,
     // so this is a fast population-level exit, not the load-bearing check.
@@ -526,7 +544,30 @@ fn analytic_cov_hessian(
         if crate::cancel::is_cancelled(&options.cancel) {
             return None;
         }
-        let h = if options.interaction {
+        let h = if let Some(n_agq) = agq {
+            // FOCEI-anchored quadrature (#251). The grid is rebuilt here from the same
+            // Gauss-Hermite rule the objective used, so the Hessian differentiates the grid the
+            // fit actually evaluated — the same reason the proposal jitter is carried.
+            let (nodes, weights) = crate::estimation::agq::gauss_hermite(n_agq);
+            let params = crate::estimation::parameterization::unpack_params(x_hat, template);
+            let (grid, pi) = crate::estimation::agq::subject_grid_and_weights(
+                model,
+                subject,
+                &params,
+                eta_hat.as_slice(),
+                &nodes,
+                &weights,
+            )?;
+            crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian(
+                model,
+                subject,
+                template,
+                x_hat,
+                eta_hat.as_slice(),
+                &grid,
+                &pi,
+            )
+        } else if options.interaction {
             subject_packed_cov_hessian(model, subject, template, x_hat, eta_hat.as_slice())
         } else {
             subject_packed_cov_hessian_foce(model, subject, template, x_hat, eta_hat.as_slice())

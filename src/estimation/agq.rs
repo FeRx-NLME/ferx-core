@@ -489,7 +489,7 @@ pub(crate) fn agq_subject_nll(
         return NLL_SENTINEL;
     };
 
-    let (_bs, terms) = agq_nodes_and_terms(
+    let (_bs, terms, _zs) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -530,12 +530,16 @@ fn agq_nodes_and_terms(
     proposal: &crate::estimation::importance_sampling::Proposal,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
-) -> (Vec<Vec<f64>>, Vec<f64>) {
+) -> (Vec<Vec<f64>>, Vec<f64>, Vec<Vec<f64>>) {
     let d = stack.d();
     let n = nodes.len();
     let cap = grid_size(n, d);
     let mut bs = Vec::with_capacity(cap);
     let mut terms = Vec::with_capacity(cap);
+    // The abscissae themselves: #251's covariance re-places the nodes from its own regularised
+    // anchor and must pair each `z_j` with the weight this loop computed for it. Rebuilding the
+    // odometer at the call site would risk an off-by-one pairing that is silently, exactly wrong.
+    let mut zs = Vec::with_capacity(cap);
     let mut idx = vec![0usize; d];
     let mut z = vec![0.0f64; d];
     let mut step = vec![0.0f64; d];
@@ -560,6 +564,7 @@ fn agq_nodes_and_terms(
         // which case the subject correctly reports the sentinel back.
         terms.push(log_w + z_sq - nll);
         bs.push(b);
+        zs.push(z.clone());
 
         // Mixed-radix increment over the d-dimensional tensor grid.
         let mut k = 0;
@@ -575,7 +580,98 @@ fn agq_nodes_and_terms(
             break;
         }
     }
-    (bs, terms)
+    (bs, terms, zs)
+}
+
+/// The FOCEI-anchored AGQ objective `F_i` for one subject at `n_agq` nodes.
+///
+/// A thin entry point over [`agq_subject_nll`] that owns the `Stack` and the Gauss-Hermite rule,
+/// so callers outside this module can evaluate the objective the covariance differentiates. #251's
+/// finite-difference oracle needs exactly this: differencing `F_i` in packed space is the only
+/// check that sees the whole assembly, including the `√2` node scaling that the `n_agq = 1`
+/// reduction cannot (its node is `z = 0`).
+///
+/// `#[cfg(test)]` because it genuinely has no production caller — the objective is reached through
+/// [`agq_population_nll`] there. Shipping it unconditionally would emit a `dead_code` warning on
+/// every downstream build, which is the exact complaint PR #955's review raised against the first
+/// version of `agq_cov_hessian`.
+#[cfg(test)]
+pub(crate) fn agq_subject_objective(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+    n_agq: usize,
+) -> f64 {
+    let stack = Stack::new(model, params, 0);
+    let (nodes, weights) = gauss_hermite(n_agq);
+    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    agq_subject_nll(
+        model,
+        subject,
+        params,
+        &stack,
+        eta_hat,
+        &nodes,
+        &log_weights,
+        HessianAnchor::GaussNewton,
+    )
+}
+
+/// The quadrature abscissae `z_j` and their softmax weights `π_j` for one subject, on exactly the
+/// grid the objective evaluates.
+///
+/// #251's analytic covariance differentiates `F`, so it must contract against *these* weights —
+/// the ones the fit actually used — not a freshly-normalised set. Returning both from a single
+/// sweep is what guarantees `z_j` and `π_j` refer to the same node.
+///
+/// `None` when the subject is outside the Gauss-Newton anchor's scope, matching
+/// [`agq_subject_nll`]'s own bail.
+pub(crate) fn subject_grid_and_weights(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+    nodes: &[f64],
+    weights: &[f64],
+) -> Option<(Vec<Vec<f64>>, Vec<f64>)> {
+    let stack = Stack::new(model, params, 0);
+    let d = stack.d();
+    if d == 0 {
+        return None;
+    }
+    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+    let schedule = cacheable_schedule(model, subject);
+    let h = anchor_hessian(
+        HessianAnchor::GaussNewton,
+        model,
+        subject,
+        params,
+        &stack,
+        eta_hat,
+        &mut scratch,
+        schedule.as_ref(),
+    )?;
+    let proposal = build_proposal(&h, &stack.omega_joint_inv, d)?;
+    let (_bs, terms, zs) = agq_nodes_and_terms(
+        model,
+        subject,
+        params,
+        &stack,
+        eta_hat,
+        nodes,
+        &log_weights,
+        &proposal,
+        &mut scratch,
+        schedule.as_ref(),
+    );
+    let lse = logsumexp(&terms);
+    if !lse.is_finite() {
+        return None;
+    }
+    let pi: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
+    Some((zs, pi))
 }
 
 /// Population AGQ objective: `Σ_i agq_subject_nll_i`. The outer loop doubles this into an
@@ -1437,7 +1533,7 @@ fn phi_grid(
 ) -> Option<f64> {
     let d = stack.d();
     let proposal = build_proposal(h_mat, omega_inv, d)?;
-    let (_bs, terms) = agq_nodes_and_terms(
+    let (_bs, terms, _zs) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -1498,7 +1594,7 @@ fn agq_subject_packed_gradient(
 
     // Sweep the grid once, keeping each node's b and its log-term, so the softmax weights
     // and the scores are computed on exactly the same nodes the objective used.
-    let (bs, terms) = agq_nodes_and_terms(
+    let (bs, terms, _zs) = agq_nodes_and_terms(
         model,
         subject,
         params,
