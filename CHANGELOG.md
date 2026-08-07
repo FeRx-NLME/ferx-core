@@ -19,6 +19,19 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **Analytic covariance (standard errors) for FOCEI-anchored adaptive Gauss-Hermite
+  quadrature** — `method = focei` with `n_agq > 1` now derives its R-matrix analytically instead
+  of finite-differencing the objective function. The finite-difference stencil it replaces costs
+  `~2·n_free²` reconverged population objectives, **each** of which sweeps the whole `n_agq^d`
+  node grid for every subject; the analytic assembly is a single pass. Standard errors are
+  unchanged in meaning — they still describe the quadrature marginal the fit actually minimised,
+  not the FOCEI one. `method = laplace` is unaffected and keeps the finite-difference covariance:
+  it anchors on the exact conditional Hessian, whose second derivative would need fourth-order
+  sensitivities. Models outside the analytic covariance scope (censored/M3 rows, IOV, non-Gaussian
+  endpoints) also keep the existing path, and a poorly identified fit falls back rather than
+  reporting an ill-conditioned analytic result (#251, PR #955).
+
 ## [0.3.0] - 2026-08-07
 
 ### Added

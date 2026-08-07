@@ -1,4 +1,8 @@
 pub mod agq;
+// `pub(crate)` like `covariance`: every item is an internal detail of the covariance step, and
+// nothing outside the crate has a reason to name them. Keeping it out of the public API also
+// keeps its private intra-doc links from being rendered as broken by `cargo doc`.
+pub(crate) mod agq_cov_hessian;
 pub mod bayes;
 pub(crate) mod covariance;
 pub mod gauss_newton;

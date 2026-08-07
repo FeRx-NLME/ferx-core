@@ -273,8 +273,10 @@ AGQ reuses the FOCE/Laplace machinery almost entirely:
 4. **Objective.** The exact conditional likelihood is evaluated at each node.
 5. **Outer loop.** AGQ has an **analytic outer gradient** (below), so
    `optimizer = auto` resolves to gradient-based **L-BFGS**. The covariance step
-   differences the AGQ objective too, so the reported standard errors belong to
-   the likelihood that was actually optimised.
+   works on the AGQ objective too, so the reported standard errors belong to
+   the likelihood that was actually optimised — see
+   [the analytic covariance](#the-analytic-covariance) for when that is computed
+   analytically rather than by finite differences.
 
 Subjects are evaluated in parallel (rayon); the node sweep is serial within a
 subject. The population sum is reduced in a fixed subject order, so the OFV does
@@ -442,6 +444,68 @@ plateau was pure waste.
 trust-region stopping rule trip sooner (63 → 34 evaluations, still reporting
 "converged"). Its ω estimates land ~3% off NONMEM. This is the failure mode ferx
 records in #317. `auto` picks L-BFGS for AGQ precisely to avoid it.
+
+## The analytic covariance
+
+By default the covariance step recovers standard errors by finite-differencing the
+objective function. Under AGQ that is expensive in a specific way: the stencil needs
+`~2·n_free²` **reconverged population objectives**, and every one of them sweeps the
+whole `n_agq^d` node grid for every subject. Doubling the node count doubles the cost
+of each of those `O(n_free²)` evaluations.
+
+For `method = focei` with `n_agq > 1`, ferx now assembles that R-matrix analytically
+instead, in a single pass. The standard errors mean the same thing they did before —
+they describe the quadrature marginal the fit actually minimised, not the FOCEI one.
+
+### Why FOCEI only
+
+The restriction is structural rather than a staging decision. The quadrature grid is
+scaled by a Hessian anchor, and the two methods anchor differently:
+
+| method | anchor | second derivative needs |
+|---|---|---|
+| `focei`, `n_agq > 1` | Gauss-Newton `H̃ = Ω⁻¹ + Σⱼ pⱼaⱼaⱼᵀ` | **third**-order sensitivities |
+| `laplace`, any `n_agq` | exact `H = ∂²nll/∂b²` | **fourth**-order sensitivities |
+
+`H̃` is built from first derivatives of the prediction, so differentiating it twice in
+the population parameters bottoms out at third-order sensitivities — which ferx already
+computes for the FOCE/FOCEI covariance. The exact conditional Hessian already contains
+`∂²f/∂η²`, so the same operation would need a fourth order that does not exist. So
+`method = laplace` keeps the finite-difference covariance at every node count.
+
+### When it applies
+
+The analytic route is taken when **all** of the following hold; otherwise the fit
+silently keeps the finite-difference covariance, which remains correct.
+
+- `method = focei` with `n_agq > 1`.
+- The model is inside the analytic covariance scope shared with FOCE/FOCEI — no
+  censored (M3/BLOQ) observations, no IOV, and a Gaussian endpoint the sensitivity
+  provider reaches. TTE and categorical endpoints are outside it.
+- The subject's anchor is well conditioned. A flat or unidentifiable random-effect
+  direction is declined rather than reported: the assembly would otherwise invert a
+  near-singular matrix and return standard errors inflated by orders of magnitude.
+
+That last point is worth stating plainly — **this does not make every AGQ fit cheaper**.
+It speeds up the covariance step for Gaussian-endpoint FOCEI-anchored quadrature, which
+is a common and expensive case, but the non-Gaussian endpoints that motivate quadrature
+in the first place keep the existing path.
+
+### Validation
+
+There is no NONMEM comparison for this feature, because NONMEM has no analytic
+covariance for adaptive quadrature to compare against. It is instead validated against
+the objective itself:
+
+- **A finite-difference oracle at `n_agq = 3`** — the packed Hessian is compared against
+  a reconverged second difference of the AGQ objective in optimizer space. This is the
+  check that matters, because it sees the assembly end to end, including the `√2` node
+  scaling and the softmax-response term.
+- **Reduction to FOCEI at one node** — at `n_agq = 1` the grid collapses onto the mode
+  and the assembly must reproduce the FOCE/FOCEI covariance exactly. Note this check
+  *cannot* see a `√2` error (the single node sits at `z = 0`, so the scaling drops out),
+  which is why the multi-node oracle above is the primary evidence rather than a
+  supplement.
 
 ## Inter-occasion variability (IOV)
 

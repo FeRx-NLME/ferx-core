@@ -489,7 +489,7 @@ pub(crate) fn agq_subject_nll(
         return NLL_SENTINEL;
     };
 
-    let (_bs, terms) = agq_nodes_and_terms(
+    let (_bs, terms, _zs) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -530,12 +530,16 @@ fn agq_nodes_and_terms(
     proposal: &crate::estimation::importance_sampling::Proposal,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
-) -> (Vec<Vec<f64>>, Vec<f64>) {
+) -> (Vec<Vec<f64>>, Vec<f64>, Vec<Vec<f64>>) {
     let d = stack.d();
     let n = nodes.len();
     let cap = grid_size(n, d);
     let mut bs = Vec::with_capacity(cap);
     let mut terms = Vec::with_capacity(cap);
+    // The abscissae themselves: #251's covariance re-places the nodes from its own regularised
+    // anchor and must pair each `z_j` with the weight this loop computed for it. Rebuilding the
+    // odometer at the call site would risk an off-by-one pairing that is silently, exactly wrong.
+    let mut zs = Vec::with_capacity(cap);
     let mut idx = vec![0usize; d];
     let mut z = vec![0.0f64; d];
     let mut step = vec![0.0f64; d];
@@ -560,6 +564,7 @@ fn agq_nodes_and_terms(
         // which case the subject correctly reports the sentinel back.
         terms.push(log_w + z_sq - nll);
         bs.push(b);
+        zs.push(z.clone());
 
         // Mixed-radix increment over the d-dimensional tensor grid.
         let mut k = 0;
@@ -575,7 +580,98 @@ fn agq_nodes_and_terms(
             break;
         }
     }
-    (bs, terms)
+    (bs, terms, zs)
+}
+
+/// The FOCEI-anchored AGQ objective `F_i` for one subject at `n_agq` nodes.
+///
+/// A thin entry point over [`agq_subject_nll`] that owns the `Stack` and the Gauss-Hermite rule,
+/// so callers outside this module can evaluate the objective the covariance differentiates. #251's
+/// finite-difference oracle needs exactly this: differencing `F_i` in packed space is the only
+/// check that sees the whole assembly, including the `√2` node scaling that the `n_agq = 1`
+/// reduction cannot (its node is `z = 0`).
+///
+/// `#[cfg(test)]` because it genuinely has no production caller — the objective is reached through
+/// [`agq_population_nll`] there. Shipping it unconditionally would emit a `dead_code` warning on
+/// every downstream build, which is the exact complaint PR #955's review raised against the first
+/// version of `agq_cov_hessian`.
+#[cfg(test)]
+pub(crate) fn agq_subject_objective(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+    n_agq: usize,
+) -> f64 {
+    let stack = Stack::new(model, params, 0);
+    let (nodes, weights) = gauss_hermite(n_agq);
+    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    agq_subject_nll(
+        model,
+        subject,
+        params,
+        &stack,
+        eta_hat,
+        &nodes,
+        &log_weights,
+        HessianAnchor::GaussNewton,
+    )
+}
+
+/// The quadrature abscissae `z_j` and their softmax weights `π_j` for one subject, on exactly the
+/// grid the objective evaluates.
+///
+/// #251's analytic covariance differentiates `F`, so it must contract against *these* weights —
+/// the ones the fit actually used — not a freshly-normalised set. Returning both from a single
+/// sweep is what guarantees `z_j` and `π_j` refer to the same node.
+///
+/// `None` when the subject is outside the Gauss-Newton anchor's scope, matching
+/// [`agq_subject_nll`]'s own bail.
+pub(crate) fn subject_grid_and_weights(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+    nodes: &[f64],
+    weights: &[f64],
+) -> Option<(Vec<Vec<f64>>, Vec<f64>)> {
+    let stack = Stack::new(model, params, 0);
+    let d = stack.d();
+    if d == 0 {
+        return None;
+    }
+    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+    let schedule = cacheable_schedule(model, subject);
+    let h = anchor_hessian(
+        HessianAnchor::GaussNewton,
+        model,
+        subject,
+        params,
+        &stack,
+        eta_hat,
+        &mut scratch,
+        schedule.as_ref(),
+    )?;
+    let proposal = build_proposal(&h, &stack.omega_joint_inv, d)?;
+    let (_bs, terms, zs) = agq_nodes_and_terms(
+        model,
+        subject,
+        params,
+        &stack,
+        eta_hat,
+        nodes,
+        &log_weights,
+        &proposal,
+        &mut scratch,
+        schedule.as_ref(),
+    );
+    let lse = logsumexp(&terms);
+    if !lse.is_finite() {
+        return None;
+    }
+    let pi: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
+    Some((zs, pi))
 }
 
 /// Population AGQ objective: `Σ_i agq_subject_nll_i`. The outer loop doubles this into an
@@ -1437,7 +1533,7 @@ fn phi_grid(
 ) -> Option<f64> {
     let d = stack.d();
     let proposal = build_proposal(h_mat, omega_inv, d)?;
-    let (_bs, terms) = agq_nodes_and_terms(
+    let (_bs, terms, _zs) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -1498,7 +1594,7 @@ fn agq_subject_packed_gradient(
 
     // Sweep the grid once, keeping each node's b and its log-term, so the softmax weights
     // and the scores are computed on exactly the same nodes the objective used.
-    let (bs, terms) = agq_nodes_and_terms(
+    let (bs, terms, _zs) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -2209,6 +2305,122 @@ mod tests {
             *errs.last().unwrap() < 1e-5,
             "21-node AGQ error {} too large (truth {want})",
             errs.last().unwrap()
+        );
+    }
+
+    /// `AGQ(1, GaussNewton)` **is** the FOCEI marginal — pinned, and its residual measured.
+    ///
+    /// This identity is the framing the analytic AGQ covariance Hessian (#251) is built on:
+    /// `F_agq = F_focei + Δ`, where `Δ` is purely the quadrature refinement and vanishes at
+    /// one node. If the identity did not hold, the decomposition would be assembling a
+    /// second derivative of the wrong object. Nothing in the repo pinned it — the existing
+    /// tests pin the *Exact*-anchor AGQ(1) against NONMEM `LAPLACIAN`, which is the other
+    /// anchor, and the `d == 0` degenerate case.
+    ///
+    /// The residual is **not zero**, and the reason is load-bearing for the derivative work:
+    /// `build_proposal` regularises with a per-dimension relative jitter
+    /// `Λᵢᵢ = max(1e-6·|Hᵢᵢ|, 1e-10)`, so the objective's log-determinant term is
+    /// `½log|H̃ + Λ|`, not `½log|H̃|`. To first order the gap is `½·1e-6·tr((H̃+Λ)⁻¹diag|H̃|)`,
+    /// i.e. `~½·1e-6·d` — small, but a *systematic* offset, not noise. Any "exact" analytic
+    /// derivative of this objective must therefore differentiate `H̃ + Λ`; differentiating
+    /// `H̃` alone would be wrong at the same relative order and would show up as a
+    /// consistent bias no amount of step-size tuning removes.
+    ///
+    /// The assertion is two-sided on purpose: an upper bound catches the identity breaking,
+    /// and a lower bound catches the jitter silently disappearing (which would make a future
+    /// `H̃`-only derivative look correct here while being wrong in general).
+    #[test]
+    fn agq_one_node_gauss_newton_is_the_focei_marginal_up_to_the_proposal_jitter() {
+        use crate::estimation::inner_optimizer::find_ebe;
+        use crate::stats::likelihood::foce_subject_nll;
+
+        let model = parse_model_string(M3_MODEL).expect("parse");
+        let theta = [0.22, 11.0, 1.4];
+        let subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta.to_vec();
+
+        let ebe = find_ebe(&model, &subject, &params, 200, 1e-11, None, None, 0);
+        let focei = foce_subject_nll(
+            &model,
+            &subject,
+            &params.theta,
+            &ebe.eta,
+            &ebe.h_matrix,
+            &params.omega,
+            &params.sigma.values,
+            true,
+        );
+
+        let stack = Stack::new(&model, &params, 0);
+        // `gauss_hermite` returns **weights**, not log-weights — the production call sites
+        // take `.ln()` themselves. Destructuring straight into `log_weights` costs a silent
+        // `d·(√π − ln√π) = 1.2·d` offset in the objective.
+        let (nodes, weights) = gauss_hermite(1);
+        let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+        let agq = agq_subject_nll(
+            &model,
+            &subject,
+            &params,
+            &stack,
+            ebe.eta.as_slice(),
+            &nodes,
+            &log_weights,
+            HessianAnchor::GaussNewton,
+        );
+
+        let d = stack.d();
+        assert_eq!(d, 3, "fixture must have 3 random effects");
+
+        // The closed form AGQ(1) must reduce to, stated independently of `agq_subject_nll`
+        // so the test pins the *reduction* and not merely its own arithmetic.
+        let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
+        let schedule = cacheable_schedule(&model, &subject);
+        let nll_at_mode = stack.nll_at(
+            &model,
+            &subject,
+            &params,
+            ebe.eta.as_slice(),
+            &mut scratch,
+            schedule.as_ref(),
+        );
+        let h_anchor = anchor_hessian(
+            HessianAnchor::GaussNewton,
+            &model,
+            &subject,
+            &params,
+            &stack,
+            ebe.eta.as_slice(),
+            &mut scratch,
+            schedule.as_ref(),
+        )
+        .expect("gauss-newton anchor in scope");
+        let proposal = build_proposal(&h_anchor, &stack.omega_joint_inv, d).expect("proposal");
+        let laplace_closed_form = nll_at_mode + 0.5 * proposal.log_det_inv_scale;
+        assert!(
+            (agq - laplace_closed_form).abs() < 1e-12,
+            "AGQ(1) must reduce to nll(b̂) + ½log|H_reg| exactly: agq={agq}, \
+             closed form={laplace_closed_form}"
+        );
+
+        let gap = (agq - focei).abs();
+
+        // Upper bound: a few times the first-order jitter estimate `½·1e-6·d`. Anything
+        // larger means the two are no longer the same marginal.
+        let jitter_scale = 0.5e-6 * d as f64;
+        assert!(
+            gap < 20.0 * jitter_scale,
+            "AGQ(1, GaussNewton) must be the FOCEI marginal: agq={agq}, focei={focei}, \
+             gap={gap:.3e}, expected < {:.3e}",
+            20.0 * jitter_scale
+        );
+        // Lower bound: the jitter is really there. If this trips, `build_proposal` stopped
+        // regularising and the derivative work below can drop its `Λ` terms.
+        assert!(
+            gap > 1e-9,
+            "expected a non-zero proposal-jitter offset, got gap={gap:.3e} — if \
+             `build_proposal` no longer jitters, the analytic AGQ derivative may \
+             differentiate H̃ directly"
         );
     }
 
