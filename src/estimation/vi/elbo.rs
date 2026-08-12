@@ -368,7 +368,7 @@ fn fd_eta_data_grad(
     // One evaluator, differenced over every stacked coordinate. Splitting inside the
     // closure rather than at the call site keeps the perturbed `κ` consistent with the
     // perturbed `η` for the same draw.
-    let mut eval = |zz: &[f64], scratch: &mut EventPkParams| -> f64 {
+    let eval = |zz: &[f64], scratch: &mut EventPkParams| -> f64 {
         if iov {
             let (eta, kappas) = split_stacked(zz, n_eta, n_kappa, k_occasions);
             obs_nll_subject_into_iov(model, subject, theta, sigma, eta, &kappas, scratch)

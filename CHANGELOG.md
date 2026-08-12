@@ -735,9 +735,13 @@ section of the SDLC for the versioning policy).
   previous defaults missed badly — θ and Ω are now within ~1% of NONMEM out of the box.
   `vi_lr` defaults to 0.02 (was 0.05): at 0.05 the σ trajectory is non-monotone in iteration
   count. Note that the residual-error estimate is the one parameter limited by Monte-Carlo
-  noise rather than by iterations — on warfarin σ² lands ~220% high at `vi_mc_samples = 3`,
-  ~39% at 16 and ~20% at 32, while θ/Ω are unaffected — so raise `vi_mc_samples` when σ
-  matters.
+  noise rather than by iterations. `vi_mc_samples` defaults to 8 (was 3, the value Janssen
+  et al. use): at 3 draws warfarin's σ² lands ~220% high, and an IOV recovery fit returns
+  `TVCL` 0.85 against a true 1.0 while reporting `converged: true` — both failing as a
+  quiet stop at a worse point rather than as an obvious error. At 8 draws the IOV fit is
+  indistinguishable from SAEM and FOCEI on every parameter. Raise it further when the
+  residual error itself matters: σ keeps improving with more draws (~72% high at 8, ~39%
+  at 16, ~20% at 32 on warfarin) long after θ and Ω have stopped moving.
   Tunable via `vi_iters`, `vi_mc_samples`, `vi_lr`, `vi_family`, `vi_omega_update`,
   `vi_avg_last`, `vi_eta_grad`, `vi_kl` and `vi_seed`. `vi_kl = mc` selects the
   Monte-Carlo KL — unbiased but noisier, what a variational family with no closed-form KL

@@ -5700,9 +5700,28 @@ pub struct FitOptions {
     /// reach the FOCEI minimum — at 1000 it stopped with σ² 159× too large. Early
     /// stopping is what makes a ceiling this high free for the easy cases.
     pub vi_iters: usize,
-    /// Monte-Carlo draws per subject per iteration. Default 3, following Janssen
-    /// et al.; their supplementary Table 2 finds 1 loses no accuracy at roughly
-    /// three times the throughput.
+    /// Monte-Carlo draws per subject per iteration. Default 8.
+    ///
+    /// Janssen et al. use 3, and their supplementary Table 2 reports 1 loses no accuracy
+    /// at roughly three times the throughput. Two anchors here disagree, and both fail
+    /// the same way — a fit that stops early and reports success at a visibly worse
+    /// point, rather than one that is obviously broken:
+    ///
+    /// * **warfarin vs the NONMEM FOCEI reference**: `σ²` lands +220% at 3 draws, +72%
+    ///   at 8, +39% at 16 and +20% at 32, while `θ` and `Ω` move by under 0.25%
+    ///   throughout. The residual-error estimate is the Monte-Carlo-limited one.
+    /// * **IOV recovery at K=4**: at 3 draws `TVCL` comes back 0.85 against a true 1.0
+    ///   and `σ` 0.137 against 0.10, with `converged: true` after 2500 iterations; at 8
+    ///   draws every parameter is indistinguishable from SAEM and FOCEI on the same data.
+    ///
+    /// That is the settling criterion behaving correctly — it asks whether the remaining
+    /// drift is distinguishable from noise, and at 3 draws it is not, while the objective
+    /// is still moving. Raising the draws lowers the noise floor rather than papering
+    /// over it. The cost is sublinear in practice because the run also settles sooner:
+    /// on the IOV fit, 3 draws took 2.9 s and 8 draws 5.2 s.
+    ///
+    /// Raise it further when the residual error itself matters; `σ` is the parameter that
+    /// keeps improving with more draws long after `θ` and `Ω` have stopped.
     pub vi_mc_samples: usize,
     /// Adam learning rate. Default 0.02. Janssen et al. use 0.1, dropping to 0.01 when
     /// unstable.
@@ -6149,7 +6168,7 @@ impl Default for FitOptions {
             sir_df: 5.0,
             n_agq: 1,
             vi_iters: 25_000,
-            vi_mc_samples: 3,
+            vi_mc_samples: 8,
             vi_lr: 0.02,
             vi_family: ViFamily::default(),
             vi_omega_update: ViOmegaUpdate::default(),
