@@ -1883,7 +1883,7 @@ fn subject_is_estimate_joint(
         let err_keys = model.error_spec.obs_keys(subject);
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
-            let f = f.max(1e-12);
+            let f = model.floor_prediction(f);
             let v = (model.residual_variance_at_scaled(
                 err_keys[j],
                 f,

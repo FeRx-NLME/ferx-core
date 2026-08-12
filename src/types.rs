@@ -3986,6 +3986,37 @@ impl CompiledModel {
         }
     }
 
+    /// Apply the positivity floor a prediction needs before it enters a Gaussian
+    /// residual — and **skip it under LTBS**, where the floor is actively wrong.
+    ///
+    /// The `1e-12` floor exists because a concentration cannot be negative: an optimizer
+    /// excursion that drives `f` below zero would otherwise produce a nonsensical
+    /// residual. Under log-transform-both-sides, though, `f` is already `log(c)`, which
+    /// is legitimately negative for **any concentration below one unit** — routine for
+    /// ng/mL data, late samples, or a high-clearance subject. Flooring it there replaces
+    /// a perfectly good negative log-prediction with ~0 and fabricates a large residual,
+    /// silently, in exactly the way this code already declines to do for FREM covariate
+    /// rows (see [`crate::stats::likelihood`]'s FREM note, which makes the same argument
+    /// for the same reason and reaches the same conclusion).
+    ///
+    /// Positivity is already enforced for LTBS models at the transform itself:
+    /// [`crate::pk::ltbs_log_g`] floors the **natural-scale** value at `LTBS_FLOOR`
+    /// before taking the log, which is the right place for it — the log-scale value that
+    /// comes out needs no further guarding.
+    ///
+    /// The conditional-mode objective ([`crate::stats::likelihood::individual_nll_into`])
+    /// never applied this floor, which is why FOCE/Laplace/AGQ match NONMEM on LTBS while
+    /// the fixed-`η` family (SAEM's M-step, IMP/IMPMAP, VI) did not. Routing every site
+    /// through this one method is what keeps them agreeing.
+    #[inline]
+    pub fn floor_prediction(&self, f: f64) -> f64 {
+        if self.log_transform {
+            f
+        } else {
+            f.max(1e-12)
+        }
+    }
+
     /// Residual *variance* for resampling observation row `j` of `subject`
     /// during simulation or NPDE, including the FREM and IIV-on-RUV splits that
     /// a bare [`residual_variance_at`](Self::residual_variance_at) call misses:

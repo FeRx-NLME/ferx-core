@@ -890,6 +890,16 @@ section of the SDLC for the versioning policy).
   for any external code that constructs or exhaustively destructures these variants.
 
 ### Fixed
+- **LTBS models scored a different objective under SAEM / IMP / VI than under FOCE.** The
+  fixed-η observation likelihood applied a `max(1e-12)` positivity floor to the
+  prediction — correct for a concentration, wrong for `log(concentration)`, which is
+  legitimately negative for any concentration below one unit (ng/mL data, late samples, a
+  high-clearance subject). Affected observations had their residual computed against ~0
+  instead of the true negative log-prediction, inflating it silently. FOCE/Laplace/AGQ
+  never applied the floor and were unaffected, so this showed up as SAEM/IMP/VI
+  disagreeing with FOCE on the same model. The floor now stands down under LTBS, where
+  positivity is already enforced on the natural scale before the log is taken.
+
 - **Gradient-path-dependent FOCE/FOCEI objective on proportional-error models with a
   near-zero prediction** (#958). The residual-variance floor (`MIN_VARIANCE`, which clamps
   `(f·σ)²` so a vanishing prediction cannot produce a zero variance) was applied to the

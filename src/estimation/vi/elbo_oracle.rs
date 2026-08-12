@@ -399,12 +399,13 @@ fn closed_form_omega_matches_the_exact_posterior_moments() {
 /// samples, or a high-clearance subject. The residual `y − log f` must stay a plain
 /// affine function of `η` there, so the observation NLL stays quadratic in `η`.
 ///
-/// It does not. Once `log f(t)` crosses zero the NLL behaves exactly as though the
-/// *log-scale* prediction were floored at `0` (equivalently, the natural-scale
-/// prediction floored at `1.0`) — even though `compute_predictions_with_tv_into`
-/// returns the correct negative log-prediction to machine precision (verified to
-/// 4e-16). The discrepancy matches `½[(y − max(log f, 0))² − (y − log f)²]/σ²` to six
-/// decimals, which is how it was identified.
+/// It did not, until the positivity floor that guards natural-scale concentrations was
+/// taught to stand down under LTBS ([`CompiledModel::floor_prediction`]). Once
+/// `log f(t)` crossed zero the NLL behaved exactly as though the log-scale prediction
+/// were floored at `1e-12` — even though `compute_predictions_with_tv_into` returned the
+/// correct negative log-prediction to machine precision (verified to 4e-16). The
+/// discrepancy matched `½[(y − max(log f, 1e-12))² − (y − log f)²]/σ²` to six decimals,
+/// which is how it was identified.
 ///
 /// This is **not** VI-specific: it lives in the observation NLL, so every estimator
 /// that scores an LTBS model with sub-unit predictions inherits it. And no
@@ -412,10 +413,9 @@ fn closed_form_omega_matches_the_exact_posterior_moments() {
 /// floored objective are themselves consistently floored — which is precisely why the
 /// exact-case oracle in this module was needed to surface it.
 ///
-/// Ignored rather than deleted: it reproduces a real defect and should be un-ignored by
-/// the fix, not rewritten to match today's behaviour.
+/// Written against the defect and un-ignored by the fix, rather than rewritten to match
+/// the behaviour that was there.
 #[test]
-#[ignore = "reproduces an open defect: LTBS residual floors at log f = 0 (see doc comment)"]
 fn ltbs_data_term_is_quadratic_below_unit_predictions() {
     let model = linear_gaussian_model();
     let template = model.default_params.clone();
@@ -769,5 +769,81 @@ fn full_rank_vi_is_exact_on_a_linear_gaussian_iov_model() {
     assert!(
         neg_two_elbo > exact - 1e-2,
         "-2*ELBO ({neg_two_elbo:.6}) fell below the exact -2 log p(y) ({exact:.6})"
+    );
+}
+
+/// The fixed-`η` observation NLL must agree with the conditional-mode objective on the
+/// same model, at the same `η`, including where `log f` is negative.
+///
+/// Lives in this module because it needs the sub-unit-prediction LTBS fixture above, but
+/// it guards a [`crate::stats::likelihood`] invariant, not a VI one: `individual_nll_into`
+/// (FOCE/Laplace/AGQ, anchored against NONMEM by `tests/ltbs_convergence.rs`) and
+/// `obs_nll_subject_into` (SAEM's M-step, IMP/IMPMAP, VI) are two spellings of the same
+/// Gaussian data term and must not disagree.
+///
+/// They did. Only the fixed-`η` family applied a `max(1e-12)` positivity floor to the
+/// prediction, which is right for a concentration and wrong for `log(concentration)`, so
+/// on any LTBS model with sub-unit predictions SAEM/IMP/VI were scoring a different
+/// objective from FOCE. The floor now defers to [`CompiledModel::floor_prediction`].
+///
+/// At `η = 0` the prior term vanishes and `individual_nll_into` reduces to
+/// `0.5·(log|Ω| + data_ll)`, while `obs_nll_subject_into` is `0.5·data_ll` — hence the
+/// single `0.5·log|Ω|` offset.
+#[test]
+fn fixed_eta_nll_agrees_with_the_conditional_mode_objective_under_ltbs() {
+    let model = linear_gaussian_model();
+    let template = model.default_params.clone();
+    let mut scratch = crate::pk::EventPkParams::default();
+
+    // Observations on the eta = 0 prediction; eta then walks far enough out that
+    // `log f` goes negative at the later times.
+    let obs: Vec<f64> = TIMES.iter().map(|&t| intercept(t)).collect();
+    let subj = oracle_subject("ltbs-agree", &obs);
+
+    let half_log_det = 0.5 * template.omega.log_det;
+    let mut saw_negative_pred = false;
+
+    for &eta in &[0.0f64, 2.0, 5.0, 8.0] {
+        let preds = crate::pk::compute_predictions_with_tv_into(
+            &model,
+            &subj,
+            &template.theta,
+            &[eta],
+            &mut scratch,
+        );
+        saw_negative_pred |= preds.iter().any(|p| *p < 0.0);
+
+        let joint = crate::stats::likelihood::individual_nll_into(
+            &model,
+            &subj,
+            &template.theta,
+            &[eta],
+            &template.omega,
+            &template.sigma.values,
+            &mut scratch,
+        );
+        let obs_only = crate::stats::likelihood::obs_nll_subject_into(
+            &model,
+            &subj,
+            &template.theta,
+            &template.sigma.values,
+            &[eta],
+            &mut scratch,
+        );
+        // eta = 0 in this single-eta model, so the eta'Omega^-1 eta prior term is only
+        // zero at eta = 0; subtract it explicitly for the others.
+        let prior = 0.5 * eta * eta / OMEGA;
+        let expected = joint - half_log_det - prior;
+        assert!(
+            (obs_only - expected).abs() < 1e-9,
+            "fixed-eta NLL {obs_only:.10} disagrees with the conditional-mode data term \
+             {expected:.10} at eta={eta} (joint {joint:.10}); the two objectives must be \
+             the same function"
+        );
+    }
+
+    assert!(
+        saw_negative_pred,
+        "fixture must actually reach negative log-predictions, else it proves nothing"
     );
 }
