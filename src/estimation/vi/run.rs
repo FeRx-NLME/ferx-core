@@ -42,8 +42,8 @@ use crate::types::{
 
 use super::adam::{averaging_start, AdamConfig, AdamState, PolyakAverager};
 use super::elbo::{
-    closed_form_omega, population_neg_elbo, unsupported_data_term_reason, ElboConfig, Families,
-    PackedLayout,
+    closed_form_omega, population_neg_elbo, stacked_prior, unsupported_data_term_reason,
+    ElboConfig, Families, PackedLayout,
 };
 use super::family::{FullRank, MeanField, VariationalFamily};
 
@@ -186,11 +186,29 @@ pub(crate) fn kl_fallback_warning(
     })
 }
 
-fn build_family(kind: ViFamily, n_eta: usize) -> Box<dyn VariationalFamily> {
+fn build_family(kind: ViFamily, d: usize) -> Box<dyn VariationalFamily> {
     match kind {
-        ViFamily::FullRank => Box::new(FullRank::new(n_eta)),
-        ViFamily::MeanField => Box::new(MeanField::new(n_eta)),
+        ViFamily::FullRank => Box::new(FullRank::new(d)),
+        ViFamily::MeanField => Box::new(MeanField::new(d)),
     }
+}
+
+/// One family per subject, sized to that subject's stacked vector
+/// `[η, κ₁ … κ_{K_i}]`.
+///
+/// Without IOV every `K_i` is zero and every family has dimension `n_eta`, so this is N
+/// copies of the same thing — cheap (a family is two `usize`s) and it keeps one code
+/// path rather than branching the whole driver on whether the model has kappas.
+fn build_families(
+    kind: ViFamily,
+    n_eta: usize,
+    n_kappa: usize,
+    k_occasions: &[usize],
+) -> Vec<Box<dyn VariationalFamily>> {
+    k_occasions
+        .iter()
+        .map(|&k| build_family(kind, n_eta + k * n_kappa))
+        .collect()
 }
 
 /// Zero the gradient at coordinates the model declares FIXed.
@@ -207,6 +225,18 @@ fn zero_fixed_coords(grad: &mut [f64], template: &ModelParameters, layout: &Pack
     for (k, &fixed) in template.sigma_fixed.iter().enumerate() {
         if fixed {
             grad[layout.sigma_start() + k] = 0.0;
+        }
+    }
+    // FIXed kappas pin their whole row and column of `Ω_iov`, matching the `fi || fj`
+    // rule `closed_form_omega` applies in Ω space and `packed_fixed_mask` applies here.
+    if let Some(iov) = template.omega_iov.as_ref() {
+        let is_fixed = |k: usize| template.kappa_fixed.get(k).copied().unwrap_or(false);
+        for (slot, (i, j)) in
+            crate::estimation::parameterization::lower_tri_iter(iov.dim(), iov.diagonal).enumerate()
+        {
+            if is_fixed(i) || is_fixed(j) {
+                grad[layout.omega_iov_start() + slot] = 0.0;
+            }
         }
     }
 }
@@ -291,7 +321,6 @@ pub fn run_vi(
     }
 
     let n_eta = model.n_eta;
-    let family = build_family(options.vi_family, n_eta);
     let layout = PackedLayout::new(init_params);
     let n_iters = options.vi_iters.max(1);
 
@@ -321,18 +350,33 @@ pub fn run_vi(
         .map(|s| super::elbo::subject_k_occasions(model, s))
         .collect();
 
+    // One family per subject, sized to `n_eta + K_i * n_kappa`.
+    let families = build_families(options.vi_family, n_eta, model.n_kappa, &k_occasions);
+    let fams = Families::PerSubject(&families);
+
     // Start q at the prior and Θ at the model file's initial estimates: no
     // randomization, so the fit is reproducible by default. The initial estimates
     // are projected too, so `x` is inside the box from the first evaluation
     // onwards rather than only after the first step.
     let mut x = pack_params(init_params);
     clamp_to_bounds(&mut x, &bounds);
+    // Each subject's `q` starts at *its own* prior: the block-diagonal
+    // `Σ_b = Ω ⊕ Ω_iov^{⊗K_i}`, which is `Ω` itself without IOV. Starting at the prior
+    // rather than at a random point keeps the fit reproducible and makes the first
+    // iteration's KL exactly zero.
     let mut phis: Vec<Vec<f64>> = (0..n_subjects)
-        .map(|_| family.init(&init_params.omega))
+        .map(|i| {
+            let prior = stacked_prior(
+                &init_params.omega,
+                init_params.omega_iov.as_ref(),
+                k_occasions[i],
+            );
+            families[i].init(&prior)
+        })
         .collect();
     let mut adam_x = AdamState::new(x.len());
     let mut adam_phi: Vec<AdamState> = (0..n_subjects)
-        .map(|_| AdamState::new(family.n_params()))
+        .map(|i| AdamState::new(families[i].n_params()))
         .collect();
 
     // Recomputed if the run settles early (see `stop_at` below), so the Polyak window
@@ -346,7 +390,7 @@ pub fn run_vi(
     let mut consecutive_settled = 0usize;
     let mut avg_x = PolyakAverager::new(x.len());
     let mut avg_phi: Vec<PolyakAverager> = (0..n_subjects)
-        .map(|_| PolyakAverager::new(family.n_params()))
+        .map(|i| PolyakAverager::new(families[i].n_params()))
         .collect();
 
     let mut warnings: Vec<String> = Vec::new();
@@ -361,7 +405,7 @@ pub fn run_vi(
             population,
             init_params,
             &x,
-            Families::Uniform(family.as_ref()),
+            fams,
             &phis,
             &cfg,
             iter as u64,
@@ -388,6 +432,11 @@ pub fn run_vi(
             for g in grad_x[layout.omega_start()..layout.sigma_start()].iter_mut() {
                 *g = 0.0;
             }
+            // Same for `Ω_iov`, which the closed form also sets. An empty range without
+            // IOV.
+            for g in grad_x[layout.omega_iov_start()..layout.total()].iter_mut() {
+                *g = 0.0;
+            }
         }
         adam_x.step(&mut x, &grad_x, &adam_cfg);
         // Project *before* the closed-form Ω is written below, not after. The two
@@ -410,12 +459,7 @@ pub fn run_vi(
         }
 
         if options.vi_omega_update == ViOmegaUpdate::ClosedForm {
-            let (omega, omega_iov) = closed_form_omega(
-                Families::Uniform(family.as_ref()),
-                &phis,
-                &k_occasions,
-                init_params,
-            );
+            let (omega, omega_iov) = closed_form_omega(fams, &phis, &k_occasions, init_params);
             write_closed_form_omegas(&mut x, &omega, omega_iov.as_ref(), init_params, &layout);
         }
 
@@ -491,12 +535,7 @@ pub fn run_vi(
         .collect();
     let mut final_params = unpack_params(&x_final, init_params);
     if options.vi_omega_update == ViOmegaUpdate::ClosedForm {
-        let (omega, omega_iov) = closed_form_omega(
-            Families::Uniform(family.as_ref()),
-            &phis_final,
-            &k_occasions,
-            init_params,
-        );
+        let (omega, omega_iov) = closed_form_omega(fams, &phis_final, &k_occasions, init_params);
         final_params.omega = omega;
         if omega_iov.is_some() {
             final_params.omega_iov = omega_iov;
@@ -515,25 +554,42 @@ pub fn run_vi(
         population,
         init_params,
         &pack_params(&final_params),
-        Families::Uniform(family.as_ref()),
+        fams,
         &phis_final,
         &report_cfg,
         n_iters as u64,
     )?;
 
     // The variational moments — VI's own output, reported on `ViResult`.
+    //
+    // Under IOV `μ` spans the stacked vector, so the reported `η` moments are its BSV
+    // head and the per-occasion `κ` means are read off the blocks behind it. `warm` keeps
+    // only the `η` part: it seeds the EBE search below, whose own `κ` solve is separate.
     let mut eta_means: Vec<Vec<f64>> = Vec::with_capacity(n_subjects);
     let mut eta_covs: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_subjects);
+    let mut kappa_means: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_subjects);
     let mut warm: Vec<DVector<f64>> = Vec::with_capacity(n_subjects);
-    for phi in &phis_final {
-        let (mu, s) = family.moments(phi);
-        eta_means.push(mu.iter().copied().collect());
+    let n_kappa = model.n_kappa;
+    for (i, phi) in phis_final.iter().enumerate() {
+        let (mu, s) = families[i].moments(phi);
+        eta_means.push(mu.iter().take(n_eta).copied().collect());
         eta_covs.push(
             (0..n_eta)
-                .map(|i| (0..n_eta).map(|j| s[(i, j)]).collect())
+                .map(|a| (0..n_eta).map(|b| s[(a, b)]).collect())
                 .collect(),
         );
-        warm.push(mu);
+        kappa_means.push(
+            (0..k_occasions[i])
+                .map(|g| {
+                    let off = n_eta + g * n_kappa;
+                    (0..n_kappa).map(|c| mu[off + c]).collect()
+                })
+                .collect(),
+        );
+        warm.push(DVector::from_iterator(
+            n_eta,
+            mu.iter().take(n_eta).copied(),
+        ));
     }
 
     // Downstream diagnostics — CWRES, IWRES, shrinkage, sdtab — are all defined in
@@ -574,7 +630,7 @@ pub fn run_vi(
              but much slower than it needs to be."
         ));
     }
-    if let Some(w) = kl_fallback_warning(n_kl_fallback_subjects, n_subjects, family.label()) {
+    if let Some(w) = kl_fallback_warning(n_kl_fallback_subjects, n_subjects, families[0].label()) {
         warnings.push(w);
     }
 
@@ -648,7 +704,7 @@ pub fn run_vi(
         kl_term: final_eval.kl_term,
         n_iterations: n_iters_run,
         converged,
-        family: family.label().to_string(),
+        family: families[0].label().to_string(),
         n_mc_samples: cfg.n_mc_samples,
         // What actually ran, not what was asked for: a family with no closed-form KL
         // is sampled even under `vi_kl = analytic`.
@@ -662,6 +718,7 @@ pub fn run_vi(
         elbo_trace: trace,
         eta_means,
         eta_covs,
+        kappa_means,
         n_fd_subjects,
     };
 

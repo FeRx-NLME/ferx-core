@@ -249,13 +249,6 @@ pub fn stacked_prior(
 /// The two failure modes therefore get different treatment, and conflating them
 /// is exactly how a scope gap turns into silently wrong estimates.
 pub fn unsupported_data_term_reason(model: &CompiledModel) -> Option<String> {
-    if model.n_kappa > 0 {
-        return Some(
-            "VI does not support IOV (n_kappa > 0): the variational family would have to \
-             cover (η, κ) jointly. Use method = saem or focei for IOV models."
-                .to_string(),
-        );
-    }
     // The data term is `obs_nll_subject_grad`'s NLL, and
     // `obs_nll_subject_from_preds` *skips* rows belonging to a non-Gaussian
     // endpoint (#905) — they are scored through `obs_records` instead. Fitting

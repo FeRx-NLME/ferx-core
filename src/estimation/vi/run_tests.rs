@@ -644,19 +644,42 @@ fn fd_eta_grad_mode_agrees_with_the_analytic_route() {
 // Refusals
 // ---------------------------------------------------------------------------
 
-/// IOV is rejected with a message naming the alternative, rather than fitting a
-/// model whose `κ` the variational family cannot represent.
+/// An IOV model now fits end to end, with a variational posterior over the stacked
+/// `[η, κ₁ … κ_K]` and per-occasion `κ` means reported alongside the `η` moments.
+///
+/// The two subjects carry **different** occasion counts, so this exercises the
+/// per-subject family dimension rather than a population that happens to be uniform.
 #[test]
-fn iov_models_are_refused() {
-    let (mut model, population, params) = fixture();
-    model.n_kappa = 1;
-    // `OuterResult` is not `Debug`, so match rather than `expect_err`.
-    let err = match run_vi(&model, &population, &params, &opts(5)) {
-        Err(e) => e,
-        Ok(_) => panic!("IOV must be refused"),
-    };
-    assert!(err.contains("IOV"), "unhelpful error: {err}");
-    assert!(err.contains("saem") || err.contains("focei"));
+fn iov_models_fit_and_report_per_occasion_kappa_means() {
+    let (model, population, params) = iov_fixture();
+    assert!(model.n_kappa > 0);
+
+    let out = run_vi(&model, &population, &params, &opts(40)).expect("IOV must fit");
+    let vi = out.vi.as_ref().expect("VI result present");
+
+    // eta moments stay `n_eta`-shaped: they are the BSV head of the stacked posterior.
+    assert_eq!(vi.eta_means.len(), population.subjects.len());
+    for m in &vi.eta_means {
+        assert_eq!(m.len(), model.n_eta);
+    }
+    // kappa means are per subject, per occasion.
+    assert_eq!(vi.kappa_means.len(), population.subjects.len());
+    assert_eq!(vi.kappa_means[0].len(), 2, "subject 1 has two occasions");
+    assert_eq!(vi.kappa_means[1].len(), 3, "subject 2 has three occasions");
+    for subj in &vi.kappa_means {
+        for occ in subj {
+            assert_eq!(occ.len(), model.n_kappa);
+            assert!(occ.iter().all(|v| v.is_finite()));
+        }
+    }
+    assert!(vi.neg_two_elbo.is_finite());
+    // The closed form must have produced an Omega_iov rather than leaving it untouched.
+    let iov = out
+        .params
+        .omega_iov
+        .as_ref()
+        .expect("an IOV fit must report Omega_iov");
+    assert!(iov.matrix[(0, 0)] > 0.0 && iov.matrix[(0, 0)].is_finite());
 }
 
 /// An empty population is refused rather than producing a vacuous fit.
@@ -797,4 +820,76 @@ fn settling_is_judged_against_noise_not_objective_magnitude() {
     // is never stricter than the one it replaces.
     let constant = vec![-286.0; 200];
     assert!(trace_has_settled(&constant, 50, CONVERGENCE_REL_TOL));
+}
+
+/// A two-subject IOV population on a closed-form 1-cpt IV model, with a differing
+/// occasion count per subject.
+///
+/// The differing `K` is the point: it is what makes the stacked dimension a per-subject
+/// quantity, so a fixture where every subject agreed would not exercise
+/// [`Families::PerSubject`] or catch an offset computed from the wrong subject's `K`.
+fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
+    let model = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  iov_column = OCC
+",
+    )
+    .expect("IOV fixture parses");
+
+    let subject = |id: &str, occ: Vec<u32>, scale: f64| Subject {
+        id: id.into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: (0..occ.len()).map(|k| 1.0 + 2.0 * k as f64).collect(),
+        obs_raw_times: Vec::new(),
+        observations: (0..occ.len())
+            .map(|k| scale * (8.0 - 0.9 * k as f64))
+            .collect(),
+        obs_cmts: vec![1; occ.len()],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0; occ.len()],
+        occasions: occ,
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1],
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+
+    let population = Population {
+        // Two occasions for the first subject, three for the second.
+        subjects: vec![
+            subject("1", vec![1, 1, 2, 2], 1.0),
+            subject("2", vec![1, 2, 2, 3, 3], 1.15),
+        ],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let params = model.default_params.clone();
+    (model, population, params)
 }

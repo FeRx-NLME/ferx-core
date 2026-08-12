@@ -1261,16 +1261,21 @@ fn mc_and_analytic_kl_agree_on_the_objective() {
     );
 }
 
-/// IOV is rejected outright — the variational family would have to cover
-/// `(η, κ)` jointly, which v1 does not implement.
+/// IOV is no longer a data-term refusal: the variational family covers `(η, κ)` jointly
+/// via the stacked prior (VI_PLAN §10).
+///
+/// Kept as a test rather than deleted, so that re-introducing a blanket `n_kappa > 0`
+/// refusal — the easy thing to do while debugging something else — fails loudly.
 #[test]
-fn iov_models_are_rejected_by_the_data_term_predicate() {
+fn iov_models_are_not_refused_by_the_data_term_predicate() {
     let mut model = analytical_model(GradientMethod::Auto);
     assert!(unsupported_data_term_reason(&model).is_none());
 
     model.n_kappa = 1;
-    let reason = unsupported_data_term_reason(&model).expect("IOV must be rejected");
-    assert!(reason.contains("IOV"), "unhelpful reason: {reason}");
+    assert!(
+        unsupported_data_term_reason(&model).is_none(),
+        "IOV must be servable: the data term routes through the _iov siblings"
+    );
 }
 
 // ---------------------------------------------------------------------------

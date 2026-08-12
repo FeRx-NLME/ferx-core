@@ -4471,6 +4471,13 @@ pub struct ViResult {
     /// Per-subject variational posterior means — VI's analogue of the EBEs, and
     /// what is reported as `eta_hat`.
     pub eta_means: Vec<Vec<f64>>,
+    /// Per-subject, per-occasion variational posterior means for the IOV `κ`, in
+    /// occasion order. Empty for a model without IOV.
+    ///
+    /// Reported separately from `eta_means` because `μ` spans the stacked vector
+    /// `[η, κ₁ … κ_K]` under IOV: `eta_means` is its BSV head, and these are the blocks
+    /// behind it.
+    pub kappa_means: Vec<Vec<Vec<f64>>>,
     /// Per-subject variational posterior covariances, row-major.
     ///
     /// A by-product of the fit rather than an extra computation: VI gets each

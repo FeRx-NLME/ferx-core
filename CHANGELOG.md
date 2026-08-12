@@ -749,8 +749,11 @@ section of the SDLC for the versioning policy).
   likelihood:** `ofv` is `NaN` by default rather than being filled with a number that is not
   comparable to a FOCE/SAEM OFV. Set `vi_final_ofv = laplace`, or chain `methods = vi, imp`
   with `imp_eval_only = true`, to evaluate a genuine marginal likelihood at the VI estimate.
-  IOV and non-Gaussian endpoints (TTE / categorical) are not supported and are refused with
-  an actionable message.
+  **IOV is supported**: the variational posterior covers the stacked `[η, κ₁ … κ_K]`
+  jointly against a block-diagonal prior `Ω ⊕ Ω_iov^{⊗K}`, `Ω_iov` gets its own
+  closed-form maximizer pooled over every occasion of every subject, and per-occasion `κ`
+  means are reported on `FitResult$vi$kappa_means`. Non-Gaussian endpoints
+  (TTE / categorical) are still unsupported and are refused with an actionable message.
 - **New ODE steppers via `[fit_options] ode_method`,** on two independent axes. For
   **stability**: the linearly implicit Rosenbrock methods `rosenbrock23` (order 2, aliases
   `ros23`/`ode23s`), `rodas4` (order 4) and `rodas5p` (order 5). These are stable at the step size the tolerance needs on **stiff**
