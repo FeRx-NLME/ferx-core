@@ -206,6 +206,46 @@ also exposed on each `FitResult.neural_networks[k]` entry). `ferx-r`
 loaders round-trip them losslessly via `fit.json` inside the `.fitrx`
 archive.
 
+## Weight gradients
+
+Estimators that hold the random effects fixed while differentiating the
+population parameters — SAEM's M-step, importance sampling, and
+[variational inference](../estimation/vi.qmd) — used to obtain
+`∂NLL/∂θ` by perturbing each `θ` in turn and re-solving the subject.
+For a classical model that is a handful of solves. For a DCM the
+weights *are* `θ`, so a 141-weight network meant 141 solves per subject
+per draw.
+
+The weights are now taken analytically. The network touches the
+likelihood through one narrow channel — its output layer — so its
+influence factors as
+
+$$\frac{\partial \mathrm{NLL}}{\partial w_j} = \sum_k \frac{\partial \mathrm{NLL}}{\partial z_k} \cdot \frac{\partial z_k}{\partial w_j}$$
+
+where $z$ is the output layer's pre-activation. The second factor is
+exact backpropagation, already available and cheap. Only the
+`n_outputs` values of the first factor need the model solved, and they
+come from the output-layer biases: $b_k$ shifts $z_k$ one-for-one and
+leaves every other output alone, so a finite difference in $b_k$ *is*
+$\partial \mathrm{NLL} / \partial z_k$. That is `2 × n_outputs` solves
+— 10 rather than 141 on the model above, taking each difference
+centrally.
+
+Two consequences worth knowing:
+
+- **Accuracy improves more than speed.** Agreement with a central
+  finite difference of the objective goes from ~2e-5 to ~1e-9 relative.
+  Wall-clock on the reference DCM improves ~1.4×, because the `θ` loop
+  was only about 30% of a VI iteration to begin with.
+- **Time-varying NN inputs opt out.** The factorization needs one
+  output vector per subject. If a covariate feeding the network changes
+  within a subject, each event has its own $z$ and the bias difference
+  returns their sum, which cannot be unpicked. Those subjects fall back
+  to the per-`θ` loop — correct, just slower. Covariates that vary but
+  do *not* feed the network are unaffected.
+
+`method = focei` uses a different gradient path and is unchanged.
+
 ## What's not yet wired
 
 These items are tracked against Phase A M2 / future PRs in the

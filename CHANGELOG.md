@@ -967,6 +967,24 @@ section of the SDLC for the versioning policy).
   through both the endpoint-routed and model-blind loaders.
 
 ### Performance
+- **Analytic weight gradients for `[covariate_nn]` models** — the fixed-η θ gradient that
+  SAEM's M-step, IMP and VI share used one perturbed model solve per θ, and on a deep
+  compartment model the network's weights *are* θ. It now takes the network's weights
+  analytically: the NN reaches the likelihood only through its output layer, so
+  `∂NLL/∂w = Σₖ (∂NLL/∂zₖ)·(∂zₖ/∂w)`, where the second factor is exact backpropagation and
+  only the `n_outputs` values of the first need the model solved. Those are obtained from
+  the output-layer biases, which move one output's pre-activation and nothing else. On the
+  reference 141-weight DCM (2 → 8 → 8 → 5) that is 10 solves per subject per draw instead
+  of 141. Because the few remaining differences are now shared by every weight, they are
+  taken *centrally* rather than forward, and agreement with a central finite difference of
+  the objective improves from ~2e-5 to ~1e-9 relative — the weight gradients stop being the
+  least accurate part of a DCM fit. Wall-clock on that model is ~1.4× (42 s → 30 s at a
+  fixed 1500 VI iterations, estimates unchanged); the finite-difference loop was roughly
+  30% of VI's runtime there, so the 14× cut in solves does not carry through to the total.
+  Models whose NN inputs vary within a subject keep the per-θ loop — a single output vector
+  no longer mediates every observation — and models with no `[covariate_nn]` block are
+  untouched.
+
 - **`method = laplace` gradients are far more accurate, and its objective is faster.** The
   posterior Hessian that scales the quadrature grid is now taken analytically — it is the exact
   conditional `∂²nll/∂b²` the shared sensitivity sweep already assembles — instead of being
