@@ -554,7 +554,13 @@ fn closed_form_omega_zeroes_the_omega_gradient() {
     let phis = perturbed_phis(&family, &params.omega, 2);
 
     let mut updated = params.clone();
-    updated.omega = closed_form_omega(&family, &phis, &params);
+    updated.omega = closed_form_omega(
+        Families::Uniform(&family),
+        &phis,
+        &vec![0usize; phis.len()],
+        &params,
+    )
+    .0;
     let x = pack_params(&updated);
 
     let e = population_neg_elbo(
@@ -721,7 +727,13 @@ fn closed_form_omega_respects_block_structure_and_fixed_rows() {
 
     let family = FullRank::new(3);
     let phis = perturbed_phis(&family, &params.omega, 4);
-    let out = closed_form_omega(&family, &phis, &params);
+    let out = closed_form_omega(
+        Families::Uniform(&family),
+        &phis,
+        &vec![0usize; phis.len()],
+        &params,
+    )
+    .0;
 
     for i in 0..3 {
         for j in 0..3 {
@@ -764,7 +776,13 @@ fn closed_form_omega_respects_structure() {
 
     let family = FullRank::new(2);
     let phis = perturbed_phis(&family, &omega, 4);
-    let out = closed_form_omega(&family, &phis, &template);
+    let out = closed_form_omega(
+        Families::Uniform(&family),
+        &phis,
+        &vec![0usize; phis.len()],
+        &template,
+    )
+    .0;
 
     assert_eq!(
         out.matrix[(0, 1)],

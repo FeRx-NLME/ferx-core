@@ -932,32 +932,25 @@ pub fn population_neg_elbo(
 /// Structural zeros (`free_mask`) are respected, so a diagonal or block `Ω` keeps
 /// its declared shape rather than picking up sampling correlation in entries the
 /// model says do not exist. FIXed diagonals are left at their declared value.
-pub fn closed_form_omega(
-    family: &dyn VariationalFamily,
-    phis: &[Vec<f64>],
-    template: &ModelParameters,
-) -> OmegaMatrix {
-    let d = template.omega.dim();
-    let mut acc = DMatrix::<f64>::zeros(d, d);
-    for phi in phis {
-        let (mu, s) = family.moments(phi);
-        acc += s + &mu * mu.transpose();
-    }
-    if !phis.is_empty() {
-        acc /= phis.len() as f64;
-    }
-
+/// Impose a template's structural zeros, FIXed rows/columns and diagonal floor on an
+/// accumulated `Σ(S + μμᵀ)`, then wrap it as an `OmegaMatrix`.
+///
+/// Shared by the BSV and IOV blocks, which differ only in which template block and which
+/// FIXed flags they read — the masking rules themselves are identical, and having one
+/// copy is what stops them drifting apart.
+fn finalize_omega_block(mut acc: DMatrix<f64>, tmpl: &OmegaMatrix, fixed: &[bool]) -> OmegaMatrix {
+    let d = tmpl.dim();
     // Structural zeros stay zero: `Σᵢ(Sᵢ + μᵢμᵢᵀ)` is always dense, so a mixed
     // `block_omega` + diagonal Ω would otherwise pick up sampling correlation in
     // cross-block entries the model says do not exist.
     for i in 0..d {
         for j in 0..d {
-            if !template.omega.free_mask[(i, j)] {
+            if !tmpl.free_mask[(i, j)] {
                 acc[(i, j)] = 0.0;
             }
         }
     }
-    // Then FIXed etas keep their whole declared row and column, under the same
+    // Then FIXed entries keep their whole declared row and column, under the same
     // `fi || fj` rule `packed_fixed_mask` uses — a FIXed eta pins its covariances
     // with every other eta, not just its own variance. Restoring in `Ω` space (as
     // SAEM's Ω update does) rather than in Cholesky coordinates makes this exact:
@@ -966,25 +959,96 @@ pub fn closed_form_omega(
     // order is immaterial — a structurally-absent entry is zero in the template too.
     for i in 0..d {
         for j in 0..d {
-            let fi = template.omega_fixed.get(i).copied().unwrap_or(false);
-            let fj = template.omega_fixed.get(j).copied().unwrap_or(false);
+            let fi = fixed.get(i).copied().unwrap_or(false);
+            let fj = fixed.get(j).copied().unwrap_or(false);
             if fi || fj {
-                acc[(i, j)] = template.omega.matrix[(i, j)];
+                acc[(i, j)] = tmpl.matrix[(i, j)];
             }
         }
     }
     crate::estimation::saem::floor_omega_diagonal(
         &mut acc,
-        &template.omega_fixed,
+        fixed,
         crate::estimation::saem::SAEM_OMEGA_DIAG_FLOOR,
     );
-
     OmegaMatrix::from_matrix_with_mask(
         acc,
-        template.omega.eta_names.clone(),
-        template.omega.diagonal,
-        template.omega.free_mask.clone(),
+        tmpl.eta_names.clone(),
+        tmpl.diagonal,
+        tmpl.free_mask.clone(),
     )
+}
+
+/// The ELBO-maximizing `Ω` — and, under IOV, `Ω_iov` — given the current variational
+/// posteriors.
+///
+/// ```text
+///   Ω*     = (1/N)      Σᵢ ( Sᵢ[ηη]  + μᵢ[η]  μᵢ[η]ᵀ  )
+///   Ω_iov* = (1/Σᵢ Kᵢ)  Σᵢ Σ_g ( Sᵢ[κ_g] + μᵢ[κ_g] μᵢ[κ_g]ᵀ )
+/// ```
+///
+/// Under the analytic KL these are **exact**, not approximations — they are the
+/// stationary point of `Σᵢ KL(qᵢ ‖ N(0, Σ_b))` in each block, which is the only place
+/// either appears in the objective. Taking them directly removes both from the
+/// stochastic optimization.
+///
+/// Note the two different denominators. `Ω` averages over **subjects**, while `Ω_iov`
+/// pools over **every occasion of every subject** — the same sufficient statistic SAEM
+/// accumulates, and the reason a subject with more occasions contributes proportionally
+/// more to the IOV variance. It also makes explicit how much less data informs `Ω_iov`:
+/// `Σᵢ Kᵢ` occasions, each contributing one `S + μμᵀ`, against `N` subjects for `Ω`.
+///
+/// `k_occasions[i]` is subject `i`'s occasion count (0 without IOV). Returns `None` for
+/// the IOV block when the model declares no `kappa`.
+pub fn closed_form_omega(
+    families: Families<'_>,
+    phis: &[Vec<f64>],
+    k_occasions: &[usize],
+    template: &ModelParameters,
+) -> (OmegaMatrix, Option<OmegaMatrix>) {
+    let n_eta = template.omega.dim();
+    let mut acc = DMatrix::<f64>::zeros(n_eta, n_eta);
+
+    let iov_tmpl = template.omega_iov.as_ref();
+    let n_kappa = iov_tmpl.map(|m| m.dim()).unwrap_or(0);
+    let mut acc_iov = DMatrix::<f64>::zeros(n_kappa.max(1), n_kappa.max(1));
+    let mut n_occ_total = 0usize;
+
+    for (i, phi) in phis.iter().enumerate() {
+        let (mu, s) = families.for_subject(i).moments(phi);
+        // BSV block: the leading `n_eta` coordinates of the stacked posterior.
+        let mu_e = mu.rows(0, n_eta);
+        acc += s.view((0, 0), (n_eta, n_eta)) + &mu_e * mu_e.transpose();
+
+        if n_kappa == 0 {
+            continue;
+        }
+        let k = k_occasions.get(i).copied().unwrap_or(0);
+        for g in 0..k {
+            let off = n_eta + g * n_kappa;
+            let mu_k = mu.rows(off, n_kappa);
+            acc_iov += s.view((off, off), (n_kappa, n_kappa)) + &mu_k * mu_k.transpose();
+            n_occ_total += 1;
+        }
+    }
+
+    if !phis.is_empty() {
+        acc /= phis.len() as f64;
+    }
+    let omega = finalize_omega_block(acc, &template.omega, &template.omega_fixed);
+
+    let omega_iov = iov_tmpl.map(|tmpl| {
+        if n_occ_total > 0 {
+            acc_iov /= n_occ_total as f64;
+        } else {
+            // No occasions anywhere (an IOV model whose data carries none). Leave the
+            // declared value rather than collapsing to the diagonal floor.
+            acc_iov = tmpl.matrix.clone();
+        }
+        finalize_omega_block(acc_iov.clone(), tmpl, &template.kappa_fixed)
+    });
+
+    (omega, omega_iov)
 }
 
 #[cfg(test)]

@@ -400,7 +400,13 @@ fn closed_form_omega_matches_the_exact_posterior_moments() {
         .collect();
     expected /= pop.subjects.len() as f64;
 
-    let omega = closed_form_omega(&family, &phis, &template);
+    let omega = closed_form_omega(
+        Families::Uniform(&family),
+        &phis,
+        &vec![0usize; phis.len()],
+        &template,
+    )
+    .0;
     let got = omega.matrix[(0, 0)];
     assert!(
         (got - expected).abs() < 1e-12,
@@ -749,7 +755,6 @@ fn iov_oracle_model_is_affine_in_the_stacked_random_effects() {
 /// preferable to a panic, and is worth adding to `population_neg_elbo` alongside the
 /// existing `run_vi` check.
 #[test]
-#[ignore = "enable with IOV support (VI_PLAN §10): vi/elbo.rs refuses n_kappa > 0 today"]
 fn full_rank_vi_is_exact_on_a_linear_gaussian_iov_model() {
     let model = linear_gaussian_iov_model();
     let pop = iov_population();
@@ -766,8 +771,12 @@ fn full_rank_vi_is_exact_on_a_linear_gaussian_iov_model() {
         exact += exact_iov_neg_two_log_marginal(&c, &a, &subj.observations, d);
     }
 
+    // The stacked vector is 3-dimensional here, so the data term's MC error is larger
+    // than the 1-D non-IOV oracle's. Measured: the gap is ~0.1 at 1e3 draws, ~0.02 at
+    // 8e3, and ~0.001 at 6.4e4 with either seed — i.e. it converges to zero, which is
+    // the claim. 64k draws puts the noise an order of magnitude under the bar below.
     let cfg = ElboConfig {
-        n_mc_samples: 4000,
+        n_mc_samples: 64_000,
         eta_grad: EtaGradMode::Auto,
         kl: KlMode::Analytic,
         seed: 20250812,
@@ -788,14 +797,18 @@ fn full_rank_vi_is_exact_on_a_linear_gaussian_iov_model() {
     let neg_two_elbo = 2.0 * eval.neg_elbo;
     let rel = (neg_two_elbo - exact).abs() / exact.abs();
     assert!(
-        rel < 1e-3,
+        rel < 5e-4,
         "-2*ELBO at the exact stacked posterior = {neg_two_elbo:.6}, exact -2 log p(y) = \
          {exact:.6} (relative gap {rel:.3e}); the family contains this posterior, so the \
          bound must be tight"
     );
+    // `ELBO <= log p(y)` holds in **expectation**; a finite-sample estimate can sit
+    // marginally the wrong side of it, so the slack is an MC tolerance rather than zero.
+    // It is still far tighter than any structural error would produce.
     assert!(
         neg_two_elbo > exact - 1e-2,
-        "-2*ELBO ({neg_two_elbo:.6}) fell below the exact -2 log p(y) ({exact:.6})"
+        "-2*ELBO ({neg_two_elbo:.6}) fell below the exact -2 log p(y) ({exact:.6}) by more \
+         than Monte-Carlo error explains"
     );
 }
 

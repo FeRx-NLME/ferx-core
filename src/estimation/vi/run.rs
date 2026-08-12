@@ -222,19 +222,35 @@ fn zero_fixed_coords(grad: &mut [f64], template: &ModelParameters, layout: &Pack
 fn write_omega_block(
     x: &mut [f64],
     omega: &crate::types::OmegaMatrix,
-    template: &ModelParameters,
-    layout: &PackedLayout,
+    diagonal: bool,
+    start: usize,
 ) {
     let l = &omega.chol;
     for (slot, (i, j)) in
-        crate::estimation::parameterization::lower_tri_iter(omega.dim(), template.omega.diagonal)
-            .enumerate()
+        crate::estimation::parameterization::lower_tri_iter(omega.dim(), diagonal).enumerate()
     {
-        x[layout.omega_start() + slot] = if i == j {
+        x[start + slot] = if i == j {
             l[(i, j)].max(1e-10).ln()
         } else {
             l[(i, j)]
         };
+    }
+}
+
+/// Write both `Ω` blocks of the closed-form maximizer into the packed vector.
+///
+/// `Ω_iov` is `None` for a model without IOV, in which case only the BSV block moves and
+/// the (empty) IOV range is untouched.
+fn write_closed_form_omegas(
+    x: &mut [f64],
+    omega: &crate::types::OmegaMatrix,
+    omega_iov: Option<&crate::types::OmegaMatrix>,
+    template: &ModelParameters,
+    layout: &PackedLayout,
+) {
+    write_omega_block(x, omega, template.omega.diagonal, layout.omega_start());
+    if let (Some(iov), Some(tmpl)) = (omega_iov, template.omega_iov.as_ref()) {
+        write_omega_block(x, iov, tmpl.diagonal, layout.omega_iov_start());
     }
 }
 
@@ -296,6 +312,14 @@ pub fn run_vi(
     // M-step VI has no optimizer to hand it to — so `θ (1.0, 0.1, 10.0)` is
     // enforced by projecting `x` after each step, or it is not enforced at all.
     let bounds = compute_bounds(init_params);
+
+    // Occasions per subject, from the data. Fixed for the run, so compute once: this is
+    // what sets each subject's stacked dimension and the pooled `Ω_iov` denominator.
+    let k_occasions: Vec<usize> = population
+        .subjects
+        .iter()
+        .map(|s| super::elbo::subject_k_occasions(model, s))
+        .collect();
 
     // Start q at the prior and Θ at the model file's initial estimates: no
     // randomization, so the fit is reproducible by default. The initial estimates
@@ -386,8 +410,13 @@ pub fn run_vi(
         }
 
         if options.vi_omega_update == ViOmegaUpdate::ClosedForm {
-            let omega = closed_form_omega(family.as_ref(), &phis, init_params);
-            write_omega_block(&mut x, &omega, init_params, &layout);
+            let (omega, omega_iov) = closed_form_omega(
+                Families::Uniform(family.as_ref()),
+                &phis,
+                &k_occasions,
+                init_params,
+            );
+            write_closed_form_omegas(&mut x, &omega, omega_iov.as_ref(), init_params, &layout);
         }
 
         if iter >= avg_start {
@@ -462,7 +491,16 @@ pub fn run_vi(
         .collect();
     let mut final_params = unpack_params(&x_final, init_params);
     if options.vi_omega_update == ViOmegaUpdate::ClosedForm {
-        final_params.omega = closed_form_omega(family.as_ref(), &phis_final, init_params);
+        let (omega, omega_iov) = closed_form_omega(
+            Families::Uniform(family.as_ref()),
+            &phis_final,
+            &k_occasions,
+            init_params,
+        );
+        final_params.omega = omega;
+        if omega_iov.is_some() {
+            final_params.omega_iov = omega_iov;
+        }
     }
     restore_fixed(&mut final_params, init_params);
 
