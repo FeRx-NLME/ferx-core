@@ -728,6 +728,16 @@ section of the SDLC for the versioning policy).
   `FitResult$vi`. Following Janssen et al. (2024), with two departures: the KL term is taken
   in closed form rather than by Monte Carlo, and Ω is then updated by its exact maximizer
   rather than by gradient descent, which removes the Ω instability that paper reports.
+  VI stops as soon as the objective has settled rather than always burning `vi_iters`
+  iterations: `vi_iters` is a **ceiling** (default 25000), and settling is judged by testing
+  whether the remaining drift is distinguishable from Monte-Carlo noise. Defaults were set
+  against the NONMEM FOCEI warfarin reference (`tests/nonmem/warfarin_imp.lst`), which the
+  previous defaults missed badly — θ and Ω are now within ~1% of NONMEM out of the box.
+  `vi_lr` defaults to 0.02 (was 0.05): at 0.05 the σ trajectory is non-monotone in iteration
+  count. Note that the residual-error estimate is the one parameter limited by Monte-Carlo
+  noise rather than by iterations — on warfarin σ² lands ~220% high at `vi_mc_samples = 3`,
+  ~39% at 16 and ~20% at 32, while θ/Ω are unaffected — so raise `vi_mc_samples` when σ
+  matters.
   Tunable via `vi_iters`, `vi_mc_samples`, `vi_lr`, `vi_family`, `vi_omega_update`,
   `vi_avg_last`, `vi_eta_grad`, `vi_kl` and `vi_seed`. `vi_kl = mc` selects the
   Monte-Carlo KL — unbiased but noisier, what a variational family with no closed-form KL

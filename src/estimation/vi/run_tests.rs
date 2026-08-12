@@ -701,3 +701,100 @@ fn fd_fallback_is_warned_about() {
         out.warnings
     );
 }
+
+// ---------------------------------------------------------------------------
+// Early stopping
+// ---------------------------------------------------------------------------
+
+/// `vi_iters` is a ceiling, so a fit that settles must stop well short of it, report the
+/// iterations it *actually* ran, and still come back converged without a warning.
+///
+/// The regression this guards is the pairing, not either half: raising the `vi_iters`
+/// default without early stopping would make every easy fit pay the ceiling, and early
+/// stopping that forgot to re-window `trace_has_settled` onto the realised run length
+/// would report `converged: false` for every early stop.
+#[test]
+fn settled_runs_stop_well_short_of_the_iteration_ceiling() {
+    let (model, population, params) = fixture();
+    let out = run_vi(&model, &population, &params, &opts(25_000)).expect("VI runs");
+    let vi = out.vi.as_ref().expect("VI result present");
+
+    assert!(
+        vi.n_iterations < 25_000,
+        "a settled fit must stop before the ceiling, but ran all {} iterations",
+        vi.n_iterations
+    );
+    assert_eq!(
+        vi.n_iterations,
+        vi.elbo_trace.len(),
+        "reported n_iterations must equal the number of iterations actually evaluated"
+    );
+    assert!(
+        vi.converged,
+        "a run stops early precisely *because* it settled, so it must report converged"
+    );
+    assert!(
+        !out.warnings.iter().any(|w| w.contains("still moving")),
+        "an early-stopped run must not warn that the objective was still moving: {:?}",
+        out.warnings
+    );
+}
+
+/// A run given no room to settle still terminates at the ceiling and reports it
+/// honestly — the path that has to keep working now that stopping is conditional.
+#[test]
+fn unsettled_runs_still_stop_at_the_ceiling() {
+    let (model, population, params) = fixture();
+    let out = run_vi(&model, &population, &params, &opts(40)).expect("VI runs");
+    let vi = out.vi.as_ref().expect("VI result present");
+    assert_eq!(vi.n_iterations, 40);
+    assert_eq!(vi.elbo_trace.len(), 40);
+}
+
+/// The noise-aware half of [`trace_has_settled`], on traces shaped like a real fit
+/// rather than the synthetic ones above.
+///
+/// This is the regression for why early stopping never fired: a plateaued warfarin run
+/// sits around `-286` with window-to-window scatter of order 0.1, while the purely
+/// relative threshold is `1e-4 * (1 + 286) ~ 0.029`. The old criterion could therefore
+/// never be satisfied by a converged fit, and the run always burned its whole budget.
+#[test]
+fn settling_is_judged_against_noise_not_objective_magnitude() {
+    // Deterministic pseudo-noise, so this test cannot flake.
+    let noise = |i: usize| ((i * 37 + 11) as f64).sin();
+
+    // Flat at a realistic OFV magnitude, with noise far larger than the relative
+    // threshold. This is a converged fit and must be recognised as one.
+    let flat: Vec<f64> = (0..200).map(|i| -286.0 + noise(i)).collect();
+    assert!(
+        trace_has_settled(&flat, 50, CONVERGENCE_REL_TOL),
+        "a flat but noisy trace at OFV scale must count as settled; this is exactly the \
+         case the purely relative criterion could never satisfy"
+    );
+
+    // The same trace judged with the noise term removed (rel_tol only, as the old
+    // criterion effectively was) is NOT settled — pinning the behaviour that changed.
+    let n = flat.len();
+    let mean = |s: &[f64]| s.iter().sum::<f64>() / s.len() as f64;
+    let d = (mean(&flat[n - 100..n - 50]) - mean(&flat[n - 50..])).abs();
+    assert!(
+        d > CONVERGENCE_REL_TOL * (1.0 + 286.0),
+        "fixture must actually exceed the old relative threshold, else it proves nothing \
+         (delta {d:.6})"
+    );
+
+    // A drift that is small in relative terms but large against the noise must still be
+    // rejected: the criterion has to catch slow descent, not just obvious descent.
+    let drifting: Vec<f64> = (0..200)
+        .map(|i| -286.0 + noise(i) - 0.05 * i as f64)
+        .collect();
+    assert!(
+        !trace_has_settled(&drifting, 50, CONVERGENCE_REL_TOL),
+        "a trace still descending well above its own noise level must not count as settled"
+    );
+
+    // A noiseless trace still settles on the relative floor alone, so the new criterion
+    // is never stricter than the one it replaces.
+    let constant = vec![-286.0; 200];
+    assert!(trace_has_settled(&constant, 50, CONVERGENCE_REL_TOL));
+}

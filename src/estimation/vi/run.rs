@@ -15,12 +15,18 @@
 //! an optional Laplace OFV, and the ordinary FD-of-OFV covariance step at the VI
 //! estimate — so a VI fit reports standard errors like any other method.
 //!
-//! # Why the full budget always runs
+//! # Stopping
 //!
-//! The objective is a Monte-Carlo estimate, so a per-iteration improvement test
-//! would stop on noise. VI therefore runs all `vi_iters` iterations and reports
-//! whether the objective had *in fact* settled, judged on a moving average.
-//! Users control cost through `vi_iters`, not through a tolerance.
+//! `vi_iters` is a **ceiling, not a budget**. The objective is a Monte-Carlo estimate,
+//! so a per-iteration improvement test would stop on noise; the run therefore stops on
+//! the same windowed moving-average predicate ([`trace_has_settled`]) that decides the
+//! reported `converged` flag, checked every [`CONVERGENCE_CHECK_INTERVAL`] iterations.
+//! Tying both to one predicate means "ran to completion" and "reported converged"
+//! cannot disagree.
+//!
+//! Detection does not stop the run on the spot: the reported estimate is a Polyak mean,
+//! so a full averaging window is collected *after* settling before breaking. Otherwise
+//! early stopping would simply trade under-convergence for a noisy last iterate.
 
 use nalgebra::DVector;
 
@@ -51,23 +57,110 @@ const CONVERGENCE_WINDOW_FRACTION: f64 = 0.1;
 /// reported as settled.
 const CONVERGENCE_REL_TOL: f64 = 1e-4;
 
+/// How often the early-stopping check runs. The predicate compares two windowed means,
+/// so testing it every iteration would buy nothing and cost a scan of the trace each
+/// time.
+const CONVERGENCE_CHECK_INTERVAL: usize = 100;
+
+/// Polyak averaging window to collect *after* the objective has settled, when the user
+/// has not pinned one with `vi_avg_last`. Mirrors [`averaging_start`]'s default
+/// fraction, applied to the run length so far rather than to `vi_iters` — which under
+/// early stopping is a ceiling nobody reached.
+fn averaging_window_for(n_so_far: usize) -> usize {
+    n_so_far
+        .saturating_sub(averaging_start(n_so_far, None))
+        .max(1)
+}
+
+/// How many standard errors the two window means may differ by and still count as
+/// settled. At `2.0` a genuinely flat trace passes ~95% of the time, so the check is
+/// not tripped up by ordinary sampling variation.
+const SETTLE_Z: f64 = 2.0;
+
+/// Smallest comparison window the settling test will use, regardless of how short the
+/// trace is.
+///
+/// [`CONVERGENCE_WINDOW_FRACTION`] alone makes the window proportional to the trace, so
+/// early in a run it is tiny — 12 samples at iteration 125 — and the standard error is
+/// correspondingly huge. Any drift then hides inside the noise band and the run stops
+/// almost immediately: on warfarin the fraction-only rule declared convergence at
+/// iteration 125, roughly 20 000 short of the actual plateau. A floor on the window is
+/// what makes the noise estimate meaningful.
+const SETTLE_MIN_WINDOW: usize = 500;
+
+/// Consecutive settled checks required before the run stops.
+///
+/// The test is a hypothesis test on noisy data, so it fires spuriously some fraction of
+/// the time by construction. Requiring it to hold across `SETTLE_PATIENCE` consecutive
+/// checks (i.e. over `SETTLE_PATIENCE * CONVERGENCE_CHECK_INTERVAL` iterations) makes an
+/// isolated lucky window insufficient. Calibrated on a 40 000-iteration warfarin trace
+/// whose objective plateaus near iteration 20 000: at patience 3 every combination of
+/// window floor and `z` stops at ~22 900, while at patience 1 the looser combinations
+/// stop in the first few hundred iterations.
+const SETTLE_PATIENCE: usize = 3;
+
+/// Comparison window for a trace of length `n`: a fixed fraction of the run, floored at
+/// [`SETTLE_MIN_WINDOW`] so the variance estimate has enough samples to mean anything.
+fn settle_window(n: usize) -> usize {
+    (((n as f64) * CONVERGENCE_WINDOW_FRACTION).round() as usize).max(SETTLE_MIN_WINDOW)
+}
+
 /// Whether the tail of the objective trace has stopped moving.
 ///
 /// Compares the mean of the last `window` values against the mean of the `window`
 /// before it. Averaging both sides is the point: single-iteration deltas are
 /// dominated by Monte-Carlo noise and would report convergence at random.
+///
+/// # Why the threshold is noise-aware, not purely relative
+///
+/// The ELBO is a Monte-Carlo estimate, so the difference between two window means is
+/// itself a random variable. Judging it against a *relative* tolerance
+/// (`rel_tol·(1 + |mean|)`) asks the wrong question: it scales with the objective's
+/// magnitude, which has nothing to do with how noisy the trace is. On a real fit that
+/// threshold is unreachable — a plateaued warfarin run still shows window-to-window
+/// differences orders of magnitude above `1e-4·(1 + 286)`, so the run is reported
+/// unsettled forever and early stopping never fires.
+///
+/// The right comparison is against the **standard error of the difference**,
+/// `√(s²_recent/w + s²_prior/w)`, estimated from the trace's own within-window
+/// variance. That is scale-free, adapts automatically to `vi_mc_samples`, and asks the
+/// question that matters: *is the remaining drift distinguishable from noise?* If it is
+/// not, more iterations at this noise level cannot resolve it — the fix would be more
+/// Monte-Carlo draws, not more epochs.
+///
+/// `rel_tol` is retained as an additive **floor** so the criterion is never stricter
+/// than the original one: a noiseless trace (`s² = 0`) still settles on the relative
+/// test alone, which is what the synthetic-trace unit tests exercise.
 pub fn trace_has_settled(trace: &[f64], window: usize, rel_tol: f64) -> bool {
     if window == 0 || trace.len() < 2 * window {
         return false;
     }
     let n = trace.len();
+    let recent = &trace[n - window..];
+    let prior = &trace[n - 2 * window..n - window];
+
     let mean = |s: &[f64]| s.iter().sum::<f64>() / s.len() as f64;
-    let recent = mean(&trace[n - window..]);
-    let prior = mean(&trace[n - 2 * window..n - window]);
-    if !recent.is_finite() || !prior.is_finite() {
+    let m_recent = mean(recent);
+    let m_prior = mean(prior);
+    if !m_recent.is_finite() || !m_prior.is_finite() {
         return false;
     }
-    (prior - recent).abs() <= rel_tol * (1.0 + recent.abs())
+
+    // Unbiased within-window variance; a 1-wide window carries no variance information,
+    // in which case this degenerates to the plain relative test below.
+    let var = |s: &[f64], m: f64| -> f64 {
+        if s.len() < 2 {
+            return 0.0;
+        }
+        s.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / (s.len() - 1) as f64
+    };
+    let se = ((var(recent, m_recent) + var(prior, m_prior)) / window as f64).sqrt();
+    if !se.is_finite() {
+        return false;
+    }
+
+    let tol = SETTLE_Z * se + rel_tol * (1.0 + m_recent.abs());
+    (m_prior - m_recent).abs() <= tol
 }
 
 /// The `vi_kl = analytic` fallback warning, or `None` when nothing fell back.
@@ -164,7 +257,8 @@ fn restore_fixed(params: &mut ModelParameters, template: &ModelParameters) {
     }
 }
 
-/// Run variational inference to a fixed iteration budget.
+/// Run variational inference, stopping once the objective has settled or `vi_iters`
+/// iterations have elapsed — whichever comes first.
 pub fn run_vi(
     model: &CompiledModel,
     population: &Population,
@@ -216,7 +310,15 @@ pub fn run_vi(
         .map(|_| AdamState::new(family.n_params()))
         .collect();
 
-    let avg_start = averaging_start(n_iters, options.vi_avg_last);
+    // Recomputed if the run settles early (see `stop_at` below), so the Polyak window
+    // always sits on the *end* of whatever run actually happened.
+    let mut avg_start = averaging_start(n_iters, options.vi_avg_last);
+    // Iteration count at which to stop. `n_iters` is a **ceiling**, not a budget: the
+    // loop breaks as soon as the objective has settled and a full averaging window has
+    // been collected after that point.
+    let mut stop_at = n_iters;
+    let mut settled_at: Option<usize> = None;
+    let mut consecutive_settled = 0usize;
     let mut avg_x = PolyakAverager::new(x.len());
     let mut avg_phi: Vec<PolyakAverager> = (0..n_subjects)
         .map(|_| PolyakAverager::new(family.n_params()))
@@ -294,14 +396,57 @@ pub fn run_vi(
             }
         }
 
-        if verbose && (iter % 100 == 0 || iter + 1 == n_iters) {
+        if verbose && (iter % 100 == 0 || iter + 1 == stop_at) {
             eprintln!(
                 "VI iter {:>5}  -2*ELBO = {:.4}",
                 iter,
                 trace[trace.len() - 1]
             );
         }
+
+        // ---- Early stopping -------------------------------------------------
+        //
+        // `vi_iters` is a ceiling. Checking the same settled-ness predicate the final
+        // `converged` flag uses means "ran to completion" and "reported converged"
+        // cannot disagree, and it keeps an easy fit at a second or two while leaving
+        // head-room for a hard one.
+        //
+        // Detecting settling is not enough to stop *immediately*: the reported estimate
+        // is a Polyak mean, so a full averaging window still has to be collected —
+        // otherwise early stopping would trade under-convergence for a noisy last
+        // iterate. So the first detection schedules the stop, it does not perform it.
+        //
+        // The rewrite is skipped once averaging is already under way (`iter >= avg_start`,
+        // i.e. settling was detected very late): the window is already being collected
+        // on the original schedule and moving it would mix pre- and post-settling
+        // iterates into one mean.
+        if settled_at.is_none() && iter < avg_start && (iter + 1) % CONVERGENCE_CHECK_INTERVAL == 0
+        {
+            if trace_has_settled(&trace, settle_window(trace.len()), CONVERGENCE_REL_TOL) {
+                consecutive_settled += 1;
+            } else {
+                // Must be *consecutive*: one settled window followed by a moving one
+                // means the run had not settled, so the count starts over.
+                consecutive_settled = 0;
+            }
+            if consecutive_settled >= SETTLE_PATIENCE {
+                let avg_window = options
+                    .vi_avg_last
+                    .unwrap_or_else(|| averaging_window_for(iter + 1))
+                    .max(1);
+                let candidate = iter + 1 + avg_window;
+                if candidate < n_iters {
+                    settled_at = Some(iter);
+                    avg_start = iter + 1;
+                    stop_at = candidate;
+                }
+            }
+        }
+        if iter + 1 >= stop_at {
+            break;
+        }
     }
+    let n_iters_run = trace.len();
 
     // The reported estimate is the Polyak mean, not the last iterate. Averaging
     // projected iterates of a convex box cannot leave it, so this clamp only
@@ -372,14 +517,14 @@ pub fn run_vi(
         0,
     );
 
-    let converged = trace_has_settled(
-        &trace,
-        ((n_iters as f64) * CONVERGENCE_WINDOW_FRACTION).round() as usize,
-        CONVERGENCE_REL_TOL,
-    );
+    // Judged on the run that actually happened, not on the `vi_iters` ceiling — under
+    // early stopping those differ, and windowing a 900-iteration trace as though it were
+    // 25 000 long would make `trace_has_settled` return `false` for every early stop.
+    let converged = settled_at.is_some()
+        || trace_has_settled(&trace, settle_window(n_iters_run), CONVERGENCE_REL_TOL);
     if !converged {
         warnings.push(format!(
-            "VI: the objective was still moving at the end of {n_iters} iterations \
+            "VI: the objective was still moving at the end of {n_iters_run} iterations \
              (see vi.elbo_trace). Increase vi_iters, or lower vi_lr if the trace is oscillating."
         ));
     }
@@ -462,7 +607,7 @@ pub fn run_vi(
         neg_two_elbo: 2.0 * final_eval.neg_elbo,
         data_term: final_eval.data_term,
         kl_term: final_eval.kl_term,
-        n_iterations: n_iters,
+        n_iterations: n_iters_run,
         converged,
         family: family.label().to_string(),
         n_mc_samples: cfg.n_mc_samples,
@@ -485,7 +630,7 @@ pub fn run_vi(
         params: final_params,
         ofv,
         converged,
-        n_iterations: n_iters,
+        n_iterations: n_iters_run,
         eta_hats,
         h_matrices,
         kappas,

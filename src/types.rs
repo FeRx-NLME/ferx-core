@@ -4415,12 +4415,15 @@ pub struct ViResult {
     /// The `Σᵢ KL(qᵢ ‖ N(0,Ω))` half of `−ELBO`, unscaled. Grows as the
     /// variational posteriors move away from the population prior.
     pub kl_term: f64,
-    /// Adam iterations run.
+    /// Adam iterations actually run, which under early stopping is normally well below
+    /// the `vi_iters` ceiling. Always equal to `elbo_trace.len()`.
     pub n_iterations: usize,
     /// Whether the objective had settled by the end of the run, judged on a
     /// **moving average** of the ELBO rather than a single-iteration change (the
     /// objective is a Monte-Carlo estimate, so per-iteration deltas are noise).
-    /// Diagnostic only: VI always runs its full `vi_iters` budget.
+    ///
+    /// This is the same predicate that stops the run, so `false` means the fit reached
+    /// the `vi_iters` ceiling while still moving — a result to re-run, not to report.
     pub converged: bool,
     /// Variational family used (`full_rank` / `mean_field`).
     pub family: String,
@@ -5644,18 +5647,33 @@ pub struct FitOptions {
     pub n_agq: usize,
 
     // ---- Variational inference (`method = vi`) ----
-    /// Adam iterations ("epochs"). Default 1000. VI runs its full budget rather
-    /// than stopping early: the ELBO is a Monte-Carlo estimate, so a
-    /// single-iteration improvement test would stop on noise. `FitResult::vi`
-    /// reports whether the objective had in fact settled.
+    /// Maximum Adam iterations ("epochs"). Default 25000.
+    ///
+    /// This is a **ceiling, not a budget**: the run stops as soon as the objective has
+    /// settled on a windowed moving average and a Polyak averaging window has been
+    /// collected after that point, so an easy fit costs a second or two and only a hard
+    /// one approaches the cap. A single-iteration improvement test is deliberately *not*
+    /// used — the ELBO is a Monte-Carlo estimate and such a test would stop on noise.
+    /// `FitResult::vi.n_iterations` reports what actually ran, and `.converged` whether
+    /// the objective had in fact settled.
+    ///
+    /// The default was 1000 before the warfarin/NONMEM anchor showed that even a small,
+    /// benign dataset (32 subjects, 3 etas) needs tens of thousands of iterations to
+    /// reach the FOCEI minimum — at 1000 it stopped with σ² 159× too large. Early
+    /// stopping is what makes a ceiling this high free for the easy cases.
     pub vi_iters: usize,
     /// Monte-Carlo draws per subject per iteration. Default 3, following Janssen
     /// et al.; their supplementary Table 2 finds 1 loses no accuracy at roughly
     /// three times the throughput.
     pub vi_mc_samples: usize,
-    /// Adam learning rate. Default 0.05. Janssen et al. use 0.1, dropping to 0.01
-    /// when unstable; the lower default here reflects that the closed-form `Ω`
-    /// update removes their main source of instability.
+    /// Adam learning rate. Default 0.02. Janssen et al. use 0.1, dropping to 0.01 when
+    /// unstable.
+    ///
+    /// The closed-form `Ω` update removes their main source of instability, but not the
+    /// one that bites here: at 0.05 the `σ` trajectory is non-monotone in iteration
+    /// count — a 30 000-iteration run landed *further* from the truth than a 10 000-
+    /// iteration one on the same data (σ 0.031 vs 0.022). That disappears at 0.02 and
+    /// below, which is why the default sits here rather than at the paper's value.
     pub vi_lr: f64,
     /// Variational family. Default [`ViFamily::FullRank`].
     pub vi_family: ViFamily,
@@ -6092,9 +6110,9 @@ impl Default for FitOptions {
             sir_keep_samples: false,
             sir_df: 5.0,
             n_agq: 1,
-            vi_iters: 1000,
+            vi_iters: 25_000,
             vi_mc_samples: 3,
-            vi_lr: 0.05,
+            vi_lr: 0.02,
             vi_family: ViFamily::default(),
             vi_omega_update: ViOmegaUpdate::default(),
             vi_avg_last: None,
