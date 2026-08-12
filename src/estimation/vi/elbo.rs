@@ -38,11 +38,15 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
-use crate::estimation::fixed_eta_gradient::obs_nll_subject_grad;
-use crate::estimation::inner_optimizer::analytic_eta_nll_gradient;
+use crate::estimation::fixed_eta_gradient::{
+    obs_nll_subject_grad, obs_nll_subject_grad_iov, obs_nll_subject_into_iov,
+};
+use crate::estimation::inner_optimizer::{
+    analytic_eta_nll_gradient, analytic_eta_nll_gradient_iov,
+};
 use crate::estimation::parameterization::{lower_tri_iter, theta_packs_log, unpack_params};
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::obs_nll_subject_into;
+use crate::stats::likelihood::{iov_occasion_groups, obs_nll_subject_into};
 use crate::types::{CompiledModel, ModelParameters, OmegaMatrix, Population, Subject};
 
 use super::family::VariationalFamily;
@@ -127,6 +131,40 @@ impl PackedLayout {
     /// model has no IOV, so the empty range `omega_iov_start()..total()` is a no-op.
     pub fn omega_iov_start(&self) -> usize {
         self.n_theta + self.n_omega + self.n_sigma
+    }
+}
+
+/// Which variational family serves each subject.
+///
+/// Without IOV every subject shares one family, and [`Families::Uniform`] borrows it
+/// rather than allocating N identical copies. Under IOV a subject's stacked vector is
+/// `[η, κ₁ … κ_{K_i}]`, so its dimension depends on how many occasions that subject
+/// has — a property of the data, not of the model — and the family becomes per-subject.
+///
+/// Modelled as an enum rather than always taking a slice so the common case stays free
+/// and reads as what it is: one family, every subject.
+#[derive(Clone, Copy)]
+pub enum Families<'a> {
+    /// One family for every subject.
+    Uniform(&'a dyn VariationalFamily),
+    /// One family per subject, indexed in `population.subjects` order.
+    PerSubject(&'a [Box<dyn VariationalFamily>]),
+}
+
+impl<'a> Families<'a> {
+    /// The family serving subject `i`.
+    #[inline]
+    pub fn for_subject(&self, i: usize) -> &'a dyn VariationalFamily {
+        match self {
+            Families::Uniform(f) => *f,
+            Families::PerSubject(v) => v[i].as_ref(),
+        }
+    }
+}
+
+impl<'a> From<&'a dyn VariationalFamily> for Families<'a> {
+    fn from(f: &'a dyn VariationalFamily) -> Self {
+        Families::Uniform(f)
     }
 }
 
@@ -320,23 +358,40 @@ fn crn_eps(seed: u64, iter: u64, subject: usize, sample: usize, d: usize) -> Vec
 
 /// `∂(−log p(y|η))/∂η` by central finite differences of the same data term the
 /// value uses.
+#[allow(clippy::too_many_arguments)]
 fn fd_eta_data_grad(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     sigma: &[f64],
-    eta: &[f64],
+    z: &[f64],
+    _kappas: &[Vec<f64>],
+    k_occasions: usize,
     scratch: &mut EventPkParams,
 ) -> Vec<f64> {
-    let mut g = vec![0.0; eta.len()];
-    for k in 0..eta.len() {
-        let h = 1e-5 * (1.0 + eta[k].abs());
-        let mut ep = eta.to_vec();
-        let mut em = eta.to_vec();
+    let n_eta = model.n_eta;
+    let n_kappa = model.n_kappa;
+    let iov = k_occasions > 0 && n_kappa > 0;
+    // One evaluator, differenced over every stacked coordinate. Splitting inside the
+    // closure rather than at the call site keeps the perturbed `κ` consistent with the
+    // perturbed `η` for the same draw.
+    let mut eval = |zz: &[f64], scratch: &mut EventPkParams| -> f64 {
+        if iov {
+            let (eta, kappas) = split_stacked(zz, n_eta, n_kappa, k_occasions);
+            obs_nll_subject_into_iov(model, subject, theta, sigma, eta, &kappas, scratch)
+        } else {
+            obs_nll_subject_into(model, subject, theta, sigma, zz, scratch)
+        }
+    };
+    let mut g = vec![0.0; z.len()];
+    for k in 0..z.len() {
+        let h = 1e-5 * (1.0 + z[k].abs());
+        let mut ep = z.to_vec();
+        let mut em = z.to_vec();
         ep[k] += h;
         em[k] -= h;
-        let fp = obs_nll_subject_into(model, subject, theta, sigma, &ep, scratch);
-        let fm = obs_nll_subject_into(model, subject, theta, sigma, &em, scratch);
+        let fp = eval(&ep, scratch);
+        let fm = eval(&em, scratch);
         g[k] = (fp - fm) / (2.0 * h);
     }
     g
@@ -353,16 +408,45 @@ fn eta_data_grad(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
-    omega: &OmegaMatrix,
+    params: &ModelParameters,
+    stacked_prior: &OmegaMatrix,
     sigma: &[f64],
-    eta: &[f64],
+    z: &[f64],
+    kappas: &[Vec<f64>],
+    k_occasions: usize,
     mode: EtaGradMode,
     scratch: &mut EventPkParams,
 ) -> (Vec<f64>, bool) {
+    let n_eta = params.omega.dim();
+    let iov = k_occasions > 0 && model.n_kappa > 0;
     if mode != EtaGradMode::Fd {
-        if let Some(joint) = analytic_eta_nll_gradient(model, subject, theta, eta, omega, sigma) {
-            let eta_v = DVector::from_column_slice(eta);
-            let prior = &omega.inv * &eta_v;
+        // Both providers return the gradient of the **joint** inner NLL, i.e. data plus
+        // the `½ zᵀ Σ_b⁻¹ z` prior. Under the analytic KL that prior is accounted for
+        // exactly, so subtract it here or every `μ` is pulled toward zero twice. The
+        // subtraction uses the *stacked* prior, which is `Ω` itself without IOV.
+        let joint = if iov {
+            analytic_eta_nll_gradient_iov(
+                model,
+                subject,
+                theta,
+                z,
+                &params.omega,
+                params
+                    .omega_iov
+                    .as_ref()
+                    .expect("an IOV subject implies an Omega_iov"),
+                sigma,
+                n_eta,
+                model.n_kappa,
+                k_occasions,
+                model.ruv_obs_mult(subject, theta).as_deref(),
+            )
+        } else {
+            analytic_eta_nll_gradient(model, subject, theta, z, &params.omega, sigma)
+        };
+        if let Some(joint) = joint {
+            let z_v = DVector::from_column_slice(z);
+            let prior = &stacked_prior.inv * &z_v;
             let g = joint.iter().zip(prior.iter()).map(|(j, p)| j - p).collect();
             return (g, false);
         }
@@ -372,7 +456,16 @@ fn eta_data_grad(
     // In `Analytic` mode FD is never *requested*, so a `true` there can only mean
     // the provider declined, which is what the caller turns into an error.
     (
-        fd_eta_data_grad(model, subject, theta, sigma, eta, scratch),
+        fd_eta_data_grad(
+            model,
+            subject,
+            theta,
+            sigma,
+            z,
+            kappas,
+            k_occasions,
+            scratch,
+        ),
         true,
     )
 }
@@ -509,19 +602,53 @@ fn theta_sigma_masks(template: &ModelParameters) -> (Vec<bool>, Vec<f64>, Vec<f6
 fn chain_omega_grad(
     d_omega: &DMatrix<f64>,
     omega: &OmegaMatrix,
-    template: &ModelParameters,
+    tmpl_block: &OmegaMatrix,
+    fixed: &[bool],
     out: &mut [f64],
 ) {
-    let n_eta = omega.dim();
+    let n = omega.dim();
     let dl = (d_omega * &omega.chol) * 2.0;
-    let is_fixed = |k: usize| template.omega_fixed.get(k).copied().unwrap_or(false);
-    for (slot, (i, j)) in lower_tri_iter(n_eta, template.omega.diagonal).enumerate() {
-        if !template.omega.free_mask[(i, j)] || is_fixed(i) || is_fixed(j) {
+    let is_fixed = |k: usize| fixed.get(k).copied().unwrap_or(false);
+    for (slot, (i, j)) in lower_tri_iter(n, tmpl_block.diagonal).enumerate() {
+        if !tmpl_block.free_mask[(i, j)] || is_fixed(i) || is_fixed(j) {
             continue;
         }
         let chain = if i == j { omega.chol[(i, i)] } else { 1.0 };
         out[slot] += dl[(i, j)] * chain;
     }
+}
+
+/// Number of occasion groups this subject presents, or `0` for a model without IOV.
+///
+/// This is what makes the stacked dimension a per-subject quantity: `K` comes from the
+/// subject's own occasion column, not from the model.
+pub(crate) fn subject_k_occasions(model: &CompiledModel, subject: &Subject) -> usize {
+    if model.n_kappa == 0 {
+        0
+    } else {
+        iov_occasion_groups(subject).len()
+    }
+}
+
+/// Split a stacked draw `z = [η, κ₁ … κ_K]` into its BSV head and per-occasion blocks.
+///
+/// Returns an empty `kappas` for a non-IOV model, so callers can branch on that alone.
+fn split_stacked(
+    z: &[f64],
+    n_eta: usize,
+    n_kappa: usize,
+    k_occasions: usize,
+) -> (&[f64], Vec<Vec<f64>>) {
+    if n_kappa == 0 || k_occasions == 0 {
+        return (z, Vec::new());
+    }
+    let kappas = (0..k_occasions)
+        .map(|g| {
+            let off = n_eta + g * n_kappa;
+            z[off..off + n_kappa].to_vec()
+        })
+        .collect();
+    (&z[..n_eta], kappas)
 }
 
 /// One subject's contribution to `−ELBO` and its gradients.
@@ -542,9 +669,26 @@ fn subject_terms(
 ) -> Result<SubjectTerms, String> {
     let n_theta = params.theta.len();
     let n_sigma = params.sigma.values.len();
+    let n_eta = params.omega.dim();
+    let n_kappa = model.n_kappa;
+    // `K` is a property of this subject's data, so the stacked dimension — and hence the
+    // family serving it — is per-subject. Zero for a non-IOV model, in which case
+    // everything below collapses to the plain `η` path.
+    let k_occasions = subject_k_occasions(model, subject);
+    let iov = k_occasions > 0 && n_kappa > 0;
     let d = family.n_eta();
+    debug_assert_eq!(
+        d,
+        n_eta + k_occasions * n_kappa,
+        "family dimension must match this subject's stacked vector"
+    );
     let s = cfg.n_mc_samples.max(1);
     let inv_s = 1.0 / s as f64;
+
+    // `Σ_b = Ω ⊕ Ω_iov^{⊗K}`, or `Ω` itself without IOV. This is the prior the KL is
+    // taken against and the one subtracted from the joint η-gradient, so building it
+    // once here keeps those two consistent by construction.
+    let prior = stacked_prior(&params.omega, params.omega_iov.as_ref(), k_occasions);
 
     let mut data_nll = 0.0;
     let mut grad_theta_sigma = vec![0.0; n_theta + n_sigma];
@@ -555,7 +699,7 @@ fn subject_terms(
     // the family, not of the draw, so probing it once keeps the loop branch-free and
     // makes "asked for analytic, had to sample" a single decision to report.
     let closed_form = match cfg.kl {
-        KlMode::Analytic => family.kl_to_normal(phi, &params.omega),
+        KlMode::Analytic => family.kl_to_normal(phi, &prior),
         KlMode::Mc => None,
     };
     let kl_fell_back = cfg.kl == KlMode::Analytic && closed_form.is_none();
@@ -565,22 +709,40 @@ fn subject_terms(
 
     for sample in 0..s {
         let eps = crn_eps(cfg.seed, iter, subject_idx, sample, d);
-        let eta = family.sample(phi, &eps);
+        let z = family.sample(phi, &eps);
+        let (eta, kappas) = split_stacked(&z, n_eta, n_kappa, k_occasions);
 
-        // Data term value and its ∂/∂(θ, σ) at this η.
-        let (nll, g_ts) = obs_nll_subject_grad(
-            model,
-            subject,
-            &params.theta,
-            &params.sigma.values,
-            &eta,
-            log_mask,
-            lower,
-            upper,
-            n_theta,
-            n_sigma,
-            scratch,
-        );
+        // Data term value and its ∂/∂(θ, σ) at this draw.
+        let (nll, g_ts) = if iov {
+            obs_nll_subject_grad_iov(
+                model,
+                subject,
+                &params.theta,
+                &params.sigma.values,
+                eta,
+                &kappas,
+                log_mask,
+                lower,
+                upper,
+                n_theta,
+                n_sigma,
+                scratch,
+            )
+        } else {
+            obs_nll_subject_grad(
+                model,
+                subject,
+                &params.theta,
+                &params.sigma.values,
+                eta,
+                log_mask,
+                lower,
+                upper,
+                n_theta,
+                n_sigma,
+                scratch,
+            )
+        };
         data_nll += inv_s * nll;
         for (acc, gi) in grad_theta_sigma.iter_mut().zip(g_ts.iter()) {
             *acc += inv_s * gi;
@@ -591,9 +753,12 @@ fn subject_terms(
             model,
             subject,
             &params.theta,
-            &params.omega,
+            params,
+            &prior,
             &params.sigma.values,
-            &eta,
+            &z,
+            &kappas,
+            k_occasions,
             cfg.eta_grad,
             scratch,
         );
@@ -614,7 +779,7 @@ fn subject_terms(
         // rather than a second gradient pass.
         let mut g_total = g_eta;
         if sampling_kl {
-            let draw = mc_kl_draw(family, phi, &eta, &params.omega);
+            let draw = mc_kl_draw(family, phi, &z, &prior);
             kl_value += inv_s * draw.integrand;
             kl_d_omega += draw.d_omega * inv_s;
             for (acc, g) in g_total.iter_mut().zip(draw.d_eta.iter()) {
@@ -662,7 +827,7 @@ pub fn population_neg_elbo(
     population: &Population,
     template: &ModelParameters,
     x: &[f64],
-    family: &dyn VariationalFamily,
+    families: Families<'_>,
     phis: &[Vec<f64>],
     cfg: &ElboConfig,
     iter: u64,
@@ -677,7 +842,17 @@ pub fn population_neg_elbo(
         .enumerate()
         .map_init(EventPkParams::default, |scratch, (i, subject)| {
             subject_terms(
-                model, subject, i, &params, family, &phis[i], cfg, iter, &log_mask, &lower, &upper,
+                model,
+                subject,
+                i,
+                &params,
+                families.for_subject(i),
+                &phis[i],
+                cfg,
+                iter,
+                &log_mask,
+                &lower,
+                &upper,
                 scratch,
             )
         })
@@ -703,12 +878,36 @@ pub fn population_neg_elbo(
         for k in 0..layout.n_sigma {
             eval.grad_x[layout.sigma_start() + k] += t.grad_theta_sigma[layout.n_theta + k];
         }
+        // `d_omega` is over the *stacked* prior, so split it before chaining. The BSV
+        // block is the top-left corner; each occasion's `κ` block is a copy of the same
+        // `Ω_iov`, so by the chain rule for a direct sum their derivatives **add**.
+        let n_eta = params.omega.dim();
+        let d_bsv = t.d_omega.view((0, 0), (n_eta, n_eta)).into_owned();
         chain_omega_grad(
-            &t.d_omega,
+            &d_bsv,
             &params.omega,
-            template,
+            &template.omega,
+            &template.omega_fixed,
             &mut eval.grad_x[layout.omega_start()..layout.sigma_start()],
         );
+        if let (Some(iov), Some(tmpl_iov)) =
+            (params.omega_iov.as_ref(), template.omega_iov.as_ref())
+        {
+            let n_kappa = iov.dim();
+            let k_occ = (t.d_omega.nrows().saturating_sub(n_eta)) / n_kappa.max(1);
+            let mut d_iov = DMatrix::<f64>::zeros(n_kappa, n_kappa);
+            for g in 0..k_occ {
+                let off = n_eta + g * n_kappa;
+                d_iov += t.d_omega.view((off, off), (n_kappa, n_kappa));
+            }
+            chain_omega_grad(
+                &d_iov,
+                iov,
+                tmpl_iov,
+                &template.kappa_fixed,
+                &mut eval.grad_x[layout.omega_iov_start()..layout.total()],
+            );
+        }
         eval.grad_phi.push(t.grad_phi);
         if t.used_fd {
             eval.n_fd_subjects += 1;

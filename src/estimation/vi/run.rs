@@ -42,7 +42,8 @@ use crate::types::{
 
 use super::adam::{averaging_start, AdamConfig, AdamState, PolyakAverager};
 use super::elbo::{
-    closed_form_omega, population_neg_elbo, unsupported_data_term_reason, ElboConfig, PackedLayout,
+    closed_form_omega, population_neg_elbo, unsupported_data_term_reason, ElboConfig, Families,
+    PackedLayout,
 };
 use super::family::{FullRank, MeanField, VariationalFamily};
 
@@ -336,7 +337,7 @@ pub fn run_vi(
             population,
             init_params,
             &x,
-            family.as_ref(),
+            Families::Uniform(family.as_ref()),
             &phis,
             &cfg,
             iter as u64,
@@ -476,7 +477,7 @@ pub fn run_vi(
         population,
         init_params,
         &pack_params(&final_params),
-        family.as_ref(),
+        Families::Uniform(family.as_ref()),
         &phis_final,
         &report_cfg,
         n_iters as u64,

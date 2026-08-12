@@ -183,15 +183,45 @@ fn evaluation_is_deterministic_given_seed_and_iteration() {
     let x = pack_params(&params);
     let cfg = cfg_seeded();
 
-    let a = population_neg_elbo(&model, &population, &params, &x, &family, &phis, &cfg, 7).unwrap();
-    let b = population_neg_elbo(&model, &population, &params, &x, &family, &phis, &cfg, 7).unwrap();
+    let a = population_neg_elbo(
+        &model,
+        &population,
+        &params,
+        &x,
+        Families::Uniform(&family),
+        &phis,
+        &cfg,
+        7,
+    )
+    .unwrap();
+    let b = population_neg_elbo(
+        &model,
+        &population,
+        &params,
+        &x,
+        Families::Uniform(&family),
+        &phis,
+        &cfg,
+        7,
+    )
+    .unwrap();
     assert_eq!(a.neg_elbo.to_bits(), b.neg_elbo.to_bits());
     for (ga, gb) in a.grad_x.iter().zip(b.grad_x.iter()) {
         assert_eq!(ga.to_bits(), gb.to_bits());
     }
 
     // A different iteration draws different ε, so the MC term must move.
-    let c = population_neg_elbo(&model, &population, &params, &x, &family, &phis, &cfg, 8).unwrap();
+    let c = population_neg_elbo(
+        &model,
+        &population,
+        &params,
+        &x,
+        Families::Uniform(&family),
+        &phis,
+        &cfg,
+        8,
+    )
+    .unwrap();
     assert!(
         (a.neg_elbo - c.neg_elbo).abs() > 0.0,
         "different iterations must draw different common random numbers"
@@ -216,7 +246,7 @@ fn kl_half_vanishes_at_the_prior() {
         &population,
         &params,
         &x,
-        &family,
+        Families::Uniform(&family),
         &phis,
         &cfg_seeded(),
         1,
@@ -264,7 +294,7 @@ fn data_term_collapses_to_fixed_eta_nll_as_q_degenerates() {
         &population,
         &params,
         &x,
-        &family,
+        Families::Uniform(&family),
         &phis,
         &cfg_seeded(),
         3,
@@ -305,7 +335,7 @@ fn fd_of_neg_elbo_wrt_x(
     population: &Population,
     params: &ModelParameters,
     x: &[f64],
-    family: &dyn VariationalFamily,
+    family: Families<'_>,
     phis: &[Vec<f64>],
     cfg: &ElboConfig,
     iter: u64,
@@ -331,7 +361,7 @@ fn fd_of_neg_elbo_wrt_phi(
     population: &Population,
     params: &ModelParameters,
     x: &[f64],
-    family: &dyn VariationalFamily,
+    family: Families<'_>,
     phis: &[Vec<f64>],
     cfg: &ElboConfig,
     iter: u64,
@@ -397,7 +427,7 @@ fn neg_elbo_gradient_matches_central_fd() {
             &population,
             &params,
             &x,
-            family.as_ref(),
+            Families::Uniform(family.as_ref()),
             &phis,
             &cfg,
             iter,
@@ -410,7 +440,7 @@ fn neg_elbo_gradient_matches_central_fd() {
                 &population,
                 &params,
                 &x,
-                family.as_ref(),
+                Families::Uniform(family.as_ref()),
                 &phis,
                 &cfg,
                 iter,
@@ -430,7 +460,7 @@ fn neg_elbo_gradient_matches_central_fd() {
                     &population,
                     &params,
                     &x,
-                    family.as_ref(),
+                    Families::Uniform(family.as_ref()),
                     &phis,
                     &cfg,
                     iter,
@@ -472,13 +502,23 @@ fn fd_and_analytic_eta_gradients_agree() {
         &population,
         &params,
         &x,
-        &family,
+        Families::Uniform(&family),
         &phis,
         &analytic,
         2,
     )
     .unwrap();
-    let b = population_neg_elbo(&model, &population, &params, &x, &family, &phis, &fd, 2).unwrap();
+    let b = population_neg_elbo(
+        &model,
+        &population,
+        &params,
+        &x,
+        Families::Uniform(&family),
+        &phis,
+        &fd,
+        2,
+    )
+    .unwrap();
 
     assert_eq!(
         a.n_fd_subjects, 0,
@@ -522,7 +562,7 @@ fn closed_form_omega_zeroes_the_omega_gradient() {
         &population,
         &updated,
         &x,
-        &family,
+        Families::Uniform(&family),
         &phis,
         &cfg_seeded(),
         1,
@@ -562,7 +602,17 @@ fn structural_zero_omega_slots_get_no_gradient() {
         "fixture must have (2,0) and (2,1) absent"
     );
 
-    let e = population_neg_elbo(&model, &population, &params, &x, &family, &phis, &cfg, 4).unwrap();
+    let e = population_neg_elbo(
+        &model,
+        &population,
+        &params,
+        &x,
+        Families::Uniform(&family),
+        &phis,
+        &cfg,
+        4,
+    )
+    .unwrap();
 
     for &slot in &zeros {
         let i = layout.omega_start() + slot;
@@ -572,7 +622,17 @@ fn structural_zero_omega_slots_get_no_gradient() {
         );
         // ... and it is a deliberate skip, not an accident of this Ω: the objective
         // really does respond to that coordinate.
-        let fd = fd_of_neg_elbo_wrt_x(&model, &population, &params, &x, &family, &phis, &cfg, 4, i);
+        let fd = fd_of_neg_elbo_wrt_x(
+            &model,
+            &population,
+            &params,
+            &x,
+            Families::Uniform(&family),
+            &phis,
+            &cfg,
+            4,
+            i,
+        );
         assert!(
             fd.abs() > 1e-6,
             "test is vacuous: FD at structural-zero slot {slot} is already ~0 ({fd:.3e})"
@@ -593,7 +653,7 @@ fn structural_zero_omega_slots_get_no_gradient() {
             &population,
             &params,
             &x,
-            &family,
+            Families::Uniform(&family),
             &phis,
             &cfg,
             4,
@@ -626,7 +686,7 @@ fn fixed_eta_zeroes_its_whole_omega_row_and_column() {
         &population,
         &params,
         &pack_params(&params),
-        &family,
+        Families::Uniform(&family),
         &phis,
         &cfg_seeded(),
         6,
@@ -760,7 +820,7 @@ fn eta_grad_probe_agrees_with_evaluation_and_falls_back_loudly() {
         &population,
         &params,
         &pack_params(&params),
-        &family,
+        Families::Uniform(&family),
         &phis,
         &cfg_seeded(),
         1,
@@ -795,7 +855,7 @@ fn eta_grad_probe_agrees_with_evaluation_and_falls_back_loudly() {
         &population,
         &shell_params,
         &shell_x,
-        &shell_family,
+        Families::Uniform(&shell_family),
         &shell_phis,
         &cfg_seeded(),
         1,
@@ -816,7 +876,7 @@ fn eta_grad_probe_agrees_with_evaluation_and_falls_back_loudly() {
         &population,
         &shell_params,
         &shell_x,
-        &shell_family,
+        Families::Uniform(&shell_family),
         &shell_phis,
         &strict,
         1,
@@ -960,7 +1020,7 @@ fn mc_and_analytic_agree_exactly_at_the_prior() {
             &population,
             &params,
             &x,
-            &family,
+            Families::Uniform(&family),
             &phis,
             &ElboConfig { kl, ..cfg_seeded() },
             3,
@@ -1011,8 +1071,17 @@ fn mc_kl_grad_x_matches_fd_but_phi_is_path_derivative() {
     let iter = 11;
     let layout = PackedLayout::new(&params);
 
-    let e =
-        population_neg_elbo(&model, &population, &params, &x, &family, &phis, &cfg, iter).unwrap();
+    let e = population_neg_elbo(
+        &model,
+        &population,
+        &params,
+        &x,
+        Families::Uniform(&family),
+        &phis,
+        &cfg,
+        iter,
+    )
+    .unwrap();
 
     for (i, &got) in e.grad_x.iter().enumerate() {
         let want = fd_of_neg_elbo_wrt_x(
@@ -1020,7 +1089,7 @@ fn mc_kl_grad_x_matches_fd_but_phi_is_path_derivative() {
             &population,
             &params,
             &x,
-            &family,
+            Families::Uniform(&family),
             &phis,
             &cfg,
             iter,
@@ -1044,7 +1113,7 @@ fn mc_kl_grad_x_matches_fd_but_phi_is_path_derivative() {
                 &population,
                 &params,
                 &x,
-                &family,
+                Families::Uniform(&family),
                 &phis,
                 &cfg,
                 iter,
@@ -1082,7 +1151,7 @@ fn family_without_a_closed_form_kl_falls_back_to_sampling() {
         &population,
         &params,
         &x,
-        &stub,
+        Families::Uniform(&stub),
         &phis,
         &ElboConfig {
             kl: KlMode::Analytic,
@@ -1101,7 +1170,7 @@ fn family_without_a_closed_form_kl_falls_back_to_sampling() {
         &population,
         &params,
         &x,
-        &real,
+        Families::Uniform(&real),
         &phis,
         &ElboConfig {
             kl: KlMode::Mc,
@@ -1142,7 +1211,7 @@ fn mc_and_analytic_kl_agree_on_the_objective() {
             &population,
             &params,
             &x,
-            &family,
+            Families::Uniform(&family),
             &phis,
             &ElboConfig {
                 kl,

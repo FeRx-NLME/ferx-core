@@ -289,8 +289,17 @@ fn full_rank_vi_is_exact_on_a_linear_gaussian_model() {
     };
 
     let x = pack_params(&template);
-    let eval = population_neg_elbo(&model, &pop, &template, &x, &family, &phis, &cfg, 0)
-        .expect("linear-Gaussian model is inside VI's support scope");
+    let eval = population_neg_elbo(
+        &model,
+        &pop,
+        &template,
+        &x,
+        Families::Uniform(&family),
+        &phis,
+        &cfg,
+        0,
+    )
+    .expect("linear-Gaussian model is inside VI's support scope");
 
     let neg_two_elbo = 2.0 * eval.neg_elbo;
     let rel = (neg_two_elbo - exact).abs() / exact.abs();
@@ -339,8 +348,17 @@ fn phi_gradient_vanishes_at_the_exact_posterior() {
     };
 
     let x = pack_params(&template);
-    let eval = population_neg_elbo(&model, &pop, &template, &x, &family, &phis, &cfg, 0)
-        .expect("linear-Gaussian model is inside VI's support scope");
+    let eval = population_neg_elbo(
+        &model,
+        &pop,
+        &template,
+        &x,
+        Families::Uniform(&family),
+        &phis,
+        &cfg,
+        0,
+    )
+    .expect("linear-Gaussian model is inside VI's support scope");
 
     // The KL half of this gradient is exact, but the data half is a Monte-Carlo mean
     // whose error does *not* vanish at the optimum, so the bar is an MC tolerance
@@ -755,8 +773,17 @@ fn full_rank_vi_is_exact_on_a_linear_gaussian_iov_model() {
         seed: 20250812,
     };
     let x = pack_params(&template);
-    let eval = population_neg_elbo(&model, &pop, &template, &x, &family, &phis, &cfg, 0)
-        .expect("IOV model must be inside VI's support scope once §10 lands");
+    let eval = population_neg_elbo(
+        &model,
+        &pop,
+        &template,
+        &x,
+        Families::Uniform(&family),
+        &phis,
+        &cfg,
+        0,
+    )
+    .expect("IOV model must be inside VI's support scope once §10 lands");
 
     let neg_two_elbo = 2.0 * eval.neg_elbo;
     let rel = (neg_two_elbo - exact).abs() / exact.abs();
