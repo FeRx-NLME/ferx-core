@@ -453,3 +453,321 @@ fn ltbs_data_term_is_quadratic_below_unit_predictions() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// IOV extension (VI_PLAN §10.5 test 2)
+// ---------------------------------------------------------------------------
+//
+// Same idea as the oracle above, over the **stacked** random-effects vector
+// `z = [η, κ₁ … κ_K]`. `CL_g = TVCL + η + κ_g` is per-occasion, so under LTBS the
+// log-prediction stays affine in `z` — even though the concentration decays piecewise,
+// with a different clearance in each occasion. The prior is block diagonal,
+// `Σ_b = Ω ⊕ Ω_iov^{⊗K}`, so the true posterior over `z` is again Gaussian and a
+// full-rank `q` over the stacked vector is exact.
+//
+// The design matrix is **measured** from the production IOV predictor rather than
+// derived here. Assuming a formula for how clearance switches at an occasion boundary
+// would make this an oracle for my assumption instead of for ferx: the affineness check
+// below is a genuine test, and everything downstream is then anchored on what the engine
+// actually computes.
+
+use crate::estimation::vi::family::{n_tril, tril_index};
+
+/// Prior variance of each `κ` in the IOV fixture.
+const OMEGA_IOV: f64 = 0.04;
+/// Observation times for the IOV fixture, three per occasion.
+const IOV_TIMES: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+/// Occasion index per observation in [`IOV_TIMES`].
+const IOV_OCCASIONS: [u32; 6] = [1, 1, 1, 2, 2, 2];
+/// Number of occasions, i.e. the number of `κ` blocks in the stacked vector.
+const K_OCC: usize = 2;
+
+fn linear_gaussian_iov_model() -> CompiledModel {
+    crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma ADD_LOG ~ 0.2 (sd)
+
+[individual_parameters]
+  CL = TVCL + ETA_CL + KAPPA_CL
+  V  = 10.0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ log_additive(ADD_LOG)
+
+[fit_options]
+  iov_column = OCC
+",
+    )
+    .expect("linear-Gaussian IOV oracle fixture parses")
+}
+
+/// One IOV subject: a dose at the start of each occasion, three log-scale observations
+/// per occasion.
+fn iov_subject(id: &str, obs: &[f64]) -> Subject {
+    Subject {
+        id: id.into(),
+        // A **single** bolus, deliberately. A second dose would make the concentration a
+        // sum of two exponentials, and `log(Σ exp)` is not affine in `z` — the affineness
+        // check catches exactly that. With one dose the amount is a single exponential
+        // whose exponent accumulates `CL_g` over each occasion's elapsed time, so the
+        // log-prediction stays affine even though clearance switches partway through.
+        doses: vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
+        obs_times: IOV_TIMES.to_vec(),
+        obs_raw_times: Vec::new(),
+        observations: obs.to_vec(),
+        obs_cmts: vec![1; IOV_TIMES.len()],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0; IOV_TIMES.len()],
+        occasions: IOV_OCCASIONS.to_vec(),
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1],
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    }
+}
+
+/// Split a stacked `z = [η, κ₁ … κ_K]` and evaluate the production IOV predictor.
+fn iov_predict(model: &CompiledModel, subject: &Subject, theta: &[f64], z: &[f64]) -> Vec<f64> {
+    let kappas: Vec<Vec<f64>> = (0..K_OCC).map(|g| vec![z[1 + g]]).collect();
+    crate::pk::predict_iov(model, subject, theta, &z[..1], &kappas)
+}
+
+/// Measure the affine decomposition `log f(t) = c_t + Σ_j A[t][j]·z_j` of the production
+/// predictor, and assert it really is affine.
+///
+/// Central differences are *exact* for an affine function, so the returned `A` is the
+/// true design matrix, not an approximation — which is what lets the closed forms below
+/// be exact rather than FD-accurate.
+fn measure_iov_design(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    d: usize,
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let n = subject.obs_times.len();
+    let zero = vec![0.0; d];
+    let c = iov_predict(model, subject, theta, &zero);
+
+    let h = 0.25;
+    let mut a = vec![vec![0.0; d]; n];
+    for j in 0..d {
+        let mut zp = zero.clone();
+        let mut zm = zero.clone();
+        zp[j] += h;
+        zm[j] -= h;
+        let up = iov_predict(model, subject, theta, &zp);
+        let dn = iov_predict(model, subject, theta, &zm);
+        for k in 0..n {
+            let second = up[k] - 2.0 * c[k] + dn[k];
+            assert!(
+                second.abs() < 1e-9,
+                "IOV log-prediction must be affine in stacked coordinate {j} at obs {k}: \
+                 second difference {second:.3e}"
+            );
+            a[k][j] = (up[k] - dn[k]) / (2.0 * h);
+        }
+    }
+    (c, a)
+}
+
+/// Block-diagonal stacked prior `Σ_b = Ω ⊕ Ω_iov^{⊗K}`.
+fn stacked_prior(d: usize) -> DMatrix<f64> {
+    let mut s = DMatrix::zeros(d, d);
+    s[(0, 0)] = OMEGA;
+    for g in 0..K_OCC {
+        s[(1 + g, 1 + g)] = OMEGA_IOV;
+    }
+    s
+}
+
+/// Exact Gaussian posterior over the stacked vector: `S = (AᵀA/σ² + Σ_b⁻¹)⁻¹`,
+/// `μ = S·Aᵀr/σ²`.
+fn exact_iov_posterior(
+    c: &[f64],
+    a: &[Vec<f64>],
+    obs: &[f64],
+    d: usize,
+) -> (DVector<f64>, DMatrix<f64>) {
+    let s2 = SIGMA * SIGMA;
+    let n = obs.len();
+    let amat = DMatrix::from_fn(n, d, |i, j| a[i][j]);
+    let r = DVector::from_fn(n, |i, _| obs[i] - c[i]);
+
+    let prec = amat.transpose() * &amat / s2
+        + stacked_prior(d)
+            .try_inverse()
+            .expect("block-diagonal prior is invertible");
+    let cov = prec
+        .try_inverse()
+        .expect("posterior precision is invertible");
+    let mean = &cov * (amat.transpose() * r) / s2;
+    (mean, cov)
+}
+
+/// Exact `−2 log p(y)` for one IOV subject, on ferx's constant-free convention
+/// (see [`exact_neg_two_log_marginal`]). `y ~ N(c, σ²I + A·Σ_b·Aᵀ)`.
+fn exact_iov_neg_two_log_marginal(c: &[f64], a: &[Vec<f64>], obs: &[f64], d: usize) -> f64 {
+    let s2 = SIGMA * SIGMA;
+    let n = obs.len();
+    let amat = DMatrix::from_fn(n, d, |i, j| a[i][j]);
+    let r = DVector::from_fn(n, |i, _| obs[i] - c[i]);
+    let sigma = DMatrix::identity(n, n) * s2 + &amat * stacked_prior(d) * amat.transpose();
+    let chol = sigma.clone().cholesky().expect("marginal covariance is PD");
+    let log_det = 2.0 * chol.l().diagonal().iter().map(|v| v.ln()).sum::<f64>();
+    let quad = r.dot(&chol.solve(&r));
+    log_det + quad
+}
+
+/// `φ` for a `d`-dimensional [`FullRank`]: `[μ | vech(L)]`, diagonal stored as `log`.
+fn full_rank_phi_nd(mean: &DVector<f64>, cov: &DMatrix<f64>) -> Vec<f64> {
+    let d = mean.len();
+    let l = cov
+        .clone()
+        .cholesky()
+        .expect("posterior covariance is PD")
+        .l();
+    let mut phi = vec![0.0; d + n_tril(d)];
+    phi[..d].copy_from_slice(mean.as_slice());
+    for i in 0..d {
+        for j in 0..=i {
+            phi[d + tril_index(i, j)] = if i == j { l[(i, i)].ln() } else { l[(i, j)] };
+        }
+    }
+    phi
+}
+
+fn iov_population() -> Population {
+    let model = linear_gaussian_iov_model();
+    let params = model.default_params.clone();
+    let probe = iov_subject("probe", &[0.0; 6]);
+    let (c, _) = measure_iov_design(&model, &probe, &params.theta, 1 + K_OCC);
+    let up: Vec<f64> = c.iter().map(|v| v + 0.16).collect();
+    let dn: Vec<f64> = c.iter().map(|v| v - 0.09).collect();
+    Population {
+        subjects: vec![iov_subject("1", &up), iov_subject("2", &dn)],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    }
+}
+
+/// The fixture really is linear-Gaussian in the stacked vector — and the measured design
+/// matrix has the structure IOV implies.
+///
+/// Runs today: it exercises only the IOV predictor, so the scaffolding the ignored oracle
+/// depends on is validated now rather than when IOV support lands.
+#[test]
+fn iov_oracle_model_is_affine_in_the_stacked_random_effects() {
+    let model = linear_gaussian_iov_model();
+    let params = model.default_params.clone();
+    let subject = iov_subject("1", &[0.0; 6]);
+    let d = 1 + K_OCC;
+
+    // `measure_iov_design` asserts affineness in every stacked coordinate.
+    let (_c, a) = measure_iov_design(&model, &subject, &params.theta, d);
+
+    // η acts on every observation; each κ acts only from its own occasion onward, so a
+    // first-occasion observation must be completely insensitive to κ₂.
+    for (k, &occ) in IOV_OCCASIONS.iter().enumerate() {
+        assert!(
+            a[k][0].abs() > 1e-9,
+            "obs {k} must respond to the BSV eta, got {:.3e}",
+            a[k][0]
+        );
+        if occ == 1 {
+            assert!(
+                a[k][2].abs() < 1e-12,
+                "obs {k} is in occasion 1 and must not respond to kappa_2, got {:.3e}",
+                a[k][2]
+            );
+        }
+    }
+    // A second-occasion observation must respond to both kappas: drug carried over from
+    // occasion 1 was cleared at occasion 1's clearance.
+    let last = IOV_TIMES.len() - 1;
+    assert!(
+        a[last][1].abs() > 1e-9 && a[last][2].abs() > 1e-9,
+        "a late observation must respond to both kappas, got k1={:.3e} k2={:.3e}",
+        a[last][1],
+        a[last][2]
+    );
+}
+
+/// The IOV oracle: with `q` set to the exact stacked posterior, `−2·ELBO` must equal the
+/// exact `−2 log p(y)`.
+///
+/// This is the gate VI_PLAN §10.6 asks for. VI's `Ω_iov` update is a mean of `S + μμᵀ`
+/// over occasions, so a variational posterior that understates `S` biases `Ω_iov`
+/// **downward** — and with only a handful of occasions per subject there is far less
+/// averaging to wash that out than `Ω_bsv` gets from N subjects. On a linear-Gaussian
+/// model the variational family contains the truth, so any gap here is implementation
+/// error rather than approximation error, which is what makes it a usable gate.
+///
+/// Ignored until IOV support lands (`vi/elbo.rs` currently refuses `n_kappa > 0`). It is
+/// written against the stacked-family contract of §10.1: one `FullRank` of dimension
+/// `n_eta + K·n_kappa`, evaluated against a block-diagonal stacked prior. Every subject
+/// here has the same `K`, so this compiles against today's single-family signature; a
+/// per-subject-`K` fixture will need the `Vec<Box<dyn VariationalFamily>>` of §10.3.
+///
+/// Run with `--ignored` today it panics inside nalgebra with `Gemv: dimensions mismatch`
+/// rather than failing an assertion: the stacked `φ` has dimension `n_eta + K·n_kappa`
+/// while the data term still assumes `n_eta`. That mismatch *is* the §10.2 work — the
+/// draw has to be split into `η` plus per-occasion `κ` and routed through
+/// `obs_nll_subject_grad_iov`. A clean `Err` from `unsupported_data_term_reason` would be
+/// preferable to a panic, and is worth adding to `population_neg_elbo` alongside the
+/// existing `run_vi` check.
+#[test]
+#[ignore = "enable with IOV support (VI_PLAN §10): vi/elbo.rs refuses n_kappa > 0 today"]
+fn full_rank_vi_is_exact_on_a_linear_gaussian_iov_model() {
+    let model = linear_gaussian_iov_model();
+    let pop = iov_population();
+    let template = model.default_params.clone();
+    let d = 1 + K_OCC;
+
+    let family = FullRank::new(d);
+    let mut phis = Vec::with_capacity(pop.subjects.len());
+    let mut exact = 0.0;
+    for subj in &pop.subjects {
+        let (c, a) = measure_iov_design(&model, subj, &template.theta, d);
+        let (mean, cov) = exact_iov_posterior(&c, &a, &subj.observations, d);
+        phis.push(full_rank_phi_nd(&mean, &cov));
+        exact += exact_iov_neg_two_log_marginal(&c, &a, &subj.observations, d);
+    }
+
+    let cfg = ElboConfig {
+        n_mc_samples: 4000,
+        eta_grad: EtaGradMode::Auto,
+        kl: KlMode::Analytic,
+        seed: 20250812,
+    };
+    let x = pack_params(&template);
+    let eval = population_neg_elbo(&model, &pop, &template, &x, &family, &phis, &cfg, 0)
+        .expect("IOV model must be inside VI's support scope once §10 lands");
+
+    let neg_two_elbo = 2.0 * eval.neg_elbo;
+    let rel = (neg_two_elbo - exact).abs() / exact.abs();
+    assert!(
+        rel < 1e-3,
+        "-2*ELBO at the exact stacked posterior = {neg_two_elbo:.6}, exact -2 log p(y) = \
+         {exact:.6} (relative gap {rel:.3e}); the family contains this posterior, so the \
+         bound must be tight"
+    );
+    assert!(
+        neg_two_elbo > exact - 1e-2,
+        "-2*ELBO ({neg_two_elbo:.6}) fell below the exact -2 log p(y) ({exact:.6})"
+    );
+}
