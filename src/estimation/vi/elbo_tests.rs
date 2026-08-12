@@ -1390,3 +1390,191 @@ fn stacked_prior_keeps_block_structure_and_marks_cross_block_zeros() {
         "distinct occasions must not correlate"
     );
 }
+
+/// A two-subject IOV population on a closed-form 1-cpt IV model, with a differing
+/// occasion count per subject.
+///
+/// The differing `K` is the point: it is what makes the stacked dimension a per-subject
+/// quantity, so a fixture where every subject agreed would not exercise
+/// [`Families::PerSubject`] or catch an offset computed from the wrong subject's `K`.
+fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
+    let model = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  iov_column = OCC
+",
+    )
+    .expect("IOV fixture parses");
+
+    let subject = |id: &str, occ: Vec<u32>, scale: f64| Subject {
+        id: id.into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: (0..occ.len()).map(|k| 1.0 + 2.0 * k as f64).collect(),
+        obs_raw_times: Vec::new(),
+        observations: (0..occ.len())
+            .map(|k| scale * (8.0 - 0.9 * k as f64))
+            .collect(),
+        obs_cmts: vec![1; occ.len()],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0; occ.len()],
+        occasions: occ,
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1],
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+
+    let population = Population {
+        // Two occasions for the first subject, three for the second.
+        subjects: vec![
+            subject("1", vec![1, 1, 2, 2], 1.0),
+            subject("2", vec![1, 2, 2, 3, 3], 1.15),
+        ],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let params = model.default_params.clone();
+    (model, population, params)
+}
+
+/// Per-subject families sized to each subject's stacked vector.
+fn iov_families(
+    model: &CompiledModel,
+    population: &Population,
+    full_rank: bool,
+) -> Vec<Box<dyn VariationalFamily>> {
+    population
+        .subjects
+        .iter()
+        .map(|s| {
+            let d = model.n_eta + subject_k_occasions(model, s) * model.n_kappa;
+            if full_rank {
+                Box::new(FullRank::new(d)) as Box<dyn VariationalFamily>
+            } else {
+                Box::new(MeanField::new(d))
+            }
+        })
+        .collect()
+}
+
+/// `Dual2`-vs-FD parity for the **IOV** ELBO gradient (CLAUDE.md's rule applied to the
+/// gradient path §10.2b introduced).
+///
+/// The oracle in `elbo_oracle.rs` checks the ELBO's *value* against a known answer; this
+/// checks its *derivatives*. Three things here exist only on the IOV path and are not
+/// covered by the non-IOV parity test: the stacked η-gradient from
+/// `analytic_eta_nll_gradient_iov`, the subtraction of the **block-diagonal** prior
+/// `Σ_b⁻¹z` rather than `Ω⁻¹η`, and the `Ω_iov` block of `grad_x`, which is reached by
+/// summing the per-occasion blocks of `∂KL/∂Σ_b` — a sign or offset error there would
+/// leave the value correct and the gradient wrong.
+///
+/// With the seed and iteration fixed, `−ELBO` is deterministic in `(x, φ)`, so central
+/// differences are exact rather than noisy.
+#[test]
+fn iov_neg_elbo_gradient_matches_central_fd() {
+    let (model, population, params) = iov_fixture();
+    assert!(model.n_kappa > 0, "fixture must carry IOV");
+    let x = pack_params(&params);
+    let layout = PackedLayout::new(&params);
+    assert!(
+        layout.n_omega_iov > 0,
+        "packed vector must carry an Omega_iov block"
+    );
+    let cfg = cfg_seeded();
+    let iter = 5;
+    // Forward-FD truncation inside the θ block; everything else is analytic.
+    let tol_for = |i: usize| if i < layout.n_theta { 2e-3 } else { 1e-6 };
+
+    for (label, full_rank) in [("full_rank", true), ("mean_field", false)] {
+        let families = iov_families(&model, &population, full_rank);
+        let fams = Families::PerSubject(&families);
+
+        // Subjects differ in K, so their φ differ in length — the case the enum exists for.
+        let phis: Vec<Vec<f64>> = families
+            .iter()
+            .enumerate()
+            .map(|(s, f)| {
+                let prior = stacked_prior(
+                    &params.omega,
+                    params.omega_iov.as_ref(),
+                    subject_k_occasions(&model, &population.subjects[s]),
+                );
+                let mut p = f.init(&prior);
+                for (i, v) in p.iter_mut().enumerate() {
+                    *v += 0.15 * (((i + s * 5) * 7 + 1) as f64).sin();
+                }
+                p
+            })
+            .collect();
+        assert_ne!(
+            phis[0].len(),
+            phis[1].len(),
+            "fixture must present differing stacked dimensions"
+        );
+
+        let e =
+            population_neg_elbo(&model, &population, &params, &x, fams, &phis, &cfg, iter).unwrap();
+        assert_eq!(
+            e.n_fd_subjects, 0,
+            "{label}: IOV eta-gradient must be analytic"
+        );
+
+        for (i, &got) in e.grad_x.iter().enumerate() {
+            let want =
+                fd_of_neg_elbo_wrt_x(&model, &population, &params, &x, fams, &phis, &cfg, iter, i);
+            let scale = want.abs().max(1.0);
+            assert!(
+                (got - want).abs() / scale < tol_for(i),
+                "{label} ∂(−ELBO)/∂x[{i}]: got {got:.9e}, fd {want:.9e}"
+            );
+        }
+
+        for (s, gphi) in e.grad_phi.iter().enumerate() {
+            for (i, &got) in gphi.iter().enumerate() {
+                let want = fd_of_neg_elbo_wrt_phi(
+                    &model,
+                    &population,
+                    &params,
+                    &x,
+                    fams,
+                    &phis,
+                    &cfg,
+                    iter,
+                    s,
+                    i,
+                );
+                let scale = want.abs().max(1.0);
+                assert!(
+                    (got - want).abs() / scale < 1e-6,
+                    "{label} ∂(−ELBO)/∂φ[{s}][{i}]: got {got:.9e}, fd {want:.9e}"
+                );
+            }
+        }
+    }
+}
