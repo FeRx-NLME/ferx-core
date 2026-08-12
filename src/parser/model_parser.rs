@@ -9130,7 +9130,15 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
     };
 
     // Reject any unknown keys so typos don't silently pass.
-    const KNOWN: &[&str] = &["inputs", "outputs", "layers", "activation", "output"];
+    const KNOWN: &[&str] = &[
+        "inputs",
+        "outputs",
+        "layers",
+        "activation",
+        "output",
+        "center",
+        "scale",
+    ];
     for k in fields.keys() {
         if !KNOWN.contains(&k.as_str()) {
             return Err(format!(
@@ -9142,6 +9150,7 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         }
     }
 
+    let n_inputs = inputs.len();
     let mut layer_sizes = Vec::with_capacity(hidden.len() + 2);
     layer_sizes.push(inputs.len());
     layer_sizes.extend(hidden.iter().copied());
@@ -9149,7 +9158,23 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
 
     let mlp = MlpMapper::new(layer_sizes.clone(), hidden_activation, output_activation)
         .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
+    // Optional per-input normalisation: the network sees `(x - center) / scale`.
+    // Absent keys default to the identity, so an existing model is unchanged. Declared
+    // rather than estimated from the data — see `NamedMlpMapper::input_scale` for why.
+    let take_float_list = |field: &str, default: f64| -> Result<Vec<f64>, String> {
+        let Some(raw) = fields.get(field) else {
+            return Ok(vec![default; n_inputs]);
+        };
+        let parsed = parse_float_array(raw)
+            .map_err(|e| format!("[covariate_nn {}] `{}`: {}", name, field, e))?;
+        Ok(parsed)
+    };
+    let center = take_float_list("center", 0.0)?;
+    let scale = take_float_list("scale", 1.0)?;
+
     let mapper = NamedMlpMapper::new(mlp, inputs, outputs)
+        .map_err(|e| format!("[covariate_nn {}] {}", name, e))?
+        .with_normalization(center, scale)
         .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
 
     // Auto-generate weight-theta names + Glorot-style deterministic inits.

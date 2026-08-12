@@ -18494,3 +18494,205 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
         "a present covariate must pass, got {diags:?}"
     );
 }
+
+/// `center` / `scale` must reach the network: the forward pass sees `(x - center)/scale`.
+///
+/// Asserted by equivalence rather than by inspecting the mapper's fields — a model
+/// declaring `center`/`scale` must predict identically to one fed the already-normalised
+/// covariate, for the same weights. That pins the transform's direction and its
+/// application point, which reading the stored vectors back would not.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_center_and_scale_normalize_the_inputs() {
+    use crate::nn::CovariateMapper;
+    use std::collections::HashMap;
+
+    let build = |extra: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [WT]
+{extra}  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+        .expect("DCM fixture parses")
+    };
+
+    let normalized = build("  center     = [70.0]\n  scale      = [12.0]\n");
+    let raw = build("");
+
+    // Same auto-generated Glorot weights in both (the init is deterministic).
+    let w_norm = &normalized.default_params.theta[2..];
+    let w_raw = &raw.default_params.theta[2..];
+    assert_eq!(
+        w_norm, w_raw,
+        "weight init must be identical across the two fixtures"
+    );
+
+    let nn_norm = &normalized.covariate_nns[0];
+    let nn_raw = &raw.covariate_nns[0];
+
+    // WT = 94 under center 70 / scale 12 is z = 2.0; the un-normalised network must
+    // reproduce it exactly when handed 2.0 directly.
+    let out_norm = nn_norm
+        .mapper
+        .forward_raw(w_norm, &HashMap::from([("WT".to_string(), 94.0)]))
+        .expect("forward");
+    let out_raw = nn_raw
+        .mapper
+        .forward_raw(w_raw, &HashMap::from([("WT".to_string(), 2.0)]))
+        .expect("forward");
+    assert!(
+        (out_norm[0] - out_raw[0]).abs() < 1e-12,
+        "normalised input must equal the pre-normalised one: {out_norm:?} vs {out_raw:?}"
+    );
+
+    // And it must NOT equal the raw network fed the raw value, or nothing happened.
+    let out_unnormalized = nn_raw
+        .mapper
+        .forward_raw(w_raw, &HashMap::from([("WT".to_string(), 94.0)]))
+        .expect("forward");
+    assert!(
+        (out_norm[0] - out_unnormalized[0]).abs() > 1e-9,
+        "declaring center/scale must change the forward pass"
+    );
+}
+
+/// Normalisation is what keeps a `tanh` layer out of saturation.
+///
+/// The motivation for the feature, as a test rather than a claim: at Glorot
+/// initialisation a raw `WT ≈ 70` drives every hidden unit to ±1, so the layer's
+/// derivative collapses and the network is nearly blind to its input. Standardised
+/// inputs leave it responsive. Measured as the spread of the output across the covariate
+/// range — a saturated network barely moves.
+#[cfg(feature = "nn")]
+#[test]
+fn normalization_keeps_the_hidden_layer_responsive() {
+    use crate::nn::CovariateMapper;
+    use std::collections::HashMap;
+
+    let build = |extra: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [WT]
+{extra}  outputs    = [CL]
+  layers     = [8]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+        .expect("DCM fixture parses")
+    };
+
+    // Observed weight range, roughly 45-95 kg.
+    let wts = [45.0, 55.0, 65.0, 75.0, 85.0, 95.0];
+    let spread = |model: &crate::types::CompiledModel| -> f64 {
+        let w = &model.default_params.theta[2..];
+        let outs: Vec<f64> = wts
+            .iter()
+            .map(|&x| {
+                model.covariate_nns[0]
+                    .mapper
+                    .forward_raw(w, &HashMap::from([("WT".to_string(), x)]))
+                    .expect("forward")[0]
+            })
+            .collect();
+        outs.iter().cloned().fold(f64::MIN, f64::max)
+            - outs.iter().cloned().fold(f64::MAX, f64::min)
+    };
+
+    let raw_spread = spread(&build(""));
+    let norm_spread = spread(&build("  center     = [70.0]\n  scale      = [15.0]\n"));
+
+    assert!(
+        norm_spread > 10.0 * raw_spread,
+        "standardising the input must leave the network far more responsive across the \
+         covariate range: raw spread {raw_spread:.3e}, normalised {norm_spread:.3e}"
+    );
+}
+
+/// `scale = 0` is a division by zero and must be rejected at parse time, as must a
+/// length that does not match `inputs`.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_rejects_invalid_normalization() {
+    let build = |extra: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [WT, CRCL]
+{extra}  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = 10.0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+    };
+
+    let err = build("  scale      = [12.0, 0.0]\n").expect_err("zero scale must be rejected");
+    assert!(
+        err.contains("scale") && err.contains("CRCL"),
+        "error must name the offending input: {err}"
+    );
+
+    let err = build("  center     = [70.0]\n").expect_err("short center must be rejected");
+    assert!(
+        err.contains("center") && err.contains("2"),
+        "error must report the expected length: {err}"
+    );
+
+    // The identity is always acceptable and matches an undeclared block.
+    build("  center     = [0.0, 0.0]\n  scale      = [1.0, 1.0]\n")
+        .expect("identity normalisation parses");
+}

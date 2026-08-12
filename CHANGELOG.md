@@ -718,6 +718,17 @@ section of the SDLC for the versioning policy).
 ## [0.3.0] - 2026-08-07
 
 ### Added
+- **`center` / `scale` on `[covariate_nn]`** — per-input normalization, so the network
+  sees `(x - center) / scale`. Both default to the identity, leaving existing models
+  unchanged. Raw covariates are badly scaled for a neural net: `WT ≈ 70` saturates a
+  `tanh` layer at initialization, where its derivative is ~0 and the layer is nearly
+  blind to its input. On a two-covariate DCM, unnormalized inputs pushed weights to ~1e11
+  and left the residual error 15× too high; the same model with standardized inputs kept
+  every weight inside `[-1.3, 1.6]`. The constants are declared rather than estimated
+  from the data so that `predict()` applies the same transform the fit used — recomputing
+  statistics on new data would silently change the model — and so the model file remains
+  a complete description of the transform, as `(WT/70)^0.75` already is.
+
 - **New ODE steppers via `[fit_options] ode_method`,** on two independent axes. For
   **stability**: the linearly implicit Rosenbrock methods `rosenbrock23` (order 2, aliases
   `ros23`/`ode23s`), `rodas4` (order 4) and `rodas5p` (order 5). These are stable at the step size the tolerance needs on **stiff**

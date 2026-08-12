@@ -62,6 +62,8 @@ the same data and eta structure but an analytical covariate model.
   layers     = [hidden_1, hidden_2, ...]
   activation = tanh | relu | sigmoid | softplus | exp | identity
   output     = tanh | relu | sigmoid | softplus | exp | identity   # optional, default `identity`
+  center     = [c_1, c_2, ...]   # optional, default all 0
+  scale      = [s_1, s_2, ...]   # optional, default all 1
 ```
 
 | Field         | Required | Meaning                                                           |
@@ -71,6 +73,8 @@ the same data and eta structure but an analytical covariate model.
 | `layers`      | yes      | Hidden layer widths, in order. At least one entry required        |
 | `activation`  | yes      | Hidden-layer element-wise activation                              |
 | `output`      | no       | Output-layer activation. Use `softplus` or `exp` for positive PK params |
+| `center`      | no       | Per-input value subtracted before the forward pass. One entry per input |
+| `scale`       | no       | Per-input divisor applied after centering. One entry per input; must be finite and non-zero |
 
 The header form `[covariate_nn NAME]` requires the **NAME** (e.g.
 `TYPICAL_PK`). NAME is the dot-access prefix in `[individual_parameters]`
@@ -78,6 +82,46 @@ expressions (`NAME.CL`, `NAME.V1`, …).
 
 Multiple `[covariate_nn]` blocks per model are permitted; they're keyed
 by NAME and ordered alphabetically when generating theta names.
+
+## Normalize your inputs
+
+The network sees `(x - center) / scale`. Both default to the identity, so an
+existing model is unchanged — but on real covariates you almost always want them
+set.
+
+Raw covariates are badly scaled for a neural net. `WT ≈ 70` or `CRCL ≈ 86` drive
+every `tanh` unit to ±1 at Glorot initialization, where the derivative is ~0 and
+the layer is nearly blind to its input. The optimizer's only route out is to
+shrink the first-layer weights toward zero while later layers grow to compensate,
+which is slow, ill-conditioned, and prone to running away. Measured on a
+two-covariate DCM, unnormalized inputs pushed weights to ~1e11 and left the
+residual error at 15× its true value; the same model with standardized inputs
+kept every weight inside `[-1.3, 1.6]`.
+
+Use the covariate's mean and SD in your dataset, or any round numbers near them —
+the network does not care whether the standardization is exact, only that its
+inputs land in roughly `[-3, 3]`:
+
+```ferx
+[covariate_nn TYPICAL_PK]
+  inputs     = [WT, CRCL]
+  center     = [70, 86]
+  scale      = [12, 23]
+  outputs    = [CL, V1]
+  layers     = [8]
+  activation = tanh
+  output     = softplus
+```
+
+### Why these are declared, not learned from the data
+
+They are constants in the model file rather than statistics computed at fit time,
+which is deliberate. Statistics derived from the estimation data could not be
+carried into `predict()` — recomputing them on a new dataset would silently
+change the model between fitting and prediction, the standard train/serve skew.
+Writing them down keeps the model file a complete description of the transform,
+and matches what population PK already does when it writes `(WT/70)^0.75` and
+names its reference weight.
 
 ## Auto-generated parameters
 

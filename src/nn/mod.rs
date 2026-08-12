@@ -49,6 +49,14 @@ pub enum NnError {
     UnknownPkOutput(String),
     #[error("duplicate output name '{0}'")]
     DuplicateOutput(String),
+    #[error("`{field}` must have one entry per input: expected {expected}, got {actual}")]
+    NormalizationLengthMismatch {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("`scale` for input '{input}' must be finite and non-zero; got {value}")]
+    InvalidScale { input: String, value: f64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +470,30 @@ pub struct NamedMlpMapper {
     /// Indices into `PkParams::values` for each output (one per
     /// `output_names`).
     output_pk_indices: Vec<usize>,
+    /// Per-input location subtracted before the forward pass (`center` in the
+    /// `[covariate_nn]` block). All zeros unless the model declares otherwise.
+    input_center: Vec<f64>,
+    /// Per-input scale divided out after centering (`scale` in the block). All ones
+    /// unless the model declares otherwise; entries are validated non-zero and finite at
+    /// parse time.
+    ///
+    /// # Why this is declared rather than estimated from the data
+    ///
+    /// A network fed raw covariates is badly conditioned: `WT ≈ 70` and `CRCL ≈ 86`
+    /// saturate a `tanh` layer at Glorot initialisation, and the optimizer's only escape
+    /// is to drive the first-layer weights to tiny values while later layers grow to
+    /// compensate. Measured on a two-covariate DCM, unnormalised inputs pushed weights to
+    /// ~1e11 and the residual error to 15× its true value; the same model with
+    /// standardised inputs stayed inside `[-1.3, 1.6]`.
+    ///
+    /// The constants live in the model file, not in fitted state, for two reasons.
+    /// `fit()` takes `&CompiledModel`, so statistics derived from the estimation data
+    /// could not be written back for `predict()` to reuse — and recomputing them on new
+    /// data would silently change the model between fitting and prediction, the classic
+    /// train/serve skew. Declaring them also matches how population PK already writes
+    /// normalisation down (`(WT/70)^0.75` names its reference weight), and keeps the
+    /// model file a complete description of the transform.
+    input_scale: Vec<f64>,
 }
 
 impl NamedMlpMapper {
@@ -500,12 +532,60 @@ impl NamedMlpMapper {
             output_pk_indices.push(idx);
         }
 
+        let n_in = input_names.len();
         Ok(Self {
             mlp,
             input_names,
             output_names,
             output_pk_indices,
+            input_center: vec![0.0; n_in],
+            input_scale: vec![1.0; n_in],
         })
+    }
+
+    /// Attach per-input normalisation: the forward pass sees `(x - center) / scale`.
+    ///
+    /// Lengths must match `inputs`, and every `scale` entry must be finite and non-zero.
+    /// Callers that want centering only (or scaling only) pass the identity for the other.
+    pub fn with_normalization(
+        mut self,
+        center: Vec<f64>,
+        scale: Vec<f64>,
+    ) -> Result<Self, NnError> {
+        let n_in = self.input_names.len();
+        for (label, v) in [("center", &center), ("scale", &scale)] {
+            if v.len() != n_in {
+                return Err(NnError::NormalizationLengthMismatch {
+                    field: label,
+                    expected: n_in,
+                    actual: v.len(),
+                });
+            }
+        }
+        for (i, s) in scale.iter().enumerate() {
+            if !s.is_finite() || *s == 0.0 {
+                return Err(NnError::InvalidScale {
+                    input: self.input_names[i].clone(),
+                    value: *s,
+                });
+            }
+        }
+        if center.iter().any(|c| !c.is_finite()) {
+            return Err(NnError::InvalidScale {
+                input: "center".to_string(),
+                value: f64::NAN,
+            });
+        }
+        self.input_center = center;
+        self.input_scale = scale;
+        Ok(self)
+    }
+
+    /// `(x - center) / scale` for input `i`. Identity unless the model declares
+    /// normalisation, and cheap enough to apply unconditionally.
+    #[inline]
+    fn normalize(&self, i: usize, x: f64) -> f64 {
+        (x - self.input_center[i]) / self.input_scale[i]
     }
 
     /// Direct access to the underlying MLP (for testing or weight
@@ -558,10 +638,12 @@ impl NamedMlpMapper {
     fn build_input_vec(&self, covariates: &HashMap<String, f64>) -> Result<Vec<f64>, NnError> {
         self.input_names
             .iter()
-            .map(|n| {
+            .enumerate()
+            .map(|(i, n)| {
                 covariates
                     .get(n)
                     .copied()
+                    .map(|x| self.normalize(i, x))
                     .ok_or_else(|| NnError::MissingCovariate(n.clone()))
             })
             .collect()
@@ -572,7 +654,15 @@ impl NamedMlpMapper {
     fn build_input_vec_zero_fill(&self, covariates: &HashMap<String, f64>) -> Vec<f64> {
         self.input_names
             .iter()
-            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .enumerate()
+            .map(|(i, n)| match covariates.get(n).copied() {
+                Some(x) => self.normalize(i, x),
+                // Absent: feed the network the *centered* origin rather than a raw 0.0,
+                // so the fallback does not depend on where the user put `center`. This
+                // path is guarded by `api::check_covariates` regardless (see
+                // `forward_raw`).
+                None => self.normalize(i, self.input_center[i]),
+            })
             .collect()
     }
 }
