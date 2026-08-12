@@ -708,3 +708,10 @@ pub fn closed_form_omega(
 #[cfg(test)]
 #[path = "elbo_tests.rs"]
 mod tests;
+
+/// Exact-case oracle (VI_PLAN §6 test 2). Kept as its own module because it is the
+/// only VI check anchored on an *externally* known answer rather than on internal
+/// consistency — see the module docs for why that distinction matters.
+#[cfg(test)]
+#[path = "elbo_oracle.rs"]
+mod oracle_tests;
