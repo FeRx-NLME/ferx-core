@@ -535,6 +535,15 @@ impl NamedMlpMapper {
     /// covariate lookups). The remaining error variants — `WeightCountMismatch`
     /// / `InputCountMismatch` — only fire on genuine wiring bugs, so callers
     /// can typically `.expect(...)` the result.
+    ///
+    /// **The zero-fill is not the guard against a bad input name.** Silently
+    /// substituting `0.0` degenerates the network to a constant — a typo'd input, or
+    /// `inputs = [TIME]` (a reserved column, not a covariate), would otherwise produce a
+    /// plausible-looking fit that learned nothing. What prevents that is
+    /// `api::check_covariates` at fit time, which sees `[covariate_nn]` inputs only
+    /// because the parser registers them in `referenced_covariates` — that registration
+    /// exists for this reason as much as for time-varying covariates. Keep the two
+    /// together: dropping the registration re-opens *both* failure modes silently.
     pub fn forward_raw(
         &self,
         weights: &[f64],

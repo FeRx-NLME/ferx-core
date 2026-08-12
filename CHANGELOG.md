@@ -865,6 +865,11 @@ section of the SDLC for the versioning policy).
   constant value per subject for the entire record — silently, with no error or warning,
   so a time-varying covariate simply had no effect on the fit. NN input names are now
   registered alongside `[scaling]` / error-selector / `[initial_conditions]` covariates.
+  The same registration also closes a second silent failure: a `[covariate_nn]` input the
+  data does not carry — a typo, or `inputs = [TIME]` (a reserved column, not a covariate)
+  — used to be zero-filled, degenerating the network to a constant and producing a
+  plausible-looking fit that had learned nothing. Such an input is now rejected at fit
+  time with `E_MISSING_COVARIATE`, like any other missing covariate.
 
 - **Gradient-path-dependent FOCE/FOCEI objective on proportional-error models with a
   near-zero prediction** (#958). The residual-variance floor (`MIN_VARIANCE`, which clamps

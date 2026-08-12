@@ -18390,3 +18390,107 @@ fn covariate_nn_reads_time_varying_covariate_values() {
          the NN is reading a frozen baseline covariate instead of the trajectory"
     );
 }
+
+/// A `[covariate_nn]` input that the data does not carry must be a hard error, not a
+/// silent zero.
+///
+/// `NamedMlpMapper::forward_raw` zero-fills any input it cannot find, matching the
+/// expression evaluator's `unwrap_or(0.0)`. On the hot path that is the right shape --
+/// it runs per prediction and must not allocate an error -- but it means a typo'd or
+/// unavailable input degenerates the network to a constant with nothing to show for it.
+/// The guard is `check_covariates` at fit time, which only sees NN inputs because they
+/// are registered as referenced covariates.
+///
+/// `TIME` is the case a user is most likely to reach for, wanting a time-varying
+/// parameter. It is a reserved column rather than a covariate, so it is not in the
+/// covariate map and must be rejected like any other absent input.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_input_missing_from_data_is_rejected() {
+    use crate::types::{DoseEvent, Population, Subject};
+    use std::collections::HashMap;
+
+    let parse = |inputs: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [{inputs}]
+  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+        .expect("DCM fixture parses")
+    };
+
+    let population = Population {
+        subjects: vec![Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::from([("WT".to_string(), 70.0)]),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }],
+        covariate_names: vec!["WT".to_string()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+
+    // A typo'd covariate name.
+    let diags = crate::api::check_covariates(&parse("ZCOV"), &population);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == "E_MISSING_COVARIATE" && d.message.contains("ZCOV")),
+        "an NN input absent from the data must be rejected, got {diags:?}"
+    );
+
+    // `TIME` is not a covariate column, so it must be rejected too rather than
+    // silently zero-filling the network's only input.
+    let diags = crate::api::check_covariates(&parse("TIME"), &population);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == "E_MISSING_COVARIATE" && d.message.contains("TIME")),
+        "`inputs = [TIME]` must be rejected, got {diags:?}"
+    );
+
+    // A present covariate must not be flagged.
+    let diags = crate::api::check_covariates(&parse("WT"), &population);
+    assert!(
+        diags.is_empty(),
+        "a present covariate must pass, got {diags:?}"
+    );
+}
