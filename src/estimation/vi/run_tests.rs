@@ -893,3 +893,54 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
     let params = model.default_params.clone();
     (model, population, params)
 }
+
+/// `max_relative_change` is scale-aware and does not blow up near zero.
+#[test]
+fn parameter_change_is_relative_with_an_absolute_floor() {
+    // A 1% move on an O(1) coordinate.
+    assert!((max_relative_change(&[1.01], &[1.0]) - 0.0099).abs() < 1e-3);
+    // The same *absolute* move on a coordinate 100x larger is 100x smaller relatively.
+    assert!(max_relative_change(&[100.01], &[100.0]) < 1e-3);
+    // Two coordinates: the worst one wins, so a single unsettled parameter blocks.
+    assert!(max_relative_change(&[1.0, 2.0], &[1.0, 1.0]) > 0.4);
+    // Near zero the floor keeps it finite rather than dividing by ~0.
+    let near_zero = max_relative_change(&[1e-9], &[0.0]);
+    assert!(near_zero.is_finite() && near_zero < 1.0, "got {near_zero}");
+    // Identical vectors have not moved.
+    assert_eq!(
+        max_relative_change(&[1.0, -2.0, 3.0], &[1.0, -2.0, 3.0]),
+        0.0
+    );
+}
+
+/// A run whose **parameters** have settled must be reported as converged even when the
+/// objective is still creeping.
+///
+/// This is the case that motivated the criterion. A neural-network weight vector has
+/// exact permutation and layer-scale symmetries, so an unregularised fit drifts along
+/// those flat directions forever: the objective test says "still moving" indefinitely
+/// while the estimates, and everything a user reads off them, have stopped. Measured on a
+/// 146-weight DCM, the objective test never fired in 25 000 iterations even though the
+/// fit was sound (weights bounded, sigma sensible, OFV better than SAEM's).
+///
+/// Exercised here through the ordinary fixture rather than a DCM, which needs
+/// `--features nn`: the assertion is that the two criteria are independent and either
+/// suffices, not that this particular model has flat directions.
+#[test]
+fn parameter_stability_alone_can_certify_convergence() {
+    let (model, population, params) = fixture();
+    // Long enough that the parameters settle well before the ceiling.
+    let out = run_vi(&model, &population, &params, &opts(25_000)).expect("VI runs");
+    let vi = out.vi.as_ref().expect("VI result present");
+    assert!(vi.converged, "a settled fit must report converged");
+    assert!(
+        vi.n_iterations < 25_000,
+        "must stop before the ceiling, ran {}",
+        vi.n_iterations
+    );
+    assert!(
+        !out.warnings.iter().any(|w| w.contains("had settled")),
+        "a converged run must not warn about settling: {:?}",
+        out.warnings
+    );
+}

@@ -106,6 +106,34 @@ fn settle_window(n: usize) -> usize {
     (((n as f64) * CONVERGENCE_WINDOW_FRACTION).round() as usize).max(SETTLE_MIN_WINDOW)
 }
 
+/// Relative movement below which a parameter block mean counts as settled.
+///
+/// Compared per coordinate against `|mean| + PARAM_SETTLE_FLOOR`, so a coordinate sitting
+/// near zero is judged on an absolute scale rather than blowing the ratio up.
+const PARAM_SETTLE_REL_TOL: f64 = 1e-3;
+
+/// Absolute floor in the relative-change denominator above.
+const PARAM_SETTLE_FLOOR: f64 = 1e-6;
+
+/// Largest relative change between two block means of the packed parameter vector.
+///
+/// This is the question a user actually asks — *have the estimates stopped moving?* — as
+/// opposed to the one [`trace_has_settled`] asks, which is whether the noisy objective
+/// has stopped creeping. The two come apart badly on a parameter space with flat
+/// directions: a neural-network weight vector has exact permutation and layer-scale
+/// symmetries, so an unregularised fit drifts along those ridges indefinitely while the
+/// likelihood, the estimates that matter, and the predictions all stop changing. The
+/// objective test correctly reports "still moving" forever; this one does not.
+///
+/// Block means rather than raw iterates, for the same reason `trace_has_settled` averages
+/// both of its windows: a single Adam iterate is a noisy draw.
+fn max_relative_change(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs() / (y.abs().max(x.abs()) + PARAM_SETTLE_FLOOR))
+        .fold(0.0f64, f64::max)
+}
+
 /// Whether the tail of the objective trace has stopped moving.
 ///
 /// Compares the mean of the last `window` values against the mean of the `window`
@@ -388,6 +416,13 @@ pub fn run_vi(
     let mut stop_at = n_iters;
     let mut settled_at: Option<usize> = None;
     let mut consecutive_settled = 0usize;
+    // Parameter-stability tracking: a running block mean of `x`, compared against the
+    // previous block every `CONVERGENCE_CHECK_INTERVAL` iterations.
+    let mut block_acc = vec![0.0f64; x.len()];
+    let mut block_n = 0usize;
+    let mut prev_block: Option<Vec<f64>> = None;
+    let mut consecutive_param_settled = 0usize;
+    let mut param_settled = false;
     let mut avg_x = PolyakAverager::new(x.len());
     let mut avg_phi: Vec<PolyakAverager> = (0..n_subjects)
         .map(|i| PolyakAverager::new(families[i].n_params()))
@@ -494,6 +529,11 @@ pub fn run_vi(
         // i.e. settling was detected very late): the window is already being collected
         // on the original schedule and moving it would mix pre- and post-settling
         // iterates into one mean.
+        for (a, v) in block_acc.iter_mut().zip(x.iter()) {
+            *a += *v;
+        }
+        block_n += 1;
+
         if settled_at.is_none() && iter < avg_start && (iter + 1) % CONVERGENCE_CHECK_INTERVAL == 0
         {
             if trace_has_settled(&trace, settle_window(trace.len()), CONVERGENCE_REL_TOL) {
@@ -503,7 +543,28 @@ pub fn run_vi(
                 // means the run had not settled, so the count starts over.
                 consecutive_settled = 0;
             }
-            if consecutive_settled >= SETTLE_PATIENCE {
+
+            // Parameter stability, on the same cadence and with the same patience.
+            let block: Vec<f64> = block_acc.iter().map(|a| a / block_n as f64).collect();
+            if let Some(prev) = prev_block.as_ref() {
+                if max_relative_change(&block, prev) < PARAM_SETTLE_REL_TOL {
+                    consecutive_param_settled += 1;
+                } else {
+                    consecutive_param_settled = 0;
+                }
+            }
+            prev_block = Some(block);
+            block_acc.iter_mut().for_each(|a| *a = 0.0);
+            block_n = 0;
+            if consecutive_param_settled >= SETTLE_PATIENCE {
+                param_settled = true;
+            }
+
+            // Either criterion is sufficient. The objective test is the stricter one on a
+            // well-conditioned model and is what the existing behaviour is pinned to; the
+            // parameter test is what rescues a flat parameter space, where the objective
+            // never settles but the estimates have.
+            if consecutive_settled >= SETTLE_PATIENCE || param_settled {
                 let avg_window = options
                     .vi_avg_last
                     .unwrap_or_else(|| averaging_window_for(iter + 1))
@@ -616,11 +677,13 @@ pub fn run_vi(
     // early stopping those differ, and windowing a 900-iteration trace as though it were
     // 25 000 long would make `trace_has_settled` return `false` for every early stop.
     let converged = settled_at.is_some()
+        || param_settled
         || trace_has_settled(&trace, settle_window(n_iters_run), CONVERGENCE_REL_TOL);
     if !converged {
         warnings.push(format!(
-            "VI: the objective was still moving at the end of {n_iters_run} iterations \
-             (see vi.elbo_trace). Increase vi_iters, or lower vi_lr if the trace is oscillating."
+            "VI: neither the objective nor the parameter estimates had settled after \
+             {n_iters_run} iterations (see vi.elbo_trace). Increase vi_iters, or lower \
+             vi_lr if the trace is oscillating."
         ));
     }
     if n_fd_subjects > 0 {
