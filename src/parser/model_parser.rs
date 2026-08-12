@@ -3077,6 +3077,28 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         register_referenced_covariates(&mut model.referenced_covariates, selector_covariates);
     }
 
+    // `[covariate_nn]` inputs are ordinary covariate reads — the mapper looks each name
+    // up in the same per-event `HashMap` every other covariate consumer uses — but they
+    // are named in the block rather than in an expression, so none of the statement
+    // walkers above ever sees them.
+    //
+    // Registering them here is what makes them *time-varying*. Without it the model does
+    // not count them as referenced, `Population::prune_irrelevant_tv_covariates` (called
+    // from `api::fit`) drops their trajectories as irrelevant, the subject stops
+    // reporting `has_tv_covariates()`, and the NN silently reads each subject's baseline
+    // value for the entire record — a covariate that changes over time is simply not
+    // seen, with no error and no warning. Same reasoning as the scaling / error-selector
+    // / initial-condition covariates above.
+    #[cfg(feature = "nn")]
+    {
+        let nn_inputs: Vec<String> = model
+            .covariate_nns
+            .iter()
+            .flat_map(|nn| nn.mapper.input_names().to_vec())
+            .collect();
+        register_referenced_covariates(&mut model.referenced_covariates, nn_inputs);
+    }
+
     // ── [initial_conditions] block (issue #521) ──
     // Non-zero starting compartment amounts for analytical PK models. The ODE
     // path seeds state via `init(...)` in [odes]; here we record closed-form

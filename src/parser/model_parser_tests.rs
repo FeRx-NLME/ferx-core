@@ -18228,3 +18228,165 @@ fn test_split_weight_modifier_peels_a_kappa_declaration() {
     assert_eq!(stmt, "kappa KAPPA_EMAX ~ 2.0 (sd)");
     assert_eq!(w.as_deref(), Some("NARM"));
 }
+
+/// `[covariate_nn]` inputs must count as referenced covariates.
+///
+/// They are named in the block, not in any expression, so no statement walker sees them.
+/// If they are not registered here the model does not treat them as required data
+/// columns, `Population::prune_irrelevant_tv_covariates` discards their trajectories, and
+/// the network silently reads each subject's baseline value for the whole record.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_inputs_are_registered_as_referenced_covariates() {
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [ZCOV, WT]
+  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("DCM fixture parses");
+
+    for name in ["ZCOV", "WT"] {
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == name),
+            "NN input {name} must be a referenced covariate, got {:?}",
+            model.referenced_covariates
+        );
+    }
+}
+
+/// The regression proper: a network whose input is time-varying must still produce
+/// time-varying predictions **after the fit pipeline has pruned covariates**.
+///
+/// Routing through `prune_irrelevant_tv_covariates` is the whole point. That is the call
+/// `api::fit` makes, and it is where the bug lived: a subject constructed by hand keeps
+/// its `obs_covariates` and predicts correctly whether or not the fix is present, so a
+/// test that skips the prune passes either way and proves nothing. (Verified: without the
+/// fix this test fails only when the prune is included.)
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_reads_time_varying_covariate_values() {
+    use crate::types::{DoseEvent, Subject};
+    use std::collections::HashMap;
+
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [ZCOV]
+  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("DCM fixture parses");
+
+    let times = vec![1.0, 4.0, 8.0, 16.0, 24.0];
+    // `obs_covariates` carries the per-observation snapshot the engine reads.
+    let make = |zcov: &[f64]| -> Subject {
+        let per_obs: Vec<HashMap<String, f64>> = zcov
+            .iter()
+            .map(|&z| HashMap::from([("ZCOV".to_string(), z)]))
+            .collect();
+        Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: times.clone(),
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; times.len()],
+            obs_cmts: vec![1; times.len()],
+            covariates: HashMap::from([("ZCOV".to_string(), zcov[0])]),
+            dose_covariates: vec![HashMap::from([("ZCOV".to_string(), zcov[0])])],
+            obs_covariates: per_obs,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; times.len()],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }
+    };
+
+    // Same baseline, but one subject's covariate swings hard after the second sample.
+    let mut pop = crate::types::Population {
+        subjects: vec![
+            make(&[-1.0, -1.0, -1.0, -1.0, -1.0]),
+            make(&[-1.0, -1.0, 1.5, 1.5, 1.5]),
+        ],
+        covariate_names: vec!["ZCOV".to_string()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    assert!(
+        pop.subjects[1].has_tv_covariates(),
+        "fixture must present time-varying covariates before pruning"
+    );
+
+    // The step that broke it: covariates the model does not reference are dropped here.
+    pop.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+
+    let constant = &pop.subjects[0];
+    let varying = &pop.subjects[1];
+    let theta = &model.default_params.theta;
+    let mut scratch = crate::pk::EventPkParams::default();
+    let p_const =
+        crate::pk::compute_predictions_with_tv_into(&model, constant, theta, &[0.0], &mut scratch);
+    let p_vary =
+        crate::pk::compute_predictions_with_tv_into(&model, varying, theta, &[0.0], &mut scratch);
+
+    // The first two samples share a covariate value, so they must agree exactly; the
+    // later ones must not, or the network never saw the change.
+    for j in 0..2 {
+        assert!(
+            (p_const[j] - p_vary[j]).abs() < 1e-12,
+            "obs {j} precedes the covariate change and must be identical"
+        );
+    }
+    let diverged = (2..times.len()).any(|j| (p_const[j] - p_vary[j]).abs() > 1e-9);
+    assert!(
+        diverged,
+        "predictions after the covariate change are identical ({p_const:?} vs {p_vary:?}); \
+         the NN is reading a frozen baseline covariate instead of the trajectory"
+    );
+}

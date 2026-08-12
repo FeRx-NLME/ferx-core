@@ -857,6 +857,15 @@ section of the SDLC for the versioning policy).
   for any external code that constructs or exhaustively destructures these variants.
 
 ### Fixed
+- **`[covariate_nn]` inputs were frozen at each subject's baseline value when the
+  covariate varied over time.** The network reads its inputs from the same per-event
+  covariate map every other consumer uses, but its input names are declared in the block
+  rather than in an expression, so nothing registered them as *referenced* covariates.
+  The fit pipeline then pruned their trajectories as irrelevant and the network saw one
+  constant value per subject for the entire record — silently, with no error or warning,
+  so a time-varying covariate simply had no effect on the fit. NN input names are now
+  registered alongside `[scaling]` / error-selector / `[initial_conditions]` covariates.
+
 - **Gradient-path-dependent FOCE/FOCEI objective on proportional-error models with a
   near-zero prediction** (#958). The residual-variance floor (`MIN_VARIANCE`, which clamps
   `(f·σ)²` so a vanishing prediction cannot produce a zero variance) was applied to the
