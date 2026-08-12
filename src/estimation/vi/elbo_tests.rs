@@ -1185,3 +1185,121 @@ fn iov_models_are_rejected_by_the_data_term_predicate() {
     let reason = unsupported_data_term_reason(&model).expect("IOV must be rejected");
     assert!(reason.contains("IOV"), "unhelpful reason: {reason}");
 }
+
+// ---------------------------------------------------------------------------
+// IOV foundations (VI_PLAN §10.2a)
+// ---------------------------------------------------------------------------
+
+/// An IOV template's packed layout must account for the trailing `chol(Ω_iov)` block,
+/// and must still describe `pack_params` exactly.
+///
+/// `pack_params` appends `Ω_iov` *after* `σ`, so a layout that stops at `σ` reports a
+/// short `total()` and would leave the IOV block of the gradient silently untouched.
+#[test]
+fn packed_layout_covers_the_omega_iov_block() {
+    let (_, _, mut template) = fixture();
+    // Two kappas, diagonal: two packed coordinates after sigma.
+    template.omega_iov = Some(OmegaMatrix::from_diagonal(
+        &[0.04, 0.02],
+        vec!["KAPPA_CL".into(), "KAPPA_V".into()],
+    ));
+    template.kappa_fixed = vec![false, false];
+
+    let layout = PackedLayout::new(&template);
+    let packed = pack_params(&template);
+
+    assert_eq!(layout.n_omega_iov, 2);
+    assert_eq!(
+        layout.total(),
+        packed.len(),
+        "layout must describe pack_params exactly"
+    );
+    assert_eq!(
+        layout.omega_iov_start(),
+        layout.sigma_start() + layout.n_sigma
+    );
+    assert_eq!(layout.total() - layout.omega_iov_start(), 2);
+
+    // Without IOV the layout is unchanged and the IOV range is empty.
+    let (_, _, plain) = fixture();
+    let plain_layout = PackedLayout::new(&plain);
+    assert_eq!(plain_layout.n_omega_iov, 0);
+    assert_eq!(plain_layout.omega_iov_start(), plain_layout.total());
+    assert_eq!(plain_layout.total(), pack_params(&plain).len());
+}
+
+/// `stacked_prior` must build `Σ_b = Ω ⊕ Ω_iov^{⊗K}` — block diagonal, with cross-block
+/// entries marked as structural zeros.
+///
+/// The mask matters as much as the values: `η` and `κ` are independent by construction,
+/// as are two distinct occasions, so those entries are not parameters and must never
+/// acquire a covariance from the closed-form update or the gradient.
+#[test]
+fn stacked_prior_is_the_block_diagonal_of_omega_and_omega_iov() {
+    let omega = OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["ETA_CL".into(), "ETA_V".into()]);
+    let iov = OmegaMatrix::from_diagonal(&[0.02], vec!["KAPPA_CL".into()]);
+
+    let k = 3;
+    let sb = stacked_prior(&omega, Some(&iov), k);
+    assert_eq!(sb.dim(), 2 + k, "d = n_eta + K*n_kappa");
+
+    // Diagonal carries the two etas then one kappa variance per occasion.
+    assert!((sb.matrix[(0, 0)] - 0.09).abs() < 1e-15);
+    assert!((sb.matrix[(1, 1)] - 0.04).abs() < 1e-15);
+    for g in 0..k {
+        assert!((sb.matrix[(2 + g, 2 + g)] - 0.02).abs() < 1e-15);
+    }
+    // Everything off the diagonal is zero, and not a free parameter.
+    for i in 0..sb.dim() {
+        for j in 0..sb.dim() {
+            if i != j {
+                assert_eq!(sb.matrix[(i, j)], 0.0, "({i},{j}) must be zero");
+                assert!(!sb.free_mask[(i, j)], "({i},{j}) must be a structural zero");
+            }
+        }
+    }
+
+    // log|Σ_b| = log|Ω| + K·log|Ω_iov| — the identity the closed-form KL relies on.
+    let expected_log_det = omega.log_det + (k as f64) * iov.log_det;
+    assert!(
+        (sb.log_det - expected_log_det).abs() < 1e-12,
+        "stacked log-determinant must decompose: {} vs {}",
+        sb.log_det,
+        expected_log_det
+    );
+
+    // No IOV, or no occasions: Ω is returned untouched, so the non-IOV path is unchanged.
+    let same = stacked_prior(&omega, None, 3);
+    assert_eq!(same.dim(), omega.dim());
+    assert_eq!(stacked_prior(&omega, Some(&iov), 0).dim(), omega.dim());
+}
+
+/// A `block_omega` on either side must leave the stacked prior non-diagonal, so
+/// `lower_tri_iter` walks the full triangle and the within-block covariance survives.
+#[test]
+fn stacked_prior_keeps_block_structure_and_marks_cross_block_zeros() {
+    let mut m = DMatrix::zeros(2, 2);
+    m[(0, 0)] = 0.09;
+    m[(1, 1)] = 0.04;
+    m[(0, 1)] = 0.02;
+    m[(1, 0)] = 0.02;
+    let mask = DMatrix::from_element(2, 2, true);
+    let omega =
+        OmegaMatrix::from_matrix_with_mask(m, vec!["ETA_CL".into(), "ETA_V".into()], false, mask);
+    let iov = OmegaMatrix::from_diagonal(&[0.02], vec!["KAPPA_CL".into()]);
+
+    let sb = stacked_prior(&omega, Some(&iov), 2);
+    assert!(
+        !sb.diagonal,
+        "a block Omega must leave the stack non-diagonal"
+    );
+    // The declared BSV covariance survives...
+    assert!((sb.matrix[(0, 1)] - 0.02).abs() < 1e-15);
+    assert!(sb.free_mask[(0, 1)]);
+    // ...while eta-to-kappa stays a structural zero.
+    assert!(!sb.free_mask[(0, 2)]);
+    assert!(
+        !sb.free_mask[(2, 3)],
+        "distinct occasions must not correlate"
+    );
+}

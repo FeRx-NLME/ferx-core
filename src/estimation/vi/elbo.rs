@@ -79,16 +79,19 @@ impl Default for ElboConfig {
     }
 }
 
-/// Offsets of the three blocks of the packed parameter vector produced by
-/// [`crate::estimation::parameterization::pack_params`]: `[θ | chol(Ω) | σ]`.
+/// Offsets of the blocks of the packed parameter vector produced by
+/// [`crate::estimation::parameterization::pack_params`]:
+/// `[θ | chol(Ω) | σ | chol(Ω_iov)]`.
 ///
-/// VI v1 rejects IOV, so the trailing `Ω_iov` block that `pack_params` would
-/// otherwise append is always absent.
+/// The trailing `Ω_iov` block is present exactly when the model declares `kappa`
+/// parameters; `n_omega_iov` is zero otherwise, so every offset below collapses to the
+/// three-block layout without special-casing.
 #[derive(Debug, Clone, Copy)]
 pub struct PackedLayout {
     pub n_theta: usize,
     pub n_omega: usize,
     pub n_sigma: usize,
+    pub n_omega_iov: usize,
 }
 
 impl PackedLayout {
@@ -98,11 +101,16 @@ impl PackedLayout {
             n_theta: template.theta.len(),
             n_omega: lower_tri_iter(n_eta, template.omega.diagonal).count(),
             n_sigma: template.sigma.values.len(),
+            n_omega_iov: template
+                .omega_iov
+                .as_ref()
+                .map(|iov| lower_tri_iter(iov.dim(), iov.diagonal).count())
+                .unwrap_or(0),
         }
     }
 
     pub fn total(&self) -> usize {
-        self.n_theta + self.n_omega + self.n_sigma
+        self.n_theta + self.n_omega + self.n_sigma + self.n_omega_iov
     }
 
     /// Index of the first `Ω` Cholesky coordinate.
@@ -114,6 +122,81 @@ impl PackedLayout {
     pub fn sigma_start(&self) -> usize {
         self.n_theta + self.n_omega
     }
+
+    /// Index of the first `Ω_iov` Cholesky coordinate. Equal to [`Self::total`] when the
+    /// model has no IOV, so the empty range `omega_iov_start()..total()` is a no-op.
+    pub fn omega_iov_start(&self) -> usize {
+        self.n_theta + self.n_omega + self.n_sigma
+    }
+}
+
+/// The prior over one subject's **stacked** random-effects vector
+/// `z = [η, κ₁ … κ_K]`: the block diagonal `Σ_b = Ω ⊕ Ω_iov^{⊗K}`.
+///
+/// This is what lets IOV reuse the variational families untouched. A
+/// [`VariationalFamily`] never assumes its dimension means "η" — `kl_to_normal` reads
+/// only `omega.inv` / `omega.log_det`, `init` only `omega.chol` — so constructing the
+/// family at `d = n_eta + K·n_kappa` and handing it this prior makes
+/// `KL(q ‖ N(0, Σ_b))` the same formula it already computes.
+///
+/// Returns `Ω` unchanged when the model has no IOV (or a subject has no occasions), so
+/// the non-IOV path allocates nothing and stays bit-identical.
+///
+/// The `free_mask` is the direct sum of the two blocks' masks: cross-block entries are
+/// structural zeros — `η` and `κ` are independent by construction, as are two distinct
+/// occasions — and must never pick up a covariance the model does not declare.
+pub fn stacked_prior(
+    omega: &OmegaMatrix,
+    omega_iov: Option<&OmegaMatrix>,
+    k_occasions: usize,
+) -> OmegaMatrix {
+    let Some(iov) = omega_iov else {
+        return omega.clone();
+    };
+    if k_occasions == 0 || iov.dim() == 0 {
+        return omega.clone();
+    }
+
+    let n_eta = omega.dim();
+    let n_kappa = iov.dim();
+    let d = n_eta + k_occasions * n_kappa;
+
+    let mut m = DMatrix::zeros(d, d);
+    let mut mask = DMatrix::from_element(d, d, false);
+    for i in 0..n_eta {
+        for j in 0..n_eta {
+            m[(i, j)] = omega.matrix[(i, j)];
+            mask[(i, j)] = omega.free_mask[(i, j)];
+        }
+    }
+    for g in 0..k_occasions {
+        let off = n_eta + g * n_kappa;
+        for i in 0..n_kappa {
+            for j in 0..n_kappa {
+                m[(off + i, off + j)] = iov.matrix[(i, j)];
+                mask[(off + i, off + j)] = iov.free_mask[(i, j)];
+            }
+        }
+    }
+
+    // Names are cosmetic here (nothing indexes the stacked prior by name), but making
+    // each occasion's block distinct keeps a debug dump readable.
+    let mut names = omega.eta_names.clone();
+    for g in 0..k_occasions {
+        for k in 0..n_kappa {
+            let base = iov
+                .eta_names
+                .get(k)
+                .cloned()
+                .unwrap_or_else(|| format!("KAPPA{k}"));
+            names.push(format!("{base}@{}", g + 1));
+        }
+    }
+
+    // Diagonal only when *both* blocks are: a block_omega on either side leaves the
+    // stacked matrix non-diagonal, and `lower_tri_iter` must then walk the full triangle.
+    let diagonal = omega.diagonal && iov.diagonal;
+    OmegaMatrix::from_matrix_with_mask(m, names, diagonal, mask)
 }
 
 // ---------------------------------------------------------------------------
