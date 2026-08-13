@@ -14243,6 +14243,100 @@ pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+thread_local! {
+    /// Ambient `[covariate_nn]` forward outputs for the generic (`PkNum`) statement
+    /// evaluator. See [`ModelNnGuard`].
+    static MODEL_NN_OUTPUTS: std::cell::RefCell<Vec<Vec<f64>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII guard supplying `[covariate_nn]` outputs to
+/// [`eval_statements_g`] for the duration of a scope, mirroring
+/// [`ModelTimeGuard`] for the `TIME` built-in.
+///
+/// # Why a thread-local rather than a parameter
+///
+/// `Op::PushNnOutput` needs the network's forward output, which the `f64`
+/// `pk_param_fn` closure already computes once per call from its captured NN
+/// handles. The generic evaluator has no such closure — it is handed a compiled
+/// [`IndivParamProgram`], which carries statements and layout but no network — so
+/// before this guard existed it evaluated `PushNnOutput` against a hardcoded empty
+/// slice and pushed **0.0**. An NN output silently read as zero is precisely the
+/// class of defect CLAUDE.md's routing rule exists to prevent, and it was reachable
+/// the moment any gate stopped excluding `[covariate_nn]` models from a
+/// program-driven analytic path.
+///
+/// Threading a parameter instead would touch eight recursive call sites in the hot
+/// inner-loop evaluator. `TIME` faced the same choice and resolved it the same way,
+/// so this follows the established seam rather than inventing a second convention.
+///
+/// # What it is *not* for
+///
+/// The outputs are lifted as **constants** on every dual axis. That is exact for
+/// `∂/∂η`: a network reads covariates and weights, never `η`. It is *not* a way to
+/// get `∂/∂θ` for NN weights — those derivatives are zero under this guard, which
+/// is why only η-gradient paths may use it. `∂NLL/∂w` comes from
+/// [`crate::estimation::nn_theta_gradient`] instead.
+pub(crate) struct ModelNnGuard(Vec<Vec<f64>>);
+
+impl ModelNnGuard {
+    /// Install `outputs` for the current thread, restoring the previous value on drop.
+    pub(crate) fn enter(outputs: Vec<Vec<f64>>) -> Self {
+        let prev = MODEL_NN_OUTPUTS.with(|cell| cell.replace(outputs));
+        ModelNnGuard(prev)
+    }
+
+    /// Compute and install every `[covariate_nn]` block's forward output at this
+    /// `(theta, covariates)` point, or `None` when the model has no network (in which
+    /// case the evaluator's empty default is already correct and no guard is needed).
+    ///
+    /// Uses `forward_raw`, the same entry point `pk_param_fn` calls, so the value the
+    /// gradient path differentiates around is the value the prediction path produced.
+    #[cfg(feature = "nn")]
+    pub(crate) fn enter_for(
+        model: &crate::types::CompiledModel,
+        theta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Self> {
+        if model.covariate_nns.is_empty() {
+            return None;
+        }
+        let outputs: Vec<Vec<f64>> = model
+            .covariate_nns
+            .iter()
+            .map(|nn| {
+                let n_w = nn.mapper.mlp().n_weights();
+                let w = &theta[nn.weights_offset..nn.weights_offset + n_w];
+                nn.mapper.forward_raw(w, covariates).unwrap_or_default()
+            })
+            .collect();
+        Some(Self::enter(outputs))
+    }
+
+    #[cfg(not(feature = "nn"))]
+    pub(crate) fn enter_for(
+        _model: &crate::types::CompiledModel,
+        _theta: &[f64],
+        _covariates: &HashMap<String, f64>,
+    ) -> Option<Self> {
+        None
+    }
+}
+
+impl Drop for ModelNnGuard {
+    fn drop(&mut self) {
+        MODEL_NN_OUTPUTS.with(|cell| {
+            *cell.borrow_mut() = std::mem::take(&mut self.0);
+        });
+    }
+}
+
+/// Run `f` with the ambient NN outputs borrowed. Empty unless a [`ModelNnGuard`] is
+/// live on this thread.
+fn with_nn_outputs<R>(f: impl FnOnce(&[Vec<f64>]) -> R) -> R {
+    MODEL_NN_OUTPUTS.with(|cell| f(&cell.borrow()))
+}
+
 /// The model-time thread-local `Expression::Time` / `Op::PushTime` resolves
 /// against. `pub(crate)` so a hand-built `OdeReadout::Single` test closure can
 /// observe the same value a compiled readout would (the readout closure signature
@@ -16916,7 +17010,12 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
     // evaluated and branches still descended, so control flow is identical.
     skip: &[bool],
 ) {
-    let empty_nn: Vec<Vec<f64>> = Vec::new();
+    // `[covariate_nn]` outputs come from the ambient `ModelNnGuard`, not from a
+    // parameter — see that type for why, and for the invariant that they are lifted as
+    // constants (exact for `∂/∂η`, deliberately *not* a route to `∂/∂θ` for NN weights).
+    // Empty when no guard is live, which is correct for every model without a network.
+    let nn_outputs: Vec<Vec<f64>> = with_nn_outputs(|o| o.to_vec());
+    let empty_nn: &[Vec<f64>] = &nn_outputs;
     let mut du_opt = du;
     for s in stmts {
         match s {
@@ -16924,13 +17023,13 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                 if skip.get(*idx).copied().unwrap_or(false) {
                     continue;
                 }
-                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, empty_nn, bc_stack);
                 if let Some(slot) = vars.get_mut(*idx) {
                     *slot = v;
                 }
             }
             Statement::DiffEqBc(state_idx, bc) => {
-                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, empty_nn, bc_stack);
                 if let Some(buf) = du_opt.as_deref_mut() {
                     if let Some(slot) = buf.get_mut(*state_idx) {
                         *slot = v;
@@ -16947,7 +17046,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                 let vars_val: Vec<f64> = vars.iter().map(|v| v.val()).collect();
                 let mut taken = false;
                 for (cond, body) in branches {
-                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, &empty_nn)
+                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, empty_nn)
                     {
                         eval_statements_g::<T>(
                             body,

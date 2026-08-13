@@ -1256,6 +1256,55 @@ pub(crate) fn iov_combined_derivs_dyn(
     )
 }
 
+/// [`CombinedDerivs`] with **only** the `∂p/∂(η_bsv, κ)` block populated, evaluated at
+/// dual width `n_eff` with θ lifted as constants.
+///
+/// The counterpart to [`iov_combined_derivs_dyn`] for the inner η-gradient, which reads
+/// `deta` and nothing else (`run_obs_iov_eta`'s seed closure: "no θ axes"). The remaining
+/// blocks are zero-filled and **must not be consumed** — they are not the derivatives,
+/// they are absent. Only [`iov_analytical_eta_supported`] admits this route.
+///
+/// Two things this buys over the `Dual2<n_theta + n_eff>` builder:
+///
+/// * It serves models whose program cannot seed every `model.n_theta` axis — notably any
+///   `[covariate_nn]` model, whose weight thetas are not referenceable from
+///   `[individual_parameters]`.
+/// * The dual width drops from `n_theta + n_eff` to `n_eff` (3 rather than 21 on the
+///   reference DCM), which is what keeps it inside the `1..=24` dispatch at all.
+///
+/// `[covariate_nn]` outputs are supplied through [`ModelNnGuard`], which lifts them as
+/// constants — exact here, because a network's output does not depend on `η`.
+fn iov_eta_only_derivs_dyn(
+    model: &CompiledModel,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    n_eff: usize,
+    n_rows: usize,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    combined: &[f64],
+) -> Option<CombinedDerivs> {
+    let _nn = crate::parser::model_parser::ModelNnGuard::enter_for(model, theta, cov);
+    const_dispatch!(
+        n_eff;
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+        |M| {
+            let p = prog.eval_param_eta_grad::<M>(theta, combined, cov);
+            if p.len() < n_rows {
+                return None;
+            }
+            let deta: Vec<Vec<f64>> = (0..n_rows)
+                .map(|i| (0..n_eff).map(|c| p[i].grad[c]).collect())
+                .collect();
+            Some(CombinedDerivs {
+                deta,
+                dtheta: vec![Vec::new(); n_rows],
+                d2eta: vec![Vec::new(); n_rows],
+                d2eta_theta: vec![Vec::new(); n_rows],
+            })
+        }
+    )
+}
+
 /// Evaluate the compiled `[individual_parameters]` program over `Dual2<MP>` seeded
 /// on `(θ, combined)` (`combined = [η_bsv, κ]`, `MP = n_theta + n_eff`) and pack
 /// the per-row derivatives in the combined layout.
@@ -1305,6 +1354,31 @@ fn iov_combined_derivs<const MP: usize>(
 /// anything outside falls back to the gradient-free path (matching the rest of the
 /// provider's gating).
 pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
+    iov_analytical_supported_core(model, true)
+}
+
+/// The **η-only** variant of [`iov_analytical_supported`], for the inner EBE
+/// gradient (`subject_eta_grad_iov_analytical` → `run_obs_iov_eta`).
+///
+/// Identical except that it does not require the compiled `[individual_parameters]`
+/// program's θ-axis count to equal `model.n_theta`. That clause is load-bearing for the
+/// *outer* gradient, which seeds θ axes; the η-only walk documents at its seed closure
+/// that it uses "no θ axes" and reads only `CombinedDerivs::deta`, so a θ-axis mismatch
+/// cannot affect its answer.
+///
+/// The distinction is not academic. An auto-generated `[covariate_nn]` weight block
+/// makes `model.n_theta` (base + weights) permanently unequal to the program's θ-axis
+/// count (base only, since `[individual_parameters]` can only reference declared θ by
+/// name). Every DCM therefore failed the combined predicate and sent **every subject**
+/// to finite-difference η-gradients — measured as 60 of 60 on a busulfan-shaped DCM,
+/// correct but far slower than necessary.
+pub(crate) fn iov_analytical_eta_supported(model: &CompiledModel) -> bool {
+    iov_analytical_supported_core(model, false)
+}
+
+/// Shared body. `require_theta_axis` distinguishes the outer predicate from the
+/// η-only one; every other clause applies to both.
+fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool) -> bool {
     if model.n_kappa == 0 || model.ode_spec.is_some() {
         return false;
     }
@@ -1419,7 +1493,7 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     match model.indiv_param_partials.indiv_param_program.as_ref() {
         Some(prog) => {
             prog_covers_required_pk_slots(model, prog)
-                && prog.n_theta_axis() == model.n_theta
+                && (!require_theta_axis || prog.n_theta_axis() == model.n_theta)
                 && prog.n_eta_axis() == n_eff
         }
         None => false,
@@ -1537,7 +1611,7 @@ pub fn subject_sensitivities_iov(
         .analytic_readout
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
-    let s = build_iov_sources(model, subject, theta, stacked_eta)?;
+    let s = build_iov_sources(model, subject, theta, stacked_eta, false)?;
     // Run the walk over `Dual2<M>` (M = n_theta + n_stacked); the dual width tracks
     // the *unknowns* (n_eta + K·n_kappa + n_theta), not the PK axes, so it stays
     // narrow for many occasions whenever n_kappa < n_diff (the usual κ-on-CL case).
@@ -1615,6 +1689,11 @@ fn build_iov_sources(
     subject: &Subject,
     theta: &[f64],
     stacked_eta: &[f64],
+    // `true` builds the η-only derivative block at dual width `n_eff` (see
+    // `iov_eta_only_derivs_dyn`). Set only by the inner η-gradient, and only when the
+    // full `Dual2<n_theta + n_eff>` route is unavailable — so every model that worked
+    // before this existed takes exactly the path it took before.
+    eta_only: bool,
 ) -> Option<IovSources> {
     // #419: decline a rate-defined infusion under `F ≠ 1` to the FD gradient — the
     // Dual2 walk applies `F` as an inline magnitude scale on the rate
@@ -1684,9 +1763,13 @@ fn build_iov_sources(
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let cd_at = |time: f64, combined: &[f64], cov: &std::collections::HashMap<String, f64>| {
         let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
-        crate::sens::provider::iov_combined_derivs_dyn(
-            prog, n_theta, n_eff, n_diff, cov, theta, combined,
-        )
+        if eta_only {
+            iov_eta_only_derivs_dyn(model, prog, n_eff, n_diff, cov, theta, combined)
+        } else {
+            crate::sens::provider::iov_combined_derivs_dyn(
+                prog, n_theta, n_eff, n_diff, cov, theta, combined,
+            )
+        }
     };
 
     // Per-event seed sources `(pk, cd, group)`. Each event's derivatives are evaluated
@@ -1888,7 +1971,10 @@ fn subject_eta_grad_iov_analytical(
     if ss_lagtime_walk_unsupported(model, subject) {
         return None;
     }
-    if !iov_analytical_supported(model) {
+    // The η-only predicate: this walk seeds no θ axes, so the program's θ-axis count is
+    // irrelevant to its answer. Admitting that is what lets a `[covariate_nn]` model off
+    // the finite-difference fallback.
+    if !iov_analytical_eta_supported(model) {
         return None;
     }
     // Analytic Form C readout program (#655); `iov_analytical_supported` has already
@@ -1897,7 +1983,10 @@ fn subject_eta_grad_iov_analytical(
         .analytic_readout
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
-    let s = build_iov_sources(model, subject, theta, stacked_eta)?;
+    // Fall back to the η-only derivative block only when the full route is unavailable,
+    // so every previously-served model keeps its exact prior path and numbers.
+    let eta_only = !iov_analytical_supported(model);
+    let s = build_iov_sources(model, subject, theta, stacked_eta, eta_only)?;
     let n_dim = s.n_stacked;
     const_dispatch!(
         n_dim;

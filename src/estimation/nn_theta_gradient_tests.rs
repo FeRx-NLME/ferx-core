@@ -595,3 +595,190 @@ fn hybrid_nn_weight_gradient_matches_central_fd_under_iov() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// DCM + IOV: the eta-only analytic route
+// ---------------------------------------------------------------------------
+
+/// A DCM fixture with a per-occasion `κ` on clearance.
+fn dcm_iov_model() -> CompiledModel {
+    let src = dcm_model_src()
+        .replace(
+            "  CL = TYPICAL_PK.CL * exp(ETA_CL)",
+            "  CL = TYPICAL_PK.CL * exp(ETA_CL + KAPPA_CL)",
+        )
+        .replace(
+            "  omega ETA_V  ~ 0.09",
+            "  omega ETA_V  ~ 0.09\n  kappa KAPPA_CL ~ 0.05",
+        );
+    parse_model_string(&src).expect("DCM+IOV parses")
+}
+
+/// A DCM **with IOV** must get its `∂/∂η` from the analytic provider, and that gradient
+/// must match central finite differences of the individual NLL across the whole stacked
+/// `[η_bsv, κ₁ … κ_K]` vector.
+///
+/// CLAUDE.md's rule applied to a path that has just become analytic. Before this,
+/// `iov_analytical_supported`'s `n_theta_axis() == model.n_theta` clause could never hold
+/// for a `[covariate_nn]` model — the program's θ axes cover only the *declared* thetas,
+/// never the auto-generated weights — so every DCM+IOV subject fell to finite
+/// differences (measured: 60 of 60 on a busulfan-shaped fit).
+///
+/// The κ columns are the point. A gradient correct on the BSV block and wrong on the
+/// per-occasion block would still have the right length and still descend — to the wrong
+/// split between between-subject and between-occasion variability.
+#[test]
+fn dcm_iov_eta_gradient_is_analytic_and_matches_central_fd() {
+    use crate::estimation::inner_optimizer::analytic_eta_nll_gradient_iov;
+    use crate::stats::likelihood::individual_nll_iov;
+
+    let model = dcm_iov_model();
+    assert!(model.n_kappa > 0, "fixture must carry IOV");
+    assert!(
+        crate::sens::provider::iov_analytical_eta_supported(&model),
+        "a DCM+IOV model must be inside the eta-only analytic scope"
+    );
+    assert!(
+        !crate::sens::provider::iov_analytical_supported(&model),
+        "and outside the full one — if this flips, the theta-axis accounting changed and \
+         this test no longer exercises the eta-only route"
+    );
+
+    let mut subject = static_subject();
+    subject.occasions = vec![1, 1, 2, 2];
+    subject.dose_occasions = vec![1];
+
+    let theta = probe_theta(&model);
+    let sigma = vec![0.2f64];
+    let omega = model.default_params.omega.clone();
+    let omega_iov = model
+        .default_params
+        .omega_iov
+        .clone()
+        .expect("IOV model carries omega_iov");
+    let n_eta = model.n_eta;
+    let k = 2usize;
+    let z = vec![0.12f64, -0.08, 0.06, -0.05];
+    assert_eq!(z.len(), n_eta + k * model.n_kappa);
+
+    let g = analytic_eta_nll_gradient_iov(
+        &model,
+        &subject,
+        &theta,
+        &z,
+        &omega,
+        &omega_iov,
+        &sigma,
+        n_eta,
+        model.n_kappa,
+        k,
+        None,
+    )
+    .expect("the eta-only analytic route must serve a DCM+IOV subject");
+
+    let nll_at = |zz: &[f64]| {
+        let (eta, kaps) = zz.split_at(n_eta);
+        let kappas: Vec<Vec<f64>> = (0..k)
+            .map(|g| kaps[g * model.n_kappa..(g + 1) * model.n_kappa].to_vec())
+            .collect();
+        individual_nll_iov(
+            &model,
+            &subject,
+            &theta,
+            eta,
+            &kappas,
+            &omega,
+            Some(&omega_iov),
+            &sigma,
+        )
+    };
+
+    for i in 0..z.len() {
+        let h = 1e-6 * (1.0 + z[i].abs());
+        let mut zp = z.clone();
+        zp[i] = z[i] + h;
+        let fp = nll_at(&zp);
+        zp[i] = z[i] - h;
+        let fm = nll_at(&zp);
+        let fd = (fp - fm) / (2.0 * h);
+        assert!(
+            fd.abs() > 1e-8,
+            "z[{i}] must carry signal or the comparison is vacuous"
+        );
+        let rel = (g[i] - fd).abs() / fd.abs().max(1e-6);
+        assert!(
+            rel < 1e-5,
+            "d/dz[{i}] ({}): analytic={:.8e} central FD={:.8e} rel={:.2e}",
+            if i < n_eta { "eta" } else { "kappa" },
+            g[i],
+            fd,
+            rel
+        );
+    }
+}
+
+/// The generic (`PkNum`) statement evaluator must see the network's **real** output.
+///
+/// `IndivParamProgram` carries statements and layout but no `[covariate_nn]` handles, so
+/// before `ModelNnGuard` existed `eval_statements_g` evaluated `Op::PushNnOutput` against
+/// a hardcoded empty slice. In a debug build that trips the arm's `debug_assert`; in a
+/// **release** build it silently pushed `0.0`. Nothing detected it, because the θ-axis
+/// accounting happened to exclude every DCM from the program-driven analytic paths and
+/// the arm was unreachable. Relaxing that gate for the IOV η-gradient made it reachable,
+/// and a network output silently read as zero is a wrong gradient with the right shape.
+///
+/// Pinned directly rather than through a gradient, so removing the plumbing fails with a
+/// message that says what broke. The unguarded case is deliberately *not* exercised — it
+/// panics under `debug_assert`, which is the behaviour we want and not something to
+/// assert around.
+#[test]
+fn the_generic_evaluator_sees_real_nn_outputs_under_the_guard() {
+    use crate::nn::CovariateMapper;
+    use crate::parser::model_parser::ModelNnGuard;
+
+    let model = parse_model_string(&dcm_model_src()).expect("DCM parses");
+    let theta = probe_theta(&model);
+    let prog = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("DCM carries an individual-parameter program");
+    let cov = HashMap::from([("WT".to_string(), 72.0), ("CRCL".to_string(), 95.0)]);
+
+    let nn = &model.covariate_nns[0];
+    let w = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+    let truth = nn.mapper.forward_raw(w, &cov).expect("forward");
+    assert!(truth[0] > 0.0, "fixture must emit a non-zero CL");
+
+    let eta = vec![0.0f64, 0.0];
+    // Slot order follows `pk_slots`; row 0 is the NN-fed CL, and with eta = 0 the
+    // mu-ref composition `TYPICAL_PK.CL * exp(ETA_CL)` is exactly the NN output.
+    let outer = ModelNnGuard::enter(vec![truth.clone()]);
+    let guarded = prog.eval_param_eta_grad::<2>(&theta, &eta, &cov);
+    assert!(
+        (guarded[0].value - truth[0]).abs() < 1e-12,
+        "guarded evaluator must see the real NN output: got {}, want {}",
+        guarded[0].value,
+        truth[0]
+    );
+
+    // A nested guard must shadow, and restore the outer values on drop — the property
+    // that keeps a per-event guard from leaking across events.
+    let shadow = truth[0] * 3.0 + 1.0;
+    {
+        let _inner = ModelNnGuard::enter(vec![vec![shadow, truth[1]]]);
+        let inner_vals = prog.eval_param_eta_grad::<2>(&theta, &eta, &cov);
+        assert!(
+            (inner_vals[0].value - shadow).abs() < 1e-12,
+            "the inner guard must shadow the outer one"
+        );
+    }
+    let restored = prog.eval_param_eta_grad::<2>(&theta, &eta, &cov);
+    assert!(
+        (restored[0].value - truth[0]).abs() < 1e-12,
+        "ModelNnGuard must restore the previous ambient outputs on drop: got {}, want {}",
+        restored[0].value,
+        truth[0]
+    );
+    drop(outer);
+}

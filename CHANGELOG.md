@@ -997,6 +997,19 @@ section of the SDLC for the versioning policy).
   through both the endpoint-routed and model-blind loaders.
 
 ### Performance
+- **Deep compartment models with IOV no longer fall back to finite-difference η-gradients.**
+  `[covariate_nn]` weights are auto-generated thetas, so `model.n_theta` (declared +
+  weights) can never equal the compiled `[individual_parameters]` program's θ-axis count
+  (declared only — the program can only reference θ by name). The analytic IOV predicate
+  required them equal, so **every** subject of every DCM+IOV fit took the slow path: 60 of
+  60 on a busulfan-shaped model, correct but roughly twice the necessary runtime. That
+  clause is load-bearing for the outer gradient, which seeds θ axes, but not for the inner
+  η-gradient, whose walk documents that it uses no θ axes and reads only the η block. The
+  two predicates are now separate. Measured on that fit: 336 s → **162 s** (2.07×), with
+  `n_fd_subjects` 60 → 0 and the objective unchanged at 1060.99 after an identical 14 625
+  iterations. Models that already had the analytic path keep it byte-for-byte — the η-only
+  route is taken only where the full one was unavailable.
+
 - **Analytic weight gradients for `[covariate_nn]` models** — the fixed-η θ gradient that
   SAEM's M-step, IMP and VI share used one perturbed model solve per θ, and on a deep
   compartment model the network's weights *are* θ. It now takes the network's weights
