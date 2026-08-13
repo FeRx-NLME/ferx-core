@@ -283,6 +283,8 @@ fn vi_recovers_time_varying_clearance_and_iov() {
     let tvcl = theta_of(&f, &full, "TVCL");
     let tvv = theta_of(&f, &full, "TVV");
     let kdec = theta_of(&f, &full, "KDEC");
+    let omega_cl = f.omega[(0, 0)];
+    let omega_v = f.omega[(1, 1)];
     let omega_iov = f
         .omega_iov
         .as_ref()
@@ -325,6 +327,40 @@ fn vi_recovers_time_varying_clearance_and_iov() {
     assert!(
         omega_iov > 0.4 * TRUE_OMEGA_IOV && omega_iov < 2.5 * TRUE_OMEGA_IOV,
         "Omega_iov: got {omega_iov:.5}, true {TRUE_OMEGA_IOV}"
+    );
+
+    // Ω_bsv, which this file simulated from `TRUE_OMEGA_CL` / `TRUE_OMEGA_V` and then did
+    // not look at. Every other `Ω` assertion VI carries is structurally blind to a
+    // downward bias in it — the exact-case oracle fits a linear-Gaussian model where
+    // full-rank VI is exact, and the `closed_form_omega` tests check that `Ω*` is the right
+    // maximizer *given* the `φᵢ`, which a biased `φ` satisfies. That left the estimator's
+    // headline output unguarded here, on the one test in position to check it.
+    //
+    // Wider on `ETA_V` than on `ETA_CL` for a design reason, not a tolerance-fudging one:
+    // with `KAPPA_CL` and the `KDEC` decline both loading on clearance, `ETA_V` is the eta
+    // this design informs least, and at `Ω_V = 0.04` (SD 0.20) it has the least room above
+    // the noise floor.
+    //
+    // The `Ω_iov` band above is the tighter statement about the per-occasion term; this is
+    // the statement that the between-subject term did not pay for it. Those two failing
+    // together means VI understated variance overall; `Ω_iov` low while `Ω_bsv` holds is
+    // the documented §10.6 characteristic; `Ω_bsv` low while `Ω_iov` holds would be new and
+    // is exactly what no test could previously see.
+    assert!(
+        omega_cl > 0.5 * TRUE_OMEGA_CL && omega_cl < 2.0 * TRUE_OMEGA_CL,
+        "Omega_cl: got {omega_cl:.5}, true {TRUE_OMEGA_CL} — between-subject IIV on CL \
+         not recovered"
+    );
+    assert!(
+        omega_v > 0.4 * TRUE_OMEGA_V && omega_v < 2.5 * TRUE_OMEGA_V,
+        "Omega_v: got {omega_v:.5}, true {TRUE_OMEGA_V} — between-subject IIV on V \
+         not recovered"
+    );
+
+    eprintln!(
+        "\nVI recovery: TVCL {tvcl:.4} TVV {tvv:.4} KDEC {kdec:.5} | \
+         w2(CL) {omega_cl:.5} w2(V) {omega_v:.5} w2_iov {omega_iov:.5} | sigma {:.4}",
+        f.sigma[0]
     );
 }
 
