@@ -213,6 +213,10 @@ Janssen et al. flag as a limitation of the approach. So `FitResult$vi$eta_covs` 
 individual-level reporting and shrinkage, and is **not** the route to population standard
 errors.
 
+The effect is real but mild — on the order of 20–25%, and it averages away over subjects. If a
+deep compartment model returns an `Ω` that is *several times* too small, this is not the
+explanation; see [Reading `Ω` from a deep compartment model](#dcm-omega).
+
 Those come from the ordinary covariance step — the same FD-of-OFV Hessian every other method
 uses — run at the VI estimate on the EBEs and `H` from VI's final inner-loop pass. It is
 therefore a *Laplace* covariance at the VI point, directly comparable with the one a FOCE/FOCEI
@@ -242,6 +246,68 @@ If it fires: start from better values (`init` on a `[covariate_nn]` block, see
 [`[covariate_nn]`](../model-file/covariate-nn.qmd#start-the-network-at-plausible-values-init)),
 or chain `method = [focei, vi]` to begin VI from a fitted point.
 
+## Reading `Ω` from a deep compartment model {#dcm-omega}
+
+A `[covariate_nn]` typical-value function can be flexible enough to explain *between-subject*
+variation as a covariate effect. When it does, that variation leaves `Ω` — and **every health
+check on this page still reads green.**
+
+Measured on a simulated busulfan-shaped DCM (60 subjects, `WT` and `CRCL`, IOV on CL, true
+`ω²(CL) = 0.09`), varying only the hidden layers and holding data, seed and options fixed:
+
+| `layers` | NN weights | ω²(CL) | −2 log L | AIC |
+|---|---|---|---|---|
+| `[2]` | 12 | 0.132 | 1151.3 | 1181.3 |
+| `[3]` | 17 | 0.132 | 1147.6 | 1187.6 |
+| `[6, 6]` | 74 | **0.017** | 1061.0 | 1215.0 |
+
+The `[6, 6]` fit reported `converged: true`, `elbo_tightness_ratio: 0.544`,
+`n_fd_subjects: 0`, and an OFV 87 points *better* than FOCEI's on the same model. Nothing
+above would have told you it had lost 80% of the IIV.
+
+**This is not the variational-variance effect** described under
+[Standard errors](#standard-errors). That one is mild (~20–25%), applies to `S_i`, and averages
+away over subjects. This is a property of the *fixed-effects* model, is not specific to VI, and
+grows with network capacity instead of washing out.
+
+### What actually drives it
+
+Not capacity on its own — **capacity relative to the number of distinct covariate patterns,
+in a space where those patterns are separable.** The dataset above has 60 subjects and 60
+distinct `(WT, CRCL)` pairs, so a 74-weight network can index subjects. Three fixtures in
+`tests/vi_dcm_omega_recovery.rs` separate the ingredients:
+
+| Covariate design | `[4]` → `[8, 8]` (22 → 114 weights) |
+|---|---|
+| 12 tied levels, 5 subjects each | 0.089 → 0.085 — no collapse at any width |
+| 60 distinct values on **one** covariate | 0.126 → 0.107 — no collapse |
+| 60 distinct **`(WT, CRCL)`** pairs | 0.072 → **0.005** — 17× collapse |
+
+Ties defeat it outright: five subjects sharing a covariate pattern cannot be told apart by any
+typical-value function, however flexible. A single subject-unique covariate is also not enough
+— 60 distinct values on one axis still ask a `tanh` network for a wiggly interpolant over an
+ordered domain, which its smoothness bias makes hard to reach. Two scattered covariates make
+the subjects trivially separable, and that is when `Ω` goes.
+
+### How to tell it happened
+
+- **Watch `σ`.** Across every fit above it stayed at 0.089–0.092. Variance the network *takes*
+  from `Ω` does not reappear in the residual, so a plausible `σ` alongside a shrunken `Ω` is the
+  signature — not reassurance.
+- **Use AIC, on `vi_final_ofv = laplace`'s `ofv`, never the ELBO.** The collapsed fit buys 87
+  points of −2 log L with 57 extra parameters, so AIC rejects it by 27 without being told
+  anything about `Ω`. It is a blunt guard — it penalises capacity unconditionally — but it
+  points the right way.
+- **Refit the same structure with FOCEI, SAEM, or a parametric covariate model.** On the
+  busulfan data, FOCEI (0.120), a `[focei, vi]` chain (0.101) and VI at `layers = [3]` (0.132)
+  all agree near the truth; only cold-started VI at `[6, 6]` disagrees. FOCEI is not more
+  trustworthy here in principle — its outer loop simply never reached the memorising optimum
+  that VI's Adam found.
+
+Regularizing the network (weight decay / curvature penalties) is the direct fix and is not yet
+implemented; until it is, size the network to the design and check `Ω` against a second
+estimator.
+
 ## Inter-occasion variability
 
 IOV (`kappa`) is supported. The variational posterior covers the **stacked** vector
@@ -260,6 +326,13 @@ comparatively few occasions to average that bias away. On a simulated 60-subject
 recovery fit, `Ω_iov` came back about 24% low while `θ` landed within 2%. Treat `Ω_iov` from
 a VI fit as an estimate with a known downward lean; if it is the parameter you care about,
 confirm it with SAEM or FOCEI.
+
+The lean is not the whole story, and the design can dominate it. On a busulfan-shaped fit
+pairing a `TIME` decline with per-occasion `κ` (true `Ω_iov = 0.09`), `Ω_iov` read **high** —
+0.16 under VI, and 0.16–0.18 under FOCEI and a `[focei, vi]` chain alike. When `κ` and a
+systematic trend compete for the same signal (see [below](#time-varying-clearance-and-iov-together)),
+that confounding moves `Ω_iov` further than the variational bias does, and it moves it in every
+estimator. Read the two together rather than assuming a direction.
 
 ### Time-varying clearance and IOV together
 
@@ -316,7 +389,12 @@ VWF:Ag → CL, Q and V₂ global — under `method = vi` and `method = focei`.
 | OFV (FOCE objective) | — | **−877.2** | −689.8 |
 | Reported converged | — | false | true |
 
-VI recovers every population parameter closely. FOCEI's Ω collapses onto a degenerate
+VI lands close on every population parameter except `ω²(CL)`, which is 21% low (0.0291 against
+0.037) — worth naming rather than rounding into "closely", because a shortfall in exactly that
+parameter is the signature discussed under
+[Reading `Ω` from a deep compartment model](#dcm-omega), and this is a multi-branch network on
+a dataset with subject-unique covariates. One fold cannot distinguish that from sampling noise;
+treat it as unresolved rather than as evidence either way. FOCEI's Ω collapses onto a degenerate
 ridge — ω²(V₁) roughly 930× the truth at correlation 0.996 — and its residual error is
 twice too large, reproducing the instability the paper reports.
 
