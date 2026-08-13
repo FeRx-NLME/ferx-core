@@ -35,7 +35,8 @@ works on any supported model.
 
 Reach for something else when you need a defensible likelihood for model comparison as the
 primary output — see [The ELBO is not an OFV](#the-elbo-is-not-an-ofv) — or when your model
-uses IOV or non-Gaussian endpoints, which VI does not support.
+has non-Gaussian endpoints, which VI does not support. IOV **is** supported; see
+[Inter-occasion variability](#inter-occasion-variability).
 
 ## The objective
 
@@ -100,9 +101,9 @@ All keys go in `[fit_options]`.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `vi_iters` | 1000 | Adam iterations ("epochs"). VI always runs its full budget — see below |
-| `vi_mc_samples` | 3 | Monte-Carlo draws per subject per iteration |
-| `vi_lr` | 0.05 | Adam learning rate |
+| `vi_iters` | 25000 | **Ceiling** on Adam iterations; the fit stops earlier once it has settled — see below |
+| `vi_mc_samples` | 8 | Monte-Carlo draws per subject per iteration. Raise it when the residual error itself matters |
+| `vi_lr` | 0.02 | Adam learning rate |
 | `vi_family` | `full_rank` | `full_rank` or `mean_field` |
 | `vi_omega_update` | `closed_form` | `closed_form` or `adam` |
 | `vi_avg_last` | final 25% | Polyak averaging window (iterations) |
@@ -156,9 +157,14 @@ optimum, where it is the only remaining noise — and makes the KL gradient vani
 ### Why there is no convergence tolerance
 
 The objective is a Monte-Carlo estimate, so a per-iteration improvement test would stop on
-noise rather than on convergence. VI therefore runs all `vi_iters` iterations and reports
-whether the objective had *in fact* settled, judged on a moving average of the trace. Control
-cost through `vi_iters`; inspect `FitResult$vi$elbo_trace` to see whether it was enough.
+noise rather than on convergence. VI instead treats `vi_iters` as a **ceiling** and stops
+once the remaining drift is indistinguishable from that noise, judged on a moving average of
+the trace together with the stability of the parameters themselves. `n_iterations` reports
+what actually ran and `converged` whether it had in fact settled.
+
+Settling is not the same as landing somewhere good — a stuck optimizer also stops moving.
+Read [`elbo_tightness_ratio`](#is-the-bound-tight-elbo_tightness_ratio) alongside
+`converged`.
 
 ### Why the estimate is averaged
 
