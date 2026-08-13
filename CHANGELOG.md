@@ -756,7 +756,14 @@ section of the SDLC for the versioning policy).
   **IOV is supported**: the variational posterior covers the stacked `[η, κ₁ … κ_K]`
   jointly against a block-diagonal prior `Ω ⊕ Ω_iov^{⊗K}`, `Ω_iov` gets its own
   closed-form maximizer pooled over every occasion of every subject, and per-occasion `κ`
-  means are reported on `FitResult$vi$kappa_means`. Non-Gaussian endpoints
+  means are reported on `FitResult$vi$kappa_means`. IOV composes with a **time-varying
+  clearance** (the busulfan shape) from either the `TIME` built-in or a time-varying
+  covariate — a pairing worth stating explicitly because the two effects are confusable:
+  both make clearance differ between early and late records. Read `Ω_iov` from a VI fit
+  with one caveat: variational posteriors understate posterior variance and `Ω_iov` is a
+  mean of `S + μμᵀ` over occasions, so it leans low (about 24% low on a simulated
+  60-subject, 4-occasion recovery where `θ` landed within 2%); confirm it with SAEM or
+  FOCEI if it is the parameter you care about. Non-Gaussian endpoints
   (TTE / categorical) are still unsupported and are refused with an actionable message.
 - **New ODE steppers via `[fit_options] ode_method`,** on two independent axes. For
   **stability**: the linearly implicit Rosenbrock methods `rosenbrock23` (order 2, aliases

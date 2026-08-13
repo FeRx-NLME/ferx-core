@@ -1583,3 +1583,543 @@ fn iov_neg_elbo_gradient_matches_central_fd() {
         }
     }
 }
+
+/// The IOV analogue of the shell [`eta_grad_probe_agrees_with_evaluation_and_falls_back_loudly`]
+/// uses: [`analytical_model`] with IOV bolted on.
+///
+/// It is a *structural* decline — `pk_param_fn` returns `PkParams::default()` and
+/// `pk_indices`/`eta_map` are empty, so there is no closed form for the provider to
+/// differentiate — and that is the point. The analytic IOV scope is very wide: probing it
+/// while writing this test, closed-form 1-cpt, **ODE**, `iiv_on_ruv`, and ODE +
+/// `iiv_on_ruv` IOV models are *all* served analytically, despite comments in
+/// `iov_analytical_supported` suggesting some are not (that predicate gates the outer
+/// assembly; the inner gradient reaches ODE subjects through
+/// `ode_subject_eta_grad_iov`). Picking any of those as the "out of scope" fixture would
+/// have produced a test that passed for the wrong reason today and silently stopped
+/// testing anything tomorrow. A model with nothing to differentiate cannot drift into
+/// scope.
+fn iov_shell_fixture() -> (CompiledModel, Population, ModelParameters) {
+    let (_, population, _) = iov_fixture();
+    let mut shell = analytical_model(GradientMethod::Auto);
+    shell.n_kappa = 1;
+    shell.kappa_names = vec!["KAPPA_CL".into()];
+    let mut params = shell.default_params.clone();
+    params.omega_iov = Some(crate::types::OmegaMatrix::from_diagonal(
+        &[0.02],
+        vec!["KAPPA_CL".into()],
+    ));
+    (shell, population, params)
+}
+
+/// VI_PLAN §10.5(4): an IOV model the analytic provider declines must fall back to
+/// finite differences **loudly**, and `vi_eta_grad = analytic` must refuse it.
+///
+/// [`eta_grad_probe_agrees_with_evaluation_and_falls_back_loudly`] pins this for the
+/// non-IOV path, but the IOV path reaches its gradient through a different function
+/// (`analytic_eta_nll_gradient_iov` → `subject_eta_grad_iov`) with its own `None` branch.
+/// Without this test the IOV coverage is entirely positive-direction — every other IOV
+/// test asserts `n_fd_subjects == 0` — so a scope gap that silently returned a *wrong*
+/// stacked gradient rather than declining would go unnoticed. That failure mode is worse
+/// on the IOV path than elsewhere: a stacked gradient has the right length whether or not
+/// its κ blocks mean anything, so nothing downstream would notice.
+#[test]
+fn iov_out_of_scope_model_falls_back_to_fd_loudly() {
+    let (shell, population, params) = iov_shell_fixture();
+    assert!(shell.n_kappa > 0, "fixture must carry IOV");
+
+    let families: Vec<Box<dyn VariationalFamily>> = population
+        .subjects
+        .iter()
+        .map(|s| {
+            let d = shell.n_eta + subject_k_occasions(&shell, s) * shell.n_kappa;
+            Box::new(FullRank::new(d)) as Box<dyn VariationalFamily>
+        })
+        .collect();
+    let phis: Vec<Vec<f64>> = families
+        .iter()
+        .enumerate()
+        .map(|(s, f)| {
+            let prior = stacked_prior(
+                &params.omega,
+                params.omega_iov.as_ref(),
+                subject_k_occasions(&shell, &population.subjects[s]),
+            );
+            f.init(&prior)
+        })
+        .collect();
+    let x = pack_params(&params);
+
+    let eval = population_neg_elbo(
+        &shell,
+        &population,
+        &params,
+        &x,
+        Families::PerSubject(&families),
+        &phis,
+        &cfg_seeded(),
+        1,
+    )
+    .expect("auto mode must fall back, not fail");
+    assert_eq!(
+        eval.n_fd_subjects,
+        population.subjects.len(),
+        "every subject of an out-of-scope IOV model must be counted as FD"
+    );
+    // The fallback has to be *usable*, not merely reported: a decline that returned NaN
+    // would satisfy the count above while being useless.
+    assert!(
+        eval.neg_elbo.is_finite(),
+        "the FD fallback must still produce a finite objective"
+    );
+    assert!(
+        eval.grad_x.iter().all(|g| g.is_finite()),
+        "the FD fallback's packed gradient must be finite"
+    );
+
+    // And `analytic` mode must refuse rather than degrade silently.
+    let strict = ElboConfig {
+        eta_grad: EtaGradMode::Analytic,
+        ..cfg_seeded()
+    };
+    let err = population_neg_elbo(
+        &shell,
+        &population,
+        &params,
+        &x,
+        Families::PerSubject(&families),
+        &phis,
+        &strict,
+        1,
+    )
+    .expect_err("vi_eta_grad = analytic must error on an out-of-scope IOV model");
+    assert!(
+        err.contains("analytic"),
+        "the error should name the mode that refused: {err}"
+    );
+}
+
+/// The IOV gradient under **`vi_kl = mc`** — the other half of VI_PLAN §10.5(1)'s
+/// "both families × both KL modes" matrix.
+///
+/// Analytic KL and MC KL reach `Ω_iov` by different routes, which is why covering one
+/// does not cover the other. Under analytic KL the `Ω_iov` gradient comes from
+/// `chain_omega_grad` contracting `∂KL/∂Σ_b` over the K κ-blocks in closed form. Under
+/// MC KL there is no closed-form KL at all: the prior enters through `mc_kl_draw`
+/// scoring each *sampled* stacked vector against `N(0, Σ_b)`, so the same `Ω_iov` entry
+/// is reached through the sampled η/κ rather than through the family's covariance. A
+/// block-offset or per-occasion summation error could be right in one path and wrong in
+/// the other.
+///
+/// The φ carve-out from [`mc_kl_grad_x_matches_fd_but_phi_is_path_derivative`] applies
+/// unchanged and for the same reason: under MC KL the φ gradient is deliberately a path
+/// derivative (Roeder's "sticking the landing"), which drops the score term and is
+/// therefore *not* the total derivative FD measures. Asserting φ against FD here would
+/// be asserting the estimator is the thing it exists not to be. θ/σ/Ω stay checkable,
+/// and the stacked dimension is what this test is actually about.
+#[test]
+fn iov_mc_kl_neg_elbo_gradient_matches_central_fd() {
+    let (model, population, params) = iov_fixture();
+    let x = pack_params(&params);
+    let layout = PackedLayout::new(&params);
+    assert!(
+        layout.n_omega_iov > 0,
+        "packed vector must carry an Omega_iov block"
+    );
+    let cfg = ElboConfig {
+        kl: KlMode::Mc,
+        ..cfg_seeded()
+    };
+    let iter = 7;
+    // Same split as the analytic-KL IOV test: forward-FD truncation inside the θ block,
+    // everything downstream analytic.
+    let tol_for = |i: usize| if i < layout.n_theta { 2e-3 } else { 1e-6 };
+
+    for (label, full_rank) in [("full_rank", true), ("mean_field", false)] {
+        let families = iov_families(&model, &population, full_rank);
+        let fams = Families::PerSubject(&families);
+
+        let phis: Vec<Vec<f64>> = families
+            .iter()
+            .enumerate()
+            .map(|(s, f)| {
+                let prior = stacked_prior(
+                    &params.omega,
+                    params.omega_iov.as_ref(),
+                    subject_k_occasions(&model, &population.subjects[s]),
+                );
+                let mut p = f.init(&prior);
+                for (i, v) in p.iter_mut().enumerate() {
+                    *v += 0.15 * (((i + s * 5) * 7 + 1) as f64).sin();
+                }
+                p
+            })
+            .collect();
+        assert_ne!(
+            phis[0].len(),
+            phis[1].len(),
+            "fixture must present differing stacked dimensions"
+        );
+
+        let e =
+            population_neg_elbo(&model, &population, &params, &x, fams, &phis, &cfg, iter).unwrap();
+        assert_eq!(
+            e.n_fd_subjects, 0,
+            "{label}: IOV eta-gradient must be analytic"
+        );
+        assert_eq!(
+            e.n_kl_fallback_subjects, 0,
+            "{label}: this family has a closed-form KL, so `mc` must be the requested \
+             mode rather than a fallback — otherwise the test is not exercising MC KL"
+        );
+
+        // Guard that the Omega_iov block actually carries signal here; a silently-zero
+        // block would satisfy the comparison below without testing anything.
+        let iov_start = layout.omega_iov_start();
+        let iov_peak = (iov_start..iov_start + layout.n_omega_iov)
+            .map(|i| e.grad_x[i].abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            iov_peak > 1e-6,
+            "{label}: Omega_iov gradient block is ~zero ({iov_peak:.3e})"
+        );
+
+        for (i, &got) in e.grad_x.iter().enumerate() {
+            let want =
+                fd_of_neg_elbo_wrt_x(&model, &population, &params, &x, fams, &phis, &cfg, iter, i);
+            let scale = want.abs().max(1.0);
+            assert!(
+                (got - want).abs() / scale < tol_for(i),
+                "{label} mc-KL ∂(−ELBO)/∂x[{i}]: got {got:.9e}, fd {want:.9e}"
+            );
+        }
+
+        // φ must remain a path derivative on the IOV path too — the stacked vector does
+        // not change which estimator `mc_kl_draw` uses.
+        let mut max_rel_gap = 0.0f64;
+        for (s, gphi) in e.grad_phi.iter().enumerate() {
+            for (i, &got) in gphi.iter().enumerate() {
+                let want = fd_of_neg_elbo_wrt_phi(
+                    &model,
+                    &population,
+                    &params,
+                    &x,
+                    fams,
+                    &phis,
+                    &cfg,
+                    iter,
+                    s,
+                    i,
+                );
+                max_rel_gap = max_rel_gap.max((got - want).abs() / want.abs().max(1.0));
+            }
+        }
+        assert!(
+            max_rel_gap > 1e-4,
+            "{label}: the path-derivative estimator drops the score term, so φ must NOT \
+             match FD (max relative gap {max_rel_gap:.3e})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Time-varying clearance × IOV ("busulfan-shaped")
+// ---------------------------------------------------------------------------
+
+/// A busulfan-shaped model: clearance **declines with time** on top of per-occasion IOV.
+///
+/// Busulfan's autoinduction-like decline in CL over a multi-day course is the canonical
+/// case where a time-varying structural parameter and IOV appear together, and it is a
+/// genuinely different code path from either alone. `TIME` in `[individual_parameters]`
+/// sets `uses_time_builtin`, which forces the per-event PK-parameter route
+/// (`compute_event_pk_params_into`) — so the sensitivity walk must seed each occasion's
+/// `CombinedDerivs` at *that event's* time, not once per subject. Get that wrong and
+/// `KDEC` and `KAPPA_CL` trade against each other silently: both make clearance differ
+/// between early and late records, so a fit still converges, to the wrong split.
+///
+/// `dose_occasions` / `occasions` give subject 1 three daily occasions and subject 2
+/// four, preserving the differing-`K` property the stacked layout needs exercised.
+fn busulfan_fixture() -> (CompiledModel, Population, ModelParameters) {
+    let model = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta KDEC(0.02, 0.0001, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(-KDEC * TIME) * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  iov_column = OCC
+",
+    )
+    .expect("busulfan fixture parses");
+
+    // One dose per day, two samples per day: the sampling design that makes a decline in
+    // CL identifiable at all. A single trough per occasion would leave KDEC and the
+    // per-occasion kappa aliased.
+    let subject = |id: &str, n_days: usize, scale: f64| {
+        let mut doses = Vec::new();
+        let mut dose_occasions = Vec::new();
+        let mut obs_times = Vec::new();
+        let mut occasions = Vec::new();
+        let mut observations = Vec::new();
+        for d in 0..n_days {
+            let t0 = 24.0 * d as f64;
+            doses.push(DoseEvent::new(t0, 100.0, 1, 0.0, false, 0.0));
+            dose_occasions.push(d as u32 + 1);
+            for (j, dt) in [1.0f64, 6.0].iter().enumerate() {
+                obs_times.push(t0 + dt);
+                occasions.push(d as u32 + 1);
+                // Declining exposure across days, decaying within each day.
+                observations.push(scale * (8.0 - 0.35 * d as f64) * (0.75f64).powi(j as i32));
+            }
+        }
+        let n_obs = obs_times.len();
+        Subject {
+            id: id.into(),
+            doses,
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations,
+            obs_cmts: vec![1; n_obs],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n_obs],
+            occasions,
+            obs_l2: Vec::new(),
+            dose_occasions,
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }
+    };
+
+    let population = Population {
+        subjects: vec![subject("1", 3, 1.0), subject("2", 4, 1.12)],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let params = model.default_params.clone();
+    (model, population, params)
+}
+
+/// The same declining clearance driven by a **time-varying covariate** rather than the
+/// `TIME` built-in.
+///
+/// This is the other per-event route, and it was entirely uncovered: before this test
+/// every subject in every VI test carried `obs_covariates: Vec::new()` and
+/// `dose_covariates: Vec::new()`, so no VI test had ever evaluated a subject whose
+/// covariates move. The two routes reach `pk_param_fn` through different branches of
+/// `subject_needs_per_event_pk` (`uses_time` vs `has_tv_covariates`) and read different
+/// snapshots, so passing on one says nothing about the other.
+fn tvcov_iov_fixture() -> (CompiledModel, Population, ModelParameters) {
+    let model = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta CLSLOPE(0.3, 0.001, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * (SCR / 1.0)^(-CLSLOPE) * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  iov_column = OCC
+",
+    )
+    .expect("tv-covariate IOV fixture parses");
+
+    let (_, base_pop, _) = busulfan_fixture();
+    let subjects: Vec<Subject> = base_pop
+        .subjects
+        .into_iter()
+        .enumerate()
+        .map(|(s, mut subj)| {
+            // SCR drifts upward across the course — clearance falls as it rises, the same
+            // shape the TIME-driven fixture produces by a different mechanism.
+            let scr_at = |t: f64| 1.0 + 0.004 * t + 0.02 * s as f64;
+            subj.obs_covariates = subj
+                .obs_times
+                .iter()
+                .map(|&t| HashMap::from([("SCR".to_string(), scr_at(t))]))
+                .collect();
+            subj.dose_covariates = subj
+                .doses
+                .iter()
+                .map(|d| HashMap::from([("SCR".to_string(), scr_at(d.time))]))
+                .collect();
+            subj.covariates = HashMap::from([("SCR".to_string(), scr_at(0.0))]);
+            subj
+        })
+        .collect();
+
+    let population = Population {
+        subjects,
+        covariate_names: vec!["SCR".into()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let params = model.default_params.clone();
+    (model, population, params)
+}
+
+/// Shared parity body for the two time-varying × IOV fixtures.
+///
+/// Both are checked against central differences of `−ELBO` at a fixed seed and iteration,
+/// which makes the objective deterministic in `(x, φ)` and the comparison exact rather
+/// than noisy.
+fn assert_tv_iov_gradient_matches_fd(
+    what: &str,
+    tv_theta: &str,
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) {
+    assert!(model.n_kappa > 0, "{what}: fixture must carry IOV");
+    let x = pack_params(params);
+    let layout = PackedLayout::new(params);
+    assert!(
+        layout.n_omega_iov > 0,
+        "{what}: packed vector must carry an Omega_iov block"
+    );
+    let cfg = cfg_seeded();
+    let iter = 3;
+    // Same split as the other IOV parity tests: forward-FD truncation inside the θ block
+    // (inherited from `obs_nll_subject_grad`), everything downstream analytic.
+    let tol_for = |i: usize| if i < layout.n_theta { 2e-3 } else { 1e-6 };
+
+    for (label, full_rank) in [("full_rank", true), ("mean_field", false)] {
+        let families = iov_families(model, population, full_rank);
+        let fams = Families::PerSubject(&families);
+        let phis: Vec<Vec<f64>> = families
+            .iter()
+            .enumerate()
+            .map(|(s, f)| {
+                let prior = stacked_prior(
+                    &params.omega,
+                    params.omega_iov.as_ref(),
+                    subject_k_occasions(model, &population.subjects[s]),
+                );
+                let mut p = f.init(&prior);
+                for (i, v) in p.iter_mut().enumerate() {
+                    *v += 0.12 * (((i + s * 3) * 5 + 1) as f64).sin();
+                }
+                p
+            })
+            .collect();
+        assert_ne!(
+            phis[0].len(),
+            phis[1].len(),
+            "{what}: fixture must present differing stacked dimensions"
+        );
+
+        let e =
+            population_neg_elbo(model, population, params, &x, fams, &phis, &cfg, iter).unwrap();
+        assert_eq!(
+            e.n_fd_subjects, 0,
+            "{what}/{label}: a time-varying IOV model is inside the analytic scope; a \
+             fallback here means the provider quietly stopped serving this model class"
+        );
+
+        // The guard that makes this a test *about* time-variation. If `TIME` (or the
+        // moving covariate) were silently read as a constant, the parameter governing
+        // the decline would simply have no gradient — and every comparison below would
+        // still pass, agreeing precisely about a model that had stopped varying.
+        let tv_idx = params
+            .theta_names
+            .iter()
+            .position(|n| n == tv_theta)
+            .unwrap_or_else(|| panic!("{what}: theta {tv_theta} not found"));
+        assert!(
+            e.grad_x[tv_idx].abs() > 1e-6,
+            "{what}/{label}: the time-varying parameter {tv_theta} has no gradient \
+             ({:.3e}) — the time dependence is not reaching the objective",
+            e.grad_x[tv_idx]
+        );
+        // Likewise the kappa block: a zero Omega_iov gradient would mean the per-occasion
+        // effect had collapsed into the time trend.
+        let iov_start = layout.omega_iov_start();
+        let iov_peak = (iov_start..iov_start + layout.n_omega_iov)
+            .map(|i| e.grad_x[i].abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            iov_peak > 1e-6,
+            "{what}/{label}: Omega_iov gradient block is ~zero ({iov_peak:.3e})"
+        );
+
+        for (i, &got) in e.grad_x.iter().enumerate() {
+            let want =
+                fd_of_neg_elbo_wrt_x(model, population, params, &x, fams, &phis, &cfg, iter, i);
+            let scale = want.abs().max(1.0);
+            assert!(
+                (got - want).abs() / scale < tol_for(i),
+                "{what}/{label} ∂(−ELBO)/∂x[{i}]: got {got:.9e}, fd {want:.9e}"
+            );
+        }
+
+        for (s, gphi) in e.grad_phi.iter().enumerate() {
+            for (i, &got) in gphi.iter().enumerate() {
+                let want = fd_of_neg_elbo_wrt_phi(
+                    model, population, params, &x, fams, &phis, &cfg, iter, s, i,
+                );
+                let scale = want.abs().max(1.0);
+                assert!(
+                    (got - want).abs() / scale < 1e-6,
+                    "{what}/{label} ∂(−ELBO)/∂φ[{s}][{i}]: got {got:.9e}, fd {want:.9e}"
+                );
+            }
+        }
+    }
+}
+
+/// Time-varying clearance via the `TIME` built-in, combined with IOV.
+#[test]
+fn busulfan_shaped_iov_gradient_matches_central_fd() {
+    let (model, population, params) = busulfan_fixture();
+    assert_tv_iov_gradient_matches_fd("busulfan", "KDEC", &model, &population, &params);
+}
+
+/// Time-varying clearance via a time-varying **covariate**, combined with IOV.
+#[test]
+fn time_varying_covariate_iov_gradient_matches_central_fd() {
+    let (model, population, params) = tvcov_iov_fixture();
+    assert!(
+        population
+            .subjects
+            .iter()
+            .all(|s| !s.obs_covariates.is_empty() && !s.time_varying_covariate_names().is_empty()),
+        "fixture must actually carry within-subject covariate variation"
+    );
+    assert_tv_iov_gradient_matches_fd("tv-covariate", "CLSLOPE", &model, &population, &params);
+}

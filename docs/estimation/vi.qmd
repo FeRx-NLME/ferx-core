@@ -216,16 +216,51 @@ objective, not of the ELBO, so a fit can legitimately report standard errors whi
 `ofv` as `NaN`. Set `run_covariance_step = false` to skip it; in a chain such as
 `methods = vi, focei` it runs once, on the final stage.
 
+## Inter-occasion variability
+
+IOV (`kappa`) is supported. The variational posterior covers the **stacked** vector
+`[η, κ₁ … κ_K]` for each subject, against the block-diagonal prior
+`Σ_b = Ω_bsv ⊕ Ω_iov^⊗K`. Because `K` is a per-subject quantity, subjects with different
+occasion counts carry differently-sized `q`; nothing else about the method changes, and
+`Ω_iov` gets the same exact-maximizer treatment as `Ω`, pooled over all occasions of all
+subjects.
+
+`FitResult$vi` reports per-occasion `κ` means alongside the `η` means.
+
+One caveat worth knowing before you read `Ω_iov` closely. Variational posteriors understate
+posterior variance, and `Ω_iov` is estimated as a mean of `S + μμᵀ` over occasions — so the
+understatement biases it **downward**, and unlike `Ω_bsv` (averaged over subjects) it has
+comparatively few occasions to average that bias away. On a simulated 60-subject, 4-occasion
+recovery fit, `Ω_iov` came back about 24% low while `θ` landed within 2%. Treat `Ω_iov` from
+a VI fit as an estimate with a known downward lean; if it is the parameter you care about,
+confirm it with SAEM or FOCEI.
+
+### Time-varying clearance and IOV together
+
+A clearance that declines over a course (the busulfan shape) and a per-occasion `κ` are
+*confusable by construction* — both make clearance differ between early and late records,
+and only the shape of the difference distinguishes them. Both are supported together,
+whether the time dependence comes from the `TIME` built-in or from a time-varying covariate.
+
+Two practical points, measured on a simulated recovery
+(`tests/vi_time_varying_iov.rs`):
+
+- **Sample more than once per occasion.** With a single trough per occasion, a systematic
+  decline and an exchangeable per-occasion offset produce the same data; no estimator can
+  separate them.
+- **Fit IOV even if you only care about the decline.** Omitting `κ` pushed the residual
+  error up 45% and understated the decline parameter by 11% — the between-occasion
+  variation has to go somewhere, and the trend absorbs part of it.
+
 ## Unsupported models
 
-Two classes are refused up front rather than fitted approximately:
+One class is refused up front rather than fitted approximately:
 
-- **IOV (`kappa`)** — the variational family would need to cover `(η, κ)` jointly.
 - **Non-Gaussian endpoints (TTE, categorical)** — VI's data term is the fixed-`η` observation
   NLL, which scores those rows through a separate channel; fitting them with VI would
   silently omit their likelihood contribution.
 
-Both produce an error naming a method that does work. This is deliberate asymmetry: a
+It produces an error naming a method that does work. This is a deliberate asymmetry: a
 *gradient* the analytic provider cannot supply falls back to finite differences and is still
 correct, but an *objective* missing part of the likelihood cannot be salvaged.
 
