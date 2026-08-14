@@ -473,11 +473,14 @@ pub fn optimize_population_warm(
 /// `d = -∇f`, projected onto the box bounds. When |∇f|∞ is several times larger
 /// than the bound width — which is what the AD/analytical FOCE gradient added in
 /// PR #48 looks like on standard PK models (≈ 10²–10³ in scaled log/Cholesky
-/// space) — that first step pins every component to a corner of the box, the OFV
-/// explodes, and the line search fails on eval 1; theta stays byte-identical to
-/// init for the rest of the budget. See issue #55 (SLSQP) and #960 (the same
-/// eval-1 failure on the analytic-gradient NLopt L-BFGS `Auto` default, which
-/// left warfarin FOCEI stuck at its initial estimates).
+/// space) — that first step pins every component to a corner of the box and the
+/// OFV explodes. The two algorithms then dead-end differently but with the same
+/// outcome: SLSQP's QP stays stuck at that projected corner, while L-BFGS's line
+/// search cannot find a decrease along the overshot direction and fails on eval
+/// 1. Either way theta stays byte-identical to init for the rest of the budget.
+/// See issue #55 (SLSQP) and #960 (the same first-step overshoot on the
+/// analytic-gradient NLopt L-BFGS `Auto` default, which left warfarin FOCEI stuck
+/// at its initial estimates).
 ///
 /// This helper rescales `g` in place by a single scalar so that no component
 /// of the identity-Hessian Newton step exceeds its per-dimension step budget,

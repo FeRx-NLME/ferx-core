@@ -5304,7 +5304,8 @@ pub struct FitOptions {
     /// **Default: `false`** (changed in issue #99). The scaling layer is *not*
     /// trajectory-transparent: although the OFV value is unchanged at any
     /// fixed point, the layer rescales the gradient the optimizer sees, and
-    /// that gradient feeds the SLSQP overshoot cap (`cap_scaled_gradient`), the
+    /// that gradient feeds the identity-Hessian overshoot cap
+    /// (`cap_scaled_gradient`, on every SLSQP eval and the first L-BFGS eval), the
     /// quasi-Newton Hessian estimate, and the xtol/ftol termination — all of
     /// which act in the scaled coordinate system, so the *trajectory* and stop
     /// point differ. Because the scaling-enabled path only ever runs on

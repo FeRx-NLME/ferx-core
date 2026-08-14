@@ -2637,56 +2637,18 @@ fn outer_maxiter_zero_is_eval_only_and_optimizer_independent() {
     );
 }
 
-/// The #960 first-step overshoot cap lets the analytic-gradient NLopt L-BFGS
-/// default leave its initial estimates and reach the optimum instead of stalling
-/// on eval 1. This is the fast, PR-CI guard for the fix (the full warfarin /
-/// SS-oral convergence checks are slow-tests). Convergence here is robust — even
-/// a 1-iteration budget converges this tiny 1-cpt fit — so the assertion carries
-/// no fragile eval-count dependency.
-#[test]
-fn lbfgs_default_converges_off_init_with_first_step_cap() {
-    let model = make_model();
-    let population = make_population(3);
-    let template = &model.default_params;
-    let init_ofv = {
-        // Objective at the initial estimates (eval-only), for the "left init" check.
-        let o = FitOptions {
-            method: EstimationMethod::FoceI,
-            interaction: true,
-            optimizer: Optimizer::NloptLbfgs,
-            outer_maxiter: 0,
-            run_covariance_step: false,
-            mu_referencing: true,
-            ..FitOptions::default()
-        };
-        optimize_population(&model, &population, template, &o).ofv
-    };
-
-    let o = FitOptions {
-        method: EstimationMethod::FoceI,
-        interaction: true,
-        optimizer: Optimizer::NloptLbfgs,
-        outer_maxiter: 50,
-        run_covariance_step: false,
-        mu_referencing: true,
-        ..FitOptions::default()
-    };
-    let r = optimize_population(&model, &population, template, &o);
-
-    assert!(
-        r.converged,
-        "with the first-step overshoot cap the L-BFGS default should converge \
-         this fit (OFV = {})",
-        r.ofv
-    );
-    // The whole point of #960: the fit must actually *descend* off the initial
-    // estimates rather than report SEs at init. A stalled fit returns `init_ofv`.
-    assert!(
-        r.ofv < init_ofv - 1.0,
-        "fit must leave init: final OFV {} not meaningfully below init OFV {init_ofv}",
-        r.ofv
-    );
-}
+// The end-to-end #960 convergence fix (analytic-gradient L-BFGS leaving init on
+// warfarin FOCEI / the SS-oral fit) is guarded by the re-enabled slow tests
+// (`warfarin_covariance_nonmem`, `ss_fit_smoke`, `covariance_method_sandwich`).
+// It is deliberately *not* reproduced as a fast unit test: the synthetic
+// `make_model()` is structurally FD-only (`indiv_param_partials::empty()` ⇒
+// `analytic_outer_gradient_available` is false even under `GradientMethod::Auto`),
+// and its scaled first-step gradient never overshoots, so the cap does not change
+// its outcome — a unit "convergence" test here would pass with or without the fix
+// and guard nothing. The cap's *mechanism* is covered fast instead by
+// `should_cap_gradient` (per-algorithm gating) and the `cap_scaled_gradient_*`
+// rescale tests above; the L-BFGS call site is exercised by the non-SLSQP fit in
+// `non_convergence_reports_directly_without_second_optimization` below.
 
 /// A non-SLSQP gradient primary that stops **non-converged** runs exactly one
 /// outer optimization — there is no automatic SLSQP retry from the stop point
@@ -2701,10 +2663,10 @@ fn lbfgs_default_converges_off_init_with_first_step_cap() {
 /// `max_unconverged_frac = 0.0` leaves at least one subject's EBEs unconverged
 /// every eval, so the EBE guard rejects every step, the fit never forms a flat
 /// plateau, and it terminates at the `maxeval` ceiling reported non-converged.
-/// (Pre-#960 this test relied on the L-BFGS first-step stall to be non-converged;
-/// that stall is now fixed, so the shape is driven by the starved inner loop
-/// instead — the fix that made `lbfgs_default_converges_off_init...` green would
-/// otherwise have silently converted this into a converged run.)
+/// (Pre-#960 the original of this test relied on the L-BFGS first-step stall to
+/// be non-converged; that stall is now fixed, so the shape is driven by the
+/// starved inner loop instead — otherwise the fix would have silently converted
+/// this into a converged run and dropped the coverage.)
 #[test]
 fn non_convergence_reports_directly_without_second_optimization() {
     let model = make_model();
