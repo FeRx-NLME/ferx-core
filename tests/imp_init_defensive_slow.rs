@@ -239,13 +239,25 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
     )
     .expect("legacy imp (default ISCALE) must produce a fit");
     let v_legacy_default = legacy_default.theta[1];
+    let cl_legacy_default = legacy_default.theta[0];
     assert!(
-        legacy_default.ofv.is_finite()
-            && v_legacy_default.is_finite()
-            && v_legacy_default < 2.0 * TRUE_V,
-        "default-config legacy IMP must stay bounded (ISCALE rescue intact): V = \
-         {v_legacy_default}, OFV = {}",
+        legacy_default.converged,
+        "default-config legacy IMP must converge (ISCALE rescue intact)"
+    );
+    assert!(
+        legacy_default.ofv.is_finite() && legacy_default.ofv.abs() < 1e6,
+        "default-config legacy IMP OFV must be finite/sane: {}",
         legacy_default.ofv
+    );
+    assert!(
+        (v_legacy_default - TRUE_V).abs() / TRUE_V < 0.25,
+        "default-config legacy IMP must recover TVV near {TRUE_V} (ISCALE rescue \
+         intact), got {v_legacy_default}"
+    );
+    assert!(
+        (cl_legacy_default - TRUE_CL).abs() / TRUE_CL < 0.25,
+        "default-config legacy IMP must recover TVCL near {TRUE_CL} (ISCALE rescue \
+         intact), got {cl_legacy_default}"
     );
 
     // --- Part 2: mixture-vs-legacy discrimination with the ISCALE scalar pilot
@@ -275,6 +287,23 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
     .expect("mixture imp (ISCALE pinned) must produce a fit");
     let v0 = no_mix.theta[1];
     let vp = with_mix_pinned.theta[1];
+    let clp = with_mix_pinned.theta[0];
+    // The pinned mixture must be a genuine, healthy recovery — not just a V that
+    // happens to land near truth. Guard convergence, OFV, and CL too, so a partial
+    // regression (CL drifts or the fit fails to converge) still trips.
+    assert!(
+        with_mix_pinned.converged,
+        "defensive mixture (ISCALE pinned) must converge"
+    );
+    assert!(
+        with_mix_pinned.ofv.is_finite() && with_mix_pinned.ofv.abs() < 1e6,
+        "defensive mixture (ISCALE pinned) OFV must be finite/sane: {}",
+        with_mix_pinned.ofv
+    );
+    assert!(
+        (clp - TRUE_CL).abs() / TRUE_CL < 0.25,
+        "defensive mixture (ISCALE pinned) should recover TVCL near {TRUE_CL}, got {clp}"
+    );
     // Legacy blows V up well past 2× truth (empirically ≈ 14×) once ISCALE cannot
     // rebroaden the collapsed proposal. If this fails, the collapse is no longer
     // reproducible even with ISCALE off and the discrimination guard is void —
