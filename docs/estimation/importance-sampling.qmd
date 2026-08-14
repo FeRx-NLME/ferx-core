@@ -260,6 +260,17 @@ Practical notes:
   IS `−2 log L`, so re-validate against your reference when you turn it on.
 - **It bounds the weights, not the raw ESS.** A sharp interior likelihood spike
   can still keep ESS low; the mixture only guarantees no single sample runs away.
+- **Complementary to the ISCALE pilot search, not redundant with it.** The
+  per-subject ISCALE search (`iscale_min`/`iscale_max`) already rescues *many*
+  collapses by isotropically rebroadening a too-narrow proposal, and with it on the
+  mixture is often unnecessary. But ISCALE applies a single scalar to the whole
+  proposal covariance: it cannot cover a proposal that is badly *centred* or wrong
+  in *shape* (anisotropic). The $\mathcal N(0,\Omega)$ mixture component covers the full
+  prior support regardless of the narrow proposal's centre or shape, so it remains
+  the guard of last resort when a scalar rescale is not enough. (On the #528
+  analytical-`[initial_conditions]` fixture the two overlap — ISCALE alone now
+  prevents the runaway — which is why the regression test pins ISCALE off to
+  isolate the mixture's distinct contribution; see #961.)
 - **ESS-floor side effect.** Roughly $\alpha$ of each subject's samples now come
   from the broad prior, which raises the per-subject ESS fraction. A genuinely
   weakly-identified subject that would have been listed under

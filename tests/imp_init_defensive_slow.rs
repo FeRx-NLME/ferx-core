@@ -18,23 +18,34 @@
 //! can dominate the M-step. It does not necessarily restore a high raw ESS, but
 //! it keeps the population estimates identifiable — which is what this test pins.
 //!
-//! What this pins now: the mixture fit recovers TVV/TVCL near the truth with a
-//! finite OFV and IS −2logL — the IMP phase does not walk the population
-//! parameters to nonsense. Data is simulated from the model (fixed seed) so the
-//! test is self-contained; the quantitative NONMEM comparison (`run14`,
-//! SAEM→IMP, OFV −249.23) lives with the cross-repo `ferx-testdata/thioguanine_mmc`
-//! model and is reported in the PR.
+//! This test pins two things:
 //!
-//! Historical note: this test used to assert a decisive mixture-vs-legacy
-//! *contrast* — with `alpha = 0` the recovered V/CL ran away to ~16× truth
-//! (OFV ≈ 1e35), with the mixture they landed within a few percent. That runaway
-//! is no longer reproducible on this fixture: the legacy single-proposal sampler
-//! now finds essentially the same estimate as the mixture (V ≈ 24.4 vs the
-//! mixture's 24.5, both against truth 20), because the collapse is prevented
-//! upstream. The contrast assertions were therefore removed; what remains guards
-//! that neither sampler diverges. Restoring genuine discrimination coverage for
-//! `imp_defensive_alpha` is tracked in #961; the fast branch-coverage smoke test
-//! is `importance_sampling_api::imp_defensive_mixture_runs_for_both_alpha_branches`.
+//! 1. **Default-config recovery (the #528 core).** Under the realistic default
+//!    options (ISCALE pilot search on), the mixture fit recovers TVV/TVCL near the
+//!    truth with a finite OFV and IS −2logL — the IMP phase does not walk the
+//!    population parameters to nonsense. The quantitative NONMEM comparison
+//!    (`run14`, SAEM→IMP, OFV −249.23) lives with the cross-repo
+//!    `ferx-testdata/thioguanine_mmc` model and is reported in the PR.
+//!
+//! 2. **Mixture-vs-legacy discrimination (#961).** A subtlety surfaced after #528:
+//!    on this fixture the *default* legacy (`alpha = 0`) sampler no longer collapses
+//!    (V ≈ 23.4, essentially the mixture's estimate). The runaway is not gone — it
+//!    is masked by a *second, general* safeguard, the per-subject **ISCALE scalar
+//!    pilot search**, which isotropically rebroadens a too-narrow proposal until
+//!    the ESS recovers. (Two upstream changes conspired: the SAEM `iiv_on_ruv`
+//!    fixes #895/#904 now hand the IMP phase a saner start, and the ISCALE search
+//!    then finishes the rescue.) ISCALE and the defensive mixture overlap, so with
+//!    ISCALE on the mixture reads as redundant *here* — but it is not redundant in
+//!    general: ISCALE is a single isotropic scale, whereas the `N(0, Ω)` mixture
+//!    component bounds every weight regardless of how badly the narrow proposal is
+//!    centred or shaped. To restore genuine discrimination we **pin ISCALE to 1.0**
+//!    (its documented "disabled" setting), removing the overlapping rescue. With it
+//!    off the weakly-identified-V collapse returns: legacy runs V/CL away
+//!    (V ≳ 14× truth), the mixture still recovers them. That is the contrast this
+//!    test asserts. The fast branch-coverage smoke test is
+//!    `importance_sampling_api::imp_defensive_mixture_runs_for_both_alpha_branches`.
+//!
+//! Data is simulated from the model (fixed seed) so the test is self-contained.
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::types::{DoseEvent, Population, SimOutcome};
@@ -139,7 +150,7 @@ fn simulate_dv(
     pop
 }
 
-fn saem_imp_opts(defensive_alpha: f64) -> FitOptions {
+fn saem_imp_opts(defensive_alpha: f64, pin_iscale: bool) -> FitOptions {
     let mut opts = FitOptions::default();
     opts.verbose = false;
     opts.run_covariance_step = false;
@@ -151,6 +162,18 @@ fn saem_imp_opts(defensive_alpha: f64) -> FitOptions {
     opts.imp_seed = Some(7);
     opts.saem_seed = Some(7);
     opts.imp_defensive_alpha = defensive_alpha;
+    if pin_iscale {
+        // Disable the per-subject ISCALE scalar pilot search (`iscale_min ==
+        // iscale_max == 1.0` is its documented "off" setting). That search is a
+        // *separate*, general safeguard: it isotropically rebroadens a too-narrow
+        // proposal until the ESS recovers, and on this fixture it alone rescues the
+        // weakly-identified-V collapse — making the defensive mixture look
+        // redundant. Pinning it isolates what `imp_defensive_alpha` uniquely
+        // contributes: bounding the importance weights via the broad `N(0, Ω)`
+        // component when the narrow proposal is badly matched (#961).
+        opts.iscale_min = 1.0;
+        opts.iscale_max = 1.0;
+    }
     opts
 }
 
@@ -169,9 +192,15 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
     );
     let pop = simulate_dv(&model, &template(), &model.default_params);
 
-    // Defensive mixture enabled (alpha = 0.1): θ is recovered near the truth.
-    let with_mix = fit(&model, &pop, &model.default_params, &saem_imp_opts(0.1))
-        .expect("saem → imp on the init model must produce a fit");
+    // --- Part 1: default config (ISCALE pilot search on). The mixture recovers
+    // θ near the truth — the #528 core: the IMP phase stays identifiable.
+    let with_mix = fit(
+        &model,
+        &pop,
+        &model.default_params,
+        &saem_imp_opts(0.1, false),
+    )
+    .expect("saem → imp on the init model must produce a fit");
     assert!(with_mix.converged, "defensive-mixture fit must converge");
     assert!(
         with_mix.ofv.is_finite() && with_mix.ofv.abs() < 1e6,
@@ -198,21 +227,50 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
         imp.minus2_log_likelihood
     );
 
-    // Legacy single-proposal sampler (alpha = 0) on identical data. Historically
-    // its weights collapsed on the weakly-identified-V baseline subjects and V/CL
-    // ran away to the bounds (OFV ≈ 1e35) — the behaviour the mixture was added to
-    // fix. That runaway is no longer reproducible on this fixture (the collapse is
-    // prevented upstream; see the module docs and #961), so we no longer assert a
-    // mixture-vs-legacy contrast. What still guards #528 is that the legacy sampler
-    // also keeps the IMP phase finite and bounded — a future regression that
-    // reintroduced the runaway (V → the 500 bound, non-finite OFV) would trip this.
-    let no_mix = fit(&model, &pop, &model.default_params, &saem_imp_opts(0.0))
-        .expect("legacy imp still returns a fit");
+    // --- Part 2: mixture-vs-legacy discrimination with the ISCALE scalar pilot
+    // search pinned off (#961). ISCALE is a *separate*, general safeguard that on
+    // this fixture alone rescues the collapse and masks the mixture's value; pin it
+    // to 1.0 to remove that overlapping rescue and re-expose the weakly-identified-V
+    // weight collapse the defensive mixture was built to fix (#528).
+    //
+    //   * legacy single-proposal (alpha = 0): weights collapse on the baseline
+    //     subjects, the importance-weighted M-step is hijacked, and V/CL run away.
+    //   * defensive mixture (alpha = 0.1): the broad `N(0, Ω)` component bounds
+    //     every weight, so no single collapsed-weight subject can dominate and θ
+    //     stays identifiable.
+    let no_mix = fit(
+        &model,
+        &pop,
+        &model.default_params,
+        &saem_imp_opts(0.0, true),
+    )
+    .expect("legacy imp still returns a (bad) fit");
+    let with_mix_pinned = fit(
+        &model,
+        &pop,
+        &model.default_params,
+        &saem_imp_opts(0.1, true),
+    )
+    .expect("mixture imp (ISCALE pinned) must produce a fit");
     let v0 = no_mix.theta[1];
+    let vp = with_mix_pinned.theta[1];
+    // Legacy blows V up well past 2× truth (empirically ≈ 14×) once ISCALE cannot
+    // rebroaden the collapsed proposal. If this fails, the collapse is no longer
+    // reproducible even with ISCALE off and the discrimination guard is void —
+    // reopen #961.
     assert!(
-        no_mix.ofv.is_finite() && v0.is_finite() && v0 < 5.0 * TRUE_V,
-        "legacy IMP must not walk the population parameters away (#528 / #961): \
-         V = {v0}, OFV = {}",
-        no_mix.ofv
+        v0 > 2.0 * TRUE_V,
+        "legacy sampler (ISCALE pinned) is expected to blow V up (>2× truth); got \
+         {v0} — if this fails the fixture no longer reproduces the collapse"
+    );
+    // The mixture (same pinned config) still recovers V near the truth...
+    assert!(
+        (vp - TRUE_V).abs() / TRUE_V < 0.25,
+        "defensive mixture (ISCALE pinned) should still recover TVV near {TRUE_V}, got {vp}"
+    );
+    // ...and is a large, unambiguous improvement on the legacy recovered V.
+    assert!(
+        (vp - TRUE_V).abs() < (v0 - TRUE_V).abs() / 3.0,
+        "defensive mixture should recover V far better than legacy: mix {vp} vs legacy {v0}"
     );
 }
