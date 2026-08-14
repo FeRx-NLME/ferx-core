@@ -26,8 +26,9 @@ section of the SDLC for the versioning policy).
   warfarin FOCEI) that step overshot, the line search failed on evaluation 1, and the fit never
   left its initial θ — reporting standard errors for the initial point instead of the optimum.
   The identity-Hessian overshoot cap (previously SLSQP-only) now also tames the **first** L-BFGS
-  gradient evaluation; later evaluations are left untouched so the `(s, y)` curvature pairs
-  L-BFGS builds stay intact. Combined with the analytic covariance Hessian (default-on), this
+  gradient evaluation; later evaluations are left untouched so every *later* `(s, y)` curvature
+  pair L-BFGS builds stays intact (only the first pair reflects the capped opening gradient).
+  Combined with the analytic covariance Hessian (default-on), this
   re-enables the warfarin FOCEI covariance SE cross-checks against NONMEM and a steady-state
   oral fit smoke test (#960).
 

@@ -2637,63 +2637,118 @@ fn outer_maxiter_zero_is_eval_only_and_optimizer_independent() {
     );
 }
 
-/// A non-SLSQP gradient primary runs **exactly one** outer optimization — there
-/// is no automatic SLSQP retry from the stop point (issue #657, which removed
-/// `should_run_slsqp_fallback` and the second `nlopt::Nlopt` run). A re-added
-/// fallback would run a *second* full optimization from the first's endpoint,
-/// roughly doubling the objective-evaluation count; this test bounds the total
-/// below that doubling.
-///
-/// (Pre-#657 the fallback fired specifically on a *non-converged* non-SLSQP
-/// primary. This model used to supply exactly that shape because the
-/// analytic-gradient L-BFGS default overshot its first step and stalled — the
-/// #960 pathology. With the first-step overshoot cap that fit now converges
-/// cleanly to its plateau, so the invariant is checked here on a converged run
-/// instead; the non-converged *reporting* path is covered by the
-/// `outer_maxiter = 0` case in `eval_only_*` above.)
+/// The #960 first-step overshoot cap lets the analytic-gradient NLopt L-BFGS
+/// default leave its initial estimates and reach the optimum instead of stalling
+/// on eval 1. This is the fast, PR-CI guard for the fix (the full warfarin /
+/// SS-oral convergence checks are slow-tests). Convergence here is robust — even
+/// a 1-iteration budget converges this tiny 1-cpt fit — so the assertion carries
+/// no fragile eval-count dependency.
 #[test]
-fn single_optimization_no_slsqp_fallback_rerun() {
+fn lbfgs_default_converges_off_init_with_first_step_cap() {
     let model = make_model();
     let population = make_population(3);
     let template = &model.default_params;
-    let n = pack_params(template).len();
+    let init_ofv = {
+        // Objective at the initial estimates (eval-only), for the "left init" check.
+        let o = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::NloptLbfgs,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            mu_referencing: true,
+            ..FitOptions::default()
+        };
+        optimize_population(&model, &population, template, &o).ofv
+    };
 
-    // Generous single-optimization budget. NLopt LD_LBFGS checks `maxeval` only
-    // between line searches, so one optimization can slightly overrun
-    // `outer_maxiter * (n + 1)`; `8 * (n + 1)` leaves headroom for a single run
-    // (~24 evals on this model) while staying well under what a second
-    // optimization from the stop point would add (a re-added fallback would push
-    // the total toward ~2× the single-run count).
-    let outer_maxiter = 8;
     let o = FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,
         optimizer: Optimizer::NloptLbfgs,
-        outer_maxiter,
+        outer_maxiter: 50,
         run_covariance_step: false,
         mu_referencing: true,
         ..FitOptions::default()
     };
     let r = optimize_population(&model, &population, template, &o);
 
-    // The #960 first-step cap lets the L-BFGS default leave init and reach the
-    // optimum instead of stalling — sanity-check the fix here too.
     assert!(
         r.converged,
         "with the first-step overshoot cap the L-BFGS default should converge \
          this fit (OFV = {})",
         r.ofv
     );
-    // One optimization only: no automatic second run from the stop point. A
-    // single L-BFGS run terminates at ~24 evals here (it converges) and its
-    // NLopt `maxeval` ceiling is `outer_maxiter * (n + 1)` = 40; a re-added
-    // fallback would launch a *second* nlopt run with its own budget from the
-    // endpoint, pushing the combined count past this single-run ceiling.
+    // The whole point of #960: the fit must actually *descend* off the initial
+    // estimates rather than report SEs at init. A stalled fit returns `init_ofv`.
+    assert!(
+        r.ofv < init_ofv - 1.0,
+        "fit must leave init: final OFV {} not meaningfully below init OFV {init_ofv}",
+        r.ofv
+    );
+}
+
+/// A non-SLSQP gradient primary that stops **non-converged** runs exactly one
+/// outer optimization — there is no automatic SLSQP retry from the stop point
+/// (issue #657, which removed `should_run_slsqp_fallback` and the second
+/// `nlopt::Nlopt` run). Two invariants, both on the non-converged shape the
+/// pre-#657 fallback actually fired on:
+///   1. Non-convergence surfaces the "did not converge" warning directly.
+///   2. Only one optimization runs; a re-added fallback would launch a *second*
+///      full nlopt run from the endpoint, ~doubling the eval count.
+///
+/// Non-convergence is forced fix-independently: `inner_maxiter = 1` with
+/// `max_unconverged_frac = 0.0` leaves at least one subject's EBEs unconverged
+/// every eval, so the EBE guard rejects every step, the fit never forms a flat
+/// plateau, and it terminates at the `maxeval` ceiling reported non-converged.
+/// (Pre-#960 this test relied on the L-BFGS first-step stall to be non-converged;
+/// that stall is now fixed, so the shape is driven by the starved inner loop
+/// instead — the fix that made `lbfgs_default_converges_off_init...` green would
+/// otherwise have silently converted this into a converged run.)
+#[test]
+fn non_convergence_reports_directly_without_second_optimization() {
+    let model = make_model();
+    let population = make_population(3);
+    let template = &model.default_params;
+    let n = pack_params(template).len();
+
+    let outer_maxiter = 8;
+    let o = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::NloptLbfgs,
+        outer_maxiter,
+        // Starve the inner loop so the EBE guard rejects every outer step and the
+        // fit cannot converge (independent of the #960 first-step cap).
+        inner_maxiter: 1,
+        max_unconverged_frac: 0.0,
+        run_covariance_step: false,
+        mu_referencing: true,
+        ..FitOptions::default()
+    };
+    let r = optimize_population(&model, &population, template, &o);
+
+    assert!(
+        !r.converged,
+        "test setup: a starved-inner-loop fit must not converge (OFV = {})",
+        r.ofv
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("did not converge")),
+        "non-convergence must surface the warning directly; got {:?}",
+        r.warnings
+    );
+    // One optimization only. NLopt LD_LBFGS checks `maxeval` only between line
+    // searches, so a single run slightly overruns `outer_maxiter * (n + 1)` (≈45
+    // on this model, budget 40); a re-added fallback would add a *second* full
+    // nlopt run from the endpoint, pushing the total toward ~2× that. Bound at
+    // `2 * budget` cleanly separates the single run (~45) from a doubling (~90).
     let single_budget = outer_maxiter as usize * (n + 1);
     assert!(
-        r.n_iterations <= single_budget,
-        "expected a single optimization (<= {single_budget} evals), got {} — \
-             a second optimization (SLSQP fallback) appears to have run",
+        r.n_iterations < 2 * single_budget,
+        "expected a single optimization (< {} evals), got {} — a second \
+         optimization (SLSQP fallback) appears to have run",
+        2 * single_budget,
         r.n_iterations
     );
 }
