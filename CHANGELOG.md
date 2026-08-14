@@ -19,6 +19,18 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+- **The default (`Auto` → analytic-gradient NLopt L-BFGS) optimizer no longer stalls at the
+  initial estimates on its first step.** From the identity initial Hessian the opening search
+  direction is `−∇`, and on models where the scaled gradient is large at the start (e.g.
+  warfarin FOCEI) that step overshot, the line search failed on evaluation 1, and the fit never
+  left its initial θ — reporting standard errors for the initial point instead of the optimum.
+  The identity-Hessian overshoot cap (previously SLSQP-only) now also tames the **first** L-BFGS
+  gradient evaluation; later evaluations are left untouched so the `(s, y)` curvature pairs
+  L-BFGS builds stay intact. Combined with the analytic covariance Hessian (default-on), this
+  re-enables the warfarin FOCEI covariance SE cross-checks against NONMEM and a steady-state
+  oral fit smoke test (#960).
+
 ## [0.3.0] - 2026-08-07
 
 ### Added

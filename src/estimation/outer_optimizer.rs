@@ -466,17 +466,18 @@ pub fn optimize_population_warm(
 //  NLopt-based outer optimizer (matches Julia's NLopt path exactly)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// SLSQP overshoot guard for the scaled gradient.
+/// Identity-Hessian first-step overshoot guard for the scaled gradient.
 ///
-/// NLopt LD_SLSQP starts each fit with its quasi-Newton Hessian set to
-/// identity, so the QP that produces its first step has an unconstrained
-/// solution d = -∇f, projected onto the box bounds. When |∇f|∞ is several
-/// times larger than the bound width — which is what the AD/analytical
-/// FOCE gradient added in PR #48 looks like on standard PK models (≈ 10²–10³
-/// in scaled log/Cholesky space) — the projected step pins every component
-/// to a corner of the box. The OFV at the corner explodes and SLSQP cannot
-/// recover; theta stays byte-identical to init for the rest of the budget.
-/// See issue #55.
+/// NLopt LD_SLSQP and LD_LBFGS both start each fit with their quasi-Newton
+/// Hessian set to identity, so the first search direction is the unconstrained
+/// `d = -∇f`, projected onto the box bounds. When |∇f|∞ is several times larger
+/// than the bound width — which is what the AD/analytical FOCE gradient added in
+/// PR #48 looks like on standard PK models (≈ 10²–10³ in scaled log/Cholesky
+/// space) — that first step pins every component to a corner of the box, the OFV
+/// explodes, and the line search fails on eval 1; theta stays byte-identical to
+/// init for the rest of the budget. See issue #55 (SLSQP) and #960 (the same
+/// eval-1 failure on the analytic-gradient NLopt L-BFGS `Auto` default, which
+/// left warfarin FOCEI stuck at its initial estimates).
 ///
 /// This helper rescales `g` in place by a single scalar so that no component
 /// of the identity-Hessian Newton step exceeds its per-dimension step budget,
@@ -493,9 +494,15 @@ pub fn optimize_population_warm(
 /// unchanged.
 ///
 /// Returns true if the cap fired (gradient was rescaled), false otherwise.
-/// LBFGS/MMA have line-search-style safeguards and BOBYQA is derivative-free,
-/// so this is only applied on the SLSQP path.
-pub(crate) fn cap_slsqp_gradient(g: &mut [f64], lower_s: &[f64], upper_s: &[f64]) -> bool {
+/// Applied on **every** SLSQP gradient eval, but on L-BFGS **only the first**
+/// (see [`should_cap_gradient`]): SLSQP re-solves its QP from the current
+/// Hessian each step so a uniform cap is harmless, whereas L-BFGS builds its
+/// Hessian from successive `(s, y)` gradient-difference pairs — capping past the
+/// first eval would corrupt that curvature (the regression noted in #960). Only
+/// the opening `H₀ = I` step needs taming; once real curvature accumulates the
+/// L-BFGS line search safeguards itself. MMA has its own trust-region-style
+/// safeguards and BOBYQA is derivative-free, so neither is capped.
+pub(crate) fn cap_scaled_gradient(g: &mut [f64], lower_s: &[f64], upper_s: &[f64]) -> bool {
     debug_assert_eq!(g.len(), lower_s.len());
     debug_assert_eq!(g.len(), upper_s.len());
     let mut worst_ratio = 0.0_f64;
@@ -513,6 +520,32 @@ pub(crate) fn cap_slsqp_gradient(g: &mut [f64], lower_s: &[f64], upper_s: &[f64]
         true
     } else {
         false
+    }
+}
+
+/// Whether the identity-Hessian overshoot cap ([`cap_scaled_gradient`]) should
+/// fire on this gradient eval.
+///
+/// `n_grad_evals` is the running count of gradient evaluations *including this
+/// one* (`population_gradient` increments it before returning), so the first
+/// gradient eval is `n_grad_evals == 1`.
+///
+/// - **SLSQP** — cap every eval. Its QP re-solves from the current quasi-Newton
+///   Hessian each step, so rescaling the gradient never corrupts stored
+///   curvature (issue #55).
+/// - **L-BFGS** — cap only the first eval. Its Hessian is reconstructed from the
+///   `(s, y)` pairs formed by successive gradient differences; a blanket cap
+///   would perturb `y` on every step and corrupt that curvature (which is why a
+///   uniform cap regressed well-behaved L-BFGS fits — #960). Only the opening
+///   `H₀ = I` step overshoots, so taming eval 1 alone lets the fit leave init
+///   while leaving every later `(s, y)` pair intact.
+/// - **MMA / BOBYQA** and everything else — never cap here (MMA has its own
+///   safeguards; BOBYQA is derivative-free).
+pub(crate) fn should_cap_gradient(algo: nlopt::Algorithm, n_grad_evals: usize) -> bool {
+    match algo {
+        nlopt::Algorithm::Slsqp => true,
+        nlopt::Algorithm::Lbfgs => n_grad_evals == 1,
+        _ => false,
     }
 }
 
@@ -1134,8 +1167,9 @@ fn optimize_nlopt(
     let has_identity_theta = init_params.theta_lower.iter().any(|&lo| lo < 0.0);
     // IOV + SLSQP: auto-enable per-coordinate scaling (issue #101 rec #2). IOV
     // models pack disparate-magnitude parameters (block-diagonal omega plus the
-    // kappa block), and SLSQP's uniform gradient cap (`cap_slsqp_gradient`,
-    // applied only on the SLSQP path) otherwise rescales the whole gradient by
+    // kappa block), and SLSQP's uniform gradient cap (`cap_scaled_gradient`,
+    // applied on every SLSQP eval — L-BFGS is capped only on its first) otherwise
+    // rescales the whole gradient by
     // the worst (theta) component, starving the omega/omega_iov step so the
     // variance components stay pinned at their initial values. Scaling presents
     // O(1) coordinates so the cap no longer starves them. The #99 regression
@@ -1145,7 +1179,7 @@ fn optimize_nlopt(
     //
     // Scope note: as of #155 the default outer optimizer is `Bobyqa`, not
     // `Slsqp` — so default-IOV fits no longer hit this branch. BOBYQA is
-    // gradient-free and doesn't suffer the `cap_slsqp_gradient` starvation that
+    // gradient-free and doesn't suffer the `cap_scaled_gradient` starvation that
     // motivates the scaling here, so leaving it disabled on the default path is
     // intentional. This auto-enable now only fires for an explicit
     // `optimizer = slsqp` on IOV models (the path it was originally written for).
@@ -1399,8 +1433,8 @@ fn optimize_nlopt(
                 if crate::estimation::trace::is_active() {
                     grad_vec_for_trace = Some(g.to_vec());
                 }
-                if matches!(algo, nlopt::Algorithm::Slsqp) {
-                    cap_slsqp_gradient(g, &lower_s, &upper_s);
+                if should_cap_gradient(algo, state.n_grad_evals) {
+                    cap_scaled_gradient(g, &lower_s, &upper_s);
                 }
                 // Gate on the global best (same tracker as the `best_seen` update
                 // below) so `last_gradient` always reflects the best point seen.

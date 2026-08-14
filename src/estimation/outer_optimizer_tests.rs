@@ -1848,14 +1848,14 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
 // AD/analytical FOCE gradient introduced in PR #48 has inf-norm ≈ 10²–10³
 // on standard PK models, while the scaled bound width is ≈ 3–9, so the
 // projected step lands at a corner of the box and the OFV explodes. The
-// `cap_slsqp_gradient` helper rescales `g` by a single scalar so the
+// `cap_scaled_gradient` helper rescales `g` by a single scalar so the
 // would-be Newton step fits inside the box on every dimension.
 
 /// Cap fires when the gradient inf-norm exceeds the per-dimension
 /// step budget, and the cap is a uniform rescale (preserves direction
 /// and relative magnitudes between components).
 #[test]
-fn test_cap_slsqp_gradient_uniformly_rescales_when_huge() {
+fn test_cap_scaled_gradient_uniformly_rescales_when_huge() {
     // Bounds chosen so each dimension's budget = clamp(half-width, 0.1, 1.0).
     //   i=0: width=2.0 → budget = clamp(1.0, …) = 1.0
     //   i=1: width=4.0 → budget = clamp(2.0, …) = 1.0 (clamped to 1.0)
@@ -1866,7 +1866,7 @@ fn test_cap_slsqp_gradient_uniformly_rescales_when_huge() {
     // Gradient with inf-norm 200 at the third component → worst_ratio = 200/0.1 = 2000.
     let mut g = vec![10.0, 100.0, 200.0];
     let g_before = g.clone();
-    let fired = cap_slsqp_gradient(&mut g, &lower, &upper);
+    let fired = cap_scaled_gradient(&mut g, &lower, &upper);
     assert!(fired, "cap should have fired for huge gradient");
 
     // Direction preserved: g[i] / g_before[i] is the same scalar across i.
@@ -1892,13 +1892,13 @@ fn test_cap_slsqp_gradient_uniformly_rescales_when_huge() {
 /// Cap is a no-op when the gradient is already within budget — preserves
 /// SLSQP convergence behaviour once it's in the basin of the optimum.
 #[test]
-fn test_cap_slsqp_gradient_noop_when_within_budget() {
+fn test_cap_scaled_gradient_noop_when_within_budget() {
     let lower = vec![-1.0, -2.0];
     let upper = vec![1.0, 2.0];
     // Per-dim budgets are both clamped to 1.0; gradient inf-norm = 0.5 < 1.0.
     let mut g = vec![0.5, -0.3];
     let g_before = g.clone();
-    let fired = cap_slsqp_gradient(&mut g, &lower, &upper);
+    let fired = cap_scaled_gradient(&mut g, &lower, &upper);
     assert!(!fired, "cap should not fire for in-budget gradient");
     assert_eq!(g, g_before, "in-budget gradient must be untouched");
 }
@@ -1907,12 +1907,12 @@ fn test_cap_slsqp_gradient_noop_when_within_budget() {
 /// log-Cholesky omega/sigma packing, where bounds span 10+ units), the
 /// budget is clamped to 1.0 so the cap still fires.
 #[test]
-fn test_cap_slsqp_gradient_clamps_wide_bounds_to_unit_budget() {
+fn test_cap_scaled_gradient_clamps_wide_bounds_to_unit_budget() {
     // Wide bounds: half-width = 5 → budget clamped to 1.0.
     let lower = vec![-10.0, -10.0];
     let upper = vec![10.0, 10.0];
     let mut g = vec![5.0, 0.0];
-    let fired = cap_slsqp_gradient(&mut g, &lower, &upper);
+    let fired = cap_scaled_gradient(&mut g, &lower, &upper);
     assert!(fired, "cap should fire: budget clamped to 1.0, |g_max| = 5");
     // Worst ratio = 5/1 = 5 → divide all by 5 → g[0] becomes 1.0.
     assert!(
@@ -1921,6 +1921,32 @@ fn test_cap_slsqp_gradient_clamps_wide_bounds_to_unit_budget() {
         g[0]
     );
     assert_eq!(g[1], 0.0);
+}
+
+/// [`should_cap_gradient`] gates the overshoot cap per-algorithm (#960):
+///   - SLSQP: cap every eval (QP re-solves from the current Hessian).
+///   - L-BFGS: cap only the first gradient eval (`n_grad_evals == 1`); a
+///     blanket cap would corrupt the `(s, y)` curvature pairs it builds from
+///     gradient differences — the regression that blocked a uniform fix.
+///   - MMA / BOBYQA: never capped here.
+#[test]
+fn test_should_cap_gradient_per_algo_gating() {
+    use crate::estimation::outer_optimizer::should_cap_gradient;
+    use nlopt::Algorithm;
+
+    // SLSQP: every eval, including well past the first.
+    assert!(should_cap_gradient(Algorithm::Slsqp, 1));
+    assert!(should_cap_gradient(Algorithm::Slsqp, 5));
+
+    // L-BFGS: first gradient eval only. `n_grad_evals == 1` is the first eval
+    // because `population_gradient` increments before returning.
+    assert!(should_cap_gradient(Algorithm::Lbfgs, 1));
+    assert!(!should_cap_gradient(Algorithm::Lbfgs, 2));
+    assert!(!should_cap_gradient(Algorithm::Lbfgs, 50));
+
+    // Derivative-free / self-safeguarding methods are never capped here.
+    assert!(!should_cap_gradient(Algorithm::Mma, 1));
+    assert!(!should_cap_gradient(Algorithm::Bobyqa, 1));
 }
 
 /// Regression test for the original issue #55 symptom: SLSQP optimizing
@@ -2611,27 +2637,34 @@ fn outer_maxiter_zero_is_eval_only_and_optimizer_independent() {
     );
 }
 
-/// Non-convergence is reported directly and runs exactly one outer
-/// optimization — there is no automatic SLSQP retry from the stop point
-/// (issue #657, which removed `should_run_slsqp_fallback` and the second
-/// `nlopt::Nlopt` run). A gradient optimizer with a tiny `outer_maxiter`
-/// stops non-converged at its eval budget; the total objective-evaluation
-/// count must stay within a *single* optimization's budget
-/// (`outer_maxiter * (n + 1)`), so a re-added second optimization from the
-/// current point would blow this bound.
+/// A non-SLSQP gradient primary runs **exactly one** outer optimization — there
+/// is no automatic SLSQP retry from the stop point (issue #657, which removed
+/// `should_run_slsqp_fallback` and the second `nlopt::Nlopt` run). A re-added
+/// fallback would run a *second* full optimization from the first's endpoint,
+/// roughly doubling the objective-evaluation count; this test bounds the total
+/// below that doubling.
+///
+/// (Pre-#657 the fallback fired specifically on a *non-converged* non-SLSQP
+/// primary. This model used to supply exactly that shape because the
+/// analytic-gradient L-BFGS default overshot its first step and stalled — the
+/// #960 pathology. With the first-step overshoot cap that fit now converges
+/// cleanly to its plateau, so the invariant is checked here on a converged run
+/// instead; the non-converged *reporting* path is covered by the
+/// `outer_maxiter = 0` case in `eval_only_*` above.)
 #[test]
-fn non_convergence_reports_directly_without_second_optimization() {
+fn single_optimization_no_slsqp_fallback_rerun() {
     let model = make_model();
     let population = make_population(3);
     let template = &model.default_params;
     let n = pack_params(template).len();
 
-    // A non-SLSQP gradient primary (`nlopt_lbfgs`) with a tiny budget: its
-    // xtol/ftol are set unreachably tight, so `outer_maxiter * (n + 1)` evals
-    // is the stop criterion and it cannot converge. Pre-#657 exactly this
-    // shape (non-converged, non-SLSQP) is what an unguarded fallback re-add
-    // would retry with SLSQP.
-    let outer_maxiter = 2;
+    // Generous single-optimization budget. NLopt LD_LBFGS checks `maxeval` only
+    // between line searches, so one optimization can slightly overrun
+    // `outer_maxiter * (n + 1)`; `8 * (n + 1)` leaves headroom for a single run
+    // (~24 evals on this model) while staying well under what a second
+    // optimization from the stop point would add (a re-added fallback would push
+    // the total toward ~2× the single-run count).
+    let outer_maxiter = 8;
     let o = FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,
@@ -2643,17 +2676,19 @@ fn non_convergence_reports_directly_without_second_optimization() {
     };
     let r = optimize_population(&model, &population, template, &o);
 
+    // The #960 first-step cap lets the L-BFGS default leave init and reach the
+    // optimum instead of stalling — sanity-check the fix here too.
     assert!(
-        !r.converged,
-        "test setup: a {outer_maxiter}-iter budget must not converge (OFV = {})",
+        r.converged,
+        "with the first-step overshoot cap the L-BFGS default should converge \
+         this fit (OFV = {})",
         r.ofv
     );
-    assert!(
-        r.warnings.iter().any(|w| w.contains("did not converge")),
-        "non-convergence must surface the warning directly; got {:?}",
-        r.warnings
-    );
-    // One optimization only: no automatic second run from the stop point.
+    // One optimization only: no automatic second run from the stop point. A
+    // single L-BFGS run terminates at ~24 evals here (it converges) and its
+    // NLopt `maxeval` ceiling is `outer_maxiter * (n + 1)` = 40; a re-added
+    // fallback would launch a *second* nlopt run with its own budget from the
+    // endpoint, pushing the combined count past this single-run ceiling.
     let single_budget = outer_maxiter as usize * (n + 1);
     assert!(
         r.n_iterations <= single_budget,
