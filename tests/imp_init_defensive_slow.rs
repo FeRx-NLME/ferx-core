@@ -227,6 +227,27 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
         imp.minus2_log_likelihood
     );
 
+    // Default-config legacy (alpha = 0, ISCALE pilot search on) — the realistic
+    // shipped path. Post-#528 the ISCALE search alone keeps this bounded; assert it
+    // stays finite and near truth so an ISCALE-rescue regression trips here (the
+    // guard the pinned-ISCALE Part 2 below deliberately removes).
+    let legacy_default = fit(
+        &model,
+        &pop,
+        &model.default_params,
+        &saem_imp_opts(0.0, false),
+    )
+    .expect("legacy imp (default ISCALE) must produce a fit");
+    let v_legacy_default = legacy_default.theta[1];
+    assert!(
+        legacy_default.ofv.is_finite()
+            && v_legacy_default.is_finite()
+            && v_legacy_default < 2.0 * TRUE_V,
+        "default-config legacy IMP must stay bounded (ISCALE rescue intact): V = \
+         {v_legacy_default}, OFV = {}",
+        legacy_default.ofv
+    );
+
     // --- Part 2: mixture-vs-legacy discrimination with the ISCALE scalar pilot
     // search pinned off (#961). ISCALE is a *separate*, general safeguard that on
     // this fixture alone rescues the collapse and masks the mixture's value; pin it
@@ -263,14 +284,14 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
         "legacy sampler (ISCALE pinned) is expected to blow V up (>2× truth); got \
          {v0} — if this fails the fixture no longer reproduces the collapse"
     );
-    // The mixture (same pinned config) still recovers V near the truth...
+    // The mixture (same pinned config) still recovers V near the truth. Combined
+    // with the `v0 > 2·TRUE_V` legacy blow-up above, this *is* the discrimination:
+    // |vp−20| < 5 while |v0−20| > 20, an unambiguous mixture-over-legacy win. (No
+    // separate ratio assert — it would be implied by these two and never fail
+    // independently.)
     assert!(
         (vp - TRUE_V).abs() / TRUE_V < 0.25,
-        "defensive mixture (ISCALE pinned) should still recover TVV near {TRUE_V}, got {vp}"
-    );
-    // ...and is a large, unambiguous improvement on the legacy recovered V.
-    assert!(
-        (vp - TRUE_V).abs() < (v0 - TRUE_V).abs() / 3.0,
-        "defensive mixture should recover V far better than legacy: mix {vp} vs legacy {v0}"
+        "defensive mixture (ISCALE pinned) should still recover TVV near {TRUE_V}, \
+         got {vp} (legacy blew up to {v0})"
     );
 }
