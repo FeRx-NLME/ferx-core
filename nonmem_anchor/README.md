@@ -110,6 +110,16 @@ respective model (see below).
 > first-order pathway, so the fraction is identified by the **shape** of the curve
 > rather than by exposure magnitude (a bioavailability `F` would be confounded
 > with `CL`/`V` in oral-only data). Both engines start at `FR1 = 0.4`.
+>
+> **`.lst` truncation.** This NONMEM 7.5.1 build aborts while printing the final
+> report section of the SAEM+IMP chain — after both estimation stages finish and
+> after every output file is written. The committed `.lst` therefore ends at
+> `#TERM` and carries no "FINAL PARAMETER ESTIMATE" block; read the estimates from
+> `results/logit_fraction_saem.ext` instead (the last `-1000000000` row of each
+> `TABLE NO.` block — table 1 is SAEM, table 2 the IMP objective, `#OBJV`
+> equivalent −3698.448). The abort is not the fit failing: the two runs performed
+> while preparing this anchor (with and without `$COVARIANCE`) produced
+> bit-identical `.ext` trajectories. The table above is what `.ext` reports.
 
 ## The dataset
 
