@@ -167,10 +167,18 @@ A GitHub Actions CI pipeline runs on every push to `main` and on pull requests (
 
 | Job | Command | Purpose |
 |-----|---------|---------|
-| **Check** | `cargo check` | Fast compilation verification |
-| **Test** | `cargo test --lib` | Run 57 unit tests |
+| **Check** | `cargo check --tests` (×3: `ci`, `ci,survival,slow-tests`, `ci,markov`) | Fast compilation verification of every feature combo, including the ones no per-PR test job builds |
+| **Tests + coverage (core)** | `cargo llvm-cov --tests --features ci` | Runs the Tier-1/2 suite and produces the per-PR patch-coverage report (`fast` flag) |
+| **Tests + coverage (TTE/CTMM endpoints)** | `cargo llvm-cov --lib --test <6 endpoint files> --features ci,markov` | Runs and measures the feature-gated TTE / categorical / CTMM code the base build compiles out (`survival` + `markov` flags) |
 | **Clippy** | `cargo clippy -- -D warnings` | Lint with warnings-as-errors |
 | **Format** | `cargo fmt -- --check` | Enforce consistent formatting |
+
+There is deliberately **no** separate uninstrumented `Test` job, and no separate
+`Survival` job: the former was a strict subset of `Tests + coverage (core)`
+(same features, `--tests` ⊇ `--lib`), and `markov = ["survival"]` makes the
+latter a strict subset of the endpoints job. Both were removed rather than left
+re-paying an ~11 min lib compile for coverage that Codecov already merges in
+from another flag.
 
 All jobs use the stock Rust nightly toolchain pinned in `rust-toolchain.toml`.
 
