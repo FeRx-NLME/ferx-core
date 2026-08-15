@@ -583,40 +583,39 @@ fn detect_mu_refs(
     nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
     let mut result = HashMap::new();
+    // NONMEM-style explicit mu syntax (`MU_1 = log(TVCL)`, `CL = exp(MU_1 + ETA_CL)`)
+    // and the "typical value on its own line" style (`TVCL = THETA_CL * (WT/70)^0.75`,
+    // `CL = TVCL * exp(ETA_CL)`) hide the anchor theta behind a local variable, so the
+    // raw expression matches no pattern. Inlining eta-free local definitions makes
+    // those forms algebraically identical to the direct ones (#918). Detection is
+    // attempted on the raw expression *first* so every form recognised before this
+    // fallback existed keeps producing exactly the same `MuRef`.
+    let mut assign_counts: HashMap<&str, usize> = HashMap::new();
+    count_all_assignments(stmts, &mut assign_counts);
+    // Definitions are accumulated in statement order, so a line can only be
+    // rewritten with values that are already in scope where it sits — a forward
+    // reference reads a covariate (or zero) at eval time and must not be
+    // "resolved" into a definition that comes later.
+    let mut inline_defs: HashMap<String, Expression> = HashMap::new();
+
     for s in stmts {
-        if let Statement::Assign(_, expr) = s {
-            if let Some((eta_idx, anchor, log_transformed)) = detect_pattern(expr) {
-                if eta_idx >= eta_names.len() {
-                    continue;
-                }
-                let name = match anchor {
-                    MuRefAnchor::Theta(ti) => {
-                        if ti >= theta_names.len() {
-                            continue;
-                        }
-                        theta_names[ti].clone()
-                    }
-                    MuRefAnchor::NnOutput { nn_idx, output_idx } => {
-                        // Defensive: indices should be valid by construction
-                        // (parse_atom built them against the same nn_specs),
-                        // but skip silently rather than panic if anything's
-                        // out of sync.
-                        let Some((nn_name, outputs)) = nn_specs.get(nn_idx) else {
-                            continue;
-                        };
-                        let Some(out_name) = outputs.get(output_idx) else {
-                            continue;
-                        };
-                        format!("{nn_name}.{out_name}")
-                    }
-                };
-                result.insert(
-                    eta_names[eta_idx].clone(),
-                    MuRef {
-                        theta_name: name,
-                        log_transformed,
-                    },
-                );
+        if let Statement::Assign(name, raw_expr) = s {
+            let mut found = classify_mu_ref(raw_expr, theta_names, eta_names, nn_specs);
+            if found.is_none() && !inline_defs.is_empty() {
+                let inlined = inline_local_vars(raw_expr, &inline_defs, 0);
+                found = classify_mu_ref(&inlined, theta_names, eta_names, nn_specs);
+            }
+            if let Some((eta_idx, mu_ref)) = found {
+                result.insert(eta_names[eta_idx].clone(), mu_ref);
+            }
+            // Eligible as a substitution for *later* lines: assigned exactly
+            // once in the whole block (so no `if` branch overrides it) and
+            // eta-free (an eta-bearing definition is an individual parameter,
+            // not a typical value).
+            if assign_counts.get(name.as_str()).copied().unwrap_or(0) == 1
+                && !expr_contains_eta(raw_expr)
+            {
+                inline_defs.insert(name.clone(), raw_expr.clone());
             }
         }
     }
@@ -823,6 +822,142 @@ fn expr_uses_mixnum(expr: &Expression) -> bool {
     }
 }
 
+/// Match one `[individual_parameters]` right-hand side against every
+/// mu-referencing form, returning `(eta_idx, MuRef)` for the first that fits.
+///
+/// Logit forms are tried before the product/additive ones: `inv_logit(THETA + ETA)`
+/// is neither a product nor a bare sum, so `detect_pattern` cannot see it (#918).
+fn classify_mu_ref(
+    expr: &Expression,
+    theta_names: &[String],
+    eta_names: &[String],
+    nn_specs: &[(String, Vec<String>)],
+) -> Option<(usize, MuRef)> {
+    if let Some((eta_idx, theta_idx, prob_scale)) = detect_logit_pattern(expr) {
+        if eta_idx < eta_names.len() && theta_idx < theta_names.len() {
+            return Some((
+                eta_idx,
+                MuRef {
+                    theta_name: theta_names[theta_idx].clone(),
+                    transform: if prob_scale {
+                        MuTransform::LogitProbability
+                    } else {
+                        MuTransform::Logit
+                    },
+                },
+            ));
+        }
+    }
+
+    let (eta_idx, anchor, log_transformed) = detect_pattern(expr)?;
+    if eta_idx >= eta_names.len() {
+        return None;
+    }
+    let theta_name = match anchor {
+        MuRefAnchor::Theta(ti) => theta_names.get(ti)?.clone(),
+        MuRefAnchor::NnOutput { nn_idx, output_idx } => {
+            // Defensive: indices should be valid by construction (parse_atom
+            // built them against the same nn_specs), but skip silently rather
+            // than panic if anything's out of sync.
+            let (nn_name, outputs) = nn_specs.get(nn_idx)?;
+            let out_name = outputs.get(output_idx)?;
+            format!("{nn_name}.{out_name}")
+        }
+    };
+    Some((
+        eta_idx,
+        MuRef {
+            theta_name,
+            transform: if log_transformed {
+                MuTransform::Log
+            } else {
+                MuTransform::Identity
+            },
+        },
+    ))
+}
+
+/// Maximum substitution depth for [`inline_local_vars`]. Chains longer than
+/// this (or cyclic ones, which the parser rejects elsewhere but which must not
+/// hang detection here) stop expanding and simply fail to match a pattern.
+const MU_REF_INLINE_MAX_DEPTH: usize = 4;
+
+/// Count assignments per variable name across top-level statements *and* every
+/// `if` branch, so a name that is conditionally reassigned is never inlined.
+fn count_all_assignments<'a>(stmts: &'a [Statement], out: &mut HashMap<&'a str, usize>) {
+    for s in stmts {
+        match s {
+            Statement::Assign(name, _) => *out.entry(name.as_str()).or_insert(0) += 1,
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    count_all_assignments(body, out);
+                }
+                if let Some(eb) = else_body {
+                    count_all_assignments(eb, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True when `expr` references any ETA anywhere in its tree.
+fn expr_contains_eta(expr: &Expression) -> bool {
+    match expr {
+        Expression::Eta(_) => true,
+        Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+            expr_contains_eta(l) || expr_contains_eta(r)
+        }
+        Expression::UnaryFn(_, a) => expr_contains_eta(a),
+        Expression::Conditional(_, t, f) => expr_contains_eta(t) || expr_contains_eta(f),
+        _ => false,
+    }
+}
+
+/// Substitute `defs` into every named reference in `expr`, recursively, up to
+/// [`MU_REF_INLINE_MAX_DEPTH`] levels. Names with no definition (genuine
+/// covariates, forward references) are left untouched.
+///
+/// Both `Variable` and `Covariate` nodes are substituted: `parse_atom` emits
+/// `Variable` for a name already assigned earlier in the block and `Covariate`
+/// otherwise, but a caller that builds statements without the surrounding
+/// `defined_vars` context (unit tests, the `[odes]` harness) yields `Covariate`
+/// for the same name. `defs` only ever holds names assigned earlier in this
+/// block, and such an assignment shadows any same-named covariate at eval time,
+/// so treating the two node kinds alike is consistent either way.
+fn inline_local_vars(
+    expr: &Expression,
+    defs: &HashMap<String, Expression>,
+    depth: usize,
+) -> Expression {
+    match expr {
+        Expression::Variable(name) | Expression::Covariate(name)
+            if depth < MU_REF_INLINE_MAX_DEPTH =>
+        {
+            match defs.get(name) {
+                Some(def) => inline_local_vars(def, defs, depth + 1),
+                None => expr.clone(),
+            }
+        }
+        Expression::BinOp(l, op, r) => Expression::BinOp(
+            Box::new(inline_local_vars(l, defs, depth)),
+            *op,
+            Box::new(inline_local_vars(r, defs, depth)),
+        ),
+        Expression::Power(b, e) => Expression::Power(
+            Box::new(inline_local_vars(b, defs, depth)),
+            Box::new(inline_local_vars(e, defs, depth)),
+        ),
+        Expression::UnaryFn(name, a) => {
+            Expression::UnaryFn(name.clone(), Box::new(inline_local_vars(a, defs, depth)))
+        }
+        _ => expr.clone(),
+    }
+}
+
 /// Intermediate result from classifying a single expression.
 #[derive(Debug, Clone, PartialEq)]
 struct ExprClass {
@@ -1001,39 +1136,93 @@ fn plain_theta_eta(a: &Expression, b: &Expression) -> Option<(usize, usize)> {
     None
 }
 
+/// Match `a + b` as a logit-scale mu-sum, returning `(eta_idx, theta_idx, prob_scale)`.
+///
+/// `prob_scale` is `true` for `logit(THETA) + ETA` (THETA on the probability
+/// scale) and `false` for `THETA + ETA` (THETA already on the logit scale).
+fn logit_mu_sum(a: &Expression, b: &Expression) -> Option<(usize, usize, bool)> {
+    // Form 1: THETA + ETA  (THETA on logit scale)
+    if let Some((ei, ti)) = plain_theta_eta(a, b) {
+        return Some((ei, ti, false));
+    }
+    // Form 2: logit(THETA) + ETA  (THETA on probability scale)
+    if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) = (a, b) {
+        if fn_name == "logit" {
+            if let Expression::Theta(ti) = inner_arg.as_ref() {
+                return Some((*ei, *ti, true));
+            }
+        }
+    }
+    None
+}
+
+/// Match a logit-scale mu-sum in either operand order.
+fn logit_mu_sum_either(a: &Expression, b: &Expression) -> Option<(usize, usize, bool)> {
+    logit_mu_sum(a, b).or_else(|| logit_mu_sum(b, a))
+}
+
+/// True when `expr` is the literal `1` (as written, or as any exactly-1.0 constant).
+fn is_literal_one(expr: &Expression) -> bool {
+    matches!(expr, Expression::Literal(v) if *v == 1.0)
+}
+
+/// Match the *negation* of a logit mu-sum, i.e. the `exp` argument in
+/// `1 / (1 + exp(-(MU + ETA)))`. The parser desugars unary minus to `0 - x`,
+/// so both `-(MU + ETA)` and `-MU - ETA` are recognised.
+fn negated_logit_mu_sum(expr: &Expression) -> Option<(usize, usize, bool)> {
+    if let Expression::BinOp(lhs, BinOp::Sub, rhs) = expr {
+        // `-(MU + ETA)`  →  `0 - (MU + ETA)`
+        if matches!(lhs.as_ref(), Expression::Literal(v) if *v == 0.0) {
+            if let Expression::BinOp(a, BinOp::Add, b) = rhs.as_ref() {
+                return logit_mu_sum_either(a, b);
+            }
+        }
+        // `-MU - ETA`  →  `(0 - MU) - ETA`
+        if let Expression::BinOp(zero, BinOp::Sub, a) = lhs.as_ref() {
+            if matches!(zero.as_ref(), Expression::Literal(v) if *v == 0.0) {
+                return logit_mu_sum_either(a, rhs);
+            }
+        }
+    }
+    None
+}
+
 /// Detect logit-normal parameterisation patterns.
 /// Returns `Some((eta_idx, theta_idx, prob_scale))` where `prob_scale` is
 /// `true` for `inv_logit(logit(THETA) + ETA)` and `false` for `inv_logit(THETA + ETA)`.
 ///
 /// Recognised forms:
-///   - `inv_logit(THETA + ETA)`          — THETA on the logit scale
-///   - `inv_logit(logit(THETA) + ETA)`   — THETA on the probability scale (0,1)
+///   - `inv_logit(THETA + ETA)`             — THETA on the logit scale
+///   - `inv_logit(logit(THETA) + ETA)`      — THETA on the probability scale (0,1)
+///   - `1 / (1 + exp(-(THETA + ETA)))`      — the same two forms written out
+///   - `1 / (1 + exp(-THETA - ETA))`          algebraically (#918)
 fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
-    if let Expression::UnaryFn(name, inner) = expr {
-        if name == "inv_logit" || name == "expit" {
+    match expr {
+        Expression::UnaryFn(name, inner) if name == "inv_logit" || name == "expit" => {
             if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
-                let try_logit_theta_eta = |a: &Expression,
-                                           b: &Expression|
-                 -> Option<(usize, usize, bool)> {
-                    // Form 1: THETA + ETA  (THETA on logit scale)
-                    if let Some((ei, ti)) = plain_theta_eta(a, b) {
-                        return Some((ei, ti, false));
-                    }
-                    // Form 2: logit(THETA) + ETA  (THETA on probability scale)
-                    if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) = (a, b) {
-                        if fn_name == "logit" {
-                            if let Expression::Theta(ti) = inner_arg.as_ref() {
-                                return Some((*ei, *ti, true));
-                            }
-                        }
-                    }
-                    None
-                };
-                return try_logit_theta_eta(lhs, rhs).or_else(|| try_logit_theta_eta(rhs, lhs));
+                return logit_mu_sum_either(lhs, rhs);
             }
+            None
         }
+        // `1 / (1 + exp(-(MU + ETA)))` — inv_logit written out by hand.
+        Expression::BinOp(num, BinOp::Div, den) if is_literal_one(num) => {
+            let Expression::BinOp(l, BinOp::Add, r) = den.as_ref() else {
+                return None;
+            };
+            for (one, other) in [(l, r), (r, l)] {
+                if !is_literal_one(one) {
+                    continue;
+                }
+                if let Expression::UnaryFn(fn_name, arg) = other.as_ref() {
+                    if fn_name == "exp" {
+                        return negated_logit_mu_sum(arg);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
     }
-    None
 }
 
 /// Per-theta Delattre class for the mixed BIC (#1177): `true` when theta `i`

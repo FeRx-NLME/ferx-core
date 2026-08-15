@@ -2293,7 +2293,7 @@ mod tests {
                 "ETA_CL".to_string(),
                 crate::types::MuRef {
                     theta_name: "TVCL".to_string(),
-                    log_transformed: true,
+                    transform: MuTransform::Log,
                 },
             );
             m
@@ -3651,7 +3651,7 @@ mod tests {
                 "ETA_CL".to_string(),
                 crate::types::MuRef {
                     theta_name: "TVCL".to_string(),
-                    log_transformed: true,
+                    transform: MuTransform::Log,
                 },
             );
             m

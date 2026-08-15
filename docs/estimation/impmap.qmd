@@ -115,13 +115,15 @@ normal`), this final marginal eval substitutes a finite-`t` proposal to keep the
 importance weights bounded. Use that field, not `ofv`, to compare against
 NONMEM's reported IMPMAP objective.
 
-> **Mu-referencing is required.** The closed-form `log θ += mean(η)` shift is the
-> EM-correct typical-value update for log-normal random effects, so it is always
-> applied for log-mu-referenced parameters (`CL = TVCL * exp(ETA_CL)`),
-> independent of the `mu_referencing` fit option — that option only governs
+> **Mu-referencing is required.** The closed-form `packed θ += mean(η)` shift is the
+> EM-correct typical-value update for a mu-referenced random effect, so it is always
+> applied for eligible parameters — log-mu-referenced (`CL = TVCL * exp(ETA_CL)`) and,
+> since [#918](https://github.com/FeRx-NLME/ferx-core/issues/918), logit-mu-referenced
+> with the theta declared on the logit scale (`F = inv_logit(LOGIT_F + ETA_F)`) —
+> independent of the `mu_referencing` fit option, which only governs
 > inner-loop centering. Like NONMEM's EM methods, IMPMAP needs a mu-referenced
 > parameterization: a model with random effects whose typical values are *not*
-> log-mu-referenced emits a warning and may estimate those typical values poorly
+> eligible emits a warning and may estimate those typical values poorly
 > (θ and the η mean are confounded over the importance samples). Use FOCEI for
 > such models.
 

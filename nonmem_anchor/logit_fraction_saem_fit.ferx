@@ -1,0 +1,54 @@
+# Logit-normal pathway fraction, SAEM — ferx side of the #918 NONMEM anchor.
+#
+# Parallel dual first-order absorption (fast KA1 / slow KA2) into a 1-cpt
+# central compartment, split by a dose fraction FR1 that carries IIV on the
+# logit scale. `FR1 = 1/(1+exp(-(LOGIT_FR1 + ETA_FR1)))` is auto-detected as a
+# logit-normal mu-reference (#918), so SAEM updates LOGIT_FR1 with the
+# closed-form `theta += gamma * mean(eta)` EM step instead of the numeric
+# M-step. The matching NONMEM control is logit_fraction_saem.ctl, which writes
+# the same relationship out as `MU_3 = THETA(3)`.
+#
+# Data: data/logit_fraction_oral.csv (obs re-keyed to CMT 1 for this
+# single-state model); simulated from this model by
+# nonmem_anchor/simulate_logit_fraction_data.py.
+#
+# Truths: CL=5, V=50, FR1=0.6 (logit 0.405465), KA1=2.0, KA2=0.2,
+#         omega^2 = 0.09 (CL), 0.09 (V), 0.25 (logit FR1), sigma (SD) = 0.08.
+# Starts deliberately away from truth (FR1 at 0.4, i.e. LOGIT_FR1 = -0.405465,
+# the mirror image of the truth) so the estimator has to move it.
+
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta LOGIT_FR1(-0.405465, -10.0, 10.0)
+  theta TVKA1(2.0,  0.5,  24.0)
+  theta TVKA2(0.2,  0.01,  0.5)
+
+  omega ETA_CL  ~ 0.09
+  omega ETA_V   ~ 0.09
+  omega ETA_FR1 ~ 0.25
+
+  sigma PROP_ERR ~ 0.08 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  FR1 = 1.0 / (1.0 + exp(-(LOGIT_FR1 + ETA_FR1)))
+  FR2 = 1 - FR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = saem

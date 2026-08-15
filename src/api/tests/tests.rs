@@ -532,7 +532,7 @@ fn saem_non_mu_referenced_warning_lists_individual_params_with_unmapped_eta() {
         "ETA_CL".into(),
         MuRef {
             theta_name: "TVCL".into(),
-            log_transformed: true,
+            transform: MuTransform::Log,
         },
     );
 
@@ -553,14 +553,14 @@ fn saem_non_mu_referenced_warning_is_none_when_all_eta_params_are_muref() {
         "ETA_CL".into(),
         MuRef {
             theta_name: "TVCL".into(),
-            log_transformed: true,
+            transform: MuTransform::Log,
         },
     );
     model.mu_refs.insert(
         "ETA_V".into(),
         MuRef {
             theta_name: "TVV".into(),
-            log_transformed: true,
+            transform: MuTransform::Log,
         },
     );
 

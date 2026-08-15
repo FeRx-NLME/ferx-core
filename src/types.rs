@@ -3329,12 +3329,46 @@ impl std::fmt::Debug for ScalingSpec {
     }
 }
 
+/// The link function connecting an ETA's anchor theta to the individual
+/// parameter — i.e. the scale on which `η` enters additively.
+///
+/// The mu-scale is `g(θ)`: the individual parameter is `g⁻¹(g(θ) + η)`.
+/// Consumers that need the mu value itself use
+/// [`crate::estimation::parameterization::compute_mu_k`]; consumers that only
+/// care whether the parameter is lognormal use [`MuRef::log_transformed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuTransform {
+    /// `P = THETA * exp(ETA)` / `exp(log(THETA) + ETA)` — mu-scale `log(θ)`.
+    Log,
+    /// `P = THETA + ETA` — mu-scale `θ`.
+    Identity,
+    /// `P = inv_logit(THETA + ETA)` — THETA is *already* on the logit scale,
+    /// so the mu-scale is `θ` itself.
+    Logit,
+    /// `P = inv_logit(logit(THETA) + ETA)` — THETA is on the probability
+    /// scale `(0,1)` and the mu-scale is `logit(θ)`.
+    LogitProbability,
+}
+
 /// Associates an ETA with its mu-referencing anchor theta.
 #[derive(Debug, Clone)]
 pub struct MuRef {
     pub theta_name: String,
-    /// true for patterns THETA*exp(ETA) or exp(log(THETA)+ETA); false for THETA+ETA
-    pub log_transformed: bool,
+    /// Which link function relates `theta_name` to the individual parameter.
+    pub transform: MuTransform,
+}
+
+impl MuRef {
+    /// True when the individual parameter is lognormal in this ETA — patterns
+    /// `THETA*exp(ETA)` and `exp(log(THETA)+ETA)`. False for the additive and
+    /// both logit forms.
+    ///
+    /// This is the historical `log_transformed` flag; consumers that reason
+    /// about the *mu scale* (rather than "is this eta lognormal?") should match
+    /// on [`MuRef::transform`] instead.
+    pub fn log_transformed(&self) -> bool {
+        matches!(self.transform, MuTransform::Log)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3921,7 +3955,7 @@ pub struct CompiledModel {
     /// must call `expand_prior_from_fit` itself; an unexpanded model is refused
     /// rather than fit unpenalized.
     pub prior_from_fit: Option<String>,
-    /// Detected mu-referencing relationships: eta_name → (theta_name, log_transformed).
+    /// Detected mu-referencing relationships: eta_name → (theta_name, transform).
     /// Populated by the parser; empty map means no mu-referencing detected.
     pub mu_refs: HashMap<String, MuRef>,
     /// Same as `mu_refs` but for IOV kappa parameters (kappa_name → MuRef).

@@ -27,14 +27,22 @@ CL = TVCL * exp(ETA_CL)              # multiplicative exp — most common
 CL = exp(log(TVCL) + ETA_CL)         # canonical MU form
 CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)   # with covariate adjustment
 CL = TVCL + ETA_CL                   # additive eta (linear shift)
+F  = inv_logit(LOGIT_F + ETA_F)      # logit-normal, theta on the logit scale
+F  = inv_logit(logit(TVF) + ETA_F)   # logit-normal, theta on the (0,1) scale
+F  = 1/(1 + exp(-(LOGIT_F + ETA_F))) # the same, written out by hand
 ```
 
-The parser records `ETA_CL → (TVCL, log_transformed)` and at each outer step computes the shift
+The parser records `ETA_CL → (TVCL, transform)` and at each outer step computes the shift
 
 ```
 mu[i] = log(theta[i])   # for multiplicative/exp patterns
-mu[i] = theta[i]        # for additive patterns
+mu[i] = theta[i]        # for additive and logit-scale-theta patterns
 ```
+
+Detection also sees through a typical value defined on its own line
+(`TVCL = THETA_CL * (WT/70)^0.75` then `CL = TVCL * exp(ETA_CL)`) and through an
+explicit NONMEM-style `MU_1 = log(TVCL)` intermediate, as long as that variable
+is assigned exactly once and is not itself eta-bearing.
 
 The inner optimizer (and the SAEM exploration-phase MH proposal) is then centred on this `mu` shift rather than on `eta = 0`. This matches the convergence behaviour that NONMEM / nlmixr2 get from an explicit `MU_i = LOG(THETA(i))` block, without requiring you to write it.
 
@@ -68,7 +76,7 @@ or, from the Rust API, `FitOptions { mu_referencing: false, .. }`. The default i
 
 ### Porting from NONMEM
 
-If you have a NONMEM model that uses an explicit `MU_1 = LOG(THETA(1))` line, just drop the `MU_i` intermediate and write the individual parameter directly — ferx will detect the equivalent mu-reference automatically and the fit will be equivalent.
+If you have a NONMEM model that uses an explicit `MU_1 = LOG(THETA(1))` line, you can either drop the `MU_i` intermediate and write the individual parameter directly, or keep it as-is — ferx detects the mu-reference either way, and the fit is equivalent.
 
 ## Can I use `if` / `else` statements like in NONMEM or nlmixr2?
 

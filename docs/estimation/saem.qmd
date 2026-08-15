@@ -114,13 +114,24 @@ $$
 
 #### Closed-form EM update for mu-referenced thetas {#saem-mstep-closed-form}
 
-When `mu_referencing = true` (the default), ferx detects lognormal parameters from the `[individual_parameters]` block and applies the **closed-form EM update** for those thetas instead of running NLopt:
+When `mu_referencing = true` (the default), ferx detects mu-referenced parameters from the `[individual_parameters]` block and applies the **closed-form EM update** for those thetas instead of running NLopt:
 
 $$
-\log \theta_j \leftarrow \log \theta_j + \gamma_k \cdot \overline{\eta_j}
+g(\theta_j) \leftarrow g(\theta_j) + \gamma_k \cdot \overline{\eta_j}
 $$
 
-where $\overline{\eta_j} = (1/N) \sum_i \eta_{i,j}$ is the empirical mean of the post-MH random effects for the eta paired with $\theta_j$. For a log-mu-referenced model where $\log P_i = \log \theta + \eta_i$ with $\eta_i \sim N(0, \omega^2)$, this is exactly the M-step that maximises the complete-data log-likelihood, scaled by the SA step size $\gamma_k$. After the update the etas are re-centred by the same shift so they remain deviations from the new $\log \theta_j$.
+where $\overline{\eta_j} = (1/N) \sum_i \eta_{i,j}$ is the empirical mean of the post-MH random effects for the eta paired with $\theta_j$, and $g$ is the mu-scale link. For a mu-referenced model where $P_i = g^{-1}(g(\theta) + \eta_i)$ with $\eta_i \sim N(0, \omega^2)$, this is exactly the M-step that maximises the complete-data log-likelihood, scaled by the SA step size $\gamma_k$ — and it is *link-independent*: the same shift is the maximiser for $g = \log$, $g = \mathrm{id}$ and $g = \mathrm{logit}$ alike. After the update the etas are re-centred by the same shift so they remain deviations from the new $g(\theta_j)$.
+
+What decides eligibility is therefore not the link but whether the **packed** theta — the quantity the optimiser actually steps — *is* $g(\theta)$. ferx packs a theta as $\log \theta$ when its lower bound is non-negative and as $\theta$ otherwise, so:
+
+| Form | mu scale $g(\theta)$ | Closed-form EM update |
+|------|----------------------|------------------------|
+| `P = THETA * exp(ETA)`, `exp(log(THETA) + ETA)` | $\log \theta$ | yes (theta is log-packed) |
+| `P = inv_logit(THETA + ETA)` | $\theta$ | yes — a logit-scale theta has a negative lower bound, so it is packed as-is (#918) |
+| `P = inv_logit(logit(THETA) + ETA)` | $\mathrm{logit}\,\theta$ | no — no packing has that scale |
+| `P = THETA + ETA` | $\theta$ | no — routed to NLopt |
+
+The two excluded forms are still mu-referenced (they still centre the inner/E-step search); they just take the numeric M-step. This matters most for bounded $(0,1)$ parameters — bioavailability, pathway fractions, $E_{max}$ fractions — in models that also carry IIV on the residual error, where the numeric M-step works from noticeably noisier conditional samples: declare the theta on the logit scale (`theta LOGIT_F(-0.477, -10.0, 10.0)`) and write `F = inv_logit(LOGIT_F + ETA_F)`.
 
 NLopt still runs for any remaining thetas (non-mu-referenced); the closed-form-updated thetas are pinned at their new values for the NLopt call.
 
@@ -165,7 +176,8 @@ the closed-form EM update above and fall back to the slower NLopt M-step, which 
 strongly slow convergence. The warning fires independently of the `mu_referencing`
 fit option: turning the option off does not remove the risk — it removes the
 mu-centering that mitigates it — so the diagnostic is most warranted in exactly that
-case. Prefer log-mu-referenced forms (`P = TV * exp(ETA)`) where the model allows.
+case. Prefer log-mu-referenced forms (`P = TV * exp(ETA)`), or, for a parameter
+bounded to $(0,1)$, the logit-scale form `P = inv_logit(LOGIT_P + ETA_P)`.
 :::
 
 ::: {.callout-important}
@@ -424,6 +436,29 @@ read from the `.phi` file — `PHI(k) − log θ_k` is the η conditional mean,
 (ferx `conddist_nsamp = 2000`. Comparison scripts:
 `tests/reference/saem_conddist/bench_saemix_conddist.R`,
 `tests/reference/saem_conddist/parse_nm_conddist.R`.)
+
+### Validation of the logit closed-form M-step (#918)
+
+Parallel dual first-order absorption (fast `KA1` / slow `KA2`) with the pathway
+fraction carrying logit-scale IIV — `FR1 = 1/(1 + exp(-(LOGIT_FR1 + ETA_FR1)))`.
+60 subjects × 16 samples, simulated from the model itself
+(`nonmem_anchor/simulate_logit_fraction_data.py`); the NONMEM side writes the
+same relationship with explicit mu syntax (`MU_3 = THETA(3)`,
+`nonmem_anchor/logit_fraction_saem.ctl`, `METHOD=SAEM`). Both start at
+`FR1 = 0.4`, the mirror image of the truth.
+
+| Quantity | truth | ferx SAEM (before #918) | ferx SAEM | NONMEM SAEM |
+|---|---:|---:|---:|---:|
+| `LOGIT_FR1` | 0.4055 | 0.2462 | 0.3793 | NONMEM_LOGIT_FR1_PLACEHOLDER |
+| `FR1` = `inv_logit(LOGIT_FR1)` | 0.600 | 0.561 | 0.594 | NONMEM_FR1_PLACEHOLDER |
+| `ω²(ETA_FR1)` (logit scale) | 0.25 | 0.326 | 0.186 | NONMEM_OMEGA_PLACEHOLDER |
+| `CL` | 5.0 | 5.35 | 5.31 | NONMEM_CL_PLACEHOLDER |
+| `V` | 50.0 | 51.4 | 54.6 | NONMEM_V_PLACEHOLDER |
+
+Before the fix the fraction's typical value went through the numeric M-step and
+stalled short of the truth, with `ω²(ETA_FR1)` inflating to absorb the bias — the
+same θ / η-mean confounding the closed-form step exists to remove. The
+slow-gated `tests/saem_logit_mu_ref.rs` pins the comparison.
 
 ## Inter-Occasion Variability (IOV)
 

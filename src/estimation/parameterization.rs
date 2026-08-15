@@ -1,4 +1,6 @@
-use crate::types::{CompiledModel, ModelParameters, OmegaMatrix, ResidualCorrelation, SigmaVector};
+use crate::types::{
+    CompiledModel, ModelParameters, MuTransform, OmegaMatrix, ResidualCorrelation, SigmaVector,
+};
 use nalgebra::DMatrix;
 
 /// Bounds for the packed parameter vector
@@ -1278,9 +1280,11 @@ pub fn get_eta_init(n_eta: usize, warm_start: Option<&[f64]>, mu_refs: Option<&[
 
 /// Compute the mu_k shift vector from current theta for mu-referenced ETAs.
 ///
-/// For each ETA that has a detected mu-reference, `mu[i]` = log(theta) or theta
-/// depending on whether the relationship is log-transformed.  ETAs without a
-/// mu-reference get `mu[i]` = 0 (no shift), preserving the standard behaviour.
+/// For each ETA that has a detected mu-reference, `mu[i] = g(theta)` — the scale
+/// on which that ETA enters additively (`P_i = g⁻¹(g(θ) + η_i)`): `log(θ)` for
+/// the lognormal forms, `θ` for the additive and logit-scale-theta forms, and
+/// `logit(θ)` when the theta is declared on the probability scale. ETAs without
+/// a mu-reference get `mu[i] = 0` (no shift), preserving the standard behaviour.
 /// When `enabled` is false, returns a zero vector (disables mu-referencing).
 pub fn compute_mu_k(model: &CompiledModel, theta: &[f64], enabled: bool) -> Vec<f64> {
     if !enabled {
@@ -1295,10 +1299,16 @@ pub fn compute_mu_k(model: &CompiledModel, theta: &[f64], enabled: bool) -> Vec<
                 .position(|n| n == &mu_ref.theta_name)
             {
                 let theta_val = theta[theta_idx];
-                mu[eta_idx] = if mu_ref.log_transformed {
-                    theta_val.max(1e-10).ln()
-                } else {
-                    theta_val
+                mu[eta_idx] = match mu_ref.transform {
+                    MuTransform::Log => theta_val.max(1e-10).ln(),
+                    MuTransform::Identity | MuTransform::Logit => theta_val,
+                    // θ is on the (0,1) probability scale here; the mu scale is
+                    // its logit. Clamped away from the open interval's ends so a
+                    // theta pinned at a 0/1 bound cannot produce ±inf.
+                    MuTransform::LogitProbability => {
+                        let p = theta_val.clamp(1e-10, 1.0 - 1e-10);
+                        (p / (1.0 - p)).ln()
+                    }
                 };
             }
         }
@@ -2634,7 +2644,11 @@ mod tests {
                 eta.to_string(),
                 MuRef {
                     theta_name: theta.to_string(),
-                    log_transformed: log_t,
+                    transform: if log_t {
+                        crate::types::MuTransform::Log
+                    } else {
+                        crate::types::MuTransform::Identity
+                    },
                 },
             );
         }
@@ -2779,6 +2793,48 @@ mod tests {
         assert_relative_eq!(mu[0], 1e-10_f64.ln(), epsilon = 1e-6);
     }
 
+    /// #918: `P = inv_logit(THETA + ETA)` puts THETA on the logit scale, which
+    /// *is* the mu scale — the shift is theta itself, not its log.
+    #[test]
+    fn test_compute_mu_k_logit_scale_theta_uses_theta_directly() {
+        let mut model = make_model_with_mu_refs(vec![]);
+        model.mu_refs.insert(
+            "ETA_CL".into(),
+            MuRef {
+                theta_name: "TVCL".into(),
+                transform: crate::types::MuTransform::Logit,
+            },
+        );
+        let mu = compute_mu_k(&model, &[-0.405_465, 10.0, 1.5], true);
+        assert_relative_eq!(mu[0], -0.405_465, epsilon = 1e-12);
+    }
+
+    /// #918: `P = inv_logit(logit(THETA) + ETA)` puts THETA on the (0,1)
+    /// probability scale, so the mu is its logit — and a theta pinned at a
+    /// degenerate bound must not produce ±inf.
+    #[test]
+    fn test_compute_mu_k_probability_scale_theta_uses_logit() {
+        let mut model = make_model_with_mu_refs(vec![]);
+        model.mu_refs.insert(
+            "ETA_CL".into(),
+            MuRef {
+                theta_name: "TVCL".into(),
+                transform: crate::types::MuTransform::LogitProbability,
+            },
+        );
+        let mu = compute_mu_k(&model, &[0.6, 10.0, 1.5], true);
+        assert_relative_eq!(mu[0], (0.6_f64 / 0.4_f64).ln(), epsilon = 1e-12);
+
+        for degenerate in [0.0, 1.0] {
+            let mu = compute_mu_k(&model, &[degenerate, 10.0, 1.5], true);
+            assert!(
+                mu[0].is_finite(),
+                "logit({degenerate}) must be clamped, got {}",
+                mu[0]
+            );
+        }
+    }
+
     #[test]
     fn test_compute_mu_k_unknown_theta_name_is_ignored() {
         // If the recorded theta_name doesn't exist in theta_names
@@ -2788,7 +2844,7 @@ mod tests {
             "ETA_CL".into(),
             MuRef {
                 theta_name: "NON_EXISTENT".into(),
-                log_transformed: true,
+                transform: crate::types::MuTransform::Log,
             },
         );
         let mu = compute_mu_k(&model, &[0.2, 10.0, 1.5], true);

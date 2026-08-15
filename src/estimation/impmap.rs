@@ -39,8 +39,8 @@ use crate::estimation::inner_optimizer::{find_ebe, EbeResult, InnerLoopStats};
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs_log};
 use crate::estimation::saem::{
-    floor_omega_diagonal, get_mixture_mu_ref_pairs, get_mu_ref_pairs, mixture_mu_ref_means,
-    MixtureMuRefPair,
+    classify_mu_ref_pairs, floor_omega_diagonal, get_mixture_mu_ref_pairs, mixture_mu_ref_means,
+    MixtureMuRefPair, MuRefPairs,
 };
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::obs_nll_subject_into;
@@ -649,13 +649,14 @@ fn run_mcem(
         }
     }
 
-    // Closed-form mu-referencing M-step: shift `log(θ) += mean(η)` for log-mu-ref
-    // pairs, with those θ pinned out of the NLopt weighted M-step (which then fits
+    // Closed-form mu-referencing M-step: shift `packed θ += mean(η)` for eligible
+    // mu-ref pairs (log-packed lognormal, identity-packed logit — #918), with those
+    // θ pinned out of the NLopt weighted M-step (which then fits
     // only σ and non-mu-ref θ). This is the EM-correct typical-value update for
-    // log-normal random effects, NOT an optional refinement: without it θ and the
+    // mu-referenced random effects, NOT an optional refinement: without it θ and the
     // η mean are confounded over the fixed importance samples, so θ stays at its
     // start and Ω inflates to absorb the misfit. It is therefore applied whenever
-    // log-mu-ref pairs exist, independent of `options.mu_referencing` (which only
+    // eligible pairs exist, independent of `options.mu_referencing` (which only
     // governs inner-loop `compute_mu_k` centering, a separate concern). NONMEM's
     // EM methods likewise require mu-referencing.
     let mut warnings: Vec<String> = Vec::new();
@@ -678,7 +679,15 @@ fn run_mcem(
         ));
     }
 
-    let mut mu_ref_pairs = get_mu_ref_pairs(model);
+    // Same eligibility rule as SAEM: a pair qualifies when the packed theta *is*
+    // the mu (log-packed lognormal, identity-packed logit — see
+    // `classify_mu_ref_pairs`), which is exactly what the `log_theta[t] +=
+    // eta_bar[e]` shift below assumes.
+    let MuRefPairs {
+        eligible: mu_ref_pairs,
+        identity_packed_log,
+        log_packed_logit,
+    } = classify_mu_ref_pairs(model, &init_params.theta_lower);
     let theta_name_list = |idx: &[usize]| -> String {
         let mut n: Vec<&str> = idx
             .iter()
@@ -688,29 +697,34 @@ fn run_mcem(
         n.dedup();
         n.join(", ")
     };
-    // A θ declared with a negative lower bound is packed on the identity scale,
-    // so `log_theta[t]` holds the raw value and the additive `+= mean(η)` shift
-    // is not its EM optimum (it would apply `θ += mean(η)` where the closed form
-    // means `θ *= exp(mean(η))`). Route those to the weighted M-step, the same
-    // guard the mixture path applies (#996 review).
-    let identity_packed_mu_ref: Vec<usize> = mu_ref_pairs
-        .iter()
-        .map(|&(t, _e)| t)
-        .filter(|&t| !theta_packs_log_mask[t])
-        .collect();
-    if !identity_packed_mu_ref.is_empty() {
-        mu_ref_pairs.retain(|&(t, _e)| theta_packs_log_mask[t]);
+    // A lognormal θ declared with a negative lower bound is packed on the
+    // identity scale, so `log_theta[t]` holds the raw value and the additive
+    // `+= mean(η)` shift is not its EM optimum (it would apply `θ += mean(η)`
+    // where the closed form means `θ *= exp(mean(η))`). Route those to the
+    // weighted M-step, the same guard the mixture path applies (#996 review).
+    if !identity_packed_log.is_empty() {
         warnings.push(format!(
             "{label}: typical value(s) {} are log-mu-referenced but declared with a negative \
              lower bound, so they are packed on the identity scale; the closed-form mu-ref \
              shift does not apply and they are estimated by the importance-weighted M-step \
              instead (#996).",
-            theta_name_list(&identity_packed_mu_ref)
+            theta_name_list(&identity_packed_log)
         ));
     }
-    let mu_ref_pairs = mu_ref_pairs;
-    // A log-mu-referenced typical value is updated only through the closed-form
-    // `log θ += mean(η)` shift. When its paired η carries negligible IIV (a tiny,
+    // Mirror image for a logit-scale theta (#918): `inv_logit(THETA + ETA)` has
+    // mu scale θ, but a non-negative lower bound makes it log-packed.
+    if !log_packed_logit.is_empty() {
+        warnings.push(format!(
+            "{label}: typical value(s) {} are logit-mu-referenced but declared with a \
+             non-negative lower bound, so they are packed on the log scale; the closed-form \
+             mu-ref shift does not apply and they are estimated by the importance-weighted \
+             M-step instead. Declare the logit-scale theta with a negative lower bound to use \
+             the closed-form update (#918).",
+            theta_name_list(&log_packed_logit)
+        ));
+    }
+    // A closed-form-eligible typical value is updated only through the
+    // `packed θ += mean(η)` shift. When its paired η carries negligible IIV (a tiny,
     // often `FIX`ed ω — e.g. a structural parameter given a dummy random effect
     // so it can be mu-referenced), that population mean is ≈ 0 and the typical
     // value would be frozen at its initial value (#411). Route those pairs to the
@@ -726,7 +740,7 @@ fn run_mcem(
     if !weak_mu_ref.is_empty() {
         let weak_list: Vec<usize> = weak_mu_ref.iter().copied().collect();
         warnings.push(format!(
-            "{label}: typical value(s) {} are log-mu-referenced but their random effect has \
+            "{label}: typical value(s) {} are mu-referenced but their random effect has \
              negligible variance (ω < {WEAK_IIV_VAR:.0e}); the mu-ref mean-shift carries no \
              information, so they are estimated through the weighted M-step instead.",
             theta_name_list(&weak_list)
@@ -737,13 +751,14 @@ fn run_mcem(
         .iter()
         .any(|&(t, _e)| !weak_mu_ref.contains(&t));
     if !use_closed_form {
-        // No log-mu-ref parameter: every typical value goes through the weighted
-        // M-step, which cannot resolve the θ/η-mean confounding on its own. Flag
-        // it — estimates may be unreliable (see the docs caveat).
+        // No closed-form-eligible parameter: every typical value goes through the
+        // weighted M-step, which cannot resolve the θ/η-mean confounding on its own.
+        // Flag it — estimates may be unreliable (see the docs caveat).
         warnings.push(format!(
-            "{label}: no log-mu-referenced parameters found (e.g. `CL = TVCL*exp(ETA)`); \
-             typical-value estimation relies on the weighted M-step alone and may converge \
-             poorly. Prefer a log-mu-referenced parameterization, or use FOCEI."
+            "{label}: no closed-form mu-referenced parameters found (e.g. \
+             `CL = TVCL*exp(ETA)`, or `F = inv_logit(LOGIT_F + ETA)` with LOGIT_F declared \
+             on the logit scale); typical-value estimation relies on the weighted M-step \
+             alone and may converge poorly. Prefer such a parameterization, or use FOCEI."
         ));
     }
 
@@ -1146,7 +1161,7 @@ fn run_mcem(
         log_theta = new_log_theta;
         log_sigma = new_log_sigma;
 
-        // ---- Closed-form mu-ref θ shift: log(θ) += population mean(η) ----
+        // ---- Closed-form mu-ref θ shift: packed θ (= mu) += population mean(η) ----
         if use_closed_form {
             let mut eta_bar = vec![0.0f64; n_eta];
             for d in &draws {

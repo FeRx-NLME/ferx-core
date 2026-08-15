@@ -2387,7 +2387,7 @@ fn fit_inner(
             model
                 .mu_refs
                 .get(name)
-                .map(|r| r.log_transformed)
+                .map(|r| r.log_transformed())
                 .unwrap_or(false)
         })
         .collect();
@@ -2408,7 +2408,7 @@ fn fit_inner(
                 model
                     .kappa_mu_refs
                     .get(name)
-                    .map(|r| r.log_transformed)
+                    .map(|r| r.log_transformed())
                     .unwrap_or(false)
             })
             .collect();

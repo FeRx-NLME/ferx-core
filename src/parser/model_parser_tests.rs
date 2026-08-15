@@ -5338,7 +5338,7 @@ fn test_detect_mu_ref_multiplicative_exp() {
     let m = detect_one("CL = TVCL * exp(ETA_CL)", &["TVCL"], &["ETA_CL"])
         .expect("should detect mu-ref");
     assert_eq!(m.theta_name, "TVCL");
-    assert!(m.log_transformed);
+    assert!(m.log_transformed());
 }
 
 #[test]
@@ -5347,7 +5347,7 @@ fn test_detect_mu_ref_exp_of_log_sum() {
     let m = detect_one("CL = exp(log(TVCL) + ETA_CL)", &["TVCL"], &["ETA_CL"])
         .expect("should detect mu-ref");
     assert_eq!(m.theta_name, "TVCL");
-    assert!(m.log_transformed);
+    assert!(m.log_transformed());
 }
 
 #[test]
@@ -5356,7 +5356,7 @@ fn test_detect_mu_ref_exp_of_log_sum_reversed() {
     let m = detect_one("CL = exp(ETA_CL + log(TVCL))", &["TVCL"], &["ETA_CL"])
         .expect("should detect mu-ref");
     assert_eq!(m.theta_name, "TVCL");
-    assert!(m.log_transformed);
+    assert!(m.log_transformed());
 }
 
 #[test]
@@ -5364,7 +5364,7 @@ fn test_detect_mu_ref_additive() {
     // Additive eta: CL = TVCL + ETA_CL → mu = TVCL (not log-transformed)
     let m = detect_one("CL = TVCL + ETA_CL", &["TVCL"], &["ETA_CL"]).expect("should detect mu-ref");
     assert_eq!(m.theta_name, "TVCL");
-    assert!(!m.log_transformed);
+    assert!(!m.log_transformed());
 }
 
 #[test]
@@ -5372,7 +5372,7 @@ fn test_detect_mu_ref_additive_reversed() {
     // ETA first: CL = ETA_CL + TVCL
     let m = detect_one("CL = ETA_CL + TVCL", &["TVCL"], &["ETA_CL"]).expect("should detect mu-ref");
     assert_eq!(m.theta_name, "TVCL");
-    assert!(!m.log_transformed);
+    assert!(!m.log_transformed());
 }
 
 #[test]
@@ -5389,7 +5389,7 @@ fn test_detect_mu_ref_product_chain_with_covariate() {
     )
     .expect("should still detect mu-ref through opaque covariate term");
     assert_eq!(m.theta_name, "TVCL");
-    assert!(m.log_transformed);
+    assert!(m.log_transformed());
 }
 
 #[test]
@@ -5422,7 +5422,7 @@ fn test_detect_mu_ref_rejects_compound_eta_expression() {
     );
     let m = m.expect("IIV+IOV combined pattern should detect mu-ref for ETA_CL");
     assert_eq!(m.theta_name, "TVCL");
-    assert!(m.log_transformed);
+    assert!(m.log_transformed());
 }
 
 #[test]
@@ -5449,7 +5449,7 @@ fn test_detect_mu_ref_multiple_parameters() {
     assert_eq!(refs["ETA_CL"].theta_name, "TVCL");
     assert_eq!(refs["ETA_V"].theta_name, "TVV");
     assert_eq!(refs["ETA_KA"].theta_name, "TVKA");
-    assert!(refs.values().all(|m| m.log_transformed));
+    assert!(refs.values().all(|m| m.log_transformed()));
 }
 
 #[test]
@@ -5479,7 +5479,199 @@ fn test_detect_mu_ref_full_model_parse() {
     assert_eq!(parsed.model.mu_refs.len(), 2);
     let cl = parsed.model.mu_refs.get("ETA_CL").unwrap();
     assert_eq!(cl.theta_name, "TVCL");
-    assert!(cl.log_transformed);
+    assert!(cl.log_transformed());
+}
+
+// ── #918: logit-normal mu-referencing ────────────────────────────────
+
+#[test]
+fn test_detect_mu_ref_inv_logit_theta_plus_eta() {
+    // Bounded (0,1) parameter with THETA declared on the logit scale.
+    let m = detect_one("F = inv_logit(LOGIT_F + ETA_F)", &["LOGIT_F"], &["ETA_F"])
+        .expect("inv_logit(THETA + ETA) should be a mu-ref");
+    assert_eq!(m.theta_name, "LOGIT_F");
+    assert_eq!(m.transform, MuTransform::Logit);
+    assert!(!m.log_transformed());
+}
+
+#[test]
+fn test_detect_mu_ref_inv_logit_reversed_and_expit_alias() {
+    for line in [
+        "F = inv_logit(ETA_F + LOGIT_F)",
+        "F = expit(LOGIT_F + ETA_F)",
+    ] {
+        let m = detect_one(line, &["LOGIT_F"], &["ETA_F"]).unwrap_or_else(|| panic!("{line}"));
+        assert_eq!(m.theta_name, "LOGIT_F");
+        assert_eq!(m.transform, MuTransform::Logit, "{line}");
+    }
+}
+
+#[test]
+fn test_detect_mu_ref_inv_logit_probability_scale() {
+    // THETA on the probability scale: mu is logit(THETA), a distinct transform.
+    let m = detect_one("F = inv_logit(logit(TVF) + ETA_F)", &["TVF"], &["ETA_F"])
+        .expect("inv_logit(logit(THETA) + ETA) should be a mu-ref");
+    assert_eq!(m.theta_name, "TVF");
+    assert_eq!(m.transform, MuTransform::LogitProbability);
+}
+
+#[test]
+fn test_detect_mu_ref_hand_written_inv_logit() {
+    // The exact form from issue #918: inv_logit written out algebraically.
+    for line in [
+        "FRD1 = 1.0 / (1.0 + exp(-(LOGIT_FRD1 + ETA_FRD1)))",
+        "FRD1 = 1 / (1 + exp(-LOGIT_FRD1 - ETA_FRD1))",
+        "FRD1 = 1.0 / (exp(-(LOGIT_FRD1 + ETA_FRD1)) + 1.0)",
+    ] {
+        let m = detect_one(line, &["LOGIT_FRD1"], &["ETA_FRD1"])
+            .unwrap_or_else(|| panic!("should detect mu-ref in `{line}`"));
+        assert_eq!(m.theta_name, "LOGIT_FRD1", "{line}");
+        assert_eq!(m.transform, MuTransform::Logit, "{line}");
+    }
+}
+
+#[test]
+fn test_detect_mu_ref_hand_written_inv_logit_probability_scale() {
+    let m = detect_one(
+        "F = 1.0 / (1.0 + exp(-(logit(TVF) + ETA_F)))",
+        &["TVF"],
+        &["ETA_F"],
+    )
+    .expect("hand-written inv_logit of a probability-scale theta");
+    assert_eq!(m.theta_name, "TVF");
+    assert_eq!(m.transform, MuTransform::LogitProbability);
+}
+
+#[test]
+fn test_detect_mu_ref_rejects_near_logit_forms() {
+    // Numerator that isn't 1, and a sign that isn't a plain negation — neither
+    // is inv_logit, so neither may be reported as a logit mu-ref.
+    for line in [
+        "F = 2.0 / (1.0 + exp(-(LOGIT_F + ETA_F)))",
+        "F = 1.0 / (1.0 + exp(LOGIT_F + ETA_F))",
+        "F = 1.0 / (1.0 + exp(-(LOGIT_F - ETA_F)))",
+    ] {
+        assert!(
+            detect_one(line, &["LOGIT_F"], &["ETA_F"]).is_none(),
+            "`{line}` is not inv_logit(THETA + ETA)"
+        );
+    }
+}
+
+#[test]
+fn test_detect_mu_ref_nonmem_explicit_mu_syntax() {
+    // NONMEM-style explicit MU_ variables: the anchor theta is hidden behind a
+    // local definition, so detection has to inline it (#918).
+    let block = "MU_1 = log(TVCL)\nCL = exp(MU_1 + ETA_CL)";
+    let tn = vec!["TVCL".to_string()];
+    let en = vec!["ETA_CL".to_string()];
+    let ctx = ParseCtx::new(&tn, &en, &[]);
+    let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+    let refs = detect_mu_refs(&stmts, &tn, &en, &[]);
+    let cl = refs.get("ETA_CL").expect("MU_1 should be inlined");
+    assert_eq!(cl.theta_name, "TVCL");
+    assert_eq!(cl.transform, MuTransform::Log);
+}
+
+#[test]
+fn test_detect_mu_ref_nonmem_explicit_mu_syntax_logit() {
+    // The exact NONMEM idiom from issue #918: `MU_3 = THETA(3)` on the logit
+    // scale, then the fraction written out as inv_logit.
+    let block = "MU_3 = LOGIT_FRD1\nFRD1 = 1.0/(1.0 + exp(-(MU_3 + ETA_FRD1)))";
+    let tn = vec!["LOGIT_FRD1".to_string()];
+    let en = vec!["ETA_FRD1".to_string()];
+    let ctx = ParseCtx::new(&tn, &en, &[]);
+    let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+    let refs = detect_mu_refs(&stmts, &tn, &en, &[]);
+    let frd1 = refs.get("ETA_FRD1").expect("MU_3 should be inlined");
+    assert_eq!(frd1.theta_name, "LOGIT_FRD1");
+    assert_eq!(frd1.transform, MuTransform::Logit);
+}
+
+#[test]
+fn test_detect_mu_ref_typical_value_on_its_own_line() {
+    // Covariate model written with the typical value on a separate line.
+    let block = "TVCL = THETA_CL * (WT/70)^0.75\nCL = TVCL * exp(ETA_CL)";
+    let tn = vec!["THETA_CL".to_string()];
+    let en = vec!["ETA_CL".to_string()];
+    let ctx = ParseCtx::new(&tn, &en, &[]);
+    let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+    let refs = detect_mu_refs(&stmts, &tn, &en, &[]);
+    let cl = refs.get("ETA_CL").expect("TVCL should be inlined");
+    assert_eq!(cl.theta_name, "THETA_CL");
+    assert_eq!(cl.transform, MuTransform::Log);
+}
+
+#[test]
+fn test_detect_mu_ref_inlining_skips_conditional_definitions() {
+    // TVCL is reassigned inside an if-branch, so its value is not a single
+    // unconditional expression — inlining must not pretend otherwise.
+    let block =
+        "TVCL = THETA_CL\nif (WT > 70) {\n  TVCL = THETA_CL * 2\n}\nCL = TVCL * exp(ETA_CL)";
+    let tn = vec!["THETA_CL".to_string()];
+    let en = vec!["ETA_CL".to_string()];
+    let ctx = ParseCtx::new(&tn, &en, &[]);
+    let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+    let refs = detect_mu_refs(&stmts, &tn, &en, &[]);
+    assert!(
+        !refs.contains_key("ETA_CL"),
+        "conditionally redefined TVCL must not be inlined, got {refs:?}"
+    );
+}
+
+#[test]
+fn test_detect_mu_ref_inlining_does_not_rewrite_direct_hits() {
+    // A directly-matching expression is classified from the raw AST, so an
+    // unrelated local definition cannot change what is detected.
+    let block = "SCALE = 1000\nCL = TVCL * exp(ETA_CL)";
+    let tn = vec!["TVCL".to_string()];
+    let en = vec!["ETA_CL".to_string()];
+    let ctx = ParseCtx::new(&tn, &en, &[]);
+    let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+    let refs = detect_mu_refs(&stmts, &tn, &en, &[]);
+    assert_eq!(refs["ETA_CL"].theta_name, "TVCL");
+    assert_eq!(refs["ETA_CL"].transform, MuTransform::Log);
+}
+
+#[test]
+fn test_logit_mu_ref_full_model_parse_and_no_warning() {
+    // End-to-end: a bounded (0,1) bioavailability is mu-referenced, so the SAEM
+    // "not mu-referenced" warning must not name it (#918).
+    let content = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta LOGIT_F(-0.477, -10.0, 10.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_F  ~ 0.01
+
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = 1.0 / (1.0 + exp(-(LOGIT_F + ETA_F)))
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=1.0, f=F)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let parsed = parse_full_model(content).expect("model should parse");
+    let f_ref = parsed
+        .model
+        .mu_refs
+        .get("ETA_F")
+        .expect("ETA_F should be mu-referenced");
+    assert_eq!(f_ref.theta_name, "LOGIT_F");
+    assert_eq!(f_ref.transform, MuTransform::Logit);
+    let warning = crate::api::saem_non_mu_referenced_individual_params_warning(&parsed.model);
+    assert!(
+        warning.is_none(),
+        "no parameter should be flagged as non-mu-referenced, got {warning:?}"
+    );
 }
 
 #[test]
@@ -8980,7 +9172,7 @@ fn test_classify_iov_combined() {
     // mu_ref must be detected so SAEM can initialise ETA_CL at ln(TVCL).
     let mu = model.mu_refs.get("ETA_CL").expect("mu_ref for ETA_CL");
     assert_eq!(mu.theta_name, "TVCL");
-    assert!(mu.log_transformed);
+    assert!(mu.log_transformed());
 }
 
 /// `KTR = 4.0 / TVMTT; KA = KTR * exp(ETA_KA)` — the base is a derived
@@ -11837,12 +12029,12 @@ fn test_detect_mu_refs_recognises_nn_anchored_lognormal() {
         .expect("ETA_CL must be detected as mu-referenced");
     assert_eq!(cl_ref.theta_name, "TYPICAL_PK.CL");
     assert!(
-        cl_ref.log_transformed,
+        cl_ref.log_transformed(),
         "TYPICAL_PK.CL * exp(ETA_CL) is lognormal"
     );
     let v_ref = model.mu_refs.get("ETA_V").expect("ETA_V mu-referenced");
     assert_eq!(v_ref.theta_name, "TYPICAL_PK.V");
-    assert!(v_ref.log_transformed);
+    assert!(v_ref.log_transformed());
 }
 
 /// Fix 1 follow-on: `eta_param_info` still classifies NN-anchored
@@ -19207,7 +19399,7 @@ fn test_weighted_kappa_preserves_the_bsv_mu_reference() {
         .get("ETA_CL")
         .expect("BSV mu-ref survives the kappa rewrite");
     assert_eq!(weighted_ref.theta_name, plain_ref.theta_name);
-    assert_eq!(weighted_ref.log_transformed, plain_ref.log_transformed);
+    assert_eq!(weighted_ref.log_transformed(), plain_ref.log_transformed());
 }
 
 #[test]
@@ -19445,7 +19637,7 @@ fn test_weighted_kappa_left_of_the_bsv_eta_keeps_the_bsv_mu_reference() {
         .get("ETA_CL")
         .expect("BSV mu-ref survives a kappa written to its left");
     assert_eq!(mu.theta_name, "TVCL");
-    assert!(mu.log_transformed);
+    assert!(mu.log_transformed());
 }
 
 #[test]
