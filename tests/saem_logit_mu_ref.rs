@@ -121,8 +121,8 @@ const TRUE_FR1: f64 = 0.6;
 /// `nonmem_anchor/results/logit_fraction_saem.ext` (the last `-1000000000` row of
 /// the SAEM table). `THETA(3)` is the logit-scale typical fraction and
 /// `OMEGA(3,3)` its logit-scale IIV variance.
-const NONMEM_SAEM_LOGIT_FR1: f64 = f64::NAN;
-const NONMEM_SAEM_OMEGA_FR1: f64 = f64::NAN;
+const NONMEM_SAEM_LOGIT_FR1: f64 = 0.421_941; // inv_logit → FR1 = 0.6039
+const NONMEM_SAEM_OMEGA_FR1: f64 = 0.182_790;
 
 fn inv_logit(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())

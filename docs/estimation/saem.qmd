@@ -449,11 +449,11 @@ same relationship with explicit mu syntax (`MU_3 = THETA(3)`,
 
 | Quantity | truth | ferx SAEM (before #918) | ferx SAEM | NONMEM SAEM |
 |---|---:|---:|---:|---:|
-| `LOGIT_FR1` | 0.4055 | 0.2462 | 0.3793 | NONMEM_LOGIT_FR1_PLACEHOLDER |
-| `FR1` = `inv_logit(LOGIT_FR1)` | 0.600 | 0.561 | 0.594 | NONMEM_FR1_PLACEHOLDER |
-| `ω²(ETA_FR1)` (logit scale) | 0.25 | 0.326 | 0.186 | NONMEM_OMEGA_PLACEHOLDER |
-| `CL` | 5.0 | 5.35 | 5.31 | NONMEM_CL_PLACEHOLDER |
-| `V` | 50.0 | 51.4 | 54.6 | NONMEM_V_PLACEHOLDER |
+| `LOGIT_FR1` | 0.4055 | 0.2462 | 0.3793 | 0.4219 |
+| `FR1` = `inv_logit(LOGIT_FR1)` | 0.600 | 0.561 | 0.594 | 0.604 |
+| `ω²(ETA_FR1)` (logit scale) | 0.25 | 0.326 | 0.186 | 0.183 |
+| `CL` | 5.0 | 5.35 | 5.31 | 5.29 |
+| `V` | 50.0 | 51.4 | 54.6 | 55.7 |
 
 Before the fix the fraction's typical value went through the numeric M-step and
 stalled short of the truth, with `ω²(ETA_FR1)` inflating to absorb the bias — the
