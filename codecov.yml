@@ -7,13 +7,17 @@
 #   project/floor        -> per-PR 90% gap shown to the author (informational)
 #   project/floor_weekly -> 90% floor ENFORCED on the weekly main run (goes red
 #                           below 90%); never evaluated on PRs, so it blocks no one
-# Slow-tests NEVER run on PRs. Per-PR uploads = `fast` (--features ci) + `survival`
-# (--features ci,survival) + `markov` (--features ci,markov); nightly upload = `slow`
-# flag (--features ci,slow-tests). carryforward lets the nightly `slow` data augment
-# the project number on PRs without re-running it. The `survival` and `markov` flags
-# exist because that feature-gated code is compiled OUT of the `fast`/`slow` FD builds
-# — Codecov merges the flags in so those lines are counted where they're actually
-# exercised (#293).
+# Slow-tests NEVER run on PRs. Per-PR uploads = `fast` (--features ci, from
+# `Tests + coverage (core)`) + `survival` AND `markov`, which are BOTH uploaded from
+# the single `Tests + coverage (TTE/CTMM endpoints)` job (--features ci,markov, and
+# `markov = ["survival"]` so that build is a strict superset of a survival-only one);
+# nightly upload = `slow` flag (--features ci,slow-tests). carryforward lets the
+# nightly `slow` data augment the project number on PRs without re-running it. The
+# `survival` and `markov` flags exist because that feature-gated code is compiled OUT
+# of the `fast`/`slow` FD builds — Codecov merges the flags in so those lines are
+# counted where they're actually exercised (#293). Both flags are kept as distinct
+# names (rather than collapsed into one) so the patch status can require each family
+# independently and so a future split of the jobs needs no config change.
 
 coverage:
   range: 85..95
@@ -70,10 +74,9 @@ coverage:
         target: 90% # new/changed lines must be tested
         threshold: 0%
         # Patch is a pull-request concept — grade changed lines only on PRs.
-        # On a push to `main` the `fast` flag is absent (its job is PR-only), so
-        # patch falls back to `survival` alone and mis-grades the merge commit's
-        # diff against a stale base: a false red on `main` that blocks nothing.
-        # `only_pulls` confines the status to PR comparisons. (#300)
+        # It previously mis-graded merge commits on `main` (a false red that
+        # blocks nothing); `only_pulls` confines the status to PR comparisons.
+        # (#300)
         only_pulls: true
         # `fast`, `survival`, and `markov` are the FRESH per-PR coverage sources,
         # so they grade the changed lines. `survival` and `markov` are each
@@ -95,13 +98,13 @@ flag_management:
     - name: slow
       carryforward: true
     - name: survival
-      # The `survival` job runs on PRs, main pushes, AND the weekly schedule, so it
-      # normally uploads fresh. carryforward is a safety net: the flag still
-      # contributes on any run where that job didn't upload (fresh data overrides).
+      # `Tests + coverage (TTE/CTMM endpoints)` runs on PRs, main pushes, AND the
+      # weekly schedule, so this flag normally uploads fresh. carryforward is a
+      # safety net: it still contributes on any run where that job didn't upload
+      # (fresh data overrides).
       carryforward: true
     - name: markov
-      # Same as survival: the `markov` job runs on PRs and main pushes and normally
-      # uploads fresh; carryforward is the safety net for any run where it didn't.
+      # Same job, same upload, same rationale as `survival` above.
       carryforward: true
 
 comment:

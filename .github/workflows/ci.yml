@@ -35,65 +35,39 @@ jobs:
         run: cargo check --tests --no-default-features --features ci
 
       # `tests/tte_convergence.rs` is gated on BOTH `survival` and `slow-tests`, and
-      # no other per-PR job sets both (check/test/coverage-pr use `ci`; the survival
-      # job uses `ci,survival`) — so those Tier-3 TTE tests are compiled in *neither*.
-      # Without this step a renamed public API or changed `FitResult` field would land
-      # green and only break the nightly slow-tests run, decoupled from the offending
-      # PR. Compile-only (`cargo check`, no run — the tests themselves stay nightly per
-      # the tier rules), so it is cheap. (#441 review finding #3.)
+      # no other per-PR job sets both — so those Tier-3 TTE tests are compiled in
+      # *neither*. Without this step a renamed public API or changed `FitResult`
+      # field would land green and only break the nightly slow-tests run, decoupled
+      # from the offending PR. Compile-only (`cargo check`, no run — the tests
+      # themselves stay nightly per the tier rules), so it is cheap.
+      # (#441 review finding #3.)
       - name: cargo check (survival + slow-tests gated tests)
         run: cargo check --tests --no-default-features --features ci,survival,slow-tests
 
-      # The `markov` module (CTMM matrix-exp) is behind `#[cfg(feature = "markov")]`
-      # and compiled by neither the base `ci` check nor the survival check. A fast,
-      # uninstrumented compile-check here surfaces a break in ~1 min instead of
-      # waiting on the instrumented markov coverage job below.
+      # This step is also what COMPILE-GATES the whole feature-gated surface. The
+      # `Tests + coverage (TTE/CTMM endpoints)` job below deliberately builds only
+      # the handful of endpoint test binaries, so a break in any *other* test file
+      # under `--features ci,markov` (which implies `survival`) is caught here, in
+      # ~1 min, instead of by an 18-min instrumented build.
       - name: cargo check (markov-gated module + tests)
         run: cargo check --tests --no-default-features --features ci,markov
 
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install nightly toolchain
-        run: rustup toolchain install nightly --profile minimal
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci
-      # `--profile ci-test` keeps release-level optimisation (population-fit
-      # tests — SDE, IOV, FOCEI, GN-hybrid — run 5-10× faster than debug) but
-      # drops fat LTO, whose whole-program link dominated these jobs. Net:
-      # avoids the >80 min debug wall without paying the LTO compile tax.
-      - name: cargo test
-        run: cargo test --lib --no-default-features --features ci --profile ci-test
-
-      # The NONMEM-anchored per-(ID,OCC) CL cross-check for IOV (issue #238)
-      # lives in an integration test, which `--lib` above does not build or run.
-      # Run that one file explicitly so the agreement with NONMEM is guarded on
-      # every PR (not just nightly). It is a FIXed-MLE fit over 10 subjects — no
-      # convergence loop, sub-second — and self-contained (reference fixture
-      # committed at tests/nonmem/warfarin_iov_cl_reference.csv).
-      - name: cargo test (NONMEM IOV CL cross-check, issue #238)
-        run: cargo test --test warfarin_iov_nonmem --no-default-features --features ci --profile ci-test
-
-      # Analytical/ODE equivalence guard for the standard PK models (ferx-r
-      # #127). Like the IOV check above it is an integration test `--lib` does
-      # not run, but it is fast (just `predict()`, no `fit()`), so run it on
-      # every PR rather than only nightly — otherwise a regression in the
-      # analytical or ODE prediction path stays green until the slow-tests run.
-      - name: cargo test (analytical/ODE equivalence, ferx-r #127)
-        run: cargo test --test analytical_ode_equivalence --no-default-features --features ci --profile ci-test
-
-  survival:
-    name: Survival (TTE)
+  # Non-Gaussian endpoint families (TTE/survival + categorical + CTMM), which the
+  # default `ci` build compiles out. This ONE job replaces the former separate
+  # `Survival (TTE)` and `Markov (CTMM)` jobs: `markov = ["survival"]` in
+  # Cargo.toml, so a `--features ci,markov` build is a strict superset of a
+  # `--features ci,survival` one — the old survival job compiled and ran nothing
+  # the markov job did not, and its lcov was a subset. Both Codecov flags are
+  # therefore uploaded from this single report (codecov.yml still names `survival`
+  # and `markov` separately in its patch/project statuses).
+  endpoints:
+    name: Tests + coverage (TTE/CTMM endpoints)
     runs-on: ubuntu-latest
     # Override the global nightly: the crate has no nightly-only code, so this
-    # job (`--features ci,survival`) builds fine on stable. Stable's rustc
-    # version holds for ~6 weeks vs nightly's daily bump, so the instrumented
-    # cache (keyed on rustc version) stays warm instead of cold-rebuilding the
-    # whole dep graph under coverage RUSTFLAGS every run.
+    # job builds fine on stable. Stable's rustc version holds for ~6 weeks vs
+    # nightly's daily bump, so the instrumented cache (keyed on rustc version)
+    # stays warm instead of cold-rebuilding the whole dep graph under coverage
+    # RUSTFLAGS every run.
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
@@ -104,73 +78,58 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Instrumented build (coverage RUSTFLAGS) can't share the plain `ci`
-          # caches; own key, like the other coverage jobs (`coverage-pr` -> ci-cov).
-          shared-key: ci-cov-survival
+          # caches; own key, like the other coverage job (`coverage-pr` -> ci-cov).
+          shared-key: ci-cov-endpoints
       - name: Install cargo-llvm-cov
         # Prebuilt binary (no compile) so this job stays fast.
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
 
-      # All TTE/survival code is behind `#[cfg(feature = "survival")]`, so neither
-      # the default `ci` jobs nor the FD coverage jobs (`fast`/`slow` flags)
-      # compile it — Codecov reports those lines as missed even though they're
-      # exercised here, undercounting the true surface (#293). So this job both
-      # GATES the survival code (a break still fails it) and MEASURES it: it runs
-      # under `cargo llvm-cov` and uploads the `survival` flag, which Codecov
-      # merges with `fast`/`slow`. `tte_smoke` is Tier-2 (a handful of outer
-      # iterations), so `--tests` stays fast; `--profile ci-test` (no fat LTO)
-      # keeps it cheap. `--no-fail-fast` mirrors the other coverage jobs.
-      - name: Generate survival coverage report
-        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,survival --profile ci-test --lcov --output-path lcov.info
+      # All TTE/categorical/CTMM code is behind `#[cfg(feature = "survival")]` or
+      # `#[cfg(feature = "markov")]`, so neither the default `ci` jobs nor the
+      # `fast`/`slow` coverage jobs compile it — Codecov would report those lines
+      # as missed even though they are exercised, and a survival- or markov-only
+      # PR would fail its own patch gate at 0% (#293). This job MEASURES that
+      # surface and uploads it under both flags, which Codecov merges with
+      # `fast`/`slow` by summing hits.
+      #
+      # Explicit `--test` list instead of `--tests`: the base suite's 122
+      # integration binaries are already run — and already measured — by
+      # `Tests + coverage (core)`, so re-running them here under a second feature
+      # set bought no coverage (Codecov merges flags by summing hits) and cost
+      # ~15 min of instrumented compile.
+      #
+      # The list is EXACTLY the set of `tests/*.rs` that mention a `survival` or
+      # `markov` cfg, and `tests/ci_workflow_endpoint_coverage.rs` asserts that
+      # equality — so adding a test file that uses either feature without adding
+      # it here fails CI instead of silently reading as uncovered. The two
+      # Tier-3 files (`tte_convergence`, `categorical_convergence`) are in the
+      # list on purpose: without `slow-tests` their tests stay `#[ignore]`d, so
+      # they cost one cheap compile each and keep the invariant a plain set
+      # equality with no exemption rule to get wrong.
+      #
+      # `--lib` stays because the unit tests for `src/survival`, `src/markov` and
+      # the feature-gated branches of the shared modules live there.
+      - name: Generate TTE/CTMM endpoint coverage report
+        run: |
+          cargo llvm-cov --no-fail-fast --no-default-features --features ci,markov --profile ci-test \
+            --lib \
+            --test agq \
+            --test categorical_convergence \
+            --test categorical_smoke \
+            --test dose_compartment_routing \
+            --test markov_nonmem \
+            --test markov_smoke \
+            --test tte_convergence \
+            --test tte_smoke \
+            --lcov --output-path lcov.info
 
-      - name: Upload to Codecov (survival flag)
+      - name: Upload to Codecov (survival + markov flags)
         uses: codecov/codecov-action@v7
         with:
           files: lcov.info
-          flags: survival
-          fail_ci_if_error: true
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-  markov:
-    name: Markov (CTMM)
-    runs-on: ubuntu-latest
-    # Same rationale as the Survival job: no nightly-only code, so pin stable to
-    # keep the instrumented (coverage-RUSTFLAGS) cache warm across runs.
-    env:
-      RUSTUP_TOOLCHAIN: stable
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install stable toolchain
-        run: rustup toolchain install stable --profile minimal -c llvm-tools-preview
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Instrumented build (coverage RUSTFLAGS) needs its own key, like the
-          # other coverage jobs (survival -> ci-cov-survival, coverage-pr -> ci-cov).
-          shared-key: ci-cov-markov
-      - name: Install cargo-llvm-cov
-        # Prebuilt binary (no compile) so this job stays fast.
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov
-
-      # All CTMM code is behind `#[cfg(feature = "markov")]`, so neither the default
-      # `ci` jobs nor the `fast`/`slow` coverage jobs compile it — Codecov would
-      # report its lines as missed even though they're exercised, so a PR touching
-      # `src/markov` would fail its own patch gate at 0% (#293). Like the survival
-      # job, this both GATES the markov code (a break fails it) and MEASURES it,
-      # uploading the `markov` flag, which Codecov merges with `fast`/`slow`. The
-      # tests are pure matrix math (milliseconds), so `--tests --profile ci-test`
-      # stays cheap.
-      - name: Generate markov coverage report
-        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,markov --profile ci-test --lcov --output-path lcov.info
-
-      - name: Upload to Codecov (markov flag)
-        uses: codecov/codecov-action@v7
-        with:
-          files: lcov.info
-          flags: markov
+          flags: survival,markov
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
@@ -186,9 +145,9 @@ jobs:
         with:
           shared-key: ci
       - name: cargo clippy
-        # Include `markov` so the CTMM module is linted too (it is compiled by
-        # neither the base `ci` build nor the survival job). Survival stays out
-        # of clippy per existing precedent; markov opts in from the start.
+        # Include `markov` so the CTMM module is linted too (it is compiled out
+        # of the base `ci` build). `markov = ["survival"]`, so this lints the
+        # whole non-Gaussian endpoint surface.
         run: cargo clippy --no-default-features --features ci,markov
 
   fmt:
@@ -203,11 +162,11 @@ jobs:
         run: cargo fmt -- --check
 
   coverage:
-    name: Coverage (full)
+    name: Tests + coverage (full, slow-tests)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     # Stable, not nightly: `--features ci,slow-tests` has no nightly-only code.
-    # Keeps the instrumented `ci-slow` cache warm. See survival.
+    # Keeps the instrumented `ci-slow` cache warm. See the endpoints job.
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
@@ -246,16 +205,28 @@ jobs:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # The per-PR run of the base (`--features ci`) test suite AND the patch-coverage
+  # gate — one instrumented build serving both. It used to be paired with a
+  # separate uninstrumented `Test` job (`cargo test --lib` + two explicit
+  # `--test`s on nightly); that job was a strict subset of this one — same
+  # features, and `--tests` ⊇ `--lib` plus both of those integration files — so it
+  # was removed rather than kept paying an 11-min lib compile twice over. The
+  # nightly toolchain is still exercised per-PR by `Check`, `Clippy` and `Format`.
   coverage-pr:
-    name: Coverage (fast, patch)
+    name: Tests + coverage (core)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # PRs *and* pushes to `main`. The `push` half matters: the removed `Test` job
+    # had no `if:` and so ran on main pushes, and this is now the only job that
+    # executes the base suite — without `push` a merge commit would run no tests
+    # at all. (It also keeps the `fast` flag fresh on `main`, which
+    # `carryforward: false` in codecov.yml otherwise leaves empty there.)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     permissions:
       contents: read
       pull-requests: write # for the below-floor nudge comment
     # Stable, not nightly: `--features ci` has no nightly-only code.
     # Keeps the instrumented `ci-cov` cache warm across runs
-    # (stable rustc bumps ~6-weekly vs nightly daily). See the survival job.
+    # (stable rustc bumps ~6-weekly vs nightly daily). See the endpoints job.
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
@@ -276,11 +247,12 @@ jobs:
 
       - name: Generate fast coverage report
         # Fast tier only: `--features ci` (no `slow-tests`, no `survival`). This
-        # is the per-PR patch gate; the full `ci,slow-tests` run is nightly (the
-        # `coverage` job above). Runs in parallel with the other PR jobs and,
-        # like them, builds with `--profile ci-test` (no fat LTO), so it stays
-        # within the PR wall-clock. `--tests` so the integration tests count
-        # (same rationale as the nightly job).
+        # both RUNS the base suite and is the per-PR patch gate; the full
+        # `ci,slow-tests` run is nightly (the `coverage` job above) and the
+        # feature-gated endpoints are the `endpoints` job. Builds with
+        # `--profile ci-test` (no fat LTO) to stay within the PR wall-clock.
+        # `--tests` so the integration tests both run and count (same rationale
+        # as the nightly job).
         run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci --profile ci-test --lcov --output-path lcov.info
 
       - name: Upload to Codecov (fast flag)
@@ -296,8 +268,9 @@ jobs:
         # coverage on `main` is below the 90% floor the weekly run enforces,
         # post/update ONE sticky PR comment so the author is nudged to cover new
         # lines. Self-resolves once the backfill clears 90%. Never fails the PR
-        # (continue-on-error); skipped on forks (read-only token).
-        if: ${{ github.event.pull_request.head.repo.fork == false }}
+        # (continue-on-error); skipped on forks (read-only token) and on the
+        # `push` half of this job's trigger, where there is no PR to comment on.
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
