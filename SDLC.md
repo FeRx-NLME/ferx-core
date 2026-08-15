@@ -169,7 +169,7 @@ A GitHub Actions CI pipeline runs on every push to `main` and on pull requests (
 |-----|---------|---------|
 | **Check** | `cargo check --tests` (×3: `ci`, `ci,survival,slow-tests`, `ci,markov`) | Fast compilation verification of every feature combo, including the ones no per-PR test job builds |
 | **Tests + coverage (core)** | `cargo llvm-cov --tests --features ci` | Runs the Tier-1/2 suite and produces the per-PR patch-coverage report (`fast` flag) |
-| **Tests + coverage (TTE/CTMM endpoints)** | `cargo llvm-cov --lib --test <6 endpoint files> --features ci,markov` | Runs and measures the feature-gated TTE / categorical / CTMM code the base build compiles out (`survival` + `markov` flags) |
+| **Tests + coverage (TTE/CTMM endpoints)** | `cargo llvm-cov --lib --test <each endpoint test file> --features ci,markov` | Runs and measures the feature-gated TTE / categorical / CTMM code the base build compiles out (`survival` + `markov` flags) |
 | **Clippy** | `cargo clippy -- -D warnings` | Lint with warnings-as-errors |
 | **Format** | `cargo fmt -- --check` | Enforce consistent formatting |
 
@@ -180,7 +180,17 @@ latter a strict subset of the endpoints job. Both were removed rather than left
 re-paying an ~11 min lib compile for coverage that Codecov already merges in
 from another flag.
 
-All jobs use the stock Rust nightly toolchain pinned in `rust-toolchain.toml`.
+The endpoints job's `--test` list is not free-form: `tests/ci_workflow_endpoint_coverage.rs`
+asserts it equals exactly the set of `tests/*.rs` that mention a `survival` or
+`markov` cfg, so the file count above is deliberately left unstated — read the
+list off `ci.yml`, and add to it when you add an endpoint test.
+
+`rust-toolchain.toml` pins a stock nightly, and `Check`, `Clippy` and `Format`
+use it. The three coverage jobs deliberately override to **stable** via
+`RUSTUP_TOOLCHAIN` — the crate has no nightly-only code, and stable's rustc
+version holds for ~6 weeks against nightly's daily bump, which keeps their
+instrumented build cache (keyed on rustc version) warm instead of cold-rebuilding
+the dependency graph under coverage `RUSTFLAGS` on every run.
 
 ### Future CI additions
 

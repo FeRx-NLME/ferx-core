@@ -313,6 +313,12 @@ ferx-core builds on a **stock nightly** toolchain — no custom compiler. The ex
 FOCE/FOCEI and HMC gradients come from hand-rolled analytic `Dual2` sensitivities
 (`sens/`), and models outside the provider's scope fall back to finite differences.
 
+In fact there is no nightly-only code left, which is why the three coverage jobs
+in `ci.yml` override `RUSTUP_TOOLCHAIN` to **stable**: stable's rustc version
+holds for ~6 weeks against nightly's daily bump, keeping their instrumented build
+cache warm. `rust-toolchain.toml` still pins nightly as the default, and `Check` /
+`Clippy` / `Format` run on it.
+
 - **Keep the build toolchain-light.** Standard-Rust users (Mac / Linux / Windows)
   and CI install ferx with `cargo build` alone. Do not reintroduce a dependency on
   a custom compiler or a non-default Cargo feature for the core gradient path.
