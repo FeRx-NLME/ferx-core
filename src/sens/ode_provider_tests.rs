@@ -6831,3 +6831,282 @@ fn ode_provider_ss_absorption_nonlinear_converged_dual_matches_production() {
         "a converging nonlinear SS must be solved by Anderson (2..cap cycles), got {cycles}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #971: bucketed ODE IOV dual-width dispatch
+// ---------------------------------------------------------------------------
+
+/// 1-cpt IV with κ on CL — the cheapest fixture that can be widened to an arbitrary
+/// stacked width purely by adding occasion groups (`m_dim = n_theta + n_eta + K·n_kappa`),
+/// with no SS equilibration or absorption in the way.
+const ONECPT_IV_IOV_WIDE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 0.5, 200.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+/// A subject with `k_groups` occasions (one observation each) and a single bolus, so the
+/// stacked IOV width is `n_eta + k_groups·n_kappa` by construction.
+fn iov_wide_subject(k_groups: usize) -> Subject {
+    let times: Vec<f64> = (1..=k_groups).map(|i| i as f64).collect();
+    let mut s = bolus_subject(&times);
+    s.occasions = (1..=k_groups as u32).collect();
+    s.dose_occasions = vec![1];
+    s
+}
+
+/// Every `ObsSens` field, bit-for-bit — padding a dual with zero lanes must not perturb a
+/// single ULP of the live block (`assert_eq!` on `f64` is exact; the `to_bits` check pins
+/// `+0.0` vs `−0.0` too, which `==` would conflate).
+fn assert_subject_sens_bit_identical(a: &SubjectSens, b: &SubjectSens, what: &str) {
+    assert_eq!(
+        a.obs.len(),
+        b.obs.len(),
+        "{what}: observation count differs"
+    );
+    assert!(!a.obs.is_empty(), "{what}: no observations to compare");
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for (j, (x, y)) in a.obs.iter().zip(b.obs.iter()).enumerate() {
+        assert_eq!(
+            x.f.to_bits(),
+            y.f.to_bits(),
+            "{what}: obs {j} value differs"
+        );
+        assert_eq!(bits(&x.df_deta), bits(&y.df_deta), "{what}: obs {j} ∂f/∂η");
+        assert_eq!(
+            bits(&x.df_dtheta),
+            bits(&y.df_dtheta),
+            "{what}: obs {j} ∂f/∂θ"
+        );
+        assert_eq!(
+            bits(&x.d2f_deta2),
+            bits(&y.d2f_deta2),
+            "{what}: obs {j} ∂²f/∂η²"
+        );
+        assert_eq!(
+            bits(&x.d2f_deta_dtheta),
+            bits(&y.d2f_deta_dtheta),
+            "{what}: obs {j} ∂²f/∂η∂θ"
+        );
+    }
+    assert!(
+        a.obs.iter().any(|o| o.f.abs() > 0.0)
+            && a.obs.iter().any(|o| o.df_deta.iter().any(|g| *g != 0.0)),
+        "{what}: reference curve/gradient must be non-trivial, else the comparison is vacuous"
+    );
+}
+
+/// The bucket ladder's contract, pinned on the real const (#971): exact through 12, rounded
+/// up past it, and `None` — the FD route — outside `1..=MAX_ODE_IOV_AXES`.
+#[test]
+fn ode_iov_width_buckets_round_up_and_decline_past_the_cap() {
+    use crate::sens::widths::bucket_for;
+    let l = &ODE_IOV_WIDTH_BUCKETS;
+
+    // The ordinary IOV model is served exactly — no padding cost at all up to the width the
+    // `MAX_ODE_AXES` / `MAX_SCALE_AXES` ladders already instantiate.
+    for w in 1..=24 {
+        assert_eq!(bucket_for(w, l), Some(w), "widths 1..=24 must stay exact");
+    }
+    // Past 24 the tail rounds up. The step holds the `O(M²)` outer padding penalty near
+    // 1.5×; a 33-axis subject runs 40 lanes, not the 48 a coarser ladder would give it.
+    assert_eq!(bucket_for(25, l), Some(28));
+    assert_eq!(bucket_for(29, l), Some(32));
+    assert_eq!(bucket_for(33, l), Some(40));
+    assert_eq!(bucket_for(41, l), Some(48));
+    assert_eq!(bucket_for(49, l), Some(56));
+    assert_eq!(bucket_for(57, l), Some(64));
+    assert_eq!(bucket_for(65, l), Some(80));
+    assert_eq!(bucket_for(81, l), Some(96));
+    assert_eq!(bucket_for(MAX_ODE_IOV_AXES, l), Some(MAX_ODE_IOV_AXES));
+
+    // No round-up may cost more than ~1.5× the exact `Dual2<M>` Hessian area.
+    for w in 1..=MAX_ODE_IOV_AXES {
+        let b = bucket_for(w, l).expect("in-cap width");
+        let area = (b * b) as f64 / (w * w) as f64;
+        assert!(
+            area <= 1.55,
+            "width {w} → bucket {b} pads {area:.2}× the M×M work"
+        );
+    }
+
+    // Past the last bucket there is no instantiation to dispatch to: the ladder declines,
+    // and `ode_iov_subject_supported` declines first (see the gate test below), so such a
+    // subject reaches FD by the loud route, never by a silent `_ => None`.
+    assert_eq!(bucket_for(MAX_ODE_IOV_AXES + 1, l), None);
+    assert_eq!(
+        bucket_for(0, l),
+        None,
+        "a zero-axis subject has nothing to seed"
+    );
+
+    // Every bucket is reachable as its own round-up target, and the ladder covers the whole
+    // gate range with no hole that would drop to FD.
+    for w in 1..=MAX_ODE_IOV_AXES {
+        let b = bucket_for(w, l).expect("every in-cap width must have a bucket");
+        assert!(b >= w && l.contains(&b), "width {w} → bucket {b}");
+    }
+}
+
+/// The teeth on the bucketing itself: for a subject whose stacked width is *not* a bucket
+/// boundary, the padded instantiation the ladder now selects must reproduce the exact-width
+/// instantiation (what the pre-#971 ladder ran) bit-for-bit — outer `Dual2` sensitivities
+/// and inner `Dual1` η-gradient alike. Padded lanes stay zero, so they can neither leak into
+/// the live block nor change the value-only ODE step control.
+#[test]
+fn ode_iov_bucketed_dispatch_is_bit_identical_to_the_exact_width() {
+    // `Dual2<24>` carries a 24×24 Hessian per value and the ODE walk holds several frames
+    // at once — past the 2 MiB default test-thread stack. Production runs fits on a 32 MiB
+    // Rayon stack for exactly this reason; mirror it rather than shrinking the fixture
+    // below the widths the test is about (same pattern as
+    // `provider_tests::ode_iov_above_legacy_axis_cap_stays_analytic`).
+    std::thread::Builder::new()
+        .stack_size(crate::api::FIT_RAYON_STACK_SIZE)
+        .spawn(ode_iov_bucketed_dispatch_body)
+        .expect("spawn wide-stack test thread")
+        .join()
+        .expect("bucketed-vs-exact IOV comparison panicked");
+}
+
+fn ode_iov_bucketed_dispatch_body() {
+    let model = parse_model_string(ONECPT_IV_IOV_WIDE).expect("parse wide-κ IOV");
+    let theta = vec![1.0, 20.0];
+    // 24 occasions ⇒ n_stacked = 25 (→ bucket 28) and m_dim = 27 (→ bucket 28): neither
+    // width is a bucket boundary, which is the whole point of the fixture.
+    let subj = iov_wide_subject(24);
+    let occ_groups = crate::stats::likelihood::iov_occasion_groups(&subj);
+    assert_eq!(
+        occ_groups.len(),
+        24,
+        "fixture must have 24 κ occasion groups"
+    );
+
+    let n_stacked = model.n_eta + occ_groups.len() * model.n_kappa;
+    let m_dim = model.n_theta + n_stacked;
+    assert_eq!(
+        (m_dim, n_stacked),
+        (27, 25),
+        "fixture pins the two widths this test is about"
+    );
+    assert_eq!(
+        crate::sens::widths::bucket_for(m_dim, &ODE_IOV_WIDTH_BUCKETS),
+        Some(28)
+    );
+    assert_eq!(
+        crate::sens::widths::bucket_for(n_stacked, &ODE_IOV_WIDTH_BUCKETS),
+        Some(28)
+    );
+
+    let stacked: Vec<f64> = (0..n_stacked)
+        .map(|k| 0.08 - 0.011 * k as f64)
+        .collect::<Vec<_>>();
+
+    // Outer (`Dual2`): exact width 27 (what the pre-#971 ladder ran) vs the padded width 28
+    // the bucketed ladder picks.
+    let exact = run_subject_iov::<27>(&model, &subj, &theta, &stacked, &occ_groups)
+        .expect("exact-width IOV walk");
+    let padded = run_subject_iov::<28>(&model, &subj, &theta, &stacked, &occ_groups)
+        .expect("bucketed IOV walk");
+    assert_subject_sens_bit_identical(&exact, &padded, "outer 27 vs 28");
+    // …and the public entry point, which is what actually goes through the ladder.
+    let dispatched = ode_subject_sensitivities_iov(&model, &subj, &theta, &stacked)
+        .expect("in-scope IOV subject must stay analytic");
+    assert_subject_sens_bit_identical(&exact, &dispatched, "outer 27 vs dispatched");
+
+    // Inner (`Dual1`): exact width 25 vs the padded width 28.
+    let exact_g = run_subject_iov_eta::<25>(&model, &subj, &theta, &stacked, &occ_groups)
+        .expect("exact-width IOV η-gradient");
+    let padded_g = run_subject_iov_eta::<28>(&model, &subj, &theta, &stacked, &occ_groups)
+        .expect("bucketed IOV η-gradient");
+    let dispatched_g = ode_subject_eta_grad_iov(&model, &subj, &theta, &stacked)
+        .expect("in-scope IOV subject must stay analytic");
+    assert_eq!(exact_g.len(), padded_g.len());
+    for (j, ((x, y), z)) in exact_g
+        .iter()
+        .zip(padded_g.iter())
+        .zip(dispatched_g.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            x.f.to_bits(),
+            y.f.to_bits(),
+            "inner: obs {j} value (padded)"
+        );
+        assert_eq!(
+            x.f.to_bits(),
+            z.f.to_bits(),
+            "inner: obs {j} value (dispatched)"
+        );
+        for k in 0..n_stacked {
+            assert_eq!(
+                x.df_deta[k].to_bits(),
+                y.df_deta[k].to_bits(),
+                "inner: obs {j} ∂f/∂η[{k}] (padded)"
+            );
+            assert_eq!(
+                x.df_deta[k].to_bits(),
+                z.df_deta[k].to_bits(),
+                "inner: obs {j} ∂f/∂η[{k}] (dispatched)"
+            );
+        }
+    }
+    assert!(
+        exact_g
+            .iter()
+            .any(|o| o.df_deta.iter().any(|g| g.abs() > 1e-12)),
+        "η-gradient must be non-trivial, else the comparison is vacuous"
+    );
+}
+
+/// A stacked width past the last bucket must decline **at the gate**, so the caller drops to
+/// FD by the same loud route it always did — not by silently falling through the ladder's
+/// `_ => None`. Both IOV entry points are checked; the observable consequence is `None`
+/// (→ FD) plus the inner router's attribution string naming the cap, not a panic and not a
+/// wrong-width analytic answer.
+#[test]
+fn ode_iov_subject_past_the_last_bucket_declines_to_fd() {
+    let model = parse_model_string(ONECPT_IV_IOV_WIDE).expect("parse wide-κ IOV");
+    let theta = vec![1.0, 20.0];
+    // n_theta(2) + n_eta(1) + K·n_kappa(1) > 96 ⇒ K ≥ 94.
+    let subj = iov_wide_subject(94);
+    let occ_groups = crate::stats::likelihood::iov_occasion_groups(&subj);
+    let n_stacked = model.n_eta + occ_groups.len() * model.n_kappa;
+    let m_dim = model.n_theta + n_stacked;
+    assert!(
+        m_dim > MAX_ODE_IOV_AXES,
+        "fixture must exceed the cap, got {m_dim}"
+    );
+
+    let stacked = vec![0.01; n_stacked];
+    assert!(
+        ode_iov_subject_supported(&model, &subj).is_none(),
+        "a subject past the cap must be declined by the gate, before any dispatch"
+    );
+    assert!(
+        ode_subject_sensitivities_iov(&model, &subj, &theta, &stacked).is_none(),
+        "outer IOV must decline past the cap"
+    );
+    assert!(
+        ode_subject_eta_grad_iov(&model, &subj, &theta, &stacked).is_none(),
+        "inner IOV must decline past the cap"
+    );
+}
