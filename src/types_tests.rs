@@ -749,6 +749,17 @@ fn classify_warning_roundtrips_every_engine_message() {
             Warning,
             "sir",
         ),
+        // #972: the stranded-SIR-after-a-failed-covariance-step message names
+        // the covariance step and the Hessian, both of which earlier arms in the
+        // chain sniff for. It must still route to "sir", not to
+        // "covariance_failed" / "optimizer_health".
+        (
+            "SIR requested but the covariance step did not succeed and no usable SIR \
+             proposal could be built from the FD Hessian (its eigendecomposition did \
+             not produce finite eigenvalues), so SIR could not run.",
+            Warning,
+            "sir",
+        ),
         (
             "IMP: 2 subject(s) had ESS = 0 (proposal collapse)",
             Warning,

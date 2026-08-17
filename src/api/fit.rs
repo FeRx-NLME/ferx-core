@@ -1682,19 +1682,20 @@ fn fit_inner(
                 }
             }
         } else {
-            warnings.push(
-                "SIR requested but covariance matrix is not available. \
-                 Enable covariance = true in [fit_options]."
-                    .to_string(),
-            );
+            // No covariance matrix — but this is not the end of the road for a
+            // `sir = true` request: the non-PD fallback below is armed by
+            // `sir = true` as well as by `covariance_fallback = sir` (#972).
+            // The warning, if SIR really cannot run, is emitted after the
+            // fallback has had its chance.
             None
         }
     } else {
         None
     };
 
-    // SIR fallback: when the FD Hessian is non-PD and covariance_fallback = sir,
-    // run SIR with the rectified |eigenvalue| proposal built inside compute_covariance.
+    // SIR fallback: when the FD Hessian is non-PD and the user asked for SIR
+    // (`covariance_fallback = sir` or `sir = true`), run SIR with the rectified
+    // |eigenvalue| proposal built inside compute_covariance.
     let sir_fallback_result = resolve_sir_fallback(
         options,
         result.covariance_matrix.is_some(),
@@ -1707,6 +1708,20 @@ fn fit_inner(
         result.ofv,
         &mut warnings,
     );
+
+    // Only now, with both SIR paths resolved, can we tell a user who asked for
+    // SIR *why* they got none — and point them at the right knob (#972).
+    if !crate::cancel::is_cancelled(&options.cancel) {
+        if let Some(msg) = sir_unavailable_warning(
+            options.sir,
+            options.run_covariance_step && result.bayes.is_none(),
+            result.covariance_matrix.is_some(),
+            result.sir_fallback_proposal.is_some(),
+            sir_result.is_some() || sir_fallback_result.is_some(),
+        ) {
+            warnings.push(msg);
+        }
+    }
 
     // `final_method` reports the last *estimating* stage. An evaluation-only IMP
     // (`imp_eval_only`) doesn't produce parameters, so a chain like `[saem, imp]`

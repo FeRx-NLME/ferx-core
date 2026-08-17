@@ -371,19 +371,83 @@ pub(crate) fn resolve_covariance_status(
 }
 
 /// Pure gate for the non-PD-Hessian SIR fallback: should it run? It fires only
-/// when the user opted in (`covariance_fallback = sir`), the FD-Hessian
-/// covariance did **not** succeed (`!has_covariance_matrix`), a normal
-/// `sir = true` run did **not** already produce intervals (`!normal_sir_ran`),
-/// and `compute_covariance` actually handed back a fallback proposal
-/// (`has_fallback_proposal`). Split out of [`resolve_sir_fallback`] so the
-/// decision is unit-testable without driving a fit to a non-PD Hessian (#264).
+/// when the user asked for SIR at all — either explicitly opting into the
+/// fallback (`covariance_fallback = sir`) **or** simply requesting SIR
+/// (`sir = true`, #972) — the FD-Hessian covariance did **not** succeed
+/// (`!has_covariance_matrix`), a normal `sir = true` run did **not** already
+/// produce intervals (`!normal_sir_ran`), and `compute_covariance` actually
+/// handed back a fallback proposal (`has_fallback_proposal`). Split out of
+/// [`resolve_sir_fallback`] so the decision is unit-testable without driving a
+/// fit to a non-PD Hessian (#264).
+///
+/// `sir_requested` arms the same fallback as `covariance_fallback = sir`
+/// because the two options were otherwise wired to independent paths: a user
+/// who set only `sir = true` and hit a non-PD Hessian got no SIR at all, even
+/// though the rectified-|λ| proposal for exactly that case had already been
+/// built (#972).
 pub(crate) fn should_run_sir_fallback(
     fallback_is_sir: bool,
+    sir_requested: bool,
     has_covariance_matrix: bool,
     normal_sir_ran: bool,
     has_fallback_proposal: bool,
 ) -> bool {
-    fallback_is_sir && !has_covariance_matrix && !normal_sir_ran && has_fallback_proposal
+    (fallback_is_sir || sir_requested)
+        && !has_covariance_matrix
+        && !normal_sir_ran
+        && has_fallback_proposal
+}
+
+/// Warning for the case where `sir = true` was requested but no SIR intervals
+/// could be produced at all — neither from an inverted covariance nor from the
+/// non-PD fallback proposal. Returns `None` whenever SIR did run, a covariance
+/// exists (so the standard path already reported its own failure), or SIR was
+/// never requested.
+///
+/// The message distinguishes the two genuinely different causes, since the old
+/// single warning pointed every user at `covariance = true` even when the
+/// covariance step *had* run and failed (#972):
+///
+/// - the covariance step was never run → enabling it is the fix;
+/// - the covariance step ran and the FD Hessian's eigendecomposition diverged
+///   (NaN/Inf entries), so no proposal could be built → SIR genuinely cannot
+///   run and there is no option that would change that.
+///
+/// When a proposal *was* built the fallback fired and [`resolve_sir_fallback`]
+/// has already pushed its own `"SIR fallback failed: …"` warning, so this
+/// returns `None` to avoid stacking two messages on one failure.
+pub(crate) fn sir_unavailable_warning(
+    sir_requested: bool,
+    covariance_requested: bool,
+    has_covariance_matrix: bool,
+    has_fallback_proposal: bool,
+    sir_ran: bool,
+) -> Option<String> {
+    if !sir_requested || has_covariance_matrix || sir_ran {
+        return None;
+    }
+    if !covariance_requested {
+        return Some(
+            "SIR requested but covariance matrix is not available. \
+             Enable covariance = true in [fit_options]."
+                .to_string(),
+        );
+    }
+    if has_fallback_proposal {
+        // The non-PD fallback ran off the rectified-|λ| proposal and failed;
+        // that path reports its own error.
+        return None;
+    }
+    // Wording note: this message must not contain "covariance step failed",
+    // "covariance failed" or "degenerate" — `classify_warning` (src/types.rs)
+    // tests those substrings *before* "sir requested", so either token would
+    // misroute a SIR warning to `covariance_failed` / `optimizer_health`.
+    Some(
+        "SIR requested but the covariance step did not succeed and no usable SIR \
+         proposal could be built from the FD Hessian (its eigendecomposition did \
+         not produce finite eigenvalues), so SIR could not run."
+            .to_string(),
+    )
 }
 
 /// Run the non-PD-Hessian SIR fallback when [`should_run_sir_fallback`] permits.
@@ -413,6 +477,7 @@ pub(crate) fn resolve_sir_fallback(
     }
     if !should_run_sir_fallback(
         options.covariance_fallback == CovarianceFallback::Sir,
+        options.sir,
         has_covariance_matrix,
         normal_sir_ran,
         fallback_proposal.is_some(),
