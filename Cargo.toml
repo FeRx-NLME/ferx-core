@@ -71,3 +71,16 @@ lto = "fat"
 [profile.ci-test]
 inherits = "release"
 lto = false
+
+# Used by the per-PR `ci.yml` jobs only. `ci-test` sets `lto = false`, which in
+# Cargo means "no *cross-crate* LTO" but still leaves rustc's *local* ThinLTO
+# across the crate's codegen units on — and that local ThinLTO is ~77% of the
+# lib's LLVM time (measured 2026-08-15, #969/#971). `lto = "off"` disables it,
+# cutting the lib compile ~31% (~404s → ~277s locally). The trade is that the
+# population fits run ~20–40% slower without it — which is why this profile is
+# for the per-PR jobs (compile-bound, fits are fast Tier-1/2) and NOT for the
+# heavy Tier-3 fits: `slow-tests.yml` and the nightly full-coverage job stay on
+# `ci-test` so their 5–60 min fits keep the ThinLTO speedup. See #969.
+[profile.ci-fast]
+inherits = "ci-test"
+lto = "off"

@@ -113,7 +113,7 @@ jobs:
       # the feature-gated branches of the shared modules live there.
       - name: Generate TTE/CTMM endpoint coverage report
         run: |
-          cargo llvm-cov --no-fail-fast --no-default-features --features ci,markov --profile ci-test \
+          cargo llvm-cov --no-fail-fast --no-default-features --features ci,markov --profile ci-fast \
             --lib \
             --test agq \
             --test categorical_convergence \
@@ -250,10 +250,12 @@ jobs:
         # both RUNS the base suite and is the per-PR patch gate; the full
         # `ci,slow-tests` run is nightly (the `coverage` job above) and the
         # feature-gated endpoints are the `endpoints` job. Builds with
-        # `--profile ci-test` (no fat LTO) to stay within the PR wall-clock.
-        # `--tests` so the integration tests both run and count (same rationale
-        # as the nightly job).
-        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci --profile ci-test --lcov --output-path lcov.info
+        # `--profile ci-fast` (no fat LTO *and* no local ThinLTO — ~31% off the
+        # lib compile, #969) to stay within the PR wall-clock; the fast Tier-1/2
+        # fits here tolerate the ThinLTO-off fit slowdown that the nightly
+        # `coverage`/`slow-tests` jobs avoid by staying on `ci-test`. `--tests`
+        # so the integration tests both run and count (same rationale as nightly).
+        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci --profile ci-fast --lcov --output-path lcov.info
 
       - name: Upload to Codecov (fast flag)
         uses: codecov/codecov-action@v7
