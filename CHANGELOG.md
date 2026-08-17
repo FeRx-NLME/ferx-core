@@ -37,9 +37,10 @@ section of the SDLC for the versioning policy).
   at `covariance = true`, even though the `|eigenvalue|`-rectified fallback proposal for
   exactly that case had already been built — reaching it required the separate
   `covariance_fallback = sir` option. `sir = true` now arms that fallback itself and the
-  fit reports `covariance_status: sir_fallback`. When no proposal can be built at all
-  (the Hessian's eigendecomposition returned NaN/Inf), the warning now says so instead
-  of suggesting an option that is already on.
+  fit reports `covariance_status: sir_fallback`. When no proposal can be built at all,
+  the warning now points at the covariance-step message that carries the actual cause,
+  and a Bayesian fit is told that posterior credible intervals replace the
+  Hessian-based covariance — instead of both being sent to an option that is already on.
 
 ## [0.3.0] - 2026-08-07
 
