@@ -404,14 +404,21 @@ pub(crate) fn should_run_sir_fallback(
 /// exists (so the standard path already reported its own failure), or SIR was
 /// never requested.
 ///
-/// The message distinguishes the two genuinely different causes, since the old
+/// The message distinguishes the genuinely different causes, since the old
 /// single warning pointed every user at `covariance = true` even when the
 /// covariance step *had* run and failed (#972):
 ///
+/// - the fit is Bayesian → the covariance/SIR steps are deliberately not run
+///   (posterior credible intervals are reported instead), so neither
+///   `covariance = true` nor anything else would produce SIR intervals;
 /// - the covariance step was never run → enabling it is the fix;
-/// - the covariance step ran and the FD Hessian's eigendecomposition diverged
-///   (NaN/Inf entries), so no proposal could be built → SIR genuinely cannot
-///   run and there is no option that would change that.
+/// - the covariance step ran and produced neither a covariance matrix nor a
+///   fallback proposal → SIR has nothing to draw from. The *cause* is whatever
+///   `compute_covariance` already reported (a divergent eigendecomposition, a
+///   flat / non-finite FD stencil, a non-finite base OFV, a singular score
+///   cross-product under `covariance_method = s`/`rsr`, …), so this message
+///   points at that warning rather than asserting one specific cause it cannot
+///   know (review #975).
 ///
 /// When a proposal *was* built the fallback fired and [`resolve_sir_fallback`]
 /// has already pushed its own `"SIR fallback failed: …"` warning, so this
@@ -419,12 +426,31 @@ pub(crate) fn should_run_sir_fallback(
 pub(crate) fn sir_unavailable_warning(
     sir_requested: bool,
     covariance_requested: bool,
+    bayes_fit: bool,
     has_covariance_matrix: bool,
     has_fallback_proposal: bool,
     sir_ran: bool,
 ) -> Option<String> {
     if !sir_requested || has_covariance_matrix || sir_ran {
         return None;
+    }
+    // Wording note (applies to every message below): none of them may contain
+    // "covariance step failed", "covariance failed", "degenerate",
+    // "ill-conditioned" or "condition number" — `classify_warning`
+    // (src/types.rs) tests those substrings *before* "sir requested", so any of
+    // them would misroute a SIR warning to `covariance_failed` /
+    // `optimizer_health` / `condition_number`.
+    if bayes_fit {
+        // Bayesian fits report posterior credible intervals and never run the
+        // covariance step, so telling the user to enable `covariance = true`
+        // (which may well already be set) would be the same useless advice #972
+        // set out to remove.
+        return Some(
+            "SIR requested but not run: Bayesian estimation reports posterior \
+             credible intervals instead of a Hessian-based covariance, which SIR \
+             would have to draw from."
+                .to_string(),
+        );
     }
     if !covariance_requested {
         return Some(
@@ -438,14 +464,10 @@ pub(crate) fn sir_unavailable_warning(
         // that path reports its own error.
         return None;
     }
-    // Wording note: this message must not contain "covariance step failed",
-    // "covariance failed" or "degenerate" — `classify_warning` (src/types.rs)
-    // tests those substrings *before* "sir requested", so either token would
-    // misroute a SIR warning to `covariance_failed` / `optimizer_health`.
     Some(
         "SIR requested but the covariance step did not succeed and no usable SIR \
-         proposal could be built from the FD Hessian (its eigendecomposition did \
-         not produce finite eigenvalues), so SIR could not run."
+         proposal could be built from it, so SIR could not run — see the \
+         covariance warning above for the cause."
             .to_string(),
     )
 }

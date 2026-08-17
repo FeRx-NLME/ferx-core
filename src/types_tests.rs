@@ -755,8 +755,15 @@ fn classify_warning_roundtrips_every_engine_message() {
         // "covariance_failed" / "optimizer_health".
         (
             "SIR requested but the covariance step did not succeed and no usable SIR \
-             proposal could be built from the FD Hessian (its eigendecomposition did \
-             not produce finite eigenvalues), so SIR could not run.",
+             proposal could be built from it, so SIR could not run — see the \
+             covariance warning above for the cause.",
+            Warning,
+            "sir",
+        ),
+        (
+            "SIR requested but not run: Bayesian estimation reports posterior \
+             credible intervals instead of a Hessian-based covariance, which SIR \
+             would have to draw from.",
             Warning,
             "sir",
         ),

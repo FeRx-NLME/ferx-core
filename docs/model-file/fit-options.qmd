@@ -249,10 +249,15 @@ of Hessian SEs. Setting `covariance_fallback = sir` explicitly is therefore
 only needed when you want the fallback *without* asking for SIR on a
 successful covariance step.
 
-SIR is skipped entirely — with a warning saying so — in only two cases: the
-covariance step was never run (`covariance = false`), or it ran and the
-Hessian's eigendecomposition did not produce finite eigenvalues (NaN/Inf
-entries), leaving no proposal to draw from.
+SIR is skipped entirely — with a warning saying so — when the covariance step
+produces neither a covariance matrix nor a fallback proposal. That happens when
+the step was never run (`covariance = false`, or a Bayesian fit, which reports
+posterior credible intervals instead), and when it ran but failed for a reason
+other than a non-PD Hessian: a divergent eigendecomposition (NaN/Inf entries), a
+flat or non-finite FD stencil, a non-finite objective at the estimates, or a
+singular score cross-product under `covariance_method = s`/`rsr`. The warning
+names the covariance-step message that carries the actual cause. A cancelled fit
+skips SIR without an additional warning.
 
 See [SIR documentation](../estimation/sir.qmd) for details.
 

@@ -1714,7 +1714,8 @@ fn fit_inner(
     if !crate::cancel::is_cancelled(&options.cancel) {
         if let Some(msg) = sir_unavailable_warning(
             options.sir,
-            options.run_covariance_step && result.bayes.is_none(),
+            options.run_covariance_step,
+            result.bayes.is_some(),
             result.covariance_matrix.is_some(),
             result.sir_fallback_proposal.is_some(),
             sir_result.is_some() || sir_fallback_result.is_some(),

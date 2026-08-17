@@ -35,19 +35,19 @@ fn sir_requested_alone_arms_the_non_pd_fallback() {
 #[test]
 fn sir_unavailable_warning_is_silent_when_sir_is_not_stranded() {
     // Not requested at all.
-    assert!(sir_unavailable_warning(false, true, false, false, false).is_none());
+    assert!(sir_unavailable_warning(false, true, false, false, false, false).is_none());
     // A covariance exists: the standard path reports its own failures.
-    assert!(sir_unavailable_warning(true, true, true, false, false).is_none());
+    assert!(sir_unavailable_warning(true, true, false, true, false, false).is_none());
     // SIR actually ran (via either path).
-    assert!(sir_unavailable_warning(true, true, false, true, true).is_none());
+    assert!(sir_unavailable_warning(true, true, false, false, true, true).is_none());
     // The fallback fired off a proposal and failed — that path already warned,
     // so this must not stack a second message on the same failure.
-    assert!(sir_unavailable_warning(true, true, false, true, false).is_none());
+    assert!(sir_unavailable_warning(true, true, false, false, true, false).is_none());
 }
 
 #[test]
 fn sir_unavailable_warning_points_at_covariance_when_the_step_never_ran() {
-    let msg = sir_unavailable_warning(true, false, false, false, false)
+    let msg = sir_unavailable_warning(true, false, false, false, false, false)
         .expect("stranded SIR with no covariance step must warn");
     assert!(
         msg.contains("covariance = true"),
@@ -56,12 +56,14 @@ fn sir_unavailable_warning_points_at_covariance_when_the_step_never_ran() {
 }
 
 /// The pre-#972 warning sent every stranded user to `covariance = true`, which
-/// is useless advice when the covariance step *did* run and failed. With a
-/// degenerate Hessian (no proposal buildable) the message must say SIR cannot
-/// run rather than suggesting an option that is already on.
+/// is useless advice when the covariance step *did* run and failed. With no
+/// proposal buildable the message must say SIR cannot run rather than
+/// suggesting an option that is already on — and, per review #975, must not
+/// assert one specific cause (a divergent eigendecomposition) when a flat FD
+/// stencil, a non-finite base OFV or a singular `S` produce the same state.
 #[test]
-fn sir_unavailable_warning_reports_a_degenerate_hessian_when_the_step_ran() {
-    let msg = sir_unavailable_warning(true, true, false, false, false)
+fn sir_unavailable_warning_reports_a_failed_covariance_step_without_guessing_the_cause() {
+    let msg = sir_unavailable_warning(true, true, false, false, false, false)
         .expect("stranded SIR after a failed covariance step must warn");
     assert!(
         !msg.contains("covariance = true"),
@@ -71,6 +73,30 @@ fn sir_unavailable_warning_reports_a_degenerate_hessian_when_the_step_ran() {
         msg.contains("no usable SIR proposal") && msg.contains("could not run"),
         "warning should explain that no proposal could be built: {msg}"
     );
+    assert!(
+        !msg.contains("eigen"),
+        "must not blame the eigendecomposition — it is only one of several \
+         covariance-step failures that leave no proposal: {msg}"
+    );
+}
+
+/// A Bayesian fit never runs the covariance step (it reports posterior
+/// credible intervals), so `covariance = true` + `sir = true` must not be told
+/// to enable an option that is both already on and irrelevant (review #975).
+#[test]
+fn sir_unavailable_warning_explains_a_bayesian_fit_instead_of_blaming_covariance() {
+    let msg = sir_unavailable_warning(true, true, true, false, false, false)
+        .expect("stranded SIR on a Bayesian fit must warn");
+    assert!(
+        !msg.contains("covariance = true"),
+        "must not tell a Bayesian user to enable covariance: {msg}"
+    );
+    assert!(
+        msg.contains("Bayesian"),
+        "warning should name the actual reason: {msg}"
+    );
+    // Silent for a Bayesian fit that did not ask for SIR.
+    assert!(sir_unavailable_warning(false, true, true, false, false, false).is_none());
 }
 
 // ── resolve_sir_fallback (gate + run_sir_core + status, #264) ─────────────
