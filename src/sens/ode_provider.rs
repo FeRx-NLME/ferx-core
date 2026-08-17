@@ -123,112 +123,96 @@ const _: () = assert!(
      MAX_SCALE_AXES (and its dispatch_init_impulse! table) to at least MAX_ODE_AXES."
 );
 
+/// Monomorphised `(Dual1, Dual2)` widths for the ODE IOV dispatch ladder (#971).
+///
+/// Enumerating every width `1..=MAX_ODE_IOV_AXES` instantiated the entire
+/// ODE-integration and sensitivity stack 96 times per worker — 62 % of the crate's LLVM
+/// IR sat on widths `13..=96` alone, and ~93 % of the lib compile is LLVM (#969/#970). So the ladder is
+/// **bucketed**: the runtime axis count is rounded up to the next width here and the extra
+/// lanes are left zero (see [`crate::sens::widths`] for why padding is semantically inert —
+/// every seeder guards its axis writes with `ax < N` and every readout indexes by the
+/// runtime `n_theta` / `n_stacked`, never by `N`).
+///
+/// Padding is not free at *runtime*: the outer walk is `Dual2<M>` with an `M×M` Hessian per
+/// value, so rounding `M` up costs about `(bucket/exact)²` (measured, #971 — the inner
+/// `Dual1<N>` walk is `O(N)` and two orders of magnitude cheaper either way). The ladder is
+/// therefore split where the two costs actually sit:
+///
+/// * **`1..=24` exact.** These widths are already instantiated by the `MAX_ODE_AXES` /
+///   `MAX_SCALE_AXES = 24` ladders, so the IOV ladder shares their monomorphisations and
+///   each extra width here costs only ~16 k LLVM lines (~0.2 % of the crate). Exactness is
+///   nearly free, and this range covers the ordinary IOV model.
+/// * **`> 24` bucketed.** Past the shared cap the IOV ladder is the sole user, at ~115 k
+///   lines per width (~1.2 % of the crate each), so the tail rounds — with a step chosen to
+///   hold the `O(M²)` padding penalty at ≤ ~1.5× rather than the ~2.1× a coarser
+///   `32/48/64/96` ladder costs.
+///
+/// The ladder is a tuning parameter: widen it where padding cost bites, narrow it where
+/// compile time does. When you retune it, edit the literal arm list in
+/// [`dispatch_ode_iov_axes`] to match — `macro_rules!` can't iterate a const, so the two are
+/// kept in lockstep by the `slices_eq` compile-time assert in `dispatch_iov_widths!` rather
+/// than shared from one source.
+pub(crate) const ODE_IOV_WIDTH_BUCKETS: [usize; 32] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 28, 32,
+    40, 48, 56, 64, 80, 96,
+];
+
+// Tripwire, replacing the old `MAX_ODE_IOV_AXES == 96` literal check: the ladder must be
+// strictly ascending and reach exactly the cap `ode_iov_subject_supported` enforces.
+// Otherwise a subject inside the gate but past the last bucket would hit the ladder's
+// `_ => None` arm and fall **silently** back to FD instead of being declined loudly by the
+// gate (the #438 / #466 / #534 convention, carried over to the bucketed form).
 const _: () = assert!(
-    MAX_ODE_IOV_AXES == 96,
-    "MAX_ODE_IOV_AXES changed: update dispatch_ode_iov_axes! to enumerate the same range"
+    crate::sens::widths::buckets_well_formed(&ODE_IOV_WIDTH_BUCKETS, MAX_ODE_IOV_AXES),
+    "ODE_IOV_WIDTH_BUCKETS must be strictly ascending and end at MAX_ODE_IOV_AXES: the \
+     dispatch ladder has to cover the whole range ode_iov_subject_supported admits, or an \
+     in-scope subject silently falls back to FD"
 );
 
-macro_rules! dispatch_ode_iov_axes {
-    ($dim:expr, $worker:ident, $($arg:expr),+ $(,)?) => {
-        match $dim {
-            1 => $worker::<1>($($arg),+),
-            2 => $worker::<2>($($arg),+),
-            3 => $worker::<3>($($arg),+),
-            4 => $worker::<4>($($arg),+),
-            5 => $worker::<5>($($arg),+),
-            6 => $worker::<6>($($arg),+),
-            7 => $worker::<7>($($arg),+),
-            8 => $worker::<8>($($arg),+),
-            9 => $worker::<9>($($arg),+),
-            10 => $worker::<10>($($arg),+),
-            11 => $worker::<11>($($arg),+),
-            12 => $worker::<12>($($arg),+),
-            13 => $worker::<13>($($arg),+),
-            14 => $worker::<14>($($arg),+),
-            15 => $worker::<15>($($arg),+),
-            16 => $worker::<16>($($arg),+),
-            17 => $worker::<17>($($arg),+),
-            18 => $worker::<18>($($arg),+),
-            19 => $worker::<19>($($arg),+),
-            20 => $worker::<20>($($arg),+),
-            21 => $worker::<21>($($arg),+),
-            22 => $worker::<22>($($arg),+),
-            23 => $worker::<23>($($arg),+),
-            24 => $worker::<24>($($arg),+),
-            25 => $worker::<25>($($arg),+),
-            26 => $worker::<26>($($arg),+),
-            27 => $worker::<27>($($arg),+),
-            28 => $worker::<28>($($arg),+),
-            29 => $worker::<29>($($arg),+),
-            30 => $worker::<30>($($arg),+),
-            31 => $worker::<31>($($arg),+),
-            32 => $worker::<32>($($arg),+),
-            33 => $worker::<33>($($arg),+),
-            34 => $worker::<34>($($arg),+),
-            35 => $worker::<35>($($arg),+),
-            36 => $worker::<36>($($arg),+),
-            37 => $worker::<37>($($arg),+),
-            38 => $worker::<38>($($arg),+),
-            39 => $worker::<39>($($arg),+),
-            40 => $worker::<40>($($arg),+),
-            41 => $worker::<41>($($arg),+),
-            42 => $worker::<42>($($arg),+),
-            43 => $worker::<43>($($arg),+),
-            44 => $worker::<44>($($arg),+),
-            45 => $worker::<45>($($arg),+),
-            46 => $worker::<46>($($arg),+),
-            47 => $worker::<47>($($arg),+),
-            48 => $worker::<48>($($arg),+),
-            49 => $worker::<49>($($arg),+),
-            50 => $worker::<50>($($arg),+),
-            51 => $worker::<51>($($arg),+),
-            52 => $worker::<52>($($arg),+),
-            53 => $worker::<53>($($arg),+),
-            54 => $worker::<54>($($arg),+),
-            55 => $worker::<55>($($arg),+),
-            56 => $worker::<56>($($arg),+),
-            57 => $worker::<57>($($arg),+),
-            58 => $worker::<58>($($arg),+),
-            59 => $worker::<59>($($arg),+),
-            60 => $worker::<60>($($arg),+),
-            61 => $worker::<61>($($arg),+),
-            62 => $worker::<62>($($arg),+),
-            63 => $worker::<63>($($arg),+),
-            64 => $worker::<64>($($arg),+),
-            65 => $worker::<65>($($arg),+),
-            66 => $worker::<66>($($arg),+),
-            67 => $worker::<67>($($arg),+),
-            68 => $worker::<68>($($arg),+),
-            69 => $worker::<69>($($arg),+),
-            70 => $worker::<70>($($arg),+),
-            71 => $worker::<71>($($arg),+),
-            72 => $worker::<72>($($arg),+),
-            73 => $worker::<73>($($arg),+),
-            74 => $worker::<74>($($arg),+),
-            75 => $worker::<75>($($arg),+),
-            76 => $worker::<76>($($arg),+),
-            77 => $worker::<77>($($arg),+),
-            78 => $worker::<78>($($arg),+),
-            79 => $worker::<79>($($arg),+),
-            80 => $worker::<80>($($arg),+),
-            81 => $worker::<81>($($arg),+),
-            82 => $worker::<82>($($arg),+),
-            83 => $worker::<83>($($arg),+),
-            84 => $worker::<84>($($arg),+),
-            85 => $worker::<85>($($arg),+),
-            86 => $worker::<86>($($arg),+),
-            87 => $worker::<87>($($arg),+),
-            88 => $worker::<88>($($arg),+),
-            89 => $worker::<89>($($arg),+),
-            90 => $worker::<90>($($arg),+),
-            91 => $worker::<91>($($arg),+),
-            92 => $worker::<92>($($arg),+),
-            93 => $worker::<93>($($arg),+),
-            94 => $worker::<94>($($arg),+),
-            95 => $worker::<95>($($arg),+),
-            96 => $worker::<96>($($arg),+),
+/// The bucketed const-generic ladder behind [`dispatch_ode_iov_axes`]. Both the runtime
+/// bucket lookup and the `match` arms are driven by the same literal list, and the
+/// `slices_eq` assert pins that list to [`ODE_IOV_WIDTH_BUCKETS`] — so editing the const
+/// without editing the arms (or vice versa) fails to compile rather than dropping a bucket
+/// into the `_ => None` FD arm.
+macro_rules! dispatch_iov_widths {
+    ([$($w:literal),+ $(,)?], $dim:expr, $worker:ident, $args:tt) => {{
+        const _: () = assert!(
+            crate::sens::widths::slices_eq(&[$($w),+], &ODE_IOV_WIDTH_BUCKETS),
+            "dispatch_iov_widths! arms are out of sync with ODE_IOV_WIDTH_BUCKETS"
+        );
+        match crate::sens::widths::bucket_for($dim, &ODE_IOV_WIDTH_BUCKETS) {
+            // The argument list arrives as one `tt` group, not a second repetition —
+            // `$(…)+` cannot nest two repetitions of different lengths, so `call_at_width!`
+            // re-parses it once per width arm.
+            $(Some($w) => call_at_width!($worker::<$w>, $args),)+
+            // Unreachable for `1..=MAX_ODE_IOV_AXES` (the assert above pins the ladder to
+            // the cap); a wider subject is declined by `ode_iov_subject_supported` before
+            // it reaches here. Kept as the belt-and-suspenders FD route.
             _ => None,
         }
+    }};
+}
+
+/// Apply a width-instantiated worker to a parenthesised argument list.
+macro_rules! call_at_width {
+    ($f:expr, ($($arg:expr),* $(,)?)) => {
+        $f($($arg),*)
+    };
+}
+
+/// Dispatch `$worker::<W>` at the bucketed width `W ≥ $dim`, or `None` (→ FD) when `$dim`
+/// is zero or past the last bucket.
+macro_rules! dispatch_ode_iov_axes {
+    ($dim:expr, $worker:ident, $($arg:expr),+ $(,)?) => {
+        dispatch_iov_widths!(
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 28, 32, 40, 48, 56, 64, 80, 96
+            ],
+            $dim,
+            $worker,
+            ($($arg),+)
+        )
     };
 }
 

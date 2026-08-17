@@ -19,6 +19,18 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Performance
+- **The ODE inter-occasion-variability (IOV) analytic sensitivity path now compiles from a
+  bucketed set of dual widths instead of one specialisation per stacked axis count**, cutting
+  the crate's generated LLVM IR by 43 % (17.4 M → 9.8 M lines) and the lib's `-Ztime-passes`
+  total by ~2.95× locally (376.7 s → 127.5 s) — the direct attack on the compile-bound CI wall clock tracked in
+  #969. Gradients are unchanged: a stacked width that is not a bucket boundary is padded with
+  zero lanes and returns bit-identical `∂f/∂η` / `∂f/∂θ` to the exact-width walk. Widths up to
+  24 axes — the ordinary IOV model — are still specialised exactly, so they pay no runtime
+  cost at all; wider subjects run up to ~1.5× more work in the outer walk for the padded
+  lanes, and the 96-axis cap (past which a subject falls back to finite differences) is
+  unchanged (#971).
+
 ### Fixed
 - **The default (`Auto` → analytic-gradient NLopt L-BFGS) optimizer no longer stalls at the
   initial estimates on its first step.** From the identity initial Hessian the opening search
