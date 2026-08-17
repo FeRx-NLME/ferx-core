@@ -43,6 +43,16 @@ section of the SDLC for the versioning policy).
   Combined with the analytic covariance Hessian (default-on), this
   re-enables the warfarin FOCEI covariance SE cross-checks against NONMEM and a steady-state
   oral fit smoke test (#960).
+- **`sir = true` is no longer silently skipped when the covariance step fails**
+  ([#972](https://github.com/FeRx-NLME/ferx-core/issues/972)). A non-positive-definite
+  FD Hessian used to leave a requested SIR run with no intervals and a warning pointing
+  at `covariance = true`, even though the `|eigenvalue|`-rectified fallback proposal for
+  exactly that case had already been built — reaching it required the separate
+  `covariance_fallback = sir` option. `sir = true` now arms that fallback itself and the
+  fit reports `covariance_status: sir_fallback`. When no proposal can be built at all,
+  the warning now points at the covariance-step message that carries the actual cause,
+  and a Bayesian fit is told that posterior credible intervals replace the
+  Hessian-based covariance — instead of both being sent to an option that is already on.
 
 ## [0.3.0] - 2026-08-07
 

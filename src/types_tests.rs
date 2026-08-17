@@ -749,6 +749,24 @@ fn classify_warning_roundtrips_every_engine_message() {
             Warning,
             "sir",
         ),
+        // #972: the stranded-SIR-after-a-failed-covariance-step message names
+        // the covariance step and the Hessian, both of which earlier arms in the
+        // chain sniff for. It must still route to "sir", not to
+        // "covariance_failed" / "optimizer_health".
+        (
+            "SIR requested but the covariance step did not succeed and no usable SIR \
+             proposal could be built from it, so SIR could not run — see the \
+             covariance warning above for the cause.",
+            Warning,
+            "sir",
+        ),
+        (
+            "SIR requested but not run: Bayesian estimation reports posterior \
+             credible intervals instead of a Hessian-based covariance, which SIR \
+             would have to draw from.",
+            Warning,
+            "sir",
+        ),
         (
             "IMP: 2 subject(s) had ESS = 0 (proposal collapse)",
             Warning,

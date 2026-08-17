@@ -6,16 +6,97 @@ use std::path::Path;
 #[test]
 fn sir_fallback_gate_fires_only_when_all_conditions_hold() {
     // Opted in, no real covariance, no normal SIR, proposal present.
-    assert!(should_run_sir_fallback(true, false, false, true));
+    assert!(should_run_sir_fallback(true, false, false, false, true));
 }
 
 #[test]
 fn sir_fallback_gate_blocked_by_each_condition() {
     // Each single deviation from the firing case blocks the fallback.
-    assert!(!should_run_sir_fallback(false, false, false, true)); // covariance_fallback != sir
-    assert!(!should_run_sir_fallback(true, true, false, true)); // a real H⁻¹ covariance exists
-    assert!(!should_run_sir_fallback(true, false, true, true)); // a normal sir=true run already produced CIs
-    assert!(!should_run_sir_fallback(true, false, false, false)); // compute_covariance produced no proposal
+    assert!(!should_run_sir_fallback(false, false, false, false, true)); // neither trigger set
+    assert!(!should_run_sir_fallback(true, false, true, false, true)); // a real H⁻¹ covariance exists
+    assert!(!should_run_sir_fallback(true, false, false, true, true)); // a normal sir=true run already produced CIs
+    assert!(!should_run_sir_fallback(true, false, false, false, false)); // compute_covariance produced no proposal
+}
+
+/// #972: `sir = true` alone arms the non-PD fallback, with no separate
+/// `covariance_fallback = sir` needed — the option the user naturally reaches
+/// for now reaches the capability built for exactly this case.
+#[test]
+fn sir_requested_alone_arms_the_non_pd_fallback() {
+    assert!(should_run_sir_fallback(false, true, false, false, true));
+    // …and the other three conditions still gate it exactly as before.
+    assert!(!should_run_sir_fallback(false, true, true, false, true)); // real covariance exists
+    assert!(!should_run_sir_fallback(false, true, false, true, true)); // normal SIR already ran
+    assert!(!should_run_sir_fallback(false, true, false, false, false)); // no proposal to run off
+}
+
+// ── sir_unavailable_warning (#972) ───────────────────────────────────────
+
+#[test]
+fn sir_unavailable_warning_is_silent_when_sir_is_not_stranded() {
+    // Not requested at all.
+    assert!(sir_unavailable_warning(false, true, false, false, false, false).is_none());
+    // A covariance exists: the standard path reports its own failures.
+    assert!(sir_unavailable_warning(true, true, false, true, false, false).is_none());
+    // SIR actually ran (via either path).
+    assert!(sir_unavailable_warning(true, true, false, false, true, true).is_none());
+    // The fallback fired off a proposal and failed — that path already warned,
+    // so this must not stack a second message on the same failure.
+    assert!(sir_unavailable_warning(true, true, false, false, true, false).is_none());
+}
+
+#[test]
+fn sir_unavailable_warning_points_at_covariance_when_the_step_never_ran() {
+    let msg = sir_unavailable_warning(true, false, false, false, false, false)
+        .expect("stranded SIR with no covariance step must warn");
+    assert!(
+        msg.contains("covariance = true"),
+        "warning should point at the covariance option: {msg}"
+    );
+}
+
+/// The pre-#972 warning sent every stranded user to `covariance = true`, which
+/// is useless advice when the covariance step *did* run and failed. With no
+/// proposal buildable the message must say SIR cannot run rather than
+/// suggesting an option that is already on — and, per review #975, must not
+/// assert one specific cause (a divergent eigendecomposition) when a flat FD
+/// stencil, a non-finite base OFV or a singular `S` produce the same state.
+#[test]
+fn sir_unavailable_warning_reports_a_failed_covariance_step_without_guessing_the_cause() {
+    let msg = sir_unavailable_warning(true, true, false, false, false, false)
+        .expect("stranded SIR after a failed covariance step must warn");
+    assert!(
+        !msg.contains("covariance = true"),
+        "must not tell the user to enable an option that is already on: {msg}"
+    );
+    assert!(
+        msg.contains("no usable SIR proposal") && msg.contains("could not run"),
+        "warning should explain that no proposal could be built: {msg}"
+    );
+    assert!(
+        !msg.contains("eigen"),
+        "must not blame the eigendecomposition — it is only one of several \
+         covariance-step failures that leave no proposal: {msg}"
+    );
+}
+
+/// A Bayesian fit never runs the covariance step (it reports posterior
+/// credible intervals), so `covariance = true` + `sir = true` must not be told
+/// to enable an option that is both already on and irrelevant (review #975).
+#[test]
+fn sir_unavailable_warning_explains_a_bayesian_fit_instead_of_blaming_covariance() {
+    let msg = sir_unavailable_warning(true, true, true, false, false, false)
+        .expect("stranded SIR on a Bayesian fit must warn");
+    assert!(
+        !msg.contains("covariance = true"),
+        "must not tell a Bayesian user to enable covariance: {msg}"
+    );
+    assert!(
+        msg.contains("Bayesian"),
+        "warning should name the actual reason: {msg}"
+    );
+    // Silent for a Bayesian fit that did not ask for SIR.
+    assert!(sir_unavailable_warning(false, true, true, false, false, false).is_none());
 }
 
 // ── resolve_sir_fallback (gate + run_sir_core + status, #264) ─────────────
