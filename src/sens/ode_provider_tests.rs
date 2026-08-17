@@ -6915,7 +6915,7 @@ fn assert_subject_sens_bit_identical(a: &SubjectSens, b: &SubjectSens, what: &st
     );
 }
 
-/// The bucket ladder's contract, pinned on the real const (#971): exact through 12, rounded
+/// The bucket ladder's contract, pinned on the real const (#971): exact through 24, rounded
 /// up past it, and `None` — the FD route — outside `1..=MAX_ODE_IOV_AXES`.
 #[test]
 fn ode_iov_width_buckets_round_up_and_decline_past_the_cap() {

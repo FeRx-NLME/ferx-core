@@ -148,7 +148,10 @@ const _: () = assert!(
 ///   `32/48/64/96` ladder costs.
 ///
 /// The ladder is a tuning parameter: widen it where padding cost bites, narrow it where
-/// compile time does.
+/// compile time does. When you retune it, edit the literal arm list in
+/// [`dispatch_ode_iov_axes`] to match — `macro_rules!` can't iterate a const, so the two are
+/// kept in lockstep by the `slices_eq` compile-time assert in `dispatch_iov_widths!` rather
+/// than shared from one source.
 pub(crate) const ODE_IOV_WIDTH_BUCKETS: [usize; 32] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 28, 32,
     40, 48, 56, 64, 80, 96,
