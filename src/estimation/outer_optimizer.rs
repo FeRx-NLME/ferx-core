@@ -110,13 +110,19 @@ pub fn optimize_population(
     // of the outer loop (optimize_nlopt re-reads `options.optimizer` for its own
     // branching). Every other variant is returned unchanged, so this is a no-op
     // unless the user left the default `auto` in place.
-    // Mixture models (#977 Phase 3) run through the derivative-free BOBYQA path:
-    // no analytic outer gradient exists yet, and a gradient optimizer would call
-    // the non-mixture `population_gradient` on the single-population objective,
-    // which is wrong for the K-fold mixture OFV. Force BOBYQA regardless of the
-    // user's/auto's choice. Analytic mixture sensitivities are #977 Phase 4.
+    // Mixture models (#977). BOBYQA (derivative-free) is the default and safe
+    // choice — robust against the mixture's label-switching multimodality. Since
+    // Phase 4 an analytic posterior-weighted outer gradient exists, so a user who
+    // explicitly picks an NLopt *gradient* optimizer (SLSQP / L-BFGS / MMA) is
+    // honoured — those route through `optimize_nlopt`, whose objective closure
+    // branches to `mixture_gradient`. Every other choice (including `auto`, and
+    // the built-in BFGS / trust-region paths, which do not carry the mixture
+    // objective) falls back to BOBYQA.
     let resolved = if init_params.mixture.is_some() {
-        Optimizer::Bobyqa
+        match options.optimizer {
+            Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => options.optimizer,
+            _ => Optimizer::Bobyqa,
+        }
     } else {
         options.optimizer.resolve_auto(model, options.interaction)
     };
@@ -1374,22 +1380,30 @@ fn optimize_nlopt(
         let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
         let params = unpack_params(&x, init_params);
 
-        // Mixture models (#977 Phase 3): K-fold log-sum-exp objective with a
-        // per-class serial inner solve. `kappas` is empty (IOV is rejected up
-        // front); the MIXEST-class EBEs stand in for the warm-start / trace.
+        // Mixture models (#977): K-fold log-sum-exp objective with a per-class
+        // serial inner solve. `kappas` is empty (IOV is rejected up front); the
+        // MIXEST-class EBEs stand in for the warm-start / trace. The full
+        // `MixtureEval` is kept in `mixeval` for the analytic gradient below.
+        let mut mixeval: Option<crate::estimation::mixture::MixtureEval> = None;
         let (ehs, hms, ebe_stats, kappas, raw_ofv) = if params.mixture.is_some() {
             let warm = (!state.cached_etas_by_class.is_empty())
                 .then_some(state.cached_etas_by_class.as_slice());
             let m =
                 crate::estimation::mixture::mixture_ofv(model, population, &params, options, warm);
-            state.cached_etas_by_class = m.etas_by_class;
-            (
-                m.mixest_etas,
-                m.mixest_h_mats,
-                m.ebe_stats,
+            state.cached_etas_by_class = m.etas_by_class.clone();
+            let out = (
+                m.mixest_etas.clone(),
+                m.mixest_h_mats.clone(),
+                InnerLoopStats {
+                    n_unconverged: m.ebe_stats.n_unconverged,
+                    n_fallback: m.ebe_stats.n_fallback,
+                    n_start_rejected: m.ebe_stats.n_start_rejected,
+                },
                 Vec::new(),
                 m.ofv,
-            )
+            );
+            mixeval = Some(m);
+            out
         } else {
             let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
             let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
@@ -1455,19 +1469,36 @@ fn optimize_nlopt(
                 }
             } else {
                 // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
-                let grad_raw = population_gradient(
-                    &x,
-                    n_subj,
-                    init_params,
-                    model,
-                    population,
-                    &ehs,
-                    &hms,
-                    &kappas,
-                    &bounds,
-                    options,
-                    &mut state.n_grad_evals,
-                );
+                // Mixture (#977 Phase 4): analytic posterior-weighted gradient,
+                // FD fallback when out of analytic scope.
+                let grad_raw = if let Some(mev) = &mixeval {
+                    crate::estimation::mixture::mixture_gradient(
+                        model, population, &params, options, mev,
+                    )
+                    .unwrap_or_else(|| {
+                        crate::estimation::mixture::mixture_gradient_fd(
+                            model,
+                            population,
+                            &x,
+                            init_params,
+                            options,
+                        )
+                    })
+                } else {
+                    population_gradient(
+                        &x,
+                        n_subj,
+                        init_params,
+                        model,
+                        population,
+                        &ehs,
+                        &hms,
+                        &kappas,
+                        &bounds,
+                        options,
+                        &mut state.n_grad_evals,
+                    )
+                };
                 let mut sq = 0.0_f64;
                 for k in 0..g.len() {
                     let gi = if grad_raw[k].is_finite() {

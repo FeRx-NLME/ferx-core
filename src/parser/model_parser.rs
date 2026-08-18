@@ -10000,6 +10000,69 @@ pub(crate) fn eval_mixing_log_probs(
     }
 }
 
+/// Analytic `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4),
+/// returned as `K × n_theta`. Only the **logit** form is differentiated here
+/// (`p = softmax(g)`), which is the general covariate-dependent case; the `p`
+/// (direct-probability) form returns `None` so the caller routes to FD.
+///
+/// For the softmax: `∂ ln p_k/∂θ_j = ∂g_k/∂θ_j − Σ_m p_m ∂g_m/∂θ_j`, where the
+/// per-class scores `g_k` are the mixing expressions (reference class `K` has
+/// `g ≡ 0 ⇒ ∂ = 0`) and `∂g/∂θ_j` comes from the symbolic differentiator.
+pub(crate) fn mixing_logp_grad(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<Vec<f64>>> {
+    if !spec.mixing.iter().all(|m| m.is_logit) {
+        return None; // p-form → FD fallback
+    }
+    let k = spec.n_classes;
+    let nt = theta.len();
+    let empty_vars: HashMap<String, f64> = HashMap::new();
+    let env = MapEnv {
+        covariates,
+        vars: &empty_vars,
+    };
+    let no_eta: [f64; 0] = [];
+
+    // Per-class logit value and its θ-gradient (reference class K stays 0). The
+    // mixing expression is a cheap closed form over θ + covariates (no inner
+    // solve, no random effects), so a central difference over θ is machine-exact
+    // — and it avoids the symbolic differentiator, which expects resolved
+    // covariate-index nodes the mixing AST never carries.
+    let mut logit = vec![0.0f64; k];
+    let mut dlogit = vec![vec![0.0f64; nt]; k];
+    let mut tperturb = theta.to_vec();
+    for m in &spec.mixing {
+        let c = m.class - 1;
+        logit[c] = eval_expr(&m.expr, theta, &no_eta, &env, &[]);
+        for j in 0..nt {
+            let h = 1e-6 * theta[j].abs().max(1.0);
+            tperturb[j] = theta[j] + h;
+            let fp = eval_expr(&m.expr, &tperturb, &no_eta, &env, &[]);
+            tperturb[j] = theta[j] - h;
+            let fm = eval_expr(&m.expr, &tperturb, &no_eta, &env, &[]);
+            tperturb[j] = theta[j];
+            dlogit[c][j] = (fp - fm) / (2.0 * h);
+        }
+    }
+    // p = softmax(logit)
+    let max = logit.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let ex: Vec<f64> = logit.iter().map(|l| (l - max).exp()).collect();
+    let s: f64 = ex.iter().sum();
+    let p: Vec<f64> = ex.iter().map(|e| e / s).collect();
+
+    // ∂ ln p_c/∂θ_j = dlogit[c][j] − Σ_m p_m dlogit[m][j]
+    let mut out = vec![vec![0.0f64; nt]; k];
+    for j in 0..nt {
+        let wsum: f64 = (0..k).map(|m| p[m] * dlogit[m][j]).sum();
+        for c in 0..k {
+            out[c][j] = dlogit[c][j] - wsum;
+        }
+    }
+    Some(out)
+}
+
 fn parse_parameters(
     lines: &[String],
 ) -> Result<

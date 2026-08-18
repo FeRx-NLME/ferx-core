@@ -24,7 +24,9 @@
 use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::inner_optimizer::{find_ebe, InnerLoopStats};
-use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
+use crate::estimation::parameterization::{omega_packed_len, pack_params, theta_packs_log};
+use crate::estimation::sens_outer_gradient::per_subject_packed_gradients;
+use crate::parser::model_parser::{eval_mixing_log_probs, mixing_logp_grad, MixtureClassGuard};
 use crate::stats::likelihood::foce_subject_nll;
 use crate::types::{CompiledModel, FitOptions, ModelParameters, Population};
 
@@ -198,6 +200,147 @@ pub fn mixture_ofv(
     }
 }
 
+/// Analytic outer gradient of the mixture OFV in **real packed space** (#977
+/// Phase 4): `∂OFV/∂x = 2 Σ_i Σ_k w_ik (∂nll_ik/∂x − ∂ln p_ik/∂x)`, where
+/// `w_ik = PMIX_ik` (from `eval`), `∂nll_ik/∂x` is the per-class per-subject
+/// analytic FOCE/FOCEI packed gradient, and `∂ln p_ik/∂θ` is the softmax mixing
+/// gradient (theta slots only). The un-scaled gradient the objective closure
+/// then multiplies by `scale[k]` for optimizer space.
+///
+/// Returns `None` (→ the caller falls back to FD of the mixture OFV) when the
+/// gradient is out of analytic scope: a non-diagonal base Omega, the `p`
+/// (direct-probability) mixing form, or any subject/class the per-subject
+/// sensitivity provider declines.
+pub fn mixture_gradient(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+    eval: &MixtureEval,
+) -> Option<Vec<f64>> {
+    let spec = model.mixture.as_ref()?;
+    let mp = params.mixture.as_ref()?;
+    // Analytic per-class Ω-slot mapping assumes a diagonal base Omega (also the
+    // rule for `omega(k)` overrides). Off-diagonal → FD fallback.
+    if !params.omega.diagonal {
+        return None;
+    }
+    let k = mp.omega.len();
+    let interaction = options.interaction;
+
+    let nt = params.theta.len();
+    let n_omega = omega_packed_len(params.omega.dim(), params.omega.diagonal);
+    let n_sigma = params.sigma.values.len();
+    let ov_base = nt + n_omega + n_sigma;
+    let n_omega_ov = mp.omega_override_addr.len();
+    let total = ov_base + n_omega_ov + mp.sigma_override_addr.len();
+
+    // θ → packed chain factor dθ_j/dx_j (θ_j for log-packed, 1 for identity).
+    let dtheta_dx: Vec<f64> = (0..nt)
+        .map(|j| {
+            if theta_packs_log(params.theta_lower[j]) {
+                params.theta[j]
+            } else {
+                1.0
+            }
+        })
+        .collect();
+
+    let mut grad = vec![0.0f64; total];
+
+    for cls in 0..k {
+        let _guard = MixtureClassGuard::enter(cls + 1);
+        let cp = class_params(params, cls);
+        let x_k = pack_params(&cp);
+        // ∂nll_ik/∂x_k over the class-k packed layout [θ, Ω(base slots), σ, …].
+        let g_k = per_subject_packed_gradients(
+            model,
+            population,
+            &cp,
+            &x_k,
+            &eval.etas_by_class[cls],
+            interaction,
+        );
+        for (i, gk_i) in g_k.iter().enumerate() {
+            let gi = gk_i.as_ref()?; // out-of-scope subject → FD fallback
+            let w = eval.pmix[i][cls];
+            if w == 0.0 {
+                continue;
+            }
+            // θ slots (shared across classes).
+            for j in 0..nt {
+                grad[j] += 2.0 * w * gi[j];
+            }
+            // Base-Ω diagonal slots: route to the override slot for classes that
+            // override eta e, else to the shared base slot.
+            for e in 0..params.omega.dim() {
+                let s = nt + e;
+                let dest = mp
+                    .omega_override_addr
+                    .iter()
+                    .position(|&(c, ee)| c == cls && ee == e)
+                    .map(|a| ov_base + a)
+                    .unwrap_or(s);
+                grad[dest] += 2.0 * w * gi[s];
+            }
+            // σ slots.
+            for t in 0..n_sigma {
+                let s = nt + n_omega + t;
+                let dest = mp
+                    .sigma_override_addr
+                    .iter()
+                    .position(|&(c, tt)| c == cls && tt == t)
+                    .map(|b| ov_base + n_omega_ov + b)
+                    .unwrap_or(s);
+                grad[dest] += 2.0 * w * gi[s];
+            }
+        }
+    }
+
+    // Softmax mixing gradient: −2 Σ_i Σ_k w_ik ∂ln p_ik/∂θ_j (theta slots).
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let dlnp = mixing_logp_grad(spec, &params.theta, &subject.covariates)?;
+        for (cls, dlnp_c) in dlnp.iter().enumerate() {
+            let w = eval.pmix[i][cls];
+            if w == 0.0 {
+                continue;
+            }
+            for j in 0..nt {
+                grad[j] -= 2.0 * w * dlnp_c[j] * dtheta_dx[j];
+            }
+        }
+    }
+
+    Some(grad)
+}
+
+/// Central-FD outer gradient of the mixture OFV in real packed space — the
+/// fallback when [`mixture_gradient`] is out of analytic scope (#977 Phase 4).
+/// Re-runs `mixture_ofv` at `x ± h` per coordinate (`2·n` cold evals).
+pub fn mixture_gradient_fd(
+    model: &CompiledModel,
+    population: &Population,
+    x: &[f64],
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let h = 1e-5;
+    let n = x.len();
+    let mut g = vec![0.0f64; n];
+    for i in 0..n {
+        let mut xp = x.to_vec();
+        let mut xm = x.to_vec();
+        xp[i] += h;
+        xm[i] -= h;
+        let pp = crate::estimation::parameterization::unpack_params(&xp, init_params);
+        let pm = crate::estimation::parameterization::unpack_params(&xm, init_params);
+        let fp = mixture_ofv(model, population, &pp, options, None).ofv;
+        let fm = mixture_ofv(model, population, &pm, options, None).ofv;
+        g[i] = (fp - fm) / (2.0 * h);
+    }
+    g
+}
+
 #[cfg(test)]
 mod tests {
     use super::combine_subject;
@@ -304,6 +447,88 @@ mod tests {
         opts.outer_maxiter = 3;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("mixture fit should return Ok");
+        assert!(res.ofv.is_finite(), "OFV = {}", res.ofv);
+    }
+
+    // Variance-mixture (classes differ only by their Ω/Σ overrides, no `MIXNUM`
+    // branch) so the per-subject analytic sensitivity provider is in scope — the
+    // parity test then exercises the real analytic gradient (softmax mixing
+    // slots, base + per-class-override Ω/σ slots). A `MIXNUM`-conditional model
+    // is out of analytic scope and takes the FD route (see `mixture_gradient`).
+    const MIX_PARITY_MODEL: &str = r"
+[parameters]
+  theta TVCL(1.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.2, -10.0, 10.0)
+  theta BWT(0.05, -5.0, 5.0)
+  omega ETA_CL ~ 0.06
+  sigma EPS ~ 0.02
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL + BWT*(WT - 75)
+  omega(2) ETA_CL ~ 0.15
+  sigma(2) EPS ~ 0.03
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    #[test]
+    fn mixture_gradient_matches_fd() {
+        // Analytic posterior-weighted outer gradient vs central FD of the mixture
+        // OFV, over the full packed vector (θ incl. mixing logits, base Ω/σ, and
+        // per-class Ω/σ overrides). Exercises the softmax mixing gradient and the
+        // override-slot mapping. FOCE FD carries some inner-solve noise, so the
+        // tolerance is per-coordinate relative with an absolute floor.
+        use crate::estimation::parameterization::pack_params;
+        let model = crate::parser::model_parser::parse_model_string(MIX_PARITY_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(5, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+        let params = &model.default_params;
+
+        let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
+        let ana = super::mixture_gradient(&model, &pop, params, &opts, &eval)
+            .expect("analytic gradient in scope (logit form, diagonal base Ω)");
+        let x = pack_params(params);
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+
+        assert_eq!(ana.len(), fd.len());
+        let mut worst = 0.0f64;
+        for (i, (a, f)) in ana.iter().zip(&fd).enumerate() {
+            let denom = f.abs().max(a.abs()).max(1e-3);
+            let rel = (a - f).abs() / denom;
+            worst = worst.max(rel);
+            assert!(
+                rel < 2e-2,
+                "coord {i}: analytic {a:.6} vs FD {f:.6} (rel {rel:.2e})"
+            );
+        }
+        assert!(worst.is_finite());
+    }
+
+    #[test]
+    fn mixture_fit_slsqp_uses_analytic_gradient() {
+        // A user-chosen NLopt gradient optimizer is honoured for mixtures (Phase 4)
+        // and drives the analytic outer gradient. Variance-mixture model → in
+        // analytic scope. Just assert it returns Ok with a finite OFV after a few
+        // iterations (the gradient path is exercised on every eval).
+        let model = crate::parser::model_parser::parse_model_string(MIX_PARITY_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(4, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            optimizer: crate::types::Optimizer::Slsqp,
+            outer_maxiter: 4,
+            ..crate::types::FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("SLSQP mixture fit should return Ok");
         assert!(res.ofv.is_finite(), "OFV = {}", res.ofv);
     }
 

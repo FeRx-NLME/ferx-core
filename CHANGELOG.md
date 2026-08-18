@@ -28,9 +28,12 @@ section of the SDLC for the versioning policy).
   subject's marginal is the covariate-weighted mixture `L_i = Σ_k p_ik · L_ik` and the objective is
   the numerically stable log-sum-exp `−2 Σ_i log Σ_k p_ik exp(−nll_ik)`, with a separate empirical
   Bayes solve per (subject × class). The mixing-logit coefficients are ordinary thetas and the
-  per-class Ω/Σ are estimated jointly. Estimation runs through the derivative-free (BOBYQA) outer
-  optimizer; other estimators (SAEM/IMP/Bayes), inter-occasion variability, and standard errors for
-  mixture models are not yet supported and error clearly. The parser rejects `nsub < 2`, `MIXNUM`
+  per-class Ω/Σ are estimated jointly. Estimation defaults to the derivative-free (BOBYQA) outer
+  optimizer, but an analytic posterior-weighted outer gradient is available, so a user-selected NLopt
+  gradient optimizer (SLSQP / L-BFGS / MMA) is honoured — with an automatic finite-difference fallback
+  for models outside analytic scope (e.g. `MIXNUM`-branched typical values). Other estimators
+  (SAEM/IMP/Bayes), inter-occasion variability, and standard errors for mixture models are not yet
+  supported and error clearly. The parser rejects `nsub < 2`, `MIXNUM`
   assignment, `MIXNUM` outside a mixture model, eta-dependent mixing expressions, missing class
   coverage, `omega(k)` on a block base, and overrides of the base class.
 
