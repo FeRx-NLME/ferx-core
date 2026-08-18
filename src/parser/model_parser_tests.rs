@@ -13576,6 +13576,30 @@ fn mixture_mixed_logit_and_prob_forms_rejected() {
 }
 
 #[test]
+fn fit_on_mixture_model_rejects_missing_mixture_params() {
+    // Custom init_params with mixture: None (e.g. rebuilt from a FitResult) must
+    // be rejected rather than silently running the single-population objective.
+    let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
+    let pop = crate::types::Population {
+        subjects: vec![],
+        covariate_names: vec![],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let mut params = model.default_params.clone();
+    params.mixture = None;
+    let opts = crate::types::FitOptions::default();
+    let err = crate::api::fit(&model, &pop, &params, &opts)
+        .expect_err("mixture model with mixture: None params must be rejected");
+    assert!(
+        err.contains("per-class Omega/Sigma") && err.contains("init_params.mixture"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn fit_on_mixture_model_rejects_unsupported_method() {
     // Phase 3 wires FOCE/FOCEI; other estimators (here SAEM) must still error
     // clearly rather than silently ignoring the mixture structure. The method

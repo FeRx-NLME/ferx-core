@@ -207,6 +207,20 @@ pub fn fit(
     // marginalisation are not yet supported — reject them clearly rather than
     // silently ignoring the mixture structure.
     if model.mixture.is_some() {
+        // The objective keys the mixture path off `params.mixture` (carried from
+        // `init_params` through `unpack_params`). If a caller passes custom
+        // `init_params` with `mixture: None` — e.g. params rebuilt from a prior
+        // `FitResult` — the fit would silently run the single-population objective
+        // with `MIXNUM` pinned to the class-1 default. Fail loudly instead: the
+        // per-class Omega/Sigma must be present.
+        if init_params.mixture.is_none() {
+            return Err(
+                "mixture model ([mixture] block, #977) requires per-class Omega/Sigma in \
+                 `init_params.mixture`; pass the parsed model's `default_params` (or rebuild \
+                 them from the model file) rather than params with `mixture: None`"
+                    .to_string(),
+            );
+        }
         for m in options.method_chain() {
             if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
                 return Err(format!(
