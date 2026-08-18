@@ -35,7 +35,9 @@ section of the SDLC for the versioning policy).
   (SAEM/IMP/Bayes), inter-occasion variability, and standard errors for mixture models are not yet
   supported and error clearly. The parser rejects `nsub < 2`, `MIXNUM`
   assignment, `MIXNUM` outside a mixture model, eta-dependent mixing expressions, missing class
-  coverage, `omega(k)` on a block base, and overrides of the base class.
+  coverage, `omega(k)` on a block base, and overrides of the base class. The `sdtab` output gains
+  per-subject `MIXEST` (most-probable class, 1-based like NONMEM) and `PMIX_1..PMIX_K` (posterior
+  class-membership probabilities `PMIX_ik ∝ p_ik·exp(−nll_ik)`) columns for a mixture fit.
 - **A missing `DV` no longer empties a simulation.** Simulating from a design — dosing plus
   sampling times, with `DV = .` because the values are what the run is about to produce — used
   to return zero rows: every `EVID=0` row with a missing `DV` was skipped as a forgotten

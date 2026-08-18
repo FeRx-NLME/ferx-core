@@ -448,6 +448,20 @@ mod tests {
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("mixture fit should return Ok");
         assert!(res.ofv.is_finite(), "OFV = {}", res.ofv);
+
+        // Phase 5: per-subject posteriors are threaded onto every SubjectResult.
+        for sr in &res.subjects {
+            let pmix = sr.pmix.as_ref().expect("PMIX populated for a mixture fit");
+            assert_eq!(pmix.len(), 2, "K = 2 posterior weights per subject");
+            let sum: f64 = pmix.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-9, "PMIX sums to 1, got {sum}");
+            assert!(pmix.iter().all(|&p| (0.0..=1.0).contains(&p)));
+            // MIXEST is the 1-based argmax-posterior class.
+            let mixest = sr.mixest.expect("MIXEST populated for a mixture fit");
+            assert!(mixest == 1 || mixest == 2, "MIXEST in 1..=K, got {mixest}");
+            let argmax = if pmix[0] >= pmix[1] { 1 } else { 2 };
+            assert_eq!(mixest, argmax, "MIXEST = argmax_k PMIX_ik (1-based)");
+        }
     }
 
     // Variance-mixture (classes differ only by their Ω/Σ overrides, no `MIXNUM`

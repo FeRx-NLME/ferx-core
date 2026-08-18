@@ -138,6 +138,8 @@ fn sr_for(n_obs: usize) -> SubjectResult {
         ofv_contribution: 0.0,
         cens: vec![0; n_obs],
         n_obs,
+        pmix: None,
+        mixest: None,
         extra_columns: Vec::new(),
         per_obs_tad: Vec::new(),
         compartment_states: Vec::new(),

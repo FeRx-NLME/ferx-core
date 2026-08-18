@@ -1299,6 +1299,7 @@ fn fit_inner(
                     bayes: None,
                     cond_dist: None,
                     packed_estimate: None,
+                    mixture_posteriors: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -1512,6 +1513,19 @@ fn fit_inner(
         &result.kappas,
         options.interaction,
     );
+
+    // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto
+    // each SubjectResult so output.rs can emit the PMIX_1..PMIX_K and MIXEST
+    // columns. MIXEST is stored 1-based to match the NONMEM `MIXEST` convention.
+    if let Some(mp) = &result.mixture_posteriors {
+        for (sr, (pmix, mixest)) in subjects
+            .iter_mut()
+            .zip(mp.pmix.iter().zip(mp.mixest.iter()))
+        {
+            sr.pmix = Some(pmix.clone());
+            sr.mixest = Some(mixest + 1);
+        }
+    }
 
     // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
     // (with individual lagtime) for the mandatory TAD column in output.rs.

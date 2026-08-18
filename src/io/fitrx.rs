@@ -1030,6 +1030,11 @@ fn parse_subjects(
             ofv_contribution: ofv,
             cens: Vec::new(),
             n_obs,
+            // Mixture posteriors are not round-tripped through the .fitrx checkpoint
+            // yet (like discrete rows below) — a restored mixture fit emits no
+            // PMIX/MIXEST columns. Checkpoint-format follow-up (#897-style).
+            pmix: None,
+            mixest: None,
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
@@ -1841,6 +1846,8 @@ mod tests {
             ofv_contribution: 12.34,
             cens: vec![0; n_obs],
             n_obs,
+            pmix: None,
+            mixest: None,
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],

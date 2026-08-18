@@ -1307,6 +1307,7 @@ fn run_mcem(
         bayes: None,
         cond_dist: None,
         packed_estimate: None,
+        mixture_posteriors: None,
     })
 }
 

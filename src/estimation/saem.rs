@@ -2705,6 +2705,7 @@ pub fn run_saem(
         bayes: None,
         cond_dist,
         packed_estimate: None,
+        mixture_posteriors: None,
     })
 }
 

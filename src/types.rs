@@ -3833,6 +3833,17 @@ pub struct SubjectResult {
     pub cens: Vec<i8>,
     /// Number of observations for this subject (MDV=0 rows).
     pub n_obs: usize,
+    /// Posterior class-membership probabilities `PMIX_ik` for a `[mixture]` model
+    /// (length = number of classes `K`); `None` for non-mixture fits. Formed from
+    /// the converged fit as `PMIX_ik ∝ p_ik · exp(−nll_ik)` (normalised over `k`)
+    /// and emitted as the `PMIX_1..PMIX_K` sdtab columns. (#977)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pmix: Option<Vec<f64>>,
+    /// Most-probable class `MIXEST_i` (1-based, NONMEM `MIXEST` convention) for a
+    /// `[mixture]` model; `None` for non-mixture fits. `argmax_k PMIX_ik`, emitted
+    /// as the `MIXEST` sdtab column. (#977)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixest: Option<usize>,
     /// Extra sdtab columns from [derived] and [output] blocks, computed
     /// post-fit. Each entry is (column_name, per-observation values). Subject-
     /// level aggregates (max, AUC, tmax) are repeated across all observation rows.

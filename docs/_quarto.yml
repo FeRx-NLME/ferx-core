@@ -95,6 +95,7 @@ website:
           - estimation/tte.qmd
           - estimation/categorical.qmd
           - estimation/ctmm.qmd
+          - estimation/mixture.qmd
       - text: "Data Format"
         href: data-format.qmd
       - text: "CLI Reference"

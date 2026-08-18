@@ -1088,6 +1088,17 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .iter()
         .any(|s| !s.npde.is_empty() || !s.npd.is_empty());
 
+    // Mixture (#977): emit MIXEST + PMIX_1..PMIX_K only for a mixture fit. `K` is
+    // the posterior-vector length (identical across subjects for a given model).
+    let n_mix_classes = result
+        .subjects
+        .iter()
+        .find_map(|s| s.pmix.as_ref().map(|p| p.len()))
+        .unwrap_or(0);
+    let any_mixture = n_mix_classes > 0;
+    let mut mixest_col = Vec::with_capacity(n_total);
+    let mut pmix_cols: Vec<Vec<f64>> = vec![Vec::with_capacity(n_total); n_mix_classes];
+
     for (si, sr) in result.subjects.iter().enumerate() {
         let subj = &population.subjects[si];
         for j in 0..sr.ipred.len() {
@@ -1116,6 +1127,14 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
             }
             ebe_ofv_col.push(sr.ofv_contribution);
             n_obs_col.push(sr.n_obs as f64);
+            if any_mixture {
+                // Subject-level scalars repeated across the subject's obs rows.
+                mixest_col.push(sr.mixest.map(|c| c as f64).unwrap_or(f64::NAN));
+                for (k, col) in pmix_cols.iter_mut().enumerate() {
+                    let p = sr.pmix.as_ref().and_then(|v| v.get(k)).copied();
+                    col.push(p.unwrap_or(f64::NAN));
+                }
+            }
         }
     }
 
@@ -1147,6 +1166,14 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         ("EBE_OFV".to_string(), ebe_ofv_col),
         ("N_OBS".to_string(), n_obs_col),
     ]);
+    if any_mixture {
+        // MIXEST (most-probable class) then PMIX_1..PMIX_K (posterior weights),
+        // mirroring the NONMEM `MIXEST` / per-class probability table layout.
+        cols.push(("MIXEST".to_string(), mixest_col));
+        for (k, col) in pmix_cols.into_iter().enumerate() {
+            cols.push((format!("PMIX_{}", k + 1), col));
+        }
+    }
 
     // NOTE: sdtab intentionally does NOT emit ETA1..ETAn columns. Per-subject
     // EBEs live in `fit$ebe_etas` on the R side; sdtab is strictly
@@ -2663,6 +2690,8 @@ mod tests {
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
+            pmix: None,
+            mixest: None,
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
@@ -3017,6 +3046,63 @@ mod tests {
     }
 
     #[test]
+    fn sdtab_mixture_columns_present_and_repeated_across_obs() {
+        // Two subjects, class-2 and class-1 winners; posteriors repeat across each
+        // subject's observation rows (subject-level scalars), MIXEST is 1-based.
+        let mut s0 = sdtab_subject_result("1", 2);
+        s0.pmix = Some(vec![0.2, 0.8]);
+        s0.mixest = Some(2);
+        let mut s1 = sdtab_subject_result("2", 1);
+        s1.pmix = Some(vec![0.9, 0.1]);
+        s1.mixest = Some(1);
+        let result = minimal_sdtab_result(vec![s0, s1]);
+        let population = Population {
+            subjects: vec![
+                sdtab_subject("1", 2, vec![1, 1]),
+                sdtab_subject("2", 1, vec![1]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        let col = |name: &str| {
+            cols.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{name} column should be present for a mixture fit"))
+        };
+        // 3 rows total (2 + 1), subject-level values repeated per row.
+        assert_eq!(col("MIXEST"), vec![2.0, 2.0, 1.0]);
+        assert_eq!(col("PMIX_1"), vec![0.2, 0.2, 0.9]);
+        assert_eq!(col("PMIX_2"), vec![0.8, 0.8, 0.1]);
+    }
+
+    #[test]
+    fn sdtab_mixture_columns_absent_for_non_mixture_fit() {
+        // sdtab_subject_result leaves pmix/mixest None (the non-mixture default).
+        let result = minimal_sdtab_result(vec![sdtab_subject_result("1", 2)]);
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        assert!(
+            cols.iter()
+                .all(|(name, _)| name != "MIXEST" && !name.starts_with("PMIX_")),
+            "MIXEST/PMIX_* columns should be absent for a non-mixture fit"
+        );
+    }
+
+    #[test]
     fn sdtab_cmt_column_absent_for_single_cmt() {
         let result = minimal_sdtab_result(vec![sdtab_subject_result("1", 2)]);
         let population = Population {
@@ -3155,6 +3241,8 @@ mod tests {
             ofv_contribution: 3.0,
             cens: vec![0, 1],
             n_obs: 2,
+            pmix: None,
+            mixest: None,
             extra_columns: Vec::new(),
             per_obs_tad: Vec::new(),
             compartment_states: Vec::new(),

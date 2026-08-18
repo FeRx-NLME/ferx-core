@@ -20,6 +20,17 @@ use std::sync::{Arc, Mutex};
 pub(crate) use crate::estimation::covariance::{compute_covariance, CovarianceStepResult};
 
 /// Result of outer optimization
+/// Per-subject mixture posteriors lifted out of a converged `[mixture]` fit
+/// (#977 Phase 5), threaded onto `SubjectResult.pmix` / `.mixest` in postfit.
+pub struct MixturePosteriors {
+    /// `PMIX_ik` — posterior class-membership probabilities per subject (each of
+    /// length `K`), in subject order.
+    pub pmix: Vec<Vec<f64>>,
+    /// `MIXEST_i` — argmax-posterior class per subject, **0-based** (converted to
+    /// the 1-based NONMEM convention when written onto `SubjectResult`).
+    pub mixest: Vec<usize>,
+}
+
 pub struct OuterResult {
     pub params: ModelParameters,
     pub ofv: f64,
@@ -82,6 +93,9 @@ pub struct OuterResult {
     /// (`omega → chol` is not the round-trip inverse of the stored `L·Lᵀ`, and the
     /// FD Hessian amplifies the difference on ill-conditioned ω directions).
     pub packed_estimate: Option<Vec<f64>>,
+    /// Per-subject mixture posteriors from the final mixture eval. `Some` only for
+    /// a converged `[mixture]` fit (#977); `None` for every non-mixture path.
+    pub mixture_posteriors: Option<MixturePosteriors>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -460,6 +474,7 @@ fn evaluate_at_initial_params(
         // fallback (`chol(L·Lᵀ) ≠ L`) would otherwise diverge on an ill-conditioned
         // init omega just as it does for a converged fit (#816 follow-up).
         packed_estimate: Some(x.clone()),
+        mixture_posteriors: None,
         params,
         ofv,
         converged: false,
@@ -1829,46 +1844,49 @@ fn optimize_nlopt(
 
     // Final inner loop at converged parameters. Mixture (#977 Phase 3): the OFV
     // is the K-fold log-sum-exp and the reported EBEs are the MIXEST class.
-    let (final_ehs, final_hms, final_kappas, final_ofv, final_mixest) = if final_is_mixture {
-        let m = crate::estimation::mixture::mixture_ofv(
-            model,
-            population,
-            &final_params,
-            options,
-            None,
-        );
-        (
-            m.mixest_etas,
-            m.mixest_h_mats,
-            Vec::new(),
-            m.ofv,
-            Some(m.mixest),
-        )
-    } else {
-        let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-        let (final_ehs, final_hms, _, final_kappas) = run_inner_loop_warm(
-            model,
-            population,
-            &final_params,
-            options.inner_maxiter,
-            options.inner_tol,
-            None,
-            Some(&final_mu_k),
-            options.min_obs_for_convergence_check as usize,
-            options.inner_restarts,
-        );
-        let final_nll = pop_nll_opts(
-            model,
-            population,
-            &final_params,
-            &final_ehs,
-            &final_hms,
-            &final_kappas,
-            options,
-        );
-        (final_ehs, final_hms, final_kappas, 2.0 * final_nll, None)
-    };
-    let _ = &final_mixest; // Phase 5 will thread MIXEST into per-subject postfit.
+    let (final_ehs, final_hms, final_kappas, final_ofv, final_mixture_posteriors) =
+        if final_is_mixture {
+            let m = crate::estimation::mixture::mixture_ofv(
+                model,
+                population,
+                &final_params,
+                options,
+                None,
+            );
+            (
+                m.mixest_etas,
+                m.mixest_h_mats,
+                Vec::new(),
+                m.ofv,
+                Some(MixturePosteriors {
+                    pmix: m.pmix,
+                    mixest: m.mixest,
+                }),
+            )
+        } else {
+            let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
+            let (final_ehs, final_hms, _, final_kappas) = run_inner_loop_warm(
+                model,
+                population,
+                &final_params,
+                options.inner_maxiter,
+                options.inner_tol,
+                None,
+                Some(&final_mu_k),
+                options.min_obs_for_convergence_check as usize,
+                options.inner_restarts,
+            );
+            let final_nll = pop_nll_opts(
+                model,
+                population,
+                &final_params,
+                &final_ehs,
+                &final_hms,
+                &final_kappas,
+                options,
+            );
+            (final_ehs, final_hms, final_kappas, 2.0 * final_nll, None)
+        };
 
     if options.verbose {
         eprintln!("Final OFV = {:.6}", final_ofv);
@@ -1990,6 +2008,7 @@ fn optimize_nlopt(
         // The exact packed vector this stage's inline covariance step used (#816
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x0.clone()),
+        mixture_posteriors: final_mixture_posteriors,
     }
 }
 
@@ -2385,6 +2404,7 @@ fn optimize_bfgs(
         // The exact packed vector this stage's inline covariance step used (#816
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x_final.clone()),
+        mixture_posteriors: None,
         params: final_params,
         ofv: final_ofv,
         converged,
