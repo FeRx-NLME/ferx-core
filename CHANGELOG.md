@@ -70,6 +70,10 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **Mixture posteriors survive a `.fitrx` checkpoint (#983).** A saved-then-restored mixture fit
+  now re-emits its per-subject `MIXEST` / `PMIX_1..K` columns: they round-trip through optional
+  trailing columns on `ebes.csv` (a non-mixture bundle is byte-identical to before). Previously the
+  checkpoint dropped them, so a restored mixture fit's `sdtab` silently lost the mixture columns.
 - **Mixture-model correctness fixes (#980, follow-up to #977).** The analytic outer gradient for a
   `MIXNUM`-branched typical value (e.g. class-specific clearance) now resolves the correct class on
   every rayon worker, so a gradient optimizer (SLSQP/L-BFGS/MMA) is no longer misled by a
