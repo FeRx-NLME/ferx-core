@@ -21,6 +21,14 @@
 //! The mixing fraction is parameterised differently in the two engines
 //! (NONMEM: `P(1)=THETA(4)`; ferx: `logit(1)=MIXL`, `p(1)=σ(MIXL)`) but denotes
 //! the same quantity — compared as the resolved `p(1)` fraction.
+//!
+//! ## Standard errors (#983 Phase 6)
+//!
+//! The test also cross-checks the mixture covariance step against
+//! `tests/nonmem/mixture_iv_cov.ctl` (`$COVARIANCE MATRIX=R` — the pure
+//! Hessian-inverse `R^-1`, the same estimator ferx computes). All four SEs agree
+//! to < 1 %. The mixing-fraction SE is compared after delta-method mapping ferx's
+//! logit-scale `SE(MIXL)` to the probability scale via `SE(p) = p(1−p)·SE(MIXL)`.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::{fit, read_nonmem_csv, FitOptions};
@@ -32,6 +40,14 @@ const NM_TVCL2: f64 = 2.84198;
 const NM_TVV: f64 = 9.97859;
 const NM_P1: f64 = 0.471970; // P(1), mixing fraction of class 1
 const NM_OFV_NO_CONST: f64 = 301.5820;
+
+// NONMEM $COVARIANCE MATRIX=R SEs (mixture_iv_cov.ext, -1000000001 row; natural
+// theta scale). MATRIX=R is the pure R^-1 Hessian-inverse — the same estimator
+// ferx computes — so these are an apples-to-apples cross-check (#983 Phase 6).
+const NM_SE_TVCL1: f64 = 0.105642;
+const NM_SE_TVCL2: f64 = 0.254347;
+const NM_SE_TVV: f64 = 0.186107;
+const NM_SE_P1: f64 = 0.102569; // SE of P(1) on the probability scale
 
 // Per-subject MIXEST (most-probable class, 1-based) from mixture_iv.sdtab,
 // indexed by subject order (ID 1..=30).
@@ -116,6 +132,51 @@ fn mixture_fit_matches_nonmem() {
     // Mixing fraction: ferx logit → p(1) = σ(MIXL), compared to NONMEM P(1).
     let p1 = 1.0 / (1.0 + (-th[3]).exp());
     assert!((p1 - NM_P1).abs() < 0.05, "p(1) {} vs NONMEM {}", p1, NM_P1);
+
+    // ── Standard errors vs NONMEM $COVARIANCE (#983 Phase 6) ────────────────────
+    // The mixture covariance step now runs (it was skipped before): its FD Hessian
+    // is built on the K-fold mixture OFV, and SE = sqrt(diag(R^-1)). Compared to
+    // `tests/nonmem/mixture_iv_cov.ctl`, which uses `$COVARIANCE MATRIX=R` — the
+    // pure Hessian-inverse estimator ferx also computes (NONMEM's default sandwich
+    // R^-1 S R^-1 would differ by the usual 10-25% between the two estimators).
+    // Observed agreement is <1% on all four (`.ext` `-1000000001` row).
+    let se = res
+        .se_theta
+        .as_ref()
+        .expect("mixture fit now reports theta SEs (#983)");
+    assert!(
+        res.covariance_matrix.is_some(),
+        "mixture covariance matrix present"
+    );
+    let rel_se = |a: f64, b: f64| (a - b).abs() / b.abs();
+    assert!(
+        rel_se(se[0], NM_SE_TVCL1) < 0.03,
+        "SE TVCL1 {} vs {}",
+        se[0],
+        NM_SE_TVCL1
+    );
+    assert!(
+        rel_se(se[1], NM_SE_TVCL2) < 0.03,
+        "SE TVCL2 {} vs {}",
+        se[1],
+        NM_SE_TVCL2
+    );
+    assert!(
+        rel_se(se[2], NM_SE_TVV) < 0.03,
+        "SE TVV {} vs {}",
+        se[2],
+        NM_SE_TVV
+    );
+    // Mixing fraction SE: ferx MIXL is on the logit scale; delta-method to p(1),
+    // p = σ(MIXL) ⇒ dp/dMIXL = p(1−p), so SE(p) = p(1−p)·SE(MIXL). NONMEM
+    // parameterizes P(1)=THETA(4) directly, so its SE is already on the p-scale.
+    let se_p1 = p1 * (1.0 - p1) * se[3];
+    assert!(
+        rel_se(se_p1, NM_SE_P1) < 0.03,
+        "SE p(1) {} vs {}",
+        se_p1,
+        NM_SE_P1
+    );
 
     // ── Per-subject MIXEST classification agreement ─────────────────────────
     assert_eq!(res.subjects.len(), NM_MIXEST.len());

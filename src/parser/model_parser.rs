@@ -2136,7 +2136,16 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &default_params.sigma.names,
             )?)
         } else {
-            if stmts_use_mixnum(&indiv_stmts) {
+            // MIXNUM is invalid anywhere in a model with no [mixture] block. The
+            // AST check covers [individual_parameters]; scan the other
+            // expression-bearing blocks ([error_model], [structural_model],
+            // [derived], [odes], …) at the token level since they compile to
+            // opaque closures below.
+            let mixnum_elsewhere = blocks
+                .iter()
+                .filter(|(k, _)| k.as_str() != "mixture" && k.as_str() != "individual_parameters")
+                .any(|(_, lines)| lines_use_mixnum(lines));
+            if stmts_use_mixnum(&indiv_stmts) || mixnum_elsewhere {
                 return Err(
                     "MIXNUM is only valid in a mixture model; add a [mixture] block".to_string(),
                 );
@@ -2275,6 +2284,16 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let mut model = model;
     model.bloq_method = fit_options.bloq_method;
     model.mixture = mixture_spec;
+
+    // Register the mixing-expression covariates (logit(k) = … BWT*(WT−75) …) as
+    // required data columns, mirroring the scaling / error-selector / init blocks
+    // below. Without this a `[covariates]`-declared model never reads the column,
+    // so a covariate used only in the mixing expression silently evaluates to 0
+    // and the mixing degrades to intercept-only (the #765 trap).
+    if let Some(ref mix) = model.mixture {
+        let mix_covs = mix.logit_covariates.clone();
+        register_referenced_covariates(&mut model.referenced_covariates, mix_covs);
+    }
 
     // Build FremConfig from fit options when frem_predictions is present.
     // Format: "THETA_NAME/ETA_NAME:FREMTYPE, ..."
@@ -12358,6 +12377,23 @@ fn stmts_use_mixnum(stmts: &[Statement]) -> bool {
         }
     });
     found
+}
+
+/// Whether any raw block line references the reserved `MIXNUM` built-in (#977).
+/// Used to reject `MIXNUM` **anywhere** in a model with no `[mixture]` block —
+/// not just `[individual_parameters]` (which is caught at the AST level by
+/// [`stmts_use_mixnum`]), but also `[error_model]`, `[structural_model]`,
+/// `[derived]`, `[odes]`, etc., whose expressions are compiled to opaque closures
+/// after this check. Tokenizes each line and matches the `MIXNUM` identifier
+/// (case-insensitive), so a substring or a comment can't false-positive. A
+/// tokenizer error is treated as "not found" — that block's own parse surfaces it.
+fn lines_use_mixnum(lines: &[String]) -> bool {
+    lines.iter().any(|line| {
+        tokenize(line).is_ok_and(|toks| {
+            toks.iter()
+                .any(|t| matches!(t, Token::Ident(s) if s.eq_ignore_ascii_case("MIXNUM")))
+        })
+    })
 }
 
 /// Whether any statement assigns to `MIXNUM`. The index is reserved read-only

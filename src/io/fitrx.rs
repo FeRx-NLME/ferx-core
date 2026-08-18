@@ -4,7 +4,8 @@
 //!
 //! - `manifest.json`     — format version, ferx version, timestamp, entry index
 //! - `fit.json`          — scalars / vectors / matrices on `FitResult`
-//! - `ebes.csv`          — per-subject EBEs (`ID, eta_1..eta_n, ofv_contribution, n_obs`)
+//! - `ebes.csv`          — per-subject EBEs (`ID, eta_1..eta_n, ofv_contribution, n_obs`;
+//!                          a mixture fit appends `MIXEST, PMIX_1..K`)
 //! - `ebes_kappa.csv`    — per-(subject, occasion) kappa EBEs (only when `n_kappa > 0`)
 //! - `conddist.csv`      — per-subject conditional η mean/SD/mode (only when `conddist = true`, SAEM-only)
 //! - `predictions.csv`   — per-observation predictions joined with TIME/DV
@@ -677,6 +678,21 @@ fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> 
         header.push_str(name);
     }
     header.push_str(",ofv_contribution,n_obs");
+    // Mixture (#983): a mixture fit carries per-subject `MIXEST` (most-probable
+    // class) and `PMIX_1..K` (posterior class weights). Append them after the
+    // fixed base columns so a non-mixture bundle is byte-identical to before and
+    // the reader can pick them up by header name. `K` comes from the first
+    // subject that has posteriors (all subjects of a mixture fit have them).
+    let mix_k = r
+        .subjects
+        .iter()
+        .find_map(|s| s.pmix.as_ref().map(|p| p.len()));
+    if let Some(k) = mix_k {
+        header.push_str(",MIXEST");
+        for j in 1..=k {
+            header.push_str(&format!(",PMIX_{j}"));
+        }
+    }
     writeln!(w, "{}", header)?;
     for s in &r.subjects {
         let mut row = csv_escape(&s.id);
@@ -688,6 +704,23 @@ fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> 
         row.push_str(&fmt_f64(s.ofv_contribution));
         row.push(',');
         row.push_str(&s.n_obs.to_string());
+        if let Some(k) = mix_k {
+            // MIXEST is 1-based; write 0 for a subject that somehow lacks it so
+            // the column count stays rectangular (should not happen — posteriors
+            // are set together for every subject of a mixture fit).
+            row.push(',');
+            row.push_str(&s.mixest.unwrap_or(0).to_string());
+            for j in 0..k {
+                row.push(',');
+                let p = s
+                    .pmix
+                    .as_ref()
+                    .and_then(|v| v.get(j))
+                    .copied()
+                    .unwrap_or(0.0);
+                row.push_str(&fmt_f64(p));
+            }
+        }
         writeln!(w, "{}", row)?;
     }
     Ok(())
@@ -972,6 +1005,25 @@ fn read_json<T: serde::de::DeserializeOwned, R: Read + std::io::Seek>(
     Ok(serde_json::from_slice(&buf)?)
 }
 
+/// Column indices of the `PMIX_{k}` headers, ordered by class number `k` rather
+/// than raw header position (#984 review). ferx writes `PMIX_1..K` in order, but a
+/// CSV tool that reordered columns (e.g. alphabetically — `PMIX_10` before
+/// `PMIX_2`) would otherwise silently swap class probabilities on restore, since
+/// the restored `pmix` vector is indexed by class. A non-numeric suffix sorts last
+/// deterministically.
+fn pmix_column_order(header_names: &[&str]) -> Vec<usize> {
+    let mut named: Vec<(usize, usize)> = header_names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            c.strip_prefix("PMIX_")
+                .map(|suf| (suf.parse::<usize>().unwrap_or(usize::MAX), i))
+        })
+        .collect();
+    named.sort_by_key(|&(cls, _)| cls);
+    named.into_iter().map(|(_, i)| i).collect()
+}
+
 fn parse_subjects(
     ebes_csv: &str,
     preds_csv: &str,
@@ -983,26 +1035,37 @@ fn parse_subjects(
     let header = lines
         .next()
         .ok_or_else(|| FitrxError::Corrupt("ebes.csv: empty".into()))?;
-    let expected_cols = 1 + n_eta + 2;
-    let header_cols = header.split(',').count();
-    if header_cols != expected_cols {
+    // The base columns (ID, eta_1..n, ofv_contribution, n_obs) are fixed at the
+    // front; a mixture bundle appends MIXEST + PMIX_1..K after them (#983). So the
+    // base count is a *minimum*, and the optional mixture columns are located by
+    // header name rather than position.
+    let base_cols = 1 + n_eta + 2;
+    let header_names: Vec<&str> = header.split(',').collect();
+    let header_cols = header_names.len();
+    if header_cols < base_cols {
         return Err(FitrxError::Corrupt(format!(
-            "ebes.csv header has {} columns, expected {}",
-            header_cols, expected_cols
+            "ebes.csv header has {} columns, expected at least {}",
+            header_cols, base_cols
         )));
     }
+    // Optional mixture columns (#983): MIXEST + PMIX_1..K, by header name.
+    let mixest_idx = header_names.iter().position(|&c| c == "MIXEST");
+    // Restore PMIX columns in class-number order, not raw header order (#984
+    // review): the restored `pmix` vector is indexed by class, so a CSV tool that
+    // reordered columns would otherwise silently swap class probabilities.
+    let pmix_idxs = pmix_column_order(&header_names);
     let mut subjects: Vec<SubjectResult> = Vec::new();
     for (i, line) in lines.enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let fields = parse_csv_row(line);
-        if fields.len() != expected_cols {
+        if fields.len() != header_cols {
             return Err(FitrxError::Corrupt(format!(
                 "ebes.csv row {} has {} fields, expected {}",
                 i + 1,
                 fields.len(),
-                expected_cols
+                header_cols
             )));
         }
         let id = fields[0].clone();
@@ -1018,6 +1081,20 @@ fn parse_subjects(
         let n_obs = fields[2 + n_eta]
             .parse::<usize>()
             .map_err(|_| FitrxError::Corrupt(format!("ebes.csv: bad n_obs in row {}", i + 1)))?;
+        // Mixture posteriors (#983): restore MIXEST + PMIX_1..K when the bundle
+        // carries them. A `MIXEST` of 0 is the sentinel for "no class" → None.
+        let mixest = mixest_idx.and_then(|mi| fields[mi].parse::<usize>().ok().filter(|&m| m != 0));
+        let pmix = if pmix_idxs.is_empty() {
+            None
+        } else {
+            let mut v = Vec::with_capacity(pmix_idxs.len());
+            for &pi in &pmix_idxs {
+                v.push(fields[pi].parse::<f64>().map_err(|_| {
+                    FitrxError::Corrupt(format!("ebes.csv: bad PMIX in row {}", i + 1))
+                })?);
+            }
+            Some(v)
+        };
         subjects.push(SubjectResult {
             id,
             eta,
@@ -1030,11 +1107,10 @@ fn parse_subjects(
             ofv_contribution: ofv,
             cens: Vec::new(),
             n_obs,
-            // Mixture posteriors are not round-tripped through the .fitrx checkpoint
-            // yet (like discrete rows below) — a restored mixture fit emits no
-            // PMIX/MIXEST columns. Checkpoint-format follow-up (#897-style).
-            pmix: None,
-            mixest: None,
+            // Mixture posteriors round-trip through ebes.csv's optional
+            // MIXEST/PMIX_* columns (#983); None for a non-mixture bundle.
+            pmix,
+            mixest,
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
@@ -1833,6 +1909,33 @@ mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector};
 
+    #[test]
+    fn pmix_column_order_sorts_by_class_number() {
+        // #984 review: restore PMIX by class number, not header position — so an
+        // alphabetically-reordered header (PMIX_10 before PMIX_2, K ≥ 10) maps each
+        // column to the right class instead of silently swapping probabilities.
+        // In-order header → identity mapping onto the PMIX columns.
+        let h = [
+            "ID", "eta_1", "ofv", "n_obs", "MIXEST", "PMIX_1", "PMIX_2", "PMIX_3",
+        ];
+        assert_eq!(pmix_column_order(&h), vec![5, 6, 7]);
+
+        // Alphabetically reordered (PMIX_1, PMIX_10, PMIX_11, PMIX_2, ...) must be
+        // re-sorted to class order 1,2,...,10,11 → the column *positions* follow.
+        let h2 = [
+            "ID", "PMIX_1", "PMIX_10", "PMIX_11", "PMIX_2", "PMIX_3", "PMIX_4", "PMIX_5", "PMIX_6",
+            "PMIX_7", "PMIX_8", "PMIX_9",
+        ];
+        // class 1..9 sit at positions 1,4,5,6,7,8,9,10,11; class 10,11 at 2,3.
+        assert_eq!(
+            pmix_column_order(&h2),
+            vec![1, 4, 5, 6, 7, 8, 9, 10, 11, 2, 3]
+        );
+
+        // No PMIX columns → empty.
+        assert!(pmix_column_order(&["ID", "eta_1", "ofv", "n_obs"]).is_empty());
+    }
+
     fn dummy_subject(id: &str, n_eta: usize, n_obs: usize) -> SubjectResult {
         SubjectResult {
             id: id.into(),
@@ -2136,6 +2239,56 @@ mod tests {
         assert_eq!(loaded.model_source, "model source\n");
         assert!(loaded.population.is_none());
         assert_eq!(loaded.manifest.format_version, FORMAT_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_mixture_pmix_mixest() {
+        // #983: a mixture fit's per-subject MIXEST + PMIX_1..K survive the .fitrx
+        // checkpoint via ebes.csv's optional trailing columns. Before, load_fit
+        // hard-coded them to None, so a restored mixture fit emitted no
+        // MIXEST/PMIX_* sdtab columns.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mix.fitrx");
+        let mut r = minimal_fit_result();
+        for (i, s) in r.subjects.iter_mut().enumerate() {
+            let p0 = 0.2 + 0.3 * i as f64; // 0.2, 0.5 → distinct per subject
+            s.pmix = Some(vec![p0, 1.0 - p0]);
+            s.mixest = Some(if p0 >= 0.5 { 1 } else { 2 });
+        }
+        let expected: Vec<(Option<usize>, Vec<f64>)> = r
+            .subjects
+            .iter()
+            .map(|s| (s.mixest, s.pmix.clone().unwrap()))
+            .collect();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "m\n", &path, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.subjects.len(), expected.len());
+        for (s, (mixest, pmix)) in loaded.fit.subjects.iter().zip(&expected) {
+            assert_eq!(s.mixest, *mixest, "MIXEST for {}", s.id);
+            let got = s.pmix.as_ref().expect("PMIX restored");
+            assert_eq!(got.len(), pmix.len());
+            for (a, b) in got.iter().zip(pmix) {
+                assert!((a - b).abs() < 1e-9, "PMIX {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn roundtrip_non_mixture_has_no_pmix() {
+        // A non-mixture bundle carries no MIXEST/PMIX columns and restores to
+        // None — the appended columns are strictly opt-in (#983).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.fitrx");
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "m\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        for s in &loaded.fit.subjects {
+            assert!(s.pmix.is_none(), "no PMIX for a non-mixture fit");
+            assert!(s.mixest.is_none(), "no MIXEST for a non-mixture fit");
+        }
     }
 
     /// The `restored_from_checkpoint` flag is set by `load_fit` and only by `load_fit`.

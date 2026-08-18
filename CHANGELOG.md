@@ -21,8 +21,8 @@ section of the SDLC for the versioning policy).
 
 ### Added
 - **Mixture models — `$MIXTURE`-style discrete latent subpopulations (#977).** Model files can
-  declare a `[mixture]` block giving the number of classes (`nsub`), the per-class mixing logits
-  (`logit(k) = …` over theta + covariates), and optional per-class Ω/Σ overrides (`omega(k)` /
+  declare a `[mixture]` block giving the number of classes (`nsub`), the per-class mixing rule
+  (`logit(k) = …` softmax, or `p(k) = …` direct probability, over theta + covariates), and optional per-class Ω/Σ overrides (`omega(k)` /
   `sigma(k)`); the reserved read-only `MIXNUM` index (1..=K) selects class-specific typical values
   inside `[individual_parameters]`. `fit()` estimates such models by **FOCE / FOCEI** — each
   subject's marginal is the covariate-weighted mixture `L_i = Σ_k p_ik · L_ik` and the objective is
@@ -32,12 +32,20 @@ section of the SDLC for the versioning policy).
   optimizer, but an analytic posterior-weighted outer gradient is available, so a user-selected NLopt
   gradient optimizer (SLSQP / L-BFGS / MMA) is honoured — with an automatic finite-difference fallback
   for models outside analytic scope (e.g. `MIXNUM`-branched typical values). Other estimators
-  (SAEM/IMP/Bayes), inter-occasion variability, and standard errors for mixture models are not yet
+  (SAEM/IMP/Bayes) and inter-occasion variability under a mixture are not yet
   supported and error clearly. The parser rejects `nsub < 2`, `MIXNUM`
   assignment, `MIXNUM` outside a mixture model, eta-dependent mixing expressions, missing class
   coverage, `omega(k)` on a block base, and overrides of the base class. The `sdtab` output gains
   per-subject `MIXEST` (most-probable class, 1-based like NONMEM) and `PMIX_1..PMIX_K` (posterior
   class-membership probabilities `PMIX_ik ∝ p_ik·exp(−nll_ik)`) columns for a mixture fit.
+- **Standard errors / covariance for mixture fits (#983).** The covariance step now runs for
+  mixture models: its finite-difference Hessian is built on the K-fold mixture objective
+  (`−2 Σ_i log Σ_k p_ik exp(−nll_ik)`), not the single-population marginal, so a mixture fit reports
+  SEs, RSEs, and a covariance matrix like any other fit. The mixing-fraction SE is reported on the
+  scale the mixing form is parameterized in — the coefficients of a `logit(k) = …` form on the logit
+  scale, a `p(k) = …` probability directly — since those coefficients are ordinary thetas. The
+  covariance-matrix labels now name the per-class Ω/Σ override coordinates (`omega[<eta>_MIX{k}]` /
+  `sigma[<sigma>_MIX{k}]`) instead of a generic `packed[N]`.
 - **A missing `DV` no longer empties a simulation.** Simulating from a design — dosing plus
   sampling times, with `DV = .` because the values are what the run is about to produce — used
   to return zero rows: every `EVID=0` row with a missing `DV` was skipped as a forgotten
@@ -62,6 +70,32 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **Mixture covariance-step and diagnostics correctness (#984, follow-up to #983).** Five fixes to
+  the mixture SE/covariance and checkpoint paths: (1) the covariance step now reconverges its per-class EBEs at
+  `cov_inner_tol`, not the fit's `inner_tol`, so a loose fit followed by a tight `cov_inner_tol` for
+  trustworthy SEs is honoured instead of silently building the Hessian on the loose EBEs; (2) when a
+  per-class `omega(k)`/`sigma(k)` override collapses and makes the covariance base OFV non-finite,
+  the diagnostic now inspects the worst-conditioned class Omega and reports the collapse instead of
+  misattributing it to a model-evaluation overflow; (3) an explicitly chosen optimizer that cannot
+  drive a mixture (built-in BFGS/L-BFGS, trust-region, Gauss-Newton) is still run under BOBYQA but
+  now emits a warning rather than dropping the choice silently; (4) EBE non-convergence / fallback /
+  hard-reject are now counted over every class that contributes to a subject's marginal, not just its
+  winning class, so a non-converged non-winning class is no longer hidden from the convergence guard;
+  (5) `.fitrx` restore now orders the `PMIX_*` columns by class number rather than raw header position,
+  so a bundle whose columns were reordered (e.g. alphabetically, `PMIX_10` before `PMIX_2`) no longer
+  silently swaps class probabilities.
+- **Mixture posteriors survive a `.fitrx` checkpoint (#983).** A saved-then-restored mixture fit
+  now re-emits its per-subject `MIXEST` / `PMIX_1..K` columns: they round-trip through optional
+  trailing columns on `ebes.csv` (a non-mixture bundle is byte-identical to before). Previously the
+  checkpoint dropped them, so a restored mixture fit's `sdtab` silently lost the mixture columns.
+- **Mixture-model correctness fixes (#980, follow-up to #977).** The analytic outer gradient for a
+  `MIXNUM`-branched typical value (e.g. class-specific clearance) now resolves the correct class on
+  every rayon worker, so a gradient optimizer (SLSQP/L-BFGS/MMA) is no longer misled by a
+  class-swapped gradient; a covariate used only in a mixing expression is now registered as a
+  required data column (it was silently read as 0, degrading covariate mixing to intercept-only);
+  `MIXNUM` outside a `[mixture]` model is rejected everywhere, not just in `[individual_parameters]`;
+  and an evaluation-only mixture run (`outer_maxiter = 0`) now emits the `PMIX_*`/`MIXEST` columns
+  like a converged fit.
 - **A design population is now rejected by `fit()` instead of being fitted to its placeholders.**
   The population returned by `read_population_for_simulation()` carries a `NaN` placeholder for
   each not-yet-generated observation, and nothing checked observations for finiteness: with

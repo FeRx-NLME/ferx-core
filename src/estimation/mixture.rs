@@ -84,6 +84,22 @@ pub fn combine_subject(logp: &[f64], nll: &[f64]) -> (f64, Vec<f64>, usize) {
     (2.0 * (-lse), pmix, mixest)
 }
 
+/// Posterior weight below which a class cannot meaningfully move a subject's
+/// mixture marginal, so its inner-solve status is not tallied (#984 review).
+const PMIX_CONTRIB_TOL: f64 = 1e-6;
+
+/// True if any class flagged `true` in `flags` carries non-negligible posterior
+/// weight `probs[k]` (> [`PMIX_CONTRIB_TOL`]). Used to score EBE
+/// non-convergence / fallback / hard-reject over every *contributing* class of a
+/// subject, not just its winning class — a non-converged non-winning class still
+/// enters the log-sum-exp OFV with weight `PMIX_ik` and must be surfaced.
+fn any_contributing(flags: &[bool], probs: &[f64]) -> bool {
+    flags
+        .iter()
+        .zip(probs)
+        .any(|(&f, &p)| f && p > PMIX_CONTRIB_TOL)
+}
+
 /// Evaluate the mixture FOCE objective at `params` (#977 Phase 3).
 ///
 /// `warm` optionally carries the previous iteration's per-class EBEs
@@ -170,13 +186,23 @@ pub fn mixture_ofv(
         let nll_i: Vec<f64> = (0..k).map(|cls| nll[cls][i]).collect();
         let (contrib, probs, best) = combine_subject(&logp, &nll_i);
         ofv += contrib;
-        if !converged[best][i] {
+        // Convergence is scored over *every* class that contributes meaningfully to
+        // this subject's marginal, not just the winning (`best`) class: each class's
+        // `nll_ik` enters the log-sum-exp with weight `PMIX_ik`, so a non-converged
+        // non-winning class still contaminates the OFV. Scoring only `best` would let
+        // that pass the outer EBE-convergence guard silently. A class with negligible
+        // posterior weight cannot move the marginal, so it is not counted. Each
+        // subject contributes at most one to each tally.
+        let unconverged_i: Vec<bool> = (0..k).map(|cls| !converged[cls][i]).collect();
+        let fallback_i: Vec<bool> = (0..k).map(|cls| fallback[cls][i]).collect();
+        let reject_i: Vec<bool> = (0..k).map(|cls| hard_reject[cls][i]).collect();
+        if any_contributing(&unconverged_i, &probs) {
             n_unconverged += 1;
         }
-        if fallback[best][i] {
+        if any_contributing(&fallback_i, &probs) {
             n_fallback += 1;
         }
-        if hard_reject[best][i] {
+        if any_contributing(&reject_i, &probs) {
             n_start_rejected += 1;
         }
         mixest_etas.push(etas_by_class[best][i].clone());
@@ -249,10 +275,12 @@ pub fn mixture_gradient(
     let mut grad = vec![0.0f64; total];
 
     for cls in 0..k {
-        let _guard = MixtureClassGuard::enter(cls + 1);
         let cp = class_params(params, cls);
         let x_k = pack_params(&cp);
         // ∂nll_ik/∂x_k over the class-k packed layout [θ, Ω(base slots), σ, …].
+        // The class thread-local is set inside each rayon worker (the outer-thread
+        // guard would not reach them), so pass `Some(cls + 1)` rather than relying
+        // on a `MixtureClassGuard` on this thread.
         let g_k = per_subject_packed_gradients(
             model,
             population,
@@ -260,6 +288,7 @@ pub fn mixture_gradient(
             &x_k,
             &eval.etas_by_class[cls],
             interaction,
+            Some(cls + 1),
         );
         for (i, gk_i) in g_k.iter().enumerate() {
             let gi = gk_i.as_ref()?; // out-of-scope subject → FD fallback
@@ -343,7 +372,25 @@ pub fn mixture_gradient_fd(
 
 #[cfg(test)]
 mod tests {
-    use super::combine_subject;
+    use super::{any_contributing, combine_subject};
+
+    #[test]
+    fn any_contributing_scores_nonwinning_classes() {
+        // #984 regression: a non-winning class that failed to converge (class 2 here,
+        // flag = true) but still carries non-negligible posterior weight must be
+        // surfaced, even though class 1 wins.
+        let flags = [false, true]; // class 2 failed
+        let winner_heavy = [0.98, 0.02]; // class 1 wins, class 2 still contributes
+        assert!(
+            any_contributing(&flags, &winner_heavy),
+            "non-winning contributing class must count"
+        );
+        // A failed class with negligible weight cannot move the marginal → not counted.
+        let winner_only = [1.0 - 1e-9, 1e-9];
+        assert!(!any_contributing(&flags, &winner_only));
+        // No class flagged → nothing counted.
+        assert!(!any_contributing(&[false, false], &winner_heavy));
+    }
 
     #[test]
     fn combine_two_equal_classes() {
@@ -464,6 +511,241 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mixture_eval_only_emits_posteriors() {
+        // Regression (#980): an eval-only run (outer_maxiter = 0, NONMEM
+        // MAXEVAL=0 semantics) must still emit PMIX/MIXEST per subject, exactly
+        // like a converged mixture fit. The eval-only path previously hard-coded
+        // `mixture_posteriors: None`, so the sdtab columns silently vanished.
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            outer_maxiter: 0,
+            ..crate::types::FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("eval-only mixture fit should return Ok");
+        assert!(res.ofv.is_finite(), "OFV = {}", res.ofv);
+        for sr in &res.subjects {
+            let pmix = sr
+                .pmix
+                .as_ref()
+                .expect("PMIX populated for an eval-only mixture fit");
+            assert_eq!(pmix.len(), 2, "K = 2 posterior weights per subject");
+            assert!((pmix.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+            assert!(
+                sr.mixest.is_some(),
+                "MIXEST populated for eval-only mixture"
+            );
+        }
+    }
+
+    /// Constant-mixing MIXNUM model with FIXED Ω/Σ, mirroring the NONMEM anchor
+    /// (`tests/nonmem/mixture_iv.ctl`): TVCL1/TVCL2 branch, `p(1)` direct-form
+    /// mixing, no per-class overrides. The four free thetas (TVCL1, TVCL2, TVV,
+    /// P1) are the covariance step's targets.
+    const MIX_COV_MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta P1(0.5, 0.001, 0.999)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  p(1) = P1
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    #[test]
+    fn mixture_covariance_step_runs_and_sizes() {
+        // #983 Phase 6: the covariance step builds its FD Hessian on the K-fold
+        // mixture OFV (`compute_covariance` branches on `template.mixture`), so a
+        // mixture fit now yields a covariance matrix + SEs — it previously skipped
+        // the step entirely. Evaluated near the data-generating optimum so the
+        // 4-theta Hessian is positive-definite; FIXED Ω/Σ rows stay zero.
+        use crate::estimation::covariance::{compute_covariance, CovarianceStepResult};
+        use crate::estimation::parameterization::pack_params;
+        let model = crate::parser::model_parser::parse_model_string(MIX_COV_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(8, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+        let params = &model.default_params;
+        let x = pack_params(params);
+        // MIXEST-class EBEs/H fill the warm-start slots the mixture branch ignores.
+        let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
+        let matrix = match compute_covariance(
+            &x,
+            params,
+            &model,
+            &pop,
+            &eval.mixest_etas,
+            &eval.mixest_h_mats,
+            &[],
+            &opts,
+        ) {
+            CovarianceStepResult::Success(out) => out.matrix,
+            CovarianceStepResult::Unusable(msg) => panic!("covariance unusable: {msg}"),
+            CovarianceStepResult::FailedNonPd { reason, .. } => {
+                panic!("covariance non-PD: {reason}")
+            }
+        };
+        assert_eq!(matrix.nrows(), x.len(), "covariance is packed-square");
+        // Free thetas (idx 0..4) get finite positive packed-scale variance.
+        for i in 0..4 {
+            let v = matrix[(i, i)];
+            assert!(v.is_finite() && v > 0.0, "theta[{i}] variance = {v}");
+        }
+        // FIXED Ω (idx 4) and Σ (idx 5) contribute no information → zeroed rows.
+        assert_eq!(matrix[(4, 4)], 0.0, "FIXED omega row zeroed");
+        assert_eq!(matrix[(5, 5)], 0.0, "FIXED sigma row zeroed");
+    }
+
+    #[test]
+    fn mixture_covariance_uses_cov_inner_tol_not_fit_tol() {
+        // #984 regression: the mixture covariance step must reconverge its per-class
+        // EBEs at `cov_inner_tol`, not the fit's `inner_tol`. Otherwise a loose fit +
+        // an explicit tight `cov_inner_tol` (set for trustworthy SEs) would silently
+        // build the Hessian on the loose, contaminated EBEs. We build the covariance
+        // twice: a reference at a tight fit tol, and a probe at an absurdly loose fit
+        // tol but the same explicit tight `cov_inner_tol`. With the fix they must
+        // match; before it, the probe would use the loose tol and diverge.
+        use crate::estimation::covariance::{compute_covariance, CovarianceStepResult};
+        use crate::estimation::parameterization::pack_params;
+        let model = crate::parser::model_parser::parse_model_string(MIX_COV_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(8, 1.0, 3.0));
+        let params = &model.default_params;
+        let x = pack_params(params);
+
+        let run = |inner_tol: f64, cov_inner_tol: Option<f64>| {
+            let opts = crate::types::FitOptions {
+                inner_tol,
+                cov_inner_tol,
+                ..crate::types::FitOptions::default()
+            };
+            let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
+            match compute_covariance(
+                &x,
+                params,
+                &model,
+                &pop,
+                &eval.mixest_etas,
+                &eval.mixest_h_mats,
+                &[],
+                &opts,
+            ) {
+                CovarianceStepResult::Success(out) => out.matrix,
+                CovarianceStepResult::Unusable(msg) => panic!("covariance unusable: {msg}"),
+                CovarianceStepResult::FailedNonPd { reason, .. } => {
+                    panic!("covariance non-PD: {reason}")
+                }
+            }
+        };
+
+        let reference = run(1e-8, None); // cov tol defaults to the tight fit tol
+        let probe = run(1.0, Some(1e-8)); // loose fit, tight explicit cov tol
+        for i in 0..4 {
+            let (r, p) = (reference[(i, i)], probe[(i, i)]);
+            let denom = r.abs().max(p.abs()).max(1e-9);
+            assert!(
+                (r - p).abs() / denom < 1e-6,
+                "theta[{i}] variance depends on the fit inner_tol: ref {r} vs probe {p}"
+            );
+        }
+    }
+
+    /// Build a constant-mixing MIXNUM model with the given mixing line and the
+    /// `MIXL`/`P1` mixing-coefficient parameter declaration, so a `p(k)` model and
+    /// its softmax-equivalent `logit(k)` model share every other line.
+    fn mix_form_model(mix_param: &str, mixing_line: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  {mix_param}
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  {mixing_line}
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        )
+    }
+
+    #[test]
+    fn mixture_pform_matches_equivalent_logit() {
+        // #983 item 4: the `p(k)` mixing form is evaluated (probabilities used
+        // directly, then renormalised), not silently dropped. A constant
+        // `p(1) = 0.3` must give the identical objective to the softmax-equivalent
+        // `logit(1) = ln(0.3/0.7)` (reference class 2 has logit 0), since both
+        // resolve to p = [0.3, 0.7] and every other line is shared.
+        let pform = mix_form_model("theta P1(0.3, 0.001, 0.999)", "p(1) = P1");
+        let logit_c = (0.3f64 / 0.7).ln(); // ≈ -0.8473
+        let lform = mix_form_model(
+            &format!("theta MIXL({logit_c}, -10.0, 10.0)"),
+            "logit(1) = MIXL",
+        );
+        let mp = crate::parser::model_parser::parse_model_string(&pform).unwrap();
+        let ml = crate::parser::model_parser::parse_model_string(&lform).unwrap();
+        let pop = read_pop(&bimodal_csv(6, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+
+        let op = super::mixture_ofv(&mp, &pop, &mp.default_params, &opts, None);
+        let ol = super::mixture_ofv(&ml, &pop, &ml.default_params, &opts, None);
+        assert!(
+            (op.ofv - ol.ofv).abs() < 1e-6,
+            "p-form OFV {} vs equivalent logit {}",
+            op.ofv,
+            ol.ofv
+        );
+        // Posterior weights match subject-by-subject too.
+        for (pp, pl) in op.pmix.iter().zip(&ol.pmix) {
+            for (a, b) in pp.iter().zip(pl) {
+                assert!((a - b).abs() < 1e-9, "PMIX {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn mixture_gradient_pform_falls_back_to_fd() {
+        // #983 item 4: the `p(k)` form has no analytic mixing-probability gradient
+        // (only the softmax `logit(k)` form is differentiated), so
+        // `mixture_gradient` returns None and the caller routes to central FD. A
+        // scope gap here would silently return a wrong analytic gradient.
+        let m = mix_form_model("theta P1(0.4, 0.001, 0.999)", "p(1) = P1");
+        let model = crate::parser::model_parser::parse_model_string(&m).unwrap();
+        let pop = read_pop(&bimodal_csv(4, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+        let eval = super::mixture_ofv(&model, &pop, &model.default_params, &opts, None);
+        assert!(
+            super::mixture_gradient(&model, &pop, &model.default_params, &opts, &eval).is_none(),
+            "p(k) mixing form must route to FD (no analytic mixing gradient)"
+        );
+    }
+
     // Variance-mixture (classes differ only by their Ω/Σ overrides, no `MIXNUM`
     // branch) so the per-subject analytic sensitivity provider is in scope — the
     // parity test then exercises the real analytic gradient (softmax mixing
@@ -529,6 +811,51 @@ mod tests {
     }
 
     #[test]
+    fn mixture_gradient_mixnum_branch_matches_fd() {
+        // Regression (#980): a MIXNUM-branched typical value (CL = if MIXNUM==1
+        // TVCL1… else TVCL2…) *is* in analytic scope (the conditional differentiates
+        // in closed form), so `mixture_gradient` returns Some and drives a gradient
+        // optimizer. The per-class analytic sensitivity runs under a rayon
+        // `par_iter`; the `MIXTURE_CLASS` thread-local must be set *inside* each
+        // worker, else class 2 is computed on the TVCL1 branch — a silently wrong,
+        // class-swapped gradient (∂/∂TVCL2 ≈ 0). Central FD of the mixture OFV knows
+        // nothing of the thread-local, so parity here pins the fix.
+        use crate::estimation::parameterization::pack_params;
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(5, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+        let params = &model.default_params;
+
+        let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
+        let ana = super::mixture_gradient(&model, &pop, params, &opts, &eval)
+            .expect("MIXNUM-conditional typical value is in analytic scope");
+        let x = pack_params(params);
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+
+        assert_eq!(ana.len(), fd.len());
+        // Locate the TVCL1 / TVCL2 theta slots: the class-swap bug zeroes the
+        // gradient for the class that isn't the thread-local default (class 1).
+        let i_tvcl2 = model
+            .theta_names
+            .iter()
+            .position(|n| n == "TVCL2")
+            .expect("TVCL2 theta");
+        assert!(
+            fd[i_tvcl2].abs() > 1e-2,
+            "FD ∂OFV/∂TVCL2 should be clearly nonzero, got {}",
+            fd[i_tvcl2]
+        );
+        for (i, (a, f)) in ana.iter().zip(&fd).enumerate() {
+            let denom = f.abs().max(a.abs()).max(1e-3);
+            let rel = (a - f).abs() / denom;
+            assert!(
+                rel < 2e-2,
+                "coord {i}: analytic {a:.6} vs FD {f:.6} (rel {rel:.2e})"
+            );
+        }
+    }
+
+    #[test]
     fn mixture_fit_slsqp_uses_analytic_gradient() {
         // A user-chosen NLopt gradient optimizer is honoured for mixtures (Phase 4)
         // and drives the analytic outer gradient. Variance-mixture model → in
@@ -544,6 +871,50 @@ mod tests {
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("SLSQP mixture fit should return Ok");
         assert!(res.ofv.is_finite(), "OFV = {}", res.ofv);
+    }
+
+    #[test]
+    fn mixture_downgraded_optimizer_warns() {
+        // #984 regression: a mixture cannot be driven by the built-in BFGS /
+        // trust-region / Gauss-Newton optimizers (none carry the mixture objective),
+        // so an *explicit* such choice is run under BOBYQA — but must say so in
+        // FitResult.warnings rather than dropping the choice invisibly.
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            optimizer: crate::types::Optimizer::Bfgs,
+            outer_maxiter: 2,
+            ..crate::types::FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("mixture fit with a downgraded optimizer should still return Ok");
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("BOBYQA") && w.contains("Bfgs")),
+            "expected an optimizer-downgrade warning, got {:?}",
+            res.warnings
+        );
+    }
+
+    #[test]
+    fn mixture_default_optimizer_does_not_warn() {
+        // The default `auto` optimizer downgrades to BOBYQA by design and must stay
+        // silent — only an explicitly-chosen unsupported optimizer warns.
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            outer_maxiter: 2,
+            ..crate::types::FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).unwrap();
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("does not carry the mixture objective")),
+            "auto optimizer must not emit a downgrade warning, got {:?}",
+            res.warnings
+        );
     }
 
     #[test]

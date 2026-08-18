@@ -43,6 +43,13 @@ The mixing rule may be given as a **logit** (`logit(k) = …`) or a **probabilit
 (`p(k) = …`) expression over thetas and covariates; the remaining class's
 probability is the complement. Mixing expressions must not depend on any $\eta$.
 
+The two forms differ only in how $p_{ik}$ is formed: `logit(k)` is passed through
+a softmax (reference class $K$ has logit 0), while `p(k)` is used as the
+probability directly and the class weights are renormalised to sum to one. A
+constant `p(1) = 0.3` is therefore identical to `logit(1) = \ln(0.3/0.7)`. The
+softmax (`logit`) form has an analytic posterior-weighted outer gradient; the
+`p(k)` form does not, so a `p(k)` fit uses the finite-difference gradient.
+
 ## Objective
 
 Each subject's marginal likelihood is the covariate-weighted mixture of its
@@ -99,6 +106,32 @@ successful.
 The objectives agree to ~0.02 units and the per-subject `MIXEST` class
 assignment is identical for every subject.
 
+### Standard errors
+
+A mixture fit runs the covariance step like any other fit: the finite-difference
+Hessian is built on the **mixture** objective (the K-fold log-sum-exp above), and
+the standard errors are $\sqrt{\operatorname{diag}(R^{-1})}$. The mixing-fraction
+SE is reported on the scale the mixing form is written in — the coefficients of a
+`logit(k) = …` form carry a logit-scale SE, a `p(k) = …` probability an SE
+directly on the probability scale — because those coefficients are ordinary
+thetas.
+
+Cross-checked against `$COVARIANCE MATRIX=R` on the same model
+(`tests/nonmem/mixture_iv_cov.ctl`); `MATRIX=R` is the pure Hessian-inverse
+estimator ferx computes (NONMEM's default sandwich $R^{-1}SR^{-1}$ differs by the
+usual 10–25 % between the two estimators):
+
+| SE | NONMEM (`MATRIX=R`) | ferx |
+|---|---|---|
+| `TVCL1` | 0.1056 | 0.1067 |
+| `TVCL2` | 0.2543 | 0.2559 |
+| `V` | 0.1861 | 0.1860 |
+| `p(1)` (delta-method) | 0.1026 | 0.1030 |
+
+All four agree to **< 1 %**. The `p(1)` row compares NONMEM's direct
+$P(1)=\theta_4$ SE to ferx's logit-scale SE mapped through
+$\operatorname{SE}(p) = p(1-p)\operatorname{SE}(\text{logit})$.
+
 ## Not yet supported
 
 Mixture models are currently limited to FOCE/FOCEI. The following error clearly
@@ -106,4 +139,3 @@ rather than silently mis-fitting:
 
 - Other estimators (SAEM / IMP / Bayes).
 - Inter-occasion variability within a mixture.
-- Standard errors / covariance step for mixture parameters.
