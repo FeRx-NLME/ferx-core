@@ -13787,6 +13787,23 @@ fn mixture_fixed_override_pinned_in_mask() {
 }
 
 #[test]
+fn mixture_negative_override_rejected() {
+    let src = MIXTURE_2ETA.replace("omega(2) ETA_CL ~ 0.4", "omega(2) ETA_CL ~ -0.4");
+    let err = parse_model_string(&src).expect_err("negative override must be rejected");
+    assert!(err.contains("non-negative"), "got: {err}");
+}
+
+#[test]
+fn mixture_duplicate_override_rejected() {
+    let src = MIXTURE_2ETA.replace(
+        "omega(2) ETA_CL ~ 0.4",
+        "omega(2) ETA_CL ~ 0.4\n  omega(2) ETA_CL ~ 0.6",
+    );
+    let err = parse_model_string(&src).expect_err("duplicate override must be rejected");
+    assert!(err.contains("duplicate"), "got: {err}");
+}
+
+#[test]
 fn mixture_block_omega_override_rejected() {
     // Per-class omega override requires a diagonal base omega.
     let src = r"

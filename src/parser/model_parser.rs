@@ -9678,6 +9678,17 @@ fn parse_mixture_block(
             let as_sd = c
                 .get(6)
                 .is_some_and(|m| m.as_str().eq_ignore_ascii_case("sd"));
+            // Reject negatives on both scales, mirroring the base omega/sigma
+            // parsing — a negative variance/SD would `sqrt` to NaN or pack to a
+            // clamped garbage value.
+            if raw_val < 0.0 {
+                let kind = if is_omega { "omega" } else { "sigma" };
+                return Err(format!(
+                    "[mixture] {kind}({class}) {} has a negative initial value ({raw_val}); \
+                     both variance and SD must be non-negative",
+                    c[3].to_string()
+                ));
+            }
             let fixed = c.get(5).is_some() || c.get(7).is_some();
             let ov = MixtureClassOverride {
                 class,
@@ -9788,12 +9799,29 @@ fn parse_mixture_block(
         }
         Ok(())
     };
+    // Reject a duplicate (class, name) override: two declarations for the same
+    // entry would emit two packed coordinates for one variance with last-wins
+    // semantics, breaking the pack/unpack round-trip.
+    let check_dupes = |overrides: &[MixtureClassOverride], kind: &str| -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for ov in overrides {
+            if !seen.insert((ov.class, ov.name.clone())) {
+                return Err(format!(
+                    "[mixture] duplicate {kind}({}) override for {}",
+                    ov.class, ov.name
+                ));
+            }
+        }
+        Ok(())
+    };
     for ov in &omega_overrides {
         check_override(ov, eta_names, "omega")?;
     }
     for ov in &sigma_overrides {
         check_override(ov, sigma_names, "sigma")?;
     }
+    check_dupes(&omega_overrides, "omega")?;
+    check_dupes(&sigma_overrides, "sigma")?;
 
     // Covariates referenced by the mixing expressions, for data validation.
     let mut cov_set = std::collections::HashSet::new();

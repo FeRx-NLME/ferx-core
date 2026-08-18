@@ -501,7 +501,9 @@ fn push_omega_names(names: &mut Vec<String>, om: &OmegaMatrix) {
 
 /// Per-coordinate **natural / reporting-scale** values, ordered like
 /// [`pack_params`]. Theta are natural values, Ω entries are variances
-/// (diagonal) / covariances (off-diagonal), sigma are variances. This is the
+/// (diagonal) / covariances (off-diagonal); sigma are the stored **SD-scale**
+/// values (`parse_parameters` `sqrt`s variance-scale input at parse time), and a
+/// mixture sigma override reports on that same SD scale. This is the
 /// back-transformed space the trace's `val:*` columns report.
 pub fn coordinate_values(params: &ModelParameters) -> Vec<f64> {
     let mut v = coordinate_values_raw(

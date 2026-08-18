@@ -1444,9 +1444,10 @@ pub struct MixtureClassOverride {
 pub struct MixtureSpec {
     /// Number of subpopulations K (>= 2).
     pub n_classes: usize,
-    /// Mixing-probability expressions (see [`MixingExpr`]). For the `logit` form,
-    /// `n_classes - 1` entries (classes `1..=K-1`); for the `p` form, one per
-    /// declared class.
+    /// Mixing-probability expressions (see [`MixingExpr`]). Both forms score
+    /// classes `1..=K-1` (`n_classes - 1` entries); the last class is implicit —
+    /// the softmax reference (logit 0) for the `logit` form, or the probability
+    /// complement `1 − Σ` for the `p` form.
     pub mixing: Vec<MixingExpr>,
     /// Covariate names referenced by the mixing expressions (for data checks).
     pub logit_covariates: Vec<String>,
