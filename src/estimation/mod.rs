@@ -6,6 +6,7 @@ pub(crate) mod hmc;
 pub mod impmap;
 pub mod importance_sampling;
 pub mod inner_optimizer;
+pub mod mixture;
 pub mod outer_optimizer;
 pub mod parameterization;
 pub mod run_covariance;

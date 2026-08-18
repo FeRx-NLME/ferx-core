@@ -20,15 +20,19 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
-- **Mixture models — `[mixture]` block and reserved `MIXNUM` index (#977, Phase 1).** Model
-  files can now declare `$MIXTURE`-style discrete latent subpopulations: a `[mixture]` block sets
-  the number of classes (`nsub`), the per-class mixing logits (`logit(k) = …` over theta +
-  covariates), and optional per-class Ω/Σ overrides (`omega(k)` / `sigma(k)`); the reserved
-  read-only `MIXNUM` index (1..=K) selects class-specific typical values inside
-  `[individual_parameters]`. This first phase parses and validates the block (rejecting `nsub < 2`,
-  `MIXNUM` assignment, `MIXNUM` outside a mixture model, eta-dependent mixing expressions, missing
-  class coverage, and overrides of the base class); `fit()` returns a clear error until the mixture
-  objective is wired in a later phase.
+- **Mixture models — `$MIXTURE`-style discrete latent subpopulations (#977).** Model files can
+  declare a `[mixture]` block giving the number of classes (`nsub`), the per-class mixing logits
+  (`logit(k) = …` over theta + covariates), and optional per-class Ω/Σ overrides (`omega(k)` /
+  `sigma(k)`); the reserved read-only `MIXNUM` index (1..=K) selects class-specific typical values
+  inside `[individual_parameters]`. `fit()` estimates such models by **FOCE / FOCEI** — each
+  subject's marginal is the covariate-weighted mixture `L_i = Σ_k p_ik · L_ik` and the objective is
+  the numerically stable log-sum-exp `−2 Σ_i log Σ_k p_ik exp(−nll_ik)`, with a separate empirical
+  Bayes solve per (subject × class). The mixing-logit coefficients are ordinary thetas and the
+  per-class Ω/Σ are estimated jointly. Estimation runs through the derivative-free (BOBYQA) outer
+  optimizer; other estimators (SAEM/IMP/Bayes), inter-occasion variability, and standard errors for
+  mixture models are not yet supported and error clearly. The parser rejects `nsub < 2`, `MIXNUM`
+  assignment, `MIXNUM` outside a mixture model, eta-dependent mixing expressions, missing class
+  coverage, `omega(k)` on a block base, and overrides of the base class.
 
 ### Performance
 - **The ODE inter-occasion-variability (IOV) analytic sensitivity path now compiles from a

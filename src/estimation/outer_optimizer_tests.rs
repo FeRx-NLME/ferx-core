@@ -741,6 +741,7 @@ fn fresh_state() -> NloptState {
     NloptState {
         cached_etas: Vec::new(),
         cached_h_mats: Vec::new(),
+        cached_etas_by_class: Vec::new(),
         best_ofv: 0.0,
         n_evals: 0,
         n_grad_evals: 0,

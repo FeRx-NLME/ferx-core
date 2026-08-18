@@ -201,15 +201,27 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
-    // Mixture models (#977) are parsed and validated (the `[mixture]` block and
-    // reserved `MIXNUM` index) but the K-fold log-sum-exp objective is not yet
-    // wired into estimation. Fail loudly rather than silently fitting class 1.
+    // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
+    // objective via the derivative-free (BOBYQA) outer optimizer. Other
+    // estimators, inter-occasion variability, and adaptive-Gauss-Hermite
+    // marginalisation are not yet supported — reject them clearly rather than
+    // silently ignoring the mixture structure.
     if model.mixture.is_some() {
-        return Err(
-            "mixture models ([mixture] block, #977) are parsed and validated but estimation is \
-             not yet implemented; fit() will be available once the mixture objective lands"
-                .to_string(),
-        );
+        for m in options.method_chain() {
+            if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
+                return Err(format!(
+                    "mixture models (#977) currently support only FOCE / FOCEI; the {} method \
+                     is not yet wired for mixtures",
+                    m.label()
+                ));
+            }
+        }
+        if init_params.omega_iov.is_some() {
+            return Err(
+                "mixture models (#977) do not yet support inter-occasion variability (kappa)"
+                    .to_string(),
+            );
+        }
     }
     // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
     // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).

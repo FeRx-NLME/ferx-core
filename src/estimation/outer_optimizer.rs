@@ -110,7 +110,16 @@ pub fn optimize_population(
     // of the outer loop (optimize_nlopt re-reads `options.optimizer` for its own
     // branching). Every other variant is returned unchanged, so this is a no-op
     // unless the user left the default `auto` in place.
-    let resolved = options.optimizer.resolve_auto(model, options.interaction);
+    // Mixture models (#977 Phase 3) run through the derivative-free BOBYQA path:
+    // no analytic outer gradient exists yet, and a gradient optimizer would call
+    // the non-mixture `population_gradient` on the single-population objective,
+    // which is wrong for the K-fold mixture OFV. Force BOBYQA regardless of the
+    // user's/auto's choice. Analytic mixture sensitivities are #977 Phase 4.
+    let resolved = if init_params.mixture.is_some() {
+        Optimizer::Bobyqa
+    } else {
+        options.optimizer.resolve_auto(model, options.interaction)
+    };
     let owned_opts;
     let options = if resolved == options.optimizer {
         options
@@ -127,15 +136,21 @@ pub fn optimize_population(
     // vector it gives a zero search direction that makes gradient NLopt return
     // `Failure` on eval 1, pinning *every* parameter at its initial value. Freeze such
     // thetas (treat as FIX) and warn, so the remaining parameters optimize normally.
+    // Skip the flat-theta pre-flight for mixture models: it probes the single-
+    // population outer gradient, which is not the mixture objective's gradient and
+    // would mis-freeze the mixing-logit thetas.
     let frozen_params;
-    let (init_params, preflight_warnings) =
+    let (init_params, preflight_warnings) = if init_params.mixture.is_some() {
+        (init_params, Vec::new())
+    } else {
         match freeze_flat_thetas(model, population, init_params, options) {
             Some((fp, w)) => {
                 frozen_params = fp;
                 (&frozen_params, w)
             }
             None => (init_params, Vec::new()),
-        };
+        }
+    };
 
     let mut result = match resolved {
         // `Auto` is resolved away above; group it with the NLopt path defensively.
@@ -359,35 +374,44 @@ fn evaluate_at_initial_params(
     let params = unpack_params(&x, init_params);
     let n_subj = population.subjects.len();
 
-    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    // Genuine cold start: an eval-only run has no warm EBE history, so pass
-    // `None` (not `Some(zeros)`). Both seed the inner search at η = 0, but `None`
-    // is what marks this as a cold start to the guarded multi-start inner EBE
-    // (`inner_restarts`), so a subject with a multimodal individual posterior —
-    // system resets / TV-covariates, or a weakly-identified random effect (#891)
-    // — is re-seeded here instead of silently reporting a sub-optimal mode. This
-    // is the scenario #891's evidence is drawn from (NONMEM `MAXEVAL=0`).
-    let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm(
-        model,
-        population,
-        &params,
-        options.inner_maxiter,
-        options.inner_tol,
-        None,
-        Some(&mu_k),
-        options.min_obs_for_convergence_check as usize,
-        options.inner_restarts,
-    );
-    let ofv = 2.0
-        * pop_nll_opts(
+    // Mixture (#977 Phase 3): the eval-only OFV is the K-fold log-sum-exp at the
+    // initial parameters; EBEs reported are the MIXEST class per subject.
+    let is_mixture = params.mixture.is_some();
+    let (eta_hats, h_matrices, kappas, ofv) = if is_mixture {
+        let m = crate::estimation::mixture::mixture_ofv(model, population, &params, options, None);
+        (m.mixest_etas, m.mixest_h_mats, Vec::new(), m.ofv)
+    } else {
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+        // Genuine cold start: an eval-only run has no warm EBE history, so pass
+        // `None` (not `Some(zeros)`). Both seed the inner search at η = 0, but `None`
+        // is what marks this as a cold start to the guarded multi-start inner EBE
+        // (`inner_restarts`), so a subject with a multimodal individual posterior —
+        // system resets / TV-covariates, or a weakly-identified random effect (#891)
+        // — is re-seeded here instead of silently reporting a sub-optimal mode. This
+        // is the scenario #891's evidence is drawn from (NONMEM `MAXEVAL=0`).
+        let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm(
             model,
             population,
             &params,
-            &eta_hats,
-            &h_matrices,
-            &kappas,
-            options,
+            options.inner_maxiter,
+            options.inner_tol,
+            None,
+            Some(&mu_k),
+            options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
         );
+        let ofv = 2.0
+            * pop_nll_opts(
+                model,
+                population,
+                &params,
+                &eta_hats,
+                &h_matrices,
+                &kappas,
+                options,
+            );
+        (eta_hats, h_matrices, kappas, ofv)
+    };
 
     if options.verbose {
         eprintln!("Iter {:>4}: OFV = {:.6}", 0, ofv);
@@ -395,24 +419,32 @@ fn evaluate_at_initial_params(
     }
 
     let mut warnings = Vec::new();
-    let out = crate::estimation::covariance::run_covariance_step(
-        &x,
-        init_params,
-        model,
-        population,
-        &eta_hats,
-        &h_matrices,
-        &kappas,
-        options,
-        options.verbose.then_some("Computing covariance matrix..."),
-    );
-    let crate::estimation::covariance::CovStepOutcome {
-        matrix: covariance_matrix,
-        wall_time_secs: covariance_wall_time_secs,
-        warnings: cov_warnings,
-        sir_fallback_proposal,
-    } = out;
-    warnings.extend(cov_warnings);
+    // Mixture (#977 Phase 3): the covariance step's FD Hessian is built from the
+    // single-population objective, not the K-fold mixture OFV, so its SEs would be
+    // wrong. Skip it — mixture covariance / SE lands in Phase 6.
+    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal) = if is_mixture {
+        (None, 0.0, None)
+    } else {
+        let out = crate::estimation::covariance::run_covariance_step(
+            &x,
+            init_params,
+            model,
+            population,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            options,
+            options.verbose.then_some("Computing covariance matrix..."),
+        );
+        let crate::estimation::covariance::CovStepOutcome {
+            matrix,
+            wall_time_secs,
+            warnings: cov_warnings,
+            sir_fallback_proposal,
+        } = out;
+        warnings.extend(cov_warnings);
+        (matrix, wall_time_secs, sir_fallback_proposal)
+    };
 
     OuterResult {
         // Evaluation-only (`outer_maxiter = 0`): no optimizer ran, but the eval
@@ -642,6 +674,9 @@ pub(crate) fn pop_nll(
 struct NloptState {
     cached_etas: Vec<DVector<f64>>,
     cached_h_mats: Vec<DMatrix<f64>>,
+    /// Mixture per-class EBE warm-start cache `[class][subject]` (#977 Phase 3).
+    /// Empty for non-mixture models.
+    cached_etas_by_class: Vec<Vec<DVector<f64>>>,
     best_ofv: f64,
     n_evals: usize,
     /// Count of gradient evaluations so far. Distinct from `n_evals` (which
@@ -754,6 +789,7 @@ fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
     NloptState {
         cached_etas: vec![DVector::zeros(n_eta); n_subj],
         cached_h_mats: Vec::new(),
+        cached_etas_by_class: Vec::new(),
         best_ofv: f64::INFINITY,
         n_evals: 0,
         n_grad_evals: 0,
@@ -1337,24 +1373,39 @@ fn optimize_nlopt(
         // Unscale from optimizer space to real (log/Cholesky) space.
         let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
         let params = unpack_params(&x, init_params);
-        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
 
-        // Run inner loop (warm-started)
-        let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
-            model,
-            population,
-            &params,
-            options.inner_maxiter,
-            options.inner_tol,
-            Some(&state.cached_etas),
-            Some(&mu_k),
-            options.min_obs_for_convergence_check as usize,
-            options.inner_restarts,
-        );
-
-        // Compute OFV with fixed EBEs
-        let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
-        let raw_ofv = 2.0 * nll;
+        // Mixture models (#977 Phase 3): K-fold log-sum-exp objective with a
+        // per-class serial inner solve. `kappas` is empty (IOV is rejected up
+        // front); the MIXEST-class EBEs stand in for the warm-start / trace.
+        let (ehs, hms, ebe_stats, kappas, raw_ofv) = if params.mixture.is_some() {
+            let warm = (!state.cached_etas_by_class.is_empty())
+                .then_some(state.cached_etas_by_class.as_slice());
+            let m =
+                crate::estimation::mixture::mixture_ofv(model, population, &params, options, warm);
+            state.cached_etas_by_class = m.etas_by_class;
+            (
+                m.mixest_etas,
+                m.mixest_h_mats,
+                m.ebe_stats,
+                Vec::new(),
+                m.ofv,
+            )
+        } else {
+            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+            let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
+                model,
+                population,
+                &params,
+                options.inner_maxiter,
+                options.inner_tol,
+                Some(&state.cached_etas),
+                Some(&mu_k),
+                options.min_obs_for_convergence_check as usize,
+                options.inner_restarts,
+            );
+            let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
+            (ehs, hms, ebe_stats, kappas, 2.0 * nll)
+        };
 
         // EBE convergence guard: reject step when too many subjects unconverged or any
         // subject was hard-rejected at its inner start.
@@ -1743,31 +1794,50 @@ fn optimize_nlopt(
     }
 
     let final_params = unpack_params(&x0, init_params);
-    let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
+    let final_is_mixture = final_params.mixture.is_some();
 
-    // Final inner loop at converged parameters
-    let (final_ehs, final_hms, _, final_kappas) = run_inner_loop_warm(
-        model,
-        population,
-        &final_params,
-        options.inner_maxiter,
-        options.inner_tol,
-        None,
-        Some(&final_mu_k),
-        options.min_obs_for_convergence_check as usize,
-        options.inner_restarts,
-    );
-
-    let final_nll = pop_nll_opts(
-        model,
-        population,
-        &final_params,
-        &final_ehs,
-        &final_hms,
-        &final_kappas,
-        options,
-    );
-    let final_ofv = 2.0 * final_nll;
+    // Final inner loop at converged parameters. Mixture (#977 Phase 3): the OFV
+    // is the K-fold log-sum-exp and the reported EBEs are the MIXEST class.
+    let (final_ehs, final_hms, final_kappas, final_ofv, final_mixest) = if final_is_mixture {
+        let m = crate::estimation::mixture::mixture_ofv(
+            model,
+            population,
+            &final_params,
+            options,
+            None,
+        );
+        (
+            m.mixest_etas,
+            m.mixest_h_mats,
+            Vec::new(),
+            m.ofv,
+            Some(m.mixest),
+        )
+    } else {
+        let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
+        let (final_ehs, final_hms, _, final_kappas) = run_inner_loop_warm(
+            model,
+            population,
+            &final_params,
+            options.inner_maxiter,
+            options.inner_tol,
+            None,
+            Some(&final_mu_k),
+            options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
+        );
+        let final_nll = pop_nll_opts(
+            model,
+            population,
+            &final_params,
+            &final_ehs,
+            &final_hms,
+            &final_kappas,
+            options,
+        );
+        (final_ehs, final_hms, final_kappas, 2.0 * final_nll, None)
+    };
+    let _ = &final_mixest; // Phase 5 will thread MIXEST into per-subject postfit.
 
     if options.verbose {
         eprintln!("Final OFV = {:.6}", final_ofv);
@@ -1825,24 +1895,33 @@ fn optimize_nlopt(
 
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
-    let out = crate::estimation::covariance::run_covariance_step(
-        &x0,
-        init_params,
-        model,
-        population,
-        &final_ehs,
-        &final_hms,
-        &final_kappas,
-        options,
-        options.verbose.then_some("Computing covariance matrix..."),
-    );
-    let crate::estimation::covariance::CovStepOutcome {
-        matrix: covariance_matrix,
-        wall_time_secs: covariance_wall_time_secs,
-        warnings: cov_warnings,
-        sir_fallback_proposal,
-    } = out;
-    warnings.extend(cov_warnings);
+    // Mixture (#977 Phase 3): the FD-Hessian covariance is built from the single-
+    // population objective, not the K-fold mixture OFV → its SEs would be wrong.
+    // Skip; mixture covariance / SE is Phase 6.
+    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal) = if final_is_mixture
+    {
+        (None, 0.0, None)
+    } else {
+        let out = crate::estimation::covariance::run_covariance_step(
+            &x0,
+            init_params,
+            model,
+            population,
+            &final_ehs,
+            &final_hms,
+            &final_kappas,
+            options,
+            options.verbose.then_some("Computing covariance matrix..."),
+        );
+        let crate::estimation::covariance::CovStepOutcome {
+            matrix,
+            wall_time_secs,
+            warnings: cov_warnings,
+            sir_fallback_proposal,
+        } = out;
+        warnings.extend(cov_warnings);
+        (matrix, wall_time_secs, sir_fallback_proposal)
+    };
 
     if !converged {
         warnings.push("Outer optimization did not converge".to_string());

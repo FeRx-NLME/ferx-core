@@ -13576,10 +13576,11 @@ fn mixture_mixed_logit_and_prob_forms_rejected() {
 }
 
 #[test]
-fn fit_on_mixture_model_errors_not_wired() {
+fn fit_on_mixture_model_rejects_unsupported_method() {
+    // Phase 3 wires FOCE/FOCEI; other estimators (here SAEM) must still error
+    // clearly rather than silently ignoring the mixture structure. The method
+    // guard fires before any subject is touched, so an empty population suffices.
     let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
-    // The `model.mixture.is_some()` guard fires before any subject is touched,
-    // so an empty population is sufficient to reach it.
     let pop = crate::types::Population {
         subjects: vec![],
         covariate_names: vec![],
@@ -13589,11 +13590,14 @@ fn fit_on_mixture_model_errors_not_wired() {
         warnings: vec![],
     };
     let params = model.default_params.clone();
-    let opts = crate::types::FitOptions::default();
+    let opts = crate::types::FitOptions {
+        method: crate::types::EstimationMethod::Saem,
+        ..crate::types::FitOptions::default()
+    };
     let err = crate::api::fit(&model, &pop, &params, &opts)
-        .expect_err("fit() must reject an unwired mixture model");
+        .expect_err("SAEM on a mixture model must be rejected");
     assert!(
-        err.contains("mixture") && err.contains("not yet implemented"),
+        err.contains("mixture") && err.contains("FOCE"),
         "got: {err}"
     );
 }

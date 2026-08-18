@@ -9904,6 +9904,74 @@ fn build_mixture_params(
     })
 }
 
+/// Re-add the RAII guard for the mixture-class thread-local (#977 Phase 3). The
+/// mixture objective sets `MIXTURE_CLASS = k` around each class's inner EBE solve
+/// and NLL so `MIXNUM` branches in `[individual_parameters]` see class `k`, then
+/// restores the prior value on drop (panic-safe). Must be set on the *same*
+/// thread that runs the prediction (the objective drives the per-class solve
+/// serially for exactly this reason — a thread-local set on the outer thread
+/// would not reach rayon workers).
+pub(crate) struct MixtureClassGuard(usize);
+
+impl MixtureClassGuard {
+    /// Set `MIXTURE_CLASS` to `class` (1-based), restoring the prior value on drop.
+    pub(crate) fn enter(class: usize) -> Self {
+        let prev = MIXTURE_CLASS.with(|cell| cell.replace(class));
+        MixtureClassGuard(prev)
+    }
+}
+
+impl Drop for MixtureClassGuard {
+    fn drop(&mut self) {
+        MIXTURE_CLASS.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Evaluate the per-class mixing log-probabilities `ln p_ik` for one subject
+/// (#977 Phase 3). Mixing expressions depend only on theta + (baseline)
+/// covariates — never eta (validated at parse time) — so this takes a plain
+/// covariate map and no random effects.
+///
+/// - `logit(k)` form: scores `1..=K-1`, reference class `K` has logit 0;
+///   `p = softmax(logits)`.
+/// - `p(k)` form: probabilities for `1..=K-1`, last class is the complement;
+///   renormalized defensively.
+pub(crate) fn eval_mixing_log_probs(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Vec<f64> {
+    let k = spec.n_classes;
+    let empty_vars: HashMap<String, f64> = HashMap::new();
+    let env = MapEnv {
+        covariates,
+        vars: &empty_vars,
+    };
+    let no_eta: [f64; 0] = [];
+
+    if spec.mixing.iter().all(|m| m.is_logit) {
+        let mut logits = vec![0.0f64; k]; // reference class K stays 0
+        for m in &spec.mixing {
+            logits[m.class - 1] = eval_expr(&m.expr, theta, &no_eta, &env, &[]);
+        }
+        // ln p_k = logit_k − logsumexp(logits)
+        let max = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let lse = max + logits.iter().map(|l| (l - max).exp()).sum::<f64>().ln();
+        logits.iter().map(|l| l - lse).collect()
+    } else {
+        let mut p = vec![0.0f64; k];
+        let mut sum = 0.0;
+        for m in &spec.mixing {
+            let v = eval_expr(&m.expr, theta, &no_eta, &env, &[]).clamp(1e-12, 1.0 - 1e-12);
+            p[m.class - 1] = v;
+            sum += v;
+        }
+        p[k - 1] = (1.0 - sum).clamp(1e-12, 1.0);
+        let tot: f64 = p.iter().sum();
+        p.iter().map(|v| (v / tot).ln()).collect()
+    }
+}
+
 fn parse_parameters(
     lines: &[String],
 ) -> Result<
