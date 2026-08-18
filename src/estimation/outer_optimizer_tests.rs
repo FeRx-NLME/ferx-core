@@ -994,6 +994,7 @@ fn make_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -1288,6 +1289,7 @@ fn test_outer_ad_gradient_block_omega() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
     check_gradient(&model, &make_population(3), 2);
 }
@@ -1709,6 +1711,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
         name: "iov_cov_test".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,

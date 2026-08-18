@@ -201,6 +201,16 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // Mixture models (#977) are parsed and validated (the `[mixture]` block and
+    // reserved `MIXNUM` index) but the K-fold log-sum-exp objective is not yet
+    // wired into estimation. Fail loudly rather than silently fitting class 1.
+    if model.mixture.is_some() {
+        return Err(
+            "mixture models ([mixture] block, #977) are parsed and validated but estimation is \
+             not yet implemented; fit() will be available once the mixture objective lands"
+                .to_string(),
+        );
+    }
     // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
     // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
     crate::dosing::clear_ss_nonconvergence_warnings();

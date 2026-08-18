@@ -86,6 +86,7 @@ fn tiny_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 

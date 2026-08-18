@@ -19,6 +19,17 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **Mixture models — `[mixture]` block and reserved `MIXNUM` index (#977, Phase 1).** Model
+  files can now declare `$MIXTURE`-style discrete latent subpopulations: a `[mixture]` block sets
+  the number of classes (`nsub`), the per-class mixing logits (`logit(k) = …` over theta +
+  covariates), and optional per-class Ω/Σ overrides (`omega(k)` / `sigma(k)`); the reserved
+  read-only `MIXNUM` index (1..=K) selects class-specific typical values inside
+  `[individual_parameters]`. This first phase parses and validates the block (rejecting `nsub < 2`,
+  `MIXNUM` assignment, `MIXNUM` outside a mixture model, eta-dependent mixing expressions, missing
+  class coverage, and overrides of the base class); `fit()` returns a clear error until the mixture
+  objective is wired in a later phase.
+
 ### Performance
 - **The ODE inter-occasion-variability (IOV) analytic sensitivity path now compiles from a
   bucketed set of dual widths instead of one specialisation per stacked axis count**, cutting

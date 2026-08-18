@@ -1156,6 +1156,7 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
 
     // Subject: 2 PK obs + 1 FREM obs

@@ -25,6 +25,7 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
         name: "test_iov_kappa".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Additive,

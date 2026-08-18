@@ -102,6 +102,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -191,6 +192,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
 
     let mut baseline_cov = HashMap::new();

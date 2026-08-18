@@ -88,6 +88,7 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 

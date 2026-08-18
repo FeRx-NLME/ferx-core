@@ -689,6 +689,7 @@ fn make_iov_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -2955,6 +2956,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -3047,6 +3049,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
         name: "noniov_mu".into(),
         has_conditional_eta_params: false,
         pk_model: PkModel::OneCptIv,

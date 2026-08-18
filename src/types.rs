@@ -1361,6 +1361,66 @@ impl ModelParameters {
     }
 }
 
+/// One mixing-probability expression for a `$MIXTURE` class (#977).
+///
+/// The inner `Expression` AST is parser-private (`pub(crate)`, mirroring
+/// [`IndivParamPartials`]); external users see the class index and form but
+/// cannot pattern-match the tree. Evaluated per subject over theta + covariates
+/// to yield the class logit (or probability); softmax-normalized across classes.
+#[derive(Debug, Clone)]
+pub struct MixingExpr {
+    /// 1-based class this expression scores. For the `logit` form only classes
+    /// `1..=n_classes-1` carry an expression (the last class is the softmax
+    /// reference with implicit logit 0).
+    pub class: usize,
+    /// `true` for `logit(k) = …` (raw logit, softmax-normalized); `false` for
+    /// `p(k) = …` (probability, must lie in (0,1) and is renormalized).
+    pub is_logit: bool,
+    /// Mixing expression over theta + covariates. Parser-private AST.
+    pub(crate) expr: crate::parser::model_parser::Expression,
+}
+
+/// A per-class Omega/Sigma override declared in a `[mixture]` block via
+/// `omega(k) NAME ~ var` / `sigma(k) NAME ~ var` (#977). An omitted class shares
+/// the base (class-1) Omega/Sigma. Phase 1 stores the raw declaration; Phase 2
+/// builds the per-class numeric matrices from it.
+#[derive(Debug, Clone)]
+pub struct MixtureClassOverride {
+    /// 1-based class this override applies to (2..=n_classes; class 1 is base).
+    pub class: usize,
+    /// Random-effect (eta) or residual (sigma) name being overridden — must name
+    /// a base declaration.
+    pub name: String,
+    /// Initial value: variance for omega, variance-or-SD for sigma per `as_sd`.
+    pub init: f64,
+    /// `true` when written on the SD scale (`(sd)` suffix).
+    pub as_sd: bool,
+    /// FIX flag.
+    pub fixed: bool,
+}
+
+/// `$MIXTURE` model structure attached to [`CompiledModel`] (#977).
+///
+/// Holds the number of subpopulations, the per-class mixing expressions, and any
+/// per-class Omega/Sigma overrides. The class-specific *typical values* are not
+/// stored here — they live in `[individual_parameters]` as `MIXNUM`-branched
+/// expressions and are shared/split entirely by the user.
+#[derive(Debug, Clone)]
+pub struct MixtureSpec {
+    /// Number of subpopulations K (>= 2).
+    pub n_classes: usize,
+    /// Mixing-probability expressions (see [`MixingExpr`]). For the `logit` form,
+    /// `n_classes - 1` entries (classes `1..=K-1`); for the `p` form, one per
+    /// declared class.
+    pub mixing: Vec<MixingExpr>,
+    /// Covariate names referenced by the mixing expressions (for data checks).
+    pub logit_covariates: Vec<String>,
+    /// Per-class Omega overrides (empty ⇒ all classes share the base Omega).
+    pub omega_overrides: Vec<MixtureClassOverride>,
+    /// Per-class Sigma overrides (empty ⇒ all classes share the base Sigma).
+    pub sigma_overrides: Vec<MixtureClassOverride>,
+}
+
 /// Supported PK structural models.
 ///
 /// IV (bolus and/or infusion) administration is represented by a single
@@ -2893,6 +2953,14 @@ pub struct CompiledModel {
     /// [`CompiledModel::effective_for`] and the parser's
     /// `absorption_ode_equivalent_source` (#486, #790).
     pub absorption_ode_equivalent: Option<AbsorptionOdeEquivalent>,
+    /// `$MIXTURE`-style discrete latent subpopulations (#977). `Some` when the
+    /// model file carries a `[mixture]` block: the subject marginal becomes a
+    /// covariate-weighted mixture over `n_classes` class-conditional
+    /// likelihoods, and the reserved `MIXNUM` index (1..=K) selects
+    /// class-specific typical values in `[individual_parameters]`. `None` for an
+    /// ordinary single-population model. Phase 1 (#977) parses and validates the
+    /// spec; `fit()` errors until the objective is wired.
+    pub mixture: Option<MixtureSpec>,
 }
 
 /// The three call-time-configurable ODE solver tolerances ([`FitOptions::ode_reltol`],

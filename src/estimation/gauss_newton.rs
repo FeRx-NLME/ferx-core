@@ -2018,6 +2018,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         }
     }
 
@@ -3025,6 +3026,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         };
 
         let template = &model.default_params;
@@ -3313,6 +3315,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         }
     }
 

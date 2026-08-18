@@ -2587,6 +2587,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         }
     }
 

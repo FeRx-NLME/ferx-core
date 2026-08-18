@@ -111,6 +111,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
 
     // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -440,6 +441,7 @@ fn test_simulate_honours_tv_covariates() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
 
     let mut baseline_cov = HashMap::new();

@@ -13428,3 +13428,197 @@ fn simulation_horizon_bad_value_errors() {
         "got: {err}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Mixture models — `[mixture]` block + reserved `MIXNUM` index (#977, Phase 1)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A valid 2-class mixture model: class-specific CL via a `MIXNUM` branch, a
+/// covariate-dependent mixing logit, and per-class Ω/Σ overrides.
+const MIXTURE_2CLASS: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.001, 100.0)
+  theta TVCL2(3.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta BWT(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL + BWT*WT
+  omega(2) ETA_CL ~ 0.4
+  sigma(2) EPS ~ 0.12
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+#[test]
+fn mixture_block_parses_into_spec() {
+    let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
+    let spec = model.mixture.as_ref().expect("mixture spec present");
+    assert_eq!(spec.n_classes, 2);
+    assert_eq!(spec.mixing.len(), 1, "K-1 mixing exprs for K=2");
+    assert_eq!(spec.mixing[0].class, 1);
+    assert!(spec.mixing[0].is_logit);
+    assert_eq!(spec.logit_covariates, vec!["WT".to_string()]);
+    assert_eq!(spec.omega_overrides.len(), 1);
+    assert_eq!(spec.omega_overrides[0].class, 2);
+    assert_eq!(spec.omega_overrides[0].name, "ETA_CL");
+    assert!((spec.omega_overrides[0].init - 0.4).abs() < 1e-12);
+    assert_eq!(spec.sigma_overrides.len(), 1);
+    assert_eq!(spec.sigma_overrides[0].class, 2);
+    assert_eq!(spec.sigma_overrides[0].name, "EPS");
+}
+
+#[test]
+fn non_mixture_model_has_no_spec() {
+    let model = minimal_model_with_indiv("  CL = TVCL * exp(ETA_CL)\n  V = TVV");
+    assert!(model.mixture.is_none());
+}
+
+#[test]
+fn mixnum_resolves_to_class_1_by_default() {
+    // With no mixture-class set (Phase 1), `MIXNUM` reads the class-1 default, so
+    // the typical-value closure evaluates the class-1 branch: CL = TVCL1 = 1.0.
+    let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
+    let theta = &model.default_params.theta;
+    let mut cov = std::collections::HashMap::new();
+    cov.insert("WT".to_string(), 70.0);
+    let tv = model.tv_fn.as_ref().unwrap()(theta, &cov);
+    // indiv_param_names order: CL then V.
+    let cl_idx = model
+        .indiv_param_names
+        .iter()
+        .position(|n| n == "CL")
+        .unwrap();
+    assert!(
+        (tv[cl_idx] - 1.0).abs() < 1e-9,
+        "class-1 branch → CL = TVCL1 = 1.0, got {}",
+        tv[cl_idx]
+    );
+}
+
+#[test]
+fn mixnum_in_non_mixture_model_rejected() {
+    let err = minimal_model_str_result("  CL = if (MIXNUM == 1) TVCL else TVCL\n  V = TVV")
+        .expect_err("MIXNUM without [mixture] must be rejected");
+    assert!(
+        err.contains("MIXNUM") && err.contains("mixture"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn mixnum_assignment_rejected() {
+    // `MIXNUM = …` in [individual_parameters] of an otherwise-valid mixture model.
+    let src = MIXTURE_2CLASS.replace("  V = TVV", "  V = TVV\n  MIXNUM = 2");
+    let err = parse_model_string(&src).expect_err("assigning MIXNUM must be rejected");
+    assert!(
+        err.contains("MIXNUM") && err.contains("reserved"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn mixture_nsub_below_two_rejected() {
+    let src = MIXTURE_2CLASS.replace("nsub = 2", "nsub = 1");
+    let err = parse_model_string(&src).expect_err("nsub < 2 must be rejected");
+    assert!(err.contains("nsub") && err.contains(">= 2"), "got: {err}");
+}
+
+#[test]
+fn mixture_missing_mixing_expr_rejected() {
+    // Declare 3 classes but only supply logit(1); logit(2) is missing.
+    let src = MIXTURE_2CLASS.replace("nsub = 2", "nsub = 3");
+    let err = parse_model_string(&src).expect_err("missing class-2 mixing expr must be rejected");
+    assert!(err.contains("missing mixing expression"), "got: {err}");
+}
+
+#[test]
+fn mixture_mixing_expr_with_eta_rejected() {
+    let src = MIXTURE_2CLASS.replace("logit(1) = MIXL + BWT*WT", "logit(1) = MIXL + ETA_CL");
+    let err = parse_model_string(&src).expect_err("eta in mixing expr must be rejected");
+    assert!(err.contains("eta"), "got: {err}");
+}
+
+#[test]
+fn mixture_override_unknown_name_rejected() {
+    let src = MIXTURE_2CLASS.replace("omega(2) ETA_CL ~ 0.4", "omega(2) ETA_NOPE ~ 0.4");
+    let err = parse_model_string(&src).expect_err("override of unknown eta must be rejected");
+    assert!(err.contains("ETA_NOPE"), "got: {err}");
+}
+
+#[test]
+fn mixture_override_of_base_class_rejected() {
+    let src = MIXTURE_2CLASS.replace("omega(2) ETA_CL ~ 0.4", "omega(1) ETA_CL ~ 0.4");
+    let err = parse_model_string(&src).expect_err("class-1 override must be rejected");
+    assert!(err.contains("class 1 is the base"), "got: {err}");
+}
+
+#[test]
+fn mixture_mixed_logit_and_prob_forms_rejected() {
+    // K=3 with logit(1) and p(2) — forms must not be mixed.
+    let src = MIXTURE_2CLASS
+        .replace("nsub = 2", "nsub = 3")
+        .replace("logit(1) = MIXL + BWT*WT", "logit(1) = MIXL\n  p(2) = 0.3");
+    let err = parse_model_string(&src).expect_err("mixed forms must be rejected");
+    assert!(err.contains("cannot mix"), "got: {err}");
+}
+
+#[test]
+fn fit_on_mixture_model_errors_not_wired() {
+    let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
+    // The `model.mixture.is_some()` guard fires before any subject is touched,
+    // so an empty population is sufficient to reach it.
+    let pop = crate::types::Population {
+        subjects: vec![],
+        covariate_names: vec![],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let params = model.default_params.clone();
+    let opts = crate::types::FitOptions::default();
+    let err = crate::api::fit(&model, &pop, &params, &opts)
+        .expect_err("fit() must reject an unwired mixture model");
+    assert!(
+        err.contains("mixture") && err.contains("not yet implemented"),
+        "got: {err}"
+    );
+}
+
+/// Helper: parse a full model whose `[individual_parameters]` body is `indiv`,
+/// returning the raw `Result` so rejection tests can inspect the error. Mirrors
+/// [`minimal_model_with_indiv`] but does not unwrap.
+fn minimal_model_str_result(indiv: &str) -> Result<crate::types::CompiledModel, String> {
+    let model_str = format!(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+{indiv}
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+    );
+    parse_model_string(&model_str)
+}
