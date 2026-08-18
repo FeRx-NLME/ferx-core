@@ -38,6 +38,33 @@ pub(crate) enum CovarianceStepResult {
     },
 }
 
+/// The Omega matrix to inspect when diagnosing a non-finite covariance base OFV.
+///
+/// For a mixture (#984 review) the base (class-1) Omega can be well-conditioned
+/// while a per-class `omega(k)` override has collapsed — the actual cause of the
+/// non-finite OFV. Return the worst-conditioned Omega (smallest minimum
+/// eigenvalue) across all classes, so the emitted reason names Omega collapse
+/// rather than misattributing it to a model-evaluation overflow. Non-mixture
+/// models return the single base Omega unchanged.
+fn diagnostic_omega(params_at: &ModelParameters) -> &DMatrix<f64> {
+    params_at
+        .mixture
+        .as_ref()
+        .and_then(|mp| {
+            mp.omega.iter().map(|o| &o.matrix).min_by(|a, b| {
+                let min_eig = |m| {
+                    extract_eigenvalues(m)
+                        .and_then(|ev| ev.last().copied())
+                        .unwrap_or(f64::INFINITY)
+                };
+                min_eig(a)
+                    .partial_cmp(&min_eig(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+        .unwrap_or(&params_at.omega.matrix)
+}
+
 /// Human-readable label for the packed parameter at position `packed_idx`.
 /// E.g. `"theta[CL]"`, `"omega[ETA_1, ETA_2]"`, `"sigma[1]"`.
 ///
@@ -681,11 +708,31 @@ pub(crate) fn compute_covariance(
     // `mixture_ofv.ofv` is already on the −2·logL scale (= −2 Σᵢ log Σₖ pᵢₖ e^{−nllᵢₖ}),
     // so it takes no ×2, and it reconverges every (subject × class) inner solve
     // internally (cold — the FD stencil favours correctness over a warm start).
+    // Mixture: reconverge its per-class EBEs at `cov_inner_tol` too, not the fit's
+    // `inner_tol` — otherwise `cov_inner_tol` is a silent no-op on the mixture path
+    // (a loose fit + tight `cov_inner_tol` for trustworthy SEs would get bit-
+    // identical contaminated numbers), exactly the trap the single-population
+    // reconvergence above avoids. `mixture_ofv` reads its inner tolerance from the
+    // options it is handed, so pass an override clone.
+    let cov_options;
+    let mixture_cov_options = if is_mixture && cov_inner_tol != options.inner_tol {
+        cov_options = FitOptions {
+            inner_tol: cov_inner_tol,
+            ..options.clone()
+        };
+        &cov_options
+    } else {
+        options
+    };
     let cov_ofv = |xv: &[f64]| -> f64 {
         if is_mixture {
             let params = unpack_params(xv, template);
             return crate::estimation::mixture::mixture_ofv(
-                model, population, &params, options, None,
+                model,
+                population,
+                &params,
+                mixture_cov_options,
+                None,
             )
             .ofv;
         }
@@ -734,9 +781,12 @@ pub(crate) fn compute_covariance(
     let _ = (&base_params, &base_h_matrices, &base_kappas);
     if !base_ofv.is_finite() {
         // Diagnose: check Omega conditioning to distinguish Omega collapse from
-        // a model-evaluation overflow/underflow.
+        // a model-evaluation overflow/underflow. For a mixture the base (class-1)
+        // Omega can be well-conditioned while a per-class `omega(k)` override has
+        // collapsed — the actual cause of the non-finite OFV — so inspect the
+        // worst-conditioned Omega across all classes, not just the base.
         let params_at = unpack_params(x_hat, template);
-        let reason = match extract_eigenvalues(&params_at.omega.matrix) {
+        let reason = match extract_eigenvalues(diagnostic_omega(&params_at)) {
             Some(ref ev) if ev.last().copied().unwrap_or(1.0) <= 1e-8 => {
                 let min_eig = ev.last().copied().unwrap_or(f64::NAN);
                 // Distinguish truly negative eigenvalues from tiny-positive (near-singular).
@@ -1388,7 +1438,7 @@ mod tests {
     // (they reach the moved symbols via the cross-module import added there). The
     // `run_covariance_step` gate + match is exercised end-to-end by every
     // estimator finalizer's integration/lib tests.
-    use super::packed_param_label;
+    use super::{diagnostic_omega, packed_param_label};
 
     /// A variance mixture (per-class Ω/Σ overrides) so the packed vector carries
     /// the override tail. Packed order: [TVCL, TVV, MIXL, BWT | ω(ETA_CL) |
@@ -1439,5 +1489,33 @@ mod tests {
         assert_eq!(packed_param_label(7, t), "sigma[EPS_MIX2]");
         // Past the override tail → generic fallback (defensive).
         assert_eq!(packed_param_label(8, t), "packed[8]");
+    }
+
+    #[test]
+    fn diagnostic_omega_picks_collapsed_class_override() {
+        // #984 regression: when a per-class `omega(k)` override collapses but the
+        // base (class-1) Omega is well-conditioned, the non-finite-OFV diagnostic
+        // must inspect the collapsed class Omega — else it misreports "numerical
+        // overflow" instead of "Omega not positive definite".
+        let model = crate::parser::model_parser::parse_model_string(MIX_OVERRIDE_MODEL).unwrap();
+        let mut params = model.default_params.clone();
+        // Base Omega stays healthy (0.06); collapse the class-2 override to negative.
+        let mix = params.mixture.as_mut().expect("mixture params");
+        mix.omega[1].matrix[(0, 0)] = -1.0;
+        let chosen = diagnostic_omega(&params);
+        assert_eq!(
+            chosen[(0, 0)],
+            -1.0,
+            "must select the collapsed class Omega"
+        );
+        assert!(
+            params.omega.matrix[(0, 0)] > 0.0,
+            "base Omega is healthy, so the base branch would have hidden the collapse"
+        );
+
+        // Non-mixture params fall back to the single base Omega unchanged.
+        let mut plain = model.default_params.clone();
+        plain.mixture = None;
+        assert_eq!(diagnostic_omega(&plain)[(0, 0)], plain.omega.matrix[(0, 0)]);
     }
 }

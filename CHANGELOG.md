@@ -70,6 +70,20 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **Mixture covariance-step and diagnostics correctness (#984, follow-up to #983).** Five fixes to
+  the mixture SE/covariance and checkpoint paths: (1) the covariance step now reconverges its per-class EBEs at
+  `cov_inner_tol`, not the fit's `inner_tol`, so a loose fit followed by a tight `cov_inner_tol` for
+  trustworthy SEs is honoured instead of silently building the Hessian on the loose EBEs; (2) when a
+  per-class `omega(k)`/`sigma(k)` override collapses and makes the covariance base OFV non-finite,
+  the diagnostic now inspects the worst-conditioned class Omega and reports the collapse instead of
+  misattributing it to a model-evaluation overflow; (3) an explicitly chosen optimizer that cannot
+  drive a mixture (built-in BFGS/L-BFGS, trust-region, Gauss-Newton) is still run under BOBYQA but
+  now emits a warning rather than dropping the choice silently; (4) EBE non-convergence / fallback /
+  hard-reject are now counted over every class that contributes to a subject's marginal, not just its
+  winning class, so a non-converged non-winning class is no longer hidden from the convergence guard;
+  (5) `.fitrx` restore now orders the `PMIX_*` columns by class number rather than raw header position,
+  so a bundle whose columns were reordered (e.g. alphabetically, `PMIX_10` before `PMIX_2`) no longer
+  silently swaps class probabilities.
 - **Mixture posteriors survive a `.fitrx` checkpoint (#983).** A saved-then-restored mixture fit
   now re-emits its per-subject `MIXEST` / `PMIX_1..K` columns: they round-trip through optional
   trailing columns on `ebes.csv` (a non-mixture bundle is byte-identical to before). Previously the

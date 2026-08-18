@@ -132,10 +132,24 @@ pub fn optimize_population(
     // branches to `mixture_gradient`. Every other choice (including `auto`, and
     // the built-in BFGS / trust-region paths, which do not carry the mixture
     // objective) falls back to BOBYQA.
+    let mut optimizer_downgrade_warning: Vec<String> = Vec::new();
     let resolved = if init_params.mixture.is_some() {
         match options.optimizer {
             Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => options.optimizer,
-            _ => Optimizer::Bobyqa,
+            // `Auto` is the mixture default and downgrades silently by design;
+            // any *explicitly* chosen optimizer that the mixture path can't drive
+            // (built-in BFGS/L-BFGS, trust-region, Gauss-Newton — none carry the
+            // mixture objective) is run under BOBYQA instead, so say so rather than
+            // dropping the choice invisibly.
+            Optimizer::Auto => Optimizer::Bobyqa,
+            other => {
+                optimizer_downgrade_warning.push(format!(
+                    "Mixture models are optimized with BOBYQA or an NLopt gradient method \
+                     (SLSQP / L-BFGS / MMA); the requested {other:?} optimizer does not carry \
+                     the mixture objective and was replaced by BOBYQA."
+                ));
+                Optimizer::Bobyqa
+            }
         }
     } else {
         options.optimizer.resolve_auto(model, options.interaction)
@@ -189,10 +203,12 @@ pub fn optimize_population(
             options,
         ),
     };
-    // Surface the freeze warnings ahead of the optimizer's own (they explain why a
-    // parameter was held fixed, which the reader wants before any convergence notes).
-    if !preflight_warnings.is_empty() {
-        let mut w = preflight_warnings;
+    // Surface the optimizer-downgrade and freeze warnings ahead of the optimizer's
+    // own (they explain the substituted optimizer / why a parameter was held fixed,
+    // which the reader wants before any convergence notes).
+    if !optimizer_downgrade_warning.is_empty() || !preflight_warnings.is_empty() {
+        let mut w = optimizer_downgrade_warning;
+        w.extend(preflight_warnings);
         w.append(&mut result.warnings);
         result.warnings = w;
     }

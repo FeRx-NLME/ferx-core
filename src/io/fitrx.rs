@@ -1005,6 +1005,25 @@ fn read_json<T: serde::de::DeserializeOwned, R: Read + std::io::Seek>(
     Ok(serde_json::from_slice(&buf)?)
 }
 
+/// Column indices of the `PMIX_{k}` headers, ordered by class number `k` rather
+/// than raw header position (#984 review). ferx writes `PMIX_1..K` in order, but a
+/// CSV tool that reordered columns (e.g. alphabetically — `PMIX_10` before
+/// `PMIX_2`) would otherwise silently swap class probabilities on restore, since
+/// the restored `pmix` vector is indexed by class. A non-numeric suffix sorts last
+/// deterministically.
+fn pmix_column_order(header_names: &[&str]) -> Vec<usize> {
+    let mut named: Vec<(usize, usize)> = header_names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            c.strip_prefix("PMIX_")
+                .map(|suf| (suf.parse::<usize>().unwrap_or(usize::MAX), i))
+        })
+        .collect();
+    named.sort_by_key(|&(cls, _)| cls);
+    named.into_iter().map(|(_, i)| i).collect()
+}
+
 fn parse_subjects(
     ebes_csv: &str,
     preds_csv: &str,
@@ -1031,12 +1050,10 @@ fn parse_subjects(
     }
     // Optional mixture columns (#983): MIXEST + PMIX_1..K, by header name.
     let mixest_idx = header_names.iter().position(|&c| c == "MIXEST");
-    let pmix_idxs: Vec<usize> = header_names
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.starts_with("PMIX_"))
-        .map(|(i, _)| i)
-        .collect();
+    // Restore PMIX columns in class-number order, not raw header order (#984
+    // review): the restored `pmix` vector is indexed by class, so a CSV tool that
+    // reordered columns would otherwise silently swap class probabilities.
+    let pmix_idxs = pmix_column_order(&header_names);
     let mut subjects: Vec<SubjectResult> = Vec::new();
     for (i, line) in lines.enumerate() {
         if line.trim().is_empty() {
@@ -1891,6 +1908,33 @@ fn parse_csv_row(line: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector};
+
+    #[test]
+    fn pmix_column_order_sorts_by_class_number() {
+        // #984 review: restore PMIX by class number, not header position — so an
+        // alphabetically-reordered header (PMIX_10 before PMIX_2, K ≥ 10) maps each
+        // column to the right class instead of silently swapping probabilities.
+        // In-order header → identity mapping onto the PMIX columns.
+        let h = [
+            "ID", "eta_1", "ofv", "n_obs", "MIXEST", "PMIX_1", "PMIX_2", "PMIX_3",
+        ];
+        assert_eq!(pmix_column_order(&h), vec![5, 6, 7]);
+
+        // Alphabetically reordered (PMIX_1, PMIX_10, PMIX_11, PMIX_2, ...) must be
+        // re-sorted to class order 1,2,...,10,11 → the column *positions* follow.
+        let h2 = [
+            "ID", "PMIX_1", "PMIX_10", "PMIX_11", "PMIX_2", "PMIX_3", "PMIX_4", "PMIX_5", "PMIX_6",
+            "PMIX_7", "PMIX_8", "PMIX_9",
+        ];
+        // class 1..9 sit at positions 1,4,5,6,7,8,9,10,11; class 10,11 at 2,3.
+        assert_eq!(
+            pmix_column_order(&h2),
+            vec![1, 4, 5, 6, 7, 8, 9, 10, 11, 2, 3]
+        );
+
+        // No PMIX columns → empty.
+        assert!(pmix_column_order(&["ID", "eta_1", "ofv", "n_obs"]).is_empty());
+    }
 
     fn dummy_subject(id: &str, n_eta: usize, n_obs: usize) -> SubjectResult {
         SubjectResult {

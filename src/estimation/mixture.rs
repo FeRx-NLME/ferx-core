@@ -84,6 +84,22 @@ pub fn combine_subject(logp: &[f64], nll: &[f64]) -> (f64, Vec<f64>, usize) {
     (2.0 * (-lse), pmix, mixest)
 }
 
+/// Posterior weight below which a class cannot meaningfully move a subject's
+/// mixture marginal, so its inner-solve status is not tallied (#984 review).
+const PMIX_CONTRIB_TOL: f64 = 1e-6;
+
+/// True if any class flagged `true` in `flags` carries non-negligible posterior
+/// weight `probs[k]` (> [`PMIX_CONTRIB_TOL`]). Used to score EBE
+/// non-convergence / fallback / hard-reject over every *contributing* class of a
+/// subject, not just its winning class — a non-converged non-winning class still
+/// enters the log-sum-exp OFV with weight `PMIX_ik` and must be surfaced.
+fn any_contributing(flags: &[bool], probs: &[f64]) -> bool {
+    flags
+        .iter()
+        .zip(probs)
+        .any(|(&f, &p)| f && p > PMIX_CONTRIB_TOL)
+}
+
 /// Evaluate the mixture FOCE objective at `params` (#977 Phase 3).
 ///
 /// `warm` optionally carries the previous iteration's per-class EBEs
@@ -170,13 +186,23 @@ pub fn mixture_ofv(
         let nll_i: Vec<f64> = (0..k).map(|cls| nll[cls][i]).collect();
         let (contrib, probs, best) = combine_subject(&logp, &nll_i);
         ofv += contrib;
-        if !converged[best][i] {
+        // Convergence is scored over *every* class that contributes meaningfully to
+        // this subject's marginal, not just the winning (`best`) class: each class's
+        // `nll_ik` enters the log-sum-exp with weight `PMIX_ik`, so a non-converged
+        // non-winning class still contaminates the OFV. Scoring only `best` would let
+        // that pass the outer EBE-convergence guard silently. A class with negligible
+        // posterior weight cannot move the marginal, so it is not counted. Each
+        // subject contributes at most one to each tally.
+        let unconverged_i: Vec<bool> = (0..k).map(|cls| !converged[cls][i]).collect();
+        let fallback_i: Vec<bool> = (0..k).map(|cls| fallback[cls][i]).collect();
+        let reject_i: Vec<bool> = (0..k).map(|cls| hard_reject[cls][i]).collect();
+        if any_contributing(&unconverged_i, &probs) {
             n_unconverged += 1;
         }
-        if fallback[best][i] {
+        if any_contributing(&fallback_i, &probs) {
             n_fallback += 1;
         }
-        if hard_reject[best][i] {
+        if any_contributing(&reject_i, &probs) {
             n_start_rejected += 1;
         }
         mixest_etas.push(etas_by_class[best][i].clone());
@@ -346,7 +372,25 @@ pub fn mixture_gradient_fd(
 
 #[cfg(test)]
 mod tests {
-    use super::combine_subject;
+    use super::{any_contributing, combine_subject};
+
+    #[test]
+    fn any_contributing_scores_nonwinning_classes() {
+        // #984 regression: a non-winning class that failed to converge (class 2 here,
+        // flag = true) but still carries non-negligible posterior weight must be
+        // surfaced, even though class 1 wins.
+        let flags = [false, true]; // class 2 failed
+        let winner_heavy = [0.98, 0.02]; // class 1 wins, class 2 still contributes
+        assert!(
+            any_contributing(&flags, &winner_heavy),
+            "non-winning contributing class must count"
+        );
+        // A failed class with negligible weight cannot move the marginal → not counted.
+        let winner_only = [1.0 - 1e-9, 1e-9];
+        assert!(!any_contributing(&flags, &winner_only));
+        // No class flagged → nothing counted.
+        assert!(!any_contributing(&[false, false], &winner_heavy));
+    }
 
     #[test]
     fn combine_two_equal_classes() {
@@ -567,6 +611,59 @@ mod tests {
         assert_eq!(matrix[(5, 5)], 0.0, "FIXED sigma row zeroed");
     }
 
+    #[test]
+    fn mixture_covariance_uses_cov_inner_tol_not_fit_tol() {
+        // #984 regression: the mixture covariance step must reconverge its per-class
+        // EBEs at `cov_inner_tol`, not the fit's `inner_tol`. Otherwise a loose fit +
+        // an explicit tight `cov_inner_tol` (set for trustworthy SEs) would silently
+        // build the Hessian on the loose, contaminated EBEs. We build the covariance
+        // twice: a reference at a tight fit tol, and a probe at an absurdly loose fit
+        // tol but the same explicit tight `cov_inner_tol`. With the fix they must
+        // match; before it, the probe would use the loose tol and diverge.
+        use crate::estimation::covariance::{compute_covariance, CovarianceStepResult};
+        use crate::estimation::parameterization::pack_params;
+        let model = crate::parser::model_parser::parse_model_string(MIX_COV_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(8, 1.0, 3.0));
+        let params = &model.default_params;
+        let x = pack_params(params);
+
+        let run = |inner_tol: f64, cov_inner_tol: Option<f64>| {
+            let opts = crate::types::FitOptions {
+                inner_tol,
+                cov_inner_tol,
+                ..crate::types::FitOptions::default()
+            };
+            let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
+            match compute_covariance(
+                &x,
+                params,
+                &model,
+                &pop,
+                &eval.mixest_etas,
+                &eval.mixest_h_mats,
+                &[],
+                &opts,
+            ) {
+                CovarianceStepResult::Success(out) => out.matrix,
+                CovarianceStepResult::Unusable(msg) => panic!("covariance unusable: {msg}"),
+                CovarianceStepResult::FailedNonPd { reason, .. } => {
+                    panic!("covariance non-PD: {reason}")
+                }
+            }
+        };
+
+        let reference = run(1e-8, None); // cov tol defaults to the tight fit tol
+        let probe = run(1.0, Some(1e-8)); // loose fit, tight explicit cov tol
+        for i in 0..4 {
+            let (r, p) = (reference[(i, i)], probe[(i, i)]);
+            let denom = r.abs().max(p.abs()).max(1e-9);
+            assert!(
+                (r - p).abs() / denom < 1e-6,
+                "theta[{i}] variance depends on the fit inner_tol: ref {r} vs probe {p}"
+            );
+        }
+    }
+
     /// Build a constant-mixing MIXNUM model with the given mixing line and the
     /// `MIXL`/`P1` mixing-coefficient parameter declaration, so a `p(k)` model and
     /// its softmax-equivalent `logit(k)` model share every other line.
@@ -774,6 +871,50 @@ mod tests {
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("SLSQP mixture fit should return Ok");
         assert!(res.ofv.is_finite(), "OFV = {}", res.ofv);
+    }
+
+    #[test]
+    fn mixture_downgraded_optimizer_warns() {
+        // #984 regression: a mixture cannot be driven by the built-in BFGS /
+        // trust-region / Gauss-Newton optimizers (none carry the mixture objective),
+        // so an *explicit* such choice is run under BOBYQA — but must say so in
+        // FitResult.warnings rather than dropping the choice invisibly.
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            optimizer: crate::types::Optimizer::Bfgs,
+            outer_maxiter: 2,
+            ..crate::types::FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("mixture fit with a downgraded optimizer should still return Ok");
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("BOBYQA") && w.contains("Bfgs")),
+            "expected an optimizer-downgrade warning, got {:?}",
+            res.warnings
+        );
+    }
+
+    #[test]
+    fn mixture_default_optimizer_does_not_warn() {
+        // The default `auto` optimizer downgrades to BOBYQA by design and must stay
+        // silent — only an explicitly-chosen unsupported optimizer warns.
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            outer_maxiter: 2,
+            ..crate::types::FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).unwrap();
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("does not carry the mixture objective")),
+            "auto optimizer must not emit a downgrade warning, got {:?}",
+            res.warnings
+        );
     }
 
     #[test]
