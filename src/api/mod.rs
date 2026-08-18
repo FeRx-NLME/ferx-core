@@ -60,8 +60,8 @@ pub use predict::{predict, PredictionResult};
 pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
 pub(crate) use run::{build_selection_filter_merged, log_transform_observations};
 pub use run::{
-    read_population_for, resolve_data_path, run_from_file, run_model_simulate, run_model_with_data,
-    run_model_with_data_inits,
+    read_population_for, read_population_for_simulation, resolve_data_path, run_from_file,
+    run_model_simulate, run_model_with_data, run_model_with_data_inits,
 };
 pub(crate) use simulate::obs_row_time;
 pub use simulate::{
@@ -164,6 +164,10 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/dose_compartment_tests.rs"]
 mod dose_compartment_tests;
+
+#[cfg(test)]
+#[path = "tests/simulation_template_tests.rs"]
+mod simulation_template_tests;
 
 // ======================================================================
 // Adaptive (state-reactive / feedback) dosing — epic #391, beta.

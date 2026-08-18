@@ -35,6 +35,60 @@ for sim in &sims[..5] {
 }
 ```
 
+## `read_population_for_simulation()`
+
+Read a NONMEM-format CSV that will be **simulated from** rather than fitted.
+
+```rust
+pub fn read_population_for_simulation(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String>
+```
+
+Identical to `read_population_for()` — the reader every fitting entry point uses
+— except in how it reads a **missing `DV`** on a scored row (`EVID=0`,
+`MDV=0`). For a fit, a missing `DV` means "no observation here", so the row is
+skipped and counted for the `W_MISSING_DV` warning. For a simulation the `DV` is
+the *output*, so the same row is a **design point**: a sampling time whose value
+has not been generated yet.
+
+That makes the natural design template simulate as written:
+
+```csv
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+1,0.25,.,0,.,1,0
+1,1,.,0,.,1,0
+1,4,.,0,.,1,0
+```
+
+```rust
+let (population, _covariates) =
+    read_population_for_simulation(&model, &None, "design.csv", None, None, None, &[])?;
+let sims = simulate(&model, &population, &model.default_params, 1000);
+```
+
+Read with `read_population_for()` the same file yields zero simulated rows. Rows
+marked `MDV=1` are excluded on both paths. Retained rows are reported once as a
+`W_DESIGN_DV` warning on the returned population, so a simulation run off an
+*observed* dataset makes visible that it kept rows a fit of the same data would
+have skipped.
+
+The retained rows carry a placeholder `DV` (`NaN`, or the endpoint's first
+declared state code for an integer-coded endpoint) that the simulated value
+replaces, so the returned population is **for simulation only** — do not pass it
+to `fit()`. That is enforced, not merely advised: a population carrying
+non-finite observations is rejected by `fit()` (and reported by `ferx check`) as
+`E_NONFINITE_DV`, and propensity-score-matched simulation
+(`SimulateOptions::match_method`) rejects it too, since a design template has
+nothing to compute posthoc etas from.
+
 ## `simulate_with_seed()`
 
 Same as `simulate()` but with a fixed random seed for reproducibility.

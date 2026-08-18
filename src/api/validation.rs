@@ -126,7 +126,8 @@ pub fn check_model_data_rule(
     population: &Population,
     iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
-    let mut diags = check_covariates(model, population);
+    let mut diags = check_finite_observations(population);
+    diags.extend(check_covariates(model, population));
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_iov_occasions(model, population, iov_rule));
@@ -135,6 +136,49 @@ pub fn check_model_data_rule(
     diags.extend(check_dose_compartments(model, population));
     diags.extend(validate_output_columns(model, population));
     diags
+}
+
+/// Every scored observation must be a finite number.
+///
+/// Nothing else on the fit path tests `observations` for finiteness — TIME is
+/// checked, DV was not — so a `NaN` reached the likelihood as a silent
+/// `NaN` objective, or worse got laundered into a finite value on the way
+/// (LTBS case 2 floors `NaN.max(LTBS_FLOOR)` to `LTBS_FLOOR`, since `f64::max`
+/// returns the non-NaN operand).
+///
+/// The concrete way to get here is misuse of
+/// [`read_population_for_simulation`](crate::api::read_population_for_simulation)
+/// (#957): it keeps a missing `DV` as a design point with a `NaN` placeholder,
+/// and its "do not pass this to `fit()`" contract was documentation-only. This
+/// makes it loud instead. A hand-built `Population` carrying a `NaN` DV is
+/// caught by the same check.
+fn check_finite_observations(population: &Population) -> Vec<Diagnostic> {
+    let Some(subject) = population
+        .subjects
+        .iter()
+        .find(|s| s.observations.iter().any(|v| !v.is_finite()))
+    else {
+        return Vec::new();
+    };
+    let n_bad = subject
+        .observations
+        .iter()
+        .filter(|v| !v.is_finite())
+        .count();
+    vec![Diagnostic::error(
+        "E_NONFINITE_DV",
+        format!(
+            "Subject '{}' has {} non-finite observation(s) (NaN/Inf). A DV must be a finite \
+             number to be scored.",
+            subject.id, n_bad
+        ),
+    )
+    .with_suggestion(
+        "If this population came from `read_population_for_simulation` (a `DV = .` design \
+         template), it is a simulation input, not a fit input — its missing DVs are NaN \
+         placeholders for values that have not been generated yet. Read the dataset with \
+         `read_population_for` to fit it.",
+    )]
 }
 
 /// IOV models require occasion labels in the dataset. When `n_kappa > 0` but
