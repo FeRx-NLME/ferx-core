@@ -44,6 +44,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let model = CompiledModel {
         name: "tv_cov_sdtab_regression".into(),
@@ -379,6 +380,7 @@ fn test_simulate_honours_tv_covariates() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let model = CompiledModel {
         name: "tv_cov_sim_regression".into(),

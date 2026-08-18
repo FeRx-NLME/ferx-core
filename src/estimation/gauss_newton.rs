@@ -1957,6 +1957,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         };
         CompiledModel {
             name: "gn_test".into(),
@@ -2965,6 +2966,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         };
         let model = CompiledModel {
             name: "gn_block_omega_test".into(),
@@ -3253,6 +3255,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
+            mixture: None,
         };
         CompiledModel {
             name: "iov_gn_test".into(),

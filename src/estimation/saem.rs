@@ -1399,6 +1399,7 @@ fn saem_state_to_params(
             init_params.omega_iov.clone()
         },
         kappa_fixed: init_params.kappa_fixed.clone(),
+        mixture: None,
     }
 }
 
@@ -3377,6 +3378,7 @@ mod tests {
                 sigma_fixed: vec![false],
                 omega_iov: Some(OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()])),
                 kappa_fixed: vec![false],
+                mixture: None,
             },
             omega_init_as_sd: vec![false],
             sigma_init_as_sd: vec![false],

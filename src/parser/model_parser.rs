@@ -1946,7 +1946,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         (Some(omega_iov), kappa_fixed)
     };
 
-    let default_params = ModelParameters {
+    let mut default_params = ModelParameters {
         theta: theta_values,
         theta_names: theta_names.clone(),
         theta_lower,
@@ -1958,6 +1958,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         sigma_fixed,
         omega_iov,
         kappa_fixed,
+        mixture: None,
     };
 
     // Auto-generate tv_fn: evaluate individual parameters with eta=0
@@ -2142,6 +2143,15 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             }
             None
         };
+
+    // Build the numeric per-class Omega/Sigma into `default_params.mixture`
+    // (#977 Phase 2). Uses the just-built base Omega/Sigma; a local avoids
+    // borrowing `default_params` immutably and mutably at once.
+    let mixture_params = mixture_spec
+        .as_ref()
+        .map(|spec| build_mixture_params(spec, &default_params.omega, &default_params.sigma))
+        .transpose()?;
+    default_params.mixture = mixture_params;
 
     let model = CompiledModel {
         name,
@@ -9803,6 +9813,94 @@ fn parse_mixture_block(
         logit_covariates,
         omega_overrides,
         sigma_overrides,
+    })
+}
+
+/// Build the numeric per-class Omega/Sigma (`MixtureParams`) from a `MixtureSpec`
+/// and the base (class-1) Omega/Sigma (#977 Phase 2).
+///
+/// Each class starts as a copy of the base; every `omega(k)` / `sigma(k)`
+/// override replaces one diagonal entry, converting from the declared scale
+/// (`(sd)` → square for Omega variance, plain → square-root for the SD-scale
+/// Sigma) exactly as the base declarations do. The override addresses drive the
+/// per-class packed segment in `estimation::parameterization`. Omega overrides
+/// require a diagonal base Omega (a block base has no well-defined per-eta
+/// variance to swap).
+fn build_mixture_params(
+    spec: &crate::types::MixtureSpec,
+    base_omega: &crate::types::OmegaMatrix,
+    base_sigma: &crate::types::SigmaVector,
+) -> Result<crate::types::MixtureParams, String> {
+    use crate::types::{MixtureParams, OmegaMatrix, SigmaVector};
+
+    if !spec.omega_overrides.is_empty() && !base_omega.diagonal {
+        return Err(
+            "[mixture] per-class `omega(k)` overrides require a diagonal base omega (a block \
+             omega has no single per-eta variance to override)"
+                .to_string(),
+        );
+    }
+
+    let k = spec.n_classes;
+    // Working matrices/vectors, one per class, seeded from the base.
+    let mut work_omega: Vec<nalgebra::DMatrix<f64>> = vec![base_omega.matrix.clone(); k];
+    let mut work_sigma: Vec<Vec<f64>> = vec![base_sigma.values.clone(); k];
+
+    let mut omega_override_addr: Vec<(usize, usize)> = Vec::new();
+    let mut omega_override_fixed: Vec<bool> = Vec::new();
+    for ov in &spec.omega_overrides {
+        let e = base_omega
+            .eta_names
+            .iter()
+            .position(|n| n == &ov.name)
+            .ok_or_else(|| format!("[mixture] omega({}) {} not a base eta", ov.class, ov.name))?;
+        let c = ov.class - 1; // class is 1-based, validated >= 2 in Phase 1
+        let variance = if ov.as_sd { ov.init * ov.init } else { ov.init };
+        work_omega[c][(e, e)] = variance;
+        omega_override_addr.push((c, e));
+        omega_override_fixed.push(ov.fixed);
+    }
+
+    let mut sigma_override_addr: Vec<(usize, usize)> = Vec::new();
+    let mut sigma_override_fixed: Vec<bool> = Vec::new();
+    for ov in &spec.sigma_overrides {
+        let s = base_sigma
+            .names
+            .iter()
+            .position(|n| n == &ov.name)
+            .ok_or_else(|| format!("[mixture] sigma({}) {} not a base sigma", ov.class, ov.name))?;
+        let c = ov.class - 1;
+        // Sigma is stored on the SD scale: `(sd)` keeps it, plain input is sqrt'd.
+        let value = if ov.as_sd { ov.init } else { ov.init.sqrt() };
+        work_sigma[c][s] = value;
+        sigma_override_addr.push((c, s));
+        sigma_override_fixed.push(ov.fixed);
+    }
+
+    let omega = (0..k)
+        .map(|c| {
+            OmegaMatrix::from_matrix_with_mask(
+                work_omega[c].clone(),
+                base_omega.eta_names.clone(),
+                base_omega.diagonal,
+                base_omega.free_mask.clone(),
+            )
+        })
+        .collect();
+    let sigma = (0..k)
+        .map(|c| SigmaVector {
+            values: work_sigma[c].clone(),
+            names: base_sigma.names.clone(),
+        })
+        .collect();
+
+    Ok(MixtureParams {
+        omega,
+        sigma,
+        omega_override_addr,
+        omega_override_fixed,
+        sigma_override_addr,
+        sigma_override_fixed,
     })
 }
 

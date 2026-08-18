@@ -19,6 +19,7 @@ fn make_params(theta: Vec<f64>, theta_lower: Vec<f64>, theta_upper: Vec<f64>) ->
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     }
 }
 

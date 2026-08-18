@@ -176,6 +176,7 @@ fn build_warfarin_model() -> CompiledModel {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
@@ -275,6 +276,7 @@ fn build_warfarin_true_params() -> ModelParameters {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     }
 }
 
@@ -306,6 +308,7 @@ fn generate_two_cpt_iv() {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
@@ -429,6 +432,7 @@ fn generate_two_cpt_oral_cov() {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
@@ -616,6 +620,7 @@ fn generate_mm_oral() {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {

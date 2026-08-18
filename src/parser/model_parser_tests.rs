@@ -13622,3 +13622,192 @@ fn minimal_model_str_result(indiv: &str) -> Result<crate::types::CompiledModel, 
     );
     parse_model_string(&model_str)
 }
+
+// ── Phase 2: per-class Omega/Sigma numeric params + packing round-trip (#977) ──
+
+/// 2-class, 2-eta model. Class 2 overrides only `omega(2) ETA_CL` and
+/// `sigma(2) EPS` — `ETA_V` is *not* overridden, so it must track the base.
+const MIXTURE_2ETA: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.001, 100.0)
+  theta TVCL2(3.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.2
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  omega(2) ETA_CL ~ 0.4
+  sigma(2) EPS ~ 0.09
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+#[test]
+fn mixture_params_built_from_overrides() {
+    let model = parse_model_string(MIXTURE_2ETA).expect("parses");
+    let mp = model
+        .default_params
+        .mixture
+        .as_ref()
+        .expect("mixture params");
+    assert_eq!(mp.omega.len(), 2);
+    assert_eq!(mp.sigma.len(), 2);
+    // Class 1 == base.
+    assert!((mp.omega[0].matrix[(0, 0)] - 0.1).abs() < 1e-12);
+    assert!((mp.omega[0].matrix[(1, 1)] - 0.2).abs() < 1e-12);
+    // Class 2: ETA_CL overridden to 0.4, ETA_V tracks base 0.2.
+    assert!((mp.omega[1].matrix[(0, 0)] - 0.4).abs() < 1e-12);
+    assert!((mp.omega[1].matrix[(1, 1)] - 0.2).abs() < 1e-12);
+    // Sigma stored on SD scale: base EPS = sqrt(0.01) = 0.1; class-2 = sqrt(0.09) = 0.3.
+    assert!((mp.sigma[0].values[0] - 0.1).abs() < 1e-12);
+    assert!((mp.sigma[1].values[0] - 0.3).abs() < 1e-12);
+    // Override addresses: class index 1 (0-based), eta/sigma index 0.
+    assert_eq!(mp.omega_override_addr, vec![(1, 0)]);
+    assert_eq!(mp.sigma_override_addr, vec![(1, 0)]);
+    assert_eq!(mp.omega_override_fixed, vec![false]);
+    assert_eq!(mp.sigma_override_fixed, vec![false]);
+}
+
+#[test]
+fn mixture_packed_len_counts_overrides() {
+    use crate::estimation::parameterization::{packed_fixed_mask, packed_len};
+    let model = parse_model_string(MIXTURE_2ETA).expect("parses");
+    let p = &model.default_params;
+    // 4 theta + 2 omega diag + 1 sigma + 2 mixture overrides = 9.
+    assert_eq!(packed_len(p), 9);
+    assert_eq!(packed_fixed_mask(p).len(), packed_len(p));
+}
+
+#[test]
+fn mixture_pack_unpack_roundtrip() {
+    use crate::estimation::parameterization::{pack_params, unpack_params};
+    let model = parse_model_string(MIXTURE_2ETA).expect("parses");
+    let p = &model.default_params;
+    let v = pack_params(p);
+    assert_eq!(v.len(), 9);
+    let rt = unpack_params(&v, p);
+    let v2 = pack_params(&rt);
+    assert_eq!(v.len(), v2.len());
+    for (a, b) in v.iter().zip(&v2) {
+        assert!(
+            (a - b).abs() < 1e-12,
+            "pack∘unpack∘pack not identity: {a} vs {b}"
+        );
+    }
+    // Numeric per-class values survive the round trip.
+    let mp = rt.mixture.as_ref().expect("mixture survives unpack");
+    assert!(
+        (mp.omega[1].matrix[(0, 0)] - 0.4).abs() < 1e-10,
+        "class-2 ETA_CL override"
+    );
+    assert!(
+        (mp.omega[1].matrix[(1, 1)] - 0.2).abs() < 1e-10,
+        "class-2 ETA_V tracks base"
+    );
+    assert!(
+        (mp.sigma[1].values[0] - 0.3).abs() < 1e-10,
+        "class-2 EPS override"
+    );
+    assert!(
+        (mp.omega[0].matrix[(0, 0)] - 0.1).abs() < 1e-10,
+        "class-1 == base"
+    );
+}
+
+#[test]
+fn mixture_unpack_tracks_perturbed_base() {
+    // Perturbing the *base* ETA_V variance in the packed vector must flow into
+    // class 2 (which does not override ETA_V), while class 2's overridden ETA_CL
+    // stays put. This is the core Phase-2 semantic: non-overridden entries track
+    // the base.
+    use crate::estimation::parameterization::{coordinate_names, pack_params, unpack_params};
+    let model = parse_model_string(MIXTURE_2ETA).expect("parses");
+    let p = &model.default_params;
+    let names = coordinate_names(p);
+    let etav_idx = names
+        .iter()
+        .position(|n| n == "ETA_V")
+        .expect("ETA_V coord");
+    let mut v = pack_params(p);
+    // Base ETA_V is packed as ln(sqrt(var)); set var := 0.5 → chol_diag = sqrt(0.5).
+    v[etav_idx] = 0.5_f64.sqrt().ln();
+    let rt = unpack_params(&v, p);
+    // Base updated.
+    assert!(
+        (rt.omega.matrix[(1, 1)] - 0.5).abs() < 1e-10,
+        "base ETA_V perturbed"
+    );
+    let mp = rt.mixture.as_ref().unwrap();
+    // Class 2 ETA_V tracks the new base; ETA_CL override unchanged.
+    assert!(
+        (mp.omega[1].matrix[(1, 1)] - 0.5).abs() < 1e-10,
+        "class-2 ETA_V tracks base"
+    );
+    assert!(
+        (mp.omega[1].matrix[(0, 0)] - 0.4).abs() < 1e-10,
+        "class-2 ETA_CL override held"
+    );
+}
+
+#[test]
+fn mixture_fixed_override_pinned_in_mask() {
+    use crate::estimation::parameterization::{coordinate_names, packed_fixed_mask};
+    let src = MIXTURE_2ETA.replace("omega(2) ETA_CL ~ 0.4", "omega(2) ETA_CL ~ 0.4 FIX");
+    let model = parse_model_string(&src).expect("parses");
+    let p = &model.default_params;
+    let mp = p.mixture.as_ref().unwrap();
+    assert_eq!(mp.omega_override_fixed, vec![true]);
+    // The FIX flag must land at the override's packed coordinate.
+    let names = coordinate_names(p);
+    let mask = packed_fixed_mask(p);
+    let mix_idx = names
+        .iter()
+        .position(|n| n == "ETA_CL_MIX2")
+        .expect("mixture coord name");
+    assert!(
+        mask[mix_idx],
+        "fixed omega override must be pinned in the mask"
+    );
+}
+
+#[test]
+fn mixture_block_omega_override_rejected() {
+    // Per-class omega override requires a diagonal base omega.
+    let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.001, 100.0)
+  theta TVCL2(3.0, 0.001, 100.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.2]
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  omega(2) ETA_CL ~ 0.4
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = 10 * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let err = parse_model_string(src).expect_err("block-omega override must be rejected");
+    assert!(err.contains("diagonal base omega"), "got: {err}");
+}

@@ -81,6 +81,21 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
         }
     }
 
+    // Mixture per-class Omega/Sigma overrides (#977). Each override is a single
+    // diagonal scalar: an Omega override packs `ln` of the class matrix's
+    // Cholesky diagonal (== `ln(sd)`, matching the base diagonal-Omega form), a
+    // Sigma override packs `ln(sd)`. Non-overridden class entries are not packed
+    // — they track the base Omega/Sigma segments above. Appended after the IOV
+    // segment so all existing offsets stay put.
+    if let Some(ref mix) = params.mixture {
+        for &(c, e) in &mix.omega_override_addr {
+            v.push(mix.omega[c].chol[(e, e)].max(1e-10).ln());
+        }
+        for &(c, s) in &mix.sigma_override_addr {
+            v.push(mix.sigma[c].values[s].max(1e-10).ln());
+        }
+    }
+
     v
 }
 
@@ -162,6 +177,49 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         None
     };
 
+    // Mixture per-class Omega/Sigma (#977). Rebuild each class from the *newly
+    // unpacked* base (`omega`/`sigma`) so non-overridden entries track the base,
+    // then apply this class's overrides from the packed scalars (same order as
+    // `pack_params`: all Omega overrides, then all Sigma overrides).
+    let mixture = template.mixture.as_ref().map(|tmpl| {
+        let k = tmpl.omega.len();
+        let mut class_omega_mat: Vec<DMatrix<f64>> = vec![omega.matrix.clone(); k];
+        let mut class_sigma_val: Vec<Vec<f64>> = vec![sigma.values.clone(); k];
+        for &(c, e) in &tmpl.omega_override_addr {
+            let chol_diag = v[idx].exp();
+            idx += 1;
+            class_omega_mat[c][(e, e)] = chol_diag * chol_diag;
+        }
+        for &(c, s) in &tmpl.sigma_override_addr {
+            class_sigma_val[c][s] = v[idx].exp();
+            idx += 1;
+        }
+        let class_omega = (0..k)
+            .map(|c| {
+                OmegaMatrix::from_matrix_with_mask(
+                    class_omega_mat[c].clone(),
+                    omega.eta_names.clone(),
+                    omega.diagonal,
+                    omega.free_mask.clone(),
+                )
+            })
+            .collect();
+        let class_sigma = (0..k)
+            .map(|c| SigmaVector {
+                values: class_sigma_val[c].clone(),
+                names: sigma.names.clone(),
+            })
+            .collect();
+        crate::types::MixtureParams {
+            omega: class_omega,
+            sigma: class_sigma,
+            omega_override_addr: tmpl.omega_override_addr.clone(),
+            omega_override_fixed: tmpl.omega_override_fixed.clone(),
+            sigma_override_addr: tmpl.sigma_override_addr.clone(),
+            sigma_override_fixed: tmpl.sigma_override_fixed.clone(),
+        }
+    });
+
     ModelParameters {
         theta,
         theta_names: template.theta_names.clone(),
@@ -174,6 +232,7 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         sigma_fixed: template.sigma_fixed.clone(),
         omega_iov,
         kappa_fixed: template.kappa_fixed.clone(),
+        mixture,
     }
 }
 
@@ -216,6 +275,13 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
             let fj = kf.get(j).copied().unwrap_or(false);
             mask.push(fi || fj);
         }
+    }
+
+    // Mixture overrides (#977): one packed scalar each, FIX flag carried on the
+    // override. Same order as `pack_params` (Omega overrides, then Sigma).
+    if let Some(ref mix) = template.mixture {
+        mask.extend_from_slice(&mix.omega_override_fixed);
+        mask.extend_from_slice(&mix.sigma_override_fixed);
     }
 
     mask
@@ -268,7 +334,10 @@ pub fn packed_len(template: &ModelParameters) -> usize {
         .omega_iov
         .as_ref()
         .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
-    n_theta + n_omega + n_sigma + n_iov
+    let n_mixture = template.mixture.as_ref().map_or(0, |mix| {
+        mix.omega_override_addr.len() + mix.sigma_override_addr.len()
+    });
+    n_theta + n_omega + n_sigma + n_iov + n_mixture
 }
 
 /// Compute box constraints for the packed parameter vector.
@@ -335,6 +404,20 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
         }
     }
 
+    // Mixture override bounds (#977): each is a diagonal scalar packed on the log
+    // scale — Omega overrides use the log-Cholesky-diagonal bound `[-6, 6]`, Sigma
+    // overrides the log-sigma bound `[-8, 5]`, matching their base counterparts.
+    if let Some(ref mix) = template.mixture {
+        for _ in 0..mix.omega_override_addr.len() {
+            lower.push(-6.0);
+            upper.push(6.0);
+        }
+        for _ in 0..mix.sigma_override_addr.len() {
+            lower.push(-8.0);
+            upper.push(5.0);
+        }
+    }
+
     // Pin any FIX parameters to their packed (log-space) initial value.
     // We pack first, then overwrite lower=upper=packed[i] for fixed indices.
     // Pack-before-overwrite is correct even for block Cholesky off-diagonals,
@@ -374,6 +457,19 @@ pub fn coordinate_names(params: &ModelParameters) -> Vec<String> {
     if let Some(ref iov) = params.omega_iov {
         push_omega_names(&mut names, iov);
     }
+    // Mixture overrides (#977): `<ETA|SIGMA>_MIX{class}`, same order as pack.
+    if let Some(ref mix) = params.mixture {
+        for &(c, e) in &mix.omega_override_addr {
+            let base = named_or(&params.omega.eta_names, e, || {
+                format!("OMEGA({},{})", e + 1, e + 1)
+            });
+            names.push(format!("{base}_MIX{}", c + 1));
+        }
+        for &(c, s) in &mix.sigma_override_addr {
+            let base = named_or(&params.sigma.names, s, || format!("SIGMA({})", s + 1));
+            names.push(format!("{base}_MIX{}", c + 1));
+        }
+    }
     names
 }
 
@@ -408,13 +504,24 @@ fn push_omega_names(names: &mut Vec<String>, om: &OmegaMatrix) {
 /// (diagonal) / covariances (off-diagonal), sigma are variances. This is the
 /// back-transformed space the trace's `val:*` columns report.
 pub fn coordinate_values(params: &ModelParameters) -> Vec<f64> {
-    coordinate_values_raw(
+    let mut v = coordinate_values_raw(
         &params.theta,
         &params.omega.matrix,
         params.omega.diagonal,
         &params.sigma.values,
         params.omega_iov.as_ref().map(|m| (&m.matrix, m.diagonal)),
-    )
+    );
+    // Mixture overrides (#977): Omega natural value = class variance, Sigma
+    // natural value = class sigma (same scale the base sigma reports).
+    if let Some(ref mix) = params.mixture {
+        for &(c, e) in &mix.omega_override_addr {
+            v.push(mix.omega[c].matrix[(e, e)]);
+        }
+        for &(c, s) in &mix.sigma_override_addr {
+            v.push(mix.sigma[c].values[s]);
+        }
+    }
+    v
 }
 
 /// Assemble the natural-scale coordinate vector directly from raw pieces, for
@@ -658,6 +765,7 @@ mod tests {
             sigma_fixed: vec![false; 1],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         }
     }
 
@@ -742,6 +850,7 @@ mod tests {
             sigma_fixed: vec![false; 1],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         };
         let packed = pack_params(&template);
         // theta[0] is sign-constrained (lower=0.1) → log-packed.
@@ -832,6 +941,7 @@ mod tests {
             sigma_fixed: vec![false; 1],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         }
     }
 
@@ -887,6 +997,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         };
         let mask = omega_structural_zero_mask(&template);
         assert_eq!(mask.len(), packed_len(&template)); // 2 + 6 + 1 = 9
@@ -942,6 +1053,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: Some(make_block_plus_diag_omega()),
             kappa_fixed: vec![false, false, false],
+            mixture: None,
         };
         let mask = omega_structural_zero_mask(&template);
         assert_eq!(mask.len(), packed_len(&template)); // 1 + 1 + 1 + 6 = 9
@@ -1062,6 +1174,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         };
         let names = coordinate_names(&t);
         assert_eq!(
@@ -1142,6 +1255,7 @@ mod tests {
             sigma_fixed: vec![false; 1],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         };
         CompiledModel {
             name: "test".into(),
@@ -1435,6 +1549,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
+            mixture: None,
         }
     }
 
@@ -1588,6 +1703,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false, false],
+            mixture: None,
         }
     }
 

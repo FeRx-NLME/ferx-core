@@ -25,6 +25,7 @@ fn tiny_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     CompiledModel {
         name: "uncertainty_smoke".into(),

@@ -1349,6 +1349,41 @@ pub struct ModelParameters {
     pub omega_iov: Option<OmegaMatrix>,
     /// Per-kappa FIX flags (parallel to `omega_iov` diagonal).
     pub kappa_fixed: Vec<bool>,
+    /// Per-class Omega/Sigma for `$MIXTURE` models (#977). `Some` iff the model
+    /// carries a `[mixture]` block; the base (class-1) Omega/Sigma stay in
+    /// `omega`/`sigma`, while this holds the full per-class matrices (class 1 is
+    /// a copy of the base) plus the packing addresses of the per-class
+    /// overrides. `None` for a single-population model.
+    pub mixture: Option<MixtureParams>,
+}
+
+/// Numeric per-class Omega/Sigma for a `$MIXTURE` model (#977 Phase 2).
+///
+/// The mixing-probability coefficients are ordinary thetas (they ride the theta
+/// vector and pack identically), so this struct only carries the per-class
+/// random-effect / residual variances. Non-overridden classes hold a copy of the
+/// base Omega/Sigma; each `[mixture]` `omega(k)` / `sigma(k)` declaration becomes
+/// one entry in the corresponding `*_override_addr` list, which drives the
+/// per-class packed segment in `estimation::parameterization`.
+#[derive(Debug, Clone)]
+pub struct MixtureParams {
+    /// Per-class Omega, length K. Index `c` is class `c + 1`; index 0 (class 1)
+    /// equals the base `ModelParameters::omega`.
+    pub omega: Vec<OmegaMatrix>,
+    /// Per-class Sigma, length K. Index 0 (class 1) equals the base sigma.
+    pub sigma: Vec<SigmaVector>,
+    /// Packed-order addresses of the Omega overrides: `(class_index_0based,
+    /// eta_index)`. Class index is >= 1 (class 1 is the base and is never
+    /// overridden). One packed scalar — `ln` of the class matrix's Cholesky
+    /// diagonal — is emitted per entry, in this order.
+    pub omega_override_addr: Vec<(usize, usize)>,
+    /// FIX flag per Omega override (parallel to `omega_override_addr`).
+    pub omega_override_fixed: Vec<bool>,
+    /// Packed-order addresses of the Sigma overrides: `(class_index_0based,
+    /// sigma_index)`.
+    pub sigma_override_addr: Vec<(usize, usize)>,
+    /// FIX flag per Sigma override (parallel to `sigma_override_addr`).
+    pub sigma_override_fixed: Vec<bool>,
 }
 
 impl ModelParameters {

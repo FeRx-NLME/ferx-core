@@ -2655,6 +2655,7 @@ mod tests {
                 sigma_fixed: vec![false],
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
+                mixture: None,
             },
             omega_init_as_sd: Vec::new(),
             sigma_init_as_sd: vec![false],

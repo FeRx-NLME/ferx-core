@@ -627,6 +627,7 @@ fn make_iov_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: Some(omega_iov),
         kappa_fixed: vec![false],
+        mixture: None,
     };
     CompiledModel {
         name: "iov_test".into(),
@@ -2895,6 +2896,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     CompiledModel {
         name: "no_iov".into(),
@@ -3041,6 +3043,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let model = CompiledModel {
         frem_config: None,

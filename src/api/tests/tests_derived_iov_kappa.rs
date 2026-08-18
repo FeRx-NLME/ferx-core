@@ -63,6 +63,7 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
             sigma_fixed: vec![false],
             omega_iov: Some(OmegaMatrix::from_diagonal(&[1.0], vec!["KAPPA_CL".into()])),
             kappa_fixed: vec![false],
+            mixture: None,
         },
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
