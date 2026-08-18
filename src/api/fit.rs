@@ -229,12 +229,12 @@ pub fn fit(
                 ));
             }
         }
-        if init_params.omega_iov.is_some() {
-            return Err(
-                "mixture models (#977) do not yet support inter-occasion variability (kappa)"
-                    .to_string(),
-            );
-        }
+        // Inter-occasion variability under a mixture (#985): the per-class inner
+        // solve carries per-occasion κ for the shared base `omega_iov` (each class's
+        // `class_params` keeps it), and the packed layout already interleaves the κ
+        // segment ahead of the per-class Ω/Σ override tail. The FOCE marginal uses
+        // `foce_subject_nll_iov` per class and the outer gradient routes to FD, so
+        // IOV + mixture now fits (previously rejected here).
     }
     // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
     // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
