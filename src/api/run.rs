@@ -9,10 +9,9 @@ use crate::estimation::parameterization::{
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped, read_nonmem_csv_routed,
     read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
-    ERR_COV_NON_NUMERIC,
+    MissingDvPolicy, ObsRouting, SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -764,6 +763,68 @@ pub fn read_population_for(
     filter: Option<&SelectionFilter>,
     column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
+    read_population_for_policy(
+        model,
+        covariate_decls,
+        data_path,
+        fallback_columns,
+        iov_column,
+        filter,
+        column_map,
+        MissingDvPolicy::Skip,
+    )
+}
+
+/// [`read_population_for`] for a dataset that will be **simulated from** rather
+/// than fitted (#957).
+///
+/// Identical in every respect but one: an `EVID=0`, `MDV=0` record whose `DV`
+/// cell is missing (`.` / `NA` / blank) is kept as a **design point** — a
+/// sampling time whose observation has not been generated yet — instead of being
+/// skipped as a forgotten `MDV=1` (#258). Writing `DV = .` at every sampling time
+/// is the natural way to express a design (and is what NONMEM's `$SIMULATION`
+/// accepts), so the fitting reading would otherwise return zero simulated rows
+/// for the most idiomatic template there is.
+///
+/// The kept row carries a placeholder DV (`NaN` for a Gaussian endpoint, `0` for
+/// an integer-coded one) which the simulated value replaces; do **not** pass the
+/// returned population to [`fit`]. `MDV=1` still excludes the record — that is
+/// the user explicitly saying it is not an observation.
+pub fn read_population_for_simulation(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String> {
+    read_population_for_policy(
+        model,
+        covariate_decls,
+        data_path,
+        fallback_columns,
+        iov_column,
+        filter,
+        column_map,
+        MissingDvPolicy::KeepAsDesign,
+    )
+}
+
+/// Shared body of [`read_population_for`] (fit: `MissingDvPolicy::Skip`) and
+/// [`read_population_for_simulation`] (`KeepAsDesign`). The policy is the only
+/// difference between them.
+#[allow(clippy::too_many_arguments)]
+fn read_population_for_policy(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
+    missing_dv: MissingDvPolicy,
+) -> Result<(Population, Option<CovariateTable>), String> {
     // Extract TTE CMTs from model endpoints so the reader can route TTE rows
     // to obs_records instead of the Gaussian parallel Vecs.
     #[cfg(feature = "survival")]
@@ -800,81 +861,24 @@ pub fn read_population_for(
     #[cfg(not(feature = "survival"))]
     let discrete_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    if tte_cmts.is_empty() && discrete_cmts.is_empty() {
-        // Gaussian-only model: use the existing (faster) path without TTE overhead.
-        match (covariate_decls, filter) {
-            (Some(decls), Some(sel)) => {
-                let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates_filtered_mapped(
-                    Path::new(data_path),
-                    decls,
-                    &extra,
-                    iov_column,
-                    sel,
-                    column_map,
-                )?;
-                Ok((pop, Some(table)))
-            }
-            (Some(decls), None) => {
-                let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates_mapped(
-                    Path::new(data_path),
-                    decls,
-                    &extra,
-                    iov_column,
-                    column_map,
-                )?;
-                Ok((pop, Some(table)))
-            }
-            (None, Some(sel)) => Ok((
-                read_nonmem_csv_filtered_mapped(
-                    Path::new(data_path),
-                    fallback_columns,
-                    iov_column,
-                    sel,
-                    column_map,
-                )?,
-                None,
-            )),
-            (None, None) => Ok((
-                read_nonmem_csv_mapped(
-                    Path::new(data_path),
-                    fallback_columns,
-                    iov_column,
-                    column_map,
-                )?,
-                None,
-            )),
-        }
-    } else {
-        // Model has TTE endpoints: use TTE-aware reader so obs_records are populated.
-        match covariate_decls {
-            Some(decls) => {
-                let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates_tte(
-                    Path::new(data_path),
-                    decls,
-                    &extra,
-                    iov_column,
-                    filter,
-                    &tte_cmts,
-                    &discrete_cmts,
-                    column_map,
-                )?;
-                Ok((pop, Some(table)))
-            }
-            None => {
-                let pop = read_nonmem_csv_filtered_tte(
-                    Path::new(data_path),
-                    fallback_columns,
-                    iov_column,
-                    filter,
-                    &tte_cmts,
-                    &discrete_cmts,
-                    column_map,
-                )?;
-                Ok((pop, None))
-            }
-        }
-    }
+    // One reader call covers every combination: the routing sets are empty for a
+    // Gaussian-only model (so no row is routed to `obs_records`), and the reader
+    // builds the covariate read set from `decls` when the model declares
+    // `[covariates]`, from `fallback_columns` otherwise.
+    let routing =
+        ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts).with_missing_dv(missing_dv);
+    let (decls, extra) = match covariate_decls {
+        Some(d) => (Some(d.as_slice()), undeclared_referenced(model, d)),
+        None => (None, Vec::new()),
+    };
+    read_nonmem_csv_routed(
+        Path::new(data_path),
+        fallback_columns,
+        decls,
+        &extra,
+        iov_column,
+        filter,
+        &routing,
+        column_map,
+    )
 }

@@ -893,9 +893,18 @@ fn test_tte_entry_time_is_raw_not_origin_shifted() {
     let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n\
                    1,100,1,0,0,.,1,90\n";
     let f = write_csv(csv);
-    let pop =
-        read_nonmem_csv_filtered_tte(f.path(), None, None, None, &tte_cmts, &HashSet::new(), &[])
-            .unwrap();
+    let pop = read_nonmem_csv_routed(
+        f.path(),
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &ObsRouting::tte_and_discrete(&tte_cmts, &HashSet::new()),
+        &[],
+    )
+    .map(|(pop, _)| pop)
+    .unwrap();
     let recs = &pop.subjects[0].obs_records;
     assert_eq!(recs.len(), 1);
     let ObsRecord::Event {
@@ -2017,13 +2026,13 @@ fn test_input_columns_preserves_full_header_order() {
 
 #[test]
 fn tte_aware_readers_route_through_gaussian_path_with_empty_tte_cmts() {
-    // `read_nonmem_csv_filtered_tte` / `_with_covariates_tte` (used by
-    // api::read_population_for for [event_model] models) are always compiled
-    // but only *called* on the TTE path, so they read as uncovered in the
-    // FD-only build. With an empty tte_cmts set they delegate to the Gaussian
-    // reader; drive them directly to cover the column-augmentation / union /
-    // delegation lines. (The cfg(survival) row-routing inside the impl is
-    // exercised by the survival job, not here.)
+    // `read_nonmem_csv_routed` (used by api::read_population_for) carries the
+    // TTE routing for [event_model] models, but its column-augmentation / union
+    // lines are shared with the Gaussian path. With an empty tte_cmts set it
+    // reads exactly like the Gaussian reader; drive it directly with both
+    // covariate shapes to cover the augmentation / union / delegation lines.
+    // (The cfg(survival) row-routing inside the impl is exercised by the
+    // survival job, not here.)
     let no_tte = std::collections::HashSet::new();
     let csv = "ID,TIME,DV,EVID,AMT,WT,STUDY,AGE\n\
                    1,0,.,1,100,70,1,30\n\
@@ -2037,16 +2046,21 @@ fn tte_aware_readers_route_through_gaussian_path_with_empty_tte_cmts() {
     // branch; the filter then drops STUDY==2 (subject 2).
     let cols: &[&str] = &["WT"];
     let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[]).unwrap();
-    let pop = read_nonmem_csv_filtered_tte(
+    let (pop, table_none) = read_nonmem_csv_routed(
         f.path(),
         Some(cols),
         None,
+        &[],
+        None,
         Some(&filter),
-        &no_tte,
-        &HashSet::new(),
+        &ObsRouting::tte_and_discrete(&no_tte, &HashSet::new()),
         &[],
     )
     .unwrap();
+    assert!(
+        table_none.is_none(),
+        "no [covariates] declaration ⇒ no covariate table"
+    );
     assert_eq!(
         pop.subjects
             .iter()
@@ -2068,17 +2082,21 @@ fn tte_aware_readers_route_through_gaussian_path_with_empty_tte_cmts() {
     }];
     let extra = ["STUDY".to_string()];
     let drop_age40 = SelectionFilter::from_opts(&["AGE == 40".to_string()], &[], &[]).unwrap();
-    let (pop2, _table) = read_nonmem_csv_with_covariates_tte(
+    let (pop2, table) = read_nonmem_csv_routed(
         f.path(),
-        &decls,
+        None,
+        Some(&decls),
         &extra,
         None,
         Some(&drop_age40),
-        &no_tte,
-        &HashSet::new(),
+        &ObsRouting::tte_and_discrete(&no_tte, &HashSet::new()),
         &[],
     )
     .unwrap();
+    assert!(
+        table.is_some(),
+        "a [covariates] declaration ⇒ a covariate table"
+    );
     // Subject 2 (AGE=40) is dropped via the merged AGE column; subject 1 remains.
     assert_eq!(
         pop2.subjects
@@ -2088,4 +2106,179 @@ fn tte_aware_readers_route_through_gaussian_path_with_empty_tte_cmts() {
         vec!["1"],
         "AGE==40 must drop subject 2 — proving AGE was pulled into the read union"
     );
+}
+
+// ── Missing DV on the simulation path (#957) ─────────────────────────────
+// `MissingDvPolicy::KeepAsDesign` reads a `DV = .` row as a design point (a
+// sampling time whose observation has not been generated yet) instead of as a
+// forgotten `MDV=1` (#258). The default `Skip` behaviour is unchanged; the two
+// policies are asserted against the same CSV so a regression in either shows up
+// as a diff between them.
+
+/// The canonical simulation template: dosing plus sampling times, `DV = .`
+/// everywhere because the DV is what the run is about to produce.
+const SIM_TEMPLATE_CSV: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+                                1,0,.,1,1.0,1,1\n\
+                                1,0.25,.,0,.,1,0\n\
+                                1,1,.,0,.,1,0\n\
+                                1,4,.,0,.,1,0\n";
+
+#[test]
+fn keep_as_design_retains_missing_dv_rows_as_sampling_times() {
+    let f = write_csv(SIM_TEMPLATE_CSV);
+    let routing = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+    let subj = &pop.subjects[0];
+
+    assert_eq!(
+        subj.obs_times,
+        vec![0.25, 1.0, 4.0],
+        "every sampling time of the template must survive"
+    );
+    assert_eq!(subj.doses.len(), 1, "the dose row is unaffected");
+    assert!(
+        subj.observations.iter().all(|v| v.is_nan()),
+        "a design point carries a NaN placeholder, never a measured 0.0: {:?}",
+        subj.observations
+    );
+    assert!(
+        !pop.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
+        "nothing was skipped, so nothing to warn about: {:?}",
+        pop.warnings
+    );
+}
+
+#[test]
+fn skip_policy_still_drops_every_row_of_the_same_template() {
+    // The fitting reading of the exact CSV above — unchanged by #957.
+    let f = write_csv(SIM_TEMPLATE_CSV);
+    let pop = read_nonmem_csv_filtered_routed(f.path(), &ObsRouting::default()).unwrap();
+    assert!(
+        pop.subjects[0].obs_times.is_empty(),
+        "under Skip a DV-less template scores nothing"
+    );
+    assert_eq!(
+        pop.warnings
+            .iter()
+            .filter(|w| w.starts_with("W_MISSING_DV"))
+            .count(),
+        1,
+        "…and says so exactly once: {:?}",
+        pop.warnings
+    );
+}
+
+#[test]
+fn keep_as_design_still_excludes_mdv1_rows() {
+    // MDV=1 is the user explicitly saying "this record is not an observation",
+    // which is unambiguous on either path; only the *forgotten* MDV is reread.
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+                   1,0,.,1,1.0,1,1\n\
+                   1,0.25,.,0,.,1,1\n\
+                   1,1,.,0,.,1,0\n";
+    let f = write_csv(csv);
+    let routing = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+    assert_eq!(
+        pop.subjects[0].obs_times,
+        vec![1.0],
+        "the MDV=1 sampling time stays excluded"
+    );
+}
+
+#[test]
+fn keep_as_design_leaves_present_dvs_alone() {
+    // A template that already carries values (the placeholder-number workaround
+    // users resorted to) must read identically under both policies.
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+                   1,0,.,1,1.0,1,1\n\
+                   1,1,5.0,0,.,1,0\n\
+                   1,4,7.0,0,.,1,0\n";
+    let f = write_csv(csv);
+    let keep = read_nonmem_csv_filtered_routed(
+        f.path(),
+        &ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign),
+    )
+    .unwrap();
+    let skip = read_nonmem_csv_filtered_routed(f.path(), &ObsRouting::default()).unwrap();
+    assert_eq!(keep.subjects[0].observations, vec![5.0, 7.0]);
+    assert_eq!(keep.subjects[0].observations, skip.subjects[0].observations);
+    assert_eq!(keep.subjects[0].obs_times, skip.subjects[0].obs_times);
+}
+
+#[test]
+fn keep_as_design_places_integer_endpoint_rows_with_a_zero_placeholder() {
+    use crate::types::ObsRecord;
+    // Discrete-state and count endpoints route to `obs_records`; their design
+    // rows need the same treatment, with an integer placeholder (`NaN` is not a
+    // state index) that the simulated outcome replaces.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,1,.,0,0,.,3\n\
+                   1,2,.,0,0,.,4\n";
+    let routing = ObsRouting {
+        discrete: [3].into_iter().collect(),
+        count: [4].into_iter().collect(),
+        ..Default::default()
+    }
+    .with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+    let recs = &pop.subjects[0].obs_records;
+    assert_eq!(recs.len(), 2, "both design rows are kept: {recs:?}");
+    assert!(
+        matches!(
+            recs[0],
+            ObsRecord::DiscreteState {
+                state: 0,
+                cmt: 3,
+                ..
+            }
+        ),
+        "got {:?}",
+        recs[0]
+    );
+    assert!(
+        matches!(
+            recs[1],
+            ObsRecord::Count {
+                count: 0,
+                cmt: 4,
+                ..
+            }
+        ),
+        "got {:?}",
+        recs[1]
+    );
+
+    // Under the fitting policy the same rows are still skipped and counted.
+    let skipped = read_nonmem_csv_filtered_routed(
+        f.path(),
+        &ObsRouting {
+            discrete: [3].into_iter().collect(),
+            count: [4].into_iter().collect(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(skipped.subjects[0].obs_records.is_empty());
+    assert!(skipped
+        .warnings
+        .iter()
+        .any(|w| w.starts_with("W_MISSING_DV")));
+}
+
+#[test]
+fn keep_as_design_still_rejects_an_out_of_range_integer_dv() {
+    // Only a *missing* DV becomes a placeholder — a present but invalid integer
+    // DV is still the user's data error, on either policy.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,1,-2,0,0,.,4\n";
+    let routing = ObsRouting {
+        count: [4].into_iter().collect(),
+        ..Default::default()
+    }
+    .with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let f = write_csv(csv);
+    let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
+    assert!(err.contains("out-of-range DV"), "{err}");
 }

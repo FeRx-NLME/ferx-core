@@ -41,6 +41,15 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 > the row is skipped rather than scored as `DV=0` — and emits a single
 > `W_MISSING_DV` warning reporting how many rows were skipped. Set `MDV=1`
 > explicitly to silence it, or fix the data if the missing values are an error.
+>
+> **Simulation reads it the other way round.** When the dataset is a *design*
+> being simulated from, the `DV` is the column about to be produced, so
+> `DV = .` at every sampling time means "simulate here" rather than "nothing to
+> score here". `simulate()` fed a population read by
+> `read_population_for_simulation()` keeps those rows and emits one simulated
+> record per sampling time; no placeholder number is needed in the `DV` column.
+> `MDV=1` still excludes the record on both paths — that is the explicit
+> statement that the row is not an observation.
 
 ## Inferring doses without an `EVID` column
 

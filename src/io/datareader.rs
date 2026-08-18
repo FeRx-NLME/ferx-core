@@ -164,11 +164,12 @@ pub(crate) fn read_nonmem_csv_mapped(
     iov_column: Option<&str>,
     column_map: &[(String, String)],
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(
+    read_nonmem_csv_routed(
         path,
         covariate_columns,
-        iov_column,
         None,
+        &[],
+        iov_column,
         None,
         &ObsRouting::default(),
         column_map,
@@ -236,13 +237,12 @@ pub(crate) fn read_nonmem_csv_with_covariates_mapped(
 ) -> Result<(Population, CovariateTable), String> {
     // Population reads the union of declared + referenced-but-undeclared columns,
     // declared first so the table's column order matches the declaration.
-    let union = declared_union(decls, extra_columns);
-    let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
-    let (pop, table) = read_nonmem_csv_impl(
+    let (pop, table) = read_nonmem_csv_routed(
         path,
-        Some(&union_refs),
-        iov_column,
+        None,
         Some(decls),
+        extra_columns,
+        iov_column,
         None,
         &ObsRouting::default(),
         column_map,
@@ -273,24 +273,17 @@ pub(crate) fn read_nonmem_csv_filtered_mapped(
     filter: &SelectionFilter,
     column_map: &[(String, String)],
 ) -> Result<Population, String> {
-    // When an explicit covariate list is supplied, make sure every covariate the
-    // filter references is in it — otherwise a filtered column outside the list
-    // would not be read and the condition would silently never fire. (With
-    // `None`, the auto-detect path already reads every non-standard column, so no
-    // augmentation is needed.) Symmetric with the `[covariates]` reader.
-    let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
-        let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
-        augment_with_filter(&mut v, Some(filter));
-        v
-    });
-    let cols_ref: Option<Vec<&str>> = augmented
-        .as_ref()
-        .map(|v| v.iter().map(|s| s.as_str()).collect());
-    read_nonmem_csv_impl(
+    // When an explicit covariate list is supplied, `read_nonmem_csv_routed` makes
+    // sure every covariate the filter references is in it — otherwise a filtered
+    // column outside the list would not be read and the condition would silently
+    // never fire. (With `None`, the auto-detect path already reads every
+    // non-standard column, so no augmentation is needed.)
+    read_nonmem_csv_routed(
         path,
-        cols_ref.as_deref(),
-        iov_column,
+        covariate_columns,
         None,
+        &[],
+        iov_column,
         Some(filter),
         &ObsRouting::default(),
         column_map,
@@ -326,20 +319,16 @@ pub(crate) fn read_nonmem_csv_with_covariates_filtered_mapped(
     filter: &SelectionFilter,
     column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
-    let mut union = declared_union(decls, extra_columns);
-    // Ensure any covariate column referenced by an ignore/accept clause is read
-    // into each subject's covariate map, even if the model never declared it.
-    // Without this, a filter on an undeclared column would silently never fire
-    // on the declared-`[covariates]` read path (`union` would lack the column,
-    // so it would be absent from `locf_state`). Case-insensitive dedup: the
-    // referenced names are lowercased, declared names may not be.
-    augment_with_filter(&mut union, Some(filter));
-    let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
-    let (pop, table) = read_nonmem_csv_impl(
+    // `read_nonmem_csv_routed` also reads any covariate column referenced by an
+    // ignore/accept clause but never declared — without that, a filter on an
+    // undeclared column would silently never fire on this path (the declared
+    // union would lack the column, so it would be absent from `locf_state`).
+    let (pop, table) = read_nonmem_csv_routed(
         path,
-        Some(&union_refs),
-        iov_column,
+        None,
         Some(decls),
+        extra_columns,
+        iov_column,
         Some(filter),
         &ObsRouting::default(),
         column_map,
@@ -350,9 +339,33 @@ pub(crate) fn read_nonmem_csv_with_covariates_filtered_mapped(
     ))
 }
 
-/// Which non-Gaussian [`ObsRecord`](crate::types::ObsRecord) variant each CMT's
-/// EVID=0 observation rows route to. Empty sets ⇒ every observation row takes the
-/// Gaussian parallel-Vec path (the all-Gaussian default).
+/// How an `EVID=0`, `MDV=0` record whose `DV` cell is missing (`.` / `NA` /
+/// blank) is read.
+///
+/// The two readings are both right, for different callers: when the `DV` is an
+/// *input* (fitting) a missing one means "nothing to score here"; when it is the
+/// *output* (simulation) it means "produce a value here" (#957).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MissingDvPolicy {
+    /// Skip the row and count it for the single `W_MISSING_DV` summary (#258) —
+    /// a forgotten `MDV=1` must never inject a phantom `DV=0` into the
+    /// likelihood. The default, and the only policy on every fitting path.
+    #[default]
+    Skip,
+    /// Keep the row as a design point: the sampling time is real, only the
+    /// observation is absent because it has not been generated yet. The DV is a
+    /// placeholder (`NaN` for a Gaussian row, `0` for an integer-coded one) and
+    /// is overwritten by the simulated value. Used by the simulation readers
+    /// (#957) so a `DV = .` template — the natural way to write a design —
+    /// simulates instead of returning zero rows. `MDV=1` still excludes the row:
+    /// that is the user explicitly saying it is not an observation.
+    KeepAsDesign,
+}
+
+/// How each `EVID=0` observation row is turned into an observation record:
+/// which non-Gaussian [`ObsRecord`](crate::types::ObsRecord) variant the row's
+/// CMT routes to, plus the missing-DV policy. Empty sets ⇒ every observation row
+/// takes the Gaussian parallel-Vec path (the all-Gaussian default).
 ///
 /// The three sets must be pairwise disjoint — a CMT has exactly one endpoint kind
 /// (§8.1: routing is by the CMT's declared endpoint, never guessed from the DV).
@@ -372,6 +385,8 @@ pub(crate) struct ObsRouting {
     /// CMTs whose non-negative-integer-DV rows become `ObsRecord::Count`
     /// (Poisson / negative-binomial).
     pub count: HashSet<usize>,
+    /// What a missing `DV` on a scored row means — see [`MissingDvPolicy`].
+    pub missing_dv: MissingDvPolicy,
 }
 
 impl ObsRouting {
@@ -385,6 +400,14 @@ impl ObsRouting {
             discrete: discrete.clone(),
             ..Default::default()
         }
+    }
+
+    /// Set the missing-DV policy (builder form), leaving the routing sets alone.
+    /// `api::read_population_for_simulation` uses this to read a `DV = .` design
+    /// template as sampling times rather than as skipped rows (#957).
+    pub(crate) fn with_missing_dv(mut self, policy: MissingDvPolicy) -> Self {
+        self.missing_dv = policy;
+        self
     }
 
     /// The integer-coded non-Gaussian endpoint kind (discrete-state or count) a
@@ -519,81 +542,68 @@ fn checked_integer_dv(
     Ok(dv_rounded)
 }
 
-// ── TTE-aware readers (pub(crate) — used by api::read_population_for) ────────
-
-/// Like [`read_nonmem_csv_filtered`] but routes EVID=0 rows on `tte_cmts` to
-/// `Subject::obs_records` instead of the Gaussian parallel Vecs.
-///
-/// Used by `api::read_population_for` when the model has one or more TTE endpoints.
-pub(crate) fn read_nonmem_csv_filtered_tte(
-    path: &Path,
-    covariate_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
-    filter: Option<&SelectionFilter>,
-    tte_cmts: &HashSet<usize>,
-    discrete_cmts: &HashSet<usize>,
-    column_map: &[(String, String)],
-) -> Result<Population, String> {
-    let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
-        let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
-        augment_with_filter(&mut v, filter);
-        v
-    });
-    let cols_ref: Option<Vec<&str>> = augmented
-        .as_ref()
-        .map(|v| v.iter().map(|s| s.as_str()).collect());
-    read_nonmem_csv_impl(
-        path,
-        cols_ref.as_deref(),
-        iov_column,
-        None,
-        filter,
-        &ObsRouting::tte_and_discrete(tte_cmts, discrete_cmts),
-        column_map,
-    )
-    .map(|(pop, _)| pop)
-}
-
-/// Like [`read_nonmem_csv_with_covariates_filtered`] but routes EVID=0 rows on
-/// `tte_cmts` to `Subject::obs_records`.
-pub(crate) fn read_nonmem_csv_with_covariates_tte(
-    path: &Path,
-    decls: &[CovariateDecl],
-    extra_columns: &[String],
-    iov_column: Option<&str>,
-    filter: Option<&SelectionFilter>,
-    tte_cmts: &HashSet<usize>,
-    discrete_cmts: &HashSet<usize>,
-    column_map: &[(String, String)],
-) -> Result<(Population, CovariateTable), String> {
-    let mut union = declared_union(decls, extra_columns);
-    augment_with_filter(&mut union, filter);
-    let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
-    let (pop, table) = read_nonmem_csv_impl(
-        path,
-        Some(&union_refs),
-        iov_column,
-        Some(decls),
-        filter,
-        &ObsRouting::tte_and_discrete(tte_cmts, discrete_cmts),
-        column_map,
-    )?;
-    Ok((
-        pop,
-        table.expect("covariate table is built whenever table_decls is Some"),
-    ))
-}
-
-/// Reader entry point taking a full [`ObsRouting`] — the general form behind
-/// [`read_nonmem_csv_filtered_tte`]. Phase 4.0 exposes it so the discrete-state /
-/// count routing can be exercised directly from unit tests (no parser produces
-/// those sets yet). Disjointness is validated inside [`read_nonmem_csv_impl`].
+/// Covariate-free shorthand for [`read_nonmem_csv_routed`]. Phase 4.0 exposes it
+/// so the discrete-state / count routing can be exercised directly from unit
+/// tests (no parser produces those sets yet). Disjointness is validated inside
+/// [`read_nonmem_csv_impl`].
 #[cfg(test)]
 pub(crate) fn read_nonmem_csv_filtered_routed(
     path: &Path,
     routing: &ObsRouting,
 ) -> Result<Population, String> {
     read_nonmem_csv_impl(path, None, None, None, None, routing, &[]).map(|(pop, _)| pop)
+}
+
+/// The one reader every wrapper above delegates to: it builds the covariate
+/// read set (declared union, or the explicit lenient list) and augments it with
+/// any `[data_selection]`-referenced column before calling
+/// [`read_nonmem_csv_impl`].
+///
+/// `decls` is `Some` on the strict `[covariates]` path — declared columns are
+/// validated and a [`CovariateTable`] is returned; `None` returns no table and
+/// reads `covariate_columns` leniently (`None` in turn is auto-detect).
+/// `routing` carries both the per-CMT endpoint routing and the missing-DV
+/// policy, so a caller that needs a non-default policy (simulation, #957) can
+/// reach every covariate/filter combination through this single entry point.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_nonmem_csv_routed(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+    decls: Option<&[CovariateDecl]>,
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    routing: &ObsRouting,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String> {
+    // Declared covariates come first (so the table's column order matches the
+    // declaration); otherwise the caller's explicit list, or `None` for
+    // auto-detect. Either way, a filter's referenced columns must be read or the
+    // condition would silently never fire.
+    let cols: Option<Vec<String>> = match decls {
+        Some(d) => {
+            let mut union = declared_union(d, extra_columns);
+            augment_with_filter(&mut union, filter);
+            Some(union)
+        }
+        None => covariate_columns.map(|cols| {
+            let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
+            augment_with_filter(&mut v, filter);
+            v
+        }),
+    };
+    let cols_ref: Option<Vec<&str>> = cols
+        .as_ref()
+        .map(|v| v.iter().map(|s| s.as_str()).collect());
+    read_nonmem_csv_impl(
+        path,
+        cols_ref.as_deref(),
+        iov_column,
+        decls,
+        filter,
+        routing,
+        column_map,
+    )
 }
 
 /// Shared CSV reader. `table_decls`, when `Some`, requests building a
@@ -1823,14 +1833,18 @@ fn parse_subject(
                 })
                 .unwrap_or(1);
 
-            // A missing DV cell (`.` / `NA` / blank) means "no observation":
-            // `parse_f64` coerced it to `0.0` above, so without this guard a
-            // forgotten MDV would inject a phantom scored row. NONMEM convention
-            // marks such rows MDV=1; treat a forgotten one the same way — skip it
-            // and count it for the single W_MISSING_DV summary (#258). Applied to
-            // every scored endpoint below (Gaussian, discrete-state, count); the
-            // TTE `Event` arm keeps its own DV-code semantics and does not use it.
+            // A missing DV cell (`.` / `NA` / blank) means "no observation" when
+            // the DV is an input: `parse_f64` coerced it to `0.0` above, so
+            // without a guard a forgotten MDV would inject a phantom scored row.
+            // NONMEM convention marks such rows MDV=1; treat a forgotten one the
+            // same way — skip it and count it for the single W_MISSING_DV summary
+            // (#258). Under `MissingDvPolicy::KeepAsDesign` the DV is instead the
+            // *output* (simulation, #957) and the row is kept as a design point
+            // with a placeholder DV. Applied to every scored endpoint below
+            // (Gaussian, discrete-state, count); the TTE `Event` arm keeps its own
+            // DV-code semantics and does not use it.
             let dv_missing = is_missing_cell(row.get(dv_col).map(|s| s.as_str()).unwrap_or(""));
+            let skip_missing_dv = dv_missing && routing.missing_dv == MissingDvPolicy::Skip;
 
             // Non-Gaussian row routing: when this CMT belongs to a declared TTE /
             // discrete-state / count endpoint, route the row to `obs_records`
@@ -1939,11 +1953,20 @@ fn parse_subject(
                 // never records a spurious `state:0` / `count:0`. Otherwise the DV
                 // must be a finite, non-negative, in-range integer (`checked_integer_dv`,
                 // #192); no endpoint math here (Phase 4.0).
-                if dv_missing {
+                if skip_missing_dv {
                     missing_dv_skipped += 1;
                     continue;
                 }
-                let magnitude = checked_integer_dv(dv, kind, id, cmt, time)?;
+                // Design-point row under `KeepAsDesign`: `dv` is the `0.0` the
+                // missing cell parsed to, which is a valid state index / count and
+                // is overwritten by the simulated outcome. Skipping
+                // `checked_integer_dv` here is deliberate — it is the *user's* DV
+                // that must be a valid integer, and there isn't one.
+                let magnitude = if dv_missing {
+                    0.0
+                } else {
+                    checked_integer_dv(dv, kind, id, cmt, time)?
+                };
                 obs_records.push(match kind {
                     IntDvKind::DiscreteState => crate::types::ObsRecord::DiscreteState {
                         time,
@@ -1962,10 +1985,17 @@ fn parse_subject(
                 // Gaussian path. A missing DV (`.`/`NA`/blank) is skipped as MDV=1
                 // (see the `dv_missing` note above; #258) so a forgotten MDV never
                 // injects a phantom zero observation.
-                if dv_missing {
+                if skip_missing_dv {
                     missing_dv_skipped += 1;
                     continue;
                 }
+                // Design-point row under `KeepAsDesign` (#957): the sampling time
+                // is real, the observation does not exist yet. `NaN` rather than
+                // the `0.0` the missing cell parsed to, so the placeholder can
+                // never be mistaken for a measured zero — the simulator reads only
+                // the times, and every downstream |DV| consumer already guards on
+                // `is_finite`.
+                let dv = if dv_missing { f64::NAN } else { dv };
                 let cens_flag = cens_col
                     .and_then(|c| row.get(c))
                     .map(|s| parse_cens(s))

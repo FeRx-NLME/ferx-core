@@ -19,6 +19,16 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **A missing `DV` no longer empties a simulation.** Simulating from a design — dosing plus
+  sampling times, with `DV = .` because the values are what the run is about to produce — used
+  to return zero rows: every `EVID=0` row with a missing `DV` was skipped as a forgotten
+  `MDV=1` (#258), which is the right reading only when the `DV` is an input. The new
+  `read_population_for_simulation()` reads such a row as a **design point** instead, so the
+  natural template simulates as written and no placeholder number is needed in the column
+  about to be overwritten. Fitting is unchanged, and `MDV=1` still excludes a record on both
+  paths (#957).
+
 ### Performance
 - **The ODE inter-occasion-variability (IOV) analytic sensitivity path now compiles from a
   bucketed set of dual widths instead of one specialisation per stacked axis count**, cutting
