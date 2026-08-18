@@ -75,10 +75,19 @@ let sims = simulate(&model, &population, &model.default_params, 1000);
 ```
 
 Read with `read_population_for()` the same file yields zero simulated rows. Rows
-marked `MDV=1` are excluded on both paths. The retained rows carry a placeholder
-`DV` (`NaN`, or `0` for an integer-coded endpoint) that the simulated value
-replaces, so the returned population is for simulation only — do not pass it to
-`fit()`.
+marked `MDV=1` are excluded on both paths. Retained rows are reported once as a
+`W_DESIGN_DV` warning on the returned population, so a simulation run off an
+*observed* dataset makes visible that it kept rows a fit of the same data would
+have skipped.
+
+The retained rows carry a placeholder `DV` (`NaN`, or the endpoint's first
+declared state code for an integer-coded endpoint) that the simulated value
+replaces, so the returned population is **for simulation only** — do not pass it
+to `fit()`. That is enforced, not merely advised: a population carrying
+non-finite observations is rejected by `fit()` (and reported by `ferx check`) as
+`E_NONFINITE_DV`, and propensity-score-matched simulation
+(`SimulateOptions::match_method`) rejects it too, since a design template has
+nothing to compute posthoc etas from.
 
 ## `simulate_with_seed()`
 

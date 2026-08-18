@@ -387,6 +387,13 @@ pub(crate) struct ObsRouting {
     pub count: HashSet<usize>,
     /// What a missing `DV` on a scored row means — see [`MissingDvPolicy`].
     pub missing_dv: MissingDvPolicy,
+    /// Placeholder DV code to write on an integer-coded design-point row, per
+    /// CMT. Only consulted under [`MissingDvPolicy::KeepAsDesign`]; a CMT absent
+    /// from the map falls back to `0`. Endpoints whose declared `state_codes`
+    /// are not 0-based (e.g. `1`/`2`) would otherwise get an out-of-range `0`
+    /// placeholder that no `state_codes` lookup can map back to a generator
+    /// index (#957 review).
+    pub design_states: HashMap<usize, usize>,
 }
 
 impl ObsRouting {
@@ -400,6 +407,16 @@ impl ObsRouting {
             discrete: discrete.clone(),
             ..Default::default()
         }
+    }
+
+    /// Register the per-CMT placeholder DV code used for integer-coded design
+    /// rows (builder form). `codes` maps a CMT to the DV value written when its
+    /// `DV` cell is missing under [`MissingDvPolicy::KeepAsDesign`] — normally
+    /// the endpoint's first declared state code, so the placeholder is always a
+    /// value the endpoint can decode. CMTs left out keep the `0` default.
+    pub(crate) fn with_design_states(mut self, codes: HashMap<usize, usize>) -> Self {
+        self.design_states = codes;
+        self
     }
 
     /// Set the missing-DV policy (builder form), leaving the routing sets alone.
@@ -1000,16 +1017,29 @@ fn read_nonmem_csv_impl(
         }
     }
 
-    // Missing-DV summary (issue #258): scored observation rows (EVID=0, MDV=0)
-    // whose DV cell was missing were skipped rather than read as DV=0. Surfaced
-    // via FitResult.warnings and `ferx check` (data path).
+    // Missing-DV summary: scored observation rows (EVID=0, MDV=0) whose DV cell
+    // was missing. Both readings change the row count relative to a dataset with
+    // no missing cells, so both get a summary line — under `Skip` the rows are
+    // dropped (issue #258), under `KeepAsDesign` they are kept as extra design
+    // points (#957). A simulation run off an *observed* dataset (a VPC, say)
+    // silently carries more rows than the fit did without this second line.
+    // Surfaced via FitResult.warnings and `ferx check` (data path).
     if total_missing_dv > 0 {
-        population_warnings.push(format!(
-            "W_MISSING_DV: {} observation row(s) (EVID=0) had a missing DV (`.`/`NA`/blank) \
-             but were not marked MDV=1; they were skipped (not scored as DV=0). Set MDV=1 \
-             on intentionally-missing observations to silence this, or check for data errors.",
-            total_missing_dv
-        ));
+        population_warnings.push(match routing.missing_dv {
+            MissingDvPolicy::Skip => format!(
+                "W_MISSING_DV: {} observation row(s) (EVID=0) had a missing DV (`.`/`NA`/blank) \
+                 but were not marked MDV=1; they were skipped (not scored as DV=0). Set MDV=1 \
+                 on intentionally-missing observations to silence this, or check for data errors.",
+                total_missing_dv
+            ),
+            MissingDvPolicy::KeepAsDesign => format!(
+                "W_DESIGN_DV: {} observation row(s) (EVID=0) had a missing DV (`.`/`NA`/blank) \
+                 and were kept as design points to simulate at. A fit of the same dataset would \
+                 skip these rows (W_MISSING_DV), so the simulated dataset has more rows than the \
+                 fitted one. Set MDV=1 on rows that are not sampling times.",
+                total_missing_dv
+            ),
+        });
     }
 
     // Dose-coverage warnings (#262), surfaced via FitResult.warnings. Most
@@ -1413,8 +1443,12 @@ fn parse_subject(
     let mut fremtype: Vec<u16> = Vec::new();
     let mut obs_l2: Vec<i64> = Vec::new();
     let mut occ_parse_failures: usize = 0;
-    // EVID=0/MDV=0 rows whose DV cell was missing and were skipped (issue #258).
-    let mut missing_dv_skipped: usize = 0;
+    // EVID=0/MDV=0 rows whose DV cell was missing, counted under **both**
+    // policies: skipped under `Skip` (issue #258, `W_MISSING_DV`) and kept as
+    // design points under `KeepAsDesign` (#957, `W_DESIGN_DV`). Either reading
+    // changes how many rows the dataset contributes, so either one is worth a
+    // summary line.
+    let mut missing_dv_rows: usize = 0;
     let mut excl_n_obs: usize = 0;
     let mut excl_n_dose: usize = 0;
     let mut excl_n_other: usize = 0;
@@ -1953,17 +1987,22 @@ fn parse_subject(
                 // never records a spurious `state:0` / `count:0`. Otherwise the DV
                 // must be a finite, non-negative, in-range integer (`checked_integer_dv`,
                 // #192); no endpoint math here (Phase 4.0).
+                if dv_missing {
+                    missing_dv_rows += 1;
+                }
                 if skip_missing_dv {
-                    missing_dv_skipped += 1;
                     continue;
                 }
-                // Design-point row under `KeepAsDesign`: `dv` is the `0.0` the
-                // missing cell parsed to, which is a valid state index / count and
-                // is overwritten by the simulated outcome. Skipping
-                // `checked_integer_dv` here is deliberate — it is the *user's* DV
-                // that must be a valid integer, and there isn't one.
+                // Design-point row under `KeepAsDesign`: there is no user DV, so
+                // write the endpoint's registered placeholder code (its first
+                // declared state code; `0` for a count or an unregistered CMT).
+                // The simulated outcome overwrites it. Skipping `checked_integer_dv`
+                // here is deliberate — it is the *user's* DV that must be a valid
+                // integer, and there isn't one — but the placeholder must still be
+                // a code the endpoint can decode, so that a mis-routed design
+                // population cannot silently score as an out-of-range state.
                 let magnitude = if dv_missing {
-                    0.0
+                    routing.design_states.get(&cmt).copied().unwrap_or(0) as f64
                 } else {
                     checked_integer_dv(dv, kind, id, cmt, time)?
                 };
@@ -1985,8 +2024,10 @@ fn parse_subject(
                 // Gaussian path. A missing DV (`.`/`NA`/blank) is skipped as MDV=1
                 // (see the `dv_missing` note above; #258) so a forgotten MDV never
                 // injects a phantom zero observation.
+                if dv_missing {
+                    missing_dv_rows += 1;
+                }
                 if skip_missing_dv {
-                    missing_dv_skipped += 1;
                     continue;
                 }
                 // Design-point row under `KeepAsDesign` (#957): the sampling time
@@ -2158,7 +2199,7 @@ fn parse_subject(
             obs_records,
         },
         occ_parse_failures,
-        missing_dv_skipped,
+        missing_dv_rows,
         SubjectExclusion {
             n_obs_excluded: excl_n_obs,
             n_dose_excluded: excl_n_dose,

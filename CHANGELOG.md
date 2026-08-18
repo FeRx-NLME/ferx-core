@@ -27,7 +27,9 @@ section of the SDLC for the versioning policy).
   `read_population_for_simulation()` reads such a row as a **design point** instead, so the
   natural template simulates as written and no placeholder number is needed in the column
   about to be overwritten. Fitting is unchanged, and `MDV=1` still excludes a record on both
-  paths (#957).
+  paths (#957). Kept design rows are reported as `W_DESIGN_DV`, the simulation-side counterpart
+  of `W_MISSING_DV`, so a simulation run off an *observed* dataset makes its extra rows visible
+  rather than silently carrying more rows than a fit of the same data.
 
 ### Performance
 - **The ODE inter-occasion-variability (IOV) analytic sensitivity path now compiles from a
@@ -42,6 +44,13 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **A design population is now rejected by `fit()` instead of being fitted to its placeholders.**
+  The population returned by `read_population_for_simulation()` carries a `NaN` placeholder for
+  each not-yet-generated observation, and nothing checked observations for finiteness: with
+  log-transformed-both-sides on natural-scale data the placeholder was floored to a finite,
+  extreme value and the fit ran to completion on fabricated data with no warning. Such a
+  population now fails up front with `E_NONFINITE_DV`, and propensity-score-matched simulation
+  reports the real cause instead of a misleading "EBE did not converge" (#957).
 - **The default (`Auto` → analytic-gradient NLopt L-BFGS) optimizer no longer stalls at the
   initial estimates on its first step.** From the identity initial Hessian the opening search
   direction is `−∇`, and on models where the scaled gradient is large at the start (e.g.

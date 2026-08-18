@@ -45,6 +45,15 @@ pub(crate) fn log_transform_observations(pop: &mut Population) -> usize {
     let mut n_nonpos = 0usize;
     for subject in &mut pop.subjects {
         for v in &mut subject.observations {
+            // A non-finite DV is left alone. `f64::max` returns the *non-NaN*
+            // operand, so `NaN.max(LTBS_FLOOR).ln()` would quietly turn a NaN
+            // design placeholder (#957) into a finite, extreme "observation" and
+            // let a mis-routed simulation population fit to completion. Leave it
+            // non-finite so `E_NONFINITE_DV` (and any downstream `is_finite`
+            // guard) still sees it.
+            if !v.is_finite() {
+                continue;
+            }
             if *v <= 0.0 {
                 n_nonpos += 1;
             }
@@ -786,10 +795,13 @@ pub fn read_population_for(
 /// accepts), so the fitting reading would otherwise return zero simulated rows
 /// for the most idiomatic template there is.
 ///
-/// The kept row carries a placeholder DV (`NaN` for a Gaussian endpoint, `0` for
-/// an integer-coded one) which the simulated value replaces; do **not** pass the
-/// returned population to [`fit`]. `MDV=1` still excludes the record — that is
-/// the user explicitly saying it is not an observation.
+/// The kept row carries a placeholder DV (`NaN` for a Gaussian endpoint, the
+/// endpoint's first declared state code for an integer-coded one) which the
+/// simulated value replaces; do **not** pass the returned population to [`fit`].
+/// That contract is enforced, not merely documented: a non-finite observation is
+/// rejected by `E_NONFINITE_DV` ([`check_model_data`]) at `fit()` entry.
+/// `MDV=1` still excludes the record — that is the user explicitly saying it is
+/// not an observation.
 pub fn read_population_for_simulation(
     model: &CompiledModel,
     covariate_decls: &Option<Vec<CovariateDecl>>,
@@ -865,8 +877,27 @@ fn read_population_for_policy(
     // Gaussian-only model (so no row is routed to `obs_records`), and the reader
     // builds the covariate read set from `decls` when the model declares
     // `[covariates]`, from `fallback_columns` otherwise.
-    let routing =
-        ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts).with_missing_dv(missing_dv);
+    // Placeholder DV code for an integer-coded design row: the endpoint's first
+    // declared state code, so a `state_codes` table that is not 0-based (e.g.
+    // `1`/`2`) never gets an undecodable `0` placeholder. Only CTMM declares
+    // codes; Binary is `{0,1}` and keeps the `0` default.
+    #[cfg(feature = "markov")]
+    let design_states: HashMap<usize, usize> = model
+        .endpoints
+        .iter()
+        .filter_map(|(&cmt, ep)| match ep {
+            EndpointLikelihood::Ctmm { state_codes, .. } => {
+                state_codes.first().map(|&code| (cmt, code))
+            }
+            _ => None,
+        })
+        .collect();
+    #[cfg(not(feature = "markov"))]
+    let design_states: HashMap<usize, usize> = HashMap::new();
+
+    let routing = ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
+        .with_missing_dv(missing_dv)
+        .with_design_states(design_states);
     let (decls, extra) = match covariate_decls {
         Some(d) => (Some(d.as_slice()), undeclared_referenced(model, d)),
         None => (None, Vec::new()),

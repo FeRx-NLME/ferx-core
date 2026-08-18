@@ -2143,9 +2143,76 @@ fn keep_as_design_retains_missing_dv_rows_as_sampling_times() {
     );
     assert!(
         !pop.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
-        "nothing was skipped, so nothing to warn about: {:?}",
+        "nothing was skipped, so the skip warning must not fire: {:?}",
         pop.warnings
     );
+}
+
+#[test]
+fn keep_as_design_reports_the_rows_it_kept() {
+    // The rows are read either way, just differently — and either reading
+    // changes how many rows the dataset contributes. Reporting only the `Skip`
+    // side left a simulation off an observed dataset silently carrying rows the
+    // fit had excluded (#957 review).
+    let f = write_csv(SIM_TEMPLATE_CSV);
+    let routing = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+    let design: Vec<_> = pop
+        .warnings
+        .iter()
+        .filter(|w| w.starts_with("W_DESIGN_DV"))
+        .collect();
+    assert_eq!(design.len(), 1, "exactly one summary: {:?}", pop.warnings);
+    assert!(
+        design[0].contains("3 observation row(s)"),
+        "the count must be the rows kept as design points: {}",
+        design[0]
+    );
+}
+
+#[test]
+fn keep_as_design_uses_the_registered_placeholder_state_code() {
+    use crate::types::ObsRecord;
+    // A `state_codes` table need not be 0-based — CTMM states are commonly coded
+    // `1`/`2`. A hard `0` placeholder is then a code no `state_codes` lookup can
+    // map to a generator index, so a mis-routed design population would score as
+    // an out-of-range state instead of failing (#957 review). The reader writes
+    // the endpoint's first declared code instead.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,1,.,0,0,.,3\n";
+    let routing = ObsRouting {
+        discrete: [3].into_iter().collect(),
+        design_states: [(3usize, 1usize)].into_iter().collect(),
+        ..Default::default()
+    }
+    .with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+    assert!(
+        matches!(
+            pop.subjects[0].obs_records[0],
+            ObsRecord::DiscreteState {
+                state: 1,
+                cmt: 3,
+                ..
+            }
+        ),
+        "got {:?}",
+        pop.subjects[0].obs_records[0]
+    );
+
+    // An unregistered CMT keeps the `0` default (Binary is `{0,1}`; counts start
+    // at 0), so the builder is opt-in per endpoint.
+    let unregistered = ObsRouting {
+        discrete: [3].into_iter().collect(),
+        ..Default::default()
+    }
+    .with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let pop = read_nonmem_csv_filtered_routed(f.path(), &unregistered).unwrap();
+    assert!(matches!(
+        pop.subjects[0].obs_records[0],
+        ObsRecord::DiscreteState { state: 0, .. }
+    ));
 }
 
 #[test]
