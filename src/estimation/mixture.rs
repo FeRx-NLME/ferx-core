@@ -496,6 +496,77 @@ mod tests {
         }
     }
 
+    /// Constant-mixing MIXNUM model with FIXED Ω/Σ, mirroring the NONMEM anchor
+    /// (`tests/nonmem/mixture_iv.ctl`): TVCL1/TVCL2 branch, `p(1)` direct-form
+    /// mixing, no per-class overrides. The four free thetas (TVCL1, TVCL2, TVV,
+    /// P1) are the covariance step's targets.
+    const MIX_COV_MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta P1(0.5, 0.001, 0.999)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  p(1) = P1
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    #[test]
+    fn mixture_covariance_step_runs_and_sizes() {
+        // #983 Phase 6: the covariance step builds its FD Hessian on the K-fold
+        // mixture OFV (`compute_covariance` branches on `template.mixture`), so a
+        // mixture fit now yields a covariance matrix + SEs — it previously skipped
+        // the step entirely. Evaluated near the data-generating optimum so the
+        // 4-theta Hessian is positive-definite; FIXED Ω/Σ rows stay zero.
+        use crate::estimation::covariance::{compute_covariance, CovarianceStepResult};
+        use crate::estimation::parameterization::pack_params;
+        let model = crate::parser::model_parser::parse_model_string(MIX_COV_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(8, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+        let params = &model.default_params;
+        let x = pack_params(params);
+        // MIXEST-class EBEs/H fill the warm-start slots the mixture branch ignores.
+        let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
+        let matrix = match compute_covariance(
+            &x,
+            params,
+            &model,
+            &pop,
+            &eval.mixest_etas,
+            &eval.mixest_h_mats,
+            &[],
+            &opts,
+        ) {
+            CovarianceStepResult::Success(out) => out.matrix,
+            CovarianceStepResult::Unusable(msg) => panic!("covariance unusable: {msg}"),
+            CovarianceStepResult::FailedNonPd { reason, .. } => {
+                panic!("covariance non-PD: {reason}")
+            }
+        };
+        assert_eq!(matrix.nrows(), x.len(), "covariance is packed-square");
+        // Free thetas (idx 0..4) get finite positive packed-scale variance.
+        for i in 0..4 {
+            let v = matrix[(i, i)];
+            assert!(v.is_finite() && v > 0.0, "theta[{i}] variance = {v}");
+        }
+        // FIXED Ω (idx 4) and Σ (idx 5) contribute no information → zeroed rows.
+        assert_eq!(matrix[(4, 4)], 0.0, "FIXED omega row zeroed");
+        assert_eq!(matrix[(5, 5)], 0.0, "FIXED sigma row zeroed");
+    }
+
     // Variance-mixture (classes differ only by their Ω/Σ overrides, no `MIXNUM`
     // branch) so the per-subject analytic sensitivity provider is in scope — the
     // parity test then exercises the real analytic gradient (softmax mixing

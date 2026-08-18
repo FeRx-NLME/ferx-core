@@ -32,12 +32,20 @@ section of the SDLC for the versioning policy).
   optimizer, but an analytic posterior-weighted outer gradient is available, so a user-selected NLopt
   gradient optimizer (SLSQP / L-BFGS / MMA) is honoured — with an automatic finite-difference fallback
   for models outside analytic scope (e.g. `MIXNUM`-branched typical values). Other estimators
-  (SAEM/IMP/Bayes), inter-occasion variability, and standard errors for mixture models are not yet
+  (SAEM/IMP/Bayes) and inter-occasion variability under a mixture are not yet
   supported and error clearly. The parser rejects `nsub < 2`, `MIXNUM`
   assignment, `MIXNUM` outside a mixture model, eta-dependent mixing expressions, missing class
   coverage, `omega(k)` on a block base, and overrides of the base class. The `sdtab` output gains
   per-subject `MIXEST` (most-probable class, 1-based like NONMEM) and `PMIX_1..PMIX_K` (posterior
   class-membership probabilities `PMIX_ik ∝ p_ik·exp(−nll_ik)`) columns for a mixture fit.
+- **Standard errors / covariance for mixture fits (#983).** The covariance step now runs for
+  mixture models: its finite-difference Hessian is built on the K-fold mixture objective
+  (`−2 Σ_i log Σ_k p_ik exp(−nll_ik)`), not the single-population marginal, so a mixture fit reports
+  SEs, RSEs, and a covariance matrix like any other fit. The mixing-fraction SE is reported on the
+  scale the mixing form is parameterized in — the coefficients of a `logit(k) = …` form on the logit
+  scale, a `p(k) = …` probability directly — since those coefficients are ordinary thetas. The
+  covariance-matrix labels now name the per-class Ω/Σ override coordinates (`omega[<eta>_MIX{k}]` /
+  `sigma[<sigma>_MIX{k}]`) instead of a generic `packed[N]`.
 - **A missing `DV` no longer empties a simulation.** Simulating from a design — dosing plus
   sampling times, with `DV = .` because the values are what the run is about to produce — used
   to return zero rows: every `EVID=0` row with a missing `DV` was skipped as a forgotten

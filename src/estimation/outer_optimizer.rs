@@ -450,12 +450,10 @@ fn evaluate_at_initial_params(
     }
 
     let mut warnings = Vec::new();
-    // Mixture (#977 Phase 3): the covariance step's FD Hessian is built from the
-    // single-population objective, not the K-fold mixture OFV, so its SEs would be
-    // wrong. Skip it — mixture covariance / SE lands in Phase 6.
-    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal) = if is_mixture {
-        (None, 0.0, None)
-    } else {
+    // Mixture (#983 Phase 6): the covariance step now builds its FD Hessian on the
+    // K-fold mixture OFV (`compute_covariance` branches on `template.mixture`), so
+    // it runs for mixtures exactly like the single-population path.
+    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal) = {
         let out = crate::estimation::covariance::run_covariance_step(
             &x,
             init_params,
@@ -1974,13 +1972,12 @@ fn optimize_nlopt(
 
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
-    // Mixture (#977 Phase 3): the FD-Hessian covariance is built from the single-
-    // population objective, not the K-fold mixture OFV → its SEs would be wrong.
-    // Skip; mixture covariance / SE is Phase 6.
-    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal) = if final_is_mixture
-    {
-        (None, 0.0, None)
-    } else {
+    // Mixture (#983 Phase 6): `compute_covariance` builds the FD Hessian on the
+    // K-fold mixture OFV when `template.mixture` is set, so the step runs for
+    // mixtures too. The `final_ehs`/`final_hms` handed in are the MIXEST-class
+    // EBEs; the mixture branch reconverges per class internally and does not use
+    // them as a warm start.
+    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal) = {
         let out = crate::estimation::covariance::run_covariance_step(
             &x0,
             init_params,
