@@ -22,6 +22,7 @@ fn make_template(omega_iov: Option<OmegaMatrix>, kappa_fixed: Vec<bool>) -> Mode
         sigma_fixed: vec![false],
         omega_iov,
         kappa_fixed,
+        mixture: None,
     }
 }
 
@@ -53,6 +54,7 @@ fn test_se_omega_block_n3_full_lower_triangle() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: vec![],
+        mixture: None,
     };
     // Packed layout: theta(1) + omega_block(6) + sigma(1) = 8.
     // Within the omega block (start = 1): L[0,0]=1, L[1,0]=2, L[2,0]=3,
@@ -115,6 +117,7 @@ fn test_se_omega_block_offdiag_positive() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: vec![],
+        mixture: None,
     };
     // Packed: theta(1) + omega_block(3) + sigma(1) = 5.  Identity cov.
     let cov = Some(DMatrix::<f64>::identity(5, 5));
@@ -153,6 +156,7 @@ fn test_se_omega_diagonal_unchanged() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: vec![],
+        mixture: None,
     };
     // Packed layout: theta(1) + omega_diag(2) + sigma(1) = 4. Identity cov.
     let cov = Some(DMatrix::<f64>::identity(4, 4));
@@ -189,6 +193,7 @@ fn test_se_theta_respects_packing_scale() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: vec![],
+        mixture: None,
     };
     // Packed layout: theta(2) + omega(1) + sigma(1) = 4.
     // Set diagonal so packed SEs are theta:0.1, theta:0.3 (the rest unused here).

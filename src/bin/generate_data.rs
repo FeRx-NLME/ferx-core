@@ -176,6 +176,7 @@ fn build_warfarin_model() -> CompiledModel {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
@@ -252,6 +253,7 @@ fn build_warfarin_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -274,6 +276,7 @@ fn build_warfarin_true_params() -> ModelParameters {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     }
 }
 
@@ -305,6 +308,7 @@ fn generate_two_cpt_iv() {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
@@ -381,6 +385,7 @@ fn generate_two_cpt_iv() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
     let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0];
     let subjects = simulate_subjects(&model, &params, 15, 100.0, 1, &obs_times, 123, None);
@@ -427,6 +432,7 @@ fn generate_two_cpt_oral_cov() {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
@@ -515,6 +521,7 @@ fn generate_two_cpt_oral_cov() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
 
     // Generate random covariates (matching Julia seed 456)
@@ -613,6 +620,7 @@ fn generate_mm_oral() {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
@@ -707,6 +715,7 @@ fn generate_mm_oral() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
     let obs_times = vec![
         0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0,

@@ -43,6 +43,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         },
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
@@ -102,6 +103,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -129,6 +131,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let model = CompiledModel {
         name: "tv_cov_iv".into(),
@@ -191,6 +194,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
 
     let mut baseline_cov = HashMap::new();

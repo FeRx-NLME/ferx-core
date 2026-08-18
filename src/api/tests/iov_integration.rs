@@ -23,6 +23,7 @@ fn make_iov_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: Some(omega_iov),
         kappa_fixed: vec![false],
+        mixture: None,
     };
     CompiledModel {
         name: "iov_test".into(),
@@ -86,6 +87,7 @@ fn make_iov_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 

@@ -1399,6 +1399,7 @@ fn saem_state_to_params(
             init_params.omega_iov.clone()
         },
         kappa_fixed: init_params.kappa_fixed.clone(),
+        mixture: None,
     }
 }
 
@@ -2704,6 +2705,7 @@ pub fn run_saem(
         bayes: None,
         cond_dist,
         packed_estimate: None,
+        mixture_posteriors: None,
     })
 }
 
@@ -3377,6 +3379,7 @@ mod tests {
                 sigma_fixed: vec![false],
                 omega_iov: Some(OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()])),
                 kappa_fixed: vec![false],
+                mixture: None,
             },
             omega_init_as_sd: vec![false],
             sigma_init_as_sd: vec![false],
@@ -3414,6 +3417,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         };
 
         // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.

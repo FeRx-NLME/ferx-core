@@ -669,6 +669,7 @@ fn run_mcem(
             sigma_fixed: init_params.sigma_fixed.clone(),
             omega_iov: None,
             kappa_fixed: init_params.kappa_fixed.clone(),
+            mixture: None,
         };
 
         // ---- E-step A: position the proposal ----
@@ -1151,6 +1152,7 @@ fn run_mcem(
         sigma_fixed: init_params.sigma_fixed.clone(),
         omega_iov: None,
         kappa_fixed: init_params.kappa_fixed.clone(),
+        mixture: None,
     };
 
     // ---- Final EBEs (warm-started) + FOCE Laplace OFV for comparability ----
@@ -1305,6 +1307,7 @@ fn run_mcem(
         bayes: None,
         cond_dist: None,
         packed_estimate: None,
+        mixture_posteriors: None,
     })
 }
 

@@ -2602,6 +2602,8 @@ mod tests {
             ofv_contribution: 0.0,
             cens: vec![],
             n_obs: 0,
+            pmix: None,
+            mixest: None,
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],

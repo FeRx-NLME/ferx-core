@@ -1349,6 +1349,41 @@ pub struct ModelParameters {
     pub omega_iov: Option<OmegaMatrix>,
     /// Per-kappa FIX flags (parallel to `omega_iov` diagonal).
     pub kappa_fixed: Vec<bool>,
+    /// Per-class Omega/Sigma for `$MIXTURE` models (#977). `Some` iff the model
+    /// carries a `[mixture]` block; the base (class-1) Omega/Sigma stay in
+    /// `omega`/`sigma`, while this holds the full per-class matrices (class 1 is
+    /// a copy of the base) plus the packing addresses of the per-class
+    /// overrides. `None` for a single-population model.
+    pub mixture: Option<MixtureParams>,
+}
+
+/// Numeric per-class Omega/Sigma for a `$MIXTURE` model (#977 Phase 2).
+///
+/// The mixing-probability coefficients are ordinary thetas (they ride the theta
+/// vector and pack identically), so this struct only carries the per-class
+/// random-effect / residual variances. Non-overridden classes hold a copy of the
+/// base Omega/Sigma; each `[mixture]` `omega(k)` / `sigma(k)` declaration becomes
+/// one entry in the corresponding `*_override_addr` list, which drives the
+/// per-class packed segment in `estimation::parameterization`.
+#[derive(Debug, Clone)]
+pub struct MixtureParams {
+    /// Per-class Omega, length K. Index `c` is class `c + 1`; index 0 (class 1)
+    /// equals the base `ModelParameters::omega`.
+    pub omega: Vec<OmegaMatrix>,
+    /// Per-class Sigma, length K. Index 0 (class 1) equals the base sigma.
+    pub sigma: Vec<SigmaVector>,
+    /// Packed-order addresses of the Omega overrides: `(class_index_0based,
+    /// eta_index)`. Class index is >= 1 (class 1 is the base and is never
+    /// overridden). One packed scalar — `ln` of the class matrix's Cholesky
+    /// diagonal — is emitted per entry, in this order.
+    pub omega_override_addr: Vec<(usize, usize)>,
+    /// FIX flag per Omega override (parallel to `omega_override_addr`).
+    pub omega_override_fixed: Vec<bool>,
+    /// Packed-order addresses of the Sigma overrides: `(class_index_0based,
+    /// sigma_index)`.
+    pub sigma_override_addr: Vec<(usize, usize)>,
+    /// FIX flag per Sigma override (parallel to `sigma_override_addr`).
+    pub sigma_override_fixed: Vec<bool>,
 }
 
 impl ModelParameters {
@@ -1359,6 +1394,67 @@ impl ModelParameters {
             || self.sigma_fixed.iter().any(|&b| b)
             || self.kappa_fixed.iter().any(|&b| b)
     }
+}
+
+/// One mixing-probability expression for a `$MIXTURE` class (#977).
+///
+/// The inner `Expression` AST is parser-private (`pub(crate)`, mirroring
+/// [`IndivParamPartials`]); external users see the class index and form but
+/// cannot pattern-match the tree. Evaluated per subject over theta + covariates
+/// to yield the class logit (or probability); softmax-normalized across classes.
+#[derive(Debug, Clone)]
+pub struct MixingExpr {
+    /// 1-based class this expression scores. For the `logit` form only classes
+    /// `1..=n_classes-1` carry an expression (the last class is the softmax
+    /// reference with implicit logit 0).
+    pub class: usize,
+    /// `true` for `logit(k) = …` (raw logit, softmax-normalized); `false` for
+    /// `p(k) = …` (probability, must lie in (0,1) and is renormalized).
+    pub is_logit: bool,
+    /// Mixing expression over theta + covariates. Parser-private AST.
+    pub(crate) expr: crate::parser::model_parser::Expression,
+}
+
+/// A per-class Omega/Sigma override declared in a `[mixture]` block via
+/// `omega(k) NAME ~ var` / `sigma(k) NAME ~ var` (#977). An omitted class shares
+/// the base (class-1) Omega/Sigma. Phase 1 stores the raw declaration; Phase 2
+/// builds the per-class numeric matrices from it.
+#[derive(Debug, Clone)]
+pub struct MixtureClassOverride {
+    /// 1-based class this override applies to (2..=n_classes; class 1 is base).
+    pub class: usize,
+    /// Random-effect (eta) or residual (sigma) name being overridden — must name
+    /// a base declaration.
+    pub name: String,
+    /// Initial value: variance for omega, variance-or-SD for sigma per `as_sd`.
+    pub init: f64,
+    /// `true` when written on the SD scale (`(sd)` suffix).
+    pub as_sd: bool,
+    /// FIX flag.
+    pub fixed: bool,
+}
+
+/// `$MIXTURE` model structure attached to [`CompiledModel`] (#977).
+///
+/// Holds the number of subpopulations, the per-class mixing expressions, and any
+/// per-class Omega/Sigma overrides. The class-specific *typical values* are not
+/// stored here — they live in `[individual_parameters]` as `MIXNUM`-branched
+/// expressions and are shared/split entirely by the user.
+#[derive(Debug, Clone)]
+pub struct MixtureSpec {
+    /// Number of subpopulations K (>= 2).
+    pub n_classes: usize,
+    /// Mixing-probability expressions (see [`MixingExpr`]). Both forms score
+    /// classes `1..=K-1` (`n_classes - 1` entries); the last class is implicit —
+    /// the softmax reference (logit 0) for the `logit` form, or the probability
+    /// complement `1 − Σ` for the `p` form.
+    pub mixing: Vec<MixingExpr>,
+    /// Covariate names referenced by the mixing expressions (for data checks).
+    pub logit_covariates: Vec<String>,
+    /// Per-class Omega overrides (empty ⇒ all classes share the base Omega).
+    pub omega_overrides: Vec<MixtureClassOverride>,
+    /// Per-class Sigma overrides (empty ⇒ all classes share the base Sigma).
+    pub sigma_overrides: Vec<MixtureClassOverride>,
 }
 
 /// Supported PK structural models.
@@ -2893,6 +2989,14 @@ pub struct CompiledModel {
     /// [`CompiledModel::effective_for`] and the parser's
     /// `absorption_ode_equivalent_source` (#486, #790).
     pub absorption_ode_equivalent: Option<AbsorptionOdeEquivalent>,
+    /// `$MIXTURE`-style discrete latent subpopulations (#977). `Some` when the
+    /// model file carries a `[mixture]` block: the subject marginal becomes a
+    /// covariate-weighted mixture over `n_classes` class-conditional
+    /// likelihoods, and the reserved `MIXNUM` index (1..=K) selects
+    /// class-specific typical values in `[individual_parameters]`. `None` for an
+    /// ordinary single-population model. Phase 1 (#977) parses and validates the
+    /// spec; `fit()` errors until the objective is wired.
+    pub mixture: Option<MixtureSpec>,
 }
 
 /// The three call-time-configurable ODE solver tolerances ([`FitOptions::ode_reltol`],
@@ -3729,6 +3833,17 @@ pub struct SubjectResult {
     pub cens: Vec<i8>,
     /// Number of observations for this subject (MDV=0 rows).
     pub n_obs: usize,
+    /// Posterior class-membership probabilities `PMIX_ik` for a `[mixture]` model
+    /// (length = number of classes `K`); `None` for non-mixture fits. Formed from
+    /// the converged fit as `PMIX_ik ∝ p_ik · exp(−nll_ik)` (normalised over `k`)
+    /// and emitted as the `PMIX_1..PMIX_K` sdtab columns. (#977)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pmix: Option<Vec<f64>>,
+    /// Most-probable class `MIXEST_i` (1-based, NONMEM `MIXEST` convention) for a
+    /// `[mixture]` model; `None` for non-mixture fits. `argmax_k PMIX_ik`, emitted
+    /// as the `MIXEST` sdtab column. (#977)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixest: Option<usize>,
     /// Extra sdtab columns from [derived] and [output] blocks, computed
     /// post-fit. Each entry is (column_name, per-observation values). Subject-
     /// level aggregates (max, AUC, tmax) are repeated across all observation rows.

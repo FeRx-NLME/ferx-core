@@ -445,6 +445,7 @@ pub fn run_foce_gn(
             // the exact factor `L`; reused by `run_covariance` for a bit-for-bit
             // covariance instead of re-decomposing `omega` (#816 follow-up).
             packed_estimate: Some(x.clone()),
+            mixture_posteriors: None,
         };
     }
 
@@ -554,6 +555,7 @@ pub fn run_foce_gn(
         // Exact packed vector this stage's covariance step used (see above);
         // reused by `run_covariance` for a bit-for-bit covariance (#816 follow-up).
         packed_estimate: Some(final_packed),
+        mixture_posteriors: None,
     }
 }
 
@@ -1957,6 +1959,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         };
         CompiledModel {
             name: "gn_test".into(),
@@ -2018,6 +2021,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         }
     }
 
@@ -2964,6 +2968,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         };
         let model = CompiledModel {
             name: "gn_block_omega_test".into(),
@@ -3025,6 +3030,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         };
 
         let template = &model.default_params;
@@ -3251,6 +3257,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
+            mixture: None,
         };
         CompiledModel {
             name: "iov_gn_test".into(),
@@ -3313,6 +3320,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         }
     }
 

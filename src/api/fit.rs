@@ -200,6 +200,42 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
+    // objective via the derivative-free (BOBYQA) outer optimizer. Other
+    // estimators, inter-occasion variability, and adaptive-Gauss-Hermite
+    // marginalisation are not yet supported — reject them clearly rather than
+    // silently ignoring the mixture structure.
+    if model.mixture.is_some() {
+        // The objective keys the mixture path off `params.mixture` (carried from
+        // `init_params` through `unpack_params`). If a caller passes custom
+        // `init_params` with `mixture: None` — e.g. params rebuilt from a prior
+        // `FitResult` — the fit would silently run the single-population objective
+        // with `MIXNUM` pinned to the class-1 default. Fail loudly instead: the
+        // per-class Omega/Sigma must be present.
+        if init_params.mixture.is_none() {
+            return Err(
+                "mixture model ([mixture] block, #977) requires per-class Omega/Sigma in \
+                 `init_params.mixture`; pass the parsed model's `default_params` (or rebuild \
+                 them from the model file) rather than params with `mixture: None`"
+                    .to_string(),
+            );
+        }
+        for m in options.method_chain() {
+            if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
+                return Err(format!(
+                    "mixture models (#977) currently support only FOCE / FOCEI; the {} method \
+                     is not yet wired for mixtures",
+                    m.label()
+                ));
+            }
+        }
+        if init_params.omega_iov.is_some() {
+            return Err(
+                "mixture models (#977) do not yet support inter-occasion variability (kappa)"
+                    .to_string(),
+            );
+        }
+    }
     // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
     // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
     crate::dosing::clear_ss_nonconvergence_warnings();
@@ -1263,6 +1299,7 @@ fn fit_inner(
                     bayes: None,
                     cond_dist: None,
                     packed_estimate: None,
+                    mixture_posteriors: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -1476,6 +1513,19 @@ fn fit_inner(
         &result.kappas,
         options.interaction,
     );
+
+    // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto
+    // each SubjectResult so output.rs can emit the PMIX_1..PMIX_K and MIXEST
+    // columns. MIXEST is stored 1-based to match the NONMEM `MIXEST` convention.
+    if let Some(mp) = &result.mixture_posteriors {
+        for (sr, (pmix, mixest)) in subjects
+            .iter_mut()
+            .zip(mp.pmix.iter().zip(mp.mixest.iter()))
+        {
+            sr.pmix = Some(pmix.clone());
+            sr.mixest = Some(mixest + 1);
+        }
+    }
 
     // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
     // (with individual lagtime) for the mandatory TAD column in output.rs.

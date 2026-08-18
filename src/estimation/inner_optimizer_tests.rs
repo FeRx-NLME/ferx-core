@@ -1088,6 +1088,7 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: vec![],
+        mixture: None,
     };
     let model = CompiledModel {
         has_conditional_eta_params: false,
@@ -1156,6 +1157,7 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
 
     // Subject: 2 PK obs + 1 FREM obs

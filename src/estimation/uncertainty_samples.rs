@@ -81,6 +81,7 @@ pub fn fitted_params_from_result(
         sigma_fixed: fit_result.sigma_fixed.clone(),
         omega_iov,
         kappa_fixed: fit_result.kappa_fixed.clone(),
+        mixture: None,
     }
 }
 
@@ -320,6 +321,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         }
     }
 

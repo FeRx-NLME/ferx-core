@@ -2519,6 +2519,7 @@ mod tests {
             sigma_fixed: vec![false, true],
             omega_iov: None,
             kappa_fixed: vec![],
+            mixture: None,
         };
         CompiledModel {
             has_conditional_eta_params: false,
@@ -2587,6 +2588,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         }
     }
 

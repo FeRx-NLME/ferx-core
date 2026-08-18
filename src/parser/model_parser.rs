@@ -1946,7 +1946,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         (Some(omega_iov), kappa_fixed)
     };
 
-    let default_params = ModelParameters {
+    let mut default_params = ModelParameters {
         theta: theta_values,
         theta_names: theta_names.clone(),
         theta_lower,
@@ -1958,6 +1958,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         sigma_fixed,
         omega_iov,
         kappa_fixed,
+        mixture: None,
     };
 
     // Auto-generate tv_fn: evaluate individual parameters with eta=0
@@ -2116,6 +2117,42 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         "classify_indiv_params must return one ThetaTransform per theta"
     );
 
+    // ── [mixture] block (#977) ──
+    // MIXNUM is reserved read-only: reject any assignment to it, and reject its
+    // use in a model without a `[mixture]` block. When the block is present,
+    // parse + validate it here (theta/eta/sigma names must still be in scope —
+    // `theta_names`/`default_params` are moved into `CompiledModel` below).
+    if stmts_assign_mixnum(&indiv_stmts) {
+        return Err(
+            "MIXNUM is a reserved read-only mixture index and may not be assigned".to_string(),
+        );
+    }
+    let mixture_spec: Option<crate::types::MixtureSpec> =
+        if let Some(mix_lines) = blocks.get("mixture") {
+            Some(parse_mixture_block(
+                mix_lines,
+                &theta_names,
+                &eta_names_bsv,
+                &default_params.sigma.names,
+            )?)
+        } else {
+            if stmts_use_mixnum(&indiv_stmts) {
+                return Err(
+                    "MIXNUM is only valid in a mixture model; add a [mixture] block".to_string(),
+                );
+            }
+            None
+        };
+
+    // Build the numeric per-class Omega/Sigma into `default_params.mixture`
+    // (#977 Phase 2). Uses the just-built base Omega/Sigma; a local avoids
+    // borrowing `default_params` immutably and mutably at once.
+    let mixture_params = mixture_spec
+        .as_ref()
+        .map(|spec| build_mixture_params(spec, &default_params.omega, &default_params.sigma))
+        .transpose()?;
+    default_params.mixture = mixture_params;
+
     let model = CompiledModel {
         name,
         pk_model,
@@ -2177,6 +2214,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // Populated below from the [error_model] magnitude expressions (#484).
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
 
     // ── Optional blocks ──
@@ -2236,6 +2274,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // functions can branch without threading bloq_method through every call.
     let mut model = model;
     model.bloq_method = fit_options.bloq_method;
+    model.mixture = mixture_spec;
 
     // Build FremConfig from fit options when frem_predictions is present.
     // Format: "THETA_NAME/ETA_NAME:FREMTYPE, ..."
@@ -9562,6 +9601,468 @@ fn join_bracketed_lines(lines: &[String]) -> Vec<String> {
     out
 }
 
+/// Whether any node of an expression references a random effect (`eta`).
+/// Mixing-probability expressions must be eta-free (#977).
+fn expr_uses_eta(expr: &Expression) -> bool {
+    let mut found = false;
+    visit_expr_nodes(expr, &mut |e| {
+        if matches!(e, Expression::Eta(_)) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Parse a `[mixture]` block into a [`crate::types::MixtureSpec`] (#977).
+///
+/// Grammar (one directive per line, `#` starts a comment):
+/// ```text
+/// nsub = K                    # number of subpopulations, K >= 2
+/// logit(k) = <expr>           # class-k logit (softmax); k in 1..=K-1
+/// p(k)     = <expr>           # class-k probability (alternative form)
+/// omega(k) NAME ~ var [(sd)] [FIX]   # per-class Omega override (k in 2..=K)
+/// sigma(k) NAME ~ var [(sd)] [FIX]   # per-class Sigma override (k in 2..=K)
+/// ```
+/// `theta_names` / `eta_names` / `sigma_names` are the base declarations, used
+/// to resolve theta references in the mixing expressions and to validate that an
+/// override names an existing random-effect / residual term.
+fn parse_mixture_block(
+    lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    sigma_names: &[String],
+) -> Result<crate::types::MixtureSpec, String> {
+    use crate::types::{MixingExpr, MixtureClassOverride, MixtureSpec};
+
+    let nsub_re = Regex::new(r"(?i)^nsub\s*=\s*(\d+)$").unwrap();
+    let mix_re = Regex::new(r"(?i)^(logit|p)\s*\(\s*(\d+)\s*\)\s*=\s*(.+)$").unwrap();
+    // `omega(k) NAME ~ var [FIX] [(sd|var)] [FIX]` — mirrors the base omega/sigma
+    // regexes in `parse_parameters`, prefixed with the `(k)` class selector.
+    let ov_re = Regex::new(
+        r"(?i)^(omega|sigma)\s*\(\s*(\d+)\s*\)\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?$",
+    )
+    .unwrap();
+
+    let mut nsub: Option<usize> = None;
+    let mut mixing: Vec<MixingExpr> = Vec::new();
+    let mut omega_overrides: Vec<MixtureClassOverride> = Vec::new();
+    let mut sigma_overrides: Vec<MixtureClassOverride> = Vec::new();
+
+    for raw in lines {
+        // Strip inline `#` comments and surrounding whitespace.
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(c) = nsub_re.captures(line) {
+            if nsub.is_some() {
+                return Err("[mixture] duplicate `nsub` declaration".to_string());
+            }
+            nsub = Some(
+                c[1].parse::<usize>()
+                    .map_err(|_| "[mixture] bad nsub value")?,
+            );
+            continue;
+        }
+
+        if let Some(c) = ov_re.captures(line) {
+            let is_omega = c[1].eq_ignore_ascii_case("omega");
+            let class = c[2]
+                .parse::<usize>()
+                .map_err(|_| "[mixture] bad class index")?;
+            let name = c[3].to_string();
+            let raw_val: f64 = c[4]
+                .parse()
+                .map_err(|_| format!("[mixture] bad numeric value in `{line}`"))?;
+            let as_sd = c
+                .get(6)
+                .is_some_and(|m| m.as_str().eq_ignore_ascii_case("sd"));
+            // Reject negatives on both scales, mirroring the base omega/sigma
+            // parsing — a negative variance/SD would `sqrt` to NaN or pack to a
+            // clamped garbage value.
+            if raw_val < 0.0 {
+                let kind = if is_omega { "omega" } else { "sigma" };
+                return Err(format!(
+                    "[mixture] {kind}({class}) {} has a negative initial value ({raw_val}); \
+                     both variance and SD must be non-negative",
+                    c[3].to_string()
+                ));
+            }
+            let fixed = c.get(5).is_some() || c.get(7).is_some();
+            let ov = MixtureClassOverride {
+                class,
+                name,
+                init: raw_val,
+                as_sd,
+                fixed,
+            };
+            if is_omega {
+                omega_overrides.push(ov);
+            } else {
+                sigma_overrides.push(ov);
+            }
+            continue;
+        }
+
+        if let Some(c) = mix_re.captures(line) {
+            let is_logit = c[1].eq_ignore_ascii_case("logit");
+            let class = c[2]
+                .parse::<usize>()
+                .map_err(|_| "[mixture] bad class index")?;
+            let expr_src = c[3].trim();
+            let ctx = ParseCtx::new(theta_names, eta_names, &[]);
+            let toks = tokenize(expr_src)?;
+            let (expr, consumed) = parse_add_sub(&toks, 0, ctx)?;
+            if consumed != toks.len() {
+                return Err(format!(
+                    "[mixture] could not fully parse mixing expression `{expr_src}`"
+                ));
+            }
+            if expr_uses_eta(&expr) {
+                return Err(
+                    "[mixture] mixing-probability expression may not depend on a random effect (eta)"
+                        .to_string(),
+                );
+            }
+            mixing.push(MixingExpr {
+                class,
+                is_logit,
+                expr,
+            });
+            continue;
+        }
+
+        return Err(format!("[mixture] unrecognized directive: `{line}`"));
+    }
+
+    let n_classes = nsub.ok_or("[mixture] block requires `nsub = K` (K >= 2)")?;
+    if n_classes < 2 {
+        return Err(format!("[mixture] nsub must be >= 2 (got {n_classes})"));
+    }
+
+    // Mixing-expression coverage: forms may not be mixed, and exactly the
+    // classes 1..=K-1 must each be scored once (the last class is the softmax
+    // reference / probability complement).
+    if mixing.is_empty() {
+        return Err(
+            "[mixture] block requires a `logit(k)` or `p(k)` for each class 1..=nsub-1".to_string(),
+        );
+    }
+    let all_logit = mixing.iter().all(|m| m.is_logit);
+    let all_prob = mixing.iter().all(|m| !m.is_logit);
+    if !(all_logit || all_prob) {
+        return Err("[mixture] cannot mix `logit(k)` and `p(k)` forms in one block".to_string());
+    }
+    let mut seen = vec![false; n_classes]; // index 0 => class 1
+    for m in &mixing {
+        if m.class < 1 || m.class >= n_classes {
+            return Err(format!(
+                "[mixture] logit/p({}) out of range: expected class in 1..={}",
+                m.class,
+                n_classes - 1
+            ));
+        }
+        if seen[m.class - 1] {
+            return Err(format!(
+                "[mixture] duplicate mixing expression for class {}",
+                m.class
+            ));
+        }
+        seen[m.class - 1] = true;
+    }
+    for k in 1..n_classes {
+        if !seen[k - 1] {
+            return Err(format!(
+                "[mixture] missing mixing expression for class {k} (need one per class 1..={})",
+                n_classes - 1
+            ));
+        }
+    }
+
+    // Overrides: class in 2..=K, and the name must exist as a base eta/sigma.
+    let check_override = |ov: &MixtureClassOverride,
+                          names: &[String],
+                          kind: &str|
+     -> Result<(), String> {
+        if ov.class < 2 || ov.class > n_classes {
+            return Err(format!(
+                "[mixture] {kind}({}) out of range: per-class overrides use class 2..={n_classes} (class 1 is the base)",
+                ov.class
+            ));
+        }
+        if !names.contains(&ov.name) {
+            return Err(format!(
+                "[mixture] {kind}({}) {} does not name a base {kind} declaration",
+                ov.class, ov.name
+            ));
+        }
+        Ok(())
+    };
+    // Reject a duplicate (class, name) override: two declarations for the same
+    // entry would emit two packed coordinates for one variance with last-wins
+    // semantics, breaking the pack/unpack round-trip.
+    let check_dupes = |overrides: &[MixtureClassOverride], kind: &str| -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for ov in overrides {
+            if !seen.insert((ov.class, ov.name.clone())) {
+                return Err(format!(
+                    "[mixture] duplicate {kind}({}) override for {}",
+                    ov.class, ov.name
+                ));
+            }
+        }
+        Ok(())
+    };
+    for ov in &omega_overrides {
+        check_override(ov, eta_names, "omega")?;
+    }
+    for ov in &sigma_overrides {
+        check_override(ov, sigma_names, "sigma")?;
+    }
+    check_dupes(&omega_overrides, "omega")?;
+    check_dupes(&sigma_overrides, "sigma")?;
+
+    // Covariates referenced by the mixing expressions, for data validation.
+    let mut cov_set = std::collections::HashSet::new();
+    for m in &mixing {
+        visit_expr_nodes(&m.expr, &mut |e| {
+            if let Expression::Covariate(name) = e {
+                cov_set.insert(name.clone());
+            }
+        });
+    }
+    let mut logit_covariates: Vec<String> = cov_set.into_iter().collect();
+    logit_covariates.sort();
+
+    Ok(MixtureSpec {
+        n_classes,
+        mixing,
+        logit_covariates,
+        omega_overrides,
+        sigma_overrides,
+    })
+}
+
+/// Build the numeric per-class Omega/Sigma (`MixtureParams`) from a `MixtureSpec`
+/// and the base (class-1) Omega/Sigma (#977 Phase 2).
+///
+/// Each class starts as a copy of the base; every `omega(k)` / `sigma(k)`
+/// override replaces one diagonal entry, converting from the declared scale
+/// (`(sd)` → square for Omega variance, plain → square-root for the SD-scale
+/// Sigma) exactly as the base declarations do. The override addresses drive the
+/// per-class packed segment in `estimation::parameterization`. Omega overrides
+/// require a diagonal base Omega (a block base has no well-defined per-eta
+/// variance to swap).
+fn build_mixture_params(
+    spec: &crate::types::MixtureSpec,
+    base_omega: &crate::types::OmegaMatrix,
+    base_sigma: &crate::types::SigmaVector,
+) -> Result<crate::types::MixtureParams, String> {
+    use crate::types::{MixtureParams, OmegaMatrix, SigmaVector};
+
+    if !spec.omega_overrides.is_empty() && !base_omega.diagonal {
+        return Err(
+            "[mixture] per-class `omega(k)` overrides require a diagonal base omega (a block \
+             omega has no single per-eta variance to override)"
+                .to_string(),
+        );
+    }
+
+    let k = spec.n_classes;
+    // Working matrices/vectors, one per class, seeded from the base.
+    let mut work_omega: Vec<nalgebra::DMatrix<f64>> = vec![base_omega.matrix.clone(); k];
+    let mut work_sigma: Vec<Vec<f64>> = vec![base_sigma.values.clone(); k];
+
+    let mut omega_override_addr: Vec<(usize, usize)> = Vec::new();
+    let mut omega_override_fixed: Vec<bool> = Vec::new();
+    for ov in &spec.omega_overrides {
+        let e = base_omega
+            .eta_names
+            .iter()
+            .position(|n| n == &ov.name)
+            .ok_or_else(|| format!("[mixture] omega({}) {} not a base eta", ov.class, ov.name))?;
+        let c = ov.class - 1; // class is 1-based, validated >= 2 in Phase 1
+        let variance = if ov.as_sd { ov.init * ov.init } else { ov.init };
+        work_omega[c][(e, e)] = variance;
+        omega_override_addr.push((c, e));
+        omega_override_fixed.push(ov.fixed);
+    }
+
+    let mut sigma_override_addr: Vec<(usize, usize)> = Vec::new();
+    let mut sigma_override_fixed: Vec<bool> = Vec::new();
+    for ov in &spec.sigma_overrides {
+        let s = base_sigma
+            .names
+            .iter()
+            .position(|n| n == &ov.name)
+            .ok_or_else(|| format!("[mixture] sigma({}) {} not a base sigma", ov.class, ov.name))?;
+        let c = ov.class - 1;
+        // Sigma is stored on the SD scale: `(sd)` keeps it, plain input is sqrt'd.
+        let value = if ov.as_sd { ov.init } else { ov.init.sqrt() };
+        work_sigma[c][s] = value;
+        sigma_override_addr.push((c, s));
+        sigma_override_fixed.push(ov.fixed);
+    }
+
+    let omega = (0..k)
+        .map(|c| {
+            OmegaMatrix::from_matrix_with_mask(
+                work_omega[c].clone(),
+                base_omega.eta_names.clone(),
+                base_omega.diagonal,
+                base_omega.free_mask.clone(),
+            )
+        })
+        .collect();
+    let sigma = (0..k)
+        .map(|c| SigmaVector {
+            values: work_sigma[c].clone(),
+            names: base_sigma.names.clone(),
+        })
+        .collect();
+
+    Ok(MixtureParams {
+        omega,
+        sigma,
+        omega_override_addr,
+        omega_override_fixed,
+        sigma_override_addr,
+        sigma_override_fixed,
+    })
+}
+
+/// Re-add the RAII guard for the mixture-class thread-local (#977 Phase 3). The
+/// mixture objective sets `MIXTURE_CLASS = k` around each class's inner EBE solve
+/// and NLL so `MIXNUM` branches in `[individual_parameters]` see class `k`, then
+/// restores the prior value on drop (panic-safe). Must be set on the *same*
+/// thread that runs the prediction (the objective drives the per-class solve
+/// serially for exactly this reason — a thread-local set on the outer thread
+/// would not reach rayon workers).
+pub(crate) struct MixtureClassGuard(usize);
+
+impl MixtureClassGuard {
+    /// Set `MIXTURE_CLASS` to `class` (1-based), restoring the prior value on drop.
+    pub(crate) fn enter(class: usize) -> Self {
+        let prev = MIXTURE_CLASS.with(|cell| cell.replace(class));
+        MixtureClassGuard(prev)
+    }
+}
+
+impl Drop for MixtureClassGuard {
+    fn drop(&mut self) {
+        MIXTURE_CLASS.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Evaluate the per-class mixing log-probabilities `ln p_ik` for one subject
+/// (#977 Phase 3). Mixing expressions depend only on theta + (baseline)
+/// covariates — never eta (validated at parse time) — so this takes a plain
+/// covariate map and no random effects.
+///
+/// - `logit(k)` form: scores `1..=K-1`, reference class `K` has logit 0;
+///   `p = softmax(logits)`.
+/// - `p(k)` form: probabilities for `1..=K-1`, last class is the complement;
+///   renormalized defensively.
+pub(crate) fn eval_mixing_log_probs(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Vec<f64> {
+    let k = spec.n_classes;
+    let empty_vars: HashMap<String, f64> = HashMap::new();
+    let env = MapEnv {
+        covariates,
+        vars: &empty_vars,
+    };
+    let no_eta: [f64; 0] = [];
+
+    if spec.mixing.iter().all(|m| m.is_logit) {
+        let mut logits = vec![0.0f64; k]; // reference class K stays 0
+        for m in &spec.mixing {
+            logits[m.class - 1] = eval_expr(&m.expr, theta, &no_eta, &env, &[]);
+        }
+        // ln p_k = logit_k − logsumexp(logits)
+        let max = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let lse = max + logits.iter().map(|l| (l - max).exp()).sum::<f64>().ln();
+        logits.iter().map(|l| l - lse).collect()
+    } else {
+        let mut p = vec![0.0f64; k];
+        let mut sum = 0.0;
+        for m in &spec.mixing {
+            let v = eval_expr(&m.expr, theta, &no_eta, &env, &[]).clamp(1e-12, 1.0 - 1e-12);
+            p[m.class - 1] = v;
+            sum += v;
+        }
+        p[k - 1] = (1.0 - sum).clamp(1e-12, 1.0);
+        let tot: f64 = p.iter().sum();
+        p.iter().map(|v| (v / tot).ln()).collect()
+    }
+}
+
+/// Analytic `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4),
+/// returned as `K × n_theta`. Only the **logit** form is differentiated here
+/// (`p = softmax(g)`), which is the general covariate-dependent case; the `p`
+/// (direct-probability) form returns `None` so the caller routes to FD.
+///
+/// For the softmax: `∂ ln p_k/∂θ_j = ∂g_k/∂θ_j − Σ_m p_m ∂g_m/∂θ_j`, where the
+/// per-class scores `g_k` are the mixing expressions (reference class `K` has
+/// `g ≡ 0 ⇒ ∂ = 0`) and `∂g/∂θ_j` comes from the symbolic differentiator.
+pub(crate) fn mixing_logp_grad(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<Vec<f64>>> {
+    if !spec.mixing.iter().all(|m| m.is_logit) {
+        return None; // p-form → FD fallback
+    }
+    let k = spec.n_classes;
+    let nt = theta.len();
+    let empty_vars: HashMap<String, f64> = HashMap::new();
+    let env = MapEnv {
+        covariates,
+        vars: &empty_vars,
+    };
+    let no_eta: [f64; 0] = [];
+
+    // Per-class logit value and its θ-gradient (reference class K stays 0). The
+    // mixing expression is a cheap closed form over θ + covariates (no inner
+    // solve, no random effects), so a central difference over θ is machine-exact
+    // — and it avoids the symbolic differentiator, which expects resolved
+    // covariate-index nodes the mixing AST never carries.
+    let mut logit = vec![0.0f64; k];
+    let mut dlogit = vec![vec![0.0f64; nt]; k];
+    let mut tperturb = theta.to_vec();
+    for m in &spec.mixing {
+        let c = m.class - 1;
+        logit[c] = eval_expr(&m.expr, theta, &no_eta, &env, &[]);
+        for j in 0..nt {
+            let h = 1e-6 * theta[j].abs().max(1.0);
+            tperturb[j] = theta[j] + h;
+            let fp = eval_expr(&m.expr, &tperturb, &no_eta, &env, &[]);
+            tperturb[j] = theta[j] - h;
+            let fm = eval_expr(&m.expr, &tperturb, &no_eta, &env, &[]);
+            tperturb[j] = theta[j];
+            dlogit[c][j] = (fp - fm) / (2.0 * h);
+        }
+    }
+    // p = softmax(logit)
+    let max = logit.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let ex: Vec<f64> = logit.iter().map(|l| (l - max).exp()).collect();
+    let s: f64 = ex.iter().sum();
+    let p: Vec<f64> = ex.iter().map(|e| e / s).collect();
+
+    // ∂ ln p_c/∂θ_j = dlogit[c][j] − Σ_m p_m dlogit[m][j]
+    let mut out = vec![vec![0.0f64; nt]; k];
+    for j in 0..nt {
+        let wsum: f64 = (0..k).map(|m| p[m] * dlogit[m][j]).sum();
+        for c in 0..k {
+            out[c][j] = dlogit[c][j] - wsum;
+        }
+    }
+    Some(out)
+}
+
 fn parse_parameters(
     lines: &[String],
 ) -> Result<
@@ -11529,6 +12030,14 @@ pub(crate) enum Expression {
     Theta(usize),
     Eta(usize),
     Time,
+    /// Reserved read-only subpopulation index `MIXNUM` (1..=K) for `$MIXTURE`
+    /// models (#977). Resolves from the mixture-class thread-local
+    /// (`current_mixture_class`, default 1) at eval time — mirrors `Time`. It is
+    /// constant within a single class evaluation (∂/∂θ = ∂/∂η = 0) but *varies
+    /// across classes*, so it is treated as dynamic by the constant-fold guards
+    /// (`bytecode_is_dynamic` / `expr_is_dynamic`) exactly like `Time`, to keep a
+    /// `MIXNUM`-dependent slot from folding to class 1's value.
+    MixNum,
     Covariate(String),
     Variable(String),
     /// Same as `Variable(name)` but pre-resolved to a slot index. Produced
@@ -11604,6 +12113,21 @@ pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
 
 fn current_model_time() -> f64 {
     MODEL_TIME.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// Active subpopulation index (1..=K) for `$MIXTURE` models (#977), read by
+    /// `Expression::MixNum` / `Op::PushMixNum`. Defaults to 1 so non-mixture
+    /// evaluation and any class-agnostic path (`predict`/`simulate`) see class 1.
+    static MIXTURE_CLASS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+}
+
+// The RAII guard that sets `MIXTURE_CLASS` per (subject × class) around each
+// class NLL lands with the mixture objective (#977 Phase 3). Until then the
+// thread-local stays at its class-1 default and `MIXNUM` resolves to 1.
+
+fn current_mixture_class() -> usize {
+    MIXTURE_CLASS.with(std::cell::Cell::get)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11821,6 +12345,36 @@ fn stmts_use_time_builtin(stmts: &[Statement]) -> bool {
         }
     });
     found
+}
+
+/// Whether any expression in the statement list references the reserved
+/// `MIXNUM` subpopulation index (#977). Used to reject `MIXNUM` in a
+/// non-mixture model.
+fn stmts_use_mixnum(stmts: &[Statement]) -> bool {
+    let mut found = false;
+    visit_stmt_nodes(stmts, &mut |e| {
+        if matches!(e, Expression::MixNum) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Whether any statement assigns to `MIXNUM`. The index is reserved read-only
+/// (#977), so an assignment to it is rejected. Recurses into `if` branches.
+/// Called before `resolve_variable_indices`, so only `Assign` / `If` appear.
+fn stmts_assign_mixnum(stmts: &[Statement]) -> bool {
+    stmts.iter().any(|s| match s {
+        Statement::Assign(name, _) => name.eq_ignore_ascii_case("MIXNUM"),
+        Statement::If {
+            branches,
+            else_body,
+        } => {
+            branches.iter().any(|(_, body)| stmts_assign_mixnum(body))
+                || else_body.as_deref().is_some_and(stmts_assign_mixnum)
+        }
+        _ => false,
+    })
 }
 
 pub(crate) fn compiled_model_uses_time_builtin(model: &CompiledModel) -> bool {
@@ -12298,6 +12852,7 @@ fn rewrite_readout_synth(expr: &mut Expression, synth: &[ReadoutSynthParam]) {
         }
         Expression::Literal(_)
         | Expression::Time
+        | Expression::MixNum
         | Expression::Covariate(_)
         | Expression::Variable(_)
         | Expression::VariableIdx(_)
@@ -12586,6 +13141,7 @@ fn eval_expr<E: EvalEnv>(
         Expression::Theta(i) => theta[*i],
         Expression::Eta(i) => eta[*i],
         Expression::Time => current_model_time(),
+        Expression::MixNum => current_mixture_class() as f64,
         Expression::Variable(_)
         | Expression::Covariate(_)
         | Expression::VariableIdx(_)
@@ -12759,6 +13315,7 @@ enum Op {
     PushTheta(u32),
     PushEta(u32),
     PushTime,
+    PushMixNum,
     PushVar(u32),
     PushCov(u32),
     PushNnOutput(u32, u32),
@@ -12932,6 +13489,7 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::PushTheta(_)
             | Op::PushEta(_)
             | Op::PushTime
+            | Op::PushMixNum
             | Op::PushVar(_)
             | Op::PushCov(_)
             | Op::PushNnOutput(_, _) => 1,
@@ -13009,6 +13567,7 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
         Expression::Theta(i) => bc.ops.push(Op::PushTheta(*i as u32)),
         Expression::Eta(i) => bc.ops.push(Op::PushEta(*i as u32)),
         Expression::Time => bc.ops.push(Op::PushTime),
+        Expression::MixNum => bc.ops.push(Op::PushMixNum),
         Expression::VariableIdx(i) => bc.ops.push(Op::PushVar(*i as u32)),
         Expression::CovariateIdx(i) => bc.ops.push(Op::PushCov(*i as u32)),
         Expression::Variable(_) | Expression::Covariate(_) => {
@@ -13166,6 +13725,7 @@ fn eval_bytecode(
             Op::PushTheta(i) => push!(theta.get(i as usize).copied().unwrap_or(0.0)),
             Op::PushEta(i) => push!(eta.get(i as usize).copied().unwrap_or(0.0)),
             Op::PushTime => push!(current_model_time()),
+            Op::PushMixNum => push!(current_mixture_class() as f64),
             Op::PushVar(i) => push!(vars.get(i as usize).copied().unwrap_or(0.0)),
             Op::PushCov(i) => push!(covariates.get(i as usize).copied().unwrap_or(0.0)),
             Op::PushNnOutput(nn_i, out_i) => {
@@ -13388,6 +13948,7 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
             Op::PushTheta(i) => push!(theta.get(i as usize).copied().unwrap_or_else(|| k(0.0))),
             Op::PushEta(i) => push!(eta.get(i as usize).copied().unwrap_or_else(|| k(0.0))),
             Op::PushTime => push!(k(current_model_time())),
+            Op::PushMixNum => push!(k(current_mixture_class() as f64)),
             Op::PushVar(i) => push!(*vars.get(i as usize).unwrap_or(&k(0.0))),
             Op::PushCov(i) => push!(k(covariates.get(i as usize).copied().unwrap_or(0.0))),
             Op::PushNnOutput(nn_i, out_i) => {
@@ -13934,7 +14495,11 @@ impl OdeRhsProgram {
 /// unfolded walk on all axes.
 fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
     bc.ops.iter().any(|op| match op {
-        Op::PushEta(_) | Op::PushTheta(_) | Op::PushTime | Op::PushNnOutput(_, _) => true,
+        Op::PushEta(_)
+        | Op::PushTheta(_)
+        | Op::PushTime
+        | Op::PushMixNum
+        | Op::PushNnOutput(_, _) => true,
         Op::PushVar(i) => dyn_vars.get(*i as usize).copied().unwrap_or(false),
         _ => false,
     })
@@ -13948,6 +14513,7 @@ fn expr_is_dynamic(e: &Expression, dyn_vars: &[bool]) -> bool {
         Expression::Eta(_)
         | Expression::Theta(_)
         | Expression::Time
+        | Expression::MixNum
         | Expression::NnOutput { .. } => true,
         Expression::Variable(_) => true,
         Expression::VariableIdx(i) => dyn_vars.get(*i).copied().unwrap_or(false),
@@ -14971,6 +15537,7 @@ fn resolve_expr_indices(
         | Expression::Theta(_)
         | Expression::Eta(_)
         | Expression::Time
+        | Expression::MixNum
         | Expression::VariableIdx(_)
         | Expression::CovariateIdx(_)
         | Expression::NnOutput { .. } => {}
@@ -15102,7 +15669,7 @@ fn differentiate_with_chain(
         }
     };
     match expr {
-        Expression::Literal(_) | Expression::Time => Expression::Literal(0.0),
+        Expression::Literal(_) | Expression::Time | Expression::MixNum => Expression::Literal(0.0),
         Expression::Theta(k) => match axis {
             DiffAxis::Theta(j) => kron(*k, j),
             _ => Expression::Literal(0.0),
@@ -15310,6 +15877,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
         | Expression::Theta(_)
         | Expression::Eta(_)
         | Expression::Time
+        | Expression::MixNum
         | Expression::Variable(_)
         | Expression::VariableIdx(_)
         | Expression::Covariate(_)
@@ -16004,6 +16572,14 @@ fn parse_atom(
         Token::Ident(name) => {
             if name == "TIME" || name == "time" {
                 return Ok((Expression::Time, pos + 1));
+            }
+
+            // MIXNUM — reserved read-only subpopulation index (1..=K) for
+            // `$MIXTURE` models (#977). Case-insensitive, like the `MACHEPS`
+            // built-in. Resolves to `Expression::MixNum`; a non-mixture model
+            // that references it is rejected later by `validate_mixture_spec`.
+            if name.eq_ignore_ascii_case("MIXNUM") {
+                return Ok((Expression::MixNum, pos + 1));
             }
 
             // compartments[N] — subscript access into DerivedContext::compartments.

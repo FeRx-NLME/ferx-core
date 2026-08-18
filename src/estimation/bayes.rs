@@ -1188,6 +1188,7 @@ pub fn run_bayes(
         sigma_fixed: init_params.sigma_fixed.clone(),
         omega_iov: omega_iov_mean.clone(),
         kappa_fixed: init_params.kappa_fixed.clone(),
+        mixture: None,
     };
 
     // Final EBEs + sensitivity (H) matrices at the posterior mean, warm-started
@@ -1300,6 +1301,7 @@ pub fn run_bayes(
         bayes: Some(bayes),
         cond_dist: None,
         packed_estimate: None,
+        mixture_posteriors: None,
     })
 }
 

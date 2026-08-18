@@ -1,0 +1,109 @@
+# Mixture Models
+
+> **Maturity: experimental** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+A **mixture model** treats each subject as belonging to one of $K$ unobserved
+subpopulations ("classes"). Class $k$ has its own set of class-specific typical
+values (and, optionally, its own $\Omega$ / $\Sigma$), and a subject is assigned
+to a class only probabilistically, through covariate-dependent **mixing
+probabilities**. This is the ferx analogue of NONMEM's `$MIXTURE`.
+
+## Model file
+
+Declare the number of classes and the mixing rule in a `[mixture]` block, and
+select class-specific typical values with the reserved read-only `MIXNUM` index
+(`1..=K`) inside `[individual_parameters]`:
+
+```toml
+[parameters]
+  theta TVCL1(1.0); theta TVCL2(3.0)   # class-specific clearance
+  theta TVV(10.0)
+  theta MIXL(0.0)                       # mixing logit intercept
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL                       # p(1) = σ(logit);  p(2) = 1 − p(1)
+  # omega(2) ETA_CL ~ 0.15              # optional per-class Ω override
+  # sigma(2) EPS ~ 0.05                 # optional per-class Σ override
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+```
+
+The mixing rule may be given as a **logit** (`logit(k) = …`) or a **probability**
+(`p(k) = …`) expression over thetas and covariates; the remaining class's
+probability is the complement. Mixing expressions must not depend on any $\eta$.
+
+## Objective
+
+Each subject's marginal likelihood is the covariate-weighted mixture of its
+class-conditional likelihoods, and the population objective is the numerically
+stable log-sum-exp of the per-class FOCE/FOCEI negative log-likelihoods:
+
+$$
+p_{ik} = \operatorname{softmax}_k\big(g_k(\theta,\, \text{cov}_i)\big),
+\qquad
+L_i = \sum_{k=1}^{K} p_{ik}\, L_{ik},
+$$
+
+$$
+\text{OFV} = -2 \sum_{i=1}^{N} \log \sum_{k=1}^{K} p_{ik}\, \exp(-\text{nll}_{ik}).
+$$
+
+`nll_ik` is the ordinary per-subject FOCE/FOCEI negative log-likelihood evaluated
+with class-$k$ parameters and a **separate empirical Bayes solve per
+(subject × class)**. The mixing-logit coefficients are ordinary thetas and any
+per-class $\Omega$/$\Sigma$ are estimated jointly. Estimation defaults to the
+derivative-free BOBYQA outer optimizer; an analytic posterior-weighted outer
+gradient is available, so a user-selected NLopt gradient optimizer (SLSQP /
+L-BFGS / MMA) is honoured, with an automatic finite-difference fallback for
+models outside analytic scope (e.g. `MIXNUM`-branched typical values).
+
+## Output
+
+For a mixture fit, `sdtab` gains two per-subject diagnostics, matching the
+NONMEM reserved variables:
+
+- **`MIXEST`** — the most-probable class $\operatorname{argmax}_k \text{PMIX}_{ik}$
+  (1-based).
+- **`PMIX_1 … PMIX_K`** — the posterior class-membership probabilities
+  $\text{PMIX}_{ik} \propto p_{ik}\exp(-\text{nll}_{ik})$, normalised over $k$.
+
+## Validation against NONMEM
+
+A two-class clearance mixture (`tests/nonmem/mixture_iv.ctl` and the
+slow-gated `tests/mixture_nonmem.rs`) was fit by both engines on the same
+30-subject IV dataset — two subpopulations with `CL ≈ 1` and `CL ≈ 3`, a
+constant mixing fraction, and $\Omega$/$\Sigma$ fixed at the data-generating
+values (`METHOD=1 INTER` in NONMEM; FOCEI in ferx). NONMEM's minimization was
+successful.
+
+| Quantity | NONMEM 7.5.1 | ferx |
+|---|---|---|
+| OFV (without constant) | 301.582 | 301.600 |
+| `TVCL1` (class 1) | 0.981 | ≈ 0.98 |
+| `TVCL2` (class 2) | 2.842 | ≈ 2.84 |
+| `V` | 9.979 | ≈ 9.98 |
+| mixing fraction `p(1)` | 0.472 | ≈ 0.47 |
+| `MIXEST` classification | — | **30 / 30 subjects agree** |
+
+The objectives agree to ~0.02 units and the per-subject `MIXEST` class
+assignment is identical for every subject.
+
+## Not yet supported
+
+Mixture models are currently limited to FOCE/FOCEI. The following error clearly
+rather than silently mis-fitting:
+
+- Other estimators (SAEM / IMP / Bayes).
+- Inter-occasion variability within a mixture.
+- Standard errors / covariance step for mixture parameters.

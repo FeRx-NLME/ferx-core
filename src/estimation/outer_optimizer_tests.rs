@@ -448,6 +448,7 @@ fn test_packed_param_label_block_omega() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
 
     // n_theta=2, so: idx=2 → omega[ETA_CL, ETA_CL], idx=3 → omega[ETA_V, ETA_CL] (off-diag),
@@ -507,6 +508,7 @@ fn test_packed_param_label_sigma() {
         sigma_fixed: vec![false, false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     // packed layout: [theta(0), omega(1), sigma(2), sigma(3)]
     assert_eq!(packed_param_label(2, &template), "sigma[1]");
@@ -535,6 +537,7 @@ fn test_packed_param_label_kappa() {
             vec!["KAPPA_CL".into()],
         )),
         kappa_fixed: vec![false],
+        mixture: None,
     };
     // packed layout: [theta(0), omega(1), sigma(2), kappa(3)]
     assert_eq!(packed_param_label(3, &template), "kappa[1]");
@@ -576,6 +579,7 @@ fn test_compute_covariance_invalid_eps() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: vec![],
+        mixture: None,
     };
     let x_hat: Vec<f64> = vec![
         5.0_f64.ln(),
@@ -737,6 +741,7 @@ fn fresh_state() -> NloptState {
     NloptState {
         cached_etas: Vec::new(),
         cached_h_mats: Vec::new(),
+        cached_etas_by_class: Vec::new(),
         best_ofv: 0.0,
         n_evals: 0,
         n_grad_evals: 0,
@@ -933,6 +938,7 @@ fn make_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     CompiledModel {
         name: "outer_test".into(),
@@ -994,6 +1000,7 @@ fn make_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -1227,6 +1234,7 @@ fn test_outer_ad_gradient_block_omega() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let model = CompiledModel {
         name: "block_test".into(),
@@ -1288,6 +1296,7 @@ fn test_outer_ad_gradient_block_omega() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
     check_gradient(&model, &make_population(3), 2);
 }
@@ -1701,6 +1710,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         sigma_fixed: vec![true],
         omega_iov: Some(omega_iov),
         kappa_fixed: vec![true],
+        mixture: None,
     };
     let model = CompiledModel {
         frem_config: None,
@@ -1709,6 +1719,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
         name: "iov_cov_test".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,

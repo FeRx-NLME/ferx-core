@@ -443,6 +443,7 @@ pub fn optimize_trust_region(
         // factor `L`; carrying it lets `run_covariance` reproduce this covariance
         // step bit-for-bit instead of re-decomposing `omega` (#816 follow-up).
         packed_estimate: Some(best_x.clone()),
+        mixture_posteriors: None,
     }
 }
 

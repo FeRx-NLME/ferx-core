@@ -627,6 +627,7 @@ fn make_iov_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: Some(omega_iov),
         kappa_fixed: vec![false],
+        mixture: None,
     };
     CompiledModel {
         name: "iov_test".into(),
@@ -689,6 +690,7 @@ fn make_iov_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -2894,6 +2896,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     CompiledModel {
         name: "no_iov".into(),
@@ -2955,6 +2958,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -3039,6 +3043,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let model = CompiledModel {
         frem_config: None,
@@ -3047,6 +3052,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
         name: "noniov_mu".into(),
         has_conditional_eta_params: false,
         pk_model: PkModel::OneCptIv,

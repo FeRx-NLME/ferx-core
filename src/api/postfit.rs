@@ -715,6 +715,10 @@ pub(crate) fn compute_subject_results(
                 ofv_contribution: 2.0 * ofv_i,
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
+                // Mixture posteriors (#977) are threaded on post-fit in fit.rs from
+                // the converged MixtureEval; None for every non-mixture subject.
+                pmix: None,
+                mixest: None,
                 extra_columns: vec![],
                 per_obs_tad: vec![],
                 compartment_states,
