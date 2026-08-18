@@ -13519,6 +13519,53 @@ fn mixnum_in_non_mixture_model_rejected() {
 }
 
 #[test]
+fn mixnum_outside_indiv_params_rejected() {
+    // #980: MIXNUM anywhere in a model with no [mixture] block must be rejected,
+    // not just in [individual_parameters]. The AST guard only scans indiv
+    // statements; a raw-token scan of the other blocks catches this [derived] use.
+    let src = r"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+
+[derived]
+  FOO = MIXNUM
+";
+    let err = parse_model_string(src)
+        .expect_err("MIXNUM in [derived] without [mixture] must be rejected");
+    assert!(
+        err.contains("MIXNUM") && err.contains("mixture"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn mixing_expression_covariate_registered() {
+    // #980: a covariate used only in the mixing expression (logit) must land in
+    // referenced_covariates so the data reader loads its column — else it silently
+    // reads 0 and the covariate-dependent mixing degrades to intercept-only (the
+    // #765 trap, already fixed for the scaling / error-selector / init blocks).
+    let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "WT"),
+        "mixing-expr covariate WT must be registered, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+#[test]
 fn mixnum_assignment_rejected() {
     // `MIXNUM = …` in [individual_parameters] of an otherwise-valid mixture model.
     let src = MIXTURE_2CLASS.replace("  V = TVV", "  V = TVV\n  MIXNUM = 2");

@@ -249,10 +249,12 @@ pub fn mixture_gradient(
     let mut grad = vec![0.0f64; total];
 
     for cls in 0..k {
-        let _guard = MixtureClassGuard::enter(cls + 1);
         let cp = class_params(params, cls);
         let x_k = pack_params(&cp);
         // ∂nll_ik/∂x_k over the class-k packed layout [θ, Ω(base slots), σ, …].
+        // The class thread-local is set inside each rayon worker (the outer-thread
+        // guard would not reach them), so pass `Some(cls + 1)` rather than relying
+        // on a `MixtureClassGuard` on this thread.
         let g_k = per_subject_packed_gradients(
             model,
             population,
@@ -260,6 +262,7 @@ pub fn mixture_gradient(
             &x_k,
             &eval.etas_by_class[cls],
             interaction,
+            Some(cls + 1),
         );
         for (i, gk_i) in g_k.iter().enumerate() {
             let gi = gk_i.as_ref()?; // out-of-scope subject → FD fallback
@@ -464,6 +467,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mixture_eval_only_emits_posteriors() {
+        // Regression (#980): an eval-only run (outer_maxiter = 0, NONMEM
+        // MAXEVAL=0 semantics) must still emit PMIX/MIXEST per subject, exactly
+        // like a converged mixture fit. The eval-only path previously hard-coded
+        // `mixture_posteriors: None`, so the sdtab columns silently vanished.
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            outer_maxiter: 0,
+            ..crate::types::FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("eval-only mixture fit should return Ok");
+        assert!(res.ofv.is_finite(), "OFV = {}", res.ofv);
+        for sr in &res.subjects {
+            let pmix = sr
+                .pmix
+                .as_ref()
+                .expect("PMIX populated for an eval-only mixture fit");
+            assert_eq!(pmix.len(), 2, "K = 2 posterior weights per subject");
+            assert!((pmix.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+            assert!(
+                sr.mixest.is_some(),
+                "MIXEST populated for eval-only mixture"
+            );
+        }
+    }
+
     // Variance-mixture (classes differ only by their Ω/Σ overrides, no `MIXNUM`
     // branch) so the per-subject analytic sensitivity provider is in scope — the
     // parity test then exercises the real analytic gradient (softmax mixing
@@ -526,6 +558,51 @@ mod tests {
             );
         }
         assert!(worst.is_finite());
+    }
+
+    #[test]
+    fn mixture_gradient_mixnum_branch_matches_fd() {
+        // Regression (#980): a MIXNUM-branched typical value (CL = if MIXNUM==1
+        // TVCL1… else TVCL2…) *is* in analytic scope (the conditional differentiates
+        // in closed form), so `mixture_gradient` returns Some and drives a gradient
+        // optimizer. The per-class analytic sensitivity runs under a rayon
+        // `par_iter`; the `MIXTURE_CLASS` thread-local must be set *inside* each
+        // worker, else class 2 is computed on the TVCL1 branch — a silently wrong,
+        // class-swapped gradient (∂/∂TVCL2 ≈ 0). Central FD of the mixture OFV knows
+        // nothing of the thread-local, so parity here pins the fix.
+        use crate::estimation::parameterization::pack_params;
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(5, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+        let params = &model.default_params;
+
+        let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
+        let ana = super::mixture_gradient(&model, &pop, params, &opts, &eval)
+            .expect("MIXNUM-conditional typical value is in analytic scope");
+        let x = pack_params(params);
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+
+        assert_eq!(ana.len(), fd.len());
+        // Locate the TVCL1 / TVCL2 theta slots: the class-swap bug zeroes the
+        // gradient for the class that isn't the thread-local default (class 1).
+        let i_tvcl2 = model
+            .theta_names
+            .iter()
+            .position(|n| n == "TVCL2")
+            .expect("TVCL2 theta");
+        assert!(
+            fd[i_tvcl2].abs() > 1e-2,
+            "FD ∂OFV/∂TVCL2 should be clearly nonzero, got {}",
+            fd[i_tvcl2]
+        );
+        for (i, (a, f)) in ana.iter().zip(&fd).enumerate() {
+            let denom = f.abs().max(a.abs()).max(1e-3);
+            let rel = (a - f).abs() / denom;
+            assert!(
+                rel < 2e-2,
+                "coord {i}: analytic {a:.6} vs FD {f:.6} (rel {rel:.2e})"
+            );
+        }
     }
 
     #[test]

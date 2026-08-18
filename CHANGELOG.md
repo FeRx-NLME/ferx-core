@@ -62,6 +62,14 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **Mixture-model correctness fixes (#980, follow-up to #977).** The analytic outer gradient for a
+  `MIXNUM`-branched typical value (e.g. class-specific clearance) now resolves the correct class on
+  every rayon worker, so a gradient optimizer (SLSQP/L-BFGS/MMA) is no longer misled by a
+  class-swapped gradient; a covariate used only in a mixing expression is now registered as a
+  required data column (it was silently read as 0, degrading covariate mixing to intercept-only);
+  `MIXNUM` outside a `[mixture]` model is rejected everywhere, not just in `[individual_parameters]`;
+  and an evaluation-only mixture run (`outer_maxiter = 0`) now emits the `PMIX_*`/`MIXEST` columns
+  like a converged fit.
 - **A design population is now rejected by `fit()` instead of being fitted to its placeholders.**
   The population returned by `read_population_for_simulation()` carries a `NaN` placeholder for
   each not-yet-generated observation, and nothing checked observations for finiteness: with

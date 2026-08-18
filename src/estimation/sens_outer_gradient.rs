@@ -2002,6 +2002,13 @@ pub fn population_gradient_sens(
 /// block stalled SLSQP/L-BFGS/MMA well above the derivative-free optimum
 /// (focei-slsqp-fixed-ebe-gradient-bias). Caller scales each entry by 2 and
 /// zeroes fixed coordinates when assembling the population sum.
+///
+/// `mixture_class` (1-based) is `Some(k)` for the mixture outer gradient (#977):
+/// the `MIXTURE_CLASS` thread-local is set **inside** each rayon worker's closure
+/// so `MIXNUM` branches in the typical value resolve to class `k`. The guard the
+/// mixture objective set on the *calling* thread does not reach rayon workers, so
+/// without this every class's analytic sensitivity would silently read the
+/// default class 1. `None` leaves the thread-local at its default (non-mixture).
 pub fn per_subject_packed_gradients(
     model: &CompiledModel,
     population: &Population,
@@ -2009,12 +2016,16 @@ pub fn per_subject_packed_gradients(
     x: &[f64],
     eta_hats: &[DVector<f64>],
     interaction: bool,
+    mixture_class: Option<usize>,
 ) -> Vec<Option<Vec<f64>>> {
     population
         .subjects
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
+            // Set the mixture-class thread-local on *this* worker thread (the
+            // outer-thread guard does not propagate into rayon workers).
+            let _guard = mixture_class.map(crate::parser::model_parser::MixtureClassGuard::enter);
             if interaction {
                 subject_packed_gradient(model, subject, template, x, eta_hats[i].as_slice())
             } else {

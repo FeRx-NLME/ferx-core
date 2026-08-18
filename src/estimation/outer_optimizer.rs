@@ -392,14 +392,25 @@ fn evaluate_at_initial_params(
     let mut x = pack_params(init_params);
     clamp_to_bounds(&mut x, &bounds);
     let params = unpack_params(&x, init_params);
-    let n_subj = population.subjects.len();
 
     // Mixture (#977 Phase 3): the eval-only OFV is the K-fold log-sum-exp at the
     // initial parameters; EBEs reported are the MIXEST class per subject.
     let is_mixture = params.mixture.is_some();
-    let (eta_hats, h_matrices, kappas, ofv) = if is_mixture {
+    let (eta_hats, h_matrices, kappas, ofv, mixture_posteriors) = if is_mixture {
         let m = crate::estimation::mixture::mixture_ofv(model, population, &params, options, None);
-        (m.mixest_etas, m.mixest_h_mats, Vec::new(), m.ofv)
+        // Carry PMIX/MIXEST like the converged path so an eval-only mixture run
+        // still emits the PMIX_*/MIXEST sdtab columns (#977).
+        let posteriors = MixturePosteriors {
+            pmix: m.pmix,
+            mixest: m.mixest,
+        };
+        (
+            m.mixest_etas,
+            m.mixest_h_mats,
+            Vec::new(),
+            m.ofv,
+            Some(posteriors),
+        )
     } else {
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         // Genuine cold start: an eval-only run has no warm EBE history, so pass
@@ -430,7 +441,7 @@ fn evaluate_at_initial_params(
                 &kappas,
                 options,
             );
-        (eta_hats, h_matrices, kappas, ofv)
+        (eta_hats, h_matrices, kappas, ofv, None)
     };
 
     if options.verbose {
@@ -474,7 +485,7 @@ fn evaluate_at_initial_params(
         // fallback (`chol(L·Lᵀ) ≠ L`) would otherwise diverge on an ill-conditioned
         // init omega just as it does for a converged fit (#816 follow-up).
         packed_estimate: Some(x.clone()),
-        mixture_posteriors: None,
+        mixture_posteriors,
         params,
         ofv,
         converged: false,
@@ -1403,22 +1414,41 @@ fn optimize_nlopt(
         let (ehs, hms, ebe_stats, kappas, raw_ofv) = if params.mixture.is_some() {
             let warm = (!state.cached_etas_by_class.is_empty())
                 .then_some(state.cached_etas_by_class.as_slice());
-            let m =
+            let mut m =
                 crate::estimation::mixture::mixture_ofv(model, population, &params, options, warm);
-            state.cached_etas_by_class = m.etas_by_class.clone();
-            let out = (
-                m.mixest_etas.clone(),
-                m.mixest_h_mats.clone(),
-                InnerLoopStats {
-                    n_unconverged: m.ebe_stats.n_unconverged,
-                    n_fallback: m.ebe_stats.n_fallback,
-                    n_start_rejected: m.ebe_stats.n_start_rejected,
-                },
-                Vec::new(),
-                m.ofv,
-            );
-            mixeval = Some(m);
-            out
+            let stats = InnerLoopStats {
+                n_unconverged: m.ebe_stats.n_unconverged,
+                n_fallback: m.ebe_stats.n_fallback,
+                n_start_rejected: m.ebe_stats.n_start_rejected,
+            };
+            let ofv = m.ofv;
+            // A derivative-free eval (`grad` is `None` — e.g. BOBYQA, the default)
+            // never touches `mixeval` or the analytic gradient, so avoid the full
+            // per-class EBE cache clone: move `etas_by_class` straight into the
+            // warm-start cache and the MIXEST EBEs into the result. When a gradient
+            // *is* requested the analytic path reads `m.etas_by_class`, so it must
+            // stay intact and the cache takes a clone.
+            if grad.is_some() {
+                state.cached_etas_by_class = m.etas_by_class.clone();
+                let out = (
+                    m.mixest_etas.clone(),
+                    m.mixest_h_mats.clone(),
+                    stats,
+                    Vec::new(),
+                    ofv,
+                );
+                mixeval = Some(m);
+                out
+            } else {
+                state.cached_etas_by_class = std::mem::take(&mut m.etas_by_class);
+                (
+                    std::mem::take(&mut m.mixest_etas),
+                    std::mem::take(&mut m.mixest_h_mats),
+                    stats,
+                    Vec::new(),
+                    ofv,
+                )
+            }
         } else {
             let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
             let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
@@ -2656,6 +2686,7 @@ pub(crate) fn population_gradient_sens_mixed(
         x,
         ehs,
         options.interaction,
+        None,
     );
     let filled: Vec<Vec<f64>> = per_sub
         .into_par_iter()

@@ -2062,7 +2062,7 @@ fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
     );
     // The per-subject view keeps the in-scope subject analytic, only the
     // out-of-scope one `None`.
-    let per_sub = per_subject_packed_gradients(&model, &pop, &template, &x, &ehs, true);
+    let per_sub = per_subject_packed_gradients(&model, &pop, &template, &x, &ehs, true, None);
     assert!(per_sub[0].is_some(), "plain subject is in analytic scope");
     assert!(
         per_sub[1].is_none(),
