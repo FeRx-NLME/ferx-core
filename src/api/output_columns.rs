@@ -9,10 +9,9 @@ use crate::estimation::parameterization::{
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
     read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
-    ERR_COV_NON_NUMERIC,
+    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;

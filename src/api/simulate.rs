@@ -9,10 +9,9 @@ use crate::estimation::parameterization::{
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
     read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
-    ERR_COV_NON_NUMERIC,
+    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -314,8 +313,10 @@ pub fn simulate_with_options(
 /// fitted (posthoc) etas are computed once from `params` + the observed
 /// `population`.
 ///
-/// Returns `Err` if matching is requested but the population is empty or any
-/// subject has no observations.
+/// Returns `Err` if matching is requested but the population is empty, or any
+/// subject has no observations or carries a non-finite DV (a `DV = .` design
+/// template read by [`crate::api::read_population_for_simulation`] is a
+/// simulation input; there is nothing to compute a posthoc eta from).
 ///
 /// This is the diagnostics-returning form: the [`SimulationOutput`] carries both the
 /// rows and any non-fatal per-subject warnings (a degenerate hazard draw, #763; a
@@ -442,6 +443,26 @@ pub fn simulate_with_options_diag(
         return Err(format!(
             "propensity-score matching requires observations for every subject \
              (to compute posthoc etas); subject '{}' has none",
+            s.id
+        ));
+    }
+    // A `DV = .` design template read by `read_population_for_simulation` (#957)
+    // has rows but NaN observations, so the emptiness check above no longer
+    // catches it. Its posthoc EBE would be optimized against a NaN objective —
+    // either tripping the non-finite-eta guard below with a misleading "did not
+    // converge", or (if the inner optimizer hands back its finite starting eta)
+    // matching every subject on all-zero etas and returning an arbitrary
+    // assignment. Reject it here with the real cause.
+    if let Some(s) = population
+        .subjects
+        .iter()
+        .find(|s| s.observations.iter().any(|v| !v.is_finite()))
+    {
+        return Err(format!(
+            "propensity-score matching requires finite observations for every subject \
+             (to compute posthoc etas); subject '{}' has non-finite DV values. A `DV = .` \
+             design template carries NaN placeholders — match against the observed dataset \
+             instead",
             s.id
         ));
     }
