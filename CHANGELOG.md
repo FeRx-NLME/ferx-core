@@ -21,8 +21,8 @@ section of the SDLC for the versioning policy).
 
 ### Added
 - **Mixture models — `$MIXTURE`-style discrete latent subpopulations (#977).** Model files can
-  declare a `[mixture]` block giving the number of classes (`nsub`), the per-class mixing logits
-  (`logit(k) = …` over theta + covariates), and optional per-class Ω/Σ overrides (`omega(k)` /
+  declare a `[mixture]` block giving the number of classes (`nsub`), the per-class mixing rule
+  (`logit(k) = …` softmax, or `p(k) = …` direct probability, over theta + covariates), and optional per-class Ω/Σ overrides (`omega(k)` /
   `sigma(k)`); the reserved read-only `MIXNUM` index (1..=K) selects class-specific typical values
   inside `[individual_parameters]`. `fit()` estimates such models by **FOCE / FOCEI** — each
   subject's marginal is the covariate-weighted mixture `L_i = Σ_k p_ik · L_ik` and the objective is

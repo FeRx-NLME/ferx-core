@@ -567,6 +567,88 @@ mod tests {
         assert_eq!(matrix[(5, 5)], 0.0, "FIXED sigma row zeroed");
     }
 
+    /// Build a constant-mixing MIXNUM model with the given mixing line and the
+    /// `MIXL`/`P1` mixing-coefficient parameter declaration, so a `p(k)` model and
+    /// its softmax-equivalent `logit(k)` model share every other line.
+    fn mix_form_model(mix_param: &str, mixing_line: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  {mix_param}
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  {mixing_line}
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        )
+    }
+
+    #[test]
+    fn mixture_pform_matches_equivalent_logit() {
+        // #983 item 4: the `p(k)` mixing form is evaluated (probabilities used
+        // directly, then renormalised), not silently dropped. A constant
+        // `p(1) = 0.3` must give the identical objective to the softmax-equivalent
+        // `logit(1) = ln(0.3/0.7)` (reference class 2 has logit 0), since both
+        // resolve to p = [0.3, 0.7] and every other line is shared.
+        let pform = mix_form_model("theta P1(0.3, 0.001, 0.999)", "p(1) = P1");
+        let logit_c = (0.3f64 / 0.7).ln(); // ≈ -0.8473
+        let lform = mix_form_model(
+            &format!("theta MIXL({logit_c}, -10.0, 10.0)"),
+            "logit(1) = MIXL",
+        );
+        let mp = crate::parser::model_parser::parse_model_string(&pform).unwrap();
+        let ml = crate::parser::model_parser::parse_model_string(&lform).unwrap();
+        let pop = read_pop(&bimodal_csv(6, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+
+        let op = super::mixture_ofv(&mp, &pop, &mp.default_params, &opts, None);
+        let ol = super::mixture_ofv(&ml, &pop, &ml.default_params, &opts, None);
+        assert!(
+            (op.ofv - ol.ofv).abs() < 1e-6,
+            "p-form OFV {} vs equivalent logit {}",
+            op.ofv,
+            ol.ofv
+        );
+        // Posterior weights match subject-by-subject too.
+        for (pp, pl) in op.pmix.iter().zip(&ol.pmix) {
+            for (a, b) in pp.iter().zip(pl) {
+                assert!((a - b).abs() < 1e-9, "PMIX {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn mixture_gradient_pform_falls_back_to_fd() {
+        // #983 item 4: the `p(k)` form has no analytic mixing-probability gradient
+        // (only the softmax `logit(k)` form is differentiated), so
+        // `mixture_gradient` returns None and the caller routes to central FD. A
+        // scope gap here would silently return a wrong analytic gradient.
+        let m = mix_form_model("theta P1(0.4, 0.001, 0.999)", "p(1) = P1");
+        let model = crate::parser::model_parser::parse_model_string(&m).unwrap();
+        let pop = read_pop(&bimodal_csv(4, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+        let eval = super::mixture_ofv(&model, &pop, &model.default_params, &opts, None);
+        assert!(
+            super::mixture_gradient(&model, &pop, &model.default_params, &opts, &eval).is_none(),
+            "p(k) mixing form must route to FD (no analytic mixing gradient)"
+        );
+    }
+
     // Variance-mixture (classes differ only by their Ω/Σ overrides, no `MIXNUM`
     // branch) so the per-subject analytic sensitivity provider is in scope — the
     // parity test then exercises the real analytic gradient (softmax mixing

@@ -43,6 +43,13 @@ The mixing rule may be given as a **logit** (`logit(k) = …`) or a **probabilit
 (`p(k) = …`) expression over thetas and covariates; the remaining class's
 probability is the complement. Mixing expressions must not depend on any $\eta$.
 
+The two forms differ only in how $p_{ik}$ is formed: `logit(k)` is passed through
+a softmax (reference class $K$ has logit 0), while `p(k)` is used as the
+probability directly and the class weights are renormalised to sum to one. A
+constant `p(1) = 0.3` is therefore identical to `logit(1) = \ln(0.3/0.7)`. The
+softmax (`logit`) form has an analytic posterior-weighted outer gradient; the
+`p(k)` form does not, so a `p(k)` fit uses the finite-difference gradient.
+
 ## Objective
 
 Each subject's marginal likelihood is the covariate-weighted mixture of its
