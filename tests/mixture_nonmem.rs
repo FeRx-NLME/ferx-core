@@ -412,3 +412,86 @@ fn saem_covariate_mixing_separates_and_recovers_beta() {
         assert_eq!(sr.mixest.expect("MIXEST"), expected, "subject {i} MIXEST");
     }
 }
+
+/// Bayesian (full-MCMC) estimation under a mixture (#985). Same two-clearance
+/// model / data as the FOCEI and SAEM anchors. ferx Rao-Blackwellises the latent
+/// class (marginalises it out of every Gibbs block), so the sampler targets the
+/// K-class marginal and the posterior mean is a point estimate of the mixture
+/// MLE.
+///
+/// **Anchor:** the shared maximum-likelihood optimum (the FOCEI `mixture_iv.ctl`
+/// values `NM_*`). The population priors are weakly-informative N(u0, 10²) on the
+/// unconstrained scale, centred on this model's initial estimates (the declared
+/// `[parameters]` bounds are *not* enforced as uniform priors inside the (θ, σ)
+/// block), and Ω/Σ are FIXed — diffuse enough that the posterior mean concentrates
+/// at the likelihood optimum, so recovering it *is* the cross-engine check. A direct NONMEM `METHOD=BAYES` run
+/// is **not** used: NONMEM's BAYES sampler aborts in burn-in on this model
+/// (`$MIX` + FIXed `$OMEGA`/`$SIGMA` — it insists on Gibbs-sampling Ω, which is
+/// FIXed), a known NONMEM mixture/BAYES fragility (cf. the covariance-step
+/// failure on IOV mixtures). The marginal OFV is additionally checked against the
+/// FOCEI optimum, and the same estimator is anchored directly to NONMEM SAEM
+/// above, so the mixture-marginal machinery this shares is cross-validated.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests (Bayes mixture)"
+)]
+fn bayes_mixture_recovers_optimum() {
+    let pop: ferx_core::Population = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .unwrap();
+    let model = parse_model_string(MODEL).unwrap();
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Bayes;
+    opts.bayes_warmup = 500;
+    opts.bayes_iters = 500;
+    opts.bayes_chains = 2;
+    opts.bayes_seed = Some(20250818);
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("Bayes mixture fit Ok");
+    let th = &res.theta;
+    let p1 = 1.0 / (1.0 + (-th[3]).exp());
+    eprintln!(
+        "Bayes mixture: TVCL1={:.4} TVCL2={:.4} TVV={:.4} p1={:.4} OFV={:.4}",
+        th[0], th[1], th[2], p1, res.ofv
+    );
+    let rel = |a: f64, b: f64| (a - b).abs() / b.abs();
+
+    // Posterior mean recovers the mixture MLE (the two class clearances are the
+    // discriminating quantities — the sampler must separate them).
+    assert!(
+        rel(th[0], NM_TVCL1) < 0.10,
+        "Bayes TVCL1 {} vs {}",
+        th[0],
+        NM_TVCL1
+    );
+    assert!(
+        rel(th[1], NM_TVCL2) < 0.10,
+        "Bayes TVCL2 {} vs {}",
+        th[1],
+        NM_TVCL2
+    );
+    assert!(
+        rel(th[2], NM_TVV) < 0.05,
+        "Bayes TVV {} vs {}",
+        th[2],
+        NM_TVV
+    );
+    assert!((p1 - NM_P1).abs() < 0.08, "Bayes p(1) {} vs {}", p1, NM_P1);
+
+    // Marginal OFV (K-fold log-sum-exp) comparable to the FOCEI optimum.
+    assert!(
+        (res.ofv - NM_OFV_NO_CONST).abs() < 3.0,
+        "Bayes OFV {} vs {}",
+        res.ofv,
+        NM_OFV_NO_CONST
+    );
+
+    // Per-subject MIXEST populated (recomputed at the posterior mean).
+    assert!(
+        res.subjects.iter().all(|s| s.mixest.is_some()),
+        "MIXEST populated"
+    );
+}

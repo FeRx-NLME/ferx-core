@@ -223,13 +223,34 @@ pub fn fit(
         for m in options.method_chain() {
             if !matches!(
                 m,
-                EstimationMethod::Foce | EstimationMethod::FoceI | EstimationMethod::Saem
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::Saem
+                    | EstimationMethod::Bayes
             ) {
                 return Err(format!(
-                    "mixture models (#977) currently support FOCE / FOCEI / SAEM; the {} method \
-                     is not yet wired for mixtures (#985)",
+                    "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes; the {} \
+                     method is not yet wired for mixtures (#985)",
                     m.label()
                 ));
+            }
+        }
+        // Per-class Omega/Sigma overrides under Bayes (#985): the Bayes Omega block
+        // is a single conjugate draw shared across classes, so `omega(k)`/`sigma(k)`
+        // cannot be honoured. `bayes.rs` re-checks this defensively, but reject it
+        // here — before any stage runs — so `method = [focei, bayes]` does not burn a
+        // full FOCEI fit only to fail at the hand-off.
+        if options.method_chain().contains(&EstimationMethod::Bayes) {
+            if let Some(mp) = init_params.mixture.as_ref() {
+                if !mp.omega_override_addr.is_empty() || !mp.sigma_override_addr.is_empty() {
+                    return Err(
+                        "Bayesian estimation (method = bayes) does not yet support per-class \
+                         Omega/Sigma overrides (omega(k)/sigma(k)) in a mixture; Omega/Sigma are \
+                         shared across classes. Fit with FOCE/FOCEI, or drop the per-class \
+                         overrides (#985)."
+                            .to_string(),
+                    );
+                }
             }
         }
         // Inter-occasion variability under a mixture (#985): the per-class inner
@@ -1506,7 +1527,14 @@ fn fit_inner(
         }
     }
 
-    // Compute per-subject diagnostics
+    // Compute per-subject diagnostics. For a mixture (#985) each subject's
+    // diagnostics are evaluated under its own MIXEST class: `result.eta_hats` are
+    // the winning class's EBEs, so predictions built with `MIXNUM` at the class-1
+    // default would mix a class-2 η̂ with class-1 typical values.
+    let mixest_classes: Option<Vec<usize>> = result
+        .mixture_posteriors
+        .as_ref()
+        .map(|mp| mp.mixest.clone());
     let mut subjects = compute_subject_results(
         model,
         population,
@@ -1515,6 +1543,7 @@ fn fit_inner(
         &result.h_matrices,
         &result.kappas,
         options.interaction,
+        mixest_classes.as_deref(),
     );
 
     // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto
@@ -1539,6 +1568,7 @@ fn fit_inner(
             &result.params.theta,
             &result.kappas,
             &mut subjects,
+            mixest_classes.as_deref(),
         );
     }
 

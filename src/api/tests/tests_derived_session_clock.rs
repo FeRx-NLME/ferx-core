@@ -174,7 +174,7 @@ fn derived_per_row_time_is_raw_clock() {
         warnings: Vec::new(),
     };
     let mut subjects_results = vec![sr_for(6)];
-    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
+    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results, None);
     let col = &subjects_results[0].extra_columns[0].1;
     let expected = vec![0.0, 1.0, 4.0, 0.0, 1.0, 4.0];
     for (j, (&got, &exp)) in col.iter().zip(expected.iter()).enumerate() {
@@ -219,7 +219,7 @@ fn derived_aggregate_tmax_returns_raw_time() {
     // ipred peak is at j=4 (shifted t=6, raw t=1) which should give tmax=1.
     sr.ipred = vec![1.0, 2.0, 1.5, 0.5, 3.0, 1.0];
     let mut subjects_results = vec![sr];
-    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
+    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results, None);
     let col = &subjects_results[0].extra_columns[0].1;
     // All entries should be 1.0 (raw time of peak at j=4).
     for &v in col {
@@ -263,7 +263,7 @@ fn derived_integral_obs_per_session_explicit_window() {
         warnings: Vec::new(),
     };
     let mut subjects_results = vec![sr_for(6)];
-    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
+    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results, None);
     let col = &subjects_results[0].extra_columns[0].1;
     // Expected AUC = 8.0 for every row in each session.
     for (j, &v) in col.iter().enumerate() {
@@ -314,7 +314,7 @@ fn derived_integral_periodic_uses_raw_clock() {
         warnings: Vec::new(),
     };
     let mut subjects_results = vec![sr_for(6)];
-    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
+    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results, None);
     let col = &subjects_results[0].extra_columns[0].1;
     // All obs land in the raw-clock window [0,5); all three per-session
     // points contribute → AUC=8.0 for every row.
@@ -374,7 +374,7 @@ fn derived_integral_single_session_unchanged() {
         warnings: Vec::new(),
     };
     let mut subjects_results = vec![sr_for(3)];
-    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
+    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results, None);
     let col = &subjects_results[0].extra_columns[0].1;
     // AUC = trapezoid([(0,0),(1,1),(4,4)]) = 8.0
     for &v in col {

@@ -134,12 +134,17 @@ pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
 
 /// Compute all [derived] and [output] columns post-fit, storing results in
 /// each SubjectResult's `extra_columns` field.
+/// `mixest` (#985) is the fitted per-subject mixture class (0-based); `None` for
+/// non-mixture fits. `[derived]` / `[output]` expressions and `pk_param_fn` can
+/// branch on `MIXNUM`, so each subject's columns are evaluated under its own class
+/// guard rather than the class-1 default.
 pub(crate) fn compute_extra_output_columns(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
     kappas_per_subject: &[Vec<DVector<f64>>],
     subjects: &mut [SubjectResult],
+    mixest: Option<&[usize]>,
 ) {
     use crate::types::{AggFunction, DerivedContext, DerivedKind, IntegralStep, IntegralWindow};
 
@@ -150,6 +155,9 @@ pub(crate) fn compute_extra_output_columns(
         .collect();
 
     for (si, sr) in subjects.iter_mut().enumerate() {
+        let _mix_guard = mixest
+            .and_then(|m| m.get(si))
+            .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
         let subject = &population.subjects[si];
         let eta_hat = sr.eta.as_slice();
         let n_obs = sr.ipred.len();

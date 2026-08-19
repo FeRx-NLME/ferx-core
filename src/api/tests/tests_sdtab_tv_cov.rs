@@ -221,6 +221,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         &h_matrices,
         &kappas,
         true,
+        None,
     );
     assert_eq!(results.len(), 1);
     let sdtab_ipred = &results[0].ipred;
@@ -346,6 +347,7 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
         &h_matrices,
         &kappas,
         false,
+        None,
     );
 
     let f = ipred[0];
