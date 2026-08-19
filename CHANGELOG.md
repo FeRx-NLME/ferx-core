@@ -27,8 +27,11 @@ section of the SDLC for the versioning policy).
   mixing coefficients (constant *or* covariate-dependent logit mixing) from the sampled class
   frequencies. Reported OFV, per-subject `MIXEST`/`PMIX`, and standard errors come from the K-fold
   mixture marginal, matching FOCEI. Cross-checked against NONMEM `METHOD=SAEM` (estimates agree to
-  ≤ 3 %). Per-class σ overrides (`sigma(k)`) are held at their initial values under SAEM (with a
-  warning) — route those to FOCEI. IMP/IMPMAP and Bayes for mixtures remain unwired and error clearly.
+  ≤ 3 %). A mixing theta marked `FIX` is honoured; a theta shared between the mixing expression and a
+  structural typical value is rejected with a clear error. Per-class σ overrides (`sigma(k)`) are held
+  at their initial values under SAEM (with a warning, and reported with SE 0 like other fixed
+  parameters) — route those to FOCEI. IMP/IMPMAP and Bayes for mixtures remain unwired and error
+  clearly.
 - **Inter-occasion variability under a mixture (#985).** A `[mixture]` model may now also carry a
   `kappa` (inter-occasion variability) term — the two features compose, where before `fit()` rejected
   the combination. Each class's per-subject inner solve estimates the per-occasion κ̂ under that
