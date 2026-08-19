@@ -227,16 +227,18 @@ pub fn fit(
                     | EstimationMethod::FoceI
                     | EstimationMethod::Saem
                     | EstimationMethod::Bayes
-                    // IMP is admitted for the objective-evaluation (EONLY) path,
-                    // which forms the class-marginal `−2 Σ log Σ_k p_ik L_ik`;
-                    // the *estimating* IMP/IMPMAP MCEM rejects mixtures in
-                    // `run_mcem` with a clear message (#985).
+                    // IMP / IMPMAP run a class-partitioned MCEM (per-class IS
+                    // E-step + responsibility-weighted M-steps) when estimating,
+                    // and form the class-marginal `−2 Σ log Σ_k p_ik L_ik` on the
+                    // objective-evaluation (EONLY) path (#985). IOV, FREM, SDE
+                    // and per-class Ω/Σ overrides are refused inside
+                    // `run_mcem_mixture`.
                     | EstimationMethod::Imp
                     | EstimationMethod::Impmap
             ) {
                 return Err(format!(
-                    "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes, and IMP \
-                     objective evaluation; the {} method is not yet wired for mixtures (#985)",
+                    "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes / IMP / \
+                     IMPMAP; the {} method is not yet wired for mixtures (#985)",
                     m.label()
                 ));
             }

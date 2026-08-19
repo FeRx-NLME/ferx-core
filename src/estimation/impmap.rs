@@ -33,6 +33,7 @@
 
 use crate::estimation::importance_sampling::{
     compute_posterior_hessian, find_optimal_iscale, subject_is_draws, SubjectDraws,
+    MIX_ESS_PMIX_FLOOR,
 };
 use crate::estimation::inner_optimizer::{find_ebe, EbeResult, InnerLoopStats};
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
@@ -174,6 +175,69 @@ pub(crate) fn non_fixed_thetas_without_eta(
         .collect()
 }
 
+/// One subject's multi-start MAP: the warm-start (or cold-start) solve plus
+/// `mceta` additional random starting points drawn from N(0, Ω) via the supplied
+/// Cholesky factor. The start with the lowest NLL wins; `omega_chol = None` (or
+/// `mceta == 0`) degrades to the single warm-start solve.
+///
+/// Shared by the single-population MAP sweep ([`run_map_multistart`]) and the
+/// mixture MCEM E-step, which runs the same multi-start *per class* inside the
+/// subject's rayon task (so `MIXNUM` stays correct on the worker thread).
+#[allow(clippy::too_many_arguments)]
+fn find_ebe_multistart(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    inner_maxiter: usize,
+    inner_tol: f64,
+    warm: Option<&[f64]>,
+    mu: Option<&[f64]>,
+    inner_restarts: usize,
+    mceta: usize,
+    omega_chol: Option<&DMatrix<f64>>,
+    subj_seed: u64,
+) -> EbeResult {
+    // Baseline: warm-start (or cold-start from η = 0).
+    let mut best = find_ebe(
+        model,
+        subject,
+        params,
+        inner_maxiter,
+        inner_tol,
+        warm,
+        mu,
+        inner_restarts,
+    );
+    let Some(l_omega) = omega_chol else {
+        return best;
+    };
+    let n_eta = l_omega.nrows();
+    let mut rng = StdRng::seed_from_u64(subj_seed);
+    for _start in 0..mceta {
+        // Draw z ~ N(0, I), compute eta_start = L_Ω · z.
+        let z: Vec<f64> = (0..n_eta)
+            .map(|_| StandardNormal.sample(&mut rng))
+            .collect();
+        let eta_start = l_omega * DVector::from_vec(z);
+        let eta_slice: Vec<f64> = eta_start.iter().copied().collect();
+
+        let candidate = find_ebe(
+            model,
+            subject,
+            params,
+            inner_maxiter,
+            inner_tol,
+            Some(&eta_slice),
+            mu,
+            inner_restarts,
+        );
+        if candidate.nll < best.nll {
+            best = candidate;
+        }
+    }
+    best
+}
+
 /// Multi-start MAP: for each subject, run `find_ebe` with the warm-start (or
 /// cold-start) and then `mceta` additional random starting points drawn from
 /// N(0, Ω). The start with the lowest NLL wins. When `mceta == 0` this
@@ -194,8 +258,6 @@ fn run_map_multistart(
     seed: u64,
     iteration: usize,
 ) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats) {
-    let n_eta = model.n_eta;
-
     // Cholesky of Ω for drawing random starts (computed once, outside the
     // per-subject parallel loop).
     let omega_chol = if mceta > 0 {
@@ -210,54 +272,24 @@ fn run_map_multistart(
         .enumerate()
         .map(|(i, subject)| {
             let warm = prev_etas.map(|pe| pe[i].as_slice());
-            let mu = Some(mu_k);
-
-            // Baseline: warm-start (or cold-start from η = 0).
-            let mut best = find_ebe(
+            // Deterministic per-subject, per-iteration seed, separated from IS draws.
+            let subj_seed = seed
+                .wrapping_add(i as u64)
+                .wrapping_add((iteration as u64) << 32)
+                .wrapping_add(0x4D43_4554_4100u64);
+            find_ebe_multistart(
                 model,
                 subject,
                 params,
                 inner_maxiter,
                 inner_tol,
                 warm,
-                mu,
+                Some(mu_k),
                 0,
-            );
-
-            if let Some(ref l_omega) = omega_chol {
-                // Deterministic per-subject, per-iteration seed, separated from IS draws.
-                let subj_seed = seed
-                    .wrapping_add(i as u64)
-                    .wrapping_add((iteration as u64) << 32)
-                    .wrapping_add(0x4D43_4554_4100u64);
-                let mut rng = StdRng::seed_from_u64(subj_seed);
-
-                for _start in 0..mceta {
-                    // Draw z ~ N(0, I), compute eta_start = L_Ω · z.
-                    let z: Vec<f64> = (0..n_eta)
-                        .map(|_| StandardNormal.sample(&mut rng))
-                        .collect();
-                    let z_dv = DVector::from_vec(z);
-                    let eta_start = l_omega * &z_dv;
-                    let eta_slice: Vec<f64> = eta_start.iter().copied().collect();
-
-                    let candidate = find_ebe(
-                        model,
-                        subject,
-                        params,
-                        inner_maxiter,
-                        inner_tol,
-                        Some(&eta_slice),
-                        mu,
-                        0,
-                    );
-                    if candidate.nll < best.nll {
-                        best = candidate;
-                    }
-                }
-            }
-
-            best
+                mceta,
+                omega_chol.as_ref(),
+                subj_seed,
+            )
         })
         .collect();
 
@@ -415,6 +447,8 @@ fn run_mcem(
             threshold,
             mceta,
             use_sobol,
+            collect_trace,
+            auto,
         );
     }
     if n_eta == 0 {
@@ -1370,14 +1404,14 @@ fn run_mcem_mixture(
     threshold: f64,
     mceta: usize,
     use_sobol: bool,
+    collect_trace: bool,
+    auto: bool,
 ) -> Result<OuterResult, String> {
     use crate::estimation::importance_sampling::{
         compute_posterior_hessian, subject_is_draws, DefensiveMixture,
     };
-    use crate::estimation::inner_optimizer::find_ebe;
     use crate::estimation::mixture::combine_subject;
     use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
-    let _ = (df_key, threshold);
 
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
@@ -1504,14 +1538,105 @@ fn run_mcem_mixture(
     let mut mix =
         crate::estimation::saem_mixture::SaemMixture::build(model, init_params, population);
 
+    // Reject a theta that drives both the mixing expression and a structural
+    // typical value. Like SAEM (`run_saem`), this MCEM runs *separated* M-steps:
+    // `theta_sigma_weighted_mstep_mixture` fits such a theta from the weighted
+    // observation likelihood and `mstep_mixing` then overwrites it from the
+    // responsibilities, silently discarding the structural estimate. FOCEI's
+    // joint marginal handles the shared parameter, so route there (#992 review).
+    let overlap = crate::estimation::saem_mixture::mixing_structural_overlap(
+        model,
+        init_params,
+        population,
+        &mix.mixing_theta_idx,
+    );
+    if !overlap.is_empty() {
+        let names: Vec<String> = overlap
+            .iter()
+            .map(|&j| {
+                init_params
+                    .theta_names
+                    .get(j)
+                    .cloned()
+                    .unwrap_or_else(|| format!("theta[{j}]"))
+            })
+            .collect();
+        return Err(format!(
+            "{label} cannot fit a mixture where a mixing-coefficient theta also drives the \
+             structural model: {} appear(s) in both the [mixture] mixing expression and an \
+             [individual_parameters] typical value. The weighted θ/σ M-step and the mixing \
+             M-step run separately, so a shared parameter would be double-owned. Split it into \
+             two thetas (one for structure, one for mixing), or fit with FOCE/FOCEI (whose \
+             joint marginal handles the shared parameter) (#985).",
+            names.join(", ")
+        ));
+    }
+
     let mut warnings: Vec<String> = Vec::new();
+
+    // The mixture MCEM never uses the closed-form log-mu-ref θ shift (a
+    // class-switched typical value cannot be paired to a single η), so *every* θ
+    // is estimated through the importance-weighted M-step alone — the channel
+    // that is biased for weakly-identified parameters. The single-population
+    // `run_mcem` pushes the equivalent warnings before this delegation point;
+    // repeat them here so a mixture fit is not silently unwarned (#992 review).
+    let mixing_names: std::collections::HashSet<&str> = mix
+        .mixing_theta_idx
+        .iter()
+        .filter_map(|&j| model.theta_names.get(j).map(String::as_str))
+        .collect();
+    // Mixing thetas are excluded: they are estimated by `mstep_mixing` from the
+    // class responsibilities, not by the weighted M-step, so an ETA on them is
+    // neither expected nor useful.
+    let thetas_without_eta: Vec<String> =
+        non_fixed_thetas_without_eta(model, &init_params.theta_fixed)
+            .into_iter()
+            .filter(|n| !mixing_names.contains(n.as_str()))
+            .collect();
+    if !thetas_without_eta.is_empty() {
+        warnings.push(format!(
+            "{label}: estimated parameter(s) [{}] have NO associated ETA. NONMEM's \
+             IMP/IMPMAP require every estimated parameter to carry a random effect; a \
+             fixed-effect-only parameter is estimated solely through the importance-weighted \
+             M-step, which is biased for weakly-identified parameters and may converge to the \
+             wrong value. STRONGLY add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, \
+             optionally FIX, omega), or hold the parameter FIX, or use FOCEI.",
+            thetas_without_eta.join(", ")
+        ));
+    }
+    warnings.push(format!(
+        "{label}: under a mixture the closed-form mu-referencing θ update does not apply (a \
+         class-switched typical value has no single paired η), so every typical value is \
+         estimated through the importance-weighted M-step alone and may converge poorly. \
+         Cross-check the typical values against a FOCEI fit."
+    ));
+    if collect_trace {
+        warnings.push(format!(
+            "{label}: iteration trace collection (impmap_trace) is not implemented for mixture \
+             models; no trace is reported (#985)."
+        ));
+    }
+    if auto {
+        warnings.push(format!(
+            "{label}: adaptive sampling (auto) is not implemented for mixture models; the sample \
+             count stays at K={k_samples} for every iteration (#985)."
+        ));
+    }
+
     let mut theta_cur = init_params.theta.clone();
     let mut sigma_cur = init_params.sigma.values.clone();
     let mut omega_mat = init_params.omega.matrix.clone();
 
     // Previous iteration's per-class weighted draws (for the IMP `SampleMoments`
-    // recenter). `None` on iteration 1 and always for IMPMAP.
+    // recenter, which rebuilds the proposal from their second moments). `None` on
+    // iteration 1 and — as in `run_mcem` — never retained on the IMPMAP (`Map`)
+    // path, which re-runs the MAP solve and only needs the previous weighted
+    // means as warm starts. Holding the full `K · n_subjects · n_classes` sample
+    // sets there would cost `K×` the memory for nothing (#992 review).
     let mut prev_draws: Option<Vec<Vec<SubjectDraws>>> = None;
+    // Previous iteration's per-class weighted posterior means, `[class][subject]`
+    // — the warm start for the next iteration's inner solve on both paths.
+    let mut prev_means: Option<Vec<Vec<Vec<f64>>>> = None;
     let warm0: Option<Vec<DVector<f64>>> = warm_etas.map(|e| e.to_vec());
 
     // Running average of the estimates over the final `n_avg` iterations.
@@ -1560,6 +1685,14 @@ fn run_mcem_mixture(
         };
         let run_inner = recenter == ProposalRecenter::Map || prev_draws.is_none();
         let prev = prev_draws.as_ref();
+        let prev_mean = prev_means.as_ref();
+        // Cholesky of the shared Ω for the MCETA random restarts (computed once
+        // per iteration, outside the parallel loop). `None` when MCETA is off.
+        let omega_chol = if mceta > 0 && run_inner {
+            omega_mat.clone().cholesky().map(|c| c.l())
+        } else {
+            None
+        };
 
         // ---- E-step: per subject, per class IS draws + class responsibilities ----
         // Parallel over subjects; the class loop runs inside each worker so the
@@ -1570,16 +1703,28 @@ fn run_mcem_mixture(
             .par_iter()
             .enumerate()
             .map_init(EventPkParams::default, |scratch, (i, subject)| {
+                // Poll per subject: one subject's E-step is `n_classes` inner
+                // solves plus `n_classes · K` importance draws — the dominant
+                // per-iteration cost — so without this a cancel set mid-sweep is
+                // not observed until the whole subject × class loop finishes.
+                // Mirrors `run_mcem`; the driver breaks right after the collect,
+                // so the placeholder draws never reach an M-step.
+                if crate::cancel::is_cancelled(cancel) {
+                    let class_draws: Vec<SubjectDraws> = (0..n_classes)
+                        .map(|_| SubjectDraws::cancelled(n_eta))
+                        .collect();
+                    return (class_draws, vec![1.0 / n_classes as f64; n_classes], 0.0);
+                }
                 let logp = eval_mixing_log_probs(spec, &theta_cur, &subject.covariates);
                 let mut class_draws: Vec<SubjectDraws> = Vec::with_capacity(n_classes);
                 let mut nll = vec![0.0f64; n_classes];
                 for c in 0..n_classes {
                     let _g = MixtureClassGuard::enter(c + 1);
                     let (center, h_post) = if run_inner {
-                        let warm_i = prev
-                            .map(|pd| DVector::from_row_slice(&pd[c][i].mean))
+                        let warm_i = prev_mean
+                            .map(|pm| DVector::from_row_slice(&pm[c][i]))
                             .or_else(|| warm0.as_ref().map(|w| w[i].clone()));
-                        let ebe = find_ebe(
+                        let ebe = find_ebe_multistart(
                             model,
                             subject,
                             &params_iter,
@@ -1588,6 +1733,12 @@ fn run_mcem_mixture(
                             warm_i.as_ref().map(|v| v.as_slice()),
                             None,
                             options.inner_restarts,
+                            mceta,
+                            omega_chol.as_ref(),
+                            seed.wrapping_add(i as u64)
+                                .wrapping_add((k as u64) << 32)
+                                .wrapping_add((c as u64) << 48)
+                                .wrapping_add(0x4D43_4554_4100u64),
                         );
                         let h_post = compute_posterior_hessian(
                             model,
@@ -1616,6 +1767,29 @@ fn run_mcem_mixture(
                         .wrapping_add(i as u64)
                         .wrapping_add((k as u64) << 32)
                         .wrapping_add((c as u64) << 48);
+                    // Per-subject, per-class ISCALE pilot search — the same guard
+                    // the single-population E-step runs (#528/#961): it rescues
+                    // subjects whose posterior Hessian is a poor curvature
+                    // estimate, whose IS weights would otherwise collapse and
+                    // drive the weighted M-step to the bounds. Skipping it is
+                    // materially riskier under a mixture, where an off-class
+                    // proposal is a poor fit by construction (#992 review).
+                    let iscale = find_optimal_iscale(
+                        model,
+                        subject,
+                        &params_iter.theta,
+                        &params_iter.sigma.values,
+                        &center,
+                        &h_post,
+                        &omega_inv,
+                        log_det_omega,
+                        n_eta,
+                        nu,
+                        subj_seed,
+                        scratch,
+                        options.iscale_min,
+                        options.iscale_max,
+                    );
                     let d = subject_is_draws(
                         model,
                         subject,
@@ -1630,7 +1804,7 @@ fn run_mcem_mixture(
                         nu,
                         subj_seed,
                         scratch,
-                        1.0,
+                        iscale,
                         use_sobol,
                         defensive.as_ref(),
                     );
@@ -1660,11 +1834,37 @@ fn run_mcem_mixture(
             ofv += contribution;
         }
         if verbose {
-            eprintln!("{label} (mixture) iter {k}: marginal −2 log L = {ofv:.4}");
+            // Per-subject ESS: the worst per-class proposal among the classes the
+            // subject actually contributes to (a collapsed proposal in a class
+            // with PMIX ≈ 0 does not degrade that subject's marginal).
+            let n_low_ess = (0..n_subjects)
+                .filter(|&i| {
+                    let worst = (0..n_classes)
+                        .filter(|&c| pmix[i][c] > MIX_ESS_PMIX_FLOOR)
+                        .map(|c| draws_by_class[c][i].ess_fraction)
+                        .fold(f64::INFINITY, f64::min);
+                    worst.is_finite() && worst < threshold
+                })
+                .count();
+            eprintln!(
+                "{label} (mixture) iter {k}: marginal −2 log L = {ofv:.4} \
+                 (low-ESS subjects: {n_low_ess})"
+            );
         }
 
         // ---- M-step ----
         // (a) θ / σ from the responsibility- and importance-weighted obs NLL.
+        // The mixing thetas are pinned out of this M-step: they do not enter
+        // `obs_nll_subject_into` at all, so leaving them free only inflates the
+        // BOBYQA dimension with degenerate directions and can park them at an
+        // arbitrary point that `mstep_mixing` (4–8 evals) then has to recover
+        // from (#992 review). `mstep_mixing` below is their sole owner.
+        let mut mstep_theta_lower = log_theta_lower.clone();
+        let mut mstep_theta_upper = log_theta_upper.clone();
+        for &j in &mix.mixing_theta_idx {
+            mstep_theta_lower[j] = log_theta[j];
+            mstep_theta_upper[j] = log_theta[j];
+        }
         let mstep_maxiter: u32 = if k <= n_iter / 2 { 4 } else { 8 };
         let (new_log_theta, new_log_sigma) = theta_sigma_weighted_mstep_mixture(
             model,
@@ -1673,8 +1873,8 @@ fn run_mcem_mixture(
             &pmix,
             &log_theta,
             &log_sigma,
-            &log_theta_lower,
-            &log_theta_upper,
+            &mstep_theta_lower,
+            &mstep_theta_upper,
             &log_sigma_lower,
             &log_sigma_upper,
             n_theta,
@@ -1743,7 +1943,25 @@ fn run_mcem_mixture(
             n_acc += 1;
         }
 
-        prev_draws = Some(draws_by_class);
+        prev_means = Some(
+            draws_by_class
+                .iter()
+                .map(|class| class.iter().map(|d| d.mean.clone()).collect())
+                .collect(),
+        );
+        prev_draws = if recenter == ProposalRecenter::SampleMoments {
+            Some(draws_by_class)
+        } else {
+            None
+        };
+    }
+
+    // A cancel observed inside (or at the top of) the loop breaks out with
+    // parameters from a truncated MCEM. Return before the K-class marginal pass
+    // and the covariance step — together the most expensive part of the run —
+    // rather than paying for them and handing back a bogus `Ok` (#992 review).
+    if crate::cancel::is_cancelled(cancel) {
+        return Err("cancelled by user".to_string());
     }
 
     // ---- Point estimate: average over the final n_avg iterations ----
@@ -1796,7 +2014,6 @@ fn run_mcem_mixture(
         kappa_fixed: init_params.kappa_fixed.clone(),
         mixture: final_mixture,
     };
-    let _ = mceta;
 
     // ---- Final EBEs / OFV / posteriors via the K-fold marginal ----
     let meval =
@@ -2347,6 +2564,230 @@ mod tests {
         assert!(
             err.contains("per-class Omega/Sigma overrides"),
             "got: {err}"
+        );
+    }
+    /// A theta that drives both the mixing expression and a structural typical
+    /// value is rejected up front: the weighted θ/σ M-step would fit it from the
+    /// observation likelihood and `mstep_mixing` would then overwrite it,
+    /// silently discarding the structural estimate (#992 review). SAEM rejects
+    /// the same shape; the estimating IMP/IMPMAP MCEM must too.
+    #[test]
+    fn estimating_imp_rejects_mixing_theta_that_drives_structure() {
+        const SHARED: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta MIXL(0.5, 0.01, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = 10.0 * MIXL
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(SHARED).unwrap();
+        let pop = mix_pop();
+        let opts = FitOptions::default();
+        let err = match run_impmap(&model, &pop, &model.default_params, None, &opts) {
+            Ok(_) => panic!("a mixing theta driving the structural model must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("also drives the structural model") && err.contains("MIXL"),
+            "got: {err}"
+        );
+    }
+
+    /// The mixture MCEM delegates before `run_mcem` builds its mu-ref warnings,
+    /// so it must push its own: the no-ETA warning (naming `TVV`, but *not* the
+    /// mixing theta `MIXL`, which `mstep_mixing` owns) and the mixture mu-ref
+    /// caveat that every typical value rides the weighted M-step alone.
+    #[test]
+    fn mixture_mcem_warns_about_weighted_mstep_only_thetas() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 1;
+        opts.impmap_samples = 50;
+        opts.impmap_seed = Some(1);
+        opts.run_covariance_step = false;
+        let res =
+            run_impmap(&model, &pop, &model.default_params, None, &opts).expect("impmap mixture");
+        let joined = res.warnings.join("\n");
+        assert!(
+            joined.contains("have NO associated ETA") && joined.contains("TVV"),
+            "no-ETA warning missing: {joined}"
+        );
+        assert!(
+            !joined.contains("MIXL"),
+            "the mixing theta must not be flagged as a missing-ETA parameter: {joined}"
+        );
+        assert!(
+            joined.contains("closed-form mu-referencing"),
+            "mixture mu-ref caveat missing: {joined}"
+        );
+    }
+
+    /// `impmap_trace` and `impmap_auto` are not implemented for mixtures; they
+    /// must warn rather than be silently ignored (#992 review).
+    #[test]
+    fn mixture_mcem_warns_that_trace_and_auto_are_ignored() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 1;
+        opts.impmap_samples = 50;
+        opts.impmap_seed = Some(1);
+        opts.impmap_trace = true;
+        opts.impmap_auto = true;
+        opts.run_covariance_step = false;
+        let res =
+            run_impmap(&model, &pop, &model.default_params, None, &opts).expect("impmap mixture");
+        let joined = res.warnings.join("\n");
+        assert!(
+            joined.contains("trace collection") && joined.contains("adaptive sampling"),
+            "trace/auto no-op warnings missing: {joined}"
+        );
+        assert!(res.impmap_trace.is_none(), "no trace is produced");
+    }
+
+    /// A cancel set before the run returns `Err` instead of falling through to
+    /// the K-class marginal pass and the covariance step — the most expensive
+    /// part of the run — with parameters from a truncated MCEM (#992 review).
+    #[test]
+    fn mixture_mcem_cancel_returns_err() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 5;
+        opts.impmap_samples = 200;
+        opts.impmap_seed = Some(1);
+        let flag = crate::cancel::CancelFlag::new();
+        flag.cancel();
+        opts.cancel = Some(flag);
+        let err = match run_impmap(&model, &pop, &model.default_params, None, &opts) {
+            Ok(_) => panic!("a cancelled mixture MCEM must not return Ok"),
+            Err(e) => e,
+        };
+        assert!(err.contains("cancelled by user"), "got: {err}");
+    }
+
+    /// `find_ebe_multistart` degrades to the plain warm-start solve when no Ω
+    /// Cholesky is supplied, and never returns a worse start than the baseline
+    /// when MCETA restarts are requested.
+    #[test]
+    fn find_ebe_multistart_never_worse_than_baseline() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let params = &model.default_params;
+        let subject = &pop.subjects[0];
+
+        let baseline =
+            find_ebe_multistart(&model, subject, params, 50, 1e-4, None, None, 0, 0, None, 7);
+        let direct = find_ebe(&model, subject, params, 50, 1e-4, None, None, 0);
+        assert!(
+            (baseline.nll - direct.nll).abs() < 1e-12,
+            "no Cholesky must reproduce find_ebe exactly: {} vs {}",
+            baseline.nll,
+            direct.nll
+        );
+
+        let chol = params.omega.matrix.clone().cholesky().unwrap().l();
+        let multi = find_ebe_multistart(
+            &model,
+            subject,
+            params,
+            50,
+            1e-4,
+            None,
+            None,
+            0,
+            4,
+            Some(&chol),
+            7,
+        );
+        assert!(
+            multi.nll <= baseline.nll + 1e-12,
+            "MCETA restarts must not return a worse mode: {} vs {}",
+            multi.nll,
+            baseline.nll
+        );
+    }
+
+    /// The weighted θ/σ M-step honours a pinned coordinate (`lower == upper`),
+    /// which is how the mixture MCEM keeps the mixing thetas — absent from the
+    /// observation likelihood — out of the BOBYQA search (#992 review).
+    #[test]
+    fn weighted_mstep_mixture_honours_pinned_theta_bounds() {
+        use crate::estimation::importance_sampling::SubjectDraws;
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let params = &model.default_params;
+        let n_theta = params.theta.len();
+        let n_sigma = params.sigma.values.len();
+        let n_eta = model.n_eta;
+
+        // One (degenerate, single-sample) draw set per class per subject.
+        let draws_by_class: Vec<Vec<SubjectDraws>> = (0..2)
+            .map(|_| {
+                pop.subjects
+                    .iter()
+                    .map(|_| {
+                        let mut d = SubjectDraws::cancelled(n_eta);
+                        d.etas = vec![vec![0.0; n_eta]];
+                        d.weights = vec![1.0];
+                        d
+                    })
+                    .collect()
+            })
+            .collect();
+        let pmix: Vec<Vec<f64>> = pop.subjects.iter().map(|_| vec![0.5, 0.5]).collect();
+
+        let log_theta: Vec<f64> = params.theta.iter().map(|&t| t.max(1e-10).ln()).collect();
+        let log_sigma: Vec<f64> = params
+            .sigma
+            .values
+            .iter()
+            .map(|&s| s.max(1e-10).ln())
+            .collect();
+        let mask = vec![true; n_theta];
+        let mut lower = vec![-10.0; n_theta];
+        let mut upper = vec![10.0; n_theta];
+        // Pin theta 0 exactly, as the mixing-theta pin does.
+        lower[0] = log_theta[0];
+        upper[0] = log_theta[0];
+
+        let (out_theta, _out_sigma) = theta_sigma_weighted_mstep_mixture(
+            &model,
+            &pop,
+            &draws_by_class,
+            &pmix,
+            &log_theta,
+            &log_sigma,
+            &lower,
+            &upper,
+            &vec![-8.0; n_sigma],
+            &vec![5.0; n_sigma],
+            n_theta,
+            n_sigma,
+            8,
+            &mask,
+        );
+        assert!(
+            (out_theta[0] - log_theta[0]).abs() < 1e-12,
+            "pinned theta must not move: {} vs {}",
+            out_theta[0],
+            log_theta[0]
         );
     }
 }

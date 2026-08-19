@@ -476,6 +476,13 @@ pub fn run_importance_sampling(
     })
 }
 
+/// Minimum class responsibility for a class's per-class ESS to count toward the
+/// reported per-subject ESS. A subject whose `PMIX_ik ≈ 0` for class `k` barely
+/// draws on that class's proposal, so a collapsed proposal there is not a defect
+/// of the subject's marginal; below this floor the class is excluded from the
+/// worst-case ESS. Shared with the mixture MCEM E-step (`impmap.rs`).
+pub(crate) const MIX_ESS_PMIX_FLOOR: f64 = 1e-3;
+
 /// Class-marginalised importance-sampling objective evaluation for a mixture
 /// model (`METHOD=IMP EONLY`, #985).
 ///
@@ -530,6 +537,25 @@ pub fn run_importance_sampling_mixture(
     if nu < 1.0 {
         return Err(format!("IS: imp_proposal_df must be >= 1.0, got {}", nu));
     }
+    // Every class's Ω must admit a finite log-determinant before any sampling:
+    // the single-population entry point rejects a degenerate Ω up front, and
+    // without the same check here a non-finite `log_det` flows into
+    // `subject_is_estimate` and yields a silently NaN/±inf marginal instead of a
+    // clear error (#992 review).
+    if !params.omega.log_det.is_finite() {
+        return Err("IS: Ω log-determinant is not finite — cannot evaluate η prior".into());
+    }
+    if let Some(mp) = params.mixture.as_ref() {
+        for (c, om) in mp.omega.iter().enumerate() {
+            if !om.log_det.is_finite() {
+                return Err(format!(
+                    "IS: Ω log-determinant is not finite for mixture class {} — cannot \
+                     evaluate η prior",
+                    c + 1
+                ));
+            }
+        }
+    }
     let n_classes = spec.n_classes;
     let n_subjects = population.subjects.len();
 
@@ -552,6 +578,7 @@ pub fn run_importance_sampling_mixture(
             // Per-class conditional log-marginals and their MC variances.
             let mut nll = vec![0.0f64; n_classes];
             let mut var_k = vec![0.0f64; n_classes];
+            let mut ess_k = vec![0.0f64; n_classes];
             for c in 0..n_classes {
                 // MIXNUM = c+1 on this worker thread for the whole class solve.
                 let _g = MixtureClassGuard::enter(c + 1);
@@ -601,19 +628,36 @@ pub fn run_importance_sampling_mixture(
                 );
                 nll[c] = -out.log_marginal; // nll_ik = −log L_ik
                 var_k[c] = out.var_log_marginal;
+                ess_k[c] = out.ess_fraction;
             }
             // Marginal contribution: combine_subject returns (−2·log Σ_k p_ik L_ik,
             // PMIX, MIXEST). log L_i = −½·contribution.
             let (contribution, pmix, _mixest) = combine_subject(&logp, &nll);
             let log_marginal = -0.5 * contribution;
             // Delta-method MC variance: ∂log L_i/∂log L_ik = PMIX_ik, so
-            // Var(log L_i) ≈ Σ_k PMIX_ik²·Var(log L_ik). ESS reported as the
-            // posterior-weighted min over contributing classes (worst-case mixing).
+            // Var(log L_i) ≈ Σ_k PMIX_ik²·Var(log L_ik).
             let var_log_marginal: f64 = pmix.iter().zip(&var_k).map(|(p, v)| p * p * v).sum();
+            // The marginal has no single-proposal ESS, so report the worst
+            // per-class ESS among the classes this subject actually contributes
+            // to — a collapsed proposal in a class with PMIX ≈ 0 barely enters
+            // the marginal and must not be reported as a degenerate fit, while a
+            // collapse in a class the subject *does* load on must not be hidden
+            // behind a hardcoded 1.0 (#992 review).
+            let ess_fraction = (0..n_classes)
+                .filter(|&c| pmix[c] > MIX_ESS_PMIX_FLOOR)
+                .map(|c| ess_k[c])
+                .fold(f64::INFINITY, f64::min);
+            let ess_fraction = if ess_fraction.is_finite() {
+                ess_fraction
+            } else {
+                // No class clears the floor (numerically degenerate PMIX): fall
+                // back to the worst class overall rather than claiming health.
+                ess_k.iter().copied().fold(f64::INFINITY, f64::min)
+            };
             SubjectIsOutput {
                 log_marginal,
                 var_log_marginal,
-                ess_fraction: 1.0, // per-class ESS folded into var; keep the field benign
+                ess_fraction,
             }
         })
         .collect();
@@ -624,24 +668,52 @@ pub fn run_importance_sampling_mixture(
 
     let mut ll = 0.0_f64;
     let mut var_ll = 0.0_f64;
-    for out in per_subject.iter() {
+    let mut ess_fracs: Vec<f64> = Vec::with_capacity(n_subjects);
+    let mut low_ess: Vec<(String, f64)> = Vec::new();
+    for (i, out) in per_subject.iter().enumerate() {
         ll += out.log_marginal;
         var_ll += out.var_log_marginal;
+        ess_fracs.push(out.ess_fraction);
+        if out.ess_fraction < threshold {
+            low_ess.push((population.subjects[i].id.clone(), out.ess_fraction));
+        }
     }
     let minus2_ll = -2.0 * ll;
     let mc_se = 2.0 * var_ll.max(0.0).sqrt();
-    let _ = threshold; // per-class ESS is folded into the delta-method variance
+
+    ess_fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ess_min = *ess_fracs.first().unwrap_or(&0.0);
+    let ess_median = if ess_fracs.is_empty() {
+        0.0
+    } else {
+        let mid = ess_fracs.len() / 2;
+        if ess_fracs.len().is_multiple_of(2) {
+            0.5 * (ess_fracs[mid - 1] + ess_fracs[mid])
+        } else {
+            ess_fracs[mid]
+        }
+    };
+
+    if options.verbose {
+        eprintln!(
+            "IS (mixture) done. −2 log L = {:.4} ± {:.4} (ess_min/K = {:.3}, ess_med/K = {:.3}, \
+             low_ess = {})",
+            minus2_ll,
+            mc_se,
+            ess_min,
+            ess_median,
+            low_ess.len()
+        );
+    }
 
     Ok(ImportanceSamplingResult {
         minus2_log_likelihood: minus2_ll,
         mc_standard_error: mc_se,
-        // Per-class ESS is folded into the marginal's MC variance rather than
-        // surfaced per subject; the marginal has no single-proposal ESS.
-        low_ess_subjects: Vec::new(),
+        low_ess_subjects: low_ess,
         n_samples: k_samples,
         proposal_df: nu,
-        ess_min: 1.0,
-        ess_median: 1.0,
+        ess_min,
+        ess_median,
         kappa_treatment: KappaTreatment::NotApplicable,
     })
 }
@@ -3003,5 +3075,78 @@ mod tests {
                 );
             }
         }
+    }
+    /// ESS diagnostics on the mixture marginal are real, not hardcoded: the
+    /// reported per-subject ESS is the worst *contributing* class's ESS, so
+    /// `imp_low_ess_threshold` actually classifies subjects and a collapsed
+    /// proposal can no longer be reported as ideal sampling (#992 review).
+    #[test]
+    fn mixture_is_reports_real_ess_and_honours_threshold() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 300;
+        opts.imp_seed = Some(11);
+
+        // A threshold of 0 can never flag a subject.
+        opts.imp_low_ess_threshold = 0.0;
+        let none = run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+            .expect("mixture IS");
+        assert!(
+            none.low_ess_subjects.is_empty(),
+            "threshold 0 must flag nobody, got {:?}",
+            none.low_ess_subjects
+        );
+        assert!(
+            none.ess_min > 0.0 && none.ess_min <= 1.0,
+            "ess_min must be a real fraction, got {}",
+            none.ess_min
+        );
+        assert!(
+            none.ess_median >= none.ess_min && none.ess_median <= 1.0,
+            "ess_median {} out of range vs ess_min {}",
+            none.ess_median,
+            none.ess_min
+        );
+
+        // A threshold above every attainable ESS flags every subject — the field
+        // is driven by the data, not pinned to 1.0.
+        opts.imp_low_ess_threshold = 1.0 + 1e-9;
+        let all = run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+            .expect("mixture IS");
+        assert_eq!(
+            all.low_ess_subjects.len(),
+            pop.subjects.len(),
+            "an unreachable threshold must flag every subject"
+        );
+        assert!(
+            (all.ess_min - none.ess_min).abs() < 1e-12,
+            "the threshold must not change the measured ESS"
+        );
+    }
+
+    /// A class Ω with a non-finite log-determinant is rejected before sampling,
+    /// as the single-population entry point does — otherwise it flows into
+    /// `subject_is_estimate` and yields a silently NaN marginal (#992 review).
+    #[test]
+    fn mixture_is_rejects_non_finite_class_log_det() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut params = model.default_params.clone();
+        let mp = params.mixture.as_mut().expect("mixture params");
+        // `from_matrix` regularises a singular Ω, so set the cached determinant
+        // directly — the state a caller-supplied Ω can genuinely arrive in.
+        mp.omega[1].log_det = f64::NAN;
+        assert!(
+            !mp.omega[1].log_det.is_finite(),
+            "test setup: class-2 log_det must be non-finite"
+        );
+        let opts = FitOptions::default();
+        let err = run_importance_sampling_mixture(&model, &pop, &params, &opts)
+            .expect_err("a non-finite class log-determinant must be rejected");
+        assert!(
+            err.contains("log-determinant is not finite") && err.contains("class 2"),
+            "got: {err}"
+        );
     }
 }

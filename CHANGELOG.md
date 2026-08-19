@@ -29,7 +29,12 @@ section of the SDLC for the versioning policy).
   Objective evaluation combines the per-class IS marginals by log-sum-exp and matches NONMEM to well
   under a Monte-Carlo SE (`−2 log L = 300.82 ± 0.06` vs NONMEM `300.87` on the two-class anchor).
   Ω/σ are class-shared (per-class overrides rejected); IOV/FREM/SDE are not supported under the
-  mixture IMP paths.
+  mixture IMP paths, and a theta shared between the mixing expression and a structural typical value
+  is rejected (as under SAEM). The per-class draws use the same ISCALE pilot search and `impmap_mceta`
+  multi-start MAP as the single-population MCEM; objective evaluation reports a real per-subject ESS
+  (the worst ESS among the classes a subject loads on), so `imp_low_ess_threshold` and the
+  proposal-collapse warning apply to mixtures. `impmap_trace` and `impmap_auto` / `imp_auto` are not
+  wired for mixtures and now warn instead of being silently ignored.
 - **Bayesian estimation for mixture models (#985).** `[mixture]` models can now be fit with
   `method = bayes`. The latent class is Rao-Blackwellised — marginalised out of every Gibbs block
   rather than sampled — so each subject's likelihood contribution is the K-class marginal

@@ -319,7 +319,11 @@ $$
 
 This is the Monte-Carlo marginal likelihood — the number to compare against
 NONMEM's `#OBJV` for `IMP EONLY` — and it is what a chained fit reports on
-`FitResult.importance_sampling`. The usual workflow is to estimate with SAEM (or
+`FitResult.importance_sampling`. The reported per-subject ESS is the worst ESS
+among the classes that subject actually loads on (classes with
+$\mathrm{PMIX}_{ik}\approx 0$ are excluded, since a poor proposal there barely
+enters the marginal), so `imp_low_ess_threshold` flags mixture subjects the same
+way it does single-population ones. The usual workflow is to estimate with SAEM (or
 FOCE/FOCEI) and append an evaluation stage:
 
 ```toml
@@ -330,7 +334,8 @@ FOCE/FOCEI) and append an evaluation stage:
 
 On `tests/nonmem/mixture_iv.csv` this recovers the NONMEM `IMP EONLY` objective to
 well under a Monte-Carlo standard error: ferx `−2 log L = 300.82 ± 0.06` vs NONMEM
-`300.87` (`mixture_iv_saem.ctl`'s second `$EST`).
+`300.87` (`mixture_iv_saem.ctl`'s second `$EST`), with `ess_min/K = 0.82` and
+`ess_med/K = 0.91`.
 
 ### Estimating IMP / IMPMAP
 
@@ -348,12 +353,22 @@ supported (as for the single-population MCEM).
 
 IMP is the noisiest of the mixture estimators — the class-switched typical value
 cannot be mu-referenced, so θ is estimated by the weighted M-step alone, which
-converges more slowly than SAEM's MCMC and typically needs more iterations. On
-the two-class anchor, estimating IMPMAP recovers `TVCL1 ≈ 1.04`, `TVCL2 ≈ 2.58`,
-`V ≈ 9.96`, `p(1) ≈ 0.47` (vs the FOCEI optimum 0.98 / 2.84 / 9.98 / 0.472). For
-a well-identified point estimate prefer SAEM or FOCE/FOCEI and use IMP for the
-marginal likelihood; for the marginal likelihood at those estimates use the
-`imp_eval_only` stage above.
+converges more slowly than SAEM's MCMC and typically needs more iterations. The
+fit warns about this, and separately names any estimated θ that carries no ETA
+(the mixing thetas are excluded — they are owned by the mixing M-step, not the
+weighted one). On the two-class anchor, estimating IMPMAP recovers
+`TVCL1 ≈ 1.00`, `TVCL2 ≈ 2.60`, `V ≈ 10.00`, `p(1) ≈ 0.47` (vs the FOCEI optimum
+0.98 / 2.84 / 9.98 / 0.472); `TVCL2` is the coordinate the weighted M-step
+resolves least well. For a well-identified point estimate prefer SAEM or
+FOCE/FOCEI and use IMP for the marginal likelihood; for the marginal likelihood
+at those estimates use the `imp_eval_only` stage above.
+
+The per-subject proposal machinery is the same as the single-population MCEM:
+each class's draws get their own ISCALE pilot search (the guard against
+importance-weight collapse), and `impmap_mceta` runs its multi-start MAP within
+every class. Two IMPMAP options are **not** wired for mixtures and warn when
+set: `impmap_trace` (no iteration trace is produced) and `impmap_auto` /
+`imp_auto` (the sample count stays fixed).
 
 ## Not yet supported
 
@@ -365,4 +380,6 @@ The following error clearly rather than silently mis-fitting:
 - IOV / FREM / SDE under the mixture IMP paths (objective evaluation and
   estimation) — use FOCE/FOCEI.
 - A theta shared between the `[mixture]` mixing expression and a structural
-  typical value, under SAEM.
+  typical value, under SAEM and under estimating IMP/IMPMAP. Both run the
+  mixing M-step separately from the θ/σ M-step, so a shared theta would be
+  double-owned; FOCE/FOCEI's joint marginal handles it.
