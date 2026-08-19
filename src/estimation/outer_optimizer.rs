@@ -1421,9 +1421,11 @@ fn optimize_nlopt(
         let params = unpack_params(&x, init_params);
 
         // Mixture models (#977): K-fold log-sum-exp objective with a per-class
-        // serial inner solve. `kappas` is empty (IOV is rejected up front); the
-        // MIXEST-class EBEs stand in for the warm-start / trace. The full
-        // `MixtureEval` is kept in `mixeval` for the analytic gradient below.
+        // serial inner solve. The per-eval `kappas` slot stays empty: on the mixture
+        // path the gradient reads `mixeval` (not these kappas), so the MIXEST-class κ
+        // are only needed at the final inner loop below, where they *are* carried. The
+        // MIXEST-class EBEs stand in for the warm-start / trace. The full `MixtureEval`
+        // is kept in `mixeval` for the analytic gradient below.
         let mut mixeval: Option<crate::estimation::mixture::MixtureEval> = None;
         let (ehs, hms, ebe_stats, kappas, raw_ofv) = if params.mixture.is_some() {
             let warm = (!state.cached_etas_by_class.is_empty())
@@ -1897,10 +1899,15 @@ fn optimize_nlopt(
                 options,
                 None,
             );
+            // #985: carry the MIXEST class's per-occasion κ̂ into postfit. Empty for a
+            // non-IOV mixture, so the downstream `kappas.is_empty()` branches (sdtab
+            // IPRED/IWRES/CWRES, per-subject OFV, κ shrinkage, `.fitrx` `ebe_kappas`)
+            // behave exactly as before for non-IOV models, and reflect the IOV the fit
+            // actually used for an IOV mixture instead of κ = 0.
             (
                 m.mixest_etas,
                 m.mixest_h_mats,
-                Vec::new(),
+                m.mixest_kappas,
                 m.ofv,
                 Some(MixturePosteriors {
                     pmix: m.pmix,

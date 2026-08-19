@@ -132,10 +132,45 @@ All four agree to **< 1 %**. The `p(1)` row compares NONMEM's direct
 $P(1)=\theta_4$ SE to ferx's logit-scale SE mapped through
 $\operatorname{SE}(p) = p(1-p)\operatorname{SE}(\text{logit})$.
 
+## Inter-occasion variability under a mixture
+
+A mixture may carry inter-occasion variability (a `kappa` on a structural
+parameter) — the two features compose (#985). Each class's per-subject inner
+solve estimates the per-occasion κ̂ under that class's typical values, and the
+FOCE/FOCEI marginal `L_ik` is the κ-augmented occasion likelihood, so the same
+`L_i = Σ_k p_ik L_ik` mixture is formed over IOV-aware class likelihoods. The
+IOV Ω is shared across classes (it sits in the base parameter block, ahead of any
+per-class Ω/Σ override), matching NONMEM's `$OMEGA BLOCK(1) … SAME` occasion
+structure. The analytic outer gradient does not yet emit κ-slot derivatives for a
+mixture, so an IOV mixture optimises against a central-difference outer gradient;
+the covariance step runs as usual on the K-fold mixture objective.
+
+### NONMEM cross-check (`tests/nonmem/mixture_iv_iov.ctl`)
+
+Two-class bimodal-CL model with a per-occasion κ on CL (30 subjects × 2
+occasions), IIV/IOV Ω and Σ FIXed at the data-generating values in both engines,
+`METHOD=1 INTER`:
+
+| Quantity | NONMEM 7.5.1 | ferx |
+|---|---|---|
+| OFV (without constant) | 470.814 | 470.930 |
+| `TVCL1` (class 1) | 1.057 | 1.069 |
+| `TVCL2` (class 2) | 3.330 | 3.275 |
+| `V` | 10.259 | 10.253 |
+| mixing fraction `p(1)` | 0.526 | 0.506 |
+| `MIXEST` classification | — | **30 / 30 subjects agree** |
+
+The objectives agree to ~0.12 units and every subject's most-probable class
+matches. Standard errors are **not** cross-checked for this model: NONMEM's
+covariance step terminates with rounding errors and substitutes the R matrix
+(`R MATRIX SUBSTITUTED: YES`, no printable SE block) — a known NONMEM fragility
+for mixture + IOV covariance — whereas ferx's covariance step completes. The
+mixture SE machinery itself is anchored to `$COVARIANCE MATRIX=R` in the non-IOV
+[standard-errors](#standard-errors) comparison above.
+
 ## Not yet supported
 
 Mixture models are currently limited to FOCE/FOCEI. The following error clearly
 rather than silently mis-fitting:
 
 - Other estimators (SAEM / IMP / Bayes).
-- Inter-occasion variability within a mixture.

@@ -20,6 +20,18 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Inter-occasion variability under a mixture (#985).** A `[mixture]` model may now also carry a
+  `kappa` (inter-occasion variability) term — the two features compose, where before `fit()` rejected
+  the combination. Each class's per-subject inner solve estimates the per-occasion κ̂ under that
+  class's typical values, and the FOCE/FOCEI marginal `L_ik` is the κ-augmented occasion likelihood,
+  so the usual `L_i = Σ_k p_ik · L_ik` mixture is formed over IOV-aware class likelihoods. The IOV Ω
+  is shared across classes (matching NONMEM `$OMEGA BLOCK(1) … SAME`). The analytic outer gradient
+  does not yet emit κ-slot derivatives for a mixture, so an IOV mixture optimises against a
+  finite-difference outer gradient; the covariance step runs as usual on the K-fold objective.
+  Per-subject diagnostics are IOV-aware: the winning (`MIXEST`) class's per-occasion κ̂ flow into the
+  sdtab IPRED/IWRES/CWRES and per-subject OFV, into κ shrinkage, and into the `.fitrx` `ebe_kappas`
+  export. Cross-checked against NONMEM 7.5.1 (`tests/nonmem/mixture_iv_iov.ctl`): OFV, class
+  clearances, `V`, mixing fraction, and all 30 `MIXEST` classifications agree.
 - **Mixture models — `$MIXTURE`-style discrete latent subpopulations (#977).** Model files can
   declare a `[mixture]` block giving the number of classes (`nsub`), the per-class mixing rule
   (`logit(k) = …` softmax, or `p(k) = …` direct probability, over theta + covariates), and optional per-class Ω/Σ overrides (`omega(k)` /
@@ -32,8 +44,8 @@ section of the SDLC for the versioning policy).
   optimizer, but an analytic posterior-weighted outer gradient is available, so a user-selected NLopt
   gradient optimizer (SLSQP / L-BFGS / MMA) is honoured — with an automatic finite-difference fallback
   for models outside analytic scope (e.g. `MIXNUM`-branched typical values). Other estimators
-  (SAEM/IMP/Bayes) and inter-occasion variability under a mixture are not yet
-  supported and error clearly. The parser rejects `nsub < 2`, `MIXNUM`
+  (SAEM/IMP/Bayes) are not yet supported and error clearly (inter-occasion variability is supported
+  since #985). The parser rejects `nsub < 2`, `MIXNUM`
   assignment, `MIXNUM` outside a mixture model, eta-dependent mixing expressions, missing class
   coverage, `omega(k)` on a block base, and overrides of the base class. The `sdtab` output gains
   per-subject `MIXEST` (most-probable class, 1-based like NONMEM) and `PMIX_1..PMIX_K` (posterior
