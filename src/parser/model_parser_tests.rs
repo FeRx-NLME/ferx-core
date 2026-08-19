@@ -13648,10 +13648,11 @@ fn fit_on_mixture_model_rejects_missing_mixture_params() {
 
 #[test]
 fn fit_on_mixture_model_rejects_unsupported_method() {
-    // FOCE/FOCEI (Phase 3) and SAEM (#985) estimate a mixture; the remaining
-    // estimators (here IMP) must still error clearly rather than silently
-    // ignoring the mixture structure. The method guard fires before any subject
-    // is touched, so an empty population suffices.
+    // FOCE/FOCEI, SAEM, Bayes, and IMP objective-evaluation estimate/evaluate a
+    // mixture (#985); the remaining estimators (here Gauss-Newton) must still
+    // error clearly rather than silently ignoring the mixture structure. The
+    // method guard fires before any subject is touched, so an empty population
+    // suffices.
     let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
     let pop = crate::types::Population {
         subjects: vec![],
@@ -13663,11 +13664,11 @@ fn fit_on_mixture_model_rejects_unsupported_method() {
     };
     let params = model.default_params.clone();
     let opts = crate::types::FitOptions {
-        method: crate::types::EstimationMethod::Imp,
+        method: crate::types::EstimationMethod::FoceGn,
         ..crate::types::FitOptions::default()
     };
     let err = crate::api::fit(&model, &pop, &params, &opts)
-        .expect_err("IMP on a mixture model must be rejected");
+        .expect_err("Gauss-Newton on a mixture model must be rejected");
     assert!(
         err.contains("mixture") && err.contains("FOCE"),
         "got: {err}"

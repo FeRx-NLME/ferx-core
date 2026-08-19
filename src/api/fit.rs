@@ -227,10 +227,16 @@ pub fn fit(
                     | EstimationMethod::FoceI
                     | EstimationMethod::Saem
                     | EstimationMethod::Bayes
+                    // IMP is admitted for the objective-evaluation (EONLY) path,
+                    // which forms the class-marginal `−2 Σ log Σ_k p_ik L_ik`;
+                    // the *estimating* IMP/IMPMAP MCEM rejects mixtures in
+                    // `run_mcem` with a clear message (#985).
+                    | EstimationMethod::Imp
+                    | EstimationMethod::Impmap
             ) {
                 return Err(format!(
-                    "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes; the {} \
-                     method is not yet wired for mixtures (#985)",
+                    "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes, and IMP \
+                     objective evaluation; the {} method is not yet wired for mixtures (#985)",
                     m.label()
                 ));
             }
@@ -1311,15 +1317,28 @@ fn fit_inner(
             let prev = result.as_ref().expect(
                 "IMP stage: prior OuterResult must exist (synthesised above when standalone)",
             );
-            match crate::estimation::importance_sampling::run_importance_sampling(
-                model,
-                population,
-                &prev.params,
-                &prev.eta_hats,
-                &prev.h_matrices,
-                &prev.kappas,
-                &stage_opts,
-            ) {
+            // Mixture (#985): evaluate the class-marginal IS objective
+            // −2 Σ log Σ_k p_ik L_ik (per-class MAP + IS, combined), rather than
+            // the single-population marginal.
+            let is_call = if model.mixture.is_some() {
+                crate::estimation::importance_sampling::run_importance_sampling_mixture(
+                    model,
+                    population,
+                    &prev.params,
+                    &stage_opts,
+                )
+            } else {
+                crate::estimation::importance_sampling::run_importance_sampling(
+                    model,
+                    population,
+                    &prev.params,
+                    &prev.eta_hats,
+                    &prev.h_matrices,
+                    &prev.kappas,
+                    &stage_opts,
+                )
+            };
+            match is_call {
                 Ok(r) => {
                     // Surface a *separate* warning for any subject whose
                     // ESS-fraction collapsed to zero. These are already in

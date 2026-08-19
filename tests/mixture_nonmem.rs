@@ -493,3 +493,79 @@ fn bayes_mixture_recovers_optimum() {
         "MIXEST populated"
     );
 }
+
+// NONMEM IMP objective (mixture_iv_saem.ext TABLE NO. 2, the `METHOD=IMP
+// EONLY=1` pass that follows SAEM): the class-marginal −2 log L evaluated by
+// importance sampling at the SAEM optimum.
+const NM_IMP_MARGINAL: f64 = 300.8707;
+
+/// IMP objective evaluation under a mixture (#985): `method = [saem, imp]` with
+/// `imp_eval_only`. The SAEM stage estimates the parameters; the IMP stage
+/// evaluates the class-marginal likelihood `−2 Σ log Σ_k p_ik L_ik` by importance
+/// sampling per class (per-class MAP + IS, combined via log-sum-exp). Anchored to
+/// the NONMEM `METHOD=IMP EONLY=1` objective from `mixture_iv_saem.ctl` (300.87).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests (NONMEM IMP mixture marginal)"
+)]
+fn imp_mixture_marginal_matches_nonmem() {
+    let pop: ferx_core::Population = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .unwrap();
+    let model = parse_model_string(MODEL).unwrap();
+    let mut opts = FitOptions::default();
+    opts.methods = vec![
+        ferx_core::EstimationMethod::Saem,
+        ferx_core::EstimationMethod::Imp,
+    ];
+    opts.interaction = true;
+    opts.saem_n_exploration = 600;
+    opts.saem_n_convergence = 800;
+    opts.saem_seed = Some(20250818);
+    opts.imp_eval_only = true;
+    opts.imp_samples = 3000;
+    opts.imp_seed = Some(20250818);
+
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("saem+imp mixture fit Ok");
+    let is = res
+        .importance_sampling
+        .as_ref()
+        .expect("IMP objective evaluation populated on the chain's last stage");
+    eprintln!(
+        "IMP mixture marginal: -2logL = {:.4} ± {:.4} vs NONMEM {:.4}",
+        is.minus2_log_likelihood, is.mc_standard_error, NM_IMP_MARGINAL
+    );
+    // The IS marginal is a Monte-Carlo estimate at the SAEM optimum; a ~1-unit
+    // band covers the MC error plus the small SAEM-vs-NONMEM optimum offset.
+    assert!(
+        (is.minus2_log_likelihood - NM_IMP_MARGINAL).abs() < 2.0,
+        "IMP marginal {} vs NONMEM {}",
+        is.minus2_log_likelihood,
+        NM_IMP_MARGINAL
+    );
+}
+
+/// Estimating IMP/IMPMAP is rejected for a mixture with a clear pointer to the
+/// EONLY objective path (#985).
+#[test]
+fn estimating_imp_rejected_for_mixture() {
+    let pop: ferx_core::Population = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .unwrap();
+    let model = parse_model_string(MODEL).unwrap();
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Impmap; // estimating
+    let err = fit(&model, &pop, &model.default_params, &opts)
+        .expect_err("estimating IMPMAP on a mixture must be rejected");
+    assert!(
+        err.contains("imp_eval_only") || err.contains("objective"),
+        "got: {err}"
+    );
+}

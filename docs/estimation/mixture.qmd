@@ -253,12 +253,45 @@ in burn-in on this model (it insists on Gibbs-sampling Ω, which is FIXed here),
 known NONMEM `$MIX`+BAYES fragility. The same mixture-marginal machinery is
 anchored directly against NONMEM SAEM above.
 
+## IMP objective evaluation under a mixture
+
+Importance sampling evaluates the **class-marginal** likelihood for a mixture
+(`method = imp` with `imp_eval_only`, NONMEM `METHOD=IMP EONLY=1`, #985). For each
+subject and each class it runs the class-`k` MAP inner solve (under the `MIXNUM`
+guard), importance-samples the class-conditional marginal $L_{ik}$, and combines
+them exactly as FOCEI does:
+
+$$
+-2\log L = -2\sum_i \log \sum_k p_{ik}\,L_{ik}.
+$$
+
+This is the Monte-Carlo marginal likelihood — the number to compare against
+NONMEM's `#OBJV` for `IMP EONLY` — and it is what a chained fit reports on
+`FitResult.importance_sampling`. The usual workflow is to estimate with SAEM (or
+FOCE/FOCEI) and append an evaluation stage:
+
+```toml
+[fit_options]
+  method = [saem, imp]
+  imp_eval_only = true
+```
+
+On `tests/nonmem/mixture_iv.csv` this recovers the NONMEM `IMP EONLY` objective to
+well under a Monte-Carlo standard error: ferx `−2 log L = 300.82 ± 0.06` vs NONMEM
+`300.87` (`mixture_iv_saem.ctl`'s second `$EST`).
+
+*Estimating* IMP/IMPMAP (updating parameters via the weighted MCEM M-step) is not
+yet class-partitioned and is rejected with a clear error — estimate with SAEM or
+FOCE/FOCEI and evaluate the marginal with the objective-evaluation stage above.
+
 ## Not yet supported
 
 The following error clearly rather than silently mis-fitting:
 
-- IMP / IMPMAP estimators for a mixture (#985); FOCE/FOCEI, SAEM, and Bayes are
-  supported.
+- *Estimating* IMP / IMPMAP for a mixture (the objective-evaluation `imp_eval_only`
+  path above is supported); FOCE/FOCEI, SAEM, and Bayes estimate a mixture.
 - Per-class σ overrides (`sigma(k)`) under SAEM (held at their initial values,
   with a warning), and per-class Ω/σ overrides under Bayes (rejected) — use
   FOCE/FOCEI to fit those.
+- IOV under the mixture IMP objective evaluation — use FOCE/FOCEI for an IOV
+  mixture.

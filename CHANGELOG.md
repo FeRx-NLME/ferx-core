@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **IMP objective evaluation for mixture models (#985).** Importance sampling now evaluates the
+  class-marginal likelihood `−2 Σ log Σ_k p_ik L_ik` for a `[mixture]` model (`method = imp` with
+  `imp_eval_only`, NONMEM `METHOD=IMP EONLY=1`): per subject and class it runs the class MAP solve and
+  importance-samples the class-conditional marginal, then combines them by log-sum-exp — the true
+  Monte-Carlo marginal for AIC/BIC and NONMEM comparison. The usual use is a chain, e.g.
+  `method = [saem, imp], imp_eval_only = true`. Matches NONMEM to well under a Monte-Carlo SE
+  (`−2 log L = 300.82 ± 0.06` vs NONMEM `300.87` on the two-class anchor). *Estimating* IMP/IMPMAP
+  (parameter updates) for a mixture is not yet class-partitioned and is rejected with a clear pointer
+  to this path; IOV under the mixture IMP objective is likewise rejected.
 - **Bayesian estimation for mixture models (#985).** `[mixture]` models can now be fit with
   `method = bayes`. The latent class is Rao-Blackwellised — marginalised out of every Gibbs block
   rather than sampled — so each subject's likelihood contribution is the K-class marginal

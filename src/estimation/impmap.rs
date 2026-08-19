@@ -393,6 +393,18 @@ fn run_mcem(
     let n_sigma = init_params.sigma.values.len();
 
     // ---- Validation ----
+    // Mixture (#985): the estimating IMP/IMPMAP MCEM (weighted M-step over the
+    // per-subject IS draws) is not yet class-partitioned. The class-marginal IS
+    // *objective* is available via `method = imp` with `imp_eval_only` (typically
+    // as the last stage of a `[saem, imp]` / `[focei, imp]` chain); route
+    // parameter estimation through SAEM or FOCE/FOCEI.
+    if model.mixture.is_some() {
+        return Err(format!(
+            "{label} (estimating IMP/IMPMAP) is not yet wired for mixture models. Estimate with \
+             SAEM or FOCE/FOCEI, then evaluate the class-marginal likelihood with an IMP \
+             objective-evaluation stage (`imp_eval_only`), e.g. method = [saem, imp] (#985)."
+        ));
+    }
     if n_eta == 0 {
         return Err(format!(
             "{label} requires at least one random effect (n_eta = 0). \
