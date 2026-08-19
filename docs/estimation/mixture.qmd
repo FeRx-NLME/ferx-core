@@ -218,11 +218,47 @@ posterior sits almost exactly on the class boundary, which NONMEM SAEM and ferx
 SAEM split marginally differently. Covariate-dependent mixing under SAEM is
 exercised end-to-end in `tests/mixture_nonmem.rs`.
 
+## Bayesian estimation under a mixture
+
+Mixtures can also be fit with full-MCMC Bayesian estimation (`method = bayes`,
+#985). The latent class is handled **Rao-Blackwellised** — marginalised out
+rather than sampled — so the sampler still sees a smooth continuous target: each
+subject's likelihood contribution is the K-class marginal
+$-\log \sum_k p_{ik}\,\exp(-\mathrm{nll}_{ik})$. Because every Gibbs block
+evaluates the per-subject likelihood through this one marginal, the whole
+Gibbs-within-MH sampler becomes mixture-aware in one place:
+
+- the **η block** samples $\eta_i$ against the class-marginal posterior (a
+  `chol(Ω)`-preconditioned random walk; HMC is disabled for mixtures because its
+  analytic gradient is single-class);
+- the **(θ, σ) block** — which also carries the mixing thetas — samples them
+  against the marginal, so the mixing coefficients (constant *or*
+  covariate-dependent logit mixing) are sampled with no extra machinery;
+- the **Ω block** draws the (class-shared) Ω from its conjugate full conditional.
+
+Ω/Σ are shared across classes (the classes differ only through the
+`MIXNUM`-switched typical values); per-class Ω/Σ overrides (`omega(k)`/`sigma(k)`)
+are rejected with a clear error — fit those with FOCE/FOCEI. The reported OFV,
+per-subject `MIXEST`/`PMIX`, and EBEs are the K-fold marginal values at the
+posterior mean.
+
+Under diffuse priors the Bayes posterior mean concentrates at the maximum-
+likelihood optimum, so it recovers the same estimates the FOCEI/SAEM anchors pin
+(observed on `tests/nonmem/mixture_iv.csv`: posterior mean `TVCL1 ≈ 0.94`,
+`TVCL2 ≈ 2.78`, `V ≈ 10.0`, `p(1) ≈ 0.47`, marginal OFV ≈ 301.8, vs the FOCEI
+optimum 0.98 / 2.84 / 9.98 / 0.472 / 301.58). That shared optimum — already
+NONMEM-anchored by the FOCEI run above — is the Bayes cross-check: a direct
+NONMEM `METHOD=BAYES` reference is not used because NONMEM's BAYES sampler aborts
+in burn-in on this model (it insists on Gibbs-sampling Ω, which is FIXed here), a
+known NONMEM `$MIX`+BAYES fragility. The same mixture-marginal machinery is
+anchored directly against NONMEM SAEM above.
+
 ## Not yet supported
 
 The following error clearly rather than silently mis-fitting:
 
-- IMP / IMPMAP and Bayes (HMC) estimators for a mixture (#985); FOCE/FOCEI and
-  SAEM are supported.
+- IMP / IMPMAP estimators for a mixture (#985); FOCE/FOCEI, SAEM, and Bayes are
+  supported.
 - Per-class σ overrides (`sigma(k)`) under SAEM (held at their initial values,
-  with a warning) — use FOCE/FOCEI to fit those.
+  with a warning), and per-class Ω/σ overrides under Bayes (rejected) — use
+  FOCE/FOCEI to fit those.

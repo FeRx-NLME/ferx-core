@@ -20,6 +20,17 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Bayesian estimation for mixture models (#985).** `[mixture]` models can now be fit with
+  `method = bayes`. The latent class is Rao-Blackwellised — marginalised out of every Gibbs block
+  rather than sampled — so each subject's likelihood contribution is the K-class marginal
+  `−log Σ_k p_ik·exp(−nll_ik)` and the sampler keeps a smooth continuous target. The η block samples
+  against the class-marginal posterior (HMC is disabled for mixtures; its analytic gradient is
+  single-class), the (θ,σ) block samples the mixing thetas (constant or covariate logit) with no extra
+  machinery, and Ω is drawn from its class-shared conjugate conditional. Reported OFV, per-subject
+  `MIXEST`/`PMIX`, and EBEs are the K-fold marginal values at the posterior mean. Per-class Ω/σ
+  overrides are rejected (Ω/σ are class-shared). Validated by recovering the mixture MLE under diffuse
+  priors (a direct NONMEM `METHOD=BAYES` reference is impractical — its sampler aborts on `$MIX` with
+  FIXed Ω/Σ).
 - **SAEM estimation for mixture models (#985).** `[mixture]` models can now be fit with
   `method = saem`, not only FOCE/FOCEI. The E-step samples the latent class per subject (from the
   current posterior `PMIX_i`) and runs the η-MCMC within the drawn class; the M-step estimates the
