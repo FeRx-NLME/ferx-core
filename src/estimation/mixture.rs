@@ -38,6 +38,12 @@ pub struct MixtureEval {
     pub mixest_etas: Vec<DVector<f64>>,
     /// MIXEST-class inner Hessian per subject.
     pub mixest_h_mats: Vec<DMatrix<f64>>,
+    /// MIXEST-class per-occasion κ̂ per subject (#985). Empty inner `Vec` for a
+    /// non-IOV mixture; `mixest_kappas[i]` is the winning class's per-occasion
+    /// κ EBEs, so postfit (IPRED/IWRES/CWRES, per-subject OFV, κ shrinkage, and
+    /// the `.fitrx` `ebe_kappas` export) sees the IOV the fit actually used
+    /// rather than κ = 0.
+    pub mixest_kappas: Vec<Vec<DVector<f64>>>,
     /// Posterior class membership `PMIX_ik` per subject (length `K`).
     pub pmix: Vec<Vec<f64>>,
     /// `MIXEST_i` = argmax-posterior class per subject (0-based).
@@ -128,6 +134,9 @@ pub fn mixture_ofv(
     let mut nll: Vec<Vec<f64>> = vec![vec![0.0; n]; k];
     let mut etas_by_class: Vec<Vec<DVector<f64>>> = Vec::with_capacity(k);
     let mut hmats_by_class: Vec<Vec<DMatrix<f64>>> = Vec::with_capacity(k);
+    // Per-occasion κ̂ per class per subject (#985). Empty inner `Vec` for a
+    // non-IOV class; kept so the MIXEST class's κ can be carried into postfit.
+    let mut kappas_by_class: Vec<Vec<Vec<DVector<f64>>>> = Vec::with_capacity(k);
     let mut converged: Vec<Vec<bool>> = vec![vec![true; n]; k];
     let mut fallback: Vec<Vec<bool>> = vec![vec![false; n]; k];
     let mut hard_reject: Vec<Vec<bool>> = vec![vec![false; n]; k];
@@ -138,6 +147,7 @@ pub fn mixture_ofv(
         let cp = class_params(params, cls);
         let mut etas_c = Vec::with_capacity(n);
         let mut hmats_c = Vec::with_capacity(n);
+        let mut kappas_c = Vec::with_capacity(n);
         for (i, subject) in population.subjects.iter().enumerate() {
             let warm_i = warm
                 .and_then(|w| w.get(cls))
@@ -157,11 +167,14 @@ pub fn mixture_ofv(
             // IOV inner solve when `n_kappa > 0` (each class carries the shared base
             // `omega_iov`, since `class_params` only swaps Ω/Σ), so `ebe.kappas` are
             // the per-occasion κ̂ for this class. The outer marginal must then use the
-            // IOV FOCE nll, which augments the marginal with the κ prior + κ columns;
-            // it self-reduces to `foce_subject_nll` when `kappas` is empty, but we
-            // branch explicitly so a non-IOV mixture keeps the byte-identical legacy
-            // call and no `omega_iov` unwrap runs.
-            nll[cls][i] = if model.n_kappa > 0 {
+            // IOV FOCE nll, which augments the marginal with the κ prior + κ columns.
+            // We key the branch on `cp.omega_iov`, the exact field the IOV nll unwraps
+            // — the same predicate `mixture_gradient` gates on — so the two paths can
+            // never disagree on scope, and no `expect`/unwrap can fire on a
+            // present-`n_kappa`-but-absent-`omega_iov` model. It self-reduces to
+            // `foce_subject_nll` when `omega_iov` is absent, keeping a non-IOV mixture
+            // on the byte-identical legacy call.
+            nll[cls][i] = if let Some(omega_iov) = cp.omega_iov.as_ref() {
                 foce_subject_nll_iov(
                     model,
                     subject,
@@ -172,9 +185,7 @@ pub fn mixture_ofv(
                     &cp.sigma.values,
                     interaction,
                     &ebe.kappas,
-                    cp.omega_iov
-                        .as_ref()
-                        .expect("IOV model (n_kappa > 0) has omega_iov"),
+                    omega_iov,
                 )
             } else {
                 foce_subject_nll(
@@ -193,9 +204,11 @@ pub fn mixture_ofv(
             hard_reject[cls][i] = ebe.hard_reject;
             etas_c.push(ebe.eta);
             hmats_c.push(ebe.h_matrix);
+            kappas_c.push(ebe.kappas);
         }
         etas_by_class.push(etas_c);
         hmats_by_class.push(hmats_c);
+        kappas_by_class.push(kappas_c);
     }
 
     // Combine per subject via log-sum-exp; pick MIXEST for warm-start / postfit.
@@ -204,6 +217,7 @@ pub fn mixture_ofv(
     let mut mixest = Vec::with_capacity(n);
     let mut mixest_etas = Vec::with_capacity(n);
     let mut mixest_h_mats = Vec::with_capacity(n);
+    let mut mixest_kappas = Vec::with_capacity(n);
     let (mut n_unconverged, mut n_fallback, mut n_start_rejected) = (0usize, 0usize, 0usize);
 
     for (i, subject) in population.subjects.iter().enumerate() {
@@ -232,6 +246,7 @@ pub fn mixture_ofv(
         }
         mixest_etas.push(etas_by_class[best][i].clone());
         mixest_h_mats.push(hmats_by_class[best][i].clone());
+        mixest_kappas.push(kappas_by_class[best][i].clone());
         pmix.push(probs);
         mixest.push(best);
     }
@@ -240,6 +255,7 @@ pub fn mixture_ofv(
         ofv,
         mixest_etas,
         mixest_h_mats,
+        mixest_kappas,
         pmix,
         mixest,
         etas_by_class,
@@ -281,8 +297,8 @@ pub fn mixture_gradient(
     // sensitivity provider does not yet emit κ-slot gradients for a mixture. Rather
     // than assemble a partial gradient with wrong override-slot offsets, route the
     // whole IOV-mixture objective to central FD (`mixture_gradient_fd`, which packs
-    // through the authoritative `pack_params` layout). `ov_base` below still adds
-    // `n_iov` so the layout stays correct if an analytic κ path is added later.
+    // through the authoritative `pack_params` layout). Returning here means every
+    // path below is non-IOV, so the κ segment is empty and `ov_base` needs no κ term.
     if params.omega_iov.is_some() {
         return None;
     }
@@ -292,13 +308,9 @@ pub fn mixture_gradient(
     let nt = params.theta.len();
     let n_omega = omega_packed_len(params.omega.dim(), params.omega.diagonal);
     let n_sigma = params.sigma.values.len();
-    // Mirror `pack_params`: the per-class override tail is appended *after* the IOV
-    // segment, so the override base must skip it (`n_iov` is 0 for a non-IOV model).
-    let n_iov = params
-        .omega_iov
-        .as_ref()
-        .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
-    let ov_base = nt + n_omega + n_sigma + n_iov;
+    // Mirror `pack_params`: the per-class override tail follows [θ, Ω, σ]. There is
+    // no κ segment on this path (the `omega_iov` early-return above guarantees it).
+    let ov_base = nt + n_omega + n_sigma;
     let n_omega_ov = mp.omega_override_addr.len();
     let total = ov_base + n_omega_ov + mp.sigma_override_addr.len();
 
@@ -619,6 +631,55 @@ mod tests {
             assert!((pmix.iter().sum::<f64>() - 1.0).abs() < 1e-9);
             assert!(sr.mixest.is_some());
         }
+    }
+
+    #[test]
+    fn iov_mixture_postfit_carries_kappa_ebes() {
+        // #986 regression: the final mixture branch used to return `Vec::new()` for
+        // the per-subject κ EBEs (MixtureEval carried none), so postfit ran with κ = 0
+        // — sdtab IPRED/IWRES/CWRES, per-subject OFV, κ shrinkage, and the `.fitrx`
+        // `ebe_kappas` export all silently ignored the IOV the fit actually used. The
+        // MIXEST-class κ̂ must now flow through to `FitResult.ebe_kappas` (one entry
+        // per subject, correctly dimensioned) and to a populated κ shrinkage vector.
+        let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
+        let pop = read_pop_iov(&bimodal_iov_csv(4, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            outer_maxiter: 3,
+            ..crate::types::FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("IOV + mixture fit should return Ok");
+
+        // One κ set per subject, each with two occasions (OCC 1 and 2), each a
+        // length-1 κ vector (single KAPPA_CL). Empty ⇒ the postfit-drops-κ bug.
+        assert_eq!(
+            res.ebe_kappas.len(),
+            pop.subjects.len(),
+            "ebe_kappas must have one entry per subject"
+        );
+        for ks in &res.ebe_kappas {
+            assert_eq!(ks.len(), 2, "two occasions per subject");
+            assert!(
+                ks.iter().all(|k| k.len() == 1),
+                "one κ (KAPPA_CL) per occasion"
+            );
+        }
+        // κ is genuinely estimated (not a zero placeholder): at least one occasion of
+        // one subject moved off the prior mode.
+        assert!(
+            res.ebe_kappas
+                .iter()
+                .flatten()
+                .any(|k| k.iter().any(|&v| v.abs() > 1e-6)),
+            "at least one κ̂ should be non-zero"
+        );
+        // κ shrinkage is reported (one per kappa parameter) — empty before the fix,
+        // since fit.rs gates it on `ebe_kappas` being non-empty.
+        assert_eq!(
+            res.shrinkage_kappa.len(),
+            1,
+            "pooled κ shrinkage populated for the IOV mixture"
+        );
     }
 
     #[test]

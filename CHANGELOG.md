@@ -28,8 +28,10 @@ section of the SDLC for the versioning policy).
   is shared across classes (matching NONMEM `$OMEGA BLOCK(1) … SAME`). The analytic outer gradient
   does not yet emit κ-slot derivatives for a mixture, so an IOV mixture optimises against a
   finite-difference outer gradient; the covariance step runs as usual on the K-fold objective.
-  Cross-checked against NONMEM 7.5.1 (`tests/nonmem/mixture_iv_iov.ctl`): OFV, class clearances, `V`,
-  mixing fraction, and all 30 `MIXEST` classifications agree.
+  Per-subject diagnostics are IOV-aware: the winning (`MIXEST`) class's per-occasion κ̂ flow into the
+  sdtab IPRED/IWRES/CWRES and per-subject OFV, into κ shrinkage, and into the `.fitrx` `ebe_kappas`
+  export. Cross-checked against NONMEM 7.5.1 (`tests/nonmem/mixture_iv_iov.ctl`): OFV, class
+  clearances, `V`, mixing fraction, and all 30 `MIXEST` classifications agree.
 - **Mixture models — `$MIXTURE`-style discrete latent subpopulations (#977).** Model files can
   declare a `[mixture]` block giving the number of classes (`nsub`), the per-class mixing rule
   (`logit(k) = …` softmax, or `p(k) = …` direct probability, over theta + covariates), and optional per-class Ω/Σ overrides (`omega(k)` /
