@@ -1846,7 +1846,7 @@ pub fn run_saem(
     // every class's thetas from its own members.
     let mut saem_mix: Option<crate::estimation::saem_mixture::SaemMixture> =
         model.mixture.as_ref().map(|_| {
-            crate::estimation::saem_mixture::SaemMixture::build(model, init_params, n_subjects)
+            crate::estimation::saem_mixture::SaemMixture::build(model, init_params, population)
         });
     if let Some(mix) = saem_mix.as_ref() {
         if mix.has_sigma_override() {
@@ -2088,6 +2088,17 @@ pub fn run_saem(
                         let mut eta_work = eta.clone();
 
                         // ---- Kernel 1: primary block move ----
+                        // Baseline for the first MH acceptance ratio is the cached
+                        // NLL (as in the non-mixture path). For a mixture that value
+                        // was computed under the previous iteration's drawn class, so
+                        // on a class flip the very first proposal is scored against a
+                        // slightly mismatched baseline — but the sweep recomputes the
+                        // NLL under the current class from the next step on, so the
+                        // effect is a single self-correcting proposal. Re-deriving the
+                        // baseline at the drawn class each iteration was tried and
+                        // measurably *worsened* the fit (it lets a wrong class draw
+                        // drag η, inflating Monte-Carlo variance), so the cached
+                        // baseline is deliberate (#987 review).
                         let mut nll_cur = nll;
                         let mut n_acc_primary = 0_usize;
                         let mut n_prop_primary = 0_usize;

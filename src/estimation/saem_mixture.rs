@@ -69,11 +69,13 @@ pub(crate) struct SaemMixture {
 }
 
 impl SaemMixture {
-    /// Build from the initial `ModelParameters` (must carry `mixture`).
+    /// Build from the initial `ModelParameters` (must carry `mixture`). Uses the
+    /// population's covariates both to detect which thetas the mixing expressions
+    /// depend on and to seed each subject's responsibility average.
     pub(crate) fn build(
         model: &CompiledModel,
         init_params: &ModelParameters,
-        n_subjects: usize,
+        population: &Population,
     ) -> Self {
         let mp = init_params
             .mixture
@@ -82,22 +84,35 @@ impl SaemMixture {
             .clone();
         let n_classes = mp.omega.len();
         let n_eta = model.n_eta;
+        let n_subjects = population.subjects.len();
         let spec = model
             .mixture
             .as_ref()
             .expect("SaemMixture::build on non-mixture model");
 
+        // Per-subject initial mixing probabilities (each under that subject's own
+        // covariates — so covariate-dependent logit mixing starts from the right,
+        // subject-specific responsibilities rather than a covariate-0 default).
+        let base_lp: Vec<Vec<f64>> = population
+            .subjects
+            .iter()
+            .map(|s| eval_mixing_log_probs(spec, &init_params.theta, &s.covariates))
+            .collect();
+
         // Detect which thetas the mixing expressions depend on: perturb each and
-        // see whether any `ln p_k` moves. Dependence on a theta shows up
-        // regardless of covariate values, so an empty covariate map suffices.
-        let empty_cov: HashMap<String, f64> = HashMap::new();
-        let base_lp = eval_mixing_log_probs(spec, &init_params.theta, &empty_cov);
+        // see whether any `ln p_ik` moves for *any* subject. Probing against the
+        // real covariates (not an empty map) is what catches a covariate that
+        // enters purely multiplicatively and is 0 at the default — e.g. `BWT*SEX`
+        // with `SEX = 0` would show no θ-dependence against a covariate-0 probe.
         let mut mixing_theta_idx = Vec::new();
         for j in 0..init_params.theta.len() {
             let mut t = init_params.theta.clone();
             t[j] += 1e-3 * t[j].abs().max(1.0);
-            let lp = eval_mixing_log_probs(spec, &t, &empty_cov);
-            if lp.iter().zip(&base_lp).any(|(a, b)| (a - b).abs() > 1e-9) {
+            let moves = population.subjects.iter().zip(&base_lp).any(|(s, blp)| {
+                let lp = eval_mixing_log_probs(spec, &t, &s.covariates);
+                lp.iter().zip(blp).any(|(a, b)| (a - b).abs() > 1e-9)
+            });
+            if moves {
                 mixing_theta_idx.push(j);
             }
         }
@@ -114,9 +129,11 @@ impl SaemMixture {
             .map(|&(c, s)| ((c, s), mp.sigma[c].values[s]))
             .collect();
 
-        // r̄ initialised from the initial mixing probabilities.
-        let init_p: Vec<f64> = base_lp.iter().map(|l| l.exp()).collect();
-        let rbar = vec![init_p; n_subjects];
+        // r̄ initialised per subject from that subject's initial mixing probs.
+        let rbar: Vec<Vec<f64>> = base_lp
+            .iter()
+            .map(|blp| blp.iter().map(|l| l.exp()).collect())
+            .collect();
 
         SaemMixture {
             n_classes,
@@ -269,6 +286,15 @@ pub(crate) fn draw_class(
 /// Covers constant mixing (closed form `p_k = mean_i r̄_ik`, which the optimiser
 /// recovers) and covariate-dependent logit mixing (a weighted multinomial fit)
 /// with one code path.
+///
+/// Runs *after* the θ/σ M-step and overwrites `theta[mixing_theta_idx]`. This
+/// assumes the mixing thetas are dedicated to the mixing expression (the
+/// conventional parameterisation — `logit(k) = MIXL + …`, NONMEM `P(k)=THETA(j)`
+/// — and how every example here is written). A theta that also drives a
+/// structural typical value would be double-owned: the residual-likelihood
+/// estimate from the θ/σ M-step would be discarded here. There is no clean joint
+/// estimate for such a shared parameter; if that pattern is ever needed, split it
+/// into two thetas (one for structure, one for mixing).
 pub(crate) fn mstep_mixing(
     model: &CompiledModel,
     population: &Population,
@@ -421,7 +447,8 @@ mod tests {
     #[test]
     fn build_detects_constant_mixing_theta() {
         let model = parse_model_string(CONST_MODEL).unwrap();
-        let mix = SaemMixture::build(&model, &model.default_params, 4);
+        let pop = read_pop(&iv_csv(2));
+        let mix = SaemMixture::build(&model, &model.default_params, &pop);
         // Only MIXL (theta index 3) enters the mixing expression.
         assert_eq!(mix.mixing_theta_idx, vec![3]);
         assert_eq!(mix.n_classes, 2);
@@ -430,15 +457,63 @@ mod tests {
     #[test]
     fn build_detects_covariate_mixing_thetas() {
         let model = parse_model_string(COV_MODEL).unwrap();
-        let mix = SaemMixture::build(&model, &model.default_params, 4);
+        let pop = read_pop(&iv_csv(2));
+        let mix = SaemMixture::build(&model, &model.default_params, &pop);
         // MIXL (3) and BWT (4) both enter the class logit.
+        assert_eq!(mix.mixing_theta_idx, vec![3, 4]);
+    }
+
+    /// A covariate that enters the class logit purely multiplicatively and is 0
+    /// at its default value must still be detected — the detection probes real
+    /// subject covariates, not a covariate-0 map (#987 review).
+    #[test]
+    fn build_detects_zero_default_product_covariate() {
+        const MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta BSEX(0.0, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL + BSEX*SEX
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        // Half the subjects have SEX = 1 so the product term is non-zero for
+        // some subject even though SEX defaults to 0.
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,SEX\n");
+        for sid in 1..=4 {
+            let sex = sid % 2; // alternate 1,0,1,0
+            csv.push_str(&format!("{sid},0,0,100,1,1,{sex}\n"));
+            csv.push_str(&format!("{sid},1,5.0,0,0,1,{sex}\n"));
+        }
+        let model = parse_model_string(MODEL).unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, csv.as_bytes()).unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(f.path(), Some(&["SEX"]), None).unwrap();
+        let mix = SaemMixture::build(&model, &model.default_params, &pop);
+        // MIXL (3) and BSEX (4) both moved p_k for at least one subject.
         assert_eq!(mix.mixing_theta_idx, vec![3, 4]);
     }
 
     #[test]
     fn update_rbar_is_robbins_monro_average() {
         let model = parse_model_string(CONST_MODEL).unwrap();
-        let mut mix = SaemMixture::build(&model, &model.default_params, 2);
+        let pop = read_pop(&iv_csv(1));
+        let mut mix = SaemMixture::build(&model, &model.default_params, &pop);
         // Force known classes and a fresh rbar, then take one SA step.
         mix.classes = vec![0, 1];
         mix.rbar = vec![vec![0.5, 0.5], vec![0.5, 0.5]];
@@ -455,7 +530,7 @@ mod tests {
     fn mstep_mixing_recovers_constant_frequency() {
         let model = parse_model_string(CONST_MODEL).unwrap();
         let pop = read_pop(&iv_csv(5)); // 10 subjects
-        let mut mix = SaemMixture::build(&model, &model.default_params, pop.subjects.len());
+        let mut mix = SaemMixture::build(&model, &model.default_params, &pop);
         // Target class-1 fraction q = 0.3 for every subject (constant mixing ⇒
         // the mixing M-step should drive p(1) = mean_i r̄_i1 = 0.3).
         let q = 0.3;
@@ -481,7 +556,7 @@ mod tests {
     fn draw_class_returns_valid_categorical() {
         let model = parse_model_string(CONST_MODEL).unwrap();
         let pop = read_pop(&iv_csv(1)); // 2 subjects
-        let mix = SaemMixture::build(&model, &model.default_params, pop.subjects.len());
+        let mix = SaemMixture::build(&model, &model.default_params, &pop);
         let mut scratch = EventPkParams::default();
         let mut rng = StdRng::seed_from_u64(1);
         let eta = vec![0.0_f64];
@@ -505,7 +580,8 @@ mod tests {
     #[test]
     fn mstep_omega_overrides_noop_without_overrides() {
         let model = parse_model_string(CONST_MODEL).unwrap();
-        let mut mix = SaemMixture::build(&model, &model.default_params, 2);
+        let pop = read_pop(&iv_csv(1));
+        let mut mix = SaemMixture::build(&model, &model.default_params, &pop);
         let before = mix.s2_diag.clone();
         // No omega(k) overrides declared ⇒ the SA update touches nothing.
         mix.classes = vec![0, 1];
