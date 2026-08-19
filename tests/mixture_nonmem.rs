@@ -420,9 +420,11 @@ fn saem_covariate_mixing_separates_and_recovers_beta() {
 /// MLE.
 ///
 /// **Anchor:** the shared maximum-likelihood optimum (the FOCEI `mixture_iv.ctl`
-/// values `NM_*`). Under diffuse priors — here the `$THETA` bounds act as uniform
-/// priors, Ω/Σ FIXed — the Bayes posterior mean concentrates at that optimum, so
-/// recovering it *is* the cross-engine check. A direct NONMEM `METHOD=BAYES` run
+/// values `NM_*`). The population priors are weakly-informative N(u0, 10²) on the
+/// unconstrained scale, centred on this model's initial estimates (the declared
+/// `[parameters]` bounds are *not* enforced as uniform priors inside the (θ, σ)
+/// block), and Ω/Σ are FIXed — diffuse enough that the posterior mean concentrates
+/// at the likelihood optimum, so recovering it *is* the cross-engine check. A direct NONMEM `METHOD=BAYES` run
 /// is **not** used: NONMEM's BAYES sampler aborts in burn-in on this model
 /// (`$MIX` + FIXed `$OMEGA`/`$SIGMA` — it insists on Gibbs-sampling Ω, which is
 /// FIXed), a known NONMEM mixture/BAYES fragility (cf. the covariance-step

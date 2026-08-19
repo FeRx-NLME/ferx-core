@@ -235,6 +235,24 @@ pub fn fit(
                 ));
             }
         }
+        // Per-class Omega/Sigma overrides under Bayes (#985): the Bayes Omega block
+        // is a single conjugate draw shared across classes, so `omega(k)`/`sigma(k)`
+        // cannot be honoured. `bayes.rs` re-checks this defensively, but reject it
+        // here — before any stage runs — so `method = [focei, bayes]` does not burn a
+        // full FOCEI fit only to fail at the hand-off.
+        if options.method_chain().contains(&EstimationMethod::Bayes) {
+            if let Some(mp) = init_params.mixture.as_ref() {
+                if !mp.omega_override_addr.is_empty() || !mp.sigma_override_addr.is_empty() {
+                    return Err(
+                        "Bayesian estimation (method = bayes) does not yet support per-class \
+                         Omega/Sigma overrides (omega(k)/sigma(k)) in a mixture; Omega/Sigma are \
+                         shared across classes. Fit with FOCE/FOCEI, or drop the per-class \
+                         overrides (#985)."
+                            .to_string(),
+                    );
+                }
+            }
+        }
         // Inter-occasion variability under a mixture (#985): the per-class inner
         // solve carries per-occasion κ for the shared base `omega_iov` (each class's
         // `class_params` keeps it), and the packed layout already interleaves the κ
