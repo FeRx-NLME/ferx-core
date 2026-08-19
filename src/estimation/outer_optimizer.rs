@@ -657,14 +657,38 @@ pub(crate) fn should_cap_gradient(
 /// ~1e-4) and well below a real first step (a healthy fit moves O(0.1)).
 pub(crate) const INIT_ESCAPE_STEP_S: f64 = 1e-2;
 
-/// L∞ distance between two scaled parameter vectors. Shorter vector wins if the
-/// lengths ever disagree (they never do in practice — both come from the same
-/// packing).
+/// L∞ distance between two scaled parameter vectors, or `NaN` when the answer
+/// is not established: mismatched lengths, or any non-finite coordinate.
+///
+/// Both degenerate cases return `NaN` rather than a number because every caller
+/// compares this against [`INIT_ESCAPE_STEP_S`], and both of those comparisons
+/// are `false` for `NaN` — which is the conservative reading in each direction:
+/// [`failure_is_converged_plateau`] does not get its `left_init` and so will not
+/// call the fit converged, while [`should_cap_gradient`] does not get its
+/// `hold_cap_at_init` and so leaves the gradient alone. Folding with
+/// `f64::max`, by contrast, *discards* `NaN` operands and would report a
+/// NaN-poisoned iterate as sitting exactly on the initial estimates.
+///
+/// The lengths never actually disagree — both vectors come from the same
+/// packing — hence the `debug_assert`; the `NaN` is the release-mode floor
+/// under a bug rather than a silently truncated comparison over the common
+/// prefix.
 pub(crate) fn max_scaled_deviation(a: &[f64], b: &[f64]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(ai, bi)| (ai - bi).abs())
-        .fold(0.0_f64, f64::max)
+    debug_assert_eq!(a.len(), b.len());
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
+    let mut worst = 0.0_f64;
+    for (ai, bi) in a.iter().zip(b.iter()) {
+        let deviation = (ai - bi).abs();
+        if !deviation.is_finite() {
+            return f64::NAN;
+        }
+        if deviation > worst {
+            worst = deviation;
+        }
+    }
+    worst
 }
 
 /// The population objective the outer loop actually minimises: [`pop_nll`] (FOCE/FOCEI),
@@ -1282,8 +1306,10 @@ fn failure_is_converged_plateau(
 /// errors as the result) — it is re-run from the same start with the cap **held
 /// on until the fit escapes** `INIT_ESCAPE_STEP_S`. A fit that never moved has
 /// no curvature worth protecting, so the trade the default declines is exactly
-/// the right one here. The better of the two OFVs wins, so the retry can only
-/// improve the outcome.
+/// the right one here. The retry is adopted only when it *both* escaped the
+/// initial estimates and reached a lower OFV — a retry that stalled too keeps
+/// the first attempt even if its OFV reads lower, since a lower objective at a
+/// point the fit never actually reached is not an improvement to report.
 ///
 /// The retry is L-BFGS-only: SLSQP is already capped on every eval, and the
 /// derivative-free algorithms never take this step at all.

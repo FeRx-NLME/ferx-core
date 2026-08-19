@@ -86,8 +86,9 @@ section of the SDLC for the versioning policy).
   opening line search fails could previously quit a hair off its starting point — the user-ODE
   warfarin twin stopped 35 OFV units short of the optimum — and report the initial estimates, with
   their standard errors, as the result. Such a fit is now automatically re-run once with the
-  identity-Hessian overshoot guard held on until it escapes its starting point, and the better of the
-  two results is reported. Affected models reach the same optimum, and the same NONMEM-validated
+  identity-Hessian overshoot guard held on until it escapes its starting point; the second attempt is
+  reported when it both left the initial estimates and reached a lower objective, and otherwise the
+  original result stands. Affected models reach the same optimum, and the same NONMEM-validated
   standard errors, as their analytical twin. Fits that were already leaving their initial estimates
   are unaffected — they never trigger the retry and their trajectory is unchanged.
 - **A fit pinned at its initial estimates is no longer reported as converged (#751).** The

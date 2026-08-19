@@ -2075,6 +2075,39 @@ fn test_max_scaled_deviation_is_l_infinity() {
     assert!(max_scaled_deviation(&[1.0], &[1.2]) >= INIT_ESCAPE_STEP_S);
 }
 
+/// The degenerate inputs return `NaN`, which every caller reads as "not
+/// established" because both `< INIT_ESCAPE_STEP_S` and `>= INIT_ESCAPE_STEP_S`
+/// are false for it — the conservative answer in each direction. A `f64::max`
+/// fold would instead swallow a NaN coordinate and report a poisoned iterate as
+/// sitting exactly on the initial estimates, which would let
+/// `failure_is_converged_plateau` call it converged.
+#[test]
+fn test_max_scaled_deviation_reports_degenerate_input_as_nan() {
+    use crate::estimation::outer_optimizer::max_scaled_deviation;
+    use crate::estimation::outer_optimizer::INIT_ESCAPE_STEP_S;
+
+    for (a, b) in [
+        (vec![1.0, f64::NAN], vec![1.0, 2.0]),
+        (vec![1.0, 2.0], vec![1.0, f64::INFINITY]),
+        (vec![f64::NEG_INFINITY], vec![f64::NEG_INFINITY]),
+    ] {
+        let deviation = max_scaled_deviation(&a, &b);
+        assert!(deviation.is_nan(), "expected NaN, got {deviation}");
+        // Neither the "left init" nor the "still at init" reading is granted.
+        assert!(!(deviation >= INIT_ESCAPE_STEP_S));
+        assert!(!(deviation < INIT_ESCAPE_STEP_S));
+    }
+
+    // A length mismatch is a bug, not a shorter comparison: it reports NaN rather
+    // than silently comparing the common prefix (which here would read 0.0 —
+    // "still at init" — and hide the real 9.0 deviation). Only exercisable where
+    // the `debug_assert_eq!` guarding the same invariant is compiled out; the
+    // release behaviour is the one that matters, since that is what CI and users
+    // run.
+    #[cfg(not(debug_assertions))]
+    assert!(max_scaled_deviation(&[1.0, 10.0], &[1.0]).is_nan());
+}
+
 /// Regression test for the original issue #55 symptom: SLSQP optimizing
 /// a multi-theta mu-referenced FOCEI fit terminated with theta byte-
 /// identical to init. The cap doesn't restore SLSQP to LBFGS's optimum
