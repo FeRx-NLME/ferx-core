@@ -393,17 +393,29 @@ fn run_mcem(
     let n_sigma = init_params.sigma.values.len();
 
     // ---- Validation ----
-    // Mixture (#985): the estimating IMP/IMPMAP MCEM (weighted M-step over the
-    // per-subject IS draws) is not yet class-partitioned. The class-marginal IS
-    // *objective* is available via `method = imp` with `imp_eval_only` (typically
-    // as the last stage of a `[saem, imp]` / `[focei, imp]` chain); route
-    // parameter estimation through SAEM or FOCE/FOCEI.
+    // Mixture (#985): estimating IMP/IMPMAP runs a class-partitioned MCEM
+    // (per-class IS E-step + responsibility-weighted M-step). Delegate to the
+    // mixture core, which reuses this function's option resolution via the same
+    // arguments.
     if model.mixture.is_some() {
-        return Err(format!(
-            "{label} (estimating IMP/IMPMAP) is not yet wired for mixture models. Estimate with \
-             SAEM or FOCE/FOCEI, then evaluate the class-marginal likelihood with an IMP \
-             objective-evaluation stage (`imp_eval_only`), e.g. method = [saem, imp] (#985)."
-        ));
+        return run_mcem_mixture(
+            model,
+            population,
+            init_params,
+            warm_etas,
+            options,
+            recenter,
+            label,
+            df_key,
+            n_iter_opt,
+            k_opt,
+            nu,
+            n_avg_opt,
+            seed,
+            threshold,
+            mceta,
+            use_sobol,
+        );
     }
     if n_eta == 0 {
         return Err(format!(
@@ -1323,6 +1335,532 @@ fn run_mcem(
     })
 }
 
+/// Estimating IMP / IMPMAP under a mixture model (#985): a class-partitioned
+/// MCEM. Each iteration importance-samples each subject's η *within every class*
+/// (under a [`MixtureClassGuard`], so `MIXNUM` resolves to that class), forms the
+/// deterministic class responsibilities `PMIX_ik ∝ p_ik · L_ik`, then runs the
+/// responsibility-weighted M-steps:
+///
+/// * mixing coefficients — from the responsibilities (reusing SAEM's mixing
+///   M-step with `r̄ = PMIX`);
+/// * Ω (class-shared) — `Σ_i Σ_k PMIX_ik · secondmoment_ik / N`;
+/// * θ / σ — the responsibility- and importance-weighted observation M-step
+///   ([`theta_sigma_weighted_mstep_mixture`]), which recovers the class-switched
+///   typical values from each class's own weighted samples.
+///
+/// Ω/σ are class-shared (per-class overrides are rejected); IOV, FREM and SDE are
+/// not supported here (as for the single-population MCEM). The final OFV,
+/// per-subject `MIXEST`/`PMIX`, and EBEs come from the K-fold marginal
+/// (`mixture_ofv`) at the estimates, matching FOCEI/SAEM.
+#[allow(clippy::too_many_arguments)]
+fn run_mcem_mixture(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>,
+    options: &FitOptions,
+    recenter: ProposalRecenter,
+    label: &str,
+    df_key: &str,
+    n_iter_opt: usize,
+    k_opt: usize,
+    nu: f64,
+    n_avg_opt: usize,
+    seed: u64,
+    threshold: f64,
+    mceta: usize,
+    use_sobol: bool,
+) -> Result<OuterResult, String> {
+    use crate::estimation::importance_sampling::{
+        compute_posterior_hessian, subject_is_draws, DefensiveMixture,
+    };
+    use crate::estimation::inner_optimizer::find_ebe;
+    use crate::estimation::mixture::combine_subject;
+    use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
+    let _ = (df_key, threshold);
+
+    let n_subjects = population.subjects.len();
+    let n_eta = model.n_eta;
+    let n_theta = init_params.theta.len();
+    let n_sigma = init_params.sigma.values.len();
+    let spec = model
+        .mixture
+        .as_ref()
+        .expect("run_mcem_mixture on non-mixture model");
+    let mp0 = init_params
+        .mixture
+        .as_ref()
+        .ok_or_else(|| format!("{label} mixture requires params.mixture (per-class Ω/Σ)"))?;
+
+    // ---- Validation (mixture scope) ----
+    if n_eta == 0 {
+        return Err(format!(
+            "{label} requires at least one random effect (n_eta = 0)."
+        ));
+    }
+    if model.n_kappa > 0 {
+        return Err(format!(
+            "{label} for a mixture does not yet support inter-occasion variability (IOV); use \
+             SAEM or FOCE/FOCEI (#985)."
+        ));
+    }
+    if model.frem_config.is_some() {
+        return Err(format!(
+            "{label} for a mixture does not support FREM models (#985)."
+        ));
+    }
+    if model.is_sde() {
+        return Err(format!(
+            "{label} for a mixture does not support SDE / [diffusion] models."
+        ));
+    }
+    if !mp0.omega_override_addr.is_empty() || !mp0.sigma_override_addr.is_empty() {
+        return Err(format!(
+            "{label} for a mixture does not yet support per-class Omega/Sigma overrides \
+             (omega(k)/sigma(k)); Omega/Sigma are class-shared. Use FOCE/FOCEI for per-class \
+             overrides (#985)."
+        ));
+    }
+    if nu.is_finite() && nu < 1.0 {
+        return Err(format!(
+            "{label}: {df_key} must be >= 1.0 (or +inf), got {nu}"
+        ));
+    }
+
+    let n_iter = n_iter_opt.max(1);
+    let k_samples = k_opt.max(2);
+    let n_avg = n_avg_opt.min(n_iter);
+    let verbose = options.verbose;
+    let cancel = &options.cancel;
+    let n_classes = spec.n_classes;
+
+    // ---- Packing scaffolding (mirrors run_mcem / SAEM) ----
+    let theta_packs_log_mask: Vec<bool> = init_params
+        .theta_lower
+        .iter()
+        .map(|&lo| theta_packs_log(lo))
+        .collect();
+    let pack_theta = |i: usize, t: f64| -> f64 {
+        if theta_packs_log_mask[i] {
+            t.max(1e-10).ln()
+        } else {
+            t
+        }
+    };
+    let mut log_theta: Vec<f64> = (0..n_theta)
+        .map(|i| pack_theta(i, init_params.theta[i]))
+        .collect();
+    let mut log_sigma: Vec<f64> = init_params
+        .sigma
+        .values
+        .iter()
+        .map(|&s| s.max(1e-10).ln())
+        .collect();
+    let mut log_theta_lower: Vec<f64> = (0..n_theta)
+        .map(|i| {
+            if theta_packs_log_mask[i] {
+                init_params.theta_lower[i].max(1e-10).ln()
+            } else {
+                init_params.theta_lower[i]
+            }
+        })
+        .collect();
+    let mut log_theta_upper: Vec<f64> = (0..n_theta)
+        .map(|i| {
+            if theta_packs_log_mask[i] {
+                init_params.theta_upper[i].min(1e9).ln()
+            } else {
+                init_params.theta_upper[i]
+            }
+        })
+        .collect();
+    let mut log_sigma_lower = vec![-8.0f64; n_sigma];
+    let mut log_sigma_upper = vec![5.0f64; n_sigma];
+    for i in 0..n_theta {
+        if init_params.theta_fixed.get(i).copied().unwrap_or(false) {
+            log_theta_lower[i] = log_theta[i];
+            log_theta_upper[i] = log_theta[i];
+        }
+    }
+    for i in 0..n_sigma {
+        if init_params.sigma_fixed.get(i).copied().unwrap_or(false) {
+            log_sigma_lower[i] = log_sigma[i];
+            log_sigma_upper[i] = log_sigma[i];
+        }
+    }
+    let unpack_theta = |i: usize, v: f64| -> f64 {
+        if theta_packs_log_mask[i] {
+            v.exp()
+        } else {
+            v
+        }
+    };
+
+    // Mixing state: detects the mixing thetas and drives the mixing M-step from
+    // the deterministic responsibilities (no stochastic averaging — `rbar` is set
+    // to the current `PMIX` each iteration). The closed-form mu-ref θ shift is not
+    // used for a mixture (the class-switched typical value can't pair to one η);
+    // every θ flows through the responsibility-weighted M-step.
+    let mut mix =
+        crate::estimation::saem_mixture::SaemMixture::build(model, init_params, population);
+
+    let mut warnings: Vec<String> = Vec::new();
+    let mut theta_cur = init_params.theta.clone();
+    let mut sigma_cur = init_params.sigma.values.clone();
+    let mut omega_mat = init_params.omega.matrix.clone();
+
+    // Previous iteration's per-class weighted draws (for the IMP `SampleMoments`
+    // recenter). `None` on iteration 1 and always for IMPMAP.
+    let mut prev_draws: Option<Vec<Vec<SubjectDraws>>> = None;
+    let warm0: Option<Vec<DVector<f64>>> = warm_etas.map(|e| e.to_vec());
+
+    // Running average of the estimates over the final `n_avg` iterations.
+    let mut acc_theta = vec![0.0f64; n_theta];
+    let mut acc_sigma = vec![0.0f64; n_sigma];
+    let mut acc_omega = DMatrix::<f64>::zeros(n_eta, n_eta);
+    let mut n_acc = 0usize;
+
+    if verbose {
+        eprintln!(
+            "{label} (mixture): {n_subjects} subjects × {n_classes} classes, {n_eta} ETAs, \
+             {n_iter} iters, K={k_samples}/subject/class, seed={seed}"
+        );
+    }
+
+    for k in 1..=n_iter {
+        if crate::cancel::is_cancelled(cancel) {
+            break;
+        }
+        // Shared Ω/σ view for this iteration (identical across classes; the class
+        // enters only through the `MIXNUM` guard on the structural model).
+        let omega_k = OmegaMatrix::from_matrix(
+            omega_mat.clone(),
+            init_params.omega.eta_names.clone(),
+            init_params.omega.diagonal,
+        );
+        let omega_inv = omega_k.inv.clone();
+        let log_det_omega = omega_k.log_det;
+        let defensive = DefensiveMixture::new(&omega_inv, n_eta, options.imp_defensive_alpha);
+        let params_iter = ModelParameters {
+            theta: theta_cur.clone(),
+            theta_names: init_params.theta_names.clone(),
+            theta_lower: init_params.theta_lower.clone(),
+            theta_upper: init_params.theta_upper.clone(),
+            theta_fixed: init_params.theta_fixed.clone(),
+            omega: omega_k.clone(),
+            omega_fixed: init_params.omega_fixed.clone(),
+            sigma: SigmaVector {
+                values: sigma_cur.clone(),
+                names: init_params.sigma.names.clone(),
+            },
+            sigma_fixed: init_params.sigma_fixed.clone(),
+            omega_iov: None,
+            kappa_fixed: init_params.kappa_fixed.clone(),
+            mixture: None,
+        };
+        let run_inner = recenter == ProposalRecenter::Map || prev_draws.is_none();
+        let prev = prev_draws.as_ref();
+
+        // ---- E-step: per subject, per class IS draws + class responsibilities ----
+        // Parallel over subjects; the class loop runs inside each worker so the
+        // `MIXNUM` guard is entered on the same thread as the solve/draws.
+        #[allow(clippy::type_complexity)]
+        let per_subject: Vec<(Vec<SubjectDraws>, Vec<f64>, f64)> = population
+            .subjects
+            .par_iter()
+            .enumerate()
+            .map_init(EventPkParams::default, |scratch, (i, subject)| {
+                let logp = eval_mixing_log_probs(spec, &theta_cur, &subject.covariates);
+                let mut class_draws: Vec<SubjectDraws> = Vec::with_capacity(n_classes);
+                let mut nll = vec![0.0f64; n_classes];
+                for c in 0..n_classes {
+                    let _g = MixtureClassGuard::enter(c + 1);
+                    let (center, h_post) = if run_inner {
+                        let warm_i = prev
+                            .map(|pd| DVector::from_row_slice(&pd[c][i].mean))
+                            .or_else(|| warm0.as_ref().map(|w| w[i].clone()));
+                        let ebe = find_ebe(
+                            model,
+                            subject,
+                            &params_iter,
+                            options.inner_maxiter,
+                            options.inner_tol,
+                            warm_i.as_ref().map(|v| v.as_slice()),
+                            None,
+                            options.inner_restarts,
+                        );
+                        let h_post = compute_posterior_hessian(
+                            model,
+                            subject,
+                            &params_iter.theta,
+                            &ebe.eta,
+                            &params_iter.sigma.values,
+                            &ebe.h_matrix,
+                            &omega_inv,
+                            n_eta,
+                            scratch,
+                        );
+                        (ebe.eta, h_post)
+                    } else {
+                        let pd = &prev.expect("prev set when !run_inner")[c][i];
+                        let center = DVector::from_row_slice(&pd.mean);
+                        let cov = &pd.second_moment - &center * center.transpose();
+                        let h_post = covariance_to_proposal_hessian(
+                            &cov,
+                            &omega_mat,
+                            IMP_PROPOSAL_COV_FLOOR,
+                        );
+                        (center, h_post)
+                    };
+                    let subj_seed = seed
+                        .wrapping_add(i as u64)
+                        .wrapping_add((k as u64) << 32)
+                        .wrapping_add((c as u64) << 48);
+                    let d = subject_is_draws(
+                        model,
+                        subject,
+                        &params_iter.theta,
+                        &params_iter.sigma.values,
+                        &center,
+                        &h_post,
+                        &omega_inv,
+                        log_det_omega,
+                        n_eta,
+                        k_samples,
+                        nu,
+                        subj_seed,
+                        scratch,
+                        1.0,
+                        use_sobol,
+                        defensive.as_ref(),
+                    );
+                    nll[c] = -d.log_marginal;
+                    class_draws.push(d);
+                }
+                let (contribution, pmix_i, _mixest) = combine_subject(&logp, &nll);
+                (class_draws, pmix_i, contribution)
+            })
+            .collect();
+
+        if crate::cancel::is_cancelled(cancel) {
+            break;
+        }
+
+        // Reorganize into [class][subject] draws + [subject][class] responsibilities.
+        let mut draws_by_class: Vec<Vec<SubjectDraws>> = (0..n_classes)
+            .map(|_| Vec::with_capacity(n_subjects))
+            .collect();
+        let mut pmix: Vec<Vec<f64>> = Vec::with_capacity(n_subjects);
+        let mut ofv = 0.0f64;
+        for (class_draws, pmix_i, contribution) in per_subject {
+            for (c, d) in class_draws.into_iter().enumerate() {
+                draws_by_class[c].push(d);
+            }
+            pmix.push(pmix_i);
+            ofv += contribution;
+        }
+        if verbose {
+            eprintln!("{label} (mixture) iter {k}: marginal −2 log L = {ofv:.4}");
+        }
+
+        // ---- M-step ----
+        // (a) θ / σ from the responsibility- and importance-weighted obs NLL.
+        let mstep_maxiter: u32 = if k <= n_iter / 2 { 4 } else { 8 };
+        let (new_log_theta, new_log_sigma) = theta_sigma_weighted_mstep_mixture(
+            model,
+            population,
+            &draws_by_class,
+            &pmix,
+            &log_theta,
+            &log_sigma,
+            &log_theta_lower,
+            &log_theta_upper,
+            &log_sigma_lower,
+            &log_sigma_upper,
+            n_theta,
+            n_sigma,
+            mstep_maxiter,
+            &theta_packs_log_mask,
+        );
+        log_theta = new_log_theta;
+        log_sigma = new_log_sigma;
+        theta_cur = (0..n_theta)
+            .map(|i| unpack_theta(i, log_theta[i]))
+            .collect();
+        sigma_cur = log_sigma.iter().map(|&v| v.exp()).collect();
+
+        // (b) mixing coefficients from the class responsibilities.
+        mix.rbar = pmix.clone();
+        crate::estimation::saem_mixture::mstep_mixing(
+            model,
+            population,
+            &mix,
+            &mut theta_cur,
+            &init_params.theta_lower,
+            &init_params.theta_upper,
+            mstep_maxiter,
+        );
+        for &j in &mix.mixing_theta_idx {
+            log_theta[j] = if theta_packs_log_mask[j] {
+                theta_cur[j].max(1e-12).ln()
+            } else {
+                theta_cur[j]
+            };
+        }
+
+        // (c) Ω (class-shared): responsibility-weighted second moment, masked/floored.
+        let mut new_omega = DMatrix::<f64>::zeros(n_eta, n_eta);
+        for (c, class) in draws_by_class.iter().enumerate() {
+            for (i, d) in class.iter().enumerate() {
+                new_omega += pmix[i][c] * &d.second_moment;
+            }
+        }
+        new_omega /= n_subjects as f64;
+        for a in 0..n_eta {
+            for b in 0..n_eta {
+                if !init_params.omega.free_mask[(a, b)] {
+                    new_omega[(a, b)] = 0.0;
+                }
+                let fa = init_params.omega_fixed.get(a).copied().unwrap_or(false);
+                let fb = init_params.omega_fixed.get(b).copied().unwrap_or(false);
+                if fa || fb {
+                    new_omega[(a, b)] = init_params.omega.matrix[(a, b)];
+                }
+            }
+        }
+        floor_omega_diagonal(&mut new_omega, &init_params.omega_fixed, OMEGA_DIAG_FLOOR);
+        omega_mat = new_omega;
+
+        // Accumulate the final `n_avg` iterations for the reported point estimate.
+        if k > n_iter - n_avg {
+            for (a, &v) in acc_theta.iter_mut().zip(&theta_cur) {
+                *a += v;
+            }
+            for (a, &v) in acc_sigma.iter_mut().zip(&sigma_cur) {
+                *a += v;
+            }
+            acc_omega += &omega_mat;
+            n_acc += 1;
+        }
+
+        prev_draws = Some(draws_by_class);
+    }
+
+    // ---- Point estimate: average over the final n_avg iterations ----
+    let (final_theta, final_sigma, final_omega_mat) = if n_acc > 0 {
+        (
+            acc_theta
+                .iter()
+                .map(|&v| v / n_acc as f64)
+                .collect::<Vec<_>>(),
+            acc_sigma
+                .iter()
+                .map(|&v| v / n_acc as f64)
+                .collect::<Vec<_>>(),
+            acc_omega / n_acc as f64,
+        )
+    } else {
+        (theta_cur.clone(), sigma_cur.clone(), omega_mat.clone())
+    };
+    let final_omega = OmegaMatrix::from_matrix(
+        final_omega_mat,
+        init_params.omega.eta_names.clone(),
+        init_params.omega.diagonal,
+    );
+    // Rebuild the per-class Ω/Σ as the (shared) final estimates so the marginal
+    // post-loop pass and covariance step see the mixture structure.
+    let final_mixture = init_params.mixture.as_ref().map(|m| {
+        let mut mm = m.clone();
+        for o in mm.omega.iter_mut() {
+            *o = final_omega.clone();
+        }
+        for s in mm.sigma.iter_mut() {
+            s.values = final_sigma.clone();
+        }
+        mm
+    });
+    let final_params = ModelParameters {
+        theta: final_theta,
+        theta_names: init_params.theta_names.clone(),
+        theta_lower: init_params.theta_lower.clone(),
+        theta_upper: init_params.theta_upper.clone(),
+        theta_fixed: init_params.theta_fixed.clone(),
+        omega: final_omega,
+        omega_fixed: init_params.omega_fixed.clone(),
+        sigma: SigmaVector {
+            values: final_sigma,
+            names: init_params.sigma.names.clone(),
+        },
+        sigma_fixed: init_params.sigma_fixed.clone(),
+        omega_iov: None,
+        kappa_fixed: init_params.kappa_fixed.clone(),
+        mixture: final_mixture,
+    };
+    let _ = mceta;
+
+    // ---- Final EBEs / OFV / posteriors via the K-fold marginal ----
+    let meval =
+        crate::estimation::mixture::mixture_ofv(model, population, &final_params, options, None);
+    let eta_hats = meval.mixest_etas;
+    let h_matrices = meval.mixest_h_mats;
+    let final_kappas = meval.mixest_kappas;
+    let ofv = meval.ofv;
+    let mixture_posteriors = Some(crate::estimation::outer_optimizer::MixturePosteriors {
+        pmix: meval.pmix,
+        mixest: meval.mixest,
+    });
+
+    // ---- Covariance step (mixture-aware) ----
+    let packed = pack_params(&final_params);
+    let cov_out = crate::estimation::covariance::run_covariance_step(
+        &packed,
+        &final_params,
+        model,
+        population,
+        &eta_hats,
+        &h_matrices,
+        &final_kappas,
+        options,
+        verbose.then_some("Running covariance step..."),
+    );
+    let crate::estimation::covariance::CovStepOutcome {
+        matrix: covariance_matrix,
+        wall_time_secs: covariance_wall_time_secs,
+        warnings: cov_warnings,
+        sir_fallback_proposal,
+    } = cov_out;
+    warnings.extend(cov_warnings);
+
+    if verbose {
+        eprintln!("{label} (mixture) completed. Final marginal OFV = {ofv:.4}");
+    }
+
+    Ok(OuterResult {
+        params: final_params,
+        ofv,
+        converged: objective_converged(ofv),
+        n_iterations: n_iter,
+        eta_hats,
+        h_matrices,
+        kappas: final_kappas,
+        covariance_matrix,
+        covariance_wall_time_secs,
+        warnings,
+        saem_mu_ref_m_step_evals_saved: None,
+        saem_n_subjects_hmc: None,
+        ebe_convergence_warnings: 0,
+        max_unconverged_subjects: 0,
+        total_ebe_fallbacks: 0,
+        final_gradient: None,
+        sir_fallback_proposal,
+        impmap_trace: None,
+        bayes: None,
+        cond_dist: None,
+        packed_estimate: None,
+        mixture_posteriors,
+    })
+}
+
 /// Extract the lower triangle of a square matrix in row-major order:
 /// `(0,0), (1,0), (1,1), (2,0), (2,1), (2,2), …`
 fn lower_triangle(m: &DMatrix<f64>) -> Vec<f64> {
@@ -1438,6 +1976,112 @@ fn theta_sigma_weighted_mstep(
     let log_theta_new = xs[..n_theta].to_vec();
     let log_sigma_new = xs[n_theta..].to_vec();
     (log_theta_new, log_sigma_new)
+}
+
+/// Mixture (#985) weighted θ/σ M-step. Minimises the class-responsibility- and
+/// importance-weighted observation NLL
+/// `Σᵢ Σ_c PMIX_ic · Σₖ w̃_ick · obs_nll(yᵢ | η_ick, θ, σ | MIXNUM = c)` over the
+/// per-(subject,class) sample sets. Each class's samples were drawn under that
+/// class's proposal, and its `obs_nll` runs under a [`MixtureClassGuard`] on the
+/// worker thread, so a class-switched typical value (`if MIXNUM == c …`) is
+/// estimated from its own class's weighted samples. `draws[c][i]` is class `c`'s
+/// draws for subject `i`; `pmix[i][c]` is the class responsibility.
+#[allow(clippy::too_many_arguments)]
+fn theta_sigma_weighted_mstep_mixture(
+    model: &CompiledModel,
+    population: &Population,
+    draws: &[Vec<crate::estimation::importance_sampling::SubjectDraws>],
+    pmix: &[Vec<f64>],
+    log_theta_init: &[f64],
+    log_sigma_init: &[f64],
+    log_theta_lower: &[f64],
+    log_theta_upper: &[f64],
+    log_sigma_lower: &[f64],
+    log_sigma_upper: &[f64],
+    n_theta: usize,
+    n_sigma: usize,
+    maxiter: u32,
+    theta_packs_log_mask: &[bool],
+) -> (Vec<f64>, Vec<f64>) {
+    use crate::parser::model_parser::MixtureClassGuard;
+    let n = n_theta + n_sigma;
+    let n_classes = draws.len();
+
+    let mut x: Vec<f64> = Vec::with_capacity(n);
+    x.extend_from_slice(log_theta_init);
+    x.extend_from_slice(log_sigma_init);
+    let mut lower: Vec<f64> = Vec::with_capacity(n);
+    lower.extend_from_slice(log_theta_lower);
+    lower.extend_from_slice(log_sigma_lower);
+    let mut upper: Vec<f64> = Vec::with_capacity(n);
+    upper.extend_from_slice(log_theta_upper);
+    upper.extend_from_slice(log_sigma_upper);
+    for i in 0..n {
+        x[i] = x[i].clamp(lower[i], upper[i]);
+    }
+
+    let unpack_thetas = |packed: &[f64]| -> Vec<f64> {
+        (0..n_theta)
+            .map(|i| {
+                if theta_packs_log_mask[i] {
+                    packed[i].exp()
+                } else {
+                    packed[i]
+                }
+            })
+            .collect()
+    };
+
+    let obj = |xv: &[f64], _: Option<&mut [f64]>, _: &mut ()| -> f64 {
+        let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
+        let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
+        let per_subj: Vec<f64> = population
+            .subjects
+            .par_iter()
+            .enumerate()
+            .map_init(EventPkParams::default, |scratch, (i, subject)| {
+                let mut s = 0.0f64;
+                for c in 0..n_classes {
+                    let p = pmix[i][c];
+                    if p == 0.0 {
+                        continue;
+                    }
+                    let _g = MixtureClassGuard::enter(c + 1);
+                    let d = &draws[c][i];
+                    let mut sc = 0.0f64;
+                    for (w, eta) in d.weights.iter().zip(d.etas.iter()) {
+                        if *w == 0.0 {
+                            continue;
+                        }
+                        sc += w * obs_nll_subject_into(model, subject, &th, &sg, eta, scratch);
+                    }
+                    s += p * sc;
+                }
+                s
+            })
+            .collect();
+        let val: f64 = per_subj.iter().sum();
+        if val.is_finite() {
+            val
+        } else {
+            1e20
+        }
+    };
+
+    let mut opt = nlopt::Nlopt::new(
+        nlopt::Algorithm::Bobyqa,
+        n,
+        obj,
+        nlopt::Target::Minimize,
+        (),
+    );
+    opt.set_lower_bounds(&lower).unwrap();
+    opt.set_upper_bounds(&upper).unwrap();
+    opt.set_maxeval(maxiter * (n as u32 + 1)).unwrap();
+    opt.set_ftol_rel(1e-4).unwrap();
+    let mut xs = x.clone();
+    let _ = opt.optimize(&mut xs);
+    (xs[..n_theta].to_vec(), xs[n_theta..].to_vec())
 }
 
 #[cfg(test)]
@@ -1586,6 +2230,123 @@ mod tests {
         assert!(
             h.iter().all(|&v| v == 0.0),
             "non-PD covariance must yield the zero fallback"
+        );
+    }
+
+    // ── Estimating IMP/IMPMAP under a mixture (#985) ──
+
+    const MIX_MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    fn mix_pop() -> Population {
+        use std::io::Write;
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,WT\n");
+        for (sid, &(cl, wt)) in [(1.0_f64, 60.0_f64), (3.0, 90.0)].iter().enumerate() {
+            let id = sid + 1;
+            csv.push_str(&format!("{id},0,0,100,1,1,{wt}\n"));
+            for t in [0.5_f64, 1.0, 2.0, 4.0] {
+                let c = (100.0 / 10.0) * (-(cl / 10.0) * t).exp();
+                csv.push_str(&format!("{id},{t},{c:.5},0,0,1,{wt}\n"));
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::read_nonmem_csv(f.path(), Some(&["WT"]), None).unwrap()
+    }
+
+    /// A short estimating IMPMAP (Map recenter) run on a mixture returns Ok,
+    /// carries the mixture through, and populates per-subject MIXEST + posteriors.
+    #[test]
+    fn impmap_mixture_short_run_populates_posteriors() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 200;
+        opts.impmap_seed = Some(1);
+        opts.run_covariance_step = false;
+        let res =
+            run_impmap(&model, &pop, &model.default_params, None, &opts).expect("impmap mixture");
+        assert!(res.ofv.is_finite());
+        assert!(res.mixture_posteriors.is_some(), "mixture posteriors set");
+        let mp = res.mixture_posteriors.unwrap();
+        assert_eq!(mp.mixest.len(), pop.subjects.len());
+        assert_eq!(mp.pmix.len(), pop.subjects.len());
+    }
+
+    /// The IMP (SampleMoments recenter) estimating path also runs on a mixture.
+    #[test]
+    fn imp_mixture_short_run_ok() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.imp_iterations = 2;
+        opts.imp_samples = 200;
+        opts.imp_seed = Some(1);
+        opts.run_covariance_step = false;
+        let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("imp mixture");
+        assert!(res.ofv.is_finite());
+        assert!(res.mixture_posteriors.is_some());
+    }
+
+    /// Estimating IMP/IMPMAP rejects a mixture with per-class Ω/Σ overrides.
+    #[test]
+    fn estimating_imp_rejects_per_class_overrides() {
+        const OV: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  omega(2) ETA_CL ~ 0.15
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(OV).unwrap();
+        let pop = mix_pop();
+        let opts = FitOptions::default();
+        let err = match run_impmap(&model, &pop, &model.default_params, None, &opts) {
+            Ok(_) => panic!("per-class overrides must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("per-class Omega/Sigma overrides"),
+            "got: {err}"
         );
     }
 }

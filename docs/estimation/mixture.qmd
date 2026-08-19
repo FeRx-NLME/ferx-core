@@ -280,18 +280,35 @@ On `tests/nonmem/mixture_iv.csv` this recovers the NONMEM `IMP EONLY` objective 
 well under a Monte-Carlo standard error: ferx `−2 log L = 300.82 ± 0.06` vs NONMEM
 `300.87` (`mixture_iv_saem.ctl`'s second `$EST`).
 
-*Estimating* IMP/IMPMAP (updating parameters via the weighted MCEM M-step) is not
-yet class-partitioned and is rejected with a clear error — estimate with SAEM or
-FOCE/FOCEI and evaluate the marginal with the objective-evaluation stage above.
+### Estimating IMP / IMPMAP
+
+Importance sampling also **estimates** a mixture (`method = imp` / `impmap`
+without `imp_eval_only`) via a class-partitioned MCEM. Each iteration importance-
+samples every subject's η *within each class* (under the `MIXNUM` guard), forms
+the deterministic class responsibilities $\mathrm{PMIX}_{ik} \propto p_{ik}L_{ik}$,
+then runs responsibility-weighted M-steps: the mixing coefficients from the
+responsibilities, the class-shared Ω from
+$\sum_i\sum_k \mathrm{PMIX}_{ik}\,\widehat{\eta\eta^{\top}}_{ik}/N$, and the
+class-switched typical values from a responsibility- and importance-weighted
+observation M-step (each class's samples scored under its own `MIXNUM`). Ω/σ are
+class-shared (per-class overrides are rejected); IOV / FREM / SDE are not
+supported (as for the single-population MCEM).
+
+IMP is the noisiest of the mixture estimators — the class-switched typical value
+cannot be mu-referenced, so θ is estimated by the weighted M-step alone, which
+converges more slowly than SAEM's MCMC and typically needs more iterations. On
+the two-class anchor, estimating IMPMAP recovers `TVCL1 ≈ 1.04`, `TVCL2 ≈ 2.58`,
+`V ≈ 9.96`, `p(1) ≈ 0.47` (vs the FOCEI optimum 0.98 / 2.84 / 9.98 / 0.472). For
+a well-identified point estimate prefer SAEM or FOCE/FOCEI and use IMP for the
+marginal likelihood; for the marginal likelihood at those estimates use the
+`imp_eval_only` stage above.
 
 ## Not yet supported
 
 The following error clearly rather than silently mis-fitting:
 
-- *Estimating* IMP / IMPMAP for a mixture (the objective-evaluation `imp_eval_only`
-  path above is supported); FOCE/FOCEI, SAEM, and Bayes estimate a mixture.
 - Per-class σ overrides (`sigma(k)`) under SAEM (held at their initial values,
-  with a warning), and per-class Ω/σ overrides under Bayes (rejected) — use
-  FOCE/FOCEI to fit those.
-- IOV under the mixture IMP objective evaluation — use FOCE/FOCEI for an IOV
-  mixture.
+  with a warning), and per-class Ω/σ overrides under Bayes and estimating
+  IMP/IMPMAP (rejected) — use FOCE/FOCEI to fit those.
+- IOV / FREM / SDE under the mixture IMP paths (objective evaluation and
+  estimation) — use FOCE/FOCEI.

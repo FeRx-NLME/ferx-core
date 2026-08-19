@@ -1474,15 +1474,22 @@ fn fit_inner(
                 let df = stage_opts.impmap_proposal_df;
                 marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
             }
-            match crate::estimation::importance_sampling::run_importance_sampling(
-                model,
-                population,
-                &r.params,
-                &r.eta_hats,
-                &r.h_matrices,
-                &r.kappas,
-                &marg_opts,
-            ) {
+            let marg_call = if model.mixture.is_some() {
+                crate::estimation::importance_sampling::run_importance_sampling_mixture(
+                    model, population, &r.params, &marg_opts,
+                )
+            } else {
+                crate::estimation::importance_sampling::run_importance_sampling(
+                    model,
+                    population,
+                    &r.params,
+                    &r.eta_hats,
+                    &r.h_matrices,
+                    &r.kappas,
+                    &marg_opts,
+                )
+            };
+            match marg_call {
                 Ok(is) => is_result = Some(is),
                 Err(e) => accumulated_warnings.push(if n_stages > 1 {
                     format!("[{}] marginal −2 log L eval skipped: {}", method.label(), e)

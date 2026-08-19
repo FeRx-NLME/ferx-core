@@ -549,10 +549,17 @@ fn imp_mixture_marginal_matches_nonmem() {
     );
 }
 
-/// Estimating IMP/IMPMAP is rejected for a mixture with a clear pointer to the
-/// EONLY objective path (#985).
+/// Estimating IMPMAP under a mixture (#985): class-partitioned MCEM recovers the MLE.
 #[test]
-fn estimating_imp_rejected_for_mixture() {
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests (IMPMAP mixture estimation)"
+)]
+fn impmap_estimating_mixture_recovers_optimum() {
+    // Estimating IMPMAP (class-partitioned MCEM): the per-class IS E-step +
+    // responsibility-weighted M-steps must recover the mixture MLE. Ω/Σ FIXed, so
+    // the estimated quantities are the two class clearances, V, and the mixing
+    // logit. Anchored to the shared optimum (NONMEM FOCEI `mixture_iv.ctl`).
     let pop: ferx_core::Population = read_nonmem_csv(
         Path::new("tests/nonmem/mixture_iv.csv"),
         Some(&["WT"]),
@@ -561,11 +568,46 @@ fn estimating_imp_rejected_for_mixture() {
     .unwrap();
     let model = parse_model_string(MODEL).unwrap();
     let mut opts = FitOptions::default();
-    opts.method = ferx_core::EstimationMethod::Impmap; // estimating
-    let err = fit(&model, &pop, &model.default_params, &opts)
-        .expect_err("estimating IMPMAP on a mixture must be rejected");
+    opts.method = ferx_core::EstimationMethod::Impmap;
+    opts.interaction = true;
+    opts.impmap_iterations = 50;
+    opts.impmap_samples = 1500;
+    opts.impmap_seed = Some(20250818);
+    opts.run_covariance_step = false;
+
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP mixture fit Ok");
+    let th = &res.theta;
+    let p1 = 1.0 / (1.0 + (-th[3]).exp());
+    eprintln!(
+        "IMPMAP mixture: TVCL1={:.4} TVCL2={:.4} TVV={:.4} p1={:.4} OFV={:.4}",
+        th[0], th[1], th[2], p1, res.ofv
+    );
+    let rel = |a: f64, b: f64| (a - b).abs() / b.abs();
+    // IMP is the noisiest of the mixture estimators (no mu-referencing is
+    // available for the class-switched typical value, so θ is estimated by the
+    // weighted M-step alone, which converges more slowly than SAEM's MCMC); the
+    // two class clearances must still separate and land near the MLE.
     assert!(
-        err.contains("imp_eval_only") || err.contains("objective"),
-        "got: {err}"
+        rel(th[0], NM_TVCL1) < 0.12,
+        "IMPMAP TVCL1 {} vs {}",
+        th[0],
+        NM_TVCL1
+    );
+    assert!(
+        rel(th[1], NM_TVCL2) < 0.12,
+        "IMPMAP TVCL2 {} vs {}",
+        th[1],
+        NM_TVCL2
+    );
+    assert!(
+        rel(th[2], NM_TVV) < 0.05,
+        "IMPMAP TVV {} vs {}",
+        th[2],
+        NM_TVV
+    );
+    assert!((p1 - NM_P1).abs() < 0.08, "IMPMAP p(1) {} vs {}", p1, NM_P1);
+    assert!(
+        res.subjects.iter().all(|s| s.mixest.is_some()),
+        "MIXEST populated"
     );
 }
