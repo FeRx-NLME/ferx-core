@@ -85,6 +85,13 @@ NONMEM reserved variables:
 - **`PMIX_1 … PMIX_K`** — the posterior class-membership probabilities
   $\text{PMIX}_{ik} \propto p_{ik}\exp(-\text{nll}_{ik})$, normalised over $k$.
 
+Every other per-subject diagnostic is evaluated **in that subject's `MIXEST`
+class**: the reported $\hat\eta$ are the winning class's EBEs, and `IPRED`,
+`PRED`, `IWRES`, `CWRES`, `EBE_OFV`, and any `[derived]` / `[output]` column
+that branches on `MIXNUM` are all computed with `MIXNUM` set to that class. So a
+subject the fit assigns to class 2 gets class-2 typical values throughout its
+sdtab row, not the class-1 default.
+
 ## Validation against NONMEM
 
 A two-class clearance mixture (`tests/nonmem/mixture_iv.ctl` and the

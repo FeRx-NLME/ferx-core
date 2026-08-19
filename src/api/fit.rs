@@ -1527,7 +1527,14 @@ fn fit_inner(
         }
     }
 
-    // Compute per-subject diagnostics
+    // Compute per-subject diagnostics. For a mixture (#985) each subject's
+    // diagnostics are evaluated under its own MIXEST class: `result.eta_hats` are
+    // the winning class's EBEs, so predictions built with `MIXNUM` at the class-1
+    // default would mix a class-2 η̂ with class-1 typical values.
+    let mixest_classes: Option<Vec<usize>> = result
+        .mixture_posteriors
+        .as_ref()
+        .map(|mp| mp.mixest.clone());
     let mut subjects = compute_subject_results(
         model,
         population,
@@ -1536,6 +1543,7 @@ fn fit_inner(
         &result.h_matrices,
         &result.kappas,
         options.interaction,
+        mixest_classes.as_deref(),
     );
 
     // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto
@@ -1560,6 +1568,7 @@ fn fit_inner(
             &result.params.theta,
             &result.kappas,
             &mut subjects,
+            mixest_classes.as_deref(),
         );
     }
 

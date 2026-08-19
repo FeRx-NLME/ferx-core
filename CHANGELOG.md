@@ -108,6 +108,11 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **Per-subject diagnostics now honour `MIXEST` in a mixture fit (#985).** `IPRED`, `PRED`,
+  `IWRES`, `CWRES`, `EBE_OFV`, and `[derived]`/`[output]` columns were computed with `MIXNUM`
+  pinned to class 1 for every subject, even for subjects the fit assigned to another class — so a
+  class-2 subject's sdtab row paired its class-2 EBEs with class-1 typical values. They are now
+  evaluated in each subject's fitted class. Affects FOCE/FOCEI, SAEM, and Bayes mixture fits.
 - **Mixture covariance-step and diagnostics correctness (#984, follow-up to #983).** Five fixes to
   the mixture SE/covariance and checkpoint paths: (1) the covariance step now reconverges its per-class EBEs at
   `cov_inner_tol`, not the fit's `inner_tol`, so a loose fit followed by a tight `cov_inner_tol` for
