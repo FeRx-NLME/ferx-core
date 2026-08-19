@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2021"
 description = "Nonlinear Mixed Effects modeling engine with FOCE/FOCEI estimation"
 license = "MIT"
-authors = ["Ron Keizer", "Teun Post"]
+authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
 repository = "https://github.com/FeRx-NLME/ferx-core"
 readme = "README.md"
 

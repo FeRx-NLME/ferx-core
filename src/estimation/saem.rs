@@ -688,6 +688,40 @@ fn fold_nll_grad(per_subj: Vec<(f64, Vec<f64>)>, n: usize) -> (f64, Vec<f64>) {
 /// construction). See the run_saem comment on `theta_packs_log_mask` for
 /// motivation — without per-theta packing, any theta with `theta_lower < 0`
 /// got pinned at 1e-10 and could never be estimated.
+/// Mixture context for the θ/σ M-step (#985): each subject's drawn class plus
+/// the per-class held σ overrides.
+///
+/// The class drives the `MIXNUM` guard (so a class-switched typical value is
+/// estimated from its own members) *and* the σ vector each subject is scored
+/// under: a `sigma(k)` override is held at its init, so a class-`k` subject's
+/// residual variance does not depend on the free base σ at all. Scoring it under
+/// the base σ anyway would drag the free base estimate toward the override — the
+/// E-step samples η under `class_sigma(c)` while the M-step would optimise a
+/// different objective (#987 review).
+#[derive(Clone, Copy)]
+pub(crate) struct MixMstep<'a> {
+    /// Per-subject drawn class (0-based).
+    pub classes: &'a [usize],
+    /// Per-class held σ overrides, `[class][(sigma_index, held_value)]`.
+    pub class_sigma_over: &'a [Vec<(usize, f64)>],
+}
+
+/// Substitute a class's held σ overrides into the base σ vector. Returns `None`
+/// when the class has no override (the caller then uses the base vector as-is,
+/// avoiding a per-subject allocation on the common path).
+fn class_sigma_subst(sigma_values: &[f64], over: &[(usize, f64)]) -> Option<Vec<f64>> {
+    if over.is_empty() {
+        return None;
+    }
+    let mut v = sigma_values.to_vec();
+    for &(s, val) in over {
+        if s < v.len() {
+            v[s] = val;
+        }
+    }
+    Some(v)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn theta_sigma_mstep_light(
     model: &CompiledModel,
@@ -705,10 +739,12 @@ fn theta_sigma_mstep_light(
     maxiter: u32,
     scale_params: bool,
     theta_packs_log_mask: &[bool],
-    // Mixture (#985): per-subject drawn class. When `Some`, every per-subject
-    // observation-likelihood evaluation runs under that subject's `MIXNUM` guard,
-    // so a class-switched typical value is estimated from its own class members.
-    classes: Option<&[usize]>,
+    // Mixture (#985): per-subject drawn class + held σ overrides. When `Some`,
+    // every per-subject observation-likelihood evaluation runs under that
+    // subject's `MIXNUM` guard and its class's σ, so a class-switched typical
+    // value is estimated from its own class members and a held `sigma(k)`
+    // override does not bias the free base σ.
+    mix_mstep: Option<MixMstep<'_>>,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = n_theta + n_sigma;
 
@@ -773,14 +809,21 @@ fn theta_sigma_mstep_light(
                     .map_init(
                         EventPkParams::default,
                         |scratch, (i, ((subject, eta), kaps))| {
-                            let _g = classes.map(|c| {
-                                crate::parser::model_parser::MixtureClassGuard::enter(c[i] + 1)
+                            let cls = mix_mstep.map(|m| m.classes[i]);
+                            let _g = cls.map(|c| {
+                                crate::parser::model_parser::MixtureClassGuard::enter(c + 1)
                             });
-                            obs_nll_subject_grad_iov(
+                            let over: &[(usize, f64)] = match (mix_mstep, cls) {
+                                (Some(m), Some(c)) => &m.class_sigma_over[c],
+                                _ => &[],
+                            };
+                            let sub_sg = class_sigma_subst(&sg, over);
+                            let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
+                            let (nll, mut grad) = obs_nll_subject_grad_iov(
                                 model,
                                 subject,
                                 &th,
-                                &sg,
+                                sg_i,
                                 eta,
                                 kaps,
                                 &theta_packs_log_mask,
@@ -789,7 +832,15 @@ fn theta_sigma_mstep_light(
                                 n_theta,
                                 n_sigma,
                                 scratch,
-                            )
+                            );
+                            // A held σ override carries no information about the
+                            // free base σ — zero that subject's contribution.
+                            for &(sidx, _) in over {
+                                if n_theta + sidx < grad.len() {
+                                    grad[n_theta + sidx] = 0.0;
+                                }
+                            }
+                            (nll, grad)
                         },
                     )
                     .collect();
@@ -801,14 +852,20 @@ fn theta_sigma_mstep_light(
                     .zip(etas.par_iter())
                     .enumerate()
                     .map_init(EventPkParams::default, |scratch, (i, (subject, eta))| {
-                        let _g = classes.map(|c| {
-                            crate::parser::model_parser::MixtureClassGuard::enter(c[i] + 1)
-                        });
-                        obs_nll_subject_grad(
+                        let cls = mix_mstep.map(|m| m.classes[i]);
+                        let _g = cls
+                            .map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                        let over: &[(usize, f64)] = match (mix_mstep, cls) {
+                            (Some(m), Some(c)) => &m.class_sigma_over[c],
+                            _ => &[],
+                        };
+                        let sub_sg = class_sigma_subst(&sg, over);
+                        let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
+                        let (nll, mut grad) = obs_nll_subject_grad(
                             model,
                             subject,
                             &th,
-                            &sg,
+                            sg_i,
                             eta,
                             &theta_packs_log_mask,
                             &lower,
@@ -816,7 +873,13 @@ fn theta_sigma_mstep_light(
                             n_theta,
                             n_sigma,
                             scratch,
-                        )
+                        );
+                        for &(sidx, _) in over {
+                            if n_theta + sidx < grad.len() {
+                                grad[n_theta + sidx] = 0.0;
+                            }
+                        }
+                        (nll, grad)
                     })
                     .collect();
                 fold_nll_grad(per_subj, n)
@@ -830,11 +893,11 @@ fn theta_sigma_mstep_light(
                 1e20
             }
         } else {
-            let val = match (classes, kappas_opt) {
-                (Some(cls), Some(kappas)) => {
-                    obs_nll_sum_iov_mix(model, population, &th, &sg, etas, kappas, cls)
+            let val = match (mix_mstep, kappas_opt) {
+                (Some(mx), Some(kappas)) => {
+                    obs_nll_sum_iov_mix(model, population, &th, &sg, etas, kappas, mx)
                 }
-                (Some(cls), None) => obs_nll_sum_mix(model, population, &th, &sg, etas, cls),
+                (Some(mx), None) => obs_nll_sum_mix(model, population, &th, &sg, etas, mx),
                 (None, Some(kappas)) => obs_nll_sum_iov(model, population, &th, &sg, etas, kappas),
                 (None, None) => obs_nll_sum(model, population, &th, &sg, etas),
             };
@@ -1148,15 +1211,16 @@ fn obs_nll_sum_iov(
 }
 
 /// Mixture (#985) variant of [`obs_nll_sum`]: each subject's observation NLL is
-/// evaluated under its drawn class's `MIXNUM` guard, so the class-switched
-/// typical values (`if MIXNUM == k …`) are seen. `classes[i]` is 0-based.
+/// evaluated under its drawn class's `MIXNUM` guard — so the class-switched
+/// typical values (`if MIXNUM == k …`) are seen — and under that class's σ, so a
+/// held `sigma(k)` override is honoured rather than replaced by the free base σ.
 fn obs_nll_sum_mix(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
     sigma_values: &[f64],
     etas: &[Vec<f64>],
-    classes: &[usize],
+    mix: MixMstep<'_>,
 ) -> f64 {
     use rayon::prelude::*;
     let per_subj: Vec<f64> = population
@@ -1164,15 +1228,17 @@ fn obs_nll_sum_mix(
         .par_iter()
         .enumerate()
         .map_init(EventPkParams::default, |scratch, (i, subject)| {
-            let _g = crate::parser::model_parser::MixtureClassGuard::enter(classes[i] + 1);
-            obs_nll_subject_into(model, subject, theta, sigma_values, &etas[i], scratch)
+            let c = mix.classes[i];
+            let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
+            let sub_sg = class_sigma_subst(sigma_values, &mix.class_sigma_over[c]);
+            let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(sigma_values);
+            obs_nll_subject_into(model, subject, theta, sg_i, &etas[i], scratch)
         })
         .collect();
     per_subj.iter().sum()
 }
 
 /// Mixture (#985) + IOV variant of [`obs_nll_sum_iov`], class-guarded per subject.
-#[allow(clippy::too_many_arguments)]
 fn obs_nll_sum_iov_mix(
     model: &CompiledModel,
     population: &Population,
@@ -1180,7 +1246,7 @@ fn obs_nll_sum_iov_mix(
     sigma_values: &[f64],
     etas: &[Vec<f64>],
     kappas: &[Vec<Vec<f64>>],
-    classes: &[usize],
+    mix: MixMstep<'_>,
 ) -> f64 {
     use rayon::prelude::*;
     let per_subj: Vec<f64> = population
@@ -1188,16 +1254,11 @@ fn obs_nll_sum_iov_mix(
         .par_iter()
         .enumerate()
         .map_init(EventPkParams::default, |scratch, (i, subject)| {
-            let _g = crate::parser::model_parser::MixtureClassGuard::enter(classes[i] + 1);
-            obs_nll_subject_into_iov(
-                model,
-                subject,
-                theta,
-                sigma_values,
-                &etas[i],
-                &kappas[i],
-                scratch,
-            )
+            let c = mix.classes[i];
+            let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
+            let sub_sg = class_sigma_subst(sigma_values, &mix.class_sigma_over[c]);
+            let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(sigma_values);
+            obs_nll_subject_into_iov(model, subject, theta, sg_i, &etas[i], &kappas[i], scratch)
         })
         .collect();
     per_subj.iter().sum()
@@ -1890,6 +1951,13 @@ pub fn run_saem(
             ));
         }
     }
+    // Per-class held σ overrides, hoisted out of the loop: they are constant
+    // under SAEM (held at their inits) and the θ/σ M-step substitutes them per
+    // subject so the free base σ is not dragged by override-class members.
+    let mix_sigma_over: Vec<Vec<(usize, f64)>> = saem_mix
+        .as_ref()
+        .map(|m| m.class_sigma_overrides())
+        .unwrap_or_default();
     let use_closed_form_mstep =
         options.mu_referencing && !mu_ref_pairs.is_empty() && saem_mix.is_none();
     // Accumulator for the `obs_nll_sum` (population OFV) evaluations skipped
@@ -2248,9 +2316,6 @@ pub fn run_saem(
             if let Some(mix) = saem_mix.as_mut() {
                 mix.classes = drawn_classes;
                 mix.update_rbar(gamma);
-                if k > omega_burnin {
-                    mix.mstep_omega_overrides(&state.etas, gamma_omega);
-                }
             }
         }
 
@@ -2270,6 +2335,19 @@ pub fn run_saem(
             if let Some(omega_iov_cur) = omega_iov_cur_opt.as_ref() {
                 for i in 0..n_subjects {
                     let subject = &population.subjects[i];
+                    // Mixture (#985): κ must be sampled inside the subject's drawn
+                    // class — under that class's `MIXNUM` branch and its Ω/σ.
+                    // Without the guard every subject's κ would be proposed against
+                    // the class-1 typical values and class-1 Ω/σ, corrupting
+                    // `state.kappas` (hence `s2_iov`, Ω_IOV and the θ/σ M-step)
+                    // for every class-2+ subject (#987 review).
+                    let cls = saem_mix.as_ref().map(|m| m.classes[i]);
+                    let _class_guard =
+                        cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let (omega_i, sigma_i): (&OmegaMatrix, &[f64]) = match cls {
+                        Some(c) => (&class_omegas[c], class_sigmas[c].as_slice()),
+                        None => (&omega_k, state.sigma_vals.as_slice()),
+                    };
                     let mut rng = StdRng::seed_from_u64(
                         master_seed
                             .wrapping_add(k as u64 * 100_000)
@@ -2290,9 +2368,9 @@ pub fn run_saem(
                         &state.theta,
                         &state.etas[i],
                         &state.kappas[i],
-                        &omega_k,
+                        omega_i,
                         Some(omega_iov_cur),
-                        &state.sigma_vals,
+                        sigma_i,
                     );
                     let (n_acc, n_prop, nll_new) = mh_kappa_steps(
                         &mut state.kappas[i],
@@ -2301,9 +2379,9 @@ pub fn run_saem(
                         model,
                         &state.theta,
                         &state.etas[i],
-                        &omega_k,
+                        omega_i,
                         omega_iov_cur,
-                        &state.sigma_vals,
+                        sigma_i,
                         state.kappa_step_scales[i],
                         &mut rng,
                     );
@@ -2339,14 +2417,45 @@ pub fn run_saem(
             );
         }
 
-        let mut eta_outer = DMatrix::zeros(n_eta, n_eta);
-        for eta in &state.etas {
-            let ev = DVector::from_column_slice(eta);
-            eta_outer += &ev * ev.transpose();
-        }
-        eta_outer /= n_subjects as f64;
+        // Mixture with `omega(k)` overrides (#987 review): the base Ω statistic
+        // must be built from the subjects that actually *share* the base entry —
+        // pooling an override class's members biases the base toward the
+        // mixture-wide spread. Entries with no base members keep their previous
+        // value. Without overrides this reduces to the pooled statistic below.
+        let base_partitioned = saem_mix
+            .as_ref()
+            .filter(|m| !m.mp.omega_override_addr.is_empty())
+            .map(|m| m.base_eta_outer(&state.etas, n_eta));
 
-        state.s2 = (1.0 - gamma_omega) * &state.s2 + gamma_omega * &eta_outer;
+        if let Some((mean, counts)) = base_partitioned {
+            for j in 0..n_eta {
+                for l in 0..n_eta {
+                    if counts[(j, l)] > 0 {
+                        state.s2[(j, l)] =
+                            (1.0 - gamma_omega) * state.s2[(j, l)] + gamma_omega * mean[(j, l)];
+                    }
+                }
+            }
+        } else {
+            let mut eta_outer = DMatrix::zeros(n_eta, n_eta);
+            for eta in &state.etas {
+                let ev = DVector::from_column_slice(eta);
+                eta_outer += &ev * ev.transpose();
+            }
+            eta_outer /= n_subjects as f64;
+
+            state.s2 = (1.0 - gamma_omega) * &state.s2 + gamma_omega * &eta_outer;
+        }
+
+        // Per-class Ω-override statistic: SA-updated on the *same* schedule as
+        // the base `s2` above — every iteration, including burn-in, so the first
+        // post-burn-in override update reflects the warmed-up chain rather than a
+        // single-iteration class mean. `omega_stat_active` is what gates whether
+        // `sync_base` *applies* it, mirroring the base Ω's burn-in gate below.
+        if let Some(mix) = saem_mix.as_mut() {
+            mix.mstep_omega_overrides(&state.etas, gamma_omega);
+            mix.omega_stat_active = k > omega_burnin;
+        }
 
         // ---- Step 2b: SA update for Omega_iov (IOV only) ----
         // s2_iov = (1 - γ) s2_iov + γ · (1/N_occ) Σᵢ Σₖ κᵢₖ κᵢₖᵀ
@@ -2565,7 +2674,10 @@ pub fn run_saem(
                     mstep_maxiter,
                     options.scale_params,
                     &theta_packs_log_mask,
-                    saem_mix.as_ref().map(|m| m.classes.as_slice()),
+                    saem_mix.as_ref().map(|m| MixMstep {
+                        classes: m.classes.as_slice(),
+                        class_sigma_over: &mix_sigma_over,
+                    }),
                 );
                 log_theta = theta_new;
                 log_sigma = sigma_new;
@@ -2834,7 +2946,15 @@ pub fn run_saem(
     // OFV, EBEs, and covariance step see the mixture structure. `mp`'s base was
     // synced from the final Ω/σ in the last NLL-cache refresh.
     if let Some(mix) = saem_mix.as_ref() {
-        final_params.mixture = Some(mix.mp.clone());
+        let mut mp = mix.mp.clone();
+        // SAEM holds the per-class σ overrides at their inits (warned above), so
+        // they are FIX as far as this fit is concerned. Marking them keeps the
+        // covariance step from building an FD-Hessian row for a coordinate SAEM
+        // never optimised — evaluated off its stationary point that row can push
+        // an otherwise-PD Hessian into the eigen-floor/SIR fallback and degrade
+        // every other SE (#987 review). Their SEs report as 0, matching FIX.
+        mp.sigma_override_fixed = vec![true; mp.sigma_override_addr.len()];
+        final_params.mixture = Some(mp);
     }
 
     if combined_additive_sigma_at_floor(model, &final_params) {
@@ -3076,6 +3196,127 @@ mod tests {
         assert_eq!(
             saem_final_ofv_report(-42.0),
             "SAEM completed. Final OFV = -42.0000"
+        );
+    }
+
+    #[test]
+    fn class_sigma_subst_is_none_without_overrides() {
+        assert!(class_sigma_subst(&[0.2, 0.3], &[]).is_none());
+    }
+
+    #[test]
+    fn class_sigma_subst_replaces_only_overridden_indices() {
+        let out = class_sigma_subst(&[0.2, 0.3, 0.4], &[(2, 0.9)]).unwrap();
+        assert_eq!(out, vec![0.2, 0.3, 0.9]);
+        // Out-of-range indices are ignored rather than panicking.
+        let out = class_sigma_subst(&[0.2], &[(7, 0.9)]).unwrap();
+        assert_eq!(out, vec![0.2]);
+    }
+
+    /// The mixture M-step objective must actually reach the `MIXNUM` branch: the
+    /// same subjects scored as class 1 vs class 2 must give different objective
+    /// values, since the model's typical clearance switches on `MIXNUM` (#987
+    /// review — this path was previously only exercised by slow-tests).
+    #[test]
+    fn obs_nll_sum_mix_class_guard_reaches_mixnum() {
+        const MIX: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(5.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  sigma(2) EPS ~ 0.25
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(MIX).unwrap();
+        let mut csv = String::from(
+            "ID,TIME,DV,AMT,EVID,CMT
+",
+        );
+        for sid in 1..=2 {
+            csv.push_str(&format!(
+                "{sid},0,0,100,1,1
+"
+            ));
+            for t in [0.5_f64, 1.0, 2.0, 4.0] {
+                csv.push_str(&format!(
+                    "{sid},{t},{:.5},0,0,1
+",
+                    10.0 * (-0.1 * t).exp()
+                ));
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, csv.as_bytes()).unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+
+        let params = &model.default_params;
+        let etas = vec![vec![0.0], vec![0.0]];
+        let sigma = &params.sigma.values;
+        let no_over: Vec<Vec<(usize, f64)>> = vec![Vec::new(), Vec::new()];
+
+        let as_class1 = obs_nll_sum_mix(
+            &model,
+            &pop,
+            &params.theta,
+            sigma,
+            &etas,
+            MixMstep {
+                classes: &[0, 0],
+                class_sigma_over: &no_over,
+            },
+        );
+        let as_class2 = obs_nll_sum_mix(
+            &model,
+            &pop,
+            &params.theta,
+            sigma,
+            &etas,
+            MixMstep {
+                classes: &[1, 1],
+                class_sigma_over: &no_over,
+            },
+        );
+        assert!(as_class1.is_finite() && as_class2.is_finite());
+        assert!(
+            (as_class1 - as_class2).abs() > 1e-6,
+            "class guard must switch TVCL1/TVCL2: {as_class1} vs {as_class2}"
+        );
+
+        // A held `sigma(2)` override must be what a class-2 subject is scored
+        // under — not the free base σ the optimizer is moving.
+        let mix = crate::estimation::saem_mixture::SaemMixture::build(&model, params, &pop);
+        let over = mix.class_sigma_overrides();
+        assert_eq!(over[1].len(), 1, "sigma(2) override present");
+        let with_override = obs_nll_sum_mix(
+            &model,
+            &pop,
+            &params.theta,
+            sigma,
+            &etas,
+            MixMstep {
+                classes: &[1, 1],
+                class_sigma_over: &over,
+            },
+        );
+        assert!(
+            (with_override - as_class2).abs() > 1e-6,
+            "class-2 σ override must change the M-step objective"
         );
     }
 
