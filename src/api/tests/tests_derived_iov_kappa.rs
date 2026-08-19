@@ -193,7 +193,14 @@ fn derived_and_indiv_use_per_occasion_kappa() {
     ]];
     let mut subjects_results = vec![sr_iov(4)];
 
-    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+    compute_extra_output_columns(
+        &model,
+        &population,
+        &[],
+        &kappas,
+        &mut subjects_results,
+        None,
+    );
 
     let cols = &subjects_results[0].extra_columns;
     let cl = &cols.iter().find(|(n, _)| n == "CL_OUT").unwrap().1;
@@ -243,7 +250,14 @@ fn missing_kappa_falls_back_to_zero() {
     let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]];
     let mut subjects_results = vec![sr_iov(4)];
 
-    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+    compute_extra_output_columns(
+        &model,
+        &population,
+        &[],
+        &kappas,
+        &mut subjects_results,
+        None,
+    );
 
     let cl = &subjects_results[0].extra_columns[0].1;
     for (j, &v) in cl.iter().enumerate() {
@@ -321,7 +335,14 @@ fn tad_uses_per_dose_occasion_lag() {
     ]];
     let mut subjects_results = vec![sr_iov(2)];
 
-    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+    compute_extra_output_columns(
+        &model,
+        &population,
+        &[],
+        &kappas,
+        &mut subjects_results,
+        None,
+    );
 
     let tad = &subjects_results[0].per_obs_tad;
     assert!(
@@ -409,7 +430,14 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
     let kappas: Vec<Vec<DVector<f64>>> = Vec::new(); // no IOV
     let mut subjects_results = vec![sr_iov(1)];
 
-    compute_extra_output_columns(&model, &population, &theta, &kappas, &mut subjects_results);
+    compute_extra_output_columns(
+        &model,
+        &population,
+        &theta,
+        &kappas,
+        &mut subjects_results,
+        None,
+    );
 
     let tad = &subjects_results[0].per_obs_tad;
     // 3 − (dose@0 + ALAG2=2) = 1.0; the pre-fix bare-lag path gives 3.0.
@@ -958,7 +986,14 @@ fn tad_lag_uses_dose_covariate_not_obs() {
     let kappas: Vec<Vec<DVector<f64>>> = vec![vec![DVector::from_vec(vec![0.0])]];
     let mut subjects_results = vec![sr_iov(1)];
 
-    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+    compute_extra_output_columns(
+        &model,
+        &population,
+        &[],
+        &kappas,
+        &mut subjects_results,
+        None,
+    );
 
     let tad = &subjects_results[0].per_obs_tad;
     assert!(

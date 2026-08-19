@@ -550,6 +550,14 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
 }
 
 /// Compute per-subject diagnostics (IPRED, PRED, IWRES, CWRES)
+///
+/// `mixest` (#985) carries the fitted per-subject mixture class (0-based, from
+/// `OuterResult::mixture_posteriors`) and is `None` for every non-mixture fit.
+/// Every prediction below is evaluated under that subject's class guard: the η̂
+/// handed in are the MIXEST-class EBEs, so building predictions from them with
+/// `MIXNUM` left at its class-1 default would pair a class-2 η̂ with class-1
+/// typical values and silently corrupt IPRED/PRED/IWRES/CWRES (and the per-subject
+/// OFV) for every subject the fit assigned to another class.
 pub(crate) fn compute_subject_results(
     model: &CompiledModel,
     population: &Population,
@@ -558,12 +566,17 @@ pub(crate) fn compute_subject_results(
     h_matrices: &[DMatrix<f64>],
     kappas_per_subject: &[Vec<DVector<f64>>],
     interaction: bool,
+    mixest: Option<&[usize]>,
 ) -> Vec<SubjectResult> {
     population
         .subjects
         .iter()
         .enumerate()
         .map(|(i, subject)| {
+            // Hold this subject's fitted class for the whole per-subject block.
+            let _mix_guard = mixest
+                .and_then(|m| m.get(i))
+                .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
             let eta = &eta_hats[i];
             let h = &h_matrices[i];
             let kappas: &[DVector<f64>] = if i < kappas_per_subject.len() {

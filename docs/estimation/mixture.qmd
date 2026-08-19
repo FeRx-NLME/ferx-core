@@ -85,6 +85,13 @@ NONMEM reserved variables:
 - **`PMIX_1 … PMIX_K`** — the posterior class-membership probabilities
   $\text{PMIX}_{ik} \propto p_{ik}\exp(-\text{nll}_{ik})$, normalised over $k$.
 
+Every other per-subject diagnostic is evaluated **in that subject's `MIXEST`
+class**: the reported $\hat\eta$ are the winning class's EBEs, and `IPRED`,
+`PRED`, `IWRES`, `CWRES`, `EBE_OFV`, and any `[derived]` / `[output]` column
+that branches on `MIXNUM` are all computed with `MIXNUM` set to that class. So a
+subject the fit assigns to class 2 gets class-2 typical values throughout its
+sdtab row, not the class-1 default.
+
 ## Validation against NONMEM
 
 A two-class clearance mixture (`tests/nonmem/mixture_iv.ctl` and the
@@ -194,9 +201,27 @@ branch). The M-step partitions the sufficient statistics by sampled class:
 The reported OFV, per-subject `MIXEST`/`PMIX`, and standard errors are computed
 from the K-fold mixture marginal at the SAEM optimum, exactly as for FOCEI.
 Per-class **σ** overrides (`sigma(k)`) are the one piece not yet re-estimated
-under SAEM — they are held at their initial values (with a warning); route such a
-model to FOCEI. HMC and the conditional-distribution pass are disabled for a
-mixture (they are class-unaware); the MH E-step is used.
+under SAEM — they are held at their initial values (with a warning), and every
+class-`k` subject is *scored* under that held σ, so the free base σ is estimated
+only from the classes that actually share it. Being held, the overrides report a
+standard error of 0, as `FIX`ed parameters do; route the model to FOCEI if they
+must be fit. HMC and the conditional-distribution pass are disabled for a mixture
+(they are class-unaware); the MH E-step is used.
+
+Two further SAEM-specific rules follow from the separated M-step:
+
+- A mixing theta marked `FIX` is honoured — it is excluded from the mixing
+  M-step and stays at its declared value, so a known mixture fraction can be
+  pinned.
+- A theta that drives **both** the mixing expression and a structural typical
+  value is rejected with an error rather than silently double-owned (SAEM
+  estimates the mixing coefficients and the structural thetas in separate
+  M-steps). Split it into two thetas, or fit with FOCE/FOCEI, whose joint
+  marginal handles the shared parameter.
+
+Under **IOV**, the per-occasion κ is sampled inside each subject's drawn class —
+under that class's `MIXNUM` branch and its Ω/Σ — so a class-switched typical
+value is never absorbed into κ.
 
 ### NONMEM cross-check (`tests/nonmem/mixture_iv_saem.ctl`)
 
@@ -234,7 +259,10 @@ Gibbs-within-MH sampler becomes mixture-aware in one place:
 - the **(θ, σ) block** — which also carries the mixing thetas — samples them
   against the marginal, so the mixing coefficients (constant *or*
   covariate-dependent logit mixing) are sampled with no extra machinery;
-- the **Ω block** draws the (class-shared) Ω from its conjugate full conditional.
+- the **Ω block** draws the (class-shared) Ω from its conjugate full conditional;
+- the **κ block** (inter-occasion variability, #985) samples the per-occasion
+  $\kappa_{ik}$ against the same marginal, so κ targets the class-marginal
+  posterior rather than class 1's.
 
 Ω/Σ are shared across classes (the classes differ only through the
 `MIXNUM`-switched typical values); per-class Ω/Σ overrides (`omega(k)`/`sigma(k)`)
@@ -242,11 +270,35 @@ are rejected with a clear error — fit those with FOCE/FOCEI. The reported OFV,
 per-subject `MIXEST`/`PMIX`, and EBEs are the K-fold marginal values at the
 posterior mean.
 
+### Priors, label switching, and the reported OFV
+
+The population priors are weakly informative normals, $\mathcal{N}(u_0, 10^2)$ on
+the unconstrained scale (log θ where θ is positive, log σ), centred on the
+*initial estimates* $u_0$ from the model file. Any `[parameters]` bounds you
+declare are **not** enforced as a uniform prior inside the (θ, σ) Metropolis
+block — only the mu-referenced conjugate θ move clamps to them — so a mixing
+logit is kept in range by the prior, not by its declared bounds.
+
+Because the classes are identified only through those priors, a chain can
+**swap labels** (class 1 ↔ class 2) and the pooled posterior mean would then
+average across two modes and estimate neither class. The signature is a high
+split-R̂ on the class-switched θ; ferx emits a warning naming label switching
+when R̂ exceeds its convergence threshold on a mixture. Separating the classes in
+the initial estimates is the practical fix.
+
+The OFV reported for a Bayes *mixture* run is the Laplace K-fold marginal at the
+posterior mean (not the posterior-mean joint NLL ×2 that a non-mixture Bayes run
+reports), and — like every mixture marginal — it is the FOCE or FOCEI form
+depending on `interaction`. In a method chain (`method = [saem, bayes]`) that
+flag follows the chain's last estimator, so compare mixture OFVs only across runs
+with the same interaction setting.
+
 Under diffuse priors the Bayes posterior mean concentrates at the maximum-
 likelihood optimum, so it recovers the same estimates the FOCEI/SAEM anchors pin
 (observed on `tests/nonmem/mixture_iv.csv`: posterior mean `TVCL1 ≈ 0.94`,
 `TVCL2 ≈ 2.78`, `V ≈ 10.0`, `p(1) ≈ 0.47`, marginal OFV ≈ 301.8, vs the FOCEI
-optimum 0.98 / 2.84 / 9.98 / 0.472 / 301.58). That shared optimum — already
+optimum 0.98 / 2.84 / 9.98 / 0.472 / 301.58; the two class means sit slightly
+inside the MLE pair, the direction partial label mixing pulls them). That shared optimum — already
 NONMEM-anchored by the FOCEI run above — is the Bayes cross-check: a direct
 NONMEM `METHOD=BAYES` reference is not used because NONMEM's BAYES sampler aborts
 in burn-in on this model (it insists on Gibbs-sampling Ω, which is FIXed here), a
@@ -312,3 +364,5 @@ The following error clearly rather than silently mis-fitting:
   IMP/IMPMAP (rejected) — use FOCE/FOCEI to fit those.
 - IOV / FREM / SDE under the mixture IMP paths (objective evaluation and
   estimation) — use FOCE/FOCEI.
+- A theta shared between the `[mixture]` mixing expression and a structural
+  typical value, under SAEM.

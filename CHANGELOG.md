@@ -40,7 +40,10 @@ section of the SDLC for the versioning policy).
   `MIXEST`/`PMIX`, and EBEs are the K-fold marginal values at the posterior mean. Per-class Ω/σ
   overrides are rejected (Ω/σ are class-shared). Validated by recovering the mixture MLE under diffuse
   priors (a direct NONMEM `METHOD=BAYES` reference is impractical — its sampler aborts on `$MIX` with
-  FIXed Ω/Σ).
+  FIXed Ω/Σ). Inter-occasion variability is supported: the κ block samples against the same
+  class-marginal target. A run that asks for HMC (`saem_n_leapfrog > 0`) on a mixture now warns that
+  the Metropolis-Hastings η kernel was used instead, and a high R̂ on a mixture warns about label
+  switching, which would make the reported posterior mean an average across class labels.
 - **SAEM estimation for mixture models (#985).** `[mixture]` models can now be fit with
   `method = saem`, not only FOCE/FOCEI. The E-step samples the latent class per subject (from the
   current posterior `PMIX_i`) and runs the η-MCMC within the drawn class; the M-step estimates the
@@ -48,8 +51,10 @@ section of the SDLC for the versioning policy).
   mixing coefficients (constant *or* covariate-dependent logit mixing) from the sampled class
   frequencies. Reported OFV, per-subject `MIXEST`/`PMIX`, and standard errors come from the K-fold
   mixture marginal, matching FOCEI. Cross-checked against NONMEM `METHOD=SAEM` (estimates agree to
-  ≤ 3 %). Per-class σ overrides (`sigma(k)`) are held at their initial values under SAEM (with a
-  warning) — route those to FOCEI. IMP/IMPMAP and Bayes for mixtures remain unwired and error clearly.
+  ≤ 3 %). A mixing theta marked `FIX` is honoured; a theta shared between the mixing expression and a
+  structural typical value is rejected with a clear error. Per-class σ overrides (`sigma(k)`) are held
+  at their initial values under SAEM (with a warning, and reported with SE 0 like other fixed
+  parameters) — route those to FOCEI.
 - **Inter-occasion variability under a mixture (#985).** A `[mixture]` model may now also carry a
   `kappa` (inter-occasion variability) term — the two features compose, where before `fit()` rejected
   the combination. Each class's per-subject inner solve estimates the per-occasion κ̂ under that
@@ -112,6 +117,11 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **Per-subject diagnostics now honour `MIXEST` in a mixture fit (#985).** `IPRED`, `PRED`,
+  `IWRES`, `CWRES`, `EBE_OFV`, and `[derived]`/`[output]` columns were computed with `MIXNUM`
+  pinned to class 1 for every subject, even for subjects the fit assigned to another class — so a
+  class-2 subject's sdtab row paired its class-2 EBEs with class-1 typical values. They are now
+  evaluated in each subject's fitted class. Affects FOCE/FOCEI, SAEM, Bayes, and estimating IMP/IMPMAP mixture fits.
 - **Mixture covariance-step and diagnostics correctness (#984, follow-up to #983).** Five fixes to
   the mixture SE/covariance and checkpoint paths: (1) the covariance step now reconverges its per-class EBEs at
   `cov_inner_tol`, not the fit's `inner_tol`, so a loose fit followed by a tight `cov_inner_tol` for
