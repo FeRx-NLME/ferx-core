@@ -108,6 +108,21 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **Inner EBE no longer certifies a runaway mode, so the FOCE/FOCEI objective is
+  gradient-path-independent (#958).** On a model where a prediction is driven toward zero under
+  proportional error, that observation's variance is clamped to the floor and its residual term
+  amplifies the ODE solver's local error by ~1e8 — enough for the *finite-difference* inner
+  gradient to come back with the wrong sign. The inner search then walked tens of prior SDs away
+  from η = 0 and accepted the point it landed on, because a noise-driven search satisfies the
+  objective-stall convergence test exactly like a converged one. `gradient = fd` and
+  `gradient = auto` therefore reported different objectives for the same model at the same
+  estimates, which made ΔOFV/ΔAIC model selection depend on the gradient route. The inner loop now
+  re-solves derivative-free from the prior mean whenever the returned EBE's Mahalanobis distance
+  `ηᵀΩ⁻¹η` exceeds 10 prior SDs per random effect, and keeps whichever point has the lower
+  objective. On the reported reproducer the first-evaluation objective goes from `fd` 6082.24 /
+  `auto` −5.478 to −5.479 / −5.478, and both routes now recover the simulating parameters. The
+  analytic (`Dual2`) sensitivities were correct throughout — verified against finite differences of
+  the predictor to 2.6e-7 — so `gradient = auto`, the default, was never affected.
 - **Per-subject diagnostics now honour `MIXEST` in a mixture fit (#985).** `IPRED`, `PRED`,
   `IWRES`, `CWRES`, `EBE_OFV`, and `[derived]`/`[output]` columns were computed with `MIXNUM`
   pinned to class 1 for every subject, even for subjects the fit assigned to another class — so a

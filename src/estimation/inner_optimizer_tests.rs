@@ -1333,3 +1333,134 @@ fn inner_restarts_bit_identical_on_wellidentified_subject() {
         );
     }
 }
+
+/// `ebe_prior_maha` is the runaway guard's detector: the squared Mahalanobis distance
+/// `ηᵀΩ⁻¹η` under the prior. Pinned on a diagonal Ω where the value is hand-computable,
+/// and on the non-finite η a diverged search can return — which must report `INFINITY`
+/// so it *trips* the guard rather than comparing false against the threshold.
+#[test]
+fn ebe_prior_maha_is_the_omega_inverse_quadratic_form() {
+    let omega =
+        crate::types::OmegaMatrix::from_diagonal(&[0.04, 0.09], vec!["A".into(), "B".into()]);
+    // (0.4²/0.04) + (0.9²/0.09) = 4 + 9 = 13 — i.e. 2 SD and 3 SD.
+    assert!((ebe_prior_maha(&[0.4, 0.9], &omega) - 13.0).abs() < 1e-9);
+    assert_eq!(ebe_prior_maha(&[0.0, 0.0], &omega), 0.0);
+    assert!(ebe_prior_maha(&[f64::NAN, 0.0], &omega).is_infinite());
+    assert!(ebe_prior_maha(&[f64::INFINITY, 0.0], &omega).is_infinite());
+}
+
+/// Subject 7 of the #958 gist reproducer (`synthetic_tmdd_init_sqrt`): a quasi-steady-state
+/// target-binding ODE whose terminal drug sample is `4.7e-5` while the prediction at η = 0 is
+/// ~`7.5e-9`. Under proportional error that row's variance is clamped to `MIN_VARIANCE`
+/// (1e-12), so its residual term `(y−f)²/R` amplifies the ODE solver's local error
+/// (`ode_abstol = 1e-9`) by ~1e8 — and the **finite-difference** inner gradient, which
+/// differences that objective, comes back with the wrong *sign*.
+///
+/// The inner BFGS then marched to η ≈ `[2.49, 16.20, 14.52]` — `ηᵀΩ⁻¹η ≈ 9000`, ~80 prior SDs
+/// on two axes — and *certified* it, because a noise-driven search satisfies the
+/// objective-stall stop exactly like a converged one (the objective stops improving and the
+/// gradient norm plateaus). Nothing downstream re-checked it, so `gradient = fd` and
+/// `gradient = auto` reported first-evaluation objectives of `6082.24` and `−5.48` for the
+/// same model at the same estimates, making ΔOFV model selection gradient-path-dependent.
+///
+/// This EBE is **not** multimodal — eight seeds under the analytic gradient (itself verified
+/// against FD of the predictor to 2.6e-7) all reach the same mode — so the two routes must
+/// return it. Fails without the runaway guard: the FD route returns the runaway instead.
+#[test]
+fn fd_inner_ebe_runaway_on_floored_row_is_recovered() {
+    let model_src = "[parameters]\n  theta KEL(0.05, 0.001, 5.0)\n  theta VC(3, 0.1, 100.0)\n  theta KSS(10, 0.1, 500.0)\n  theta KINT(0.5, 0.01, 50.0)\n  theta KDEG(0.05, 0.001, 5.0)\n  theta RBASE(20, 0.5, 500.0)\n  omega IIV_KEL   ~ 0.09\n  omega IIV_VC    ~ 0.04\n  omega IIV_RBASE ~ 0.09\n  sigma PROP_DRUG ~ 0.15 (sd)\n  sigma PROP_TGT  ~ 0.20 (sd)\n[individual_parameters]\n  KEL   = KEL * exp(IIV_KEL)\n  VC    = VC * exp(IIV_VC)\n  RBASE = RBASE * exp(IIV_RBASE)\n  KSS   = KSS\n  KINT  = KINT\n  KDEG  = KDEG\n  KSYN  = RBASE * KDEG\n[structural_model]\n  ode(states=[CENT, RTOT])\n[odes]\n  init(RTOT) = RBASE\n  CT = CENT / VC\n  RT = RTOT\n  BB = CT - RT - KSS\n  CF = 0.5 * (BB + sqrt(BB*BB + 4*KSS*CT))\n  FB = CF / (KSS + CF)\n  d/dt(CENT) = -KEL * CF * VC - RT * KINT * FB * VC\n  d/dt(RTOT) = KSYN - KDEG * RT - (KINT - KDEG) * RT * FB\n[scaling]\n  y[CMT=1] = CENT / VC\n  y[CMT=3] = RTOT\n[error_model]\n  CMT=1: DV ~ proportional(PROP_DRUG)\n  CMT=3: DV ~ proportional(PROP_TGT)\n[fit_options]\n  method     = focei\n  ode_reltol = 1e-9\n  ode_abstol = 1e-9\n";
+
+    // (time, cmt, DV) exactly as the gist's subject 7 — the `112 / cmt 1 / 4.7e-05` row is
+    // the one whose proportional variance floors.
+    let rows: [(f64, usize, f64); 23] = [
+        (0.083, 1, 183.756742),
+        (0.083, 3, 15.161013),
+        (0.25, 1, 204.703415),
+        (0.25, 3, 14.124375),
+        (1.0, 1, 194.836064),
+        (1.0, 3, 11.059003),
+        (3.0, 1, 189.142239),
+        (3.0, 3, 5.061678),
+        (7.0, 1, 112.589072),
+        (7.0, 3, 2.117357),
+        (14.0, 1, 121.725206),
+        (14.0, 3, 1.917394),
+        (28.0, 1, 72.126391),
+        (28.0, 3, 2.068264),
+        (42.0, 1, 25.918106),
+        (42.0, 3, 2.43914),
+        (56.0, 1, 15.509434),
+        (56.0, 3, 3.649646),
+        (84.0, 1, 0.161923),
+        (84.0, 3, 12.591933),
+        (112.0, 1, 4.7e-05),
+        (112.0, 3, 18.294563),
+        (126.0, 3, 17.544296),
+    ];
+    let n = rows.len();
+    let subject = Subject {
+        id: "7".into(),
+        doses: vec![DoseEvent::new(0.0, 600.0, 1, 0.0, false, 0.0)],
+        obs_times: rows.iter().map(|r| r.0).collect(),
+        obs_raw_times: Vec::new(),
+        observations: rows.iter().map(|r| r.2).collect(),
+        obs_cmts: rows.iter().map(|r| r.1).collect(),
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        cens: vec![0; n],
+        occasions: vec![1; n],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+
+    let base = crate::parser::model_parser::parse_model_string(model_src)
+        .expect("QSS TMDD model with a parameter-dependent init parses");
+    let params = base.default_params.clone();
+
+    // Precondition: the terminal drug row really is at the variance floor at η = 0. Without
+    // this the test would pass vacuously if the model or data ever drifted out of the regime
+    // that produces the runaway.
+    let preds = crate::pk::compute_predictions_with_tv(&base, &subject, &params.theta, &[0.0; 3]);
+    assert!(
+        base.residual_variance_at(1, preds[20], &params.sigma.values) <= 1e-12,
+        "terminal drug prediction {} must drive its proportional variance to the floor",
+        preds[20]
+    );
+
+    let solve = |gm: GradientMethod| -> Vec<f64> {
+        let mut m = crate::parser::model_parser::parse_model_string(model_src).unwrap();
+        m.gradient_method = gm;
+        find_ebe(&m, &subject, &params, 50, 1e-5, None, None, 0)
+            .eta
+            .iter()
+            .copied()
+            .collect()
+    };
+    let eta_auto = solve(GradientMethod::Auto);
+    let eta_fd = solve(GradientMethod::Fd);
+
+    // Both routes must land in the prior-plausible region — the runaway sat at ~9000.
+    for (label, eta) in [("auto", &eta_auto), ("fd", &eta_fd)] {
+        let maha = ebe_prior_maha(eta, &params.omega);
+        assert!(
+            maha < RUNAWAY_EBE_MAHA_PER_ETA * base.n_eta as f64,
+            "{label} EBE {eta:?} is a prior runaway (ηᵀΩ⁻¹η = {maha})"
+        );
+    }
+    // …and on the *same* mode, since this subject's individual objective is unimodal.
+    for k in 0..base.n_eta {
+        assert!(
+            (eta_auto[k] - eta_fd[k]).abs() < 1e-3,
+            "η[{k}]: analytic {} vs FD {} — the FOCEI objective must not depend on the \
+             gradient route",
+            eta_auto[k],
+            eta_fd[k]
+        );
+    }
+}
