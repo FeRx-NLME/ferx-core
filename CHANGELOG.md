@@ -82,6 +82,19 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **Fits no longer stall on their initial estimates under the default optimizer (#751).** A fit whose
+  opening line search fails could previously quit a hair off its starting point — the user-ODE
+  warfarin twin stopped 35 OFV units short of the optimum — and report the initial estimates, with
+  their standard errors, as the result. Such a fit is now automatically re-run once with the
+  identity-Hessian overshoot guard held on until it escapes its starting point, and the better of the
+  two results is reported. Affected models reach the same optimum, and the same NONMEM-validated
+  standard errors, as their analytical twin. Fits that were already leaving their initial estimates
+  are unaffected — they never trigger the retry and their trajectory is unchanged.
+- **A fit pinned at its initial estimates is no longer reported as converged (#751).** The
+  plateau rule that reclassifies a bare NLopt `Failure` at a flat optimum as convergence now also
+  requires the fit to have left its starting point. A stalled fit that booked one small objective
+  improvement and then went flat previously satisfied the rule and was flagged `converged`, which
+  also handed the covariance step a non-stationary point.
 - **Mixture covariance-step and diagnostics correctness (#984, follow-up to #983).** Five fixes to
   the mixture SE/covariance and checkpoint paths: (1) the covariance step now reconverges its per-class EBEs at
   `cov_inner_tol`, not the fit's `inner_tol`, so a loose fit followed by a tight `cov_inner_tol` for

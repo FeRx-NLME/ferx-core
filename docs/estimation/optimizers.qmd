@@ -96,6 +96,16 @@ The choice mirrors the analytic-vs-FD decision the outer loop already makes, so 
 
 The resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)` — so a run records which algorithm actually executed. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
 
+### Leaving the initial estimates
+
+Both gradient-based NLopt optimizers start with their quasi-Newton Hessian set to the identity, so their opening search direction is simply $-\nabla f$. On a typical PK model the scaled analytic gradient is large at the initial estimates ($10^2$–$10^3$ in log/Cholesky space), so that first step lands in a corner of the parameter box, the objective there explodes, and the line search fails — leaving the fit sitting on (or a hair off) its initial estimates for the rest of the budget.
+
+ferx rescales the gradient by a single scalar on that opening step, so it stays inside a sane per-dimension budget. The direction is unchanged. The rescale is deliberately *not* held on afterwards: L-BFGS reconstructs its Hessian from successive gradient differences, and rescaling those differences corrupts the curvature it has learned (SLSQP re-solves its subproblem from scratch each step, so it is rescaled throughout).
+
+If the fit nevertheless ends up still on its initial estimates, ferx re-runs it once from the same start with the rescale **held on until the fit escapes** — a fit that never moved has no curvature worth protecting — and reports whichever of the two attempts reached the lower OFV. A fit that was descending normally never triggers this and follows exactly the trajectory it always did.
+
+A fit that nonetheless fails to leave its initial estimates is reported with `converged = false` and a "did not converge" warning — never as a converged fit whose estimates and standard errors happen to be the starting values. If you see this, the usual remedies are better initial estimates, a different `optimizer`, or `parameter_scaling` (see [`fit_options`](../model-file/fit-options.qmd)).
+
 ---
 
 ## Fixed-EBE gradient bias and `reconverge_gradient_interval`

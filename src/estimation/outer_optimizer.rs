@@ -614,20 +614,57 @@ pub(crate) fn cap_scaled_gradient(g: &mut [f64], lower_s: &[f64], upper_s: &[f64
 /// - **SLSQP** — cap every eval. Its QP re-solves from the current quasi-Newton
 ///   Hessian each step, so rescaling the gradient never corrupts stored
 ///   curvature (issue #55).
-/// - **L-BFGS** — cap only the first eval. Its Hessian is reconstructed from the
-///   `(s, y)` pairs formed by successive gradient differences; a blanket cap
-///   would perturb `y` on every step and corrupt that curvature (which is why a
-///   uniform cap regressed well-behaved L-BFGS fits — #960). Only the opening
-///   `H₀ = I` step overshoots, so taming eval 1 alone lets the fit leave init
-///   while leaving every later `(s, y)` pair intact.
+/// - **L-BFGS** — cap the first eval always, and every later eval only on the
+///   *stall-retry* pass, while the fit is still sitting on its initial estimates
+///   (`hold_cap_at_init`; see [`optimize_nlopt`]). L-BFGS reconstructs its
+///   Hessian from the `(s, y)` pairs formed by successive gradient differences,
+///   so capping past eval 1 perturbs `y` and corrupts that curvature: held on
+///   from the start it costs ~11 OFV units on the `scaling_convergence` fit and
+///   ~4 on the 2-cpt transit fit (#960). That is why the held cap is not the
+///   default but the second attempt, run only for a fit that already failed to
+///   leave its initial estimates and therefore has nothing to lose.
 /// - **MMA / BOBYQA** and everything else — never cap here (MMA has its own
 ///   safeguards; BOBYQA is derivative-free).
-pub(crate) fn should_cap_gradient(algo: nlopt::Algorithm, n_grad_evals: usize) -> bool {
+pub(crate) fn should_cap_gradient(
+    algo: nlopt::Algorithm,
+    n_grad_evals: usize,
+    hold_cap_at_init: bool,
+) -> bool {
     match algo {
         nlopt::Algorithm::Slsqp => true,
-        nlopt::Algorithm::Lbfgs => n_grad_evals == 1,
+        nlopt::Algorithm::Lbfgs => n_grad_evals == 1 || hold_cap_at_init,
         _ => false,
     }
+}
+
+/// Scaled-space displacement from the initial estimates below which a point
+/// still counts as "at init".
+///
+/// Scaled coordinates are O(1) by construction (`compute_scale` normalises by
+/// `|packed value|`), so this is a ~1% move on any coordinate. It gates three
+/// decisions, all of which key off the same question — *has the fit actually
+/// left where it started?*:
+///   - [`optimize_nlopt`] retries a fit that answered no, holding the
+///     identity-Hessian cap on for the retry;
+///   - within that retry, [`should_cap_gradient`] keeps the cap engaged while
+///     the answer is still no; and
+///   - [`failure_is_converged_plateau`] refuses to call a bare NLopt `Failure`
+///     "converged" while the answer is no (issue #751: the stalled user-ODE fit
+///     had moved 1.4e-4 in TVCL and was still reported converged, publishing
+///     standard errors for the initial estimates).
+///
+/// Chosen well above the FOCE objective's own noise floor (a stalled fit moves
+/// ~1e-4) and well below a real first step (a healthy fit moves O(0.1)).
+pub(crate) const INIT_ESCAPE_STEP_S: f64 = 1e-2;
+
+/// L∞ distance between two scaled parameter vectors. Shorter vector wins if the
+/// lengths ever disagree (they never do in practice — both come from the same
+/// packing).
+pub(crate) fn max_scaled_deviation(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(ai, bi)| (ai - bi).abs())
+        .fold(0.0_f64, f64::max)
 }
 
 /// The population objective the outer loop actually minimises: [`pop_nll`] (FOCE/FOCEI),
@@ -1197,6 +1234,15 @@ const PLATEAU_CONSISTENCY_REL_TOL: f64 = 1e-3;
 ///     evals were guard-penalised, so a "significant improvement" there is not
 ///     descent. That is a failed start, not a converged plateau, even though the
 ///     objective is then "flat" for the remaining probes;
+///   - **left init**: the restored best point is at least
+///     [`INIT_ESCAPE_STEP_S`] away from `x₀` in scaled space. The feasible-eval
+///     progress test above is necessary but not sufficient: a stalled fit can
+///     book one "significant" improvement (> `PLATEAU_OFV_THRESHOLD`) while
+///     barely moving — the user-ODE warfarin twin improved 0.028 on feasible
+///     eval 4, 35 short of the optimum, and then went flat, which satisfied
+///     *progress* and *plateau* and was reported `converged = true` with the
+///     initial estimates and their standard errors (#751). Displacement is the
+///     check that separates "descended to a minimum" from "twitched and died";
 ///   - **plateau**: the flat tail (feasible evals since the last improvement
 ///     above `PLATEAU_OFV_THRESHOLD`, = `feasible_evals − last_sig_feasible_eval`)
 ///     is at least `PLATEAU_MIN_FLAT_EVALS` — a genuine mid-descent stall has
@@ -1211,21 +1257,101 @@ fn failure_is_converged_plateau(
     last_sig_feasible_eval: usize,
     best_seen_ofv: Option<f64>,
     final_ofv: f64,
+    left_init: bool,
 ) -> bool {
     let made_progress = last_sig_feasible_eval >= 2;
     let flat_tail = feasible_evals.saturating_sub(last_sig_feasible_eval);
     let plateaued = flat_tail >= PLATEAU_MIN_FLAT_EVALS;
     let consistent = best_seen_ofv
         .is_none_or(|best| final_ofv <= best + PLATEAU_CONSISTENCY_REL_TOL * (1.0 + best.abs()));
-    made_progress && plateaued && consistent
+    made_progress && plateaued && consistent && left_init
 }
 
+/// Run the NLopt outer optimizer, retrying once if the fit never left its
+/// initial estimates.
+///
+/// The first attempt is the default configuration: the identity-Hessian
+/// overshoot cap fires on L-BFGS's opening gradient eval only, because holding
+/// it on corrupts the `(s, y)` curvature pairs of a fit that is descending
+/// normally (#960 — measured at ~11 OFV units on `scaling_convergence`).
+///
+/// When that attempt ends with the estimates still on top of the initial ones —
+/// the opening line search failed and the fit never recovered (#751: the
+/// user-ODE warfarin twin quit at eval 4, 0.03 OFV below its start and 35 short
+/// of the optimum, and reported the initial estimates plus their standard
+/// errors as the result) — it is re-run from the same start with the cap **held
+/// on until the fit escapes** `INIT_ESCAPE_STEP_S`. A fit that never moved has
+/// no curvature worth protecting, so the trade the default declines is exactly
+/// the right one here. The better of the two OFVs wins, so the retry can only
+/// improve the outcome.
+///
+/// The retry is L-BFGS-only: SLSQP is already capped on every eval, and the
+/// derivative-free algorithms never take this step at all.
 fn optimize_nlopt(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
+    let first = optimize_nlopt_once(model, population, init_params, options, false);
+    resolve_stall_retry(
+        options.optimizer,
+        options.verbose,
+        first,
+        || optimize_nlopt_once(model, population, init_params, options, true),
+        |result| result.ofv,
+    )
+}
+
+/// The stall-retry decision behind [`optimize_nlopt`], factored out of the fit
+/// itself so every branch is unit-testable without driving two NLopt runs.
+///
+/// `first` is the default attempt as `(result, left_init)`; `retry` produces the
+/// held-cap attempt in the same shape and is called **only** when the first one
+/// stalled. Returns whichever result should be reported.
+///
+/// The retry is L-BFGS-only: SLSQP is already capped on every eval, and the
+/// derivative-free algorithms never take the identity-Hessian step at all. It is
+/// kept only when it both escaped the initial estimates and reached a lower OFV,
+/// so a second equally-stuck fit leaves the original result — and its warnings —
+/// standing, and the retry can never make the reported outcome worse.
+fn resolve_stall_retry<T>(
+    optimizer: Optimizer,
+    verbose: bool,
+    first: (T, bool),
+    retry: impl FnOnce() -> (T, bool),
+    ofv_of: impl Fn(&T) -> f64,
+) -> T {
+    let (first, left_init) = first;
+    if left_init || !matches!(optimizer, Optimizer::NloptLbfgs) {
+        return first;
+    }
+    let (retry, retry_left_init) = retry();
+    if !retry_left_init || !(ofv_of(&retry) < ofv_of(&first)) {
+        return first;
+    }
+    if verbose {
+        eprintln!(
+            "Fit stalled on its initial estimates (OFV = {:.6}); retried with the \
+             identity-Hessian cap held on and reached OFV = {:.6}.",
+            ofv_of(&first),
+            ofv_of(&retry),
+        );
+    }
+    retry
+}
+
+/// One NLopt outer-optimizer run. Returns the result and whether the fit left
+/// its initial estimates (by more than [`INIT_ESCAPE_STEP_S`] in scaled space),
+/// which is what [`optimize_nlopt`] retries on. `hold_cap_at_init` is the retry
+/// mode — see [`should_cap_gradient`].
+fn optimize_nlopt_once(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+    hold_cap_at_init: bool,
+) -> (OuterResult, bool) {
     let bounds = compute_bounds(init_params);
     let mut x0 = pack_params(init_params);
     clamp_to_bounds(&mut x0, &bounds);
@@ -1299,6 +1425,11 @@ fn optimize_nlopt(
     for i in 0..n {
         x0[i] /= scale[i];
     }
+    // Snapshot of the scaled starting point. `x0` itself is handed to NLopt as
+    // the mutable iterate (and later overwritten with the restored best point),
+    // so the "how far has the fit moved from init?" tests below — the L-BFGS
+    // overshoot cap and the plateau verdict — need their own copy.
+    let x0_start_s: Vec<f64> = x0.clone();
 
     // Optional gradient-free global pre-search (NLopt CRS2-LM). Samples
     // within the parameter bounds and lets the local optimizer pick up
@@ -1579,7 +1710,9 @@ fn optimize_nlopt(
                 if crate::estimation::trace::is_active() {
                     grad_vec_for_trace = Some(g.to_vec());
                 }
-                if should_cap_gradient(algo, state.n_grad_evals) {
+                let hold_cap =
+                    hold_cap_at_init && max_scaled_deviation(xs, &x0_start_s) < INIT_ESCAPE_STEP_S;
+                if should_cap_gradient(algo, state.n_grad_evals, hold_cap) {
                     cap_scaled_gradient(g, &lower_s, &upper_s);
                 }
                 // Gate on the global best (same tracker as the `best_seen` update
@@ -1880,6 +2013,12 @@ fn optimize_nlopt(
         }
     }
 
+    // Did the fit leave its initial estimates? Measured on the restored best
+    // point (still in scaled space here), which is what the reported estimates
+    // and the covariance step are built from. Feeds both the plateau verdict
+    // below and the stall retry in `optimize_nlopt`.
+    let left_init = max_scaled_deviation(&x0, &x0_start_s) >= INIT_ESCAPE_STEP_S;
+
     // Unscale x0 back from optimizer space to real (log/Cholesky) space.
     for i in 0..n {
         x0[i] *= scale[i];
@@ -1975,6 +2114,7 @@ fn optimize_nlopt(
             last_sig_feasible_eval,
             best_seen_ofv,
             final_ofv,
+            left_init,
         ) {
             converged = true;
         }
@@ -1982,12 +2122,13 @@ fn optimize_nlopt(
             let flat_tail = feasible_evals.saturating_sub(last_sig_feasible_eval);
             eprintln!(
                 "Plateau check: flat_tail = {} feasible evals (min {}), feasible_evals = {}, \
-                 best-seen {:?} vs final {:.6} → converged = {}",
+                 best-seen {:?} vs final {:.6}, left init = {} → converged = {}",
                 flat_tail,
                 PLATEAU_MIN_FLAT_EVALS,
                 feasible_evals,
                 best_seen_ofv,
                 final_ofv,
+                left_init,
                 converged,
             );
         }
@@ -2029,7 +2170,7 @@ fn optimize_nlopt(
     let final_gradient = last_gradient.lock().unwrap().clone();
 
     let ebe_final = ebe_accum.lock().unwrap();
-    OuterResult {
+    let result = OuterResult {
         params: final_params,
         ofv: final_ofv,
         converged,
@@ -2059,7 +2200,8 @@ fn optimize_nlopt(
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x0.clone()),
         mixture_posteriors: final_mixture_posteriors,
-    }
+    };
+    (result, left_init)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
