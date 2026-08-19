@@ -213,10 +213,12 @@ impl SaemMixture {
     }
 }
 
-/// Draw a class for one subject from its current posterior `PMIX_i ∝ p_ik ·
-/// exp(−nll_ik)`, where `nll_ik` is the complete-data individual objective at
-/// the subject's *current* η (and κ, for IOV) evaluated under class `k`'s
-/// parameters. Returns `(drawn_class_0based, pmix_vec)`.
+/// Draw a class (0-based) for one subject from its current posterior
+/// `PMIX_i ∝ p_ik · exp(−nll_ik)`, where `nll_ik` is the complete-data
+/// individual objective at the subject's *current* η (and κ, for IOV) evaluated
+/// under class `k`'s parameters. The final per-subject posterior is recomputed at
+/// the converged parameters after the loop (via `mixture_ofv`), so only the
+/// sampled class is returned here.
 ///
 /// Must run on the same thread that owns the `MixtureClassGuard` — the caller
 /// (the rayon E-step closure) enters this per subject, so the guard set inside
@@ -232,7 +234,7 @@ pub(crate) fn draw_class(
     omega_iov: Option<&OmegaMatrix>,
     scratch: &mut EventPkParams,
     rng: &mut StdRng,
-) -> (usize, Vec<f64>) {
+) -> usize {
     use crate::parser::model_parser::MixtureClassGuard;
     let spec = model.mixture.as_ref().expect("draw_class non-mixture");
     let k = mix.n_classes;
@@ -268,15 +270,13 @@ pub(crate) fn draw_class(
     // Sample z ~ Categorical(pmix).
     let u: f64 = rng.random::<f64>();
     let mut acc = 0.0;
-    let mut z = k - 1;
     for (c, &p) in pmix.iter().enumerate() {
         acc += p;
         if u <= acc {
-            z = c;
-            break;
+            return c;
         }
     }
-    (z, pmix)
+    k - 1
 }
 
 /// M-step for the mixing thetas: maximise the SA-averaged expected complete-data
@@ -294,7 +294,8 @@ pub(crate) fn draw_class(
 /// structural typical value would be double-owned: the residual-likelihood
 /// estimate from the θ/σ M-step would be discarded here. There is no clean joint
 /// estimate for such a shared parameter; if that pattern is ever needed, split it
-/// into two thetas (one for structure, one for mixing).
+/// into two thetas (one for structure, one for mixing). [`mixing_structural_overlap`]
+/// detects the pattern up front so `run_saem` can reject it with a clear error.
 pub(crate) fn mstep_mixing(
     model: &CompiledModel,
     population: &Population,
@@ -359,6 +360,73 @@ pub(crate) fn mstep_mixing(
     for (p, &j) in idx.iter().enumerate() {
         theta[j] = x[p].clamp(lower[p], upper[p]);
     }
+}
+
+/// Detect mixing thetas that *also* drive the structural model — the pattern
+/// [`mstep_mixing`] cannot handle (it would discard the θ/σ M-step's structural
+/// estimate). A theta is flagged if perturbing it changes a subject's observation
+/// likelihood under any class (the residual/structural path), which a purely-
+/// mixing theta (`MIXL`, only in the class logit) never does. Returns the offending
+/// theta indices; `run_saem` turns a non-empty result into a clear error so the
+/// user splits the parameter rather than getting a silently wrong SAEM fit (#987
+/// review). One-time build-cost: `|mixing_theta_idx| · n_classes · n_subjects` NLL
+/// evaluations, and `mixing_theta_idx` is a handful of thetas.
+pub(crate) fn mixing_structural_overlap(
+    model: &CompiledModel,
+    init_params: &ModelParameters,
+    population: &Population,
+    mixing_theta_idx: &[usize],
+) -> Vec<usize> {
+    use crate::parser::model_parser::MixtureClassGuard;
+    if mixing_theta_idx.is_empty() {
+        return Vec::new();
+    }
+    let n_classes = model.mixture.as_ref().map(|m| m.n_classes).unwrap_or(1);
+    let n_eta = model.n_eta;
+    let eta0 = vec![0.0f64; n_eta];
+    let omega = &init_params.omega;
+    let sigma = &init_params.sigma.values;
+    let mut scratch = EventPkParams::default();
+    let mut overlap = Vec::new();
+    for &j in mixing_theta_idx {
+        let mut moved = false;
+        let mut bumped_theta = init_params.theta.clone();
+        bumped_theta[j] += 1e-3 * bumped_theta[j].abs().max(1.0);
+        'probe: for subject in &population.subjects {
+            if subject.observations.is_empty() {
+                continue;
+            }
+            for c in 0..n_classes {
+                let _g = MixtureClassGuard::enter(c + 1);
+                let base = individual_nll_into(
+                    model,
+                    subject,
+                    &init_params.theta,
+                    &eta0,
+                    omega,
+                    sigma,
+                    &mut scratch,
+                );
+                let bumped = individual_nll_into(
+                    model,
+                    subject,
+                    &bumped_theta,
+                    &eta0,
+                    omega,
+                    sigma,
+                    &mut scratch,
+                );
+                if base.is_finite() && bumped.is_finite() && (bumped - base).abs() > 1e-9 {
+                    moved = true;
+                    break 'probe;
+                }
+            }
+        }
+        if moved {
+            overlap.push(j);
+        }
+    }
+    overlap
 }
 
 #[cfg(test)]
@@ -560,21 +628,21 @@ mod tests {
         let mut scratch = EventPkParams::default();
         let mut rng = StdRng::seed_from_u64(1);
         let eta = vec![0.0_f64];
-        let (z, pmix) = draw_class(
-            &model,
-            &pop.subjects[0],
-            &model.default_params.theta,
-            &eta,
-            &[],
-            &mix,
-            None,
-            &mut scratch,
-            &mut rng,
-        );
-        assert!(z < 2, "class index in range");
-        assert_eq!(pmix.len(), 2);
-        assert!((pmix.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-        assert!(pmix.iter().all(|&p| (0.0..=1.0).contains(&p)));
+        // Every draw must be a valid class index (0 or 1).
+        for _ in 0..50 {
+            let z = draw_class(
+                &model,
+                &pop.subjects[0],
+                &model.default_params.theta,
+                &eta,
+                &[],
+                &mix,
+                None,
+                &mut scratch,
+                &mut rng,
+            );
+            assert!(z < 2, "class index in range");
+        }
     }
 
     #[test]
@@ -587,5 +655,98 @@ mod tests {
         mix.classes = vec![0, 1];
         mix.mstep_omega_overrides(&[vec![0.5], vec![-0.5]], 1.0);
         assert_eq!(mix.s2_diag, before);
+    }
+
+    #[test]
+    fn overlap_empty_for_dedicated_mixing_theta() {
+        // MIXL is only in the class logit, never in a typical value ⇒ no overlap.
+        let model = parse_model_string(CONST_MODEL).unwrap();
+        let pop = read_pop(&iv_csv(2));
+        let mix = SaemMixture::build(&model, &model.default_params, &pop);
+        let overlap =
+            mixing_structural_overlap(&model, &model.default_params, &pop, &mix.mixing_theta_idx);
+        assert!(
+            overlap.is_empty(),
+            "dedicated MIXL must not flag: {overlap:?}"
+        );
+    }
+
+    #[test]
+    fn overlap_detects_theta_shared_with_structure() {
+        // TVV drives V structurally AND appears in the mixing logit — the shared
+        // parameter SAEM cannot fit; the probe must flag its index (2).
+        const SHARED: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = 0.01 * TVV
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = parse_model_string(SHARED).unwrap();
+        let pop = read_pop(&iv_csv(2));
+        let mix = SaemMixture::build(&model, &model.default_params, &pop);
+        // TVV (index 2) must be detected as a mixing theta AND flagged as shared.
+        assert!(mix.mixing_theta_idx.contains(&2));
+        let overlap =
+            mixing_structural_overlap(&model, &model.default_params, &pop, &mix.mixing_theta_idx);
+        assert_eq!(
+            overlap,
+            vec![2],
+            "TVV shared with structure must be flagged"
+        );
+    }
+
+    #[test]
+    fn run_saem_rejects_mixing_theta_shared_with_structure() {
+        // End-to-end: fit() must error clearly (before any iteration) rather than
+        // silently double-owning the shared parameter (#987 review).
+        const SHARED: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = 0.01 * TVV
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = parse_model_string(SHARED).unwrap();
+        let pop = read_pop(&iv_csv(2));
+        let mut opts = crate::types::FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        let err = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("shared mixing/structural theta under SAEM must be rejected");
+        assert!(
+            err.contains("mixing-coefficient theta also drives the structural model")
+                && err.contains("TVV"),
+            "got: {err}"
+        );
     }
 }

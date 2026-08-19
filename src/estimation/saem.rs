@@ -1857,6 +1857,38 @@ pub fn run_saem(
                     .to_string(),
             );
         }
+        // Reject a theta that drives both the mixing expression and a structural
+        // typical value: SAEM's separated M-step would estimate it from the
+        // residual likelihood and then discard that for the mixing fit, silently
+        // mis-fitting. FOCEI's joint marginal handles the shared parameter, so
+        // route there instead of guessing (#987 review).
+        let overlap = crate::estimation::saem_mixture::mixing_structural_overlap(
+            model,
+            init_params,
+            population,
+            &mix.mixing_theta_idx,
+        );
+        if !overlap.is_empty() {
+            let names: Vec<String> = overlap
+                .iter()
+                .map(|&j| {
+                    init_params
+                        .theta_names
+                        .get(j)
+                        .cloned()
+                        .unwrap_or_else(|| format!("theta[{j}]"))
+                })
+                .collect();
+            return Err(format!(
+                "SAEM cannot fit a mixture where a mixing-coefficient theta also drives the \
+                 structural model: {} appear(s) in both the [mixture] mixing expression and an \
+                 [individual_parameters] typical value. SAEM estimates the mixing coefficients \
+                 and the structural thetas in separate M-steps, so a shared parameter would be \
+                 double-owned. Split it into two thetas (one for structure, one for mixing), or \
+                 fit with FOCE/FOCEI (whose joint marginal handles the shared parameter) (#985).",
+                names.join(", ")
+            ));
+        }
     }
     let use_closed_form_mstep =
         options.mu_referencing && !mu_ref_pairs.is_empty() && saem_mix.is_none();
@@ -2015,7 +2047,7 @@ pub fn run_saem(
             let omega_iov_for_eta_mh: Option<&OmegaMatrix> = omega_iov_cur_opt.as_ref();
 
             // Returns (eta_new, nll_after, n_acc_primary, n_prop_primary,
-            //          per_eta_acc_cw, n_sweeps_cw, used_hmc, mix_class, mix_pmix)
+            //          per_eta_acc_cw, n_sweeps_cw, used_hmc, mix_class)
             #[allow(clippy::type_complexity)]
             let results: Vec<(
                 Vec<f64>,
@@ -2026,7 +2058,6 @@ pub fn run_saem(
                 usize,
                 bool,
                 usize,
-                Vec<f64>,
             )> = state
                 .etas
                 .par_iter()
@@ -2058,7 +2089,10 @@ pub fn run_saem(
                         // posterior at this subject's η (and κ), then run the η
                         // moves *within* the drawn class: set the MIXNUM guard and
                         // point the proposal Ω/σ/CW-SDs at that class (#985).
-                        let (mix_class, mix_pmix): (usize, Vec<f64>) = if let Some(mix) = mix_ref {
+                        // Draw the latent class; the per-subject posterior is
+                        // recomputed at the converged params after the loop (via
+                        // `mixture_ofv`), so only the sampled class is carried out.
+                        let mix_class: usize = if let Some(mix) = mix_ref {
                             crate::estimation::saem_mixture::draw_class(
                                 model,
                                 subject,
@@ -2071,7 +2105,7 @@ pub fn run_saem(
                                 &mut rng,
                             )
                         } else {
-                            (0, Vec::new())
+                            0
                         };
                         let _class_guard = mix_ref.map(|_| MixtureClassGuard::enter(mix_class + 1));
                         let (omega_ref, sigma_ref, cw_sd_ref): (&OmegaMatrix, &[f64], &[f64]) =
@@ -2173,7 +2207,6 @@ pub fn run_saem(
                             n_prop_cw,
                             did_hmc,
                             mix_class,
-                            mix_pmix,
                         )
                     },
                 )
@@ -2185,17 +2218,7 @@ pub fn run_saem(
             let mut drawn_classes: Vec<usize> = vec![0; n_subjects];
             for (
                 i,
-                (
-                    eta_new,
-                    nll_new,
-                    n_acc,
-                    n_prop,
-                    per_eta_acc_cw,
-                    n_prop_cw,
-                    used_hmc,
-                    mix_class,
-                    _mix_pmix,
-                ),
+                (eta_new, nll_new, n_acc, n_prop, per_eta_acc_cw, n_prop_cw, used_hmc, mix_class),
             ) in results.into_iter().enumerate()
             {
                 drawn_classes[i] = mix_class;
