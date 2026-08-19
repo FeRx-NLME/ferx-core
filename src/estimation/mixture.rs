@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn iov_mixture_postfit_carries_kappa_ebes() {
-        // #986 regression: the final mixture branch used to return `Vec::new()` for
+        // #985 regression (PR #986 review): the final mixture branch used to return `Vec::new()` for
         // the per-subject κ EBEs (MixtureEval carried none), so postfit ran with κ = 0
         // — sdtab IPRED/IWRES/CWRES, per-subject OFV, κ shrinkage, and the `.fitrx`
         // `ebe_kappas` export all silently ignored the IOV the fit actually used. The
@@ -750,7 +750,10 @@ mod tests {
             &pop,
             &eval.mixest_etas,
             &eval.mixest_h_mats,
-            &[],
+            // Pass the real MIXEST-class per-occasion κ̂ (not an empty slice) so the
+            // test exercises the full IOV packed layout end-to-end and stays correct
+            // if the covariance method later consumes κ (Copilot review, PR #986).
+            &eval.mixest_kappas,
             &opts,
         ) {
             CovarianceStepResult::Success(out) => out.matrix,
