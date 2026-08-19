@@ -221,10 +221,13 @@ pub fn fit(
             );
         }
         for m in options.method_chain() {
-            if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
+            if !matches!(
+                m,
+                EstimationMethod::Foce | EstimationMethod::FoceI | EstimationMethod::Saem
+            ) {
                 return Err(format!(
-                    "mixture models (#977) currently support only FOCE / FOCEI; the {} method \
-                     is not yet wired for mixtures",
+                    "mixture models (#977) currently support FOCE / FOCEI / SAEM; the {} method \
+                     is not yet wired for mixtures (#985)",
                     m.label()
                 ));
             }

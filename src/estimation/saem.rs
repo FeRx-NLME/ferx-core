@@ -688,6 +688,7 @@ fn fold_nll_grad(per_subj: Vec<(f64, Vec<f64>)>, n: usize) -> (f64, Vec<f64>) {
 /// construction). See the run_saem comment on `theta_packs_log_mask` for
 /// motivation — without per-theta packing, any theta with `theta_lower < 0`
 /// got pinned at 1e-10 and could never be estimated.
+#[allow(clippy::too_many_arguments)]
 fn theta_sigma_mstep_light(
     model: &CompiledModel,
     population: &Population,
@@ -704,6 +705,10 @@ fn theta_sigma_mstep_light(
     maxiter: u32,
     scale_params: bool,
     theta_packs_log_mask: &[bool],
+    // Mixture (#985): per-subject drawn class. When `Some`, every per-subject
+    // observation-likelihood evaluation runs under that subject's `MIXNUM` guard,
+    // so a class-switched typical value is estimated from its own class members.
+    classes: Option<&[usize]>,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = n_theta + n_sigma;
 
@@ -764,22 +769,29 @@ fn theta_sigma_mstep_light(
                     .par_iter()
                     .zip(etas.par_iter())
                     .zip(kappas.par_iter())
-                    .map_init(EventPkParams::default, |scratch, ((subject, eta), kaps)| {
-                        obs_nll_subject_grad_iov(
-                            model,
-                            subject,
-                            &th,
-                            &sg,
-                            eta,
-                            kaps,
-                            &theta_packs_log_mask,
-                            &lower,
-                            &upper,
-                            n_theta,
-                            n_sigma,
-                            scratch,
-                        )
-                    })
+                    .enumerate()
+                    .map_init(
+                        EventPkParams::default,
+                        |scratch, (i, ((subject, eta), kaps))| {
+                            let _g = classes.map(|c| {
+                                crate::parser::model_parser::MixtureClassGuard::enter(c[i] + 1)
+                            });
+                            obs_nll_subject_grad_iov(
+                                model,
+                                subject,
+                                &th,
+                                &sg,
+                                eta,
+                                kaps,
+                                &theta_packs_log_mask,
+                                &lower,
+                                &upper,
+                                n_theta,
+                                n_sigma,
+                                scratch,
+                            )
+                        },
+                    )
                     .collect();
                 fold_nll_grad(per_subj, n)
             } else {
@@ -787,7 +799,11 @@ fn theta_sigma_mstep_light(
                     .subjects
                     .par_iter()
                     .zip(etas.par_iter())
-                    .map_init(EventPkParams::default, |scratch, (subject, eta)| {
+                    .enumerate()
+                    .map_init(EventPkParams::default, |scratch, (i, (subject, eta))| {
+                        let _g = classes.map(|c| {
+                            crate::parser::model_parser::MixtureClassGuard::enter(c[i] + 1)
+                        });
                         obs_nll_subject_grad(
                             model,
                             subject,
@@ -814,10 +830,13 @@ fn theta_sigma_mstep_light(
                 1e20
             }
         } else {
-            let val = if let Some(kappas) = kappas_opt {
-                obs_nll_sum_iov(model, population, &th, &sg, etas, kappas)
-            } else {
-                obs_nll_sum(model, population, &th, &sg, etas)
+            let val = match (classes, kappas_opt) {
+                (Some(cls), Some(kappas)) => {
+                    obs_nll_sum_iov_mix(model, population, &th, &sg, etas, kappas, cls)
+                }
+                (Some(cls), None) => obs_nll_sum_mix(model, population, &th, &sg, etas, cls),
+                (None, Some(kappas)) => obs_nll_sum_iov(model, population, &th, &sg, etas, kappas),
+                (None, None) => obs_nll_sum(model, population, &th, &sg, etas),
             };
             if val.is_finite() {
                 val
@@ -1114,6 +1133,62 @@ fn obs_nll_sum_iov(
         .par_iter()
         .enumerate()
         .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            obs_nll_subject_into_iov(
+                model,
+                subject,
+                theta,
+                sigma_values,
+                &etas[i],
+                &kappas[i],
+                scratch,
+            )
+        })
+        .collect();
+    per_subj.iter().sum()
+}
+
+/// Mixture (#985) variant of [`obs_nll_sum`]: each subject's observation NLL is
+/// evaluated under its drawn class's `MIXNUM` guard, so the class-switched
+/// typical values (`if MIXNUM == k …`) are seen. `classes[i]` is 0-based.
+fn obs_nll_sum_mix(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    sigma_values: &[f64],
+    etas: &[Vec<f64>],
+    classes: &[usize],
+) -> f64 {
+    use rayon::prelude::*;
+    let per_subj: Vec<f64> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            let _g = crate::parser::model_parser::MixtureClassGuard::enter(classes[i] + 1);
+            obs_nll_subject_into(model, subject, theta, sigma_values, &etas[i], scratch)
+        })
+        .collect();
+    per_subj.iter().sum()
+}
+
+/// Mixture (#985) + IOV variant of [`obs_nll_sum_iov`], class-guarded per subject.
+#[allow(clippy::too_many_arguments)]
+fn obs_nll_sum_iov_mix(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    sigma_values: &[f64],
+    etas: &[Vec<f64>],
+    kappas: &[Vec<Vec<f64>>],
+    classes: &[usize],
+) -> f64 {
+    use rayon::prelude::*;
+    let per_subj: Vec<f64> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            let _g = crate::parser::model_parser::MixtureClassGuard::enter(classes[i] + 1);
             obs_nll_subject_into_iov(
                 model,
                 subject,
@@ -1464,7 +1539,12 @@ pub fn run_saem(
         && model.ode_spec.is_none()
         && model.tv_fn.is_some()
         && n_kappa == 0
-        && model.residual_error_eta.is_none();
+        && model.residual_error_eta.is_none()
+        // Mixture models (#985): the E-step must sample the class indicator and
+        // run η-MCMC within the drawn class (per-subject `MIXNUM` guard). The HMC
+        // gradient kernel is class-unaware, so disable it and use the MH kernels,
+        // which honour the class thread-local set in the E-step closure.
+        && model.mixture.is_none();
 
     let n_theta = init_params.theta.len();
     let n_sigma = init_params.sigma.values.len();
@@ -1759,7 +1839,27 @@ pub fn run_saem(
     // additive ones), since the closed-form `log_theta += γ · mean(η)` only
     // applies to log-mu-referenced thetas.
     let mu_ref_pairs: Vec<(usize, usize)> = get_mu_ref_pairs(model);
-    let use_closed_form_mstep = options.mu_referencing && !mu_ref_pairs.is_empty();
+    // Mixture (#985): a MIXNUM-switched typical value pairs one η with several
+    // class thetas, so the closed-form `log_theta += γ·mean(η)` update (which
+    // assumes one theta per η) is ill-defined. Route mixtures through the full
+    // NLopt θ/σ M-step, which — run under each subject's class guard — estimates
+    // every class's thetas from its own members.
+    let mut saem_mix: Option<crate::estimation::saem_mixture::SaemMixture> =
+        model.mixture.as_ref().map(|_| {
+            crate::estimation::saem_mixture::SaemMixture::build(model, init_params, n_subjects)
+        });
+    if let Some(mix) = saem_mix.as_ref() {
+        if mix.has_sigma_override() {
+            warnings.push(
+                "SAEM does not yet re-estimate per-class σ overrides (sigma(k)); they are held \
+                 at their initial values. Class-switched θ, Ω overrides, and the mixing \
+                 coefficients are estimated. Route to FOCEI if the σ overrides must be fit (#985)."
+                    .to_string(),
+            );
+        }
+    }
+    let use_closed_form_mstep =
+        options.mu_referencing && !mu_ref_pairs.is_empty() && saem_mix.is_none();
     // Accumulator for the `obs_nll_sum` (population OFV) evaluations skipped
     // by pinning mu-ref dims out of NLopt's central-FD gradient.  Each pinned
     // dim costs `2 * mstep_maxiter` `obs_nll_sum` calls inside NLopt — that's
@@ -1832,6 +1932,32 @@ pub fn run_saem(
             None
         };
 
+        // Mixture (#985): refresh every class's Ω/σ from the just-rebuilt base
+        // plus the per-class overrides, then precompute the per-class proposal
+        // Ω, σ, and componentwise SDs the E-step indexes by each subject's drawn
+        // class. `class_omegas[0]` is the base (== omega_k) for a shared-Ω model.
+        let (class_omegas, class_sigmas, class_cw_sd): (
+            Vec<OmegaMatrix>,
+            Vec<Vec<f64>>,
+            Vec<Vec<f64>>,
+        ) = if let Some(mix) = saem_mix.as_mut() {
+            mix.sync_base(&omega_k, &state.sigma_vals);
+            let n_c = mix.n_classes;
+            let omg: Vec<OmegaMatrix> = (0..n_c).map(|c| mix.class_omega(c).clone()).collect();
+            let sig: Vec<Vec<f64>> = (0..n_c).map(|c| mix.class_sigma(c).to_vec()).collect();
+            let cw: Vec<Vec<f64>> = omg
+                .iter()
+                .map(|o| {
+                    (0..n_eta)
+                        .map(|j| o.matrix[(j, j)].max(SAEM_OMEGA_DIAG_FLOOR).sqrt())
+                        .collect()
+                })
+                .collect();
+            (omg, sig, cw)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+
         // ---- Step 1: MH simulation (parallelized) ----
         // Symmetric random-walk MH in eta_true space, identical schedule
         // throughout exploration and convergence — the only thing that
@@ -1844,10 +1970,18 @@ pub fn run_saem(
         // is what keeps a block Ω from collapsing to rank-1 — see that fn's
         // docstring.
         {
+            use crate::parser::model_parser::MixtureClassGuard;
             use rayon::prelude::*;
             let theta_ref = &state.theta;
             let sigma_ref = &state.sigma_vals;
             let omega_ref = &omega_k;
+            // Immutable view of the mixture state for the per-subject class draw
+            // (the `sync_base` mutable borrow above has ended). The per-class
+            // proposal Ω/σ/CW-SDs precomputed above are indexed by the draw.
+            let mix_ref = saem_mix.as_ref();
+            let class_omegas_ref = &class_omegas;
+            let class_sigmas_ref = &class_sigmas;
+            let class_cw_sd_ref = &class_cw_sd;
             // Per-coordinate componentwise proposal SDs — computed once here (Ω's
             // diagonal is shared across subjects) rather than per subject inside
             // the parallel kernel. Floored to match the Ω diagonal floor.
@@ -1881,8 +2015,19 @@ pub fn run_saem(
             let omega_iov_for_eta_mh: Option<&OmegaMatrix> = omega_iov_cur_opt.as_ref();
 
             // Returns (eta_new, nll_after, n_acc_primary, n_prop_primary,
-            //          per_eta_acc_cw, n_sweeps_cw, used_hmc)
-            let results: Vec<(Vec<f64>, f64, usize, usize, Vec<usize>, usize, bool)> = state
+            //          per_eta_acc_cw, n_sweeps_cw, used_hmc, mix_class, mix_pmix)
+            #[allow(clippy::type_complexity)]
+            let results: Vec<(
+                Vec<f64>,
+                f64,
+                usize,
+                usize,
+                Vec<usize>,
+                usize,
+                bool,
+                usize,
+                Vec<f64>,
+            )> = state
                 .etas
                 .par_iter()
                 .zip(state.nll_cache.par_iter())
@@ -1907,6 +2052,39 @@ pub fn run_saem(
                         );
                         let kappas_mh_opt =
                             omega_iov_for_eta_mh.map(|iov| (kappas_i.as_slice(), iov));
+
+                        // ---- Mixture E-step: draw the latent class ----
+                        // Sample z_i ~ Categorical(PMIX_i) from the current
+                        // posterior at this subject's η (and κ), then run the η
+                        // moves *within* the drawn class: set the MIXNUM guard and
+                        // point the proposal Ω/σ/CW-SDs at that class (#985).
+                        let (mix_class, mix_pmix): (usize, Vec<f64>) = if let Some(mix) = mix_ref {
+                            crate::estimation::saem_mixture::draw_class(
+                                model,
+                                subject,
+                                theta_ref,
+                                eta,
+                                kappas_i,
+                                mix,
+                                omega_iov_for_eta_mh,
+                                pk_scratch,
+                                &mut rng,
+                            )
+                        } else {
+                            (0, Vec::new())
+                        };
+                        let _class_guard = mix_ref.map(|_| MixtureClassGuard::enter(mix_class + 1));
+                        let (omega_ref, sigma_ref, cw_sd_ref): (&OmegaMatrix, &[f64], &[f64]) =
+                            if mix_ref.is_some() {
+                                (
+                                    &class_omegas_ref[mix_class],
+                                    &class_sigmas_ref[mix_class],
+                                    &class_cw_sd_ref[mix_class],
+                                )
+                            } else {
+                                (omega_ref, sigma_ref.as_slice(), cw_sd_ref.as_slice())
+                            };
+
                         let mut eta_work = eta.clone();
 
                         // ---- Kernel 1: primary block move ----
@@ -1983,14 +2161,33 @@ pub fn run_saem(
                             per_eta_acc_cw,
                             n_prop_cw,
                             did_hmc,
+                            mix_class,
+                            mix_pmix,
                         )
                     },
                 )
                 .collect();
 
-            for (i, (eta_new, nll_new, n_acc, n_prop, per_eta_acc_cw, n_prop_cw, used_hmc)) in
-                results.into_iter().enumerate()
+            // Collect the drawn classes for the mixture M-step. The per-subject
+            // posterior is recomputed at the converged parameters after the loop
+            // (via `mixture_ofv`), matching what the FOCEI mixture path reports.
+            let mut drawn_classes: Vec<usize> = vec![0; n_subjects];
+            for (
+                i,
+                (
+                    eta_new,
+                    nll_new,
+                    n_acc,
+                    n_prop,
+                    per_eta_acc_cw,
+                    n_prop_cw,
+                    used_hmc,
+                    mix_class,
+                    _mix_pmix,
+                ),
+            ) in results.into_iter().enumerate()
             {
+                drawn_classes[i] = mix_class;
                 state.etas[i] = eta_new;
                 state.nll_cache[i] = nll_new;
                 state.accept_counts[i] += n_acc;
@@ -2008,6 +2205,18 @@ pub fn run_saem(
                 // mixing fine, so a block-only rate is misleading.
                 iter_acc += n_acc + cw_acc_i;
                 iter_prop += n_prop + n_prop_cw;
+            }
+
+            // ---- Mixture bookkeeping (#985) ----
+            // Record the drawn classes, SA-update the responsibility average and
+            // the Ω-override statistics, and accumulate the posterior for the
+            // final output (convergence phase only, once θ/Ω have settled).
+            if let Some(mix) = saem_mix.as_mut() {
+                mix.classes = drawn_classes;
+                mix.update_rbar(gamma);
+                if k > omega_burnin {
+                    mix.mstep_omega_overrides(&state.etas, gamma_omega);
+                }
             }
         }
 
@@ -2296,11 +2505,16 @@ pub fn run_saem(
                     mstep_maxiter,
                     options.scale_params,
                     &theta_packs_log_mask,
+                    // Closed-form branch is never taken for a mixture (disabled
+                    // above), so no class guard is needed here.
+                    None,
                 );
                 log_theta = theta_new;
                 log_sigma = sigma_new;
             } else {
-                // mu_referencing = false: full NLopt M-step for all thetas + sigma (unchanged)
+                // mu_referencing = false (or a mixture): full NLopt M-step for all
+                // thetas + sigma. For a mixture, `mstep_classes` guards each
+                // subject so class-switched thetas are estimated per class (#985).
                 let (theta_new, sigma_new) = theta_sigma_mstep_light(
                     model,
                     population,
@@ -2317,6 +2531,7 @@ pub fn run_saem(
                     mstep_maxiter,
                     options.scale_params,
                     &theta_packs_log_mask,
+                    saem_mix.as_ref().map(|m| m.classes.as_slice()),
                 );
                 log_theta = theta_new;
                 log_sigma = sigma_new;
@@ -2338,6 +2553,30 @@ pub fn run_saem(
                 .map(|i| unpack_theta(i, log_theta[i]))
                 .collect();
             state.sigma_vals = log_sigma.iter().map(|&v| v.exp()).collect();
+
+            // ---- Step 4b: M-step for the mixing coefficients (#985) ----
+            // The mixing thetas do not enter the residual/η likelihood, so the
+            // θ/σ M-step above leaves them untouched. Update them from the SA
+            // responsibility average `r̄_ik` (constant closed form or covariate
+            // logistic fit), then re-sync `log_theta` for those indices.
+            if let Some(mix) = saem_mix.as_ref() {
+                crate::estimation::saem_mixture::mstep_mixing(
+                    model,
+                    population,
+                    mix,
+                    &mut state.theta,
+                    &init_params.theta_lower,
+                    &init_params.theta_upper,
+                    mstep_maxiter,
+                );
+                for &j in &mix.mixing_theta_idx {
+                    log_theta[j] = if theta_packs_log_mask[j] {
+                        state.theta[j].max(1e-12).ln()
+                    } else {
+                        state.theta[j]
+                    };
+                }
+            }
         }
 
         // ---- Update NLL cache (parallelized, needed for MH acceptance ratios) ----
@@ -2346,6 +2585,24 @@ pub fn run_saem(
             init_params.omega.eta_names.clone(),
             init_params.omega.diagonal,
         );
+        // Mixture (#985): refresh each class's Ω/σ from the just-updated base and
+        // evaluate every subject's cached NLL under its drawn class (guard + class
+        // Ω/σ), so the next iteration's MH acceptance baseline is class-consistent.
+        let mix_classes: Option<Vec<usize>> = saem_mix.as_ref().map(|m| m.classes.clone());
+        let (mix_omegas, mix_sigmas): (Vec<OmegaMatrix>, Vec<Vec<f64>>) =
+            if let Some(mix) = saem_mix.as_mut() {
+                mix.sync_base(&omega_upd, &state.sigma_vals);
+                (
+                    (0..mix.n_classes)
+                        .map(|c| mix.class_omega(c).clone())
+                        .collect(),
+                    (0..mix.n_classes)
+                        .map(|c| mix.class_sigma(c).to_vec())
+                        .collect(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
         if n_kappa > 0 {
             // IOV NLL cache refresh — sequential rather than rayon-parallel.
             // individual_nll_iov is cheap (analytical PK, few occasions) and
@@ -2361,15 +2618,22 @@ pub fn run_saem(
             });
             let new_nlls: Vec<f64> = (0..n_subjects)
                 .map(|i| {
+                    let cls = mix_classes.as_ref().map(|c| c[i]);
+                    let _g =
+                        cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let (omega_i, sigma_i): (&OmegaMatrix, &[f64]) = match cls {
+                        Some(c) => (&mix_omegas[c], &mix_sigmas[c]),
+                        None => (&omega_upd, state.sigma_vals.as_slice()),
+                    };
                     individual_nll_iov(
                         model,
                         &population.subjects[i],
                         &state.theta,
                         &state.etas[i],
                         &state.kappas[i],
-                        &omega_upd,
+                        omega_i,
                         omega_iov_upd.as_ref(),
-                        &state.sigma_vals,
+                        sigma_i,
                     )
                 })
                 .collect();
@@ -2381,18 +2645,28 @@ pub fn run_saem(
             // pattern as the MH step above. Without it, the per-iter
             // refresh was allocating n_subj scratch buffers per outer
             // iter on TV-cov data.
+            let mix_omegas_ref = &mix_omegas;
+            let mix_sigmas_ref = &mix_sigmas;
+            let mix_classes_ref = mix_classes.as_ref();
             let new_nlls: Vec<f64> = state
                 .etas
                 .par_iter()
                 .enumerate()
                 .map_init(EventPkParams::default, |scratch, (i, eta)| {
+                    let cls = mix_classes_ref.map(|c| c[i]);
+                    let _g =
+                        cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let (omega_i, sigma_i): (&OmegaMatrix, &[f64]) = match cls {
+                        Some(c) => (&mix_omegas_ref[c], &mix_sigmas_ref[c]),
+                        None => (&omega_upd, state.sigma_vals.as_slice()),
+                    };
                     individual_nll_into(
                         model,
                         &population.subjects[i],
                         &state.theta,
                         eta,
-                        &omega_upd,
-                        &state.sigma_vals,
+                        omega_i,
+                        sigma_i,
                         scratch,
                     )
                 })
@@ -2521,7 +2795,13 @@ pub fn run_saem(
     }
 
     // ---- Post-SAEM: build final parameters ----
-    let final_params = saem_state_to_params(&state, init_params, n_kappa);
+    let mut final_params = saem_state_to_params(&state, init_params, n_kappa);
+    // Mixture (#985): carry the estimated per-class Ω/σ overrides so the final
+    // OFV, EBEs, and covariance step see the mixture structure. `mp`'s base was
+    // synced from the final Ω/σ in the last NLL-cache refresh.
+    if let Some(mix) = saem_mix.as_ref() {
+        final_params.mixture = Some(mix.mp.clone());
+    }
 
     if combined_additive_sigma_at_floor(model, &final_params) {
         warnings
@@ -2583,36 +2863,62 @@ pub fn run_saem(
         }
     }
 
-    // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----
-    let warm_etas: Vec<DVector<f64>> = state
-        .etas
-        .iter()
-        .map(|e| DVector::from_column_slice(e))
-        .collect();
-    let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _, final_kappas) = run_inner_loop_warm(
-        model,
-        population,
-        &final_params,
-        options.inner_maxiter,
-        options.inner_tol,
-        Some(&warm_etas),
-        Some(&saem_final_mu_k),
-        0, // SAEM: no EBE convergence tracking
-        0, // SAEM final EBE is warm-started; no inner multi-start
-    );
-
-    // ---- Final OFV via FOCE approximation (for AIC/BIC comparability) ----
-    let ofv = 2.0
-        * pop_nll(
-            model,
-            population,
-            &final_params,
-            &eta_hats,
-            &h_matrices,
-            &final_kappas,
-            options.interaction,
-        );
+    // ---- Final EBEs + OFV ----
+    // For a mixture (#985), the population objective is the K-fold marginal
+    // `−2 Σ_i log Σ_k p_ik e^{−nll_ik}`, and the reported EBEs / κ̂ are the
+    // MIXEST class's — both produced by `mixture_ofv` (the same routine the
+    // FOCEI mixture path uses), so SAEM and FOCEI report comparable OFVs and
+    // per-subject posteriors. Otherwise the single-population FOCE approximation.
+    let (eta_hats, h_matrices, final_kappas, ofv, mixture_posteriors) =
+        if final_params.mixture.is_some() {
+            let meval = crate::estimation::mixture::mixture_ofv(
+                model,
+                population,
+                &final_params,
+                options,
+                None,
+            );
+            let posteriors = crate::estimation::outer_optimizer::MixturePosteriors {
+                pmix: meval.pmix.clone(),
+                mixest: meval.mixest.clone(),
+            };
+            (
+                meval.mixest_etas,
+                meval.mixest_h_mats,
+                meval.mixest_kappas,
+                meval.ofv,
+                Some(posteriors),
+            )
+        } else {
+            let warm_etas: Vec<DVector<f64>> = state
+                .etas
+                .iter()
+                .map(|e| DVector::from_column_slice(e))
+                .collect();
+            let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
+            let (eta_hats, h_matrices, _, final_kappas) = run_inner_loop_warm(
+                model,
+                population,
+                &final_params,
+                options.inner_maxiter,
+                options.inner_tol,
+                Some(&warm_etas),
+                Some(&saem_final_mu_k),
+                0, // SAEM: no EBE convergence tracking
+                0, // SAEM final EBE is warm-started; no inner multi-start
+            );
+            let ofv = 2.0
+                * pop_nll(
+                    model,
+                    population,
+                    &final_params,
+                    &eta_hats,
+                    &h_matrices,
+                    &final_kappas,
+                    options.interaction,
+                );
+            (eta_hats, h_matrices, final_kappas, ofv, None)
+        };
 
     // ---- Report OFV *before* the covariance step (#893) ----
     // SAEM only learns its OFV here (the final FOCE approximation); the covariance
@@ -2659,7 +2965,17 @@ pub fn run_saem(
     // ---- Post-fit conditional-distribution pass (opt-in, #257) ----
     // Characterise each subject's p(η_i | y_i; θ̂) by MCMC at the fixed
     // population parameters, warm-started from the EBE mode (`eta_hats`).
-    let cond_dist = if options.saem_conddist {
+    // The conditional-distribution pass samples p(η_i | y_i) at fixed θ̂ with a
+    // single-population target; it is not class-aware, so skip it for a mixture
+    // (#985) rather than characterise the posterior under the wrong class.
+    if options.saem_conddist && final_params.mixture.is_some() {
+        warnings.push(
+            "SAEM conditional-distribution pass (conddist) is not yet mixture-aware; skipping \
+             it for this mixture fit (#985)."
+                .to_string(),
+        );
+    }
+    let cond_dist = if options.saem_conddist && final_params.mixture.is_none() {
         if verbose {
             eprintln!(
                 "Running SAEM conditional-distribution pass ({} samples/subject, {} burn-in)...",
@@ -2705,7 +3021,7 @@ pub fn run_saem(
         bayes: None,
         cond_dist,
         packed_estimate: None,
-        mixture_posteriors: None,
+        mixture_posteriors,
     })
 }
 

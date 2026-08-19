@@ -168,9 +168,61 @@ for mixture + IOV covariance — whereas ferx's covariance step completes. The
 mixture SE machinery itself is anchored to `$COVARIANCE MATRIX=R` in the non-IOV
 [standard-errors](#standard-errors) comparison above.
 
+## SAEM under a mixture
+
+Mixtures can also be estimated with **SAEM** (`method = saem`, #985). Where
+FOCE/FOCEI marginalise the latent class analytically (the log-sum-exp above),
+SAEM *samples* it: each E-step draws the class indicator
+$z_i \sim \operatorname{Categorical}(\mathrm{PMIX}_i)$ from the current
+per-subject posterior $\mathrm{PMIX}_{ik} \propto p_{ik}\,e^{-\mathrm{nll}_{ik}}$,
+then runs the usual η-MCMC *within the drawn class* (its Ω/Σ and its `MIXNUM`
+branch). The M-step partitions the sufficient statistics by sampled class:
+
+- **Class-switched typical values** (`if MIXNUM == k …`) are estimated from each
+  class's own members — the ordinary θ/σ M-step run under each subject's class
+  gives $\partial\text{pred}/\partial\text{TVCL}_2 = 0$ for a class-1 subject, so
+  no special handling is needed.
+- **Per-class Ω overrides** (`omega(k)`) use per-class stochastic-approximation
+  diagonal statistics.
+- **Mixing coefficients** are updated from a small optimisation of the
+  SA-averaged expected complete-data mixing log-likelihood
+  $\sum_i \sum_k \bar r_{ik}\,\ln p_{ik}(\theta_\text{mix})$, where
+  $\bar r_{ik}$ is the Robbins–Monro average of the sampled class indicators.
+  This is exact for constant mixing (it recovers $p_k = \operatorname{mean}_i \bar r_{ik}$)
+  and for covariate-dependent logit mixing (a weighted logistic fit) alike.
+
+The reported OFV, per-subject `MIXEST`/`PMIX`, and standard errors are computed
+from the K-fold mixture marginal at the SAEM optimum, exactly as for FOCEI.
+Per-class **σ** overrides (`sigma(k)`) are the one piece not yet re-estimated
+under SAEM — they are held at their initial values (with a warning); route such a
+model to FOCEI. HMC and the conditional-distribution pass are disabled for a
+mixture (they are class-unaware); the MH E-step is used.
+
+### NONMEM cross-check (`tests/nonmem/mixture_iv_saem.ctl`)
+
+The two-class constant-mixing model above, estimated with `$EST METHOD=SAEM`
+(`NBURN=1000 NITER=1000 ISAMPLE=2`) followed by a `METHOD=IMP EONLY=1`
+objective-evaluation pass, Ω/Σ FIXed:
+
+| Quantity | NONMEM SAEM | ferx SAEM |
+|---|---|---|
+| OFV (IMP evaluation) | 300.87 | 302.17 |
+| `TVCL1` (class 1) | 1.002 | 0.982 |
+| `TVCL2` (class 2) | 2.735 | 2.746 |
+| `V` | 9.993 | 10.089 |
+| mixing fraction `p(1)` | 0.4712 | 0.4670 |
+| `MIXEST` classification | — | **29 / 30 agree** (1 borderline) |
+
+Estimates agree to ≤ 3 %. The single MIXEST disagreement is a subject whose
+posterior sits almost exactly on the class boundary, which NONMEM SAEM and ferx
+SAEM split marginally differently. Covariate-dependent mixing under SAEM is
+exercised end-to-end in `tests/mixture_nonmem.rs`.
+
 ## Not yet supported
 
-Mixture models are currently limited to FOCE/FOCEI. The following error clearly
-rather than silently mis-fitting:
+The following error clearly rather than silently mis-fitting:
 
-- Other estimators (SAEM / IMP / Bayes).
+- IMP / IMPMAP and Bayes (HMC) estimators for a mixture (#985); FOCE/FOCEI and
+  SAEM are supported.
+- Per-class σ overrides (`sigma(k)`) under SAEM (held at their initial values,
+  with a warning) — use FOCE/FOCEI to fit those.

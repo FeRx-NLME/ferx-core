@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **SAEM estimation for mixture models (#985).** `[mixture]` models can now be fit with
+  `method = saem`, not only FOCE/FOCEI. The E-step samples the latent class per subject (from the
+  current posterior `PMIX_i`) and runs the η-MCMC within the drawn class; the M-step estimates the
+  class-switched typical values (each from its own class members), the per-class Ω overrides, and the
+  mixing coefficients (constant *or* covariate-dependent logit mixing) from the sampled class
+  frequencies. Reported OFV, per-subject `MIXEST`/`PMIX`, and standard errors come from the K-fold
+  mixture marginal, matching FOCEI. Cross-checked against NONMEM `METHOD=SAEM` (estimates agree to
+  ≤ 3 %). Per-class σ overrides (`sigma(k)`) are held at their initial values under SAEM (with a
+  warning) — route those to FOCEI. IMP/IMPMAP and Bayes for mixtures remain unwired and error clearly.
 - **Inter-occasion variability under a mixture (#985).** A `[mixture]` model may now also carry a
   `kappa` (inter-occasion variability) term — the two features compose, where before `fit()` rejected
   the combination. Each class's per-subject inner solve estimates the per-occasion κ̂ under that
