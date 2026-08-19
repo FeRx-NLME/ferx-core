@@ -123,6 +123,12 @@ section of the SDLC for the versioning policy).
   `auto` −5.478 to −5.479 / −5.478, and both routes now recover the simulating parameters. The
   analytic (`Dual2`) sensitivities were correct throughout — verified against finite differences of
   the predictor to 2.6e-7 — so `gradient = auto`, the default, was never affected.
+- **`gradient` option error no longer advertises the retired `ad` route (#958).** The parse-time
+  message for an unknown `gradient` value listed `'auto'`, `'ad'`, or `'fd'`, but no fit accepts
+  `ad` — the Enzyme automatic-differentiation path was retired in #428 and the engine rejects it —
+  so a mistyped option pointed users at a setting that cannot work. The message now lists only
+  `'auto'` and `'fd'`. Writing `gradient = ad` still parses, so it continues to reach the engine's
+  specific "no longer supported" error rather than a generic one.
 - **Per-subject diagnostics now honour `MIXEST` in a mixture fit (#985).** `IPRED`, `PRED`,
   `IWRES`, `CWRES`, `EBE_OFV`, and `[derived]`/`[output]` columns were computed with `MIXNUM`
   pinned to class 1 for every subject, even for subjects the fit assigned to another class — so a
