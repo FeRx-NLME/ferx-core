@@ -524,6 +524,25 @@ pub fn run_importance_sampling_mixture(
                 .to_string(),
         );
     }
+    // Same two scope guards the single-population entry point applies (#992
+    // review). With n_eta = 0 there is nothing to integrate — the class-
+    // conditional marginal collapses to the obs likelihood — and for SDE models
+    // the IS obs-NLL path omits the EKF process-noise variance, so the marginal
+    // would be silently biased.
+    if model.n_eta == 0 {
+        return Err("Importance sampling requires at least one random effect. \
+             With n_eta = 0 the class-conditional marginal is just the observation likelihood — \
+             read `FitResult.ofv` directly (no IS needed)."
+            .to_string());
+    }
+    if model.is_sde() {
+        return Err(
+            "Importance sampling is not yet supported for SDE / [diffusion] models. \
+             The EKF process-noise variance is not included in the IS observation likelihood, \
+             so the marginal would be biased. Use FOCE / FOCEI for the Laplace OFV instead."
+                .to_string(),
+        );
+    }
     let n_eta = model.n_eta;
     let k_samples = options.imp_samples;
     let nu = options.imp_proposal_df;
@@ -3031,6 +3050,63 @@ mod tests {
             res.minus2_log_likelihood
         );
         assert!(res.mc_standard_error >= 0.0);
+    }
+
+    #[test]
+    fn mixture_is_rejects_no_random_effects() {
+        // n_eta = 0: the class-conditional marginal collapses to the obs
+        // likelihood, so IS is meaningless — refuse rather than return a
+        // silently meaningless number (#992 review). The parser requires at
+        // least one omega, so the fixture is degraded to n_eta = 0 directly.
+        let mut model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        model.n_eta = 0;
+        let pop = mix_pop();
+        let opts = FitOptions::default();
+        let err = run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+            .expect_err("n_eta = 0 mixture IS must be rejected");
+        assert!(err.contains("at least one random effect"), "got: {err}");
+    }
+
+    #[test]
+    fn mixture_is_rejects_sde() {
+        // The IS obs-NLL path omits the EKF process-noise variance, so an SDE
+        // mixture marginal would be silently biased (#992 review).
+        const SDE: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[diffusion]
+  central ~ 0.05 FIX
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(SDE).unwrap();
+        assert!(model.is_sde(), "fixture must be an SDE model");
+        let pop = mix_pop();
+        let opts = FitOptions::default();
+        let err = run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+            .expect_err("SDE mixture IS must be rejected");
+        assert!(err.contains("SDE"), "got: {err}");
     }
 
     #[test]
