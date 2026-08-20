@@ -12,6 +12,18 @@ The R wrapper package lives at `../ferx-r` (sibling directory). The R package's 
 
 Note that ferx-r's **CI** does not get the change automatically: it builds from the ferx-core commit pinned in `ferx-r/src/rust/Cargo.lock` (the patch only applies locally). A ferx-r PR that needs a new ferx-core commit — e.g. a newly-`pub` API — must bump that lock, via `ferx-r/tools/update-ferx-core-lock.sh` (never a bare `cargo update`, which the patch will unpin). Otherwise CI fails with `error[E0603]: ... is private`.
 
+### Downstream repos pin ferx-core *transitively* — there is no ferx-core SHA to hand out
+
+`ferxtranslate` (and anything else built on the R package) does not depend on ferx-core directly: it pins **ferx-r** at a commit, and that ferx-r commit's `src/rust/Cargo.lock` pins ferx-core. So a merge here is **not** reachable downstream until two bumps land, in order — ferx-r's `Cargo.lock`, then the downstream repo's ferx-r pin. Do not tell a downstream maintainer to "pin ferx-core at `<sha>`"; there is no such knob on their side.
+
+The trap that makes this easy to get wrong: reading `ferx-r/src/rust/Cargo.toml` alone shows `branch = "main"` and reads as *unpinned*. **The lock is the pin.** Check it, don't infer it:
+
+```bash
+git -C ../ferx-r show origin/main:src/rust/Cargo.lock | grep -A2 'name = "ferx-core"'
+```
+
+When a change here matters to a downstream consumer, tell them the two-step and the current lock rev — not a ferx-core SHA.
+
 ## Worktree isolation
 
 When working on a feature branch or any branch other than `main`, always use `EnterWorktree` at the start of the session. This prevents uncommitted WIP from one session contaminating another session on a different branch (a real problem when two chats share the same checkout directory).
