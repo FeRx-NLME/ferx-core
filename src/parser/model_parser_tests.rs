@@ -1691,6 +1691,275 @@ fn test_ode_engine_applied_f_lagtime_not_flagged_dead() {
     );
 }
 
+// ── #993: a dose attribute applied by the engine AND read by the model ───────
+//
+// The mirror image of the carve-out above. `F` / `LAGTIME` / `ALAG` (and the
+// compartment-indexed `F{n}` / `ALAG{n}` / `LAGTIME{n}`) are load-bearing while
+// textually absent, so the dead-param census exempts them — but a model that
+// *does* read one on the prediction path gets it applied twice, silently: once by
+// the engine at the dose event, once where it is read. Measured on the engine at
+// exactly `F` on every prediction, and `exp(LAGTIME·ke)` for lag.
+
+/// Build a 1-compartment ODE model whose only individual parameter besides CL/V is
+/// `name`, read in the `[odes]` RHS as the elimination rate constant. This is the
+/// exact shape of the #993 repro: rename `name` and the fit moves by a factor.
+fn dose_attr_rhs_model(name: &str) -> String {
+    format!(
+        "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  {name} = 0.1
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -{name} * central
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+    )
+}
+
+#[test]
+fn dose_attr_read_in_odes_rhs_is_rejected() {
+    // Every spelling the engine applies to *every* dose: the two bare reserved-slot
+    // names plus the `alag` alias, and the compartment-indexed forms. Each must be
+    // a hard parse error naming the parameter, both readings, and the rename.
+    for (name, noun) in [
+        ("F", "bioavailability"),
+        ("LAGTIME", "absorption lag"),
+        ("ALAG", "absorption lag"),
+        ("F1", "bioavailability"),
+        ("ALAG1", "absorption lag"),
+        ("LAGTIME1", "absorption lag"),
+    ] {
+        let err = expect_parse_err(&dose_attr_rhs_model(name));
+        assert!(
+            err.contains("[odes]:") && err.contains(&format!("`{name}`")),
+            "must name the block and the parameter, got: {err}"
+        );
+        assert!(
+            err.contains(noun),
+            "must say what `{name}` means to the engine ({noun}), got: {err}"
+        );
+        // The remediation is the half a user acts on, and the sentinel
+        // `parse_error_to_diagnostic` keys `E_DOSE_ATTR_DOUBLE_USE` off.
+        assert!(
+            err.contains("reserved dose-attribute name"),
+            "must offer the rename, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn dose_attr_read_in_odes_rhs_is_matched_case_insensitively() {
+    // `build_ode_spec` aliases each parameter's case variants onto one var slot, so
+    // a lower-case `f` in the RHS reads the very same value as `F` and must
+    // diagnose identically. Guards against a check that compares raw spellings.
+    let src = dose_attr_rhs_model("F").replace("-F * central", "-f * central");
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("reserved dose-attribute name"),
+        "a lower-case read of `F` is the same double use: {err}"
+    );
+}
+
+#[test]
+fn ordinary_names_read_in_odes_rhs_are_accepted() {
+    // The other half of the contract, and the one that would break real models if
+    // the predicate over-matched. `N`/`MTT`/`MAT`/`CV2` hold canonical PK slots but
+    // are only ever read through an explicit `transit(n=…)`/`igd(…)` arg mapping;
+    // `S{n}` is not routed at all; `D{n}`/`R{n}` are dose attributes but inert
+    // unless the *data* codes RATE, so they are not a parse error (see
+    // `tests/modeled_rate.rs` for the data-gated half).
+    for name in [
+        "KA", "Q", "V2", "Q3", "V3", "N", "MTT", "MAT", "CV2", "S1", "S2", "D1", "R1", "KEL", "ZQ",
+    ] {
+        assert!(
+            parse_full_model(&dose_attr_rhs_model(name)).is_ok(),
+            "`{name}` in the [odes] RHS is not a dose-attribute double use and must parse"
+        );
+    }
+}
+
+#[test]
+fn dose_attr_read_in_scaling_is_rejected() {
+    // The readout is a prediction path too: dividing by `F` applies bioavailability
+    // a second time, measured at exactly `F`. Both readout forms — Form-C `y` and
+    // `obs_scale` — reach the same check.
+    for readout in ["y = central / (V * F)", "obs_scale = V * F"] {
+        let src = format!(
+            "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  {readout}
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+        );
+        let err = expect_parse_err(&src);
+        assert!(
+            err.contains("[scaling]:") && err.contains("reserved dose-attribute name"),
+            "`{readout}` double-applies F and must be rejected, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn dose_attr_read_only_for_reporting_is_accepted() {
+    // `[derived]` / `[output]` are post-solve reporting, not the prediction path: a
+    // model that tabulates its own bioavailability (and an exposure derived from
+    // it) is correct and must stay silent. Rejecting here would also panic the
+    // absorption ODE twin, which re-emits `[derived]` verbatim into a source it
+    // `.expect()`s to re-parse.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[derived]
+  AUCF = F * 100.0 / CL
+
+[output]
+  F
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let parsed = parse_full_model(src)
+        .expect("reading F only for reporting is not a double use and must parse");
+    assert!(
+        !parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("computed but never used")),
+        "a reported F is used, not dead: {:?}",
+        parsed.model.parse_warnings
+    );
+}
+
+#[test]
+fn analytical_f_mapping_is_not_a_double_use() {
+    // Scope boundary. An analytical model binds F through an explicit
+    // `pk(..., f=F)` mapping, so a second use is *stated* rather than silent, and
+    // `ode_param_slots` — what makes a bare `F` a dose attribute — never runs. The
+    // check must not fire here, or every `f=F` model with a `[scaling]` block
+    // breaks.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+
+[scaling]
+  obs_scale = V * F
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    assert!(
+        parse_full_model(src).is_ok(),
+        "an analytical `f=F` mapping is out of scope for the #993 rejection"
+    );
+}
+
+#[test]
+fn transit_twin_with_reserved_f_name_still_builds() {
+    // Regression guard on the absorption ODE twin. `AbsorptionOdeEquivalent::
+    // get_or_build` `.expect()`s its reconstructed source to re-parse, so any new
+    // parse error that the twin can trip turns into a panic at fit time. The twin
+    // re-emits `[individual_parameters]` verbatim and, for an `f=` role whose
+    // parameter does not already self-route, appends an `f = <param>` alias — so
+    // `f` appears as a declaration but never as a read. Cover both: a parameter
+    // literally named `F` (self-routing, no alias) and one named `FBIO` (alias
+    // emitted).
+    for (fname, mapping) in [("F", "f=F"), ("FBIO", "f=FBIO")] {
+        let src = format!(
+            "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta THETA_F(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  {fname}   = inv_logit(THETA_F)
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=N, mtt=MTT, {mapping})
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+        );
+        let parsed = parse_full_model(&src)
+            .unwrap_or_else(|e| panic!("transit model with {mapping} must parse: {e}"));
+        // Force the lazy twin build — this is the `.expect()` that would panic.
+        if let Some(eq) = parsed.model.absorption_ode_equivalent.as_ref() {
+            let _ = eq.get_or_build();
+        }
+    }
+}
+
 #[test]
 fn test_ode_multiple_dead_params_use_plural_message() {
     // #315: two+ dead ODE params share one warning and use the plural grammar

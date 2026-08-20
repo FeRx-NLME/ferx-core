@@ -309,11 +309,43 @@ when not declared, so IV and non-bioavailability models are unaffected.
 > compartment and required `F` to be folded into the absorption flux (e.g.
 > `d/dt(central) = F * KA * depot / V - …`). That `F` must now be removed from
 > the right-hand side — otherwise it is applied both at dose entry **and** in the
-> flux, giving an effective bioavailability of `F²`.
+> flux, giving an effective bioavailability of `F²`. Since
+> [#993](https://github.com/FeRx-NLME/ferx-core/issues/993) such a model is
+> rejected rather than quietly computing `F²`, so a model carried over from that
+> era fails loudly with the fix named.
 
 The name `F` (any case) is what flags a parameter as bioavailability and routes
 it to the dosing compartment. If you need a fraction-like quantity inside the
 RHS that is *not* bioavailability, give it a different name.
+
+### Reading a dose attribute is an error, not a warning
+
+`F` is consumed by the engine **at the dose event**, so a correct model never
+reads it back. Declaring `F` *and* referencing it in `[odes]` or `[scaling]` is
+rejected at parse time with `E_DOSE_ATTR_DOUBLE_USE`
+([#993](https://github.com/FeRx-NLME/ferx-core/issues/993)):
+
+```text
+[odes]: `F` is this model's bioavailability — the engine already scales each dose
+amount by it — but it is also read in [odes], so the value is applied twice: once
+at the dose, once where you read it (#993). If `F` is meant to be bioavailability,
+remove it from [odes]; if it is meant to be an ordinary parameter, rename it —
+`F` is a reserved dose-attribute name.
+```
+
+The same rule covers `LAGTIME`/`ALAG` and the compartment-indexed `F{n}` /
+`ALAG{n}` / `LAGTIME{n}` below. These apply to **every** dose, so the collision
+is decidable from the model alone. `D{n}` / `R{n}` are different: the engine only
+consults them for a dose that codes `RATE=-2` / `RATE=-1`, so an `R1` that is
+really a rate constant is a perfectly good model on ordinary data. That pair is
+therefore checked against the **dataset** instead — see
+[Modeled infusion duration](#modeled-infusion-duration-dn-rate-2) and
+[Modeled infusion rate](#modeled-infusion-rate-rn-rate-1) — and reports the same
+code only when a coded-`RATE` dose actually lands on the parameter.
+
+Reads that are *not* on the prediction path are fine: `[derived]` and `[output]`
+are post-solve reporting, so tabulating your own `F` (or an exposure computed
+from it) is correct and stays silent.
 
 See `examples/bioavailability_ode.ferx` for a complete worked model.
 

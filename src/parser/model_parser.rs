@@ -2422,6 +2422,83 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         )?;
         model.parse_warnings.extend(scaling_parse_warnings);
 
+        // #993, the `[scaling]` half of the dose-attribute double-use rejection
+        // (`[odes]`'s lives in `build_ode_spec`). A readout that divides by `F` gets
+        // bioavailability applied once at the dose and once here — measured at
+        // exactly `F` on the prediction, for `y` and `obs_scale` alike. Runs after
+        // `parse_scaling_block` so a malformed block reports its own syntax error
+        // first, and re-walks the entries because the parsed `ScalingSpec` keeps
+        // compiled programs rather than the name references.
+        //
+        // The read-set is collected on **both** engines, because the `D{n}`/`R{n}`
+        // recording below applies to both; only the rejection is ODE-scoped.
+        let mut scaling_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for line in scaling_lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let (key, value) = split_scaling_entry(trimmed)?;
+            let (base, _cmt) = parse_scaling_key(key)?;
+            if base != "y" && base != "obs_scale" {
+                continue;
+            }
+            let ctx = ParseCtx::new(
+                &theta_names_for_scaling,
+                &eta_names_for_scaling,
+                &indiv_var_names_for_scaling,
+            );
+            // Individual params in scope resolve to `Variable(name)`; θ/η/covariate
+            // references resolve to their own leaves and are ignored here.
+            let expr = parse_scalar_expression(value, ctx)
+                .map_err(|e| format!("[scaling] {base}: {e}"))?;
+            visit_expr_nodes(&expr, &mut |e: &Expression| {
+                if let Expression::Variable(name) = e {
+                    scaling_reads.insert(name.to_ascii_uppercase());
+                }
+            });
+        }
+
+        // Rejection is ODE-only: an analytical model binds F/lagtime through an
+        // explicit `pk(..., f=F)` mapping, so a double use there is stated rather
+        // than silent, and `ode_slot_map` — what makes a *bare* `F` a dose attribute
+        // — is empty for that engine anyway.
+        if is_ode_model {
+            check_dose_attr_double_use(
+                &indiv_var_names_for_scaling,
+                &ode_slot_map,
+                &scaling_reads,
+                "[scaling]",
+            )?;
+        }
+
+        // Record a `D{n}`/`R{n}` read by the readout, on either engine, for the
+        // data-aware check (#993 — see `mark_prediction_path_read`). The ODE RHS half
+        // is recorded in `build_ode_spec`; this adds the readout half, which is the
+        // *only* prediction path an analytical model has.
+        //
+        // `ode_slot_map` is parallel to the individual-parameter list *by position*,
+        // but only as a prefix: the `__ferx_pktime_` desugaring appends names after
+        // the slot map was built, so it can be the shorter of the two. `get(i)` is
+        // therefore the correct lookup (and matches `check_dose_attr_double_use`) —
+        // a real dose attribute is always a user name, hence inside the prefix,
+        // while the synthetic tail is never one. Empty for analytical models, whose
+        // indexed `D{n}`/`R{n}` are recognised by name alone.
+        for (i, name) in indiv_var_names_for_scaling.iter().enumerate() {
+            if !scaling_reads.contains(&name.to_ascii_uppercase()) {
+                continue;
+            }
+            let slot = ode_slot_map.get(i).copied();
+            if let Some((attr, when, Some(cmt))) = crate::types::DoseAttrConsumption::of(name, slot)
+            {
+                if when == crate::types::DoseAttrConsumption::CodedRateOnly {
+                    model
+                        .active_dose_attr_map_mut()
+                        .mark_prediction_path_read(attr, cmt, name);
+                }
+            }
+        }
+
         // AD compatibility check (Phase 2.5):
         //
         // (`gradient = ad` no longer needs a Form-C-specific guard here: it is
@@ -8267,6 +8344,62 @@ fn ode_free_slot_count(names: &[String]) -> usize {
         .count()
 }
 
+/// Reject an individual parameter that the engine applies to the **dose** and the
+/// model *also* reads on the **prediction path** — its value is then applied twice,
+/// silently (#993).
+///
+/// `F` (and `LAGTIME`/`ALAG`, and the compartment-indexed `F{n}`/`ALAG{n}`) never
+/// appear in the `[odes]` RHS or the `[scaling]` readout of a correct model: the
+/// engine consumes them at the dose event. A model that reads one anyway gets it
+/// applied once by the engine and once where it is read — measured at exactly `F`
+/// on the prediction, and at `exp(LAGTIME·ke)` for lag. `docs/model-file/
+/// ode-models.qmd` has said so in prose since the dose-entry migration; this is the
+/// enforcement, so the legacy `F`-in-the-flux models that prose was written for
+/// fail loudly instead of quietly computing `F²`.
+///
+/// Scoped to [`DoseAttrConsumption::EveryDose`]. `D{n}`/`R{n}` are consumed only by
+/// a coded-`RATE` dose, so an `R1` that is really a rate constant is a correct model
+/// on ordinary data and cannot be judged here — that pair is checked against the
+/// dataset in `api::validation::check_modeled_dose_rates`.
+///
+/// `reads` holds the names actually referenced in `block`, upper-cased: the ODE
+/// var-slot map aliases each parameter's case variants onto one slot, so a `f` in
+/// the RHS reads the same value as `F` and must diagnose the same.
+fn check_dose_attr_double_use(
+    indiv_param_names: &[String],
+    indiv_param_slots: &[usize],
+    reads: &std::collections::HashSet<String>,
+    block: &str,
+) -> Result<(), String> {
+    for (i, name) in indiv_param_names.iter().enumerate() {
+        let slot = indiv_param_slots.get(i).copied();
+        let Some((attr, when, cmt)) = crate::types::DoseAttrConsumption::of(name, slot) else {
+            continue;
+        };
+        if when != crate::types::DoseAttrConsumption::EveryDose {
+            continue;
+        }
+        if !reads.contains(&name.to_ascii_uppercase()) {
+            continue;
+        }
+        let scope = match cmt {
+            Some(c) => format!(" for doses into compartment {c}"),
+            None => String::new(),
+        };
+        return Err(format!(
+            "{block}: `{name}` is this model's {noun}{scope} — the engine already \
+             {applied} — but it is also read in {block}, so the value is applied \
+             twice: once at the dose, once where you read it (#993). If `{name}` is \
+             meant to be {noun}, remove it from {block}; if it is meant to be an \
+             ordinary parameter, rename it — `{name}` is a reserved dose-attribute \
+             name.",
+            noun = attr.noun(),
+            applied = attr.applied_as(),
+        ));
+    }
+    Ok(())
+}
+
 /// Find `name(` at a word boundary in `s` (ASCII), returning the index of `name`.
 fn find_word_call(s: &str, name: &str) -> Option<usize> {
     let pat = format!("{name}(");
@@ -9015,6 +9148,23 @@ fn build_ode_spec(
         ));
     }
 
+    // Reject a dose attribute (`F`, `LAGTIME`/`ALAG`, `F{n}`, `ALAG{n}`) that the
+    // engine applies at the dose event *and* the RHS reads — it would be applied
+    // twice, silently (#993). Sibling of the covariate rejection above: same class
+    // of defect (a model that parses clean and computes the wrong number), same
+    // remedy (say so at parse time). Read off the resolved statement tree rather
+    // than the block text, so it sees exactly what the evaluator will: comments are
+    // already stripped, `d/dt(X)` / `Assign` left-hand sides are not reads, and the
+    // `ode_template`-generated equations plus the injected joint-PK-TTE
+    // `d/dt(__chz_n)` hazard lines are all in `stmts_owned` by now.
+    let mut rhs_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visit_stmt_nodes(&stmts_owned, &mut |e: &Expression| {
+        if let Expression::Variable(name) = e {
+            rhs_reads.insert(name.to_ascii_uppercase());
+        }
+    });
+    check_dose_attr_double_use(&indiv_names_owned, &indiv_slots_owned, &rhs_reads, "[odes]")?;
+
     // Reject name collisions (case-insensitive) across the three name spaces.
     // Without this, the eager alias insertion below would silently route reads
     // of one identifier through another's slot — pathological but real, and the
@@ -9340,6 +9490,15 @@ fn build_ode_spec(
             // input-rate extractor (`extract_input_rate_terms`) already does.
             let slot = indiv_param_slots[i];
             dose_attr_map.insert(attr, cmt, slot);
+            // #993: a `D{cmt}`/`R{cmt}` that the RHS *also* reads is a double use —
+            // but only for a dose that actually codes `RATE=-2`/`-1`, which is a
+            // property of the data, not the model. (`F{cmt}`/`ALAG{cmt}` in the same
+            // position were already rejected above; they apply to every dose.) Record
+            // it so `check_modeled_dose_rates` can report it once the dataset is in
+            // hand, and leave a model whose data never codes `RATE` untouched.
+            if rhs_reads.contains(&name.to_ascii_uppercase()) {
+                dose_attr_map.mark_prediction_path_read(attr, cmt, name);
+            }
         }
     }
 

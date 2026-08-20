@@ -607,11 +607,22 @@ pub(crate) fn check_absorption_dosing(
 ///     the slot on `ode_spec.dose_attr_map`, analytical models (#394) on
 ///     `model.dose_attr_map`.
 ///
+///   - **`D{cmt}`/`R{cmt}` not also used as an ordinary parameter.** Since #993 the
+///     name collision *is* a runtime check rather than a docs note: if the model
+///     reads the same parameter on its prediction path (`[odes]` RHS / `[scaling]`
+///     readout), this dose is asking one value to be both the modeled infusion
+///     {duration,rate} and a model term, so it is rejected
+///     (`E_DOSE_ATTR_DOUBLE_USE`). It belongs here rather than in the parser
+///     precisely because it is data-dependent: with no coded-`RATE` dose the
+///     attribute is inert and an `R1` that is really a rate constant is a correct
+///     model. The unconditional siblings `F{n}`/`ALAG{n}` (and bare `F`/`LAGTIME`)
+///     apply to *every* dose, so the parser rejects those outright — see
+///     `model_parser::check_dose_attr_double_use`.
+///
 /// Reported once per offending compartment (naming the first dose that hits it),
 /// so a dataset with many `RATE=-2` rows yields one actionable error per cause.
-/// (The `D{n}`-is-also-an-RHS-rate-constant name collision is handled the same
-/// way `F{n}` is — a documented reserved-name note in `docs/`, not a runtime
-/// check — see ode-models.md.)
+/// The two checks are mutually exclusive per `(attr, cmt)`: a missing parameter
+/// cannot also be a double use.
 pub(crate) fn check_modeled_dose_rates(
     model: &CompiledModel,
     population: &Population,
@@ -664,6 +675,34 @@ pub(crate) fn check_modeled_dose_rates(
                              [individual_parameters], but none is declared. Add \
                              `{param}{cmt} = ...` (the modeled {kind}), or supply an explicit \
                              positive RATE.",
+                            subject.id, dose.time
+                        ),
+                    )
+                    .with_block("individual_parameters"),
+                );
+            } else if let Some(name) = model.active_dose_attr_map().prediction_path_read(attr, cmt)
+            {
+                // #993, the data-gated half. The parameter exists (so the check above
+                // passed) but the model *also* reads it on the prediction path — the
+                // `[odes]` RHS or the `[scaling]` readout. This dose codes `RATE`, so
+                // the engine is using it as the infusion {kind} at the same time: one
+                // value, two roles, and neither the model nor the data says which was
+                // meant. Measured driving the infusion while simultaneously being read
+                // in the RHS. Unlike `F{n}`/`ALAG{n}` — rejected by the parser, since
+                // they apply to every dose — this can only be judged here: with no
+                // coded-`RATE` dose in the dataset the same model is perfectly correct
+                // and `{name}` is an ordinary rate constant.
+                diags.push(
+                    Diagnostic::error(
+                        "E_DOSE_ATTR_DOUBLE_USE",
+                        format!(
+                            "subject {}, time {}: RATE={code} (modeled infusion {kind}) into \
+                             compartment {cmt} makes `{name}` the {kind} of this dose, but \
+                             `{name}` is also read on the model's prediction path ([odes] RHS \
+                             or [scaling]), so its value is used twice. Rename the parameter if \
+                             it is an ordinary rate constant — `{param}{cmt}` is a reserved \
+                             dose-attribute name — or remove the read if it really is the \
+                             modeled {kind}.",
                             subject.id, dose.time
                         ),
                     )
@@ -2782,6 +2821,18 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     if err.contains("[covariate_nn]") && err.contains("--features nn") {
         return Diagnostic::error("E_NN_FEATURE_DISABLED", err.to_string())
             .with_block("covariate_nn");
+    }
+    // #993: a dose attribute applied by the engine *and* read on the prediction
+    // path. Worth its own code rather than a generic `E_PARSE` — the fix is
+    // mechanical (rename, or drop the read), so a consumer (`ferxtranslate`,
+    // `ferx-r`) can act on it rather than surfacing prose. The sentinel is the
+    // remediation clause `check_dose_attr_double_use` always emits.
+    //
+    // No `.with_block()`: the message already opens with `[odes]: ` / `[scaling]: `
+    // like every other block-scoped parse error, and the renderer prefixes the block
+    // it is given — setting both prints it twice.
+    if err.contains("reserved dose-attribute name") {
+        return Diagnostic::error("E_DOSE_ATTR_DOUBLE_USE", err.to_string());
     }
     Diagnostic::error("E_PARSE", err.to_string())
 }
