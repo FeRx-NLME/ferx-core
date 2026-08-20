@@ -20,6 +20,22 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Class-aware mu-referencing for mixture models (#996).** A `MIXNUM`-switched typical value written
+  as `CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)` is now recognised at parse
+  time and resolved to one anchor theta per class (any number of classes; a trailing `else` covers
+  every class the chain does not name). Estimating **IMP / IMPMAP** uses it to apply the EM
+  responsibility-weighted shift `log θ_k += (Σ_i PMIX_ic · η̄_ic) / (Σ_i PMIX_ic)` and pins those θ out
+  of the importance-weighted M-step. This closes the accuracy gap that made IMP the noisiest mixture
+  estimator: on the two-class anchor IMPMAP now recovers `TVCL1 = 0.952`, `TVCL2 = 2.821` against
+  `0.949` / `2.819` from NONMEM IMPMAP with `MU_1` assigned inside the `MIXNUM` branch
+  (`tests/nonmem/mixture_iv_impmap_mu.ctl`, NM 7.6.0) — under 0.5 % on every estimated parameter,
+  versus `2.60` for `TVCL2` before. **SAEM** gains the closed-form shift for class-*shared* typical
+  values (`V = TVV * exp(ETA_V)` inside a mixture), which previously fell back to the numerical
+  M-step; its class-*switched* θ deliberately stay numerical, because SAEM's hard per-subject class
+  draw makes the per-class η mean a biased classification-EM statistic (measured: `TVCL2` 2.75 → 3.02,
+  OFV 302.2 → 305.0). `mu_referencing = false` restores the pre-#996 behaviour for both estimators.
+  A `MIXNUM`-switched expression that cannot be resolved to a class-aware anchor now warns instead of
+  silently dropping to the numerical M-step.
 - **IMP / IMPMAP estimation and objective evaluation for mixture models (#985).** Importance sampling
   now both **estimates** a `[mixture]` model (`method = imp` / `impmap`) and **evaluates** its
   class-marginal likelihood `−2 Σ log Σ_k p_ik L_ik` (`imp_eval_only`, NONMEM `METHOD=IMP EONLY=1`).
@@ -122,6 +138,10 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **Log-mu-referenced θ with a negative lower bound no longer takes the wrong closed-form update
+  (#996).** Such a θ is packed on the identity scale, so the SAEM/IMP `log θ += mean(η)` shift was not
+  its EM optimum. It is now excluded from the closed-form channel and estimated by the numerical /
+  weighted M-step instead, with a warning naming it.
 - **Fits no longer stall on their initial estimates under the default optimizer (#751).** A fit whose
   opening line search fails could previously quit a hair off its starting point — the user-ODE
   warfarin twin stopped 35 OFV units short of the optimum — and report the initial estimates, with

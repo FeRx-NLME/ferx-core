@@ -9,6 +9,13 @@
 //! exactly the mixture-specific quantities under test). Data:
 //! `tests/nonmem/mixture_iv.csv` (30 subjects, seed-977 simulation).
 //!
+//! `impmap_estimating_mixture_recovers_optimum` additionally cross-checks the
+//! class-aware mu-referencing θ shift (#996) against
+//! `tests/nonmem/mixture_iv_impmap_mu.ctl` — the same model with the
+//! class-switched typical value written as `MU_1` *inside* the `MIXNUM` branch
+//! and run with `$EST METHOD=IMPMAP`, which is the like-for-like NONMEM anchor
+//! for that shift.
+//!
 //! `mixture_fit_matches_nonmem` is the FOCEI anchor (`mixture_iv.ctl`);
 //! `saem_mixture_fit_matches_nonmem_saem` is the SAEM anchor
 //! (`mixture_iv_saem.ctl`, `$EST METHOD=SAEM`); and
@@ -56,6 +63,18 @@ const NM_SE_TVCL1: f64 = 0.105642;
 const NM_SE_TVCL2: f64 = 0.254347;
 const NM_SE_TVV: f64 = 0.186107;
 const NM_SE_P1: f64 = 0.102569; // SE of P(1) on the probability scale
+
+// NONMEM IMPMAP with the class-switched typical value written as a MU_ reference
+// *inside* the MIXNUM branch (`tests/nonmem/mixture_iv_impmap_mu.ctl`, NM 7.6.0,
+// `$EST METHOD=IMPMAP NITER=50 ISAMPLE=1500 SEED=20250818`, Ω/Σ FIX). This is the
+// anchor for ferx's class-aware mu-ref θ shift under estimating IMP/IMPMAP
+// (#996) — the pre-existing anchors use a plain `IF (MIXNUM.EQ.1) TVCL=THETA(1)`
+// with no MU_, so they pin the *objective* but not the mu-referenced θ move.
+// Values are the `mixture_iv_impmap_mu.ext` `-1000000000` row.
+const NM_IMPMAP_MU_TVCL1: f64 = 0.949116;
+const NM_IMPMAP_MU_TVCL2: f64 = 2.81929;
+const NM_IMPMAP_MU_TVV: f64 = 10.0095;
+const NM_IMPMAP_MU_P1: f64 = 0.473425;
 
 // Per-subject MIXEST (most-probable class, 1-based) from mixture_iv.sdtab,
 // indexed by subject order (ID 1..=30).
@@ -585,19 +604,46 @@ fn impmap_estimating_mixture_recovers_optimum() {
         th[0], th[1], th[2], p1, res.ofv
     );
     let rel = |a: f64, b: f64| (a - b).abs() / b.abs();
-    // IMP is the noisiest of the mixture estimators (no mu-referencing is
-    // available for the class-switched typical value, so θ is estimated by the
-    // weighted M-step alone, which converges more slowly than SAEM's MCMC); the
-    // two class clearances must still separate and land near the MLE.
+    // ── vs NONMEM IMPMAP with MU_ inside the MIXNUM branch (#996) ──
+    // The like-for-like anchor: both engines now apply a mu-referenced θ move
+    // per class, so the class clearances agree to well under 1 %.
     assert!(
-        rel(th[0], NM_TVCL1) < 0.12,
-        "IMPMAP TVCL1 {} vs {}",
+        rel(th[0], NM_IMPMAP_MU_TVCL1) < 0.02,
+        "IMPMAP TVCL1 {} vs NONMEM MU-IMPMAP {}",
+        th[0],
+        NM_IMPMAP_MU_TVCL1
+    );
+    assert!(
+        rel(th[1], NM_IMPMAP_MU_TVCL2) < 0.02,
+        "IMPMAP TVCL2 {} vs NONMEM MU-IMPMAP {}",
+        th[1],
+        NM_IMPMAP_MU_TVCL2
+    );
+    assert!(
+        rel(th[2], NM_IMPMAP_MU_TVV) < 0.02,
+        "IMPMAP TVV {} vs NONMEM MU-IMPMAP {}",
+        th[2],
+        NM_IMPMAP_MU_TVV
+    );
+    assert!(
+        (p1 - NM_IMPMAP_MU_P1).abs() < 0.02,
+        "IMPMAP p(1) {} vs NONMEM MU-IMPMAP {}",
+        p1,
+        NM_IMPMAP_MU_P1
+    );
+    // ── vs the shared FOCEI optimum ──
+    // The EM estimator settles slightly below FOCEI's TVCL1/TVCL2 (NONMEM's
+    // mu-referenced IMPMAP does the same), so this is the looser of the two
+    // checks; before #996 the weighted M-step alone left TVCL2 at ≈ 2.60.
+    assert!(
+        rel(th[0], NM_TVCL1) < 0.05,
+        "IMPMAP TVCL1 {} vs FOCEI {}",
         th[0],
         NM_TVCL1
     );
     assert!(
-        rel(th[1], NM_TVCL2) < 0.12,
-        "IMPMAP TVCL2 {} vs {}",
+        rel(th[1], NM_TVCL2) < 0.03,
+        "IMPMAP TVCL2 {} vs FOCEI {}",
         th[1],
         NM_TVCL2
     );
@@ -607,9 +653,29 @@ fn impmap_estimating_mixture_recovers_optimum() {
         th[2],
         NM_TVV
     );
-    assert!((p1 - NM_P1).abs() < 0.08, "IMPMAP p(1) {} vs {}", p1, NM_P1);
+    assert!((p1 - NM_P1).abs() < 0.05, "IMPMAP p(1) {} vs {}", p1, NM_P1);
     assert!(
         res.subjects.iter().all(|s| s.mixest.is_some()),
         "MIXEST populated"
+    );
+
+    // The class-aware shift is what buys this: with `mu_referencing = false`
+    // every θ falls back to the importance-weighted M-step alone (the pre-#996
+    // path), which leaves TVCL2 materially short of the optimum.
+    let mut opts_off = opts.clone();
+    opts_off.mu_referencing = false;
+    let res_off =
+        fit(&model, &pop, &model.default_params, &opts_off).expect("IMPMAP mixture fit Ok");
+    let th_off = &res_off.theta;
+    eprintln!(
+        "IMPMAP mixture (mu_referencing off): TVCL1={:.4} TVCL2={:.4}",
+        th_off[0], th_off[1]
+    );
+    assert!(
+        rel(th[1], NM_IMPMAP_MU_TVCL2) < rel(th_off[1], NM_IMPMAP_MU_TVCL2),
+        "class-aware TVCL2 {} must beat the numerical M-step's {} (target {})",
+        th[1],
+        th_off[1],
+        NM_IMPMAP_MU_TVCL2
     );
 }

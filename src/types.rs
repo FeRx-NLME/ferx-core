@@ -1455,6 +1455,39 @@ pub struct MixtureSpec {
     pub omega_overrides: Vec<MixtureClassOverride>,
     /// Per-class Sigma overrides (empty ⇒ all classes share the base Sigma).
     pub sigma_overrides: Vec<MixtureClassOverride>,
+    /// Class-aware mu-references detected from `[individual_parameters]` (#996).
+    ///
+    /// Empty unless a typical value is written as a `MIXNUM`-switched chain whose
+    /// every arm is the *same* log-mu-ref pattern on the *same* eta, e.g.
+    /// `CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)`.
+    /// This is the only structured per-class θ mapping in the codebase — the
+    /// class-specific typical values otherwise live purely as `MIXNUM`-branched
+    /// expressions (see the type doc above). The stochastic estimators (SAEM,
+    /// IMP/IMPMAP) use it to apply the per-class closed-form mu-ref θ shift
+    /// instead of estimating every class θ by numerical M-step alone.
+    pub mu_refs: Vec<MixtureMuRef>,
+}
+
+/// A `MIXNUM`-switched log-mu-reference: one eta paired with one anchor theta
+/// **per class** (#996).
+///
+/// Produced by the parser when every arm of a `MIXNUM` chain matches the same
+/// mu-ref pattern on the same eta. `theta_names[c]` is the anchor for class
+/// `c + 1`; the same theta name may repeat (a class-shared typical value), which
+/// is what makes the degenerate one-theta case reduce to the classical pooled
+/// mu-ref update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixtureMuRef {
+    /// Eta this mu-reference is attached to.
+    pub eta_name: String,
+    /// Anchor theta name per class; `theta_names[c]` serves class `c + 1`.
+    /// Length is always the mixture's `n_classes`.
+    pub theta_names: Vec<String>,
+    /// Always `true` today — only log-mu-ref patterns (`THETA*exp(ETA)` /
+    /// `exp(log(THETA)+ETA)`) are detected, mirroring `get_mu_ref_pairs`'s
+    /// filter. Kept explicit so an additive class-aware pattern can be added
+    /// without changing the consumer's shape.
+    pub log_transformed: bool,
 }
 
 /// Supported PK structural models.

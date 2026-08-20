@@ -188,7 +188,12 @@ branch). The M-step partitions the sufficient statistics by sampled class:
 - **Class-switched typical values** (`if MIXNUM == k …`) are estimated from each
   class's own members — the ordinary θ/σ M-step run under each subject's class
   gives $\partial\text{pred}/\partial\text{TVCL}_2 = 0$ for a class-1 subject, so
-  no special handling is needed.
+  no special handling is needed. They are *not* mu-referenced under SAEM; see
+  [Mu-referencing under a mixture](#mu-referencing-under-a-mixture) below.
+- **Class-shared typical values** (`V = TVV * exp(ETA_V)`, the same theta in
+  every class) do take the closed-form mu-referencing shift
+  $\log\theta \mathrel{+}= \gamma\,\operatorname{mean}_i(\eta_i)$, exactly as in a
+  single-population SAEM fit (#996).
 - **Per-class Ω overrides** (`omega(k)`) use per-class stochastic-approximation
   diagonal statistics.
 - **Mixing coefficients** are updated from a small optimisation of the
@@ -218,6 +223,44 @@ Two further SAEM-specific rules follow from the separated M-step:
   estimates the mixing coefficients and the structural thetas in separate
   M-steps). Split it into two thetas, or fit with FOCE/FOCEI, whose joint
   marginal handles the shared parameter.
+
+### Mu-referencing under a mixture
+
+A `MIXNUM`-switched typical value pairs one η with *K* class thetas, so the
+classical pooled mu-referencing move
+$\log\theta \mathrel{+}= \gamma\,\operatorname{mean}_i(\eta_i)$ (one theta per η)
+does not apply to it directly. ferx detects the class-aware form at parse time —
+a chain of `MIXNUM == k` branches whose arms are all `THETA_k * exp(ETA)` (or
+`exp(log(THETA_k) + ETA)`) on the **same** ETA — and resolves one anchor theta
+per class. Anything else (mixed anchors, a different ETA per arm, an additive
+arm, a non-`MIXNUM` condition, an out-of-range class) falls back to the numerical
+M-step, and the parser says so in a warning rather than degrading silently.
+
+What each estimator does with that anchor set differs, and the difference is
+empirical:
+
+| Estimator | Class-shared θ | Class-switched θ |
+|---|---|---|
+| SAEM | closed-form pooled shift | numerical M-step |
+| IMP / IMPMAP (estimating) | closed-form shift | responsibility-weighted closed-form shift |
+
+**SAEM deliberately keeps the switched θ numerical.** It draws one *hard* class
+per subject each E-step, so the per-class mean $\operatorname{mean}_{i:c_i=k}(\eta_i)$
+is a classification-EM statistic: the class boundary is re-drawn from the
+$\theta_k$ that the shift just moved, and the two feed back. Measured on the
+two-class anchor (`tests/nonmem/mixture_iv.csv`, seed 20250818) the class-aware
+variant lands at `TVCL2 = 3.02` with OFV 305.0, against `2.75` / 302.2 for the
+numerical M-step — worse on every coordinate (NONMEM SAEM: 2.735; FOCEI optimum:
+2.842). A Rao-Blackwellised soft-responsibility variant converges to the same
+wrong point, so the bias is in the hard-class sufficient statistic rather than
+the weighting. IMP/IMPMAP importance-samples η *within every class* and weights
+by the responsibilities, so it has no hard assignment and no such feedback.
+
+Setting `mu_referencing = false` disables the class-aware shift under both
+estimators and restores the pre-#996 behaviour (every θ through the numerical /
+weighted M-step). Note that for a **single-population** IMP/IMPMAP fit the
+closed-form shift is EM-mandatory and stays on regardless of that option; only
+the mixture path is switchable.
 
 Under **IOV**, the per-occasion κ is sampled inside each subject's drawn class —
 under that class's `MIXNUM` branch and its Ω/Σ — so a class-switched typical
@@ -351,17 +394,36 @@ observation M-step (each class's samples scored under its own `MIXNUM`). Ω/σ a
 class-shared (per-class overrides are rejected); IOV / FREM / SDE are not
 supported (as for the single-population MCEM).
 
-IMP is the noisiest of the mixture estimators — the class-switched typical value
-cannot be mu-referenced, so θ is estimated by the weighted M-step alone, which
-converges more slowly than SAEM's MCMC and typically needs more iterations. The
-fit warns about this, and separately names any estimated θ that carries no ETA
-(the mixing thetas are excluded — they are owned by the mixing M-step, not the
-weighted one). On the two-class anchor, estimating IMPMAP recovers
-`TVCL1 ≈ 1.00`, `TVCL2 ≈ 2.60`, `V ≈ 10.00`, `p(1) ≈ 0.47` (vs the FOCEI optimum
-0.98 / 2.84 / 9.98 / 0.472); `TVCL2` is the coordinate the weighted M-step
-resolves least well. For a well-identified point estimate prefer SAEM or
-FOCE/FOCEI and use IMP for the marginal likelihood; for the marginal likelihood
-at those estimates use the `imp_eval_only` stage above.
+The class-switched typical values are **mu-referenced per class** (#996). Because
+the MCEM importance-samples η within every class, a per-class posterior mean
+$\bar\eta_{ic}$ exists directly, and the EM move is the responsibility-weighted
+
+$$\log\theta_k \mathrel{+}= \frac{\sum_i r_{ic}\,\bar\eta_{ic}}{\sum_i r_{ic}},
+\qquad r_{ic} = \mathrm{PMIX}_{ic}$$
+
+summed over the classes $\theta_k$ serves. Those θ are pinned out of the weighted
+M-step, which then fits only σ and the remaining θ. A class-*shared* typical value
+repeats the same theta in every class slot, so it collapses to the pooled
+single-population shift. See
+[Mu-referencing under a mixture](#mu-referencing-under-a-mixture) for the
+detection rules and for why SAEM does not do the same.
+
+This is what closes the old gap: on the two-class anchor, estimating IMPMAP now
+recovers `TVCL1 = 0.952`, `TVCL2 = 2.821`, `V = 10.008`, `p(1) = 0.472`, against
+`0.949 / 2.819 / 10.010 / 0.473` from NONMEM IMPMAP with `MU_1` assigned inside
+the `MIXNUM` branch (`tests/nonmem/mixture_iv_impmap_mu.ctl`, NM 7.6.0) — better
+than 0.5 % on every coordinate. With `mu_referencing = false` the same run falls
+back to the weighted M-step alone and returns `TVCL1 = 0.998`, `TVCL2 = 2.597`,
+which is the pre-#996 behaviour and shows how much of the accuracy the shift buys.
+Note that the EM estimators settle slightly below the FOCEI optimum
+(0.98 / 2.84) on `TVCL1`/`TVCL2`; NONMEM's mu-referenced IMPMAP does the same.
+
+A θ whose paired ω is negligible (`ω < 1e-3`) carries no mean-shift information,
+so it is routed to the weighted M-step with a warning, as in the single-population
+MCEM; so is a θ declared with a negative lower bound (identity-packed, so the
+additive log-scale shift is not its EM optimum). The fit also names any estimated
+θ that carries no ETA at all — the mixing thetas are excluded, since they are
+owned by the mixing M-step.
 
 The per-subject proposal machinery is the same as the single-population MCEM:
 each class's draws get their own ISCALE pilot search (the guard against

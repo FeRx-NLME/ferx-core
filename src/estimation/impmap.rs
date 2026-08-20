@@ -38,7 +38,10 @@ use crate::estimation::importance_sampling::{
 use crate::estimation::inner_optimizer::{find_ebe, EbeResult, InnerLoopStats};
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs_log};
-use crate::estimation::saem::{floor_omega_diagonal, get_mu_ref_pairs};
+use crate::estimation::saem::{
+    floor_omega_diagonal, get_mixture_mu_ref_pairs, get_mu_ref_pairs, mixture_mu_ref_means,
+    MixtureMuRefPair,
+};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::obs_nll_subject_into;
 use crate::types::*;
@@ -159,11 +162,21 @@ pub(crate) fn non_fixed_thetas_without_eta(
     theta_fixed: &[bool],
 ) -> Vec<String> {
     use std::collections::HashSet;
-    let with_eta: HashSet<&str> = model
+    let mut with_eta: HashSet<&str> = model
         .mu_refs
         .values()
         .map(|m| m.theta_name.as_str())
         .collect();
+    // A MIXNUM-switched typical value carries an ETA in every class arm, so its
+    // class thetas must not be flagged as fixed-effect-only (#996) — they are
+    // mu-referenced per class, not estimated by the weighted M-step alone.
+    if let Some(spec) = model.mixture.as_ref() {
+        with_eta.extend(
+            spec.mu_refs
+                .iter()
+                .flat_map(|m| m.theta_names.iter().map(String::as_str)),
+        );
+    }
     model
         .theta_names
         .iter()
@@ -1604,12 +1617,90 @@ fn run_mcem_mixture(
             thetas_without_eta.join(", ")
         ));
     }
-    warnings.push(format!(
-        "{label}: under a mixture the closed-form mu-referencing θ update does not apply (a \
-         class-switched typical value has no single paired η), so every typical value is \
-         estimated through the importance-weighted M-step alone and may converge poorly. \
-         Cross-check the typical values against a FOCEI fit."
-    ));
+    // ---- Class-aware closed-form mu-ref θ shift (#996) ----
+    //
+    // MCEM over a mixture importance-samples η *within every class*, so a
+    // per-class posterior mean η̄_ic exists directly and the EM update for the
+    // class-switched typical value is the responsibility-weighted
+    //     log θ_k += (Σ_i r_ic η̄_ic) / (Σ_i r_ic),   r_ic = PMIX_ic
+    // (`mixture_mu_ref_means`). A class-*shared* typical value repeats the same
+    // theta in every class slot, so it collapses to the pooled `mean_i(η̄_i)`
+    // shift the single-population `run_mcem` applies. Those θ are pinned out of
+    // the weighted M-step below, exactly as in `run_mcem`.
+    //
+    // Disabled by `mu_referencing = false`, which restores the pre-#996 behaviour
+    // (every θ through the weighted M-step alone). Note this differs from the
+    // single-population IMP path, where the closed-form shift is EM-mandatory and
+    // applied regardless of that option.
+    const WEAK_IIV_VAR: f64 = 1e-3;
+    let mut mix_mu_ref_pairs: Vec<MixtureMuRefPair> = if options.mu_referencing {
+        get_mixture_mu_ref_pairs(model)
+    } else {
+        Vec::new()
+    };
+    // An identity-packed θ (`theta_lower < 0`) is not on the log scale, so the
+    // additive shift is not its EM optimum — route it to the weighted M-step.
+    let identity_packed: Vec<usize> = mix_mu_ref_pairs
+        .iter()
+        .flat_map(|p| p.theta_idx.iter().copied())
+        .filter(|&t| !theta_packs_log_mask[t])
+        .collect();
+    mix_mu_ref_pairs.retain(|p| p.theta_idx.iter().all(|&t| theta_packs_log_mask[t]));
+    // A η with negligible IIV carries no mean-shift information, so its typical
+    // values would be frozen at their inits (#411) — same guard as `run_mcem`,
+    // applied per pair (all of that η's class θ share the one ω).
+    let weak: Vec<usize> = mix_mu_ref_pairs
+        .iter()
+        .filter(|p| init_params.omega.matrix[(p.eta_idx, p.eta_idx)] < WEAK_IIV_VAR)
+        .flat_map(|p| p.theta_idx.iter().copied())
+        .collect();
+    mix_mu_ref_pairs.retain(|p| init_params.omega.matrix[(p.eta_idx, p.eta_idx)] >= WEAK_IIV_VAR);
+    let name_list = |idx: Vec<usize>| -> String {
+        let mut n: Vec<&str> = idx
+            .iter()
+            .map(|&t| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
+            .collect();
+        n.sort_unstable();
+        n.dedup();
+        n.join(", ")
+    };
+    if !identity_packed.is_empty() {
+        warnings.push(format!(
+            "{label}: typical value(s) {} are log-mu-referenced but declared with a negative \
+             lower bound, so they are packed on the identity scale; the closed-form mu-ref \
+             shift does not apply and they are estimated by the importance-weighted M-step \
+             instead (#996).",
+            name_list(identity_packed)
+        ));
+    }
+    if !weak.is_empty() {
+        warnings.push(format!(
+            "{label}: typical value(s) {} are log-mu-referenced but their random effect has \
+             negligible variance (ω < {WEAK_IIV_VAR:.0e}); the mu-ref mean-shift carries no \
+             information, so they are estimated through the weighted M-step instead.",
+            name_list(weak)
+        ));
+    }
+    // Thetas the closed-form shift owns — pinned out of the weighted M-step each
+    // iteration. A FIXed θ is left to the regular fixed-bounds path.
+    let mu_ref_pinned: Vec<usize> = {
+        let mut v: Vec<usize> = mix_mu_ref_pairs
+            .iter()
+            .flat_map(|p| p.theta_idx.iter().copied())
+            .filter(|&t| !init_params.theta_fixed.get(t).copied().unwrap_or(false))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    if mix_mu_ref_pairs.is_empty() {
+        warnings.push(format!(
+            "{label}: no class-aware mu-referencing was applied, so every typical value is \
+             estimated through the importance-weighted M-step alone and may converge poorly. \
+             Write each class-switched typical value as a MIXNUM chain of \
+             `THETA_k * exp(ETA)` terms on one ETA, or cross-check against a FOCEI fit (#996)."
+        ));
+    }
     if collect_trace {
         warnings.push(format!(
             "{label}: iteration trace collection (impmap_trace) is not implemented for mixture \
@@ -1865,6 +1956,12 @@ fn run_mcem_mixture(
             mstep_theta_lower[j] = log_theta[j];
             mstep_theta_upper[j] = log_theta[j];
         }
+        // Pin the class-aware mu-ref θ too: the closed-form shift below is their
+        // sole owner, so NLopt optimizes only σ and the remaining θ (#996).
+        for &t in &mu_ref_pinned {
+            mstep_theta_lower[t] = log_theta[t];
+            mstep_theta_upper[t] = log_theta[t];
+        }
         let mstep_maxiter: u32 = if k <= n_iter / 2 { 4 } else { 8 };
         let (new_log_theta, new_log_sigma) = theta_sigma_weighted_mstep_mixture(
             model,
@@ -1884,6 +1981,30 @@ fn run_mcem_mixture(
         );
         log_theta = new_log_theta;
         log_sigma = new_log_sigma;
+
+        // (a2) Class-aware closed-form mu-ref θ shift (#996):
+        //      log θ_k += (Σ_i r_ic η̄_ic) / (Σ_i r_ic) over the classes θ_k serves.
+        // The draws are not re-centred: Ω below is the weighted second moment
+        // about zero of these same draws, which is what the single-population
+        // `run_mcem` also uses (its shift likewise leaves the draws alone), and
+        // the next E-step re-solves at the updated θ.
+        for pair in &mix_mu_ref_pairs {
+            let eta_idx = pair.eta_idx;
+            let means = mixture_mu_ref_means(n_theta, &pair.theta_idx, &pmix, |i, c| {
+                draws_by_class[c][i].mean[eta_idx]
+            });
+            for (t, mean_eta) in means.iter().enumerate() {
+                // `None` means no responsibility mass reached any class this θ
+                // serves — hold it and let the next E-step move it.
+                let Some(mean_eta) = mean_eta else { continue };
+                if init_params.theta_fixed.get(t).copied().unwrap_or(false) {
+                    continue;
+                }
+                log_theta[t] =
+                    (log_theta[t] + mean_eta).clamp(log_theta_lower[t], log_theta_upper[t]);
+            }
+        }
+
         theta_cur = (0..n_theta)
             .map(|i| unpack_theta(i, log_theta[i]))
             .collect();
@@ -2305,6 +2426,160 @@ fn theta_sigma_weighted_mstep_mixture(
 mod tests {
     use super::*;
 
+    // ── #996 end-to-end helpers: a tiny 2-class mixture dataset ──────────
+    //
+    // Two weight groups with well-separated clearances, so the class draw is
+    // stable and a handful of iterations is enough to exercise the M-step.
+
+    /// Small 1-cpt IV dataset, `n_per` subjects at each of two weights.
+    fn mix996_csv(n_per: usize) -> String {
+        let mut s = String::from("ID,TIME,DV,AMT,EVID,CMT,WT\n");
+        let mut sid = 0;
+        for (g, &wt) in [60.0_f64, 90.0].iter().enumerate() {
+            let cl = if g == 0 { 1.0 } else { 3.0 };
+            for _ in 0..n_per {
+                sid += 1;
+                s.push_str(&format!("{sid},0,0,100,1,1,{wt}\n"));
+                for (ti, t) in [0.5_f64, 1.0, 2.0, 4.0].iter().enumerate() {
+                    let c = (100.0 / 10.0) * (-(cl / 10.0) * t).exp();
+                    let dv = c * (1.0 + 0.02 * ((sid + ti) as f64).sin());
+                    s.push_str(&format!("{sid},{t},{dv:.5},0,0,1,{wt}\n"));
+                }
+            }
+        }
+        s
+    }
+
+    fn mix996_pop(n_per: usize) -> Population {
+        use std::io::Write;
+        let csv = mix996_csv(n_per);
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::io::datareader::read_nonmem_csv(f.path(), Some(&["WT"]), None).unwrap()
+    }
+
+    /// Two-class mixture. `v_expr` picks whether V carries a class-shared
+    /// mu-referenced ETA (`TVV * exp(ETA_V)`) or none (`TVV`).
+    fn mix996_model(v_expr: &str) -> CompiledModel {
+        let src = format!(
+            r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  omega ETA_V ~ 0.04 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = {v_expr}
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("mixture model parses")
+    }
+
+    #[test]
+    fn impmap_mixture_applies_class_aware_mu_ref_shift() {
+        // The MIXNUM-switched clearances are mu-referenced per class, so the
+        // "no class-aware mu-referencing" fallback warning must be absent.
+        let model = mix996_model("TVV");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Impmap;
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 40;
+        opts.impmap_seed = Some(996);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP Ok");
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("no class-aware mu-referencing was applied")),
+            "class-aware shift should be active, got {:?}",
+            res.warnings
+        );
+    }
+
+    #[test]
+    fn impmap_mixture_mu_referencing_off_restores_numerical_mstep() {
+        // The degenerate-oracle switch: `mu_referencing = false` must reproduce
+        // the pre-#996 behaviour, where every θ goes through the weighted M-step.
+        let model = mix996_model("TVV");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Impmap;
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 40;
+        opts.impmap_seed = Some(996);
+        opts.run_covariance_step = false;
+        opts.mu_referencing = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP Ok");
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("no class-aware mu-referencing was applied")),
+            "expected the fallback warning with mu_referencing off, got {:?}",
+            res.warnings
+        );
+    }
+
+    #[test]
+    fn impmap_mixture_weak_iiv_mu_ref_routes_to_weighted_mstep() {
+        // A near-zero ω on the mu-ref η carries no mean-shift information, so the
+        // class θ must fall back to the weighted M-step with a warning (#411).
+        let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 1e-6 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Impmap;
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 40;
+        opts.impmap_seed = Some(996);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP Ok");
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("negligible variance") && w.contains("TVCL1")),
+            "expected the weak-IIV warning, got {:?}",
+            res.warnings
+        );
+    }
+
     #[test]
     fn objective_converged_rejects_runaway_and_nonfinite() {
         // A normal objective converges.
@@ -2609,9 +2884,10 @@ mod tests {
     }
 
     /// The mixture MCEM delegates before `run_mcem` builds its mu-ref warnings,
-    /// so it must push its own: the no-ETA warning (naming `TVV`, but *not* the
-    /// mixing theta `MIXL`, which `mstep_mixing` owns) and the mixture mu-ref
-    /// caveat that every typical value rides the weighted M-step alone.
+    /// so it must push its own no-ETA warning. It names `TVV` (a bare typical
+    /// value) but neither the mixing theta `MIXL` (which `mstep_mixing` owns)
+    /// nor the class-switched `TVCL1`/`TVCL2`, which carry `ETA_CL` in every
+    /// class arm and are class-aware mu-referenced (#996).
     #[test]
     fn mixture_mcem_warns_about_weighted_mstep_only_thetas() {
         let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
@@ -2633,8 +2909,12 @@ mod tests {
             "the mixing theta must not be flagged as a missing-ETA parameter: {joined}"
         );
         assert!(
-            joined.contains("closed-form mu-referencing"),
-            "mixture mu-ref caveat missing: {joined}"
+            !joined.contains("TVCL1") && !joined.contains("TVCL2"),
+            "class-aware mu-referenced thetas must not be flagged as ETA-less: {joined}"
+        );
+        assert!(
+            !joined.contains("no class-aware mu-referencing was applied"),
+            "the class-aware shift is available for this model: {joined}"
         );
     }
 
