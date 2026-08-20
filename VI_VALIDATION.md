@@ -745,6 +745,20 @@ the follow-up is a fixture chosen for posterior geometry (a nonlinear/saturating
 or the Janssen fold-1 setup of §7) rather than for sparsity. `Ω_iov` ~24 % low is untouched here
 too: it needs the IOV fixture, not this one.
 
+**The off-diagonals too, not just the diagonal.** Against NUTS there is no packing ambiguity —
+both covariances come from the same convention — so §4.7's open question does not apply here and
+the whole matrix is comparable:
+
+| max \|VI − NUTS\| | corr(CL,V) | corr(CL,KA) | corr(V,KA) | whole matrix (relative Frobenius) |
+|---|---|---|---|---|
+| warfarin | 0.0042 | 0.0062 | 0.0077 | 0.93 % median, 5.3 % worst subject |
+| sparse | 0.0107 | 0.0117 | 0.0005 | 1.6 % median, 2.6 % worst |
+
+The correlations being reproduced are not small ones — `+0.67` on warfarin's `(V, KA)` and `+0.99`
+in the sparse case — which is the regime where a full-rank `q` is doing work a `mean_field` one
+could not, and it recovers them to under 0.01. So the per-subject posterior is validated as a
+covariance, not as three variances.
+
 **Figures.** `Rscript tools/vi-nuts-anchor/plots.R` — the overlay of each subject's NUTS marginal
 with the variational Gaussian (`posterior-overlay.png`) is the direct form of the claim; the
 variance ratios and the three-ratio decomposition are the numbers above. The decomposition figure
