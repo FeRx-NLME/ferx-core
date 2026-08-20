@@ -13648,9 +13648,11 @@ fn fit_on_mixture_model_rejects_missing_mixture_params() {
 
 #[test]
 fn fit_on_mixture_model_rejects_unsupported_method() {
-    // Phase 3 wires FOCE/FOCEI; other estimators (here SAEM) must still error
-    // clearly rather than silently ignoring the mixture structure. The method
-    // guard fires before any subject is touched, so an empty population suffices.
+    // FOCE/FOCEI, SAEM, Bayes, and IMP objective-evaluation estimate/evaluate a
+    // mixture (#985); the remaining estimators (here Gauss-Newton) must still
+    // error clearly rather than silently ignoring the mixture structure. The
+    // method guard fires before any subject is touched, so an empty population
+    // suffices.
     let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
     let pop = crate::types::Population {
         subjects: vec![],
@@ -13662,11 +13664,11 @@ fn fit_on_mixture_model_rejects_unsupported_method() {
     };
     let params = model.default_params.clone();
     let opts = crate::types::FitOptions {
-        method: crate::types::EstimationMethod::Saem,
+        method: crate::types::EstimationMethod::FoceGn,
         ..crate::types::FitOptions::default()
     };
     let err = crate::api::fit(&model, &pop, &params, &opts)
-        .expect_err("SAEM on a mixture model must be rejected");
+        .expect_err("Gauss-Newton on a mixture model must be rejected");
     assert!(
         err.contains("mixture") && err.contains("FOCE"),
         "got: {err}"
@@ -13902,4 +13904,35 @@ fn mixture_block_omega_override_rejected() {
 ";
     let err = parse_model_string(src).expect_err("block-omega override must be rejected");
     assert!(err.contains("diagonal base omega"), "got: {err}");
+}
+
+/// #958 (second reported item): the parse-time error for an unknown `gradient` value
+/// advertised `'ad'`, but no fit accepts it — the Enzyme AD path was retired in #428 and
+/// the engine rejects `gradient = ad` at fit time. So a user who mistyped the option was
+/// pointed at a setting that cannot work. The message now lists only what a fit will take.
+/// `ad` itself still parses, so requesting it deliberately still reaches the engine's
+/// specific "no longer supported, use auto or fd" error rather than a generic one.
+#[test]
+fn unknown_gradient_value_does_not_advertise_the_retired_ad_route() {
+    let err = parse_model_string(
+        "[parameters]\n  theta CL(1.0,0.1,10)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.1\n[individual_parameters]\n  CL = CL * exp(ETA_CL)\n  V = 10\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n[fit_options]\n  gradient = enzyme\n",
+    )
+    .expect_err("an unknown `gradient` value must be rejected at parse time");
+    assert!(
+        err.contains("expected 'auto' or 'fd'"),
+        "message must list only the values a fit accepts, got: {err}"
+    );
+    assert!(
+        !err.contains("'ad'"),
+        "the retired AD route must not be advertised, got: {err}"
+    );
+
+    // `ad` still parses — the engine, not the parser, owns its retirement message.
+    assert!(
+        parse_model_string(
+            "[parameters]\n  theta CL(1.0,0.1,10)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.1\n[individual_parameters]\n  CL = CL * exp(ETA_CL)\n  V = 10\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n[fit_options]\n  gradient = ad\n",
+        )
+        .is_ok(),
+        "`gradient = ad` must still parse so the engine can emit its own retirement error"
+    );
 }

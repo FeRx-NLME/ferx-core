@@ -19,8 +19,10 @@
 //!   - inverse-Wishart via the Bartlett decomposition of a Wishart draw, then
 //!     matrix inversion ([`inverse_wishart_draw`], [`wishart_draw`]).
 
+use crate::estimation::mixture::combine_subject;
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::saem::{mh_kappa_steps, mh_steps};
+use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
     individual_nll_into_with_schedule, individual_nll_iov, iov_occasion_groups,
@@ -188,6 +190,16 @@ enum PopCoord {
 /// subject carries per-occasion kappas (`kappas` non-empty) and the plain kernel
 /// otherwise. Centralizes the IOV/non-IOV branch so every sweep site stays
 /// consistent.
+///
+/// **Mixture models (#985)** are handled Rao-Blackwellised: the class indicator
+/// is marginalised out, so this returns the K-class marginal NLL
+/// `−log Σ_k p_ik · exp(−nll_ik)` — a smooth function of η and θ. Because *every*
+/// Gibbs block (η-MH, the (θ,σ) Metropolis block that also carries the mixing
+/// thetas, and the Ω-conjugate baseline) evaluates the per-subject likelihood
+/// through this one function, marginalising here makes the whole sampler
+/// mixture-aware. Ω/Σ are class-shared here (per-class overrides are rejected for
+/// Bayes upstream), so the same `omega`/`sigma` feed every class; the classes
+/// differ only through the `MIXNUM`-switched structural typical values.
 #[allow(clippy::too_many_arguments)]
 fn subject_nll(
     model: &CompiledModel,
@@ -201,6 +213,23 @@ fn subject_nll(
     scratch: &mut EventPkParams,
     schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> f64 {
+    if let Some(spec) = model.mixture.as_ref() {
+        let k = spec.n_classes;
+        let logp = eval_mixing_log_probs(spec, theta, &subject.covariates);
+        let mut nll = vec![0.0f64; k];
+        for (c, slot) in nll.iter_mut().enumerate() {
+            let _g = MixtureClassGuard::enter(c + 1);
+            *slot = if kappas.is_empty() {
+                individual_nll_into_with_schedule(
+                    model, subject, theta, eta, omega, sigma, scratch, schedule,
+                )
+            } else {
+                individual_nll_iov(model, subject, theta, eta, kappas, omega, omega_iov, sigma)
+            };
+        }
+        // combine_subject returns 2·(−lse); the NLL scale wants −lse.
+        return 0.5 * combine_subject(&logp, &nll).0;
+    }
     if kappas.is_empty() {
         individual_nll_into_with_schedule(
             model, subject, theta, eta, omega, sigma, scratch, schedule,
@@ -208,6 +237,120 @@ fn subject_nll(
     } else {
         individual_nll_iov(model, subject, theta, eta, kappas, omega, omega_iov, sigma)
     }
+}
+
+/// Mixture (#985) η-block random walk: `n_steps` symmetric `chol(Ω)·z` proposals
+/// evaluated against the **class-marginal** per-subject NLL (`subject_nll` with a
+/// mixture model), so the sampled η targets `p(η_i | y_i, θ, Ω)` marginalised over
+/// the latent class. Mirrors `saem::mh_steps` but calls `subject_nll` (which does
+/// the K-class log-sum-exp) instead of the single-population `individual_nll`, and
+/// returns the marginal NLL so the sweep's cache stays consistent. HMC is disabled
+/// for mixtures (its Dual2 gradient is single-class), so this is the η kernel.
+#[allow(clippy::too_many_arguments)]
+fn mh_steps_mixture(
+    eta: &mut [f64],
+    nll_current: f64,
+    subject: &Subject,
+    model: &CompiledModel,
+    theta: &[f64],
+    kappas: &[Vec<f64>],
+    omega: &OmegaMatrix,
+    omega_iov: Option<&OmegaMatrix>,
+    sigma: &[f64],
+    step_scale: f64,
+    rng: &mut impl Rng,
+    n_steps: usize,
+    scratch: &mut EventPkParams,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+) -> (usize, f64) {
+    let n_eta = eta.len();
+    let l = &omega.chol;
+    let mut nll = nll_current;
+    let mut n_accepted = 0;
+    for _ in 0..n_steps {
+        let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(StandardNormal)).collect();
+        let perturbation = l * DVector::from_column_slice(&z);
+        let eta_prop: Vec<f64> = (0..n_eta)
+            .map(|j| eta[j] + step_scale * perturbation[j])
+            .collect();
+        let nll_prop = subject_nll(
+            model, subject, theta, &eta_prop, kappas, omega, omega_iov, sigma, scratch, schedule,
+        );
+        // Symmetric proposal cancels; the marginal prior+likelihood difference is
+        // the full acceptance criterion.
+        if rng.random::<f64>().ln() < nll - nll_prop {
+            eta.copy_from_slice(&eta_prop);
+            nll = nll_prop;
+            n_accepted += 1;
+        }
+    }
+    (n_accepted, nll)
+}
+
+/// κ-block MH kernel for a mixture model (#985).
+///
+/// [`mh_kappa_steps`](crate::estimation::saem::mh_kappa_steps) scores its proposal
+/// with `individual_nll_iov`, which is *single-class*: it evaluates whichever class
+/// the ambient `MIXNUM` guard names (the default, class 1). Under a mixture the
+/// cached `nll[i]` that the η block just produced is the K-class **marginal**, so
+/// pairing it with a single-class proposal offsets the acceptance ratio by roughly
+/// `−log p_i1` and makes κ target `p(κ | class 1)` rather than the class-marginal
+/// posterior — and it would write a single-class value back into `nll[i]`. Route
+/// the proposal through [`subject_nll`] instead, so both sides of the ratio are the
+/// same Rao-Blackwellised target that every other Gibbs block uses.
+#[allow(clippy::too_many_arguments)]
+fn mh_kappa_steps_mixture(
+    kappas: &mut [Vec<f64>],
+    nll_current: f64,
+    subject: &Subject,
+    model: &CompiledModel,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    omega_iov: &OmegaMatrix,
+    sigma: &[f64],
+    step_scale: f64,
+    rng: &mut impl Rng,
+    scratch: &mut EventPkParams,
+) -> (usize, usize, f64) {
+    let n_kappa = omega_iov.matrix.nrows();
+    let l = &omega_iov.chol;
+    let mut nll = nll_current;
+    let mut n_accepted = 0;
+    let n_occ = kappas.len();
+
+    for k in 0..n_occ {
+        let z: Vec<f64> = (0..n_kappa).map(|_| rng.sample(StandardNormal)).collect();
+        let perturbation = l * DVector::from_column_slice(&z);
+        let kap_prop: Vec<f64> = (0..n_kappa)
+            .map(|j| kappas[k][j] + step_scale * perturbation[j])
+            .collect();
+
+        // Temporarily substitute κ_k with the proposal; restore on reject.
+        let old_kap = std::mem::replace(&mut kappas[k], kap_prop);
+        let nll_prop = subject_nll(
+            model,
+            subject,
+            theta,
+            eta,
+            kappas,
+            omega,
+            Some(omega_iov),
+            sigma,
+            scratch,
+            None,
+        );
+        // Symmetric proposal cancels; the marginal prior+likelihood difference is
+        // the full acceptance criterion.
+        if rng.random::<f64>().ln() < nll - nll_prop {
+            nll = nll_prop;
+            n_accepted += 1;
+        } else {
+            kappas[k] = old_kap;
+        }
+    }
+
+    (n_accepted, n_occ, nll)
 }
 
 /// Re-impose a covariance matrix's structural template onto a fresh draw `m`:
@@ -281,6 +424,22 @@ pub fn run_bayes(
             return Err(
                 "Bayesian estimation (method = bayes) supports zero-mean IOV kappas only \
                  (κ ~ N(0, Ω_iov)); kappa mu-references are not yet supported"
+                    .to_string(),
+            );
+        }
+    }
+
+    // Mixture (#985): Bayes marginalises the latent class (Rao-Blackwell), with
+    // Ω/Σ shared across classes — the Ω-conjugate block draws a single population
+    // Ω. Per-class Ω/Σ overrides (`omega(k)`/`sigma(k)`) would need class-indexed
+    // conjugate draws; reject them here rather than silently ignoring the
+    // override. Class-switched θ and constant/covariate mixing are supported.
+    if let Some(mp) = init_params.mixture.as_ref() {
+        if !mp.omega_override_addr.is_empty() || !mp.sigma_override_addr.is_empty() {
+            return Err(
+                "Bayesian estimation (method = bayes) does not yet support per-class Omega/Sigma \
+                 overrides (omega(k)/sigma(k)) in a mixture; Omega/Sigma are shared across \
+                 classes. Fit with FOCE/FOCEI, or drop the per-class overrides (#985)."
                     .to_string(),
             );
         }
@@ -410,8 +569,17 @@ pub fn run_bayes(
     // `∂NLL/∂η` (no autodiff). HMC is BSV-only (kappa-unaware), so IOV models always
     // use the MH eta kernel.
     let n_leapfrog = options.saem_n_leapfrog;
-    let using_hmc =
-        n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && n_kappa == 0;
+    let using_hmc = n_leapfrog > 0
+        && model.ode_spec.is_none()
+        && model.tv_fn.is_some()
+        && n_kappa == 0
+        // Mixture (#985): the η target is the class-marginal log-sum-exp, whose
+        // gradient is a pmix-weighted average of per-class gradients; the HMC
+        // Dual2 kernel is single-class, so use the marginal MH kernel instead.
+        && model.mixture.is_none();
+    // Warn rather than silently downgrading: a user who asked for HMC gets the MH
+    // kernel here, and `n_divergent = 0` would otherwise read as "HMC ran cleanly".
+    let hmc_disabled_by_mixture = n_leapfrog > 0 && model.mixture.is_some();
 
     // Post-warmup HMC divergences across all chains (only the HMC η-kernel
     // produces these; the MH kernel never mutates it).
@@ -622,23 +790,45 @@ pub fn run_bayes(
                 };
 
                 if !did_hmc {
-                    // IOV: sample η | κ (kappas held fixed) via the IOV-aware NLL.
-                    let kappas_opt = omega_iov_cur.as_ref().map(|oi| (kappas[i].as_slice(), oi));
-                    let (na, nll_new) = mh_steps(
-                        &mut etas[i],
-                        nll[i],
-                        &population.subjects[i],
-                        model,
-                        &theta,
-                        &omega_cur,
-                        &sigma,
-                        eta_scale,
-                        None,
-                        &mut rng,
-                        n_eta_mh,
-                        &mut scratch,
-                        kappas_opt,
-                    );
+                    // Mixture (#985): target the class-marginal η posterior via the
+                    // marginal MH kernel (HMC is off for mixtures). Otherwise the
+                    // single-population kernel; IOV samples η | κ (kappas fixed).
+                    let (na, nll_new) = if model.mixture.is_some() {
+                        mh_steps_mixture(
+                            &mut etas[i],
+                            nll[i],
+                            &population.subjects[i],
+                            model,
+                            &theta,
+                            &kappas[i],
+                            &omega_cur,
+                            omega_iov_cur.as_ref(),
+                            &sigma,
+                            eta_scale,
+                            &mut rng,
+                            n_eta_mh,
+                            &mut scratch,
+                            schedules[i].as_ref(),
+                        )
+                    } else {
+                        let kappas_opt =
+                            omega_iov_cur.as_ref().map(|oi| (kappas[i].as_slice(), oi));
+                        mh_steps(
+                            &mut etas[i],
+                            nll[i],
+                            &population.subjects[i],
+                            model,
+                            &theta,
+                            &omega_cur,
+                            &sigma,
+                            eta_scale,
+                            None,
+                            &mut rng,
+                            n_eta_mh,
+                            &mut scratch,
+                            kappas_opt,
+                        )
+                    };
                     nll[i] = nll_new;
                     acc_eta += na as u64;
                     prop_eta += n_eta_mh as u64;
@@ -653,19 +843,39 @@ pub fn run_bayes(
                     .as_ref()
                     .expect("should_sample_kappa_block requires OMEGA_IOV");
                 for i in 0..n_subjects {
-                    let (na, np, nll_new) = mh_kappa_steps(
-                        &mut kappas[i],
-                        nll[i],
-                        &population.subjects[i],
-                        model,
-                        &theta,
-                        &etas[i],
-                        &omega_cur,
-                        oi,
-                        &sigma,
-                        kappa_scale,
-                        &mut rng,
-                    );
+                    // Mixture (#985): the marginal κ kernel, so the acceptance
+                    // ratio compares like with like (`nll[i]` is the K-class
+                    // marginal the η block left behind).
+                    let (na, np, nll_new) = if model.mixture.is_some() {
+                        mh_kappa_steps_mixture(
+                            &mut kappas[i],
+                            nll[i],
+                            &population.subjects[i],
+                            model,
+                            &theta,
+                            &etas[i],
+                            &omega_cur,
+                            oi,
+                            &sigma,
+                            kappa_scale,
+                            &mut rng,
+                            &mut scratch,
+                        )
+                    } else {
+                        mh_kappa_steps(
+                            &mut kappas[i],
+                            nll[i],
+                            &population.subjects[i],
+                            model,
+                            &theta,
+                            &etas[i],
+                            &omega_cur,
+                            oi,
+                            &sigma,
+                            kappa_scale,
+                            &mut rng,
+                        )
+                    };
                     nll[i] = nll_new;
                     acc_kappa += na as u64;
                     prop_kappa += np as u64;
@@ -1188,7 +1398,19 @@ pub fn run_bayes(
         sigma_fixed: init_params.sigma_fixed.clone(),
         omega_iov: omega_iov_mean.clone(),
         kappa_fixed: init_params.kappa_fixed.clone(),
-        mixture: None,
+        // Carry the mixture so the post-loop pass sees the structure (#985). Ω/Σ
+        // are class-shared under Bayes (overrides rejected above), so set every
+        // class to the posterior-mean Ω/Σ that this ModelParameters carries.
+        mixture: init_params.mixture.as_ref().map(|mp| {
+            let mut m = mp.clone();
+            for o in m.omega.iter_mut() {
+                *o = omega_mean.clone();
+            }
+            for s in m.sigma.iter_mut() {
+                s.values = sigma_mean.clone();
+            }
+            m
+        }),
     };
 
     // Final EBEs + sensitivity (H) matrices at the posterior mean, warm-started
@@ -1204,44 +1426,68 @@ pub fn run_bayes(
             }
         })
         .collect();
-    let (eta_hats, h_matrices, _inner_stats, kappas) =
-        crate::estimation::inner_optimizer::run_inner_loop_warm(
-            model,
-            population,
-            &mean_params,
-            options.inner_maxiter,
-            options.inner_tol,
-            Some(&warm_etas),
-            None,
-            0,
-            0,
-        );
-
-    // OFV at the posterior mean (2·Σ individual_nll, IOV-aware). NOTE: this is
-    // the posterior-mean joint NLL ×2, NOT a FOCE/Laplace marginal OFV — it is
-    // reported for a rough AIC-style comparison only.
-    let kappas_mean: Vec<Vec<Vec<f64>>> = kappas
-        .iter()
-        .map(|ks| ks.iter().map(|k| k.iter().copied().collect()).collect())
-        .collect();
-    let mut scratch = EventPkParams::default();
-    let ofv = 2.0
-        * (0..n_subjects)
-            .map(|i| {
-                subject_nll(
-                    model,
-                    &population.subjects[i],
-                    &theta_mean,
-                    eta_hats[i].as_slice(),
-                    &kappas_mean[i],
-                    &omega_mean,
-                    omega_iov_mean.as_ref(),
-                    &sigma_mean,
-                    &mut scratch,
-                    schedules[i].as_ref(),
-                )
-            })
-            .sum::<f64>();
+    // Post-loop pass at the posterior mean. For a mixture (#985), the EBEs / OFV /
+    // per-subject posteriors are the MIXEST-class values from `mixture_ofv` (the
+    // K-fold marginal `−2 Σ log Σ_k p_ik L_ik`), matching FOCEI/SAEM; otherwise
+    // the single-population inner solve plus the posterior-mean joint NLL ×2.
+    let (eta_hats, h_matrices, kappas, ofv, mixture_posteriors, ebe_stats) = if mean_params
+        .mixture
+        .is_some()
+    {
+        let meval =
+            crate::estimation::mixture::mixture_ofv(model, population, &mean_params, options, None);
+        let posteriors = crate::estimation::outer_optimizer::MixturePosteriors {
+            pmix: meval.pmix.clone(),
+            mixest: meval.mixest.clone(),
+        };
+        (
+            meval.mixest_etas,
+            meval.mixest_h_mats,
+            meval.mixest_kappas,
+            meval.ofv,
+            Some(posteriors),
+            meval.ebe_stats,
+        )
+    } else {
+        let (eta_hats, h_matrices, inner_stats, kappas) =
+            crate::estimation::inner_optimizer::run_inner_loop_warm(
+                model,
+                population,
+                &mean_params,
+                options.inner_maxiter,
+                options.inner_tol,
+                Some(&warm_etas),
+                None,
+                0,
+                0,
+            );
+        // OFV at the posterior mean (2·Σ individual_nll, IOV-aware). NOTE: this is
+        // the posterior-mean joint NLL ×2, NOT a FOCE/Laplace marginal OFV — it is
+        // reported for a rough AIC-style comparison only.
+        let kappas_mean: Vec<Vec<Vec<f64>>> = kappas
+            .iter()
+            .map(|ks| ks.iter().map(|k| k.iter().copied().collect()).collect())
+            .collect();
+        let mut scratch = EventPkParams::default();
+        let ofv = 2.0
+            * (0..n_subjects)
+                .map(|i| {
+                    subject_nll(
+                        model,
+                        &population.subjects[i],
+                        &theta_mean,
+                        eta_hats[i].as_slice(),
+                        &kappas_mean[i],
+                        &omega_mean,
+                        omega_iov_mean.as_ref(),
+                        &sigma_mean,
+                        &mut scratch,
+                        schedules[i].as_ref(),
+                    )
+                })
+                .sum::<f64>();
+        (eta_hats, h_matrices, kappas, ofv, None, inner_stats)
+    };
 
     let bayes = BayesResult {
         summaries,
@@ -1270,6 +1516,25 @@ pub fn run_bayes(
                 .to_string(),
         );
     }
+    if hmc_disabled_by_mixture {
+        warnings.push(
+            "Bayes: saem_n_leapfrog > 0 is ignored for a mixture model — the eta target is the \
+             class-marginal log-sum-exp and the HMC gradient kernel is single-class, so the \
+             Metropolis-Hastings eta kernel was used instead (n_divergent is reported as 0 \
+             because no HMC step ran) (#985)."
+                .to_string(),
+        );
+    }
+    if model.mixture.is_some() && max_rhat > RHAT_CONVERGENCE_THRESHOLD {
+        warnings.push(
+            "Bayes: mixture classes are identified only by the priors centred on the initial \
+             estimates, so a chain can swap labels (class 1 <-> class 2). A high R-hat on the \
+             class-switched thetas is the signature; the reported posterior mean would then \
+             average across modes and estimate neither class. Inspect the per-chain draws, and \
+             separate the classes more strongly in the initial estimates (#985)."
+                .to_string(),
+        );
+    }
     if partial_mu_ref {
         warnings.push(
             "Bayes: only some random effects are log mu-referenced — the conjugate θ Gibbs \
@@ -1292,16 +1557,19 @@ pub fn run_bayes(
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
+        // Post-loop EBE health at the posterior mean. Non-convergence is likelier
+        // on the mixture path (K multimodal inner solves per subject), so report it
+        // instead of hardcoding a clean run (#985).
+        ebe_convergence_warnings: ebe_stats.n_unconverged as u32,
+        max_unconverged_subjects: ebe_stats.n_unconverged as u32,
+        total_ebe_fallbacks: ebe_stats.n_fallback as u32,
         final_gradient: None,
         sir_fallback_proposal: None,
         impmap_trace: None,
         bayes: Some(bayes),
         cond_dist: None,
         packed_estimate: None,
-        mixture_posteriors: None,
+        mixture_posteriors,
     })
 }
 
@@ -1999,5 +2267,375 @@ mod tests {
             .expect("FitResult.bayes set by dispatch");
         assert!(!b.summaries.is_empty());
         assert!(b.max_rhat.is_finite());
+    }
+
+    // ── Mixture (#985) ──
+
+    const MIX_MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    fn mix_pop() -> crate::types::Population {
+        use std::io::Write;
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,WT\n");
+        for (sid, &(cl, wt)) in [(1.0_f64, 60.0_f64), (3.0, 90.0)].iter().enumerate() {
+            let id = sid + 1;
+            csv.push_str(&format!("{id},0,0,100,1,1,{wt}\n"));
+            for t in [0.5_f64, 1.0, 2.0, 4.0] {
+                let c = (100.0 / 10.0) * (-(cl / 10.0) * t).exp();
+                csv.push_str(&format!("{id},{t},{c:.5},0,0,1,{wt}\n"));
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::read_nonmem_csv(f.path(), Some(&["WT"]), None).unwrap()
+    }
+
+    /// `subject_nll` on a mixture returns the K-class log-sum-exp marginal
+    /// `−log Σ_k p_ik exp(−nll_ik)` (the Rao-Blackwell target), not a single class.
+    #[test]
+    fn mixture_subject_nll_is_marginal_lse() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let params = &model.default_params;
+        let subject = &pop.subjects[0];
+        let eta = vec![0.0f64];
+        let mut scratch = EventPkParams::default();
+
+        // Hand-compute the two per-class NLLs under the MIXNUM guard.
+        let spec = model.mixture.as_ref().unwrap();
+        let logp = eval_mixing_log_probs(spec, &params.theta, &subject.covariates);
+        let mut nll = [0.0f64; 2];
+        for (c, slot) in nll.iter_mut().enumerate() {
+            let _g = MixtureClassGuard::enter(c + 1);
+            *slot = individual_nll_into_with_schedule(
+                &model,
+                subject,
+                &params.theta,
+                &eta,
+                &params.omega,
+                &params.sigma.values,
+                &mut scratch,
+                None,
+            );
+        }
+        let expected = 0.5 * combine_subject(&logp, &nll).0;
+
+        let got = subject_nll(
+            &model,
+            subject,
+            &params.theta,
+            &eta,
+            &[],
+            &params.omega,
+            None,
+            &params.sigma.values,
+            &mut scratch,
+            None,
+        );
+        assert!((got - expected).abs() < 1e-9, "got {got} vs {expected}");
+        // Sanity: the marginal is below the larger per-class NLL (mixing helps).
+        assert!(got <= nll[0].max(nll[1]) + 1e-9);
+    }
+
+    /// A short Bayes run on a mixture returns Ok, carries the mixture through to
+    /// the result, and populates per-subject MIXEST (#985).
+    #[test]
+    fn bayes_mixture_fit_populates_mixest() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Bayes;
+        opts.run_covariance_step = false;
+        opts.bayes_warmup = 10;
+        opts.bayes_iters = 10;
+        opts.bayes_chains = 1;
+        opts.bayes_seed = Some(1);
+        let res =
+            crate::api::fit(&model, &pop, &model.default_params, &opts).expect("bayes mixture");
+        assert!(res.ofv.is_finite());
+        assert!(res.subjects.iter().all(|s| s.mixest.is_some()));
+    }
+
+    // ── IOV + mixture under Bayes (#985) ──
+
+    /// Same two-class model as `MIX_MODEL` plus a per-occasion κ on CL, so the
+    /// Bayes κ block runs under a mixture.
+    const MIX_IOV_MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta P1(0.5, 0.001, 0.999)
+  omega ETA_CL ~ 0.05
+  kappa KAPPA_CL ~ 0.02
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  p(1) = P1
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL + KAPPA_CL) else TVCL2 * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    /// Two subjects × two dosing occasions (`OCC`), bimodal CL.
+    fn mix_iov_pop() -> crate::types::Population {
+        use std::io::Write;
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,OCC,WT\n");
+        for (sid, &cl) in [1.0_f64, 3.0].iter().enumerate() {
+            let id = sid + 1;
+            let wt = 60.0 + 30.0 * sid as f64;
+            for (occ, &t0) in [0.0_f64, 24.0].iter().enumerate() {
+                let occ_idx = occ + 1;
+                csv.push_str(&format!("{id},{t0},0,100,1,1,{occ_idx},{wt}\n"));
+                for dt in [0.5_f64, 1.0, 2.0, 4.0] {
+                    let c = (100.0 / 10.0) * (-(cl / 10.0) * dt).exp();
+                    let t = t0 + dt;
+                    csv.push_str(&format!("{id},{t},{c:.5},0,0,1,{occ_idx},{wt}\n"));
+                }
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::read_nonmem_csv(f.path(), Some(&["WT"]), Some("OCC")).unwrap()
+    }
+
+    /// The κ block under a mixture must evaluate the **class-marginal** NLL, the
+    /// same target every other Gibbs block uses. The SAEM kernel
+    /// (`mh_kappa_steps`) scores its proposal single-class (`MIXNUM` at its
+    /// default of 1) while the cached baseline is the marginal, so the acceptance
+    /// ratio would carry a ≈ `−log p_i1` offset and κ would target `p(κ | class 1)`.
+    #[test]
+    fn mixture_kappa_kernel_targets_the_marginal() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
+        assert_eq!(model.n_kappa, 1);
+        let pop = mix_iov_pop();
+        let params = &model.default_params;
+        let subject = &pop.subjects[0];
+        let omega_iov = params
+            .omega_iov
+            .as_ref()
+            .expect("kappa declared ⇒ OMEGA_IOV");
+        let n_occ = crate::stats::likelihood::iov_occasion_groups(subject).len();
+        assert_eq!(n_occ, 2, "two dosing occasions per subject");
+
+        let eta = vec![0.0f64];
+        let mut kappas: Vec<Vec<f64>> = vec![vec![0.0; model.n_kappa]; n_occ];
+        let mut scratch = EventPkParams::default();
+
+        let marginal = subject_nll(
+            &model,
+            subject,
+            &params.theta,
+            &eta,
+            &kappas,
+            &params.omega,
+            Some(omega_iov),
+            &params.sigma.values,
+            &mut scratch,
+            None,
+        );
+        // The class-1 value the single-class kernel would score against.
+        let class1 = {
+            let _g = MixtureClassGuard::enter(1);
+            individual_nll_iov(
+                &model,
+                subject,
+                &params.theta,
+                &eta,
+                &kappas,
+                &params.omega,
+                Some(omega_iov),
+                &params.sigma.values,
+            )
+        };
+        assert!(
+            (marginal - class1).abs() > 1e-6,
+            "test is only meaningful when the marginal and class 1 differ ({marginal} vs {class1})"
+        );
+
+        // Zero-scale proposal: κ is unchanged, so every step must accept with the
+        // baseline returned untouched — i.e. the kernel's own evaluation of the
+        // proposal is the marginal, not `class1`.
+        let mut rng = StdRng::seed_from_u64(7);
+        let (na, np, nll_out) = mh_kappa_steps_mixture(
+            &mut kappas,
+            marginal,
+            subject,
+            &model,
+            &params.theta,
+            &eta,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            0.0,
+            &mut rng,
+            &mut scratch,
+        );
+        assert_eq!((na, np), (n_occ, n_occ));
+        assert!(
+            (nll_out - marginal).abs() < 1e-12,
+            "zero-step κ move must return the marginal baseline, got {nll_out} vs {marginal}"
+        );
+
+        // Live proposal: whatever the accept/reject pattern, the returned NLL must
+        // be the marginal *at the κ actually held* when the kernel returns.
+        let mut rng = StdRng::seed_from_u64(11);
+        let (_, _, nll_out) = mh_kappa_steps_mixture(
+            &mut kappas,
+            marginal,
+            subject,
+            &model,
+            &params.theta,
+            &eta,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            0.5,
+            &mut rng,
+            &mut scratch,
+        );
+        let recomputed = subject_nll(
+            &model,
+            subject,
+            &params.theta,
+            &eta,
+            &kappas,
+            &params.omega,
+            Some(omega_iov),
+            &params.sigma.values,
+            &mut scratch,
+            None,
+        );
+        assert!(
+            (nll_out - recomputed).abs() < 1e-9,
+            "returned NLL must be the marginal at the retained κ ({nll_out} vs {recomputed})"
+        );
+    }
+
+    /// A short Bayes run on an IOV mixture completes and estimates non-zero κ.
+    #[test]
+    fn bayes_iov_mixture_fit_runs() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
+        let pop = mix_iov_pop();
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Bayes;
+        opts.run_covariance_step = false;
+        opts.bayes_warmup = 10;
+        opts.bayes_iters = 10;
+        opts.bayes_chains = 1;
+        opts.bayes_seed = Some(3);
+        let res =
+            crate::api::fit(&model, &pop, &model.default_params, &opts).expect("bayes IOV mixture");
+        assert!(res.ofv.is_finite());
+        assert!(res.subjects.iter().all(|s| s.mixest.is_some()));
+    }
+
+    /// HMC is unavailable for a mixture (its Dual2 gradient is single-class), so an
+    /// explicit `saem_n_leapfrog > 0` must warn rather than silently downgrade to
+    /// the MH kernel while reporting `n_divergent = 0` (#985).
+    #[test]
+    fn bayes_mixture_warns_when_hmc_requested() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Bayes;
+        opts.run_covariance_step = false;
+        opts.bayes_warmup = 5;
+        opts.bayes_iters = 5;
+        opts.bayes_chains = 1;
+        opts.bayes_seed = Some(4);
+        opts.saem_n_leapfrog = 4;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("bayes fit");
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("saem_n_leapfrog") && w.contains("mixture")),
+            "expected an HMC-downgrade warning, got: {:?}",
+            res.warnings
+        );
+    }
+
+    /// Bayes rejects a mixture that declares per-class Ω/Σ overrides (Ω/Σ are
+    /// class-shared under the conjugate Ω block) with a clear error (#985).
+    #[test]
+    fn bayes_rejects_per_class_overrides() {
+        const OV: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  omega(2) ETA_CL ~ 0.15
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(OV).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Bayes;
+        let err = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("per-class overrides under Bayes must be rejected");
+        assert!(
+            err.contains("per-class Omega/Sigma overrides") && err.contains("bayes"),
+            "got: {err}"
+        );
+
+        // Same rejection in a method chain, raised by the `fit()` mixture gate
+        // *before* any stage runs — so `method = [focei, bayes]` does not burn a
+        // full FOCEI fit only to fail at the hand-off (#985).
+        let mut chain_opts = FitOptions::default();
+        chain_opts.methods = vec![
+            crate::types::EstimationMethod::FoceI,
+            crate::types::EstimationMethod::Bayes,
+        ];
+        let err = crate::api::fit(&model, &pop, &model.default_params, &chain_opts)
+            .expect_err("per-class overrides in a bayes chain must be rejected");
+        assert!(
+            err.contains("per-class Omega/Sigma overrides"),
+            "got: {err}"
+        );
     }
 }

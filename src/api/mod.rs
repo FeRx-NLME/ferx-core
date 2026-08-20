@@ -231,6 +231,10 @@ mod sde_integration;
 mod multi_start_tests;
 
 #[cfg(test)]
+#[path = "tests/tests_mixture_postfit.rs"]
+mod tests_mixture_postfit;
+
+#[cfg(test)]
 #[path = "tests/tests_sdtab_tv_cov.rs"]
 mod tests_sdtab_tv_cov;
 

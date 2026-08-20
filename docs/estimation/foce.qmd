@@ -53,6 +53,30 @@ This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and
 
 If the EBE search wanders into a region where the individual NLL evaluates to a non-finite value (for example, an ODE model whose integration blows up at extreme $\eta$), that point is treated as the worst possible objective rather than aborting the fit. The subject is reported as non-converged and estimation continues for the remaining subjects.
 
+**Runaway EBEs are re-checked (#958).** A subject's inner search can be led somewhere its
+own objective does not actually have a minimum, and then stop there: once the steps are noise
+rather than descent the objective stops improving and the gradient norm plateaus, which is
+exactly what the convergence test looks for. The usual cause is a **finite-difference** inner
+gradient on an objective whose value carries the ODE solver's local error. That error is
+normally far below the signal being differenced, but a prediction driven toward zero under a
+proportional error model has its residual variance clamped to the floor, and the resulting
+`(y − f)² / R` term amplifies solver noise by many orders of magnitude — enough for the FD
+gradient to come back with the wrong sign. No FD step size repairs that: too small and it is
+noise, too large and it truncates on a very curved objective.
+
+So whenever the returned η̂ sits further than about ten prior standard deviations per random
+effect from the prior mean (measured as `ηᵀΩ⁻¹η`, the prior's own metric), the inner loop
+re-solves derivative-free from the prior mean and keeps whichever point has the **lower**
+objective. The check can only improve the objective — a genuinely extreme EBE that a
+derivative-free search cannot beat is the objective's own minimum and is returned unchanged —
+so fits whose inner loop was already right are unaffected.
+
+The practical guidance is unchanged: leave `gradient_method` at its default `auto`. The
+analytic route differentiates the *same* integration it predicts from, so it has no
+differencing step to be swamped and is immune to this failure mode; `gradient_method = fd` on
+a model with near-zero predictions is accuracy-limited by `ode_abstol`, not by the step size.
+
+
 ### Gradient accuracy vs cost (reconverged EBEs)
 
 By default the population gradient holds each subject's EBEs ($\hat\eta$) and FOCE Hessian fixed while perturbing the population parameters — the *fixed-EBE* gradient. This is cheap, but it omits the response of the inner solution to $\theta$ and $\Omega$. On well-conditioned problems that omitted term is negligible and a gradient optimizer matches the derivative-free `bobyqa` (see [Outer Optimizers](optimizers.qmd)). On **ill-conditioned** problems it is not: the omitted term is what separates a true descent direction from a flat-looking plateau, and `slsqp` can report `converged` at an OFV far above the `bobyqa` optimum — which is exactly why the default `optimizer = auto` falls back to `bobyqa` on the FD-only fits where this bias bites.

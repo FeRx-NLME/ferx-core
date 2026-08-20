@@ -221,12 +221,44 @@ pub fn fit(
             );
         }
         for m in options.method_chain() {
-            if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
+            if !matches!(
+                m,
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::Saem
+                    | EstimationMethod::Bayes
+                    // IMP / IMPMAP run a class-partitioned MCEM (per-class IS
+                    // E-step + responsibility-weighted M-steps) when estimating,
+                    // and form the class-marginal `−2 Σ log Σ_k p_ik L_ik` on the
+                    // objective-evaluation (EONLY) path (#985). IOV, FREM, SDE
+                    // and per-class Ω/Σ overrides are refused inside
+                    // `run_mcem_mixture`.
+                    | EstimationMethod::Imp
+                    | EstimationMethod::Impmap
+            ) {
                 return Err(format!(
-                    "mixture models (#977) currently support only FOCE / FOCEI; the {} method \
-                     is not yet wired for mixtures",
+                    "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes / IMP / \
+                     IMPMAP; the {} method is not yet wired for mixtures (#985)",
                     m.label()
                 ));
+            }
+        }
+        // Per-class Omega/Sigma overrides under Bayes (#985): the Bayes Omega block
+        // is a single conjugate draw shared across classes, so `omega(k)`/`sigma(k)`
+        // cannot be honoured. `bayes.rs` re-checks this defensively, but reject it
+        // here — before any stage runs — so `method = [focei, bayes]` does not burn a
+        // full FOCEI fit only to fail at the hand-off.
+        if options.method_chain().contains(&EstimationMethod::Bayes) {
+            if let Some(mp) = init_params.mixture.as_ref() {
+                if !mp.omega_override_addr.is_empty() || !mp.sigma_override_addr.is_empty() {
+                    return Err(
+                        "Bayesian estimation (method = bayes) does not yet support per-class \
+                         Omega/Sigma overrides (omega(k)/sigma(k)) in a mixture; Omega/Sigma are \
+                         shared across classes. Fit with FOCE/FOCEI, or drop the per-class \
+                         overrides (#985)."
+                            .to_string(),
+                    );
+                }
             }
         }
         // Inter-occasion variability under a mixture (#985): the per-class inner
@@ -1305,15 +1337,28 @@ fn fit_inner(
             let prev = result.as_ref().expect(
                 "IMP stage: prior OuterResult must exist (synthesised above when standalone)",
             );
-            match crate::estimation::importance_sampling::run_importance_sampling(
-                model,
-                population,
-                &prev.params,
-                &prev.eta_hats,
-                &prev.h_matrices,
-                &prev.kappas,
-                &stage_opts,
-            ) {
+            // Mixture (#985): evaluate the class-marginal IS objective
+            // −2 Σ log Σ_k p_ik L_ik (per-class MAP + IS, combined), rather than
+            // the single-population marginal.
+            let is_call = if model.mixture.is_some() {
+                crate::estimation::importance_sampling::run_importance_sampling_mixture(
+                    model,
+                    population,
+                    &prev.params,
+                    &stage_opts,
+                )
+            } else {
+                crate::estimation::importance_sampling::run_importance_sampling(
+                    model,
+                    population,
+                    &prev.params,
+                    &prev.eta_hats,
+                    &prev.h_matrices,
+                    &prev.kappas,
+                    &stage_opts,
+                )
+            };
+            match is_call {
                 Ok(r) => {
                     // Surface a *separate* warning for any subject whose
                     // ESS-fraction collapsed to zero. These are already in
@@ -1449,15 +1494,22 @@ fn fit_inner(
                 let df = stage_opts.impmap_proposal_df;
                 marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
             }
-            match crate::estimation::importance_sampling::run_importance_sampling(
-                model,
-                population,
-                &r.params,
-                &r.eta_hats,
-                &r.h_matrices,
-                &r.kappas,
-                &marg_opts,
-            ) {
+            let marg_call = if model.mixture.is_some() {
+                crate::estimation::importance_sampling::run_importance_sampling_mixture(
+                    model, population, &r.params, &marg_opts,
+                )
+            } else {
+                crate::estimation::importance_sampling::run_importance_sampling(
+                    model,
+                    population,
+                    &r.params,
+                    &r.eta_hats,
+                    &r.h_matrices,
+                    &r.kappas,
+                    &marg_opts,
+                )
+            };
+            match marg_call {
                 Ok(is) => is_result = Some(is),
                 Err(e) => accumulated_warnings.push(if n_stages > 1 {
                     format!("[{}] marginal −2 log L eval skipped: {}", method.label(), e)
@@ -1503,7 +1555,14 @@ fn fit_inner(
         }
     }
 
-    // Compute per-subject diagnostics
+    // Compute per-subject diagnostics. For a mixture (#985) each subject's
+    // diagnostics are evaluated under its own MIXEST class: `result.eta_hats` are
+    // the winning class's EBEs, so predictions built with `MIXNUM` at the class-1
+    // default would mix a class-2 η̂ with class-1 typical values.
+    let mixest_classes: Option<Vec<usize>> = result
+        .mixture_posteriors
+        .as_ref()
+        .map(|mp| mp.mixest.clone());
     let mut subjects = compute_subject_results(
         model,
         population,
@@ -1512,6 +1571,7 @@ fn fit_inner(
         &result.h_matrices,
         &result.kappas,
         options.interaction,
+        mixest_classes.as_deref(),
     );
 
     // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto
@@ -1536,6 +1596,7 @@ fn fit_inner(
             &result.params.theta,
             &result.kappas,
             &mut subjects,
+            mixest_classes.as_deref(),
         );
     }
 

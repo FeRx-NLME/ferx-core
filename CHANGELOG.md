@@ -20,6 +20,46 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **IMP / IMPMAP estimation and objective evaluation for mixture models (#985).** Importance sampling
+  now both **estimates** a `[mixture]` model (`method = imp` / `impmap`) and **evaluates** its
+  class-marginal likelihood `−2 Σ log Σ_k p_ik L_ik` (`imp_eval_only`, NONMEM `METHOD=IMP EONLY=1`).
+  Estimation runs a class-partitioned MCEM: per subject and class it importance-samples η under the
+  `MIXNUM` guard, forms the responsibilities `PMIX_ik ∝ p_ik L_ik`, and runs responsibility-weighted
+  M-steps for the mixing coefficients, the class-shared Ω, and the class-switched typical values.
+  Objective evaluation combines the per-class IS marginals by log-sum-exp and matches NONMEM to well
+  under a Monte-Carlo SE (`−2 log L = 300.82 ± 0.06` vs NONMEM `300.87` on the two-class anchor).
+  Ω/σ are class-shared (per-class overrides rejected); IOV/FREM/SDE are not supported under the
+  mixture IMP paths, and a theta shared between the mixing expression and a structural typical value
+  is rejected (as under SAEM). The per-class draws use the same ISCALE pilot search and `impmap_mceta`
+  multi-start MAP as the single-population MCEM; objective evaluation reports a real per-subject ESS
+  (the worst ESS among the classes a subject loads on), so `imp_low_ess_threshold` and the
+  proposal-collapse warning apply to mixtures. `impmap_trace` and `impmap_auto` / `imp_auto` are not
+  wired for mixtures and now warn instead of being silently ignored.
+- **Bayesian estimation for mixture models (#985).** `[mixture]` models can now be fit with
+  `method = bayes`. The latent class is Rao-Blackwellised — marginalised out of every Gibbs block
+  rather than sampled — so each subject's likelihood contribution is the K-class marginal
+  `−log Σ_k p_ik·exp(−nll_ik)` and the sampler keeps a smooth continuous target. The η block samples
+  against the class-marginal posterior (HMC is disabled for mixtures; its analytic gradient is
+  single-class), the (θ,σ) block samples the mixing thetas (constant or covariate logit) with no extra
+  machinery, and Ω is drawn from its class-shared conjugate conditional. Reported OFV, per-subject
+  `MIXEST`/`PMIX`, and EBEs are the K-fold marginal values at the posterior mean. Per-class Ω/σ
+  overrides are rejected (Ω/σ are class-shared). Validated by recovering the mixture MLE under diffuse
+  priors (a direct NONMEM `METHOD=BAYES` reference is impractical — its sampler aborts on `$MIX` with
+  FIXed Ω/Σ). Inter-occasion variability is supported: the κ block samples against the same
+  class-marginal target. A run that asks for HMC (`saem_n_leapfrog > 0`) on a mixture now warns that
+  the Metropolis-Hastings η kernel was used instead, and a high R̂ on a mixture warns about label
+  switching, which would make the reported posterior mean an average across class labels.
+- **SAEM estimation for mixture models (#985).** `[mixture]` models can now be fit with
+  `method = saem`, not only FOCE/FOCEI. The E-step samples the latent class per subject (from the
+  current posterior `PMIX_i`) and runs the η-MCMC within the drawn class; the M-step estimates the
+  class-switched typical values (each from its own class members), the per-class Ω overrides, and the
+  mixing coefficients (constant *or* covariate-dependent logit mixing) from the sampled class
+  frequencies. Reported OFV, per-subject `MIXEST`/`PMIX`, and standard errors come from the K-fold
+  mixture marginal, matching FOCEI. Cross-checked against NONMEM `METHOD=SAEM` (estimates agree to
+  ≤ 3 %). A mixing theta marked `FIX` is honoured; a theta shared between the mixing expression and a
+  structural typical value is rejected with a clear error. Per-class σ overrides (`sigma(k)`) are held
+  at their initial values under SAEM (with a warning, and reported with SE 0 like other fixed
+  parameters) — route those to FOCEI.
 - **Inter-occasion variability under a mixture (#985).** A `[mixture]` model may now also carry a
   `kappa` (inter-occasion variability) term — the two features compose, where before `fit()` rejected
   the combination. Each class's per-subject inner solve estimates the per-occasion κ̂ under that
@@ -96,6 +136,32 @@ section of the SDLC for the versioning policy).
   requires the fit to have left its starting point. A stalled fit that booked one small objective
   improvement and then went flat previously satisfied the rule and was flagged `converged`, which
   also handed the covariance step a non-stationary point.
+- **Inner EBE no longer certifies a runaway mode, so the FOCE/FOCEI objective is
+  gradient-path-independent (#958).** On a model where a prediction is driven toward zero under
+  proportional error, that observation's variance is clamped to the floor and its residual term
+  amplifies the ODE solver's local error by ~1e8 — enough for the *finite-difference* inner
+  gradient to come back with the wrong sign. The inner search then walked tens of prior SDs away
+  from η = 0 and accepted the point it landed on, because a noise-driven search satisfies the
+  objective-stall convergence test exactly like a converged one. `gradient = fd` and
+  `gradient = auto` therefore reported different objectives for the same model at the same
+  estimates, which made ΔOFV/ΔAIC model selection depend on the gradient route. The inner loop now
+  re-solves derivative-free from the prior mean whenever the returned EBE's Mahalanobis distance
+  `ηᵀΩ⁻¹η` exceeds 10 prior SDs per random effect, and keeps whichever point has the lower
+  objective. On the reported reproducer the first-evaluation objective goes from `fd` 6082.24 /
+  `auto` −5.478 to −5.479 / −5.478, and both routes now recover the simulating parameters. The
+  analytic (`Dual2`) sensitivities were correct throughout — verified against finite differences of
+  the predictor to 2.6e-7 — so `gradient = auto`, the default, was never affected.
+- **`gradient` option error no longer advertises the retired `ad` route (#958).** The parse-time
+  message for an unknown `gradient` value listed `'auto'`, `'ad'`, or `'fd'`, but no fit accepts
+  `ad` — the Enzyme automatic-differentiation path was retired in #428 and the engine rejects it —
+  so a mistyped option pointed users at a setting that cannot work. The message now lists only
+  `'auto'` and `'fd'`. Writing `gradient = ad` still parses, so it continues to reach the engine's
+  specific "no longer supported" error rather than a generic one.
+- **Per-subject diagnostics now honour `MIXEST` in a mixture fit (#985).** `IPRED`, `PRED`,
+  `IWRES`, `CWRES`, `EBE_OFV`, and `[derived]`/`[output]` columns were computed with `MIXNUM`
+  pinned to class 1 for every subject, even for subjects the fit assigned to another class — so a
+  class-2 subject's sdtab row paired its class-2 EBEs with class-1 typical values. They are now
+  evaluated in each subject's fitted class. Affects FOCE/FOCEI, SAEM, Bayes, and estimating IMP/IMPMAP mixture fits.
 - **Mixture covariance-step and diagnostics correctness (#984, follow-up to #983).** Five fixes to
   the mixture SE/covariance and checkpoint paths: (1) the covariance step now reconverges its per-class EBEs at
   `cov_inner_tol`, not the fit's `inner_tol`, so a loose fit followed by a tight `cov_inner_tol` for
