@@ -1055,6 +1055,14 @@ mod tests;
 #[path = "elbo_oracle.rs"]
 mod oracle_tests;
 
+/// The bound property against AGQ (`VI_VALIDATION.md` Anchor A). Separate from
+/// `oracle_tests` because it covers the case that oracle structurally cannot: a
+/// posterior the variational family is *unable* to represent, so the bound gap is
+/// genuinely nonzero — see the module docs.
+#[cfg(test)]
+#[path = "elbo_agq_bound.rs"]
+mod agq_bound_tests;
+
 // ---------------------------------------------------------------------------
 // ELBO tightness diagnostic
 // ---------------------------------------------------------------------------

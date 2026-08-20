@@ -95,6 +95,20 @@ or, for an importance-sampling `−2 log L` with the full IS diagnostics:
 
 The chain is the recommended way to finish a VI fit for a model you intend to report.
 
+### The bound is verified, not assumed
+
+`−2·ELBO ≥ −2 log p(y)` is a theorem, but an implementation can still violate it. It is
+checked per subject against adaptive Gauss–Hermite quadrature — which reproduces NONMEM
+`LAPLACIAN` to six significant figures, and is itself pinned to a closed-form marginal at
+machine precision on a linear-Gaussian fixture — over a sweep of deliberately-wrong `q`s, in
+one and two `η` dimensions, for both the ELBO formula and the number `FitResult$vi$neg_two_elbo`
+reports. See `src/estimation/vi/elbo_agq_bound.rs`.
+
+Worth knowing what that does *not* cover, since the bound is one-sided: an objective that came
+out too *large* would satisfy it more comfortably, so it is paired with a two-sided check of
+the Monte-Carlo ELBO against a deterministic quadrature ELBO, and an exact comparison of the
+closed-form KL.
+
 ## Options
 
 All keys go in `[fit_options]`.

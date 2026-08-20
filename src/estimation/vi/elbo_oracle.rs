@@ -887,3 +887,90 @@ fn fixed_eta_nll_agrees_with_the_conditional_mode_objective_under_ltbs() {
         "fixture must actually reach negative log-predictions, else it proves nothing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Calibration for the AGQ bound check (`elbo_agq_bound.rs`)
+// ---------------------------------------------------------------------------
+
+/// Adaptive Gauss–Hermite quadrature reproduces the **exact** marginal on this
+/// fixture, in the *same additive-constant convention* the ELBO uses.
+///
+/// This is the hinge the `−2·ELBO ≥ −2 log p(y)` check in `elbo_agq_bound.rs` hangs
+/// on. There, AGQ stands in for the true marginal on models where no closed form
+/// exists — so if its constant convention differed from the ELBO's by even
+/// `n_obs·log 2π` (≈ 18.4 here), every bound comparison would carry a fixed offset and
+/// would say nothing about correctness. Here the answer *is* known in closed form, so
+/// the two conventions agreeing is checkable rather than assumed.
+///
+/// # Why 3 nodes is exact and 11 is not
+///
+/// `p(y, η)` is `exp(quadratic in η)` for this model, and adaptive GH centres its grid
+/// at the mode and scales it by the posterior Hessian, so the transformed integrand is
+/// `const · e^{−z²}` — which any rule with ≥ 2 nodes integrates exactly, independently
+/// of how well the Hessian was estimated. Hence machine precision at 3 and 5 nodes. The
+/// one-node rule has no such cancellation: it is Laplace, so it inherits the error in
+/// the finite-differenced Hessian, which is the `1e-6` below.
+///
+/// Beyond 5 nodes the agreement **degrades** — 4.0e-5 at 7 nodes, 1.4e-5 at 11 — and
+/// that is the *fixture* failing, not the quadrature. `η` enters this model additively
+/// (`CL = TVCL + ETA_CL`, the construction the module docs explain is what makes `log f`
+/// affine), so a wide grid drives `CL` toward and past zero: the half-width in `η` is
+/// `√2·z_max·σ_post ≈ 0.75` at 7 nodes and `1.04` at 11, against `TVCL = 1.0`. Once the
+/// prediction leaves the affine regime the model is no longer linear-Gaussian and the
+/// closed form above no longer describes it.
+///
+/// **Do not "improve" this test by raising the node count.** Wider is not tighter here;
+/// the node counts are chosen to stay inside the fixture's domain of validity.
+#[test]
+fn agq_marginal_matches_the_exact_linear_gaussian_marginal() {
+    let model = linear_gaussian_model();
+    let pop = oracle_population();
+    let params = model.default_params.clone();
+
+    // The posterior is Gaussian here, so its mode *is* its mean — no inner loop needed,
+    // and AGQ is handed the exact centre it would otherwise have to converge to.
+    let eta_hats: Vec<nalgebra::DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|s| nalgebra::DVector::from_vec(vec![exact_posterior(&s.observations).0]))
+        .collect();
+    let kappas: Vec<Vec<nalgebra::DVector<f64>>> = vec![Vec::new(); pop.subjects.len()];
+
+    let exact: f64 = pop
+        .subjects
+        .iter()
+        .map(|s| exact_neg_two_log_marginal(&s.observations))
+        .sum();
+
+    let agq_at = |n_nodes: usize| {
+        2.0 * crate::estimation::agq::agq_population_nll(
+            &model,
+            &pop,
+            &params,
+            &eta_hats,
+            &kappas,
+            n_nodes,
+            crate::types::HessianAnchor::Exact,
+        )
+    };
+
+    // One node is Laplace: exact for the integral, but scaled by an FD Hessian.
+    let rel_1 = (agq_at(1) - exact).abs() / exact.abs();
+    assert!(
+        rel_1 < 1e-6,
+        "AGQ(1 node) -2 log p(y) = {:.10}, exact = {exact:.10} (relative gap {rel_1:.3e})",
+        agq_at(1)
+    );
+
+    // Three and five nodes integrate the quadratic exactly, Hessian error and all.
+    for n_nodes in [3usize, 5] {
+        let agq = agq_at(n_nodes);
+        let rel = (agq - exact).abs() / exact.abs();
+        assert!(
+            rel < 1e-12,
+            "AGQ({n_nodes} nodes) -2 log p(y) = {agq:.14}, exact = {exact:.14} \
+             (relative gap {rel:.3e}); a rule spanning a quadratic integrand must be \
+             exact regardless of the Hessian it was scaled by"
+        );
+    }
+}
