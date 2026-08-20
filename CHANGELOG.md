@@ -19,6 +19,27 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **A dose attribute that is also read by the model is now an error (#993).** `F`,
+  `LAGTIME`/`ALAG` and the compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` are applied by the
+  engine **at the dose event**. A model that declares one and *also* references it in `[odes]`
+  (the RHS or an `init(...)` seed), the `[scaling]` readout, or the `[adaptive_dosing] observe`
+  controller signal was applying it twice — silently, and by exactly that factor: an
+  ODE model reading its own `F` produced every prediction scaled by `F`, and renaming the parameter
+  changed the fit by that amount with no diagnostic either way. This is now rejected at parse time
+  with `E_DOSE_ATTR_DOUBLE_USE`, naming both readings and the fix. `D{n}`/`R{n}` carry the same
+  reservation but are consulted only for a coded `RATE=-2`/`-1` dose, so that collision is reported
+  against the dataset (same code) and a model whose data never codes `RATE` is untouched. Reads from
+  `[derived]`/`[output]` are post-solve reporting and remain silent, as does an analytical model's
+  explicit `pk(..., f=F)` mapping. **Breaking** for a model that folds `F` into the absorption flux
+  — the pre-dose-entry convention the ODE docs' migration note describes, which until now computed
+  `F²` without complaint; the fix is to drop `F` from the right-hand side, or rename the parameter
+  if it was never bioavailability. Note this makes ferx **stricter than NONMEM**, which allows a
+  `$PK` `F1` to be referenced in `$DES` and quietly computes `F²` — so a mechanically translated
+  control stream can newly fail to parse even though it ran in NONMEM. Anchored on NONMEM 7.6.0:
+  two `ADVAN13` streams differing in one `$DES` line give predictions differing by exactly `F1`,
+  with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
+
 ### Added
 - **Class-aware mu-referencing for mixture models (#996).** A `MIXNUM`-switched typical value written
   as `CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)` is now recognised at parse

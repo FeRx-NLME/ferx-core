@@ -418,6 +418,72 @@ pub const PK_IDX_CV2: usize = 12;
 /// parameters routed here. Single source of truth so those sites can't drift.
 pub(crate) const RESERVED_PK_SLOTS: [usize; 2] = [PK_IDX_F, PK_IDX_LAGTIME];
 
+/// When the engine consumes a dose attribute, and therefore whether a model that
+/// *also* reads the same individual parameter can be diagnosed without a dataset
+/// in hand. See [`DoseAttrConsumption::of`] and issue #993.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoseAttrConsumption {
+    /// Applied to **every** dose that reaches the compartment, whatever the dataset
+    /// says: bioavailability (`F`, `F{n}`) scales the amount, absorption lag
+    /// (`LAGTIME`/`ALAG`, `ALAG{n}`/`LAGTIME{n}`) shifts the event time. A model
+    /// that also reads such a parameter on the prediction path applies it twice for
+    /// any dosed subject, so the parser can reject it outright.
+    EveryDose,
+    /// Consulted only when a dose carries a **coded `RATE`** — `D{n}` on `RATE=-2`
+    /// (modeled duration), `R{n}` on `RATE=-1` (modeled rate). On an ordinary
+    /// dataset the parameter is inert, so `R1` as a plain rate constant is a
+    /// perfectly correct model; the collision can only be judged with the data, in
+    /// [`crate::api::check_modeled_dose_rates`].
+    CodedRateOnly,
+}
+
+impl DoseAttrConsumption {
+    /// The dose-attribute meaning an `[individual_parameters]` name carries on an
+    /// ODE model, or `None` for an ordinary parameter. Returns the attribute, when
+    /// the engine consumes it, and the compartment it applies to (`None` for the
+    /// bare all-compartment forms).
+    ///
+    /// The engine applies these at the **dose event**, never through the `[odes]`
+    /// RHS, so they are the one class of parameter that is load-bearing while
+    /// textually absent — which is why the "computed but never used" census exempts
+    /// them. The flip side is that a model which *also* reads one on the prediction
+    /// path gets it applied twice, silently (#993). Single source of truth for both
+    /// halves: the census exemption and the double-use diagnostic.
+    ///
+    /// `slot` is the parameter's `ode_param_slots` assignment. That is what makes a
+    /// **bare** `F`/`LAGTIME`/`ALAG` a dose attribute — the name alone is not
+    /// enough, since the routing is what binds it to [`PK_IDX_F`] /
+    /// [`PK_IDX_LAGTIME`]. Pass `None` for an analytical model, whose parameters
+    /// take no such slot; the compartment-indexed forms are recognised by name
+    /// through [`DoseAttr::from_indexed_name`] on either engine.
+    ///
+    /// Deliberately **not** a list of forbidden names: `F` and `LAGTIME` are the
+    /// correct spellings for what they mean, and `D{n}`/`R{n}` are what a NONMEM
+    /// user reaches for. The name is fine; the name read as something *else* in the
+    /// same model is the defect (#995).
+    pub fn of(name: &str, slot: Option<usize>) -> Option<(DoseAttr, Self, Option<usize>)> {
+        // Bare `F` / `LAGTIME` / `ALAG`: a dose attribute only because
+        // `ode_param_slots` routed it to a reserved slot. Keyed off the real routing
+        // rather than the name so it cannot drift from `ode_param_slots`.
+        if let Some(s) = slot {
+            if s == PK_IDX_F {
+                return Some((DoseAttr::F, Self::EveryDose, None));
+            }
+            if s == PK_IDX_LAGTIME {
+                return Some((DoseAttr::Lag, Self::EveryDose, None));
+            }
+        }
+        // Compartment-indexed `F{n}` / `ALAG{n}` / `LAGTIME{n}` / `D{n}` / `R{n}`,
+        // via the same predicate that builds `DoseAttrMap`.
+        let (attr, cmt) = DoseAttr::from_indexed_name(name)?;
+        let when = match attr {
+            DoseAttr::F | DoseAttr::Lag => Self::EveryDose,
+            DoseAttr::Duration | DoseAttr::Rate => Self::CodedRateOnly,
+        };
+        Some((attr, when, Some(cmt)))
+    }
+}
+
 /// A dose-modifying attribute that NONMEM keys by **compartment** — `Fn`
 /// (bioavailability), `ALAGn` (absorption lag), `Dn` (modeled infusion
 /// *duration*, `RATE=-2`), `Rn` (modeled infusion *rate*, `RATE=-1`). A dose
@@ -463,9 +529,40 @@ pub struct DoseAttrMap {
     /// single-route / bare-`F`/`lagtime` model, where every lookup falls through
     /// to the reserved slot.
     indexed: HashMap<(DoseAttr, usize), usize>,
+    /// The entries whose parameter is **also** read on the model's prediction path
+    /// (`[odes]` RHS / `[scaling]` readout), carrying the parameter's name for the
+    /// diagnostic. Only `Duration`/`Rate` ever land here: an `F{n}`/`ALAG{n}` in the
+    /// same position is already a parse error, since those apply to *every* dose,
+    /// whereas a `D{n}`/`R{n}` is inert unless the data codes `RATE=-2`/`-1`. That
+    /// makes the collision data-dependent, so it is judged in
+    /// `api::validation::check_modeled_dose_rates` rather than by the parser (#993).
+    prediction_path_reads: HashMap<(DoseAttr, usize), String>,
 }
 
 impl DoseAttr {
+    /// Short noun for this attribute, for diagnostics ("bioavailability", …).
+    /// Kept beside [`DoseAttrConsumption::of`] so a message can never name one
+    /// attribute and describe another.
+    pub fn noun(self) -> &'static str {
+        match self {
+            DoseAttr::F => "bioavailability",
+            DoseAttr::Lag => "absorption lag",
+            DoseAttr::Duration => "modeled infusion duration",
+            DoseAttr::Rate => "modeled infusion rate",
+        }
+    }
+
+    /// What the engine does with it at the dose event, phrased to complete
+    /// "the engine already …".
+    pub fn applied_as(self) -> &'static str {
+        match self {
+            DoseAttr::F => "scales each dose amount by it",
+            DoseAttr::Lag => "delays each dose event by it",
+            DoseAttr::Duration => "uses it as the infusion duration (RATE=-2)",
+            DoseAttr::Rate => "uses it as the infusion rate (RATE=-1)",
+        }
+    }
+
     /// Recognise a compartment-indexed dose-attribute parameter name, returning
     /// `(attr, 1-based compartment)`. Case-insensitive; the numeric suffix must
     /// be a positive integer (so `F0` is *not* an attribute, and bare `F` /
@@ -524,6 +621,24 @@ impl DoseAttrMap {
     /// Record that compartment `cmt`'s `attr` is held in PkParams `slot`.
     pub fn insert(&mut self, attr: DoseAttr, cmt: usize, slot: usize) {
         self.indexed.insert((attr, cmt), slot);
+    }
+
+    /// Record that `name` — the `D{cmt}`/`R{cmt}` parameter for `attr` — is also
+    /// read on the prediction path, so a coded-`RATE` dose that lands on it can be
+    /// reported as a double use once the data is known (#993). Recording is
+    /// unconditional and cheap; whether it *matters* depends on the dataset, which
+    /// is why nothing here rejects.
+    pub fn mark_prediction_path_read(&mut self, attr: DoseAttr, cmt: usize, name: &str) {
+        self.prediction_path_reads
+            .insert((attr, cmt), name.to_string());
+    }
+
+    /// The parameter name for `(attr, cmt)` when it is read on the prediction path,
+    /// else `None`. See [`Self::mark_prediction_path_read`].
+    pub fn prediction_path_read(&self, attr: DoseAttr, cmt: usize) -> Option<&str> {
+        self.prediction_path_reads
+            .get(&(attr, cmt))
+            .map(String::as_str)
     }
 
     /// `true` when no compartment-indexed attribute is recorded — the common
@@ -3228,6 +3343,17 @@ impl CompiledModel {
         match &self.ode_spec {
             Some(ode) => &ode.dose_attr_map,
             None => &self.dose_attr_map,
+        }
+    }
+
+    /// Mutable [`Self::active_dose_attr_map`], for the parser to annotate the map
+    /// after both engines' maps have been built — currently only
+    /// [`DoseAttrMap::mark_prediction_path_read`] (#993), which is discovered when
+    /// `[scaling]` is parsed, after the ODE spec already exists.
+    pub(crate) fn active_dose_attr_map_mut(&mut self) -> &mut DoseAttrMap {
+        match &mut self.ode_spec {
+            Some(ode) => &mut ode.dose_attr_map,
+            None => &mut self.dose_attr_map,
         }
     }
 

@@ -97,6 +97,52 @@ fn missing_covariate_is_reported_with_data() {
 }
 
 #[test]
+fn dose_attr_double_use_is_reported_as_its_own_code() {
+    // #993. The whole point of minting a code instead of leaving this as `E_PARSE`
+    // is that a consumer (`ferxtranslate`, ferx-r) can act on it without matching
+    // prose — but the mapping itself keys off a prose substring, so it needs a test
+    // or a reworded message silently downgrades every parse-time case to `E_PARSE`.
+    let model = temp_model(
+        "dose_attr_double_use",
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central * F
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid);
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_DOSE_ATTR_DOUBLE_USE");
+    // The message already opens with the block, so attaching one too would print it
+    // twice — the renderer prefixes whatever `block` it is given.
+    assert_eq!(d.block, None);
+    assert!(
+        d.message.starts_with("[odes]:") && d.message.contains("bioavailability"),
+        "{}",
+        d.message
+    );
+    let _ = std::fs::remove_file(&model);
+}
+
+#[test]
 fn no_data_means_no_covariate_check() {
     // Same model, but without --data the covariate check does not run, so the
     // model is structurally valid.

@@ -65,6 +65,7 @@ Optional fields are omitted entirely when absent (not emitted as `null`).
 | `E_SDE_INCOMPATIBLE` | error | An SDE (`[diffusion]`) model used with an incompatible method (`saem`, `gn`, `gn_hybrid`) or gradient setting. |
 | `E_IMP_CHAIN` | error | `imp` is mis-placed in a method chain — repeated, or (with `imp_eval_only = true`) not the terminal stage. The estimating `imp` may sit anywhere; an evaluation-only `imp` must be terminal. |
 | `E_OPTIMIZER_IOV` | error | `optimizer = trust_region` used with an IOV model (`n_kappa > 0`). |
+| `E_DOSE_ATTR_DOUBLE_USE` | error | A dose attribute the engine applies at the dose event is *also* read by the model, so its value is applied twice. `F`, `LAGTIME`/`ALAG`, `F{n}`/`ALAG{n}`/`LAGTIME{n}` are caught at parse time (message names `[odes]`, `[scaling]` or `[adaptive_dosing]`); `D{n}`/`R{n}` only when a coded `RATE=-2`/`-1` dose in the data lands on them. See [#993](https://github.com/FeRx-NLME/ferx-core/issues/993). |
 | `W_STEADY_STATE_II` | warning | SS=1 doses with missing / non-positive `II` (treated as non-SS). |
 | `W_STEADY_STATE_INFUSION` | warning | SS=1 infusion with `T_inf > II` (overlapping pulses; SS skipped). |
 | `W_SDE_RESET` | warning | EVID=3/4 resets under an SDE `[diffusion]` model are not honoured. |
