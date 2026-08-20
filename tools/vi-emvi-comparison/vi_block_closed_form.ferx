@@ -1,10 +1,16 @@
+# VI on the mixed omega, Omega by the closed-form ELBO maximizer -- the other route, and the
+# full_rank reference for the mean_field bound-looseness arm.
+#
+# See vi_block_adam.ferx for the structural-zero claim both routes are being checked against.
+# This file is also the baseline half of the second claim: vi_block_mean_field.ferx differs
+# from it in `vi_family` ALONE, so the ELBO difference between the two is attributable to the
+# variational family and nothing else.
 [parameters]
   theta TVCL(0.13, 0.001, 10.0)
   theta TVV(8.0, 0.1, 500.0)
   theta TVKA(1.0, 0.01, 50.0)
 
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
   omega ETA_KA ~ 0.30
 
   sigma PROP_ERR ~ 0.1 (sd)
@@ -29,5 +35,5 @@
   # (docs/estimation/vi.qmd, "How sigma is updated"). A comparison run must be converged or it
   # measures the stopping rule rather than the estimator.
   vi_mc_samples = 128
-  vi_omega_update = adam
+  vi_omega_update = closed_form
   vi_final_ofv = laplace

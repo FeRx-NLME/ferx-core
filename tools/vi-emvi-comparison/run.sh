@@ -51,17 +51,56 @@ Rscript tools/vi-emvi-comparison/emvi-compare.R
 # ci-fast is release-level optimisation without LTO. The shipped `release` profile uses fat
 # LTO, whose whole-program link dominates the wall clock for a one-off run like this.
 echo
-echo "=== ferx: FOCEI + VI (both omega routes) ==="
+echo "=== ferx: FOCEI + VI (diagonal omega, both omega routes; then mixed omega) ==="
 cargo build --profile ci-fast --bin ferx
-for m in warfarin_cmp vi_adam vi_closed_form; do
+# agq_ref first: it is the arbiter the rest are read against, and it is the cheapest arm.
+MODELS="agq_ref warfarin_cmp vi_adam vi_closed_form"
+# Part 2 (VI_VALIDATION.md 4.9): the mixed-omega arms. FERX_VI_DIAG_ONLY=1 skips them when
+# only the section-4.11 diagonal numbers are wanted -- they are four more multi-minute fits.
+if [ "${FERX_VI_DIAG_ONLY:-0}" != "1" ]; then
+  MODELS="$MODELS warfarin_block_cmp vi_block_adam vi_block_closed_form vi_block_mean_field"
+fi
+for m in $MODELS; do
   echo "--- $m ---"
   ( cd "$RESULTS" && "$REPO/target/ci-fast/ferx" \
       "$REPO/tools/vi-emvi-comparison/$m.ferx" --data "$REPO/data/warfarin.csv" \
       | tail -n 20 )
 done
 
+# ---- Claim (a): the structural zeros, read off the ferx fits -----------------------------
+# io/output.rs emits an `ETA_x__ETA_y:` entry for every omega pair with |cov| > 1e-15, so
+# ABSENCE of the ETA_KA pairs is a positive result, not missing output -- and the block's own
+# ETA_V__ETA_CL entry being present is what proves the emitter ran at all.
+if [ "${FERX_VI_DIAG_ONLY:-0}" != "1" ]; then
+  echo
+  echo "=== claim (a): structural zeros in the ferx mixed-omega fits ==="
+  # warfarin_block_cmp is in this loop on purpose: ferx's FOCEI does NOT honour the declared
+  # structure (it estimates the full lower triangle, n_parameters = 10 rather than 8), so it is
+  # EXPECTED to report NOT HELD while every VI arm reports HELD. Surfacing that every run beats
+  # burying it in a doc -- see warfarin_block_cmp.ferx and VI_VALIDATION.md 4.13.
+  for m in vi_block_adam vi_block_closed_form vi_block_mean_field warfarin_block_cmp; do
+    y="$RESULTS/$m-fit.yaml"
+    [ -f "$y" ] || { echo "$m: no fit YAML -- the fit did not finish"; continue; }
+    blk=$(grep -c 'ETA_V__ETA_CL:' "$y" || true)
+    ka=$(grep -cE 'ETA_KA__ETA_(CL|V):' "$y" || true)
+    if [ "$blk" -ge 1 ] && [ "$ka" -eq 0 ]; then
+      verdict="HELD (block covariance estimated, ETA_KA pairs absent)"
+    elif [ "$blk" -eq 0 ]; then
+      verdict="INCONCLUSIVE -- the block covariance is absent too, so nothing was emitted"
+    else
+      verdict="NOT HELD -- an ETA_KA off-diagonal was emitted"
+      [ "$m" = "warfarin_block_cmp" ] && verdict="$verdict (EXPECTED: FOCEI, see the .ferx header)"
+    fi
+    printf '  %-24s %s\n' "$m" "$verdict"
+  done
+fi
+
 echo
 echo "results in $RESULTS"
-echo "  emvi-results.rds        nlmixr2 estimates + per-subject q"
+echo "  emvi-results.rds        nlmixr2 estimates + per-subject q; block_* entries are Part 2"
 echo "  *-fit.yaml              ferx estimates; the vi: block carries eta_posterior"
-echo "interpretation: VI_VALIDATION.md section 4.11"
+echo "  vi_block_*-fit.yaml     mixed omega -- structural zeros and the mean_field bound"
+echo "  agq_ref-fit.yaml        near-exact AGQ reference -- the arbiter for both tools"
+echo "interpretation: VI_VALIDATION.md section 4.11 (diagonal), 4.13 (mixed omega)"
+echo
+echo "figures: Rscript tools/vi-emvi-comparison/plots.R   (FERX_VI_FIGS=<dir> to place them)"

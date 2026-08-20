@@ -23,6 +23,11 @@
 [fit_options]
   method = vi
   vi_family = full_rank
-  vi_mc_samples = 8
+  # 128 draws, not the default 8. The convergence rule stops when the ELBO's drift falls below
+  # its own Monte-Carlo noise floor, and at 8 draws it does so while real drift remains: on this
+  # model that left the fit 9.4 OFV short of AGQ. More draws, not more iterations, is the lever
+  # (docs/estimation/vi.qmd, "How sigma is updated"). A comparison run must be converged or it
+  # measures the stopping rule rather than the estimator.
+  vi_mc_samples = 128
   vi_omega_update = closed_form
   vi_final_ofv = laplace
