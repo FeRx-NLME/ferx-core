@@ -140,8 +140,17 @@ section of the SDLC for the versioning policy).
 ### Fixed
 - **Log-mu-referenced θ with a negative lower bound no longer takes the wrong closed-form update
   (#996).** Such a θ is packed on the identity scale, so the SAEM/IMP `log θ += mean(η)` shift was not
-  its EM optimum. It is now excluded from the closed-form channel and estimated by the numerical /
-  weighted M-step instead, with a warning naming it.
+  its EM optimum — it applied `θ += mean(η)` where the closed form means `θ *= exp(mean(η))`. It is
+  now excluded from the closed-form channel and estimated by the numerical / weighted M-step instead,
+  with a warning naming it, on the mixture *and* the single-population IMP/IMPMAP path.
+- **A collapsed mixture class no longer freezes its typical values (#996).** When no subject carried
+  any responsibility for a class, its class-aware mu-ref shift was undefined but the θ stayed pinned
+  out of the weighted M-step, so it could never move again for the rest of the fit. Those θ are now
+  left free for that iteration and the fit warns that the class received no responsibility mass.
+- **The "no associated ETA" advisory (#406) is no longer suppressed for mixture class thetas whose
+  class-aware shift is switched off (#996)** — under `mu_referencing = false`, for identity-packed θ,
+  or for a random effect with negligible variance those θ really are estimated by the
+  importance-weighted M-step alone, and the fit now says so.
 - **Fits no longer stall on their initial estimates under the default optimizer (#751).** A fit whose
   opening line search fails could previously quit a hair off its starting point — the user-ODE
   warfarin twin stopped 35 OFV units short of the optimum — and report the initial estimates, with

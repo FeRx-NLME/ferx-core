@@ -13723,6 +13723,79 @@ fn class_aware_mu_ref_success_emits_no_warning() {
 }
 
 #[test]
+fn class_aware_mu_ref_no_warning_for_a_class_switched_value_without_iiv() {
+    // A class-switched typical value the user deliberately gave no IIV is not a
+    // missed mu-ref: there is no eta to anchor, and advising them to add one
+    // would be wrong (#996 review).
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = TVCL1 * exp(ETA_CL)\n  V = if (MIXNUM == 1) TVV else TVV * 2.0",
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied")),
+        "an eta-free MIXNUM expression must not be flagged: {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_no_warning_for_an_intermediate_class_flag() {
+    // Same for an intermediate flag variable that merely reads MIXNUM.
+    let model = mixture_model_with_indiv(
+        2,
+        "  FLAG = if (MIXNUM == 1) 1.0 else 2.0\n  \
+         CL = TVCL1 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied")),
+        "a MIXNUM flag variable must not be flagged: {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_still_warns_when_an_eta_bearing_switch_fails_to_match() {
+    // The guard above must not swallow the real case: the expression carries an
+    // eta but is not a mu-ref chain, so the fallback warning still fires.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) + 1.0 else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert!(
+        model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied") && w.contains("CL")),
+        "expected the #996 fallback warning, got {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_duplicate_eta_keeps_the_last_like_detect_mu_refs() {
+    // Two class-aware assignments on the same eta: the mixture map must keep the
+    // *last*, matching `detect_mu_refs`' `insert`, so `MixtureSpec::mu_refs` and
+    // `CompiledModel::mu_refs` never name different anchors for one eta
+    // (#996 review).
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         CL = if (MIXNUM == 1) TVCL2 * exp(ETA_CL) else TVCL3 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL2".to_string(), "TVCL3".to_string()]),
+        "the last assignment wins"
+    );
+}
+
+#[test]
 fn non_mixture_model_has_no_spec() {
     let model = minimal_model_with_indiv("  CL = TVCL * exp(ETA_CL)\n  V = TVV");
     assert!(model.mixture.is_none());

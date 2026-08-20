@@ -941,9 +941,14 @@ pub fn prepare_frem(
     // weakly-identified fixed effects — see #406). Flag them now so the user can
     // add an ETA before fitting; ferx mu-references automatically.
     let mut warnings: Vec<String> = Vec::new();
+    // No class-aware mu-ref thetas are excluded here: conversion time does not
+    // know the estimator, `mu_referencing`, or the packing/IIV filters that decide
+    // whether the class-aware shift actually runs, so the advisory stays
+    // conservative and flags every ETA-less estimated parameter (#996 review).
     let no_eta = crate::estimation::impmap::non_fixed_thetas_without_eta(
         base_model,
         &base_model.default_params.theta_fixed,
+        &[],
     );
     if !no_eta.is_empty() {
         warnings.push(format!(

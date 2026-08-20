@@ -1558,13 +1558,28 @@ pub(crate) struct MixtureMuRefPair {
 /// across all classes. Additive (`THETA + ETA`) mu-refs are excluded for the
 /// same reason as in [`get_mu_ref_pairs`]: the closed-form shift is only valid
 /// on the log scale.
+///
+/// A theta is claimed by **at most one** pair. Two etas anchored to the same
+/// typical value (`CL = TVP*exp(ETA_CL)` and `V = TVP*exp(ETA_V)`) have no
+/// well-defined joint closed form — applying both shifts would move that θ twice
+/// in one iteration — so the first eta to claim a θ keeps it and any later pair
+/// that reuses it is dropped, leaving those θ to the numerical / weighted M-step
+/// (#996 review).
 pub(crate) fn get_mixture_mu_ref_pairs(model: &CompiledModel) -> Vec<MixtureMuRefPair> {
     let Some(spec) = model.mixture.as_ref() else {
         return Vec::new();
     };
     let k = spec.n_classes;
     let idx_of = |name: &str| model.theta_names.iter().position(|n| n == name);
-    let mut out = Vec::new();
+    let mut out: Vec<MixtureMuRefPair> = Vec::new();
+    let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut push_pair = |out: &mut Vec<MixtureMuRefPair>, pair: MixtureMuRefPair| {
+        if pair.theta_idx.iter().any(|t| claimed.contains(t)) {
+            return;
+        }
+        claimed.extend(pair.theta_idx.iter().copied());
+        out.push(pair);
+    };
     for (eta_idx, eta_name) in model.eta_names.iter().enumerate() {
         if let Some(m) = spec.mu_refs.iter().find(|m| &m.eta_name == eta_name) {
             if !m.log_transformed || m.theta_names.len() != k {
@@ -1578,7 +1593,7 @@ pub(crate) fn get_mixture_mu_ref_pairs(model: &CompiledModel) -> Vec<MixtureMuRe
             else {
                 continue;
             };
-            out.push(MixtureMuRefPair { eta_idx, theta_idx });
+            push_pair(&mut out, MixtureMuRefPair { eta_idx, theta_idx });
         } else if let Some(mu_ref) = model.mu_refs.get(eta_name) {
             if !mu_ref.log_transformed {
                 continue;
@@ -1586,10 +1601,13 @@ pub(crate) fn get_mixture_mu_ref_pairs(model: &CompiledModel) -> Vec<MixtureMuRe
             let Some(t) = idx_of(&mu_ref.theta_name) else {
                 continue;
             };
-            out.push(MixtureMuRefPair {
-                eta_idx,
-                theta_idx: vec![t; k],
-            });
+            push_pair(
+                &mut out,
+                MixtureMuRefPair {
+                    eta_idx,
+                    theta_idx: vec![t; k],
+                },
+            );
         }
     }
     out
@@ -2216,8 +2234,12 @@ pub fn run_saem(
     // sufficient statistic, not the weighting. IMP/IMPMAP, which importance-
     // samples within *every* class and weights by the responsibilities, does not
     // have this failure mode and does use the switched anchors.
+    //
+    // All of this is conditional on `mu_referencing`: with it off every θ goes
+    // through the numerical M-step by construction, so telling the user to switch
+    // estimator to get a closed-form shift they turned off is noise (#996 review).
     let mut mix_switched_skipped: Vec<usize> = Vec::new();
-    let mix_mu_ref_pairs: Vec<MixtureMuRefPair> = if saem_mix.is_some() {
+    let mix_mu_ref_pairs: Vec<MixtureMuRefPair> = if saem_mix.is_some() && options.mu_referencing {
         get_mixture_mu_ref_pairs(model)
             .into_iter()
             .filter(|p| p.theta_idx.iter().all(|&t| theta_packs_log_mask[t]))
@@ -2248,7 +2270,7 @@ pub fn run_saem(
         ));
     }
     let mut dropped_identity = dropped_identity;
-    if saem_mix.is_some() {
+    if saem_mix.is_some() && options.mu_referencing {
         for p in get_mixture_mu_ref_pairs(model) {
             if p.theta_idx.iter().any(|&t| !theta_packs_log_mask[t]) {
                 dropped_identity.extend(p.theta_idx.iter().copied());
@@ -2257,7 +2279,9 @@ pub fn run_saem(
         dropped_identity.sort_unstable();
         dropped_identity.dedup();
     }
-    if !dropped_identity.is_empty() {
+    // Same gate: the identity-packing advisory is about a closed-form update that
+    // does not run at all under `mu_referencing = false` (#996 review).
+    if !dropped_identity.is_empty() && options.mu_referencing {
         let names: Vec<&str> = dropped_identity
             .iter()
             .map(|&t| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
@@ -3716,6 +3740,37 @@ mod tests {
     }
 
     #[test]
+    fn saem_mixture_mu_referencing_off_suppresses_the_muref_advisories() {
+        // With mu_referencing off every θ goes through the numerical M-step by
+        // construction, so advising the user to switch estimator to get a
+        // closed-form shift they turned off is noise (#996 review).
+        let model = mix996_model("TVV * exp(ETA_V)");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(996);
+        opts.run_covariance_step = false;
+        opts.mu_referencing = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("MIXNUM-switched typical value")),
+            "no switched-theta advisory with mu_referencing off, got {:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("packed on the identity scale")),
+            "no identity-pack advisory with mu_referencing off, got {:?}",
+            res.warnings
+        );
+    }
+
+    #[test]
     fn saem_mixture_without_shared_mu_ref_stays_on_numerical_mstep() {
         // Only the class-switched CL is mu-ref-shaped; V carries no ETA. SAEM
         // takes no closed-form pair, so the whole θ/σ M-step stays numerical.
@@ -4067,6 +4122,61 @@ mod tests {
                     theta_idx: vec![2, 2, 2]
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn mixture_mu_ref_pairs_drop_a_theta_claimed_by_a_second_eta() {
+        // Two etas anchored to the same typical value: the shift loops apply one
+        // update per pair, so keeping both would move TVCL twice in a single
+        // iteration. The first eta keeps it; the second pair is dropped (#996
+        // review).
+        let m = model_with_mixture_mu_refs(
+            &["TVCL", "TVV"],
+            &["ETA_CL", "ETA_V"],
+            &[("ETA_CL", "TVCL", true), ("ETA_V", "TVCL", true)],
+            2,
+            &[],
+        );
+        let pairs = get_mixture_mu_ref_pairs(&m);
+        assert_eq!(
+            pairs,
+            vec![MixtureMuRefPair {
+                eta_idx: 0,
+                theta_idx: vec![0, 0]
+            }]
+        );
+        // Every theta is claimed at most once across the whole pair set.
+        let mut all: Vec<usize> = pairs
+            .iter()
+            .flat_map(|p| p.theta_idx.iter().copied())
+            .collect();
+        all.sort_unstable();
+        let n = all.len();
+        all.dedup();
+        assert_eq!(all.len(), 1, "theta claimed once, got {n} slots");
+    }
+
+    #[test]
+    fn mixture_mu_ref_pairs_drop_a_partially_overlapping_class_anchor_set() {
+        // ETA_CL claims TVCL1/TVCL2; ETA_V's class anchors reuse TVCL2, so its
+        // whole pair is dropped rather than double-shifting that theta.
+        let m = model_with_mixture_mu_refs(
+            &["TVCL1", "TVCL2", "TVV1"],
+            &["ETA_CL", "ETA_V"],
+            &[],
+            2,
+            &[
+                ("ETA_CL", vec!["TVCL1", "TVCL2"]),
+                ("ETA_V", vec!["TVV1", "TVCL2"]),
+            ],
+        );
+        assert_eq!(
+            get_mixture_mu_ref_pairs(&m),
+            vec![MixtureMuRefPair {
+                eta_idx: 0,
+                theta_idx: vec![0, 1]
+            }]
         );
     }
 

@@ -719,18 +719,23 @@ fn detect_mixture_mu_refs(
             continue;
         }
         // One eta can only carry one class-aware anchor set; a second assignment
-        // to the same eta is ambiguous, so keep the first and skip the rest.
-        if out
-            .iter()
-            .any(|m: &crate::types::MixtureMuRef| m.eta_name == eta_names[eta_idx])
-        {
-            continue;
-        }
-        out.push(crate::types::MixtureMuRef {
+        // to the same eta is ambiguous. Keep the **last**, matching
+        // `detect_mu_refs`' `result.insert` — otherwise `MixtureSpec::mu_refs` and
+        // `CompiledModel::mu_refs` would name different anchors for the same eta
+        // and `get_mixture_mu_ref_pairs`, which prefers the spec, would silently
+        // disagree with every `mu_refs` consumer (#996 review).
+        let entry = crate::types::MixtureMuRef {
             eta_name: eta_names[eta_idx].clone(),
             theta_names: theta_idx.iter().map(|&t| theta_names[t].clone()).collect(),
             log_transformed,
-        });
+        };
+        match out
+            .iter_mut()
+            .find(|m: &&mut crate::types::MixtureMuRef| m.eta_name == entry.eta_name)
+        {
+            Some(existing) => *existing = entry,
+            None => out.push(entry),
+        }
     }
     out
 }
@@ -2477,11 +2482,19 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // A `MIXNUM`-switched typical value that did *not* yield a class-aware
     // mu-ref falls back to the purely numerical M-step under SAEM/IMP, which is
     // the slowest-converging channel. Say so rather than degrading silently.
+    //
+    // Only eta-carrying expressions qualify: a class-switched typical value with
+    // no IIV (`V = if (MIXNUM == 1) TVV1 else TVV2`) or an intermediate class flag
+    // (`FLAG = if (MIXNUM == 1) 1 else 2`) is not a missed mu-ref, and advising
+    // the user to add a random effect they deliberately omitted is wrong
+    // (#996 review).
     if let Some(ref mix) = model.mixture {
         let unmatched: Vec<String> = indiv_stmts
             .iter()
             .filter_map(|st| match st {
-                Statement::Assign(name, expr) if expr_uses_mixnum(expr) => Some((name, expr)),
+                Statement::Assign(name, expr) if expr_uses_mixnum(expr) && expr_uses_eta(expr) => {
+                    Some((name, expr))
+                }
                 _ => None,
             })
             .filter(|(_, expr)| detect_mixture_pattern(expr, mix.n_classes).is_none())

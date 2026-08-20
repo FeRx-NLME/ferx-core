@@ -234,7 +234,16 @@ a chain of `MIXNUM == k` branches whose arms are all `THETA_k * exp(ETA)` (or
 `exp(log(THETA_k) + ETA)`) on the **same** ETA — and resolves one anchor theta
 per class. Anything else (mixed anchors, a different ETA per arm, an additive
 arm, a non-`MIXNUM` condition, an out-of-range class) falls back to the numerical
-M-step, and the parser says so in a warning rather than degrading silently.
+M-step, and the parser says so in a warning rather than degrading silently. The
+warning is only raised for expressions that actually carry an ETA: a
+class-switched typical value written without IIV (`V = if (MIXNUM == 1) TVV1 else
+TVV2`) or an intermediate `MIXNUM` flag variable is not a missed mu-reference and
+is left alone.
+
+Each anchor theta belongs to **one** η. If two η are written against the same
+typical value, only the first keeps the closed-form shift — applying both would
+move that θ twice per iteration — and the other η's θ go to the numerical /
+weighted M-step.
 
 What each estimator does with that anchor set differs, and the difference is
 empirical:
@@ -261,6 +270,25 @@ estimators and restores the pre-#996 behaviour (every θ through the numerical /
 weighted M-step). Note that for a **single-population** IMP/IMPMAP fit the
 closed-form shift is EM-mandatory and stays on regardless of that option; only
 the mixture path is switchable.
+
+Two further conditions turn an individual θ's shift off, on either path, each with
+a warning naming the parameter:
+
+- **A θ declared with a negative lower bound** is packed on the identity scale, so
+  `log θ += mean(η)` would apply `θ += mean(η)` where the closed form means
+  `θ *= exp(mean(η))`. Give the parameter a non-negative lower bound to keep the
+  closed-form update.
+- **A class that receives no responsibility mass** in an iteration has no
+  per-class η mean to shift with. Its θ is handed back to the weighted M-step for
+  that iteration rather than held fixed, and the fit warns at the end; a class
+  that collapses this way usually means the mixture is over-specified.
+
+When the class-aware shift is off for a class θ — by any of these routes, or by
+`mu_referencing = false` — that θ is estimated by the importance-weighted M-step
+alone, which is biased for weakly-identified parameters ([#406]). IMP/IMPMAP fits
+say so in a warning; cross-check such a fit against FOCEI.
+
+[#406]: https://github.com/FeRx-NLME/ferx-core/issues/406
 
 Under **IOV**, the per-occasion κ is sampled inside each subject's drawn class —
 under that class's `MIXNUM` branch and its Ω/Σ — so a class-switched typical
