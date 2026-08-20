@@ -1934,10 +1934,12 @@ fn test_cap_scaled_gradient_clamps_wide_bounds_to_unit_budget() {
     assert_eq!(g[1], 0.0);
 }
 
-/// [`should_cap_gradient`] gates the overshoot cap per-algorithm (#960):
+/// [`should_cap_gradient`] gates the overshoot cap per-algorithm (#960, #751):
 ///   - SLSQP: cap every eval (QP re-solves from the current Hessian).
-///   - L-BFGS: cap only the first gradient eval (`n_grad_evals == 1`); a
-///     blanket cap would corrupt the `(s, y)` curvature pairs it builds from
+///   - L-BFGS: cap the first gradient eval always, and later evals only on the
+///     stall-retry pass (`hold_cap_at_init`), which `optimize_nlopt` runs when
+///     the default attempt never left its initial estimates. Holding the cap on
+///     by default would corrupt the `(s, y)` curvature pairs L-BFGS builds from
 ///     gradient differences — the regression that blocked a uniform fix.
 ///   - MMA / BOBYQA: never capped here.
 #[test]
@@ -1945,19 +1947,165 @@ fn test_should_cap_gradient_per_algo_gating() {
     use crate::estimation::outer_optimizer::should_cap_gradient;
     use nlopt::Algorithm;
 
-    // SLSQP: every eval, including well past the first.
-    assert!(should_cap_gradient(Algorithm::Slsqp, 1));
-    assert!(should_cap_gradient(Algorithm::Slsqp, 5));
+    // SLSQP: every eval, including well past the first, moved or not.
+    assert!(should_cap_gradient(Algorithm::Slsqp, 1, true));
+    assert!(should_cap_gradient(Algorithm::Slsqp, 5, false));
 
-    // L-BFGS: first gradient eval only. `n_grad_evals == 1` is the first eval
-    // because `population_gradient` increments before returning.
-    assert!(should_cap_gradient(Algorithm::Lbfgs, 1));
-    assert!(!should_cap_gradient(Algorithm::Lbfgs, 2));
-    assert!(!should_cap_gradient(Algorithm::Lbfgs, 50));
+    // L-BFGS: the first gradient eval is always capped. `n_grad_evals == 1` is
+    // the first eval because `population_gradient` increments before returning.
+    assert!(should_cap_gradient(Algorithm::Lbfgs, 1, false));
+    assert!(should_cap_gradient(Algorithm::Lbfgs, 1, true));
+
+    // Later evals: capped only on the retry pass. The default pass leaves every
+    // later `(s, y)` pair built from uncapped gradients (#960); the retry keeps
+    // the identity-Hessian step tame for a fit that already stalled (#751).
+    assert!(!should_cap_gradient(Algorithm::Lbfgs, 2, false));
+    assert!(!should_cap_gradient(Algorithm::Lbfgs, 50, false));
+    assert!(should_cap_gradient(Algorithm::Lbfgs, 2, true));
+    assert!(should_cap_gradient(Algorithm::Lbfgs, 50, true));
 
     // Derivative-free / self-safeguarding methods are never capped here.
-    assert!(!should_cap_gradient(Algorithm::Mma, 1));
-    assert!(!should_cap_gradient(Algorithm::Bobyqa, 1));
+    assert!(!should_cap_gradient(Algorithm::Mma, 1, true));
+    assert!(!should_cap_gradient(Algorithm::Bobyqa, 1, true));
+}
+
+/// [`resolve_stall_retry`] decides whether a finished fit is re-run with the
+/// identity-Hessian cap held on, and which of the two attempts is reported
+/// (#751). Driven here with `T = f64` (the OFV itself) so every branch is
+/// exercised without running two NLopt fits.
+#[test]
+fn test_stall_retry_only_fires_for_a_stalled_lbfgs_fit() {
+    use crate::estimation::outer_optimizer::resolve_stall_retry;
+
+    let ofv = |x: &f64| *x;
+    // Retry must never run for a fit that left its initial estimates.
+    let out = resolve_stall_retry(
+        Optimizer::NloptLbfgs,
+        false,
+        (-286.0, true),
+        || panic!("retry must not run for a fit that left init"),
+        ofv,
+    );
+    assert_eq!(out, -286.0);
+
+    // ...nor for the other optimizers: SLSQP is capped on every eval already,
+    // and BOBYQA never takes an identity-Hessian step.
+    for optimizer in [Optimizer::Slsqp, Optimizer::Bobyqa, Optimizer::Mma] {
+        let out = resolve_stall_retry(
+            optimizer,
+            false,
+            (-250.87, false),
+            || panic!("retry is L-BFGS-only"),
+            ofv,
+        );
+        assert_eq!(out, -250.87);
+    }
+}
+
+#[test]
+fn test_stall_retry_keeps_the_better_attempt() {
+    use crate::estimation::outer_optimizer::resolve_stall_retry;
+
+    let ofv = |x: &f64| *x;
+    // The #751 case: the default attempt stalled at -250.87, the held-cap retry
+    // escaped and reached the true optimum. Report the retry. `verbose = true`
+    // also covers the reporting line.
+    assert_eq!(
+        resolve_stall_retry(
+            Optimizer::NloptLbfgs,
+            true,
+            (-250.87, false),
+            || (-286.0042, true),
+            ofv
+        ),
+        -286.0042
+    );
+
+    // Retry escaped but landed *worse*: keep the first result.
+    assert_eq!(
+        resolve_stall_retry(
+            Optimizer::NloptLbfgs,
+            false,
+            (-286.0042, false),
+            || (-250.87, true),
+            ofv
+        ),
+        -286.0042
+    );
+
+    // Retry stalled too, even at a nominally lower OFV: keep the first result,
+    // so a genuinely stuck fit reports as stuck instead of as a second stall.
+    assert_eq!(
+        resolve_stall_retry(
+            Optimizer::NloptLbfgs,
+            false,
+            (-250.87, false),
+            || (-260.0, false),
+            ofv
+        ),
+        -250.87
+    );
+
+    // Ties do not displace the first attempt.
+    assert_eq!(
+        resolve_stall_retry(
+            Optimizer::NloptLbfgs,
+            false,
+            (-250.87, false),
+            || (-250.87, true),
+            ofv
+        ),
+        -250.87
+    );
+}
+
+/// [`max_scaled_deviation`] is the L∞ "how far has the fit moved?" measure both
+/// the cap gate and the plateau verdict key off.
+#[test]
+fn test_max_scaled_deviation_is_l_infinity() {
+    use crate::estimation::outer_optimizer::max_scaled_deviation;
+
+    assert_eq!(max_scaled_deviation(&[1.0, 2.0], &[1.0, 2.0]), 0.0);
+    // Largest single-coordinate move wins, sign-independent.
+    assert_eq!(max_scaled_deviation(&[1.0, 2.0], &[1.5, -3.0]), 5.0);
+    // The stalled user-ODE fit's displacement (~1e-4) is below the escape step;
+    // a real first step (O(0.1)) is above it.
+    use crate::estimation::outer_optimizer::INIT_ESCAPE_STEP_S;
+    assert!(max_scaled_deviation(&[1.0], &[1.000_14]) < INIT_ESCAPE_STEP_S);
+    assert!(max_scaled_deviation(&[1.0], &[1.2]) >= INIT_ESCAPE_STEP_S);
+}
+
+/// The degenerate inputs return `NaN`, which every caller reads as "not
+/// established" because both `< INIT_ESCAPE_STEP_S` and `>= INIT_ESCAPE_STEP_S`
+/// are false for it — the conservative answer in each direction. A `f64::max`
+/// fold would instead swallow a NaN coordinate and report a poisoned iterate as
+/// sitting exactly on the initial estimates, which would let
+/// `failure_is_converged_plateau` call it converged.
+#[test]
+fn test_max_scaled_deviation_reports_degenerate_input_as_nan() {
+    use crate::estimation::outer_optimizer::max_scaled_deviation;
+    use crate::estimation::outer_optimizer::INIT_ESCAPE_STEP_S;
+
+    for (a, b) in [
+        (vec![1.0, f64::NAN], vec![1.0, 2.0]),
+        (vec![1.0, 2.0], vec![1.0, f64::INFINITY]),
+        (vec![f64::NEG_INFINITY], vec![f64::NEG_INFINITY]),
+    ] {
+        let deviation = max_scaled_deviation(&a, &b);
+        assert!(deviation.is_nan(), "expected NaN, got {deviation}");
+        // Neither the "left init" nor the "still at init" reading is granted.
+        assert!(!(deviation >= INIT_ESCAPE_STEP_S));
+        assert!(!(deviation < INIT_ESCAPE_STEP_S));
+    }
+
+    // A length mismatch is a bug, not a shorter comparison: it reports NaN rather
+    // than silently comparing the common prefix (which here would read 0.0 —
+    // "still at init" — and hide the real 9.0 deviation). Only exercisable where
+    // the `debug_assert_eq!` guarding the same invariant is compiled out; the
+    // release behaviour is the one that matters, since that is what CI and users
+    // run.
+    #[cfg(not(debug_assertions))]
+    assert!(max_scaled_deviation(&[1.0, 10.0], &[1.0]).is_nan());
 }
 
 /// Regression test for the original issue #55 symptom: SLSQP optimizing
@@ -2733,7 +2881,8 @@ fn non_convergence_reports_directly_without_second_optimization() {
 // once its line search can no longer beat an already-flat OFV) as convergence.
 // It must accept a genuine plateau and reject a real early stall.
 
-// Signature: (feasible_evals, last_sig_feasible_eval, best_seen, final).
+// Signature: (feasible_evals, last_sig_feasible_eval, best_seen, final,
+// left_init).
 // Every eval count/index is over *feasible* (unguarded) evals only, 1-based;
 // `last_sig_feasible_eval == 1` means the last significant improvement was the
 // first feasible eval (the baseline), i.e. the fit never descended.
@@ -2748,6 +2897,7 @@ fn plateau_with_flat_tail_and_consistent_ofv_is_converged() {
         36, // last significant improvement → flat tail of 8 (≥ 5)
         Some(-286.004247),
         -286.004205, // ties best-seen to ~4e-5
+        true,        // best point is far from init
     ));
 }
 
@@ -2755,13 +2905,20 @@ fn plateau_with_flat_tail_and_consistent_ofv_is_converged() {
 fn short_descending_tail_is_not_converged() {
     // SS-oral shape: the fit quits after ~5 evals still plunging — the last
     // improvement is the final feasible eval, so there is no flat tail at all.
-    assert!(!failure_is_converged_plateau(5, 5, Some(83.26), 83.26));
+    assert!(!failure_is_converged_plateau(
+        5,
+        5,
+        Some(83.26),
+        83.26,
+        true
+    ));
     // Even one eval short of the minimum flat tail must stay unconverged.
     assert!(!failure_is_converged_plateau(
         10,
         10 - (PLATEAU_MIN_FLAT_EVALS - 1),
         Some(-100.0),
         -100.0,
+        true,
     ));
 }
 
@@ -2770,14 +2927,26 @@ fn plateau_but_inconsistent_cold_restart_is_not_converged() {
     // SS-oral warm-start artifact: the OFV trace could look flat, yet the cold
     // inner-loop restart lands far worse (best-seen 83.3 vs final 121.4) — the
     // "optimum" was an EBE warm-start artifact, so it is rejected.
-    assert!(!failure_is_converged_plateau(50, 40, Some(83.26), 121.36));
+    assert!(!failure_is_converged_plateau(
+        50,
+        40,
+        Some(83.26),
+        121.36,
+        true
+    ));
 }
 
 #[test]
 fn plateau_with_better_cold_restart_is_converged() {
     // A cold restart that ties or *improves* on best-seen is a valid minimum —
     // only the materially-worse direction signals an artifact.
-    assert!(failure_is_converged_plateau(50, 40, Some(-286.0), -286.5));
+    assert!(failure_is_converged_plateau(
+        50,
+        40,
+        Some(-286.0),
+        -286.5,
+        true
+    ));
 }
 
 #[test]
@@ -2788,6 +2957,32 @@ fn plateau_check_reaches_min_flat_tail_boundary() {
         20 - PLATEAU_MIN_FLAT_EVALS,
         Some(1.0),
         1.0,
+        true,
+    ));
+}
+
+#[test]
+fn plateau_pinned_at_init_is_not_converged() {
+    // The user-ODE warfarin twin (#751): its line search died at feasible eval 4
+    // having improved the OFV by 0.028 — enough to clear `PLATEAU_OFV_THRESHOLD`
+    // and register as "progress" — then went flat for the rest of the budget.
+    // Progress + plateau + consistency all hold, yet the fit never left its
+    // initial estimates, so it must not be reported converged (it would publish
+    // standard errors for the initial point).
+    assert!(!failure_is_converged_plateau(
+        15,
+        4,
+        Some(-250.866184),
+        -250.866178,
+        false, // never left init
+    ));
+    // Same trace, but the fit did move: that is a genuine plateau.
+    assert!(failure_is_converged_plateau(
+        15,
+        4,
+        Some(-250.866184),
+        -250.866178,
+        true,
     ));
 }
 
@@ -2795,8 +2990,8 @@ fn plateau_check_reaches_min_flat_tail_boundary() {
 fn plateau_check_handles_missing_best_seen() {
     // No best-seen point recorded → consistency cannot fail; the plateau length
     // alone decides.
-    assert!(failure_is_converged_plateau(30, 10, None, -50.0));
-    assert!(!failure_is_converged_plateau(3, 3, None, -50.0));
+    assert!(failure_is_converged_plateau(30, 10, None, -50.0, true));
+    assert!(!failure_is_converged_plateau(3, 3, None, -50.0, true));
 }
 
 #[test]
@@ -2811,10 +3006,11 @@ fn stuck_at_initial_estimate_is_not_converged() {
         12,
         1,
         Some(-250.838),
-        -250.838
+        -250.838,
+        false
     ));
     // No feasible eval at all (`feasible_evals == 0`): not converged.
-    assert!(!failure_is_converged_plateau(0, 0, None, -250.838));
+    assert!(!failure_is_converged_plateau(0, 0, None, -250.838, false));
 }
 
 #[test]
@@ -2827,7 +3023,13 @@ fn guard_rejected_first_eval_does_not_fake_progress() {
     // objective. Counting over feasible evals keeps this `converged = false`; the
     // earlier total-eval basis let the first feasible point land at index ≥ 2 and
     // wrongly satisfy `>= 2`.
-    assert!(!failure_is_converged_plateau(20, 1, Some(83.26), 83.26));
+    assert!(!failure_is_converged_plateau(
+        20,
+        1,
+        Some(83.26),
+        83.26,
+        true
+    ));
 }
 
 #[test]
@@ -2838,13 +3040,20 @@ fn guarded_tail_does_not_pad_plateau() {
     // eval (feasible_evals = 4) has a flat tail of 1 — NOT converged — even if
     // dozens of guarded evals followed. The guarded tail is invisible here by
     // construction (it never advances `feasible_evals`).
-    assert!(!failure_is_converged_plateau(4, 3, Some(-100.0), -100.0));
+    assert!(!failure_is_converged_plateau(
+        4,
+        3,
+        Some(-100.0),
+        -100.0,
+        true
+    ));
     // The same real improvement followed by ≥ 5 *feasible* flat evals does plateau.
     assert!(failure_is_converged_plateau(
         3 + PLATEAU_MIN_FLAT_EVALS,
         3,
         Some(-100.0),
-        -100.0
+        -100.0,
+        true
     ));
 }
 
@@ -2854,5 +3063,11 @@ fn genuine_progress_after_guarded_start_is_converged() {
     // then genuinely descends: a significant improvement lands at feasible-eval 5,
     // after the baseline, followed by a flat tail of 15. Real progress-then-plateau
     // — must be accepted.
-    assert!(failure_is_converged_plateau(20, 5, Some(-286.0), -286.0));
+    assert!(failure_is_converged_plateau(
+        20,
+        5,
+        Some(-286.0),
+        -286.0,
+        true
+    ));
 }

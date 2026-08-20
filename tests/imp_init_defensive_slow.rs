@@ -41,8 +41,11 @@
 //!    centred or shaped. To restore genuine discrimination we **pin ISCALE to 1.0**
 //!    (its documented "disabled" setting), removing the overlapping rescue. With it
 //!    off the weakly-identified-V collapse returns: legacy runs V/CL away
-//!    (V ≳ 14× truth), the mixture still recovers them. That is the contrast this
-//!    test asserts. The fast branch-coverage smoke test is
+//!    (> 50% off truth, and > 3× the mixture's error), the mixture still recovers
+//!    them. That is the contrast this test asserts. The guard is deliberately
+//!    relative — the runaway's *magnitude* is chaotic and libm-dependent (macOS
+//!    V ≈ 40+, glibc V ≈ 36.5), so an absolute multiple-of-truth threshold reads
+//!    as a platform-dependent failure rather than a lost contrast (#751). The fast branch-coverage smoke test is
 //!    `importance_sampling_api::imp_defensive_mixture_runs_for_both_alpha_branches`.
 //!
 //! Data is simulated from the model (fixed seed) so the test is self-contained.
@@ -304,23 +307,36 @@ fn saem_imp_on_analytical_init_recovers_parameters_with_defensive_mixture() {
         (clp - TRUE_CL).abs() / TRUE_CL < 0.25,
         "defensive mixture (ISCALE pinned) should recover TVCL near {TRUE_CL}, got {clp}"
     );
-    // Legacy blows V up well past 2× truth (empirically ≈ 14×) once ISCALE cannot
-    // rebroaden the collapsed proposal. If this fails, the collapse is no longer
-    // reproducible even with ISCALE off and the discrimination guard is void —
-    // reopen #961.
-    assert!(
-        v0 > 2.0 * TRUE_V,
-        "legacy sampler (ISCALE pinned) is expected to blow V up (>2× truth); got \
-         {v0} — if this fails the fixture no longer reproduces the collapse"
-    );
-    // The mixture (same pinned config) still recovers V near the truth. Combined
-    // with the `v0 > 2·TRUE_V` legacy blow-up above, this *is* the discrimination:
-    // |vp−20| < 5 while |v0−20| > 20, an unambiguous mixture-over-legacy win. (No
-    // separate ratio assert — it would be implied by these two and never fail
-    // independently.)
+    // The mixture (same pinned config) recovers V near the truth.
     assert!(
         (vp - TRUE_V).abs() / TRUE_V < 0.25,
         "defensive mixture (ISCALE pinned) should still recover TVV near {TRUE_V}, \
-         got {vp} (legacy blew up to {v0})"
+         got {vp} (legacy landed at {v0})"
+    );
+    // ...and the legacy sampler does not: with ISCALE unable to rebroaden the
+    // collapsed proposal, its V runs far outside the 25% band the mixture stays
+    // inside. The guard is stated as *relative* discrimination rather than an
+    // absolute multiple of truth on purpose: how far the runaway travels is a
+    // chaotic property of the collapsed weights and differs by libm — macOS lands
+    // above 40 (> 2× truth) where glibc lands at 36.5 (1.8×), and pinning the
+    // absolute magnitude turned a real, reproducible contrast into a
+    // platform-dependent red (#751 / #961). What the test actually needs is that
+    // legacy is *badly* wrong and the mixture is not.
+    let err_legacy = (v0 - TRUE_V).abs() / TRUE_V;
+    let err_mixture = (vp - TRUE_V).abs() / TRUE_V;
+    assert!(
+        err_legacy > 0.5,
+        "legacy sampler (ISCALE pinned) is expected to run V far off truth \
+         (>50% error); got {v0} ({:.0}% off) — if this fails the fixture no \
+         longer reproduces the collapse",
+        err_legacy * 100.0
+    );
+    assert!(
+        err_legacy > 3.0 * err_mixture,
+        "defensive mixture must beat legacy by a wide margin: mixture V = {vp} \
+         ({:.0}% off truth) vs legacy V = {v0} ({:.0}% off) — only {:.1}× better",
+        err_mixture * 100.0,
+        err_legacy * 100.0,
+        err_legacy / err_mixture
     );
 }
