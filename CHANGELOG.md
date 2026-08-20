@@ -36,7 +36,9 @@ section of the SDLC for the versioning policy).
   `F²` without complaint; the fix is to drop `F` from the right-hand side, or rename the parameter
   if it was never bioavailability. Note this makes ferx **stricter than NONMEM**, which allows a
   `$PK` `F1` to be referenced in `$DES` and quietly computes `F²` — so a mechanically translated
-  control stream can newly fail to parse even though it ran in NONMEM.
+  control stream can newly fail to parse even though it ran in NONMEM. Anchored on NONMEM 7.6.0:
+  two `ADVAN13` streams differing in one `$DES` line give predictions differing by exactly `F1`,
+  with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Added
 - **IMP / IMPMAP estimation and objective evaluation for mixture models (#985).** Importance sampling

@@ -314,13 +314,19 @@ when not declared, so IV and non-bioavailability models are unaffected.
 > rejected rather than quietly computing `F²`, so a model carried over from that
 > era fails loudly with the fix named.
 >
-> **ferx is stricter than NONMEM here.** NONMEM lets a `$PK` `F1 = …` be
-> referenced in `$DES` and quietly computes `F²`. That divergence is the entire
-> point of [#993](https://github.com/FeRx-NLME/ferx-core/issues/993) — but it
-> means a mechanically translated control stream can newly fail to parse even
-> though it ran in NONMEM. Anyone converting control streams (including
-> `ferxtranslate`) should drop the `F` from the translated RHS rather than
-> transcribe `$DES` literally.
+> **ferx is stricter than NONMEM here — measured, not assumed.** Two `ADVAN13`
+> control streams differing in exactly one `$DES` line, `F1 = 0.5` fixed, run on
+> NONMEM 7.6.0: with `DADT(2) = F1*KA*A(1) − K*A(2)` every prediction is lower
+> than the `DADT(2) = KA*A(1) − K*A(2)` form by exactly `F1` (`B/A = 0.500000`
+> across 0.5–24 h), i.e. an effective bioavailability of `F²` — and NONMEM
+> reports **nothing**, completing the run with an objective function value.
+> That divergence is the entire point of
+> [#993](https://github.com/FeRx-NLME/ferx-core/issues/993), but it means a
+> mechanically translated control stream can newly fail to parse even though it
+> ran in NONMEM. Anyone converting control streams (including `ferxtranslate`)
+> should drop the `F` from the translated RHS rather than transcribe `$DES`
+> literally. Control streams, outputs and the ferx-vs-NONMEM comparison are in
+> `nonmem_anchor/` and `tests/dose_attr_double_use_nonmem_anchor.rs`.
 
 The name `F` (any case) is what flags a parameter as bioavailability and routes
 it to the dosing compartment. If you need a fraction-like quantity inside the

@@ -7868,6 +7868,21 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
         .get("lagtime")
         .or_else(|| roles.get("alag"))
         .map(String::as_str);
+    // #993 companion to the guard above. That one asks "is this reserved-name param the
+    // intended mapping for its slot?"; it never asks whether the same param *also* fills a
+    // disposition role. `pk one_cpt_transit(cl=CL, v=F, n=N, mtt=MTT, f=F)` passes it — `F`
+    // is the `f=` mapping — but the twin then emits `d/dt(central) = … − (CL/F) * central`
+    // and `obs_scale = F`, reading a name `ode_param_slots` routes to the F slot. That is a
+    // dose-attribute double use, so the twin's own parse now rejects it and `get_or_build`
+    // turns the rejection into a panic. Decline instead, per this function's standing
+    // policy: keep the model closed-form rather than panicking at eval time.
+    if disposition
+        .iter()
+        .filter_map(|role| roles.get(*role))
+        .any(|p| Some(p.as_str()) == f_param || Some(p.as_str()) == lag_param)
+    {
+        return None;
+    }
     let mut twin_param_names: Vec<String> = Vec::new();
     if let Some(ip_lines) = extracted.unnamed.get("individual_parameters") {
         for line in ip_lines {
@@ -7919,11 +7934,27 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // the ODE twin. Parsing this source yields a normal ODE model — it contains no
     // `pk one_cpt_transit`/`pk two_cpt_transit`/`pk one_cpt_ig`/`pk two_cpt_ig`, so it does
     // not recurse into this desugar.
+    //
+    // `adaptive_dosing` is dropped rather than carried (#993). Two independent reasons,
+    // and the first is a crash: the twin *is* an ODE model, so a re-emitted
+    // `observe` that reads a dose attribute hits `check_dose_attr_double_use` — which
+    // the analytical primary is deliberately out of scope for — and the resulting parse
+    // error surfaces through `get_or_build`'s `.expect()` as a panic mid-fit, on the
+    // plain `predict`/`fit` path that reroutes TV-covariate / `TIME` / IOV subjects here.
+    // Blocks that would otherwise reach a new ODE-only check (`odes`, `scaling`) decline
+    // the twin outright above; `adaptive_dosing` does not, so it has to be dropped here.
+    // Second, the twin is reached only through `CompiledModel::effective_for` on the
+    // prediction path (`pk/mod.rs`), and nothing there reads a controller spec —
+    // `simulate_adaptive_from_spec` takes the spec as an argument from the primary — so
+    // carrying it would only give the twin a stale block it can never act on.
     let mut src = String::new();
     let mut names: Vec<&String> = extracted.unnamed.keys().collect();
     names.sort();
     for name in names {
-        if matches!(name.as_str(), "structural_model" | "odes" | "scaling") {
+        if matches!(
+            name.as_str(),
+            "structural_model" | "odes" | "scaling" | "adaptive_dosing"
+        ) {
             continue;
         }
         src.push_str(&format!("[{name}]\n"));

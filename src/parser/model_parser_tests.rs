@@ -1975,6 +1975,117 @@ fn coded_rate_param_read_in_adaptive_observe_is_recorded() {
 }
 
 #[test]
+fn dose_attr_param_reused_as_a_disposition_role_declines_the_twin() {
+    // Second door into the same panic, found probing the first. `F` here is the `f=`
+    // mapping — so the #735 shadow guard allows it — *and* the `v=` role, so the
+    // generated twin emits `d/dt(central) = … − (CL/F) * central` with
+    // `obs_scale = F`, reading a name `ode_param_slots` routes to the F slot. The
+    // twin's own parse rejects that as a #993 double use and `get_or_build`
+    // `.expect()`s, so a model the analytical primary accepts crashed the moment a
+    // TV-covariate / `TIME` / IOV subject rerouted to the twin.
+    //
+    // The model is pharmacological nonsense (bioavailability used as a volume), but
+    // nonsense must not panic. Declining keeps it closed-form — exactly what it was
+    // before the twin existed.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta THETA_F(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  N   = TVN
+  MTT = TVMTT
+  F   = inv_logit(THETA_F)
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=F, n=N, mtt=MTT, f=F)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let parsed = parse_full_model(src).expect("the analytical primary still parses");
+    assert!(
+        parsed.model.absorption_ode_equivalent.is_none(),
+        "a dose-attribute parameter reused as a disposition role must decline the twin, \
+         not build one that panics"
+    );
+}
+
+#[test]
+fn adaptive_observe_does_not_reach_the_absorption_twin() {
+    // Regression guard on the interaction between the #993 `[adaptive_dosing]`
+    // rejection and the absorption ODE twin, found reviewing that commit.
+    //
+    // `absorption_ode_equivalent_source` re-emits the model's blocks into a source
+    // whose `[structural_model]` is `ode(...)`. `[odes]` and `[scaling]` can never
+    // reach a new ODE-only check from there — their presence makes the twin decline
+    // outright — but `[adaptive_dosing]` does not decline it. So an analytical model
+    // that the parser deliberately accepts (the rejection is ODE-scoped, see #1004)
+    // produced a twin that the parser *rejects*, and `get_or_build` turns a parse
+    // error into a `.expect()` panic — mid-fit, on the plain predict path that
+    // reroutes TV-covariate / `TIME` / IOV subjects to the twin.
+    //
+    // The block is now dropped from the twin. Without that, this test panics rather
+    // than failing.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta THETA_F(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  F   = inv_logit(THETA_F)
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=N, mtt=MTT, f=F)
+
+[adaptive_dosing]
+  observe = central / (V * F)
+  at = [24, 48]
+  start_dose = 100
+  route = bolus(cmt = 1)
+  dose_bounds = [0, 400]
+  when signal < 10 : increase 25%
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let parsed = parse_full_model(src)
+        .expect("the analytical primary is out of scope for the #993 rejection");
+    // The primary keeps its controller — only the twin drops it.
+    assert!(
+        parsed.adaptive_dosing.is_some(),
+        "the primary must still carry the [adaptive_dosing] block"
+    );
+    let eq = parsed
+        .model
+        .absorption_ode_equivalent
+        .as_ref()
+        .expect("a plain transit model carries an ODE twin");
+    // The `.expect()` inside `get_or_build` is what used to blow up here. A twin
+    // that builds at all is the proof the block was dropped: had it been re-emitted,
+    // the twin is an ODE model and the check would have rejected `observe`.
+    let twin = eq.get_or_build();
+    assert!(
+        twin.ode_spec.is_some(),
+        "the twin must be a working ODE model"
+    );
+}
+
+#[test]
 fn dose_attr_read_in_scaling_is_rejected() {
     // The readout is a prediction path too: dividing by `F` applies bioavailability
     // a second time, measured at exactly `F`. Both readout forms — Form-C `y` and
