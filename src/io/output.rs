@@ -2109,6 +2109,54 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         for t in &v.elbo_trace {
             writeln!(f, "    - {:.6}", t).map_err(|e| e.to_string())?;
         }
+
+        // Per-subject variational posterior. This is the object VI produces that no other
+        // method here does — FOCE and Laplace need a Hessian for the covariance — so it is
+        // emitted rather than left reachable only from the Rust/R API. Keyed by subject ID
+        // so a row can be matched back to the data without relying on ordering.
+        //
+        // `eta_covs` is the *variational* covariance, which is known to understate the true
+        // posterior variance (see docs/estimation/vi.qmd). It is for individual-level
+        // reporting and shrinkage, not a route to population standard errors.
+        if !v.eta_means.is_empty() {
+            writeln!(f, "  eta_names: [{}]", result.eta_names.join(", "))
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "  eta_posterior:").map_err(|e| e.to_string())?;
+            for (i, mean) in v.eta_means.iter().enumerate() {
+                let id = result
+                    .subjects
+                    .get(i)
+                    .map(|s| s.id.as_str())
+                    .unwrap_or("unknown");
+                writeln!(f, "    - id: {}", id).map_err(|e| e.to_string())?;
+                let means: Vec<String> = mean.iter().map(|m| format!("{:.6}", m)).collect();
+                writeln!(f, "      mean: [{}]", means.join(", ")).map_err(|e| e.to_string())?;
+                // Full covariance, row by row: the off-diagonals are the point of a
+                // full-rank family, so a diagonal-only summary would discard what
+                // distinguishes it from `mean_field`.
+                if let Some(cov) = v.eta_covs.get(i) {
+                    writeln!(f, "      cov:").map_err(|e| e.to_string())?;
+                    for row in cov {
+                        let cells: Vec<String> = row.iter().map(|c| format!("{:.8}", c)).collect();
+                        writeln!(f, "        - [{}]", cells.join(", "))
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                // Per-occasion kappa means, when the model has IOV. Omitted entirely
+                // otherwise rather than emitted as an empty list.
+                if let Some(kappas) = v.kappa_means.get(i) {
+                    if !kappas.is_empty() {
+                        writeln!(f, "      kappa_means:").map_err(|e| e.to_string())?;
+                        for occ in kappas {
+                            let cells: Vec<String> =
+                                occ.iter().map(|k| format!("{:.6}", k)).collect();
+                            writeln!(f, "        - [{}]", cells.join(", "))
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // SIR section
@@ -3504,6 +3552,96 @@ mod tests {
     /// theta/omega/sigma, eta/eps/kappa shrinkage (with a NaN entry), a
     /// computed covariance, and a warning. Drives the maximal branch coverage
     /// of both `print_results` and `write_estimates_yaml` in one pass.
+    /// The per-subject variational posterior reaches the YAML.
+    ///
+    /// `FitResult::vi::eta_means` / `eta_covs` were previously reachable only from the Rust
+    /// and R APIs, which made the CLI unable to support any per-subject comparison against
+    /// another tool — the concrete blocker was Tier 2 of `VI_VALIDATION.md` Anchor B.
+    ///
+    /// Three things are asserted, and the ID keying is the one that matters most: a row that
+    /// could not be matched back to a subject would be useless for exactly the comparison
+    /// this emission exists to enable.
+    #[test]
+    fn vi_per_subject_posterior_is_emitted_with_ids_and_full_covariance() {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.method = EstimationMethod::Vi;
+        r.method_chain = vec![EstimationMethod::Vi];
+        r.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
+        r.subjects = vec![
+            sdtab_subject_result("subj-A", 1),
+            sdtab_subject_result("subj-B", 1),
+        ];
+        r.vi = Some(ViResult {
+            neg_two_elbo: -12.5,
+            data_term: -20.0,
+            kl_term: 3.75,
+            n_iterations: 100,
+            converged: true,
+            family: "full_rank".into(),
+            n_mc_samples: 8,
+            kl: "analytic".into(),
+            n_kl_fallback_subjects: 0,
+            elbo_trace: vec![1.0, 0.5],
+            eta_means: vec![vec![0.25, -0.5], vec![-0.125, 0.75]],
+            // Deliberately non-diagonal: a diagonal-only emission would pass a
+            // weaker test and would discard what a full-rank family is for.
+            eta_covs: vec![
+                vec![vec![0.04, 0.01], vec![0.01, 0.09]],
+                vec![vec![0.16, -0.02], vec![-0.02, 0.25]],
+            ],
+            kappa_means: vec![Vec::new(), Vec::new()],
+            n_fd_subjects: 0,
+            elbo_tightness_ratio: 1.02,
+        });
+
+        let dir = std::env::temp_dir().join(format!("ferx_vi_yaml_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml writes");
+        let out = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            out.contains("eta_names: [ETA_CL, ETA_V]"),
+            "eta names must be emitted so the vectors below can be read; got:\n{out}"
+        );
+        // Keyed by ID, in subject order.
+        assert!(
+            out.contains("- id: subj-A") && out.contains("- id: subj-B"),
+            "each posterior must carry its subject id; got:\n{out}"
+        );
+        assert!(
+            out.contains("mean: [0.250000, -0.500000]"),
+            "variational means must round-trip; got:\n{out}"
+        );
+        // The off-diagonal is the assertion with teeth.
+        assert!(
+            out.contains("- [0.04000000, 0.01000000]")
+                && out.contains("- [0.01000000, 0.09000000]"),
+            "the full covariance including off-diagonals must be emitted; got:\n{out}"
+        );
+        assert!(
+            !out.contains("kappa_means"),
+            "a non-IOV fit must not emit an empty kappa_means block; got:\n{out}"
+        );
+    }
+
+    /// A non-VI fit emits no `eta_posterior` block at all.
+    #[test]
+    fn non_vi_fits_emit_no_eta_posterior() {
+        let r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        let dir = std::env::temp_dir().join(format!("ferx_novi_yaml_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml writes");
+        let out = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            !out.contains("eta_posterior"),
+            "only a VI fit has a variational posterior to report; got:\n{out}"
+        );
+    }
+
     fn comprehensive_result() -> FitResult {
         let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.1, 0.5]);
         // theta: one free (with SE), one fixed.

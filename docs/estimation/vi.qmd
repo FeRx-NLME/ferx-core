@@ -128,6 +128,7 @@ out too *large* would satisfy it more comfortably, so it is paired with a two-si
 the Monte-Carlo ELBO against a deterministic quadrature ELBO, and an exact comparison of the
 closed-form KL.
 
+
 ## Options
 
 All keys go in `[fit_options]`.
@@ -258,6 +259,37 @@ It runs independently of `vi_final_ofv`: the covariance is the curvature of the 
 objective, not of the ELBO, so a fit can legitimately report standard errors while leaving
 `ofv` as `NaN`. Set `run_covariance_step = false` to skip it; in a chain such as
 `methods = vi, focei` it runs once, on the final stage.
+
+## Reading the per-subject posterior
+
+VI produces each subject's posterior mean *and covariance* as a by-product, where FOCE and
+Laplace need a Hessian for the latter. Both are on `FitResult$vi$eta_means` / `$eta_covs`, and
+a `method = vi` fit also writes them to the fit YAML:
+
+``` yaml
+vi:
+  eta_names: [ETA_CL, ETA_V, ETA_KA]
+  eta_posterior:
+    - id: 1
+      mean: [0.029863, 0.064874, 0.369859]
+      cov:
+        - [0.00002566, 0.00001221, 0.00001864]
+        - [0.00001221, 0.00004973, 0.00008409]
+        - [0.00001864, 0.00008409, 0.00036332]
+```
+
+Rows are keyed by **subject ID**, not position, so a posterior can be matched back to the data
+without relying on ordering. The covariance is emitted in full rather than as a diagonal: the
+off-diagonals are the whole point of `vi_family = full_rank`, and a CL/V posterior correlation is
+usually the largest of them. Under IOV each entry also carries a `kappa_means` list, one row per
+occasion; a non-IOV fit omits the key entirely.
+
+Two cautions carry over from [Standard errors](#standard-errors). This is the **variational**
+covariance, so it understates the true posterior variance — it is for individual-level reporting
+and shrinkage, not a route to population standard errors. And it is a converged-`φ` quantity: read
+it alongside `converged` and `elbo_tightness_ratio`, because a stuck optimizer also reports a
+covariance.
+
 
 ## Is the bound tight? (`elbo_tightness_ratio`)
 

@@ -517,6 +517,13 @@ section of the SDLC for the versioning policy).
   lanes, and the 96-axis cap (past which a subject falls back to finite differences) is
   unchanged (#971).
 ### Added
+- **The per-subject variational posterior is now written to the fit YAML.** A `method = vi` fit
+  emits an `eta_posterior` block under `vi:`, keyed by subject ID, carrying each subject's
+  variational mean and its **full** covariance (plus per-occasion `kappa` means under IOV).
+  Previously `FitResult$vi$eta_means` / `eta_covs` were reachable only from the Rust and R APIs,
+  so the CLI could not support any per-subject comparison. Note the covariance is the
+  *variational* one, which understates the true posterior variance — see
+  `docs/estimation/vi.qmd`.
 - **`agq_eval_only`** — a `laplace` stage can now *evaluate* the adaptive-Gauss-Hermite
   marginal likelihood at the parameters it is handed instead of estimating, reporting it as
   `ofv` and leaving `θ`/`Ω`/`σ` untouched. It must be the final stage. This is the
