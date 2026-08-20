@@ -1,0 +1,21 @@
+$PROBLEM one_cpt_iv naive-pooled via OMEGA 0 FIX — ferx #989 anchor
+$INPUT ID TIME DV EVID AMT CMT RATE MDV
+$DATA one_cpt_iv.csv IGNORE=@
+$SUBROUTINE ADVAN1 TRANS2
+$PK
+  CL = THETA(1)*EXP(ETA(1))
+  V  = THETA(2)
+  S1 = V
+$ERROR
+  IPRED = F
+  Y = IPRED*(1 + EPS(1))
+$THETA
+  (0.1, 4.0, 100.0)   ; TVCL
+  (1.0, 40.0, 500.0)  ; TVV
+$OMEGA
+  0 FIX               ; degenerate ETA: naive-pooled
+$SIGMA
+  0.0004              ; PROP_ERR variance (sd 0.02)
+$ESTIMATION METHOD=0 MAXEVAL=9999 PRINT=1 NOABORT SIGDIGITS=4
+$COVARIANCE
+$TABLE ID TIME DV PRED IPRED CWRES NOPRINT ONEHEADER FILE=sdtab1

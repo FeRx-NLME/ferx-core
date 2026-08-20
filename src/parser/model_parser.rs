@@ -1827,26 +1827,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     }
     // set here after diffusion thetas are appended above
     n_theta = theta_names.len();
-    // A `[event_model]` (TTE) or `[binary_model]` (categorical, #760) endpoint makes a
-    // fixed-effects model legitimate: the endpoint parameters can be pure theta/covariate,
-    // so n_eta = 0 (an empty BSV Omega) is valid — even though `build_omega_matrix` rejects
-    // an empty Omega for ordinary PK models. Detect the block from the raw parse so the same
-    // `.ferx` parses identically with or without the `survival` feature compiled in (the
-    // actual endpoints are only built under `survival`).
-    let has_event_model = blocks.get("event_model").is_some()
-        || extracted
-            .named
-            .get("event_model")
-            .is_some_and(|m| !m.is_empty());
-    // BSV omega is built from the BSV-only eta names (no kappas)
-    let omega = if eta_names_bsv.is_empty() && (has_event_model || has_binary_model_block) {
-        // 0×0 Omega — `from_matrix` handles the empty matrix (cholesky of a
-        // 0-dim matrix is trivial, log|Ω| = 0); `build_omega_fixed` below
-        // already returns an empty `Vec` for an empty eta list.
-        OmegaMatrix::from_diagonal(&[], Vec::new())
-    } else {
-        build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?
-    };
+    // BSV omega is built from the BSV-only eta names (no kappas). An empty eta list
+    // yields a 0×0 Omega — a fixed-effects-only (naive-pooled) model — which
+    // `build_omega_matrix` handles directly; see its `n == 0` branch for why the
+    // empty matrix is well-defined here.
+    let omega = build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?;
     let omega_fixed = build_omega_fixed(&omegas, &block_omegas, &eta_names_bsv)?;
     // Per-eta SD-init flags, parallel to `eta_names_bsv`. Diagonal omega
     // declarations carry their `(sd)` flag from the parser; block-omega etas
@@ -10455,7 +10440,13 @@ fn build_omega_matrix(
 ) -> Result<OmegaMatrix, String> {
     let n = eta_names.len();
     if n == 0 {
-        return Err("No omega parameters defined".to_string());
+        // Fixed-effects-only (naive-pooled) model: no random effects at all. The
+        // 0×0 Omega is well-defined — the Cholesky of a 0-dim matrix is trivial and
+        // log|Ω| = 0 — so FOCE/FOCEI collapse to the plain ML objective with no inner
+        // optimisation (#989). This is the same path a `[event_model]` / `[binary_model]`
+        // endpoint has always taken; it is not restricted to non-Gaussian endpoints.
+        // `build_omega_fixed` likewise returns an empty `Vec` for an empty eta list.
+        return Ok(OmegaMatrix::from_diagonal(&[], Vec::new()));
     }
 
     // If no block omegas, use the simple diagonal path

@@ -63,6 +63,53 @@ The `(sd)` form is convenient when you're setting initial values from expected C
 
 Block omega (`block_omega (...) = [...]`) is variance-only — `(sd)` is not accepted there because the lower-triangle list mixes variances and covariances and a single tag would be ambiguous.
 
+### No omega at all — fixed-effects-only (naive-pooled) fits
+
+The `omega` block is **optional**. A model may declare no random effects, giving a
+fixed-effects-only (naive-pooled) fit in which every subject shares one set of
+parameters and `sigma` alone carries the spread:
+
+```
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV(40.0,  1.0, 500.0)
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+```
+
+With `n_eta = 0` there is no inner empirical-Bayes problem and no `log|Ω|` term, so
+FOCE/FOCEI collapse to the plain maximum-likelihood objective. `PRED` and `IPRED`
+coincide, and so do `CWRES` and `IWRES`. No `OMEGA` section is printed and no ETA
+columns are written to the sdtab. See `examples/one_cpt_iv_pooled.ferx`.
+
+Useful for naive-pooled analyses, single-subject fits, reduced models where a
+variance component has collapsed to the boundary and should be removed rather than
+fixed near zero, and for isolating a diagnostic by removing the inner problem
+entirely.
+
+**`sigma` is still required.** "No random effects" and "no residual error" are
+separate capabilities: a continuous endpoint has no likelihood without a `sigma`,
+so omitting the `[error_model]` or its `sigma` remains an error. (A pure
+`[event_model]` / `[binary_model]` endpoint legitimately has neither — that is a
+different case, not this one.)
+
+**Which estimators apply.** `foce`, `focei`, `laplace`, `gn` and `gn_hybrid` all
+reduce correctly and agree to the last printed digit. `saem`, `imp`, `impmap` and
+`bayes` are rejected: each integrates over the random effects, and with none
+declared there is nothing to integrate.
+
+**Starting values matter more.** Without random effects there is no inner loop to
+absorb a poor `sigma` start, so a start that a mixed-effects model shrugs off can
+stall a fixed-effects one. On `examples/one_cpt_iv.ferx`'s own `0.02 (sd)` start
+the `gn` optimizer does not converge within `maxiter`; from `0.13 (sd)` it reaches
+the optimum. If a fixed-effects fit stalls, check `sigma` first.
+
+For the NONMEM equivalent — and why simply omitting `$OMEGA` is *not* it — see
+[the FAQ](../faq.qmd#fixed-effects-only-fits-vs-nonmem).
+
 ### Block omega (correlated random effects)
 
 To estimate correlations between random effects, use `block_omega`:

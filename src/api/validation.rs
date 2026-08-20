@@ -7,14 +7,66 @@
 //! `pub` / `pub(crate)` re-exports in the parent module.
 use super::*;
 
+/// Does this identifier read as a random-effect name (`ETA_CL`, `eta_v`,
+/// `KAPPA_CL`)?
+///
+/// A random effect exists only because an `omega` / `kappa` line declares it —
+/// there is no reserved prefix — so an identifier that *looks* like one but binds
+/// to nothing is far more likely a forgotten declaration than a covariate the data
+/// was supposed to carry. Since #989 dropped the parse-time `No omega parameters
+/// defined` rejection, this heuristic is what keeps a model whose whole `omega`
+/// block was deleted from silently resolving its etas as covariate columns.
+/// Prefix-only and case-insensitive; a genuine `ETA_CL` *column* in the data
+/// resolves normally and never reaches this predicate.
+pub(crate) fn is_random_effect_shaped(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("ETA") || upper.starts_with("KAPPA")
+}
+
+/// The model's unresolved identifiers that read as random-effect names.
+///
+/// Data-independent: reads `referenced_covariates`, which holds every identifier
+/// the parser could not bind to a theta, a declared eta/kappa, or a built-in.
+pub(crate) fn undeclared_random_effect_names(model: &CompiledModel) -> Vec<&str> {
+    model
+        .referenced_covariates
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|n| is_random_effect_shaped(n))
+        .collect()
+}
+
+/// Message body shared by the data-present error and the data-absent warning, so
+/// the two cannot drift apart.
+pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
+    format!(
+        "Model references {} as {} but no `omega` / `kappa` declaration defines {}. \
+         Declare the random effect in [parameters] (e.g. `omega {} ~ 0.09`), or — if this \
+         is meant to be a data column — add that column to the data file. A model with no \
+         random effects at all is valid (#989): to make it fixed-effects-only, drop the \
+         `exp({})` term as well as the omega line.",
+        names.join(", "),
+        if names.len() == 1 {
+            "a random effect"
+        } else {
+            "random effects"
+        },
+        if names.len() == 1 { "it" } else { "them" },
+        names[0],
+        names[0],
+    )
+}
+
 /// Fail early if the model references covariates that the data doesn't carry.
 /// Case-sensitive: `CRCL` and `crcl` are distinct names. Historically a missing
 /// covariate silently evaluated to zero, which left fits stuck at the initial
 /// estimates with no visible diagnostic (see commit introducing this check).
 ///
-/// Returns a diagnostic per problem (here, at most one). The message text is
-/// kept byte-for-byte identical to the historical `Err(String)` so `fit()`'s
-/// error — produced via [`first_error`] — is unchanged.
+/// Unresolved names that read as random effects get their own `E_ETA_NOT_DECLARED`
+/// diagnostic, pushed first so [`first_error`] — which is what `fit()` reports —
+/// surfaces the actionable message instead of "covariate not found in data". The
+/// `E_MISSING_COVARIATE` message text stays byte-for-byte identical to the
+/// historical `Err(String)` for the names that remain.
 pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     let missing: Vec<&str> = model
         .referenced_covariates
@@ -27,21 +79,43 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
         return Vec::new();
     }
 
+    let (eta_shaped, plain): (Vec<&str>, Vec<&str>) =
+        missing.iter().partition(|n| is_random_effect_shaped(n));
+
+    let mut diags = Vec::new();
+    if !eta_shaped.is_empty() {
+        diags.push(
+            Diagnostic::error(
+                "E_ETA_NOT_DECLARED",
+                undeclared_random_effect_message(&eta_shaped),
+            )
+            .with_block("parameters")
+            .with_suggestion(format!("declare `omega {} ~ <variance>`", eta_shaped[0])),
+        );
+    }
+
+    if plain.is_empty() {
+        return diags;
+    }
+
     let available = if population.covariate_names.is_empty() {
         "(none)".to_string()
     } else {
         population.covariate_names.join(", ")
     };
-    vec![Diagnostic::error(
-        "E_MISSING_COVARIATE",
-        format!(
-            "Model references covariate(s) not found in data (case-sensitive): {}. \
-             Available covariate columns: {}.",
-            missing.join(", "),
-            available
-        ),
-    )
-    .with_suggestion(format!("available covariate columns: {}", available))]
+    diags.push(
+        Diagnostic::error(
+            "E_MISSING_COVARIATE",
+            format!(
+                "Model references covariate(s) not found in data (case-sensitive): {}. \
+                 Available covariate columns: {}.",
+                plain.join(", "),
+                available
+            ),
+        )
+        .with_suggestion(format!("available covariate columns: {}", available)),
+    );
+    diags
 }
 
 /// Map an error string from [`read_population_for`] onto a `ferx check`
@@ -1685,6 +1759,29 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     let chain = options.method_chain();
     let mut diags = Vec::new();
 
+    // A fixed-effects-only model (`n_eta = 0`, #989) has no latent variable, so
+    // SAEM's E-step is empty: the stochastic approximation has nothing to average
+    // and the M-step is plain ML on θ/σ. It runs, reports `converged`, and lands
+    // slightly off the true optimum (−269.5986 vs −269.6370 on the `one_cpt_iv`
+    // zero-Ω anchor) purely because the SA gain sequence stops short. Reject it
+    // and point at the estimators that solve this exactly, matching what
+    // `imp` / `impmap` / `bayes` already do at run time — but check it *here* so
+    // `ferx check` catches it and a `methods = [saem, focei]` chain fails up
+    // front rather than mid-run.
+    if model.n_eta == 0 && chain.contains(&EstimationMethod::Saem) {
+        diags.push(
+            Diagnostic::error(
+                "E_SAEM_NO_RANDOM_EFFECTS",
+                "method = saem requires at least one random effect (n_eta = 0). \
+                 SAEM is an EM over the random effects, so with none declared its \
+                 E-step is empty and it only approaches the objective that FOCE/FOCEI \
+                 minimise exactly. Use method = foce, focei, or laplace for a \
+                 fixed-effects-only (naive-pooled) model.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
     // SDE ([diffusion]) is incompatible with SAEM, with the Gauss-Newton
     // methods, and with the analytic-sensitivity gradient path (EKF estimation
     // requires FD-FOCE/FOCEI).
@@ -2862,6 +2959,31 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    the model, so they surface from `ferx check model.ferx` even without a
     //    `--data` file.
     diags.extend(check_experimental_features(&parsed.model));
+
+    // 2d. Undeclared random effects, *without* a dataset. With data present this
+    //    is an `E_ETA_NOT_DECLARED` error from `check_covariates` below (we know
+    //    the column is absent); without one we cannot know whether the data
+    //    happens to carry an `ETA_CL` column, so it can only be a warning — but
+    //    it must still be said. Before #989 a model that dropped its whole
+    //    `omega` block was rejected at parse time; now it parses, and a bare
+    //    `ferx check model.ferx` would otherwise report "no errors" for a model
+    //    whose etas silently became covariate lookups.
+    if data_path.is_none() {
+        let undeclared = undeclared_random_effect_names(&parsed.model);
+        if !undeclared.is_empty() {
+            diags.push(
+                Diagnostic::warning(
+                    "W_ETA_NOT_DECLARED",
+                    undeclared_random_effect_message(&undeclared),
+                )
+                .with_block("parameters")
+                .with_suggestion(format!(
+                    "re-run with --data to confirm whether the data carries the `{}` column",
+                    undeclared[0]
+                )),
+            );
+        }
+    }
 
     // 3. Data-dependent checks (only when a dataset is supplied). Read through
     //    the same covariate-aware chokepoint the fit uses, so `ferx check` and

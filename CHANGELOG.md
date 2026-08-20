@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Models with no random effects — fixed-effects-only / naive-pooled fits (#989).** A continuous
+  (residual-error) model may now omit every `omega` declaration; previously this was rejected at
+  parse time with `No omega parameters defined`, and the 0×0 Ω path was reachable only from an
+  `[event_model]` / `[binary_model]` endpoint. With `n_eta = 0` there is no inner empirical-Bayes
+  problem and no `log|Ω|` term, so FOCE/FOCEI collapse to the plain maximum-likelihood objective.
+  An `[error_model]` and its `sigma` are still required for a continuous endpoint — only Ω becomes
+  optional. Anchored against a NONMEM `$OMEGA 0 FIX` population fit on `data/one_cpt_iv.csv`
+  (OFV −269.637010 vs −269.63700440; θ and σ to 4+ significant figures; SEs match under
+  `covariance_method = rsr`, which is NONMEM's `$COVARIANCE` default).
 - **IMP / IMPMAP estimation and objective evaluation for mixture models (#985).** Importance sampling
   now both **estimates** a `[mixture]` model (`method = imp` / `impmap`) and **evaluates** its
   class-marginal likelihood `−2 Σ log Σ_k p_ik L_ik` (`imp_eval_only`, NONMEM `METHOD=IMP EONLY=1`).

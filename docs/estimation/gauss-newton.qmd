@@ -99,3 +99,21 @@ The initial Levenberg-Marquardt damping factor defaults to 0.01 and adapts autom
 **Stick with `foce`/`focei`** when:
 - The model has convergence issues with GN (rare)
 - You need exact compatibility with standard FOCE/FOCEI results
+- The model has **no random effects** and you are not confident in the `sigma`
+  start (see below)
+
+### Fixed-effects-only models
+
+`gn` and `gn_hybrid` both reduce correctly at `n_eta = 0`
+([no omega at all](../model-file/parameters.qmd#no-omega-at-all-fixed-effects-only-naive-pooled-fits)),
+but GN is the method most sensitive to the starting values there. Without random
+effects there is no inner EBE loop to absorb a mis-specified `sigma`, so the
+initial objective can start orders of magnitude above the optimum, and BHHH's
+outer-product Hessian badly over-estimates curvature that far out — the step
+collapses and the fit crawls into `maxiter`.
+
+Concretely, on `examples/one_cpt_iv.ferx` with its omegas removed and its own
+`sigma PROP_ERR ~ 0.02 (sd)` start, `gn` begins at OFV 11374 and reports
+`Converged: NO`. From `0.13 (sd)` it converges to the optimum. FOCEI reaches the
+optimum from either start. If a fixed-effects GN fit stalls, check `sigma` before
+anything else — or use `gn_hybrid`, whose FOCEI polish recovers it.
