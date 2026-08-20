@@ -333,6 +333,9 @@ remove it from [odes]; if it is meant to be an ordinary parameter, rename it —
 `F` is a reserved dose-attribute name.
 ```
 
+Every read inside `[odes]` counts, including an `init(state) = …` seed — otherwise
+the rule would have a hole the size of its own remedy.
+
 The same rule covers `LAGTIME`/`ALAG` and the compartment-indexed `F{n}` /
 `ALAG{n}` / `LAGTIME{n}` below. These apply to **every** dose, so the collision
 is decidable from the model alone. `D{n}` / `R{n}` are different: the engine only

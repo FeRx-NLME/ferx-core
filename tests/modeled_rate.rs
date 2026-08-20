@@ -510,6 +510,94 @@ fn modeled_rate_param_also_read_in_rhs_is_rejected_only_with_coded_rate() {
     );
 }
 
+/// `[scaling]`-side twin of `ODE_R1_ALSO_IN_RHS`: `R1` is read by the **readout**
+/// rather than the derivative. The `0.0 *` keeps the numbers identical so only the
+/// naming collision is under test.
+const ODE_R1_ALSO_IN_SCALING: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVR1(20.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  R1 = TVR1
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y = central / V + 0.0 * R1
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// `ANALYTICAL_R1` with the readout reading `R1`. The readout is the **only**
+/// prediction path an analytical model has — it has no `[odes]` RHS — so this is
+/// the whole of the analytical-engine half of the rule.
+const ANALYTICAL_R1_ALSO_IN_SCALING: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVR1(20.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  R1 = TVR1
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[scaling]
+  obs_scale = V + 0.0 * R1
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+#[test]
+fn modeled_rate_param_read_in_scaling_is_rejected_on_both_engines() {
+    // #993, the readout half. `build_ode_spec` records a `D{n}`/`R{n}` read by the
+    // ODE *RHS*; the `[scaling]` walk in `parse_full_model` records one read by the
+    // readout, and is the only recorder an analytical model has. Both must land on
+    // the engine-correct `dose_attr_map` — `active_dose_attr_map_mut()` — or the
+    // mark is written somewhere `check_modeled_dose_rates` never looks.
+    let coded = pop_of(&coded_csv());
+    let explicit = pop_of(&explicit_csv());
+    for (label, src) in [
+        ("ODE", ODE_R1_ALSO_IN_SCALING),
+        ("analytical", ANALYTICAL_R1_ALSO_IN_SCALING),
+    ] {
+        let model = model_of(src);
+        let d = check_model_data(&model, &coded)
+            .into_iter()
+            .find(|d| d.code == "E_DOSE_ATTR_DOUBLE_USE")
+            .unwrap_or_else(|| panic!("{label}: RATE=-1 onto an R1 the readout reads is rejected"));
+        assert!(
+            d.message.contains("R1") && d.message.contains("[scaling]"),
+            "{label}: {}",
+            d.message
+        );
+        // Same model, no coded RATE: `R1` is an ordinary parameter and stays silent.
+        assert!(
+            !check_model_data(&model, &explicit)
+                .iter()
+                .any(|d| d.code == "E_DOSE_ATTR_DOUBLE_USE"),
+            "{label}: without a coded RATE, `R1` is an ordinary parameter"
+        );
+    }
+}
+
 #[test]
 fn analytical_modeled_rate_matches_explicit_infusion() {
     // Core invariant on the ANALYTICAL engine: `RATE=-1` with `R1=20` equals an

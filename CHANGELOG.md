@@ -22,8 +22,8 @@ section of the SDLC for the versioning policy).
 ### Changed
 - **A dose attribute that is also read by the model is now an error (#993).** `F`,
   `LAGTIME`/`ALAG` and the compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` are applied by the
-  engine **at the dose event**. A model that declares one and *also* references it in the `[odes]`
-  RHS or the `[scaling]` readout was applying it twice — silently, and by exactly that factor: an
+  engine **at the dose event**. A model that declares one and *also* references it in `[odes]`
+  (the RHS or an `init(...)` seed) or the `[scaling]` readout was applying it twice — silently, and by exactly that factor: an
   ODE model reading its own `F` produced every prediction scaled by `F`, and renaming the parameter
   changed the fit by that amount with no diagnostic either way. This is now rejected at parse time
   with `E_DOSE_ATTR_DOUBLE_USE`, naming both readings and the fix. `D{n}`/`R{n}` carry the same

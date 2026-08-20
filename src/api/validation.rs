@@ -2808,9 +2808,12 @@ pub fn check_experimental_features(model: &CompiledModel) -> Vec<Diagnostic> {
 }
 
 /// Map a free-text parser error string to a single structured [`Diagnostic`].
-/// Recognises the `"Missing [X] block"` shape (→ `E_MISSING_BLOCK`, with the
-/// block name attached) and the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`);
-/// everything else is a generic `E_PARSE`.
+/// Recognises the `"Missing [X] block"` shape (→ `E_MISSING_BLOCK`, with the block
+/// name attached), the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`), and the
+/// dose-attribute double use (→ `E_DOSE_ATTR_DOUBLE_USE`, #993); everything else is
+/// a generic `E_PARSE`. Each shape is matched on a sentinel the emitting site is
+/// pinned to by a test, so a reworded message cannot silently fall through to the
+/// catch-all.
 fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     if let Some(rest) = err.strip_prefix("Missing [") {
         if let Some(end) = rest.find(']') {

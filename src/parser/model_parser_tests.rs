@@ -1774,6 +1774,61 @@ fn dose_attr_read_in_odes_rhs_is_matched_case_insensitively() {
 }
 
 #[test]
+fn dose_attr_read_in_odes_init_is_rejected() {
+    // `init(state) = <expr>` lives in `[odes]` but is split out of the block before
+    // the derivative statements are parsed, so it needs its own walk. Without one
+    // the rule has a hole the exact size of its own remedy: a user told to drop `F`
+    // from the RHS can move it into the initial condition and get the same silent
+    // double application from the same block.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  init(central) = F * 100.0
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let err = expect_parse_err(src);
+    assert!(
+        err.contains("[odes]:") && err.contains("reserved dose-attribute name"),
+        "an `init(...)` read of `F` is the same double use: {err}"
+    );
+}
+
+#[test]
+fn out_of_range_indexed_dose_attr_reports_the_compartment_error() {
+    // Scope boundary on the compartment index. `F5` on a one-state model is a
+    // *different* defect, and `dose_attr_map`'s build reports it precisely. This
+    // check runs first, so it must decline out-of-range indices — otherwise the
+    // user is told to rename `F5` when the real problem is that compartment 5 does
+    // not exist.
+    let err = expect_parse_err(&dose_attr_rhs_model("F5"));
+    assert!(
+        err.contains("only 1 compartment"),
+        "the compartment-index error must win over the double-use rename advice: {err}"
+    );
+    assert!(
+        !err.contains("reserved dose-attribute name"),
+        "out-of-range `F5` is not the #993 diagnostic: {err}"
+    );
+}
+
+#[test]
 fn ordinary_names_read_in_odes_rhs_are_accepted() {
     // The other half of the contract, and the one that would break real models if
     // the predicate over-matched. `N`/`MTT`/`MAT`/`CV2` hold canonical PK slots but

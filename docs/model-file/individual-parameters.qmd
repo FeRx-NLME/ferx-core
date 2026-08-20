@@ -301,7 +301,7 @@ If you need an ordinary parameter, rename it: the name is what routes it.
 `D{n}`/`R{n}` (modeled infusion duration/rate) carry the same reservation, but the
 engine only consults them for a dose that codes `RATE=-2`/`-1`. That check
 therefore runs against the dataset, not the model file — see
-[Bioavailability](ode-models.qmd#reading-a-dose-attribute-is-an-error-not-a-warning).
+[Reading a dose attribute is an error, not a warning](ode-models.qmd#reading-a-dose-attribute-is-an-error-not-a-warning).
 
 Reporting is unaffected: referencing any of these from `[derived]` or `[output]`
 is post-solve tabulation, not a second application, and stays silent.

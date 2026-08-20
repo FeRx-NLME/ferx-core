@@ -2468,6 +2468,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &indiv_var_names_for_scaling,
                 &ode_slot_map,
                 &scaling_reads,
+                state_names_for_scaling.len(),
                 "[scaling]",
             )?;
         }
@@ -8365,10 +8366,17 @@ fn ode_free_slot_count(names: &[String]) -> usize {
 /// `reads` holds the names actually referenced in `block`, upper-cased: the ODE
 /// var-slot map aliases each parameter's case variants onto one slot, so a `f` in
 /// the RHS reads the same value as `F` and must diagnose the same.
+///
+/// `n_states` bounds the compartment indices this check will claim. An `F{c}` with
+/// `c` past the last state is a *different* defect, and the `dose_attr_map` build
+/// below reports it precisely ("the model has only N compartment(s)"); telling such
+/// a user to rename `F5` would send them after the wrong thing, so out-of-range
+/// indices are left for that check.
 fn check_dose_attr_double_use(
     indiv_param_names: &[String],
     indiv_param_slots: &[usize],
     reads: &std::collections::HashSet<String>,
+    n_states: usize,
     block: &str,
 ) -> Result<(), String> {
     for (i, name) in indiv_param_names.iter().enumerate() {
@@ -8377,6 +8385,9 @@ fn check_dose_attr_double_use(
             continue;
         };
         if when != crate::types::DoseAttrConsumption::EveryDose {
+            continue;
+        }
+        if cmt.is_some_and(|c| c > n_states) {
             continue;
         }
         if !reads.contains(&name.to_ascii_uppercase()) {
@@ -9157,13 +9168,29 @@ fn build_ode_spec(
     // already stripped, `d/dt(X)` / `Assign` left-hand sides are not reads, and the
     // `ode_template`-generated equations plus the injected joint-PK-TTE
     // `d/dt(__chz_n)` hazard lines are all in `stmts_owned` by now.
+    //
+    // `init(state) = <expr>` directives are pulled out of the block *before*
+    // `stmts_owned` is parsed, so they must be walked separately or the rule has a
+    // hole exactly the size of its own remedy: a user told to drop `F` from the RHS
+    // could move it into `init(central) = F * AMT` and get the same silent double
+    // application from the same block.
     let mut rhs_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
-    visit_stmt_nodes(&stmts_owned, &mut |e: &Expression| {
+    let mut collect_reads = |e: &Expression| {
         if let Expression::Variable(name) = e {
             rhs_reads.insert(name.to_ascii_uppercase());
         }
-    });
-    check_dose_attr_double_use(&indiv_names_owned, &indiv_slots_owned, &rhs_reads, "[odes]")?;
+    };
+    visit_stmt_nodes(&stmts_owned, &mut collect_reads);
+    for (_, init_expr) in &init_specs {
+        visit_expr_nodes(init_expr, &mut collect_reads);
+    }
+    check_dose_attr_double_use(
+        &indiv_names_owned,
+        &indiv_slots_owned,
+        &rhs_reads,
+        n_states,
+        "[odes]",
+    )?;
 
     // Reject name collisions (case-insensitive) across the three name spaces.
     // Without this, the eager alias insertion below would silently route reads
