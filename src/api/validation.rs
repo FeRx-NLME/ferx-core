@@ -2191,13 +2191,22 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // `chain.contains`. An unconverged pure-GN run at n_eta = 0 additionally
     // pushes a post-fit warning (`gauss_newton.rs`), under the same rule, since
     // `Converged: NO` is the state that actually predicts the bad answer.
+    // `eval_only` mirrors `fit()`'s construction: the methods running as pure
+    // likelihood evaluators for this fit, which therefore cede "last estimating
+    // stage" to the estimator before them. `laplace` joins `imp` here because
+    // `agq_eval_only` makes it an evaluator the same way `imp_eval_only` does.
+    let mut eval_only: Vec<EstimationMethod> = Vec::new();
+    if options.imp_eval_only {
+        eval_only.push(EstimationMethod::Imp);
+    }
+    if options.agq_eval_only {
+        eval_only.push(EstimationMethod::Laplace);
+    }
     if model.n_eta == 0
         && chain
             .iter()
             .rposition(|&m| m == EstimationMethod::FoceGn)
-            .is_some_and(|idx| {
-                crate::api::is_last_estimating_stage(&chain, idx, options.imp_eval_only)
-            })
+            .is_some_and(|idx| crate::api::is_last_estimating_stage(&chain, idx, &eval_only))
     {
         diags.push(
             Diagnostic::warning(
@@ -2668,6 +2677,34 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                      populated with a log-likelihood computed at parameters that the following \
                      stage then overwrites. Move `imp` to the end, or drop `imp_eval_only` to run \
                      it as an estimator.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
+    // `agq_eval_only` turns a `laplace` stage into a likelihood *evaluator* rather than an
+    // estimator, so the same terminal-stage rule as `imp_eval_only` applies: an evaluator
+    // mid-chain would report a `−2 log L` computed at parameters the next stage overwrites.
+    if options.agq_eval_only {
+        if !chain.contains(&EstimationMethod::Laplace) {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_EVAL_ONLY",
+                    "`agq_eval_only = true` requires a `laplace` stage — it is what evaluates \
+                     the adaptive-quadrature marginal likelihood. Add `laplace` to `methods` \
+                     (e.g. `methods = vi, laplace`), or drop `agq_eval_only`.",
+                )
+                .with_block("fit_options"),
+            );
+        } else if chain.last().copied() != Some(EstimationMethod::Laplace) {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_EVAL_ONLY",
+                    "method `laplace` with `agq_eval_only = true` must be the final stage of \
+                     the chain — placing the evaluator mid-chain would report a `−2 log L` \
+                     computed at parameters that the following stage then overwrites. Move \
+                     `laplace` to the end, or drop `agq_eval_only` to run it as an estimator.",
                 )
                 .with_block("fit_options"),
             );

@@ -7049,6 +7049,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         }
         "imp_averaging" => opts.imp_averaging = parse_usize("imp_averaging")?,
         "imp_eval_only" => opts.imp_eval_only = parse_bool("imp_eval_only")?,
+        "agq_eval_only" => opts.agq_eval_only = parse_bool("agq_eval_only")?,
         "impmap_iterations" => {
             let v = parse_usize("impmap_iterations")?;
             if v < 1 {

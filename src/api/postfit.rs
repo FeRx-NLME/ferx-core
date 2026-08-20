@@ -337,14 +337,16 @@ pub(crate) fn compute_param_corr(
 pub(crate) fn is_last_estimating_stage(
     chain: &[EstimationMethod],
     stage_idx: usize,
-    imp_eval_only: bool,
+    eval_only: &[EstimationMethod],
 ) -> bool {
     let is_last = stage_idx + 1 == chain.len();
-    let trailing_eval_only_imp = imp_eval_only
-        && chain[stage_idx + 1..]
-            .iter()
-            .all(|&m| m == EstimationMethod::Imp);
-    is_last || trailing_eval_only_imp
+    // Every remaining stage is a pure evaluator, so *this* one is the last that estimates.
+    // `eval_only` is the set of methods running in evaluation-only mode for this fit —
+    // `imp` under `imp_eval_only`, `laplace` under `agq_eval_only`. An empty slice means
+    // nothing is an evaluator, so only the literal last stage qualifies.
+    let trailing_all_eval_only = !chain[stage_idx + 1..].is_empty()
+        && chain[stage_idx + 1..].iter().all(|m| eval_only.contains(m));
+    is_last || trailing_all_eval_only
 }
 
 /// Whether a Gauss-Newton stage's warning survives into `FitResult.warnings`.

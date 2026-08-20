@@ -197,6 +197,25 @@ n_agq  = 3
 
 The **method name selects the Hessian anchor**: `method = laplace` places the grid with the exact Hessian, `method = focei` with the Gauss-Newton `H̃`. So `method = focei` with `n_agq > 1` is the Gauss-Newton-anchored quadrature — FOCEI refined toward the exact marginal. See the [AGQ page](../estimation/agq.qmd).
 
+#### `agq_eval_only` — AGQ as a likelihood evaluator
+
+```
+method        = vi, laplace
+n_agq         = 21
+agq_eval_only = true
+```
+
+With `agq_eval_only = true` a `laplace` stage stops being an estimator and becomes a pure **evaluator**: it reconverges the EBEs at the parameters it was handed, evaluates the adaptive-quadrature marginal there, and reports it as `ofv`. The preceding stage's `θ`, `Ω` and `σ` are left exactly as they were. It must be the final stage — an evaluator mid-chain would report a likelihood at parameters the next stage overwrites.
+
+This is the deterministic counterpart to `methods = ..., imp` with `imp_eval_only = true`. Both turn a fitted point into a `−2 log L`; the AGQ route carries **no Monte-Carlo error**, so two runs agree bit for bit, at the cost of `n_agq ^ n_eta` likelihood evaluations per subject.
+
+Two uses:
+
+- **Finishing a VI fit.** The ELBO is a lower bound, not a likelihood, so `ofv` is `NaN` by default. This gives a real marginal likelihood at the VI estimate — and being deterministic, it is directly comparable across VI fits. `vi_final_ofv = laplace` is the same idea pinned at one node.
+- **Checking a bound or an approximation.** Because `−2·ELBO ≥ −2 log p(y)` must hold, evaluating the marginal at a VI point tells you how tight the variational approximation actually is. The same comparison against a FOCE/FOCEI OFV measures what the first-order approximation costs on your model.
+
+The EBEs are recomputed rather than inherited, because adaptive quadrature centres its grid on the conditional mode and scales it by the posterior Hessian — and a VI stage reports variational *means*, which are not modes.
+
 ### SAEM
 ```
 method = saem
@@ -211,7 +230,7 @@ method = vi
 
 Suits deep compartment models (`[covariate_nn]`), models where the FOCE inner loop is unstable, and cases where you want a per-subject posterior *covariance* without paying for a Hessian — VI produces one as a by-product.
 
-**Its objective is a lower bound, not a likelihood.** `ofv` is `NaN` after a VI fit by default rather than being filled with a number that is not comparable to a FOCE or SAEM OFV. Set `vi_final_ofv = laplace`, or chain `methods = vi, imp` with `imp_eval_only = true`, to evaluate a genuine marginal likelihood at the VI estimate. IOV and non-Gaussian endpoints are not supported. See the [VI page](../estimation/vi.qmd).
+**Its objective is a lower bound, not a likelihood.** `ofv` is `NaN` after a VI fit by default rather than being filled with a number that is not comparable to a FOCE or SAEM OFV. Set `vi_final_ofv = laplace`, or chain `method = vi, laplace` with `agq_eval_only = true` (deterministic) or `method = vi, imp` with `imp_eval_only = true` (importance sampling), to evaluate a genuine marginal likelihood at the VI estimate. IOV and non-Gaussian endpoints are not supported. See the [VI page](../estimation/vi.qmd).
 
 ## AGQ-Specific Options
 
@@ -250,7 +269,7 @@ Only used when `method = vi`. See the [VI page](../estimation/vi.qmd).
 | `vi_avg_last` | final 25% | Polyak averaging window, in iterations. The reported estimate is the mean over the final window — the last iterate of a stochastic optimizer is a draw carrying its final step's full gradient noise. |
 | `vi_eta_grad` | `auto` | `auto` uses the analytic `Dual2` η-gradient where available and central finite differences where not; `analytic` errors instead of degrading; `fd` forces finite differences (diagnostic). `vi$n_fd_subjects` reports how many subjects took the slow path. |
 | `vi_kl` | `analytic` | How the `KL(q ‖ N(0, Ω))` half is evaluated. `analytic` takes it in closed form, so only the data term is sampled — that is what lets Ω be updated in closed form. `mc` estimates it from the same draws, using the path-derivative gradient: unbiased but noisier, needed by a variational family with no closed-form KL (such a family falls back to it automatically, with a warning), and useful as a cross-check of the analytic KL. `vi$kl` reports the route actually taken. |
-| `vi_final_ofv` | `none` | `none` leaves `ofv` as `NaN` — the ELBO is a lower bound, not a `−2 log L`, and is not comparable with a FOCE/SAEM OFV. `laplace` reconverges EBEs at the VI estimate and reports the FOCE objective, which is. For an importance-sampling `−2 log L`, chain `methods = vi, imp` with `imp_eval_only = true`. |
+| `vi_final_ofv` | `none` | `none` leaves `ofv` as `NaN` — the ELBO is a lower bound, not a `−2 log L`, and is not comparable with a FOCE/SAEM OFV. `laplace` reconverges EBEs at the VI estimate and reports the FOCE objective, which is. For a *quadrature* `−2 log L`, chain `method = vi, laplace` with [`agq_eval_only`](#agq_eval_only-agq-as-a-likelihood-evaluator); for an importance-sampling one, `method = vi, imp` with `imp_eval_only = true`. |
 | `vi_seed` | `20240704` | Seed for the common random numbers. Draws are derived from `(seed, iteration, subject, sample)`, so a fit is reproducible regardless of thread count. |
 
 ## SIR (Sampling Importance Resampling)

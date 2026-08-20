@@ -516,6 +516,15 @@ section of the SDLC for the versioning policy).
   cost at all; wider subjects run up to ~1.5× more work in the outer walk for the padded
   lanes, and the 96-axis cap (past which a subject falls back to finite differences) is
   unchanged (#971).
+### Added
+- **`agq_eval_only`** — a `laplace` stage can now *evaluate* the adaptive-Gauss-Hermite
+  marginal likelihood at the parameters it is handed instead of estimating, reporting it as
+  `ofv` and leaving `θ`/`Ω`/`σ` untouched. It must be the final stage. This is the
+  deterministic counterpart to `imp_eval_only`: `method = vi, laplace` with
+  `agq_eval_only = true` turns a VI fit's ELBO — which is only a lower bound — into a real
+  `−2 log L` that carries no Monte-Carlo error, so two runs agree bit for bit. See
+  `docs/model-file/fit-options.qmd`.
+
 
 ### Fixed
 - **`optimizer = trust_region` no longer reports `Converged: YES` when it merely ran out of

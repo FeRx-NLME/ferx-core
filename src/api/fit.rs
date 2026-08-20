@@ -1271,7 +1271,14 @@ fn fit_inner(
         // Run the covariance step (and SIR) only on the last *estimating* stage,
         // so a chain doesn't recompute the expensive FD covariance after every
         // method (#615). See `is_last_estimating_stage` for the eval-only-IMP rule.
-        let is_last_estimating = is_last_estimating_stage(&chain, stage_idx, options.imp_eval_only);
+        let mut eval_only_methods: Vec<EstimationMethod> = Vec::new();
+        if options.imp_eval_only {
+            eval_only_methods.push(EstimationMethod::Imp);
+        }
+        if options.agq_eval_only {
+            eval_only_methods.push(EstimationMethod::Laplace);
+        }
+        let is_last_estimating = is_last_estimating_stage(&chain, stage_idx, &eval_only_methods);
         if !is_last_estimating {
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
@@ -1291,6 +1298,82 @@ fn fit_inner(
                 n_stages,
                 method.label()
             );
+        }
+
+        // AGQ evaluation-only stage (`agq_eval_only`): not an estimator. Reconverges the
+        // EBEs at the incoming parameters, evaluates the adaptive-Gauss–Hermite marginal
+        // there, and overwrites only the reported OFV — the preceding stage's parameters,
+        // EBEs and Hessians stay canonical.
+        //
+        // The EBEs are recomputed rather than reused because adaptive quadrature centres its
+        // grid on the conditional mode and scales it by the posterior Hessian; a mode carried
+        // over from a method that never converged one (VI reports variational means, not
+        // modes) would put the grid in the wrong place. Deterministic throughout, which is
+        // the whole point relative to `methods = ..., imp` with `imp_eval_only`.
+        if method == EstimationMethod::Laplace && stage_opts.agq_eval_only {
+            let n_nodes = stage_opts.agq_nodes().unwrap_or(1);
+            let mu_k = crate::estimation::parameterization::compute_mu_k(
+                model,
+                &stage_params.theta,
+                stage_opts.mu_referencing,
+            );
+            let (eta_hats, h_matrices, _stats, kappas) =
+                crate::estimation::inner_optimizer::run_inner_loop_warm(
+                    model,
+                    population,
+                    &stage_params,
+                    stage_opts.inner_maxiter,
+                    stage_opts.inner_tol,
+                    result.as_ref().map(|r| r.eta_hats.as_slice()),
+                    Some(&mu_k),
+                    stage_opts.min_obs_for_convergence_check as usize,
+                    stage_opts.inner_restarts,
+                );
+            let nll = crate::estimation::agq::agq_population_nll(
+                model,
+                population,
+                &stage_params,
+                &eta_hats,
+                &kappas,
+                n_nodes,
+                stage_opts.hessian_anchor(),
+            );
+            let ofv = 2.0 * nll;
+            match result.as_mut() {
+                // Chained: keep the estimator's parameters and replace only the OFV, so the
+                // reported objective is the quadrature marginal at the point it reached.
+                Some(prev) => prev.ofv = ofv,
+                // Standalone: there is nothing to preserve, so this becomes the canonical
+                // result at the (unchanged) initial parameters.
+                None => {
+                    result = Some(crate::estimation::outer_optimizer::OuterResult {
+                        params: stage_params.clone(),
+                        ofv,
+                        converged: true,
+                        n_iterations: 0,
+                        eta_hats,
+                        h_matrices,
+                        kappas,
+                        covariance_matrix: None,
+                        covariance_wall_time_secs: 0.0,
+                        warnings: Vec::new(),
+                        saem_mu_ref_m_step_evals_saved: None,
+                        saem_n_subjects_hmc: None,
+                        ebe_convergence_warnings: 0,
+                        max_unconverged_subjects: 0,
+                        total_ebe_fallbacks: 0,
+                        final_gradient: None,
+                        sir_fallback_proposal: None,
+                        impmap_trace: None,
+                        bayes: None,
+                        cond_dist: None,
+                        packed_estimate: None,
+                        vi: None,
+                    });
+                }
+            }
+            method_wall_times_secs.push(stage_start.elapsed().as_secs_f64());
+            continue;
         }
 
         // IMP evaluation-only stage (`imp_eval_only`, NONMEM `IMP EONLY=1`): not an

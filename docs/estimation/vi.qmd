@@ -85,6 +85,15 @@ To get a genuine marginal likelihood at the VI estimate:
   vi_final_ofv = laplace     # EBE reconvergence + the FOCE objective; cheap, deterministic
 ```
 
+for a **deterministic** quadrature `−2 log L`:
+
+```
+[fit_options]
+  method        = vi, laplace
+  n_agq         = 21
+  agq_eval_only = true
+```
+
 or, for an importance-sampling `−2 log L` with the full IS diagnostics:
 
 ```
@@ -93,7 +102,17 @@ or, for an importance-sampling `−2 log L` with the full IS diagnostics:
   imp_eval_only  = true
 ```
 
-The chain is the recommended way to finish a VI fit for a model you intend to report.
+Any of the three is a reasonable way to finish a VI fit for a model you intend to report. The
+middle one is the tightest: adaptive quadrature converges to the exact marginal as `n_agq`
+rises and carries no Monte-Carlo error, so two runs agree bit for bit and the number is
+comparable across fits without a sampling caveat. It costs `n_agq ^ n_eta` likelihood
+evaluations per subject, so it suits `n_eta ≤ 4`. The IS route scales better in `n_eta` and
+brings its own diagnostics.
+
+Evaluating the marginal this way also lets you read the **bound gap** directly: `−2·ELBO`
+minus the AGQ `ofv` is `2·KL(q ‖ p(η|y))` summed over subjects, which is the quantity
+[`elbo_tightness_ratio`](#is-the-bound-tight-elbo_tightness_ratio) approximates. That
+inequality is enforced as a test — see the note below.
 
 ### The bound is verified, not assumed
 

@@ -5795,6 +5795,19 @@ pub struct FitOptions {
     /// chain stage. When `false` (default), `imp` is an MCEM estimator
     /// (NONMEM `METHOD=IMP`).
     pub imp_eval_only: bool,
+    /// When `true`, a `laplace` stage **evaluates** `−2 log L` by adaptive Gauss–Hermite
+    /// quadrature at the fixed input parameters instead of estimating, and must then be the
+    /// terminal chain stage. The AGQ analogue of [`Self::imp_eval_only`].
+    ///
+    /// The point is a *deterministic* marginal likelihood at a point some other method
+    /// reached. `methods = vi, laplace` with `agq_eval_only = true` and `n_agq = 21` is the
+    /// recommended way to turn a VI fit's ELBO — which is only a bound — into a real
+    /// `−2 log L`, and unlike the `imp` route it carries no Monte-Carlo error, so two runs
+    /// agree bit for bit. `vi_final_ofv = laplace` is the same idea fixed at one node.
+    ///
+    /// The EBEs are reconverged at the incoming parameters before the grid is laid, because
+    /// adaptive quadrature centres itself on the conditional mode.
+    pub agq_eval_only: bool,
     // IMPMAP (Importance Sampling assisted by Mode A Posteriori) options,
     // consumed by the `Impmap` estimating stage. IMPMAP runs a Monte-Carlo EM
     // loop: each iteration re-centers a per-subject importance-sampling proposal
@@ -6197,6 +6210,7 @@ impl Default for FitOptions {
             imp_iterations: 200,
             imp_averaging: 50,
             imp_eval_only: false,
+            agq_eval_only: false,
             impmap_iterations: 200,
             impmap_samples: 300,
             impmap_proposal_df: 4.0,
@@ -6936,6 +6950,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
         // `n_agq = 1` is Laplace, `> 1` is adaptive Gauss–Hermite quadrature.
         EstimationMethod::Laplace => &[
             "n_agq",
+            "agq_eval_only",
             "maxiter",
             "inner_maxiter",
             "inner_tol",

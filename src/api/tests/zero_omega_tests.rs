@@ -566,3 +566,36 @@ fn check_model_options_warns_gn_followed_only_by_an_eval_only_imp() {
         "gn before an eval-only IMP is still the last estimating stage: {diags:?}"
     );
 }
+
+#[test]
+fn check_model_options_warns_gn_followed_only_by_an_eval_only_laplace() {
+    // The `agq_eval_only` twin of the eval-only-IMP rule above (#1017): a
+    // `laplace` stage running as a terminal AGQ evaluator is a likelihood
+    // evaluation, not an estimator, so it does not re-optimise the GN result and
+    // `gn` remains the last *estimating* stage — warning kept.
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::FoceGn, EstimationMethod::Laplace],
+        agq_eval_only: true,
+        ..Default::default()
+    };
+    let diags = check_model_options(&model, &opts);
+    assert!(
+        diags.iter().any(|d| d.code == "W_GN_NO_RANDOM_EFFECTS"),
+        "gn before an eval-only laplace is still the last estimating stage: {diags:?}"
+    );
+
+    // Without `agq_eval_only` the same chain has `laplace` estimating after `gn`,
+    // which re-optimises the result — so the warning must drop. This is the pair
+    // that pins the flag as the thing that matters, not the method token.
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::FoceGn, EstimationMethod::Laplace],
+        ..Default::default()
+    };
+    let diags = check_model_options(&model, &opts);
+    assert!(
+        !diags.iter().any(|d| d.code == "W_GN_NO_RANDOM_EFFECTS"),
+        "gn polished by an estimating laplace must not warn: {diags:?}"
+    );
+}

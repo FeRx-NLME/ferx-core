@@ -150,15 +150,15 @@ use EstimationMethod::*;
 
 #[test]
 fn cov_stage_single_method_is_last() {
-    assert!(is_last_estimating_stage(&[Foce], 0, false));
+    assert!(is_last_estimating_stage(&[Foce], 0, &[]));
 }
 
 #[test]
 fn cov_stage_only_final_estimator_in_plain_chain() {
     // [foce, saem]: covariance only on saem (the last stage), never on foce.
     let chain = [Foce, Saem];
-    assert!(!is_last_estimating_stage(&chain, 0, false));
-    assert!(is_last_estimating_stage(&chain, 1, false));
+    assert!(!is_last_estimating_stage(&chain, 0, &[]));
+    assert!(is_last_estimating_stage(&chain, 1, &[]));
 }
 
 #[test]
@@ -167,8 +167,8 @@ fn cov_stage_estimating_imp_owns_step_not_predecessor() {
     // IMP is a real estimator and owns the covariance step, so saem must NOT
     // also run it — otherwise covariance is computed twice (#615).
     let chain = [Saem, Imp];
-    assert!(!is_last_estimating_stage(&chain, 0, false));
-    assert!(is_last_estimating_stage(&chain, 1, false));
+    assert!(!is_last_estimating_stage(&chain, 0, &[]));
+    assert!(is_last_estimating_stage(&chain, 1, &[]));
 }
 
 #[test]
@@ -176,20 +176,20 @@ fn cov_stage_eval_only_imp_cedes_step_to_predecessor() {
     // [saem, imp] with imp_eval_only = true: trailing IMP is a likelihood
     // evaluation, so saem is the last estimating stage and owns covariance.
     let chain = [Saem, Imp];
-    assert!(is_last_estimating_stage(&chain, 0, true));
+    assert!(is_last_estimating_stage(&chain, 0, &[Imp]));
     // The eval-only IMP stage itself never runs the covariance step (handled
     // by the eval-only branch in fit), but as the last stage it still reports
     // as last-estimating; gating there is a no-op since it skips covariance.
-    assert!(is_last_estimating_stage(&chain, 1, true));
+    assert!(is_last_estimating_stage(&chain, 1, &[Imp]));
 }
 
 #[test]
 fn cov_stage_three_method_chain_estimating_imp() {
     // [foce, saem, imp] estimating: only the final imp owns covariance.
     let chain = [Foce, Saem, Imp];
-    assert!(!is_last_estimating_stage(&chain, 0, false));
-    assert!(!is_last_estimating_stage(&chain, 1, false));
-    assert!(is_last_estimating_stage(&chain, 2, false));
+    assert!(!is_last_estimating_stage(&chain, 0, &[]));
+    assert!(!is_last_estimating_stage(&chain, 1, &[]));
+    assert!(is_last_estimating_stage(&chain, 2, &[]));
 }
 
 // ── keep_gn_zero_eta_warning: the chain half of the #1006 exemption ──
