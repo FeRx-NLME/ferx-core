@@ -11,8 +11,11 @@ posterior shape, so it asks *is a Gaussian right at all?* — which is the quest
 ## Running it
 
 ```bash
-tools/vi-nuts-anchor/run.sh
+tools/vi-nuts-anchor/run.sh                  # both sides + the comparison
+Rscript tools/vi-nuts-anchor/plots.R         # then the three figures
 ```
+
+`FERX_VI_FIGS` places the figures (default: alongside the inputs), same as the emvi harness.
 
 First run builds an isolated venv at `$FERX_VI_STATE/pyenv` and installs jax + numpyro into it.
 The system Python is never touched and deleting `$FERX_VI_STATE` undoes the install — the same
@@ -29,6 +32,7 @@ Not wired into CI, and shouldn't be: no CI image here carries jax, and NUTS take
 | `run.sh` | driver — provisions the venv, runs the ferx side, then the reference |
 | `anchor_c.py` | numpyro model, NUTS, the Laplace reference, and the comparison |
 | `q_at_agq.ferx` | ferx VI with every population parameter FIXed at the AGQ estimate |
+| `plots.R` | the three figures, drawn from the JSON `anchor_c.py` writes |
 
 ## Why both sides are pinned at the AGQ estimate
 
@@ -54,6 +58,21 @@ Three ratio rows, and the middle one is the interpretive key:
 
 `FERX_DATA` / `FERX_Q_FILE` / `FERX_ANCHOR_C_OUT` run the same comparison on another dataset; §5.1
 uses them for a 2-observations-per-subject variant of warfarin.
+
+## The figures
+
+- **`posterior-overlay.png`** — each subject's NUTS marginal with the variational Gaussian drawn
+  over it. The summaries can only show two covariances agreeing; this shows the *shape* agreeing,
+  which is the claim being made.
+- **`anchor-c-variance.png`** — VI variance ÷ NUTS variance per subject, both regimes. This is
+  the published understatement claim, measured.
+- **`anchor-c-why.png`** — the three ratios. Exists so the first figure cannot be over-read: a
+  small understatement against a Gaussian truth says the dataset cannot test the approximation,
+  not that the approximation is good.
+
+Regime is a facet rather than a hue in these, deliberately. Orange means nlmixr2 across the emvi
+figures, the two sets land in the same directory, and spending that colour on "data regime" here
+would make one hue mean two things to anyone reading them together.
 
 ## Deliberately not ferx's own `method = bayes`
 

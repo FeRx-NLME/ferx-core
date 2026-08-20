@@ -32,3 +32,6 @@ cargo build --profile ci-fast --bin ferx
 echo
 echo "=== NUTS reference ==="
 FERX_REPO="$REPO" FERX_VI_OUT="$RESULTS" "$PYENV/bin/python" tools/vi-nuts-anchor/anchor_c.py
+
+echo
+echo "figures: Rscript tools/vi-nuts-anchor/plots.R   (FERX_VI_FIGS=<dir> to place them)"

@@ -745,6 +745,12 @@ the follow-up is a fixture chosen for posterior geometry (a nonlinear/saturating
 or the Janssen fold-1 setup of §7) rather than for sparsity. `Ω_iov` ~24 % low is untouched here
 too: it needs the IOV fixture, not this one.
 
+**Figures.** `Rscript tools/vi-nuts-anchor/plots.R` — the overlay of each subject's NUTS marginal
+with the variational Gaussian (`posterior-overlay.png`) is the direct form of the claim; the
+variance ratios and the three-ratio decomposition are the numbers above. The decomposition figure
+exists so the first cannot be over-read: a small understatement measured against a Gaussian truth
+is a statement about the dataset.
+
 **Not attempted:** the gradient-level comparison, which is still gated on `vi_estimator`
 (§5 blocker) having no implementation in `src/`. The `(μ, S)` comparison above is the whole
 variance claim and needed none of it.

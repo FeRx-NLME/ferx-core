@@ -197,8 +197,13 @@ def main():
     vi_cov = np.stack([np.array(s["cov"]) for s in ferx])
     lap_cov = laplace_cov(jnp.array(t), jnp.array(y), jnp.array(mask), jnp.array(dose), nuts_mean)
 
+    # A thinned slice of the draws travels with the summaries so the figures can overlay the
+    # NUTS marginal against the variational Gaussian. Summaries alone can only show that two
+    # covariances agree; the overlay shows the *shape* agreeing, which is the claim.
+    thin = max(1, draws.shape[0] // 2000)
     out = {
         "ids": ids,
+        "draws_thinned": draws[::thin].tolist(),
         "nuts_mean": nuts_mean.tolist(),
         "nuts_cov": nuts_cov.tolist(),
         "vi_mean": vi_mean.tolist(),
