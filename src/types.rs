@@ -1440,7 +1440,14 @@ pub struct MixtureClassOverride {
 /// per-class Omega/Sigma overrides. The class-specific *typical values* are not
 /// stored here — they live in `[individual_parameters]` as `MIXNUM`-branched
 /// expressions and are shared/split entirely by the user.
+///
+/// `#[non_exhaustive]`: this struct is built by the parser, and #996 had to add a
+/// field to it — a source-breaking change for any downstream crate constructing
+/// it with a struct literal. Marking it non-exhaustive makes the next field
+/// addition non-breaking; construct it inside this crate (where literals are
+/// still allowed) or read it field-by-field.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MixtureSpec {
     /// Number of subpopulations K (>= 2).
     pub n_classes: usize,
@@ -1455,6 +1462,52 @@ pub struct MixtureSpec {
     pub omega_overrides: Vec<MixtureClassOverride>,
     /// Per-class Sigma overrides (empty ⇒ all classes share the base Sigma).
     pub sigma_overrides: Vec<MixtureClassOverride>,
+    /// Class-aware mu-references detected from `[individual_parameters]` (#996).
+    ///
+    /// Empty unless a typical value is written as a `MIXNUM`-switched chain whose
+    /// every arm is the *same* log-mu-ref pattern on the *same* eta, e.g.
+    /// `CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)`.
+    /// This is the only structured per-class θ mapping in the codebase — the
+    /// class-specific typical values otherwise live purely as `MIXNUM`-branched
+    /// expressions (see the type doc above).
+    ///
+    /// What each estimator does with it differs:
+    ///
+    /// - **IMP / IMPMAP** apply the responsibility-weighted per-class shift
+    ///   `log θ_k += (Σ_i PMIX_ic · η̄_ic) / (Σ_i PMIX_ic)` to every anchor here,
+    ///   switched and class-shared alike.
+    /// - **SAEM** keeps genuinely class-*switched* anchors on the numerical
+    ///   M-step — its hard per-subject class draw makes the per-class η mean a
+    ///   biased classification-EM statistic — and takes the closed form only for
+    ///   a class-*shared* anchor, i.e. one whose theta is the same in every class
+    ///   slot. Those are also the ones `CompiledModel::mu_refs` can express.
+    ///
+    /// An eta appears here at most once, and only when its class-aware
+    /// assignment is the *last* one for that eta, so this never contradicts
+    /// `CompiledModel::mu_refs`.
+    pub mu_refs: Vec<MixtureMuRef>,
+}
+
+/// A `MIXNUM`-switched log-mu-reference: one eta paired with one anchor theta
+/// **per class** (#996).
+///
+/// Produced by the parser when every arm of a `MIXNUM` chain matches the same
+/// mu-ref pattern on the same eta. `theta_names[c]` is the anchor for class
+/// `c + 1`; the same theta name may repeat (a class-shared typical value), which
+/// is what makes the degenerate one-theta case reduce to the classical pooled
+/// mu-ref update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixtureMuRef {
+    /// Eta this mu-reference is attached to.
+    pub eta_name: String,
+    /// Anchor theta name per class; `theta_names[c]` serves class `c + 1`.
+    /// Length is always the mixture's `n_classes`.
+    pub theta_names: Vec<String>,
+    /// Always `true` today — only log-mu-ref patterns (`THETA*exp(ETA)` /
+    /// `exp(log(THETA)+ETA)`) are detected, mirroring `get_mu_ref_pairs`'s
+    /// filter. Kept explicit so an additive class-aware pattern can be added
+    /// without changing the consumer's shape.
+    pub log_transformed: bool,
 }
 
 /// Supported PK structural models.

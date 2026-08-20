@@ -13600,6 +13600,358 @@ fn mixture_block_parses_into_spec() {
     assert_eq!(spec.sigma_overrides[0].name, "EPS");
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Class-aware mu-referencing for MIXNUM-switched typical values (#996)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Build a mixture model with `nsub = k` and the given `[individual_parameters]`
+/// body, using thetas TVCL1/TVCL2/TVCL3/TVV/MIXL1/MIXL2 and eta ETA_CL/ETA_V.
+fn mixture_model_with_indiv(n_classes: usize, indiv: &str) -> crate::types::CompiledModel {
+    let mixing: String = (1..n_classes)
+        .map(|c| format!("  logit({c}) = MIXL{c}\n"))
+        .collect();
+    let src = format!(
+        r"
+[parameters]
+  theta TVCL1(1.0, 0.001, 100.0)
+  theta TVCL2(3.0, 0.001, 100.0)
+  theta TVCL3(5.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL1(0.0, -10.0, 10.0)
+  theta MIXL2(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = {n_classes}
+{mixing}
+[individual_parameters]
+{indiv}
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+    );
+    parse_model_string(&src).expect("mixture model parses")
+}
+
+/// Names of the class anchors detected for `eta`, or `None` when the eta has no
+/// class-aware mu-ref.
+fn class_anchors(model: &crate::types::CompiledModel, eta: &str) -> Option<Vec<String>> {
+    model
+        .mixture
+        .as_ref()
+        .expect("mixture spec")
+        .mu_refs
+        .iter()
+        .find(|m| m.eta_name == eta)
+        .map(|m| m.theta_names.clone())
+}
+
+#[test]
+fn class_aware_mu_ref_detects_canonical_two_class_ternary() {
+    // The canonical ferx mixture form: one eta, one theta per class.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string()])
+    );
+    // The unswitched V carries no eta at all, so no entry.
+    assert_eq!(class_anchors(&model, "ETA_V"), None);
+    // The classical (non-class-aware) map is untouched — a mixture must not
+    // start reporting a single anchor for a class-switched parameter.
+    assert!(!model.mu_refs.contains_key("ETA_CL"));
+}
+
+#[test]
+fn class_aware_mu_ref_detects_three_class_chain() {
+    let model = mixture_model_with_indiv(
+        3,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) \
+             else if (MIXNUM == 2) TVCL2 * exp(ETA_CL) \
+             else TVCL3 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec![
+            "TVCL1".to_string(),
+            "TVCL2".to_string(),
+            "TVCL3".to_string()
+        ])
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_trailing_else_covers_every_unnamed_class() {
+    // K = 3 but only class 1 is named: classes 2 and 3 share the else arm's
+    // theta, which is well-defined (and updates from their pooled members).
+    let model = mixture_model_with_indiv(
+        3,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec![
+            "TVCL1".to_string(),
+            "TVCL2".to_string(),
+            "TVCL2".to_string()
+        ])
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_degenerate_same_theta_in_both_arms() {
+    // The degenerate oracle: both classes anchor on the *same* theta, so the
+    // per-class update must collapse to the classical pooled one.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL1 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL1".to_string()])
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_accepts_log_sum_form_in_every_arm() {
+    // Pattern 2 (`exp(log(THETA) + ETA)`) is a log mu-ref just like Pattern 1.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) exp(log(TVCL1) + ETA_CL) else exp(log(TVCL2) + ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string()])
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_differing_eta_per_arm() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_V)\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+    assert_eq!(class_anchors(&model, "ETA_V"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_mixed_log_and_additive_arms() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 + ETA_CL\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_all_additive_arms() {
+    // Additive mu-refs are excluded on purpose: the closed-form shift is only
+    // the EM optimum on the log scale.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 + ETA_CL else TVCL2 + ETA_CL\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_non_mixnum_condition() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (TVV > 5) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_out_of_range_class() {
+    // `MIXNUM == 3` is unreachable in a 2-class mixture; reject loudly rather
+    // than silently mapping a dead branch onto a class.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 3) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_non_mu_ref_arm() {
+    // A class arm with no eta at all is not a mu-ref pattern.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_class_shared_param_stays_in_plain_mu_refs() {
+    // A non-switched typical value in a mixture model is an ordinary mu-ref;
+    // it must keep appearing in `mu_refs` (the estimators broadcast it across
+    // classes themselves).
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         V = TVV * exp(ETA_V)",
+    );
+    assert_eq!(class_anchors(&model, "ETA_V"), None);
+    assert_eq!(
+        model.mu_refs.get("ETA_V").map(|m| m.theta_name.as_str()),
+        Some("TVV")
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_failure_is_warned_not_silent() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_V)\n  V = TVV",
+    );
+    assert!(
+        model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied") && w.contains("CL")),
+        "expected a #996 fallback warning, got {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_success_emits_no_warning() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied")),
+        "unexpected fallback warning: {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_no_warning_for_a_class_switched_value_without_iiv() {
+    // A class-switched typical value the user deliberately gave no IIV is not a
+    // missed mu-ref: there is no eta to anchor, and advising them to add one
+    // would be wrong (#996 review).
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = TVCL1 * exp(ETA_CL)\n  V = if (MIXNUM == 1) TVV else TVV * 2.0",
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied")),
+        "an eta-free MIXNUM expression must not be flagged: {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_no_warning_for_an_intermediate_class_flag() {
+    // Same for an intermediate flag variable that merely reads MIXNUM.
+    let model = mixture_model_with_indiv(
+        2,
+        "  FLAG = if (MIXNUM == 1) 1.0 else 2.0\n  \
+         CL = TVCL1 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied")),
+        "a MIXNUM flag variable must not be flagged: {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_still_warns_when_an_eta_bearing_switch_fails_to_match() {
+    // The guard above must not swallow the real case: the expression carries an
+    // eta but is not a mu-ref chain, so the fallback warning still fires.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) + 1.0 else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert!(
+        model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied") && w.contains("CL")),
+        "expected the #996 fallback warning, got {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_duplicate_eta_keeps_the_last_like_detect_mu_refs() {
+    // Two class-aware assignments on the same eta: the mixture map must keep the
+    // *last*, matching `detect_mu_refs`' `insert`, so `MixtureSpec::mu_refs` and
+    // `CompiledModel::mu_refs` never name different anchors for one eta
+    // (#996 review).
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         CL = if (MIXNUM == 1) TVCL2 * exp(ETA_CL) else TVCL3 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL2".to_string(), "TVCL3".to_string()]),
+        "the last assignment wins"
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_yields_to_a_later_ordinary_mu_ref_on_the_same_eta() {
+    // An ordinary mu-ref written *after* a class-aware one is what
+    // `detect_mu_refs` keeps, so the mixture spec must drop its entry — otherwise
+    // `get_mixture_mu_ref_pairs` (which prefers the spec) and every
+    // `CompiledModel::mu_refs` consumer would use different anchors for one eta.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         CL = TVCL3 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        None,
+        "the later ordinary mu-ref wins, so no class-aware entry survives"
+    );
+    assert_eq!(
+        model.mu_refs.get("ETA_CL").map(|m| m.theta_name.clone()),
+        Some("TVCL3".to_string())
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_survives_an_earlier_ordinary_mu_ref_on_the_same_eta() {
+    // The other order: the class-aware assignment is last, so it is the anchor
+    // both maps agree on (`get_mixture_mu_ref_pairs` prefers the spec).
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = TVCL3 * exp(ETA_CL)\n  \
+         CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string()])
+    );
+}
+
 #[test]
 fn non_mixture_model_has_no_spec() {
     let model = minimal_model_with_indiv("  CL = TVCL * exp(ETA_CL)\n  V = TVV");

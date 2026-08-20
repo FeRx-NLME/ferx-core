@@ -581,6 +581,204 @@ fn detect_mu_refs(
     result
 }
 
+/// Match a `MIXNUM == <k>` (or `<k> == MIXNUM`) condition, returning the
+/// 1-based class index `k`. Any other condition — a different comparison
+/// operator, a compound `and`/`or`/`not`, or a non-`MIXNUM` operand — returns
+/// `None`, which makes the class-aware mu-ref detector reject the whole chain
+/// and fall back to the numerical M-step (#996).
+fn mixnum_eq_class(cond: &Condition) -> Option<usize> {
+    let Condition::Compare(lhs, CmpOp::Eq, rhs) = cond else {
+        return None;
+    };
+    let lit = match (lhs, rhs) {
+        (Expression::MixNum, Expression::Literal(v)) => *v,
+        (Expression::Literal(v), Expression::MixNum) => *v,
+        _ => return None,
+    };
+    // MIXNUM is an integer index; a non-integral literal can never match.
+    if lit.fract() != 0.0 || lit < 1.0 {
+        return None;
+    }
+    Some(lit as usize)
+}
+
+/// Detect a `MIXNUM`-switched log-mu-reference (#996).
+///
+/// Recognises a chain of if-*expressions* whose conditions are all
+/// `MIXNUM == k` and whose arms all match the same mu-ref pattern on the same
+/// eta with the same log/additive flag, e.g.
+///
+/// ```text
+/// CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+/// CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL)
+///      else if (MIXNUM == 2) TVCL2 * exp(ETA_CL)
+///      else TVCL3 * exp(ETA_CL)
+/// ```
+///
+/// Returns `(eta_idx, theta_idx_per_class, log_transformed)` where
+/// `theta_idx_per_class[c]` is the anchor for class `c + 1`. The trailing
+/// `else` supplies every class the chain did not name explicitly, so a
+/// three-class model whose chain names only class 1 collapses classes 2 and 3
+/// onto the trailing-`else` theta. A class named twice keeps the *first* arm,
+/// matching evaluation order.
+///
+/// Returns `None` — i.e. "no class-aware mu-ref, use the numerical M-step" —
+/// for anything else: a non-`MIXNUM` condition, an out-of-range class index,
+/// an arm that is not a mu-ref pattern, arms on different etas, arms mixing
+/// log and additive forms, or an NN-anchored arm.
+fn detect_mixture_pattern(
+    expr: &Expression,
+    n_classes: usize,
+) -> Option<(usize, Vec<usize>, bool)> {
+    // The expression must actually be a conditional — a plain `THETA*exp(ETA)`
+    // is the classical (class-shared) mu-ref and is handled by `detect_mu_refs`.
+    if !matches!(expr, Expression::Conditional(..)) {
+        return None;
+    }
+    let mut by_class: Vec<Option<usize>> = vec![None; n_classes];
+    let mut eta: Option<usize> = None;
+    let mut log_t: Option<bool> = None;
+
+    // Validate one arm and fold its (eta, log_transformed) into the running
+    // consistency check. Returns the arm's anchor theta index.
+    fn check_arm(
+        arm: &Expression,
+        eta: &mut Option<usize>,
+        log_t: &mut Option<bool>,
+    ) -> Option<usize> {
+        let (ei, anchor, lt) = detect_pattern(arm)?;
+        let MuRefAnchor::Theta(ti) = anchor else {
+            // An NN-anchored class arm has no theta to shift.
+            return None;
+        };
+        if *eta.get_or_insert(ei) != ei {
+            return None;
+        }
+        if *log_t.get_or_insert(lt) != lt {
+            return None;
+        }
+        Some(ti)
+    }
+
+    let mut cur = expr;
+    loop {
+        match cur {
+            Expression::Conditional(cond, then_e, else_e) => {
+                let k = mixnum_eq_class(cond)?;
+                if k > n_classes {
+                    return None;
+                }
+                let ti = check_arm(then_e.as_ref(), &mut eta, &mut log_t)?;
+                // First arm naming a class wins, as at eval time.
+                if by_class[k - 1].is_none() {
+                    by_class[k - 1] = Some(ti);
+                }
+                cur = else_e.as_ref();
+            }
+            terminal => {
+                let ti = check_arm(terminal, &mut eta, &mut log_t)?;
+                // The trailing `else` serves every class the chain never named.
+                for slot in by_class.iter_mut() {
+                    if slot.is_none() {
+                        *slot = Some(ti);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    let thetas: Vec<usize> = by_class.into_iter().collect::<Option<Vec<_>>>()?;
+    Some((eta?, thetas, log_t?))
+}
+
+/// Scan `[individual_parameters]` for class-aware mu-references (#996).
+///
+/// Only top-level (unconditional) assignments participate, exactly as in
+/// [`detect_mu_refs`] — the class switch lives in the *expression*, not in a
+/// `Statement::If`. Non-log patterns are dropped here rather than downstream so
+/// the returned list is directly consumable by the SAEM / IMP closed-form
+/// shift, which is only valid on the log scale.
+///
+/// An eta assigned more than once keeps the **last** anchor, matching
+/// `detect_mu_refs`' `result.insert`. The scan is over *both* pattern kinds, not
+/// just the class-aware ones: an ordinary (non-switched) mu-ref written after a
+/// class-aware one wins, and clears the class-aware entry. Without that,
+/// `MixtureSpec::mu_refs` and `CompiledModel::mu_refs` could name different
+/// anchors for one eta, and `get_mixture_mu_ref_pairs` — which prefers the spec
+/// — would silently disagree with `compute_mu_k` and every other `mu_refs`
+/// consumer (#996 review).
+fn detect_mixture_mu_refs(
+    stmts: &[Statement],
+    theta_names: &[String],
+    eta_names: &[String],
+    n_classes: usize,
+) -> Vec<crate::types::MixtureMuRef> {
+    // `None` records "the last anchor for this eta was an ordinary mu-ref", which
+    // `detect_mu_refs` already stores; the spec must then carry no entry for it.
+    let mut latest: Vec<(String, Option<crate::types::MixtureMuRef>)> = Vec::new();
+    let mut set = |eta: &str, entry: Option<crate::types::MixtureMuRef>| match latest
+        .iter_mut()
+        .find(|(name, _)| name == eta)
+    {
+        Some(slot) => slot.1 = entry,
+        None => latest.push((eta.to_string(), entry)),
+    };
+    for s in stmts {
+        let Statement::Assign(_, expr) = s else {
+            continue;
+        };
+        if let Some((eta_idx, theta_idx, log_transformed)) = detect_mixture_pattern(expr, n_classes)
+        {
+            if !log_transformed || eta_idx >= eta_names.len() {
+                continue;
+            }
+            if theta_idx.iter().any(|&t| t >= theta_names.len()) {
+                continue;
+            }
+            let eta_name = eta_names[eta_idx].clone();
+            let entry = crate::types::MixtureMuRef {
+                eta_name: eta_name.clone(),
+                theta_names: theta_idx.iter().map(|&t| theta_names[t].clone()).collect(),
+                log_transformed,
+            };
+            set(&eta_name, Some(entry));
+        } else if let Some((eta_idx, _anchor, _log)) = detect_pattern(expr) {
+            // An ordinary mu-ref on the same eta, later in the block: it is what
+            // `detect_mu_refs` will keep, so drop any class-aware entry.
+            if eta_idx < eta_names.len() {
+                let eta_name = eta_names[eta_idx].clone();
+                set(&eta_name, None);
+            }
+        }
+    }
+    latest.into_iter().filter_map(|(_, entry)| entry).collect()
+}
+
+/// Whether a top-level `[individual_parameters]` assignment reads `MIXNUM`
+/// anywhere in its right-hand side. Used to warn when a class-switched typical
+/// value could *not* be class-aware mu-referenced (#996) — without this the
+/// fallback to the purely numerical M-step is silent.
+fn expr_uses_mixnum(expr: &Expression) -> bool {
+    fn cond_uses(c: &Condition) -> bool {
+        match c {
+            Condition::Compare(a, _, b) => expr_uses_mixnum(a) || expr_uses_mixnum(b),
+            Condition::And(a, b) | Condition::Or(a, b) => cond_uses(a) || cond_uses(b),
+            Condition::Not(a) => cond_uses(a),
+        }
+    }
+    match expr {
+        Expression::MixNum => true,
+        Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+            expr_uses_mixnum(a) || expr_uses_mixnum(b)
+        }
+        Expression::UnaryFn(_, a) => expr_uses_mixnum(a),
+        Expression::Conditional(c, t, e) => {
+            cond_uses(c) || expr_uses_mixnum(t) || expr_uses_mixnum(e)
+        }
+        _ => false,
+    }
+}
+
 /// Intermediate result from classifying a single expression.
 #[derive(Debug, Clone, PartialEq)]
 struct ExprClass {
@@ -2268,7 +2466,50 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // functions can branch without threading bloq_method through every call.
     let mut model = model;
     model.bloq_method = fit_options.bloq_method;
-    model.mixture = mixture_spec;
+    // Class-aware mu-references (#996): detected here rather than in
+    // `parse_mixture_block` because the scan needs both the parsed
+    // `[individual_parameters]` statements and the mixture's class count.
+    model.mixture = mixture_spec.map(|mut spec| {
+        spec.mu_refs = detect_mixture_mu_refs(
+            &indiv_stmts,
+            &model.theta_names,
+            &model.eta_names,
+            spec.n_classes,
+        );
+        spec
+    });
+    // A `MIXNUM`-switched typical value that did *not* yield a class-aware
+    // mu-ref falls back to the purely numerical M-step under SAEM/IMP, which is
+    // the slowest-converging channel. Say so rather than degrading silently.
+    //
+    // Only eta-carrying expressions qualify: a class-switched typical value with
+    // no IIV (`V = if (MIXNUM == 1) TVV1 else TVV2`) or an intermediate class flag
+    // (`FLAG = if (MIXNUM == 1) 1 else 2`) is not a missed mu-ref, and advising
+    // the user to add a random effect they deliberately omitted is wrong
+    // (#996 review).
+    if let Some(ref mix) = model.mixture {
+        let unmatched: Vec<String> = indiv_stmts
+            .iter()
+            .filter_map(|st| match st {
+                Statement::Assign(name, expr) if expr_uses_mixnum(expr) && expr_uses_eta(expr) => {
+                    Some((name, expr))
+                }
+                _ => None,
+            })
+            .filter(|(_, expr)| detect_mixture_pattern(expr, mix.n_classes).is_none())
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !unmatched.is_empty() {
+            model.parse_warnings.push(format!(
+                "Class-aware mu-referencing not applied to {}: the MIXNUM-switched \
+                 expression is not a chain of `MIXNUM == k` branches whose arms are all \
+                 `THETA_k * exp(ETA)` (or `exp(log(THETA_k) + ETA)`) on the same ETA. Under \
+                 SAEM/IMP the class typical values are estimated by the numerical M-step \
+                 alone, which converges more slowly (#996).",
+                unmatched.join(", ")
+            ));
+        }
+    }
 
     // Register the mixing-expression covariates (logit(k) = … BWT*(WT−75) …) as
     // required data columns, mirroring the scaling / error-selector / init blocks
@@ -9850,6 +10091,9 @@ fn parse_mixture_block(
         logit_covariates,
         omega_overrides,
         sigma_overrides,
+        // Filled in by `parse_model_string` once `[individual_parameters]` has
+        // been parsed (this block is parsed before the mu-ref scan can run).
+        mu_refs: Vec::new(),
     })
 }
 

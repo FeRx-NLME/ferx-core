@@ -20,6 +20,22 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Class-aware mu-referencing for mixture models (#996).** A `MIXNUM`-switched typical value written
+  as `CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)` is now recognised at parse
+  time and resolved to one anchor theta per class (any number of classes; a trailing `else` covers
+  every class the chain does not name). Estimating **IMP / IMPMAP** uses it to apply the EM
+  responsibility-weighted shift `log θ_k += (Σ_i PMIX_ic · η̄_ic) / (Σ_i PMIX_ic)` and pins those θ out
+  of the importance-weighted M-step. This closes the accuracy gap that made IMP the noisiest mixture
+  estimator: on the two-class anchor IMPMAP now recovers `TVCL1 = 0.952`, `TVCL2 = 2.821` against
+  `0.949` / `2.819` from NONMEM IMPMAP with `MU_1` assigned inside the `MIXNUM` branch
+  (`tests/nonmem/mixture_iv_impmap_mu.ctl`, NM 7.6.0) — under 0.5 % on every estimated parameter,
+  versus `2.60` for `TVCL2` before. **SAEM** gains the closed-form shift for class-*shared* typical
+  values (`V = TVV * exp(ETA_V)` inside a mixture), which previously fell back to the numerical
+  M-step; its class-*switched* θ deliberately stay numerical, because SAEM's hard per-subject class
+  draw makes the per-class η mean a biased classification-EM statistic (measured: `TVCL2` 2.75 → 3.02,
+  OFV 302.2 → 305.0). `mu_referencing = false` restores the pre-#996 behaviour for both estimators.
+  A `MIXNUM`-switched expression that cannot be resolved to a class-aware anchor now warns instead of
+  silently dropping to the numerical M-step.
 - **Models with no random effects — fixed-effects-only / naive-pooled fits (#989).** A continuous
   (residual-error) model may now omit every `omega` declaration; previously this was rejected at
   parse time with `No omega parameters defined`, and the 0×0 Ω path was reachable only from an
@@ -126,6 +142,14 @@ section of the SDLC for the versioning policy).
   of `W_MISSING_DV`, so a simulation run off an *observed* dataset makes its extra rows visible
   rather than silently carrying more rows than a fit of the same data.
 
+### Changed
+- **API (breaking for struct-literal construction): `MixtureSpec` gained a `mu_refs` field and is
+  now `#[non_exhaustive]` (#996).** The new field carries the class-aware mu-references described
+  above. Downstream Rust code that built a `MixtureSpec` with a struct literal will no longer
+  compile — read its fields, or obtain one from the parser, instead. `#[non_exhaustive]` makes the
+  next field addition non-breaking. No effect on `.ferx` models, the CLI, or the R wrapper, neither
+  of which constructs the struct.
+
 ### Performance
 - **The ODE inter-occasion-variability (IOV) analytic sensitivity path now compiles from a
   bucketed set of dual widths instead of one specialisation per stacked axis count**, cutting
@@ -139,6 +163,19 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **Log-mu-referenced θ with a negative lower bound no longer takes the wrong closed-form update
+  (#996).** Such a θ is packed on the identity scale, so the SAEM/IMP `log θ += mean(η)` shift was not
+  its EM optimum — it applied `θ += mean(η)` where the closed form means `θ *= exp(mean(η))`. It is
+  now excluded from the closed-form channel and estimated by the numerical / weighted M-step instead,
+  with a warning naming it, on the mixture *and* the single-population IMP/IMPMAP path.
+- **A collapsed mixture class no longer freezes its typical values (#996).** When no subject carried
+  any responsibility for a class, its class-aware mu-ref shift was undefined but the θ stayed pinned
+  out of the weighted M-step, so it could never move again for the rest of the fit. Those θ are now
+  left free for that iteration and the fit warns that the class received no responsibility mass.
+- **The "no associated ETA" advisory (#406) is no longer suppressed for mixture class thetas whose
+  class-aware shift is switched off (#996)** — under `mu_referencing = false`, for identity-packed θ,
+  or for a random effect with negligible variance those θ really are estimated by the
+  importance-weighted M-step alone, and the fit now says so.
 - **Fits no longer stall on their initial estimates under the default optimizer (#751).** A fit whose
   opening line search fails could previously quit a hair off its starting point — the user-ODE
   warfarin twin stopped 35 OFV units short of the optimum — and report the initial estimates, with
