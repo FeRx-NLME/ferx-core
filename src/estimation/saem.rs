@@ -2304,6 +2304,50 @@ pub fn run_saem(
         } else {
             !mu_ref_pairs.is_empty()
         };
+
+    // STRONG advisory: an estimated θ with **no associated ETA** is not
+    // mu-referenced, so it never receives the γ-damped closed-form
+    // `log θ += γ·mean(η)` shift. It is moved only by the η-frozen numerical
+    // M-step, which re-maximises the conditional observation likelihood against
+    // a *single* MCMC η draw with no stochastic-approximation damping — the
+    // update is a random walk on a noisy surface, not an SA-averaged statistic,
+    // and it can drift a long way from the marginal optimum.
+    //
+    // Measured on the FREM `iiv_on_ruv` reprex (475 subjects, 12 ETAs, the same
+    // `FRD1` absorption fraction that motivated the IMP/IMPMAP advisory in
+    // #406): SAEM drove `TVFRD1` 0.383 → 0.039 while IMP (0.311), IMPMAP
+    // (0.318) and NONMEM IMP (0.394) agree, dragging `TVV` +6% and `TVMAT` +9%
+    // with it. The drift is not a start artifact — restarting SAEM *at* the
+    // IMPMAP solution still walked it down to 0.065 — and it is removed
+    // entirely by attaching an ETA (`FRD1 = TVFRD1*exp(ETA_FRD1)`, ω² = 0.01 →
+    // SAEM recovers 0.313) or by holding the parameter FIX (every other θ then
+    // lands within 3% of NONMEM).
+    let class_mu_ref_thetas: Vec<usize> = if use_closed_form_mstep && saem_mix.is_some() {
+        mix_mu_ref_pairs
+            .iter()
+            .flat_map(|p| p.theta_idx.iter().copied())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let thetas_without_eta = crate::estimation::impmap::non_fixed_thetas_without_eta(
+        model,
+        &init_params.theta_fixed,
+        &class_mu_ref_thetas,
+    );
+    if !thetas_without_eta.is_empty() {
+        warnings.push(format!(
+            "SAEM: estimated parameter(s) [{}] have NO associated ETA, so they are not \
+             mu-referenced and are moved only by the η-frozen numerical M-step. That channel \
+             re-maximises against a single MCMC η draw with no SA damping and can drift far \
+             from the marginal optimum, taking correlated typical values with it. STRONGLY \
+             add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, optionally FIX, \
+             omega — ferx applies mu-referencing automatically), or hold the parameter FIX, \
+             or use FOCEI/IMPMAP.",
+            thetas_without_eta.join(", ")
+        ));
+    }
+
     // Accumulator for the `obs_nll_sum` (population OFV) evaluations skipped
     // by pinning mu-ref dims out of NLopt's central-FD gradient.  Each pinned
     // dim costs `2 * mstep_maxiter` `obs_nll_sum` calls inside NLopt — that's
@@ -3705,6 +3749,82 @@ mod tests {
 "
         );
         crate::parser::model_parser::parse_model_string(&src).expect("mixture model parses")
+    }
+
+    /// Single-population 1-cpt IV model whose `V` either carries a
+    /// mu-referenceable ETA or is a bare fixed-effect-only θ — the shape that
+    /// makes SAEM's η-frozen numerical M-step the *only* channel that can move
+    /// it (the FREM `FRD1` absorption fraction of #406).
+    fn noeta_model(v_expr: &str) -> CompiledModel {
+        let src = format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09 FIX
+  omega ETA_V ~ 0.04 FIX
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = {v_expr}
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("model parses")
+    }
+
+    fn saem_noeta_warnings(v_expr: &str) -> Vec<String> {
+        let model = noeta_model(v_expr);
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(406);
+        opts.run_covariance_step = false;
+        crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("SAEM Ok")
+            .warnings
+    }
+
+    /// An estimated θ with no ETA is not mu-referenced, so it never gets the
+    /// γ-damped closed-form shift and is left to the η-frozen numerical M-step.
+    /// SAEM must name it, the way IMP/IMPMAP already do (#406) — on the FREM
+    /// `iiv_on_ruv` reprex that channel drove `TVFRD1` 0.383 → 0.039 against
+    /// IMP 0.311 / IMPMAP 0.318 / NONMEM 0.394, and attaching an ETA recovered
+    /// 0.313.
+    #[test]
+    fn saem_warns_when_an_estimated_theta_has_no_eta() {
+        let ws = saem_noeta_warnings("TVV");
+        let hit = ws
+            .iter()
+            .find(|w| w.contains("NO associated ETA"))
+            .unwrap_or_else(|| panic!("expected the no-ETA advisory, got {ws:?}"));
+        assert!(
+            hit.starts_with("SAEM:") && hit.contains("TVV"),
+            "advisory must be SAEM-labelled and name TVV: {hit}"
+        );
+        assert!(
+            !hit.contains("TVCL"),
+            "TVCL is mu-referenced and must not be named: {hit}"
+        );
+    }
+
+    /// ...and stays quiet once every estimated θ carries one, so the advisory
+    /// keeps its signal.
+    #[test]
+    fn saem_no_eta_advisory_silent_when_every_theta_is_mu_referenced() {
+        let ws = saem_noeta_warnings("TVV * exp(ETA_V)");
+        assert!(
+            !ws.iter().any(|w| w.contains("NO associated ETA")),
+            "no advisory when every θ is mu-referenced, got {ws:?}"
+        );
     }
 
     #[test]

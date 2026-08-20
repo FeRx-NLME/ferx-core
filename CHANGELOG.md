@@ -41,6 +41,18 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Added
+- **SAEM now warns when an estimated theta carries no ETA at all.** A fixed-effect-only theta is not
+  mu-referenced, so it never gets the γ-damped closed-form `log θ += γ·mean(η)` update and is moved
+  only by the η-frozen numerical M-step — which re-maximises against a *single* MCMC η draw with no
+  stochastic-approximation damping and can drift far from the marginal optimum, dragging correlated
+  typical values with it. SAEM previously said nothing (its existing advisory only covers a theta
+  whose ETA could not be mu-referenced); IMP/IMPMAP have warned about this since #406. On a FREM
+  `iiv_on_ruv` model whose absorption fraction `TVFRD1` has no ETA, SAEM drove it to **0.039** while
+  IMP (0.311), IMPMAP (0.318) and NONMEM IMP (0.394) agree, with `TVV` +6% and `TVMAT` +9% carried
+  along; restarting SAEM *at* the IMPMAP solution still walked it down to 0.065. Adding
+  `FRD1 = TVFRD1*exp(ETA_FRD1)` (ω² = 0.01) recovers 0.313, and holding `TVFRD1` `FIX` puts every
+  other theta within 3% of NONMEM. See
+  [SAEM: non-mu-referenced parameters](https://ferx-nlme.github.io/ferx-core/estimation/saem.html).
 - **Class-aware mu-referencing for mixture models (#996).** A `MIXNUM`-switched typical value written
   as `CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)` is now recognised at parse
   time and resolved to one anchor theta per class (any number of classes; a trailing `else` covers

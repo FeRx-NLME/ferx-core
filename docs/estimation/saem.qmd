@@ -134,6 +134,55 @@ mu-centering that mitigates it — so the diagnostic is most warranted in exactl
 case. Prefer log-mu-referenced forms (`P = TV * exp(ETA)`) where the model allows.
 :::
 
+::: {.callout-important}
+## A theta with no ETA at all is worse than slow — it can drift
+
+The warning above covers a parameter whose eta ferx could not mu-reference. A
+**fixed-effect-only theta** — one that carries no eta anywhere in
+`[individual_parameters]` — is a distinct and more damaging case, and SAEM warns
+about it separately:
+
+```
+SAEM: estimated parameter(s) [TVFRD1] have NO associated ETA, so they are not
+mu-referenced and are moved only by the η-frozen numerical M-step. ...
+```
+
+Such a theta never receives the γ-damped closed-form shift. Its only channel is
+the numerical M-step, which re-maximises the conditional observation likelihood
+against a **single** MCMC η draw with no stochastic-approximation damping. That
+is a random walk on a noisy surface rather than an SA-averaged sufficient
+statistic, and it can drift a long way from the marginal optimum — dragging any
+correlated typical value with it.
+
+Measured on a FREM `iiv_on_ruv` model (475 subjects, 12 etas) whose absorption
+fraction `TVFRD1` splits a zero-order duration and a first-order rate
+(`D1 = MAT*(1-TVFRD1)`, `KA = 1/(MAT*TVFRD1)`) with no eta of its own:
+
+| Run | TVCL | TVV | TVMAT | TVFRD1 |
+|---|---|---|---|---|
+| NONMEM IMP (reference) | 7.060 | 133.8 | 2.680 | 0.394 |
+| ferx IMP | 7.068 | 135.5 | 2.751 | 0.311 |
+| ferx IMPMAP | 7.046 | 134.2 | 2.780 | 0.318 |
+| ferx SAEM | 7.169 | 143.2 | 3.020 | **0.039** |
+| ferx SAEM, started *at* the IMPMAP solution | 7.046 | 136.4 | 3.191 | **0.065** |
+| ferx SAEM, `FRD1 = TVFRD1*exp(ETA_FRD1)`, ω² = 0.01 | 7.181 | 142.5 | 2.646 | **0.313** |
+| ferx SAEM, `TVFRD1` held `FIX` at 0.394 | 7.025 | 131.9 | 2.770 | (fixed) |
+
+Restarting SAEM at the right answer does not rescue it — the M-step walks the
+parameter back down — so this is not a starting-value problem. The two remedies
+that do work are the ones the warning names:
+
+* **Attach an eta** — `P = TVP * exp(ETA_P)` with a small omega (optionally
+  `FIX`). ferx then mu-references it automatically and the closed-form,
+  γ-damped update takes over. Here it recovered `TVFRD1` to 0.313 and removed
+  the `TVMAT` bias (+9.2% → −1.3%).
+* **Hold it `FIX`** at a value estimated by another method. Every theta then
+  lands within 3% of NONMEM, `TVV` included.
+
+Otherwise estimate the model with [FOCEI](foce.qmd) or
+[IMPMAP](impmap.qmd), which do not depend on this channel.
+:::
+
 The number of NLopt evaluations saved is stored in `FitResult::saem_mu_ref_m_step_evals_saved`, accumulated across SAEM iterations as `2 × mstep_maxiter × n_mu_ref_pairs` per outer step (one finite-difference probe pair per pinned mu-ref dimension, capped at `mstep_maxiter` NLopt gradient requests). The field is `None` when mu-referencing is off or method ≠ SAEM.
 
 When `n_leapfrog > 0`, `FitResult::saem_n_subjects_hmc` records how many subjects used HMC at least once during the E-step (the remainder used MH fallback). The field is `None` for MH-only runs. The fit YAML also emits `saem_n_subjects_hmc` and `saem_n_subjects_mh` when the field is `Some`.
