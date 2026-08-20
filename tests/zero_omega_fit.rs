@@ -173,3 +173,156 @@ fn tte_model_with_no_random_effects_and_no_sigma_fits() {
     assert!(res.shrinkage_eta.is_empty());
     assert!(res.sigma.is_empty(), "a pure-TTE fit reports no sigma");
 }
+
+// --- IOV without BSV --------------------------------------------------------
+//
+// `n_eta = 0` with `n_kappa > 0` is a model class #989 unblocked on its own: the
+// removed rejection keyed on the **BSV** eta list, so a kappa-only model was
+// refused even though its IOV Omega was well-formed. `parse_full_model` coverage
+// lives in `src/parser/model_parser_tests.rs`; what needs an *oracle* is the
+// marginal, because the FOCE augmented prior at `n_eta = 0` is
+// `blkdiag(Ω_bsv (0x0), Ω_iov x K)` and a silently-dropped kappa penalty would
+// still produce a finite, plausible OFV.
+//
+// There is no NONMEM run to anchor a kappa-only fit against as a single object,
+// so this uses the **degenerate oracle** CLAUDE.md prescribes for that case.
+// Collapse the data to one occasion per subject and a kappa is, term for term, a
+// BSV eta: one draw per subject from one prior. The two objectives must therefore
+// agree exactly at a shared point, and they do — bit-for-bit, not to a tolerance.
+
+/// `data/warfarin_iov.csv` with every row's `OCC` forced to 1, so each subject
+/// has exactly one occasion.
+fn single_occasion_warfarin() -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let src = std::fs::read_to_string("data/warfarin_iov.csv").expect("read warfarin_iov.csv");
+    let mut lines = src.lines();
+    let header = lines.next().expect("csv has a header");
+    let occ = header
+        .split(',')
+        .position(|c| c.trim() == "OCC")
+        .expect("warfarin_iov.csv carries an OCC column");
+
+    let mut out = String::with_capacity(src.len());
+    out.push_str(header);
+    out.push('\n');
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut cells: Vec<&str> = line.split(',').collect();
+        cells[occ] = "1";
+        out.push_str(&cells.join(","));
+        out.push('\n');
+    }
+
+    let mut f = tempfile::Builder::new()
+        .suffix(".csv")
+        .tempfile()
+        .expect("create temp data");
+    f.write_all(out.as_bytes()).expect("write temp data");
+    f.flush().expect("flush temp data");
+    f
+}
+
+/// The two models differ only in whether the single random effect is declared as
+/// BSV or as IOV; `{RE}` is substituted with the declaration and `{TERM}` with the
+/// name used in `CL`. `maxiter = 0` makes this a pure evaluation at the shared
+/// starting values, and `checkpoint = false` keeps it from writing a `.tmp`.
+fn one_effect_model(decl: &str, term: &str, extra_opts: &str) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let src = format!(
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  {decl}
+  sigma PROP_ERR ~ 0.2 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp({term})
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 0
+  covariance = false
+  checkpoint = false
+{extra_opts}"
+    );
+    let mut f = tempfile::Builder::new()
+        .suffix(".ferx")
+        .tempfile()
+        .expect("create temp model");
+    f.write_all(src.as_bytes()).expect("write temp model");
+    f.flush().expect("flush temp model");
+    f
+}
+
+#[test]
+fn iov_without_bsv_reduces_to_bsv_on_a_single_occasion() {
+    use ferx_core::run_model_with_data;
+
+    let data = single_occasion_warfarin();
+    let data_path = data.path().to_str().expect("temp data path is utf-8");
+
+    let bsv = one_effect_model("omega ETA_CL ~ 0.09", "ETA_CL", "");
+    let iov = one_effect_model("kappa KAPPA_CL ~ 0.09", "KAPPA_CL", "  iov_column = OCC\n");
+
+    let (bsv_res, _) = run_model_with_data(
+        bsv.path().to_str().expect("temp model path is utf-8"),
+        Some(data_path),
+    )
+    .expect("the BSV reference fit must return Ok");
+    let (iov_res, _) = run_model_with_data(
+        iov.path().to_str().expect("temp model path is utf-8"),
+        Some(data_path),
+    )
+    .expect("a kappa-only fit must return Ok (#989)");
+
+    assert_eq!(
+        bsv_res.omega.nrows(),
+        1,
+        "the reference must carry exactly one BSV eta"
+    );
+    assert_eq!(
+        iov_res.omega.nrows(),
+        0,
+        "the IOV model must carry no BSV Omega"
+    );
+    assert_eq!(
+        iov_res
+            .omega_iov
+            .as_ref()
+            .expect("a declared kappa must yield an IOV Omega")
+            .nrows(),
+        1
+    );
+
+    // Not bit-for-bit, and it cannot be: the IOV marginal builds its kappa columns
+    // of H by central differences (`foce_subject_nll_iov`, EPS = 1e-6) where the BSV
+    // path gets its eta columns from the shared Jacobian, so the two log|H̃| terms
+    // differ in the last few ULP of the stencil. Observed delta 1.3e-7 on ~553.
+    //
+    // The band is what makes this an oracle rather than a smoke test: dropping the
+    // kappa prior — the failure this guards against — costs `½·log|Ω_iov|` per
+    // occasion plus the Mahalanobis term, ~24 OFV units for these 10 subjects at
+    // Ω_iov = 0.09. Anything that silently loses the penalty misses by seven orders
+    // of magnitude more than the stencil noise.
+    let delta = (bsv_res.ofv - iov_res.ofv).abs();
+    assert!(
+        delta < 1e-6,
+        "one occasion makes a kappa a BSV eta, so the objectives must agree: \
+         BSV {} vs IOV-only {} (delta {:.3e})",
+        bsv_res.ofv,
+        iov_res.ofv,
+        delta
+    );
+}

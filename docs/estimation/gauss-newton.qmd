@@ -112,8 +112,12 @@ initial objective can start orders of magnitude above the optimum, and BHHH's
 outer-product Hessian badly over-estimates curvature that far out — the step
 collapses and the fit crawls into `maxiter`.
 
-Concretely, on `examples/one_cpt_iv.ferx` with its omegas removed and its own
-`sigma PROP_ERR ~ 0.02 (sd)` start, `gn` begins at OFV 11374 and reports
-`Converged: NO`. From `0.13 (sd)` it converges to the optimum. FOCEI reaches the
-optimum from either start. If a fixed-effects GN fit stalls, check `sigma` before
-anything else — or use `gn_hybrid`, whose FOCEI polish recovers it.
+Concretely, on `examples/one_cpt_iv_pooled.ferx` and its own
+`sigma PROP_ERR ~ 0.02 (sd)` start, `gn` begins at OFV 11374, stops at **8670**
+and reports `Converged: NO` with ~6900% RSEs, where `foce`, `focei`, `laplace`
+and `gn_hybrid` all reach **−269.6370**. That is a wrong answer, not an imprecise
+one, so `gn` is **not recommended** for fixed-effects-only models. From
+`0.13 (sd)` it does converge, to −269.6322 — the right basin, still 0.005 short of
+FOCEI's −269.6370. FOCEI reaches the optimum from either start. If a
+fixed-effects GN fit stalls, check `sigma` before anything else — or use
+`gn_hybrid`, whose FOCEI polish recovers it.

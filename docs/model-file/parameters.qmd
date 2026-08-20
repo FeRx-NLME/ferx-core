@@ -96,16 +96,24 @@ so omitting the `[error_model]` or its `sigma` remains an error. (A pure
 `[event_model]` / `[binary_model]` endpoint legitimately has neither — that is a
 different case, not this one.)
 
-**Which estimators apply.** `foce`, `focei`, `laplace`, `gn` and `gn_hybrid` all
-reduce correctly and agree to the last printed digit. `saem`, `imp`, `impmap` and
-`bayes` are rejected: each integrates over the random effects, and with none
-declared there is nothing to integrate.
+**Which estimators apply.** `foce`, `focei`, `laplace` and `gn_hybrid` all reduce
+correctly and agree to the last printed digit — all four land on OFV −269.6370 on
+the anchor below. `saem` is rejected outright; `imp`, `impmap` and `bayes` error
+when the fit reaches them. Each of the four integrates over the random effects,
+and with none declared there is nothing to integrate.
+
+**`gn` is not recommended at `n_eta = 0`.** Pure Gauss-Newton reduces correctly in
+principle, but its BHHH Hessian badly over-estimates curvature far from the
+optimum and there is no inner loop to keep it close. On this page's own example it
+stops at OFV 8670 with `Converged: NO` and 6900% RSEs — a result that is wrong
+rather than merely imprecise. Use `gn_hybrid`, whose FOCEI polish recovers it, or
+`focei`. See [Gauss-Newton — fixed-effects-only models](../estimation/gauss-newton.qmd#fixed-effects-only-models).
 
 **Starting values matter more.** Without random effects there is no inner loop to
 absorb a poor `sigma` start, so a start that a mixed-effects model shrugs off can
-stall a fixed-effects one. On `examples/one_cpt_iv.ferx`'s own `0.02 (sd)` start
-the `gn` optimizer does not converge within `maxiter`; from `0.13 (sd)` it reaches
-the optimum. If a fixed-effects fit stalls, check `sigma` first.
+stall a fixed-effects one. On `examples/one_cpt_iv_pooled.ferx`'s own `0.02 (sd)`
+start `gn` does not converge within `maxiter`; from `0.13 (sd)` it reaches the
+optimum. If a fixed-effects fit stalls, check `sigma` first.
 
 For the NONMEM equivalent — and why simply omitting `$OMEGA` is *not* it — see
 [the FAQ](../faq.qmd#fixed-effects-only-fits-vs-nonmem).

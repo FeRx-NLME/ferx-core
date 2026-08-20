@@ -121,6 +121,156 @@ fn check_covariates_silent_when_an_eta_named_column_exists() {
     assert!(check_covariates(&model, &pop).is_empty());
 }
 
+#[test]
+fn check_covariates_reports_only_the_eta_diagnostic_when_nothing_else_is_missing() {
+    // The actual shape of the #989 bug report: an `omega` line was deleted and its
+    // `exp(ETA_CL)` left behind, with every real covariate present. The tests above
+    // all pair the eta with a genuinely-missing covariate, so this — the common
+    // case — is the one that exercises the `plain.is_empty()` early return, and
+    // it is the one that must NOT also emit `E_MISSING_COVARIATE` for a name the
+    // user never meant as a covariate.
+    let model = model_referencing(&["ETA_CL", "WT"]);
+    let pop = population_with_covariates(&["WT"]);
+    let diags = check_covariates(&model, &pop);
+
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected the eta diagnostic alone: {diags:?}"
+    );
+    assert_eq!(diags[0].code, "E_ETA_NOT_DECLARED");
+    assert_eq!(diags[0].block.as_deref(), Some("parameters"));
+}
+
+#[test]
+fn undeclared_random_effect_message_agrees_in_number() {
+    // Singular and plural are separate arms; a model can easily lose a whole
+    // `omega` block and strand several etas at once, so both must read correctly.
+    let one = crate::api::validation::undeclared_random_effect_message(&["ETA_CL"]);
+    assert!(
+        one.contains("references ETA_CL as a random effect"),
+        "{one}"
+    );
+    assert!(one.contains("declaration defines it"), "{one}");
+
+    let many = crate::api::validation::undeclared_random_effect_message(&["ETA_CL", "KAPPA_V"]);
+    assert!(
+        many.contains("references ETA_CL, KAPPA_V as random effects"),
+        "{many}"
+    );
+    assert!(many.contains("declaration defines them"), "{many}");
+    // The worked example is drawn from the first name in both arms.
+    assert!(many.contains("omega ETA_CL ~ 0.09"), "{many}");
+}
+
+// --- validate_model_file (`ferx check`) -------------------------------------
+
+/// Write `src` to a `.ferx` temp file. The suffix matters: `parse_full_model_file`
+/// is reached through the path, and the model stem names the report.
+fn temp_model(src: &str) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut f = tempfile::Builder::new()
+        .suffix(".ferx")
+        .tempfile()
+        .expect("create temp model");
+    f.write_all(src.as_bytes()).expect("write temp model");
+    f.flush().expect("flush temp model");
+    f
+}
+
+/// `MINIMAL_MODEL`-shaped continuous model whose `omega` line was deleted but
+/// whose `exp(ETA_CL)` term was left behind.
+const FORGOT_OMEGA: &str = "\
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+#[test]
+fn check_without_data_warns_about_an_undeclared_random_effect() {
+    // Without a dataset ferx cannot know whether an `ETA_CL` column exists, so this
+    // can only be a warning — but it must still be said. Before #989 the parser
+    // rejected this model outright; now it parses, and a silent "ok" would ship a
+    // model whose eta had quietly become a covariate lookup.
+    let f = temp_model(FORGOT_OMEGA);
+    let report = validate_model_file(f.path().to_str().expect("utf-8 temp path"), None);
+
+    let hit = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "W_ETA_NOT_DECLARED")
+        .expect("a stranded eta must be reported without --data");
+    assert_eq!(hit.severity, crate::Severity::Warning);
+    assert!(hit.message.contains("ETA_CL"), "{}", hit.message);
+    assert!(
+        hit.suggestion
+            .as_deref()
+            .is_some_and(|s| s.contains("--data")),
+        "the suggestion must point at re-running with data: {:?}",
+        hit.suggestion
+    );
+    // Warnings alone keep the report valid — this is a warning, not a rejection.
+    assert!(report.valid, "a warning must not invalidate the report");
+}
+
+#[test]
+fn check_with_data_escalates_the_undeclared_random_effect_to_an_error() {
+    // With a dataset in hand the column is known to be absent, so the same finding
+    // is an error and the report is invalid. This also pins the `data_path.is_none()`
+    // branch: the warning must NOT be emitted as well, or the user sees the finding
+    // twice at two severities.
+    let f = temp_model(FORGOT_OMEGA);
+    let report = validate_model_file(
+        f.path().to_str().expect("utf-8 temp path"),
+        Some("data/one_cpt_iv.csv"),
+    );
+
+    assert!(
+        !report.valid,
+        "a stranded eta with data present is an error"
+    );
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "E_ETA_NOT_DECLARED"));
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "W_ETA_NOT_DECLARED"),
+        "the warning must not double up with the error: {:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn check_is_clean_for_a_deliberately_fixed_effects_only_model() {
+    // The negative control for both tests above, and the whole point of #989: a
+    // model that drops the `omega` line AND the `exp(ETA_…)` term is simply valid.
+    let report = validate_model_file("examples/one_cpt_iv_pooled.ferx", None);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "W_ETA_NOT_DECLARED"),
+        "a fixed-effects-only model must not be warned about: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        report.valid,
+        "unexpected findings: {:?}",
+        report.diagnostics
+    );
+}
+
 // --- SAEM guard -------------------------------------------------------------
 
 fn opts_with_methods(methods: Vec<EstimationMethod>) -> FitOptions {

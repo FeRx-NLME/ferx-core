@@ -282,11 +282,17 @@ covariate.
 
 ```
 $ ferx check model.ferx --data data.csv
-error[E_ETA_NOT_DECLARED] parameters: Model references ETA_CL as a random effect but
-no `omega` / `kappa` declaration defines it. Declare the random effect in
+error[E_ETA_NOT_DECLARED] parameters:1: Model references ETA_CL as a random effect
+but no `omega` / `kappa` declaration defines it. Declare the random effect in
 [parameters] (e.g. `omega ETA_CL ~ 0.09`), or — if this is meant to be a data
-column — add that column to the data file.
+column — add that column to the data file. A model with no random effects at all
+is valid (#989): to make it fixed-effects-only, drop the `exp(ETA_CL)` term as
+well as the omega line.
+    help: declare `omega ETA_CL ~ <variance>`
+invalid: model — 1 error(s), 0 warning(s)
 ```
+
+(The diagnostic is one line; it is wrapped here to fit the page.)
 
 Without `--data` this is a warning rather than an error, since ferx cannot yet know
 whether the dataset carries such a column: reading a NONMEM-exported `ETA_CL`

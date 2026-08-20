@@ -173,8 +173,15 @@ pub fn print_results(result: &FitResult) {
     }
 
     // Omega estimates
-    eprintln!("\n--- OMEGA Estimates ---");
     let n_eta = result.omega.nrows();
+    // A fixed-effects-only fit (`n_eta = 0`, #989) has no Omega to report. Printing
+    // the header above an empty body reads as an estimation that failed rather than
+    // one that was never asked for, so suppress the whole section; the loops below
+    // are already no-ops at 0. Mirrors the `if n_eta > 0` guard the YAML writer's
+    // `--- OMEGA ---` section already carries.
+    if n_eta > 0 {
+        eprintln!("\n--- OMEGA Estimates ---");
+    }
     let show_cv = !matches!(
         result.covariance_status,
         CovarianceStatus::Failed | CovarianceStatus::SirFallback
