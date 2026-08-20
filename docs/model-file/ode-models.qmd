@@ -313,6 +313,14 @@ when not declared, so IV and non-bioavailability models are unaffected.
 > [#993](https://github.com/FeRx-NLME/ferx-core/issues/993) such a model is
 > rejected rather than quietly computing `F²`, so a model carried over from that
 > era fails loudly with the fix named.
+>
+> **ferx is stricter than NONMEM here.** NONMEM lets a `$PK` `F1 = …` be
+> referenced in `$DES` and quietly computes `F²`. That divergence is the entire
+> point of [#993](https://github.com/FeRx-NLME/ferx-core/issues/993) — but it
+> means a mechanically translated control stream can newly fail to parse even
+> though it ran in NONMEM. Anyone converting control streams (including
+> `ferxtranslate`) should drop the `F` from the translated RHS rather than
+> transcribe `$DES` literally.
 
 The name `F` (any case) is what flags a parameter as bioavailability and routes
 it to the dosing compartment. If you need a fraction-like quantity inside the
@@ -333,8 +341,12 @@ remove it from [odes]; if it is meant to be an ordinary parameter, rename it —
 `F` is a reserved dose-attribute name.
 ```
 
-Every read inside `[odes]` counts, including an `init(state) = …` seed — otherwise
-the rule would have a hole the size of its own remedy.
+The rule follows the **expressions compiled against your individual parameters**,
+not the block headings: every read inside `[odes]` counts, including an
+`init(state) = …` seed, and so does the `[adaptive_dosing] observe` signal. That
+last one matters most — `observe` is what the `when` rules compare against, so a
+double-applied `F` there biases the titration decision itself and every dose the
+controller goes on to emit, not just a reported number.
 
 The same rule covers `LAGTIME`/`ALAG` and the compartment-indexed `F{n}` /
 `ALAG{n}` / `LAGTIME{n}` below. These apply to **every** dose, so the collision

@@ -2285,6 +2285,49 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     model.bloq_method = fit_options.bloq_method;
     model.mixture = mixture_spec;
 
+    // #993, the `[adaptive_dosing]` half. `observe` is compiled through the very
+    // same `build_y_output_fn` as a Form-C `y` readout (`compile_observe`), so it
+    // sees individual parameters — and it is the *controller's* signal, not a
+    // reported number. A dose attribute read here is applied once at the dose and
+    // once in the signal, so the titration logic compares a value that is wrong by
+    // exactly that attribute and every dose it then emits inherits the error. The
+    // `when` rules cannot reach a parameter (they compare the `signal` keyword to an
+    // `f64` literal), so `observe` is the whole surface.
+    //
+    // Same split as `[scaling]`: rejection is ODE-scoped — an analytical model binds
+    // F/lagtime through an explicit `pk(..., f=F)` mapping, and `ode_slot_map`, what
+    // makes a *bare* `F` a dose attribute, is empty there — while the `D{n}`/`R{n}`
+    // recording runs on both engines.
+    if let Some(observe) = adaptive_dosing.as_ref().and_then(|s| s.observe.as_deref()) {
+        let observe_reads = collect_indiv_param_reads(
+            observe,
+            &model.theta_names,
+            &model.eta_names,
+            &model.indiv_param_names,
+            "[adaptive_dosing] observe",
+        )?;
+        if let Some(ode) = model.ode_spec.as_ref() {
+            let n_states = ode.state_names.len();
+            check_dose_attr_double_use(
+                &model.indiv_param_names,
+                &ode_slot_map,
+                &observe_reads,
+                n_states,
+                "[adaptive_dosing]",
+            )?;
+        }
+        // Cloned because `record_coded_rate_reads` needs `&mut model` for the map
+        // while reading the name list off the same model; one short-string Vec per
+        // parse. (`[scaling]` needs no clone — it already holds its own copy.)
+        let adaptive_indiv_names = model.indiv_param_names.clone();
+        record_coded_rate_reads(
+            &mut model,
+            &adaptive_indiv_names,
+            &ode_slot_map,
+            &observe_reads,
+        );
+    }
+
     // Register the mixing-expression covariates (logit(k) = … BWT*(WT−75) …) as
     // required data columns, mirroring the scaling / error-selector / init blocks
     // below. Without this a `[covariates]`-declared model never reads the column,
@@ -2443,20 +2486,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             if base != "y" && base != "obs_scale" {
                 continue;
             }
-            let ctx = ParseCtx::new(
+            scaling_reads.extend(collect_indiv_param_reads(
+                value,
                 &theta_names_for_scaling,
                 &eta_names_for_scaling,
                 &indiv_var_names_for_scaling,
-            );
-            // Individual params in scope resolve to `Variable(name)`; θ/η/covariate
-            // references resolve to their own leaves and are ignored here.
-            let expr = parse_scalar_expression(value, ctx)
-                .map_err(|e| format!("[scaling] {base}: {e}"))?;
-            visit_expr_nodes(&expr, &mut |e: &Expression| {
-                if let Expression::Variable(name) = e {
-                    scaling_reads.insert(name.to_ascii_uppercase());
-                }
-            });
+                &format!("[scaling] {base}"),
+            )?);
         }
 
         // Rejection is ODE-only: an analytical model binds F/lagtime through an
@@ -2477,28 +2513,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // data-aware check (#993 — see `mark_prediction_path_read`). The ODE RHS half
         // is recorded in `build_ode_spec`; this adds the readout half, which is the
         // *only* prediction path an analytical model has.
-        //
-        // `ode_slot_map` is parallel to the individual-parameter list *by position*,
-        // but only as a prefix: the `__ferx_pktime_` desugaring appends names after
-        // the slot map was built, so it can be the shorter of the two. `get(i)` is
-        // therefore the correct lookup (and matches `check_dose_attr_double_use`) —
-        // a real dose attribute is always a user name, hence inside the prefix,
-        // while the synthetic tail is never one. Empty for analytical models, whose
-        // indexed `D{n}`/`R{n}` are recognised by name alone.
-        for (i, name) in indiv_var_names_for_scaling.iter().enumerate() {
-            if !scaling_reads.contains(&name.to_ascii_uppercase()) {
-                continue;
-            }
-            let slot = ode_slot_map.get(i).copied();
-            if let Some((attr, when, Some(cmt))) = crate::types::DoseAttrConsumption::of(name, slot)
-            {
-                if when == crate::types::DoseAttrConsumption::CodedRateOnly {
-                    model
-                        .active_dose_attr_map_mut()
-                        .mark_prediction_path_read(attr, cmt, name);
-                }
-            }
-        }
+        record_coded_rate_reads(
+            &mut model,
+            &indiv_var_names_for_scaling,
+            &ode_slot_map,
+            &scaling_reads,
+        );
 
         // AD compatibility check (Phase 2.5):
         //
@@ -8409,6 +8429,78 @@ fn check_dose_attr_double_use(
         ));
     }
     Ok(())
+}
+
+/// The individual-parameter names an expression *source* references, upper-cased,
+/// for [`check_dose_attr_double_use`] (#993).
+///
+/// The block parsers keep compiled programs rather than the name references, so the
+/// source is re-walked here. `ParseCtx::new` is deliberately the same constructor
+/// `build_y_output_fn` / `build_obs_scale_spec` / `compile_observe` use, minus the
+/// state names: with `fallback_covariate`, a state resolves to `Covariate` here and
+/// is ignored, which is what we want — the check is about *parameters*. Dropping the
+/// state names can only *lose* a `Variable`, never invent one, so this cannot
+/// manufacture a rejection the real parse would not have seen.
+///
+/// For `[scaling]` this re-walks an expression `parse_scaling_block` already parsed,
+/// so it cannot fail. For `[adaptive_dosing] observe` it is the **first** parse —
+/// the block parser stores the raw string and `compile_observe` only runs at
+/// simulate time — so a syntactically malformed `observe` now surfaces here, at
+/// parse time, instead of at the first `simulate()`. Earlier and with the same
+/// message; nothing that used to compile stops compiling.
+///
+/// One shared collector rather than one per block: the boundary that matters is
+/// "an expression compiled against the individual parameters", not any particular
+/// block heading, and this rule already had to be extended to a third such
+/// expression once (`[adaptive_dosing] observe`).
+fn collect_indiv_param_reads(
+    src: &str,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    context: &str,
+) -> Result<std::collections::HashSet<String>, String> {
+    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
+    let expr = parse_scalar_expression(src, ctx).map_err(|e| format!("{context}: {e}"))?;
+    let mut reads: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visit_expr_nodes(&expr, &mut |e: &Expression| {
+        if let Expression::Variable(name) = e {
+            reads.insert(name.to_ascii_uppercase());
+        }
+    });
+    Ok(reads)
+}
+
+/// Record every `D{n}`/`R{n}` in `reads` on the model's active dose-attribute map,
+/// so `check_modeled_dose_rates` can report the double use once a dataset is in hand
+/// (#993). Unlike its `EveryDose` siblings these are inert until a dose codes
+/// `RATE=-2`/`-1`, so nothing is rejected here — see [`DoseAttrConsumption`].
+///
+/// `slot_map` is parallel to `indiv_var_names` by position but only as a **prefix**:
+/// the `__ferx_pktime_` desugaring appends names after the slot map was built. `get(i)`
+/// is therefore the correct lookup (and matches [`check_dose_attr_double_use`]) — a
+/// real dose attribute is always a user name, hence inside the prefix, while the
+/// synthetic tail is never one. Empty for analytical models, whose indexed
+/// `D{n}`/`R{n}` are recognised by name alone.
+fn record_coded_rate_reads(
+    model: &mut CompiledModel,
+    indiv_var_names: &[String],
+    slot_map: &[usize],
+    reads: &std::collections::HashSet<String>,
+) {
+    for (i, name) in indiv_var_names.iter().enumerate() {
+        if !reads.contains(&name.to_ascii_uppercase()) {
+            continue;
+        }
+        let slot = slot_map.get(i).copied();
+        if let Some((attr, crate::types::DoseAttrConsumption::CodedRateOnly, Some(cmt))) =
+            crate::types::DoseAttrConsumption::of(name, slot)
+        {
+            model
+                .active_dose_attr_map_mut()
+                .mark_prediction_path_read(attr, cmt, name);
+        }
+    }
 }
 
 /// Find `name(` at a word boundary in `s` (ASCII), returning the index of `name`.

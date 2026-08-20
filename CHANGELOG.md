@@ -23,7 +23,8 @@ section of the SDLC for the versioning policy).
 - **A dose attribute that is also read by the model is now an error (#993).** `F`,
   `LAGTIME`/`ALAG` and the compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` are applied by the
   engine **at the dose event**. A model that declares one and *also* references it in `[odes]`
-  (the RHS or an `init(...)` seed) or the `[scaling]` readout was applying it twice — silently, and by exactly that factor: an
+  (the RHS or an `init(...)` seed), the `[scaling]` readout, or the `[adaptive_dosing] observe`
+  controller signal was applying it twice — silently, and by exactly that factor: an
   ODE model reading its own `F` produced every prediction scaled by `F`, and renaming the parameter
   changed the fit by that amount with no diagnostic either way. This is now rejected at parse time
   with `E_DOSE_ATTR_DOUBLE_USE`, naming both readings and the fix. `D{n}`/`R{n}` carry the same
@@ -33,7 +34,9 @@ section of the SDLC for the versioning policy).
   explicit `pk(..., f=F)` mapping. **Breaking** for a model that folds `F` into the absorption flux
   — the pre-dose-entry convention the ODE docs' migration note describes, which until now computed
   `F²` without complaint; the fix is to drop `F` from the right-hand side, or rename the parameter
-  if it was never bioavailability.
+  if it was never bioavailability. Note this makes ferx **stricter than NONMEM**, which allows a
+  `$PK` `F1` to be referenced in `$DES` and quietly computes `F²` — so a mechanically translated
+  control stream can newly fail to parse even though it ran in NONMEM.
 
 ### Added
 - **IMP / IMPMAP estimation and objective evaluation for mixture models (#985).** Importance sampling

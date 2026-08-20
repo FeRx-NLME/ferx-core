@@ -293,7 +293,8 @@ The parameter names on the left side of each assignment must map to recognized P
 
 On an ODE model the engine consumes `F`, `LAGTIME`/`ALAG` and the indexed
 `F{n}`/`ALAG{n}`/`LAGTIME{n}` **at the dose event** — they never appear in a
-correct `[odes]` RHS or `[scaling]` readout. Declaring one *and* referencing it on
+correct `[odes]` block (RHS or `init(...)` seed), `[scaling]` readout, or
+`[adaptive_dosing] observe` signal. Declaring one *and* referencing it on
 the prediction path applies it twice and is rejected with
 `E_DOSE_ATTR_DOUBLE_USE` ([#993](https://github.com/FeRx-NLME/ferx-core/issues/993)).
 If you need an ordinary parameter, rename it: the name is what routes it.

@@ -1846,6 +1846,134 @@ fn ordinary_names_read_in_odes_rhs_are_accepted() {
     }
 }
 
+/// A 1-compartment ODE model with a declarative reactive controller whose
+/// `observe` signal is `signal_expr`. `[adaptive_dosing] observe` is compiled by
+/// the same `build_y_output_fn` a Form-C `y` readout uses, so it reaches
+/// individual parameters — including the reserved dose-attribute names.
+fn adaptive_observe_model(extra_param: &str, signal_expr: &str) -> String {
+    format!(
+        "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVX(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  {extra_param} = TVX
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[adaptive_dosing]
+  observe = {signal_expr}
+  at = [24, 48]
+  start_dose = 100
+  route = bolus(cmt = 1)
+  dose_bounds = [0, 400]
+  when signal < 10 : increase 25%
+"
+    )
+}
+
+#[test]
+fn dose_attr_read_in_adaptive_observe_is_rejected() {
+    // The controller's signal is a prediction path too, and the worst one to get
+    // wrong: `observe` does not merely report a number, it is what the `when` rules
+    // compare against, so a double-applied `F` biases the titration decision and
+    // every dose the controller then emits.
+    for (name, noun) in [
+        ("F", "bioavailability"),
+        ("LAGTIME", "absorption lag"),
+        ("F1", "bioavailability"),
+    ] {
+        let err = expect_parse_err(&adaptive_observe_model(
+            name,
+            &format!("central / (V * {name})"),
+        ));
+        assert!(
+            err.contains("[adaptive_dosing]:") && err.contains(&format!("`{name}`")),
+            "must name the block and the parameter, got: {err}"
+        );
+        assert!(
+            err.contains(noun) && err.contains("reserved dose-attribute name"),
+            "must say what `{name}` means and offer the rename, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_name_read_in_adaptive_observe_is_accepted() {
+    // Over-match guard: an ordinary parameter in the controller signal is the
+    // normal case and must keep parsing. `D1`/`R1` are dose attributes but inert
+    // until the data codes a RATE, so they are not a parse error either.
+    for name in ["KEL", "ZQ", "D1", "R1"] {
+        let src = adaptive_observe_model(name, &format!("central / (V * {name})"));
+        assert!(
+            parse_full_model(&src).is_ok(),
+            "`{name}` in [adaptive_dosing] observe must parse"
+        );
+    }
+}
+
+#[test]
+fn malformed_adaptive_observe_now_fails_at_parse_time() {
+    // Consequence of the #993 walk, worth pinning because it is a behaviour change:
+    // `parse_adaptive_dosing_block` only stores `observe` as a string (the real
+    // compile happens in `compile_observe`, at simulate time), so this is the FIRST
+    // parse of that expression. A syntactically broken signal now surfaces here
+    // rather than at the first `simulate()` — earlier, and attributed to the block
+    // it came from.
+    let err = expect_parse_err(&adaptive_observe_model("KEL", "central / (V * KEL"));
+    assert!(
+        err.contains("[adaptive_dosing] observe"),
+        "the error must name the block and key it came from, got: {err}"
+    );
+}
+
+#[test]
+fn coded_rate_param_read_in_adaptive_observe_is_recorded() {
+    // The data-gated half of the same path: `R1` in the controller signal is legal
+    // on ordinary data, so nothing is rejected — but the read must be *recorded* so
+    // `check_modeled_dose_rates` can report it once a `RATE=-1` dose lands on it.
+    // Silence here and a diagnostic there is the whole contract.
+    use crate::types::DoseAttr;
+    let parsed = parse_full_model(&adaptive_observe_model("R1", "central / (V * R1)"))
+        .expect("an R1 controller signal parses");
+    assert_eq!(
+        parsed
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Rate, 1),
+        Some("R1"),
+        "an `R1` read by [adaptive_dosing] observe must be recorded for the data check"
+    );
+    // The same model without the read records nothing — otherwise the assertion
+    // above would pass for a map that marks everything.
+    let clean = parse_full_model(&adaptive_observe_model("R1", "central / V"))
+        .expect("the control model parses");
+    assert_eq!(
+        clean
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Rate, 1),
+        None,
+        "an unread `R1` must not be marked"
+    );
+}
+
 #[test]
 fn dose_attr_read_in_scaling_is_rejected() {
     // The readout is a prediction path too: dividing by `F` applies bioavailability
