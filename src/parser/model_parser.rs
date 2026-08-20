@@ -618,8 +618,9 @@ fn mixnum_eq_class(cond: &Condition) -> Option<usize> {
 /// Returns `(eta_idx, theta_idx_per_class, log_transformed)` where
 /// `theta_idx_per_class[c]` is the anchor for class `c + 1`. The trailing
 /// `else` supplies every class the chain did not name explicitly, so a
-/// two-class model may collapse three classes onto one shared theta. A class
-/// named twice keeps the *first* arm, matching evaluation order.
+/// three-class model whose chain names only class 1 collapses classes 2 and 3
+/// onto the trailing-`else` theta. A class named twice keeps the *first* arm,
+/// matching evaluation order.
 ///
 /// Returns `None` — i.e. "no class-aware mu-ref, use the numerical M-step" —
 /// for anything else: a non-`MIXNUM` condition, an out-of-range class index,
@@ -697,47 +698,60 @@ fn detect_mixture_pattern(
 /// `Statement::If`. Non-log patterns are dropped here rather than downstream so
 /// the returned list is directly consumable by the SAEM / IMP closed-form
 /// shift, which is only valid on the log scale.
+///
+/// An eta assigned more than once keeps the **last** anchor, matching
+/// `detect_mu_refs`' `result.insert`. The scan is over *both* pattern kinds, not
+/// just the class-aware ones: an ordinary (non-switched) mu-ref written after a
+/// class-aware one wins, and clears the class-aware entry. Without that,
+/// `MixtureSpec::mu_refs` and `CompiledModel::mu_refs` could name different
+/// anchors for one eta, and `get_mixture_mu_ref_pairs` — which prefers the spec
+/// — would silently disagree with `compute_mu_k` and every other `mu_refs`
+/// consumer (#996 review).
 fn detect_mixture_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
     eta_names: &[String],
     n_classes: usize,
 ) -> Vec<crate::types::MixtureMuRef> {
-    let mut out = Vec::new();
+    // `None` records "the last anchor for this eta was an ordinary mu-ref", which
+    // `detect_mu_refs` already stores; the spec must then carry no entry for it.
+    let mut latest: Vec<(String, Option<crate::types::MixtureMuRef>)> = Vec::new();
+    let mut set = |eta: &str, entry: Option<crate::types::MixtureMuRef>| match latest
+        .iter_mut()
+        .find(|(name, _)| name == eta)
+    {
+        Some(slot) => slot.1 = entry,
+        None => latest.push((eta.to_string(), entry)),
+    };
     for s in stmts {
         let Statement::Assign(_, expr) = s else {
             continue;
         };
-        let Some((eta_idx, theta_idx, log_transformed)) = detect_mixture_pattern(expr, n_classes)
-        else {
-            continue;
-        };
-        if !log_transformed || eta_idx >= eta_names.len() {
-            continue;
-        }
-        if theta_idx.iter().any(|&t| t >= theta_names.len()) {
-            continue;
-        }
-        // One eta can only carry one class-aware anchor set; a second assignment
-        // to the same eta is ambiguous. Keep the **last**, matching
-        // `detect_mu_refs`' `result.insert` — otherwise `MixtureSpec::mu_refs` and
-        // `CompiledModel::mu_refs` would name different anchors for the same eta
-        // and `get_mixture_mu_ref_pairs`, which prefers the spec, would silently
-        // disagree with every `mu_refs` consumer (#996 review).
-        let entry = crate::types::MixtureMuRef {
-            eta_name: eta_names[eta_idx].clone(),
-            theta_names: theta_idx.iter().map(|&t| theta_names[t].clone()).collect(),
-            log_transformed,
-        };
-        match out
-            .iter_mut()
-            .find(|m: &&mut crate::types::MixtureMuRef| m.eta_name == entry.eta_name)
+        if let Some((eta_idx, theta_idx, log_transformed)) = detect_mixture_pattern(expr, n_classes)
         {
-            Some(existing) => *existing = entry,
-            None => out.push(entry),
+            if !log_transformed || eta_idx >= eta_names.len() {
+                continue;
+            }
+            if theta_idx.iter().any(|&t| t >= theta_names.len()) {
+                continue;
+            }
+            let eta_name = eta_names[eta_idx].clone();
+            let entry = crate::types::MixtureMuRef {
+                eta_name: eta_name.clone(),
+                theta_names: theta_idx.iter().map(|&t| theta_names[t].clone()).collect(),
+                log_transformed,
+            };
+            set(&eta_name, Some(entry));
+        } else if let Some((eta_idx, _anchor, _log)) = detect_pattern(expr) {
+            // An ordinary mu-ref on the same eta, later in the block: it is what
+            // `detect_mu_refs` will keep, so drop any class-aware entry.
+            if eta_idx < eta_names.len() {
+                let eta_name = eta_names[eta_idx].clone();
+                set(&eta_name, None);
+            }
         }
     }
-    out
+    latest.into_iter().filter_map(|(_, entry)| entry).collect()
 }
 
 /// Whether a top-level `[individual_parameters]` assignment reads `MIXNUM`

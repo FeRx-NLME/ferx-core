@@ -13916,6 +13916,43 @@ fn class_aware_mu_ref_duplicate_eta_keeps_the_last_like_detect_mu_refs() {
 }
 
 #[test]
+fn class_aware_mu_ref_yields_to_a_later_ordinary_mu_ref_on_the_same_eta() {
+    // An ordinary mu-ref written *after* a class-aware one is what
+    // `detect_mu_refs` keeps, so the mixture spec must drop its entry — otherwise
+    // `get_mixture_mu_ref_pairs` (which prefers the spec) and every
+    // `CompiledModel::mu_refs` consumer would use different anchors for one eta.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         CL = TVCL3 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        None,
+        "the later ordinary mu-ref wins, so no class-aware entry survives"
+    );
+    assert_eq!(
+        model.mu_refs.get("ETA_CL").map(|m| m.theta_name.clone()),
+        Some("TVCL3".to_string())
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_survives_an_earlier_ordinary_mu_ref_on_the_same_eta() {
+    // The other order: the class-aware assignment is last, so it is the anchor
+    // both maps agree on (`get_mixture_mu_ref_pairs` prefers the spec).
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = TVCL3 * exp(ETA_CL)\n  \
+         CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string()])
+    );
+}
+
+#[test]
 fn non_mixture_model_has_no_spec() {
     let model = minimal_model_with_indiv("  CL = TVCL * exp(ETA_CL)\n  V = TVV");
     assert!(model.mixture.is_none());

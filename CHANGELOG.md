@@ -142,6 +142,14 @@ section of the SDLC for the versioning policy).
   of `W_MISSING_DV`, so a simulation run off an *observed* dataset makes its extra rows visible
   rather than silently carrying more rows than a fit of the same data.
 
+### Changed
+- **API (breaking for struct-literal construction): `MixtureSpec` gained a `mu_refs` field and is
+  now `#[non_exhaustive]` (#996).** The new field carries the class-aware mu-references described
+  above. Downstream Rust code that built a `MixtureSpec` with a struct literal will no longer
+  compile — read its fields, or obtain one from the parser, instead. `#[non_exhaustive]` makes the
+  next field addition non-breaking. No effect on `.ferx` models, the CLI, or the R wrapper, neither
+  of which constructs the struct.
+
 ### Performance
 - **The ODE inter-occasion-variability (IOV) analytic sensitivity path now compiles from a
   bucketed set of dual widths instead of one specialisation per stacked axis count**, cutting

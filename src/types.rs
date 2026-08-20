@@ -1440,7 +1440,14 @@ pub struct MixtureClassOverride {
 /// per-class Omega/Sigma overrides. The class-specific *typical values* are not
 /// stored here — they live in `[individual_parameters]` as `MIXNUM`-branched
 /// expressions and are shared/split entirely by the user.
+///
+/// `#[non_exhaustive]`: this struct is built by the parser, and #996 had to add a
+/// field to it — a source-breaking change for any downstream crate constructing
+/// it with a struct literal. Marking it non-exhaustive makes the next field
+/// addition non-breaking; construct it inside this crate (where literals are
+/// still allowed) or read it field-by-field.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MixtureSpec {
     /// Number of subpopulations K (>= 2).
     pub n_classes: usize,
@@ -1462,9 +1469,22 @@ pub struct MixtureSpec {
     /// `CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)`.
     /// This is the only structured per-class θ mapping in the codebase — the
     /// class-specific typical values otherwise live purely as `MIXNUM`-branched
-    /// expressions (see the type doc above). The stochastic estimators (SAEM,
-    /// IMP/IMPMAP) use it to apply the per-class closed-form mu-ref θ shift
-    /// instead of estimating every class θ by numerical M-step alone.
+    /// expressions (see the type doc above).
+    ///
+    /// What each estimator does with it differs:
+    ///
+    /// - **IMP / IMPMAP** apply the responsibility-weighted per-class shift
+    ///   `log θ_k += (Σ_i PMIX_ic · η̄_ic) / (Σ_i PMIX_ic)` to every anchor here,
+    ///   switched and class-shared alike.
+    /// - **SAEM** keeps genuinely class-*switched* anchors on the numerical
+    ///   M-step — its hard per-subject class draw makes the per-class η mean a
+    ///   biased classification-EM statistic — and takes the closed form only for
+    ///   a class-*shared* anchor, i.e. one whose theta is the same in every class
+    ///   slot. Those are also the ones `CompiledModel::mu_refs` can express.
+    ///
+    /// An eta appears here at most once, and only when its class-aware
+    /// assignment is the *last* one for that eta, so this never contradicts
+    /// `CompiledModel::mu_refs`.
     pub mu_refs: Vec<MixtureMuRef>,
 }
 
