@@ -913,7 +913,7 @@ pub fn find_ebe(
     //     mis-center the FREM/IMP proposal, so recover with NM from η=0 (or the warm partial)
     //     exactly as prior releases — bit-identical for analytical/FREM fits.
     let bfgs_converged = result;
-    let (nm_converged, used_fallback) = if !bfgs_converged {
+    let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
         let cold = vec![0.0; n_eta];
         if enable_stall {
@@ -1021,6 +1021,60 @@ pub fn find_ebe(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // ── Runaway-EBE guard (#958) ───────────────────────────────────────────
+    // A gradient the search cannot trust can march the inner BFGS tens of prior
+    // SDs away from η = 0 and then *certify* the point it lands on: the objective
+    // stops improving (the steps are noise, not descent) and the gradient norm
+    // plateaus, which is exactly the objective-stall stop's acceptance condition
+    // (#555). Nothing downstream re-checks the result, so the subject contributes
+    // a mode that is not a mode to the FOCE/FOCEI objective, and the reported OFV
+    // becomes gradient-path-dependent.
+    //
+    // The trigger is not exotic. Finite-difference inner gradients difference an
+    // objective whose value carries the ODE solver's local error (~`ode_abstol`),
+    // amplified in the residual term by `1/R`. Once a prediction is driven toward
+    // zero under a proportional error model, `R` hits `MIN_VARIANCE` (1e-12) while
+    // the noise stays at `ode_abstol` (1e-9 by default), so the differenced signal
+    // is ~1e8 × smaller than the noise riding on it and the FD gradient can come
+    // back with the wrong *sign*. No FD step size repairs that — too small and it
+    // is noise, too large and it truncates on a very curved objective — so the
+    // inner loop needs a correctness backstop rather than a better step.
+    //
+    // `ηᵀΩ⁻¹η` is the natural detector: it is the prior's own metric (χ²(n_eta) at
+    // the truth), it is scale-free, and it is already what the objective penalises.
+    // The threshold is deliberately far out — [`RUNAWAY_EBE_MAHA_PER_ETA`] is 10
+    // prior SDs per random effect — so a merely-unusual subject never trips it and
+    // every fit whose EBEs are plausible stays bit-identical.
+    //
+    // Recovery is Nelder–Mead from the prior mean: derivative-free, so it is immune
+    // to the noise that produced the runaway in the first place (the objective's
+    // *value* is fine — only its finite difference is not).
+    //
+    // The guard is deliberately **strictly objective-improving**: it swaps in the
+    // recovered point only when that point has a lower objective, and it leaves the
+    // convergence flag alone otherwise. A far-out EBE is not by itself proof of a
+    // numerical artifact — a grossly misspecified subject can have its true posterior
+    // mode tens of prior SDs out, and if a derivative-free search from the prior mean
+    // cannot beat that point then it *is* the objective's minimum and there is no
+    // evidence against it. So a distance check alone never demotes a result or
+    // rewrites one; only actually finding something better does. That keeps every fit
+    // whose inner loop was already right bit-identical, whether its EBEs are plausible
+    // or merely extreme.
+    let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_eta as f64;
+    if ebe_prior_maha(&eta, &params.omega) > runaway_limit {
+        let mut cold = vec![0.0; n_eta];
+        let nm_ok = nelder_mead_minimize(&obj, &mut cold, n_eta, max_iter * 5, tol);
+        if cold.iter().all(|v| v.is_finite()) {
+            let cold_nll = obj(&cold);
+            if cold_nll < nll {
+                nll = cold_nll;
+                eta = cold;
+                ebe_converged = nm_ok;
+                used_fallback = true;
             }
         }
     }
@@ -1263,7 +1317,7 @@ fn find_ebe_iov(
     // lower-objective of {BFGS partial, NM restart} so a correct η̂ floored above `tol` by
     // solver noise is never discarded (#555); for exact objectives recover with NM from the
     // cold seed, as prior releases, so a non-stationary low-objective partial can't be kept.
-    let (nm_converged, used_fallback) = if !bfgs_converged {
+    let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
         cold[..n_eta].copy_from_slice(&mu);
@@ -1282,6 +1336,35 @@ fn find_ebe_iov(
     } else {
         (false, false)
     };
+
+    // ── Runaway-EBE guard (#958), IOV twin ─────────────────────────────────
+    // Same failure and same detector as the non-IOV `find_ebe` (see the comment there):
+    // a noise-dominated inner gradient can march the search tens of prior SDs out and
+    // then satisfy the objective-stall stop, certifying a point that is not a mode. The
+    // metric is the joint prior's, so it spans both blocks of the flat vector —
+    // `bsv_etaᵀΩ⁻¹bsv_eta` plus each occasion's `κᵀΩ_iov⁻¹κ`.
+    //
+    // Recovery differs in one respect: an ODE+IOV model deliberately declines the
+    // Nelder–Mead fallback, because every simplex vertex is a full ODE + steady-state
+    // solve and one bad outer line-search point would launch a very expensive search
+    // ([`skip_ode_iov_nm_fallback`]). That policy stands here, so such a subject keeps
+    // whatever the BFGS returned.
+    let mut bfgs_converged = bfgs_converged;
+    let mut nm_converged = nm_converged;
+    let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
+    if !skip_ode_iov_nm_fallback(model)
+        && iov_prior_maha(&x, &mu, n_eta, n_kappa, k_occasions, params) > runaway_limit
+    {
+        let mut cold = vec![0.0; n_flat];
+        cold[..n_eta].copy_from_slice(&mu);
+        let ok = nelder_mead_minimize(&obj, &mut cold, n_flat, max_iter * 5, tol);
+        if cold.iter().all(|v| v.is_finite()) && obj(&cold) < obj(&x) {
+            x = cold;
+            bfgs_converged = false;
+            nm_converged = ok;
+            used_fallback = true;
+        }
+    }
 
     let nll = obj(&x);
     // Recover bsv_eta = psi - mu (mean-zero, NONMEM-compatible output).
@@ -2980,6 +3063,65 @@ const INNER_STALL_LIMIT: u32 = 3;
 /// dropping by more than this fraction the search is still descending, so the stall is held
 /// off; once it plateaus (no such decrease) the search is at the noise floor.
 const INNER_FTOL_GNORM_PLATEAU: f64 = 1e-3;
+
+/// Per-random-effect budget on the returned inner EBE's squared Mahalanobis distance
+/// `ηᵀΩ⁻¹η`, above which the point is treated as a numerical runaway rather than a mode
+/// (#958). `100` is 10 prior SDs per random effect — `ηᵀΩ⁻¹η` is χ²(n_eta) at the truth,
+/// so for `n_eta = 3` the limit of 300 sits past any quantile a real subject reaches
+/// (χ²₃ = 300 has p ≈ 1e-63), while the observed failure lands at ~9000. Deliberately far
+/// out: below it the guard is a no-op and the EBE is bit-identical to prior releases, so
+/// the threshold only has to separate "unusual subject" from "not a mode at all".
+///
+/// The one legitimate large-|η| family — FREM covariate pseudo-observation etas, which sit
+/// at `cov_obs − TV` and can reach ±40 (#406) — is large in *raw* η only: its Ω carries the
+/// covariate's own variance, so its Mahalanobis distance stays O(1) and it never trips this.
+const RUNAWAY_EBE_MAHA_PER_ETA: f64 = 100.0;
+
+/// Squared Mahalanobis distance of an EBE under the prior, `ηᵀΩ⁻¹η` — the metric the
+/// runaway guard (see [`RUNAWAY_EBE_MAHA_PER_ETA`]) tests. Uses the cached `Ω⁻¹` the
+/// individual objective already carries, so this costs `O(n_eta²)` flops and no
+/// factorisation. Non-finite η (a diverged search) reports `INFINITY` so it trips the
+/// guard rather than comparing false.
+fn ebe_prior_maha(eta: &[f64], omega: &crate::types::OmegaMatrix) -> f64 {
+    if !eta.iter().all(|v| v.is_finite()) {
+        return f64::INFINITY;
+    }
+    let n = eta.len().min(omega.inv.nrows());
+    let mut q = 0.0;
+    for i in 0..n {
+        for j in 0..n {
+            q += eta[i] * omega.inv[(i, j)] * eta[j];
+        }
+    }
+    q
+}
+
+/// [`ebe_prior_maha`] for the IOV inner loop's flat vector `[bsv_psi, κ_1, …, κ_K]`: the
+/// joint prior's quadratic form, `(ψ−μ)ᵀΩ⁻¹(ψ−μ) + Σ_k κ_kᵀΩ_iov⁻¹κ_k`. The BSV block is
+/// shifted back out of ψ-space first, since the prior is centred on `μ`, not on 0. A model
+/// with no `omega_iov` contributes only the BSV block (its κ block is not a random effect
+/// with a prior to be far from).
+fn iov_prior_maha(
+    x: &[f64],
+    mu: &[f64],
+    n_eta: usize,
+    n_kappa: usize,
+    k_occasions: usize,
+    params: &ModelParameters,
+) -> f64 {
+    let bsv: Vec<f64> = x[..n_eta]
+        .iter()
+        .zip(mu.iter())
+        .map(|(p, m)| p - m)
+        .collect();
+    let mut q = ebe_prior_maha(&bsv, &params.omega);
+    if let Some(oi) = params.omega_iov.as_ref() {
+        for k in 0..k_occasions {
+            q += ebe_prior_maha(&x[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa], oi);
+        }
+    }
+    q
+}
 
 /// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`
 /// for [`INNER_STALL_LIMIT`] consecutive accepted steps. Shared verbatim by the dense and

@@ -6349,11 +6349,16 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "gradient" | "gradient_method" => {
             opts.gradient_method = match value.to_lowercase().as_str() {
                 "auto" => GradientMethod::Auto,
+                // `ad` still *parses* so that requesting it reaches the engine's specific
+                // "the Enzyme AD path was retired, use auto/fd" error (#428) rather than a
+                // generic unknown-value one. It is not advertised below: listing it as a
+                // valid value in the message shown for some *other* typo pointed users at a
+                // setting no fit accepts (#958).
                 "ad" | "autodiff" => GradientMethod::Ad,
                 "fd" | "finite" | "finite_difference" | "finite-difference" => GradientMethod::Fd,
                 other => {
                     return Err(format!(
-                        "fit option `gradient`: unknown value `{other}` — expected 'auto', 'ad', or 'fd'"
+                        "fit option `gradient`: unknown value `{other}` — expected 'auto' or 'fd'"
                     ));
                 }
             };
