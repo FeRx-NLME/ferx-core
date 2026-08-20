@@ -18,7 +18,7 @@
 use ferx_core::parser::model_parser::{parse_full_model, parse_model_string};
 use ferx_core::{
     fit, read_nonmem_csv, CompiledModel, EstimationMethod, FitOptions, FitResult, Population,
-    ViFamily, ViFinalOfv,
+    ViFamily, ViFinalOfv, ViSigmaUpdate,
 };
 use std::path::Path;
 
@@ -388,4 +388,110 @@ fn focei_chains_into_vi() {
         result.ofv.is_nan(),
         "a terminal VI stage reports no OFV by default"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3 — convergence, against a near-exact reference
+// ---------------------------------------------------------------------------
+
+/// VI must recover the maximum-likelihood solution on warfarin, measured against AGQ.
+///
+/// # What this pins, and why it exists
+///
+/// The regression it guards is real and shipped: `method = vi` returned `σ = 0.014150` on this
+/// exact model where AGQ (`n_agq = 9`) and FOCEI both give `0.010565` — 34% high — with an OFV
+/// 11.3 units short of the reference, while reporting `converged: true`. Because per-subject
+/// posterior width scales with `σ²`, every variational covariance the fit reported was ~1.75×
+/// too wide. Nothing in the Tier-1 or Tier-2 suites caught it: the ELBO gradient matches central
+/// differences to 1e-6, and the failure was in *where the optimizer stopped*, not in any formula.
+/// Only a full fit compared against an external quantity can see it, which is what this is.
+///
+/// # The reference is computed, not hardcoded
+///
+/// AGQ is fitted here rather than pinned to a literal, so the assertion keeps its meaning if the
+/// fixture or the data changes. `n_agq = 9` reproduces both ferx's and nlmixr2's FOCEI `σ` to six
+/// decimals, which is what qualifies it as the arbiter.
+///
+/// # Why it runs at `vi_mc_samples = 128`
+///
+/// Not to flatter the estimator — because at the default 8 draws this fit does **not** converge,
+/// and that is a documented limitation rather than the behaviour worth pinning. VI's convergence
+/// rule stops once the ELBO's drift falls below its own Monte-Carlo noise floor, and at 8 draws it
+/// does so while real drift remains (`docs/estimation/vi.qmd`, "How σ is updated"). Asserting the
+/// default's numbers would pin a stopping artifact; asserting the converged ones pins the
+/// estimator. If the default draw count is raised, this test does not need to change.
+///
+/// Both `σ` routes are checked. At adequate draws they agree — which is itself the point, since a
+/// route-specific result here would mean one of them is not solving the same problem.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: full warfarin VI + AGQ convergence fits; opt in with --features slow-tests"
+)]
+fn vi_recovers_the_agq_solution_on_warfarin() {
+    let (model, population) = (warfarin_model(), warfarin_data());
+
+    // ---- the reference -------------------------------------------------------------------
+    let agq_opts = FitOptions {
+        method: EstimationMethod::Laplace,
+        n_agq: 9,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let agq =
+        fit(&model, &population, &model.default_params, &agq_opts).expect("AGQ fit converges");
+    let agq_sigma = agq.sigma[0];
+    assert!(
+        agq.ofv.is_finite() && agq_sigma.is_finite(),
+        "the AGQ reference must produce a usable σ and OFV"
+    );
+
+    for route in [ViSigmaUpdate::ClosedForm, ViSigmaUpdate::Adam] {
+        let opts = FitOptions {
+            method: EstimationMethod::Vi,
+            vi_mc_samples: 128,
+            vi_sigma_update: route,
+            vi_final_ofv: ViFinalOfv::Laplace,
+            vi_seed: Some(7),
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let vi = fit(&model, &population, &model.default_params, &opts).expect("VI fit converges");
+        let vi_sigma = vi.sigma[0];
+
+        // 15%: the observed error is ~6% and the regression was 34%, so the threshold sits in
+        // the empty gap between them rather than on either boundary.
+        let sigma_err = (vi_sigma - agq_sigma).abs() / agq_sigma;
+        assert!(
+            sigma_err < 0.15,
+            "{route:?}: VI σ = {vi_sigma:.6} against AGQ's {agq_sigma:.6} ({:.1}% off). \
+             The regression this guards returned 0.014150 (+34%).",
+            sigma_err * 100.0
+        );
+
+        // 3 OFV units, on the same reasoning: observed ~0.6, regression 11.3. `vi_final_ofv =
+        // laplace` makes this the FOCE-family objective at the VI estimate, so it is directly
+        // comparable with AGQ's.
+        let ofv_gap = (vi.ofv - agq.ofv).abs();
+        assert!(
+            ofv_gap < 3.0,
+            "{route:?}: VI OFV = {:.3} against AGQ's {:.3} (gap {ofv_gap:.3}). \
+             The regression this guards was 11.3 units short.",
+            vi.ofv,
+            agq.ofv
+        );
+
+        // The bound must still be a bound at the point it converged to. The ELBO is a *lower*
+        // bound on `log L`, so `−2·ELBO` sits **above** `−2 log L` — and AGQ's OFV is `−2 log L`
+        // at its own optimum, which is itself no larger than `−2 log L` at the VI estimate, so
+        // this holds with room to spare. `1e-6` absorbs the reported value's rounding, not any
+        // real slack.
+        let v = vi.vi.as_ref().expect("a VI fit reports its vi block");
+        assert!(
+            v.neg_two_elbo >= agq.ofv - 1e-6,
+            "{route:?}: −2·ELBO = {:.3} is BELOW −2 log L ≈ {:.3}, so it is not a bound",
+            v.neg_two_elbo,
+            agq.ofv
+        );
+    }
 }

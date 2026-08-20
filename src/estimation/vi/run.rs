@@ -37,13 +37,13 @@ use crate::estimation::parameterization::{
 };
 use crate::types::{
     CompiledModel, FitOptions, ModelParameters, Population, ViFamily, ViFinalOfv, ViOmegaUpdate,
-    ViResult,
+    ViResult, ViSigmaUpdate,
 };
 
 use super::adam::{averaging_start, AdamConfig, AdamState, PolyakAverager};
 use super::elbo::{
-    closed_form_omega, population_neg_elbo, stacked_prior, unsupported_data_term_reason,
-    ElboConfig, Families, PackedLayout,
+    closed_form_omega, closed_form_sigma, closed_form_sigma_support, population_neg_elbo,
+    stacked_prior, unsupported_data_term_reason, ElboConfig, Families, PackedLayout,
 };
 use super::family::{FullRank, MeanField, VariationalFamily};
 
@@ -132,6 +132,31 @@ fn max_relative_change(a: &[f64], b: &[f64]) -> f64 {
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs() / (y.abs().max(x.abs()) + PARAM_SETTLE_FLOOR))
         .fold(0.0f64, f64::max)
+}
+
+/// Whether the parameter-stability criterion means anything for this model.
+///
+/// [`max_relative_change`] asks whether the population estimates have stopped moving. When every
+/// packed coordinate is FIXed or a structural zero, `x` is constant *by construction* — so the
+/// criterion answers "settled" from its first comparison, no matter what the fit is doing, and
+/// stops the run. It does not see `φ`, which in that configuration is the only thing being
+/// optimized and is nowhere near converged.
+///
+/// Measured on warfarin with `θ`, `Ω` and `σ` all FIXed at a known-good estimate: the fit stopped
+/// after **500 iterations** reporting `converged: true` with `elbo_tightness_ratio: 78` (the
+/// implausibility threshold is 25) and `−2·ELBO = +2026`, on a model that reaches `−286` when `φ`
+/// is allowed to converge. The objective trace had fallen from ~21 000 to ~2 900 across those 500
+/// iterations and was still dropping steeply, so the *objective* criterion had correctly reported
+/// "still moving" — the parameter criterion overrode it, because either is sufficient.
+///
+/// Pinning every population parameter and fitting only `q` is a legitimate thing to ask for (it is
+/// how you read per-subject posteriors at a fixed estimate), so the fix is to recognise the
+/// criterion as vacuous rather than to forbid the configuration. With no free population
+/// coordinate the objective is the only convergence signal there is, and it is used alone.
+fn param_criterion_applies(template: &ModelParameters) -> bool {
+    let fixed = crate::estimation::parameterization::packed_fixed_mask(template);
+    let structural = crate::estimation::parameterization::omega_structural_zero_mask(template);
+    fixed.iter().zip(structural.iter()).any(|(&f, &z)| !f && !z)
 }
 
 /// Whether the tail of the objective trace has stopped moving.
@@ -429,6 +454,35 @@ pub fn run_vi(
         .collect();
 
     let mut warnings: Vec<String> = Vec::new();
+
+    // Resolve the σ route once: support is a property of the model's error structure, not
+    // of the iterate, so probing it here keeps the loop branch-free and makes "asked for
+    // the closed form, had to Adam-step" a single decision to report.
+    let (sigma_mstep, sigma_fallback) = match options.vi_sigma_update {
+        ViSigmaUpdate::Adam => (None, None),
+        ViSigmaUpdate::ClosedForm => match closed_form_sigma_support(model, init_params) {
+            Ok(k) => (Some(k), None),
+            Err(reason) => (None, Some(reason)),
+        },
+    };
+    if let Some(reason) = sigma_fallback {
+        warnings.push(format!(
+            "VI: vi_sigma_update = closed_form does not apply to this model ({reason}), so σ is \
+             stepped by Adam instead. Adam on σ is sensitive to vi_lr — if the fit lands with a σ \
+             well above a FOCEI/AGQ fit of the same data, lower vi_lr."
+        ));
+    }
+    // The stationarity condition is summed over every observation entering the data term.
+    let n_obs_total = population.n_obs();
+    let param_criterion_live = param_criterion_applies(init_params);
+    if !param_criterion_live {
+        warnings.push(
+            "VI: every population parameter is FIXed, so only `q` is being optimized. Convergence \
+             is judged on the objective alone — the parameter-stability test cannot say anything \
+             about a vector that never moves."
+                .to_string(),
+        );
+    }
     let mut trace: Vec<f64> = Vec::with_capacity(n_iters);
     let mut n_fd_subjects = 0usize;
     let mut n_kl_fallback_subjects = 0usize;
@@ -473,7 +527,23 @@ pub fn run_vi(
                 *g = 0.0;
             }
         }
+        // σ, like Ω, is replaced by its exact maximizer rather than stepped. Compute it from
+        // this iteration's gradient *before* zeroing that coordinate, then apply it after the
+        // Adam step so the write is not undone. Stepping and solving the same coordinate would
+        // apply the same information twice, exactly as for Ω above.
+        let sigma_next = sigma_mstep.and_then(|k| {
+            let slot = layout.sigma_start() + k;
+            closed_form_sigma(x[slot].exp(), grad_x[slot], n_obs_total)
+        });
+        if let Some(k) = sigma_mstep {
+            grad_x[layout.sigma_start() + k] = 0.0;
+        }
         adam_x.step(&mut x, &grad_x, &adam_cfg);
+        if let (Some(k), Some(next)) = (sigma_mstep, sigma_next) {
+            // Packed as `ln σ` (see `pack_params`). Written before `clamp_to_bounds` so the
+            // maximizer still picks up the σ runaway guard every other estimator gets.
+            x[layout.sigma_start() + k] = next.ln();
+        }
         // Project *before* the closed-form Ω is written below, not after. The two
         // blocks want different treatment: `θ`/`σ` are stepped by Adam and need the
         // box, whereas a closed-form `Ω` is already a valid covariance by
@@ -556,7 +626,9 @@ pub fn run_vi(
             prev_block = Some(block);
             block_acc.iter_mut().for_each(|a| *a = 0.0);
             block_n = 0;
-            if consecutive_param_settled >= SETTLE_PATIENCE {
+            // Guarded: with no free population coordinate this criterion is vacuous and must
+            // not certify convergence. See `param_criterion_applies`.
+            if consecutive_param_settled >= SETTLE_PATIENCE && param_criterion_live {
                 param_settled = true;
             }
 
@@ -595,6 +667,12 @@ pub fn run_vi(
         .map(|(a, last)| a.mean().unwrap_or_else(|| last.clone()))
         .collect();
     let mut final_params = unpack_params(&x_final, init_params);
+    // σ needs no recompute here, unlike Ω. Ω is a function of `phis_final`, so it has to be
+    // rebuilt at the averaged φ; σ lives *in* `x`, where every iterate written above was
+    // already an exact maximizer, so the Polyak mean of `x` carries the mean of those
+    // maximizers — which is what `vi_avg_last` exists to report. Re-solving here would also
+    // need a gradient at the averaged point, and applying it after `final_eval` would leave
+    // the reported ELBO evaluated at a σ the fit no longer holds.
     if options.vi_omega_update == ViOmegaUpdate::ClosedForm {
         let (omega, omega_iov) = closed_form_omega(fams, &phis_final, &k_occasions, init_params);
         final_params.omega = omega;

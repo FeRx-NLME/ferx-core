@@ -517,6 +517,61 @@ section of the SDLC for the versioning policy).
   lanes, and the 96-axis cap (past which a subject falls back to finite differences) is
   unchanged (#971).
 ### Added
+- **`vi_sigma_update`** — `σ` can now be replaced each iteration by the **exact** ELBO maximizer
+  rather than stepped by Adam, the same treatment `Ω` already gets from
+  `vi_omega_update = closed_form`. For a single proportional or additive `σ`, stationarity of the
+  data term gives `σ*² = (1/n_obs) · Σ E_q[(y − f(η))²/f(η)²]`, and the same identity expresses
+  that sum in terms of the `σ` gradient the ELBO already computes, so the update costs nothing.
+  `closed_form` is the default; `adam` restores the previous behaviour. Error structures with no
+  scalar stationary point (combined error, several `σ`, per-endpoint or covariate-selected error,
+  correlated residuals, M3 BLOQ, IIV-on-RUV, FREM, or a FIXed `σ`) fall back to Adam with the
+  reason recorded in `FitResult$warnings`.
+
+  **What this does and does not buy.** It makes `σ` exact given `q` and removes it from the
+  stochastic trajectory, so `σ` no longer carries its own `vi_lr` sensitivity. It is *not* what
+  closes the warfarin gap below — at `vi_mc_samples = 128` the two routes agree to 0.3 OFV, and
+  Adam is marginally ahead. Adopted for exactness and consistency with `Ω`, not for a measured
+  improvement at converged settings.
+
+### Changed
+- **The documented size of VI's posterior-variance understatement is now measured rather than
+  cited.** `docs/estimation/vi.qmd` presented "on the order of 20–25%" as a general figure; it is
+  the number for deep compartment models. Measured against per-subject NUTS at a fixed population
+  estimate, ferx's variational posterior matches the exact posterior to **0.2%** in variance on
+  warfarin (means to `2×10⁻⁵`), and to 4% when thinned to two observations a subject. The Laplace
+  covariance matches NUTS to 0.1% on the same fits, so the true posterior is Gaussian there and a
+  Gaussian `q` has nothing to get wrong. The page now reports the measurements and scopes the
+  citation to the regime it came from.
+
+### Fixed
+- **`method = vi` no longer reports `converged: true` after ~500 iterations when every population
+  parameter is FIXed.** Fitting `q` alone at a pinned `(θ, Ω, σ)` — how you read per-subject
+  posteriors at a known estimate — is a legitimate request, but VI's parameter-stability
+  convergence test was comparing a vector that cannot move against itself, reporting "settled" at
+  its first opportunity and stopping the run. Since either convergence criterion is sufficient,
+  that overrode the objective test, which had correctly reported "still moving". On warfarin with
+  everything FIXed at a known-good estimate the fit stopped after 500 iterations with
+  `elbo_tightness_ratio: 78` (implausible above 25) and `−2·ELBO = +2026`, on a model that reaches
+  `−283` once `φ` converges; it now runs 6250 iterations to `−282.6` with a ratio of `1.4`. When no
+  population coordinate is free, convergence is judged on the objective alone and a warning says
+  so.
+
+### Changed
+- **`method = vi` needs more Monte-Carlo draws than the default provides.** On warfarin,
+  `vi_mc_samples = 8` (the default) returns `σ = 0.014150` against `0.010565` from both AGQ
+  (`n_agq = 9`) and FOCEI — 34% high — with an OFV 11.3 units short of the reference and
+  `converged: true`. Because per-subject posterior width scales with `σ²`, every variational
+  covariance reported at that point was ~1.75× too wide. The cause is the convergence rule
+  meeting its own noise floor: it stops when the ELBO's drift is no longer distinguishable from
+  Monte-Carlo noise, and at 8 draws it becomes indistinguishable while real drift remains — so
+  the fit stops short and `σ`, the slowest-moving coordinate, is left furthest from its optimum.
+  Raising the draw count resolves it (`32` → −284.6, `128` → −285.4 against AGQ's −285.977), and
+  lowering `vi_lr` does too. Starting from a fitted FOCEI point does **not** help. Documented in
+  `docs/estimation/vi.qmd`; the default is unchanged pending a check against the deep-compartment
+  models it was tuned for. **If a VI fit lands well short of a FOCEI or AGQ fit of the same data,
+  raise `vi_mc_samples` first.**
+
+### Added
 - **The per-subject variational posterior is now written to the fit YAML.** A `method = vi` fit
   emits an `eta_posterior` block under `vi:`, keyed by subject ID, carrying each subject's
   variational mean and its **full** covariance (plus per-occasion `kappa` means under IOV).

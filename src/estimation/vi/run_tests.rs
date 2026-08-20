@@ -944,3 +944,219 @@ fn parameter_stability_alone_can_certify_convergence() {
         out.warnings
     );
 }
+
+// ---------------------------------------------------------------------------
+// Closed-form σ route
+// ---------------------------------------------------------------------------
+
+/// The M-step must actually be wired into the loop, not merely available.
+///
+/// Asserted by the two routes disagreeing on `σ` from the same fixture, seed and
+/// draw stream: `ViSigmaUpdate::ClosedForm` replaces `σ` with the exact maximizer
+/// every iteration where `Adam` steps it, so an identical `σ` would mean the option
+/// is being ignored. (The formula's *correctness* is pinned separately, against the
+/// vanishing σ-gradient, in `closed_form_sigma_zeroes_the_sigma_gradient`.)
+#[test]
+fn sigma_closed_form_route_moves_sigma_off_the_adam_path() {
+    let (model, population, params) = fixture();
+
+    let mut o_cf = opts(60);
+    o_cf.vi_sigma_update = crate::types::ViSigmaUpdate::ClosedForm;
+    let cf = run_vi(&model, &population, &params, &o_cf).unwrap();
+
+    let mut o_adam = opts(60);
+    o_adam.vi_sigma_update = crate::types::ViSigmaUpdate::Adam;
+    let adam = run_vi(&model, &population, &params, &o_adam).unwrap();
+
+    assert_ne!(
+        cf.params.sigma.values[0], adam.params.sigma.values[0],
+        "both σ routes returned {}, so vi_sigma_update is not reaching the loop",
+        cf.params.sigma.values[0]
+    );
+    // Neither route may emit the fallback warning on this model: the fixture is a
+    // single proportional σ, which is exactly the supported case.
+    assert!(
+        !cf.warnings.iter().any(|w| w.contains("vi_sigma_update")),
+        "unexpected σ fallback on a supported model: {:?}",
+        cf.warnings
+    );
+}
+
+/// A model outside the scalar derivation's scope must fall back to Adam **and say
+/// so**. A silent fallback would apply a formula that does not describe the model,
+/// which is the failure mode the support predicate exists to prevent.
+#[test]
+fn sigma_closed_form_falls_back_loudly_on_combined_error() {
+    let model = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.04
+  sigma ADD_ERR ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+",
+    )
+    .expect("combined-error fixture parses");
+    let (_m, population, _p) = fixture();
+    let params = model.default_params.clone();
+
+    let mut o = opts(40);
+    o.vi_sigma_update = crate::types::ViSigmaUpdate::ClosedForm;
+    let out = run_vi(&model, &population, &params, &o).unwrap();
+
+    let w = out
+        .warnings
+        .iter()
+        .find(|w| w.contains("vi_sigma_update"))
+        .unwrap_or_else(|| panic!("no σ fallback warning; warnings were {:?}", out.warnings));
+    assert!(
+        w.contains("combined") && w.contains("Adam"),
+        "the warning must name the reason and the route taken: {w}"
+    );
+    // The combined model is refused for the *right* reason. It necessarily declares two
+    // σ, so an ordering that checked the count first would report that instead — true,
+    // but not the thing the user needs to know.
+    assert!(
+        !w.contains("σ parameters"),
+        "refused on the σ count rather than on the error structure: {w}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Vacuous parameter-stability criterion
+// ---------------------------------------------------------------------------
+
+/// A model whose population vector cannot move must not be judged by whether it moved.
+///
+/// The regression: with `θ`, `Ω` and `σ` all FIXed, `max_relative_change` compares a constant
+/// against itself, reports "settled" at its first opportunity, and stops the fit — while `φ`, the
+/// only thing being optimized in that configuration and the one thing the criterion cannot see,
+/// is nowhere near converged. Measured on warfarin before the guard: 500 iterations,
+/// `converged: true`, `elbo_tightness_ratio: 78` (implausible above 25) and `−2·ELBO = +2026` on
+/// a model that reaches `−283` once `φ` is allowed to finish.
+#[test]
+fn param_criterion_is_vacuous_when_every_population_parameter_is_fixed() {
+    let (model, _population, params) = fixture();
+    assert!(
+        super::param_criterion_applies(&params),
+        "a model with free θ/Ω/σ must keep the parameter-stability criterion"
+    );
+
+    let all_fixed = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0) FIX
+  theta TVV(10.0, 1.0, 100.0) FIX
+  omega ETA_CL ~ 0.09 FIX
+  omega ETA_V  ~ 0.04 FIX
+  sigma PROP_ERR ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("all-FIXed fixture parses");
+    assert!(
+        !super::param_criterion_applies(&all_fixed.default_params),
+        "with every population coordinate FIXed the criterion is vacuous and must be disabled"
+    );
+
+    // A single free coordinate is enough to make it meaningful again — the guard must key on
+    // "nothing can move", not on "something is fixed", which is the common and harmless case.
+    let one_free = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0) FIX
+  omega ETA_CL ~ 0.09 FIX
+  sigma PROP_ERR ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("one-free fixture parses");
+    assert!(
+        super::param_criterion_applies(&one_free.default_params),
+        "one free θ is enough for the criterion to mean something"
+    );
+}
+
+/// And the user is told, because it changes what `converged` is based on.
+#[test]
+fn all_fixed_population_says_convergence_rests_on_the_objective_alone() {
+    let all_fixed = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0) FIX
+  theta TVV(10.0, 1.0, 100.0) FIX
+  omega ETA_CL ~ 0.09 FIX
+  omega ETA_V  ~ 0.04 FIX
+  sigma PROP_ERR ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("all-FIXed fixture parses");
+    let (_m, population, _p) = fixture();
+    let out = run_vi(
+        &all_fixed,
+        &population,
+        &all_fixed.default_params,
+        &opts(40),
+    )
+    .unwrap();
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("every population parameter is FIXed")),
+        "the all-FIXed case must say what convergence now rests on; warnings were {:?}",
+        out.warnings
+    );
+
+    // The ordinary case must stay quiet about it.
+    let (model, population, params) = fixture();
+    let free = run_vi(&model, &population, &params, &opts(40)).unwrap();
+    assert!(
+        !free
+            .warnings
+            .iter()
+            .any(|w| w.contains("every population parameter is FIXed")),
+        "a model with free parameters must not get the all-FIXed warning: {:?}",
+        free.warnings
+    );
+}

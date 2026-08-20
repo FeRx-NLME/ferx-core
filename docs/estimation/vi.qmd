@@ -140,6 +140,7 @@ All keys go in `[fit_options]`.
 | `vi_lr` | 0.02 | Adam learning rate |
 | `vi_family` | `full_rank` | `full_rank` or `mean_field` |
 | `vi_omega_update` | `closed_form` | `closed_form` or `adam` |
+| `vi_sigma_update` | `closed_form` | `closed_form` or `adam` |
 | `vi_avg_last` | final 25% | Polyak averaging window (iterations) |
 | `vi_eta_grad` | `auto` | `auto`, `analytic`, or `fd` |
 | `vi_kl` | `analytic` | `analytic` or `mc` — how the KL half is evaluated |
@@ -200,6 +201,66 @@ Settling is not the same as landing somewhere good — a stuck optimizer also st
 Read [`elbo_tightness_ratio`](#is-the-bound-tight-elbo_tightness_ratio) alongside
 `converged`.
 
+Either criterion is sufficient, which is what makes the second one worth stating carefully: it
+measures the **population** vector, not `q`. If you FIX every population parameter and fit `q`
+alone — a reasonable thing to ask for, since it is how you read per-subject posteriors at a known
+estimate — that test compares a constant against itself and would stop the fit immediately. It is
+disabled in that case, convergence rests on the objective alone, and a warning says so.
+
+### How `σ` is updated
+
+`Ω` is not the only population parameter with an exact ELBO maximizer. For a single
+proportional or additive residual error, stationarity of the data term gives
+
+$$\sigma^{*2} = \frac{1}{n_{obs}} \sum_{obs} \mathbb{E}_q\!\left[\frac{(y - f(\eta))^2}{f(\eta)^2}\right]$$
+
+(the `f^2` divisor present for proportional error, absent for additive). `vi_sigma_update =
+closed_form`, the default, takes that maximizer each iteration, so `σ` never enters the
+stochastic optimization. It costs nothing: the same identity expresses the sum in terms of the
+`σ` gradient the ELBO already computes, so no extra pass over the data is needed.
+
+**Why this is the default.** Exactness and consistency with `Ω`, rather than a measured
+improvement: it makes `σ` the exact conditional maximizer, so that coordinate carries no `vi_lr`
+sensitivity of its own. At adequate draw counts the two routes agree to ~0.3 OFV on warfarin, with
+`adam` marginally ahead, so do not expect `closed_form` to change a converged answer. Error
+structures with no scalar stationary point — combined error, several `σ`, per-endpoint or
+covariate-selected error, correlated residuals, M3 BLOQ, IIV-on-RUV, FREM, or a FIXed `σ` — fall
+back to `adam`, with the reason in `FitResult$warnings`.
+
+**The thing actually worth knowing about `σ`.** At the default `vi_mc_samples = 8`, a warfarin fit
+returns `σ = 0.011234`–`0.014150` depending on the route where AGQ (`n_agq = 9`) and FOCEI both
+give `0.010565`, and reports `converged: true` while sitting up to 11.3 OFV short of the
+reference. Since per-subject posterior width scales with `σ²`, a 34% error there makes every
+reported variational covariance about 1.75× too wide. This is **not** a defect in the `σ` update —
+both routes show it, and both stop showing it at higher draw counts. It is the convergence rule
+meeting its own noise floor, described next.
+
+**`vi_mc_samples = 8` is not enough on this problem.** Warfarin's OFV gap to AGQ runs 11.3 units
+at 8 draws, 1.4 at 32, and 0.55 at 128 (−285.4 against −285.977). The mechanism is the trade the
+convergence rule is deliberately written to make (see [Why there is no convergence
+tolerance](#why-there-is-no-convergence-tolerance)): it stops when the ELBO's drift is no longer
+distinguishable from Monte-Carlo noise, and at 8 draws it becomes indistinguishable while real
+drift remains. So the fit stops short, and `σ` — the coordinate that moves slowest — is left
+furthest from its optimum.
+
+Three consequences worth carrying:
+
+- **If a VI fit lands well short of a FOCEI or AGQ fit of the same data, raise `vi_mc_samples`
+  first.** More iterations will not help; the rule has already decided more epochs at this noise
+  level cannot resolve the drift, and it is right.
+- Lowering `vi_lr` also works (`0.002` reaches −285.9 at 8 draws), but it is tuning where the
+  draw count is the principled knob.
+- **Chaining `[focei, vi]` does not help.** Starting from the fitted FOCEI point, the fit still
+  ends at `σ ≈ 0.0141`: `σ` legitimately rises early, because FOCEI's value is not the ELBO's
+  conditional optimum given a `q` that starts at the prior, and the run stops before it comes back
+  down. So a bad `σ` here is not a bad-basin problem and a warm start is not the remedy.
+
+`converged: true` therefore means the drift became unresolvable at the current noise level, not
+that the optimizer found the optimum. Read it with `elbo_tightness_ratio` — and note that ratio
+does **not** catch this case either: it read `0.960`, a healthy value, at the point 11.3 units
+short, because it measures whether `q` matches the posterior *at the current parameters* and `q`
+did.
+
 ### Why the estimate is averaged
 
 The last iterate of a stochastic optimizer is a draw carrying the full gradient noise of its
@@ -242,14 +303,25 @@ row and column of `Ω`, not just its own variance.
 
 ## Standard errors
 
-Variational posteriors are known to **understate** posterior variance relative to MCMC, which
-Janssen et al. flag as a limitation of the approach. So `FitResult$vi$eta_covs` is for
-individual-level reporting and shrinkage, and is **not** the route to population standard
-errors.
+Variational posteriors can **understate** posterior variance relative to MCMC, which Janssen et
+al. flag as a limitation of the approach. So `FitResult$vi$eta_covs` is for individual-level
+reporting and shrinkage, and is **not** the route to population standard errors.
 
-The effect is real but mild — on the order of 20–25%, and it averages away over subjects. If a
-deep compartment model returns an `Ω` that is *several times* too small, this is not the
-explanation; see [Reading `Ω` from a deep compartment model](#dcm-omega).
+How large the effect is depends on the model, and on warfarin it is **negligible**. Measured
+against NUTS at a fixed population estimate (4 chains × 20 000 draws, 0 divergences), the
+variational per-subject variance comes out at **1.00× the exact posterior's** — 0.2% — with means
+agreeing to `2×10⁻⁵`. Thinning to two observations a subject moves it to **4%**. The reason it is
+this small is measurable rather than lucky: the Laplace covariance matches NUTS to 0.1% on the
+same fits, so the true per-subject posterior *is* Gaussian here, and a Gaussian `q` has nothing to
+get wrong. Both limits of this model are Gaussian — data-rich by asymptotics, data-poor because
+the `N(0, Ω)` prior dominates.
+
+The **20–25%** figure in the literature comes from deep compartment models, where a
+neural-network structural model gives the per-subject posterior a geometry a 1-cpt model cannot
+produce. Treat it as the number for that regime, not a general one, and expect something closer to
+the measurements above on ordinary compartmental models. It has not been reproduced here, and if
+a deep compartment model returns an `Ω` that is *several times* too small, understatement is not
+the explanation either way; see [Reading `Ω` from a deep compartment model](#dcm-omega).
 
 Those come from the ordinary covariance step — the same FD-of-OFV Hessian every other method
 uses — run at the VI estimate on the EBEs and `H` from VI's final inner-loop pass. It is
@@ -481,8 +553,25 @@ covered here.
 
 ## Comparison with NONMEM
 
-*To be added: warfarin θ/Ω/σ and `−2 log L` under NONMEM FOCEI, ferx FOCEI, ferx SAEM and
-ferx VI (`vi_final_ofv = laplace`).* Run as a slow-tests-gated convergence test.
+*Still to be added: the NONMEM FOCEI column, as a slow-tests-gated convergence test.* What is
+measured so far, on warfarin (10 subjects, 110 observations, 1-cpt oral, lognormal `η` on
+CL/V/KA, proportional error):
+
+| | TVCL | TVV | TVKA | σ | OFV |
+|---|---|---|---|---|---|
+| ferx AGQ (`n_agq = 9`) | 0.132687 | 7.7375 | 0.8109 | 0.010565 | −285.977 |
+| ferx FOCEI | 0.132695 | 7.7377 | 0.8108 | 0.010565 | −286.004 |
+| nlmixr2 FOCEI | 0.132738 | 7.7385 | 0.8285 | 0.010574 | −285.947 |
+| ferx VI (`vi_mc_samples = 128`) | — | — | — | 0.011234 | −285.425 |
+
+The FOCEI columns also pin the objective *convention*: ferx omits `½·n_obs·log 2π` and nlmixr2
+has an `adjObf` flag defaulting to `TRUE`, and the measured offset between them is zero — a
+mismatch would have shown as `110 · log 2π ≈ 202`. VI's OFV here is the Laplace objective at the
+VI estimate (`vi_final_ofv = laplace`), so it is directly comparable with the rest of the column.
+
+The harness that produces these numbers, including a cross-implementation comparison against
+nlmixr2 7.0's `est = "emvi"` — the only other variational-inference implementation in a
+pharmacometrics package — lives in `tools/vi-emvi-comparison/`.
 
 ## References
 

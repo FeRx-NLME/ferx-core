@@ -58,8 +58,9 @@ pub mod run;
 
 pub use adam::{AdamConfig, AdamState, PolyakAverager};
 pub use elbo::{
-    analytic_eta_grad_available, closed_form_omega, population_neg_elbo,
-    unsupported_data_term_reason, ElboConfig, ElboEval, EtaGradMode, KlMode, PackedLayout,
+    analytic_eta_grad_available, closed_form_omega, closed_form_sigma, closed_form_sigma_support,
+    population_neg_elbo, unsupported_data_term_reason, ElboConfig, ElboEval, EtaGradMode, KlMode,
+    PackedLayout,
 };
 pub use family::{FullRank, KlTerm, MeanField, VariationalFamily};
 pub use run::run_vi;

@@ -47,7 +47,10 @@ use crate::estimation::inner_optimizer::{
 use crate::estimation::parameterization::{lower_tri_iter, theta_packs_log, unpack_params};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{iov_occasion_groups, obs_nll_subject_into};
-use crate::types::{CompiledModel, ModelParameters, OmegaMatrix, Population, Subject};
+use crate::types::{
+    BloqMethod, CompiledModel, ErrorModel, ErrorSpec, ModelParameters, OmegaMatrix, Population,
+    Subject,
+};
 
 use super::family::VariationalFamily;
 
@@ -1042,6 +1045,116 @@ pub fn closed_form_omega(
     });
 
     (omega, omega_iov)
+}
+
+/// Whether this model's residual error admits the closed-form `σ` M-step, and if
+/// so which `σ` it applies to.
+///
+/// `Ok(k)` means `sigma.values[k]` is the single scalar the closed form solves for.
+/// `Err(reason)` is a user-facing sentence explaining the fall back to Adam; it is
+/// surfaced through `FitResult::warnings` rather than swallowed, on the same
+/// principle as the KL fallback — a scope gap must fail loudly, not silently
+/// produce a `σ` from a formula that does not apply to the model in hand.
+pub fn closed_form_sigma_support(
+    model: &CompiledModel,
+    template: &ModelParameters,
+) -> Result<usize, String> {
+    // The error structure is checked *before* the σ count, so the reason a user is given
+    // is the one that explains their model: a combined model necessarily declares two σ,
+    // and "combined error has no scalar stationary point" is more use than "you declared
+    // two σ". The count check below still catches a declared-but-unused σ.
+    match model.error_spec {
+        ErrorSpec::Single(ErrorModel::Additive) | ErrorSpec::Single(ErrorModel::Proportional) => {}
+        ErrorSpec::Single(ErrorModel::Combined) => {
+            return Err(
+                "the combined error model couples two σ in one variance, which has no \
+                 scalar stationary point"
+                    .to_string(),
+            )
+        }
+        // Per-endpoint and covariate-selected error models each carry their own
+        // σ set, so the single-scalar derivation does not describe them.
+        ErrorSpec::PerCmt(_) => {
+            return Err("per-CMT error models declare a σ set per endpoint".to_string())
+        }
+        ErrorSpec::Selected { .. } => {
+            return Err("covariate-selected error models declare a σ set per branch".to_string())
+        }
+    }
+    // One scalar only. Two σ that both scale the same variance are not separately
+    // identified by a single stationarity condition.
+    if template.sigma.values.len() != 1 {
+        return Err(format!(
+            "the model declares {} σ parameters and the closed form solves for one",
+            template.sigma.values.len()
+        ));
+    }
+    if template.sigma_fixed.first().copied().unwrap_or(false) {
+        return Err("σ is declared FIX".to_string());
+    }
+    if !model.residual_correlations.is_empty() {
+        return Err("correlated residuals put σ inside a non-diagonal R".to_string());
+    }
+    if model.frem_config.is_some() {
+        return Err("FREM pseudo-observations carry their own residual variance".to_string());
+    }
+    if matches!(model.bloq_method, BloqMethod::M3) {
+        return Err(
+            "M3 BLOQ adds a censored log-CDF term in which σ has no closed form".to_string(),
+        );
+    }
+    if model.residual_error_eta.is_some() {
+        return Err("IIV on residual error scales the variance per subject".to_string());
+    }
+    Ok(0)
+}
+
+/// The **exact** maximizer of the ELBO in a single proportional or additive `σ`.
+///
+/// # The identity this uses
+///
+/// The data term is `E_q[−log p(y|η)] = ½ Σ_obs E_q[log 2π + log v + (y−f)²/v]`,
+/// with `v = (σ·f)²` for proportional error and `v = σ²` for additive. Either way
+/// `σ` enters `log v` as `2 log σ` and `(y−f)²/v` as a `σ⁻²` factor, so
+///
+/// ```text
+/// ∂(data term)/∂(log σ) = n_obs − (1/σ²) · Σ_obs E_q[(y − f)² / f²]      (proportional)
+///                       = n_obs − (1/σ²) · Σ_obs E_q[(y − f)²]           (additive)
+/// ```
+///
+/// Setting that to zero gives `σ*² = (1/n_obs) Σ E_q[…]`, and rearranging the same
+/// identity expresses the sufficient statistic in terms of the gradient already in
+/// hand: `Σ E_q[…] = σ²(n_obs − g)`. Hence
+///
+/// ```text
+/// σ* = σ · sqrt(1 − g / n_obs)
+/// ```
+///
+/// So the M-step costs **nothing** beyond the gradient the ELBO computes anyway —
+/// no extra prediction pass, unlike a fresh `E_q` evaluation. `g` is the gradient
+/// of the **negative** ELBO with respect to `log σ`; the KL term does not involve
+/// `σ`, so the data term is the whole of it.
+///
+/// # Returns
+///
+/// `None` when the implied statistic is not positive (`g ≥ n_obs`). Exactly, that
+/// cannot happen — `Σ E_q[(y−f)²/f²] ≥ 0` bounds `g ≤ n_obs` — so it signals Monte
+/// Carlo noise having pushed the estimate past the boundary, and the caller keeps
+/// the current `σ` for this iteration rather than taking a `sqrt` of a negative.
+pub fn closed_form_sigma(sigma: f64, grad_log_sigma: f64, n_obs: usize) -> Option<f64> {
+    if n_obs == 0 || !sigma.is_finite() || sigma <= 0.0 || !grad_log_sigma.is_finite() {
+        return None;
+    }
+    let factor = 1.0 - grad_log_sigma / n_obs as f64;
+    if factor <= 0.0 || factor.is_nan() {
+        return None;
+    }
+    let next = sigma * factor.sqrt();
+    if next.is_finite() && next > 0.0 {
+        Some(next)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

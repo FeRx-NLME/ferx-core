@@ -2244,3 +2244,134 @@ fn tightness_flags_a_grossly_loose_bound_but_not_a_healthy_one() {
         broken.ratio()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Closed-form σ M-step
+// ---------------------------------------------------------------------------
+
+/// The M-step must land exactly where the ELBO's σ-gradient vanishes.
+///
+/// This is the check that makes `closed_form_sigma` trustworthy, and it is exact
+/// rather than approximate: the Monte Carlo draws come from `crn_eps`, which is
+/// seeded on `(seed, iter, subject, sample)` and does **not** depend on `σ`. So
+/// re-evaluating the ELBO with `σ` replaced by the M-step's answer reuses the very
+/// same draws, and the residual gradient there is a pure statement about the
+/// formula — no sampling noise to hide behind a tolerance.
+#[test]
+fn closed_form_sigma_zeroes_the_sigma_gradient() {
+    let (model, population, mut params) = fixture();
+    let layout = PackedLayout::new(&params);
+    let cfg = cfg_seeded();
+    let iter = 7;
+    let n_obs = population.n_obs();
+    let family = FullRank::new(model.n_eta);
+    let phis = perturbed_phis(&family, &params.omega, population.subjects.len());
+
+    // Start well off the optimum in both directions, so a formula that merely damped
+    // toward the right answer instead of solving for it would fail here.
+    for start in [0.01_f64, 0.04, 0.2] {
+        params.sigma.values[0] = start;
+        let x = pack_params(&params);
+        let e = population_neg_elbo(
+            &model,
+            &population,
+            &params,
+            &x,
+            Families::Uniform(&family),
+            &phis,
+            &cfg,
+            iter,
+        )
+        .unwrap();
+        let g = e.grad_x[layout.sigma_start()];
+        let next = closed_form_sigma(start, g, n_obs).expect("σ M-step has a solution here");
+
+        let mut p2 = params.clone();
+        p2.sigma.values[0] = next;
+        let e2 = population_neg_elbo(
+            &model,
+            &population,
+            &p2,
+            &pack_params(&p2),
+            Families::Uniform(&family),
+            &phis,
+            &cfg,
+            iter,
+        )
+        .unwrap();
+        let g2 = e2.grad_x[layout.sigma_start()];
+        assert!(
+            g2.abs() < 1e-6,
+            "σ: {start} -> {next}, but the σ-gradient there is {g2:.3e}, not 0 \
+             (gradient at the start was {g:.3e})"
+        );
+        // ...and it is a maximum of the ELBO along σ, not merely a stationary point.
+        assert!(
+            e2.neg_elbo <= e.neg_elbo,
+            "σ M-step raised −ELBO from {:.6} to {:.6}",
+            e.neg_elbo,
+            e2.neg_elbo
+        );
+    }
+}
+
+/// A `σ` already at the maximizer must not move: `g = 0` implies `σ* = σ`.
+#[test]
+fn closed_form_sigma_is_a_fixed_point_at_the_optimum() {
+    assert_eq!(closed_form_sigma(0.037, 0.0, 110), Some(0.037));
+}
+
+/// The boundary guard. `Σ E_q[(y−f)²/f²] ≥ 0` bounds `g ≤ n_obs` exactly, so a
+/// gradient past that is Monte Carlo noise, and the caller must keep the current σ
+/// rather than take the square root of a negative.
+#[test]
+fn closed_form_sigma_refuses_a_non_positive_statistic() {
+    assert_eq!(closed_form_sigma(0.04, 110.0, 110), None);
+    assert_eq!(closed_form_sigma(0.04, 200.0, 110), None);
+    assert_eq!(closed_form_sigma(0.04, f64::NAN, 110), None);
+    assert_eq!(closed_form_sigma(0.04, -1.0, 0), None);
+    assert_eq!(closed_form_sigma(0.0, -1.0, 110), None);
+}
+
+/// Scope: every model the scalar derivation does not describe must be refused by
+/// name, so a gap falls loudly back to Adam instead of silently applying a formula
+/// that does not hold. The proportional fixture is the supported case.
+#[test]
+fn closed_form_sigma_support_refuses_models_outside_its_scope() {
+    let (model, _population, params) = fixture();
+    assert_eq!(closed_form_sigma_support(&model, &params), Ok(0));
+
+    // Combined error: two σ in one variance, no scalar stationary point.
+    let combined = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+  sigma ADD_ERR ~ 0.1
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+",
+    )
+    .expect("combined fixture parses");
+    let err = closed_form_sigma_support(&combined, &combined.default_params)
+        .expect_err("combined error must be refused");
+    assert!(
+        err.contains("combined") || err.contains("σ parameters"),
+        "unhelpful reason: {err}"
+    );
+
+    // A FIXed σ is not an estimated parameter.
+    let mut fixed = params.clone();
+    let mut tmpl_fixed = model.default_params.clone();
+    tmpl_fixed.sigma_fixed = vec![true];
+    fixed.sigma_fixed = vec![true];
+    let err = closed_form_sigma_support(&model, &fixed).expect_err("FIXed σ must be refused");
+    assert!(err.contains("FIX"), "unhelpful reason: {err}");
+}

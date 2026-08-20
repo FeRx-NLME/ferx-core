@@ -5749,6 +5749,8 @@ pub struct FitOptions {
     pub vi_family: ViFamily,
     /// How `Ω` is updated. Default [`ViOmegaUpdate::ClosedForm`].
     pub vi_omega_update: ViOmegaUpdate,
+    /// How `σ` is updated each iteration. See [`ViSigmaUpdate`].
+    pub vi_sigma_update: ViSigmaUpdate,
     /// Polyak averaging window: how many trailing iterations to average for the
     /// reported estimate. `None` averages the final 25%.
     ///
@@ -6198,6 +6200,7 @@ impl Default for FitOptions {
             vi_lr: 0.02,
             vi_family: ViFamily::default(),
             vi_omega_update: ViOmegaUpdate::default(),
+            vi_sigma_update: ViSigmaUpdate::default(),
             vi_avg_last: None,
             vi_eta_grad: ViEtaGrad::default(),
             vi_kl: ViKl::default(),
@@ -6585,6 +6588,41 @@ pub enum ViOmegaUpdate {
     /// Step `Ω` with Adam alongside `θ` and `Σ`. Provided for comparison against
     /// the published behaviour, and as an escape hatch should the closed form ever
     /// prove unsuitable for a structured `Ω`.
+    Adam,
+}
+
+/// How the residual error `σ` is updated each iteration.
+///
+/// Adam-stepping `σ` alongside `θ` was the original behaviour and it is not
+/// reliable: on warfarin with the default `vi_lr = 0.02` the σ coordinate has a
+/// spurious attracting point 34% above the maximum-likelihood value, and the
+/// optimizer lands there *even when started from the fitted FOCEI point*, then
+/// reports `converged: true` at an ELBO 11.4 units short of what the same model
+/// reaches with σ held at its correct value. Smaller `vi_lr` walks the answer back
+/// monotonically, which is the signature of a step too large for the curvature in
+/// that coordinate rather than of a wrong gradient — the ELBO gradient itself
+/// matches central differences to 1e-6 (`neg_elbo_gradient_matches_central_fd`).
+///
+/// The fix is the same one [`ViOmegaUpdate::ClosedForm`] applies to `Ω`: take the
+/// exact maximizer and keep the coordinate out of the stochastic optimization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ViSigmaUpdate {
+    /// Replace `σ` with the exact ELBO maximizer each iteration. The default.
+    ///
+    /// For a single proportional or additive `σ`, stationarity of the ELBO data
+    /// term gives `σ*² = (1/n_obs) · Σ E_q[(y − f(η))² / f(η)²]` (the `f²` divisor
+    /// present for proportional, absent for additive). That expectation is already
+    /// implied by the σ gradient the ELBO computes, so the update costs nothing:
+    /// see [`crate::estimation::vi::closed_form_sigma`].
+    ///
+    /// Models outside that scope — combined error, several `σ`s, per-endpoint or
+    /// covariate-selected error, correlated residuals, M3 BLOQ, IIV-on-RUV, FREM,
+    /// or a FIXed `σ` — have no scalar closed form and fall back to `Adam`, with
+    /// the reason recorded in `FitResult::warnings`.
+    #[default]
+    ClosedForm,
+    /// Step `σ` with Adam alongside `θ`. The pre-fix behaviour, kept as an escape
+    /// hatch and for reproducing earlier fits; expect the bias described above.
     Adam,
 }
 
@@ -7070,6 +7108,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "vi_lr",
             "vi_family",
             "vi_omega_update",
+            "vi_sigma_update",
             "vi_avg_last",
             "vi_eta_grad",
             "vi_kl",

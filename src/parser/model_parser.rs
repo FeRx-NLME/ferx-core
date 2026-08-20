@@ -6957,6 +6957,17 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             }
         }
+        "vi_sigma_update" => {
+            opts.vi_sigma_update = match value.trim().to_lowercase().as_str() {
+                "closed_form" | "closedform" => crate::types::ViSigmaUpdate::ClosedForm,
+                "adam" => crate::types::ViSigmaUpdate::Adam,
+                other => {
+                    return Err(format!(
+                        "vi_sigma_update must be `closed_form` or `adam`, got `{other}`"
+                    ))
+                }
+            }
+        }
         "vi_omega_update" => {
             opts.vi_omega_update = match value.trim().to_lowercase().as_str() {
                 "closed_form" | "closedform" => crate::types::ViOmegaUpdate::ClosedForm,
