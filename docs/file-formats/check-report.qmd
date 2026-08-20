@@ -56,6 +56,9 @@ Optional fields are omitted entirely when absent (not emitted as `null`).
 | `E_MISSING_BLOCK` | error | A required `[block]` is absent. `block` names which one. |
 | `E_NN_FEATURE_DISABLED` | error | A `[covariate_nn]` block requires building with `--features nn`. |
 | `E_MISSING_COVARIATE` | error | The model references a covariate not present in the data (case-sensitive). |
+| `E_ETA_NOT_DECLARED` | error | An unresolved identifier reads as a random effect (`ETA…` / `KAPPA…`) but no `omega` / `kappa` declaration defines it, and the data carries no such column. Usually a deleted `omega` line whose `exp(ETA_…)` term was left behind. |
+| `W_ETA_NOT_DECLARED` | warning | As `E_ETA_NOT_DECLARED`, but reported without `--data`, where ferx cannot yet know whether the dataset supplies the column. |
+| `E_SAEM_NO_RANDOM_EFFECTS` | error | `method = saem` (anywhere in a method chain) on a model with no random effects (`n_eta = 0`). SAEM is an EM over the random effects; use `foce` / `focei` / `laplace`. |
 | `E_PER_CMT_SCALING` | error | An observed compartment lacks a per-CMT scaling entry. |
 | `E_PER_CMT_ERROR_MODEL` | error | An observed compartment lacks a per-CMT `[error_model]` entry. |
 | `E_DATA` | error | The `--data` file could not be read or parsed. |

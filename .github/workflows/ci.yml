@@ -123,6 +123,7 @@ jobs:
             --test markov_smoke \
             --test tte_convergence \
             --test tte_smoke \
+            --test zero_omega_fit \
             --lcov --output-path lcov.info
 
       - name: Upload to Codecov (survival + markov flags)

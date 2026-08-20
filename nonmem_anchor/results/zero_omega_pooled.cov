@@ -1,0 +1,6 @@
+TABLE NO.     1: First Order: Problem=1 Subproblem=0 Superproblem1=0 Iteration1=0 Superproblem2=0 Iteration2=0
+ NAME         THETA1       THETA2       SIGMA(1,1)   OMEGA(1,1)
+ THETA1        2.76552E-02  6.32071E-02  2.18292E-04  0.00000E+00
+ THETA2        6.32071E-02  3.09835E+00  4.11362E-03  0.00000E+00
+ SIGMA(1,1)    2.18292E-04  4.11362E-03  2.21328E-05  0.00000E+00
+ OMEGA(1,1)    0.00000E+00  0.00000E+00  0.00000E+00  0.00000E+00
