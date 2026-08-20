@@ -1295,12 +1295,16 @@ fn combined_additive_sigma_at_floor(model: &CompiledModel, params: &ModelParamet
 /// The IIV-on-RUV parameterization writes the residual variance as
 /// `σ²·exp(2·η_RUV)`, so σ and ω_RUV trade off along a ridge; a poorly-mixing
 /// E-step can let the M-step ride σ up to its e⁵ ceiling. This returns, per σ,
-/// `Some(cap)` = `min(log σ₀ + SAEM_RUV_SIGMA_LN_GROWTH, existing log-upper)` for
-/// each *free* RUV-scaled residual σ, and `None` for any σ that must not be
-/// capped: every σ when the model has no `iiv_on_ruv` (`has_ruv_eta == false`), a
-/// FIXed σ, or the FREM covariate σ (EPSCOV — always FIX and independent of the
-/// RUV scaling). The cap is enforced as a post-M-step clamp, never as an NLopt
-/// bound, so a well-posed fit whose σ stays below the cap is unaffected.
+/// `Some(cap)` = `log σ₀ + SAEM_RUV_SIGMA_LN_GROWTH` for each *free* RUV-scaled
+/// residual σ **whose growth cap is stricter than its own NLopt upper bound**,
+/// and `None` for any σ that must not carry a growth cap: every σ when the model
+/// has no `iiv_on_ruv` (`has_ruv_eta == false`), a FIXed σ, the FREM covariate σ
+/// (EPSCOV — always FIX and independent of the RUV scaling), or a σ whose
+/// user-set upper bound is already tighter than the growth cap (the NLopt bound
+/// governs there, so a σ converging to its own bound must not be mis-flagged as a
+/// bound RUV growth cap — #903 review). The cap is enforced as a post-M-step
+/// clamp, never as an NLopt bound, so a well-posed fit whose σ stays below the cap
+/// is unaffected.
 fn compute_ruv_sigma_caps(
     has_ruv_eta: bool,
     frem_cov_sigma: Option<usize>,
@@ -1318,9 +1322,37 @@ fn compute_ruv_sigma_caps(
                 return None;
             }
             let upper = log_sigma_upper.get(i).copied().unwrap_or(f64::INFINITY);
-            Some((log_sigma_init[i] + SAEM_RUV_SIGMA_LN_GROWTH).min(upper))
+            let growth_cap = log_sigma_init[i] + SAEM_RUV_SIGMA_LN_GROWTH;
+            // If the user's own upper bound is at least as tight, NLopt already
+            // enforces it and our clamp/warning would just misattribute that bound
+            // to the RUV safeguard — so carry no growth cap here.
+            if growth_cap < upper {
+                Some(growth_cap)
+            } else {
+                None
+            }
         })
         .collect()
+}
+
+/// Whether the `iiv_on_ruv` η may be re-centered while exactly preserving each
+/// subject's residual variance (issue #904 correctness gate).
+///
+/// Re-centering shifts η_RUV by `−mean`, multiplying the *whole* residual variance
+/// `R = Σ σ_c²` by `exp(−2·mean)`, and compensates by scaling the free residual σ
+/// by `exp(mean)`. The compensation is exact only if *every* non-FREM residual σ
+/// component absorbs the shift, i.e. is free. If any RUV-scaled σ component is
+/// FIXed (e.g. a fixed additive term of a combined error), scaling only the free
+/// component leaves the fixed part uncompensated and silently perturbs `R`, so
+/// re-centering must be skipped (the σ/ω_RUV growth caps then act as the
+/// backstop; a fixed component also partially anchors the ridge). The FREM EPSCOV
+/// (always FIX and not on a real-observation row) is exempt.
+fn ruv_recenter_allowed(
+    has_ruv_eta: bool,
+    frem_cov_sigma: Option<usize>,
+    sigma_fixed: &[bool],
+) -> bool {
+    has_ruv_eta && (0..sigma_fixed.len()).all(|i| Some(i) == frem_cov_sigma || !sigma_fixed[i])
 }
 
 /// Re-center the `iiv_on_ruv` η to zero mean, absorbing the shift into the
@@ -1389,7 +1421,18 @@ fn compute_ruv_omega_cap(
 /// row/column covariances by `√(v_cap/v_old)` so every correlation with the RUV
 /// eta is preserved and the matrix stays positive-definite (#895). A no-op when
 /// the diagonal is already at or below the cap. Returns `true` when it clamped.
-fn apply_ruv_omega_cap(omega_mat: &mut DMatrix<f64>, k: usize, log_cap: f64) -> bool {
+///
+/// A FIXed off-diagonal partner `j` (`omega_fixed[j]`) is left untouched: its
+/// covariance with the RUV eta is a user-declared constant that the Ω M-step
+/// restores verbatim each iteration, so rescaling it would silently mutate a
+/// FIXed entry (#903 review). Skipping it can only *lower* the correlation the
+/// cap preserves, never break positive-definiteness (the diagonal still shrinks).
+fn apply_ruv_omega_cap(
+    omega_mat: &mut DMatrix<f64>,
+    k: usize,
+    log_cap: f64,
+    omega_fixed: &[bool],
+) -> bool {
     let v_old = omega_mat[(k, k)];
     let v_cap = log_cap.exp();
     if !(v_old > v_cap) {
@@ -1398,13 +1441,41 @@ fn apply_ruv_omega_cap(omega_mat: &mut DMatrix<f64>, k: usize, log_cap: f64) -> 
     let s = (v_cap / v_old).sqrt();
     let n = omega_mat.nrows();
     for j in 0..n {
-        if j != k {
+        if j != k && !omega_fixed.get(j).copied().unwrap_or(false) {
             omega_mat[(k, j)] *= s;
             omega_mat[(j, k)] *= s;
         }
     }
     omega_mat[(k, k)] = v_cap;
     true
+}
+
+/// Re-anchor the per-σ iiv_on_ruv growth caps to the data-informed σ reached by
+/// the end of the exploration phase (#903 review). Each cap is loosened (never
+/// tightened) to `max(existing, min(log σ_now + growth, upper))`, so a well-posed
+/// fit started from a σ guess far below the truth is not spuriously clamped and
+/// falsely flagged, while a genuine post-exploration runaway is still bounded.
+fn reanchor_ruv_sigma_caps(caps: &mut [Option<f64>], log_sigma: &[f64], log_sigma_upper: &[f64]) {
+    for (i, cap) in caps.iter_mut().enumerate() {
+        if let Some(c) = cap {
+            let upper = log_sigma_upper.get(i).copied().unwrap_or(f64::INFINITY);
+            let settled = (log_sigma[i] + SAEM_RUV_SIGMA_LN_GROWTH).min(upper);
+            *c = c.max(settled);
+        }
+    }
+}
+
+/// Re-anchor the iiv_on_ruv Ω growth cap to the ω_RUV variance reached by the end
+/// of exploration (#903 review), loosening only. `None` (no cap) stays `None`;
+/// a non-positive variance leaves the cap unchanged.
+fn reanchor_ruv_omega_cap(cap: Option<f64>, omega_ruv_var: f64) -> Option<f64> {
+    cap.map(|c| {
+        if omega_ruv_var > 0.0 {
+            c.max(omega_ruv_var.ln() + SAEM_RUV_OMEGA_LN_GROWTH)
+        } else {
+            c
+        }
+    })
 }
 
 /// Decide whether SAEM should warn that its E-step never mixed (issue #895).
@@ -1848,7 +1919,7 @@ pub fn run_saem(
     // handed to NLopt perturbs its search path even when the optimum is interior).
     // `None` means "no cap for this σ"; a `Some(cap)` records the log-σ ceiling so
     // the update can be clamped and a run that ends pinned against it flagged.
-    let ruv_sigma_caps: Vec<Option<f64>> = compute_ruv_sigma_caps(
+    let mut ruv_sigma_caps: Vec<Option<f64>> = compute_ruv_sigma_caps(
         model.residual_error_eta.is_some(),
         model
             .frem_config
@@ -1860,13 +1931,43 @@ pub fn run_saem(
     );
 
     // #904: which residual σ absorb the iiv_on_ruv η-mean during re-centering —
-    // exactly the free, non-FREM, RUV-scaled σ (the same set that carries a growth
-    // cap). A FREM EPSCOV or a FIXed σ is never scaled.
-    let ruv_sigma_absorb: Vec<bool> = ruv_sigma_caps.iter().map(|c| c.is_some()).collect();
+    // exactly the free, non-FREM, RUV-scaled σ. Computed directly (not from
+    // `ruv_sigma_caps`, which drops a free σ whose growth cap is looser than a
+    // tight user upper bound — that σ must still absorb the shift). A FREM EPSCOV
+    // or a FIXed σ is never scaled.
+    let frem_cov_sigma_idx = model
+        .frem_config
+        .as_ref()
+        .map(|fc| fc.covariate_sigma_index);
+    let ruv_sigma_absorb: Vec<bool> = (0..n_sigma)
+        .map(|i| {
+            !init_params.sigma_fixed.get(i).copied().unwrap_or(false)
+                && Some(i) != frem_cov_sigma_idx
+        })
+        .collect();
+
+    // Re-centering scales η_RUV by −mean, which multiplies the *whole* residual
+    // variance R = Σ σ_c² (all components, e.g. additive + proportional) by
+    // exp(−2·mean). It preserves each subject's residual variance exactly only if
+    // *every* non-FREM residual σ component absorbs the shift (each scaled by
+    // exp(mean), so R → R·exp(2·mean)). If any RUV-scaled σ component is FIXed,
+    // scaling only the free ones leaves the fixed part uncompensated and silently
+    // perturbs R — so re-centering is disabled for that config and the σ/ω_RUV
+    // growth caps carry the load instead (a FIXed component also partially anchors
+    // the σ × η_RUV ridge). The FREM EPSCOV (always FIX, not on a real-obs row) is
+    // exempt from this check.
+    let ruv_recenter_ok = ruv_recenter_allowed(
+        model.residual_error_eta.is_some(),
+        model
+            .frem_config
+            .as_ref()
+            .map(|fc| fc.covariate_sigma_index),
+        &init_params.sigma_fixed,
+    );
 
     // #895: log-variance ceiling for the iiv_on_ruv Ω diagonal — the ω_RUV half
     // of the σ × ω_RUV ridge backstop (see `compute_ruv_omega_cap`).
-    let ruv_omega_cap: Option<f64> = compute_ruv_omega_cap(
+    let mut ruv_omega_cap: Option<f64> = compute_ruv_omega_cap(
         model.residual_error_eta,
         n_eta,
         &init_params.omega.matrix,
@@ -2405,9 +2506,11 @@ pub fn run_saem(
         // of the residual-scale typical value here: shifting η_RUV by −mean and
         // scaling every RUV-scaled σ by exp(mean) leaves each subject's residual
         // variance exactly unchanged while restoring E[η_RUV] = 0, so the next Ω
-        // M-step sees the true variance. Only done when a free RUV σ exists to
-        // absorb the shift (a FIXed σ already pins the mean — no degeneracy).
-        if let Some(kr) = model.residual_error_eta {
+        // M-step sees the true variance. Only done when every non-FREM residual σ
+        // is free to absorb the shift (`ruv_recenter_ok`); a FIXed component would
+        // leave R only partially rescaled and break the exact-invariance guarantee
+        // (it also already partially pins the mean — no full degeneracy).
+        if let (true, Some(kr)) = (ruv_recenter_ok, model.residual_error_eta) {
             recenter_ruv_eta(
                 &mut state.etas,
                 kr,
@@ -2533,7 +2636,7 @@ pub fn run_saem(
             // ω_RUV without bound (the original report saw ~49). No-op for a
             // well-posed fit; a correlation-preserving rescale keeps Ω PD.
             if let (Some(k), Some(log_cap)) = (model.residual_error_eta, ruv_omega_cap) {
-                apply_ruv_omega_cap(&mut state.omega_mat, k, log_cap);
+                apply_ruv_omega_cap(&mut state.omega_mat, k, log_cap, &init_params.omega_fixed);
             }
 
             // ---- Step 3b: Omega_iov (analytic, IOV only) ----
@@ -2818,6 +2921,22 @@ pub fn run_saem(
                 })
                 .collect();
             state.nll_cache = new_nlls;
+        }
+
+        // #903 review: re-anchor the iiv_on_ruv growth caps to the data-informed
+        // σ/ω_RUV reached by the end of the exploration phase, taking the *looser*
+        // of the init-based and settled-value-based ceilings. The caps are pure
+        // runaway backstops (~20× a sensible scale); anchoring them to the raw
+        // user *init* alone would spuriously clamp — and falsely warn about — a
+        // well-posed fit started from a σ/ω guess many-fold below the truth. Only
+        // ever loosens (`max`), so a genuine post-exploration runaway is still
+        // bounded, and it preserves the bit-for-bit trajectory of a fit that never
+        // approaches either ceiling.
+        if k == k1 {
+            reanchor_ruv_sigma_caps(&mut ruv_sigma_caps, &log_sigma, &log_sigma_upper);
+            if let Some(kr) = model.residual_error_eta {
+                ruv_omega_cap = reanchor_ruv_omega_cap(ruv_omega_cap, state.omega_mat[(kr, kr)]);
+            }
         }
 
         // ---- Adapt MH step sizes ----
@@ -4649,11 +4768,15 @@ mod tests {
     }
 
     #[test]
-    fn ruv_sigma_caps_never_loosen_existing_upper() {
-        // If the model's own upper bound is tighter than log σ₀ + growth, the cap
-        // takes the tighter of the two — it can only ever tighten σ, never loosen.
+    fn ruv_sigma_caps_defer_to_tighter_user_upper_bound() {
+        // If the model's own upper bound is tighter than log σ₀ + growth, NLopt
+        // already enforces it, so no RUV growth cap is carried — a σ converging to
+        // its own bound must not be mis-flagged as hitting the iiv_on_ruv cap (#903).
         let caps = compute_ruv_sigma_caps(true, None, &[0.0], &[1.0], &[false]);
-        assert_eq!(caps[0], Some(1.0));
+        assert_eq!(caps[0], None);
+        // A growth cap strictly below the upper bound is still carried.
+        let caps = compute_ruv_sigma_caps(true, None, &[0.0], &[5.0], &[false]);
+        assert_eq!(caps[0], Some(SAEM_RUV_SIGMA_LN_GROWTH));
     }
 
     // ---- #904: iiv_on_ruv eta re-centering ----
@@ -4692,6 +4815,23 @@ mod tests {
         }
         // Non-RUV coordinate untouched.
         assert_eq!(etas[0][0], 0.3);
+    }
+
+    #[test]
+    fn ruv_recenter_allowed_only_when_all_residual_sigma_free() {
+        // No iiv_on_ruv → never re-center.
+        assert!(!ruv_recenter_allowed(false, None, &[false]));
+        // Single free residual σ → OK.
+        assert!(ruv_recenter_allowed(true, None, &[false]));
+        // Combined error, additive FIXed (index 1) → NOT OK: scaling only the free
+        // proportional σ would leave the fixed additive part uncompensated and
+        // break the residual-variance invariance (the #903 review finding).
+        assert!(!ruv_recenter_allowed(true, None, &[false, true]));
+        // FREM EPSCOV (index 1, always FIX) is exempt — a free PK residual σ at 0
+        // still re-centers.
+        assert!(ruv_recenter_allowed(true, Some(1), &[false, true]));
+        // FREM EPSCOV exempt, but a second *real* residual σ FIXed (index 2) blocks.
+        assert!(!ruv_recenter_allowed(true, Some(1), &[false, true, true]));
     }
 
     #[test]
@@ -4736,9 +4876,34 @@ mod tests {
         let mut om = DMatrix::from_row_slice(2, 2, &[0.3, 0.05, 0.05, 0.2]);
         let before = om.clone();
         // cap = exp(log(0.3)+3) ≈ 6.0, well above 0.3 → no change.
-        let clamped = apply_ruv_omega_cap(&mut om, 0, 0.3_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH);
+        let clamped = apply_ruv_omega_cap(
+            &mut om,
+            0,
+            0.3_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH,
+            &[false, false],
+        );
         assert!(!clamped);
         assert_eq!(om, before);
+    }
+
+    #[test]
+    fn apply_ruv_omega_cap_leaves_fixed_offdiagonal_untouched() {
+        // ω_RUV (index 0) runs away to 9.0 with a covariance to a FIXed eta (index
+        // 1). The cap must pull the diagonal down but leave the user-declared FIXed
+        // covariance Ω[0,1] exactly as-is (#903 review), never silently rescale it.
+        let cov = 0.5_f64;
+        let mut om = DMatrix::from_row_slice(2, 2, &[9.0, cov, cov, 0.2]);
+        let log_cap = 0.2977886_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH;
+        let clamped = apply_ruv_omega_cap(&mut om, 0, log_cap, &[false, true]);
+        assert!(clamped);
+        assert!((om[(0, 0)] - log_cap.exp()).abs() < 1e-9);
+        // FIXed off-diagonal unchanged (both symmetric entries).
+        assert_eq!(om[(0, 1)], cov);
+        assert_eq!(om[(1, 0)], cov);
+        // Diagonal shrank while the off-diagonal held, so it stays PD here
+        // (det = 5.98·0.2 − 0.25 > 0).
+        let det = om[(0, 0)] * om[(1, 1)] - om[(0, 1)] * om[(1, 0)];
+        assert!(det > 0.0);
     }
 
     #[test]
@@ -4748,7 +4913,7 @@ mod tests {
         let mut om = DMatrix::from_row_slice(2, 2, &[9.0, cov, cov, 0.2]);
         let corr_before = om[(0, 1)] / (om[(0, 0)] * om[(1, 1)]).sqrt();
         let log_cap = 0.2977886_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH; // ≈ log(5.98)
-        let clamped = apply_ruv_omega_cap(&mut om, 0, log_cap);
+        let clamped = apply_ruv_omega_cap(&mut om, 0, log_cap, &[false, false]);
         assert!(clamped);
         // Diagonal pulled down to the cap.
         assert!((om[(0, 0)] - log_cap.exp()).abs() < 1e-9);
@@ -4759,6 +4924,49 @@ mod tests {
         assert_eq!(om[(0, 1)], om[(1, 0)]);
         let det = om[(0, 0)] * om[(1, 1)] - om[(0, 1)] * om[(1, 0)];
         assert!(det > 0.0 && om[(0, 0)] > 0.0);
+    }
+
+    // ---- #903 review: end-of-exploration cap re-anchoring ----
+
+    #[test]
+    fn reanchor_ruv_sigma_caps_loosens_for_low_init_only() {
+        // σ init 0.01 (log ≈ -4.6): init cap = -4.6 + 3 = -1.6 (≈ 0.2). If the fit
+        // legitimately settled near σ = 0.3 (log ≈ -1.2) by end of exploration, the
+        // cap must loosen to -1.2 + 3 = 1.8, not clamp the well-posed fit at 0.2.
+        let ln_init = 0.01_f64.ln();
+        let mut caps = vec![Some(ln_init + SAEM_RUV_SIGMA_LN_GROWTH)];
+        let log_sigma_settled = vec![0.3_f64.ln()];
+        reanchor_ruv_sigma_caps(&mut caps, &log_sigma_settled, &[5.0]);
+        assert!((caps[0].unwrap() - (0.3_f64.ln() + SAEM_RUV_SIGMA_LN_GROWTH)).abs() < 1e-12);
+
+        // If σ never moved above its init, the cap is unchanged (only loosens).
+        let mut caps = vec![Some(ln_init + SAEM_RUV_SIGMA_LN_GROWTH)];
+        reanchor_ruv_sigma_caps(&mut caps, &[ln_init], &[5.0]);
+        assert!((caps[0].unwrap() - (ln_init + SAEM_RUV_SIGMA_LN_GROWTH)).abs() < 1e-12);
+
+        // Never loosens past the user's own upper bound.
+        let mut caps = vec![Some(ln_init + SAEM_RUV_SIGMA_LN_GROWTH)];
+        reanchor_ruv_sigma_caps(&mut caps, &[10.0], &[2.0]);
+        assert_eq!(caps[0], Some(2.0));
+
+        // `None` (uncapped σ) stays `None`.
+        let mut caps = vec![None];
+        reanchor_ruv_sigma_caps(&mut caps, &[0.0], &[5.0]);
+        assert_eq!(caps[0], None);
+    }
+
+    #[test]
+    fn reanchor_ruv_omega_cap_loosens_only() {
+        let ln_init = 0.01_f64.ln();
+        let cap = Some(ln_init + SAEM_RUV_OMEGA_LN_GROWTH);
+        // Settled ω_RUV = 0.3 → loosen to log(0.3) + growth.
+        let out = reanchor_ruv_omega_cap(cap, 0.3);
+        assert!((out.unwrap() - (0.3_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH)).abs() < 1e-12);
+        // Settled below init → unchanged.
+        assert_eq!(reanchor_ruv_omega_cap(cap, 0.01), cap);
+        // No cap stays none; non-positive variance is a no-op.
+        assert_eq!(reanchor_ruv_omega_cap(None, 0.3), None);
+        assert_eq!(reanchor_ruv_omega_cap(cap, 0.0), cap);
     }
 
     // ---- #895: MH mixing warning ----

@@ -714,10 +714,15 @@ section of the SDLC for the versioning policy).
   absorbed and drifted along the σ × η_RUV degenerate direction, injecting a spurious mean² into
   `ω_RUV = mean(η_RUV²)`. SAEM now re-centres η_RUV to zero mean each iteration, absorbing the
   shift into σ (which leaves every subject's residual variance exactly unchanged) — the same
-  device mu-referenced structural etas already use with their θ. On the 475-subject FREM reprex
+  device mu-referenced structural etas already use with their θ. Re-centring runs only when every
+  RUV-scaled σ component is free; if any is FIXed (e.g. a fixed additive term), it is skipped and
+  the growth caps below act as the backstop. On the 475-subject FREM reprex
   this converges to ω_RUV ≈ 0.28 / σ ≈ 0.20 from both a too-small and a too-large σ start (NONMEM:
-  0.28 / 0.18). Belt-and-braces σ and ω_RUV growth caps (each ≈ 20× the starting value; the Ω cap
-  is a correlation-preserving rescale) remain as no-op backstops, warning if they ever bind.
+  0.28 / 0.18). Belt-and-braces σ and ω_RUV growth caps (each ≈ 20× the reference scale; the Ω cap
+  is a correlation-preserving rescale that leaves FIXed off-diagonals untouched) remain as no-op
+  backstops, warning if they ever bind. The reference scale is re-anchored to the data-informed
+  value reached by the end of exploration and defers to a tighter user upper bound, so a fit
+  started from a σ/ω_RUV guess far below the truth is not spuriously clamped or warned.
 - **Guarded multi-start inner EBE now covers weakly-identified random effects** (#891). The
   per-subject EBE search (`inner_restarts`, default `1`) previously re-seeded only subjects with
   system resets or time-varying covariates. It now also detects a **weakly-identified coordinate**
