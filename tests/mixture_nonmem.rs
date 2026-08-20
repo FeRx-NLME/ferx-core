@@ -495,3 +495,121 @@ fn bayes_mixture_recovers_optimum() {
         "MIXEST populated"
     );
 }
+
+// NONMEM IMP objective (mixture_iv_saem.ext TABLE NO. 2, the `METHOD=IMP
+// EONLY=1` pass that follows SAEM): the class-marginal −2 log L evaluated by
+// importance sampling at the SAEM optimum.
+const NM_IMP_MARGINAL: f64 = 300.8707;
+
+/// IMP objective evaluation under a mixture (#985): `method = [saem, imp]` with
+/// `imp_eval_only`. The SAEM stage estimates the parameters; the IMP stage
+/// evaluates the class-marginal likelihood `−2 Σ log Σ_k p_ik L_ik` by importance
+/// sampling per class (per-class MAP + IS, combined via log-sum-exp). Anchored to
+/// the NONMEM `METHOD=IMP EONLY=1` objective from `mixture_iv_saem.ctl` (300.87).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests (NONMEM IMP mixture marginal)"
+)]
+fn imp_mixture_marginal_matches_nonmem() {
+    let pop: ferx_core::Population = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .unwrap();
+    let model = parse_model_string(MODEL).unwrap();
+    let mut opts = FitOptions::default();
+    opts.methods = vec![
+        ferx_core::EstimationMethod::Saem,
+        ferx_core::EstimationMethod::Imp,
+    ];
+    opts.interaction = true;
+    opts.saem_n_exploration = 600;
+    opts.saem_n_convergence = 800;
+    opts.saem_seed = Some(20250818);
+    opts.imp_eval_only = true;
+    opts.imp_samples = 3000;
+    opts.imp_seed = Some(20250818);
+
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("saem+imp mixture fit Ok");
+    let is = res
+        .importance_sampling
+        .as_ref()
+        .expect("IMP objective evaluation populated on the chain's last stage");
+    eprintln!(
+        "IMP mixture marginal: -2logL = {:.4} ± {:.4} vs NONMEM {:.4}",
+        is.minus2_log_likelihood, is.mc_standard_error, NM_IMP_MARGINAL
+    );
+    // The IS marginal is a Monte-Carlo estimate at the SAEM optimum; a ~1-unit
+    // band covers the MC error plus the small SAEM-vs-NONMEM optimum offset.
+    assert!(
+        (is.minus2_log_likelihood - NM_IMP_MARGINAL).abs() < 2.0,
+        "IMP marginal {} vs NONMEM {}",
+        is.minus2_log_likelihood,
+        NM_IMP_MARGINAL
+    );
+}
+
+/// Estimating IMPMAP under a mixture (#985): class-partitioned MCEM recovers the MLE.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests (IMPMAP mixture estimation)"
+)]
+fn impmap_estimating_mixture_recovers_optimum() {
+    // Estimating IMPMAP (class-partitioned MCEM): the per-class IS E-step +
+    // responsibility-weighted M-steps must recover the mixture MLE. Ω/Σ FIXed, so
+    // the estimated quantities are the two class clearances, V, and the mixing
+    // logit. Anchored to the shared optimum (NONMEM FOCEI `mixture_iv.ctl`).
+    let pop: ferx_core::Population = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .unwrap();
+    let model = parse_model_string(MODEL).unwrap();
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Impmap;
+    opts.interaction = true;
+    opts.impmap_iterations = 50;
+    opts.impmap_samples = 1500;
+    opts.impmap_seed = Some(20250818);
+    opts.run_covariance_step = false;
+
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP mixture fit Ok");
+    let th = &res.theta;
+    let p1 = 1.0 / (1.0 + (-th[3]).exp());
+    eprintln!(
+        "IMPMAP mixture: TVCL1={:.4} TVCL2={:.4} TVV={:.4} p1={:.4} OFV={:.4}",
+        th[0], th[1], th[2], p1, res.ofv
+    );
+    let rel = |a: f64, b: f64| (a - b).abs() / b.abs();
+    // IMP is the noisiest of the mixture estimators (no mu-referencing is
+    // available for the class-switched typical value, so θ is estimated by the
+    // weighted M-step alone, which converges more slowly than SAEM's MCMC); the
+    // two class clearances must still separate and land near the MLE.
+    assert!(
+        rel(th[0], NM_TVCL1) < 0.12,
+        "IMPMAP TVCL1 {} vs {}",
+        th[0],
+        NM_TVCL1
+    );
+    assert!(
+        rel(th[1], NM_TVCL2) < 0.12,
+        "IMPMAP TVCL2 {} vs {}",
+        th[1],
+        NM_TVCL2
+    );
+    assert!(
+        rel(th[2], NM_TVV) < 0.05,
+        "IMPMAP TVV {} vs {}",
+        th[2],
+        NM_TVV
+    );
+    assert!((p1 - NM_P1).abs() < 0.08, "IMPMAP p(1) {} vs {}", p1, NM_P1);
+    assert!(
+        res.subjects.iter().all(|s| s.mixest.is_some()),
+        "MIXEST populated"
+    );
+}

@@ -20,6 +20,21 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **IMP / IMPMAP estimation and objective evaluation for mixture models (#985).** Importance sampling
+  now both **estimates** a `[mixture]` model (`method = imp` / `impmap`) and **evaluates** its
+  class-marginal likelihood `−2 Σ log Σ_k p_ik L_ik` (`imp_eval_only`, NONMEM `METHOD=IMP EONLY=1`).
+  Estimation runs a class-partitioned MCEM: per subject and class it importance-samples η under the
+  `MIXNUM` guard, forms the responsibilities `PMIX_ik ∝ p_ik L_ik`, and runs responsibility-weighted
+  M-steps for the mixing coefficients, the class-shared Ω, and the class-switched typical values.
+  Objective evaluation combines the per-class IS marginals by log-sum-exp and matches NONMEM to well
+  under a Monte-Carlo SE (`−2 log L = 300.82 ± 0.06` vs NONMEM `300.87` on the two-class anchor).
+  Ω/σ are class-shared (per-class overrides rejected); IOV/FREM/SDE are not supported under the
+  mixture IMP paths, and a theta shared between the mixing expression and a structural typical value
+  is rejected (as under SAEM). The per-class draws use the same ISCALE pilot search and `impmap_mceta`
+  multi-start MAP as the single-population MCEM; objective evaluation reports a real per-subject ESS
+  (the worst ESS among the classes a subject loads on), so `imp_low_ess_threshold` and the
+  proposal-collapse warning apply to mixtures. `impmap_trace` and `impmap_auto` / `imp_auto` are not
+  wired for mixtures and now warn instead of being silently ignored.
 - **Bayesian estimation for mixture models (#985).** `[mixture]` models can now be fit with
   `method = bayes`. The latent class is Rao-Blackwellised — marginalised out of every Gibbs block
   rather than sampled — so each subject's likelihood contribution is the K-class marginal
@@ -44,8 +59,7 @@ section of the SDLC for the versioning policy).
   ≤ 3 %). A mixing theta marked `FIX` is honoured; a theta shared between the mixing expression and a
   structural typical value is rejected with a clear error. Per-class σ overrides (`sigma(k)`) are held
   at their initial values under SAEM (with a warning, and reported with SE 0 like other fixed
-  parameters) — route those to FOCEI. IMP/IMPMAP and Bayes for mixtures remain unwired and error
-  clearly.
+  parameters) — route those to FOCEI.
 - **Inter-occasion variability under a mixture (#985).** A `[mixture]` model may now also carry a
   `kappa` (inter-occasion variability) term — the two features compose, where before `fit()` rejected
   the combination. Each class's per-subject inner solve estimates the per-occasion κ̂ under that
@@ -112,7 +126,7 @@ section of the SDLC for the versioning policy).
   `IWRES`, `CWRES`, `EBE_OFV`, and `[derived]`/`[output]` columns were computed with `MIXNUM`
   pinned to class 1 for every subject, even for subjects the fit assigned to another class — so a
   class-2 subject's sdtab row paired its class-2 EBEs with class-1 typical values. They are now
-  evaluated in each subject's fitted class. Affects FOCE/FOCEI, SAEM, and Bayes mixture fits.
+  evaluated in each subject's fitted class. Affects FOCE/FOCEI, SAEM, Bayes, and estimating IMP/IMPMAP mixture fits.
 - **Mixture covariance-step and diagnostics correctness (#984, follow-up to #983).** Five fixes to
   the mixture SE/covariance and checkpoint paths: (1) the covariance step now reconverges its per-class EBEs at
   `cov_inner_tol`, not the fit's `inner_tol`, so a loose fit followed by a tight `cov_inner_tol` for

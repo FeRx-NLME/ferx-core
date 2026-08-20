@@ -227,10 +227,18 @@ pub fn fit(
                     | EstimationMethod::FoceI
                     | EstimationMethod::Saem
                     | EstimationMethod::Bayes
+                    // IMP / IMPMAP run a class-partitioned MCEM (per-class IS
+                    // E-step + responsibility-weighted M-steps) when estimating,
+                    // and form the class-marginal `−2 Σ log Σ_k p_ik L_ik` on the
+                    // objective-evaluation (EONLY) path (#985). IOV, FREM, SDE
+                    // and per-class Ω/Σ overrides are refused inside
+                    // `run_mcem_mixture`.
+                    | EstimationMethod::Imp
+                    | EstimationMethod::Impmap
             ) {
                 return Err(format!(
-                    "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes; the {} \
-                     method is not yet wired for mixtures (#985)",
+                    "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes / IMP / \
+                     IMPMAP; the {} method is not yet wired for mixtures (#985)",
                     m.label()
                 ));
             }
@@ -1329,15 +1337,28 @@ fn fit_inner(
             let prev = result.as_ref().expect(
                 "IMP stage: prior OuterResult must exist (synthesised above when standalone)",
             );
-            match crate::estimation::importance_sampling::run_importance_sampling(
-                model,
-                population,
-                &prev.params,
-                &prev.eta_hats,
-                &prev.h_matrices,
-                &prev.kappas,
-                &stage_opts,
-            ) {
+            // Mixture (#985): evaluate the class-marginal IS objective
+            // −2 Σ log Σ_k p_ik L_ik (per-class MAP + IS, combined), rather than
+            // the single-population marginal.
+            let is_call = if model.mixture.is_some() {
+                crate::estimation::importance_sampling::run_importance_sampling_mixture(
+                    model,
+                    population,
+                    &prev.params,
+                    &stage_opts,
+                )
+            } else {
+                crate::estimation::importance_sampling::run_importance_sampling(
+                    model,
+                    population,
+                    &prev.params,
+                    &prev.eta_hats,
+                    &prev.h_matrices,
+                    &prev.kappas,
+                    &stage_opts,
+                )
+            };
+            match is_call {
                 Ok(r) => {
                     // Surface a *separate* warning for any subject whose
                     // ESS-fraction collapsed to zero. These are already in
@@ -1473,15 +1494,22 @@ fn fit_inner(
                 let df = stage_opts.impmap_proposal_df;
                 marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
             }
-            match crate::estimation::importance_sampling::run_importance_sampling(
-                model,
-                population,
-                &r.params,
-                &r.eta_hats,
-                &r.h_matrices,
-                &r.kappas,
-                &marg_opts,
-            ) {
+            let marg_call = if model.mixture.is_some() {
+                crate::estimation::importance_sampling::run_importance_sampling_mixture(
+                    model, population, &r.params, &marg_opts,
+                )
+            } else {
+                crate::estimation::importance_sampling::run_importance_sampling(
+                    model,
+                    population,
+                    &r.params,
+                    &r.eta_hats,
+                    &r.h_matrices,
+                    &r.kappas,
+                    &marg_opts,
+                )
+            };
+            match marg_call {
                 Ok(is) => is_result = Some(is),
                 Err(e) => accumulated_warnings.push(if n_stages > 1 {
                     format!("[{}] marginal −2 log L eval skipped: {}", method.label(), e)
