@@ -235,6 +235,10 @@ mod multi_start_tests;
 mod tests_mixture_postfit;
 
 #[cfg(test)]
+#[path = "tests/zero_omega_tests.rs"]
+mod zero_omega_tests;
+
+#[cfg(test)]
 #[path = "tests/tests_sdtab_tv_cov.rs"]
 mod tests_sdtab_tv_cov;
 

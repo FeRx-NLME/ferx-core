@@ -293,6 +293,70 @@ Both produce IPRED, PRED, IWRES, and CWRES on the log scale (back-transform with
 
 **Gradient-based (`lbfgs`, `mma`)** are rarely needed; prefer `bobyqa` or `slsqp`. See [FOCE/FOCEI — Optimizer Options](estimation/foce.qmd#optimizer-options) for a full comparison.
 
+## Fixed-effects-only fits vs NONMEM
+
+You can fit a model with no random effects at all — just omit every `omega`
+declaration and the corresponding `exp(ETA_…)` terms (see
+[no omega at all](model-file/parameters.qmd#no-omega-at-all-fixed-effects-only-naive-pooled-fits)).
+`sigma` is still required for a continuous endpoint.
+
+**The NONMEM equivalent is `$OMEGA 0 FIX`, not an omitted `$OMEGA`.** This trips
+people up, so it is worth being precise. If you delete `$OMEGA` from a control
+stream, NM-TRAN does not give you a fixed-effects population fit — it reports
+
+```text
+(WARNING  1) NM-TRAN INFERS THAT THE DATA ARE SINGLE-SUBJECT.
+(WARNING 132) SIGMA IS INTEPRETED AS RESIDUAL VARIANCE TO SINGLE SUBJECT ANALYSIS
+```
+
+and switches to a **single-subject** analysis, dropping the `ID` grouping. On a
+multi-subject dataset whose `TIME` restarts at 0 for each subject, the run then
+aborts outright:
+
+```text
+0DATA REC          11: TIME DATA ITEM IS LESS THAN PREVIOUS TIME DATA ITEM
+0RUN TERMINATED BECAUSE OF ERRORS IN DATA RECORDS
+```
+
+Declaring a degenerate `ETA(1)` with its variance fixed at zero keeps NONMEM in
+population mode with per-subject dose bookkeeping, which is what ferx does at
+`n_eta = 0`:
+
+```text
+$PK    CL = THETA(1)*EXP(ETA(1))
+       V  = THETA(2)
+       S1 = V
+$OMEGA 0 FIX
+```
+
+### Anchor
+
+`examples/one_cpt_iv_pooled.ferx` against `data/one_cpt_iv.csv`, versus the
+control stream above under `$EST METHOD=0 MAXEVAL=9999 SIGDIGITS=4`
+(`nonmem_anchor/results/zero_omega_pooled.{ctl,lst,ext}`, NONMEM 7.6.0):
+
+| Quantity | ferx | NONMEM | Relative Δ |
+|---|---|---|---|
+| OFV | −269.637010 | −269.63700440 | 6e-6 (abs) |
+| TVCL | 4.840820 | 4.84070 | 2.5e-5 |
+| TVV | 52.834133 | 52.8324 | 3.3e-5 |
+| SIGMA (variance) | 0.0166360 | 0.0166323 | 2.2e-4 |
+| SE TVCL | 0.166312 | 0.166298 | 8e-5 |
+| SE TVV | 1.760499 | 1.76021 | 1.6e-4 |
+| SE SIGMA (SD scale) | 0.018243 | 0.0182395 | 2e-4 |
+
+Two conventions matter when reproducing this:
+
+- **OFV constant.** ferx's `ofv` is `Σ IWRES² + Σ log Var`, matching NONMEM's
+  `OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT`. NONMEM also prints a *with
+  constant* figure (here −104.228068) that adds `n·log 2π`.
+- **Covariance estimator.** The standard errors above are ferx's under
+  `covariance_method = rsr`. NONMEM's `$COVARIANCE` default is the `RSR`
+  sandwich, while ferx's default is `r` (the inverse Hessian). Comparing ferx's
+  default against NONMEM's default on this model gives SEs that differ by roughly
+  a factor of two — that is the convention difference, not a discrepancy. See
+  [`covariance_method`](model-file/fit-options.qmd).
+
 ## How do I validate a model file without running a full fit?
 
 Use `ferx check`:

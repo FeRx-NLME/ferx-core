@@ -1,0 +1,40 @@
+# One-compartment IV PK, fixed-effects only (naive-pooled) — no random effects.
+#
+# `examples/one_cpt_iv.ferx` with both `omega` declarations and both `exp(ETA_*)`
+# terms removed. With no random effects there is no inner empirical-Bayes problem
+# and no `log|Omega|` term, so FOCE/FOCEI collapse to the plain maximum-likelihood
+# objective: every subject shares one CL and one V, and `sigma` alone carries the
+# spread. `PRED` and `IPRED` coincide, and so do `CWRES` and `IWRES`.
+#
+# An `[error_model]` and its `sigma` are still required — a continuous endpoint
+# has no likelihood without one. Only Omega is optional (#989).
+#
+# NONMEM equivalent: the same model with `$OMEGA 0 FIX` on a degenerate ETA.
+# Note that simply *omitting* `$OMEGA` is NOT equivalent — NM-TRAN then infers a
+# single-subject analysis and drops the ID grouping (see docs/faq.qmd).
+#
+# Anchor on data/one_cpt_iv.csv: OFV -269.637010 (NONMEM -269.63700440),
+# TVCL 4.8408, TVV 52.834, PROP_ERR 0.12898 (sd). Standard errors match NONMEM's
+# default `$COVARIANCE` under `covariance_method = rsr`; ferx's default is `r`.
+#
+# Run: cargo run --release -- examples/one_cpt_iv_pooled.ferx --data data/one_cpt_iv.csv
+
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV(40.0,  1.0, 500.0)
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 300

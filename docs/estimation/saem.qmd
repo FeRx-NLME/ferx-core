@@ -251,6 +251,34 @@ read from the `.phi` file — `PHI(k) − log θ_k` is the η conditional mean,
 
 No additional configuration is required; `method = saem` works for both BSV-only and IOV models.
 
+## Models with no random effects are rejected
+
+SAEM is an EM algorithm *over the random effects*. A model that declares none
+(`n_eta = 0` — see [no omega at all](../model-file/parameters.qmd#no-omega-at-all-fixed-effects-only-naive-pooled-fits))
+has an empty E-step: there is nothing to sample and the stochastic approximation
+has nothing to average, leaving an M-step that is plain maximum likelihood on
+θ/σ. Left to run, it terminates on its own criterion slightly short of the
+optimum — on the `one_cpt_iv` zero-Ω anchor it reports converged at OFV −269.599
+where FOCEI reaches −269.637.
+
+Rather than return a quietly-wrong answer, `method = saem` errors at `n_eta = 0`:
+
+```text
+method = saem requires at least one random effect (n_eta = 0). SAEM is an EM over
+the random effects, so with none declared its E-step is empty and it only
+approaches the objective that FOCE/FOCEI minimise exactly. Use method = foce,
+focei, or laplace for a fixed-effects-only (naive-pooled) model.
+```
+
+The check runs in the same validation pass as `ferx check`, and fires if `saem`
+appears **anywhere** in a `methods = [...]` chain — so `methods = [saem, focei]`
+fails up front rather than after the SAEM stage has already run.
+
+`imp`, `impmap` and `bayes` refuse `n_eta = 0` for the same reason, but they do so
+**at run time rather than in `ferx check`** — a `methods = [focei, imp]` chain
+still runs its FOCEI stage before the `imp` stage errors, and `ferx check` reports
+the model as valid.
+
 ## Configuration
 
 ```

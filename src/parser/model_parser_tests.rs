@@ -3228,6 +3228,103 @@ const MINIMAL_MODEL: &str = "\
   DV ~ proportional(PROP_ERR)
 ";
 
+/// `MINIMAL_MODEL` with every `omega` declaration and every `exp(ETA_*)` term
+/// removed — a continuous (residual-error) endpoint with no random effects. This
+/// is the shape #989 unblocked; before it, `parse_full_model` returned
+/// `Err("No omega parameters defined")`.
+const NO_OMEGA_MODEL: &str = "\
+[parameters]
+  theta TVCL(1.0)
+  theta TVV(1.0)
+  sigma PROP_ERR ~ 0.1
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+#[test]
+fn test_parse_continuous_model_with_no_omega_declarations() {
+    let parsed = parse_full_model(NO_OMEGA_MODEL)
+        .expect("a continuous model with no random effects must parse (#989)");
+    assert_eq!(parsed.model.n_eta, 0);
+    assert_eq!(parsed.model.default_params.omega.matrix.nrows(), 0);
+    assert!(parsed.model.default_params.omega.eta_names.is_empty());
+    assert!(parsed.model.default_params.omega_fixed.is_empty());
+    // Only Ω went away — the residual error is untouched, and its sigma is still
+    // the thing that defines the likelihood.
+    assert_eq!(parsed.model.default_params.sigma.values.len(), 1);
+    // No IOV was declared, so the kappa matrix must stay absent rather than
+    // becoming a second empty matrix (`omega_iov.is_some()` reads as "IOV active").
+    assert!(parsed.model.default_params.omega_iov.is_none());
+}
+
+#[test]
+fn test_no_omega_model_still_requires_sigma() {
+    // Ω is optional; σ is not. The two capabilities are separate, and the error
+    // must say so — a user who deleted the wrong line needs to see which.
+    let no_sigma = NO_OMEGA_MODEL.replace("  sigma PROP_ERR ~ 0.1\n", "");
+    // `ParsedModel` is not `Debug`, so `expect_err` is unavailable here.
+    let err = match parse_full_model(&no_sigma) {
+        Ok(_) => panic!("a continuous endpoint with no sigma must still be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("sigma"),
+        "the sigma error must name sigma, not Omega: {err}"
+    );
+    assert!(
+        !err.contains("omega parameters"),
+        "must not report this as an Omega problem: {err}"
+    );
+}
+
+#[test]
+fn test_no_omega_model_with_error_model_removed_is_rejected() {
+    let no_error_model =
+        NO_OMEGA_MODEL.replace("[error_model]\n  DV ~ proportional(PROP_ERR)\n", "");
+    let err = match parse_full_model(&no_error_model) {
+        Ok(_) => panic!("a continuous model with no [error_model] must still be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.contains("[error_model]"), "{err}");
+}
+
+#[test]
+fn test_parse_no_bsv_omega_with_kappa_is_iov_only() {
+    // Kappas with no BSV etas: Ω is 0x0 while Ω_IOV is 1x1. This combination was
+    // also blocked by the old rejection (it keys on the BSV eta list), so it needs
+    // its own pin — the IOV matrix must not be collapsed along with Ω.
+    let src = "\
+[parameters]
+  theta TVCL(1.0)
+  theta TVV(1.0)
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.1
+[individual_parameters]
+  CL = TVCL * exp(KAPPA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+    let parsed = parse_full_model(src).expect("kappa without BSV omega must parse (#989)");
+    assert_eq!(parsed.model.n_eta, 0);
+    assert_eq!(parsed.model.default_params.omega.matrix.nrows(), 0);
+    let iov = parsed
+        .model
+        .default_params
+        .omega_iov
+        .as_ref()
+        .expect("declaring a kappa must still build an IOV matrix");
+    assert_eq!(iov.matrix.nrows(), 1);
+    assert!((iov.matrix[(0, 0)] - 0.01).abs() < 1e-12);
+}
+
 #[test]
 fn test_data_block_populates_parsed_model_data_path() {
     let content = format!("{MINIMAL_MODEL}[data]\n  path = warfarin.csv\n");
@@ -3641,6 +3738,29 @@ fn test_declaration_order_block_before_diagonal() {
     let (_, _, _, _, _, eta_names, _) = parse_parameters(&lines).unwrap();
     // block_omega declared first, so ETA_CL, ETA_V come before ETA_KA
     assert_eq!(eta_names, vec!["ETA_CL", "ETA_V", "ETA_KA"]);
+}
+
+/// #989: an empty eta list is a fixed-effects-only (naive-pooled) model, not an
+/// error. This used to return `Err("No omega parameters defined")`, which is what
+/// blocked a continuous model from omitting its `omega` declarations.
+#[test]
+fn test_build_omega_matrix_empty_is_naive_pooled_not_an_error() {
+    let omega = build_omega_matrix(&[], &[], &[])
+        .expect("an empty eta list must yield a 0x0 Omega, not an error");
+    assert_eq!(omega.matrix.nrows(), 0);
+    assert_eq!(omega.matrix.ncols(), 0);
+    assert!(omega.eta_names.is_empty());
+    // The 0x0 matrix must take the diagonal packing path: `omega_packed_len(0, ..)`
+    // is 0 either way, but the flag is what `parameterization.rs` branches on.
+    assert!(omega.diagonal);
+    // `log|Ω| = 0` is what makes the FOCE/FOCEI objective collapse to plain ML —
+    // the marginal loses its `½log|Ω|` penalty rather than picking up a NaN.
+    assert_eq!(omega.log_det, 0.0);
+    assert_eq!(
+        crate::estimation::parameterization::omega_packed_len(0, false),
+        0,
+        "a 0x0 Omega must contribute no packed optimizer coordinates"
+    );
 }
 
 #[test]

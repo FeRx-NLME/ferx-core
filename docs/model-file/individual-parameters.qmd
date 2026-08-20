@@ -272,6 +272,37 @@ For example, in `CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)`:
 - `ETA_CL` matches an omega parameter
 - `WT` matches neither, so it is treated as a covariate column
 
+### Forgetting an omega declaration
+
+Because unmatched names fall through to covariates, deleting an `omega` line while
+leaving its `exp(ETA_…)` term in place turns that random effect into a covariate
+lookup. ferx catches this on the name's shape: an unresolved identifier beginning
+`ETA` or `KAPPA` is reported as an undeclared random effect rather than a missing
+covariate.
+
+```
+$ ferx check model.ferx --data data.csv
+error[E_ETA_NOT_DECLARED] parameters:1: Model references ETA_CL as a random effect
+but no `omega` / `kappa` declaration defines it. Declare the random effect in
+[parameters] (e.g. `omega ETA_CL ~ 0.09`), or — if this is meant to be a data
+column — add that column to the data file. A model with no random effects at all
+is valid (#989): to make it fixed-effects-only, drop the `exp(ETA_CL)` term as
+well as the omega line.
+    help: declare `omega ETA_CL ~ <variance>`
+invalid: model — 1 error(s), 0 warning(s)
+```
+
+(The diagnostic is one line; it is wrapped here to fit the page.)
+
+Without `--data` this is a warning rather than an error, since ferx cannot yet know
+whether the dataset carries such a column: reading a NONMEM-exported `ETA_CL`
+column as a genuine covariate is legitimate, and in that case the name resolves and
+nothing is reported.
+
+To make a model deliberately fixed-effects-only, remove the `exp(ETA_…)` term as
+well as the `omega` line — see
+[no omega at all](parameters.qmd#no-omega-at-all-fixed-effects-only-naive-pooled-fits).
+
 ## PK Parameter Names
 
 The parameter names on the left side of each assignment must map to recognized PK parameter names:
