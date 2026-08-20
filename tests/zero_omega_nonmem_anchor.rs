@@ -28,12 +28,12 @@
 //! OBJ (without constant) -269.63700440359776
 //! ```
 //!
-//! Standard errors are NOT checked here. NONMEM's `$COVARIANCE` default is the
-//! `RSR` sandwich while ferx's `covariance_method` default is `r`, so the two
-//! disagree by design; under `covariance_method = rsr` they agree to four
-//! significant figures (SE TVCL 0.166312 vs 1.66298E-01, SE TVV 1.760499 vs
-//! 1.76021E+00). That comparison lives in the docs, not in an assertion, because
-//! pinning it would be pinning NONMEM's print precision.
+//! Standard errors are checked too, but only under `covariance_method = rsr`:
+//! NONMEM's `$COVARIANCE` default is the `RSR` sandwich while ferx's default is
+//! `r`, so the two disagree **by design**. On a naive-pooled model that is not a
+//! cosmetic difference — the model ignores within-subject correlation on purpose,
+//! so the sandwich runs about twice the naive inverse-Hessian (SE TVCL 0.166 vs
+//! 0.078). Comparing the two defaults would look like a factor-of-two bug.
 
 use ferx_core::parser::model_parser::parse_full_model_file;
 use ferx_core::{fit, read_nonmem_csv, FitOptions};
@@ -49,6 +49,14 @@ const NM_TVCL: f64 = 4.84070;
 const NM_TVV: f64 = 52.8324;
 /// `sqrt(1.66323E-02)` — ferx stores the proportional sigma on the SD scale.
 const NM_SIGMA_SD: f64 = 0.12896627466124622;
+
+/// Standard errors from the `.ext` `-1000000001` row, which is NONMEM's own
+/// `$COVARIANCE` default — the `RSR` sandwich. `.cov` agrees: `sqrt(2.76552E-02)`
+/// and `sqrt(3.09835E+00)`.
+const NM_SE_TVCL: f64 = 0.166298;
+const NM_SE_TVV: f64 = 1.76021;
+/// `-1000000005` row: the SD-scale sigma SE, matching how ferx reports it.
+const NM_SE_SIGMA_SD: f64 = 0.0182395;
 
 fn anchor_opts(outer_maxiter: usize) -> FitOptions {
     FitOptions {
@@ -153,5 +161,110 @@ fn converged_estimates_match_nonmem_naive_pooled_run() {
         "PROP_ERR (sd) {} vs NONMEM {}",
         res.sigma[0],
         NM_SIGMA_SD
+    );
+}
+
+/// Run the **covariance step** at `n_eta = 0` and require its standard errors to
+/// reproduce NONMEM's.
+///
+/// The two tests above both disable the covariance step, so without this one the
+/// whole SE path is unexercised at `n_eta = 0` — and the SE table in
+/// `docs/faq.qmd` would be a documented numeric claim with nothing behind it.
+/// That path is not trivially safe here: the packed optimizer vector carries **no**
+/// Omega coordinates at `n_eta = 0`, so the FD-of-OFV Hessian, the score
+/// cross-product and the eigen-floor inverse all run on a θ/σ-only parameter
+/// space that no Gaussian model could reach before #989.
+///
+/// `covariance_method = rsr` because that — not ferx's default `r` — is what
+/// NONMEM's `$COVARIANCE` computes. On a naive-pooled model the distinction is
+/// not cosmetic: the model deliberately ignores within-subject correlation, so
+/// the sandwich is roughly twice the naive inverse-Hessian (SE TVCL 0.166 vs
+/// 0.078). Comparing ferx's default against NONMEM's default would look like a
+/// factor-of-two bug.
+///
+/// Evaluation-only (`outer_maxiter = 0`, NONMEM `MAXEVAL=0`) at NONMEM's own
+/// optimum, so it returns immediately and needs no `slow-tests` gate — and so the
+/// Hessian is formed at the same point NONMEM formed its own.
+#[test]
+fn covariance_step_at_nonmem_optimum_matches_nonmem_rsr_standard_errors() {
+    use ferx_core::types::{CovarianceMethod, CovarianceStatus};
+
+    let parsed = parse_full_model_file(Path::new(MODEL)).expect("pooled example must parse");
+    let model = parsed.model;
+    assert_eq!(
+        model.n_eta, 0,
+        "the anchor model must carry no random effects"
+    );
+
+    let mut params = model.default_params.clone();
+    params.theta[0] = NM_TVCL;
+    params.theta[1] = NM_TVV;
+    params.sigma.values[0] = NM_SIGMA_SD;
+
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        covariance_method: CovarianceMethod::Sandwich,
+        ..Default::default()
+    };
+    let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("anchor data must read");
+    let res = fit(&model, &pop, &params, &opts).expect("the covariance step must run at n_eta = 0");
+
+    assert_ne!(
+        res.covariance_status,
+        CovarianceStatus::Failed,
+        "the covariance step must not fail at n_eta = 0"
+    );
+    // A zero-Omega fit must report no Omega SEs at all — not a phantom entry, and
+    // not a `None` standing in for a failed step (the status assert above rules
+    // that reading out).
+    assert!(
+        res.se_omega.as_ref().is_none_or(|s| s.is_empty()),
+        "an Omega-less fit must carry no Omega SEs, got {:?}",
+        res.se_omega
+    );
+
+    let se_theta = res
+        .se_theta
+        .as_ref()
+        .expect("theta SEs must be produced at n_eta = 0");
+    let se_sigma = res
+        .se_sigma
+        .as_ref()
+        .expect("sigma SEs must be produced at n_eta = 0");
+
+    // Observed at the time of writing: 2.0e-6 (TVCL), 7.6e-6 (TVV), 2.7e-6 (sigma)
+    // — an order of magnitude closer than the *converged*-fit comparison in
+    // `docs/faq.qmd` (8e-5 / 1.6e-4 / 2e-4), because this forms the Hessian at
+    // exactly the point NONMEM formed its own rather than at ferx's own optimum.
+    //
+    // The band is 1e-4, and it cannot usefully go tighter: NONMEM prints these to
+    // six figures, so `1.76021` alone carries ±3e-6 of relative rounding. That
+    // still leaves it a real assertion — ferx's *default* `r` covariance gives SE
+    // TVCL 0.0776, a relative error of 0.53, five thousand times outside the band.
+    // Naive-pooled ignores within-subject correlation by construction, so the
+    // sandwich and the naive inverse-Hessian differ by about a factor of two here;
+    // this test is what keeps the two from being silently interchanged.
+    let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
+    assert!(
+        rel(se_theta[0], NM_SE_TVCL) < 1e-4,
+        "SE TVCL {} vs NONMEM {} (rel {:.2e})",
+        se_theta[0],
+        NM_SE_TVCL,
+        rel(se_theta[0], NM_SE_TVCL)
+    );
+    assert!(
+        rel(se_theta[1], NM_SE_TVV) < 1e-4,
+        "SE TVV {} vs NONMEM {} (rel {:.2e})",
+        se_theta[1],
+        NM_SE_TVV,
+        rel(se_theta[1], NM_SE_TVV)
+    );
+    assert!(
+        rel(se_sigma[0], NM_SE_SIGMA_SD) < 1e-4,
+        "SE PROP_ERR (sd) {} vs NONMEM {} (rel {:.2e})",
+        se_sigma[0],
+        NM_SE_SIGMA_SD,
+        rel(se_sigma[0], NM_SE_SIGMA_SD)
     );
 }
