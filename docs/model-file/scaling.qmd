@@ -113,7 +113,12 @@ The negative-prediction clamp that guards the ODE solver applies only to the
 **default readout** — the bare compartment state (`obs_cmt`, and the analytical
 PK concentration), where non-negativity is a physical property of the quantity
 and a negative value can only be integration overshoot. It is not applied to
-Forms B or C.
+Form C.
+
+Forms A and B (`obs_scale = <expr>` / `obs_scale[CMT=n] = <expr>`) keep the
+default bare-state readout — the divisor is applied *downstream* of it — so the
+clamp still guards the compartment state they read. Only Form C (`y = <expr>`)
+replaces the readout and so opts out of the clamp.
 
 Before #1020 the ODE path clamped the final prediction vector unconditionally,
 after the Form C expression had been evaluated, so every negative readout was
