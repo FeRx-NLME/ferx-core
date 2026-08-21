@@ -19,11 +19,29 @@ use crate::types::*;
 use nalgebra::DVector;
 use std::path::Path;
 
+/// Append the SIR kernel's proposal-conditioning notes to a fit's warnings,
+/// skipping any that are already there.
+///
+/// `run_sir` clones its input fit, and that fit may already carry identical
+/// `SIR:` lines — it was produced with `sir = true` (the inline path in
+/// `fit_inner` pushes the same text), or its own `run_sir` output is being piped
+/// back in. Without the dedupe the same line accumulates and is printed once per
+/// pass (#1037).
+fn push_sir_warnings(warnings: &mut Vec<String>, sir_warnings: &[String]) {
+    for w in sir_warnings {
+        let line = format!("SIR: {}", w);
+        if !warnings.contains(&line) {
+            warnings.push(line);
+        }
+    }
+}
+
 /// Run SIR against an existing fit. Returns a new `FitResult` that is a clone
-/// of `fit` with the `sir_*` fields populated. The returned fit's
-/// `warnings` vector is unchanged — SIR-specific diagnostics live on
-/// `sir_ess` (low ESS signals a poorly-matched proposal); the SIR kernel
-/// does not emit structured warnings, so there is nothing to propagate.
+/// of `fit` with the `sir_*` fields populated. Proposal-conditioning
+/// diagnostics (rank deficiency / bound-driven shrinkage, #1021) are appended
+/// to the returned fit's `warnings` as `SIR: …` lines, deduplicated against
+/// what the input fit already carried; `sir_ess` remains the quantitative
+/// signal for a poorly-matched proposal.
 ///
 /// # Notes on integrity
 ///
@@ -203,11 +221,7 @@ pub fn run_sir(
 
     // --- Build the augmented FitResult ------------------------------------
     let mut out = fit.clone();
-    // Proposal-conditioning notes (rank deficiency / bound-driven shrinkage,
-    // #1021) are the caller's only signal that the SIR CIs are qualified.
-    for w in &sir.warnings {
-        out.warnings.push(format!("SIR: {}", w));
-    }
+    push_sir_warnings(&mut out.warnings, &sir.warnings);
     out.sir_ci_theta = Some(sir.ci_theta);
     out.sir_ci_omega = Some(sir.ci_omega);
     out.sir_ci_sigma = Some(sir.ci_sigma);
@@ -220,6 +234,39 @@ pub fn run_sir(
 mod tests {
     use super::*;
     use crate::api::fit_from_files;
+
+    /// #1037: a fit that already carries the same `SIR:` line — because it was
+    /// fitted with `sir = true`, or because its `run_sir` output is being piped
+    /// back in — must not collect a second copy.
+    #[test]
+    fn push_sir_warnings_does_not_duplicate() {
+        let mut warnings = vec![
+            "Covariance step: matrix was not positive definite".to_string(),
+            "SIR: proposal covariance is rank-deficient [CL +0.71, V -0.70]".to_string(),
+        ];
+        let sir = vec![
+            "proposal covariance is rank-deficient [CL +0.71, V -0.70]".to_string(),
+            "proposal was shrunk in 1 direction(s) [KA +1.00]".to_string(),
+        ];
+        push_sir_warnings(&mut warnings, &sir);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings[2].starts_with("SIR: proposal was shrunk"),
+            "{warnings:?}"
+        );
+
+        // Idempotent: a second pass over the same kernel output adds nothing.
+        push_sir_warnings(&mut warnings, &sir);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+    }
+
+    /// A clean SIR run leaves the fit's warnings untouched.
+    #[test]
+    fn push_sir_warnings_is_a_no_op_when_the_proposal_was_clean() {
+        let mut warnings = vec!["Minimization terminated".to_string()];
+        push_sir_warnings(&mut warnings, &[]);
+        assert_eq!(warnings, vec!["Minimization terminated".to_string()]);
+    }
 
     // Use the in-tree warfarin example + data. They live at repo paths
     // `examples/warfarin.ferx` and `data/warfarin.csv` (see CLAUDE.md);

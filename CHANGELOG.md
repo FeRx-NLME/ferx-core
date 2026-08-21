@@ -188,7 +188,8 @@ section of the SDLC for the versioning policy).
   (#1021).** A parameter direction the data do not identify comes back from the covariance step with
   a variance around `1 / eigenvalue floor` — thousands of standard deviations in packed log-space —
   so every proposal draw landed outside the parameter bounds and was rejected. Each proposal
-  direction is now capped so ±3 standard deviations stay inside the packed bounds, near-null
+  direction is now capped so ±2 standard deviations stay inside the room between the estimate and
+  its nearer packed bound, near-null
   directions (a likelihood ridge left over after `FIX`ed parameters are excluded) are floored rather
   than fatal, and both cases are reported as `SIR:` warnings naming the parameters involved. When
   every sample *is* still rejected, the error now reports the rejection tally, the coordinates whose

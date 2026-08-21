@@ -11,6 +11,7 @@ use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
     compute_bounds, compute_mu_k, coordinate_names, pack_params, packed_fixed_mask, unpack_params,
+    PackedBounds,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -40,17 +41,46 @@ pub struct SirResult {
     pub warnings: Vec<String>,
 }
 
-/// How many proposal standard deviations must fit inside the packed parameter
-/// bounds. A direction wider than `bound width / PROPOSAL_BOUND_SIGMAS` is not
+/// How many proposal standard deviations must fit between the ML estimate and
+/// the *nearer* of its packed bounds. A direction much wider than that is not
 /// merely inefficient: every draw along it fails the bounds check in the weight
 /// loop, and SIR degenerates to "All SIR samples had invalid weights" (#1021).
-/// `4.0` (±2 sd inside the declared bounds) is deliberately generous: the cap is
-/// meant to catch a proposal direction that is *wider than the box the parameter
-/// is allowed to live in* — the signature of an eigenvalue-floored, non-identified
-/// direction — not to trim a genuinely wide but legitimate one. A tighter cap
-/// would silently narrow the CIs of a parameter whose real uncertainty fills its
-/// user-declared bounds.
+/// `4.0` (±2 sd of usable room on each side) is deliberately generous: the cap
+/// is meant to catch a proposal direction that is *wider than the room the
+/// parameter has to move in* — the signature of an eigenvalue-floored,
+/// non-identified direction — not to trim a genuinely wide but legitimate one.
+/// A tighter cap would silently narrow the CIs of a parameter whose real
+/// uncertainty fills its user-declared bounds.
+///
+/// The guarantee is approximate, not exact, for two reasons that
+/// [`proposal_sd_caps`] and [`CAP_TRIGGER_FACTOR`] between them keep small: the
+/// cap is applied per eigen-direction while a coordinate's realised marginal sd
+/// sums over directions (`Σ_i λ_i v_ki²`), and the proposal is Student-t rather
+/// than Gaussian. The t inflation is compensated in `proposal_sd_caps`; the
+/// per-direction accumulation is not, but only grossly-overshooting directions
+/// are capped at all, so at most a handful contribute.
 const PROPOSAL_BOUND_SIGMAS: f64 = 4.0;
+
+/// How far a direction must overshoot a coordinate's usable room before the
+/// bound cap touches it, expressed as a multiple of the per-coordinate sd cap.
+///
+/// Without this gate the cap fires on *legitimately* wide directions. The
+/// packed bounds are narrow for the variance components — `compute_bounds`
+/// gives an omega log-Cholesky diagonal `[-6, 6]` and a sigma `[-8, 5]`, so
+/// their usable room is only a few units — and a collapsing omega genuinely has
+/// log-scale uncertainty of that order. Shrinking it would silently narrow its
+/// CI and mislabel it in the warning as "eigenvalue-floored (non-identified)
+/// curvature". The failure this cap exists for overshoots by 1e3–1e4, so a
+/// factor of ten separates the two cases cleanly (#1037).
+const CAP_TRIGGER_FACTOR: f64 = 10.0;
+
+/// Floor for a coordinate's usable room, as a fraction of its full packed bound
+/// width. An ML estimate sitting *on* a bound has zero room, which would cap
+/// every direction loading on it to a zero-variance proposal and abort SIR with
+/// "no positive eigenvalue". Keeping a sliver of room keeps the proposal PD;
+/// only directions that already overshoot by [`CAP_TRIGGER_FACTOR`] are shrunk
+/// to it, and those are non-identified anyway.
+const PROPOSAL_MIN_ROOM_FRAC: f64 = 0.01;
 
 /// Relative floor for near-null proposal directions, mirroring the Hessian
 /// floor in [`crate::estimation::covariance::invert_psd_with_floor`].
@@ -106,8 +136,8 @@ impl ConditionedProposal {
         }
         if !self.capped_dirs.is_empty() {
             out.push(format!(
-                "proposal was shrunk in {} direction(s) so draws stay inside the \
-                 parameter bounds [{}]. Those directions come from eigenvalue-floored \
+                "proposal was shrunk in {} direction(s) so draws mostly stay inside \
+                 the parameter bounds [{}]. Those directions come from eigenvalue-floored \
                  (non-identified) curvature in the covariance step; the SIR CIs along \
                  them understate the true uncertainty.",
                 self.capped_dirs.len(),
@@ -119,20 +149,32 @@ impl ConditionedProposal {
 }
 
 /// Name the parameters that load on eigenvector column `col`, largest first.
+///
+/// Loadings below [`DIRECTION_LOADING_MIN`] are noise on a direction that has a
+/// dominant parameter. On a model with many free coordinates, though, a
+/// degenerate direction can be spread thinly enough that *no* loading clears the
+/// threshold — and "no dominant parameter" leaves the user with nothing to act
+/// on, while the accompanying advice ("fix or drop one parameter from each
+/// listed combination") points at nothing. In that case fall back to the three
+/// largest loadings whatever their magnitude (#1037).
 fn describe_direction(eigenvectors: &DMatrix<f64>, col: usize, names: &[String]) -> String {
     let mut loadings: Vec<(usize, f64)> = (0..eigenvectors.nrows())
         .map(|k| (k, eigenvectors[(k, col)]))
-        .filter(|(_, v)| v.abs() >= DIRECTION_LOADING_MIN)
         .collect();
     loadings.sort_by(|a, b| {
         b.1.abs()
             .partial_cmp(&a.1.abs())
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    loadings.truncate(3);
     if loadings.is_empty() {
         return "no dominant parameter".to_string();
     }
+    let n_above = loadings
+        .iter()
+        .take_while(|(_, v)| v.abs() >= DIRECTION_LOADING_MIN)
+        .count();
+    let n_report = if n_above == 0 { 3 } else { n_above.min(3) };
+    loadings.truncate(n_report);
     loadings
         .iter()
         .map(|(k, v)| {
@@ -143,14 +185,66 @@ fn describe_direction(eigenvectors: &DMatrix<f64>, col: usize, names: &[String])
         .join(", ")
 }
 
+/// Largest proposal standard deviation each free coordinate can carry.
+///
+/// The bound cap used to derive this from the *width* of the packed box,
+/// `(upper - lower) / PROPOSAL_BOUND_SIGMAS`, which silently assumes the
+/// proposal centre sits in the middle of that box. It does not: a theta declared
+/// `(0, 100)` whose ML estimate is `0.5` packs to bounds
+/// `[ln(1e-10), ln(100)] = [-23.0, 4.6]` around `x̂ = -0.69`, so it has 5.3 of
+/// room above and 22.3 below. A width-derived cap would allow ±13.8 and leave
+/// the large majority of draws above the upper bound — the very rejection the
+/// cap exists to prevent, now with a warning claiming the proposal had been made
+/// bound-safe (#1037).
+///
+/// So the room is the distance to the *nearer* bound, and the cap keeps
+/// `PROPOSAL_BOUND_SIGMAS / 2` standard deviations inside it. Two corrections on
+/// top of that:
+///
+///  * the proposal is Student-t with `nu = sir_df` degrees of freedom, whose
+///    draws are `sqrt(nu / (nu - 2))` wider than its Cholesky scale, so the cap
+///    is divided by that factor;
+///  * room is floored at [`PROPOSAL_MIN_ROOM_FRAC`] of the box width, so an
+///    estimate sitting exactly on its bound still yields a PD proposal instead
+///    of aborting SIR with "no positive eigenvalue".
+fn proposal_sd_caps(
+    x_hat: &[f64],
+    bounds: &PackedBounds,
+    free_idx: &[usize],
+    sir_df: f64,
+) -> Vec<f64> {
+    // Var(t_nu) = nu / (nu - 2), undefined at or below 2 df — there the raw
+    // Cholesky scale is the only finite proxy available.
+    let t_inflation = if sir_df > 2.0 {
+        (sir_df / (sir_df - 2.0)).sqrt()
+    } else {
+        1.0
+    };
+    free_idx
+        .iter()
+        .map(|&i| {
+            let room = (x_hat[i] - bounds.lower[i])
+                .min(bounds.upper[i] - x_hat[i])
+                .max(0.0);
+            let floor = (bounds.upper[i] - bounds.lower[i]).max(0.0) * PROPOSAL_MIN_ROOM_FRAC;
+            room.max(floor) * 2.0 / PROPOSAL_BOUND_SIGMAS / t_inflation
+        })
+        .collect()
+}
+
 /// Turn the free-block covariance into a proposal SIR can sample from.
 ///
 /// Each eigen-direction's variance is
 ///  * floored at `λ_max · PROPOSAL_EIG_FLOOR_REL` when it is ≤ 0 or negligible
 ///    (a ridge / rank deficiency that survived the FIX exclusion), and
-///  * capped so that `sqrt(λ)·|v_k| ≤ half_widths[k]` for every coordinate `k`
-///    the direction loads on — i.e. ±2 sd of the proposal stays inside the
-///    packed parameter bounds.
+///  * capped so that `sqrt(λ)·|v_k| ≤ sd_caps[k]` for every coordinate `k` the
+///    direction loads on — but *only* when it overshoots that cap by more than
+///    [`CAP_TRIGGER_FACTOR`], so a legitimately wide direction is left alone
+///    (#1037).
+///
+/// `sd_caps[k]` is the largest proposal standard deviation coordinate `k` can
+/// carry and still keep `PROPOSAL_BOUND_SIGMAS / 2` sd inside the *nearer* of
+/// its packed bounds; see [`proposal_sd_caps`].
 ///
 /// The cap is what makes SIR survive a covariance matrix whose non-identified
 /// directions were eigenvalue-floored during inversion: those come back with
@@ -158,7 +252,7 @@ fn describe_direction(eigenvectors: &DMatrix<f64>, col: usize, names: &[String])
 /// cap puts every single draw outside the bounds (#1021).
 pub(crate) fn condition_free_proposal(
     sub_cov: &DMatrix<f64>,
-    half_widths: &[f64],
+    sd_caps: &[f64],
     names: &[String],
 ) -> Result<ConditionedProposal, String> {
     let n = sub_cov.nrows();
@@ -167,10 +261,10 @@ pub(crate) fn condition_free_proposal(
         sub_cov.ncols(),
         "condition_free_proposal needs a square block"
     );
-    debug_assert_eq!(n, half_widths.len(), "one half-width per free coordinate");
+    debug_assert_eq!(n, sd_caps.len(), "one sd cap per free coordinate");
 
     let sym = (sub_cov + sub_cov.transpose()) * 0.5;
-    let eig = sym.symmetric_eigen();
+    let eig = sym.clone().symmetric_eigen();
     if eig.eigenvalues.iter().any(|v| !v.is_finite()) {
         return Err(
             "SIR proposal covariance has non-finite eigenvalues — the covariance step \
@@ -180,21 +274,33 @@ pub(crate) fn condition_free_proposal(
         );
     }
     // Pass 1 — cap each direction at the widest variance that keeps
-    // ±(PROPOSAL_BOUND_SIGMAS / 2) standard deviations inside the packed bounds
-    // of every coordinate it loads on.
+    // ±(PROPOSAL_BOUND_SIGMAS / 2) standard deviations inside the usable room of
+    // every coordinate it loads on.
     let caps: Vec<f64> = (0..n)
         .map(|i| {
             let mut cap = f64::INFINITY;
-            for (k, &w) in half_widths.iter().enumerate() {
+            for (k, &sd_cap) in sd_caps.iter().enumerate() {
                 let load = eig.eigenvectors[(k, i)].abs();
                 if load > 1e-8 {
-                    cap = cap.min((w / load).powi(2));
+                    cap = cap.min((sd_cap / load).powi(2));
                 }
             }
             cap
         })
         .collect();
-    let capped_eigs: Vec<f64> = (0..n).map(|i| eig.eigenvalues[i].min(caps[i])).collect();
+    // The cap only fires on a *gross* overshoot. `CAP_TRIGGER_FACTOR` is an sd
+    // multiple, so the variance trigger is its square.
+    let trigger = CAP_TRIGGER_FACTOR * CAP_TRIGGER_FACTOR;
+    let capped_eigs: Vec<f64> = (0..n)
+        .map(|i| {
+            let lam = eig.eigenvalues[i];
+            if lam > caps[i] * trigger {
+                caps[i]
+            } else {
+                lam
+            }
+        })
+        .collect();
 
     // The near-null floor is anchored on the *capped* spectrum, not the raw one.
     // An eigenvalue-floored direction can come back at 1e7+; anchoring on it
@@ -218,7 +324,7 @@ pub(crate) fn condition_free_proposal(
     for i in 0..n {
         let raw = eig.eigenvalues[i];
         let mut lam = capped_eigs[i];
-        if raw > caps[i] && caps[i] >= floor {
+        if capped_eigs[i] < raw && caps[i] >= floor {
             capped.push((
                 (raw / caps[i]).sqrt(),
                 format!(
@@ -239,24 +345,34 @@ pub(crate) fn condition_free_proposal(
     }
     capped.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let cov_raw =
-        &eig.eigenvectors * DMatrix::from_diagonal(&lambdas) * eig.eigenvectors.transpose();
-    let cov = (&cov_raw + cov_raw.transpose()) * 0.5;
-    let chol = cov
-        .clone()
-        .cholesky()
-        .or_else(|| {
-            // Eigen-reconstruction can leave a sub-ULP indefinite remainder;
-            // a jitter proportional to the spectrum recovers it.
-            let jitter = DMatrix::identity(n, n) * (max_eig * 1e-12).max(1e-14);
-            (&cov + jitter).cholesky()
-        })
-        .ok_or_else(|| {
-            "SIR proposal covariance could not be made positive definite after \
-             eigenvalue conditioning."
-                .to_string()
-        })?
-        .l();
+    // A healthy block must not be perturbed. Round-tripping it through `V Λ Vᵀ`
+    // changes it at ~1e-16 relative, which changes every drawn sample and
+    // therefore the SIR CIs — so when no eigenvalue was capped or floored,
+    // factor the input directly and leave the draws bit-identical (#1037).
+    let untouched = (0..n).all(|i| lambdas[i] == eig.eigenvalues[i]);
+    let chol = untouched
+        .then(|| sym.cholesky().map(|c| c.l()))
+        .flatten()
+        .map(Ok)
+        .unwrap_or_else(|| {
+            let cov_raw =
+                &eig.eigenvectors * DMatrix::from_diagonal(&lambdas) * eig.eigenvectors.transpose();
+            let cov = (&cov_raw + cov_raw.transpose()) * 0.5;
+            cov.clone()
+                .cholesky()
+                .or_else(|| {
+                    // Eigen-reconstruction can leave a sub-ULP indefinite
+                    // remainder; a jitter proportional to the spectrum recovers it.
+                    let jitter = DMatrix::identity(n, n) * (max_eig * 1e-12).max(1e-14);
+                    (&cov + jitter).cholesky()
+                })
+                .map(|c| c.l())
+                .ok_or_else(|| {
+                    "SIR proposal covariance could not be made positive definite after \
+                     eigenvalue conditioning."
+                        .to_string()
+                })
+        })?;
 
     Ok(ConditionedProposal {
         chol,
@@ -418,7 +534,7 @@ pub fn run_sir_core(
     //    non-identified direction comes back with variance ≈ 1/floor ≈ 1e7+.
     //    In packed (log) space that is a proposal sd of thousands: every draw
     //    lands outside the parameter bounds and is rejected. Those directions
-    //    are shrunk so ±2 sd still fits inside the packed bounds.
+    //    are shrunk so ±2 sd still fits inside the room the ML estimate has.
     let bounds = compute_bounds(params);
     let coord_names = coordinate_names(params);
     let free_names: Vec<String> = free_idx
@@ -430,11 +546,8 @@ pub fn run_sir_core(
                 .unwrap_or_else(|| format!("packed[{i}]"))
         })
         .collect();
-    let half_widths: Vec<f64> = free_idx
-        .iter()
-        .map(|&i| (bounds.upper[i] - bounds.lower[i]) / PROPOSAL_BOUND_SIGMAS)
-        .collect();
-    let conditioned = condition_free_proposal(&sub_cov, &half_widths, &free_names)?;
+    let sd_caps = proposal_sd_caps(&x_hat, &bounds, &free_idx, options.sir_df);
+    let conditioned = condition_free_proposal(&sub_cov, &sd_caps, &free_names)?;
     if options.verbose {
         for w in conditioned.warnings() {
             eprintln!("  SIR: {w}");
@@ -871,6 +984,204 @@ mod tests {
         assert!(msg.contains("1 non-finite OFV"), "{msg}");
         assert!(!msg.contains("rank-deficient"), "{msg}");
         assert!(!msg.contains("Fix or drop"), "{msg}");
+    }
+
+    /// #1037: the cap must be driven by the room the estimate actually has, not
+    /// by the width of its box. A theta declared `(0, 100)` estimated at `0.5`
+    /// packs to `[-23.0, 4.6]` around `x̂ = -0.69`: 5.3 above, 22.3 below. A
+    /// width-derived cap would allow ±13.8 and still put most draws over the
+    /// upper bound.
+    #[test]
+    fn proposal_sd_caps_use_the_nearer_bound() {
+        let x_hat = vec![(0.5_f64).ln()];
+        let bounds = PackedBounds {
+            lower: vec![(1e-10_f64).ln()],
+            upper: vec![(100.0_f64).ln()],
+        };
+        // 30 df: t inflation sqrt(30/28) = 1.035, small enough to read the
+        // geometry through.
+        let caps = proposal_sd_caps(&x_hat, &bounds, &[0], 30.0);
+        let room = bounds.upper[0] - x_hat[0];
+        // ±2 sd of the *realised* t draws must fit in the room above.
+        let realised_sd = caps[0] * (30.0_f64 / 28.0).sqrt();
+        assert!(
+            2.0 * realised_sd <= room + 1e-9,
+            "cap {} overshoots the {} of room above x_hat",
+            caps[0],
+            room
+        );
+        // And it must be materially tighter than the old width-derived cap.
+        let width_cap = (bounds.upper[0] - bounds.lower[0]) / PROPOSAL_BOUND_SIGMAS;
+        assert!(caps[0] < 0.5 * width_cap, "{} vs {}", caps[0], width_cap);
+    }
+
+    /// A centred estimate must be unaffected by the switch from box width to
+    /// nearer-bound room — the two agree exactly there (before the t correction).
+    #[test]
+    fn proposal_sd_caps_match_the_box_half_width_when_centred() {
+        let bounds = PackedBounds {
+            lower: vec![-6.0],
+            upper: vec![6.0],
+        };
+        // 1e12 df ⇒ t inflation ≈ 1, isolating the geometry.
+        let caps = proposal_sd_caps(&[0.0], &bounds, &[0], 1e12);
+        let width_cap = (bounds.upper[0] - bounds.lower[0]) / PROPOSAL_BOUND_SIGMAS;
+        assert!(
+            (caps[0] - width_cap).abs() < 1e-6,
+            "{} vs {}",
+            caps[0],
+            width_cap
+        );
+    }
+
+    /// The Student-t proposal draws are `sqrt(nu/(nu-2))` wider than the
+    /// Cholesky scale; the cap compensates so "±2 sd inside the room" is a
+    /// statement about the draws, not about the scale matrix.
+    #[test]
+    fn proposal_sd_caps_compensate_the_student_t_inflation() {
+        let bounds = PackedBounds {
+            lower: vec![-4.0],
+            upper: vec![4.0],
+        };
+        let wide = proposal_sd_caps(&[0.0], &bounds, &[0], 1e12);
+        let heavy = proposal_sd_caps(&[0.0], &bounds, &[0], 5.0);
+        let ratio = wide[0] / heavy[0];
+        assert!(
+            (ratio - (5.0_f64 / 3.0).sqrt()).abs() < 1e-6,
+            "t inflation not applied: {ratio}"
+        );
+        // Degrees of freedom at or below 2 have no finite variance; fall back to
+        // the raw scale rather than dividing by a NaN.
+        let df2 = proposal_sd_caps(&[0.0], &bounds, &[0], 2.0);
+        assert!(df2[0].is_finite() && df2[0] > 0.0, "{}", df2[0]);
+    }
+
+    /// An estimate pinned exactly on its bound has zero room. Capping every
+    /// direction that loads on it to zero variance would abort SIR with "no
+    /// positive eigenvalue"; a sliver of room keeps the proposal PD.
+    #[test]
+    fn proposal_sd_caps_floor_the_room_for_an_estimate_on_its_bound() {
+        let bounds = PackedBounds {
+            lower: vec![-6.0],
+            upper: vec![6.0],
+        };
+        let caps = proposal_sd_caps(&[6.0], &bounds, &[0], 5.0);
+        assert!(caps[0] > 0.0, "a zero cap would abort SIR: {}", caps[0]);
+        let expected =
+            12.0 * PROPOSAL_MIN_ROOM_FRAC * 2.0 / PROPOSAL_BOUND_SIGMAS / (5.0_f64 / 3.0).sqrt();
+        assert!((caps[0] - expected).abs() < 1e-12, "{}", caps[0]);
+        // A proposal built on it is still PD, not an error.
+        let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e7]));
+        let c = condition_free_proposal(&cov, &caps, &names(1)).unwrap();
+        assert!(c.chol[(0, 0)] > 0.0);
+    }
+
+    /// Only free coordinates get a cap, and they line up with `free_idx`.
+    #[test]
+    fn proposal_sd_caps_follow_the_free_index_map() {
+        let bounds = PackedBounds {
+            lower: vec![-6.0, -2.0, -8.0],
+            upper: vec![6.0, 2.0, 5.0],
+        };
+        let caps = proposal_sd_caps(&[0.0, 0.0, 0.0], &bounds, &[0, 2], 1e12);
+        assert_eq!(caps.len(), 2);
+        assert!((caps[0] - 3.0).abs() < 1e-6, "{}", caps[0]);
+        // Coordinate 2 is off-centre in [-8, 5]: nearer bound is 5.
+        assert!((caps[1] - 2.5).abs() < 1e-6, "{}", caps[1]);
+    }
+
+    /// #1037: the packed bounds are narrow for the variance components (an omega
+    /// log-Cholesky diagonal lives in `[-6, 6]`), so a *legitimately* imprecise
+    /// omega exceeds its cap without being an eigenvalue-floored artifact.
+    /// Shrinking it would narrow its CI and mislabel it as non-identified.
+    #[test]
+    fn condition_free_proposal_leaves_a_legitimately_wide_direction_alone() {
+        // sd 3.0 against a cap of 1.5: over the cap, but nowhere near the
+        // 1e3–1e4 overshoot the cap exists for.
+        let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[9.0, 0.01]));
+        let c = condition_free_proposal(&cov, &[1.5, 1.5], &names(2)).unwrap();
+        assert!(
+            c.capped_dirs.is_empty(),
+            "a merely imprecise direction must not be shrunk: {:?}",
+            c.capped_dirs
+        );
+        let round = &c.chol * c.chol.transpose();
+        assert!((round[(0, 0)] - 9.0).abs() < 1e-9, "{}", round[(0, 0)]);
+    }
+
+    /// The gate is a factor, not a switch: past `CAP_TRIGGER_FACTOR` sd the
+    /// direction is still shrunk all the way back to the cap.
+    #[test]
+    fn condition_free_proposal_still_caps_past_the_trigger() {
+        let cap_sd = 1.5_f64;
+        let over = (CAP_TRIGGER_FACTOR + 1.0) * cap_sd;
+        let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[over * over, 0.01]));
+        let c = condition_free_proposal(&cov, &[cap_sd, cap_sd], &names(2)).unwrap();
+        assert_eq!(c.capped_dirs.len(), 1, "{:?}", c.capped_dirs);
+        let round = &c.chol * c.chol.transpose();
+        assert!(
+            (round[(0, 0)] - cap_sd * cap_sd).abs() < 1e-9,
+            "not shrunk to the cap: {}",
+            round[(0, 0)]
+        );
+    }
+
+    /// #1037: a healthy block must come back *bit*-identical, not merely close.
+    /// Round-tripping through `V Λ Vᵀ` perturbs it at ~1e-16 relative, which
+    /// changes every drawn sample and so the reported CIs.
+    #[test]
+    fn condition_free_proposal_is_bit_identical_on_a_healthy_block() {
+        let cov = DMatrix::from_row_slice(
+            3,
+            3,
+            &[
+                0.013, 0.0021, -0.0007, 0.0021, 0.041, 0.0033, -0.0007, 0.0033, 0.0089,
+            ],
+        );
+        let c = condition_free_proposal(&cov, &[1.0, 1.0, 1.0], &names(3)).unwrap();
+        let expected = cov.clone().cholesky().expect("input is PD").l();
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_eq!(
+                    c.chol[(i, j)].to_bits(),
+                    expected[(i, j)].to_bits(),
+                    "({i},{j}) drifted: {} vs {}",
+                    c.chol[(i, j)],
+                    expected[(i, j)]
+                );
+            }
+        }
+    }
+
+    /// #1037: a degenerate direction spread thinly over many coordinates has no
+    /// loading above `DIRECTION_LOADING_MIN`. "No dominant parameter" leaves the
+    /// user nothing to act on, so name the largest loadings anyway.
+    #[test]
+    fn describe_direction_falls_back_when_no_loading_dominates() {
+        // 100 coordinates, each loading 0.1 — well under the 0.15 threshold.
+        let n = 100;
+        let mut v = DMatrix::zeros(n, n);
+        for k in 0..n {
+            v[(k, 0)] = 1.0 / (n as f64).sqrt();
+        }
+        let d = describe_direction(&v, 0, &names(n));
+        assert!(!d.contains("no dominant parameter"), "{d}");
+        assert_eq!(d.matches(',').count(), 2, "expected three loadings: {d}");
+        assert!(d.contains("P0"), "{d}");
+    }
+
+    /// The fallback must not fire when a direction *does* have dominant
+    /// loadings — reporting the noise floor alongside them would be worse.
+    #[test]
+    fn describe_direction_reports_only_dominant_loadings_when_present() {
+        let mut v = DMatrix::zeros(3, 3);
+        v[(0, 0)] = 0.99;
+        v[(1, 0)] = 0.1;
+        v[(2, 0)] = 0.05;
+        let d = describe_direction(&v, 0, &names(3));
+        assert!(d.contains("P0"), "{d}");
+        assert!(!d.contains("P1"), "{d}");
+        assert!(!d.contains("P2"), "{d}");
     }
 
     #[test]
