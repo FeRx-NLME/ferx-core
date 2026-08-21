@@ -2520,10 +2520,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // `when` rules cannot reach a parameter (they compare the `signal` keyword to an
     // `f64` literal), so `observe` is the whole surface.
     //
-    // Same split as `[scaling]`: rejection is ODE-scoped — an analytical model binds
-    // F/lagtime through an explicit `pk(..., f=F)` mapping, and `ode_slot_map`, what
-    // makes a *bare* `F` a dose attribute, is empty there — while the `D{n}`/`R{n}`
-    // recording runs on both engines.
+    // Same split as `[scaling]`: the rejection runs on both engines — the ODE
+    // side over `ode_slot_map` (#993), the analytical side over the explicit
+    // `pk(..., f=F)`/`lagtime=` mapping (#1004) — as does the `D{n}`/`R{n}`
+    // recording.
     if let Some(observe) = adaptive_dosing.as_ref().and_then(|s| s.observe.as_deref()) {
         let observe_reads = collect_indiv_param_reads(
             observe,
@@ -2540,6 +2540,18 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &observe_reads,
                 n_states,
                 "[adaptive_dosing]",
+                None,
+            )?;
+        } else {
+            let analytical_slots =
+                analytical_dose_attr_slot_map(&pk_param_map, &model.indiv_param_names);
+            check_dose_attr_double_use(
+                &model.indiv_param_names,
+                &analytical_slots,
+                &observe_reads,
+                usize::MAX,
+                "[adaptive_dosing]",
+                Some(&pk_param_map),
             )?;
         }
         // Cloned because `record_coded_rate_reads` needs `&mut model` for the map
@@ -2721,10 +2733,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             )?);
         }
 
-        // Rejection is ODE-only: an analytical model binds F/lagtime through an
-        // explicit `pk(..., f=F)` mapping, so a double use there is stated rather
-        // than silent, and `ode_slot_map` — what makes a *bare* `F` a dose attribute
-        // — is empty for that engine anyway.
+        // Both engines. The ODE side (#993) keys off `ode_slot_map` — name-based
+        // routing is what makes a bare `F` a dose attribute there. The analytical
+        // side (#1004) keys off the explicit `pk(..., f=F)`/`lagtime=` mapping:
+        // #1003's scope note argued that mapping made a second use "stated rather
+        // than silent", but nothing in the model states the value is applied
+        // twice, which is the same silence #993 closed — measured at exactly `F`
+        // on the prediction on both ferx and NONMEM's analytical ADVAN2 routine
+        // (`S2 = V/F1` with `F1` defined; see the anchor test).
         if is_ode_model {
             check_dose_attr_double_use(
                 &indiv_var_names_for_scaling,
@@ -2732,6 +2748,18 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &scaling_reads,
                 state_names_for_scaling.len(),
                 "[scaling]",
+                None,
+            )?;
+        } else {
+            let analytical_slots =
+                analytical_dose_attr_slot_map(&pk_param_map, &indiv_var_names_for_scaling);
+            check_dose_attr_double_use(
+                &indiv_var_names_for_scaling,
+                &analytical_slots,
+                &scaling_reads,
+                usize::MAX,
+                "[scaling]",
+                Some(&pk_param_map),
             )?;
         }
 
@@ -2825,6 +2853,40 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.pk_indices,
             &model.kappa_names,
         )?;
+        // #1004: a dose attribute the `pk(...)` call maps (`f=`/`lagtime=`) that an
+        // init expression *also* reads. Exact analytical analogue of the `[odes]`
+        // `init(state) = <expr>` half of #993: without it the rule has a hole the
+        // size of its own remedy — a user told to drop `F` from `[scaling]` could
+        // move it into `init(central) = F * 100` from the same model. Runs after
+        // `parse_initial_conditions_block` so a malformed block reports its own
+        // syntax error first (this block is analytical-only; the ODE arm above
+        // already rejected `is_ode`). The `D{n}`/`R{n}` recording mirrors the
+        // `[scaling]` site: an init expression is a prediction path for the
+        // data-gated half too.
+        let mut init_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for line in ic_lines {
+            if let Some((_, expr)) = parse_init_line(line) {
+                init_reads.extend(collect_indiv_param_reads(
+                    &expr,
+                    &model.theta_names,
+                    &model.eta_names,
+                    &model.indiv_param_names,
+                    "[initial_conditions] init",
+                )?);
+            }
+        }
+        let analytical_slots =
+            analytical_dose_attr_slot_map(&pk_param_map, &model.indiv_param_names);
+        check_dose_attr_double_use(
+            &model.indiv_param_names,
+            &analytical_slots,
+            &init_reads,
+            usize::MAX,
+            "[initial_conditions]",
+            Some(&pk_param_map),
+        )?;
+        let init_indiv_names = model.indiv_param_names.clone();
+        record_coded_rate_reads(&mut model, &init_indiv_names, &ode_slot_map, &init_reads);
         model.analytical_init = analytical_init;
         // Register init-expression covariates as required data columns, mirroring
         // the scaling (`scaling_covariates`) and error-selector blocks above. Without
@@ -8649,12 +8711,31 @@ fn ode_free_slot_count(names: &[String]) -> usize {
 /// below reports it precisely ("the model has only N compartment(s)"); telling such
 /// a user to rename `F5` would send them after the wrong thing, so out-of-range
 /// indices are left for that check.
+///
+/// Runs on **both engines** (#993 shipped the ODE half; #1004 the analytical).
+/// `indiv_param_slots` is what differs: the ODE caller passes `ode_slot_map`
+/// (name-based routing is what makes a bare `F` a dose attribute there), the
+/// analytical caller passes [`analytical_dose_attr_slot_map`] (the explicit
+/// `pk(..., f=F)` / `lagtime=` mapping is what binds it there — measured on
+/// NONMEM's own analytical routine, ADVAN2 with `F1` defined and `S2 = V/F1`:
+/// predictions shift by exactly `F1` with no diagnostic, see
+/// `tests/dose_attr_double_use_nonmem_anchor.rs`). An analytical caller passes
+/// `usize::MAX` for `n_states`: a compartment-indexed `EveryDose` attribute
+/// cannot reach this check there — an *unmapped* `F{n}`/`ALAG{n}` is already a
+/// parse error ("nothing binds it to the dose route"), and a mapped one resolves
+/// through the bare-slot arm of `DoseAttrConsumption::of`, whose `cmt` is `None`.
+///
+/// `analytical_pk_map` is `None` for the ODE callers and `Some(pk_param_map)` for
+/// the analytical ones. It selects the remediation clause (rename vs drop the
+/// mapping) and supplies the role name **as the user spelled it**, so an `alag=`
+/// model is not told to look for a `lagtime=` argument it never wrote.
 fn check_dose_attr_double_use(
     indiv_param_names: &[String],
     indiv_param_slots: &[usize],
     reads: &std::collections::HashSet<String>,
     n_states: usize,
     block: &str,
+    analytical_pk_map: Option<&HashMap<String, String>>,
 ) -> Result<(), String> {
     for (i, name) in indiv_param_names.iter().enumerate() {
         let slot = indiv_param_slots.get(i).copied();
@@ -8674,18 +8755,99 @@ fn check_dose_attr_double_use(
             Some(c) => format!(" for doses into compartment {c}"),
             None => String::new(),
         };
+        // The remedy for "it is meant to be an ordinary parameter" differs by
+        // engine. On an ODE model the *name* is what routes a bare `F`/`LAGTIME`
+        // (or an indexed `F{n}`/`ALAG{n}`) onto the dose, so renaming un-routes
+        // it. On an analytical model the name is inert; the explicit
+        // `pk(..., f=NAME)` / `lagtime=NAME` mapping is what binds it, so the
+        // mapping — not the name — is what has to go (#1004; renaming alone
+        // changes nothing, the mapping follows the parameter).
+        //
+        // The analytical clause quotes the role **as the user spelled it** —
+        // `alag=` is a legal alias for `lagtime=`, and naming an argument the model
+        // file does not contain sends the reader looking for the wrong text.
+        let (ordinary_remedy, issue) = match analytical_pk_map {
+            Some(map) => {
+                let role = map
+                    .iter()
+                    .find(|(key, value)| {
+                        value.as_str() == name
+                            && PkParams::name_to_index(key)
+                                .is_some_and(|s| crate::types::RESERVED_PK_SLOTS.contains(&s))
+                    })
+                    .map(|(key, _)| key.clone())
+                    // Unreachable: `analytical_dose_attr_slot_map` set this
+                    // parameter's slot from exactly such an entry. Name the
+                    // canonical role rather than panicking if that ever drifts.
+                    .unwrap_or_else(|| match attr {
+                        crate::types::DoseAttr::F => "f".to_string(),
+                        _ => "lagtime".to_string(),
+                    });
+                (
+                    format!(
+                        "remove the `{role}={name}` mapping from the `pk(...)` call — the \
+                         mapping, not the name, is what makes `{name}` a dose attribute"
+                    ),
+                    "#1004",
+                )
+            }
+            None => (
+                format!("rename it — `{name}` is a reserved dose-attribute name"),
+                "#993",
+            ),
+        };
         return Err(format!(
             "{block}: `{name}` is this model's {noun}{scope} — the engine already \
              {applied} — but it is also read in {block}, so the value is applied \
-             twice: once at the dose, once where you read it (#993). If `{name}` is \
+             twice: once at the dose, once where you read it ({issue}). If `{name}` is \
              meant to be {noun}, remove it from {block}; if it is meant to be an \
-             ordinary parameter, rename it — `{name}` is a reserved dose-attribute \
-             name.",
+             ordinary parameter, {ordinary_remedy}.",
             noun = attr.noun(),
             applied = attr.applied_as(),
         ));
     }
     Ok(())
+}
+
+/// The `indiv_param_slots` argument of [`check_dose_attr_double_use`] for an
+/// **analytical** model (#1004): a vector parallel to `indiv_var_names` carrying
+/// [`crate::types::PK_IDX_F`] / [`crate::types::PK_IDX_LAGTIME`] for the
+/// parameter(s) the `pk(...)` call maps onto the dose route via `f=` /
+/// `lagtime=`/`alag=`, and a `usize::MAX` sentinel everywhere else.
+///
+/// The sentinel makes `DoseAttrConsumption::of` fall through its bare-slot arm
+/// to name-based recognition, exactly as the ODE caller's unrelated slots do —
+/// so an analytical `D{n}`/`R{n}` still classifies as `CodedRateOnly` (skipped
+/// here, judged with the data in `check_modeled_dose_rates`) and everything else
+/// stays an ordinary parameter.
+///
+/// Binding resolution mirrors `build_pk_param_fn`'s, which is what actually
+/// wires the value: the mapped name matches a declared parameter exactly, or by
+/// its lowercase form (the legacy `vars.get(to_lowercase())` compat lookup). A
+/// value that resolves to neither is a numeric literal, `TIME` (desugared to a
+/// synthetic parameter upstream), or an undefined name that
+/// `build_pk_param_fn` rejects with its own error — none of which can collide
+/// with a read.
+fn analytical_dose_attr_slot_map(
+    pk_param_map: &HashMap<String, String>,
+    indiv_var_names: &[String],
+) -> Vec<usize> {
+    let mut slots = vec![usize::MAX; indiv_var_names.len()];
+    for (key, value) in pk_param_map {
+        let target = match PkParams::name_to_index(key) {
+            Some(s @ (crate::types::PK_IDX_F | crate::types::PK_IDX_LAGTIME)) => s,
+            _ => continue,
+        };
+        let idx = indiv_var_names.iter().position(|n| n == value).or_else(|| {
+            indiv_var_names
+                .iter()
+                .position(|n| *n == value.to_lowercase())
+        });
+        if let Some(i) = idx {
+            slots[i] = target;
+        }
+    }
+    slots
 }
 
 /// The individual-parameter names an expression *source* references, upper-cased,
@@ -9539,6 +9701,7 @@ fn build_ode_spec(
         &rhs_reads,
         n_states,
         "[odes]",
+        None,
     )?;
 
     // Reject name collisions (case-insensitive) across the three name spaces.
