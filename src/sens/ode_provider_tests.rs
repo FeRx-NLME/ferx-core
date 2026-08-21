@@ -7206,3 +7206,64 @@ fn ode_iov_subject_past_the_last_bucket_declines_to_fd() {
         "inner IOV must decline past the cap"
     );
 }
+
+// #1020: a Form C readout whose value legitimately goes negative — here a
+// concentration expressed as a change from a baseline (`central/V1 - TVBASE`),
+// the same shape as the `sqrt(N)*logit(p)` readout of a model-based
+// meta-analysis. The overshoot clamp used to zero the negative part in both the
+// f64 predictor and the dual walk.
+const TWOCPT_ODE_SIGNED_READOUT: &str = r#"
+[parameters]
+  theta TVCL(4.0,   0.1, 100.0)
+  theta TVV1(12.0,  1.0, 500.0)
+  theta TVQ(2.0,    0.01, 100.0)
+  theta TVV2(25.0,  1.0, 500.0)
+  theta TVBASE(2.0, 0.0, 100.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma ADD_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1 - TVBASE
+[error_model]
+  DV ~ additive(ADD_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+/// Regression for #1020: the negative part of a Form C `[scaling]` readout must
+/// survive both the f64 predictor and the `Dual2`/`Dual1` walks, and the two must
+/// still agree — the clamp gate is shared, so a gate that drifted between them
+/// would show up as an analytic/FD mismatch on the negative observations (where a
+/// clamped jet carries zero derivatives and an unclamped one does not).
+#[test]
+fn ode_provider_signed_form_c_readout_not_clamped_and_matches_production() {
+    let model = parse_model_string(TWOCPT_ODE_SIGNED_READOUT).expect("parse");
+    let theta = vec![4.0, 12.0, 2.0, 25.0, 2.0];
+    let eta = vec![0.12, -0.08];
+    // Late times sit below the 2.0 baseline; early ones above it.
+    let times = [0.25, 1.0, 4.0, 12.0, 24.0];
+    let subj = bolus_subject(&times);
+
+    let preds = compute_predictions_with_tv(&model, &subj, &theta, &eta);
+    assert!(
+        preds.last().copied().unwrap() < -0.5,
+        "fixture must produce a genuinely negative readout, got {preds:?}"
+    );
+    assert!(preds[0] > 0.0, "fixture must straddle zero, got {preds:?}");
+
+    check_vs_production(&model, &subj, &theta, &eta);
+    check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subj, &theta, &eta);
+}
