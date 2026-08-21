@@ -54,6 +54,31 @@ $$
 
 Use when both proportional and additive error sources are present. Requires two sigma parameters defined in `[parameters]`. The first argument is the **proportional** sigma and the second the **additive** one — see [Sigma order](#sigma-order) below, which also explains why the argument order and the declaration order must agree.
 
+::: {.callout-warning}
+## Choose the additive initial estimate on the scale of your data
+
+A combined error model has a competing local minimum in which the **additive**
+term collapses toward zero and the proportional term inflates to absorb the
+scatter. Starting the additive SD far below the scale of the observations can
+trap the fit in that worse basin: low-magnitude points then carry near-infinite
+`1/Var` weight, and the optimizer is happy to keep the additive term at zero.
+This is not a ferx-specific quirk — NONMEM shows the same trapping, and it is
+most damaging on multimodal / over-parameterised models.
+
+ferx emits a `W_ADDITIVE_INIT_SCALE` warning before fitting when the additive SD
+initial estimate is below **1% of the data scale** (median `|DV|`) on that
+endpoint. It never changes your value — it advises a larger start. As a rule of
+thumb, seed the additive SD at roughly **10%** of the typical observed
+concentration (`median(|DV|) / 10`) rather than an arbitrary small number.
+
+**Worked example (cyclophosphamide parent→metabolite).** Metabolite
+concentrations reach the hundreds/thousands of ng/mL. Seeding the additive
+*variance* at 0.5 (SD ≈ 0.7) traps both ferx and NONMEM at additive variance
+≈ 0.94, ~50 OFV points worse than the global optimum (additive variance ≈ 1878,
+matching Pumas). Re-seeding the additive SD to a data-scaled value (tens of
+ng/mL) reaches the correct basin.
+:::
+
 ## Sigma order {#sigma-order}
 
 A single-endpoint `[error_model]` — one `DV ~ ...` line with no `CMT=` prefix and no `if/else` selector — consumes its sigmas **positionally**, from the order they are declared in `[parameters]`. The names written in the arguments are checked against the declared order and must match it:
@@ -93,31 +118,6 @@ Rejecting keeps one resolution rule for the whole positional path. It is a break
 A sigma declared *after* the ones the error model names is untouched by this rule — it simply occupies a later slot that the error model never loads, and it still earns the usual "declared but not referenced in `[error_model]`" warning. This is the shape used by, for example, FREM models, where a trailing sigma is consumed by machinery other than `[error_model]`.
 
 Per-CMT and covariate-selected error models (below) resolve each endpoint's sigmas by name, so declaration order does not constrain them.
-
-::: {.callout-warning}
-## Choose the additive initial estimate on the scale of your data
-
-A combined error model has a competing local minimum in which the **additive**
-term collapses toward zero and the proportional term inflates to absorb the
-scatter. Starting the additive SD far below the scale of the observations can
-trap the fit in that worse basin: low-magnitude points then carry near-infinite
-`1/Var` weight, and the optimizer is happy to keep the additive term at zero.
-This is not a ferx-specific quirk — NONMEM shows the same trapping, and it is
-most damaging on multimodal / over-parameterised models.
-
-ferx emits a `W_ADDITIVE_INIT_SCALE` warning before fitting when the additive SD
-initial estimate is below **1% of the data scale** (median `|DV|`) on that
-endpoint. It never changes your value — it advises a larger start. As a rule of
-thumb, seed the additive SD at roughly **10%** of the typical observed
-concentration (`median(|DV|) / 10`) rather than an arbitrary small number.
-
-**Worked example (cyclophosphamide parent→metabolite).** Metabolite
-concentrations reach the hundreds/thousands of ng/mL. Seeding the additive
-*variance* at 0.5 (SD ≈ 0.7) traps both ferx and NONMEM at additive variance
-≈ 0.94, ~50 OFV points worse than the global optimum (additive variance ≈ 1878,
-matching Pumas). Re-seeding the additive SD to a data-scaled value (tens of
-ng/mL) reaches the correct basin.
-:::
 
 ## Time-varying / covariate-dependent magnitude
 

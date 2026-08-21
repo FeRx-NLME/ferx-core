@@ -5443,10 +5443,9 @@ fn single_error_model_repeated_sigma_arg_without_a_second_sigma_errs() {
 
 #[test]
 fn single_error_model_trailing_unused_sigma_parses() {
-    // The FREM shape (`examples/warfarin_frem.ferx`): a sigma declared *after*
-    // the error-model sigma and consumed elsewhere (`frem_sigma`, by name) is
-    // untouched by the order rule, and still earns the pre-existing
-    // "not referenced in [error_model]" warning.
+    // A sigma declared *after* the ones the error model names occupies a slot the
+    // error model never loads, so the order rule does not reach it. It still earns
+    // the pre-existing "not referenced in [error_model]" warning.
     let content = sigma_order_model(
         "  sigma PROP_ERR ~ 0.04 (sd)\n  sigma EPSCOV ~ 1.0 (sd)",
         "DV ~ proportional(PROP_ERR)",
@@ -5461,6 +5460,36 @@ fn single_error_model_trailing_unused_sigma_parses() {
         "got: {:?}",
         parsed.model.parse_warnings
     );
+}
+
+#[test]
+fn single_error_model_frem_shape_parses() {
+    // The real FREM shape, which the test above only approximates: `prepare_frem`
+    // (`src/frem/mod.rs`) copies the base model's sigmas in order and then appends
+    // `sigma EPSCOV`, wiring it up through `[fit_options] frem_sigma` rather than
+    // `[error_model]`. That generated text is never written to disk in a form the
+    // `examples/` sweep would catch, so its survival under the #1001 order rule
+    // depends entirely on EPSCOV being appended *last* — pin that here, rather
+    // than leaving it asserted-but-unmeasured. If `prepare_frem` ever emitted the
+    // covariate sigma first, every generated FREM model would fail to parse.
+    let content = r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+  sigma EPSCOV ~ 1e-6 FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  frem_sigma = EPSCOV
+";
+    parse_full_model(content).expect("a generated FREM model keeps its trailing covariate sigma");
 }
 
 #[test]

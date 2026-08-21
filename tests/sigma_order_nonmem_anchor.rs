@@ -46,42 +46,15 @@
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, read_nonmem_csv};
-use std::io::Write;
-use tempfile::NamedTempFile;
+use std::path::Path;
 
-/// `nonmem_anchor/sigma_order.csv`, verbatim — 6 subjects, one 100 mg bolus into
-/// the single state, four observations each.
-const CSV: &str = "ID,TIME,AMT,EVID,MDV,CMT,DV\n\
-1,0,100,1,1,1,0\n\
-1,0.5,0,0,0,1,9.5\n\
-1,2,0,0,0,1,8.2\n\
-1,8,0,0,0,1,4.5\n\
-1,24,0,0,0,1,0.9\n\
-2,0,100,1,1,1,0\n\
-2,0.5,0,0,0,1,10.4\n\
-2,2,0,0,0,1,8.9\n\
-2,8,0,0,0,1,5.1\n\
-2,24,0,0,0,1,1.2\n\
-3,0,100,1,1,1,0\n\
-3,0.5,0,0,0,1,8.7\n\
-3,2,0,0,0,1,7.4\n\
-3,8,0,0,0,1,3.9\n\
-3,24,0,0,0,1,0.7\n\
-4,0,100,1,1,1,0\n\
-4,0.5,0,0,0,1,11.2\n\
-4,2,0,0,0,1,9.6\n\
-4,8,0,0,0,1,5.6\n\
-4,24,0,0,0,1,1.4\n\
-5,0,100,1,1,1,0\n\
-5,0.5,0,0,0,1,9.1\n\
-5,2,0,0,0,1,7.9\n\
-5,8,0,0,0,1,4.2\n\
-5,24,0,0,0,1,0.8\n\
-6,0,100,1,1,1,0\n\
-6,0.5,0,0,0,1,10.0\n\
-6,2,0,0,0,1,8.5\n\
-6,8,0,0,0,1,4.8\n\
-6,24,0,0,0,1,1.0\n";
+/// The dataset NONMEM was run on, read from the committed file rather than
+/// inlined. An inline copy would let the two drift apart silently — the test
+/// would keep passing while comparing ferx on one dataset against NONMEM
+/// constants measured on another, which is exactly the failure an anchor exists
+/// to prevent. Integration tests run with the crate root as the working
+/// directory, so this relative path resolves.
+const DATA: &str = "nonmem_anchor/sigma_order.csv";
 
 /// NONMEM `sigma_order_small.ctl`: `$SIGMA 0.0025 FIX`.
 const NONMEM_OFV_SMALL: f64 = -6.8389311000825916;
@@ -140,10 +113,7 @@ fn ofv(model_str: &str) -> f64 {
         Ok(p) => p,
         Err(e) => panic!("model must parse: {e}"),
     };
-    let mut csv = NamedTempFile::new().expect("temp csv");
-    csv.write_all(CSV.as_bytes()).expect("write csv");
-    csv.flush().expect("flush csv");
-    let pop = read_nonmem_csv(csv.path(), None, None).expect("anchor data must read");
+    let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("anchor data must read");
     let params = parsed.model.default_params.clone();
     let result = fit(&parsed.model, &pop, &params, &parsed.fit_options).expect("fit returns");
     result.ofv
@@ -196,11 +166,20 @@ fn leading_sigma_is_the_one_that_binds_and_matches_nonmem() {
         (got - NONMEM_OFV_BIG).abs() < 1e-5,
         "ferx {got} vs NONMEM {NONMEM_OFV_BIG}"
     );
-    // The span the silent misbind used to cover, confirmed on both engines.
+    // The span the silent misbind used to cover, measured on *ferx* and checked
+    // against the span NONMEM reports. Differencing the two NONMEM constants
+    // instead would be arithmetic on two literals — constant-foldable, and unable
+    // to fail for any reason involving ferx — so the second fit is run here rather
+    // than assumed.
+    let small = ofv(&model(
+        "  sigma S_SMALL ~ 0.05 (sd)",
+        "DV ~ proportional(S_SMALL)",
+    ));
+    let ferx_delta = got - small;
     let nonmem_delta = NONMEM_OFV_BIG - NONMEM_OFV_SMALL;
     assert!(
-        (nonmem_delta - 110.667_895_32).abs() < 1e-6,
-        "NONMEM delta {nonmem_delta}"
+        (ferx_delta - nonmem_delta).abs() < 1e-5,
+        "ferx delta {ferx_delta} vs NONMEM delta {nonmem_delta}"
     );
 }
 
@@ -221,5 +200,58 @@ fn mis_ordered_model_is_rejected_rather_than_silently_bound() {
     assert!(
         err.contains("consumed positionally") && err.contains("S_SMALL") && err.contains("S_BIG"),
         "got: {err}"
+    );
+}
+
+#[test]
+fn default_tolerances_stay_close_to_nonmem() {
+    // The comparisons above deliberately run at `inner_tol = 1e-10` to isolate the
+    // binding question from EBE noise. Nobody fits at that tolerance, so on their
+    // own they would let a regression that only degrades the *default* path pass
+    // unnoticed. This pins the shipped defaults against the same NONMEM constant.
+    //
+    // The band is 1e-2, not 1e-5: the measured gap at `inner_tol = 1e-5` is ~8e-4
+    // and is genuine inner-EBE residual noise, not disagreement — it closes on both
+    // rows together when the tolerance is tightened. 1e-2 leaves an order of
+    // magnitude of headroom over that while still being ~10,000x tighter than the
+    // 110.67-unit span a mis-binding would move the objective by, so this cannot be
+    // satisfied by the wrong sigma.
+    // Deliberately not built through `model()`: that helper splices in
+    // `FIT_OPTIONS`, whose whole purpose is the tightened tolerances this test
+    // exists to avoid.
+    let model_str = "\
+[parameters]
+  theta TVKE(0.1, 0.001, 1.0)
+  theta TVV(10.0, 1.0, 100.0)
+
+  omega ETA1 ~ 0.09
+
+  sigma S_SMALL ~ 0.05 (sd)
+
+[individual_parameters]
+  KE = TVKE * exp(ETA1)
+  V = TVV
+
+[structural_model]
+  ode(obs_cmt=CENT, states=[CENT])
+
+[odes]
+  d/dt(CENT) = -KE * CENT
+
+[error_model]
+  DV ~ proportional(S_SMALL)
+
+[scaling]
+  obs_scale = V
+
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false
+";
+    let got = ofv(model_str);
+    assert!(
+        (got - NONMEM_OFV_SMALL).abs() < 1e-2,
+        "ferx at default tolerances {got} vs NONMEM {NONMEM_OFV_SMALL}"
     );
 }

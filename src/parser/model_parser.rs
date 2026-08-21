@@ -12,6 +12,16 @@ use std::sync::LazyLock;
 static DIFFUSION_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?").unwrap());
 
+/// Identifier scanner for `[error_model]` arguments (`arg_sigma_name`). Hoisted
+/// out of the function because it is called once per argument from both
+/// `build_error_spec` and `build_ruv_magnitude`, and compiling the regex costs
+/// far more than the scan it performs.
+static ARG_IDENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z_]\w*").unwrap());
+
+/// Whether an `[error_model]` argument is a bare identifier (so an unresolved one
+/// is a typo'd sigma name) rather than a #484 magnitude expression.
+static BARE_IDENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_]\w*$").unwrap());
+
 // ── Mu-referencing pattern detection ────────────────────────────────────────
 
 /// Anchor of a mu-referencing relationship — either a plain user-declared
@@ -11875,27 +11885,29 @@ fn build_error_spec(
                             slot
                         ));
                     }
-                    // Unreachable except by repeating a name: `parse_error_model`
-                    // pins `args.len()` to the model's `n_sigma()`, and every
-                    // argument resolves to a *declared* sigma, so running off the
-                    // end means two arguments claimed the same one. That is a
-                    // count problem, not an ordering one — say so, and do not
-                    // suggest a reordering that cannot help.
+                    // Reachable only by repeating a name, and then only for
+                    // `Combined`: `parse_error_model` pins `args.len()` to the
+                    // model's `n_sigma()`, and every argument resolves to a
+                    // *declared* sigma, so running off the end means two arguments
+                    // claimed the same one — which needs two arguments to begin
+                    // with. (A one-sigma model can only reach `idx == 0`, and an
+                    // empty `sigma_names` is already rejected by `arg_sigma_name`
+                    // above.) That is a count problem, not an ordering one — say
+                    // so, and do not suggest a reordering that cannot help.
+                    //
+                    // The counts are interpolated rather than written as the
+                    // literals they currently always are (2 and 1), so the message
+                    // stays honest if either invariant above is ever relaxed.
                     None => {
                         return Err(format!(
-                            "[error_model] {} needs {} declared sigmas but \
-                             [parameters] declares only {}; argument {} names '{}', \
-                             which already fills an earlier slot. Declare one sigma \
-                             per argument.",
-                            match model {
-                                ErrorModel::Additive => "additive",
-                                ErrorModel::Proportional => "proportional",
-                                ErrorModel::Combined => "combined",
-                            },
-                            args.len(),
-                            sigma_names.len(),
+                            "[error_model] argument {} names '{}', which already \
+                             fills an earlier slot; the error model needs {} \
+                             distinct declared sigmas but [parameters] declares \
+                             only {}. Declare one sigma per argument.",
                             idx + 1,
-                            named
+                            named,
+                            args.len(),
+                            sigma_names.len()
                         ));
                     }
                 }
@@ -13544,9 +13556,8 @@ fn used_sigma_names(
 fn arg_sigma_name(arg: &str, sigma_names: &[String]) -> Result<String, String> {
     let sigma_set: std::collections::HashSet<&str> =
         sigma_names.iter().map(|s| s.as_str()).collect();
-    let ident_re = Regex::new(r"[A-Za-z_]\w*").unwrap();
     let mut found: Vec<String> = Vec::new();
-    for m in ident_re.find_iter(arg) {
+    for m in ARG_IDENT_RE.find_iter(arg) {
         let id = m.as_str();
         if sigma_set.contains(id) && !found.iter().any(|f| f == id) {
             found.push(id.to_string());
@@ -13559,7 +13570,7 @@ fn arg_sigma_name(arg: &str, sigma_names: &[String]) -> Result<String, String> {
             // the historical "unknown sigma" wording. A non-trivial expression
             // that names no sigma is the #484-specific error.
             let trimmed = arg.trim();
-            if Regex::new(r"^[A-Za-z_]\w*$").unwrap().is_match(trimmed) {
+            if BARE_IDENT_RE.is_match(trimmed) {
                 Err(format!(
                     "[error_model] references unknown sigma '{}' \
                      (declare it in [parameters])",

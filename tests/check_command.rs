@@ -173,6 +173,14 @@ fn single_endpoint_sigma_order_mismatch_is_reported_as_its_own_code() {
     );
     let report = validate_model_file(model.to_str().unwrap(), None);
     assert!(!report.valid);
+    // Assert the count before indexing, so a regression that reports nothing fails
+    // with this line rather than an opaque index-out-of-bounds panic.
+    assert_eq!(
+        report.diagnostics.len(),
+        1,
+        "expected exactly one diagnostic, got: {:?}",
+        report.diagnostics
+    );
     let d = &report.diagnostics[0];
     assert_eq!(d.code, "E_SIGMA_ORDER_MISMATCH");
     // The message already opens with the block, so attaching one too would print it
