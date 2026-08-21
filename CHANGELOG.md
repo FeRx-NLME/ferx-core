@@ -40,6 +40,40 @@ section of the SDLC for the versioning policy).
   two `ADVAN13` streams differing in one `$DES` line give predictions differing by exactly `F1`,
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
+### Fixed
+- **SAEM no longer lets a fixed-effect-only theta drift away from the marginal optimum (#1011).** The
+  numerical θ/σ M-step assigned NLopt's maximiser outright, re-maximising against a *single* MCMC η
+  draw each iteration — `argmax` of one draw rather than the stochastic-approximation average of
+  `E[argmax]`, a Monte-Carlo bias that does not decay with iteration count. A log-mu-referenced theta
+  was unaffected (its closed-form `log θ += γ·mean(η)` update is already an exact Robbins-Monro
+  average), and Ω was already protected by a per-iteration SA cap; the θ channel was the one left
+  exposed. The M-step result is now blended in as `θ ← θ + γ_θ·(θ* − θ)` with `γ_θ` capped at 0.03
+  during exploration and following the full decaying `γ = 1/(k−k1)` in convergence — the θ-side
+  counterpart of the existing Ω cap. On the FREM `iiv_on_ruv` model of #1011, whose absorption
+  fraction `TVFRD1` carries no ETA, SAEM moves from **0.039 to 0.290** against a marginal −2logL
+  optimum of ≈ 0.29 (NONMEM IMP 0.394, ferx IMP 0.311, IMPMAP 0.318); `TVMAT` 3.020 → 2.686 (NONMEM
+  2.680) and σ 0.213 → 0.170 (NONMEM 0.177). Damping applies **only when NLopt is left estimating a theta
+  that is not mu-referenced** — the shape the bias was measured on, and the same condition the
+  advisory below warns about. A theta that is `FIX`, that is pinned out by the mu-reference shift,
+  or that is mu-referenceable at all (so the exact closed-form `log θ += γ·mean(η)` update is
+  available to it) stays on the undamped update, and a fit whose every estimated theta is one of
+  those is bit-identical to before — `warfarin_saem`, all three of whose thetas are
+  log-mu-referenced, is unchanged. Mu-referencing here means the pairing ferx *detects*: a parameter
+  whose eta is attached in a form ferx cannot pair with a single theta (an additive
+  `X = TVX + ETA_X`, a covariate model that is not log-linear in one theta) counts as un-referenced
+  and is damped, which is the intended side to err on — that theta has no closed-form shift either. Mixture models are excluded: a `MIXNUM`-switched
+  typical value uses the same M-step but must *separate* from a common start before the class
+  assignments settle, and damping that excursion stalls it (a 0.03 cap left `TVCL1 = 1.145` against
+  NONMEM's 1.002 on `tests/nonmem/mixture_iv_saem`), so mixtures keep the undamped update. The bias
+  is reduced, not removed, so the #1011 advisory still fires — attaching an ETA or holding the
+  parameter `FIX` remains the better fix. The cap is exposed as the `mstep_damping` `[fit_options]`
+  key (default `0.03`, must be in `(0, 1]`); smaller damps harder, and **`mstep_damping = 1.0`
+  disables the damping entirely**, restoring the previous behaviour exactly if a model fitted better
+  without it. Setting it on a model it cannot affect warns rather than being silently ignored, and a value
+  outside `(0, 1]` reaching `run_saem` from a programmatic caller that bypassed the parser is
+  clamped with a warning rather than applied (a negative damping would step theta and sigma away
+  from the M-step optimum every iteration).
+
 ### Added
 - **SAEM now warns when an estimated theta carries no ETA at all.** A fixed-effect-only theta is not
   mu-referenced, so it never gets the γ-damped closed-form `log θ += γ·mean(η)` update and is moved

@@ -87,6 +87,153 @@ const SAEM_RUV_OMEGA_LN_GROWTH: f64 = 3.0;
 /// uses the full decaying γ = 1/(k−k1), the same Robbins-Monro schedule as θ.
 const OMEGA_SA_MAX_STEP: f64 = 0.1;
 
+/// Maximum per-iteration stochastic-approximation step for the **numerical θ/σ
+/// M-step** during the exploration phase — the θ-side counterpart of
+/// [`OMEGA_SA_MAX_STEP`] (issue #1011).
+///
+/// A log-mu-referenced θ is updated by the closed-form `log θ += γ·mean(η)`,
+/// which is an exact Robbins-Monro average and therefore already damped. A θ
+/// with **no ETA** has no such channel: it is moved only by NLopt re-maximising
+/// the η-frozen conditional observation likelihood against a *single* MCMC draw.
+/// Assigning that maximiser outright is `argmax` of one draw, not the SA average
+/// of `E[argmax]`, so the estimate carries a Monte-Carlo bias that does not decay
+/// with iteration count — precisely the "single un-equilibrated MCMC draw"
+/// hazard [`OMEGA_SA_MAX_STEP`] exists to prevent for Ω, which the θ channel was
+/// left exposed to.
+///
+/// Measured on the FREM `iiv_on_ruv` reprex of #1011, whose absorption fraction
+/// `TVFRD1` carries no ETA (marginal −2logL optimum ≈ 0.29, NONMEM IMP 0.394):
+///
+/// | exploration cap | TVFRD1 |
+/// |---|---|
+/// | undamped (1.0, pre-#1011) | 0.039 |
+/// | 0.1 | 0.170 |
+/// | **0.03** | **0.290** |
+/// | 0.01 | 0.355 |
+/// | 0.003 | 0.357 |
+///
+/// 0.03 lands on the marginal optimum. Averaging the M-step *objective* over the
+/// last K draws instead reaches only 0.081 at K = 50, and 0.130 at K = 150 for
+/// 15× the wall time, because consecutive SAEM draws are heavily autocorrelated.
+/// Damping the iterate accumulates over every iteration rather than a K-window,
+/// so it is both the more accurate and the cheaper cure.
+///
+/// In the convergence phase the cap is lifted and the full decaying
+/// `γ = 1/(k−k1)` applies, exactly as for Ω.
+const MSTEP_SA_MAX_STEP: f64 = 0.03;
+
+/// Does this fit's numerical θ/σ M-step get the #1011 SA damping?
+///
+/// Only when NLopt is left estimating a θ that **anchors no mu-reference** — the
+/// #1011 shape, and exactly the condition the no-ETA advisory warns on.
+/// `theta_is_mu_ref_anchor` is that predicate, and it is mu-reference *detection*
+/// rather than a scan of ETA usage: an η attached in a form the parser cannot pair
+/// with a θ (an additive `X = TVX + ETA_X`, a non-log-linear covariate model,
+/// #619) counts as un-anchored here and is damped. That is deliberate — such a θ
+/// has no closed-form shift either, so the numerical M-step really is its only
+/// mover, which is the biased channel #1011 is about.
+///
+/// A θ that is `FIX`ed, or pinned out by the closed-form mu-ref shift (`pinned`),
+/// is returned unchanged by NLopt and so has nothing to damp. A free θ that *does*
+/// anchor a mu-reference is not the #1011 channel: it has the exact Robbins-Monro
+/// `log θ += γ·mean(η)` update available, and where that shift is nevertheless
+/// switched off for the fit (`mu_referencing = false`, an identity-packed θ, a
+/// negative lower bound) the numerical M-step it falls back to is the one ferx
+/// shipped before #1011. Damping those too would cap ~85 exploration M-steps at 3%
+/// on a configuration the #1011 anchors never covered, so the gate is kept to the
+/// shape that was measured; every fit whose free thetas all anchor a mu-reference
+/// stays byte-identical to its pre-#1011 result, σ included.
+///
+/// `is_mixture` vetoes it outright. A `MIXNUM`-switched typical value is
+/// estimated by this same numerical M-step (#996 routes it there deliberately,
+/// because SAEM's hard class draw makes the per-class η mean a biased
+/// statistic), but it is solving a different problem: the class typical values
+/// must *separate* from a common start, and the class assignments only stabilise
+/// once they have. Damping that excursion stalls the separation — on
+/// `tests/nonmem/mixture_iv_saem` a 0.03 exploration cap leaves `TVCL1 = 1.145`
+/// against NONMEM's 1.002, and drags the chained IMP marginal with it. Whether
+/// the #1011 bias also affects mixture class θ (it plausibly does) needs its own
+/// schedule and its own anchor, so it is left alone rather than half-fixed; the
+/// no-ETA advisory still fires for those models.
+fn damps_numerical_mstep(
+    is_mixture: bool,
+    n_theta: usize,
+    theta_fixed: &[bool],
+    pinned: &[usize],
+    theta_is_mu_ref_anchor: &[bool],
+) -> bool {
+    if is_mixture {
+        return false;
+    }
+    (0..n_theta).any(|t| {
+        !theta_fixed.get(t).copied().unwrap_or(false)
+            && !pinned.contains(&t)
+            && !theta_is_mu_ref_anchor.get(t).copied().unwrap_or(false)
+    })
+}
+
+/// SA step size for the numerical θ/σ M-step (#1011).
+///
+/// * No θ for the damping to act on (see [`damps_numerical_mstep`]) → `1.0`,
+///   the undamped pre-#1011 assignment, so those fits are byte-identical.
+/// * Exploration → capped at [`MSTEP_SA_MAX_STEP`], the θ-side counterpart of
+///   the [`OMEGA_SA_MAX_STEP`] cap on Ω.
+/// * Convergence → the full decaying `γ = 1/(k−k1)`, same schedule as Ω.
+fn mstep_sa_step(numerically_estimated_theta: bool, exploring: bool, gamma: f64, cap: f64) -> f64 {
+    // `cap >= 1.0` is the documented "off" switch and must restore the pre-#1011
+    // assignment in **both** phases. Returning `gamma` in convergence would still
+    // damp at `1/(k−k1)`, so "off" has to short-circuit here rather than rely on
+    // the `min` below.
+    if !numerically_estimated_theta || cap >= 1.0 {
+        return 1.0;
+    }
+    if exploring {
+        gamma.min(cap)
+    } else {
+        gamma
+    }
+}
+
+/// Sanitise the `mstep_damping` fit option at its point of use.
+///
+/// The parser rejects anything outside `(0, 1]`, but `FitOptions` is public: a
+/// Rust caller — the ferx-r glue, a test, any embedder — can build one directly
+/// and never pass through that validator. The failure would be silent and
+/// severe: a negative γ makes [`damp_mstep`] step θ and σ *away* from the M-step
+/// maximiser on every iteration, and `0.0` freezes both for the whole
+/// exploration phase, neither of which the fit would otherwise report. So clamp
+/// here as well, and return the substituted value so the caller can warn.
+///
+/// `> 1.0` becomes `1.0`, which is what any γ above 1 already meant (the
+/// documented "off" switch). Anything non-finite or `<= 0.0` falls back to the
+/// calibrated default rather than to a hair above zero, since a near-zero cap is
+/// itself a frozen fit. `None` means the value was already in range.
+fn sanitize_mstep_damping(cap: f64) -> Option<f64> {
+    if !cap.is_finite() || cap <= 0.0 {
+        Some(MSTEP_SA_MAX_STEP)
+    } else if cap > 1.0 {
+        Some(1.0)
+    } else {
+        None
+    }
+}
+
+/// Robbins-Monro blend of a numerical M-step result into the running estimate:
+/// `cur += γ·(new − cur)`. `γ >= 1.0` reproduces the undamped assignment
+/// byte-for-byte, which is what a fit with no free numerical θ still does.
+///
+/// A pinned dimension (mu-referenced, or FIXed) is unaffected either way — NLopt
+/// returns it unchanged, so `new == cur` and the blend is a no-op regardless of γ.
+fn damp_mstep(cur: &mut [f64], new: &[f64], gamma: f64) {
+    if gamma >= 1.0 {
+        cur.copy_from_slice(new);
+        return;
+    }
+    for (c, &n) in cur.iter_mut().zip(new.iter()) {
+        *c += gamma * (n - *c);
+    }
+}
+
 /// Raise every *free* diagonal entry of the BSV Ω that has fallen below `floor`
 /// up to `floor`. FIX-ed diagonals (`omega_fixed[i] == true`) are left untouched
 /// — they carry the user's declared variance and must not be perturbed.
@@ -2339,12 +2486,84 @@ pub fn run_saem(
         warnings.push(format!(
             "SAEM: estimated parameter(s) [{}] have NO associated ETA, so they are not \
              mu-referenced and are moved only by the η-frozen numerical M-step. That channel \
-             re-maximises against a single MCMC η draw with no SA damping and can drift far \
-             from the marginal optimum, taking correlated typical values with it. STRONGLY \
-             add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, optionally FIX, \
-             omega — ferx applies mu-referencing automatically), or hold the parameter FIX, \
-             or use FOCEI/IMPMAP.",
+             re-maximises against a single MCMC η draw, so it carries a Monte-Carlo bias that \
+             SA damping (#1011) reduces but does not remove, and it can still settle away from \
+             the marginal optimum. Prefer an ETA on each (e.g. `P = TVP * exp(ETA_P)` with a \
+             small, optionally FIX, omega — ferx applies mu-referencing automatically), or hold \
+             the parameter FIX, or use FOCEI/IMPMAP.",
             thetas_without_eta.join(", ")
+        ));
+    }
+
+    // #1011: is the numerical M-step left estimating a fixed-effect-only θ this
+    // fit? A θ that is FIXed, or pinned out by the closed-form mu-ref shift, is
+    // returned unchanged by NLopt, so there is nothing for the SA damping below
+    // to act on; a free θ that anchors a mu-reference has the exact closed-form
+    // shift available to it, which is not the #1011 bias. Skipping the damping in
+    // both cases keeps those fits byte-identical to the pre-#1011 behaviour (σ
+    // included) — `thetas_without_eta` above lists exactly the θ that do trip it,
+    // under the same mu-ref-detection predicate (see `theta_is_mu_ref_anchor_mask`
+    // for what that does and does not see).
+    //
+    // **Mixtures are excluded.** A `MIXNUM`-switched typical value is estimated
+    // by this same numerical M-step (#996 routes it there deliberately, because
+    // SAEM's hard class draw makes the per-class η mean a biased statistic), but
+    // it is solving a different problem: the class typical values must *separate*
+    // from a common start, and the class assignments only stabilise once they
+    // have. Damping that excursion stalls the separation — measured on
+    // `tests/nonmem/mixture_iv_saem`, a 0.03 exploration cap leaves
+    // `TVCL1 = 1.145` against NONMEM's 1.002, and drags the chained IMP marginal
+    // with it. Whether the #1011 bias also affects mixture class θ (it plausibly
+    // does) needs its own schedule and its own anchor, so it is left alone here
+    // rather than half-fixed; the advisory above still fires for them.
+    let numerically_estimated_theta = {
+        let pinned: Vec<usize> = if !use_closed_form_mstep {
+            Vec::new()
+        } else if saem_mix.is_some() {
+            class_mu_ref_thetas.clone()
+        } else {
+            mu_ref_pairs.iter().map(|&(t, _e)| t).collect()
+        };
+        let theta_is_mu_ref_anchor =
+            crate::estimation::impmap::theta_is_mu_ref_anchor_mask(model, &class_mu_ref_thetas);
+        damps_numerical_mstep(
+            saem_mix.is_some(),
+            n_theta,
+            &init_params.theta_fixed,
+            &pinned,
+            &theta_is_mu_ref_anchor,
+        )
+    };
+
+    // #1011: exploration-phase cap on the numerical M-step's SA step. `None`
+    // takes the calibrated default; `1.0` disables the damping entirely.
+    let mstep_damping_cap = match options.saem_mstep_damping {
+        None => MSTEP_SA_MAX_STEP,
+        Some(v) => match sanitize_mstep_damping(v) {
+            None => v,
+            Some(fixed) => {
+                warnings.push(format!(
+                    "SAEM: `mstep_damping` = {v} is outside (0, 1] — using {fixed} instead. A \
+                     non-positive damping would step theta and sigma away from the M-step \
+                     optimum on every iteration, and zero would freeze them (#1011)."
+                ));
+                fixed
+            }
+        },
+    };
+    // A setting the fit cannot act on is worse than no setting: say so rather
+    // than accepting it silently.
+    if options.saem_mstep_damping.is_some() && !numerically_estimated_theta {
+        let reason = if saem_mix.is_some() {
+            "this is a mixture model, whose class typical values must separate from a common \
+             start before the class assignments settle — damping that excursion stalls it"
+        } else {
+            "every estimated theta in this model is mu-referenced (so it has the exact \
+             closed-form shift available, not the biased fixed-effect-only channel) or is FIX, \
+             so the numerical M-step has no theta to damp"
+        };
+        warnings.push(format!(
+            "SAEM: `mstep_damping` was set but has no effect — {reason} (#1011)."
         ));
     }
 
@@ -2390,6 +2609,17 @@ pub fn run_saem(
         // γ = 1/(k−k1), the same schedule as θ, so the SA estimate settles
         // correctly (the chain is equilibrated by then, so the single-draw
         // overwrite risk that motivated the cap no longer applies).
+        // #1011: SA step for the numerical θ/σ M-step result, mirroring
+        // `gamma_omega`. Capped during exploration so a single un-equilibrated
+        // MCMC draw cannot carry an un-mu-referenced θ away; full decaying γ in
+        // the convergence phase. Left at 1.0 (undamped, pre-#1011) when NLopt has
+        // no θ to estimate, so those fits are unchanged.
+        let gamma_theta = mstep_sa_step(
+            numerically_estimated_theta,
+            k <= k1,
+            gamma,
+            mstep_damping_cap,
+        );
         let gamma_omega = if k <= k1 {
             gamma.min(OMEGA_SA_MAX_STEP)
         } else {
@@ -3042,8 +3272,8 @@ pub fn run_saem(
                     // above), so no class guard is needed here.
                     None,
                 );
-                log_theta = theta_new;
-                log_sigma = sigma_new;
+                damp_mstep(&mut log_theta, &theta_new, gamma_theta);
+                damp_mstep(&mut log_sigma, &sigma_new, gamma_theta);
             } else if use_closed_form_mstep {
                 // ---- Closed-form EM M-step under a mixture (#996) ----
                 //
@@ -3139,8 +3369,8 @@ pub fn run_saem(
                         class_sigma_over: &mix_sigma_over,
                     }),
                 );
-                log_theta = theta_new;
-                log_sigma = sigma_new;
+                damp_mstep(&mut log_theta, &theta_new, gamma_theta);
+                damp_mstep(&mut log_sigma, &sigma_new, gamma_theta);
             } else {
                 // mu_referencing = false (or a mixture whose class thetas could not
                 // be class-aware mu-referenced): full NLopt M-step for all thetas
@@ -3167,8 +3397,8 @@ pub fn run_saem(
                         class_sigma_over: &mix_sigma_over,
                     }),
                 );
-                log_theta = theta_new;
-                log_sigma = sigma_new;
+                damp_mstep(&mut log_theta, &theta_new, gamma_theta);
+                damp_mstep(&mut log_sigma, &sigma_new, gamma_theta);
             }
 
             // #895: clamp any RUV-scaled residual σ that the M-step pushed past its
@@ -3814,6 +4044,235 @@ mod tests {
             !hit.contains("TVCL"),
             "TVCL is mu-referenced and must not be named: {hit}"
         );
+    }
+
+    /// #1011 keys off the fixed-effect-only channel, not off "NLopt has some
+    /// free θ". With `mu_referencing = false` every θ goes through the numerical
+    /// M-step, but a θ that anchors a mu-reference (detected here even though the
+    /// shift is switched off) is not the biased channel — capping those at 3% for
+    /// the whole exploration phase was never anchored, so such a fit keeps the
+    /// pre-#1011 update and `mstep_damping` reports no effect.
+    #[test]
+    fn mstep_damping_is_inert_when_mu_referencing_is_off_but_every_theta_is_anchored() {
+        let model = noeta_model("TVV * exp(ETA_V)");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(406);
+        opts.run_covariance_step = false;
+        opts.mu_referencing = false;
+        opts.saem_mstep_damping = Some(0.01);
+        let ws = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("SAEM Ok")
+            .warnings;
+        assert!(
+            ws.iter()
+                .any(|w| w.contains("`mstep_damping` was set but has no effect")),
+            "expected the no-effect warning, got {ws:?}"
+        );
+    }
+
+    /// A `mstep_damping` that never passed the parser — a Rust caller building
+    /// `FitOptions` directly — must be clamped and reported, not applied: a
+    /// negative γ would walk θ/σ away from the M-step optimum every iteration.
+    #[test]
+    fn out_of_range_mstep_damping_from_a_programmatic_caller_is_clamped() {
+        let model = noeta_model("TVV");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(406);
+        opts.run_covariance_step = false;
+        opts.saem_mstep_damping = Some(-0.5);
+        let ws = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("SAEM Ok")
+            .warnings;
+        let hit = ws
+            .iter()
+            .find(|w| w.contains("is outside (0, 1]"))
+            .unwrap_or_else(|| panic!("expected the clamp warning, got {ws:?}"));
+        assert!(
+            hit.contains("-0.5") && hit.contains(&format!("{MSTEP_SA_MAX_STEP}")),
+            "warning must name the rejected value and the substitute: {hit}"
+        );
+    }
+
+    /// The undamped assignment must be reproduced byte-for-byte at `γ >= 1.0`,
+    /// and a pinned dimension (where NLopt returns `new == cur`) must be a no-op
+    /// at every γ — those two properties are what keep a fit with no free
+    /// numerical θ identical to its pre-#1011 result.
+    #[test]
+    fn damp_mstep_is_a_robbins_monro_blend() {
+        let new = [1.0_f64, -2.0, 0.5];
+
+        // γ = 1 (and above) → straight assignment, bit-for-bit.
+        for g in [1.0_f64, 1.5] {
+            let mut cur = [10.0_f64, 10.0, 10.0];
+            damp_mstep(&mut cur, &new, g);
+            assert_eq!(cur, new, "γ = {g} must assign outright");
+        }
+
+        // 0 < γ < 1 → cur += γ·(new − cur).
+        let mut cur = [0.0_f64, 0.0, 0.0];
+        damp_mstep(&mut cur, &new, 0.25);
+        for (c, n) in cur.iter().zip(new.iter()) {
+            assert!(
+                (c - 0.25 * n).abs() < 1e-15,
+                "expected {}, got {c}",
+                0.25 * n
+            );
+        }
+
+        // γ = 0 → frozen.
+        let mut cur = [3.0_f64, 4.0, 5.0];
+        let before = cur;
+        damp_mstep(&mut cur, &new, 0.0);
+        assert_eq!(cur, before);
+
+        // A pinned dim (new == cur) is untouched at any γ — no drift from the
+        // closed-form mu-ref value the M-step was told to leave alone.
+        for g in [0.0_f64, 0.03, 0.5, 1.0] {
+            let mut cur = [7.0_f64; 3];
+            damp_mstep(&mut cur, &[7.0; 3], g);
+            assert_eq!(cur, [7.0; 3], "pinned dim moved at γ = {g}");
+        }
+    }
+
+    /// The SA schedule: off entirely when NLopt has no θ to estimate (so those
+    /// fits keep their pre-#1011 numbers), capped in exploration, full decaying
+    /// γ in convergence.
+    #[test]
+    fn mstep_sa_step_caps_exploration_and_frees_convergence() {
+        let d = MSTEP_SA_MAX_STEP;
+
+        // No numerically-estimated θ → undamped, in both phases.
+        assert_eq!(mstep_sa_step(false, true, 1.0, d), 1.0);
+        assert_eq!(mstep_sa_step(false, false, 0.002, d), 1.0);
+
+        // Exploration (γ = 1.0) is capped.
+        assert_eq!(mstep_sa_step(true, true, 1.0, d), d);
+        // ...but a γ already below the cap is not raised to it.
+        assert_eq!(mstep_sa_step(true, true, 0.001, d), 0.001);
+        // Convergence uses the full decaying γ, uncapped.
+        assert_eq!(mstep_sa_step(true, false, 0.5, d), 0.5);
+        assert_eq!(mstep_sa_step(true, false, 0.002, d), 0.002);
+
+        // `mstep_damping` overrides the cap.
+        assert_eq!(mstep_sa_step(true, true, 1.0, 0.005), 0.005);
+
+        // Its documented "off" value of 1.0 must restore the undamped pre-#1011
+        // assignment in BOTH phases — convergence included, where the schedule
+        // would otherwise still damp at γ = 1/(k−k1). Regression: `cap = 1.0`
+        // first only lifted the exploration cap, which left the reprex at
+        // TVFRD1 0.047 instead of its true undamped 0.039.
+        assert_eq!(mstep_sa_step(true, true, 1.0, 1.0), 1.0);
+        assert_eq!(mstep_sa_step(true, false, 0.002, 1.0), 1.0);
+        assert_eq!(mstep_sa_step(true, false, 0.5, 1.0), 1.0);
+
+        // The θ cap must be at least as tight as Ω's: the θ channel has no
+        // closed-form averaged alternative, so it is the more exposed of the two.
+        assert!(MSTEP_SA_MAX_STEP <= OMEGA_SA_MAX_STEP);
+    }
+
+    /// The damping gate (#1011). A mixture is vetoed outright; otherwise the
+    /// damping runs exactly when NLopt is left estimating a θ that anchors no
+    /// mu-reference, so an all-mu-referenced or all-`FIX` fit keeps its pre-#1011
+    /// numbers.
+    #[test]
+    fn damps_numerical_mstep_only_for_a_free_unanchored_theta() {
+        let free = [false, false, false];
+        let no_eta = [false, false, false];
+
+        // One free, unpinned θ anchoring no mu-reference (the #1011 shape) → damp.
+        assert!(damps_numerical_mstep(
+            false,
+            3,
+            &free,
+            &[0, 1],
+            &[true, true, false]
+        ));
+        // Every θ pinned by the closed-form mu-ref shift → nothing to damp.
+        assert!(!damps_numerical_mstep(false, 3, &free, &[0, 1, 2], &no_eta));
+        // Every θ FIXed → nothing to damp.
+        assert!(!damps_numerical_mstep(
+            false,
+            3,
+            &[true, true, true],
+            &[],
+            &no_eta
+        ));
+        // Mixed: the only unpinned θ is also FIXed → nothing to damp.
+        assert!(!damps_numerical_mstep(
+            false,
+            3,
+            &[false, false, true],
+            &[0, 1],
+            &no_eta
+        ));
+        // Nothing pinned, but every free θ anchors a mu-reference — the
+        // `mu_referencing = false` / identity-packed shape. Those θ go through
+        // the numerical M-step too, but they have the exact closed-form shift
+        // available, and damping ~85 exploration M-steps to 3% on a configuration
+        // none of the #1011 anchors covered would be a blind change: leave them
+        // undamped.
+        assert!(!damps_numerical_mstep(
+            false,
+            3,
+            &free,
+            &[],
+            &[true, true, true]
+        ));
+        // ...but an un-anchored θ in that same unpinned fit does trip it.
+        assert!(damps_numerical_mstep(
+            false,
+            3,
+            &free,
+            &[],
+            &[true, false, true]
+        ));
+        // No thetas at all (σ-only M-step) → undamped, as before #1011.
+        assert!(!damps_numerical_mstep(false, 0, &[], &[], &[]));
+
+        // A mixture is vetoed even with a free unpinned, un-anchored θ — its class
+        // typical values must separate from a common start before the class
+        // assignments settle, and damping that stalls it.
+        assert!(damps_numerical_mstep(false, 3, &free, &[], &no_eta));
+        assert!(!damps_numerical_mstep(true, 3, &free, &[], &no_eta));
+        assert!(!damps_numerical_mstep(true, 3, &free, &[0, 1], &no_eta));
+    }
+
+    /// `mstep_damping` is validated by the parser, but `FitOptions` is public:
+    /// a programmatic caller can hand `run_saem` a γ the parser would have
+    /// rejected. Those must be clamped, not applied — a negative γ steps θ/σ
+    /// away from the M-step optimum every iteration, and 0.0 freezes them.
+    #[test]
+    fn sanitize_mstep_damping_clamps_out_of_range_values() {
+        // In range → untouched.
+        for v in [f64::MIN_POSITIVE, 0.003, MSTEP_SA_MAX_STEP, 0.5, 1.0] {
+            assert_eq!(sanitize_mstep_damping(v), None, "{v} is in (0, 1]");
+        }
+        // Non-positive / non-finite → back to the calibrated default.
+        for v in [0.0, -0.0, -0.5, f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
+            assert_eq!(
+                sanitize_mstep_damping(v),
+                Some(MSTEP_SA_MAX_STEP),
+                "{v} must fall back to the default"
+            );
+        }
+        // Above 1 already meant "off" → the documented off value.
+        for v in [1.0000001, 2.0, 1e9] {
+            assert_eq!(
+                sanitize_mstep_damping(v),
+                Some(1.0),
+                "{v} must clamp to 1.0"
+            );
+        }
+        // ...and the clamped value must actually disable the damping.
+        assert_eq!(mstep_sa_step(true, true, 1.0, 1.0), 1.0);
     }
 
     /// ...and stays quiet once every estimated θ carries one, so the advisory
