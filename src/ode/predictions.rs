@@ -3409,9 +3409,23 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             // finiteness guard. Value-pathology (a NaN/∞ in `sigma`, a
                             // diverged IPRED) is whole-sim garbage-in, out of scope here.
                             let eps = assay_standard_normal(a.base_seed, decision_index, &m.name);
+                            let noised = latent + var.sqrt() * eps;
                             // Edge (b): an assay cannot read below zero; clamp the
                             // noised value at 0 (BLQ-blinding is deferred to Part F).
-                            (latent + var.sqrt() * eps).max(0.0)
+                            // Gated on the same predicate as the prediction path
+                            // (#1039): "cannot read below zero" is a statement about a
+                            // compartment amount / concentration, not about a Form C
+                            // `[scaling]` readout, which is an arbitrary expression
+                            // (change from baseline, z-score, `sqrt(N)*logit(p)`) and is
+                            // legitimately signed. Without the gate the *same* model
+                            // read `mode = ipred` correctly and `mode = dv` floored at 0,
+                            // so a controller thresholding a signed signal silently saw
+                            // `0` over the whole negative region.
+                            if ode.readout.clamps_negative() {
+                                noised.max(0.0)
+                            } else {
+                                noised
+                            }
                         }
                     };
                     signals.insert(m.name.clone(), value);
