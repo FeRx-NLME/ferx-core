@@ -149,13 +149,26 @@ fn covariance_to_proposal_hessian(
     }
 }
 
-/// Per-θ mask of "carries an ETA", indexed by θ position.
+/// Per-θ mask of "is the anchor of a detected mu-reference", indexed by θ
+/// position — the proxy both the #406 IMP/IMPMAP advisory
+/// ([`non_fixed_thetas_without_eta`]) and the #1011 SAEM M-step damping gate use
+/// for "this θ carries an ETA", read from here so the two cannot drift apart.
 ///
-/// A θ carries an ETA when it is the target of a mu-reference, or when it is a
-/// class θ whose class-aware shift is active this fit. The complement — the
-/// fixed-effect-only set — is what both the #406 IMP/IMPMAP advisory
-/// ([`non_fixed_thetas_without_eta`]) and the #1011 SAEM M-step damping gate key
-/// off, so both read the set from here rather than re-deriving it.
+/// **It is mu-reference *detection*, not a scan of ETA usage.** `true` means the
+/// parser paired this θ with an η it can move by a closed-form shift — the
+/// `TVX * exp(ETA_X)` and logit forms, plus a class θ whose class-aware shift is
+/// active this fit. An η attached in a form the detector does not recognise (an
+/// additive `X = TVX + ETA_X`, a covariate model whose typical value is not
+/// log-linear in one θ, #619) reads as `false` even though an η exists.
+///
+/// That is the right side to err on for both consumers, because both are about
+/// the *channel that moves the θ*, not about η bookkeeping: an un-anchored θ has
+/// no closed-form shift and is moved solely by the numerical / importance-
+/// weighted M-step, which is exactly the biased channel #406 and #1011 are
+/// about. The cost is that the advisory's wording ("no associated ETA") is
+/// stricter than the predicate, and says "attach an ETA" to a model that has one
+/// in an unrecognised form — where the fix is to put it in a mu-referenceable
+/// form, which is the same remedy.
 ///
 /// A MIXNUM-switched typical value carries an ETA in every class arm, so its
 /// class thetas must not be counted as fixed-effect-only (#996) — they are
@@ -167,7 +180,7 @@ fn covariance_to_proposal_hessian(
 /// and in each of those cases the class θ really is estimated by the weighted
 /// M-step alone — exactly the situation these consumers exist for (#996
 /// review). Pass `&[]` where no class-aware shift runs.
-pub(crate) fn theta_has_eta_mask(
+pub(crate) fn theta_is_mu_ref_anchor_mask(
     model: &CompiledModel,
     class_mu_ref_thetas: &[usize],
 ) -> Vec<bool> {
@@ -198,21 +211,23 @@ pub(crate) fn theta_has_eta_mask(
 /// parameter to carry a random effect; ferx applies mu-referencing
 /// automatically, so the user only needs to add the ETA.
 ///
-/// See [`theta_has_eta_mask`] for what counts as carrying an ETA, and for what
+/// See [`theta_is_mu_ref_anchor_mask`] for the exact predicate this uses as the
+/// stand-in for "carries an ETA" — it is mu-reference detection, so an η in a
+/// form the detector does not recognise is reported here too — and for what
 /// `class_mu_ref_thetas` must contain.
 pub(crate) fn non_fixed_thetas_without_eta(
     model: &CompiledModel,
     theta_fixed: &[bool],
     class_mu_ref_thetas: &[usize],
 ) -> Vec<String> {
-    let has_eta = theta_has_eta_mask(model, class_mu_ref_thetas);
+    let anchored = theta_is_mu_ref_anchor_mask(model, class_mu_ref_thetas);
     model
         .theta_names
         .iter()
         .enumerate()
         .filter(|(i, _)| {
             !theta_fixed.get(*i).copied().unwrap_or(false)
-                && !has_eta.get(*i).copied().unwrap_or(false)
+                && !anchored.get(*i).copied().unwrap_or(false)
         })
         .map(|(_, name)| name.clone())
         .collect()

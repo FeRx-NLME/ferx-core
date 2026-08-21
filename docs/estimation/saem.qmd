@@ -200,13 +200,20 @@ entirely**, in both phases, restoring the pre-0.3.x behaviour exactly; that is
 the escape hatch if a model fitted better without it.
 
 The damping is applied only to the channel the bias lives in: a fit is damped
-when NLopt is left estimating a theta that carries **no ETA**, which is exactly
-the situation the advisory above warns about. A theta that is `FIX`, that is
-pinned out by the mu-reference shift, or that simply carries an ETA (so the eta
-absorbs the per-draw misfit) is left on the undamped update, and a fit whose
-every estimated theta is one of those is unaffected down to the last bit — and
-setting `mstep_damping` on such a model warns that it has no effect rather than
-accepting it silently.
+when NLopt is left estimating a theta that is **not mu-referenced**, which is
+exactly the situation the advisory above warns about. A theta that is `FIX`, that
+is pinned out by the mu-reference shift, or that is mu-referenceable at all (so
+the exact closed-form `log θ += γ·mean(η)` update is available to it) is left on
+the undamped update, and a fit whose every estimated theta is one of those is
+unaffected down to the last bit — and setting `mstep_damping` on such a model
+warns that it has no effect rather than accepting it silently.
+
+"Mu-referenced" here means ferx *detected* the pairing — the `TVX * exp(ETA_X)`
+and logit forms. A parameter that carries an eta in a form ferx cannot pair with
+a single theta (an additive `X = TVX + ETA_X`, or a covariate model whose typical
+value is not log-linear in one theta) counts as un-referenced and is damped,
+which is the intended side to err on: that theta has no closed-form shift either,
+so the numerical M-step really is its only mover.
 
 [Mixture models](mixture.qmd) are also excluded. A `MIXNUM`-switched typical
 value goes through the same numerical M-step, but it is solving a different

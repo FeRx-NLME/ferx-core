@@ -124,18 +124,25 @@ const MSTEP_SA_MAX_STEP: f64 = 0.03;
 
 /// Does this fit's numerical θ/σ M-step get the #1011 SA damping?
 ///
-/// Only when NLopt is left estimating a θ that carries **no ETA** — the #1011
-/// shape, and exactly the condition the no-ETA advisory warns on. A θ that is
-/// `FIX`ed, or pinned out by the closed-form mu-ref shift (`pinned`), is returned
-/// unchanged by NLopt and so has nothing to damp. A free θ that *does* carry an
-/// ETA is not the biased channel #1011 is about: the η absorbs the per-draw
-/// misfit, and where the closed-form shift does not run for it (`mu_referencing =
-/// false`, an identity-packed θ, a negative lower bound) it is just the ordinary
-/// numerical M-step ferx shipped before #1011. Damping those too would cap ~85
-/// exploration M-steps at 3% on a configuration the #1011 anchors never covered,
-/// so the gate is kept to the shape that was measured; every fit whose free
-/// thetas all carry an ETA stays byte-identical to its pre-#1011 result, σ
-/// included.
+/// Only when NLopt is left estimating a θ that **anchors no mu-reference** — the
+/// #1011 shape, and exactly the condition the no-ETA advisory warns on.
+/// `theta_is_mu_ref_anchor` is that predicate, and it is mu-reference *detection*
+/// rather than a scan of ETA usage: an η attached in a form the parser cannot pair
+/// with a θ (an additive `X = TVX + ETA_X`, a non-log-linear covariate model,
+/// #619) counts as un-anchored here and is damped. That is deliberate — such a θ
+/// has no closed-form shift either, so the numerical M-step really is its only
+/// mover, which is the biased channel #1011 is about.
+///
+/// A θ that is `FIX`ed, or pinned out by the closed-form mu-ref shift (`pinned`),
+/// is returned unchanged by NLopt and so has nothing to damp. A free θ that *does*
+/// anchor a mu-reference is not the #1011 channel: it has the exact Robbins-Monro
+/// `log θ += γ·mean(η)` update available, and where that shift is nevertheless
+/// switched off for the fit (`mu_referencing = false`, an identity-packed θ, a
+/// negative lower bound) the numerical M-step it falls back to is the one ferx
+/// shipped before #1011. Damping those too would cap ~85 exploration M-steps at 3%
+/// on a configuration the #1011 anchors never covered, so the gate is kept to the
+/// shape that was measured; every fit whose free thetas all anchor a mu-reference
+/// stays byte-identical to its pre-#1011 result, σ included.
 ///
 /// `is_mixture` vetoes it outright. A `MIXNUM`-switched typical value is
 /// estimated by this same numerical M-step (#996 routes it there deliberately,
@@ -153,7 +160,7 @@ fn damps_numerical_mstep(
     n_theta: usize,
     theta_fixed: &[bool],
     pinned: &[usize],
-    theta_has_eta: &[bool],
+    theta_is_mu_ref_anchor: &[bool],
 ) -> bool {
     if is_mixture {
         return false;
@@ -161,7 +168,7 @@ fn damps_numerical_mstep(
     (0..n_theta).any(|t| {
         !theta_fixed.get(t).copied().unwrap_or(false)
             && !pinned.contains(&t)
-            && !theta_has_eta.get(t).copied().unwrap_or(false)
+            && !theta_is_mu_ref_anchor.get(t).copied().unwrap_or(false)
     })
 }
 
@@ -2491,11 +2498,12 @@ pub fn run_saem(
     // #1011: is the numerical M-step left estimating a fixed-effect-only θ this
     // fit? A θ that is FIXed, or pinned out by the closed-form mu-ref shift, is
     // returned unchanged by NLopt, so there is nothing for the SA damping below
-    // to act on; a free θ that carries an ETA is moved by a channel the η can
-    // absorb the per-draw misfit for, which is not the #1011 bias. Skipping the
-    // damping in both cases keeps those fits byte-identical to the pre-#1011
-    // behaviour (σ included) — `thetas_without_eta` above lists exactly the θ
-    // that do trip it.
+    // to act on; a free θ that anchors a mu-reference has the exact closed-form
+    // shift available to it, which is not the #1011 bias. Skipping the damping in
+    // both cases keeps those fits byte-identical to the pre-#1011 behaviour (σ
+    // included) — `thetas_without_eta` above lists exactly the θ that do trip it,
+    // under the same mu-ref-detection predicate (see `theta_is_mu_ref_anchor_mask`
+    // for what that does and does not see).
     //
     // **Mixtures are excluded.** A `MIXNUM`-switched typical value is estimated
     // by this same numerical M-step (#996 routes it there deliberately, because
@@ -2516,14 +2524,14 @@ pub fn run_saem(
         } else {
             mu_ref_pairs.iter().map(|&(t, _e)| t).collect()
         };
-        let theta_has_eta =
-            crate::estimation::impmap::theta_has_eta_mask(model, &class_mu_ref_thetas);
+        let theta_is_mu_ref_anchor =
+            crate::estimation::impmap::theta_is_mu_ref_anchor_mask(model, &class_mu_ref_thetas);
         damps_numerical_mstep(
             saem_mix.is_some(),
             n_theta,
             &init_params.theta_fixed,
             &pinned,
-            &theta_has_eta,
+            &theta_is_mu_ref_anchor,
         )
     };
 
@@ -2550,9 +2558,9 @@ pub fn run_saem(
             "this is a mixture model, whose class typical values must separate from a common \
              start before the class assignments settle — damping that excursion stalls it"
         } else {
-            "every estimated theta in this model carries an ETA (so it is moved by the \
-             mu-reference channel, not the biased fixed-effect-only one) or is FIX, so the \
-             numerical M-step has no theta to damp"
+            "every estimated theta in this model is mu-referenced (so it has the exact \
+             closed-form shift available, not the biased fixed-effect-only channel) or is FIX, \
+             so the numerical M-step has no theta to damp"
         };
         warnings.push(format!(
             "SAEM: `mstep_damping` was set but has no effect — {reason} (#1011)."
@@ -4040,11 +4048,12 @@ mod tests {
 
     /// #1011 keys off the fixed-effect-only channel, not off "NLopt has some
     /// free θ". With `mu_referencing = false` every θ goes through the numerical
-    /// M-step, but a θ that carries an ETA is not the biased channel — capping
-    /// those at 3% for the whole exploration phase was never anchored, so such a
-    /// fit keeps the pre-#1011 update and `mstep_damping` reports no effect.
+    /// M-step, but a θ that anchors a mu-reference (detected here even though the
+    /// shift is switched off) is not the biased channel — capping those at 3% for
+    /// the whole exploration phase was never anchored, so such a fit keeps the
+    /// pre-#1011 update and `mstep_damping` reports no effect.
     #[test]
-    fn mstep_damping_is_inert_when_every_theta_carries_an_eta_without_mu_referencing() {
+    fn mstep_damping_is_inert_when_mu_referencing_is_off_but_every_theta_is_anchored() {
         let model = noeta_model("TVV * exp(ETA_V)");
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
@@ -4170,15 +4179,15 @@ mod tests {
     }
 
     /// The damping gate (#1011). A mixture is vetoed outright; otherwise the
-    /// damping runs exactly when NLopt is left estimating a θ that carries no
-    /// ETA, so an all-mu-referenced, all-ETA or all-`FIX` fit keeps its
-    /// pre-#1011 numbers.
+    /// damping runs exactly when NLopt is left estimating a θ that anchors no
+    /// mu-reference, so an all-mu-referenced or all-`FIX` fit keeps its pre-#1011
+    /// numbers.
     #[test]
-    fn damps_numerical_mstep_only_for_a_free_theta_without_eta() {
+    fn damps_numerical_mstep_only_for_a_free_unanchored_theta() {
         let free = [false, false, false];
         let no_eta = [false, false, false];
 
-        // One free, unpinned θ with no ETA (the #1011 shape) → damp.
+        // One free, unpinned θ anchoring no mu-reference (the #1011 shape) → damp.
         assert!(damps_numerical_mstep(
             false,
             3,
@@ -4204,11 +4213,12 @@ mod tests {
             &[0, 1],
             &no_eta
         ));
-        // No mu-referencing at all, but every free θ carries an ETA — the
+        // Nothing pinned, but every free θ anchors a mu-reference — the
         // `mu_referencing = false` / identity-packed shape. Those θ go through
-        // the numerical M-step too, but the η absorbs the per-draw misfit, and
-        // damping ~85 exploration M-steps to 3% on a configuration none of the
-        // #1011 anchors covered would be a blind change: leave them undamped.
+        // the numerical M-step too, but they have the exact closed-form shift
+        // available, and damping ~85 exploration M-steps to 3% on a configuration
+        // none of the #1011 anchors covered would be a blind change: leave them
+        // undamped.
         assert!(!damps_numerical_mstep(
             false,
             3,
@@ -4216,7 +4226,7 @@ mod tests {
             &[],
             &[true, true, true]
         ));
-        // ...but a fixed-effect-only θ in that same unpinned fit does trip it.
+        // ...but an un-anchored θ in that same unpinned fit does trip it.
         assert!(damps_numerical_mstep(
             false,
             3,
@@ -4227,7 +4237,7 @@ mod tests {
         // No thetas at all (σ-only M-step) → undamped, as before #1011.
         assert!(!damps_numerical_mstep(false, 0, &[], &[], &[]));
 
-        // A mixture is vetoed even with a free unpinned θ with no ETA — its class
+        // A mixture is vetoed even with a free unpinned, un-anchored θ — its class
         // typical values must separate from a common start before the class
         // assignments settle, and damping that stalls it.
         assert!(damps_numerical_mstep(false, 3, &free, &[], &no_eta));

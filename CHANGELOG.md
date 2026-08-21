@@ -53,11 +53,15 @@ section of the SDLC for the versioning policy).
   fraction `TVFRD1` carries no ETA, SAEM moves from **0.039 to 0.290** against a marginal −2logL
   optimum of ≈ 0.29 (NONMEM IMP 0.394, ferx IMP 0.311, IMPMAP 0.318); `TVMAT` 3.020 → 2.686 (NONMEM
   2.680) and σ 0.213 → 0.170 (NONMEM 0.177). Damping applies **only when NLopt is left estimating a theta
-  that carries no ETA** — the shape the bias was measured on, and the same condition the advisory
-  below warns about. A theta that is `FIX`, that is pinned out by the mu-reference shift, or that
-  simply carries an ETA (so the eta absorbs the per-draw misfit) stays on the undamped update, and a
-  fit whose every estimated theta is one of those is bit-identical to before — `warfarin_saem`, all
-  three of whose thetas are log-mu-referenced, is unchanged. Mixture models are excluded: a `MIXNUM`-switched
+  that is not mu-referenced** — the shape the bias was measured on, and the same condition the
+  advisory below warns about. A theta that is `FIX`, that is pinned out by the mu-reference shift,
+  or that is mu-referenceable at all (so the exact closed-form `log θ += γ·mean(η)` update is
+  available to it) stays on the undamped update, and a fit whose every estimated theta is one of
+  those is bit-identical to before — `warfarin_saem`, all three of whose thetas are
+  log-mu-referenced, is unchanged. Mu-referencing here means the pairing ferx *detects*: a parameter
+  whose eta is attached in a form ferx cannot pair with a single theta (an additive
+  `X = TVX + ETA_X`, a covariate model that is not log-linear in one theta) counts as un-referenced
+  and is damped, which is the intended side to err on — that theta has no closed-form shift either. Mixture models are excluded: a `MIXNUM`-switched
   typical value uses the same M-step but must *separate* from a common start before the class
   assignments settle, and damping that excursion stalls it (a 0.03 cap left `TVCL1 = 1.145` against
   NONMEM's 1.002 on `tests/nonmem/mixture_iv_saem`), so mixtures keep the undamped update. The bias
