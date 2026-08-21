@@ -20,6 +20,20 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **A single-endpoint `[error_model]` must now name its sigmas in declaration order (#1001).**
+  A one-line `DV ~ ...` error model consumes its sigmas **positionally** from the `[parameters]`
+  declaration order. The names written in the arguments were checked for existence and then
+  discarded, so `DV ~ proportional(S_SMALL)` bound `S_BIG` whenever `S_BIG` happened to be declared
+  first — and `combined(A, B)` ignored a transposition of its two arguments entirely. The fit
+  converged and every reported SE and diagnostic was internally consistent, so there was nothing to
+  notice; on a 24-observation dataset two sigmas 40× apart moved the objective by 110.7 units
+  (confirmed on both engines against NONMEM 7.6.0, `nonmem_anchor/sigma_order_{small,big}.ctl`).
+  Mismatches are now rejected at parse time with `E_SIGMA_ORDER_MISMATCH`, naming the argument, the
+  sigma that actually occupies the slot, and the fix. This generalises a check that previously fired
+  only when `block_sigma` was present. Per-CMT and covariate-selected error models bind by name and
+  are unaffected, as is a trailing sigma consumed elsewhere (e.g. FREM's `frem_sigma`). **Breaking**
+  for any model that named its sigmas out of order — such a model was already getting a different fit
+  from the one it appeared to describe; reorder either list to fix it.
 - **A dose attribute that is also read by the model is now an error (#993).** `F`,
   `LAGTIME`/`ALAG` and the compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` are applied by the
   engine **at the dose event**. A model that declares one and *also* references it in `[odes]`

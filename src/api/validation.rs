@@ -2906,11 +2906,12 @@ pub fn check_experimental_features(model: &CompiledModel) -> Vec<Diagnostic> {
 
 /// Map a free-text parser error string to a single structured [`Diagnostic`].
 /// Recognises the `"Missing [X] block"` shape (→ `E_MISSING_BLOCK`, with the block
-/// name attached), the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`), and the
-/// dose-attribute double use (→ `E_DOSE_ATTR_DOUBLE_USE`, #993); everything else is
-/// a generic `E_PARSE`. Each shape is matched on a sentinel the emitting site is
-/// pinned to by a test, so a reworded message cannot silently fall through to the
-/// catch-all.
+/// name attached), the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`), the
+/// dose-attribute double use (→ `E_DOSE_ATTR_DOUBLE_USE`, #993), and the
+/// single-endpoint sigma order mismatch (→ `E_SIGMA_ORDER_MISMATCH`, #1001);
+/// everything else is a generic `E_PARSE`. Each shape is matched on a sentinel the
+/// emitting site is pinned to by a test, so a reworded message cannot silently fall
+/// through to the catch-all.
 fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     if let Some(rest) = err.strip_prefix("Missing [") {
         if let Some(end) = rest.find(']') {
@@ -2933,6 +2934,18 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     // it is given — setting both prints it twice.
     if err.contains("reserved dose-attribute name") {
         return Diagnostic::error("E_DOSE_ATTR_DOUBLE_USE", err.to_string());
+    }
+    // #1001: a single-endpoint `[error_model]` naming its sigmas in an order other
+    // than the `[parameters]` declaration order — which used to fit silently against
+    // the leading slots instead. Its own code for the same reason as #993: the remedy
+    // is mechanical (reorder one list), so a consumer can offer it rather than
+    // reprinting prose. The sentinel is the rule clause the emitting arm in
+    // `build_error_spec` always carries.
+    //
+    // No `.with_block()`: the message already opens with `[error_model] `, and the
+    // renderer prefixes whatever block it is given — setting both prints it twice.
+    if err.contains("consumed positionally") {
+        return Diagnostic::error("E_SIGMA_ORDER_MISMATCH", err.to_string());
     }
     Diagnostic::error("E_PARSE", err.to_string())
 }

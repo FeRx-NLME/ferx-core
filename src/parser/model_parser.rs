@@ -2053,7 +2053,6 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // restriction.
     // Capture referenced sigma names before `parsed_error_model` is consumed.
     let used_sigmas_in_error = used_sigma_names(&parsed_error_model, &sigma_names);
-    validate_block_sigma_single_error_order(&parsed_error_model, &block_sigmas, &sigma_names)?;
     // Capture the single-endpoint arguments before `parsed_error_model` is
     // consumed, so the custom residual-magnitude programs (#484) can be built
     // after the [covariates] block is parsed (covariate names are needed to
@@ -11177,37 +11176,6 @@ fn build_residual_correlations(
     Ok(out)
 }
 
-fn validate_block_sigma_single_error_order(
-    parsed_error_model: &ParsedErrorModel,
-    block_sigmas: &[BlockSigmaSpec],
-    sigma_names: &[String],
-) -> Result<(), String> {
-    if block_sigmas.is_empty() {
-        return Ok(());
-    }
-    let ParsedErrorModel::Single(_, error_sigma_args) = parsed_error_model else {
-        return Ok(());
-    };
-    for (idx, arg) in error_sigma_args.iter().enumerate() {
-        let expected = arg_sigma_name(arg, sigma_names)?;
-        let expected = &expected;
-        if sigma_names.get(idx) != Some(expected) {
-            return Err(format!(
-                "block_sigma with a single-endpoint [error_model] requires the \
-                 error-model sigma order to match the leading sigma slots; expected \
-                 '{}' at position {}, got '{}'",
-                sigma_names
-                    .get(idx)
-                    .map(String::as_str)
-                    .unwrap_or("<missing>"),
-                idx + 1,
-                expected
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validate_residual_correlations(
     error_spec: &ErrorSpec,
     correlations: &[ResidualCorrelation],
@@ -11870,11 +11838,67 @@ fn build_error_spec(
     match parsed {
         ParsedErrorModel::Single(model, args) => {
             // Single-endpoint sigmas are consumed positionally from the global
-            // sigma vector. Each argument must scale exactly one declared sigma
-            // (a bare name or a magnitude expression, #484); `arg_sigma_name`
-            // both resolves that sigma and rejects an unknown/typo'd reference.
-            for arg in &args {
-                arg_sigma_name(arg, sigma_names)?;
+            // sigma vector: `ErrorSpec::Single` carries no indices, so every
+            // consumer (`sigma_loadings`, `residual_variance`, `sigma_types`,
+            // the #484 magnitude multipliers, …) reads the *leading* slots.
+            //
+            // Each argument must therefore scale exactly one declared sigma —
+            // `arg_sigma_name` resolves that sigma and rejects an unknown/typo'd
+            // reference — **and** must be the sigma that actually occupies its
+            // slot. Before #1001 the resolved name was discarded here, so
+            // `proportional(S_SMALL)` with `S_BIG` declared first validated,
+            // fitted against `S_BIG`, and reported nothing: the written name was
+            // checked for existence and then ignored. The per-CMT and
+            // covariate-selected arms below bind strictly by name, so without
+            // this the same file meant two different things depending on which
+            // `[error_model]` form it used.
+            //
+            // Rejecting rather than binding by name keeps one resolution rule
+            // for the whole positional path (including `block_sigma`, whose
+            // entries land in the same flat vector — this check generalises the
+            // block_sigma-only guard it replaces). The remedy is mechanical:
+            // reorder the declarations, or reorder the arguments.
+            for (idx, arg) in args.iter().enumerate() {
+                let named = arg_sigma_name(arg, sigma_names)?;
+                match sigma_names.get(idx) {
+                    Some(slot) if *slot == named => {}
+                    Some(slot) => {
+                        return Err(format!(
+                            "[error_model] argument {} names sigma '{}', but a \
+                             single-endpoint [error_model] has its sigmas consumed \
+                             positionally from the [parameters] declaration order, \
+                             which supplies '{}' in that position. Reorder the sigma \
+                             declarations to match the [error_model] argument order \
+                             (or reorder the arguments).",
+                            idx + 1,
+                            named,
+                            slot
+                        ));
+                    }
+                    // Unreachable except by repeating a name: `parse_error_model`
+                    // pins `args.len()` to the model's `n_sigma()`, and every
+                    // argument resolves to a *declared* sigma, so running off the
+                    // end means two arguments claimed the same one. That is a
+                    // count problem, not an ordering one — say so, and do not
+                    // suggest a reordering that cannot help.
+                    None => {
+                        return Err(format!(
+                            "[error_model] {} needs {} declared sigmas but \
+                             [parameters] declares only {}; argument {} names '{}', \
+                             which already fills an earlier slot. Declare one sigma \
+                             per argument.",
+                            match model {
+                                ErrorModel::Additive => "additive",
+                                ErrorModel::Proportional => "proportional",
+                                ErrorModel::Combined => "combined",
+                            },
+                            args.len(),
+                            sigma_names.len(),
+                            idx + 1,
+                            named
+                        ));
+                    }
+                }
             }
             Ok((model, ErrorSpec::Single(model)))
         }

@@ -5312,9 +5312,12 @@ fn test_ruv_magnitude_rejects_covariate_without_covariates_block() {
 
 #[test]
 fn test_parse_full_model_block_sigma_single_endpoint_order_mismatch_errs() {
-    // Single-endpoint error models use the leading sigma slots
-    // positionally; with block_sigma present, reject a name order that
-    // would silently bind the proportional/additive components backwards.
+    // Single-endpoint error models use the leading sigma slots positionally, so
+    // a name order that would bind the proportional/additive components
+    // backwards is rejected. `block_sigma` declares its entries into the same
+    // flat sigma vector, so it reaches the same rule as plain `sigma` lines —
+    // this was the one case the order was enforced in before #1001 generalised
+    // it to every single-endpoint model.
     let content = r#"
 [parameters]
   theta TVCL(0.2)
@@ -5331,7 +5334,162 @@ fn test_parse_full_model_block_sigma_single_endpoint_order_mismatch_errs() {
 "#;
     let err = expect_parse_err(content);
     assert!(
-        err.contains("block_sigma") && err.contains("sigma order"),
+        err.contains("consumed positionally") && err.contains("PROP_ERR"),
+        "got: {err}"
+    );
+}
+
+// ── #1001: single-endpoint sigma names must match declaration order ──────────
+//
+// A single-endpoint `[error_model]` consumes its sigmas positionally from the
+// `[parameters]` declaration order, so the names written in the arguments are
+// only meaningful if they *are* that order. Before #1001 those names were
+// validated (the sigma had to exist) and then discarded, so a model naming them
+// in any other order fitted silently against different sigmas than it reads as
+// describing. These pin the parse-time rejection that replaced the silence.
+
+/// A one-compartment analytical model with the given `[parameters]` sigma
+/// declarations and `[error_model]` statement.
+fn sigma_order_model(sigma_decls: &str, error_stmt: &str) -> String {
+    format!(
+        r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+{sigma_decls}
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  {error_stmt}
+"
+    )
+}
+
+#[test]
+fn single_error_model_wrong_sigma_name_errs() {
+    // The #1001 reproducer: `proportional(S_SMALL)` bound `S_BIG` because
+    // `S_BIG` was declared first (OFV 103.217 rather than the −41.979 the file
+    // reads as describing).
+    let content = sigma_order_model(
+        "  sigma S_BIG ~ 2.0 (sd)\n  sigma S_SMALL ~ 0.05 (sd)",
+        "DV ~ proportional(S_SMALL)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("consumed positionally") && err.contains("S_SMALL") && err.contains("S_BIG"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_declaration_order_match_parses() {
+    // The control for the test above: the same file with the declarations in
+    // the order the `[error_model]` names them is accepted unchanged.
+    let content = sigma_order_model(
+        "  sigma S_SMALL ~ 0.05 (sd)\n  sigma S_BIG ~ 2.0 (sd)",
+        "DV ~ proportional(S_SMALL)",
+    );
+    parse_full_model(&content).expect("declaration order matches the argument order");
+}
+
+#[test]
+fn single_error_model_combined_transposed_args_err() {
+    // `combined(prop, add)` is positional in both directions: transposing the
+    // two arguments used to be a no-op that silently swapped which sigma played
+    // the proportional role.
+    let content = sigma_order_model(
+        "  sigma ADD_ERR ~ 1.0 (sd)\n  sigma PROP_ERR ~ 0.04 (sd)",
+        "DV ~ combined(PROP_ERR, ADD_ERR)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("consumed positionally") && err.contains("PROP_ERR"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_repeated_sigma_arg_errs() {
+    // `combined(S_A, S_A)` parsed and then bound slot 1 to whatever was
+    // declared second — here `S_B`, which the model never names. Rejected as an
+    // ordinary order mismatch at the second argument.
+    let content = sigma_order_model(
+        "  sigma S_A ~ 0.05 (sd)\n  sigma S_B ~ 1.0 (sd)",
+        "DV ~ combined(S_A, S_A)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("consumed positionally") && err.contains("S_B"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_repeated_sigma_arg_without_a_second_sigma_errs() {
+    // The same repetition with only one sigma declared is a different defect —
+    // there is no second sigma to bind at all — so it reports the count rather
+    // than an order mismatch, and must not claim a reordering would fix it.
+    let content = sigma_order_model("  sigma S_A ~ 0.05 (sd)", "DV ~ combined(S_A, S_A)");
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("declares only 1") && !err.contains("consumed positionally"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_trailing_unused_sigma_parses() {
+    // The FREM shape (`examples/warfarin_frem.ferx`): a sigma declared *after*
+    // the error-model sigma and consumed elsewhere (`frem_sigma`, by name) is
+    // untouched by the order rule, and still earns the pre-existing
+    // "not referenced in [error_model]" warning.
+    let content = sigma_order_model(
+        "  sigma PROP_ERR ~ 0.04 (sd)\n  sigma EPSCOV ~ 1.0 (sd)",
+        "DV ~ proportional(PROP_ERR)",
+    );
+    let parsed = parse_full_model(&content).expect("a trailing unused sigma is not an order error");
+    assert!(
+        parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("EPSCOV") && w.contains("not referenced")),
+        "got: {:?}",
+        parsed.model.parse_warnings
+    );
+}
+
+#[test]
+fn single_error_model_magnitude_expression_respects_declaration_order() {
+    // #484 magnitude expressions inherit the positional binding: the multiplier
+    // is stored per argument slot and applied to that slot's sigma, so an
+    // expression scaling `S_SMALL` in argument 1 was applied to `S_BIG`.
+    let content = sigma_order_model(
+        "  sigma S_BIG ~ 2.0 (sd)\n  sigma S_SMALL ~ 0.05 (sd)",
+        "DV ~ proportional(S_SMALL * 2.0)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("consumed positionally") && err.contains("S_SMALL"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_ltbs_respects_declaration_order() {
+    // The LTBS spelling reaches the same `ParsedErrorModel::Single`, so it must
+    // be held to the same rule rather than slipping past on its own regex.
+    let content = sigma_order_model(
+        "  sigma S_BIG ~ 2.0 (sd)\n  sigma ADD_LOG ~ 0.1 (sd)",
+        "log(DV) ~ additive(ADD_LOG)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("consumed positionally") && err.contains("ADD_LOG"),
         "got: {err}"
     );
 }
