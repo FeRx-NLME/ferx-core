@@ -274,10 +274,13 @@ The check runs in the same validation pass as `ferx check`, and fires if `saem`
 appears **anywhere** in a `methods = [...]` chain — so `methods = [saem, focei]`
 fails up front rather than after the SAEM stage has already run.
 
-`imp`, `impmap` and `bayes` refuse `n_eta = 0` for the same reason, but they do so
-**at run time rather than in `ferx check`** — a `methods = [focei, imp]` chain
-still runs its FOCEI stage before the `imp` stage errors, and `ferx check` reports
-the model as valid.
+`imp`, `impmap` and `bayes` are rejected at `n_eta = 0` in the same pass, under the
+code `E_METHOD_NO_RANDOM_EFFECTS` (#1007) — each integrates over the random
+effects, and with none declared the marginal likelihood collapses to the
+observation likelihood FOCE/FOCEI already minimise exactly. Like the SAEM guard
+this fires anywhere in a chain, so `methods = [focei, imp]` fails up front instead
+of after the FOCEI stage has run. Each of the three still refuses at run time as
+well, which is what a direct `fit()` caller bypassing `ferx check` sees.
 
 ## Configuration
 

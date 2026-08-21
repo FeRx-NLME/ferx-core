@@ -1821,6 +1821,67 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // `imp`, `impmap` and `bayes` (#1007) likewise require at least one random
+    // effect: their E-step / sampler integrates over η, and with none declared
+    // the marginal collapses to the observation likelihood that FOCE/FOCEI
+    // already minimise exactly. Each refuses at run time too
+    // (`importance_sampling.rs`, `impmap.rs`, `bayes.rs` — those guards stay as
+    // the backstop for callers that bypass this check); rejecting here as well
+    // means `ferx check` catches it and a `methods = [focei, imp]` chain fails
+    // up front rather than after the FOCEI stage has run. Sibling of the SAEM
+    // guard above — `E_SAEM_NO_RANDOM_EFFECTS` is documented as stable, so it
+    // keeps its code and the three additions share one new code. Note this also
+    // fail-fasts an `imp_eval_only` chain whose IMP failure was previously
+    // downgraded to a warning after the fit: requesting an IMP objective at
+    // n_eta = 0 is a spec contradiction better surfaced before the fit runs.
+    if model.n_eta == 0 {
+        for (method, name) in [
+            (EstimationMethod::Imp, "imp"),
+            (EstimationMethod::Impmap, "impmap"),
+            (EstimationMethod::Bayes, "bayes"),
+        ] {
+            if chain.contains(&method) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_METHOD_NO_RANDOM_EFFECTS",
+                        format!(
+                            "method = {name} requires at least one random effect \
+                             (n_eta = 0). With no random effects the marginal \
+                             likelihood is just the observation likelihood, which \
+                             FOCE/FOCEI minimise exactly. Use method = foce, focei, \
+                             or laplace for a fixed-effects-only (naive-pooled) model."
+                        ),
+                    )
+                    .with_block("fit_options"),
+                );
+            }
+        }
+    }
+
+    // Pure Gauss-Newton at n_eta = 0 (#1006) is start-sensitive rather than
+    // invalid: with no inner EBE loop to absorb a poor `sigma` start, the BHHH
+    // outer-product Hessian over-estimates curvature far from the optimum and
+    // the LM-damped step can collapse — on the `one_cpt_iv_pooled` anchor it
+    // stops 8940 OFV units short, reporting nothing beyond `Converged: NO`.
+    // A warning, not an error, because `gn` does reach the optimum from a good
+    // start; `gn_hybrid` is exempt because its FOCEI polish recovers the
+    // optimum regardless. An unconverged pure-GN run at n_eta = 0 additionally
+    // pushes a post-fit warning (`gauss_newton.rs`), since `Converged: NO` is
+    // the state that actually predicts the bad answer.
+    if model.n_eta == 0 && chain.contains(&EstimationMethod::FoceGn) {
+        diags.push(
+            Diagnostic::warning(
+                "W_GN_NO_RANDOM_EFFECTS",
+                "method = gn on a model with no random effects (n_eta = 0) is \
+                 start-sensitive: without an inner EBE loop to absorb a poor start, \
+                 the BHHH step can collapse far from the optimum and return a badly \
+                 wrong result with no diagnostic beyond Converged: NO. Prefer \
+                 method = gn_hybrid or focei for a fixed-effects-only model.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
     // SDE ([diffusion]) is incompatible with SAEM, with the Gauss-Newton
     // methods, and with the analytic-sensitivity gradient path (EKF estimation
     // requires FD-FOCE/FOCEI).

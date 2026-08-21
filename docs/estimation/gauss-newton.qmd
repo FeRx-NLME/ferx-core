@@ -121,3 +121,11 @@ one, so `gn` is **not recommended** for fixed-effects-only models. From
 FOCEI's −269.6370. FOCEI reaches the optimum from either start. If a
 fixed-effects GN fit stalls, check `sigma` before anything else — or use
 `gn_hybrid`, whose FOCEI polish recovers it.
+
+Since [#1006](https://github.com/FeRx-NLME/ferx-core/issues/1006) the combination
+is flagged rather than left to the reader: `ferx check` emits
+`W_GN_NO_RANDOM_EFFECTS` for `method = gn` at `n_eta = 0`, and a pure-GN run that
+ends `Converged: NO` there adds a post-fit warning saying the result may be badly
+wrong rather than merely imprecise — `Converged: NO` is the state that actually
+predicts the bad answer. `gn_hybrid` is exempt from both, since its FOCEI polish
+recovers the optimum.

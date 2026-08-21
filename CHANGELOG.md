@@ -20,6 +20,18 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **`method = imp`, `impmap` and `bayes` are now rejected by `ferx check` on a model with no
+  random effects (#1007).** All three already refused `n_eta = 0` at run time, so a
+  `methods = [focei, imp]` chain ran its whole FOCEI stage before failing and `ferx check`
+  reported the model as valid. The new `E_METHOD_NO_RANDOM_EFFECTS` diagnostic fires up front,
+  anywhere in a method chain, matching the `saem` guard added in #1002. The run-time errors stay
+  as the backstop for direct `fit()` callers.
+- **`method = gn` on a fixed-effects-only model now warns (#1006).** Pure Gauss-Newton is
+  start-sensitive at `n_eta = 0`: with no inner EBE loop to absorb a poor `sigma` start, the BHHH
+  step can collapse far from the optimum and return a badly wrong answer whose only signal was
+  `Converged: NO`. `ferx check` now emits `W_GN_NO_RANDOM_EFFECTS` pointing at `gn_hybrid` /
+  `focei`, and an unconverged pure-GN run at `n_eta = 0` adds a matching post-fit warning. A
+  warning rather than an error, since `gn` does reach the optimum from a good start.
 - **A dose attribute that is also read by the model is now an error (#993).** `F`,
   `LAGTIME`/`ALAG` and the compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` are applied by the
   engine **at the dose event**. A model that declares one and *also* references it in `[odes]`
