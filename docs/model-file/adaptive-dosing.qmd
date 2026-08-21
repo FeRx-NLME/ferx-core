@@ -182,8 +182,9 @@ expression may be legitimately signed (a change from baseline, a z-score, a
 difference from comparator), so its negative samples reach the controller
 unchanged, exactly as they do under `Ipred`. See
 [Scaling](scaling.qmd#signed-readouts-since-1020). With `sigma → 0` a `Dv`
-monitor therefore reproduces the `Ipred` monitor sample for sample on *any*
-readout, negative samples included.
+monitor therefore reproduces the `Ipred` monitor sample for sample on a Form C
+readout, negative samples included; on the bare-state readout the floor still
+applies, so the two agree only where the latent value is non-negative.
 
 ## Example
 
