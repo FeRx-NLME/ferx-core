@@ -9417,10 +9417,10 @@ fn test_unknown_block_name_is_rejected_with_line_and_valid_set() {
         "near miss should be suggested, got: {err}"
     );
     // The valid set is enumerated, in the `[event_model]: unknown key ...` style.
-    assert!(
-        err.contains("Valid blocks: adaptive_dosing, binary_model"),
-        "{err}"
-    );
+    // Assert on names present in every build — the enumeration is filtered by
+    // the features this binary carries (see `known_block_names`).
+    assert!(err.contains("Valid blocks: adaptive_dosing, "), "{err}");
+    assert!(err.contains("fit_options, "), "{err}");
     assert!(err.contains("structural_model."), "{err}");
 }
 
@@ -9536,6 +9536,65 @@ fn test_known_block_names_are_sorted_and_unique() {
     sorted.dedup();
     assert_eq!(names, sorted, "BLOCK_REGISTRY must be sorted and unique");
     assert!(names.contains(&"fit_options"));
+    // Deprecated names are not valid, so they must never be advertised.
+    assert!(!names.contains(&"initial_values"));
+}
+
+/// The advertised list is what *this* binary accepts. A build without a
+/// feature must not name the blocks it would then refuse — a consumer told to
+/// source the list from the engine (`ferx-r`) would otherwise call
+/// `[markov_model]` valid against a core that rejects it.
+#[test]
+fn test_known_block_names_track_the_build_features() {
+    let names = known_block_names();
+    assert_eq!(
+        names.contains(&"event_model"),
+        cfg!(feature = "survival"),
+        "event_model must be advertised iff `survival` is on"
+    );
+    assert_eq!(
+        names.contains(&"markov_model"),
+        cfg!(feature = "markov"),
+        "markov_model must be advertised iff `markov` is on"
+    );
+    // Ungated blocks are there whatever the build.
+    assert!(names.contains(&"parameters") && names.contains(&"odes"));
+    // A registry entry naming a feature this function does not know can only be
+    // a typo in the table; treat it as enabled so the mistake never rejects a
+    // valid model.
+    assert!(block_feature_enabled("not-a-real-feature"));
+}
+
+/// A block that *was* ferx syntax gets its own code and remediation rather
+/// than a bare "unknown block": `initial_values` predates inline inits, the
+/// parser stopped reading it silently, and `nearest_block_name` finds nothing
+/// close enough to suggest (`initial_conditions` is far past edit distance 2),
+/// so the generic path would leave the user with no explanation at all.
+#[test]
+fn test_deprecated_block_is_rejected_with_its_remediation() {
+    assert_eq!(nearest_block_name("initial_values"), None);
+    let src = model_with_extra_block("[initial_values]\n  theta = [0.2, 10.0]\n  sigma = [0.02]\n");
+    let err = parse_model_string(&src).expect_err("deprecated block must be an error");
+    assert!(
+        err.starts_with("Deprecated block `[initial_values]` (line 16) is no longer read:"),
+        "{err}"
+    );
+    assert!(err.contains("declared inline in `[parameters]`"), "{err}");
+    assert!(err.contains("delete it"), "{err}");
+    // Not the generic bucket: no "valid blocks" dump, no did-you-mean.
+    assert!(!err.contains("Valid blocks"), "{err}");
+}
+
+/// An unknown header written with an instance name is echoed as written, so
+/// the message can be grepped for in the user's own file — and two instances
+/// of the same unknown type are two findings, not one entry that names only
+/// the first.
+#[test]
+fn test_unknown_named_block_reports_its_instance_name() {
+    let src = model_with_extra_block("[foo BAR]\n  k = 1\n\n[foo BAZ]\n  k = 2\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert!(err.contains("`[foo BAR]` (line 16)"), "{err}");
+    assert!(err.contains("`[foo BAZ]` (line 19)"), "{err}");
 }
 
 // ─── [covariate_nn] dot-access + pk_param_fn dispatch (Phase A M1 step 3) ────

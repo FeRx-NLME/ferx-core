@@ -10079,15 +10079,46 @@ const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
     ("structural_model", BlockForm::Unnamed, None),
 ];
 
-/// The name of every `[block]` this build of the parser recognises, in the
+/// Blocks that *were* ferx syntax and are no longer read, with the remediation
+/// to print. Kept separate from [`BLOCK_REGISTRY`] because they are neither
+/// valid (they must not appear in the "valid blocks" enumeration) nor unknown
+/// (a bare "unknown block, did you mean …" is unhelpful for something that was
+/// once the documented spelling, and the nearest valid name is often far enough
+/// away that no did-you-mean fires at all).
+///
+/// `initial_values` is the one live case: initial estimates moved inline into
+/// `[parameters]`, the parser stopped reading the block, and — because unknown
+/// names were silently dropped — nothing ever said so. `ferx-r` still lists it
+/// in its section docs and three of its checked-in example models still carry
+/// one, so this fires for real files (#1040).
+const DEPRECATED_BLOCKS: &[(&str, &str)] = &[(
+    "initial_values",
+    "initial estimates are declared inline in `[parameters]` \
+     (`theta NAME(init, lower, upper)`, `omega NAME ~ variance`); \
+     the block has not been read for several releases — delete it",
+)];
+
+/// The name of every `[block]` **this build** of the parser will accept, in the
 /// order they appear in the error message (alphabetical).
+///
+/// Feature-gated blocks are filtered out when their feature is off: a default
+/// build cannot use `[event_model]`, so listing it as valid would advertise a
+/// name the same binary then rejects with `E_BLOCK_FEATURE_DISABLED`. The
+/// registry itself still *recognises* those names in every build — that is what
+/// makes the rejection a specific "build with `--features …`" error rather than
+/// a bare "unknown block".
 ///
 /// Exposed so downstream consumers (`ferx-r`'s `ferx_model_validate()`,
 /// `ferxtranslate`) can source the block list from the engine instead of
 /// keeping their own copy — the duplicated R-side list had already drifted
-/// from this one (#1040).
+/// from this one (#1040). Because the result is build-dependent, a consumer
+/// must read it from the same binary it will parse with.
 pub fn known_block_names() -> Vec<&'static str> {
-    BLOCK_REGISTRY.iter().map(|(n, _, _)| *n).collect()
+    BLOCK_REGISTRY
+        .iter()
+        .filter(|(_, _, feature)| feature.is_none_or(block_feature_enabled))
+        .map(|(n, _, _)| *n)
+        .collect()
 }
 
 /// Whether the cargo feature a registry entry names is enabled in this build.
@@ -10133,38 +10164,54 @@ pub(crate) fn nearest_block_name(name: &str) -> Option<&'static str> {
 /// Reject any `[block]` header the parser would otherwise drop on the floor.
 ///
 /// `headers` is every header seen, in source order, as
-/// `(type, instance, 1-based line)`. Three silent-drop shapes are caught, in
+/// `(type, instance, 1-based line)`. Four silent-drop shapes are caught, in
 /// the order a user is most likely to hit them:
 ///
-/// 1. an unrecognised block name (`E_UNKNOWN_BLOCK`),
-/// 2. a known block written in the wrong header form — an instance name on a
+/// 1. a block that was ferx syntax and is no longer read
+///    (`E_DEPRECATED_BLOCK`),
+/// 2. an unrecognised block name (`E_UNKNOWN_BLOCK`),
+/// 3. a known block written in the wrong header form — an instance name on a
 ///    block that takes none, or a missing one on `[covariate_nn NAME]`
 ///    (`E_BLOCK_INSTANCE_NAME`),
-/// 3. a known block whose cargo feature this binary was not built with
+/// 4. a known block whose cargo feature this binary was not built with
 ///    (`E_BLOCK_FEATURE_DISABLED`).
 ///
 /// All findings of the first non-empty class are reported together, so an
 /// author fixing a batch of typos sees them in one pass.
 fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), String> {
+    let mut deprecated: Vec<String> = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
     let mut wrong_form: Vec<String> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
-    let mut seen: Vec<(&str, bool)> = Vec::new();
+    let mut seen: Vec<(&str, Option<&str>)> = Vec::new();
 
     for (ty, instance, line) in headers {
-        // Report each distinct (name, named-or-not) shape once, however many
-        // times it is repeated in the file.
-        let key = (ty.as_str(), instance.is_some());
+        // Report each distinct header once, however many times it is repeated.
+        // Keyed on the instance name too, so `[foo A]` and `[foo B]` are two
+        // findings rather than one entry that names only the first.
+        let key = (ty.as_str(), instance.as_deref());
         if seen.contains(&key) {
             continue;
         }
         seen.push(key);
+        // Echo the header exactly as written, instance name included, so the
+        // text is greppable in the user's own file.
+        let header = match instance {
+            Some(inst) => format!("[{ty} {inst}]"),
+            None => format!("[{ty}]"),
+        };
+        if let Some((name, remedy)) = DEPRECATED_BLOCKS.iter().find(|(n, _)| *n == ty) {
+            deprecated.push(format!(
+                "`[{name}]` (line {line}) is no longer read: {remedy}"
+            ));
+            continue;
+        }
         let Some((name, form, feature)) = BLOCK_REGISTRY.iter().find(|(n, _, _)| n == ty) else {
             let hint = match nearest_block_name(ty) {
                 Some(near) => format!(" — did you mean `[{near}]`"),
                 None => String::new(),
             };
-            unknown.push(format!("`[{ty}]` (line {line}){hint}"));
+            unknown.push(format!("`{header}` (line {line}){hint}"));
             continue;
         };
         match (form, instance) {
@@ -10185,6 +10232,9 @@ fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), 
         }
     }
 
+    if !deprecated.is_empty() {
+        return Err(format!("Deprecated block {}.", deprecated.join("; ")));
+    }
     if !unknown.is_empty() {
         return Err(format!(
             "Unknown block {}. Valid blocks: {}.",

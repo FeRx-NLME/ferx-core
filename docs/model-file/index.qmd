@@ -37,7 +37,15 @@ covariance step while `ferx check` still reported `valid: true`.
 The same applies to the instance-name form: `[covariate_nn NAME]` requires a
 name, and every other block refuses one (`E_BLOCK_INSTANCE_NAME`). A block whose
 cargo feature this binary lacks is refused too, rather than quietly dropped
-(`E_BLOCK_FEATURE_DISABLED`).
+(`E_BLOCK_FEATURE_DISABLED`); the valid-set the error message enumerates is
+likewise the set *this* build accepts, so a default build does not advertise
+`[event_model]`.
+
+`[initial_values]` is **not** a block. Initial estimates are declared inline in
+`[parameters]` (`theta NAME(init, lower, upper)`, `omega NAME ~ variance`); the
+separate block predates that and has not been read for several releases. A file
+still carrying one is now rejected with `E_DEPRECATED_BLOCK` naming the
+replacement — delete the block.
 
 ## Minimal Example
 

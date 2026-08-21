@@ -107,6 +107,35 @@ fn unknown_block_is_reported_as_e_unknown_block() {
     let _ = std::fs::remove_file(&model);
 }
 
+/// `[initial_values]` was ferx's own spelling for initial estimates before they
+/// moved inline into `[parameters]`. The parser stopped reading it and — because
+/// unknown names were dropped in silence — never said so. It gets its own code
+/// and a remediation rather than a bare "unknown block", since no valid name is
+/// close enough for a did-you-mean.
+#[test]
+fn deprecated_block_is_reported_as_e_deprecated_block() {
+    let model = temp_model(
+        "deprecated_block",
+        &format!("{COV_MODEL}\n[initial_values]\n  theta = [0.2, 10.0]\n"),
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(
+        !report.valid,
+        "a deprecated block must invalidate the report"
+    );
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_DEPRECATED_BLOCK");
+    assert_eq!(d.block.as_deref(), Some("initial_values"));
+    assert_eq!(d.line, Some(17));
+    assert!(
+        d.message.contains("`[parameters]`") && d.message.contains("delete it"),
+        "message must name the replacement: {}",
+        d.message
+    );
+    assert!(d.suggestion.is_none());
+    let _ = std::fs::remove_file(&model);
+}
+
 /// The same rejection reaches `fit()` through `first_error`, byte-identical —
 /// there is no separate path for the batch and the fail-fast callers.
 #[test]

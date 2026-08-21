@@ -21,6 +21,61 @@ fn unknown_block_maps_to_e_unknown_block_with_block_line_and_suggestion() {
         d.suggestion.as_deref(),
         Some("did you mean `[fit_options]`?")
     );
+    // The line moved into the structured field, so it is gone from the message:
+    // the renderer already prints `fit_option:16` ahead of it.
+    assert_eq!(
+        d.message,
+        "Unknown block `[fit_option]` — did you mean `[fit_options]`. \
+         Valid blocks: adaptive_dosing, fit_options."
+    );
+}
+
+/// With more than one offending header the structured `line` would have to pick
+/// one and mislocate the rest, so none is attached and every parenthetical
+/// stays in the message.
+#[test]
+fn several_unknown_blocks_keep_their_lines_in_the_message() {
+    let err = "Unknown block `[scalings]` (line 16) — did you mean `[scaling]`; \
+               `[outputs]` (line 20) — did you mean `[output]`. Valid blocks: output, scaling.";
+    let d = parse_error_to_diagnostic(err);
+    assert_eq!(d.code, "E_UNKNOWN_BLOCK");
+    assert_eq!(d.block.as_deref(), Some("scalings"));
+    assert!(d.line.is_none());
+    assert_eq!(d.message, err);
+}
+
+/// An unknown header written with an instance name is echoed as written, so the
+/// text can be grepped for in the user's file — but `block` is still the type.
+#[test]
+fn unknown_named_block_keeps_its_instance_name_in_the_message() {
+    let err = "Unknown block `[foo BAR]` (line 9). Valid blocks: parameters.";
+    let d = parse_error_to_diagnostic(err);
+    assert_eq!(d.code, "E_UNKNOWN_BLOCK");
+    assert_eq!(d.block.as_deref(), Some("foo"));
+    assert_eq!(d.line, Some(9));
+    assert!(d.message.contains("`[foo BAR]`"), "{}", d.message);
+}
+
+/// A malformed parenthetical is not a line: the block still transfers, the
+/// message is left alone, and nothing is mis-parsed into `line`.
+#[test]
+fn unparseable_line_parenthetical_is_ignored() {
+    let err = "Unknown block `[foo]` (line later). Valid blocks: parameters.";
+    let d = parse_error_to_diagnostic(err);
+    assert_eq!(d.code, "E_UNKNOWN_BLOCK");
+    assert_eq!(d.block.as_deref(), Some("foo"));
+    assert!(d.line.is_none());
+    assert_eq!(d.message, err);
+}
+
+#[test]
+fn deprecated_block_maps_to_e_deprecated_block() {
+    let err = "Deprecated block `[initial_values]` (line 25) is no longer read: \
+               initial estimates are declared inline in `[parameters]` — delete it.";
+    let d = parse_error_to_diagnostic(err);
+    assert_eq!(d.code, "E_DEPRECATED_BLOCK");
+    assert_eq!(d.block.as_deref(), Some("initial_values"));
+    assert_eq!(d.line, Some(25));
 }
 
 #[test]
@@ -71,6 +126,17 @@ fn covariate_nn_feature_gate_keeps_its_dedicated_code() {
                See plans/dcm-and-low-dim-node.md for the design and roadmap.";
     let d = parse_error_to_diagnostic(err);
     assert_eq!(d.code, "E_NN_FEATURE_DISABLED");
+}
+
+/// `E_BLOCK_FEATURE_DISABLED` is matched on its own sentinel, not taken as the
+/// `else` of the instance-name branch: a future ``Block `[…]`` message that is
+/// neither shape must fall through to `E_PARSE` rather than be mis-coded.
+#[test]
+fn other_block_prefixed_errors_fall_through_to_e_parse() {
+    let d = parse_error_to_diagnostic("Block `[odes]` (line 3) has something else wrong.");
+    assert_eq!(d.code, "E_PARSE");
+    assert!(d.block.is_none());
+    assert!(d.line.is_none());
 }
 
 /// Anything else still falls through to the catch-all.
