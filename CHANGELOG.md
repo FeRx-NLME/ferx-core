@@ -40,6 +40,27 @@ section of the SDLC for the versioning policy).
   two `ADVAN13` streams differing in one `$DES` line give predictions differing by exactly `F1`,
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
+### Fixed
+- **SAEM no longer lets a fixed-effect-only theta drift away from the marginal optimum (#1011).** The
+  numerical θ/σ M-step assigned NLopt's maximiser outright, re-maximising against a *single* MCMC η
+  draw each iteration — `argmax` of one draw rather than the stochastic-approximation average of
+  `E[argmax]`, a Monte-Carlo bias that does not decay with iteration count. A log-mu-referenced theta
+  was unaffected (its closed-form `log θ += γ·mean(η)` update is already an exact Robbins-Monro
+  average), and Ω was already protected by a per-iteration SA cap; the θ channel was the one left
+  exposed. The M-step result is now blended in as `θ ← θ + γ_θ·(θ* − θ)` with `γ_θ` capped at 0.03
+  during exploration and following the full decaying `γ = 1/(k−k1)` in convergence — the θ-side
+  counterpart of the existing Ω cap. On the FREM `iiv_on_ruv` model of #1011, whose absorption
+  fraction `TVFRD1` carries no ETA, SAEM moves from **0.039 to 0.290** against a marginal −2logL
+  optimum of ≈ 0.29 (NONMEM IMP 0.394, ferx IMP 0.311, IMPMAP 0.318); `TVMAT` 3.020 → 2.686 (NONMEM
+  2.680) and σ 0.213 → 0.170 (NONMEM 0.177). Damping applies **only when NLopt actually has a theta
+  to estimate**, so a fit whose every theta is mu-referenced or `FIX` is bit-identical to before;
+  `warfarin_saem` shifts OFV −286.00 → −285.83. Mixture models are excluded: a `MIXNUM`-switched
+  typical value uses the same M-step but must *separate* from a common start before the class
+  assignments settle, and damping that excursion stalls it (a 0.03 cap left `TVCL1 = 1.145` against
+  NONMEM's 1.002 on `tests/nonmem/mixture_iv_saem`), so mixtures keep the undamped update. The bias
+  is reduced, not removed, so the #1011 advisory still fires — attaching an ETA or holding the
+  parameter `FIX` remains the better fix.
+
 ### Added
 - **SAEM now warns when an estimated theta carries no ETA at all.** A fixed-effect-only theta is not
   mu-referenced, so it never gets the γ-damped closed-form `log θ += γ·mean(η)` update and is moved
