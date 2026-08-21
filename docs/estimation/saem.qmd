@@ -184,8 +184,25 @@ convergence. This is the θ-side counterpart of the cap SAEM already applied to
 the Ω sufficient statistic, and it exists for the same reason: a single
 un-equilibrated MCMC draw must not be able to carry a parameter away.
 
+The cap is the `mstep_damping` fit option, and defaults to 0.03:
+
+```
+[fit_options]
+  method        = saem
+  mstep_damping = 0.01   # smaller damps harder; 1.0 turns the damping off
+```
+
+Values must lie in `(0, 1]`. Smaller damps harder — on the model below, 0.01
+moves `TVFRD1` to 0.355 and 0.003 to 0.357, against NONMEM's 0.394 — but tighter
+caps also slow legitimate exploration, and here they pull `TVV` off (129.9 at
+0.01 against NONMEM's 133.8). **`mstep_damping = 1.0` disables the damping
+entirely**, in both phases, restoring the pre-0.3.x behaviour exactly; that is
+the escape hatch if a model fitted better without it.
+
 The damping is applied only when NLopt actually has a θ to estimate. A fit whose
-every theta is mu-referenced or `FIX` is unaffected, down to the last bit.
+every theta is mu-referenced or `FIX` is unaffected, down to the last bit — and
+setting `mstep_damping` on such a model warns that it has no effect rather than
+accepting it silently.
 
 [Mixture models](mixture.qmd) are also excluded. A `MIXNUM`-switched typical
 value goes through the same numerical M-step, but it is solving a different

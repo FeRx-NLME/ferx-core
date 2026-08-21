@@ -2716,6 +2716,62 @@ fn test_apply_fit_option_known_applies() {
     assert_eq!(opts.saem_omega_burnin, 30);
 }
 
+/// `mstep_damping` (#1011) round-trips under both spellings, defaults to `None`
+/// so the calibrated constant applies, and rejects anything outside `(0, 1]` —
+/// `1.0` is the documented "off" value and must stay accepted.
+#[test]
+fn test_mstep_damping_round_trips_and_validates() {
+    let mut opts = FitOptions::default();
+    assert_eq!(
+        opts.saem_mstep_damping, None,
+        "unset must stay None so the MSTEP_SA_MAX_STEP default applies"
+    );
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_damping", "0.01"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_mstep_damping, Some(0.01));
+
+    // The `saem_`-prefixed spelling writes the same field.
+    assert_eq!(
+        apply_fit_option(&mut opts, "saem_mstep_damping", "0.5"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_mstep_damping, Some(0.5));
+
+    // 1.0 disables the damping and is in range.
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_damping", "1.0"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_mstep_damping, Some(1.0));
+
+    for bad in ["0", "-0.1", "1.5"] {
+        let err = apply_fit_option(&mut opts, "mstep_damping", bad)
+            .expect_err("out-of-range mstep_damping must be rejected");
+        assert!(err.contains("(0, 1]"), "got: {err}");
+    }
+    // A rejected value must not have clobbered the last good one.
+    assert_eq!(opts.saem_mstep_damping, Some(1.0));
+}
+
+/// The key is advertised as SAEM-specific, so using it under FOCEI warns rather
+/// than silently doing nothing.
+#[test]
+fn test_mstep_damping_under_focei_warns() {
+    let opts = parse_fit_options(&[
+        "method = focei".to_string(),
+        "mstep_damping = 0.01".to_string(),
+    ])
+    .unwrap();
+    let warnings = opts.unsupported_keys_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("mstep_damping")),
+        "got: {warnings:?}"
+    );
+}
+
 /// Conditional-distribution keys (#257) round-trip into FitOptions, both the
 /// bare and `saem_`-prefixed spellings of the master switch.
 #[test]

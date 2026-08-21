@@ -6546,6 +6546,19 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "n_mh_steps" => opts.saem_n_mh_steps = parse_usize("n_mh_steps")?,
         "n_leapfrog" | "saem_n_leapfrog" => opts.saem_n_leapfrog = parse_usize("n_leapfrog")?,
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
+        "mstep_damping" | "saem_mstep_damping" => {
+            let v = parse_f64("mstep_damping")?;
+            // `1.0` is the documented "off" value (the pre-#1011 assignment), so
+            // the range is half-open at the bottom and closed at the top.
+            if !(v > 0.0 && v <= 1.0) {
+                return Err(
+                    "fit option `mstep_damping` must be in (0, 1] — smaller damps the SAEM \
+                     numerical θ/σ M-step harder, 1.0 disables the damping (#1011)"
+                        .to_string(),
+                );
+            }
+            opts.saem_mstep_damping = Some(v);
+        }
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
         "conddist" | "saem_conddist" => opts.saem_conddist = parse_bool("conddist")?,
         "conddist_nsamp" => opts.saem_conddist_nsamp = parse_usize("conddist_nsamp")?,

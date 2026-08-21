@@ -59,7 +59,10 @@ section of the SDLC for the versioning policy).
   assignments settle, and damping that excursion stalls it (a 0.03 cap left `TVCL1 = 1.145` against
   NONMEM's 1.002 on `tests/nonmem/mixture_iv_saem`), so mixtures keep the undamped update. The bias
   is reduced, not removed, so the #1011 advisory still fires — attaching an ETA or holding the
-  parameter `FIX` remains the better fix.
+  parameter `FIX` remains the better fix. The cap is exposed as the `mstep_damping` `[fit_options]`
+  key (default `0.03`, must be in `(0, 1]`); smaller damps harder, and **`mstep_damping = 1.0`
+  disables the damping entirely**, restoring the previous behaviour exactly if a model fitted better
+  without it. Setting it on a model it cannot affect warns rather than being silently ignored.
 
 ### Added
 - **SAEM now warns when an estimated theta carries no ETA at all.** A fixed-effect-only theta is not

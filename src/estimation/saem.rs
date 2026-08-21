@@ -165,12 +165,16 @@ fn damps_numerical_mstep(
 /// * Exploration → capped at [`MSTEP_SA_MAX_STEP`], the θ-side counterpart of
 ///   the [`OMEGA_SA_MAX_STEP`] cap on Ω.
 /// * Convergence → the full decaying `γ = 1/(k−k1)`, same schedule as Ω.
-fn mstep_sa_step(numerically_estimated_theta: bool, exploring: bool, gamma: f64) -> f64 {
-    if !numerically_estimated_theta {
+fn mstep_sa_step(numerically_estimated_theta: bool, exploring: bool, gamma: f64, cap: f64) -> f64 {
+    // `cap >= 1.0` is the documented "off" switch and must restore the pre-#1011
+    // assignment in **both** phases. Returning `gamma` in convergence would still
+    // damp at `1/(k−k1)`, so "off" has to short-circuit here rather than rely on
+    // the `min` below.
+    if !numerically_estimated_theta || cap >= 1.0 {
         return 1.0;
     }
     if exploring {
-        gamma.min(MSTEP_SA_MAX_STEP)
+        gamma.min(cap)
     } else {
         gamma
     }
@@ -2480,6 +2484,24 @@ pub fn run_saem(
         )
     };
 
+    // #1011: exploration-phase cap on the numerical M-step's SA step. `None`
+    // takes the calibrated default; `1.0` disables the damping entirely.
+    let mstep_damping_cap = options.saem_mstep_damping.unwrap_or(MSTEP_SA_MAX_STEP);
+    // A setting the fit cannot act on is worse than no setting: say so rather
+    // than accepting it silently.
+    if options.saem_mstep_damping.is_some() && !numerically_estimated_theta {
+        let reason = if saem_mix.is_some() {
+            "this is a mixture model, whose class typical values must separate from a common \
+             start before the class assignments settle — damping that excursion stalls it"
+        } else {
+            "every theta in this model is mu-referenced or FIX, so the numerical M-step has no \
+             theta to damp"
+        };
+        warnings.push(format!(
+            "SAEM: `mstep_damping` was set but has no effect — {reason} (#1011)."
+        ));
+    }
+
     // Accumulator for the `obs_nll_sum` (population OFV) evaluations skipped
     // by pinning mu-ref dims out of NLopt's central-FD gradient.  Each pinned
     // dim costs `2 * mstep_maxiter` `obs_nll_sum` calls inside NLopt — that's
@@ -2527,7 +2549,12 @@ pub fn run_saem(
         // MCMC draw cannot carry an un-mu-referenced θ away; full decaying γ in
         // the convergence phase. Left at 1.0 (undamped, pre-#1011) when NLopt has
         // no θ to estimate, so those fits are unchanged.
-        let gamma_theta = mstep_sa_step(numerically_estimated_theta, k <= k1, gamma);
+        let gamma_theta = mstep_sa_step(
+            numerically_estimated_theta,
+            k <= k1,
+            gamma,
+            mstep_damping_cap,
+        );
         let gamma_omega = if k <= k1 {
             gamma.min(OMEGA_SA_MAX_STEP)
         } else {
@@ -4000,17 +4027,31 @@ mod tests {
     /// γ in convergence.
     #[test]
     fn mstep_sa_step_caps_exploration_and_frees_convergence() {
+        let d = MSTEP_SA_MAX_STEP;
+
         // No numerically-estimated θ → undamped, in both phases.
-        assert_eq!(mstep_sa_step(false, true, 1.0), 1.0);
-        assert_eq!(mstep_sa_step(false, false, 0.002), 1.0);
+        assert_eq!(mstep_sa_step(false, true, 1.0, d), 1.0);
+        assert_eq!(mstep_sa_step(false, false, 0.002, d), 1.0);
 
         // Exploration (γ = 1.0) is capped.
-        assert_eq!(mstep_sa_step(true, true, 1.0), MSTEP_SA_MAX_STEP);
+        assert_eq!(mstep_sa_step(true, true, 1.0, d), d);
         // ...but a γ already below the cap is not raised to it.
-        assert_eq!(mstep_sa_step(true, true, 0.001), 0.001);
+        assert_eq!(mstep_sa_step(true, true, 0.001, d), 0.001);
         // Convergence uses the full decaying γ, uncapped.
-        assert_eq!(mstep_sa_step(true, false, 0.5), 0.5);
-        assert_eq!(mstep_sa_step(true, false, 0.002), 0.002);
+        assert_eq!(mstep_sa_step(true, false, 0.5, d), 0.5);
+        assert_eq!(mstep_sa_step(true, false, 0.002, d), 0.002);
+
+        // `mstep_damping` overrides the cap.
+        assert_eq!(mstep_sa_step(true, true, 1.0, 0.005), 0.005);
+
+        // Its documented "off" value of 1.0 must restore the undamped pre-#1011
+        // assignment in BOTH phases — convergence included, where the schedule
+        // would otherwise still damp at γ = 1/(k−k1). Regression: `cap = 1.0`
+        // first only lifted the exploration cap, which left the reprex at
+        // TVFRD1 0.047 instead of its true undamped 0.039.
+        assert_eq!(mstep_sa_step(true, true, 1.0, 1.0), 1.0);
+        assert_eq!(mstep_sa_step(true, false, 0.002, 1.0), 1.0);
+        assert_eq!(mstep_sa_step(true, false, 0.5, 1.0), 1.0);
 
         // The θ cap must be at least as tight as Ω's: the θ channel has no
         // closed-form averaged alternative, so it is the more exposed of the two.
