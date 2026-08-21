@@ -127,6 +127,54 @@ impl Activation {
         }
     }
 
+    /// Solve `f(z) = y` for `z`, or `None` when `y` lies outside the
+    /// activation's range.
+    ///
+    /// Used to turn a declared output value into the output-layer bias that
+    /// produces it (`[covariate_nn] init`). The inverse is exact for every
+    /// activation here, so a declared `init` is realised exactly rather than
+    /// approached.
+    pub fn invert(self, y: f64) -> Option<f64> {
+        if !y.is_finite() {
+            return None;
+        }
+        match self {
+            Activation::Identity => Some(y),
+            // 0 has no unique preimage under ReLU (every z ≤ 0 maps to it), so only
+            // the strictly positive branch is invertible.
+            Activation::Relu => (y > 0.0).then_some(y),
+            Activation::Softplus => {
+                if y <= 0.0 {
+                    None
+                } else if y > 20.0 {
+                    // `apply` returns `x` unchanged past this threshold, so the exact
+                    // inverse of the implemented function is the identity here too.
+                    Some(y)
+                } else {
+                    // `exp_m1` keeps the small-`y` end accurate, where `exp(y) - 1`
+                    // would lose most of its significant digits to cancellation.
+                    Some(y.exp_m1().ln())
+                }
+            }
+            Activation::Tanh => (y.abs() < 1.0).then(|| y.atanh()),
+            Activation::Sigmoid => (y > 0.0 && y < 1.0).then(|| (y / (1.0 - y)).ln()),
+            Activation::Exp => (y > 0.0).then(|| y.ln()),
+        }
+    }
+
+    /// Human-readable description of the activation's range, for error messages
+    /// when [`invert`](Self::invert) declines.
+    pub fn range_description(self) -> &'static str {
+        match self {
+            Activation::Identity => "any finite value",
+            Activation::Relu => "a value > 0",
+            Activation::Softplus => "a value > 0",
+            Activation::Tanh => "a value strictly between -1 and 1",
+            Activation::Sigmoid => "a value strictly between 0 and 1",
+            Activation::Exp => "a value > 0",
+        }
+    }
+
     /// Derivative f'(x). For ReLU at x=0 we return 0 (left-derivative
     /// convention, also what FOCEI implementations typically use).
     #[inline]
@@ -282,6 +330,18 @@ impl MlpMapper {
         let l = self.layers.len() - 1;
         let n_lm1 = self.layers[l - 1];
         self.offsets[l - 1] + n_out * n_lm1 + k
+    }
+
+    /// Index range of the output layer's **weight** block (`W_L`, excluding its
+    /// biases) within the flat weight vector.
+    ///
+    /// Zeroing this block makes the output layer's pre-activation equal its bias
+    /// for every input, which is how a declared `[covariate_nn] init` is made
+    /// exact rather than approximate — see the parser's `init` handling.
+    pub fn output_weight_range(&self) -> std::ops::Range<usize> {
+        let l = self.layers.len() - 1;
+        let start = self.offsets[l - 1];
+        start..self.output_bias_index(0)
     }
 
     /// Forward pass.
@@ -1252,5 +1312,93 @@ mod tests {
         let cl_indiv = tv_cl * eta_cl.exp();
         assert!(cl_indiv > tv_cl); // positive eta increases CL
         assert_relative_eq!(cl_indiv / tv_cl, eta_cl.exp(), epsilon = 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod invert_tests {
+    use super::*;
+    use approx::assert_relative_eq;
+
+    /// `invert` must be the exact inverse of `apply` across each activation's
+    /// range — including the piecewise branches `apply` uses for numerical
+    /// stability, which are the easy place for an inverse to disagree.
+    #[test]
+    fn invert_round_trips_through_apply() {
+        let cases: &[(Activation, &[f64])] = &[
+            (Activation::Identity, &[-3.0, 0.0, 7.5]),
+            (Activation::Relu, &[0.25, 1.0, 40.0]),
+            // Spans the `y > 20` branch of `apply` and the small-`y` end where
+            // `exp(y) - 1` would lose precision to cancellation.
+            (
+                Activation::Softplus,
+                &[1e-8, 1e-3, 0.693_147, 1.0, 10.0, 25.0, 400.0],
+            ),
+            (Activation::Tanh, &[-0.95, 0.0, 0.5]),
+            (Activation::Sigmoid, &[0.01, 0.5, 0.99]),
+            (Activation::Exp, &[1e-6, 1.0, 500.0]),
+        ];
+        for (act, ys) in cases {
+            for &y in *ys {
+                let z = act
+                    .invert(y)
+                    .unwrap_or_else(|| panic!("{:?} should invert {y}", act));
+                assert_relative_eq!(act.apply(z), y, max_relative = 1e-9);
+            }
+        }
+    }
+
+    /// Out-of-range values must decline rather than return a NaN that would
+    /// silently become a NaN weight.
+    #[test]
+    fn invert_declines_outside_the_range() {
+        assert!(Activation::Softplus.invert(0.0).is_none());
+        assert!(Activation::Softplus.invert(-1.0).is_none());
+        assert!(Activation::Exp.invert(0.0).is_none());
+        assert!(Activation::Relu.invert(0.0).is_none());
+        assert!(Activation::Tanh.invert(1.0).is_none());
+        assert!(Activation::Sigmoid.invert(1.0).is_none());
+        assert!(Activation::Sigmoid.invert(0.0).is_none());
+        assert!(Activation::Identity.invert(f64::NAN).is_none());
+        assert!(Activation::Identity.invert(f64::INFINITY).is_none());
+    }
+
+    /// The output-layer weight block must be exactly the entries between the
+    /// last layer's start and its first bias — the range `init` zeroes.
+    #[test]
+    fn output_weight_range_covers_the_last_layer_weights_only() {
+        let mlp = MlpMapper::new(vec![2, 4, 3], Activation::Tanh, Activation::Softplus).unwrap();
+        let r = mlp.output_weight_range();
+        assert_eq!(r.len(), 3 * 4, "W_L is n_out x n_hidden");
+        assert_eq!(r.end, mlp.output_bias_index(0));
+        // And it must not overlap any bias.
+        for k in 0..mlp.n_outputs() {
+            assert!(!r.contains(&mlp.output_bias_index(k)));
+        }
+    }
+
+    /// The property `init` exists to provide: with `W_L` zeroed and the biases
+    /// set to `f^{-1}(v)`, the network emits exactly `v` — for *any* input, so
+    /// every subject starts at the same declared value.
+    #[test]
+    fn zeroed_output_weights_make_the_bias_the_whole_output() {
+        let mlp = MlpMapper::new(vec![2, 4, 3], Activation::Tanh, Activation::Softplus).unwrap();
+        let mut w: Vec<f64> = (0..mlp.n_weights())
+            .map(|i| 0.3 * (i as f64).sin())
+            .collect();
+        for i in mlp.output_weight_range() {
+            w[i] = 0.0;
+        }
+        let targets = [0.75f64, 10.0, 3.5];
+        for (k, &v) in targets.iter().enumerate() {
+            w[mlp.output_bias_index(k)] = Activation::Softplus.invert(v).unwrap();
+        }
+        // Two very different input vectors must give the same output.
+        for x in [[0.0, 0.0], [4.0, -9.0]] {
+            let y = mlp.forward(&x, &w).unwrap();
+            for (k, &v) in targets.iter().enumerate() {
+                assert_relative_eq!(y[k], v, max_relative = 1e-12);
+            }
+        }
     }
 }

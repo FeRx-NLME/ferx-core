@@ -718,6 +718,21 @@ section of the SDLC for the versioning policy).
 ## [0.3.0] - 2026-08-07
 
 ### Added
+- **`init` on `[covariate_nn]`** — one starting value per output, on the parameter's own
+  scale (`init = [1.0, 10.0]` for a CL of 1 L/h and a V of 10 L). **Set this on every
+  DCM.** Without it every output-layer bias starts at 0, so a `softplus` head starts
+  *every* PK parameter at `softplus(0) = 0.693` — a 0.69 L volume regardless of what the
+  parameter means — and the fit begins orders of magnitude away from the data. That is not
+  a slow start, it changes the answer: on a 60-subject busulfan-shaped deep compartment
+  model with identical data and seed, the bare head converged to `−2 log L` 2033.6 with the
+  clearance decline understated 43%, and **reported `converged: true`**; declaring
+  `init = [1.0, 10.0]` reached 1061.0 and recovered the decline. The value is realised
+  exactly rather than approximately — the output-layer weight block is zeroed alongside the
+  biases, so the network emits exactly `init` for every subject at iteration 0 whatever its
+  covariates, and those weights take gradient from the first step. Values must be reachable
+  by the output activation, or the model file is rejected rather than producing a `NaN`
+  weight.
+
 - **`center` / `scale` on `[covariate_nn]`** — per-input normalization, so the network
   sees `(x - center) / scale`. Both default to the identity, leaving existing models
   unchanged. Raw covariates are badly scaled for a neural net: `WT ≈ 70` saturates a
@@ -728,6 +743,21 @@ section of the SDLC for the versioning policy).
   from the data so that `predict()` applies the same transform the fit used — recomputing
   statistics on new data would silently change the model — and so the model file remains
   a complete description of the transform, as `(WT/70)^0.75` already is.
+
+- **`init` on `[covariate_nn]`** — one starting value per output, on the parameter's own
+  scale (`init = [1.0, 10.0]` for a CL of 1 L/h and a V of 10 L). **Set this on every
+  DCM.** Without it every output-layer bias starts at 0, so a `softplus` head starts
+  *every* PK parameter at `softplus(0) = 0.693` — a 0.69 L volume regardless of what the
+  parameter means — and the fit begins orders of magnitude away from the data. That is not
+  a slow start, it changes the answer: on a 60-subject busulfan-shaped deep compartment
+  model with identical data and seed, the bare head converged to `−2 log L` 2033.6 with the
+  clearance decline understated 43%, and **reported `converged: true`**; declaring
+  `init = [1.0, 10.0]` reached 1061.0 and recovered the decline. The value is realised
+  exactly rather than approximately — the output-layer weight block is zeroed alongside the
+  biases, so the network emits exactly `init` for every subject at iteration 0 whatever its
+  covariates, and those weights take gradient from the first step. Values must be reachable
+  by the output activation, or the model file is rejected rather than producing a `NaN`
+  weight.
 
 - **New ODE steppers via `[fit_options] ode_method`,** on two independent axes. For
   **stability**: the linearly implicit Rosenbrock methods `rosenbrock23` (order 2, aliases

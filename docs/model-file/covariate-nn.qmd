@@ -75,6 +75,7 @@ the same data and eta structure but an analytical covariate model.
 | `output`      | no       | Output-layer activation. Use `softplus` or `exp` for positive PK params |
 | `center`      | no       | Per-input value subtracted before the forward pass. One entry per input |
 | `scale`       | no       | Per-input divisor applied after centering. One entry per input; must be finite and non-zero |
+| `init`        | no       | Starting value per output, on the parameter's own scale. One entry per output; must be reachable by the output activation. Strongly recommended — see [Start the network at plausible values](#start-the-network-at-plausible-values-init) |
 
 The header form `[covariate_nn NAME]` requires the **NAME** (e.g.
 `TYPICAL_PK`). NAME is the dot-access prefix in `[individual_parameters]`
@@ -205,6 +206,47 @@ Full per-weight values remain in `result.theta` at indices
 also exposed on each `FitResult.neural_networks[k]` entry). `ferx-r`
 loaders round-trip them losslessly via `fit.json` inside the `.fitrx`
 archive.
+
+## Start the network at plausible values (`init`)
+
+Declare one starting value per output, on the scale the parameter actually has:
+
+```{.ferx}
+[covariate_nn TYPICAL_PK]
+  inputs  = [WT, CRCL]
+  outputs = [CL, V]
+  layers  = [8, 8]
+  activation = tanh
+  output  = softplus
+  center  = [70, 90]
+  scale   = [15, 30]
+  init    = [1.0, 10.0]        # CL ≈ 1 L/h, V ≈ 10 L at iteration 0
+```
+
+**Do this on every DCM.** Without it, every output-layer bias starts at 0, so a
+`softplus` head starts *every* PK parameter at `softplus(0) = 0.693` — a clearance of
+0.69 L/h and a volume of 0.69 L, whatever the model means by them. The initial
+predictions are then wrong by orders of magnitude and the optimizer starts from a
+correspondingly absurd objective.
+
+That is not a slow start; it changes the answer. On a 60-subject busulfan-shaped DCM,
+identical data and seed:
+
+| start | `−2 log L` | KDEC (true 0.01) | `elbo_tightness_ratio` |
+|---|---|---|---|
+| bare head | 2033.6 | 0.0057 | 306.6 |
+| `init = [1.0, 10.0]` | **1061.0** | **0.0126** | **0.54** |
+
+The bare-head fit reported `converged: true`.
+
+The realisation is exact: the output-layer weight block is zeroed alongside the biases,
+so the network emits exactly `init` for every subject at iteration 0, independent of
+covariates. Those weights are not frozen — they take gradient from the first step, and
+the hidden layers from the second.
+
+Values must be reachable by the output activation (`softplus`/`exp`/`relu` need a
+positive value, `sigmoid` needs one in (0, 1), `tanh` one in (−1, 1)); anything else is
+a parse error rather than a `NaN` weight.
 
 ## Weight gradients
 

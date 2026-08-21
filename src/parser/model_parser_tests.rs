@@ -18696,3 +18696,122 @@ fn covariate_nn_rejects_invalid_normalization() {
     build("  center     = [0.0, 0.0]\n  scale      = [1.0, 1.0]\n")
         .expect("identity normalisation parses");
 }
+
+// ---------------------------------------------------------------------------
+// [covariate_nn] `init`
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "nn")]
+fn covariate_nn_init_model_src(init_line: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma ADD ~ 0.1
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT, CRCL]
+  outputs = [CL, V]
+  layers = [4]
+  activation = tanh
+  output = softplus
+{init_line}
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V  = TYPICAL_PK.V  * exp(ETA_V)
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ additive(ADD)
+"#
+    )
+}
+
+/// The behaviour `init` exists for: at the model's default parameters the
+/// network emits exactly the declared values, for every subject's covariates.
+///
+/// Checked at two very different covariate vectors, because the whole point of
+/// zeroing the output-layer weight block is that the starting value does not
+/// depend on the inputs. Setting the bias alone would leave a covariate-dependent
+/// `W_L · a_{L-1}` on top, of the same order as the value being set.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_init_sets_the_starting_outputs_exactly() {
+    use crate::nn::CovariateMapper;
+
+    let model = parse_model_string(&covariate_nn_init_model_src("  init = [1.25, 18.0]\n"))
+        .expect("model with init parses");
+    let theta = model.default_params.theta.clone();
+    let nn = &model.covariate_nns[0];
+    let w = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+
+    for (wt, crcl) in [(70.0, 95.0), (45.0, 150.0)] {
+        let cov = HashMap::from([("WT".to_string(), wt), ("CRCL".to_string(), crcl)]);
+        let out = nn.mapper.forward_raw(w, &cov).expect("forward");
+        assert!(
+            (out[0] - 1.25).abs() < 1e-12,
+            "CL init at WT={wt}: got {}, want 1.25",
+            out[0]
+        );
+        assert!(
+            (out[1] - 18.0).abs() < 1e-12,
+            "V init at WT={wt}: got {}, want 18.0",
+            out[1]
+        );
+    }
+}
+
+/// Without `init` the head starts at `softplus(0) = 0.693` for *every* output —
+/// the behaviour that made a DCM's initial volume 0.69 L. Pinned so the
+/// difference `init` makes is visible in the test suite rather than only in a
+/// changelog entry.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_without_init_starts_every_output_at_softplus_zero() {
+    use crate::nn::CovariateMapper;
+
+    let model = parse_model_string(&covariate_nn_init_model_src("")).expect("model parses");
+    let theta = model.default_params.theta.clone();
+    let nn = &model.covariate_nns[0];
+    let w = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+    let cov = HashMap::from([("WT".to_string(), 70.0), ("CRCL".to_string(), 95.0)]);
+    let out = nn.mapper.forward_raw(w, &cov).expect("forward");
+    // Biases are 0 and W_L is Glorot (not zeroed), so the output is near but not
+    // exactly softplus(0); the point is the *scale* — every output lands around
+    // 0.7 no matter what the parameter means.
+    for &v in &out {
+        assert!(
+            (0.2..2.0).contains(&v),
+            "expected an un-initialised head near softplus(0)=0.693, got {v}"
+        );
+    }
+}
+
+/// `init` must not silently accept a value the head cannot emit — a negative
+/// target under `softplus` would otherwise become a NaN bias and poison every
+/// downstream evaluation.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_init_rejects_values_outside_the_activation_range() {
+    let err = parse_model_string(&covariate_nn_init_model_src("  init = [1.0, -5.0]\n"))
+        .expect_err("a negative softplus target must be rejected");
+    assert!(
+        err.contains("init") && err.contains("softplus"),
+        "error should name the key and the activation: {err}"
+    );
+}
+
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_init_requires_one_entry_per_output() {
+    let err = parse_model_string(&covariate_nn_init_model_src("  init = [1.0]\n"))
+        .expect_err("a short init list must be rejected");
+    assert!(
+        err.contains("one entry per output"),
+        "error should explain the arity: {err}"
+    );
+}

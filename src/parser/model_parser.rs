@@ -9138,6 +9138,7 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         "output",
         "center",
         "scale",
+        "init",
     ];
     for k in fields.keys() {
         if !KNOWN.contains(&k.as_str()) {
@@ -9221,6 +9222,59 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         }
     }
     debug_assert_eq!(theta_names.len(), mapper.n_weights());
+
+    // Optional `init = [v_1, …, v_K]`: one starting value per output, on the scale the
+    // network *emits* (a clearance in L/h, a volume in L) rather than on the weight
+    // scale.
+    //
+    // # Why this exists
+    //
+    // Without it every output-layer bias starts at 0, so a `softplus` head starts every
+    // PK parameter at `softplus(0) = 0.693` — whatever the parameter means. On a
+    // 60-subject busulfan-shaped DCM that put the initial volume at 0.69 L against a true
+    // 10 L, the objective started around 1e12, and variational inference descended into a
+    // basin 889 OFV worse than FOCEI's optimum *and reported convergence there*. Declaring
+    // `init = [1.0, 10.0]` moved the same cold-start fit to within 7 OFV of FOCEI. The
+    // network was never the problem; where it started was.
+    //
+    // The realisation is exact, not approximate: the output-layer weight block is zeroed
+    // alongside the bias, so `z_k = b_k` for every subject regardless of covariates and
+    // the initial output is exactly `v_k`. Setting the bias alone would leave
+    // `W_L · a_{L-1}` riding on top — a covariate-dependent offset of the same order as
+    // the value being set, which is most of the problem still unsolved. The zeroed block
+    // is not frozen: it receives gradient immediately (`∂z_k/∂W_L[k,j] = a_{L-1}[j]`, which
+    // is nonzero), and the hidden layers start receiving gradient one step later, once
+    // `W_L` has moved off zero.
+    if let Some(raw) = fields.get("init") {
+        let values =
+            parse_float_array(raw).map_err(|e| format!("[covariate_nn {}] `init`: {}", name, e))?;
+        let n_out = mapper.mlp().n_outputs();
+        if values.len() != n_out {
+            return Err(format!(
+                "[covariate_nn {}] `init` must have one entry per output: expected {}, got {}",
+                name,
+                n_out,
+                values.len()
+            ));
+        }
+        for i in mapper.mlp().output_weight_range() {
+            theta_inits[i] = 0.0;
+        }
+        for (k, &v) in values.iter().enumerate() {
+            let z = output_activation.invert(v).ok_or_else(|| {
+                format!(
+                    "[covariate_nn {}] `init` entry {} is {}, which the `{}` output \
+                     activation cannot produce — it needs {}",
+                    name,
+                    k + 1,
+                    v,
+                    output_activation.as_str(),
+                    output_activation.range_description()
+                )
+            })?;
+            theta_inits[mapper.mlp().output_bias_index(k)] = z;
+        }
+    }
 
     Ok(CovariateNnSpec {
         name: name.to_string(),
