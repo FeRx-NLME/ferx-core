@@ -5310,6 +5310,24 @@ pub struct FitOptions {
     /// the M-step is still tracking correlated samples.
     pub saem_n_mh_steps: usize,
     pub saem_adapt_interval: usize,
+    /// Exploration-phase cap on the stochastic-approximation step for the
+    /// **numerical θ/σ M-step** (issue #1011); `None` uses the
+    /// `MSTEP_SA_MAX_STEP` default of 0.03.
+    ///
+    /// The M-step result is blended in as `θ ← θ + γ_θ·(θ* − θ)` rather than
+    /// assigned, because assigning it outright is `argmax` of a *single* MCMC η
+    /// draw rather than the SA average of `E[argmax]` — a Monte-Carlo bias that
+    /// does not decay with iteration count for a θ with no ETA. This is the
+    /// θ-side counterpart of the Ω cap; in the convergence phase the cap lifts
+    /// and the full decaying `γ = 1/(k−k1)` applies either way.
+    ///
+    /// Smaller damps harder. **`1.0` disables the damping**, reproducing the
+    /// pre-#1011 assignment exactly. Must be in `(0, 1]`.
+    ///
+    /// Ignored when the numerical M-step has no θ to estimate (every θ
+    /// mu-referenced or `FIX`), and for mixture models — see
+    /// `estimation::saem::damps_numerical_mstep`.
+    pub saem_mstep_damping: Option<f64>,
     /// Number of initial exploration iterations during which the BSV/IOV Ω
     /// M-step is suppressed (Ω held at its initial value) while the MH chain
     /// warms up. Prevents the iteration-1 Ω collapse on sparse data, where a
@@ -5790,6 +5808,7 @@ impl Default for FitOptions {
             saem_n_convergence: 250,
             saem_n_mh_steps: 20,
             saem_adapt_interval: 50,
+            saem_mstep_damping: None,
             saem_omega_burnin: 20,
             saem_seed: None,
             saem_conddist: false,
@@ -6483,6 +6502,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "n_leapfrog",
             "saem_n_leapfrog",
             "adapt_interval",
+            "mstep_damping",
+            "saem_mstep_damping",
             "omega_burnin",
             "conddist",
             "saem_conddist",
