@@ -2934,7 +2934,69 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     if err.contains("reserved dose-attribute name") {
         return Diagnostic::error("E_DOSE_ATTR_DOUBLE_USE", err.to_string());
     }
+    // #1040: the three block-header shapes the parser used to drop silently.
+    // `check_block_names` writes the offending header as ``[name] (line N)``, so
+    // the block / line the check report wants come straight out of the message —
+    // this path has no `ParsedModel` to read `block_lines` from, since a parse
+    // error is terminal.
+    if let Some(rest) = err.strip_prefix("Unknown block `[") {
+        let (block, line) = block_and_line(rest);
+        let mut d = Diagnostic::error("E_UNKNOWN_BLOCK", err.to_string());
+        if let Some(near) = block
+            .as_deref()
+            .and_then(crate::parser::model_parser::nearest_block_name)
+        {
+            d = d.with_suggestion(format!("did you mean `[{near}]`?"));
+        }
+        return attach(d, block, line);
+    }
+    if let Some(rest) = err.strip_prefix("Block `[") {
+        let (block, line) = block_and_line(rest);
+        let code = if err.contains("instance name") {
+            "E_BLOCK_INSTANCE_NAME"
+        } else {
+            "E_BLOCK_FEATURE_DISABLED"
+        };
+        return attach(Diagnostic::error(code, err.to_string()), block, line);
+    }
     Diagnostic::error("E_PARSE", err.to_string())
+}
+
+#[cfg(test)]
+#[path = "tests/block_name_diagnostic_tests.rs"]
+mod block_name_diagnostic_tests;
+
+/// Attach an optional block / line to a diagnostic (builder style, but for
+/// `Option`s).
+fn attach(mut d: Diagnostic, block: Option<String>, line: Option<usize>) -> Diagnostic {
+    if let Some(b) = block {
+        d = d.with_block(b);
+    }
+    if let Some(l) = line {
+        d = d.with_line(l);
+    }
+    d
+}
+
+/// Read the block type and 1-based header line out of the tail of a
+/// `check_block_names` message — `rest` starts just after the opening
+/// ``` `[ ```, e.g. ``covariate_nn X]` (line 7) requires …``. The instance name,
+/// when present, is dropped: `block` names the block *type*, matching every
+/// other block-scoped diagnostic.
+fn block_and_line(rest: &str) -> (Option<String>, Option<usize>) {
+    let block = rest.find(']').map(|end| {
+        rest[..end]
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    });
+    let line = rest
+        .find("(line ")
+        .map(|i| &rest[i + "(line ".len()..])
+        .and_then(|t| t.split(')').next())
+        .and_then(|n| n.parse::<usize>().ok());
+    (block.filter(|b| !b.is_empty()), line)
 }
 
 /// Validate a model file (and optionally a dataset) **without fitting**.

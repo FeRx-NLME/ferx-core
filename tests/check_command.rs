@@ -80,6 +80,50 @@ fn missing_block_is_reported_as_e_missing_block() {
     let _ = std::fs::remove_file(&model);
 }
 
+/// #1040: a misspelled optional block used to leave `ferx check` reporting
+/// `valid: true` while the fit silently ran with the default method and no
+/// covariance step. It is now an error, located at the offending header.
+#[test]
+fn unknown_block_is_reported_as_e_unknown_block() {
+    let model = temp_model(
+        "unknown_block",
+        &format!("{COV_MODEL}\n[fit_option]\n  method = focei\n  covariance = true\n"),
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid, "unknown block must invalidate the report");
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_UNKNOWN_BLOCK");
+    assert_eq!(d.block.as_deref(), Some("fit_option"));
+    assert_eq!(d.line, Some(17));
+    assert_eq!(
+        d.suggestion.as_deref(),
+        Some("did you mean `[fit_options]`?")
+    );
+    assert!(
+        d.message.contains("Valid blocks: "),
+        "message must enumerate the valid set: {}",
+        d.message
+    );
+    let _ = std::fs::remove_file(&model);
+}
+
+/// The same rejection reaches `fit()` through `first_error`, byte-identical —
+/// there is no separate path for the batch and the fail-fast callers.
+#[test]
+fn unknown_block_also_fails_the_parser_directly() {
+    let model = temp_model(
+        "unknown_block_parse",
+        &format!("{COV_MODEL}\n[scalings]\n  V = 1.0\n"),
+    );
+    let err = match parse_full_model_file(Path::new(model.to_str().unwrap())) {
+        Err(e) => e,
+        Ok(_) => panic!("unknown block must fail the parse"),
+    };
+    assert!(err.starts_with("Unknown block `[scalings]`"), "{err}");
+    assert!(err.contains("did you mean `[scaling]`"), "{err}");
+    let _ = std::fs::remove_file(&model);
+}
+
 #[test]
 fn missing_covariate_is_reported_with_data() {
     // bioavailability.csv carries no covariate columns, but the model references WGT.

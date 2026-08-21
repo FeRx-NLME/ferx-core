@@ -11,9 +11,33 @@ ferx-core models are defined in `.ferx` files using a declarative DSL. Each file
 | `[structural_model]` | Yes | Specify the PK model (analytical or ODE) |
 | `[error_model]` | Yes | Define the residual error model |
 | `[odes]` | If ODE | ODE right-hand-side equations |
+| `[adaptive_dosing]` | No | Feedback / TDM dose controller for `simulate()` |
+| `[covariates]` | No | Declare which data columns are covariates (and how they interpolate) |
+| `[covariate_nn NAME]` | No | Neural-network covariate model (needs `--features nn`) |
 | `[data]` | No | Point at the dataset CSV (`$DATA` equivalent); overridden by an explicit CLI/R path |
+| `[data_selection]` | No | Row/subject filters applied to the dataset |
+| `[derived]` | No | Post-hoc derived quantities written to sdtab |
+| `[diffusion]` | No | SDE diffusion terms |
 | `[fit_options]` | No | Configure estimation method and optimizer |
+| `[initial_conditions]` | No | Non-zero compartment initial amounts |
+| `[mixture]` | No | Mixture (subpopulation) model |
+| `[output]` | No | Extra sdtab output columns |
+| `[scaling]` | No | Compartment scaling / observation readouts |
 | `[simulation]` | No | Define a simulation trial design |
+| `[binary_model]` | No | Binary / logistic endpoint (needs `--features survival`) |
+| `[event_model]` | No | Time-to-event endpoint (needs `--features survival`) |
+| `[markov_model]` | No | Continuous-time Markov endpoint (needs `--features markov`) |
+
+Block names are **closed-world**: a header that is not in this table is an error
+(`E_UNKNOWN_BLOCK`), reported with its line number and a did-you-mean when there
+is a near match. A misspelled optional block used to be ignored in silence — a
+`[fit_option]` typo left the fit running with the default method and no
+covariance step while `ferx check` still reported `valid: true`.
+
+The same applies to the instance-name form: `[covariate_nn NAME]` requires a
+name, and every other block refuses one (`E_BLOCK_INSTANCE_NAME`). A block whose
+cargo feature this binary lacks is refused too, rather than quietly dropped
+(`E_BLOCK_FEATURE_DISABLED`).
 
 ## Minimal Example
 

@@ -54,6 +54,9 @@ Optional fields are omitted entirely when absent (not emitted as `null`).
 |------|----------|---------|
 | `E_PARSE` | error | The model file failed to parse (catch-all for parser errors). |
 | `E_MISSING_BLOCK` | error | A required `[block]` is absent. `block` names which one. |
+| `E_UNKNOWN_BLOCK` | error | A `[block]` header is not a recognised block name. The message lists every offending header with its line, the full valid set, and a did-you-mean when there is a near match; `suggestion` carries the near match on its own. See [#1040](https://github.com/FeRx-NLME/ferx-core/issues/1040). |
+| `E_BLOCK_INSTANCE_NAME` | error | A `[block NAME]` instance name is given for a block that takes none (e.g. `[fit_options DOSE]`), or omitted for one that requires it (`[covariate_nn NAME]`). |
+| `E_BLOCK_FEATURE_DISABLED` | error | A recognised block needs a cargo feature this binary was not built with — `[event_model]` / `[binary_model]` need `--features survival`, `[markov_model]` needs `--features markov`. (`[covariate_nn]` has its own `E_NN_FEATURE_DISABLED`.) |
 | `E_NN_FEATURE_DISABLED` | error | A `[covariate_nn]` block requires building with `--features nn`. |
 | `E_MISSING_COVARIATE` | error | The model references a covariate not present in the data (case-sensitive). |
 | `E_ETA_NOT_DECLARED` | error | An unresolved identifier reads as a random effect (`ETA…` / `KAPPA…`) but no `omega` / `kappa` declaration defines it, and the data carries no such column. Usually a deleted `omega` line whose `exp(ETA_…)` term was left behind. |
