@@ -203,6 +203,11 @@ pub fn run_sir(
 
     // --- Build the augmented FitResult ------------------------------------
     let mut out = fit.clone();
+    // Proposal-conditioning notes (rank deficiency / bound-driven shrinkage,
+    // #1021) are the caller's only signal that the SIR CIs are qualified.
+    for w in &sir.warnings {
+        out.warnings.push(format!("SIR: {}", w));
+    }
     out.sir_ci_theta = Some(sir.ci_theta);
     out.sir_ci_omega = Some(sir.ci_omega);
     out.sir_ci_sigma = Some(sir.ci_sigma);
@@ -574,6 +579,44 @@ mod tests {
             "ess = {} out of (0, {}]",
             ess,
             opts.sir_samples
+        );
+    }
+
+    /// #1021: the covariance step floors non-identified eigenvalues of the FD
+    /// Hessian before inverting it, so such a direction comes back in
+    /// `covariance_matrix` with a variance of ~1/floor. Sampling that direction
+    /// unshrunk put every SIR draw outside the packed bounds, and SIR failed
+    /// with the uninformative "All SIR samples had invalid weights". The
+    /// proposal is now capped at the bounds: SIR runs, and says so.
+    #[test]
+    fn run_sir_survives_an_explosive_proposal_direction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (model_path, data_path) = copy_example_to_tempdir(dir.path());
+
+        let opts = quick_opts();
+        let Some(mut fit) = fit_with_cov_or_skip(
+            model_path.to_str().unwrap(),
+            data_path.to_str().unwrap(),
+            opts.clone(),
+        ) else {
+            return;
+        };
+
+        // Inflate one free direction to the magnitude an eigenvalue-floored
+        // Hessian produces. Adding to a diagonal keeps the matrix PSD, so this
+        // is a covariance a real fit could hand us — not a malformed input.
+        let mut cov = fit.covariance_matrix.clone().expect("covariance present");
+        cov[(0, 0)] += 1e8;
+        fit.covariance_matrix = Some(cov);
+
+        let out = run_sir(&fit, None, None, &opts)
+            .expect("SIR must survive an eigenvalue-floored proposal direction");
+        let ess = out.sir_ess.expect("sir_ess populated");
+        assert!(ess > 0.0, "ess = {ess}");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("shrunk")),
+            "the shrinkage must be reported to the user: {:?}",
+            out.warnings
         );
     }
 

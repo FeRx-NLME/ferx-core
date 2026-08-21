@@ -10,7 +10,7 @@
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
-    compute_bounds, compute_mu_k, pack_params, packed_fixed_mask, unpack_params,
+    compute_bounds, compute_mu_k, coordinate_names, pack_params, packed_fixed_mask, unpack_params,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -34,6 +34,307 @@ pub struct SirResult {
     /// `FitOptions.sir_keep_samples = true`. `None` otherwise.
     /// Length equals `FitOptions.sir_resamples` when populated.
     pub resamples_packed: Option<Vec<Vec<f64>>>,
+    /// Diagnostics about the proposal that callers should surface to the user
+    /// — currently the rank deficiency and the bound-driven shrinkage the
+    /// proposal needed (#1021). Empty on a clean run.
+    pub warnings: Vec<String>,
+}
+
+/// How many proposal standard deviations must fit inside the packed parameter
+/// bounds. A direction wider than `bound width / PROPOSAL_BOUND_SIGMAS` is not
+/// merely inefficient: every draw along it fails the bounds check in the weight
+/// loop, and SIR degenerates to "All SIR samples had invalid weights" (#1021).
+/// `4.0` (±2 sd inside the declared bounds) is deliberately generous: the cap is
+/// meant to catch a proposal direction that is *wider than the box the parameter
+/// is allowed to live in* — the signature of an eigenvalue-floored, non-identified
+/// direction — not to trim a genuinely wide but legitimate one. A tighter cap
+/// would silently narrow the CIs of a parameter whose real uncertainty fills its
+/// user-declared bounds.
+const PROPOSAL_BOUND_SIGMAS: f64 = 4.0;
+
+/// Relative floor for near-null proposal directions, mirroring the Hessian
+/// floor in [`crate::estimation::covariance::invert_psd_with_floor`].
+const PROPOSAL_EIG_FLOOR_REL: f64 = 1e-10;
+
+/// Loadings below this magnitude are not reported when naming the parameters
+/// that make up a degenerate or shrunk proposal direction.
+const DIRECTION_LOADING_MIN: f64 = 0.15;
+
+/// Why a proposal sample contributed no weight. Tallied so a run in which
+/// *every* sample is rejected can say which check did the rejecting (#1021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleOutcome {
+    Accepted,
+    /// Packed coordinate index that fell outside its bound.
+    OutOfBounds(usize),
+    NonPositiveParams,
+    NonFiniteOfv,
+    Cancelled,
+}
+
+/// A SIR proposal that has been made safe to sample from, plus a record of
+/// what had to be done to the raw covariance to get there.
+#[derive(Debug, Clone)]
+pub(crate) struct ConditionedProposal {
+    /// Lower-triangular Cholesky factor of the conditioned free-block covariance.
+    pub chol: DMatrix<f64>,
+    /// `log|C|` of the conditioned free block, taken from the (modified)
+    /// eigenvalues rather than the Cholesky diagonal.
+    pub log_det: f64,
+    /// Directions with effectively zero variance — the rank deficiency that
+    /// remains *after* FIX-ed parameters have been removed. Described as
+    /// "PAR_A +0.71, PAR_B -0.70".
+    pub null_dirs: Vec<String>,
+    /// Directions shrunk to keep draws inside the packed bounds, worst first.
+    pub capped_dirs: Vec<String>,
+}
+
+impl ConditionedProposal {
+    /// User-facing notes about the conditioning, empty when the raw covariance
+    /// needed no repair.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.null_dirs.is_empty() {
+            out.push(format!(
+                "proposal covariance is rank-deficient beyond the FIX-ed parameters: \
+                 {} direction(s) carry no uncertainty [{}]. SIR holds those parameter \
+                 combinations at their ML values, so their CIs are not explored — \
+                 they are not identified by the data.",
+                self.null_dirs.len(),
+                self.null_dirs.join("; ")
+            ));
+        }
+        if !self.capped_dirs.is_empty() {
+            out.push(format!(
+                "proposal was shrunk in {} direction(s) so draws stay inside the \
+                 parameter bounds [{}]. Those directions come from eigenvalue-floored \
+                 (non-identified) curvature in the covariance step; the SIR CIs along \
+                 them understate the true uncertainty.",
+                self.capped_dirs.len(),
+                self.capped_dirs.join("; ")
+            ));
+        }
+        out
+    }
+}
+
+/// Name the parameters that load on eigenvector column `col`, largest first.
+fn describe_direction(eigenvectors: &DMatrix<f64>, col: usize, names: &[String]) -> String {
+    let mut loadings: Vec<(usize, f64)> = (0..eigenvectors.nrows())
+        .map(|k| (k, eigenvectors[(k, col)]))
+        .filter(|(_, v)| v.abs() >= DIRECTION_LOADING_MIN)
+        .collect();
+    loadings.sort_by(|a, b| {
+        b.1.abs()
+            .partial_cmp(&a.1.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    loadings.truncate(3);
+    if loadings.is_empty() {
+        return "no dominant parameter".to_string();
+    }
+    loadings
+        .iter()
+        .map(|(k, v)| {
+            let name = names.get(*k).map(String::as_str).unwrap_or("?");
+            format!("{name} {v:+.2}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Turn the free-block covariance into a proposal SIR can sample from.
+///
+/// Each eigen-direction's variance is
+///  * floored at `λ_max · PROPOSAL_EIG_FLOOR_REL` when it is ≤ 0 or negligible
+///    (a ridge / rank deficiency that survived the FIX exclusion), and
+///  * capped so that `sqrt(λ)·|v_k| ≤ half_widths[k]` for every coordinate `k`
+///    the direction loads on — i.e. ±2 sd of the proposal stays inside the
+///    packed parameter bounds.
+///
+/// The cap is what makes SIR survive a covariance matrix whose non-identified
+/// directions were eigenvalue-floored during inversion: those come back with
+/// variances around `1/floor` (1e7 and up in packed log-space), which without a
+/// cap puts every single draw outside the bounds (#1021).
+pub(crate) fn condition_free_proposal(
+    sub_cov: &DMatrix<f64>,
+    half_widths: &[f64],
+    names: &[String],
+) -> Result<ConditionedProposal, String> {
+    let n = sub_cov.nrows();
+    debug_assert_eq!(
+        n,
+        sub_cov.ncols(),
+        "condition_free_proposal needs a square block"
+    );
+    debug_assert_eq!(n, half_widths.len(), "one half-width per free coordinate");
+
+    let sym = (sub_cov + sub_cov.transpose()) * 0.5;
+    let eig = sym.symmetric_eigen();
+    if eig.eigenvalues.iter().any(|v| !v.is_finite()) {
+        return Err(
+            "SIR proposal covariance has non-finite eigenvalues — the covariance step \
+             produced an unusable matrix; re-run the fit with `covariance = true` and \
+             check the covariance warnings."
+                .to_string(),
+        );
+    }
+    // Pass 1 — cap each direction at the widest variance that keeps
+    // ±(PROPOSAL_BOUND_SIGMAS / 2) standard deviations inside the packed bounds
+    // of every coordinate it loads on.
+    let caps: Vec<f64> = (0..n)
+        .map(|i| {
+            let mut cap = f64::INFINITY;
+            for (k, &w) in half_widths.iter().enumerate() {
+                let load = eig.eigenvectors[(k, i)].abs();
+                if load > 1e-8 {
+                    cap = cap.min((w / load).powi(2));
+                }
+            }
+            cap
+        })
+        .collect();
+    let capped_eigs: Vec<f64> = (0..n).map(|i| eig.eigenvalues[i].min(caps[i])).collect();
+
+    // The near-null floor is anchored on the *capped* spectrum, not the raw one.
+    // An eigenvalue-floored direction can come back at 1e7+; anchoring on it
+    // would put the relative floor at ~1e-3 and flag every genuinely
+    // well-determined direction (variance ~1e-4) as null — inflating real,
+    // informative variances by orders of magnitude.
+    let max_eig = capped_eigs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+    if max_eig <= 0.0 {
+        return Err(
+            "SIR proposal covariance has no positive eigenvalue — there is no uncertainty \
+             direction to sample; the covariance step carries no usable information."
+                .to_string(),
+        );
+    }
+    let floor = (max_eig * PROPOSAL_EIG_FLOOR_REL).max(1e-12);
+
+    // Pass 2 — apply the floor to the capped spectrum and record what changed.
+    let mut lambdas = DVector::zeros(n);
+    let mut null_dirs = Vec::new();
+    let mut capped: Vec<(f64, String)> = Vec::new();
+    for i in 0..n {
+        let raw = eig.eigenvalues[i];
+        let mut lam = capped_eigs[i];
+        if raw > caps[i] && caps[i] >= floor {
+            capped.push((
+                (raw / caps[i]).sqrt(),
+                format!(
+                    "{} (sd {:.2e} → {:.2e})",
+                    describe_direction(&eig.eigenvectors, i, names),
+                    raw.sqrt(),
+                    caps[i].sqrt()
+                ),
+            ));
+        }
+        if lam < floor {
+            null_dirs.push(describe_direction(&eig.eigenvectors, i, names));
+            lam = floor;
+        }
+        // A coordinate pinned to a zero-width bound would cap at exactly 0;
+        // keep the proposal strictly PD so the Cholesky below succeeds.
+        lambdas[i] = lam.max(1e-12);
+    }
+    capped.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let cov_raw =
+        &eig.eigenvectors * DMatrix::from_diagonal(&lambdas) * eig.eigenvectors.transpose();
+    let cov = (&cov_raw + cov_raw.transpose()) * 0.5;
+    let chol = cov
+        .clone()
+        .cholesky()
+        .or_else(|| {
+            // Eigen-reconstruction can leave a sub-ULP indefinite remainder;
+            // a jitter proportional to the spectrum recovers it.
+            let jitter = DMatrix::identity(n, n) * (max_eig * 1e-12).max(1e-14);
+            (&cov + jitter).cholesky()
+        })
+        .ok_or_else(|| {
+            "SIR proposal covariance could not be made positive definite after \
+             eigenvalue conditioning."
+                .to_string()
+        })?
+        .l();
+
+    Ok(ConditionedProposal {
+        chol,
+        log_det: lambdas.iter().map(|l| l.ln()).sum::<f64>(),
+        null_dirs,
+        capped_dirs: capped.into_iter().map(|(_, d)| d).collect(),
+    })
+}
+
+/// Build the error returned when no proposal sample earned a finite weight.
+///
+/// The bare "All SIR samples had invalid weights" gave no hint of *why*; this
+/// reports the rejection tally, the coordinates whose bounds were overshot, and
+/// the proposal's rank/shrinkage diagnostics (#1021).
+fn all_invalid_weights_message(
+    outcomes: &[SampleOutcome],
+    coord_names: &[String],
+    conditioned: &ConditionedProposal,
+) -> String {
+    let mut n_bounds = 0usize;
+    let mut n_nonpos = 0usize;
+    let mut n_ofv = 0usize;
+    let mut n_cancelled = 0usize;
+    let mut per_coord: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for o in outcomes {
+        match *o {
+            SampleOutcome::OutOfBounds(i) => {
+                n_bounds += 1;
+                *per_coord.entry(i).or_insert(0) += 1;
+            }
+            SampleOutcome::NonPositiveParams => n_nonpos += 1,
+            SampleOutcome::NonFiniteOfv => n_ofv += 1,
+            SampleOutcome::Cancelled => n_cancelled += 1,
+            SampleOutcome::Accepted => {}
+        }
+    }
+    let mut msg = format!(
+        "All {} SIR samples had invalid weights (rejected: {} out of bounds, {} \
+         non-positive theta/sigma/omega, {} non-finite OFV, {} cancelled).",
+        outcomes.len(),
+        n_bounds,
+        n_nonpos,
+        n_ofv,
+        n_cancelled
+    );
+    if !per_coord.is_empty() {
+        let mut top: Vec<(usize, usize)> = per_coord.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        top.truncate(3);
+        let listed = top
+            .iter()
+            .map(|(i, c)| {
+                let name = coord_names.get(*i).map(String::as_str).unwrap_or("?");
+                format!("{name} ({c})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        msg.push_str(&format!(
+            " Bound first overshot by: {listed} (count of samples, first offending coordinate only)."
+        ));
+    }
+    for w in conditioned.warnings() {
+        msg.push(' ');
+        // Capitalise the fragment so it reads as its own sentence here.
+        let mut chars = w.chars();
+        if let Some(first) = chars.next() {
+            msg.push_str(&first.to_uppercase().to_string());
+            msg.push_str(chars.as_str());
+        }
+    }
+    if !conditioned.null_dirs.is_empty() || !conditioned.capped_dirs.is_empty() {
+        msg.push_str(
+            " Fix or drop one parameter from each listed combination, or re-fit a model \
+             the data can identify; the asymptotic covariance is not a usable SIR proposal \
+             as it stands.",
+        );
+    }
+    msg
 }
 
 /// Math kernel for the SIR procedure. Operates on pre-built parameter and
@@ -105,35 +406,45 @@ pub fn run_sir_core(
         }
     }
 
-    // Cholesky-decompose the free block; regularise with an eigenvalue floor
-    // if the free block is not strictly positive definite.
-    let proposal_chol = match sub_cov.clone().cholesky() {
-        Some(c) => c.l(),
-        None => {
-            let eig = sub_cov.clone().symmetric_eigen();
-            let min_eig = eig.eigenvalues.min();
-            let reg = if min_eig < 1e-8 {
-                -min_eig + 1e-8
-            } else {
-                1e-8
-            };
-            let reg_cov = &sub_cov + DMatrix::identity(n_free, n_free) * reg;
-            if options.verbose {
-                eprintln!(
-                    "  SIR: free-block proposal covariance not PD (min eigenvalue = {:.2e}), regularizing",
-                    min_eig
-                );
-            }
-            reg_cov
-                .cholesky()
-                .ok_or("Proposal covariance could not be made positive definite")?
-                .l()
+    // Condition the free block into a proposal SIR can actually sample from
+    // (#1021). Two failure modes are handled here, both of which used to
+    // degenerate into "All SIR samples had invalid weights":
+    //
+    //  * near-null directions — a rank deficiency left over *after* FIX-ed
+    //    parameters are removed (a likelihood ridge; two parameters that
+    //    determine only their sum). These are floored to keep the proposal PD.
+    //  * explosive directions — the covariance step floors the FD Hessian's
+    //    eigenvalues before inverting it (`invert_psd_with_floor`), so a
+    //    non-identified direction comes back with variance ≈ 1/floor ≈ 1e7+.
+    //    In packed (log) space that is a proposal sd of thousands: every draw
+    //    lands outside the parameter bounds and is rejected. Those directions
+    //    are shrunk so ±2 sd still fits inside the packed bounds.
+    let bounds = compute_bounds(params);
+    let coord_names = coordinate_names(params);
+    let free_names: Vec<String> = free_idx
+        .iter()
+        .map(|&i| {
+            coord_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("packed[{i}]"))
+        })
+        .collect();
+    let half_widths: Vec<f64> = free_idx
+        .iter()
+        .map(|&i| (bounds.upper[i] - bounds.lower[i]) / PROPOSAL_BOUND_SIGMAS)
+        .collect();
+    let conditioned = condition_free_proposal(&sub_cov, &half_widths, &free_names)?;
+    if options.verbose {
+        for w in conditioned.warnings() {
+            eprintln!("  SIR: {w}");
         }
-    };
+    }
+    let proposal_chol = conditioned.chol.clone();
 
-    // Log-determinant of the free-block proposal covariance (for density
-    // computation). Uses n_free, matching the dimensionality of the Student-t.
-    let log_det_proposal = 2.0 * (0..n_free).map(|i| proposal_chol[(i, i)].ln()).sum::<f64>();
+    // Log-determinant of the conditioned free-block proposal covariance (for
+    // density computation). Uses n_free, matching the Student-t dimensionality.
+    let log_det_proposal = conditioned.log_det;
 
     let mut rng = match options.sir_seed {
         Some(seed) => StdRng::seed_from_u64(seed),
@@ -185,22 +496,23 @@ pub fn run_sir_core(
     // Step 2: Evaluate importance weights in parallel (warm-started inner loop)
     let inner_maxiter = options.inner_maxiter;
     let inner_tol = options.inner_tol;
-    let bounds = compute_bounds(params);
 
-    let log_weights: Vec<f64> = samples
+    let (log_weights, outcomes): (Vec<f64>, Vec<SampleOutcome>) = samples
         .par_iter()
         .zip(z_vectors.par_iter())
         .map(|(x_k, z)| {
             if crate::cancel::is_cancelled(&options.cancel) {
-                return f64::NEG_INFINITY;
+                return (f64::NEG_INFINITY, SampleOutcome::Cancelled);
             }
-            // Reject samples outside parameter bounds (avoids wasting inner-loop work)
+            // Reject samples outside parameter bounds (avoids wasting inner-loop work).
+            // The first offending coordinate is recorded so a total rejection can
+            // name the parameter whose bound the proposal keeps overshooting (#1021).
             let out_of_bounds = x_k
                 .iter()
                 .zip(bounds.lower.iter().zip(bounds.upper.iter()))
-                .any(|(&x, (&lo, &hi))| x < lo || x > hi);
-            if out_of_bounds {
-                return f64::NEG_INFINITY;
+                .position(|(&x, (&lo, &hi))| x < lo || x > hi);
+            if let Some(i) = out_of_bounds {
+                return (f64::NEG_INFINITY, SampleOutcome::OutOfBounds(i));
             }
 
             let params_k = unpack_params(x_k, params);
@@ -219,7 +531,7 @@ pub fn run_sir_core(
                 !var.is_finite() || var <= 0.0 || !lii.is_finite() || lii <= 0.0
             });
             if theta_invalid || sigma_invalid || omega_invalid {
-                return f64::NEG_INFINITY;
+                return (f64::NEG_INFINITY, SampleOutcome::NonPositiveParams);
             }
 
             // Run inner loop warm-started from ML EBEs
@@ -241,7 +553,7 @@ pub fn run_sir_core(
             let nll_k = pop_nll_opts(model, population, &params_k, &ehs, &hms, &_kappas, options);
             let ofv_k = 2.0 * nll_k;
             if !ofv_k.is_finite() {
-                return f64::NEG_INFINITY;
+                return (f64::NEG_INFINITY, SampleOutcome::NonFiniteOfv);
             }
 
             let dofv = ofv_k - ofv_hat;
@@ -254,9 +566,9 @@ pub fn run_sir_core(
                 log_norm - 0.5 * log_det_proposal - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
 
             // Importance weight: log w_k = -0.5 * dOFV_k - log_q_k + log_q_hat
-            -0.5 * dofv - log_q_k + log_q_hat
+            (-0.5 * dofv - log_q_k + log_q_hat, SampleOutcome::Accepted)
         })
-        .collect();
+        .unzip();
 
     // Step 2: Normalize weights using log-sum-exp trick
     let max_log_w = log_weights
@@ -266,7 +578,11 @@ pub fn run_sir_core(
         .fold(f64::NEG_INFINITY, f64::max);
 
     if max_log_w == f64::NEG_INFINITY {
-        return Err("All SIR samples had invalid weights".to_string());
+        return Err(all_invalid_weights_message(
+            &outcomes,
+            &coord_names,
+            &conditioned,
+        ));
     }
 
     let weights: Vec<f64> = log_weights
@@ -335,6 +651,7 @@ pub fn run_sir_core(
         ci_sigma,
         effective_sample_size: ess,
         resamples_packed,
+        warnings: conditioned.warnings(),
     })
 }
 
@@ -381,6 +698,180 @@ fn percentile_ci(values: &[f64]) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("P{i}")).collect()
+    }
+
+    /// A well-conditioned block must come back untouched: no floor, no cap,
+    /// and `L·Lᵀ` reproducing the input.
+    #[test]
+    fn condition_free_proposal_is_identity_on_a_healthy_block() {
+        let cov = DMatrix::from_row_slice(2, 2, &[0.01, 0.002, 0.002, 0.04]);
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        assert!(c.null_dirs.is_empty(), "{:?}", c.null_dirs);
+        assert!(c.capped_dirs.is_empty(), "{:?}", c.capped_dirs);
+        assert!(c.warnings().is_empty());
+        let round = &c.chol * c.chol.transpose();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (round[(i, j)] - cov[(i, j)]).abs() < 1e-12,
+                    "({i},{j}): {} vs {}",
+                    round[(i, j)],
+                    cov[(i, j)]
+                );
+            }
+        }
+        let expected_log_det = (0.01_f64 * 0.04 - 0.002 * 0.002).ln();
+        assert!(
+            (c.log_det - expected_log_det).abs() < 1e-12,
+            "{}",
+            c.log_det
+        );
+    }
+
+    /// #1021: the covariance step floors non-identified Hessian eigenvalues
+    /// before inverting, so their proposal variance comes back at ~1/floor.
+    /// Sampling that direction unshrunk puts every draw outside the bounds.
+    #[test]
+    fn condition_free_proposal_caps_an_explosive_direction() {
+        // Coordinate 0 carries variance 1e7 (sd ≈ 3162 in packed log-space);
+        // its bound allows a proposal sd of at most 1.0.
+        let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e7, 0.01]));
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        assert_eq!(c.capped_dirs.len(), 1, "{:?}", c.capped_dirs);
+        assert!(
+            c.capped_dirs[0].contains("P0"),
+            "the shrunk direction must name its parameter: {}",
+            c.capped_dirs[0]
+        );
+        let round = &c.chol * c.chol.transpose();
+        assert!(
+            round[(0, 0)] <= 1.0 + 1e-9,
+            "variance not capped: {}",
+            round[(0, 0)]
+        );
+        // The identified direction is left alone.
+        assert!((round[(1, 1)] - 0.01).abs() < 1e-12, "{}", round[(1, 1)]);
+        assert!(c
+            .warnings()
+            .iter()
+            .any(|w| w.contains("shrunk") && w.contains("P0")));
+    }
+
+    /// The near-null floor must be anchored on the *capped* spectrum. Anchored
+    /// on the raw one, a single eigenvalue-floored direction (variance 1e8)
+    /// would put the relative floor at ~1e-2 and inflate every genuinely
+    /// well-determined direction to it — reporting real parameters as null and
+    /// widening their CIs by orders of magnitude.
+    #[test]
+    fn condition_free_proposal_does_not_let_an_explosive_direction_swamp_the_floor() {
+        let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e8, 1e-4]));
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        assert_eq!(c.capped_dirs.len(), 1, "{:?}", c.capped_dirs);
+        assert!(
+            c.null_dirs.is_empty(),
+            "a well-determined direction must not be reported null: {:?}",
+            c.null_dirs
+        );
+        let round = &c.chol * c.chol.transpose();
+        assert!(
+            (round[(1, 1)] - 1e-4).abs() < 1e-12,
+            "well-determined variance was altered: {}",
+            round[(1, 1)]
+        );
+    }
+
+    /// A likelihood ridge (two parameters determining only their sum) leaves an
+    /// exactly-null direction after FIX-ed parameters are excluded. It must be
+    /// floored — not rejected — and reported by name.
+    #[test]
+    fn condition_free_proposal_floors_and_names_a_null_direction() {
+        // Eigenvectors (1,1)/√2 with λ=0.02 and (1,-1)/√2 with λ=0.
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        let v = DMatrix::from_row_slice(2, 2, &[h, h, h, -h]);
+        let cov =
+            &v * DMatrix::from_diagonal(&DVector::from_column_slice(&[0.02, 0.0])) * v.transpose();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        assert_eq!(c.null_dirs.len(), 1, "{:?}", c.null_dirs);
+        assert!(
+            c.null_dirs[0].contains("P0") && c.null_dirs[0].contains("P1"),
+            "both ridge parameters must be named: {}",
+            c.null_dirs[0]
+        );
+        // Still PD, so sampling works.
+        let round = &c.chol * c.chol.transpose();
+        assert!(round[(0, 0)] > 0.0 && round[(1, 1)] > 0.0);
+        assert!(c.log_det.is_finite());
+        assert!(c.warnings().iter().any(|w| w.contains("rank-deficient")));
+    }
+
+    /// Two null directions (the reported #1021 case: two FIX-like degeneracies)
+    /// are just as survivable as one.
+    #[test]
+    fn condition_free_proposal_survives_two_null_directions() {
+        let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[0.01, 0.0, 0.0]));
+        let c = condition_free_proposal(&cov, &[1.0, 1.0, 1.0], &names(3)).unwrap();
+        assert_eq!(c.null_dirs.len(), 2, "{:?}", c.null_dirs);
+        assert!(c.chol.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn condition_free_proposal_rejects_a_covariance_with_no_positive_direction() {
+        let cov = DMatrix::zeros(2, 2);
+        let err = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap_err();
+        assert!(err.contains("no positive eigenvalue"), "{err}");
+    }
+
+    #[test]
+    fn condition_free_proposal_rejects_a_non_finite_covariance() {
+        let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[f64::NAN, 0.01]));
+        let err = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap_err();
+        assert!(err.contains("non-finite"), "{err}");
+    }
+
+    /// #1021: the bare "All SIR samples had invalid weights" was a dead end.
+    /// The replacement names the rejecting check, the coordinates whose bounds
+    /// were overshot, and the proposal's rank deficiency.
+    #[test]
+    fn all_invalid_weights_message_reports_tally_and_offenders() {
+        let outcomes = vec![
+            SampleOutcome::OutOfBounds(1),
+            SampleOutcome::OutOfBounds(1),
+            SampleOutcome::OutOfBounds(0),
+            SampleOutcome::NonFiniteOfv,
+            SampleOutcome::NonPositiveParams,
+        ];
+        let coord_names = vec!["TVCL".to_string(), "PROP_ERR".to_string()];
+        let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e7, 0.0]));
+        let conditioned = condition_free_proposal(&cov, &[1.0, 1.0], &coord_names).unwrap();
+
+        let msg = all_invalid_weights_message(&outcomes, &coord_names, &conditioned);
+        assert!(msg.contains("All 5 SIR samples"), "{msg}");
+        assert!(msg.contains("3 out of bounds"), "{msg}");
+        assert!(msg.contains("1 non-positive"), "{msg}");
+        assert!(msg.contains("1 non-finite OFV"), "{msg}");
+        // Most-frequent offender first, with its hit count.
+        assert!(msg.contains("PROP_ERR (2)"), "{msg}");
+        assert!(msg.contains("TVCL (1)"), "{msg}");
+        // Proposal diagnosis + what to do about it.
+        assert!(msg.contains("rank-deficient"), "{msg}");
+        assert!(msg.contains("Fix or drop one parameter"), "{msg}");
+    }
+
+    /// A clean run must not decorate the failure message with proposal
+    /// diagnostics it doesn't have.
+    #[test]
+    fn all_invalid_weights_message_stays_bare_for_a_healthy_proposal() {
+        let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[0.01, 0.04]));
+        let conditioned = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        let msg =
+            all_invalid_weights_message(&[SampleOutcome::NonFiniteOfv], &names(2), &conditioned);
+        assert!(msg.contains("1 non-finite OFV"), "{msg}");
+        assert!(!msg.contains("rank-deficient"), "{msg}");
+        assert!(!msg.contains("Fix or drop"), "{msg}");
+    }
 
     #[test]
     fn test_percentile_ci_sorted() {

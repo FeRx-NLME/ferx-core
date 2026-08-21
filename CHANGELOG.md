@@ -184,6 +184,17 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **SIR no longer fails with "All SIR samples had invalid weights" on a rank-deficient covariance
+  (#1021).** A parameter direction the data do not identify comes back from the covariance step with
+  a variance around `1 / eigenvalue floor` — thousands of standard deviations in packed log-space —
+  so every proposal draw landed outside the parameter bounds and was rejected. Each proposal
+  direction is now capped so ±3 standard deviations stay inside the packed bounds, near-null
+  directions (a likelihood ridge left over after `FIX`ed parameters are excluded) are floored rather
+  than fatal, and both cases are reported as `SIR:` warnings naming the parameters involved. When
+  every sample *is* still rejected, the error now reports the rejection tally, the coordinates whose
+  bounds were hit, and the proposal's rank deficiency instead of the bare message. This is the
+  common model-based meta-analysis case, where fixing the residual variance is the weighting scheme
+  and cannot be dropped.
 - **Log-mu-referenced θ with a negative lower bound no longer takes the wrong closed-form update
   (#996).** Such a θ is packed on the identity scale, so the SAEM/IMP `log θ += mean(η)` shift was not
   its EM optimum — it applied `θ += mean(η)` where the closed form means `θ *= exp(mean(η))`. It is
