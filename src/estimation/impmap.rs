@@ -149,35 +149,34 @@ fn covariance_to_proposal_hessian(
     }
 }
 
-/// Names of non-fixed thetas that have **no associated ETA** (are not the target
-/// of any mu-reference). Under IMP/IMPMAP such fixed-effect-only parameters are
-/// estimated solely through the importance-weighted θ M-step, which carries an
-/// IS-weight bias for weakly-identified parameters and can converge to the wrong
-/// value (issue #406: the FREM `FRD1` absorption-fraction drove to 0.90 vs a
-/// FOCEI/NONMEM value of ~0.4). NONMEM's IMP methods require every estimated
-/// parameter to carry a random effect; ferx applies mu-referencing
-/// automatically, so the user only needs to add the ETA.
-pub(crate) fn non_fixed_thetas_without_eta(
+/// Per-θ mask of "carries an ETA", indexed by θ position.
+///
+/// A θ carries an ETA when it is the target of a mu-reference, or when it is a
+/// class θ whose class-aware shift is active this fit. The complement — the
+/// fixed-effect-only set — is what both the #406 IMP/IMPMAP advisory
+/// ([`non_fixed_thetas_without_eta`]) and the #1011 SAEM M-step damping gate key
+/// off, so both read the set from here rather than re-deriving it.
+///
+/// A MIXNUM-switched typical value carries an ETA in every class arm, so its
+/// class thetas must not be counted as fixed-effect-only (#996) — they are
+/// mu-referenced per class, not estimated by the weighted M-step alone.
+///
+/// The caller passes the thetas whose class-aware shift is *actually active*
+/// this fit rather than everything the parser detected: the shift is skipped
+/// under `mu_referencing = false`, for identity-packed θ, and for weak-IIV η,
+/// and in each of those cases the class θ really is estimated by the weighted
+/// M-step alone — exactly the situation these consumers exist for (#996
+/// review). Pass `&[]` where no class-aware shift runs.
+pub(crate) fn theta_has_eta_mask(
     model: &CompiledModel,
-    theta_fixed: &[bool],
     class_mu_ref_thetas: &[usize],
-) -> Vec<String> {
+) -> Vec<bool> {
     use std::collections::HashSet;
     let mut with_eta: HashSet<&str> = model
         .mu_refs
         .values()
         .map(|m| m.theta_name.as_str())
         .collect();
-    // A MIXNUM-switched typical value carries an ETA in every class arm, so its
-    // class thetas must not be flagged as fixed-effect-only (#996) — they are
-    // mu-referenced per class, not estimated by the weighted M-step alone.
-    //
-    // The caller passes the thetas whose class-aware shift is *actually active*
-    // this fit rather than everything the parser detected: the shift is skipped
-    // under `mu_referencing = false`, for identity-packed θ, and for weak-IIV η,
-    // and in each of those cases the class θ really is estimated by the weighted
-    // M-step alone — exactly the situation this advisory exists for (#996
-    // review). Pass `&[]` where no class-aware shift runs.
     with_eta.extend(
         class_mu_ref_thetas
             .iter()
@@ -186,9 +185,34 @@ pub(crate) fn non_fixed_thetas_without_eta(
     model
         .theta_names
         .iter()
+        .map(|name| with_eta.contains(name.as_str()))
+        .collect()
+}
+
+/// Names of non-fixed thetas that have **no associated ETA** (are not the target
+/// of any mu-reference). Under IMP/IMPMAP such fixed-effect-only parameters are
+/// estimated solely through the importance-weighted θ M-step, which carries an
+/// IS-weight bias for weakly-identified parameters and can converge to the wrong
+/// value (issue #406: the FREM `FRD1` absorption-fraction drove to 0.90 vs a
+/// FOCEI/NONMEM value of ~0.4). NONMEM's IMP methods require every estimated
+/// parameter to carry a random effect; ferx applies mu-referencing
+/// automatically, so the user only needs to add the ETA.
+///
+/// See [`theta_has_eta_mask`] for what counts as carrying an ETA, and for what
+/// `class_mu_ref_thetas` must contain.
+pub(crate) fn non_fixed_thetas_without_eta(
+    model: &CompiledModel,
+    theta_fixed: &[bool],
+    class_mu_ref_thetas: &[usize],
+) -> Vec<String> {
+    let has_eta = theta_has_eta_mask(model, class_mu_ref_thetas);
+    model
+        .theta_names
+        .iter()
         .enumerate()
-        .filter(|(i, name)| {
-            !theta_fixed.get(*i).copied().unwrap_or(false) && !with_eta.contains(name.as_str())
+        .filter(|(i, _)| {
+            !theta_fixed.get(*i).copied().unwrap_or(false)
+                && !has_eta.get(*i).copied().unwrap_or(false)
         })
         .map(|(_, name)| name.clone())
         .collect()

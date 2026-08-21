@@ -199,8 +199,12 @@ caps also slow legitimate exploration, and here they pull `TVV` off (129.9 at
 entirely**, in both phases, restoring the pre-0.3.x behaviour exactly; that is
 the escape hatch if a model fitted better without it.
 
-The damping is applied only when NLopt actually has a θ to estimate. A fit whose
-every theta is mu-referenced or `FIX` is unaffected, down to the last bit — and
+The damping is applied only to the channel the bias lives in: a fit is damped
+when NLopt is left estimating a theta that carries **no ETA**, which is exactly
+the situation the advisory above warns about. A theta that is `FIX`, that is
+pinned out by the mu-reference shift, or that simply carries an ETA (so the eta
+absorbs the per-draw misfit) is left on the undamped update, and a fit whose
+every estimated theta is one of those is unaffected down to the last bit — and
 setting `mstep_damping` on such a model warns that it has no effect rather than
 accepting it silently.
 

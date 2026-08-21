@@ -2751,7 +2751,13 @@ fn test_mstep_damping_round_trips_and_validates() {
         let err = apply_fit_option(&mut opts, "mstep_damping", bad)
             .expect_err("out-of-range mstep_damping must be rejected");
         assert!(err.contains("(0, 1]"), "got: {err}");
+        // The offending value is echoed, as the neighbouring range validators do.
+        assert!(err.contains(bad), "value not echoed, got: {err}");
     }
+    // The error names the spelling the user actually wrote.
+    let err = apply_fit_option(&mut opts, "saem_mstep_damping", "-1")
+        .expect_err("out-of-range saem_mstep_damping must be rejected");
+    assert!(err.contains("`saem_mstep_damping`"), "got: {err}");
     // A rejected value must not have clobbered the last good one.
     assert_eq!(opts.saem_mstep_damping, Some(1.0));
 }

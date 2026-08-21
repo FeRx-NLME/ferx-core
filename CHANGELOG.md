@@ -52,9 +52,12 @@ section of the SDLC for the versioning policy).
   counterpart of the existing Ω cap. On the FREM `iiv_on_ruv` model of #1011, whose absorption
   fraction `TVFRD1` carries no ETA, SAEM moves from **0.039 to 0.290** against a marginal −2logL
   optimum of ≈ 0.29 (NONMEM IMP 0.394, ferx IMP 0.311, IMPMAP 0.318); `TVMAT` 3.020 → 2.686 (NONMEM
-  2.680) and σ 0.213 → 0.170 (NONMEM 0.177). Damping applies **only when NLopt actually has a theta
-  to estimate**, so a fit whose every theta is mu-referenced or `FIX` is bit-identical to before;
-  `warfarin_saem` shifts OFV −286.00 → −285.83. Mixture models are excluded: a `MIXNUM`-switched
+  2.680) and σ 0.213 → 0.170 (NONMEM 0.177). Damping applies **only when NLopt is left estimating a theta
+  that carries no ETA** — the shape the bias was measured on, and the same condition the advisory
+  below warns about. A theta that is `FIX`, that is pinned out by the mu-reference shift, or that
+  simply carries an ETA (so the eta absorbs the per-draw misfit) stays on the undamped update, and a
+  fit whose every estimated theta is one of those is bit-identical to before — `warfarin_saem`, all
+  three of whose thetas are log-mu-referenced, is unchanged. Mixture models are excluded: a `MIXNUM`-switched
   typical value uses the same M-step but must *separate* from a common start before the class
   assignments settle, and damping that excursion stalls it (a 0.03 cap left `TVCL1 = 1.145` against
   NONMEM's 1.002 on `tests/nonmem/mixture_iv_saem`), so mixtures keep the undamped update. The bias
@@ -62,7 +65,10 @@ section of the SDLC for the versioning policy).
   parameter `FIX` remains the better fix. The cap is exposed as the `mstep_damping` `[fit_options]`
   key (default `0.03`, must be in `(0, 1]`); smaller damps harder, and **`mstep_damping = 1.0`
   disables the damping entirely**, restoring the previous behaviour exactly if a model fitted better
-  without it. Setting it on a model it cannot affect warns rather than being silently ignored.
+  without it. Setting it on a model it cannot affect warns rather than being silently ignored, and a value
+  outside `(0, 1]` reaching `run_saem` from a programmatic caller that bypassed the parser is
+  clamped with a warning rather than applied (a negative damping would step theta and sigma away
+  from the M-step optimum every iteration).
 
 ### Added
 - **SAEM now warns when an estimated theta carries no ETA at all.** A fixed-effect-only theta is not
