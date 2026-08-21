@@ -4606,7 +4606,16 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || lower.contains("censoring handling")
     {
         (WarningSeverity::Warning, WarningCode::BloqMethod)
-    } else if lower.contains("sir failed") || lower.contains("sir requested") {
+    } else if lower.contains("sir failed")
+        || lower.contains("sir requested")
+        || lower.starts_with("sir:")
+        || lower.starts_with("sir fallback:")
+    {
+        // The `sir:` / `sir fallback:` prefixes carry the proposal-conditioning
+        // diagnostics (#1021) — a rank-deficient or bound-shrunk proposal. They
+        // reach this arm because no earlier pattern matches them: the shrinkage
+        // message mentions "the covariance step" but not "not positive definite",
+        // so the compound covariance arm above does not claim it.
         (WarningSeverity::Warning, WarningCode::Sir)
     } else if lower.contains("ess = 0") || lower.contains("proposal collapse") {
         (WarningSeverity::Warning, WarningCode::ImportanceSampling)
