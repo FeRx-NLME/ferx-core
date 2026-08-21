@@ -184,6 +184,16 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **`optimizer = trust_region` no longer reports `Converged: YES` when it merely ran out of
+  iterations (#1000).** The underlying solver has no convergence criterion of its own, so
+  exhausting `maxiter` was its only way to stop — and every such run was labelled converged, with
+  standard errors computed at a non-stationary point (on the `one_cpt_iv_pooled` zero-Ω anchor,
+  8 000–11 000 OFV units short of the optimum). The trust region now stops when it can no longer
+  make progress — no objective improvement beyond `outer_ftol` and no parameter movement beyond
+  `outer_xtol` for 20 consecutive iterations — and a run that instead hits `maxiter` reports
+  `Converged: NO` with a warning naming the budget and the gradient norm it stopped at. Fits that
+  do settle now also stop as soon as they settle instead of grinding out the remaining budget (the
+  warfarin fit returns at iteration 59), and the trust-region path now reports `final_gradient`.
 - **Log-mu-referenced θ with a negative lower bound no longer takes the wrong closed-form update
   (#996).** Such a θ is packed on the identity scale, so the SAEM/IMP `log θ += mean(η)` shift was not
   its EM optimum — it applied `θ += mean(η)` where the closed form means `θ *= exp(mean(η))`. It is

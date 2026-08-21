@@ -63,7 +63,49 @@ aliases for `nlopt_lbfgs`. The built-in implementation is slated for removal.
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `trust_region` | Newton trust-region with Steihaug CG | Uses the analytic outer gradient and a BHHH approximate Hessian `H ≈ 4 Σ gᵢgᵢᵀ` (always positive semi-definite). The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)`; pin it with `steihaug_max_iters`. Best combined with `inits_from_nca` since it benefits from good starting values. |
+| `trust_region` | Newton trust-region with Steihaug CG | Uses the analytic outer gradient and a BHHH approximate Hessian `H ≈ 4 Σ gᵢgᵢᵀ` (always positive semi-definite). The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)`; pin it with `steihaug_max_iters`. Best combined with `inits_from_nca` since it benefits from good starting values. Stops when it can no longer make progress — see [convergence reporting](#trust-region-convergence-reporting). |
+
+### Trust-region convergence reporting {#trust-region-convergence-reporting}
+
+`trust_region` stops once it has gone 20 consecutive iterations without
+measurable progress — no objective improvement beyond `outer_ftol` (default
+`1e-6`, relative) and no parameter movement beyond `outer_xtol` (default `1e-4`,
+relative). A run that instead exhausts `maxiter` is reported as **`Converged:
+NO`**, with a warning naming the budget it ran out of and the gradient norm it
+stopped at.
+
+Before [#1000](https://github.com/FeRx-NLME/ferx-core/issues/1000) every
+`trust_region` run reported `Converged: YES`, including one that had simply run
+out of iterations: the underlying solver has no convergence criterion of its own,
+so hitting `maxiter` was its only way to stop. On `examples/one_cpt_iv_pooled.ferx`
+with `data/one_cpt_iv.csv`:
+
+| `maxiter` | OFV | reported (before) | reported (now) |
+|---|---|---|---|
+| 5 | 11325.8283 | `Converged: YES` | `Converged: NO` |
+| 300 | 8504.4349 | `Converged: YES` | `Converged: NO` |
+| 2000 | −269.6370 | `Converged: YES` | `Converged: YES` (at iteration 1920) |
+
+The true optimum is −269.6370 (NONMEM `$OMEGA 0 FIX` anchors it at −269.63700440),
+so the first two rows were 8 000–11 000 OFV units off and reported as converged,
+with standard errors computed at a non-stationary point.
+
+The stopping rule is deliberately **not** a gradient test. The outer gradient here
+is evaluated at fixed EBEs, which makes it unusable as a stationarity measure on
+an ODE model: on `one_cpt_iv_ode` the gradient norm at the optimum the default
+optimizer reaches (OFV −387.0737) is 43.2, while a *worse* point 0.73 OFV units
+away carries 4.0 — the norm is not monotone in solution quality, so no threshold
+separates the two. Objective and step size are the noise-robust measures, and they
+are what the NLopt outer optimizers already stop on.
+
+Stopping early also saves work: the warfarin fit settles at iteration 59 and now
+returns there rather than grinding out the remaining budget.
+
+Note that "converged" still means *this optimizer stopped making progress*, not
+that the point is a verified global optimum — a `trust_region` fit can settle
+slightly above the optimum other optimizers reach (the `one_cpt_iv_ode` case
+above, and [#864](https://github.com/FeRx-NLME/ferx-core/issues/864)). Compare
+against a second optimizer when the OFV matters.
 
 ---
 

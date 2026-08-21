@@ -409,3 +409,65 @@ fn flat_theta_is_frozen_and_fit_proceeds() {
         r.theta
     );
 }
+
+/// #1000, Tier 3: the converged direction, end to end. `trust_region` must not
+/// only stop labelling budget exhaustion as convergence — it has to be able to
+/// report `converged` at all, which before the fix came for free from any `Ok(_)`
+/// and now depends on the no-progress stopping rule firing.
+///
+/// Warfarin under `foce` settles at iteration 59, well inside this budget, so
+/// reaching `maxiter` here would itself be the regression. The OFV is checked
+/// against the optimizer `auto` picks for the same options rather than a
+/// hardcoded constant, so the anchor cannot drift out of step with the objective
+/// these options select.
+///
+/// `foce` specifically: on the `focei` objective this same fit settles 4.1 OFV
+/// units above what `auto` reaches (−281.88 vs −286.00) — a genuine stall at a
+/// non-stationary point, which is
+/// [#864](https://github.com/FeRx-NLME/ferx-core/issues/864) and not what #1000
+/// is about. `trust_region` reports "converged" for a stall the same way the
+/// NLopt optimizers report their own `xtol`/`ftol` stops; what #1000 fixed is the
+/// separate case of *budget exhaustion* being labelled converged.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn trust_region_reports_converged_when_it_settles() {
+    let (model, population) = data_and_model();
+    let mut opts = base_options();
+    opts.method = EstimationMethod::Foce;
+    opts.optimizer = Optimizer::TrustRegion;
+    opts.outer_maxiter = 1000;
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("trust_region fit must succeed");
+
+    assert!(
+        result.converged,
+        "a settled trust-region fit must report converged (OFV {}, warnings {:?})",
+        result.ofv, result.warnings
+    );
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("reached outer_maxiter")),
+        "a settled fit must not carry the budget-exhaustion warning: {:?}",
+        result.warnings
+    );
+    // Anchor: the same fit under the default optimizer. `trust_region` may take a
+    // slightly different path, but a run that reports converged must land at the
+    // same optimum, not somewhere short of it.
+    let mut ref_opts = base_options();
+    ref_opts.method = EstimationMethod::Foce;
+    ref_opts.optimizer = Optimizer::Auto;
+    ref_opts.outer_maxiter = 1000;
+    let reference = fit(&model, &population, &model.default_params, &ref_opts)
+        .expect("reference fit must succeed");
+    assert!(
+        (result.ofv - reference.ofv).abs() < 0.05,
+        "trust_region reported converged at OFV {} but the default optimizer reaches {}",
+        result.ofv,
+        reference.ofv
+    );
+}
