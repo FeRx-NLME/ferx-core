@@ -41,6 +41,18 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **A zero, negative, or non-finite residual-error magnitude is now rejected (#484 / #1029).** The
+  magnitude multiplies a sigma loading, so a zero one — an MBMA arm with no reported standard error,
+  say — collapses that observation's variance onto the internal `1e-12` floor and lets a single row
+  own the entire objective. Fits like that used to run and report a converged answer; they now stop
+  at `E_RUV_MAGNITUDE_NONPOSITIVE`, naming the subject and TIME.
+- **A covariate used only by the residual-error magnitude is no longer frozen at the subject's first
+  value (#484, found while implementing #1029).** A covariate that a model referenced *only* from an
+  `[error_model]` magnitude expression was not counted as model-referenced, so the pre-fit pass that
+  drops unused per-record covariate snapshots discarded them for any subject whose only time-varying
+  column was that one. Every observation was then scored with the subject's first value of it —
+  silently, with no diagnostic, and with the whole point of a time- or record-varying magnitude lost.
+  Such covariates now register as referenced, so their per-observation snapshots survive.
 - **SAEM no longer lets a fixed-effect-only theta drift away from the marginal optimum (#1011).** The
   numerical θ/σ M-step assigned NLopt's maximiser outright, re-maximising against a *single* MCMC η
   draw each iteration — `argmax` of one draw rather than the stochastic-approximation average of
@@ -82,6 +94,25 @@ section of the SDLC for the versioning policy).
   stopped theta from fixing.
 
 ### Added
+- **First-class residual weighting: `weight = <expr>` on the error model (#1029).** Meta-analysis
+  rows are trial-arm summaries that differ in precision, and inverse-variance weighting is what makes
+  an MBMA an MBMA. Until now it had to be hand-built in three places that must agree — divide `DV` in
+  R, divide the prediction again in `[scaling]`, and pin `sigma` to 1 in `[parameters]` — with the
+  side effect that every diagnostic ferx ships (`sdtab`, VPC, obs-vs-pred, residual-vs-time) came out
+  in weighted units nobody can read. Declare it once instead:
+  `DV ~ additive(ADD_ERR) weight = WPSE`. `DV` stays on the natural scale in the data, and `PRED`,
+  `IPRED`, `CWRES`, `sdtab` and the VPC are all reported on the natural scale with no
+  back-transformation. The modifier means "score as if `DV` and the prediction were both divided by
+  the weight", so the additive loading picks up a factor `W` and the proportional loading is
+  untouched (a common scale factor cancels out of a constant-CV error) — `weight =` on a purely
+  proportional model is therefore rejected rather than silently doing nothing. Whether `sigma` is
+  fixed stays your call, because both conventions are real: fix it to 1 for a continuous endpoint
+  with a known SE, estimate it for a weighted logit of a responder proportion (σ absorbs the
+  `p(1-p)` factor). One caveat when reconciling with a published run: ferx scores on the natural
+  scale, so its OFV differs from the hand-built one by the change-of-variable constant
+  `Σ 2·ln(weight)` — data-only, identical across models on the same rows, and cancelling out of every
+  ΔOFV, LRT and AIC comparison. Not yet supported with per-CMT error models, inside a
+  covariate-selected `if/else`, or for methods other than `foce`/`focei`.
 - **SAEM now warns when an estimated theta carries no ETA at all.** A fixed-effect-only theta is not
   mu-referenced, so it never gets the γ-damped closed-form `log θ += γ·mean(η)` update and is moved
   only by the η-frozen numerical M-step — which re-maximises against a *single* MCMC η draw with no

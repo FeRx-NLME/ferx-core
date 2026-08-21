@@ -2670,6 +2670,71 @@ mod tests {
         approx::assert_relative_eq!(got, expected, epsilon = 1e-9);
     }
 
+    /// #1029 degenerate oracle: `weight = W` reproduces the hand-built
+    /// study-as-subject construction — `DV/W` in the data, `PRED/W` in the
+    /// `[scaling]` block, `sigma FIX 1` in `[parameters]` — exactly.
+    ///
+    /// The two objectives differ only by the Jacobian of the `y ↦ y/W` change of
+    /// variable, `Σ_j ln W_j`. That is a data-only constant: identical for every
+    /// model fitted to the same rows with the same weight column, so it cancels
+    /// out of every ΔOFV, likelihood-ratio test, and AIC comparison. It appears
+    /// at all only because ferx scores on the *natural* scale, which is what
+    /// keeps DV / PRED / IPRED / CWRES and the VPC in reported units with no
+    /// back-transformation.
+    #[test]
+    fn test_weighted_error_model_matches_the_hand_built_construction() {
+        let src = |err: &str| {
+            format!(
+                "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  omega ETA_CL ~ 0.09\n  \
+                 sigma ADD_ERR ~ 1.0 (variance) FIX\n[individual_parameters]\n  CL = TVCL * \
+                 exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, \
+                 v=V)\n[error_model]\n{err}\n[covariates]\n  WPSE continuous\n"
+            )
+        };
+        let weighted = crate::parser::model_parser::parse_model_string(&src(
+            "  DV ~ additive(ADD_ERR) weight = WPSE",
+        ))
+        .unwrap();
+        let plain =
+            crate::parser::model_parser::parse_model_string(&src("  DV ~ additive(ADD_ERR)"))
+                .unwrap();
+
+        // One row per trial arm, each carrying its own reported standard error.
+        let w = [0.5_f64, 2.0, 1.25];
+        let y = [12.0_f64, 9.0, 15.0];
+        let f = [11.0_f64, 10.0, 14.0];
+
+        let mut natural = make_simple_subject();
+        natural.obs_times = vec![1.0, 2.0, 3.0];
+        natural.observations = y.to_vec();
+        natural.obs_cmts = vec![1; 3];
+        natural.cens = vec![0; 3];
+        natural.occasions = vec![1; 3];
+        natural.obs_covariates = w
+            .iter()
+            .map(|&wi| [("WPSE".to_string(), wi)].into_iter().collect())
+            .collect();
+
+        // The hand-built twin: DV and the prediction both pre-divided by the
+        // weight, scored by an unweighted additive model on the same sigma.
+        let mut prescaled = natural.clone();
+        prescaled.observations = y.iter().zip(w).map(|(&yi, wi)| yi / wi).collect();
+        prescaled.obs_covariates = Vec::new();
+        let scaled_preds: Vec<f64> = f.iter().zip(w).map(|(&fi, wi)| fi / wi).collect();
+
+        let theta = [0.2, 10.0];
+        let sigma = [0.8];
+        let eta = [0.0];
+
+        let nll_weighted =
+            obs_nll_subject_from_preds(&weighted, &natural, &f, &theta, &sigma, &eta);
+        let nll_hand =
+            obs_nll_subject_from_preds(&plain, &prescaled, &scaled_preds, &theta, &sigma, &eta);
+        let jacobian: f64 = w.iter().map(|wi| wi.ln()).sum();
+
+        approx::assert_relative_eq!(nll_weighted, nll_hand + jacobian, epsilon = 1e-12);
+    }
+
     #[test]
     fn test_split_obs_by_occasion_two_occ() {
         let subj = make_simple_subject();
