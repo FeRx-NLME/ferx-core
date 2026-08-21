@@ -78,6 +78,87 @@ FOCE fit, proposal = ML covariance matrix, default Student-t (ν=5). ESS scales 
 
 The full fit + SIR runs in ~0.1s.
 
+### Rank-deficient and non-identified proposals
+
+The proposal is the fit's asymptotic covariance matrix, and that matrix is often
+degenerate in ways SIR has to handle explicitly.
+
+**`FIX`ed parameters are never sampled.** A fixed parameter has no uncertainty:
+its row/column in the covariance matrix is exactly zero and its packed bounds
+are pinned (`lower == upper`). SIR restricts the proposal to the *free* block,
+holds fixed parameters at their fixed values, and uses the free dimension as
+the Student-t dimensionality, so the importance weights stay consistent. This
+matters for model-based meta-analysis, where fixing the residual variance
+(`sigma ADD_ERR ~ 1.0 (variance) FIX`) *is* the inverse-variance weighting
+scheme and cannot be dropped.
+
+**Directions the data do not identify are floored or shrunk, and reported.**
+Two things can go wrong with the free block itself:
+
+- A **likelihood ridge** — two parameters that determine only their sum — leaves
+  a direction with (near-)zero variance. SIR floors it so the proposal stays
+  positive definite, and warns that those parameter combinations are held at
+  their ML values rather than explored.
+- A **non-identified direction** comes back from the covariance step with an
+  enormous variance: the FD Hessian's near-zero eigenvalues are floored before
+  inversion, so the inverse carries variances around `1 / floor` — thousands of
+  standard deviations in packed (log) space. Drawing from that proposal
+  unshrunk places every single sample outside the parameter bounds. SIR now caps
+  each direction so ±2 proposal standard deviations still fit between the ML
+  estimate and the *nearer* of its packed bounds, and warns that CIs along those
+  directions understate the uncertainty. The room is measured from the estimate,
+  not from the middle of the box: a `theta (0, 100)` estimated at `0.5` has far
+  more room below it than above, and a cap derived from the box width would let
+  most draws overshoot the upper bound. The Student-t tails are accounted for
+  too, so the ±2 sd is a statement about the draws rather than about the scale
+  matrix.
+
+  The cap is deliberately loose — it bites only a direction more than ten times
+  wider than the room its parameters have — so a legitimately wide uncertainty is
+  left alone. That gate matters most for the variance components, whose packed
+  bounds are narrow (an omega log-Cholesky diagonal lives in `[-6, 6]`): a
+  collapsing omega genuinely has log-scale uncertainty of that order, and
+  shrinking it would silently narrow its CI and mislabel it as non-identified.
+  The failure the cap exists for overshoots by a factor of 1e3–1e4.
+
+Both notes arrive as fit warnings prefixed `SIR:` and name the parameters
+involved, e.g.
+
+```
+SIR: proposal was shrunk in 3 direction(s) so draws mostly stay inside the
+parameter bounds [TVKA -0.74, ETA_KA -0.60, ETA_V +0.28 (sd 6.15e3 → 2.89e0); ETA_V +0.84,
+TVV +0.36, ETA_CL +0.24 (sd 6.15e3 → 3.58e0); ...]. Those directions come from
+eigenvalue-floored (non-identified) curvature in the covariance step; the SIR
+CIs along them understate the true uncertainty.
+```
+
+That example is the bundled warfarin model refitted with `PROP_ERR` fixed far
+from its ML value: the fit is misspecified, three of six free-block Hessian
+eigenvalues get floored, and before this the run died with `All SIR samples had
+invalid weights`. It now completes with an ESS of ~1 — which, together with the
+warning, is the honest answer: the proposal carries no usable information in
+those directions.
+
+They are a signal about the *model*, not only about SIR: a direction the
+covariance step had to floor is a direction the data do not inform.
+
+**When every sample is still rejected**, the error names the failing check
+rather than just saying the weights were invalid — how many samples fell out of
+bounds, which coordinates' bounds they hit, and what the proposal's rank
+deficiency looks like:
+
+```
+All 1000 SIR samples had invalid weights (rejected: 1000 out of bounds, 0
+non-positive theta/sigma/omega, 0 non-finite OFV, 0 cancelled). Bound first
+overshot by: TVET50 (734), TVEMAX (266) (count of samples, first offending
+coordinate only). Proposal covariance is rank-deficient beyond the FIX-ed
+parameters: ...
+```
+
+The fit-time counterpart of this diagnosis is the covariance step's own
+`Covariance step regularized: eigenvalue floor applied to FD Hessian ...`
+warning, which fires whenever the free-block Hessian had eigenvalues clipped.
+
 ## Computational Cost
 
 SIR evaluates the inner loop (EBE optimization) for each of the M proposal samples. With the default M=1000, this is roughly 3-10x the cost of the estimation step itself. The computation is parallelized across samples and warm-started from the ML EBEs to minimize runtime.
