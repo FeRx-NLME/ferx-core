@@ -19,11 +19,29 @@ use crate::types::*;
 use nalgebra::DVector;
 use std::path::Path;
 
+/// Append the SIR kernel's proposal-conditioning notes to a fit's warnings,
+/// skipping any that are already there.
+///
+/// `run_sir` clones its input fit, and that fit may already carry identical
+/// `SIR:` lines — it was produced with `sir = true` (the inline path in
+/// `fit_inner` pushes the same text), or its own `run_sir` output is being piped
+/// back in. Without the dedupe the same line accumulates and is printed once per
+/// pass (#1037).
+fn push_sir_warnings(warnings: &mut Vec<String>, sir_warnings: &[String]) {
+    for w in sir_warnings {
+        let line = format!("SIR: {}", w);
+        if !warnings.contains(&line) {
+            warnings.push(line);
+        }
+    }
+}
+
 /// Run SIR against an existing fit. Returns a new `FitResult` that is a clone
-/// of `fit` with the `sir_*` fields populated. The returned fit's
-/// `warnings` vector is unchanged — SIR-specific diagnostics live on
-/// `sir_ess` (low ESS signals a poorly-matched proposal); the SIR kernel
-/// does not emit structured warnings, so there is nothing to propagate.
+/// of `fit` with the `sir_*` fields populated. Proposal-conditioning
+/// diagnostics (rank deficiency / bound-driven shrinkage, #1021) are appended
+/// to the returned fit's `warnings` as `SIR: …` lines, deduplicated against
+/// what the input fit already carried; `sir_ess` remains the quantitative
+/// signal for a poorly-matched proposal.
 ///
 /// # Notes on integrity
 ///
@@ -203,6 +221,7 @@ pub fn run_sir(
 
     // --- Build the augmented FitResult ------------------------------------
     let mut out = fit.clone();
+    push_sir_warnings(&mut out.warnings, &sir.warnings);
     out.sir_ci_theta = Some(sir.ci_theta);
     out.sir_ci_omega = Some(sir.ci_omega);
     out.sir_ci_sigma = Some(sir.ci_sigma);
@@ -215,6 +234,39 @@ pub fn run_sir(
 mod tests {
     use super::*;
     use crate::api::fit_from_files;
+
+    /// #1037: a fit that already carries the same `SIR:` line — because it was
+    /// fitted with `sir = true`, or because its `run_sir` output is being piped
+    /// back in — must not collect a second copy.
+    #[test]
+    fn push_sir_warnings_does_not_duplicate() {
+        let mut warnings = vec![
+            "Covariance step: matrix was not positive definite".to_string(),
+            "SIR: proposal covariance is rank-deficient [CL +0.71, V -0.70]".to_string(),
+        ];
+        let sir = vec![
+            "proposal covariance is rank-deficient [CL +0.71, V -0.70]".to_string(),
+            "proposal was shrunk in 1 direction(s) [KA +1.00]".to_string(),
+        ];
+        push_sir_warnings(&mut warnings, &sir);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings[2].starts_with("SIR: proposal was shrunk"),
+            "{warnings:?}"
+        );
+
+        // Idempotent: a second pass over the same kernel output adds nothing.
+        push_sir_warnings(&mut warnings, &sir);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+    }
+
+    /// A clean SIR run leaves the fit's warnings untouched.
+    #[test]
+    fn push_sir_warnings_is_a_no_op_when_the_proposal_was_clean() {
+        let mut warnings = vec!["Minimization terminated".to_string()];
+        push_sir_warnings(&mut warnings, &[]);
+        assert_eq!(warnings, vec!["Minimization terminated".to_string()]);
+    }
 
     // Use the in-tree warfarin example + data. They live at repo paths
     // `examples/warfarin.ferx` and `data/warfarin.csv` (see CLAUDE.md);
@@ -574,6 +626,44 @@ mod tests {
             "ess = {} out of (0, {}]",
             ess,
             opts.sir_samples
+        );
+    }
+
+    /// #1021: the covariance step floors non-identified eigenvalues of the FD
+    /// Hessian before inverting it, so such a direction comes back in
+    /// `covariance_matrix` with a variance of ~1/floor. Sampling that direction
+    /// unshrunk put every SIR draw outside the packed bounds, and SIR failed
+    /// with the uninformative "All SIR samples had invalid weights". The
+    /// proposal is now capped at the bounds: SIR runs, and says so.
+    #[test]
+    fn run_sir_survives_an_explosive_proposal_direction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (model_path, data_path) = copy_example_to_tempdir(dir.path());
+
+        let opts = quick_opts();
+        let Some(mut fit) = fit_with_cov_or_skip(
+            model_path.to_str().unwrap(),
+            data_path.to_str().unwrap(),
+            opts.clone(),
+        ) else {
+            return;
+        };
+
+        // Inflate one free direction to the magnitude an eigenvalue-floored
+        // Hessian produces. Adding to a diagonal keeps the matrix PSD, so this
+        // is a covariance a real fit could hand us — not a malformed input.
+        let mut cov = fit.covariance_matrix.clone().expect("covariance present");
+        cov[(0, 0)] += 1e8;
+        fit.covariance_matrix = Some(cov);
+
+        let out = run_sir(&fit, None, None, &opts)
+            .expect("SIR must survive an eigenvalue-floored proposal direction");
+        let ess = out.sir_ess.expect("sir_ess populated");
+        assert!(ess > 0.0, "ess = {ess}");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("shrunk")),
+            "the shrinkage must be reported to the user: {:?}",
+            out.warnings
         );
     }
 

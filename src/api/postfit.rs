@@ -513,7 +513,12 @@ pub(crate) fn resolve_sir_fallback(
     match crate::estimation::sir::run_sir_core(
         model, population, params, eta_hats, proposal, ofv, options,
     ) {
-        Ok(sir) => Some(sir),
+        Ok(sir) => {
+            for w in &sir.warnings {
+                warnings.push(format!("SIR fallback: {}", w));
+            }
+            Some(sir)
+        }
         Err(e) => {
             warnings.push(format!("SIR fallback failed: {}", e));
             None

@@ -259,6 +259,18 @@ section of the SDLC for the versioning policy).
   every ODE driver (dense, dense-with-states, event-driven, adaptive-dosing replay) and to the
   analytic `Dual2`/`Dual1` sensitivity walks, whose clamp is gated identically so the analytic
   gradient still matches finite differences of the predictor.
+- **SIR no longer fails with "All SIR samples had invalid weights" on a rank-deficient covariance
+  (#1021).** A parameter direction the data do not identify comes back from the covariance step with
+  a variance around `1 / eigenvalue floor` — thousands of standard deviations in packed log-space —
+  so every proposal draw landed outside the parameter bounds and was rejected. Each proposal
+  direction is now capped so ±2 standard deviations stay inside the room between the estimate and
+  its nearer packed bound, near-null
+  directions (a likelihood ridge left over after `FIX`ed parameters are excluded) are floored rather
+  than fatal, and both cases are reported as `SIR:` warnings naming the parameters involved. When
+  every sample *is* still rejected, the error now reports the rejection tally, the coordinates whose
+  bounds were hit, and the proposal's rank deficiency instead of the bare message. This is the
+  common model-based meta-analysis case, where fixing the residual variance is the weighting scheme
+  and cannot be dropped.
 - **Simulating an IOV (`kappa`) model with parameters that carry no IOV covariance now reports an
   error instead of panicking (#1019).** `simulate()` draws one κ per occasion from `omega_iov`; a
   caller that rebuilds `ModelParameters` from a fit and drops that block (the R

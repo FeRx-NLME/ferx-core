@@ -1785,7 +1785,12 @@ fn fit_inner(
                 result.ofv,
                 options,
             ) {
-                Ok(sir) => Some(sir),
+                Ok(sir) => {
+                    for w in &sir.warnings {
+                        warnings.push(format!("SIR: {}", w));
+                    }
+                    Some(sir)
+                }
                 Err(e) => {
                     warnings.push(format!("SIR failed: {}", e));
                     None
