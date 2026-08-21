@@ -131,10 +131,36 @@ around this with a dummy integrating state —
 subject's **first record**, not at `t = 0`, so it silently disagrees with `TIME`
 on any dataset with no `TIME = 0` row.
 
+The value is the **raw data-file `TIME`**, the same clock sdtab/covtab `TIME`,
+`predict()` / `simulate()` `TIME`, `[derived]` integral windows, and a custom
+residual-error magnitude report. This matters only for datasets with stacked
+reset occasions whose `TIME` restarts: there the integrator runs on an internal
+monotonic timeline, and the readout — like NONMEM's `$ERROR`, whose `TIME` is
+also not `$DES`'s clock — stays on the user clock.
+
+#### If your dataset has a column named `T`
+
+`T` and `t` are the `[odes]` spellings of the model-time built-in, and
+`[scaling]` folds them the same way — so a `T` **column** would otherwise be
+silently replaced by the clock. Declaring it wins:
+
+```ferx
+[covariates]
+  T continuous
+[scaling]
+  y = central / V * T     # the column, not the clock
+```
+
+Whenever `T` / `t` *is* folded into the built-in, ferx emits a parse warning
+saying so and naming both escapes (spell it `TIME`, or declare the column).
+Writing `TIME` is unambiguous and never warns.
+
 `TAFD` and `TAD` are *not* built-ins here. They stay ordinary covariate
 references in `[scaling]`, so a `TAFD` / `TAD` **column** in the dataset
 resolves normally — unlike in `[odes]`, where the two names are reserved for
-the solver-injected anchors and a same-named data column is unreachable.
+the solver-injected anchors and a same-named data column is unreachable. If the
+column is absent, the resulting `E_MISSING_COVARIATE` names that scope split, so
+"I meant the `[odes]` built-in" is not mistaken for a typo.
 
 ### Undefined names are data columns, not zeros
 

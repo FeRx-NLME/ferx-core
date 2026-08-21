@@ -312,8 +312,10 @@ pub fn apply_analytic_readout(
         // as the guard (#1028), so the readout evaluates `TIME` at the observation
         // here exactly as it does on the ODE predictor path. A no-op for a readout
         // that does not reference `TIME`; the analytic providers set the matching
-        // guard around their own readout eval, keeping FD parity.
-        let t = subject.obs_times.get(i).copied().unwrap_or(0.0);
+        // guard around their own readout eval, keeping FD parity. `readout_time` is
+        // the raw data-file clock — the `$ERROR` convention, which differs from the
+        // integrator timeline only under stacked reset occasions.
+        let t = subject.readout_time(i);
         *pred = ar
             .readout
             .eval(&state, &pk_i.values, theta, eta, cov, obs_cmt, t);

@@ -1052,6 +1052,29 @@ impl Subject {
         self.dose_covariates.get(k).unwrap_or(&self.covariates)
     }
 
+    /// The `TIME` a *record-level* expression sees at observation index `j`: the
+    /// raw data-file time ([`Subject::obs_raw_times`]), falling back to the
+    /// internal monotonic [`Subject::obs_times`] for in-memory subjects that
+    /// don't carry it.
+    ///
+    /// This is the user clock, and it is the convention every other per-record
+    /// object already uses — sdtab/covtab `TIME`, `predict()`/`simulate()` `TIME`,
+    /// `[derived]` integral windows, and the custom residual-magnitude model
+    /// ([`ModelParameters::ruv_obs_mult`], documented as "matching what NONMEM's
+    /// `$ERROR` sees"). A `[scaling]` Form C readout is the `$ERROR` twin — it is
+    /// anchored against NONMEM's `$ERROR` in
+    /// `tests/scaling_time_readout_nonmem_anchor.rs` — so it reads the same clock
+    /// (#1028). The two differ only for subjects with stacked reset occasions
+    /// whose data TIME restarts, where `obs_times` is the shifted integrator
+    /// timeline; the integrator itself keeps using `obs_times`, exactly as
+    /// NONMEM's `$DES` clock is not its `$ERROR` `TIME`.
+    pub fn readout_time(&self, j: usize) -> f64 {
+        self.obs_raw_times
+            .get(j)
+            .copied()
+            .unwrap_or_else(|| self.obs_times.get(j).copied().unwrap_or(0.0))
+    }
+
     /// Covariate snapshot at EVID=2 row index `m`. Same fallback as
     /// the others — for time-constant covariates this returns the
     /// subject-static map.

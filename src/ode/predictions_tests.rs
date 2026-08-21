@@ -56,6 +56,62 @@ fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
     }
 }
 
+/// A Form C readout that returns nothing but the model-time thread-local, so a
+/// prediction vector *is* the sequence of `TIME` values the readout saw (#1028).
+fn time_readout_ode_spec() -> OdeSpec {
+    OdeSpec {
+        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+            dy[0] = 0.0;
+        }),
+        n_states: 1,
+        state_names: vec!["central".into()],
+        readout: OdeReadout::Single(Box::new(|_state, _pk, _theta, _eta, _cov| {
+            crate::parser::model_parser::current_model_time()
+        })),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+        init_fn: None,
+    }
+}
+
+/// The Form C readout's `TIME` is the **raw data-file clock** (`obs_raw_times`),
+/// not the shifted internal timeline `obs_times` carries for subjects with stacked
+/// reset occasions (#1028). That is the convention every other per-record object
+/// already uses — sdtab/covtab `TIME`, `predict()`/`simulate()` `TIME`, `[derived]`
+/// integral windows, and the custom residual-magnitude model
+/// (`ModelParameters::ruv_obs_mult`, documented as matching what NONMEM's `$ERROR`
+/// sees) — and a Form C readout is the `$ERROR` twin. Before this, a reset-stacked
+/// dataset got the integrator clock in the readout and the data clock in the
+/// residual-magnitude model, for the same record.
+#[test]
+fn form_c_readout_time_is_the_raw_data_clock() {
+    // Two occasions of 0 h / 1 h, stacked onto a monotonic 0/1/2/3 integrator grid.
+    let mut subj = make_subject(Vec::new(), vec![0.0, 1.0, 2.0, 3.0]);
+    subj.obs_raw_times = vec![0.0, 1.0, 0.0, 1.0];
+
+    let ode = time_readout_ode_spec();
+    let pk = pk_one(5.0, 1.0);
+    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+    assert_eq!(
+        preds, subj.obs_raw_times,
+        "the readout must see the raw data-file TIME, got {preds:?}"
+    );
+
+    // Fallback: an in-memory subject with no `obs_raw_times` keeps reading
+    // `obs_times`, so nothing changes for the (overwhelmingly common) no-reset case.
+    let plain = make_subject(Vec::new(), vec![0.0, 1.0, 2.0, 3.0]);
+    let preds_plain = ode_predictions(&ode, &pk.values, &[], &[], &plain);
+    assert_eq!(
+        preds_plain, plain.obs_times,
+        "with no raw times the readout falls back to obs_times, got {preds_plain:?}"
+    );
+}
+
 /// 1-cpt IV bolus + a cumulative-hazard accumulator: state 0 = central
 /// (`dC/dt = -ke·C`, `ke = CL/V`), state 1 = CHZ (`dCHZ/dt = 0.1·C`). With a
 /// bolus `amt` at t=0 this has the closed form `C(t) = amt·e^{-ke t}`,

@@ -116,3 +116,29 @@ fn predict_accepts_a_scaling_identifier_the_data_carries() {
         preds.iter().map(|p| p.pred).collect::<Vec<_>>()
     );
 }
+
+/// The check keys on what the *predictor* can resolve, which is wider than
+/// `Population::covariate_names`. A CSV-read population always lists every
+/// covariate column there, but an in-memory `Population` may populate each
+/// `Subject::covariates` map and leave the name list empty — a construction
+/// `predict()` has always served correctly, because it resolves covariates from
+/// the subject map (`Subject::obs_cov`), not the list. Adding the check to
+/// `predict()` must not turn that into a panic.
+#[test]
+fn predict_accepts_a_covariate_carried_only_by_the_subject_maps() {
+    let model =
+        parse_model_string(&UNDEFINED_READOUT.replace("TOTALLY_UNDEFINED_NAME", "SOME_COVARIATE"))
+            .expect("parse");
+    let pop = population(&[], HashMap::from([("SOME_COVARIATE".to_string(), 2.0)]));
+    assert!(
+        pop.covariate_names.is_empty(),
+        "the point of this case is an unpopulated name list"
+    );
+    let preds = predict(&model, &pop, &model.default_params);
+    assert_eq!(preds.len(), 3, "one row per observation");
+    assert!(
+        preds.iter().all(|p| p.pred > 0.0),
+        "a covariate every subject map carries must still scale the readout, got {:?}",
+        preds.iter().map(|p| p.pred).collect::<Vec<_>>()
+    );
+}

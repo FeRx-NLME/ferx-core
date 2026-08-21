@@ -10930,6 +10930,94 @@ fn scaling_y_readout_folds_the_t_alias_under_every_node_kind() {
     );
 }
 
+/// A `[scaling]` `y` covariate has been a required data column since #540, so a
+/// dataset with a real column named `T` and a readout like `y = central/V * T`
+/// worked before #1028 — and the alias fold must not silently repoint it at the
+/// clock. Declaring `T` in `[covariates]` is the explicit escape hatch: the name
+/// then keeps its data-column meaning, exactly as a bound state or individual
+/// parameter does.
+#[test]
+fn scaling_y_readout_t_alias_loses_to_a_declared_covariate() {
+    for alias in ["T", "t"] {
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some(&format!("  y = central / V * {alias}\n")),
+        ) + &format!("\n[covariates]\n  {alias} continuous\n");
+        let model = parse_model_string(&src).expect("a declared T covariate parses");
+        assert_eq!(
+            model.referenced_covariates,
+            vec![alias.to_string()],
+            "a `[covariates]`-declared `{alias}` must stay a required data column"
+        );
+        assert!(
+            !readout_reads_time(&model),
+            "a declared `{alias}` must not be folded into the model-time built-in"
+        );
+    }
+}
+
+/// …and when the fold *does* fire (no declaration), it says so. The undeclared
+/// case is the one the parser cannot disambiguate — a dataset column named `T` is
+/// only a warning elsewhere — so the note names both escapes: spell it `TIME`, or
+/// declare the column.
+#[test]
+fn scaling_y_readout_t_alias_fold_warns() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = central / V * T\n"),
+    );
+    let model = parse_model_string(&src).expect("the T alias parses");
+    let note = model
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("model-time built-in"))
+        .unwrap_or_else(|| panic!("expected a fold warning, got {:?}", model.parse_warnings));
+    assert!(
+        note.contains("[covariates]"),
+        "warning must name the escape hatch: {note}"
+    );
+
+    // Spelling it `TIME` is unambiguous and must not warn.
+    let src_time = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = central / V * TIME\n"),
+    );
+    let model_time = parse_model_string(&src_time).expect("TIME parses");
+    assert!(
+        !model_time
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("model-time built-in")),
+        "the unambiguous `TIME` spelling must not warn, got {:?}",
+        model_time.parse_warnings
+    );
+}
+
+/// `[odes]` reserves `TIME`/`T`/`TAFD`/`TAD`/`MACHEPS`, but only `TIME` (and its
+/// `T` alias) is a `[scaling]` built-in. `TAFD`/`TAD`/`MACHEPS` stay **ordinary
+/// covariates** here — documented behaviour (`docs/model-file/scaling.qmd`), so a
+/// dataset that really carries a `TAD` column can use it. This pins that: they
+/// register as required data columns and are not folded into anything.
+#[test]
+fn scaling_odes_only_builtins_stay_covariates() {
+    for builtin in ["TAFD", "TAD", "MACHEPS"] {
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some(&format!("  y = central / V + {builtin}\n")),
+        );
+        let model = parse_model_string(&src).expect("an [odes]-only name parses as a covariate");
+        assert_eq!(
+            model.referenced_covariates,
+            vec![builtin.to_string()],
+            "`{builtin}` must register as a required data column in [scaling]"
+        );
+        assert!(
+            !readout_reads_time(&model),
+            "`{builtin}` must not resolve to the model-time built-in"
+        );
+    }
+}
+
 #[test]
 fn test_parse_scaling_y_per_cmt_form_c() {
     // Per-CMT Form C on an ODE model. Build_y_output_fn picks up each

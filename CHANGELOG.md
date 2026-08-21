@@ -60,10 +60,20 @@ section of the SDLC for the versioning policy).
   `E_MISSING_COVARIATE` for a missing column just as `fit()` and `simulate()` already did.
   **Breaking** in two narrow places: `obs_scale = TIME` (or `= T`) is now a parse error naming Form
   C as the place for a time-dependent readout — the divisor is subject-static, evaluated once at
-  `t = 0`, so it could only ever have read `0`; and a `[scaling]` expression referencing a data
-  column named `T` now reads the model-time built-in instead, matching `[odes]`, where that name has
-  always been reserved. `TAFD` / `TAD` are unaffected and remain ordinary covariate references in
-  `[scaling]`.
+  `t = 0`, so it could only ever have read `0`; and a `[scaling]` expression referencing an
+  *undeclared* data column named `T` now reads the model-time built-in instead, matching `[odes]`,
+  where that name has always been reserved. Declaring `T` in `[covariates]` keeps it a data column,
+  and whenever the fold does happen ferx warns and names both escapes, so the substitution is never
+  silent. `TAFD` / `TAD` are unaffected and remain ordinary covariate references in `[scaling]`;
+  when such a column is missing, `E_MISSING_COVARIATE` now explains that the name is an `[odes]`-only
+  built-in rather than reading as a plain typo report. The readout's `TIME` is the raw data-file
+  clock — the same one sdtab, `predict()`/`simulate()` and `[derived]` windows report, and NONMEM's
+  `$ERROR` uses — which differs from the integrator timeline only for datasets with stacked reset
+  occasions. A modified-release model whose closed-form fast path applies now declines to the ODE
+  path when its readout reads `TIME`, instead of dropping the time term via a state-space linearity
+  probe. `predict()`'s new covariate check accepts a name every subject's covariate map carries even
+  when the population's `covariate_names` list is empty, so a programmatically built in-memory
+  `Population` keeps working.
 - **SAEM no longer lets a fixed-effect-only theta drift away from the marginal optimum (#1011).** The
   numerical θ/σ M-step assigned NLopt's maximiser outright, re-maximising against a *single* MCMC η
   draw each iteration — `argmax` of one draw rather than the stochastic-approximation average of

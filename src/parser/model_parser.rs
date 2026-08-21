@@ -2674,6 +2674,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 .cloned()
         };
         let mut scaling_parse_warnings: Vec<String> = Vec::new();
+        // Peek the `[covariates]` declarations (parsed for real further down, at the
+        // block's own site) purely for name precedence inside `[scaling]`: a declared
+        // `T` is a data column, not the model-time alias, and a declared `TAD` is a
+        // data column rather than the rejected `[odes]` built-in (#1028). Peeked
+        // rather than hoisted so a malformed `[covariates]` block still reports its
+        // own error at its own site, in the existing order — hence the `.ok()`.
+        let declared_covariates_for_scaling: Vec<String> = blocks
+            .get("covariates")
+            .and_then(|lines| parse_covariates_block(lines).ok())
+            .map(|decls| decls.into_iter().map(|d| d.name).collect())
+            .unwrap_or_default();
 
         let (scaling, output_fn, output_program, scaling_covariates) = parse_scaling_block(
             scaling_lines,
@@ -2687,6 +2698,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.kappa_names,
             &readout_synth_params,
             volume_indiv_name_for_scaling.as_deref(),
+            &declared_covariates_for_scaling,
             &mut scaling_parse_warnings,
         )?;
         model.parse_warnings.extend(scaling_parse_warnings);
@@ -6992,6 +7004,7 @@ fn build_obs_scale_spec(
     indiv_var_names: &[String],
     pk_indices: &[usize],
     volume_indiv_name: Option<&str>,
+    declared_covariates: &[String],
     parse_warnings: &mut Vec<String>,
 ) -> Result<(ScalingSpec, Vec<String>), String> {
     // Try scalar first (Form A). Otherwise parse as expression (Form B).
@@ -7017,7 +7030,7 @@ fn build_obs_scale_spec(
     // observation by the t=0 value. Reject it rather than serve that (#1028); a
     // genuinely time-dependent readout is Form C's job, where `TIME` resolves per
     // observation.
-    if expr_references_time_builtin(&expr) {
+    if expr_references_time_builtin(&expr, declared_covariates) {
         return Err(format!(
             "[scaling] obs_scale: `{}` references the `TIME` built-in (or its `T` alias), \
              but `obs_scale` is a subject-static divisor — it is evaluated once per \
@@ -7363,25 +7376,62 @@ fn parse_initial_conditions_block(
 /// a state or individual parameter genuinely named `T` resolves to `Variable("T")`
 /// during the parse and keeps winning, matching the usual name-resolution
 /// precedence (the ODE-model case can't arise — `[odes]` rejects that name).
-fn rewrite_scaling_time_alias(expr: &mut Expression) {
+///
+/// Two further guards keep the fold from *taking* a name that means something
+/// else. A `[scaling]` `y` covariate has been a required data column since #540,
+/// so a dataset with a real column named `T` used to work and must keep working:
+///
+/// 1. a `T` / `t` listed in `declared_covariates` (the `[covariates]` block) is a
+///    data column by explicit declaration and is left as `Covariate` — the same
+///    precedence a bound state or individual parameter gets; and
+/// 2. when the fold does fire it pushes a `parse_warnings` note naming that escape
+///    hatch, so a model that meant the column — and did not declare it, which is
+///    only a warning elsewhere — is told rather than silently re-pointed at the
+///    clock. Spelling it `TIME` clears the warning.
+fn rewrite_scaling_time_alias(
+    expr: &mut Expression,
+    context: &str,
+    declared_covariates: &[String],
+    parse_warnings: &mut Vec<String>,
+) {
+    let mut folded: Option<String> = None;
     visit_expr_nodes_mut(expr, &mut |e: &mut Expression| {
         if let Expression::Covariate(name) = e {
-            if name == "T" || name == "t" {
+            if (name == "T" || name == "t") && !declared_covariates.iter().any(|d| d == name) {
+                if folded.is_none() {
+                    folded = Some(name.clone());
+                }
                 *e = Expression::Time;
             }
         }
     });
+    if let Some(name) = folded {
+        parse_warnings.push(format!(
+            "{context}: `{name}` resolved as the model-time built-in (the `[odes]` alias \
+             for `TIME`), not as a data column. Spell it `TIME` to silence this; if your \
+             dataset really has a column named `{name}`, declare it in `[covariates]` and \
+             it will be read as the column instead. See issue #1028."
+        ));
+    }
 }
 
 /// Whether `expr` reads the model-time built-in, under either spelling: the
 /// `Expression::Time` node a bare `TIME` parses to, or the `T` / `t` alias
 /// [`rewrite_scaling_time_alias`] folds into it. Drives the `obs_scale`
 /// rejection (#1028) — see [`build_obs_scale_spec`].
-fn expr_references_time_builtin(expr: &Expression) -> bool {
+///
+/// `declared_covariates` gets the same precedence it gets in the fold: a `T`
+/// declared in `[covariates]` is a data column, not the clock, so it does not
+/// trip the rejection.
+fn expr_references_time_builtin(expr: &Expression, declared_covariates: &[String]) -> bool {
     let mut found = false;
     visit_expr_nodes(expr, &mut |e: &Expression| match e {
         Expression::Time => found = true,
-        Expression::Covariate(n) if n == "T" || n == "t" => found = true,
+        Expression::Covariate(n)
+            if (n == "T" || n == "t") && !declared_covariates.iter().any(|d| d == n) =>
+        {
+            found = true
+        }
         _ => {}
     });
     found
@@ -7401,6 +7451,8 @@ pub(crate) fn build_y_output_fn(
     kappa_names: &[String],
     readout_synth: &[ReadoutSynthParam],
     forbidden_state_names: &[String],
+    declared_covariates: &[String],
+    parse_warnings: &mut Vec<String>,
 ) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram, Vec<String>), String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
@@ -7416,8 +7468,9 @@ pub(crate) fn build_y_output_fn(
     // `T` / `t` is the `[odes]` spelling of the model-time built-in; fold it into
     // the `Expression::Time` node a bare `TIME` already parses to, so the two
     // blocks agree on the name (#1028). Runs before the covariate scan below so
-    // the alias never registers as a required data column.
-    rewrite_scaling_time_alias(&mut expr);
+    // the alias never registers as a required data column — unless `[covariates]`
+    // declares it, in which case it stays the data column it was declared to be.
+    rewrite_scaling_time_alias(&mut expr, context, declared_covariates, parse_warnings);
 
     // Analytic Form C (#650): reject a readout that references a peripheral (or a
     // depot/transit amount with no closed form) — the analytical solutions don't
@@ -7648,6 +7701,11 @@ pub(crate) fn build_y_output_fn(
 ///   not an error: it's a supported feature, but also the signature of a
 ///   common mistake (a leftover `obs_scale = V` from an `ode(...)`
 ///   translation) — see [`build_obs_scale_spec`] (#712).
+///
+/// `declared_covariates` is the `[covariates]` block's name list (empty when the
+/// block is absent). It only affects name *precedence*: a `T` / `t` declared there
+/// is a data column and is read as one, instead of being folded into the
+/// model-time built-in (#1028).
 #[allow(clippy::too_many_arguments)]
 fn parse_scaling_block(
     lines: &[String],
@@ -7661,6 +7719,7 @@ fn parse_scaling_block(
     kappa_names: &[String],
     readout_synth: &[ReadoutSynthParam],
     volume_indiv_name: Option<&str>,
+    declared_covariates: &[String],
     parse_warnings: &mut Vec<String>,
 ) -> Result<
     (
@@ -7705,6 +7764,7 @@ fn parse_scaling_block(
                     indiv_var_names,
                     pk_indices,
                     volume_indiv_name,
+                    declared_covariates,
                     parse_warnings,
                 )?;
                 // Form B `obs_scale` covariate leaves are required data columns too
@@ -7765,6 +7825,8 @@ fn parse_scaling_block(
                     kappa_names,
                     readout_synth,
                     &forbidden,
+                    declared_covariates,
+                    parse_warnings,
                 )?;
                 for cov in cov_names {
                     if !scaling_covariates.contains(&cov) {
@@ -12788,7 +12850,11 @@ pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-fn current_model_time() -> f64 {
+/// The model-time thread-local `Expression::Time` / `Op::PushTime` resolves
+/// against. `pub(crate)` so a hand-built `OdeReadout::Single` test closure can
+/// observe the same value a compiled readout would (the readout closure signature
+/// carries no `time` argument — the guard is the channel).
+pub(crate) fn current_model_time() -> f64 {
     MODEL_TIME.with(std::cell::Cell::get)
 }
 
@@ -15840,6 +15906,23 @@ impl OdeOutputProgram {
     /// See [`OdeOutputProgram::dual_evaluable`].
     pub(crate) fn is_dual_evaluable(&self) -> bool {
         self.dual_evaluable
+    }
+
+    /// Whether the readout reads the model-time built-in (`Op::PushTime`, from a
+    /// `TIME` / `T` / `t` reference). Such a readout is **not** a pure function of
+    /// the compartment state: its value at a fixed state depends on which
+    /// observation is being read.
+    ///
+    /// That breaks any consumer that characterises the readout by probing it at a
+    /// synthetic state — the modified-release closed-form fast path
+    /// (`pk::modified_release::recover_disp_params_g`) probes `readout(0)`,
+    /// `readout(e_c)`, `readout(2·e_c)` to establish linearity in the central
+    /// amount, and an additive `TIME` term evaluates to its *ambient* thread-local
+    /// value there (`0.0` at the gate), so the probe would certify a linear readout
+    /// and the fast path would then silently drop the whole time term. Callers that
+    /// probe must decline on `true` (#1028).
+    pub(crate) fn reads_time_builtin(&self) -> bool {
+        self.bc.ops.iter().any(|op| matches!(op, Op::PushTime))
     }
 
     /// Number of compartment-state inputs in the readout's `vars[0..n_states]`

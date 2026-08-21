@@ -1600,7 +1600,10 @@ fn record_observations(
 ) {
     for &obs_idx in obs_idxs {
         let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-        let t_obs = subject.obs_times.get(obs_idx).copied().unwrap_or(0.0);
+        // The readout's `TIME` is the *user* clock (`readout_time`), not the shifted
+        // integrator timeline — the `$ERROR` convention the rest of the per-record
+        // objects use. The two differ only under stacked reset occasions (#1028).
+        let t_obs = subject.readout_time(obs_idx);
         predictions[obs_idx] =
             read_observable(ode, u, pk, theta, eta, subject.obs_cov(obs_idx), cmt, t_obs);
         if let Some(states) = states.as_deref_mut() {
@@ -4650,7 +4653,8 @@ pub fn ode_predictions_event_driven(
                     eta,
                     subject.obs_cov(idx),
                     cmt,
-                    subject.obs_times.get(idx).copied().unwrap_or(0.0),
+                    // User-clock `TIME` for the readout — see `record_observations`.
+                    subject.readout_time(idx),
                 );
                 // Clamp negative readouts (ODE solver overshoot guard);
                 // let NaN through so a missing `OdeReadout::PerCmt` entry

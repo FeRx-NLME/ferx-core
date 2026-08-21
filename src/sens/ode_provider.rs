@@ -1738,9 +1738,10 @@ fn resolve_obs_readout<T: crate::sens::num::PkNum>(
     // basis. Entered once here rather than per readout arm: it is a thread-local
     // swap plus a restore on drop, and the `ObsCmt` arm (which reads a state slot
     // and never evaluates a program) is the only one that cannot observe it.
-    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(
-        subject.obs_times.get(j).copied().unwrap_or(0.0),
-    );
+    // `readout_time` (the raw data-file clock, not the shifted integrator timeline)
+    // is the same convention the f64 predictor feeds `OdeReadout::eval`, so the two
+    // linearise the same expression under stacked resets too.
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(j));
     let raw = match &ode.readout {
         OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(T::from_f64(0.0)),
         OdeReadout::Single(_) => ode

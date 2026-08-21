@@ -67,11 +67,29 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
 /// surfaces the actionable message instead of "covariate not found in data". The
 /// `E_MISSING_COVARIATE` message text stays byte-for-byte identical to the
 /// historical `Err(String)` for the names that remain.
+///
+/// "Carries" means the *predictor* can resolve the name, which is a slightly wider
+/// test than membership in `Population::covariate_names`. A CSV-read population
+/// always lists every covariate column there, but an in-memory `Population` built
+/// programmatically may populate each `Subject::covariates` map and leave the name
+/// list empty — a construction the predictors have always resolved fine, since they
+/// read the per-subject map (`Subject::obs_cov`), not the list. So a name every
+/// subject's map carries counts as present. Without this, `predict()` gaining the
+/// check (#1028) would have started panicking on those callers even though nothing
+/// about their predictions was undefined.
 pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let carried = |name: &str| -> bool {
+        population.covariate_names.iter().any(|n| n == name)
+            || (!population.subjects.is_empty()
+                && population
+                    .subjects
+                    .iter()
+                    .all(|s| s.covariates.contains_key(name)))
+    };
     let missing: Vec<&str> = model
         .referenced_covariates
         .iter()
-        .filter(|name| !population.covariate_names.iter().any(|n| n == *name))
+        .filter(|name| !carried(name))
         .map(|s| s.as_str())
         .collect();
 
@@ -103,14 +121,44 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
     } else {
         population.covariate_names.join(", ")
     };
+    // `TAFD` / `TAD` / `MACHEPS` are solver-injected built-ins *inside `[odes]`* and
+    // ordinary covariates everywhere else — including `[scaling]`, which is
+    // deliberate (`docs/model-file/scaling.qmd`) so a dataset that really carries a
+    // `TAD` column can use it. The failure mode is a user who expected the `[odes]`
+    // built-in and gets the bare "covariate not found in data: TAD", which reads as
+    // a typo report rather than a scope explanation. Name the scope when one of them
+    // is among the missing (#1028). Appended only in that case, so the historical
+    // message text is byte-for-byte unchanged for every ordinary covariate.
+    const ODE_ONLY_BUILTINS: &[&str] = &["TAFD", "TAD", "MACHEPS"];
+    let builtin_shaped: Vec<&str> = plain
+        .iter()
+        .copied()
+        .filter(|n| ODE_ONLY_BUILTINS.contains(n))
+        .collect();
+    let builtin_hint = if builtin_shaped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Note: {} {} a solver-injected built-in only inside `[odes]`; anywhere else \
+             (including `[scaling]`) the name is an ordinary covariate and must be a data \
+             column. Compute it as an `[odes]` intermediate and read that state instead.",
+            builtin_shaped.join(", "),
+            if builtin_shaped.len() == 1 {
+                "is"
+            } else {
+                "are"
+            },
+        )
+    };
     diags.push(
         Diagnostic::error(
             "E_MISSING_COVARIATE",
             format!(
                 "Model references covariate(s) not found in data (case-sensitive): {}. \
-                 Available covariate columns: {}.",
+                 Available covariate columns: {}.{}",
                 plain.join(", "),
-                available
+                available,
+                builtin_hint,
             ),
         )
         .with_suggestion(format!("available covariate columns: {}", available)),

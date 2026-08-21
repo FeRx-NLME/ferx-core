@@ -253,6 +253,14 @@ pub(crate) fn compile_observe(
     // caller validates them against the data so a misspelt name fails loudly
     // instead of silently reading 0.0 (the readout leaves an absent covariate at
     // 0.0, which would drive the controller off a wrong signal).
+    // `[adaptive_dosing]` compiles at simulate time, long after `parse_warnings` has
+    // been sealed onto the model, so the `T`-alias note the shared compiler emits has
+    // no sink here and is dropped (#1028). The precedence half of that guard still
+    // applies: `referenced_covariates` is every name the rest of the model reads as a
+    // covariate, so a data column named `T` that the model actually uses keeps
+    // winning over the model-time alias, exactly as a `[covariates]` declaration does
+    // in `[scaling]`.
+    let mut observe_warnings: Vec<String> = Vec::new();
     let (out_fn, _program, cov_names) = crate::parser::model_parser::build_y_output_fn(
         observe,
         "[adaptive_dosing] observe",
@@ -267,6 +275,8 @@ pub(crate) fn compile_observe(
         &[],
         // ODE-only path: any integrated state is valid, no forbidden names (#650).
         &[],
+        &model.referenced_covariates,
+        &mut observe_warnings,
     )?;
     Ok((out_fn, cov_names))
 }
