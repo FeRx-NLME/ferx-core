@@ -182,7 +182,16 @@ draws (under a fixed `seed`):
   draws, so the frozen-replay verifier stays exact.
 
 A `Dv` monitor on a compartment with no `[error_model]` is a typed error (never a
-fabricated σ), and a noised reading below zero is clamped to 0.
+fabricated σ), and a noised reading below zero is clamped to 0 — but **only on the
+default bare-state readout**, where non-negativity is a physical property of the
+quantity. Since #1039 a Form C `[scaling] y = <expr>` readout is exempt: the
+expression may be legitimately signed (a change from baseline, a z-score, a
+difference from comparator), so its negative samples reach the controller
+unchanged, exactly as they do under `Ipred`. See
+[Scaling](scaling.qmd#signed-readouts-since-1020). With `sigma → 0` a `Dv`
+monitor therefore reproduces the `Ipred` monitor sample for sample on a Form C
+readout, negative samples included; on the bare-state readout the floor still
+applies, so the two agree only where the latent value is non-negative.
 
 ## Example
 

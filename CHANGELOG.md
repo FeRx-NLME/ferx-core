@@ -74,6 +74,18 @@ section of the SDLC for the versioning policy).
   probe. `predict()`'s new covariate check accepts a name every subject's covariate map carries even
   when the population's `covariate_names` list is empty, so a programmatically built in-memory
   `Population` keeps working.
+- **An adaptive-dosing `dv` monitor no longer floors a negative Form C `[scaling]` readout at zero
+  (#1039).** The assay floor on the `ObserveMode::Dv` path ("an assay cannot read below zero") was
+  written when every monitored readout was a compartment amount or concentration, and was applied
+  unconditionally after the residual draw. A Form C `y = <expr>` readout is an arbitrary
+  expression — a change from baseline, a difference from a comparator, a z-score, the
+  `sqrt(N) * logit(p)` transform — so the *same model* read correctly under `mode = ipred` and
+  came back as exactly `0` under `mode = dv` for every negative sample, silently: a controller
+  thresholding a change-from-baseline signal saw `0` over precisely the region it was written to
+  react to, and dosed accordingly. The floor is now gated on the same predicate as the prediction
+  path (#1020), so it applies only to the bare-state readout and to Forms A/B, which keep it. With
+  `sigma → 0` a `dv` monitor again reproduces the `ipred` monitor sample for sample, negative
+  samples included.
 - **SAEM no longer lets a fixed-effect-only theta drift away from the marginal optimum (#1011).** The
   numerical θ/σ M-step assigned NLopt's maximiser outright, re-maximising against a *single* MCMC η
   draw each iteration — `argmax` of one draw rather than the stochastic-approximation average of

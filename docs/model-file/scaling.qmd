@@ -121,6 +121,12 @@ PK concentration), where non-negativity is a physical property of the quantity
 and a negative value can only be integration overshoot. It is not applied to
 Form C.
 
+The same gate applies to the adaptive-dosing monitor path: a `Dv` monitor's
+assay floor (`max(0)` after the residual draw) fires only on the bare-state
+readout, so a Form C signal a controller thresholds is not silently floored at
+`0` over its whole negative region (#1039). See
+[Adaptive dosing](adaptive-dosing.qmd).
+
 Forms A and B (`obs_scale = <expr>` / `obs_scale[CMT=n] = <expr>`) keep the
 default bare-state readout — the divisor is applied *downstream* of it — so the
 clamp still guards the compartment state they read. Only Form C (`y = <expr>`)
