@@ -1119,6 +1119,25 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
     }
 }
 
+/// Panic when the data does not carry every covariate the model references, for
+/// the `Vec`-returning [`predict()`](crate::predict) path (issue #1028).
+///
+/// `fit()` runs [`check_covariates`] through [`check_model_data`] and `simulate()`
+/// calls it directly, so both already refuse a model whose identifiers don't bind
+/// to a data column. `predict()` ran no data check at all, which is what let an
+/// undefined name in `[scaling]` reach the predictor: the parser classifies any
+/// identifier it cannot bind to a theta / eta / individual parameter / state as a
+/// covariate, and a covariate missing from the data resolves to the map's `0.0`
+/// default — so `y[CMT=1] = A * TOTALLY_UNDEFINED_NAME` returned an all-zero
+/// structural prediction with no diagnostic. This closes that gap so `predict()`
+/// fails as loudly as `fit()` does, on the same message.
+pub(crate) fn assert_covariates_present(model: &CompiledModel, population: &Population) {
+    panic_if_unsupported(
+        first_error(&check_covariates(model, population)).err(),
+        "a model referencing covariates the data does not carry",
+    );
+}
+
 /// Shared check→`panic!` wrapper for the non-`fit` entry points (`predict()`/
 /// `simulate()`): if the sibling `check_*` produced a message, fail loudly with
 /// the common template naming `what` the engine received. `fit()` surfaces the

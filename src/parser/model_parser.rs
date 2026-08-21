@@ -6993,7 +6993,7 @@ fn build_obs_scale_spec(
     pk_indices: &[usize],
     volume_indiv_name: Option<&str>,
     parse_warnings: &mut Vec<String>,
-) -> Result<ScalingSpec, String> {
+) -> Result<(ScalingSpec, Vec<String>), String> {
     // Try scalar first (Form A). Otherwise parse as expression (Form B).
     if let Ok(k) = value.parse::<f64>() {
         // Divisor — strictly positive. A negative scale would flip every
@@ -7004,11 +7004,30 @@ fn build_obs_scale_spec(
                 value
             ));
         }
-        return Ok(ScalingSpec::ScalarScale(k));
+        return Ok((ScalingSpec::ScalarScale(k), Vec::new()));
     }
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
     let expr =
         parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] obs_scale: {}", e))?;
+    // `obs_scale` is a **subject-static** divisor: `apply_scaling` evaluates it once
+    // per subject against the baseline covariate map and a `t = 0` `pk_param_fn`
+    // snapshot, then divides the whole prediction vector by the result. A `TIME`
+    // reference in it would therefore read whatever the model-time thread-local
+    // happened to hold — in practice the `0.0` default — and silently scale every
+    // observation by the t=0 value. Reject it rather than serve that (#1028); a
+    // genuinely time-dependent readout is Form C's job, where `TIME` resolves per
+    // observation.
+    if expr_references_time_builtin(&expr) {
+        return Err(format!(
+            "[scaling] obs_scale: `{}` references the `TIME` built-in (or its `T` alias), \
+             but `obs_scale` is a subject-static divisor — it is evaluated once per \
+             subject at t = 0 and applied to every observation, so `TIME` would always \
+             read 0. Write the time-dependent readout as Form C instead \
+             (`y = <expr>`, or `y[CMT=N] = <expr>`), where `TIME` resolves to each \
+             observation's own time. See issue #1028.",
+            value.trim()
+        ));
+    }
     if let Some(vname) = volume_indiv_name {
         let mut references_volume = false;
         visit_expr_nodes(&expr, &mut |e| {
@@ -7032,6 +7051,19 @@ fn build_obs_scale_spec(
             ));
         }
     }
+    // Covariate leaves — every identifier the parse could not bind to a theta, an
+    // eta, or an individual parameter. The `scale_fn` below reads them straight out
+    // of the per-subject covariate map, so they are required data columns and must
+    // be registered as such (issue #1028). Before this they were silently dropped:
+    // a typo'd name (or a real covariate the data didn't carry) resolved to the
+    // map's `0.0` default, and the divisive scale then turned every prediction into
+    // `x / 0` → the `apply_scaling` NaN/zero path, with no diagnostic. The `y`
+    // (Form C) half of `[scaling]` has registered its covariates since #540; this
+    // closes the `obs_scale` half. Returned unsorted — `register_referenced_covariates`
+    // pools and re-sorts.
+    let mut cov_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_covariates(&expr, &mut cov_set);
+    let covariates_ref: Vec<String> = cov_set.into_iter().collect();
     // Pre-resolve indiv param name → PK slot so the closure can look up
     // `pk.values[slot]` for each `Expression::Variable(name)`. Mirrors
     // the analytical Form B path from Phase 1.5.
@@ -7067,7 +7099,10 @@ fn build_obs_scale_spec(
             eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
         },
     );
-    Ok(ScalingSpec::ExpressionScale { scale_fn, deriv })
+    Ok((
+        ScalingSpec::ExpressionScale { scale_fn, deriv },
+        covariates_ref,
+    ))
 }
 
 /// Resolve a `[initial_conditions] init(NAME)` compartment name to a 1-based
@@ -7315,6 +7350,43 @@ fn parse_initial_conditions_block(
     Ok((out, init_covariates))
 }
 
+/// Fold the `[odes]` model-time alias `T` / `t` into the same `Expression::Time`
+/// node a bare `TIME` produces, so a `[scaling]` expression spells the built-in
+/// the way `[odes]` does (issue #1028).
+///
+/// `[odes]` reserves `TIME`/`T`/`t` for the solver clock and rejects any state,
+/// individual parameter, or intermediate that collides with them. `[scaling]`
+/// parses with `fallback_covariate = true`, so `TIME` was already special-cased by
+/// `parse_atom` but a bare `T` landed as `Covariate("T")` — a required data column
+/// named `T` if the dataset happened to carry one, and otherwise (before the
+/// undefined-name guard) a silent zero. Only `Covariate` leaves are folded:
+/// a state or individual parameter genuinely named `T` resolves to `Variable("T")`
+/// during the parse and keeps winning, matching the usual name-resolution
+/// precedence (the ODE-model case can't arise — `[odes]` rejects that name).
+fn rewrite_scaling_time_alias(expr: &mut Expression) {
+    visit_expr_nodes_mut(expr, &mut |e: &mut Expression| {
+        if let Expression::Covariate(name) = e {
+            if name == "T" || name == "t" {
+                *e = Expression::Time;
+            }
+        }
+    });
+}
+
+/// Whether `expr` reads the model-time built-in, under either spelling: the
+/// `Expression::Time` node a bare `TIME` parses to, or the `T` / `t` alias
+/// [`rewrite_scaling_time_alias`] folds into it. Drives the `obs_scale`
+/// rejection (#1028) — see [`build_obs_scale_spec`].
+fn expr_references_time_builtin(expr: &Expression) -> bool {
+    let mut found = false;
+    visit_expr_nodes(expr, &mut |e: &Expression| match e {
+        Expression::Time => found = true,
+        Expression::Covariate(n) if n == "T" || n == "t" => found = true,
+        _ => {}
+    });
+    found
+}
+
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
 /// the uniform and per-CMT paths.
 #[allow(clippy::too_many_arguments)]
@@ -7340,6 +7412,12 @@ pub(crate) fn build_y_output_fn(
     }
     let ctx = ParseCtx::new(theta_names, eta_names, &defined);
     let mut expr = parse_scalar_expression(value, ctx).map_err(|e| format!("{context}: {e}"))?;
+
+    // `T` / `t` is the `[odes]` spelling of the model-time built-in; fold it into
+    // the `Expression::Time` node a bare `TIME` already parses to, so the two
+    // blocks agree on the name (#1028). Runs before the covariate scan below so
+    // the alias never registers as a required data column.
+    rewrite_scaling_time_alias(&mut expr);
 
     // Analytic Form C (#650): reject a readout that references a peripheral (or a
     // depot/transit amount with no closed form) — the analytical solutions don't
@@ -7543,6 +7621,12 @@ pub(crate) fn build_y_output_fn(
 ///   `y[CMT=N] = <expr>` and uniform `y = <expr>` syntaxes both go here
 ///   (`OdeReadout::PerCmt` vs `OdeReadout::Single` respectively), and
 ///   replace the default `OdeReadout::ObsCmt(idx)` state-index readout.
+/// - The trailing `Vec<String>` is every covariate name referenced across the
+///   block — **both** the Form C `y` readouts and the Form B `obs_scale`
+///   expressions (#1028). The caller registers them via
+///   `register_referenced_covariates`, which is what makes an identifier the
+///   parse could not bind to a theta / eta / individual parameter / state a
+///   *required data column* rather than a silent `0.0`.
 ///
 /// `is_ode = true` enables Form C and lets expressions reference state names.
 /// `pk_indices` is parallel to `indiv_var_names`: `pk_indices[i]` is the
@@ -7556,6 +7640,9 @@ pub(crate) fn build_y_output_fn(
 /// - Mixing uniform (`obs_scale = K`) with per-CMT (`obs_scale[CMT=N] = K`)
 ///   within the same group → error.
 /// - Duplicate `[CMT=N]` keys → error.
+/// - `obs_scale` referencing the `TIME` built-in (or its `T` alias) → error: the
+///   divisor is subject-static, so `TIME` would always read the t=0 default
+///   (#1028). Form C `y = <expr>` is where a time-dependent readout belongs.
 /// - `obs_scale` referencing the same individual parameter bound to a built-in
 ///   `pk <model>(...)` block's `v`/`v1` role → **warning** (`parse_warnings`),
 ///   not an error: it's a supported feature, but also the signature of a
@@ -7596,7 +7683,7 @@ fn parse_scaling_block(
     // per-CMT readouts carry their own program inside each `PerCmtReadout` (#439),
     // so the analytic-sensitivity provider can differentiate each endpoint.
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
-    let mut y_covariates: Vec<String> = Vec::new();
+    let mut scaling_covariates: Vec<String> = Vec::new();
 
     for line in lines {
         let trimmed = line.trim();
@@ -7611,7 +7698,7 @@ fn parse_scaling_block(
 
         match base {
             "obs_scale" => {
-                let spec = build_obs_scale_spec(
+                let (spec, cov_names) = build_obs_scale_spec(
                     value,
                     theta_names,
                     eta_names,
@@ -7620,6 +7707,14 @@ fn parse_scaling_block(
                     volume_indiv_name,
                     parse_warnings,
                 )?;
+                // Form B `obs_scale` covariate leaves are required data columns too
+                // (#1028) — pooled into the same list the Form C `y` readout feeds,
+                // so both halves of `[scaling]` reach `register_referenced_covariates`.
+                for cov in cov_names {
+                    if !scaling_covariates.contains(&cov) {
+                        scaling_covariates.push(cov);
+                    }
+                }
                 match cmt_opt {
                     None => {
                         if obs_scale_uniform.is_some() {
@@ -7672,8 +7767,8 @@ fn parse_scaling_block(
                     &forbidden,
                 )?;
                 for cov in cov_names {
-                    if !y_covariates.contains(&cov) {
-                        y_covariates.push(cov);
+                    if !scaling_covariates.contains(&cov) {
+                        scaling_covariates.push(cov);
                     }
                 }
                 match cmt_opt {
@@ -7749,8 +7844,8 @@ fn parse_scaling_block(
         );
     }
 
-    y_covariates.sort();
-    Ok((scaling, readout, readout_program, y_covariates))
+    scaling_covariates.sort();
+    Ok((scaling, readout, readout_program, scaling_covariates))
 }
 
 // ── ode_template desugaring + the analytical+ODE-only-absorption error rule ──
@@ -12855,6 +12950,48 @@ fn visit_expr_nodes(expr: &Expression, f: &mut dyn FnMut(&Expression)) {
             visit_expr_nodes(e, f);
         }
         _ => {}
+    }
+}
+
+/// Mutable twin of [`visit_expr_nodes`] — same pre-order shape, but `f` may
+/// **replace** the node it is handed. Backs the in-place node rewrites
+/// (`rewrite_scaling_time_alias`) that run between parse and index resolution.
+/// Recursion happens after `f` returns, so a replacement node's children are
+/// visited too; a rewrite that could re-fire on its own output must therefore be
+/// idempotent (all current ones replace a leaf with a leaf).
+fn visit_expr_nodes_mut(expr: &mut Expression, f: &mut dyn FnMut(&mut Expression)) {
+    f(expr);
+    match expr {
+        Expression::BinOp(lhs, _, rhs) => {
+            visit_expr_nodes_mut(lhs, f);
+            visit_expr_nodes_mut(rhs, f);
+        }
+        Expression::UnaryFn(_, arg) => visit_expr_nodes_mut(arg, f),
+        Expression::Power(base, exp) => {
+            visit_expr_nodes_mut(base, f);
+            visit_expr_nodes_mut(exp, f);
+        }
+        Expression::Conditional(cond, t, e) => {
+            visit_condition_nodes_mut(cond, f);
+            visit_expr_nodes_mut(t, f);
+            visit_expr_nodes_mut(e, f);
+        }
+        _ => {}
+    }
+}
+
+/// Condition companion of [`visit_expr_nodes_mut`].
+fn visit_condition_nodes_mut(cond: &mut Condition, f: &mut dyn FnMut(&mut Expression)) {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            visit_expr_nodes_mut(l, f);
+            visit_expr_nodes_mut(r, f);
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            visit_condition_nodes_mut(l, f);
+            visit_condition_nodes_mut(r, f);
+        }
+        Condition::Not(c) => visit_condition_nodes_mut(c, f),
     }
 }
 

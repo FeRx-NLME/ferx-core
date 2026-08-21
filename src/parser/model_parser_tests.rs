@@ -10746,6 +10746,190 @@ fn test_parse_scaling_per_cmt_accepts_ad() {
     parse_model_string(&src).expect("per-CMT obs_scale + gradient = ad now parses");
 }
 
+// ── [scaling] undefined-identifier guard + TIME built-in (issue #1028) ──
+
+/// Every identifier a `[scaling]` expression cannot bind to a theta / eta /
+/// individual parameter / state is a **covariate**, and therefore a required data
+/// column. The Form C `y` half has registered them since #540; the Form B
+/// `obs_scale` half silently dropped them, so a typo (or a real covariate the data
+/// didn't carry) resolved to the covariate map's `0.0` default and the divisive
+/// scale turned every prediction into the `apply_scaling` NaN path — with nothing
+/// in `referenced_covariates` for `check_covariates` to catch. Registering the name
+/// is what makes `fit()` / `simulate()` / `predict()` refuse the model instead.
+#[test]
+fn scaling_obs_scale_registers_covariate_references() {
+    let src = analytical_model_with_scaling(Some("  obs_scale = V / TOTALLY_UNDEFINED_NAME\n"));
+    let model = parse_model_string(&src).expect("obs_scale expression parses");
+    assert!(
+        model
+            .referenced_covariates
+            .iter()
+            .any(|c| c == "TOTALLY_UNDEFINED_NAME"),
+        "an unbindable `obs_scale` identifier must become a required data column, \
+         got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// The per-CMT `obs_scale[CMT=N]` form registers its covariates too — the
+/// collection sits in `build_obs_scale_spec`, which both key forms route through.
+#[test]
+fn scaling_obs_scale_per_cmt_registers_covariate_references() {
+    let src = analytical_model_with_scaling(Some(
+        "  obs_scale[CMT=1] = SCALE_A\n  obs_scale[CMT=2] = SCALE_B\n",
+    ));
+    let model = parse_model_string(&src).expect("per-CMT obs_scale expression parses");
+    for name in ["SCALE_A", "SCALE_B"] {
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == name),
+            "`{name}` must be registered, got {:?}",
+            model.referenced_covariates
+        );
+    }
+}
+
+/// A bound name is *not* a covariate: `obs_scale = V` reads the individual
+/// parameter, so nothing is added to the required-column set. Guards the new
+/// collection against over-registering.
+#[test]
+fn scaling_obs_scale_indiv_param_is_not_a_covariate() {
+    let src = analytical_model_with_scaling(Some("  obs_scale = V / 10\n"));
+    let model = parse_model_string(&src).expect("obs_scale expression parses");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "an individual-parameter reference must not register as a data column, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// `obs_scale` is a subject-static divisor — `apply_scaling` evaluates it once per
+/// subject at t = 0 and divides the whole prediction vector by the result — so a
+/// `TIME` reference in it would always read the t=0 value. Reject it (naming Form C
+/// as the place for a time-dependent readout) rather than serve the silent
+/// collapse. Both spellings of the built-in are caught.
+#[test]
+fn scaling_obs_scale_rejects_the_time_builtin() {
+    for expr in ["TIME", "V * TIME", "T", "V + T"] {
+        let src = analytical_model_with_scaling(Some(&format!("  obs_scale = {expr}\n")));
+        let err =
+            parse_model_string(&src).expect_err("obs_scale referencing TIME must be rejected");
+        assert!(
+            err.contains("subject-static") && err.contains("y = <expr>"),
+            "error for `{expr}` must explain the subject-static divisor and point at \
+             Form C, got: {err}"
+        );
+    }
+}
+
+/// A Form C `y = <expr>` readout may reference `TIME` — it is evaluated per
+/// observation — so the parser must leave it alone and, crucially, must not
+/// register it as a data column.
+#[test]
+fn scaling_y_readout_accepts_the_time_builtin() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = central / V * TIME\n"),
+    );
+    let model = parse_model_string(&src).expect("Form C readout may reference TIME");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "`TIME` is a built-in, not a data column, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// Does the model's uniform Form C readout compile to a `PushTime` read? The
+/// direct discriminator for the `[scaling]` time built-in: `referenced_covariates`
+/// alone cannot tell "folded into `TIME`" from "bound to something else", since
+/// both leave it empty.
+fn readout_reads_time(model: &CompiledModel) -> bool {
+    let program = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.readout_program.as_ref())
+        .or_else(|| {
+            model
+                .analytic_readout
+                .as_ref()
+                .and_then(|a| a.program.as_ref())
+        })
+        .expect("uniform Form C readout carries a program");
+    program.bc.ops.iter().any(|op| matches!(op, Op::PushTime))
+}
+
+/// `T` / `t` is the `[odes]` spelling of the same built-in (reserved there against
+/// every state / indiv-param / intermediate name). `[scaling]` parses with
+/// `fallback_covariate = true`, so before #1028 a bare `T` landed as a covariate —
+/// a required column named `T`, or a silent zero. It now folds into the same
+/// `Expression::Time` node `TIME` produces, so the two blocks agree on the name.
+#[test]
+fn scaling_y_readout_accepts_the_t_time_alias() {
+    for alias in ["T", "t", "TIME", "time"] {
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some(&format!("  y = central / V * {alias}\n")),
+        );
+        let model =
+            parse_model_string(&src).expect("Form C readout may reference the T time alias");
+        assert!(
+            model.referenced_covariates.is_empty(),
+            "`{alias}` must fold into the TIME built-in, not register as a data \
+             column; got {:?}",
+            model.referenced_covariates
+        );
+        assert!(
+            readout_reads_time(&model),
+            "`{alias}` must compile to the model-time read"
+        );
+    }
+}
+
+/// The `T` fold targets `Covariate` leaves only, so a name the parse *did* bind
+/// keeps winning — an individual parameter named `T` still resolves to itself, and
+/// the readout compiles to a plain variable read rather than a model-time read.
+/// (Unreachable on ODE models, where `[odes]` rejects that name outright.)
+#[test]
+fn scaling_y_readout_t_alias_does_not_shadow_a_bound_name() {
+    let src = analytical_model_with_scaling(Some("  y = central / T\n"))
+        .replace("  V  = TVV\n", "  V  = TVV\n  T  = TVV / 2\n");
+    let model = parse_model_string(&src).expect("indiv param named T parses");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "an individual parameter named `T` must win over the time alias, got {:?}",
+        model.referenced_covariates
+    );
+    assert!(
+        !readout_reads_time(&model),
+        "an individual parameter named `T` must not be folded into the time built-in"
+    );
+}
+
+/// The `T` fold walks the whole expression tree, not just its top-level operands:
+/// `visit_expr_nodes_mut` has to recurse through every node kind that carries a
+/// child. This readout puts a `T` under each one — a compound `if` condition
+/// (`Conditional` over `Condition::And` over `Condition::Compare`) and both of its
+/// arms, a unary function argument (`UnaryFn`), and both sides of a power
+/// (`Power`) — so a missed arm leaves a stray `Covariate("T")` behind and shows up
+/// as a spurious required data column.
+#[test]
+fn scaling_y_readout_folds_the_t_alias_under_every_node_kind() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = if (T > 1 && T < 100) exp(-T) * (T ^ T) else central / V + sqrt(T)\n"),
+    );
+    let model = parse_model_string(&src).expect("nested T references parse");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "every `T` must fold into the time built-in, whatever node it sits under; \
+         got {:?}",
+        model.referenced_covariates
+    );
+    assert!(
+        readout_reads_time(&model),
+        "the folded readout must compile to the model-time read"
+    );
+}
+
 #[test]
 fn test_parse_scaling_y_per_cmt_form_c() {
     // Per-CMT Form C on an ODE model. Build_y_output_fn picks up each

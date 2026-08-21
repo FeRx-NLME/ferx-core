@@ -1730,6 +1730,17 @@ fn resolve_obs_readout<T: crate::sens::num::PkNum>(
     // (#540); for static covariates this is the subject map. Threaded as constants
     // — a covariate carries no derivative in the individual-parameter dual basis.
     let obs_cov = subject.obs_cov(j);
+    // A `TIME`-referencing Form C readout resolves `Op::PushTime` from the model-time
+    // thread-local; enter this observation's time so the dual walk differentiates the
+    // same expression the f64 predictor evaluates (`OdeReadout::eval` enters the
+    // matching guard, #1028). `TIME` is η/θ-constant, so it lands as `k(t)` in the
+    // dual bytecode — the guard changes the *value* it folds in, not the derivative
+    // basis. Entered once here rather than per readout arm: it is a thread-local
+    // swap plus a restore on drop, and the `ObsCmt` arm (which reads a state slot
+    // and never evaluates a program) is the only one that cannot observe it.
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(
+        subject.obs_times.get(j).copied().unwrap_or(0.0),
+    );
     let raw = match &ode.readout {
         OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(T::from_f64(0.0)),
         OdeReadout::Single(_) => ode

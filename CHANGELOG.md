@@ -41,6 +41,29 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **`TIME` now works in a `[scaling]` Form C readout, and an undefined name in `[scaling]` is no
+  longer a silent zero (#1028).** A `y = <expr>` / `y[CMT=N] = <expr>` readout referencing the
+  `TIME` built-in parsed fine but was never bound to the observation — the integrator's model-time
+  guard is dropped before the readout runs — so `TIME` read `0` at every row and the whole
+  time-dependent term vanished. A response-versus-time readout such as
+  `y[CMT=1] = EMAX * TIME / (TIME + T50)` therefore fit, converged, and reported plausible
+  parameters for a structural model nobody wrote. `TIME` (and the `T` alias `[odes]` also accepts)
+  now resolves to each observation's own time on both the ODE and analytical Form C paths, on the
+  production predictor and the analytic sensitivity walks alike — and to each decision's time in an
+  `[adaptive_dosing] observe` expression, which compiles through the same readout compiler — so the
+  dummy `d/dt(clock) = 1`
+  workaround is no longer needed (and is better dropped: `clock` starts at the subject's first
+  record, not at `t = 0`). Separately, `obs_scale` expressions never registered their covariate
+  references as required data columns, and `predict()` ran no covariate check at all, so an
+  unresolvable identifier anywhere in `[scaling]` reached the predictor as the covariate map's
+  `0.0` default. Both halves of the block now register their references, and `predict()` reports
+  `E_MISSING_COVARIATE` for a missing column just as `fit()` and `simulate()` already did.
+  **Breaking** in two narrow places: `obs_scale = TIME` (or `= T`) is now a parse error naming Form
+  C as the place for a time-dependent readout — the divisor is subject-static, evaluated once at
+  `t = 0`, so it could only ever have read `0`; and a `[scaling]` expression referencing a data
+  column named `T` now reads the model-time built-in instead, matching `[odes]`, where that name has
+  always been reserved. `TAFD` / `TAD` are unaffected and remain ordinary covariate references in
+  `[scaling]`.
 - **SAEM no longer lets a fixed-effect-only theta drift away from the marginal optimum (#1011).** The
   numerical θ/σ M-step assigned NLopt's maximiser outright, re-maximising against a *single* MCMC η
   draw each iteration — `argmax` of one draw rather than the stochastic-approximation average of
