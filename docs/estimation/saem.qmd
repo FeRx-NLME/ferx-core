@@ -175,6 +175,25 @@ Restarting SAEM at the right answer did not rescue the old behaviour — the
 M-step walked the parameter back down — so this was never a starting-value
 problem.
 
+The remedy depends on what the parameter *is*. A typical value should be put in
+a mu-referenceable form (`P = TVP * exp(ETA_P)`, with a small — optionally `FIX`
+— omega; ferx applies the mu-referencing automatically). A parameter that has no
+eta to give — a covariate coefficient, an allometric exponent, a structural
+constant — should be held `FIX`, or the fit cross-checked against FOCEI/IMPMAP.
+
+The advisory deliberately stays quiet about two kinds of theta, because "has no
+ETA" would be false for them:
+
+- **Mixing coefficients** of a [mixture model](mixture.qmd). The numerical θ/σ
+  M-step never moves them — they do not enter the residual/eta likelihood, and
+  the mixing M-step overwrites them from the class responsibilities — and a
+  mixing expression is *forbidden* from depending on an eta in the first place.
+- **`MIXNUM`-switched class typical values**, and log-mu-referenced thetas
+  dropped to the identity scale by a negative lower bound. These carry an eta in
+  the model text and are on the numerical M-step for a reason SAEM already
+  states in its own warning; repeating "add an ETA" on top of that would be both
+  false and contradictory.
+
 ### What SAEM does about it now
 
 The numerical θ/σ M-step result is blended in as a Robbins-Monro step
@@ -199,6 +218,14 @@ caps also slow legitimate exploration, and here they pull `TVV` off (129.9 at
 entirely**, in both phases, restoring the pre-0.3.x behaviour exactly; that is
 the escape hatch if a model fitted better without it.
 
+`1.0` is therefore a *sentinel*, not a cap value, and the option is deliberately
+discontinuous there: `mstep_damping = 0.999` still buys the full convergence
+schedule `γ = 1/(k−k1)`, while `1.0` buys none of it. There is no setting that
+means "cap exploration a little and leave convergence alone" — the option only
+ever governs the exploration cap — and "off" has to restore the whole pre-damping
+trajectory to be a useful escape hatch. (Lifting only the exploration cap left
+the model above at `TVFRD1` 0.047 rather than its true undamped 0.039.)
+
 The damping is applied only to the channel the bias lives in: a fit is damped
 when NLopt is left estimating a theta that is **not mu-referenced**, which is
 exactly the situation the advisory above warns about. A theta that is `FIX`, that
@@ -207,6 +234,23 @@ the exact closed-form `log θ += γ·mean(η)` update is available to it) is lef
 the undamped update, and a fit whose every estimated theta is one of those is
 unaffected down to the last bit — and setting `mstep_damping` on such a model
 warns that it has no effect rather than accepting it silently.
+
+**Sigma is damped with the same `γ_θ`**, on the same gate, even though the gate
+is a statement about theta. That is not an oversight: the numerical M-step is a
+*single* NLopt problem over the concatenated `[θ; σ]` vector, so `θ*` and `σ*`
+are one joint maximiser of the same frozen-η likelihood. Blending theta at `γ_θ`
+while assigning sigma outright would take an inconsistent partial step — sigma
+would jump to the value that is optimal for the theta the M-step wanted, while
+theta is held near the theta it had, leaving sigma to absorb the very misfit the
+damping just stopped theta from fixing. So a model that trips the gate has its
+sigma damped too, including when the theta that trips it is a covariate
+coefficient or an allometric exponent rather than a typical value.
+
+One case is deliberately left out of scope: under `mu_referencing = false` every
+theta goes through the numerical M-step, but a theta written in a
+mu-referenceable form is not the fixed-effect-only channel the damping was
+calibrated against, so such a fit keeps the undamped update and `mstep_damping`
+reports that it had no effect (naming that reason).
 
 "Mu-referenced" here means ferx *detected* the pairing — the `TVX * exp(ETA_X)`
 and logit forms. A parameter that carries an eta in a form ferx cannot pair with

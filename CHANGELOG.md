@@ -72,7 +72,14 @@ section of the SDLC for the versioning policy).
   without it. Setting it on a model it cannot affect warns rather than being silently ignored, and a value
   outside `(0, 1]` reaching `run_saem` from a programmatic caller that bypassed the parser is
   clamped with a warning rather than applied (a negative damping would step theta and sigma away
-  from the M-step optimum every iteration).
+  from the M-step optimum every iteration; `+∞`, which reads as "no damping", now clamps to the
+  `1.0` off value rather than to the tightest damping). `mstep_damping = 1.0` is a *sentinel*, not
+  a cap value — the option is discontinuous there, since `0.999` still buys the full convergence
+  schedule — and the no-effect warning now names which of the three reasons applies, including the
+  `mu_referencing = false` case it previously mis-described as "every theta is mu-referenced".
+  Sigma is blended with the same `γ_θ` on the same gate: theta and sigma come out of one joint
+  NLopt solve, so damping only theta would leave sigma absorbing the misfit the damping just
+  stopped theta from fixing.
 
 ### Added
 - **SAEM now warns when an estimated theta carries no ETA at all.** A fixed-effect-only theta is not
@@ -85,7 +92,13 @@ section of the SDLC for the versioning policy).
   IMP (0.311), IMPMAP (0.318) and NONMEM IMP (0.394) agree, with `TVV` +6% and `TVMAT` +9% carried
   along; restarting SAEM *at* the IMPMAP solution still walked it down to 0.065. Adding
   `FRD1 = TVFRD1*exp(ETA_FRD1)` (ω² = 0.01) recovers 0.313, and holding `TVFRD1` `FIX` puts every
-  other theta within 3% of NONMEM. See
+  other theta within 3% of NONMEM. The advisory names the remedy that fits the parameter — put a
+  typical value in a mu-referenceable form, or hold a covariate coefficient / allometric exponent /
+  structural constant `FIX` and cross-check against FOCEI/IMPMAP — and stays quiet about thetas for
+  which "has no ETA" would be false: a mixture's mixing coefficients (never moved by the numerical
+  M-step, and forbidden from depending on an eta at all), and `MIXNUM`-switched class typical values
+  or identity-scale-dropped log-mu-references, which carry an eta and already get their own message.
+  See
   [SAEM: non-mu-referenced parameters](https://ferx-nlme.github.io/ferx-core/estimation/saem.html).
 - **Class-aware mu-referencing for mixture models (#996).** A `MIXNUM`-switched typical value written
   as `CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)` is now recognised at parse
