@@ -144,7 +144,7 @@ pub(crate) fn effective_model_for_eval<'a>(
     if structural.ode_spec.is_some() || !absorption_flip_flop_at(model, subject, theta, eta) {
         return structural;
     }
-    twin.get_or_build()
+    twin.built()
 }
 
 /// Divide each prediction in-place by the scale derived from

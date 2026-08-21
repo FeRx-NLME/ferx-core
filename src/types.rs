@@ -3167,81 +3167,56 @@ pub struct CompiledModel {
     pub mixture: Option<MixtureSpec>,
 }
 
-/// The three call-time-configurable ODE solver tolerances ([`FitOptions::ode_reltol`],
-/// `ode_abstol`, `ode_max_steps`) to stamp onto the absorption ODE twin when it is built. Only
-/// these three fields are carried; the twin keeps the parse defaults for the other
-/// [`crate::ode::OdeSolverOptions`] fields (step-size seeds). See #814.
-#[derive(Clone, Copy)]
-struct TwinSolverOpts {
-    reltol: f64,
-    abstol: f64,
-    max_steps: usize,
-    method: crate::ode::OdeMethod,
-}
-
-/// A lazily-built ODE representation of an analytical absorption model that carries one (a
-/// plain `one_cpt_transit` / `two_cpt_transit`, or `one_cpt_ig` / `two_cpt_ig`). Holds the
-/// equivalent's reconstructed `.ferx` source and compiles the boxed sub-model on first use, so
-/// a fit whose subjects never hit the fallback (constant-parameter, non-`TIME`, in-domain) pays
-/// no extra parse or allocation. See [`CompiledModel::effective_for`] (#486, #790).
+/// The ODE representation of an analytical absorption model that carries one (a plain
+/// `one_cpt_transit` / `two_cpt_transit`, or `one_cpt_ig` / `two_cpt_ig`), built **eagerly at
+/// parse time** from the equivalent's reconstructed `.ferx` source.
+///
+/// It used to be built lazily (a `OnceLock` compiled the source on first use, so a fit whose
+/// subjects never hit the fallback paid no extra parse), with a build failure turned into a
+/// `.expect()` panic on the grounds that the source "is reconstructed from already-validated
+/// blocks". That reasoning was structurally wrong: the twin is an **ODE** model while the
+/// primary is **analytical**, so every ODE-scoped parse check runs on the twin and not on the
+/// primary, and a model the primary accepts can produce a twin the parser rejects — which
+/// surfaced as an internal panic mid-fit, the first time a TV-covariate / `TIME` / IOV / SS /
+/// infusion subject rerouted (#1003 hit it twice; #1008 found a third live door, an individual
+/// parameter named `CENTRAL`/`PERIPH` colliding with the twin's state names). Building at
+/// parse time makes the failure a parse-time **decline** instead: `parse_full_model` attaches
+/// `None`, records a parse warning, and the model stays closed-form, exactly as if the desugar
+/// had declined it. The cost is one extra parse of the twin source per transit/IG model
+/// (~12 ms measured at `ci-test` opt level, ≈ the primary's own parse; paid once, where the
+/// lazy path paid the same parse on first reroute). See [`CompiledModel::effective_for`]
+/// (#486, #790, #1008).
 pub struct AbsorptionOdeEquivalent {
-    source: String,
-    /// Call-time ODE solver tolerances (from the `[fit_options]`-merged runtime [`FitOptions`])
-    /// to apply when the twin is built. `None` until a caller syncs them via
-    /// [`CompiledModel::sync_ode_solver_opts`]; the twin then integrates at the requested
-    /// accuracy instead of the parse-default baked into its reconstructed source. Without this,
-    /// a closed-form transit/IG primary is analytic — its `sync_ode_solver_opts` was a no-op —
-    /// so every rerouted (TV-cov / `TIME` / IOV) subject silently integrated at the twin
-    /// source's default tolerance (#814).
-    solver_opts_override: Option<TwinSolverOpts>,
-    built: std::sync::OnceLock<Box<CompiledModel>>,
+    built: Box<CompiledModel>,
 }
 
 impl AbsorptionOdeEquivalent {
-    pub(crate) fn new(source: String) -> Self {
-        Self {
-            source,
-            solver_opts_override: None,
-            built: std::sync::OnceLock::new(),
-        }
-    }
-
-    /// Build (once, thread-safely) and return the ODE equivalent sub-model. The source is
-    /// reconstructed from already-validated model blocks, so parsing it is infallible in
-    /// practice; a failure is an internal reconstruction bug and panics loudly rather than
-    /// silently degrading the fit.
-    pub(crate) fn get_or_build(&self) -> &CompiledModel {
-        self.built.get_or_init(|| {
-            let mut built = crate::parser::model_parser::parse_model_string(&self.source)
-                .expect("internal: absorption ODE equivalent failed to build");
-            // The twin's own `[fit_options]` (re-emitted into its source) were applied during
-            // that parse; a call-time override recorded before the build wins over them (#814).
-            if let (Some(ov), Some(ode)) = (self.solver_opts_override, built.ode_spec.as_mut()) {
-                ode.solver_opts.reltol = ov.reltol;
-                ode.solver_opts.abstol = ov.abstol;
-                ode.solver_opts.max_steps = ov.max_steps;
-                ode.solver_opts.method = ov.method;
-            }
-            Box::new(built)
+    /// Parse the reconstructed twin source into the boxed sub-model. `Err` carries the twin
+    /// parser's own message; the caller (`parse_full_model`) declines the twin and records it
+    /// as a parse warning rather than failing the primary parse (#1008). The source contains
+    /// no `pk one_cpt_transit`/…/`pk two_cpt_ig` line, so this parse cannot recurse into the
+    /// desugar that produced it.
+    pub(crate) fn build(source: &str) -> Result<Self, String> {
+        let built = crate::parser::model_parser::parse_model_string(source)?;
+        Ok(Self {
+            built: Box::new(built),
         })
     }
 
-    /// Record the call-time ODE solver tolerances so the lazily-built twin integrates at the
-    /// requested accuracy. If the twin is **already** built (a second fit reusing this model
-    /// with new tolerances), stamp them onto it immediately as well. Called by
-    /// [`CompiledModel::sync_ode_solver_opts`]; see #814.
+    /// The ODE equivalent sub-model.
+    pub(crate) fn built(&self) -> &CompiledModel {
+        &self.built
+    }
+
+    /// Stamp the call-time ODE solver tolerances onto the twin so rerouted subjects integrate
+    /// at the requested accuracy. Called by [`CompiledModel::sync_ode_solver_opts`]. Without
+    /// this, a closed-form transit/IG primary is analytic — its own `ode_spec` stamp is a
+    /// no-op — so every rerouted (TV-cov / `TIME` / IOV) subject silently integrated at the
+    /// tolerance baked into the twin's re-emitted `[fit_options]` (#814). The twin is itself
+    /// an ODE model, so this stamps its `ode_spec.solver_opts`; it carries no nested twin, so
+    /// the twin-branch in `sync_ode_solver_opts` is a no-op.
     pub(crate) fn sync_solver_opts(&mut self, opts: &FitOptions) {
-        self.solver_opts_override = Some(TwinSolverOpts {
-            reltol: opts.ode_reltol,
-            abstol: opts.ode_abstol,
-            max_steps: opts.ode_max_steps,
-            method: opts.ode_method,
-        });
-        if let Some(built) = self.built.get_mut() {
-            // The twin is itself an ODE model, so this stamps its `ode_spec.solver_opts`; it
-            // carries no nested twin, so the twin-branch in `sync_ode_solver_opts` is a no-op.
-            built.sync_ode_solver_opts(opts);
-        }
+        self.built.sync_ode_solver_opts(opts);
     }
 }
 
@@ -3328,7 +3303,7 @@ impl CompiledModel {
                 // combinations the twin can't yet serve are rejected upfront.
                 || subject.doses.iter().any(|d| d.is_infusion())
             {
-                return eq.get_or_build();
+                return eq.built();
             }
         }
         self
@@ -4433,6 +4408,15 @@ pub enum WarningCode {
     /// fitted EBE — a silently degenerate likelihood contribution the η = 0
     /// fit-start reject could not catch (#785).
     FlipFlop,
+    /// An analytic transit / inverse-Gaussian model's ODE twin could not be built, so
+    /// the model keeps no ODE fallback (#1008). The twin is an ODE model while the
+    /// primary is analytical, so an ODE-scoped parse check can reject a twin whose
+    /// primary the parser accepts — most often an individual parameter named after one
+    /// of the twin's own states (`CENTRAL` / `PERIPH`). The model still fits as a pure
+    /// closed form; what it loses is the reroute, so any subject that needs it (TV
+    /// covariates, `TIME`-dependent parameters, IOV, SS / infusion doses, the flip-flop
+    /// regime) is rejected with an explicit error rather than mis-served.
+    AbsorptionTwinDeclined,
     /// A non-fixed theta whose outer gradient is ≈ 0 at the initial estimate — it
     /// has no effect on the objective (unmapped, or dropped from the structural /
     /// scaling model). The pre-flight guard freezes it at its initial value so the
@@ -4475,6 +4459,7 @@ impl WarningCode {
             WarningCode::Threads => "threads",
             WarningCode::Simulation => "simulation",
             WarningCode::FlipFlop => "flip_flop",
+            WarningCode::AbsorptionTwinDeclined => "absorption_twin_declined",
             WarningCode::FlatParameter => "flat_parameter",
             WarningCode::General => "general",
         }
@@ -4584,6 +4569,18 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // otherwise match — these flag a pathological *simulated subject*, not an
         // estimation/optimizer problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
+    } else if lower.contains("w_absorption_twin_declined") {
+        // #1008: the analytic absorption model kept no ODE twin. Not an estimation
+        // problem — the fit that follows is a pure closed form — but the model has
+        // silently lost the reroute, so it is worth its own code rather than the
+        // `general` bucket. Must precede the `flip-flop regime` arm below: this
+        // message *lists* the flip-flop reroute among the features the model has just
+        // lost, so prose-matching would classify a declined twin as a flip-flop
+        // subject. An explicit `W_` token beats a prose match, hence the ordering.
+        (
+            WarningSeverity::Warning,
+            WarningCode::AbsorptionTwinDeclined,
+        )
     } else if lower.contains("flip-flop regime") {
         // Transit / IG absorption closed form in the flip-flop regime (#776/#785):
         // auto-rerouted to the ODE twin (informational) or, twin-less at a fitted

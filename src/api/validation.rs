@@ -2997,6 +2997,8 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
             "W_DERIVED_COVARIATE_SHADOW"
         } else if w.contains("W_DERIVED_STEP_IGNORED") {
             "W_DERIVED_STEP_IGNORED"
+        } else if w.contains("W_ABSORPTION_TWIN_DECLINED") {
+            "W_ABSORPTION_TWIN_DECLINED"
         } else {
             "W_PARSE"
         };

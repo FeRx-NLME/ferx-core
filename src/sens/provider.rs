@@ -1435,12 +1435,10 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
 pub fn iov_sens_supported(model: &CompiledModel) -> bool {
     // A closed-form transit/IG IOV model is served by its ODE twin (issue #719, routed
     // per-subject by `CompiledModel::effective_for`), so its analytic-IOV outer-gradient scope
-    // is the twin's ODE-IOV scope. (`get_or_build` is cached; the twin is built for the fit
-    // anyway.)
+    // is the twin's ODE-IOV scope. (The twin is built at parse time, #1008.)
     if model.n_kappa > 0 {
         if let Some(eq) = &model.absorption_ode_equivalent {
-            return ODE_SENS_ENABLED
-                && crate::sens::ode_provider::ode_iov_supported(eq.get_or_build());
+            return ODE_SENS_ENABLED && crate::sens::ode_provider::ode_iov_supported(eq.built());
         }
     }
     iov_analytical_supported(model)

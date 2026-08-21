@@ -211,7 +211,7 @@ fn transit_time_desugars_to_ode_equivalent() {
         .absorption_ode_equivalent
         .as_ref()
         .expect("transit + TIME must carry an ODE equivalent")
-        .get_or_build();
+        .built();
     let ode = eq
         .ode_spec
         .as_ref()
@@ -1980,9 +1980,16 @@ fn dose_attr_param_reused_as_a_disposition_role_declines_the_twin() {
     // mapping — so the #735 shadow guard allows it — *and* the `v=` role, so the
     // generated twin emits `d/dt(central) = … − (CL/F) * central` with
     // `obs_scale = F`, reading a name `ode_param_slots` routes to the F slot. The
-    // twin's own parse rejects that as a #993 double use and `get_or_build`
-    // `.expect()`s, so a model the analytical primary accepts crashed the moment a
-    // TV-covariate / `TIME` / IOV subject rerouted to the twin.
+    // twin's own parse rejects that as a #993 double use, which (before #1008 made
+    // the build a parse-time decline) `get_or_build` `.expect()`ed — so a model the
+    // analytical primary accepts crashed the moment a TV-covariate / `TIME` / IOV
+    // subject rerouted to the twin.
+    //
+    // The specific guard is kept even though #1008's attach-site decline would now
+    // catch this generically: it declines *before* reconstructing a twin known to be
+    // unusable, so the model needs no `W_ABSORPTION_TWIN_DECLINED` warning for a case
+    // the desugar can name exactly. (`state_named_parameter_declines_the_absorption_
+    // twin_with_a_warning` covers the generic backstop.)
     //
     // The model is pharmacological nonsense (bioavailability used as a volume), but
     // nonsense must not panic. Declining keeps it closed-form — exactly what it was
@@ -2014,6 +2021,197 @@ fn dose_attr_param_reused_as_a_disposition_role_declines_the_twin() {
         "a dose-attribute parameter reused as a disposition role must decline the twin, \
          not build one that panics"
     );
+    // The desugar names this case, so it declines *before* reconstructing a source —
+    // no generic build-failure warning is raised.
+    assert!(
+        !parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("W_ABSORPTION_TWIN_DECLINED")),
+        "a guard-recognised decline must not fall through to the generic build-failure \
+         warning; warnings: {:?}",
+        parsed.model.parse_warnings
+    );
+}
+
+/// #1008: the third live door into the `.expect()` panic the first two (#1003) armed —
+/// found by probing the class rather than the instances, and the reason the fix is
+/// structural instead of a fourth point guard.
+///
+/// The twin's ODE states are named `central` (and `periph` for 2-cpt). An individual
+/// parameter named `CENTRAL` is meaningless to the analytical primary — which has no state
+/// namespace at all — so nothing rejects it there; the twin then re-emits it into
+/// `[individual_parameters]` beside `states=[central]`, and the twin's own parse rejects the
+/// case-insensitive name collision. None of the three existing guards look at state names,
+/// so this reached `get_or_build` and panicked mid-fit.
+///
+/// Three shapes are covered: a stray parameter that merely *exists* (never referenced by the
+/// `pk()` mapping), one that fills a disposition role, and the 2-cpt `periph` analogue —
+/// whose colliding name set differs because the twin's state list is topology-dependent.
+#[test]
+fn state_named_parameter_declines_the_absorption_twin_with_a_warning() {
+    let stray = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta TVX(1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  CENTRAL = TVX
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    // `v=CENTRAL` — the parameter is load-bearing, so the twin's `d/dt(central)` RHS reads
+    // the very name it declares as a state.
+    let disposition_role = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  CENTRAL = TVV
+  N   = TVN
+  MTT = TVMTT
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=CENTRAL, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    // The 2-cpt twin declares a second state, `periph`, so its state namespace — and hence
+    // the set of parameter names that collide — depends on the topology. Cover both.
+    let two_cpt_periph = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV1(50.0, 0.0, 1e15)
+  theta TVQ(10.0, 0.0, 1e15)
+  theta TVV2(80.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V1  = TVV1
+  Q   = TVQ
+  PERIPH = TVV2
+  N   = TVN
+  MTT = TVMTT
+
+[structural_model]
+  pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=PERIPH, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    for (label, src, colliding) in [
+        ("stray", stray, "CENTRAL"),
+        ("disposition role", disposition_role, "CENTRAL"),
+        ("2-cpt periph", two_cpt_periph, "PERIPH"),
+    ] {
+        let parsed = parse_full_model(src)
+            .unwrap_or_else(|e| panic!("the analytical primary ({label}) must still parse: {e}"));
+        assert!(
+            parsed.model.absorption_ode_equivalent.is_none(),
+            "a parameter named after a twin state ({label}) must decline the twin, not build \
+             one that panics"
+        );
+        let warning = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .find(|w| w.contains("W_ABSORPTION_TWIN_DECLINED"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the decline ({label}) must be reported; warnings: {:?}",
+                    parsed.model.parse_warnings
+                )
+            });
+        // The twin parser's own message is carried through, so the reason is readable
+        // without a debugger — the specific complaint here is the state-name collision.
+        assert!(
+            warning.contains(colliding) && warning.contains("collides"),
+            "the warning must carry the twin parser's reason (naming `{colliding}`), \
+             got: {warning}"
+        );
+        // …and it must classify to its own code rather than the `general` bucket, so a
+        // consumer can branch on "this model kept no ODE fallback". Asserted here on the
+        // *produced* message, so the code cannot drift away from the text that carries it.
+        assert_eq!(
+            crate::types::classify_warning(warning).category.as_str(),
+            "absorption_twin_declined",
+            "the decline ({label}) must classify to its own warning code"
+        );
+    }
+}
+
+/// The positive control for the test above: an ordinary transit model — same shape, no
+/// state-named parameter — keeps its twin and is warned about nothing. Without this, the
+/// decline path could pass by declining *everything*.
+#[test]
+fn an_ordinary_transit_model_keeps_its_twin_and_warns_about_nothing() {
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta TVX(1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  CENTRAL_AMT = TVX
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let parsed = parse_full_model(src).expect("an ordinary transit model parses");
+    assert!(
+        parsed
+            .model
+            .absorption_ode_equivalent
+            .as_ref()
+            .is_some_and(|eq| eq.built().ode_spec.is_some()),
+        "an ordinary transit model must keep a working ODE twin; warnings: {:?}",
+        parsed.model.parse_warnings
+    );
+    assert!(
+        !parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("W_ABSORPTION_TWIN_DECLINED")),
+        "nothing to decline here; warnings: {:?}",
+        parsed.model.parse_warnings
+    );
 }
 
 #[test]
@@ -2026,12 +2224,14 @@ fn adaptive_observe_does_not_reach_the_absorption_twin() {
     // reach a new ODE-only check from there — their presence makes the twin decline
     // outright — but `[adaptive_dosing]` does not decline it. So an analytical model
     // that the parser deliberately accepts (the rejection is ODE-scoped, see #1004)
-    // produced a twin that the parser *rejects*, and `get_or_build` turns a parse
-    // error into a `.expect()` panic — mid-fit, on the plain predict path that
-    // reroutes TV-covariate / `TIME` / IOV subjects to the twin.
+    // produced a twin that the parser *rejects* — which, before #1008 made the build
+    // a parse-time decline, `get_or_build` turned into a `.expect()` panic mid-fit, on
+    // the plain predict path that reroutes TV-covariate / `TIME` / IOV subjects.
     //
-    // The block is now dropped from the twin. Without that, this test panics rather
-    // than failing.
+    // The block is now dropped from the twin, so the model keeps a working fallback.
+    // Without that drop this test fails on the `is_some` below (and, before #1008,
+    // panicked instead): #1008's decline stops the crash but would still cost this
+    // model its twin.
     let src = "
 [parameters]
   theta TVCL(5.0, 0.0, 1e15)
@@ -2075,10 +2275,10 @@ fn adaptive_observe_does_not_reach_the_absorption_twin() {
         .absorption_ode_equivalent
         .as_ref()
         .expect("a plain transit model carries an ODE twin");
-    // The `.expect()` inside `get_or_build` is what used to blow up here. A twin
-    // that builds at all is the proof the block was dropped: had it been re-emitted,
-    // the twin is an ODE model and the check would have rejected `observe`.
-    let twin = eq.get_or_build();
+    // A twin that exists at all is the proof the block was dropped: had it been
+    // re-emitted, the twin is an ODE model, the check would have rejected `observe`,
+    // and the attach site would have declined the twin (panicked, before #1008).
+    let twin = eq.built();
     assert!(
         twin.ode_spec.is_some(),
         "the twin must be a working ODE model"
@@ -2211,9 +2411,9 @@ fn analytical_f_mapping_is_not_a_double_use() {
 
 #[test]
 fn transit_twin_with_reserved_f_name_still_builds() {
-    // Regression guard on the absorption ODE twin. `AbsorptionOdeEquivalent::
-    // get_or_build` `.expect()`s its reconstructed source to re-parse, so any new
-    // parse error that the twin can trip turns into a panic at fit time. The twin
+    // Regression guard on the absorption ODE twin: any new parse error the twin can
+    // trip costs the model its fallback (and, before #1008, panicked at fit time), so
+    // the twin must keep re-parsing for the shapes the desugar accepts. The twin
     // re-emits `[individual_parameters]` verbatim and, for an `f=` role whose
     // parameter does not already self-route, appends an `f = <param>` alias — so
     // `f` appears as a declaration but never as a read. Cover both: a parameter
@@ -2247,10 +2447,23 @@ fn transit_twin_with_reserved_f_name_still_builds() {
         );
         let parsed = parse_full_model(&src)
             .unwrap_or_else(|e| panic!("transit model with {mapping} must parse: {e}"));
-        // Force the lazy twin build — this is the `.expect()` that would panic.
-        if let Some(eq) = parsed.model.absorption_ode_equivalent.as_ref() {
-            let _ = eq.get_or_build();
-        }
+        // The twin is built during that parse (#1008). Assert it is *present*: a twin
+        // whose source fails to parse is now declined rather than panicking, so
+        // "didn't panic" alone would pass vacuously for a broken reconstruction.
+        let eq = parsed
+            .model
+            .absorption_ode_equivalent
+            .as_ref()
+            .unwrap_or_else(|| {
+                panic!(
+                    "transit model with {mapping} must keep its ODE twin; warnings: {:?}",
+                    parsed.model.parse_warnings
+                )
+            });
+        assert!(
+            eq.built().ode_spec.is_some(),
+            "the twin for {mapping} must be a working ODE model"
+        );
     }
 }
 

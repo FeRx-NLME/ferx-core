@@ -478,6 +478,25 @@ fn classify_warning_flat_parameter_is_warning() {
     assert_eq!(w.source_method.as_deref(), Some("parameters"));
 }
 
+/// #1008: a declined absorption ODE twin gets its own code rather than the `general`
+/// fallback, so a consumer (the R wrapper, an agent) can branch on "this model kept no
+/// ODE fallback" instead of matching prose. Uses the parser's real message text — if
+/// that text stops carrying the `W_ABSORPTION_TWIN_DECLINED` token, this fails.
+#[test]
+fn classify_warning_absorption_twin_declined_is_warning() {
+    let w = classify_warning(
+        "This absorption model's ODE equivalent could not be built, so the model stays \
+         closed-form: [odes]: name `CENTRAL` collides with a previously-declared state \
+         (case-insensitive); state, individual-parameter, and ODE-block intermediate names \
+         must all be distinct. Subjects needing the ODE fallback (time-varying covariates, \
+         a `TIME`-dependent parameter, IOV, steady-state or infusion doses, or the \
+         flip-flop regime) will be rejected with an explicit error instead of silently \
+         rerouting (W_ABSORPTION_TWIN_DECLINED, #1008).",
+    );
+    assert_eq!(w.severity, WarningSeverity::Warning);
+    assert_eq!(w.category.as_str(), "absorption_twin_declined");
+}
+
 #[test]
 fn classify_warning_dw_is_warning() {
     let w = classify_warning("Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).");
@@ -2219,7 +2238,7 @@ fn call_time_ode_tolerances_reach_the_absorption_twin() {
     // rather than be silently dropped at the twin source's parse default.
     use crate::parser::model_parser::parse_model_string;
 
-    // Lazy branch: sync BEFORE the twin is built, so the override is applied at build time.
+    // Sync-then-read: the override must reach the twin (built at parse time since #1008).
     let mut lazy = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
     assert!(
         lazy.absorption_ode_equivalent.is_some(),
@@ -2266,8 +2285,8 @@ fn call_time_ode_tolerances_reach_the_absorption_twin() {
         "un-synced twin keeps its source max_steps"
     );
 
-    // Already-built branch: build the twin first, THEN sync — the override must still land
-    // on the cached model (a second fit reusing the model with new tolerances).
+    // Read-then-sync: read the twin's tolerances first, THEN sync — the override must still
+    // land on it (a second fit reusing the same model with new tolerances).
     let mut prebuilt = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
     let built_reltol = prebuilt
         .effective_for(&bare_subject("3"))
