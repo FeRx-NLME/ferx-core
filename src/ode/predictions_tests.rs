@@ -6025,6 +6025,113 @@ fn test_ode_predictions_still_clamps_negatives() {
     );
 }
 
+/// A `clock` system (`d/dt clock = 1`, no doses) whose Form C readout is the
+/// straight line `clock - 5`: exactly zero at t=5, legitimately negative before
+/// it. The reprex of #1020, reduced to a Tier-1 spec.
+fn signed_readout_clock_spec(readout: OdeReadout) -> OdeSpec {
+    OdeSpec {
+        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+            dy[0] = 1.0;
+        }),
+        n_states: 1,
+        state_names: vec!["clock".into()],
+        readout,
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+        init_fn: None,
+    }
+}
+
+/// The clamp is a property of the readout, not of the driver: `ObsCmt` (a bare
+/// compartment amount, physically non-negative) clamps, both Form C `[scaling]`
+/// variants (arbitrary user expressions) do not.
+#[test]
+fn only_bare_state_readouts_clamp_negatives() {
+    assert!(OdeReadout::ObsCmt(0).clamps_negative());
+    assert!(
+        !OdeReadout::Single(Box::new(|s: &[f64], _p: &[f64], _t, _e, _c| s[0])).clamps_negative()
+    );
+    let mut map: HashMap<usize, PerCmtReadout> = HashMap::new();
+    map.insert(
+        1,
+        PerCmtReadout {
+            out_fn: Box::new(|s: &[f64], _p: &[f64], _t, _e, _c| s[0]),
+            program: None,
+        },
+    );
+    assert!(!OdeReadout::PerCmt(map).clamps_negative());
+}
+
+/// Regression for #1020: a Form C `[scaling] y[CMT=N] = <expr>` readout is an
+/// arbitrary user expression (change from baseline, z-score, `sqrt(N)*logit(p)`)
+/// and its negative part must reach the caller, not be silently zeroed by the
+/// ODE overshoot guard.
+#[test]
+fn form_c_per_cmt_readout_keeps_negative_predictions() {
+    let mut map: HashMap<usize, PerCmtReadout> = HashMap::new();
+    map.insert(
+        1,
+        PerCmtReadout {
+            out_fn: Box::new(|s: &[f64], _pk: &[f64], _t, _e, _c| s[0] - 5.0),
+            program: None,
+        },
+    );
+    let ode = signed_readout_clock_spec(OdeReadout::PerCmt(map));
+    let pk = pk_one(1.0, 1.0);
+    // Zero-amount bolus at t=0, as in the issue's reprex: it anchors the
+    // timeline at 0 (a dose-free subject starts integrating at its first
+    // observation) without perturbing the clock state.
+    let doses = vec![DoseEvent::new(0.0, 0.0, 1, 0.0, false, 0.0)];
+    let subj = make_subject(doses, vec![2.0, 4.0, 6.0, 10.0]);
+
+    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+    for (got, want) in preds.iter().zip([-3.0, -1.0, 1.0, 5.0]) {
+        assert!(
+            (got - want).abs() < 1e-6,
+            "signed Form C readout must not be clamped: got {preds:?}"
+        );
+    }
+}
+
+/// The uniform Form C variant (`[scaling] y = <expr>`) behaves the same, on
+/// every driver that shares the clamp epilogue: the dense predictor, the
+/// dense-with-states predictor, and the event-driven walk (whose clamp is
+/// inline, per observation).
+#[test]
+fn form_c_single_readout_keeps_negative_predictions_on_all_drivers() {
+    let ode = signed_readout_clock_spec(OdeReadout::Single(Box::new(
+        |s: &[f64], _pk: &[f64], _t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| s[0] - 5.0,
+    )));
+    let pk = pk_one(1.0, 1.0);
+    let doses = vec![DoseEvent::new(0.0, 0.0, 1, 0.0, false, 0.0)];
+    let subj = make_subject(doses, vec![2.0, 10.0]);
+    let want = [-3.0, 5.0];
+
+    let dense = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+    let (with_states, _) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subj);
+    let dose_pk = vec![pk; subj.doses.len()];
+    let obs_pk = vec![pk; subj.obs_times.len()];
+    let event_driven = ode_predictions_event_driven(&ode, &subj, &[], &[], &dose_pk, &obs_pk, &[]);
+
+    for (name, preds) in [
+        ("dense", &dense),
+        ("with_states", &with_states),
+        ("event_driven", &event_driven),
+    ] {
+        for (got, w) in preds.iter().zip(want) {
+            assert!(
+                (got - w).abs() < 1e-6,
+                "{name}: signed Form C readout must not be clamped, got {preds:?}"
+            );
+        }
+    }
+}
+
 /// Helper: oral PK params with clearance, volume, ka, and bioavailability.
 fn pk_oral_f(cl: f64, v: f64, ka: f64, f: f64) -> PkParams {
     let mut p = PkParams::default();

@@ -97,6 +97,57 @@ at evaluation time — states from the ODE solver, individual parameters
 from the subject-static `pk_param_fn`, and thetas/etas/covariates from
 the values supplied by the caller.
 
+### Signed readouts (since #1020)
+
+A Form C readout is an arbitrary expression, so it may legitimately be
+**negative** — a change from baseline, a difference from a comparator, a
+z-score, or the `sqrt(N) * logit(p)` transform used in model-based
+meta-analysis of a bounded endpoint. Its negative part is preserved.
+
+```ferx
+[scaling]
+  y[CMT=1] = sqrt(N) * log(P / (1 - P))    # negative for every arm below 50%
+```
+
+The negative-prediction clamp that guards the ODE solver applies only to the
+**default readout** — the bare compartment state (`obs_cmt`, and the analytical
+PK concentration), where non-negativity is a physical property of the quantity
+and a negative value can only be integration overshoot. It is not applied to
+Forms B or C.
+
+Before #1020 the ODE path clamped the final prediction vector unconditionally,
+after the Form C expression had been evaluated, so every negative readout was
+silently returned as exactly `0`: no warning, no error, and a fit that converged
+to plausible-looking parameters with the residual σ inflated to absorb the
+mismatch. (The analytical Form C path — #650 — always left the readout
+unclamped; the two paths now agree.)
+
+`NaN` is still not clamped on either path: it propagates to a `NaN` objective
+so the optimizer rejects the step, which is what surfaces a bad scale or a
+missing per-CMT entry loudly (see [Runtime behaviour on bad
+scales](#runtime-behaviour-on-bad-scales)).
+
+This matches NONMEM, which applies no non-negativity guard to `$ERROR` output.
+Anchored on NONMEM 7.5.1 (`nonmem_anchor/signed_readout.ctl`): a one-compartment
+`$DES` model read out as a change from baseline, `IPRED = A(1)/V - BASE`, with
+`CL = 4`, `V = 12`, `BASE = 2` all `FIX` and `MAXEVAL=0`.
+
+| t (h) | NONMEM `IPRED` | ferx `y = central / V - BASE` |
+|---|---|---|
+| 0.25 | 5.6670 | 5.667037 |
+| 1 | 3.9711 | 3.971094 |
+| 4 | 0.19664 | 0.196643 |
+| 12 | −1.8474 | −1.847370 |
+| 24 | −1.9972 | −1.997204 |
+
+The two sub-baseline points come back negative on both engines; before #1020
+ferx returned exactly `0` for them. Every point agrees to within the reference
+table's own 5-significant-figure rounding. The ferx run pins `ode_reltol` /
+`ode_abstol` tight, because a readout written as a *difference* of two numbers of
+size ~2 amplifies any solver-level disagreement by the cancellation — worth doing
+in your own model too when the readout is a change from baseline. The test is
+`tests/signed_readout_nonmem_anchor.rs`.
+
 ### Form C on analytical PK models (since #650)
 
 Form C is also accepted on **analytical** (closed-form) PK models. There the
