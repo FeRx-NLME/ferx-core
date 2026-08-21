@@ -714,6 +714,22 @@ section of the SDLC for the versioning policy).
   the warning now points at the covariance-step message that carries the actual cause,
   and a Bayesian fit is told that posterior credible intervals replace the
   Hessian-based covariance — instead of both being sent to an option that is already on.
+- **`FitResult$vi$elbo_tightness_ratio` says whether the reported bound is usable**, which
+  `converged` cannot: a stuck optimizer produces a flat objective and stable parameters
+  just like a successful one. The data term's excess over its value at the variational
+  means is `≈ d/2` per subject when `q` has the posterior's curvature, so the ratio of
+  measured to expected is ~1 for a healthy fit; above 25 the fit warns and names the likely
+  fix. A deep compartment model started badly scored 306.6 while reporting
+  `converged: true`; the same model with `init` declared scored 0.54.
+
+  **`FitResult$vi$elbo_tightness_ratio` says whether the reported bound is usable**, which
+  `converged` cannot: a stuck optimizer produces a flat objective and stable parameters
+  just like a successful one. The data term's excess over its value at the variational
+  means is `≈ d/2` per subject when `q` has the posterior's curvature, so the ratio of
+  measured to expected is ~1 for a healthy fit; above 25 the fit warns and names the likely
+  fix. A deep compartment model started badly scored 306.6 while reporting
+  `converged: true`; the same model with `init` declared scored 0.54.
+
 
 ## [0.3.0] - 2026-08-07
 
@@ -765,6 +781,13 @@ section of the SDLC for the versioning policy).
   60-subject, 4-occasion recovery where `θ` landed within 2%); confirm it with SAEM or
   FOCEI if it is the parameter you care about. Non-Gaussian endpoints
   (TTE / categorical) are still unsupported and are refused with an actionable message.
+  **`FitResult$vi$elbo_tightness_ratio` says whether the reported bound is usable**, which
+  `converged` cannot: a stuck optimizer produces a flat objective and stable parameters
+  just like a successful one. The data term's excess over its value at the variational
+  means is `≈ d/2` per subject when `q` has the posterior's curvature, so the ratio of
+  measured to expected is ~1 for a healthy fit; above 25 the fit warns and names the likely
+  fix. A deep compartment model started badly scored 306.6 while reporting
+  `converged: true`; the same model with `init` declared scored 0.54.
 - **New ODE steppers via `[fit_options] ode_method`,** on two independent axes. For
   **stability**: the linearly implicit Rosenbrock methods `rosenbrock23` (order 2, aliases
   `ros23`/`ode23s`), `rodas4` (order 4) and `rodas5p` (order 5). These are stable at the step size the tolerance needs on **stiff**

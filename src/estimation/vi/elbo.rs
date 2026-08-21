@@ -1054,3 +1054,128 @@ mod tests;
 #[cfg(test)]
 #[path = "elbo_oracle.rs"]
 mod oracle_tests;
+
+// ---------------------------------------------------------------------------
+// ELBO tightness diagnostic
+// ---------------------------------------------------------------------------
+
+/// How far the sampled data term sits above the same term evaluated at the
+/// variational means, against how far it *should* sit.
+///
+/// # What this catches
+///
+/// The ELBO is a lower bound on the log likelihood, so `−2·ELBO` overshoots
+/// `−2 log L`. A healthy fit overshoots by a little. A fit that has descended
+/// into a bad basin can overshoot by orders of magnitude — and nothing in the
+/// convergence test notices, because a stuck optimizer produces a flat trace
+/// and stable parameters just as a converged one does. Measured on a
+/// 60-subject deep compartment model: `−2·ELBO` reported 140 136 where the true
+/// `−2 log L` at the same estimate was 2 034, and the fit reported
+/// `converged: true` — 973 OFV worse than the same model started sensibly, with
+/// the clearance decline understated by 43%.
+///
+/// The check is a comparison the run can make on its own, without a second
+/// estimator. `E_q[−log p(y|η)] − (−log p(y|μ))` is the expected excess of the
+/// data term over its value at the posterior mean; to second order that is
+/// `½ tr(H·S)`, and when `q` approximates the posterior curvature (`S ≈ H⁻¹`)
+/// it reduces to `d/2` per subject. So the *scale* of a healthy excess is set by
+/// the stacked dimension and the subject count, both of which are known.
+/// Anything far above that means `q` is nowhere near the posterior, the
+/// objective is dominated by draws in a region the mean never sees, or both.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ElboTightness {
+    /// `data_term − data_term_at_means`.
+    pub excess: f64,
+    /// `Σᵢ dᵢ/2`, the second-order expectation when `q` matches the posterior.
+    pub expected: f64,
+}
+
+impl ElboTightness {
+    /// Multiple of the expected excess. `1.0` is the ideal; large values mean
+    /// the bound is not usable and the estimate should not be trusted.
+    pub fn ratio(&self) -> f64 {
+        if self.expected > 0.0 {
+            self.excess / self.expected
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// Above this multiple the fit is reported as untrustworthy.
+    ///
+    /// Measured on the same 60-subject deep compartment model, same data, same
+    /// seed, differing only in where the network started:
+    ///
+    /// | start | `−2 log L` | ratio |
+    /// |---|---|---|
+    /// | bare `softplus` head (every output at 0.693) | 2033.6 | **306.6** |
+    /// | `init = [1.0, 10.0]` | 1061.0 | **0.54** |
+    ///
+    /// Nearly three orders of magnitude apart, so the threshold sits in a wide
+    /// empty gap rather than on a boundary. That is the property worth having:
+    /// a diagnostic needing per-model calibration would not survive contact with
+    /// models nobody has run yet. It is set at 25 rather than nearer the healthy
+    /// value because the `d/2` expectation is exact only for a quadratic
+    /// log-likelihood, and a nonlinear PK model with a proportional residual can
+    /// legitimately run some multiple above it.
+    pub const IMPLAUSIBLE_RATIO: f64 = 25.0;
+
+    pub fn is_implausible(&self) -> bool {
+        self.excess.is_finite() && self.ratio() > Self::IMPLAUSIBLE_RATIO
+    }
+}
+
+/// Evaluate the data term at the variational means and compare it against the
+/// sampled one.
+///
+/// Costs one likelihood evaluation per subject — the same call the ELBO already
+/// makes `n_mc_samples` times per subject per iteration — so running it once at
+/// the end is free relative to the fit.
+pub(crate) fn elbo_tightness(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    sampled_data_term: f64,
+    eta_means: &[Vec<f64>],
+    kappa_means: &[Vec<Vec<f64>>],
+) -> ElboTightness {
+    let n_eta = params.omega.dim();
+    let mut at_means = 0.0;
+    let mut expected = 0.0;
+    let mut scratch = EventPkParams::default();
+
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let Some(eta) = eta_means.get(i) else {
+            continue;
+        };
+        let kappas = kappa_means.get(i).cloned().unwrap_or_default();
+        let iov = !kappas.is_empty() && model.n_kappa > 0;
+        at_means += if iov {
+            obs_nll_subject_into_iov(
+                model,
+                subject,
+                &params.theta,
+                &params.sigma.values,
+                eta,
+                &kappas,
+                &mut scratch,
+            )
+        } else {
+            obs_nll_subject_into(
+                model,
+                subject,
+                &params.theta,
+                &params.sigma.values,
+                eta,
+                &mut scratch,
+            )
+        };
+        // The stacked dimension this subject's `q` actually covers.
+        expected += 0.5 * (n_eta + kappas.len() * model.n_kappa) as f64;
+    }
+
+    ElboTightness {
+        excess: sampled_data_term - at_means,
+        expected,
+    }
+}

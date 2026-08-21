@@ -4491,6 +4491,19 @@ pub struct ViResult {
     /// provider. Non-zero means the fit was much slower than it needed to be, not
     /// that it was wrong.
     pub n_fd_subjects: usize,
+    /// How loose the reported bound is, as a multiple of how loose a
+    /// posterior-shaped `q` would make it.
+    ///
+    /// The data term is `E_q[−log p(y|η)]`; evaluated at the variational means it is
+    /// `−log p(y|μ)`. The gap between them is `≈ ½ tr(H·S)`, which is `d/2` per subject
+    /// when `S ≈ H⁻¹`. This is the measured gap divided by that expectation, so `1`
+    /// is ideal and single digits are unremarkable on a nonlinear model.
+    ///
+    /// **Read this before trusting `converged`.** A large value means the optimizer
+    /// settled somewhere the bound is meaningless — which a flat objective and stable
+    /// parameters cannot distinguish from success. A deep compartment model that
+    /// reported `converged: true` at 889 OFV worse than FOCEI scored ~380 here.
+    pub elbo_tightness_ratio: f64,
 }
 
 /// Result of a full MCMC Bayesian fit (`EstimationMethod::Bayes`). Surfaced on

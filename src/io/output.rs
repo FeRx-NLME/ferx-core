@@ -2101,6 +2101,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             .map_err(|e| e.to_string())?;
         writeln!(f, "  converged: {}", v.converged).map_err(|e| e.to_string())?;
         writeln!(f, "  n_fd_subjects: {}", v.n_fd_subjects).map_err(|e| e.to_string())?;
+        // Read alongside `converged`, not after it: a flat objective cannot tell a
+        // converged fit from a stuck one, and this can. ~1 is ideal.
+        writeln!(f, "  elbo_tightness_ratio: {:.3}", v.elbo_tightness_ratio)
+            .map_err(|e| e.to_string())?;
         writeln!(f, "  elbo_trace:").map_err(|e| e.to_string())?;
         for t in &v.elbo_trace {
             writeln!(f, "    - {:.6}", t).map_err(|e| e.to_string())?;

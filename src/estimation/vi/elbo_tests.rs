@@ -2123,3 +2123,124 @@ fn time_varying_covariate_iov_gradient_matches_central_fd() {
     );
     assert_tv_iov_gradient_matches_fd("tv-covariate", "CLSLOPE", &model, &population, &params);
 }
+
+// ---------------------------------------------------------------------------
+// ELBO tightness diagnostic
+// ---------------------------------------------------------------------------
+
+/// At the variational means the excess is zero by construction, so a `q` placed
+/// at a point mass reports a ratio of 0 — the floor the measure is built on.
+#[test]
+fn tightness_excess_is_zero_when_the_data_term_is_taken_at_the_means() {
+    let (model, population, params) = fixture();
+    let family = FullRank::new(model.n_eta);
+    let phis = perturbed_phis(&family, &params.omega, 2);
+    let eta_means: Vec<Vec<f64>> = phis
+        .iter()
+        .map(|p| family.moments(p).0.iter().copied().collect())
+        .collect();
+    let kappa_means: Vec<Vec<Vec<f64>>> = vec![Vec::new(); population.subjects.len()];
+
+    // Feed it the data term *at the means* rather than the sampled one.
+    let at_means =
+        super::elbo_tightness(&model, &population, &params, 0.0, &eta_means, &kappa_means);
+    // excess = 0 - data_term_at_means, so recovering the latter gives an exact zero.
+    let exact = super::elbo_tightness(
+        &model,
+        &population,
+        &params,
+        -at_means.excess,
+        &eta_means,
+        &kappa_means,
+    );
+    assert!(
+        exact.excess.abs() < 1e-9,
+        "excess should vanish at the means, got {:.3e}",
+        exact.excess
+    );
+    assert!(!exact.is_implausible());
+    assert!(exact.expected > 0.0, "expected excess must be positive");
+}
+
+/// The expectation is `d/2` per subject, and under IOV `d` is the *stacked*
+/// dimension — an expectation computed on `n_eta` alone would understate it and
+/// make every IOV fit look looser than it is.
+#[test]
+fn tightness_expectation_counts_the_stacked_dimension_under_iov() {
+    let (model, population, params) = iov_fixture();
+    let n_eta = params.omega.dim();
+    let eta_means: Vec<Vec<f64>> = population
+        .subjects
+        .iter()
+        .map(|_| vec![0.0; n_eta])
+        .collect();
+    let kappa_means: Vec<Vec<Vec<f64>>> = population
+        .subjects
+        .iter()
+        .map(|s| vec![vec![0.0; model.n_kappa]; subject_k_occasions(&model, s)])
+        .collect();
+
+    let t = super::elbo_tightness(&model, &population, &params, 0.0, &eta_means, &kappa_means);
+    let want: f64 = population
+        .subjects
+        .iter()
+        .map(|s| 0.5 * (n_eta + subject_k_occasions(&model, s) * model.n_kappa) as f64)
+        .sum();
+    assert!(
+        (t.expected - want).abs() < 1e-12,
+        "expected {want}, got {}",
+        t.expected
+    );
+    // And it must exceed the BSV-only count, or the IOV blocks were ignored.
+    assert!(want > 0.5 * (n_eta * population.subjects.len()) as f64);
+}
+
+/// A data term far above its value at the means must be flagged; one close to it
+/// must not. This is the decision the warning is built on.
+#[test]
+fn tightness_flags_a_grossly_loose_bound_but_not_a_healthy_one() {
+    let (model, population, params) = fixture();
+    let family = FullRank::new(model.n_eta);
+    let phis = perturbed_phis(&family, &params.omega, 2);
+    let eta_means: Vec<Vec<f64>> = phis
+        .iter()
+        .map(|p| family.moments(p).0.iter().copied().collect())
+        .collect();
+    let kappa_means: Vec<Vec<Vec<f64>>> = vec![Vec::new(); population.subjects.len()];
+    let base =
+        -super::elbo_tightness(&model, &population, &params, 0.0, &eta_means, &kappa_means).excess;
+
+    // A healthy excess: the second-order expectation itself.
+    let expected =
+        super::elbo_tightness(&model, &population, &params, base, &eta_means, &kappa_means)
+            .expected;
+    let healthy = super::elbo_tightness(
+        &model,
+        &population,
+        &params,
+        base + expected,
+        &eta_means,
+        &kappa_means,
+    );
+    assert!(
+        (healthy.ratio() - 1.0).abs() < 1e-9,
+        "a d/2 excess is the definition of ratio 1, got {}",
+        healthy.ratio()
+    );
+    assert!(!healthy.is_implausible());
+
+    // The measured deep-compartment failure was ~300x.
+    let broken = super::elbo_tightness(
+        &model,
+        &population,
+        &params,
+        base + 300.0 * expected,
+        &eta_means,
+        &kappa_means,
+    );
+    assert!(
+        broken.is_implausible(),
+        "a 300x excess must be flagged, ratio was {}",
+        broken.ratio()
+    );
+}

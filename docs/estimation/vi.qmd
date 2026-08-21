@@ -216,6 +216,26 @@ objective, not of the ELBO, so a fit can legitimately report standard errors whi
 `ofv` as `NaN`. Set `run_covariance_step = false` to skip it; in a chain such as
 `methods = vi, focei` it runs once, on the final stage.
 
+## Is the bound tight? (`elbo_tightness_ratio`)
+
+`converged` answers "did the objective stop moving", which a stuck optimizer satisfies
+just as well as a successful one. Read `FitResult$vi$elbo_tightness_ratio` alongside it.
+
+The data term is `E_q[−log p(y|η)]`. Evaluated at the variational means it is
+`−log p(y|μ)`, and the gap between them is `≈ ½ tr(H·S)` — which is `d/2` per subject
+when `q` has the posterior's curvature. The ratio is the measured gap over that
+expectation, so **≈ 1 is ideal** and single digits are unremarkable on a nonlinear model.
+Above 25 the fit emits a warning naming the likely cause.
+
+This is what distinguishes a converged fit from a stuck one without running a second
+estimator. On a deep compartment model started badly it read **306.6** while the fit
+reported `converged: true` at 973 OFV worse than the same model started sensibly;
+started sensibly it read **0.54**.
+
+If it fires: start from better values (`init` on a `[covariate_nn]` block, see
+[`[covariate_nn]`](../model-file/covariate-nn.qmd#start-the-network-at-plausible-values-init)),
+or chain `method = [focei, vi]` to begin VI from a fitted point.
+
 ## Inter-occasion variability
 
 IOV (`kappa`) is supported. The variational posterior covers the **stacked** vector

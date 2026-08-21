@@ -697,6 +697,33 @@ pub fn run_vi(
         warnings.push(w);
     }
 
+    // Is the bound we are about to report actually tight? A stuck optimizer produces a
+    // flat trace and stable parameters — indistinguishable, to the convergence test, from
+    // a converged one. This is the check that tells them apart, and it is the difference
+    // between reporting a bad fit as successful and saying so.
+    let tightness = super::elbo::elbo_tightness(
+        model,
+        population,
+        &final_params,
+        final_eval.data_term,
+        &eta_means,
+        &kappa_means,
+    );
+    if tightness.is_implausible() {
+        warnings.push(format!(
+            "VI: the ELBO is not a usable bound at this estimate — the data term sits \
+             {:.0}x further above its value at the variational means than a posterior-shaped \
+             q would put it ({:.3e} against an expected {:.3e}). The optimizer has almost \
+             certainly settled in a bad basin: `converged` reflects a flat objective, not a \
+             good one. Re-run from better starting values (for a [covariate_nn] model, \
+             declare `init` so the network starts at plausible parameter values), or chain \
+             `method = [focei, vi]` to start VI from a fitted point.",
+            tightness.ratio(),
+            tightness.excess,
+            tightness.expected
+        ));
+    }
+
     // The ELBO is a lower bound, so it is never reported as the OFV. See
     // `ViFinalOfv` for why, and for how to obtain a real marginal likelihood.
     let ofv = match options.vi_final_ofv {
@@ -783,6 +810,7 @@ pub fn run_vi(
         eta_covs,
         kappa_means,
         n_fd_subjects,
+        elbo_tightness_ratio: tightness.ratio(),
     };
 
     Ok(OuterResult {
