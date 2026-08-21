@@ -16,7 +16,9 @@ if [ ! -x "$PYENV/bin/python" ]; then
   echo "creating an isolated venv at $PYENV"
   # Python 3.11: jax publishes arm64 wheels for it, and the system python3 here is 3.14 with
   # no numpy at all.
-  "${FERX_PY:-/opt/anaconda3/bin/python3.11}" -m venv "$PYENV"
+  # jax publishes arm64 wheels for 3.11/3.12; set FERX_PY if your python3 is outside that
+  # range (this was developed against a 3.14 system python, which has no jax wheels at all).
+  "${FERX_PY:-python3.11}" -m venv "$PYENV"
   "$PYENV/bin/python" -m pip install --quiet --upgrade pip
   "$PYENV/bin/python" -m pip install --quiet jax numpyro
 fi

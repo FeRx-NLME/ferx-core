@@ -36,7 +36,7 @@ wanted somewhere a person actually looks while the fits stay in the harness stat
 So to send the figures elsewhere, set only `FERX_VI_FIGS` — the directory is created if needed:
 
 ```bash
-FERX_VI_FIGS=~/Downloads/dcm_comparison Rscript tools/vi-emvi-comparison/plots.R
+FERX_VI_FIGS=./figures Rscript tools/vi-emvi-comparison/plots.R
 ```
 
 Pointing `FERX_VI_OUT` at the destination instead is the mistake to avoid: the script would look

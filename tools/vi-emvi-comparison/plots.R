@@ -30,7 +30,7 @@
 # only FERX_VI_FIGS at the destination; pointing FERX_VI_OUT there instead would make the script
 # look for emvi-results.rds in the figure folder and fail.
 #
-#   FERX_VI_FIGS=~/Downloads/dcm_comparison Rscript tools/vi-emvi-comparison/plots.R
+#   FERX_VI_FIGS=./figures Rscript tools/vi-emvi-comparison/plots.R
 suppressMessages({
   library(ggplot2); library(dplyr); library(tidyr); library(scales); library(patchwork)
   library(numDeriv)

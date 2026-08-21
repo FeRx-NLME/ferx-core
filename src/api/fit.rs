@@ -1369,6 +1369,7 @@ fn fit_inner(
                         cond_dist: None,
                         packed_estimate: None,
                         vi: None,
+                        mixture_posteriors: None,
                     });
                 }
             }

@@ -19,9 +19,9 @@ Rscript tools/vi-nuts-anchor/plots.R         # then the three figures
 
 First run builds an isolated venv at `$FERX_VI_STATE/pyenv` and installs jax + numpyro into it.
 The system Python is never touched and deleting `$FERX_VI_STATE` undoes the install — the same
-arrangement `tools/vi-emvi-comparison` uses for its R library. Built from
-`/opt/anaconda3/bin/python3.11` (override with `FERX_PY`): the system `python3` here is 3.14,
-which has no `numpy` and no jax wheels.
+arrangement `tools/vi-emvi-comparison` uses for its R library. Built from `python3.11` (override with `FERX_PY`, e.g. an Anaconda interpreter): jax publishes
+arm64 wheels for 3.11/3.12, and this was developed against a system `python3` of 3.14, which has
+neither `numpy` nor a jax wheel.
 
 Not wired into CI, and shouldn't be: no CI image here carries jax, and NUTS takes minutes.
 
