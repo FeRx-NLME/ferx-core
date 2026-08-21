@@ -2124,9 +2124,11 @@ fn adaptive_dv_noised_and_deterministic() {
 
 #[test]
 fn adaptive_dv_clamps_negative_at_zero() {
-    // Edge (b): the noised value cannot read below zero. At t=0 the pre-dose
-    // trough is 0, so a negative assay draw with a large sigma would push it
-    // negative; assert it clamps to exactly 0.
+    // Edge (b): on a *bare-state* readout (`OdeReadout::ObsCmt`, a compartment
+    // amount / concentration) the noised value cannot read below zero. At t=0 the
+    // pre-dose trough is 0, so a negative assay draw with a large sigma would push
+    // it negative; assert it clamps to exactly 0. Form C readouts are exempt —
+    // see `adaptive_dv_form_c_monitor_keeps_negative_sample` (#1039).
     let ode = one_cpt_ode_spec();
     let pk = pk_one(1.0, 10.0);
     let neg_seed = (0u64..)
@@ -2155,6 +2157,113 @@ fn adaptive_dv_clamps_negative_at_zero() {
     assert_eq!(
         run.decisions[0].observed_signals[0].value, 0.0,
         "a negative assay reading must clamp at 0"
+    );
+}
+
+/// A Form C `[scaling]` monitor read in `dv` mode must keep its negative
+/// samples (#1039). The assay floor is a statement about a compartment amount,
+/// not about an arbitrary user expression — a change-from-baseline signal that
+/// a controller thresholds is legitimately negative, and flooring it at 0 made
+/// the controller blind over exactly the region it reacts to.
+#[test]
+fn adaptive_dv_form_c_monitor_keeps_negative_sample() {
+    // `clock - 5`: latent = -5 at t=0. sd = 0.1, so no draw of a standard normal
+    // this test could see reaches 0 — the sample must stay negative *and* noised.
+    let ode = signed_readout_clock_spec(OdeReadout::Single(Box::new(
+        |s: &[f64], _pk: &[f64], _t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| s[0] - 5.0,
+    )));
+    let pk = pk_one(1.0, 1.0);
+    let small_var = |_cmt: usize, _ipred: f64| Some(0.01);
+    let assay = AssayNoise {
+        resid_var: &small_var,
+        base_seed: 4242,
+    };
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+    let base = make_subject(
+        vec![DoseEvent::new(0.0, 0.0, 1, 0.0, false, 0.0)],
+        vec![1.0],
+    );
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base,
+        &[0.0],
+        &dv_monitor(),
+        &mut controller,
+        100,
+        Some(&assay),
+    )
+    .expect("dv run");
+    let value = run.decisions[0].observed_signals[0].value;
+    assert!(
+        value < 0.0,
+        "a Form C dv monitor must keep its negative sample, got {value}"
+    );
+    assert!(
+        (value + 5.0).abs() > 1e-12,
+        "expected the assay to perturb the latent value, got {value}"
+    );
+    assert!(
+        (value + 5.0).abs() < 1.0,
+        "expected a sd=0.1 perturbation around -5, got {value}"
+    );
+}
+
+/// Degenerate oracle for #1039 (epic #391 validation rule — no NONMEM anchor):
+/// with `sigma -> 0` a `dv` monitor on a Form C model must equal the `ipred`
+/// monitor on the same model, decision for decision, *including* the negative
+/// samples. That equality is exactly what the ungated assay clamp broke.
+#[test]
+fn adaptive_dv_zero_variance_equals_ipred_on_signed_form_c() {
+    let ode = signed_readout_clock_spec(OdeReadout::Single(Box::new(
+        |s: &[f64], _pk: &[f64], _t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| s[0] - 5.0,
+    )));
+    let pk = pk_one(1.0, 1.0);
+    // Straddle the sign change at t=5: two negative samples, then two positive.
+    let decisions = [0.0, 2.0, 6.0, 10.0];
+    let base = make_subject(
+        vec![DoseEvent::new(0.0, 0.0, 1, 0.0, false, 0.0)],
+        vec![1.0],
+    );
+    let hold = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+
+    let sample = |monitors: &[MonitorSpec], assay: Option<&AssayNoise>| -> Vec<f64> {
+        let mut ctrl = hold;
+        ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            monitors,
+            &mut ctrl,
+            100,
+            assay,
+        )
+        .expect("adaptive run")
+        .decisions
+        .iter()
+        .map(|d| d.observed_signals[0].value)
+        .collect()
+    };
+
+    let ipred = sample(&[MonitorSpec::new("A", 1, ObserveMode::Ipred)], None);
+    let zero_var = |_cmt: usize, _ipred: f64| Some(0.0);
+    let assay = AssayNoise {
+        resid_var: &zero_var,
+        base_seed: 7,
+    };
+    let dv = sample(&dv_monitor(), Some(&assay));
+
+    for (got, want) in ipred.iter().zip([-5.0, -3.0, 1.0, 5.0]) {
+        assert_relative_eq!(*got, want, epsilon = 1e-9);
+    }
+    assert_eq!(
+        dv, ipred,
+        "a zero-variance dv monitor must reproduce the ipred monitor sample for sample"
     );
 }
 
