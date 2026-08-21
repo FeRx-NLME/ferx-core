@@ -1750,7 +1750,12 @@ fn resolve_obs_readout<T: crate::sens::num::PkNum>(
     // `conc.max(0)` (predictions.rs) and the dual walks: a clamped value carries zero
     // derivatives. A NaN readout is `< 0.0` → false, so it passes through and
     // `apply_output_transform` preserves it as a tripwire (#449 review).
-    let raw = if raw.val() < 0.0 {
+    //
+    // Gated on `clamps_negative` exactly as the f64 predictor is: a Form C `[scaling]`
+    // readout is an arbitrary expression that may be legitimately negative, so it is
+    // left alone (#1020). Keeping the two gates identical is what keeps the analytic
+    // jet equal to FD of the f64 predictor.
+    let raw = if raw.val() < 0.0 && ode.readout.clamps_negative() {
         T::from_f64(0.0)
     } else {
         raw

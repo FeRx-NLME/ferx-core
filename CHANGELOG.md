@@ -243,6 +243,22 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **A negative Form C `[scaling]` prediction is no longer silently clamped to zero on ODE models
+  (#1020).** The ODE predictor applied its negative-prediction guard to the *final* prediction
+  vector — after the `y = <expr>` / `y[CMT=N] = <expr>` readout had been evaluated. That guard is a
+  statement about a compartment amount (which cannot go below zero, so a negative value is solver
+  overshoot), but a Form C readout is an arbitrary user expression that is often legitimately
+  signed: a change from baseline, a difference from a comparator, a z-score, or the
+  `sqrt(N) * logit(p)` transform used in model-based meta-analysis of a bounded endpoint, which is
+  negative for every arm below 50%. Every such prediction came back as exactly `0`, with no warning
+  and nothing in the fit output to show it — the fit converged with the residual σ inflated to
+  absorb the mismatch and the between-subject variance collapsed. The clamp now applies only to the
+  default bare-state readout (`obs_cmt`, and the analytical PK concentration), matching the
+  analytical Form C path, which never clamped its readout. `NaN` is still never clamped on either
+  path, so a bad scale or a missing per-CMT entry keeps surfacing as a `NaN` objective. Applies to
+  every ODE driver (dense, dense-with-states, event-driven, adaptive-dosing replay) and to the
+  analytic `Dual2`/`Dual1` sensitivity walks, whose clamp is gated identically so the analytic
+  gradient still matches finite differences of the predictor.
 - **SIR no longer fails with "All SIR samples had invalid weights" on a rank-deficient covariance
   (#1021).** A parameter direction the data do not identify comes back from the covariance step with
   a variance around `1 / eigenvalue floor` — thousands of standard deviations in packed log-space —

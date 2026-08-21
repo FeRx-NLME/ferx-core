@@ -1588,8 +1588,16 @@ fn record_observations(
 /// Clamp negative predictions to zero (ODE solver overshoot guard) — the shared
 /// epilogue of the dense drivers. NaN is intentionally NOT clamped (it survives
 /// `< 0.0` per IEEE 754) so it propagates to a NaN OFV.
+///
+/// A no-op unless the readout is a bare state ([`OdeReadout::clamps_negative`]):
+/// the overshoot guard is a statement about a compartment amount, not about an
+/// arbitrary Form C `[scaling]` expression, which is often legitimately signed
+/// (#1020).
 #[inline]
-fn clamp_negative_predictions(predictions: &mut [f64]) {
+fn clamp_negative_predictions(readout: &OdeReadout, predictions: &mut [f64]) {
+    if !readout.clamps_negative() {
+        return;
+    }
     for p in predictions.iter_mut() {
         if *p < 0.0 {
             *p = 0.0;
@@ -1827,6 +1835,31 @@ impl OdeReadout {
         match self {
             OdeReadout::ObsCmt(_) => false,
             OdeReadout::Single(_) | OdeReadout::PerCmt(_) => true,
+        }
+    }
+
+    /// Whether a negative prediction from this readout is a solver artefact that
+    /// should be clamped to zero (#1020).
+    ///
+    /// True only for the bare-state readout [`OdeReadout::ObsCmt`], where
+    /// non-negativity is a *physical* property of the quantity: a compartment
+    /// amount / concentration cannot go below zero, so a negative value is RK
+    /// overshoot and clamping it is the ODE analogue of the analytical path's
+    /// `conc.max(0.0)`.
+    ///
+    /// False for both Form C `[scaling]` variants. `y = <expr>` is an arbitrary
+    /// user expression with no non-negativity guarantee — a change from baseline,
+    /// a z-score, a difference from comparator, or the `sqrt(N) * logit(p)`
+    /// transform used by model-based meta-analysis are all legitimately negative.
+    /// Clamping those silently returned `0` for every genuinely negative
+    /// prediction. This also matches the analytical Form C path
+    /// (`pk::apply_analytic_readout` / the `sens` providers), which clamps the
+    /// *concentration* fed into the readout but never the readout's output.
+    #[inline]
+    pub fn clamps_negative(&self) -> bool {
+        match self {
+            OdeReadout::ObsCmt(_) => true,
+            OdeReadout::Single(_) | OdeReadout::PerCmt(_) => false,
         }
     }
 }
@@ -2498,7 +2531,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // This is also what surfaces a missing `OdeReadout::PerCmt` entry as
     // a loud failure rather than a silent zero. (Pre-Phase-2 the clamp
     // included NaN; Copilot's review of #84 caught the inconsistency.)
-    clamp_negative_predictions(&mut predictions);
+    clamp_negative_predictions(&ode.readout, &mut predictions);
 
     (predictions, chz_states)
 }
@@ -3694,7 +3727,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     }
 
     // Clamp negative predictions to zero, matching the static predictor.
-    clamp_negative_predictions(&mut predictions);
+    clamp_negative_predictions(&ode.readout, &mut predictions);
 
     Ok(AdaptiveRun {
         predictions,
@@ -4102,7 +4135,7 @@ fn adaptive_frozen_replay_tv(
         }
     }
 
-    clamp_negative_predictions(&mut predictions);
+    clamp_negative_predictions(&ode.readout, &mut predictions);
     predictions
 }
 
@@ -4606,8 +4639,13 @@ pub fn ode_predictions_event_driven(
                 // let NaN through so a missing `OdeReadout::PerCmt` entry
                 // (or any other genuine NaN) surfaces as a NaN OFV
                 // rather than a silent zero. See the corresponding note
-                // in `ode_predictions`.
-                predictions[idx] = if v < 0.0 { 0.0 } else { v };
+                // in `ode_predictions`. Bare-state readouts only — a Form C
+                // `[scaling]` expression may legitimately be negative (#1020).
+                predictions[idx] = if v < 0.0 && ode.readout.clamps_negative() {
+                    0.0
+                } else {
+                    v
+                };
                 last_pk = pk_now;
             }
             Kind::PkOnly => {
@@ -4998,7 +5036,7 @@ pub fn ode_predictions_with_states(
         }
     }
 
-    clamp_negative_predictions(&mut predictions);
+    clamp_negative_predictions(&ode.readout, &mut predictions);
 
     (predictions, states)
 }
