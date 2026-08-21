@@ -243,6 +243,13 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **Simulating an IOV (`kappa`) model with parameters that carry no IOV covariance now reports an
+  error instead of panicking (#1019).** `simulate()` draws one κ per occasion from `omega_iov`; a
+  caller that rebuilds `ModelParameters` from a fit and drops that block (the R
+  `ferx_simulate(..., fit = f)` bridge did) hit an `expect()` deep in the row emitter, which crossed
+  the FFI boundary as a process panic. `simulate_with_options`/`_diag` now return a clean `Err`
+  naming the missing `omega_iov` and the fix; the `Vec`-returning `simulate`/`simulate_with_seed`
+  fail loud with the same message rather than emitting rows with no inter-occasion variability.
 - **Log-mu-referenced θ with a negative lower bound no longer takes the wrong closed-form update
   (#996).** Such a θ is packed on the identity scale, so the SAEM/IMP `log θ += mean(η)` shift was not
   its EM optimum — it applied `θ += mean(η)` where the closed form means `θ *= exp(mean(η))`. It is
