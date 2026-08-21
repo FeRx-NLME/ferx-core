@@ -20,6 +20,23 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **An unrecognised `[block]` name is now an error (#1040).** Blocks were read by name lookup, so a
+  header the parser did not know was never read and never reported: a misspelled `[fit_option]` left
+  `ferx check` saying `valid: true` while the fit ran with the default method, the default iteration
+  cap and **no covariance step** — returning without standard errors and no indication why. The same
+  went for `[scalings]`, `[outputs]`, `[derived]`, `[covariates]` and friends. Block names are now
+  closed-world, like the keys inside a block already were: an unknown header is `E_UNKNOWN_BLOCK`,
+  listing every offender with its line, the full valid set, and a did-you-mean for a near match. Two
+  neighbouring silent drops go with it — an instance name where none is taken (`[fit_options DOSE]`)
+  or missing where one is required (`[covariate_nn]`) is `E_BLOCK_INSTANCE_NAME`, and a block whose
+  cargo feature this binary lacks (`[event_model]` without `--features survival`, `[markov_model]`
+  without `--features markov`) is `E_BLOCK_FEATURE_DISABLED` instead of being parsed away, and
+  `[initial_values]` — ferx's own former spelling for initial estimates, unread since they moved
+  inline into `[parameters]` — is `E_DEPRECATED_BLOCK`, naming the replacement rather than offering
+  a did-you-mean that does not exist. The recognised block names are exported as
+  `known_block_names()` so wrappers can read the list from the engine rather than keeping their own
+  copy; it reflects the features the binary was built with, so it never advertises a name the same
+  binary would refuse.
 - **A dose attribute that is also read by the model is now an error (#993).** `F`,
   `LAGTIME`/`ALAG` and the compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` are applied by the
   engine **at the dose event**. A model that declares one and *also* references it in `[odes]`

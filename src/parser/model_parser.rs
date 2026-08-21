@@ -10026,6 +10026,231 @@ struct ParsedKappas {
 
 // --- Block extraction ---
 
+/// Which header form a `[block]` accepts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlockForm {
+    /// `[name]` only.
+    Unnamed,
+    /// `[name]` or `[name INSTANCE]` — several instances may coexist.
+    Either,
+    /// `[name INSTANCE]` only.
+    Named,
+}
+
+/// Every `[block]` name the parser reads, with the header form it accepts and
+/// the cargo feature it needs (`None` = always compiled in).
+///
+/// This is the closed-world registry behind `E_UNKNOWN_BLOCK` (#1040). Blocks
+/// are consumed by *name lookup* — `blocks.get("fit_options")` and friends —
+/// never by an exhaustive match, so without this table a block the parser does
+/// not know is simply never read: a misspelled `[fit_option]` used to leave
+/// `ferx check` reporting `valid: true` while the fit silently ran with the
+/// default method and no covariance step. Keys inside a block are already
+/// closed-world (`[event_model]: unknown key ...`); this closes the same door
+/// on the block names themselves.
+///
+/// **Teaching the parser a new block means adding it here in the same PR** —
+/// otherwise the new block is rejected as unknown.
+///
+/// `covariate_nn` carries no feature here on purpose: it has its own, more
+/// specific `E_NN_FEATURE_DISABLED` error (which points at the design doc)
+/// raised further down in `parse_full_model`.
+const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
+    ("adaptive_dosing", BlockForm::Unnamed, None),
+    ("binary_model", BlockForm::Either, Some("survival")),
+    ("covariate_nn", BlockForm::Named, None),
+    ("covariates", BlockForm::Unnamed, None),
+    ("data", BlockForm::Unnamed, None),
+    ("data_selection", BlockForm::Unnamed, None),
+    ("derived", BlockForm::Unnamed, None),
+    ("diffusion", BlockForm::Unnamed, None),
+    ("error_model", BlockForm::Unnamed, None),
+    ("event_model", BlockForm::Either, Some("survival")),
+    ("fit_options", BlockForm::Unnamed, None),
+    ("individual_parameters", BlockForm::Unnamed, None),
+    ("initial_conditions", BlockForm::Unnamed, None),
+    ("markov_model", BlockForm::Either, Some("markov")),
+    ("mixture", BlockForm::Unnamed, None),
+    ("odes", BlockForm::Unnamed, None),
+    ("output", BlockForm::Unnamed, None),
+    ("parameters", BlockForm::Unnamed, None),
+    ("scaling", BlockForm::Unnamed, None),
+    ("simulation", BlockForm::Unnamed, None),
+    ("structural_model", BlockForm::Unnamed, None),
+];
+
+/// Blocks that *were* ferx syntax and are no longer read, with the remediation
+/// to print. Kept separate from [`BLOCK_REGISTRY`] because they are neither
+/// valid (they must not appear in the "valid blocks" enumeration) nor unknown
+/// (a bare "unknown block, did you mean …" is unhelpful for something that was
+/// once the documented spelling, and the nearest valid name is often far enough
+/// away that no did-you-mean fires at all).
+///
+/// `initial_values` is the one live case: initial estimates moved inline into
+/// `[parameters]`, the parser stopped reading the block, and — because unknown
+/// names were silently dropped — nothing ever said so. `ferx-r` still lists it
+/// in its section docs and three of its checked-in example models still carry
+/// one, so this fires for real files (#1040).
+const DEPRECATED_BLOCKS: &[(&str, &str)] = &[(
+    "initial_values",
+    "initial estimates are declared inline in `[parameters]` \
+     (`theta NAME(init, lower, upper)`, `omega NAME ~ variance`); \
+     the block has not been read for several releases — delete it",
+)];
+
+/// The name of every `[block]` **this build** of the parser will accept, in the
+/// order they appear in the error message (alphabetical).
+///
+/// Feature-gated blocks are filtered out when their feature is off: a default
+/// build cannot use `[event_model]`, so listing it as valid would advertise a
+/// name the same binary then rejects with `E_BLOCK_FEATURE_DISABLED`. The
+/// registry itself still *recognises* those names in every build — that is what
+/// makes the rejection a specific "build with `--features …`" error rather than
+/// a bare "unknown block".
+///
+/// Exposed so downstream consumers (`ferx-r`'s `ferx_model_validate()`,
+/// `ferxtranslate`) can source the block list from the engine instead of
+/// keeping their own copy — the duplicated R-side list had already drifted
+/// from this one (#1040). Because the result is build-dependent, a consumer
+/// must read it from the same binary it will parse with.
+pub fn known_block_names() -> Vec<&'static str> {
+    BLOCK_REGISTRY
+        .iter()
+        .filter(|(_, _, feature)| feature.is_none_or(block_feature_enabled))
+        .map(|(n, _, _)| *n)
+        .collect()
+}
+
+/// Whether the cargo feature a registry entry names is enabled in this build.
+fn block_feature_enabled(feature: &str) -> bool {
+    match feature {
+        "survival" => cfg!(feature = "survival"),
+        "markov" => cfg!(feature = "markov"),
+        "nn" => cfg!(feature = "nn"),
+        // An unrecognised feature name can only be a registry typo; treating it
+        // as enabled keeps a mistake here from rejecting a valid model.
+        _ => true,
+    }
+}
+
+/// Levenshtein distance, used only to offer a did-you-mean for a misspelled
+/// block name.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The registry name closest to `name`, when one is close enough to be worth
+/// suggesting: an edit distance of at most 2, or a plain prefix relationship
+/// (which catches `fit_option` → `fit_options` and `param` → `parameters`).
+pub(crate) fn nearest_block_name(name: &str) -> Option<&'static str> {
+    BLOCK_REGISTRY
+        .iter()
+        .map(|(n, _, _)| *n)
+        .filter(|n| n.starts_with(name) || name.starts_with(*n) || edit_distance(name, n) <= 2)
+        .min_by_key(|n| edit_distance(name, n))
+}
+
+/// Reject any `[block]` header the parser would otherwise drop on the floor.
+///
+/// `headers` is every header seen, in source order, as
+/// `(type, instance, 1-based line)`. Four silent-drop shapes are caught, in
+/// the order a user is most likely to hit them:
+///
+/// 1. a block that was ferx syntax and is no longer read
+///    (`E_DEPRECATED_BLOCK`),
+/// 2. an unrecognised block name (`E_UNKNOWN_BLOCK`),
+/// 3. a known block written in the wrong header form — an instance name on a
+///    block that takes none, or a missing one on `[covariate_nn NAME]`
+///    (`E_BLOCK_INSTANCE_NAME`),
+/// 4. a known block whose cargo feature this binary was not built with
+///    (`E_BLOCK_FEATURE_DISABLED`).
+///
+/// All findings of the first non-empty class are reported together, so an
+/// author fixing a batch of typos sees them in one pass.
+fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), String> {
+    let mut deprecated: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    let mut wrong_form: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
+    let mut seen: Vec<(&str, Option<&str>)> = Vec::new();
+
+    for (ty, instance, line) in headers {
+        // Report each distinct header once, however many times it is repeated.
+        // Keyed on the instance name too, so `[foo A]` and `[foo B]` are two
+        // findings rather than one entry that names only the first.
+        let key = (ty.as_str(), instance.as_deref());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        // Echo the header exactly as written, instance name included, so the
+        // text is greppable in the user's own file.
+        let header = match instance {
+            Some(inst) => format!("[{ty} {inst}]"),
+            None => format!("[{ty}]"),
+        };
+        if let Some((name, remedy)) = DEPRECATED_BLOCKS.iter().find(|(n, _)| *n == ty) {
+            deprecated.push(format!(
+                "`[{name}]` (line {line}) is no longer read: {remedy}"
+            ));
+            continue;
+        }
+        let Some((name, form, feature)) = BLOCK_REGISTRY.iter().find(|(n, _, _)| n == ty) else {
+            let hint = match nearest_block_name(ty) {
+                Some(near) => format!(" — did you mean `[{near}]`"),
+                None => String::new(),
+            };
+            unknown.push(format!("`{header}` (line {line}){hint}"));
+            continue;
+        };
+        match (form, instance) {
+            (BlockForm::Unnamed, Some(inst)) => wrong_form.push(format!(
+                "`[{name} {inst}]` (line {line}) does not take an instance name — write `[{name}]`"
+            )),
+            (BlockForm::Named, None) => wrong_form.push(format!(
+                "`[{name}]` (line {line}) requires an instance name — write `[{name} NAME]`"
+            )),
+            _ => {}
+        }
+        if let Some(feature) = feature {
+            if !block_feature_enabled(feature) {
+                disabled.push(format!(
+                    "`[{name}]` (line {line}) requires building ferx-core with `--features {feature}`"
+                ));
+            }
+        }
+    }
+
+    if !deprecated.is_empty() {
+        return Err(format!("Deprecated block {}.", deprecated.join("; ")));
+    }
+    if !unknown.is_empty() {
+        return Err(format!(
+            "Unknown block {}. Valid blocks: {}.",
+            unknown.join("; "),
+            known_block_names().join(", ")
+        ));
+    }
+    if !wrong_form.is_empty() {
+        return Err(format!("Block {}.", wrong_form.join("; ")));
+    }
+    if !disabled.is_empty() {
+        return Err(format!("Block {}.", disabled.join("; ")));
+    }
+    Ok(())
+}
+
 fn extract_model_name(content: &str) -> String {
     let re = Regex::new(r"(?m)^\s*model\s+(\w+)").unwrap();
     re.captures(content)
@@ -10069,6 +10294,10 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
         Named { ty: String, name: String },
     }
     let mut current: Option<BlockTarget> = None;
+    // Every header seen, in source order, as `(type, instance, 1-based line)`.
+    // Validated against `BLOCK_REGISTRY` once the whole file has been scanned
+    // (#1040) so a misspelled block name is an error rather than a silent drop.
+    let mut headers: Vec<(String, Option<String>, usize)> = Vec::new();
 
     for (idx, line) in content.lines().enumerate() {
         let without_comment = match line.find('#').into_iter().chain(line.find("//")).min() {
@@ -10082,6 +10311,11 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
 
         if let Some(caps) = block_re.captures(trimmed) {
             let ty = caps[1].to_lowercase();
+            headers.push((
+                ty.clone(),
+                caps.get(2).map(|m| m.as_str().to_string()),
+                idx + 1,
+            ));
             current = match caps.get(2) {
                 Some(m) => Some(BlockTarget::Named {
                     ty,
@@ -10118,6 +10352,8 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
             None => { /* lines before any block header are ignored */ }
         }
     }
+
+    check_block_names(&headers)?;
 
     Ok(out)
 }

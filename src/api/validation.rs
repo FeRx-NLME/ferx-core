@@ -2934,7 +2934,102 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     if err.contains("reserved dose-attribute name") {
         return Diagnostic::error("E_DOSE_ATTR_DOUBLE_USE", err.to_string());
     }
+    // #1040: the block-header shapes the parser used to drop silently.
+    // `check_block_names` writes each offending header as ``[name] (line N)``,
+    // so the block / line the check report wants come straight out of the
+    // message — this path has no `ParsedModel` to read `block_lines` from,
+    // since a parse error is terminal.
+    if let Some(rest) = err.strip_prefix("Unknown block `[") {
+        let mut d = Diagnostic::error("E_UNKNOWN_BLOCK", String::new());
+        if let Some(near) =
+            block_type(rest).and_then(|b| crate::parser::model_parser::nearest_block_name(&b))
+        {
+            d = d.with_suggestion(format!("did you mean `[{near}]`?"));
+        }
+        return locate(d, err, rest);
+    }
+    if let Some(rest) = err.strip_prefix("Deprecated block `[") {
+        return locate(
+            Diagnostic::error("E_DEPRECATED_BLOCK", String::new()),
+            err,
+            rest,
+        );
+    }
+    if let Some(rest) = err.strip_prefix("Block `[") {
+        // Match each shape on its own sentinel rather than letting one be the
+        // `else` of the other: a future ``Block `[…]`` message that is neither
+        // must fall through to `E_PARSE`, not be mis-coded as the last branch.
+        let code = if err.contains("instance name") {
+            "E_BLOCK_INSTANCE_NAME"
+        } else if err.contains("requires building ferx-core with `--features") {
+            "E_BLOCK_FEATURE_DISABLED"
+        } else {
+            return Diagnostic::error("E_PARSE", err.to_string());
+        };
+        return locate(Diagnostic::error(code, String::new()), err, rest);
+    }
     Diagnostic::error("E_PARSE", err.to_string())
+}
+
+#[cfg(test)]
+#[path = "tests/block_name_diagnostic_tests.rs"]
+mod block_name_diagnostic_tests;
+
+/// Give a block-header diagnostic its message plus whatever location the
+/// message text carries.
+///
+/// `err` is the whole parser error; `rest` is its tail, starting just after the
+/// opening ``` `[ ```. The block type always transfers to `block`.
+///
+/// The line is only lifted into `line` when the message names exactly **one**
+/// header — the structured field points at a single place, so promoting the
+/// first of several would silently mislocate the rest. In that unambiguous case
+/// the ` (line N)` is also *removed* from the message, since the renderer
+/// already prints `block:line` ahead of it and repeating it reads as
+/// `fit_option:16: … (line 16)`. With several headers the message keeps every
+/// parenthetical (each finding needs its own) and no `line` is attached.
+fn locate(mut d: Diagnostic, err: &str, rest: &str) -> Diagnostic {
+    if let Some(b) = block_type(rest) {
+        d = d.with_block(b);
+    }
+    let mut lines = line_spans(err);
+    match (lines.next(), lines.next()) {
+        (Some((span, n)), None) => {
+            let mut message = String::with_capacity(err.len());
+            message.push_str(&err[..span.0]);
+            message.push_str(&err[span.1..]);
+            d.message = message;
+            d.with_line(n)
+        }
+        _ => {
+            d.message = err.to_string();
+            d
+        }
+    }
+}
+
+/// The block *type* out of the tail of a `check_block_names` message — `rest`
+/// starts just after the opening ``` `[ ```, e.g. ``covariate_nn X]` (line 7)
+/// requires …``. An instance name, when present, is dropped: `block` names the
+/// type, matching every other block-scoped diagnostic.
+fn block_type(rest: &str) -> Option<String> {
+    rest.find(']')
+        .and_then(|end| rest[..end].split_whitespace().next())
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+}
+
+/// Every ` (line N)` in `msg`, as `((start, end), N)` byte spans over `msg`.
+/// The leading space is part of the span so removing one leaves no double
+/// space behind.
+fn line_spans(msg: &str) -> impl Iterator<Item = ((usize, usize), usize)> + '_ {
+    msg.match_indices(" (line ").filter_map(move |(at, pat)| {
+        let digits_at = at + pat.len();
+        let digits = &msg[digits_at..];
+        let end = digits.find(')')?;
+        let n = digits[..end].parse::<usize>().ok()?;
+        Some(((at, digits_at + end + 1), n))
+    })
 }
 
 /// Validate a model file (and optionally a dataset) **without fitting**.

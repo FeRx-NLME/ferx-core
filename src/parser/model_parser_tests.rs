@@ -3664,35 +3664,28 @@ fn test_parse_all_example_ferx_files() {
                 continue;
             }
         }
-        // Endpoint-only files (no [structural_model] block) — TTE `[event_model]` or the
-        // #760 `[binary_model]` — require the survival feature to parse (the endpoint
-        // block is unrecognized without it, so the parser demands the Gaussian PK blocks).
-        // Use a line-start check so a comment like "# Note: [structural_model] ..." in an
+        // A file declaring a feature-gated endpoint block — TTE `[event_model]` /
+        // `[binary_model]` (`survival`), or the CTMM `[markov_model]` (`markov`,
+        // which implies `survival`) — cannot parse in a build without that feature:
+        // since #1040 the parser rejects the block outright rather than reading the
+        // file as a Gaussian-only model. Skip those files here; the rejection itself
+        // is pinned by `test_feature_gated_block_rejected_without_its_feature`.
+        // Line-start checks so a comment like "# Note: [structural_model] ..." in an
         // example header does not falsely count as a block.
+        let block_at_line_start = |src: &str, block: &str| {
+            src.lines()
+                .any(|l| l.trim_start().starts_with(&format!("[{block}")))
+        };
         if !cfg!(feature = "survival") {
             let src = std::fs::read_to_string(&path).unwrap_or_default();
-            let has_nongaussian_endpoint =
-                src.contains("[event_model") || src.contains("[binary_model");
-            let has_struct_block = src
-                .lines()
-                .any(|l| l.trim_start().starts_with("[structural_model"));
-            if has_nongaussian_endpoint && !has_struct_block {
+            if block_at_line_start(&src, "event_model") || block_at_line_start(&src, "binary_model")
+            {
                 continue;
             }
         }
-        // A `[markov_model]` (CTMM) endpoint-only file needs the `markov` feature
-        // specifically (`markov` implies `survival`, so the `survival`-only build above
-        // does not cover it): without `markov` the block is unrecognized and the parser
-        // demands the Gaussian PK blocks. Skip such a file whenever `markov` is off.
         if !cfg!(feature = "markov") {
             let src = std::fs::read_to_string(&path).unwrap_or_default();
-            let has_markov_endpoint = src
-                .lines()
-                .any(|l| l.trim_start().starts_with("[markov_model"));
-            let has_struct_block = src
-                .lines()
-                .any(|l| l.trim_start().starts_with("[structural_model"));
-            if has_markov_endpoint && !has_struct_block {
+            if block_at_line_start(&src, "markov_model") {
                 continue;
             }
         }
@@ -9357,14 +9350,16 @@ fn test_covariate_nn_block_without_nn_feature_errors() {
 }
 
 /// Sanity for the named-block parser extension itself (independent of the
-/// NN feature). `[block_type NAME]` should be recognised and parsed.
+/// NN feature). `[block_type NAME]` should be recognised and parsed. Uses a
+/// registry block (`covariate_nn`, which is named-only) rather than an invented
+/// name — since #1040 `extract_blocks` rejects unknown block names.
 #[test]
 fn test_extract_blocks_recognizes_named_block_form() {
     let src = "
 [parameters]
   theta T1(1.0, 0.001, 10.0)
 
-[some_named_block FOO]
+[covariate_nn FOO]
   key = value
 ";
     let extracted = extract_blocks(src).unwrap();
@@ -9373,11 +9368,233 @@ fn test_extract_blocks_recognizes_named_block_form() {
     // Named block captured by type + instance.
     let by_inst = extracted
         .named
-        .get("some_named_block")
+        .get("covariate_nn")
         .expect("named block extracted");
     let lines = by_inst.get("FOO").expect("instance FOO present");
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0], "key = value");
+}
+
+// ─── Closed-world `[block]` names (#1040) ────────────────────────────────────
+
+/// A minimal but complete model, with `{extra}` spliced in after the required
+/// blocks so a test can add one offending header.
+fn model_with_extra_block(extra: &str) -> String {
+    format!(
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+{extra}"
+    )
+}
+
+/// The headline regression: a misspelled optional block used to be dropped on
+/// the floor — `[fit_option]` left the fit running with the default method and
+/// no covariance step while `ferx check` still said `valid: true`.
+#[test]
+fn test_unknown_block_name_is_rejected_with_line_and_valid_set() {
+    let src = model_with_extra_block("[fit_option]\n  method = focei\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert!(
+        err.starts_with("Unknown block `[fit_option]` (line 16)"),
+        "message should name the block and its header line, got: {err}"
+    );
+    assert!(
+        err.contains("did you mean `[fit_options]`"),
+        "near miss should be suggested, got: {err}"
+    );
+    // The valid set is enumerated, in the `[event_model]: unknown key ...` style.
+    // Assert on names present in every build — the enumeration is filtered by
+    // the features this binary carries (see `known_block_names`).
+    assert!(err.contains("Valid blocks: adaptive_dosing, "), "{err}");
+    assert!(err.contains("fit_options, "), "{err}");
+    assert!(err.contains("structural_model."), "{err}");
+}
+
+/// Every offender is reported in one pass, so a batch of typos does not turn
+/// into a fix-one-reparse loop.
+#[test]
+fn test_unknown_block_names_are_all_reported_together() {
+    let src = model_with_extra_block("[scalings]\n  V = 1.0\n\n[outputs]\n  CL\n");
+    let err = parse_model_string(&src).expect_err("unknown blocks must be an error");
+    assert!(err.contains("`[scalings]`"), "{err}");
+    assert!(err.contains("`[outputs]`"), "{err}");
+    assert!(err.contains("did you mean `[scaling]`"), "{err}");
+    assert!(err.contains("did you mean `[output]`"), "{err}");
+}
+
+/// An invented name with no near miss still errors — just without a hint.
+#[test]
+fn test_unknown_block_without_near_match_has_no_suggestion() {
+    let src = model_with_extra_block("[qqqqqqqq]\n  key = value\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert!(err.contains("`[qqqqqqqq]`"), "{err}");
+    assert!(!err.contains("did you mean"), "{err}");
+}
+
+/// A repeated unknown header is reported once, not once per occurrence.
+#[test]
+fn test_unknown_block_reported_once_per_name() {
+    let src =
+        model_with_extra_block("[fit_option]\n  method = focei\n\n[fit_option]\n  maxiter = 5\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert_eq!(err.matches("`[fit_option]`").count(), 1, "{err}");
+}
+
+/// Block names are case-folded before the lookup, as they always have been —
+/// `[FIT_OPTIONS]` is valid, not unknown.
+#[test]
+fn test_uppercase_block_name_is_not_unknown() {
+    let src = model_with_extra_block("[FIT_OPTIONS]\n  maxiter = 5\n");
+    assert!(parse_model_string(&src).is_ok());
+}
+
+/// An instance name on a block that takes none is the same silent drop by
+/// another route: it lands in the `named` map that nothing reads.
+#[test]
+fn test_instance_name_on_unnamed_only_block_is_rejected() {
+    let src = model_with_extra_block("[fit_options DOSE]\n  maxiter = 5\n");
+    let err = parse_model_string(&src).expect_err("instance name must be an error");
+    assert!(
+        err.contains("`[fit_options DOSE]` (line 16) does not take an instance name"),
+        "{err}"
+    );
+    assert!(err.contains("write `[fit_options]`"), "{err}");
+}
+
+/// The mirror case: `[covariate_nn]` is read only out of the named map, so an
+/// unnamed one was silently ignored.
+#[test]
+fn test_named_only_block_without_instance_name_is_rejected() {
+    let src = model_with_extra_block("[covariate_nn]\n  inputs = [WT]\n");
+    let err = parse_model_string(&src).expect_err("missing instance name must be an error");
+    assert!(
+        err.contains("`[covariate_nn]` (line 16) requires an instance name"),
+        "{err}"
+    );
+    assert!(err.contains("write `[covariate_nn NAME]`"), "{err}");
+}
+
+/// A block whose cargo feature is off is *known* but unusable — reject it
+/// rather than parse the file as if the endpoint were not there.
+#[cfg(not(feature = "survival"))]
+#[test]
+fn test_feature_gated_block_rejected_without_its_feature() {
+    let src = model_with_extra_block("[event_model]\n  family = exponential\n");
+    let err = parse_model_string(&src).expect_err("feature-gated block must be an error");
+    assert!(
+        err.contains(
+            "`[event_model]` (line 16) requires building ferx-core with `--features survival`"
+        ),
+        "{err}"
+    );
+}
+
+/// With the feature on, the same file parses — the gate is the only reason the
+/// block is refused above.
+#[cfg(feature = "survival")]
+#[test]
+fn test_feature_gated_block_accepted_with_its_feature() {
+    let src = model_with_extra_block(
+        "[event_model]\n  cmt = 2\n  family = exponential\n  scale = TVCL\n",
+    );
+    assert!(parse_model_string(&src).is_ok());
+}
+
+#[test]
+fn test_nearest_block_name_thresholds() {
+    // Prefix relationship, either direction.
+    assert_eq!(nearest_block_name("fit_option"), Some("fit_options"));
+    assert_eq!(nearest_block_name("parameters_pk"), Some("parameters"));
+    // Within edit distance 2.
+    assert_eq!(nearest_block_name("odez"), Some("odes"));
+    // Far enough away that a suggestion would be noise.
+    assert_eq!(nearest_block_name("qqqqqqqq"), None);
+}
+
+/// The registry is what the rest of the parser looks up, so nothing may be in
+/// one and not the other. `known_block_names` is also the list `ferx-r` and
+/// `ferxtranslate` are meant to read instead of keeping their own copy.
+#[test]
+fn test_known_block_names_are_sorted_and_unique() {
+    let names = known_block_names();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(names, sorted, "BLOCK_REGISTRY must be sorted and unique");
+    assert!(names.contains(&"fit_options"));
+    // Deprecated names are not valid, so they must never be advertised.
+    assert!(!names.contains(&"initial_values"));
+}
+
+/// The advertised list is what *this* binary accepts. A build without a
+/// feature must not name the blocks it would then refuse — a consumer told to
+/// source the list from the engine (`ferx-r`) would otherwise call
+/// `[markov_model]` valid against a core that rejects it.
+#[test]
+fn test_known_block_names_track_the_build_features() {
+    let names = known_block_names();
+    assert_eq!(
+        names.contains(&"event_model"),
+        cfg!(feature = "survival"),
+        "event_model must be advertised iff `survival` is on"
+    );
+    assert_eq!(
+        names.contains(&"markov_model"),
+        cfg!(feature = "markov"),
+        "markov_model must be advertised iff `markov` is on"
+    );
+    // Ungated blocks are there whatever the build.
+    assert!(names.contains(&"parameters") && names.contains(&"odes"));
+    // A registry entry naming a feature this function does not know can only be
+    // a typo in the table; treat it as enabled so the mistake never rejects a
+    // valid model.
+    assert!(block_feature_enabled("not-a-real-feature"));
+}
+
+/// A block that *was* ferx syntax gets its own code and remediation rather
+/// than a bare "unknown block": `initial_values` predates inline inits, the
+/// parser stopped reading it silently, and `nearest_block_name` finds nothing
+/// close enough to suggest (`initial_conditions` is far past edit distance 2),
+/// so the generic path would leave the user with no explanation at all.
+#[test]
+fn test_deprecated_block_is_rejected_with_its_remediation() {
+    assert_eq!(nearest_block_name("initial_values"), None);
+    let src = model_with_extra_block("[initial_values]\n  theta = [0.2, 10.0]\n  sigma = [0.02]\n");
+    let err = parse_model_string(&src).expect_err("deprecated block must be an error");
+    assert!(
+        err.starts_with("Deprecated block `[initial_values]` (line 16) is no longer read:"),
+        "{err}"
+    );
+    assert!(err.contains("declared inline in `[parameters]`"), "{err}");
+    assert!(err.contains("delete it"), "{err}");
+    // Not the generic bucket: no "valid blocks" dump, no did-you-mean.
+    assert!(!err.contains("Valid blocks"), "{err}");
+}
+
+/// An unknown header written with an instance name is echoed as written, so
+/// the message can be grepped for in the user's own file — and two instances
+/// of the same unknown type are two findings, not one entry that names only
+/// the first.
+#[test]
+fn test_unknown_named_block_reports_its_instance_name() {
+    let src = model_with_extra_block("[foo BAR]\n  k = 1\n\n[foo BAZ]\n  k = 2\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert!(err.contains("`[foo BAR]` (line 16)"), "{err}");
+    assert!(err.contains("`[foo BAZ]` (line 19)"), "{err}");
 }
 
 // ─── [covariate_nn] dot-access + pk_param_fn dispatch (Phase A M1 step 3) ────
