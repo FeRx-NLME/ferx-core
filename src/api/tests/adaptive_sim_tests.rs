@@ -2726,6 +2726,7 @@ const SPEC_TIME_OBSERVE: &str = r#"
 fn simple_titration_spec() -> AdaptiveDosingSpec {
     AdaptiveDosingSpec {
         observe: Some("central".to_string()),
+        observe_declared_covariates: Vec::new(),
         with_assay_error: false,
         assay_cmt: None,
         at: vec![0.0, 24.0],
@@ -3438,6 +3439,7 @@ fn from_spec_three_witnesses_equals_handwritten_closure() {
 
     let spec = AdaptiveDosingSpec {
         observe: Some("central".to_string()),
+        observe_declared_covariates: Vec::new(),
         with_assay_error: false,
         assay_cmt: None,
         at: at.clone(),
@@ -3645,6 +3647,85 @@ fn from_spec_observe_reads_the_time_builtin_at_the_decision() {
     approx::assert_relative_eq!(amts[0], 125.0, max_relative = 1e-9);
     approx::assert_relative_eq!(amts[1], 156.25, max_relative = 1e-9);
     approx::assert_relative_eq!(amts[2], 156.25, max_relative = 1e-9);
+}
+
+#[test]
+fn from_spec_observe_t_alias_loses_to_a_declared_covariate() {
+    // `observe` compiles through the same `build_y_output_fn` as a `[scaling]` Form C
+    // readout, so it must apply the same `T` / `t` name precedence — otherwise the
+    // *same* model reads a declared `T` as the data column in `[scaling]` and as the
+    // model-time built-in in `observe` (#1042 review of #1028). The declarations reach
+    // the simulate-time compiler via `AdaptiveDosingSpec::observe_declared_covariates`,
+    // captured at parse time.
+    //
+    // `T` is declared but referenced *only* by `observe`, which is exactly the case a
+    // `referenced_covariates`-based precedence list would have missed.
+    let src = SPEC_TIME_OBSERVE.replace("observe = TIME", "observe = T")
+        + "[covariates]\n  T continuous\n";
+    let parsed = parse_full_model(&src).expect("a declared T covariate parses");
+    let spec = parsed.adaptive_dosing.as_ref().expect("block present");
+    assert!(
+        spec.observe_declared_covariates.iter().any(|c| c == "T"),
+        "the spec must carry the [covariates] declarations, got {:?}",
+        spec.observe_declared_covariates
+    );
+
+    // The controller reads the column (60.0 for this subject), not the decision time —
+    // so `signal < 30` never fires and the dose is re-issued unchanged at all three
+    // decisions. Under the model-time reading it would have fired at t=0 and t=24.
+    let mut s = subj("P", vec![60.0], vec![]);
+    s.covariates.insert("T".to_string(), 60.0);
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["T".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        ..Default::default()
+    };
+    let res = simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        spec,
+        &opts,
+    )
+    .expect("the covariate-driven controller runs");
+    for d in &res.decisions {
+        approx::assert_relative_eq!(d.observed_signals[0].value, 60.0, epsilon = 1e-9);
+    }
+    let amts: Vec<f64> = res.ledger.iter().map(|d| d.amt).collect();
+    assert_eq!(amts, vec![100.0, 100.0, 100.0], "no rule may fire on 60.0");
+}
+
+#[test]
+fn from_spec_observe_t_alias_fold_warns_at_parse_time() {
+    // `observe` is compiled at simulate time, where `parse_warnings` is long sealed
+    // and the adaptive result has no warnings channel — so the parser emits the
+    // `T`-alias note itself, from the same helper the compiler runs. Without it the
+    // fold would be silent on this one path (#1042 review of #1028).
+    let src = SPEC_TIME_OBSERVE.replace("observe = TIME", "observe = T");
+    let parsed = parse_full_model(&src).expect("the T alias parses");
+    assert!(
+        parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("[adaptive_dosing] observe") && w.contains("model-time built-in")),
+        "expected a fold warning naming the block, got {:?}",
+        parsed.model.parse_warnings
+    );
+
+    // The unambiguous `TIME` spelling stays quiet.
+    let parsed_time = parse_full_model(SPEC_TIME_OBSERVE).expect("TIME parses");
+    assert!(
+        !parsed_time
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("model-time built-in")),
+        "`TIME` must not warn, got {:?}",
+        parsed_time.model.parse_warnings
+    );
 }
 
 #[test]
@@ -3909,6 +3990,7 @@ fn from_spec_rejects_observe_covariate_absent_from_data() {
     let model = parse_model_string(ODE_NO_IIV).expect("parse");
     let spec = AdaptiveDosingSpec {
         observe: Some("central / BADCOV".to_string()),
+        observe_declared_covariates: Vec::new(),
         ..simple_titration_spec()
     };
     let pop = population(vec![subj("1", vec![6.0], vec![])]); // no covariate columns
@@ -3936,6 +4018,7 @@ fn from_spec_dv_collapses_to_ipred_as_sigma_to_zero() {
 
     let ipred_spec = AdaptiveDosingSpec {
         observe: Some("central".to_string()),
+        observe_declared_covariates: Vec::new(),
         with_assay_error: false,
         assay_cmt: None,
         at: at.clone(),
@@ -3957,6 +4040,7 @@ fn from_spec_dv_collapses_to_ipred_as_sigma_to_zero() {
     // observes) with assay noise.
     let dv_spec = AdaptiveDosingSpec {
         observe: None,
+        observe_declared_covariates: Vec::new(),
         with_assay_error: true,
         assay_cmt: Some(1),
         ..ipred_spec.clone()

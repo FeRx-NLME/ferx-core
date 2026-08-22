@@ -3689,7 +3689,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     obs_eta,
                     shadow.obs_cov(obs_idx),
                     cmt,
-                    t_start,
+                    // The readout's `TIME` is the user clock, not `t_start` — the
+                    // integrator break this observation was keyed to. `obs_map` keys off
+                    // `shadow.obs_times`, so `t_start` is the shifted monotonic timeline
+                    // (and, thanks to the reader's pre-dose trough nudge, 1 ULP off the
+                    // data value even with no resets). Using it here would give
+                    // `simulate_adaptive` a different `TIME` than `predict()`/`fit()` for
+                    // the same record, and break the frozen-schedule replay oracle's
+                    // bit-equality against the static engine (#1028).
+                    shadow.readout_time(obs_idx),
                 );
             }
         }
@@ -4134,7 +4142,11 @@ fn adaptive_frozen_replay_tv(
                     obs_eta,
                     subject.obs_cov(obs_idx),
                     cmt,
-                    t_start,
+                    // User clock, not the integrator break — see the matching note in
+                    // `ode_predictions_adaptive_impl`. This is the replay verifier, so it
+                    // is the one path that *must* agree with the static engine bit for
+                    // bit (#1028).
+                    subject.readout_time(obs_idx),
                 );
             }
         }

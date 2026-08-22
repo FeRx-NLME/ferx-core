@@ -810,6 +810,129 @@ fn adaptive_state_independent_controller_matches_static_ode() {
 }
 
 #[test]
+fn adaptive_form_c_readout_time_matches_the_static_engine() {
+    // Degenerate oracle for the readout clock (#1028). The adaptive driver used to
+    // feed the readout `t_start` — the integrator break the observation was keyed to,
+    // off `shadow.obs_times` — while the static predictor reads the raw data clock.
+    // For a subject with stacked reset occasions the two are *different numbers*, so
+    // a `TIME`-reading Form C readout returned one answer under `simulate_adaptive`
+    // and another under `predict()`/`fit()` for the same record.
+    //
+    // The readout here returns nothing but the model-time thread-local, so each
+    // prediction *is* the `TIME` the readout saw. A fixed-dose controller keeps the
+    // dynamics identical to the static twin, isolating the clock.
+    let ode = time_readout_ode_spec();
+    let pk = pk_one(1.0, 10.0);
+    let decisions = [0.0, 24.0];
+    let obs = vec![6.0, 30.0, 54.0, 78.0];
+    // Two occasions whose data TIME restarts: the internal grid stays monotonic
+    // while the user clock repeats 6/30.
+    let raw = vec![6.0, 30.0, 6.0, 30.0];
+
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+    let mut base = make_subject(vec![], obs.clone());
+    base.obs_raw_times = raw.clone();
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base,
+        &decisions,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs");
+
+    assert_eq!(
+        run.predictions, raw,
+        "the adaptive readout must see the raw data-file TIME, got {:?}",
+        run.predictions
+    );
+
+    // …and agree with the static engine on the realized doses, record for record.
+    let static_doses: Vec<DoseEvent> = decisions
+        .iter()
+        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    let mut static_subject = make_subject(static_doses, obs);
+    static_subject.obs_raw_times = raw;
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+    assert_eq!(
+        run.predictions, static_preds,
+        "adaptive and static readouts must be on the same clock"
+    );
+}
+
+#[test]
+fn adaptive_tv_frozen_replay_readout_time_matches_the_driver() {
+    // The same clock split in `adaptive_frozen_replay_tv` (#1028) — the replay
+    // verifier, whose entire job is to prove bit-equality with the static engine, so
+    // it is the one path that must not be on the other convention. Same TIME-returning
+    // readout; the replay must reproduce the driver's `TIME` values exactly.
+    let ode = time_readout_ode_spec();
+    let v = 10.0;
+    let obs_times = [0.0, 24.0, 48.0, 72.0];
+    let raw = vec![0.0, 24.0, 0.0, 24.0];
+    let cls = [1.0, 0.7, 0.5, 0.3];
+    let obs_pk: Vec<PkParams> = cls.iter().map(|&cl| pk_one(cl, v)).collect();
+    let event_pk = crate::pk::EventPkParams {
+        dose: Vec::new(),
+        obs: obs_pk.clone(),
+        pk_only: Vec::new(),
+    };
+    let decisions = [0.0, 24.0, 48.0];
+    let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+        actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+        rule: None,
+    };
+    let mut base = make_subject(vec![], obs_times.to_vec());
+    base.obs_raw_times = raw.clone();
+    let run = ode_predictions_adaptive_impl(
+        &ode,
+        &obs_pk[0].values,
+        Some(&event_pk),
+        None,
+        None,
+        &[],
+        &[],
+        &base,
+        &decisions,
+        &[],
+        &mut decide,
+        100,
+        None,
+    )
+    .expect("driver runs");
+    assert_eq!(run.predictions, raw, "driver reads the raw data clock");
+
+    let mut static_subject = base.clone();
+    static_subject.doses = run
+        .ledger
+        .iter()
+        .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+        .collect();
+    let dose_f: Vec<f64> = run.ledger.iter().map(|e| e.f_applied).collect();
+    let replay = adaptive_frozen_replay_tv(
+        &ode,
+        &event_pk,
+        None,
+        None,
+        &[],
+        &[],
+        &static_subject,
+        &dose_f,
+        &decisions,
+    );
+    assert_eq!(
+        replay, run.predictions,
+        "the frozen replay must be on the driver's clock, bit for bit"
+    );
+}
+
+#[test]
 fn adaptive_tv_covariate_controller_matches_static_event_driven() {
     // Degenerate oracle on the time-varying-covariate path (#700): a controller
     // that ignores state and gives a fixed bolus at every decision must

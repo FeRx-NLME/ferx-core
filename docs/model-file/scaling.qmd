@@ -213,6 +213,17 @@ silently replaced by the clock. Declaring it wins:
   y = central / V * T     # the column, not the clock
 ```
 
+The declaration is matched **case-insensitively** against both spellings, so
+declaring `T` also protects a `t` reference and vice versa — the fold treats the
+two as one built-in, so the escape hatch has to as well. It covers the whole
+block: Form C `y`, and `obs_scale`, where an undeclared `T` is instead rejected
+as a time reference in a subject-static divisor.
+
+The declaration also reaches `[adaptive_dosing] observe`, which compiles through
+the same readout compiler — so a declared `T` is the data column there too,
+rather than the same model reading the column in `[scaling]` and the clock in
+`observe`.
+
 Whenever `T` / `t` *is* folded into the built-in, ferx emits a parse warning
 saying so and naming both escapes (spell it `TIME`, or declare the column).
 Writing `TIME` is unambiguous and never warns.
