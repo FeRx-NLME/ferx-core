@@ -33,7 +33,10 @@ section of the SDLC for the versioning policy).
   only when `block_sigma` was present. Per-CMT and covariate-selected error models bind by name and
   are unaffected, as is a trailing sigma consumed elsewhere (e.g. FREM's `frem_sigma`). **Breaking**
   for any model that named its sigmas out of order — such a model was already getting a different fit
-  from the one it appeared to describe; reorder either list to fix it.
+  from the one it appeared to describe. Fix it by reordering the `sigma` **declarations** (and, for a
+  `block_sigma`, permuting its lower triangle to match); reordering the *arguments* instead also
+  parses but swaps which sigma is the proportional component, which changes the model rather than the
+  spelling.
 - **An unrecognised `[block]` name is now an error (#1040).** Blocks were read by name lookup, so a
   header the parser did not know was never read and never reported: a misspelled `[fit_option]` left
   `ferx check` saying `valid: true` while the fit ran with the default method, the default iteration
@@ -72,6 +75,22 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **A sigma declared past the ones a `combined` `[error_model]` names no longer perturbs the FOCE
+  score or the `s` / `rsr` standard errors (#1001 review).** `dr_diag_d_log_sigma`'s `Combined` arm
+  answered every `sigma_k >= 1` with the *additive* sigma's derivative, where its `additive` and
+  `proportional` siblings correctly returned zero. Since the loop runs over the whole flat sigma
+  vector, a third, unreferenced sigma — legal, and documented as inert — picked up a non-zero
+  `∂R/∂log σ` it has no business having, putting a spurious row and column into
+  `subject_nll_pop_grad` and hence into the score cross-product behind `covariance = s` / `rsr`.
+  Affected `method = foce` / `gn` / `gn_hybrid` fits of a `combined` error model with an extra
+  declared sigma; the reported standard errors were wrong for *every* parameter, silently.
+- **`examples/per_route_lag_absorption.ferx` had its two residual components the wrong way round
+  (#1001 review).** The file declared `sigma ADD_ERR` before `sigma PROP_ERR` and wrote
+  `combined(ADD_ERR, PROP_ERR)`; a single-endpoint `combined` model consumes those positionally, so
+  0.02 was the *proportional* coefficient and 0.10 the *additive* SD — the inverse of the file's own
+  header, both inline comments, and the `--simulate` parameters it advertises. Both lists were
+  transposed together, so the new #1001 check could not see it. Declarations and arguments are now
+  in role order. Users who copied this example's error model should swap it back the same way.
 - **An adaptive-dosing run now reads a `TIME`-dependent `[scaling]` Form C readout on the same
   clock as `fit()` / `predict()` (#1028 follow-up).** #1028 moved the readout's `TIME` to the raw
   data-file clock (the `$ERROR` convention shared by sdtab, `predict()`/`simulate()` and `[derived]`

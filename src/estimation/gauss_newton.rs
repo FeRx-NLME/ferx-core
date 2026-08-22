@@ -684,9 +684,24 @@ fn dr_diag_d_log_sigma(
                     // d(sigma_prop^2 * f^2)/d(log sigma_prop) = 2 * sigma_prop^2 * f^2
                     let sp2 = sigma_values[0] * sigma_values[0];
                     2.0 * sp2 * f_j * f_j
-                } else {
-                    // sigma_k == 1: d(sigma_add^2)/d(log sigma_add) = 2 * sigma_add^2
+                } else if sigma_k == 1 {
+                    // d(sigma_add^2)/d(log sigma_add) = 2 * sigma_add^2
                     2.0 * sigma_values[1] * sigma_values[1]
+                } else {
+                    // `ks` runs over the *whole* flat sigma vector (`for ks in
+                    // 0..n_sigma`, where `n_sigma = template.sigma.values.len()`),
+                    // not over the error model's own count. A sigma declared past
+                    // the ones a single-endpoint `[error_model]` loads — legal, and
+                    // documented as inert since #1001 — does not enter R, so ∂R/∂log
+                    // σ_k is identically zero for it. Without this arm the `else`
+                    // above answered for every `sigma_k >= 1` and handed the
+                    // trailing sigma the *additive* sigma's derivative, putting a
+                    // spurious row/column into the FOCE score (`subject_nll_pop_grad`)
+                    // and hence into the `s`/`rsr` cross-product in
+                    // `covariance.rs` — wrong sandwich SEs for every parameter, with
+                    // no diagnostic. The `Additive`/`Proportional` arms above always
+                    // guarded this; `Combined` did not.
+                    0.0
                 }
             }
         })
@@ -2055,6 +2070,41 @@ mod tests {
             input_columns: vec![],
             exclusions: None,
             warnings: vec![],
+        }
+    }
+
+    /// A sigma declared past the ones the `[error_model]` names is inert — #1001
+    /// documents it that way and accepts the spelling (FREM's trailing `EPSCOV`
+    /// is the shipped example). `dr_diag_d_log_sigma`'s `Combined` arm used a
+    /// bare `else` for `sigma_k != 0`, so the trailing sigma was handed the
+    /// *additive* sigma's derivative instead of zero, and `subject_nll_pop_grad`
+    /// (also the `s`/`rsr` score cross-product in `covariance.rs`) carried a
+    /// spurious row for a parameter that does not enter `R`.
+    ///
+    /// Mutation check: reverting the `else if sigma_k == 1` to a bare `else`
+    /// makes `combined_ignores_sigmas_past_its_own_slots` fail on the
+    /// `sigma_k = 2` row with `2·0.1² = 0.02`.
+    #[test]
+    fn combined_ignores_sigmas_past_its_own_slots() {
+        let r_diag = [0.25_f64, 1.0];
+        let pred = [2.0_f64, 4.0];
+        let sigmas = [0.2_f64, 0.1, 1.0]; // prop, add, trailing/unreferenced
+
+        // Slot 0 and slot 1 keep their derivatives.
+        let d0 = dr_diag_d_log_sigma(ErrorModel::Combined, &r_diag, &pred, &sigmas, 0);
+        assert!((d0[0] - 2.0 * 0.04 * 4.0).abs() < 1e-12, "{d0:?}");
+        let d1 = dr_diag_d_log_sigma(ErrorModel::Combined, &r_diag, &pred, &sigmas, 1);
+        assert!(d1.iter().all(|v| (v - 2.0 * 0.01).abs() < 1e-12), "{d1:?}");
+
+        // Slot 2 is not loaded by a `combined` error model, so ∂R/∂log σ₂ ≡ 0.
+        let d2 = dr_diag_d_log_sigma(ErrorModel::Combined, &r_diag, &pred, &sigmas, 2);
+        assert!(d2.iter().all(|v| *v == 0.0), "{d2:?}");
+
+        // The other two error models always guarded this; pin that they still do,
+        // so the three arms cannot drift apart again.
+        for em in [ErrorModel::Additive, ErrorModel::Proportional] {
+            let d = dr_diag_d_log_sigma(em, &r_diag, &pred, &sigmas, 1);
+            assert!(d.iter().all(|v| *v == 0.0), "{em:?}: {d:?}");
         }
     }
 

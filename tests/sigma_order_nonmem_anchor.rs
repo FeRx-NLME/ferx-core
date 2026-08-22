@@ -75,8 +75,22 @@ const FIT_OPTIONS: &str = "\
   ode_abstol = 1e-12
 ";
 
-/// The ferx model, parameterised by its `sigma` declarations and error statement.
+/// The ferx model, parameterised by its `sigma` declarations and error statement,
+/// at the tightened tolerances the cross-engine comparisons use.
 fn model(sigma_decls: &str, error_stmt: &str) -> String {
+    model_with_options(sigma_decls, error_stmt, FIT_OPTIONS)
+}
+
+/// The `sigma` declarations both single-sigma runs use, named once so the two
+/// call sites cannot drift into measuring different models against the same
+/// NONMEM constant.
+const SMALL_ONLY: (&str, &str) = ("  sigma S_SMALL ~ 0.05 (sd)", "DV ~ proportional(S_SMALL)");
+
+/// The model body, parameterised by its `[fit_options]` too. Exactly one copy of
+/// the structural model exists, so the default-tolerance test below cannot end up
+/// comparing a *different* model against the same NONMEM constant — the same
+/// argument the `DATA` const above makes for the dataset.
+fn model_with_options(sigma_decls: &str, error_stmt: &str, fit_options: &str) -> String {
     format!(
         "\
 [parameters]
@@ -103,7 +117,7 @@ fn model(sigma_decls: &str, error_stmt: &str) -> String {
 [scaling]
   obs_scale = V
 
-{FIT_OPTIONS}"
+{fit_options}"
     )
 }
 
@@ -116,6 +130,14 @@ fn ofv(model_str: &str) -> f64 {
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("anchor data must read");
     let params = parsed.model.default_params.clone();
     let result = fit(&parsed.model, &pop, &params, &parsed.fit_options).expect("fit returns");
+    // Same guard the other NONMEM anchors carry (`tests/per_route_lag_nonmem_anchor.rs`):
+    // a NaN objective otherwise fails on an opaque tolerance assert rather than
+    // saying what went wrong.
+    assert!(
+        result.ofv.is_finite(),
+        "OFV must be finite, got {}",
+        result.ofv
+    );
     result.ofv
 }
 
@@ -124,10 +146,7 @@ fn single_sigma_matches_nonmem() {
     // The baseline: one declared sigma, no order to get wrong. Establishes that
     // ferx's proportional-error objective agrees with NONMEM's `Y = F*(1+EPS(1))`
     // on this dataset before any ordering question is asked.
-    let got = ofv(&model(
-        "  sigma S_SMALL ~ 0.05 (sd)",
-        "DV ~ proportional(S_SMALL)",
-    ));
+    let got = ofv(&model(SMALL_ONLY.0, SMALL_ONLY.1));
     assert!(
         (got - NONMEM_OFV_SMALL).abs() < 1e-5,
         "ferx {got} vs NONMEM {NONMEM_OFV_SMALL}"
@@ -137,8 +156,9 @@ fn single_sigma_matches_nonmem() {
 #[test]
 fn in_order_trailing_sigma_matches_nonmem_and_does_not_change_the_fit() {
     // Declaring a second, unreferenced sigma *after* the one the error model names
-    // must not perturb the fit — it occupies slot 1, which a `proportional` model
-    // never loads. This is the invariant that makes the in-order spelling safe, and
+    // must not perturb the fit — it occupies the second slot, which a
+    // `proportional` model never loads (that model reads slot 1 only, in the
+    // 1-based numbering the error messages and the docs use). This is the invariant that makes the in-order spelling safe, and
     // it is pinned against NONMEM rather than only against ferx's own single-sigma
     // run.
     let got = ofv(&model(
@@ -171,14 +191,17 @@ fn leading_sigma_is_the_one_that_binds_and_matches_nonmem() {
     // instead would be arithmetic on two literals — constant-foldable, and unable
     // to fail for any reason involving ferx — so the second fit is run here rather
     // than assumed.
-    let small = ofv(&model(
-        "  sigma S_SMALL ~ 0.05 (sd)",
-        "DV ~ proportional(S_SMALL)",
-    ));
+    let small = ofv(&model(SMALL_ONLY.0, SMALL_ONLY.1));
     let ferx_delta = got - small;
     let nonmem_delta = NONMEM_OFV_BIG - NONMEM_OFV_SMALL;
+    // 2e-5, not 1e-5: this difference composes two independently-toleranced
+    // measurements, so `|Δ_ferx − Δ_nonmem| ≤ |got − BIG| + |small − SMALL|`, and
+    // each endpoint is asserted at 1e-5. A 1e-5 band here would fail on a drift
+    // both endpoint asserts still pass — reporting a "delta" problem that isn't
+    // the actual defect. Still ~5,000,000× tighter than the 110.67-unit span a
+    // mis-binding moves the objective by.
     assert!(
-        (ferx_delta - nonmem_delta).abs() < 1e-5,
+        (ferx_delta - nonmem_delta).abs() < 2e-5,
         "ferx delta {ferx_delta} vs NONMEM delta {nonmem_delta}"
     );
 }
@@ -216,40 +239,23 @@ fn default_tolerances_stay_close_to_nonmem() {
     // magnitude of headroom over that while still being ~10,000x tighter than the
     // 110.67-unit span a mis-binding would move the objective by, so this cannot be
     // satisfied by the wrong sigma.
-    // Deliberately not built through `model()`: that helper splices in
-    // `FIT_OPTIONS`, whose whole purpose is the tightened tolerances this test
-    // exists to avoid.
-    let model_str = "\
-[parameters]
-  theta TVKE(0.1, 0.001, 1.0)
-  theta TVV(10.0, 1.0, 100.0)
-
-  omega ETA1 ~ 0.09
-
-  sigma S_SMALL ~ 0.05 (sd)
-
-[individual_parameters]
-  KE = TVKE * exp(ETA1)
-  V = TVV
-
-[structural_model]
-  ode(obs_cmt=CENT, states=[CENT])
-
-[odes]
-  d/dt(CENT) = -KE * CENT
-
-[error_model]
-  DV ~ proportional(S_SMALL)
-
-[scaling]
-  obs_scale = V
-
+    //
+    // Built through `model_with_options` with the shipped defaults rather than
+    // re-inlining the model text: an inline copy would let this test drift into
+    // comparing a *different* model against `NONMEM_OFV_SMALL` while still
+    // passing — the same failure the `DATA` const above avoids for the dataset,
+    // and one this test's wide 1e-2 band would hide particularly well.
+    let model_str = model_with_options(
+        SMALL_ONLY.0,
+        SMALL_ONLY.1,
+        "\
 [fit_options]
   method = focei
   maxiter = 0
   covariance = false
-";
-    let got = ofv(model_str);
+",
+    );
+    let got = ofv(&model_str);
     assert!(
         (got - NONMEM_OFV_SMALL).abs() < 1e-2,
         "ferx at default tolerances {got} vs NONMEM {NONMEM_OFV_SMALL}"

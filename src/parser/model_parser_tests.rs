@@ -5388,10 +5388,20 @@ fn test_parse_full_model_block_sigma_single_endpoint_order_mismatch_errs() {
   DV ~ combined(PROP_ERR, ADD_ERR)
 "#;
     let err = expect_parse_err(content);
+    // Pin the argument index, not just a name: `PROP_ERR` appears in the
+    // argument-1 message (`named`) *and* in the argument-2 message (`slot`), so
+    // asserting the name alone would still pass if the enumerate loop reported
+    // the wrong argument.
     assert!(
-        err.contains("consumed positionally") && err.contains("PROP_ERR"),
+        err.contains("consumed positionally")
+            && err.contains("argument 1 names sigma 'PROP_ERR'")
+            && err.contains("supplies 'ADD_ERR'"),
         "got: {err}"
     );
+    // The block_sigma-specific half of the remedy: reordering the names without
+    // permuting the lower triangle parses clean and silently swaps the two
+    // variances, so the message must say so.
+    assert!(err.contains("lower triangle"), "got: {err}");
 }
 
 // ── #1001: single-endpoint sigma names must match declaration order ──────────
@@ -5426,9 +5436,12 @@ fn sigma_order_model(sigma_decls: &str, error_stmt: &str) -> String {
 
 #[test]
 fn single_error_model_wrong_sigma_name_errs() {
-    // The #1001 reproducer: `proportional(S_SMALL)` bound `S_BIG` because
-    // `S_BIG` was declared first (OFV 103.217 rather than the −41.979 the file
-    // reads as describing).
+    // The #1001 reproducer, in the shape a parse test can hold: before the fix
+    // `proportional(S_SMALL)` bound `S_BIG` because `S_BIG` was declared first.
+    // The objective that misbinding cost is measured — on the anchor dataset,
+    // against NONMEM — in `tests/sigma_order_nonmem_anchor.rs` (103.828964 vs
+    // −6.838931, a 110.67-unit span); this test only pins the rejection, so it
+    // deliberately quotes no number of its own.
     let content = sigma_order_model(
         "  sigma S_BIG ~ 2.0 (sd)\n  sigma S_SMALL ~ 0.05 (sd)",
         "DV ~ proportional(S_SMALL)",
@@ -5470,28 +5483,41 @@ fn single_error_model_combined_transposed_args_err() {
 #[test]
 fn single_error_model_repeated_sigma_arg_errs() {
     // `combined(S_A, S_A)` parsed and then bound slot 1 to whatever was
-    // declared second — here `S_B`, which the model never names. Rejected as an
-    // ordinary order mismatch at the second argument.
+    // declared second — here `S_B`, which the model never names.
+    //
+    // Reported as a repeat, *not* as an order mismatch: duplicate `sigma`
+    // declarations are rejected upstream, so no permutation of `[S_A, S_B]`
+    // puts `S_A` in both slots and transposing two identical arguments is a
+    // no-op. Telling the user to reorder here — and handing a consumer the
+    // reorder-shaped `E_SIGMA_ORDER_MISMATCH` — would prescribe a fix that
+    // cannot work, which is exactly what the count arm below avoids for the
+    // one-sigma spelling of the same defect.
     let content = sigma_order_model(
         "  sigma S_A ~ 0.05 (sd)\n  sigma S_B ~ 1.0 (sd)",
         "DV ~ combined(S_A, S_A)",
     );
     let err = expect_parse_err(&content);
     assert!(
-        err.contains("consumed positionally") && err.contains("S_B"),
+        err.contains("argument 2 names sigma 'S_A'")
+            && err.contains("argument 1 already claims")
+            && !err.contains("consumed positionally")
+            && !err.contains("Reorder"),
         "got: {err}"
     );
 }
 
 #[test]
 fn single_error_model_repeated_sigma_arg_without_a_second_sigma_errs() {
-    // The same repetition with only one sigma declared is a different defect —
-    // there is no second sigma to bind at all — so it reports the count rather
-    // than an order mismatch, and must not claim a reordering would fix it.
+    // The same repetition with only one sigma declared reaches the same arm and
+    // reports the same defect — one message, one code, for both spellings — and
+    // still carries the counts, which are the actionable part here: there is no
+    // second sigma to name yet.
     let content = sigma_order_model("  sigma S_A ~ 0.05 (sd)", "DV ~ combined(S_A, S_A)");
     let err = expect_parse_err(&content);
     assert!(
-        err.contains("declares only 1") && !err.contains("consumed positionally"),
+        err.contains("argument 1 already claims")
+            && err.contains("needs 2, [parameters] declares 1")
+            && !err.contains("consumed positionally"),
         "got: {err}"
     );
 }
@@ -5522,11 +5548,17 @@ fn single_error_model_frem_shape_parses() {
     // The real FREM shape, which the test above only approximates: `prepare_frem`
     // (`src/frem/mod.rs`) copies the base model's sigmas in order and then appends
     // `sigma EPSCOV`, wiring it up through `[fit_options] frem_sigma` rather than
-    // `[error_model]`. That generated text is never written to disk in a form the
-    // `examples/` sweep would catch, so its survival under the #1001 order rule
-    // depends entirely on EPSCOV being appended *last* — pin that here, rather
-    // than leaving it asserted-but-unmeasured. If `prepare_frem` ever emitted the
-    // covariate sigma first, every generated FREM model would fail to parse.
+    // `[error_model]`. This pins that the *spelling* survives the #1001 order
+    // rule — a trailing sigma consumed by a `[fit_options]` key rather than by
+    // `[error_model]` is still accepted.
+    //
+    // It does NOT pin `generate_frem_model`'s emission order, because it
+    // hand-writes the text rather than generating it. The end-to-end pin is
+    // `frem::tests::test_generate_frem_model_preserves_scaling_block`
+    // (`src/frem/mod.rs`), which runs `generate_frem_model` on a base model with
+    // `sigma PROP_ERR` + `DV ~ proportional(PROP_ERR)` and parses the result: if
+    // EPSCOV were ever emitted before the copied base sigmas, that test — not
+    // this one — is what fails.
     let content = r"
 [parameters]
   theta TVCL(0.2)

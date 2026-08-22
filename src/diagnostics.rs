@@ -34,6 +34,7 @@
 //! | `E_AD_RETIRED`            | `gradient_method = ad` requested; the Enzyme AD path was retired (use `auto` / `fd`) |
 //! | `E_IMP_CHAIN`             | `imp` mis-placed in a method chain (repeated / non-terminal) |
 //! | `E_OPTIMIZER_IOV`         | `optimizer = trust_region` used with an IOV model |
+//! | `E_SIGMA_ORDER_MISMATCH`  | a single-endpoint `[error_model]` names its sigmas in an order other than the `[parameters]` declaration order |
 //! | `W_STEADY_STATE_II`       | SS=1 dose with missing / non-positive II |
 //! | `W_STEADY_STATE_INFUSION` | SS=1 infusion with `T_inf > II` (overlapping pulses) |
 //! | `W_SDE_RESET`             | EVID=3/4 resets under an SDE model are not honoured |

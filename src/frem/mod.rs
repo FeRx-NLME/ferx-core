@@ -548,7 +548,14 @@ pub fn generate_frem_model(
             }
         }
     }
-    // Add fixed covariate sigma.
+    // Add fixed covariate sigma. Must stay *after* the base-sigma copy above:
+    // the generated `[error_model]` is the base model's verbatim, and a
+    // single-endpoint one consumes the flat sigma vector positionally (#1001),
+    // so emitting EPSCOV first would leave every generated FREM model failing to
+    // parse with `E_SIGMA_ORDER_MISMATCH`. `frem_sigma` itself binds by name and
+    // does not care where EPSCOV lands. Pinned end-to-end by
+    // `test_generate_frem_model_preserves_scaling_block`, which parses the
+    // generated text.
     model.push_str("  sigma EPSCOV ~ 1e-6 FIX\n\n");
 
     // ── [individual_parameters] block ──
