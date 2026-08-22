@@ -3172,13 +3172,21 @@ pub struct CompiledModel {
     /// (`one_cpt_ig` / `two_cpt_ig`, #790) closed forms assume constant parameters over each
     /// absorption window, so a mid-profile `TIME` switch or time-varying covariates route to
     /// this exact ODE (`transit()` / `igd()`) equivalent instead (a full boxed sub-model, built
-    /// lazily so it reuses the whole ODE prediction/sensitivity path unchanged and costs
-    /// nothing for a fit whose subjects never need it). It is also the target of the
-    /// parameter-dependent flip-flop reroute (`ke` outside the tilting convergence domain). `None`
-    /// when the model needs no fallback (not a closed-form absorption model, or a form outside
-    /// the desugar's scope — a `lagtime`/`f` mapping or user `[odes]`). See
-    /// [`CompiledModel::effective_for`] and the parser's
-    /// `absorption_ode_equivalent_source` (#486, #790).
+    /// eagerly at parse time so it reuses the whole ODE prediction/sensitivity path unchanged).
+    /// It is also the target of the parameter-dependent flip-flop reroute (`ke` outside the
+    /// tilting convergence domain).
+    ///
+    /// `None` means the model has **no ODE fallback**, for any of three reasons: it is not a
+    /// closed-form absorption model at all; it is one the desugar declines by name (a
+    /// `lagtime`/`f` mapping that shadows a reserved slot, a user `[odes]` / `[scaling]` /
+    /// `[initial_conditions]` block, a dose-attribute parameter in a disposition role); or the
+    /// twin *was* reconstructed and its own parse rejected it (#1008), in which case the model
+    /// carries a `W_ABSORPTION_TWIN_DECLINED` [`Self::parse_warnings`] entry naming the reason —
+    /// read it with [`absorption_twin_decline_reason`]. The cause set is open-ended by
+    /// construction (the twin is an ODE model, so every ODE-scoped parse check applies to it and
+    /// not to the analytical primary), so do not treat `None` as "outside the desugar's scope".
+    /// See [`CompiledModel::effective_for`], [`AbsorptionOdeEquivalent`], and the parser's
+    /// `absorption_ode_equivalent_source` (#486, #790, #1008).
     pub absorption_ode_equivalent: Option<AbsorptionOdeEquivalent>,
     /// `$MIXTURE`-style discrete latent subpopulations (#977). `Some` when the
     /// model file carries a `[mixture]` block: the subject marginal becomes a
@@ -3241,6 +3249,57 @@ impl AbsorptionOdeEquivalent {
     pub(crate) fn sync_solver_opts(&mut self, opts: &FitOptions) {
         self.built.sync_ode_solver_opts(opts);
     }
+}
+
+/// The marker that separates the fixed `W_ABSORPTION_TWIN_DECLINED` text from the twin parser's
+/// own reason (#1008). Written by [`absorption_twin_declined_warning`] and read back by
+/// [`absorption_twin_decline_reason`], so the round-trip is one constant rather than two
+/// independent substring guesses. The fixed text contains no other occurrence, so splitting on
+/// the first one recovers the reason exactly — including a reason that itself says "Reason:".
+const TWIN_DECLINE_REASON_MARKER: &str = " Reason: ";
+
+/// The parse warning recorded when an absorption model's ODE twin was reconstructed but its own
+/// parse rejected it (#1008).
+///
+/// The reason goes **last**, behind [`TWIN_DECLINE_REASON_MARKER`], for two reasons: the fixed
+/// consequence text (which features the model just lost) reads first, and the variable tail is
+/// recoverable verbatim by [`absorption_twin_decline_reason`] so the up-front rejection messages
+/// in `api::validation` can quote it. The twin parser's message is trimmed and given a sentence
+/// terminator — most parser errors carry none, and without this the reason ran into the
+/// following sentence.
+pub(crate) fn absorption_twin_declined_warning(reason: &str) -> String {
+    let reason = reason.trim();
+    let terminator = if reason.ends_with(['.', '!', '?']) {
+        ""
+    } else {
+        "."
+    };
+    format!(
+        "This absorption model's ODE equivalent could not be built, so the model stays \
+         closed-form. Subjects needing the ODE fallback (time-varying covariates, a \
+         `TIME`-dependent parameter, IOV, steady-state or infusion doses, or the flip-flop \
+         regime) will be rejected with an explicit error instead of silently rerouting \
+         (W_ABSORPTION_TWIN_DECLINED, #1008).{TWIN_DECLINE_REASON_MARKER}{reason}{terminator}"
+    )
+}
+
+/// The `#1008` twin-decline reason `model` recorded at parse time, or `None` when its twin was
+/// never declined that way (it built, or the desugar declined it by name before reconstructing
+/// a source).
+///
+/// The reason lives in [`CompiledModel::parse_warnings`] rather than in a field of its own:
+/// `CompiledModel` is not `#[non_exhaustive]`, so a new public field would be a breaking change
+/// for struct-literal construction, and `parse_warnings` is already the model's parse-diagnostics
+/// channel. That makes the `W_ABSORPTION_TWIN_DECLINED` token load-bearing — it is what
+/// `classify_warning` and `api::validation::parse_warning_to_code` key on too — so it is written
+/// and read in one place here.
+pub(crate) fn absorption_twin_decline_reason(model: &CompiledModel) -> Option<&str> {
+    model
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("W_ABSORPTION_TWIN_DECLINED"))
+        .and_then(|w| w.split_once(TWIN_DECLINE_REASON_MARKER))
+        .map(|(_, reason)| reason)
 }
 
 /// FREM (Full Random Effects Model) configuration.
@@ -4548,7 +4607,24 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     // rewrite instead of a one-line edit. Scoped to this statement rather than
     // the whole fn so a future duplicated arm in another chain still lints.
     #[allow(clippy::if_same_then_else)]
-    let (severity, category) = if lower.contains("did not converge")
+    let (severity, category) = if lower.contains("w_absorption_twin_declined") {
+        // #1008: the analytic absorption model kept no ODE twin. Not an estimation problem —
+        // the fit that follows is a pure closed form — but the model has silently lost the
+        // reroute, so it is worth its own code rather than the `general` bucket.
+        //
+        // First in the chain, ahead of *every* prose arm, because this message interpolates
+        // the twin parser's own error text: any substring an arm below matches ("condition
+        // number", "ill-conditioned", "did not converge", …) could arrive inside that reason
+        // and misclassify a decline as a Critical estimation failure. The message also *lists*
+        // the flip-flop reroute among the features the model just lost, which is how the
+        // `flip-flop regime` arm claimed it during development. An explicit `W_` token beats
+        // a prose match, so it is tested before any of them rather than just before the one
+        // that happened to collide.
+        (
+            WarningSeverity::Warning,
+            WarningCode::AbsorptionTwinDeclined,
+        )
+    } else if lower.contains("did not converge")
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")
     {
@@ -4582,18 +4658,6 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // otherwise match — these flag a pathological *simulated subject*, not an
         // estimation/optimizer problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
-    } else if lower.contains("w_absorption_twin_declined") {
-        // #1008: the analytic absorption model kept no ODE twin. Not an estimation
-        // problem — the fit that follows is a pure closed form — but the model has
-        // silently lost the reroute, so it is worth its own code rather than the
-        // `general` bucket. Must precede the `flip-flop regime` arm below: this
-        // message *lists* the flip-flop reroute among the features the model has just
-        // lost, so prose-matching would classify a declined twin as a flip-flop
-        // subject. An explicit `W_` token beats a prose match, hence the ordering.
-        (
-            WarningSeverity::Warning,
-            WarningCode::AbsorptionTwinDeclined,
-        )
     } else if lower.contains("flip-flop regime") {
         // Transit / IG absorption closed form in the flip-flop regime (#776/#785):
         // auto-rerouted to the ODE twin (informational) or, twin-less at a fitted

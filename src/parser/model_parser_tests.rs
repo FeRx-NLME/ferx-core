@@ -2162,6 +2162,69 @@ fn state_named_parameter_declines_the_absorption_twin_with_a_warning() {
             "absorption_twin_declined",
             "the decline ({label}) must classify to its own warning code"
         );
+
+        // The load-bearing half of the trade (#1027 review): declining is only safe because a
+        // subject that would have rerouted is *rejected*, not silently served by the closed
+        // form. Reach the guard directly rather than through `fit()` (Tier 1: no convergence
+        // loop) — this is the exact call `fit()` makes at its `check_absorption_closed_form_
+        // support` gate, and the same `Option<String>` `predict()`/`simulate()` panic on.
+        let rejection =
+            crate::api::check_absorption_closed_form_support(&parsed.model, &tv_cov_population())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a declined-twin model ({label}) must reject a TV-covariate subject, \
+                         not silently serve it from the closed form"
+                    )
+                });
+        // …and the rejection must name the real cause. Before #1027 it told the author their
+        // model was "an unrecognised closed form" and pointed at a rewrite they did not need,
+        // while the reason lived in a parse warning `fit()` never reaches on the `Err` path.
+        // Asserted on the *content* (the colliding name) rather than the wrapper wording, so a
+        // reworded clause does not silently pass a rejection that dropped the reason.
+        assert!(
+            rejection.contains(colliding),
+            "the rejection ({label}) must quote the twin's decline reason (naming \
+             `{colliding}`), got: {rejection}"
+        );
+        assert!(
+            !rejection.contains("an unrecognised closed form"),
+            "a recognised closed form whose twin was declined must not be called unrecognised \
+             ({label}), got: {rejection}"
+        );
+    }
+}
+
+/// A one-subject population whose subject carries a time-varying covariate row — the cheapest
+/// thing that makes `Subject::has_tv_covariates()` true, which is what routes a closed-form
+/// absorption subject to its twin (`CompiledModel::effective_for`) and, twin-less, is what
+/// `check_absorption_closed_form_support` rejects on.
+fn tv_cov_population() -> crate::types::Population {
+    crate::types::Population {
+        subjects: vec![crate::types::Subject {
+            id: "TV1".to_string(),
+            doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![10.0],
+            obs_cmts: vec![1],
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![std::collections::HashMap::from([("WT".to_string(), 80.0)])],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }],
+        covariate_names: vec!["WT".to_string()],
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
     }
 }
 
@@ -2211,6 +2274,14 @@ fn an_ordinary_transit_model_keeps_its_twin_and_warns_about_nothing() {
             .any(|w| w.contains("W_ABSORPTION_TWIN_DECLINED")),
         "nothing to decline here; warnings: {:?}",
         parsed.model.parse_warnings
+    );
+    // The negative control for the rejection assertion in the test above: a twin-carrying
+    // model must *accept* the very subject a declined one rejects — otherwise that assertion
+    // could pass by rejecting every transit model with a TV covariate.
+    assert_eq!(
+        crate::api::check_absorption_closed_form_support(&parsed.model, &tv_cov_population()),
+        None,
+        "a twin-carrying transit model must reroute a TV-covariate subject, not reject it"
     );
 }
 

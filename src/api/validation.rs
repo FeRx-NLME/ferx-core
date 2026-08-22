@@ -1200,6 +1200,45 @@ fn panic_if_unsupported(result: Option<String>, what: &str) {
     }
 }
 
+/// The short parenthetical naming *why* a closed-form absorption model has no ODE twin, for the
+/// twin-less rejection messages below.
+///
+/// Two shapes reach those messages. The desugar can decline by name before reconstructing a
+/// source (a user `[odes]` / `[scaling]` / `[initial_conditions]` block, a reserved-slot shadow
+/// or collision, a dose-attribute parameter in a disposition role) — "an unrecognised closed
+/// form" describes that. Or the twin *was* reconstructed and its own parse rejected it (#1008),
+/// which the model records as a `W_ABSORPTION_TWIN_DECLINED` parse warning. Both land on
+/// `absorption_ode_equivalent.is_none()`, so without this the second case is told it is an
+/// unrecognised form and pointed at a rewrite it does not need.
+fn twin_less_cause(model: &CompiledModel) -> &'static str {
+    if crate::types::absorption_twin_decline_reason(model).is_some() {
+        "(its twin was built and declined, #1008)"
+    } else {
+        "(an unrecognised closed form)"
+    }
+}
+
+/// The clause appended to a twin-less rejection when the twin was declined at parse time
+/// (#1008), quoting the twin parser's own reason; empty otherwise. Pairs with
+/// [`twin_less_cause`], which names the cause — this one carries only the reason, so the two
+/// do not repeat each other.
+///
+/// This is the only place the reason reaches a user on the reject path. `fit()` copies
+/// `model.parse_warnings` into the result at `api::fit`, but every call site of
+/// [`check_absorption_closed_form_support`] / [`check_absorption_flip_flop_no_twin`] returns
+/// `Err` (or panics, on `predict`/`simulate`) *before* that — so the warning that names the
+/// colliding parameter is otherwise visible only through `ferx check`.
+fn twin_decline_clause(model: &CompiledModel) -> String {
+    match crate::types::absorption_twin_decline_reason(model) {
+        Some(reason) => format!(
+            " Note: this model is not outside the rewrite's scope — its twin was built and then \
+             rejected by its own parse: {reason} Fixing that restores the twin and this feature, \
+             and is usually easier than the rewrite suggested above."
+        ),
+        None => String::new(),
+    }
+}
+
 /// Features the analytic closed-form absorption models — transit (`one_cpt_transit`,
 /// `two_cpt_transit`, #386) and inverse-Gaussian (`one_cpt_ig`, `two_cpt_ig`, #790) —
 /// do not support: the exponential-tilting closed form is a constant-parameter
@@ -1225,47 +1264,56 @@ pub(crate) fn check_absorption_closed_form_support(
         return None;
     }
     let name = model.pk_model.canonical_name();
+    // Why this model has no twin, and (for a #1008 decline) the twin parser's own reason. Every
+    // message below is reached under `absorption_ode_equivalent.is_none()`, which covers both
+    // "the desugar declined by name" and "the twin was built and rejected" — see
+    // `twin_decline_clause`.
+    let no_twin_cause = twin_less_cause(model);
+    let decline = twin_decline_clause(model);
     // IOV (n_kappa > 0): the closed-form superposition cannot express cross-occasion dose
     // carryover (#104) — a dose whose drug persists into a later occasion must decay with that
     // occasion's disposition. The plain form carries an `absorption_ode_equivalent` (the
     // `transit()`/`igd()` forcing twin) that `effective_for` routes IOV subjects to (it
-    // integrates the carryover exactly, #663), so it is NOT rejected. Only a twin-less form (a
-    // user `[odes]`/`[scaling]`/`[initial_conditions]` block, or a role shadowing a reserved
-    // F/lagtime slot) is rejected here rather than mis-fit.
+    // integrates the carryover exactly, #663), so it is NOT rejected. Only a twin-less form is
+    // rejected here rather than mis-fit — either one the desugar declines by name (a user
+    // `[odes]`/`[scaling]`/`[initial_conditions]` block, a role shadowing a reserved F/lagtime
+    // slot) or one whose twin was built and rejected by its own parse (#1008); the cause set is
+    // open-ended, which is why `no_twin_cause`/`decline` name it instead of the message text.
     if model.n_kappa > 0 && model.absorption_ode_equivalent.is_none() {
         return Some(format!(
             "{name} does not support IOV (n_kappa > 0) in this form: the analytic absorption \
              closed form assumes constant disposition over each absorption window, and this \
-             form is outside the automatic ODE-equivalent rewrite. Write the model as an ODE \
-             transit()/igd() forcing in [odes] directly."
+             model has no ODE twin {no_twin_cause} to reroute to. Write the model as an ODE \
+             transit()/igd() forcing in [odes] directly.{decline}"
         ));
     }
     // A `TIME`-built-in structural parameter makes the disposition switch mid-profile — the
     // closed form assumes constant parameters over each absorption window, so it cannot serve
     // it. The plain form carries an `absorption_ode_equivalent` (built at parse time), which
-    // the runtime dispatch routes such subjects to, so it is NOT rejected. Only a form outside
-    // the desugar's scope (a `lagtime=`/`f=` mapping or a custom `[scaling]` — no equivalent)
-    // is rejected here rather than mis-predict.
+    // the runtime dispatch routes such subjects to, so it is NOT rejected. Only a twin-less form
+    // is rejected here rather than mis-predict — outside the desugar's scope (a custom
+    // `[scaling]`, a reserved-slot shadow), or declined because its twin failed to parse (#1008).
     if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
         && model.absorption_ode_equivalent.is_none()
     {
         return Some(format!(
             "{name} does not support a TIME-dependent structural parameter in this form: \
              the analytic absorption closed form assumes constant parameters over each \
-             absorption window, and this form is outside the automatic ODE-equivalent rewrite. \
-             Write the model as an ODE transit()/igd() forcing in [odes] directly."
+             absorption window, and this model has no ODE twin {no_twin_cause} to reroute to. \
+             Write the model as an ODE transit()/igd() forcing in [odes] directly.{decline}"
         ));
     }
     for subject in &population.subjects {
         // Time-varying covariates make the disposition switch mid-absorption, which the
         // closed form cannot serve. The plain form's `absorption_ode_equivalent` handles it
-        // (the runtime dispatch routes TV-cov subjects there), so reject only the
-        // out-of-scope forms that carry no equivalent.
+        // (the runtime dispatch routes TV-cov subjects there), so reject only the forms that
+        // carry no equivalent — out of the desugar's scope, or declined at parse time (#1008).
         if subject.has_tv_covariates() && model.absorption_ode_equivalent.is_none() {
             return Some(format!(
                 "{name} does not support within-subject time-varying covariates \
                  (subject {}): the analytic absorption closed form assumes constant parameters \
-                 over each absorption window. Use an ODE absorption model.",
+                 over each absorption window, and this model has no ODE twin {no_twin_cause} to \
+                 reroute to. Use an ODE absorption model.{decline}",
                 subject.id
             ));
         }
@@ -1335,12 +1383,14 @@ pub(crate) fn check_absorption_closed_form_support(
                         "{name} does not support steady-state (SS) doses in this form (subject \
                          {}): SS reroutes to the ODE absorption twin, but this model has no twin \
                          {}. Use a non-SS multiple-dose schedule, or write the model as an ODE \
-                         transit()/igd() forcing in [odes].",
+                         transit()/igd() forcing in [odes].{decline}",
                         subject.id,
                         if model.has_lagtime_on_cmt(dose.cmt_raw()) {
+                            // The lagtime case is a twin-*carrying* scope limit, so it names the
+                            // combination rather than the twin-less cause.
                             "for the SS + lagtime combination (a follow-up)"
                         } else {
-                            "(an unrecognised closed form)"
+                            no_twin_cause
                         }
                     ));
                 }
@@ -1354,8 +1404,8 @@ pub(crate) fn check_absorption_closed_form_support(
                     return Some(format!(
                         "{name} does not support infusion doses in this form (subject {}): an \
                          infusion reroutes to the ODE absorption twin, but this model has no twin \
-                         (an unrecognised closed form). Write the model as an ODE transit()/igd() \
-                         forcing in [odes] for a zero-order input into the kernel.",
+                         {no_twin_cause}. Write the model as an ODE transit()/igd() forcing in \
+                         [odes] for a zero-order input into the kernel.{decline}",
                         subject.id
                     ));
                 }
@@ -1789,6 +1839,16 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
         }
         _ => ("1/(2·MAT·CV²)", "igd()", "MAT / CV² / CL"),
     };
+    // The twin-less cause, and (for a #1008 decline) the twin parser's own reason — the
+    // desugar's by-name declines and a rejected twin build both land on `is_none()` here.
+    let cause = if crate::types::absorption_twin_decline_reason(model).is_some() {
+        "its twin was built and declined, #1008"
+    } else {
+        "a user `[odes]` / `[scaling]` / `[initial_conditions]` block, or a parameter whose name \
+         collides with a reserved `f`/`lagtime` slot, declines the desugar — a `lagtime=`/`f=` \
+         mapping alone now auto-routes, #735"
+    };
+    let decline = twin_decline_clause(model);
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     for subject in &population.subjects {
         if crate::pk::absorption_flip_flop_at(model, subject, theta, &zero_eta) {
@@ -1798,11 +1858,8 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
                  or (2-cpt) coincident disposition eigenvalues — so it returns an \
                  identically-zero concentration profile, which silently degenerates the objective \
                  (a proportional error model collapses `(σ·pred)²` to 0). This model has no ODE \
-                 twin to fall back on (a user `[odes]` / `[scaling]` / `[initial_conditions]` \
-                 block, or a parameter whose name collides with a reserved `f`/`lagtime` slot, \
-                 declines the desugar — a `lagtime=`/`f=` mapping alone now auto-routes, #735) — \
-                 rewrite it as an explicit ODE `{ode_fn}` model, or check the {params} starting \
-                 estimates.",
+                 twin to fall back on ({cause}) — rewrite it as an explicit ODE `{ode_fn}` model, \
+                 or check the {params} starting estimates.{decline}",
                 model.pk_model.canonical_name(),
                 subject.id
             ));

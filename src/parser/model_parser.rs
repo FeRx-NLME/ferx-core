@@ -3092,13 +3092,9 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     if let Some(src) = absorption_ode_equivalent_src {
         match crate::types::AbsorptionOdeEquivalent::build(&src) {
             Ok(eq) => model.absorption_ode_equivalent = Some(eq),
-            Err(e) => model.parse_warnings.push(format!(
-                "This absorption model's ODE equivalent could not be built, so the model stays \
-                 closed-form: {e} Subjects needing the ODE fallback (time-varying covariates, a \
-                 `TIME`-dependent parameter, IOV, steady-state or infusion doses, or the \
-                 flip-flop regime) will be rejected with an explicit error instead of silently \
-                 rerouting (W_ABSORPTION_TWIN_DECLINED, #1008)."
-            )),
+            Err(e) => model
+                .parse_warnings
+                .push(crate::types::absorption_twin_declined_warning(&e)),
         }
     }
 
@@ -8252,14 +8248,22 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // `cl/v1/q/v2/<abs>`, where `<abs>` is `n/mtt` (transit) or `mat/cv2` (IG). Any other
     // structural form stays closed-form.
     let structural = extracted.unnamed.get("structural_model")?;
-    let transit_one = Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
-    let transit_two = Regex::new(r"^pk\s+two_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
-    let ig_one = Regex::new(r"^pk\s+one_cpt_ig\s*\(([^)]*)\)\s*$").unwrap();
-    let ig_two = Regex::new(r"^pk\s+two_cpt_ig\s*\(([^)]*)\)\s*$").unwrap();
+    // `LazyLock` rather than per-call `Regex::new`: since #1008 the twin is compiled eagerly, so
+    // every transit/IG model reaches this function twice — once for itself, once from the twin's
+    // own parse, where all four patterns are compiled only to miss (the twin's structural model
+    // is `ode(...)`). Compiling them per call cost ~0.9 ms of the parse, measured on #1027.
+    static TRANSIT_ONE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap());
+    static TRANSIT_TWO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+two_cpt_transit\s*\(([^)]*)\)\s*$").unwrap());
+    static IG_ONE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+one_cpt_ig\s*\(([^)]*)\)\s*$").unwrap());
+    static IG_TWO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+two_cpt_ig\s*\(([^)]*)\)\s*$").unwrap());
     // (args, is_two_cpt, is_ig, pk_label)
     let (args_str, is_two_cpt, is_ig, pk_label) = if let Some(caps) = structural
         .iter()
-        .find_map(|l| transit_one.captures(l.trim()))
+        .find_map(|l| TRANSIT_ONE.captures(l.trim()))
     {
         (
             caps.get(1)?.as_str().to_string(),
@@ -8269,7 +8273,7 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
         )
     } else if let Some(caps) = structural
         .iter()
-        .find_map(|l| transit_two.captures(l.trim()))
+        .find_map(|l| TRANSIT_TWO.captures(l.trim()))
     {
         (
             caps.get(1)?.as_str().to_string(),
@@ -8277,14 +8281,14 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
             false,
             "pk two_cpt_transit",
         )
-    } else if let Some(caps) = structural.iter().find_map(|l| ig_one.captures(l.trim())) {
+    } else if let Some(caps) = structural.iter().find_map(|l| IG_ONE.captures(l.trim())) {
         (
             caps.get(1)?.as_str().to_string(),
             false,
             true,
             "pk one_cpt_ig",
         )
-    } else if let Some(caps) = structural.iter().find_map(|l| ig_two.captures(l.trim())) {
+    } else if let Some(caps) = structural.iter().find_map(|l| IG_TWO.captures(l.trim())) {
         (
             caps.get(1)?.as_str().to_string(),
             true,
