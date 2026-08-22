@@ -2687,6 +2687,40 @@ const SPEC_TITRATE: &str = r#"
   when signal > 13 : decrease 25%
 "#;
 
+// Same structural core, but the controller's `observe` expression is the `TIME`
+// built-in itself (#1028). `[adaptive_dosing] observe` compiles through the same
+// `build_y_output_fn` as a `[scaling]` Form C readout, so it reads the model-time
+// thread-local — and the reactive driver calls the compiled closure directly rather
+// than through `OdeReadout::eval`, so it needs its own guard. Decisions at 0/24/48
+// with a `signal < 30` rule therefore fire at t=0 and t=24 and *not* at t=48. Had
+// the closure read a stale `TIME = 0` the rule would fire at all three, so the dose
+// ladder below discriminates the two outright.
+const SPEC_TIME_OBSERVE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = TIME
+  at = [0, 24, 48]
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 30 : increase 25%
+"#;
+
 /// A minimal valid titration spec (built directly, no file) for the rejection
 /// tests, which never reach the run loop.
 fn simple_titration_spec() -> AdaptiveDosingSpec {
@@ -3571,6 +3605,46 @@ fn from_spec_closed_loop_converges_into_target_band() {
         last.amt, prev.amt,
         "the maintenance dose should be steady once the trough is in band"
     );
+}
+
+#[test]
+fn from_spec_observe_reads_the_time_builtin_at_the_decision() {
+    // #1028: `observe = TIME` must see each decision's own time. The compiled
+    // `observe` closure resolves the `TIME` built-in from the model-time
+    // thread-local, and the reactive driver evaluates it directly (not through
+    // `OdeReadout::eval`), so the driver enters the guard itself.
+    let parsed = parse_full_model(SPEC_TIME_OBSERVE).expect("observe = TIME parses");
+    let spec = parsed.adaptive_dosing.as_ref().expect("block present");
+    let pop = population(vec![subj("P", vec![60.0], vec![])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        ..Default::default()
+    };
+    let res = simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        spec,
+        &opts,
+    )
+    .expect("the TIME-driven controller runs");
+
+    // The observed signal IS the decision time.
+    let times = [0.0, 24.0, 48.0];
+    assert_eq!(res.decisions.len(), 3, "one decision per `at` entry");
+    for (d, &t) in res.decisions.iter().zip(times.iter()) {
+        approx::assert_relative_eq!(d.observed_signals[0].value, t, epsilon = 1e-9);
+    }
+
+    // …and the rule (`signal < 30 : increase 25%`) therefore fires at t=0 and t=24
+    // but not at t=48: 100 → 125 → 156.25 → held. A stale `TIME = 0` would have
+    // fired all three (100 → 125 → 156.25 → 195.3125).
+    let amts: Vec<f64> = res.ledger.iter().map(|d| d.amt).collect();
+    assert_eq!(amts.len(), 3, "one dose per decision");
+    approx::assert_relative_eq!(amts[0], 125.0, max_relative = 1e-9);
+    approx::assert_relative_eq!(amts[1], 156.25, max_relative = 1e-9);
+    approx::assert_relative_eq!(amts[2], 156.25, max_relative = 1e-9);
 }
 
 #[test]

@@ -76,6 +76,13 @@ a dose that codes `RATE=-2`/`-1`, so an `R1` in `observe` is reported against th
 **dataset** rather than the model file, and only when such a dose lands on it.
 :::
 
+`observe` compiles through the same expression compiler as a `[scaling]` Form C
+readout, so it shares that block's name scope — including the `TIME` built-in
+(spelled `TIME` or `T`), which resolves to **the decision's own time**. A
+protocol-time-dependent target such as `observe = central / V - TARGET * TIME /
+(TIME + T50)` therefore titrates against the intended ramp
+([#1028](https://github.com/FeRx-NLME/ferx-core/issues/1028)).
+
 ¹ **The signal source is exactly one of `observe` (a latent expression, un-noised) or `with_assay_error = true` + `assay_cmt` (a noised model output).** Setting both, or neither, is a parse error. Titrating on a *measured* quantity uses the model's own output (so its value and σ can never disagree on scale); titrating on a *derived latent* quantity (effect-site, a ratio — anything with no error model) uses `observe`.
 
 ### Rules — `when signal <op> <value> : <action>`
