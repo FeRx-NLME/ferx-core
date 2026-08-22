@@ -149,35 +149,47 @@ fn covariance_to_proposal_hessian(
     }
 }
 
-/// Names of non-fixed thetas that have **no associated ETA** (are not the target
-/// of any mu-reference). Under IMP/IMPMAP such fixed-effect-only parameters are
-/// estimated solely through the importance-weighted θ M-step, which carries an
-/// IS-weight bias for weakly-identified parameters and can converge to the wrong
-/// value (issue #406: the FREM `FRD1` absorption-fraction drove to 0.90 vs a
-/// FOCEI/NONMEM value of ~0.4). NONMEM's IMP methods require every estimated
-/// parameter to carry a random effect; ferx applies mu-referencing
-/// automatically, so the user only needs to add the ETA.
-pub(crate) fn non_fixed_thetas_without_eta(
+/// Per-θ mask of "is the anchor of a detected mu-reference", indexed by θ
+/// position — the proxy both the #406 IMP/IMPMAP advisory
+/// ([`non_fixed_thetas_without_eta`]) and the #1011 SAEM M-step damping gate use
+/// for "this θ carries an ETA", read from here so the two cannot drift apart.
+///
+/// **It is mu-reference *detection*, not a scan of ETA usage.** `true` means the
+/// parser paired this θ with an η it can move by a closed-form shift — the
+/// `TVX * exp(ETA_X)` and logit forms, plus a class θ whose class-aware shift is
+/// active this fit. An η attached in a form the detector does not recognise (an
+/// additive `X = TVX + ETA_X`, a covariate model whose typical value is not
+/// log-linear in one θ, #619) reads as `false` even though an η exists.
+///
+/// That is the right side to err on for both consumers, because both are about
+/// the *channel that moves the θ*, not about η bookkeeping: an un-anchored θ has
+/// no closed-form shift and is moved solely by the numerical / importance-
+/// weighted M-step, which is exactly the biased channel #406 and #1011 are
+/// about. The cost is that the advisory's wording ("no associated ETA") is
+/// stricter than the predicate, and says "attach an ETA" to a model that has one
+/// in an unrecognised form — where the fix is to put it in a mu-referenceable
+/// form, which is the same remedy.
+///
+/// A MIXNUM-switched typical value carries an ETA in every class arm, so its
+/// class thetas must not be counted as fixed-effect-only (#996) — they are
+/// mu-referenced per class, not estimated by the weighted M-step alone.
+///
+/// The caller passes the thetas whose class-aware shift is *actually active*
+/// this fit rather than everything the parser detected: the shift is skipped
+/// under `mu_referencing = false`, for identity-packed θ, and for weak-IIV η,
+/// and in each of those cases the class θ really is estimated by the weighted
+/// M-step alone — exactly the situation these consumers exist for (#996
+/// review). Pass `&[]` where no class-aware shift runs.
+pub(crate) fn theta_is_mu_ref_anchor_mask(
     model: &CompiledModel,
-    theta_fixed: &[bool],
     class_mu_ref_thetas: &[usize],
-) -> Vec<String> {
+) -> Vec<bool> {
     use std::collections::HashSet;
     let mut with_eta: HashSet<&str> = model
         .mu_refs
         .values()
         .map(|m| m.theta_name.as_str())
         .collect();
-    // A MIXNUM-switched typical value carries an ETA in every class arm, so its
-    // class thetas must not be flagged as fixed-effect-only (#996) — they are
-    // mu-referenced per class, not estimated by the weighted M-step alone.
-    //
-    // The caller passes the thetas whose class-aware shift is *actually active*
-    // this fit rather than everything the parser detected: the shift is skipped
-    // under `mu_referencing = false`, for identity-packed θ, and for weak-IIV η,
-    // and in each of those cases the class θ really is estimated by the weighted
-    // M-step alone — exactly the situation this advisory exists for (#996
-    // review). Pass `&[]` where no class-aware shift runs.
     with_eta.extend(
         class_mu_ref_thetas
             .iter()
@@ -186,9 +198,36 @@ pub(crate) fn non_fixed_thetas_without_eta(
     model
         .theta_names
         .iter()
+        .map(|name| with_eta.contains(name.as_str()))
+        .collect()
+}
+
+/// Names of non-fixed thetas that have **no associated ETA** (are not the target
+/// of any mu-reference). Under IMP/IMPMAP such fixed-effect-only parameters are
+/// estimated solely through the importance-weighted θ M-step, which carries an
+/// IS-weight bias for weakly-identified parameters and can converge to the wrong
+/// value (issue #406: the FREM `FRD1` absorption-fraction drove to 0.90 vs a
+/// FOCEI/NONMEM value of ~0.4). NONMEM's IMP methods require every estimated
+/// parameter to carry a random effect; ferx applies mu-referencing
+/// automatically, so the user only needs to add the ETA.
+///
+/// See [`theta_is_mu_ref_anchor_mask`] for the exact predicate this uses as the
+/// stand-in for "carries an ETA" — it is mu-reference detection, so an η in a
+/// form the detector does not recognise is reported here too — and for what
+/// `class_mu_ref_thetas` must contain.
+pub(crate) fn non_fixed_thetas_without_eta(
+    model: &CompiledModel,
+    theta_fixed: &[bool],
+    class_mu_ref_thetas: &[usize],
+) -> Vec<String> {
+    let anchored = theta_is_mu_ref_anchor_mask(model, class_mu_ref_thetas);
+    model
+        .theta_names
+        .iter()
         .enumerate()
-        .filter(|(i, name)| {
-            !theta_fixed.get(*i).copied().unwrap_or(false) && !with_eta.contains(name.as_str())
+        .filter(|(i, _)| {
+            !theta_fixed.get(*i).copied().unwrap_or(false)
+                && !anchored.get(*i).copied().unwrap_or(false)
         })
         .map(|(_, name)| name.clone())
         .collect()

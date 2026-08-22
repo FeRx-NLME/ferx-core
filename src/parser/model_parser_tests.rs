@@ -2716,6 +2716,68 @@ fn test_apply_fit_option_known_applies() {
     assert_eq!(opts.saem_omega_burnin, 30);
 }
 
+/// `mstep_damping` (#1011) round-trips under both spellings, defaults to `None`
+/// so the calibrated constant applies, and rejects anything outside `(0, 1]` —
+/// `1.0` is the documented "off" value and must stay accepted.
+#[test]
+fn test_mstep_damping_round_trips_and_validates() {
+    let mut opts = FitOptions::default();
+    assert_eq!(
+        opts.saem_mstep_damping, None,
+        "unset must stay None so the MSTEP_SA_MAX_STEP default applies"
+    );
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_damping", "0.01"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_mstep_damping, Some(0.01));
+
+    // The `saem_`-prefixed spelling writes the same field.
+    assert_eq!(
+        apply_fit_option(&mut opts, "saem_mstep_damping", "0.5"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_mstep_damping, Some(0.5));
+
+    // 1.0 disables the damping and is in range.
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_damping", "1.0"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_mstep_damping, Some(1.0));
+
+    for bad in ["0", "-0.1", "1.5"] {
+        let err = apply_fit_option(&mut opts, "mstep_damping", bad)
+            .expect_err("out-of-range mstep_damping must be rejected");
+        assert!(err.contains("(0, 1]"), "got: {err}");
+        // The offending value is echoed, as the neighbouring range validators do.
+        assert!(err.contains(bad), "value not echoed, got: {err}");
+    }
+    // The error names the spelling the user actually wrote.
+    let err = apply_fit_option(&mut opts, "saem_mstep_damping", "-1")
+        .expect_err("out-of-range saem_mstep_damping must be rejected");
+    assert!(err.contains("`saem_mstep_damping`"), "got: {err}");
+    // A rejected value must not have clobbered the last good one.
+    assert_eq!(opts.saem_mstep_damping, Some(1.0));
+}
+
+/// The key is advertised as SAEM-specific, so using it under FOCEI warns rather
+/// than silently doing nothing.
+#[test]
+fn test_mstep_damping_under_focei_warns() {
+    let opts = parse_fit_options(&[
+        "method = focei".to_string(),
+        "mstep_damping = 0.01".to_string(),
+    ])
+    .unwrap();
+    let warnings = opts.unsupported_keys_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("mstep_damping")),
+        "got: {warnings:?}"
+    );
+}
+
 /// Conditional-distribution keys (#257) round-trip into FitOptions, both the
 /// bare and `saem_`-prefixed spellings of the master switch.
 #[test]
@@ -3602,35 +3664,28 @@ fn test_parse_all_example_ferx_files() {
                 continue;
             }
         }
-        // Endpoint-only files (no [structural_model] block) — TTE `[event_model]` or the
-        // #760 `[binary_model]` — require the survival feature to parse (the endpoint
-        // block is unrecognized without it, so the parser demands the Gaussian PK blocks).
-        // Use a line-start check so a comment like "# Note: [structural_model] ..." in an
+        // A file declaring a feature-gated endpoint block — TTE `[event_model]` /
+        // `[binary_model]` (`survival`), or the CTMM `[markov_model]` (`markov`,
+        // which implies `survival`) — cannot parse in a build without that feature:
+        // since #1040 the parser rejects the block outright rather than reading the
+        // file as a Gaussian-only model. Skip those files here; the rejection itself
+        // is pinned by `test_feature_gated_block_rejected_without_its_feature`.
+        // Line-start checks so a comment like "# Note: [structural_model] ..." in an
         // example header does not falsely count as a block.
+        let block_at_line_start = |src: &str, block: &str| {
+            src.lines()
+                .any(|l| l.trim_start().starts_with(&format!("[{block}")))
+        };
         if !cfg!(feature = "survival") {
             let src = std::fs::read_to_string(&path).unwrap_or_default();
-            let has_nongaussian_endpoint =
-                src.contains("[event_model") || src.contains("[binary_model");
-            let has_struct_block = src
-                .lines()
-                .any(|l| l.trim_start().starts_with("[structural_model"));
-            if has_nongaussian_endpoint && !has_struct_block {
+            if block_at_line_start(&src, "event_model") || block_at_line_start(&src, "binary_model")
+            {
                 continue;
             }
         }
-        // A `[markov_model]` (CTMM) endpoint-only file needs the `markov` feature
-        // specifically (`markov` implies `survival`, so the `survival`-only build above
-        // does not cover it): without `markov` the block is unrecognized and the parser
-        // demands the Gaussian PK blocks. Skip such a file whenever `markov` is off.
         if !cfg!(feature = "markov") {
             let src = std::fs::read_to_string(&path).unwrap_or_default();
-            let has_markov_endpoint = src
-                .lines()
-                .any(|l| l.trim_start().starts_with("[markov_model"));
-            let has_struct_block = src
-                .lines()
-                .any(|l| l.trim_start().starts_with("[structural_model"));
-            if has_markov_endpoint && !has_struct_block {
+            if block_at_line_start(&src, "markov_model") {
                 continue;
             }
         }
@@ -9482,14 +9537,16 @@ fn test_covariate_nn_block_without_nn_feature_errors() {
 }
 
 /// Sanity for the named-block parser extension itself (independent of the
-/// NN feature). `[block_type NAME]` should be recognised and parsed.
+/// NN feature). `[block_type NAME]` should be recognised and parsed. Uses a
+/// registry block (`covariate_nn`, which is named-only) rather than an invented
+/// name — since #1040 `extract_blocks` rejects unknown block names.
 #[test]
 fn test_extract_blocks_recognizes_named_block_form() {
     let src = "
 [parameters]
   theta T1(1.0, 0.001, 10.0)
 
-[some_named_block FOO]
+[covariate_nn FOO]
   key = value
 ";
     let extracted = extract_blocks(src).unwrap();
@@ -9498,11 +9555,233 @@ fn test_extract_blocks_recognizes_named_block_form() {
     // Named block captured by type + instance.
     let by_inst = extracted
         .named
-        .get("some_named_block")
+        .get("covariate_nn")
         .expect("named block extracted");
     let lines = by_inst.get("FOO").expect("instance FOO present");
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0], "key = value");
+}
+
+// ─── Closed-world `[block]` names (#1040) ────────────────────────────────────
+
+/// A minimal but complete model, with `{extra}` spliced in after the required
+/// blocks so a test can add one offending header.
+fn model_with_extra_block(extra: &str) -> String {
+    format!(
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+{extra}"
+    )
+}
+
+/// The headline regression: a misspelled optional block used to be dropped on
+/// the floor — `[fit_option]` left the fit running with the default method and
+/// no covariance step while `ferx check` still said `valid: true`.
+#[test]
+fn test_unknown_block_name_is_rejected_with_line_and_valid_set() {
+    let src = model_with_extra_block("[fit_option]\n  method = focei\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert!(
+        err.starts_with("Unknown block `[fit_option]` (line 16)"),
+        "message should name the block and its header line, got: {err}"
+    );
+    assert!(
+        err.contains("did you mean `[fit_options]`"),
+        "near miss should be suggested, got: {err}"
+    );
+    // The valid set is enumerated, in the `[event_model]: unknown key ...` style.
+    // Assert on names present in every build — the enumeration is filtered by
+    // the features this binary carries (see `known_block_names`).
+    assert!(err.contains("Valid blocks: adaptive_dosing, "), "{err}");
+    assert!(err.contains("fit_options, "), "{err}");
+    assert!(err.contains("structural_model."), "{err}");
+}
+
+/// Every offender is reported in one pass, so a batch of typos does not turn
+/// into a fix-one-reparse loop.
+#[test]
+fn test_unknown_block_names_are_all_reported_together() {
+    let src = model_with_extra_block("[scalings]\n  V = 1.0\n\n[outputs]\n  CL\n");
+    let err = parse_model_string(&src).expect_err("unknown blocks must be an error");
+    assert!(err.contains("`[scalings]`"), "{err}");
+    assert!(err.contains("`[outputs]`"), "{err}");
+    assert!(err.contains("did you mean `[scaling]`"), "{err}");
+    assert!(err.contains("did you mean `[output]`"), "{err}");
+}
+
+/// An invented name with no near miss still errors — just without a hint.
+#[test]
+fn test_unknown_block_without_near_match_has_no_suggestion() {
+    let src = model_with_extra_block("[qqqqqqqq]\n  key = value\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert!(err.contains("`[qqqqqqqq]`"), "{err}");
+    assert!(!err.contains("did you mean"), "{err}");
+}
+
+/// A repeated unknown header is reported once, not once per occurrence.
+#[test]
+fn test_unknown_block_reported_once_per_name() {
+    let src =
+        model_with_extra_block("[fit_option]\n  method = focei\n\n[fit_option]\n  maxiter = 5\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert_eq!(err.matches("`[fit_option]`").count(), 1, "{err}");
+}
+
+/// Block names are case-folded before the lookup, as they always have been —
+/// `[FIT_OPTIONS]` is valid, not unknown.
+#[test]
+fn test_uppercase_block_name_is_not_unknown() {
+    let src = model_with_extra_block("[FIT_OPTIONS]\n  maxiter = 5\n");
+    assert!(parse_model_string(&src).is_ok());
+}
+
+/// An instance name on a block that takes none is the same silent drop by
+/// another route: it lands in the `named` map that nothing reads.
+#[test]
+fn test_instance_name_on_unnamed_only_block_is_rejected() {
+    let src = model_with_extra_block("[fit_options DOSE]\n  maxiter = 5\n");
+    let err = parse_model_string(&src).expect_err("instance name must be an error");
+    assert!(
+        err.contains("`[fit_options DOSE]` (line 16) does not take an instance name"),
+        "{err}"
+    );
+    assert!(err.contains("write `[fit_options]`"), "{err}");
+}
+
+/// The mirror case: `[covariate_nn]` is read only out of the named map, so an
+/// unnamed one was silently ignored.
+#[test]
+fn test_named_only_block_without_instance_name_is_rejected() {
+    let src = model_with_extra_block("[covariate_nn]\n  inputs = [WT]\n");
+    let err = parse_model_string(&src).expect_err("missing instance name must be an error");
+    assert!(
+        err.contains("`[covariate_nn]` (line 16) requires an instance name"),
+        "{err}"
+    );
+    assert!(err.contains("write `[covariate_nn NAME]`"), "{err}");
+}
+
+/// A block whose cargo feature is off is *known* but unusable — reject it
+/// rather than parse the file as if the endpoint were not there.
+#[cfg(not(feature = "survival"))]
+#[test]
+fn test_feature_gated_block_rejected_without_its_feature() {
+    let src = model_with_extra_block("[event_model]\n  family = exponential\n");
+    let err = parse_model_string(&src).expect_err("feature-gated block must be an error");
+    assert!(
+        err.contains(
+            "`[event_model]` (line 16) requires building ferx-core with `--features survival`"
+        ),
+        "{err}"
+    );
+}
+
+/// With the feature on, the same file parses — the gate is the only reason the
+/// block is refused above.
+#[cfg(feature = "survival")]
+#[test]
+fn test_feature_gated_block_accepted_with_its_feature() {
+    let src = model_with_extra_block(
+        "[event_model]\n  cmt = 2\n  family = exponential\n  scale = TVCL\n",
+    );
+    assert!(parse_model_string(&src).is_ok());
+}
+
+#[test]
+fn test_nearest_block_name_thresholds() {
+    // Prefix relationship, either direction.
+    assert_eq!(nearest_block_name("fit_option"), Some("fit_options"));
+    assert_eq!(nearest_block_name("parameters_pk"), Some("parameters"));
+    // Within edit distance 2.
+    assert_eq!(nearest_block_name("odez"), Some("odes"));
+    // Far enough away that a suggestion would be noise.
+    assert_eq!(nearest_block_name("qqqqqqqq"), None);
+}
+
+/// The registry is what the rest of the parser looks up, so nothing may be in
+/// one and not the other. `known_block_names` is also the list `ferx-r` and
+/// `ferxtranslate` are meant to read instead of keeping their own copy.
+#[test]
+fn test_known_block_names_are_sorted_and_unique() {
+    let names = known_block_names();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(names, sorted, "BLOCK_REGISTRY must be sorted and unique");
+    assert!(names.contains(&"fit_options"));
+    // Deprecated names are not valid, so they must never be advertised.
+    assert!(!names.contains(&"initial_values"));
+}
+
+/// The advertised list is what *this* binary accepts. A build without a
+/// feature must not name the blocks it would then refuse — a consumer told to
+/// source the list from the engine (`ferx-r`) would otherwise call
+/// `[markov_model]` valid against a core that rejects it.
+#[test]
+fn test_known_block_names_track_the_build_features() {
+    let names = known_block_names();
+    assert_eq!(
+        names.contains(&"event_model"),
+        cfg!(feature = "survival"),
+        "event_model must be advertised iff `survival` is on"
+    );
+    assert_eq!(
+        names.contains(&"markov_model"),
+        cfg!(feature = "markov"),
+        "markov_model must be advertised iff `markov` is on"
+    );
+    // Ungated blocks are there whatever the build.
+    assert!(names.contains(&"parameters") && names.contains(&"odes"));
+    // A registry entry naming a feature this function does not know can only be
+    // a typo in the table; treat it as enabled so the mistake never rejects a
+    // valid model.
+    assert!(block_feature_enabled("not-a-real-feature"));
+}
+
+/// A block that *was* ferx syntax gets its own code and remediation rather
+/// than a bare "unknown block": `initial_values` predates inline inits, the
+/// parser stopped reading it silently, and `nearest_block_name` finds nothing
+/// close enough to suggest (`initial_conditions` is far past edit distance 2),
+/// so the generic path would leave the user with no explanation at all.
+#[test]
+fn test_deprecated_block_is_rejected_with_its_remediation() {
+    assert_eq!(nearest_block_name("initial_values"), None);
+    let src = model_with_extra_block("[initial_values]\n  theta = [0.2, 10.0]\n  sigma = [0.02]\n");
+    let err = parse_model_string(&src).expect_err("deprecated block must be an error");
+    assert!(
+        err.starts_with("Deprecated block `[initial_values]` (line 16) is no longer read:"),
+        "{err}"
+    );
+    assert!(err.contains("declared inline in `[parameters]`"), "{err}");
+    assert!(err.contains("delete it"), "{err}");
+    // Not the generic bucket: no "valid blocks" dump, no did-you-mean.
+    assert!(!err.contains("Valid blocks"), "{err}");
+}
+
+/// An unknown header written with an instance name is echoed as written, so
+/// the message can be grepped for in the user's own file — and two instances
+/// of the same unknown type are two findings, not one entry that names only
+/// the first.
+#[test]
+fn test_unknown_named_block_reports_its_instance_name() {
+    let src = model_with_extra_block("[foo BAR]\n  k = 1\n\n[foo BAZ]\n  k = 2\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert!(err.contains("`[foo BAR]` (line 16)"), "{err}");
+    assert!(err.contains("`[foo BAZ]` (line 19)"), "{err}");
 }
 
 // ─── [covariate_nn] dot-access + pk_param_fn dispatch (Phase A M1 step 3) ────
@@ -10869,6 +11148,321 @@ fn test_parse_scaling_per_cmt_accepts_ad() {
         analytical_model_with_scaling(Some("  obs_scale[CMT=1] = 1000\n  obs_scale[CMT=2] = 1\n"));
     let src = base.replace("gradient = fd", "gradient = ad");
     parse_model_string(&src).expect("per-CMT obs_scale + gradient = ad now parses");
+}
+
+// ── [scaling] undefined-identifier guard + TIME built-in (issue #1028) ──
+
+/// Every identifier a `[scaling]` expression cannot bind to a theta / eta /
+/// individual parameter / state is a **covariate**, and therefore a required data
+/// column. The Form C `y` half has registered them since #540; the Form B
+/// `obs_scale` half silently dropped them, so a typo (or a real covariate the data
+/// didn't carry) resolved to the covariate map's `0.0` default and the divisive
+/// scale turned every prediction into the `apply_scaling` NaN path — with nothing
+/// in `referenced_covariates` for `check_covariates` to catch. Registering the name
+/// is what makes `fit()` / `simulate()` / `predict()` refuse the model instead.
+#[test]
+fn scaling_obs_scale_registers_covariate_references() {
+    let src = analytical_model_with_scaling(Some("  obs_scale = V / TOTALLY_UNDEFINED_NAME\n"));
+    let model = parse_model_string(&src).expect("obs_scale expression parses");
+    assert!(
+        model
+            .referenced_covariates
+            .iter()
+            .any(|c| c == "TOTALLY_UNDEFINED_NAME"),
+        "an unbindable `obs_scale` identifier must become a required data column, \
+         got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// The per-CMT `obs_scale[CMT=N]` form registers its covariates too — the
+/// collection sits in `build_obs_scale_spec`, which both key forms route through.
+#[test]
+fn scaling_obs_scale_per_cmt_registers_covariate_references() {
+    let src = analytical_model_with_scaling(Some(
+        "  obs_scale[CMT=1] = SCALE_A\n  obs_scale[CMT=2] = SCALE_B\n",
+    ));
+    let model = parse_model_string(&src).expect("per-CMT obs_scale expression parses");
+    for name in ["SCALE_A", "SCALE_B"] {
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == name),
+            "`{name}` must be registered, got {:?}",
+            model.referenced_covariates
+        );
+    }
+}
+
+/// A bound name is *not* a covariate: `obs_scale = V` reads the individual
+/// parameter, so nothing is added to the required-column set. Guards the new
+/// collection against over-registering.
+#[test]
+fn scaling_obs_scale_indiv_param_is_not_a_covariate() {
+    let src = analytical_model_with_scaling(Some("  obs_scale = V / 10\n"));
+    let model = parse_model_string(&src).expect("obs_scale expression parses");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "an individual-parameter reference must not register as a data column, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// `obs_scale` is a subject-static divisor — `apply_scaling` evaluates it once per
+/// subject at t = 0 and divides the whole prediction vector by the result — so a
+/// `TIME` reference in it would always read the t=0 value. Reject it (naming Form C
+/// as the place for a time-dependent readout) rather than serve the silent
+/// collapse. Both spellings of the built-in are caught.
+#[test]
+fn scaling_obs_scale_rejects_the_time_builtin() {
+    for expr in ["TIME", "V * TIME", "T", "V + T"] {
+        let src = analytical_model_with_scaling(Some(&format!("  obs_scale = {expr}\n")));
+        let err =
+            parse_model_string(&src).expect_err("obs_scale referencing TIME must be rejected");
+        assert!(
+            err.contains("subject-static") && err.contains("y = <expr>"),
+            "error for `{expr}` must explain the subject-static divisor and point at \
+             Form C, got: {err}"
+        );
+    }
+}
+
+/// A Form C `y = <expr>` readout may reference `TIME` — it is evaluated per
+/// observation — so the parser must leave it alone and, crucially, must not
+/// register it as a data column.
+#[test]
+fn scaling_y_readout_accepts_the_time_builtin() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = central / V * TIME\n"),
+    );
+    let model = parse_model_string(&src).expect("Form C readout may reference TIME");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "`TIME` is a built-in, not a data column, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// Does the model's uniform Form C readout compile to a `PushTime` read? The
+/// direct discriminator for the `[scaling]` time built-in: `referenced_covariates`
+/// alone cannot tell "folded into `TIME`" from "bound to something else", since
+/// both leave it empty.
+fn readout_reads_time(model: &CompiledModel) -> bool {
+    let program = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.readout_program.as_ref())
+        .or_else(|| {
+            model
+                .analytic_readout
+                .as_ref()
+                .and_then(|a| a.program.as_ref())
+        })
+        .expect("uniform Form C readout carries a program");
+    program.bc.ops.iter().any(|op| matches!(op, Op::PushTime))
+}
+
+/// `T` / `t` is the `[odes]` spelling of the same built-in (reserved there against
+/// every state / indiv-param / intermediate name). `[scaling]` parses with
+/// `fallback_covariate = true`, so before #1028 a bare `T` landed as a covariate —
+/// a required column named `T`, or a silent zero. It now folds into the same
+/// `Expression::Time` node `TIME` produces, so the two blocks agree on the name.
+#[test]
+fn scaling_y_readout_accepts_the_t_time_alias() {
+    for alias in ["T", "t", "TIME", "time"] {
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some(&format!("  y = central / V * {alias}\n")),
+        );
+        let model =
+            parse_model_string(&src).expect("Form C readout may reference the T time alias");
+        assert!(
+            model.referenced_covariates.is_empty(),
+            "`{alias}` must fold into the TIME built-in, not register as a data \
+             column; got {:?}",
+            model.referenced_covariates
+        );
+        assert!(
+            readout_reads_time(&model),
+            "`{alias}` must compile to the model-time read"
+        );
+    }
+}
+
+/// The `T` fold targets `Covariate` leaves only, so a name the parse *did* bind
+/// keeps winning — an individual parameter named `T` still resolves to itself, and
+/// the readout compiles to a plain variable read rather than a model-time read.
+/// (Unreachable on ODE models, where `[odes]` rejects that name outright.)
+#[test]
+fn scaling_y_readout_t_alias_does_not_shadow_a_bound_name() {
+    let src = analytical_model_with_scaling(Some("  y = central / T\n"))
+        .replace("  V  = TVV\n", "  V  = TVV\n  T  = TVV / 2\n");
+    let model = parse_model_string(&src).expect("indiv param named T parses");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "an individual parameter named `T` must win over the time alias, got {:?}",
+        model.referenced_covariates
+    );
+    assert!(
+        !readout_reads_time(&model),
+        "an individual parameter named `T` must not be folded into the time built-in"
+    );
+}
+
+/// The `T` fold walks the whole expression tree, not just its top-level operands:
+/// `visit_expr_nodes_mut` has to recurse through every node kind that carries a
+/// child. This readout puts a `T` under each one — a compound `if` condition
+/// (`Conditional` over `Condition::And` over `Condition::Compare`) and both of its
+/// arms, a unary function argument (`UnaryFn`), and both sides of a power
+/// (`Power`) — so a missed arm leaves a stray `Covariate("T")` behind and shows up
+/// as a spurious required data column.
+#[test]
+fn scaling_y_readout_folds_the_t_alias_under_every_node_kind() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = if (T > 1 && T < 100) exp(-T) * (T ^ T) else central / V + sqrt(T)\n"),
+    );
+    let model = parse_model_string(&src).expect("nested T references parse");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "every `T` must fold into the time built-in, whatever node it sits under; \
+         got {:?}",
+        model.referenced_covariates
+    );
+    assert!(
+        readout_reads_time(&model),
+        "the folded readout must compile to the model-time read"
+    );
+}
+
+/// A `[scaling]` `y` covariate has been a required data column since #540, so a
+/// dataset with a real column named `T` and a readout like `y = central/V * T`
+/// worked before #1028 — and the alias fold must not silently repoint it at the
+/// clock. Declaring `T` in `[covariates]` is the explicit escape hatch: the name
+/// then keeps its data-column meaning, exactly as a bound state or individual
+/// parameter does.
+#[test]
+fn scaling_y_readout_t_alias_loses_to_a_declared_covariate() {
+    for alias in ["T", "t"] {
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some(&format!("  y = central / V * {alias}\n")),
+        ) + &format!("\n[covariates]\n  {alias} continuous\n");
+        let model = parse_model_string(&src).expect("a declared T covariate parses");
+        assert_eq!(
+            model.referenced_covariates,
+            vec![alias.to_string()],
+            "a `[covariates]`-declared `{alias}` must stay a required data column"
+        );
+        assert!(
+            !readout_reads_time(&model),
+            "a declared `{alias}` must not be folded into the model-time built-in"
+        );
+    }
+}
+
+/// The alias collapses `T` and `t` into one built-in, so the declaration that
+/// protects it has to be matched the same way. A case-exact guard let
+/// `[covariates] T` fail to protect a `y = ... t ...` reference — silently folding
+/// it to the clock even though the user took the documented escape hatch — and, in
+/// `obs_scale`, raised the `TIME`-rejection error against a legitimately declared
+/// column. Both spellings of the declaration must cover both spellings of the
+/// reference (#1042 review).
+#[test]
+fn scaling_time_alias_declaration_is_case_insensitive() {
+    for declared in ["T", "t"] {
+        for used in ["T", "t"] {
+            let src = ode_model_with_scaling(
+                "ode(states=[depot, central])",
+                Some(&format!("  y = central / V * {used}\n")),
+            ) + &format!("\n[covariates]\n  {declared} continuous\n");
+            let model = parse_model_string(&src)
+                .unwrap_or_else(|e| panic!("declared `{declared}`, used `{used}`: {e}"));
+            assert_eq!(
+                model.referenced_covariates,
+                vec![used.to_string()],
+                "declared `{declared}` must protect the `{used}` reference"
+            );
+            assert!(
+                !readout_reads_time(&model),
+                "declared `{declared}`, used `{used}`: must not fold to the clock"
+            );
+        }
+    }
+}
+
+/// The same case-insensitivity on the `obs_scale` side, where the mismatch was not
+/// a silent fold but a hard error thrown at a column the model legitimately
+/// declared.
+#[test]
+fn obs_scale_time_rejection_respects_a_case_mismatched_declaration() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  obs_scale = 1000 / t\n  y = central\n"),
+    ) + "\n[covariates]\n  T continuous\n";
+    let model = parse_model_string(&src).expect("a declared `T` column is not the TIME built-in");
+    assert_eq!(model.referenced_covariates, vec!["t".to_string()]);
+}
+
+/// …and when the fold *does* fire (no declaration), it says so. The undeclared
+/// case is the one the parser cannot disambiguate — a dataset column named `T` is
+/// only a warning elsewhere — so the note names both escapes: spell it `TIME`, or
+/// declare the column.
+#[test]
+fn scaling_y_readout_t_alias_fold_warns() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = central / V * T\n"),
+    );
+    let model = parse_model_string(&src).expect("the T alias parses");
+    let note = model
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("model-time built-in"))
+        .unwrap_or_else(|| panic!("expected a fold warning, got {:?}", model.parse_warnings));
+    assert!(
+        note.contains("[covariates]"),
+        "warning must name the escape hatch: {note}"
+    );
+
+    // Spelling it `TIME` is unambiguous and must not warn.
+    let src_time = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = central / V * TIME\n"),
+    );
+    let model_time = parse_model_string(&src_time).expect("TIME parses");
+    assert!(
+        !model_time
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("model-time built-in")),
+        "the unambiguous `TIME` spelling must not warn, got {:?}",
+        model_time.parse_warnings
+    );
+}
+
+/// `[odes]` reserves `TIME`/`T`/`TAFD`/`TAD`/`MACHEPS`, but only `TIME` (and its
+/// `T` alias) is a `[scaling]` built-in. `TAFD`/`TAD`/`MACHEPS` stay **ordinary
+/// covariates** here — documented behaviour (`docs/model-file/scaling.qmd`), so a
+/// dataset that really carries a `TAD` column can use it. This pins that: they
+/// register as required data columns and are not folded into anything.
+#[test]
+fn scaling_odes_only_builtins_stay_covariates() {
+    for builtin in ["TAFD", "TAD", "MACHEPS"] {
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some(&format!("  y = central / V + {builtin}\n")),
+        );
+        let model = parse_model_string(&src).expect("an [odes]-only name parses as a covariate");
+        assert_eq!(
+            model.referenced_covariates,
+            vec![builtin.to_string()],
+            "`{builtin}` must register as a required data column in [scaling]"
+        );
+        assert!(
+            !readout_reads_time(&model),
+            "`{builtin}` must not resolve to the model-time built-in"
+        );
+    }
 }
 
 #[test]

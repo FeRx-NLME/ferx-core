@@ -2423,11 +2423,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .get("simulation")
         .map(|lines| parse_simulation_block(lines))
         .transpose()?;
+    // Peek the `[covariates]` declarations (parsed for real further down, at the
+    // block's own site) purely for name precedence: a declared `T` / `t` is a data
+    // column, not the `[odes]` model-time alias, in `[scaling]` and in
+    // `[adaptive_dosing] observe` alike (#1028). Peeked rather than hoisted so a
+    // malformed `[covariates]` block still reports its own error at its own site, in
+    // the existing order — hence the `.ok()`.
+    let declared_covariate_names: Vec<String> = blocks
+        .get("covariates")
+        .and_then(|lines| parse_covariates_block(lines).ok())
+        .map(|decls| decls.into_iter().map(|d| d.name).collect())
+        .unwrap_or_default();
     // Declarative reactive-dosing controller (#391 S2). Parsed and validated here;
     // compiled to a controller and run by the adaptive simulate path in a later slice.
     let adaptive_dosing = blocks
         .get("adaptive_dosing")
-        .map(|lines| parse_adaptive_dosing_block(lines))
+        .map(|lines| parse_adaptive_dosing_block(lines, &declared_covariate_names))
         .transpose()?;
     let mut fit_options = if let Some(lines) = blocks.get("fit_options") {
         parse_fit_options(lines)?
@@ -2541,6 +2552,20 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.indiv_param_names,
             "[adaptive_dosing] observe",
         )?;
+        // The `T` / `t` model-time fold warns wherever it fires — but `observe` is
+        // compiled at *simulate* time (`sim::adaptive_control::compile_observe`), long
+        // after `parse_warnings` is sealed, and the adaptive result has no warnings
+        // channel of its own. Emit the note here instead, from the same helper the
+        // compiler will run, so the fold is not silent on this one path (#1028).
+        warn_if_time_alias_folds(
+            observe,
+            "[adaptive_dosing] observe",
+            &model.theta_names,
+            &model.eta_names,
+            &model.indiv_param_names,
+            &declared_covariate_names,
+            &mut model.parse_warnings,
+        );
         if let Some(ode) = model.ode_spec.as_ref() {
             let n_states = ode.state_names.len();
             check_dose_attr_double_use(
@@ -2696,6 +2721,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.kappa_names,
             &readout_synth_params,
             volume_indiv_name_for_scaling.as_deref(),
+            &declared_covariate_names,
             &mut scaling_parse_warnings,
         )?;
         model.parse_warnings.extend(scaling_parse_warnings);
@@ -5663,7 +5689,10 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
 /// is the S2.2 step. The one ambiguity this parser *can* settle without the model
 /// — `with_assay_error` on an expression `observe` with no designated endpoint —
 /// is rejected here rather than left to guess a σ downstream.
-fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, String> {
+fn parse_adaptive_dosing_block(
+    lines: &[String],
+    declared_covariates: &[String],
+) -> Result<AdaptiveDosingSpec, String> {
     let mut observe: Option<String> = None;
     let mut with_assay_error = false;
     let mut assay_cmt: Option<usize> = None;
@@ -5828,6 +5857,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
     // controller with a contradiction the parser would have rejected here.
     let spec = AdaptiveDosingSpec {
         observe,
+        observe_declared_covariates: declared_covariates.to_vec(),
         with_assay_error,
         assay_cmt,
         at,
@@ -6555,6 +6585,20 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "n_mh_steps" => opts.saem_n_mh_steps = parse_usize("n_mh_steps")?,
         "n_leapfrog" | "saem_n_leapfrog" => opts.saem_n_leapfrog = parse_usize("n_leapfrog")?,
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
+        "mstep_damping" | "saem_mstep_damping" => {
+            let v = parse_f64(key)?;
+            // `1.0` is the documented "off" value (the pre-#1011 assignment), so
+            // the range is half-open at the bottom and closed at the top.
+            // Report back the spelling the user wrote, and the value they wrote,
+            // the way the neighbouring range validators do.
+            if !(v > 0.0 && v <= 1.0) {
+                return Err(format!(
+                    "fit option `{key}` must be in (0, 1] — smaller damps the SAEM numerical \
+                     θ/σ M-step harder, 1.0 disables the damping (#1011), got {v}"
+                ));
+            }
+            opts.saem_mstep_damping = Some(v);
+        }
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
         "conddist" | "saem_conddist" => opts.saem_conddist = parse_bool("conddist")?,
         "conddist_nsamp" => opts.saem_conddist_nsamp = parse_usize("conddist_nsamp")?,
@@ -6987,8 +7031,9 @@ fn build_obs_scale_spec(
     indiv_var_names: &[String],
     pk_indices: &[usize],
     volume_indiv_name: Option<&str>,
+    declared_covariates: &[String],
     parse_warnings: &mut Vec<String>,
-) -> Result<ScalingSpec, String> {
+) -> Result<(ScalingSpec, Vec<String>), String> {
     // Try scalar first (Form A). Otherwise parse as expression (Form B).
     if let Ok(k) = value.parse::<f64>() {
         // Divisor — strictly positive. A negative scale would flip every
@@ -6999,11 +7044,30 @@ fn build_obs_scale_spec(
                 value
             ));
         }
-        return Ok(ScalingSpec::ScalarScale(k));
+        return Ok((ScalingSpec::ScalarScale(k), Vec::new()));
     }
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
     let expr =
         parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] obs_scale: {}", e))?;
+    // `obs_scale` is a **subject-static** divisor: `apply_scaling` evaluates it once
+    // per subject against the baseline covariate map and a `t = 0` `pk_param_fn`
+    // snapshot, then divides the whole prediction vector by the result. A `TIME`
+    // reference in it would therefore read whatever the model-time thread-local
+    // happened to hold — in practice the `0.0` default — and silently scale every
+    // observation by the t=0 value. Reject it rather than serve that (#1028); a
+    // genuinely time-dependent readout is Form C's job, where `TIME` resolves per
+    // observation.
+    if expr_references_time_builtin(&expr, declared_covariates) {
+        return Err(format!(
+            "[scaling] obs_scale: `{}` references the `TIME` built-in (or its `T` alias), \
+             but `obs_scale` is a subject-static divisor — it is evaluated once per \
+             subject at t = 0 and applied to every observation, so `TIME` would always \
+             read 0. Write the time-dependent readout as Form C instead \
+             (`y = <expr>`, or `y[CMT=N] = <expr>`), where `TIME` resolves to each \
+             observation's own time. See issue #1028.",
+            value.trim()
+        ));
+    }
     if let Some(vname) = volume_indiv_name {
         let mut references_volume = false;
         visit_expr_nodes(&expr, &mut |e| {
@@ -7027,6 +7091,19 @@ fn build_obs_scale_spec(
             ));
         }
     }
+    // Covariate leaves — every identifier the parse could not bind to a theta, an
+    // eta, or an individual parameter. The `scale_fn` below reads them straight out
+    // of the per-subject covariate map, so they are required data columns and must
+    // be registered as such (issue #1028). Before this they were silently dropped:
+    // a typo'd name (or a real covariate the data didn't carry) resolved to the
+    // map's `0.0` default, and the divisive scale then turned every prediction into
+    // `x / 0` → the `apply_scaling` NaN/zero path, with no diagnostic. The `y`
+    // (Form C) half of `[scaling]` has registered its covariates since #540; this
+    // closes the `obs_scale` half. Returned unsorted — `register_referenced_covariates`
+    // pools and re-sorts.
+    let mut cov_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_covariates(&expr, &mut cov_set);
+    let covariates_ref: Vec<String> = cov_set.into_iter().collect();
     // Pre-resolve indiv param name → PK slot so the closure can look up
     // `pk.values[slot]` for each `Expression::Variable(name)`. Mirrors
     // the analytical Form B path from Phase 1.5.
@@ -7062,7 +7139,10 @@ fn build_obs_scale_spec(
             eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
         },
     );
-    Ok(ScalingSpec::ExpressionScale { scale_fn, deriv })
+    Ok((
+        ScalingSpec::ExpressionScale { scale_fn, deriv },
+        covariates_ref,
+    ))
 }
 
 /// Resolve a `[initial_conditions] init(NAME)` compartment name to a 1-based
@@ -7310,6 +7390,128 @@ fn parse_initial_conditions_block(
     Ok((out, init_covariates))
 }
 
+/// Fold the `[odes]` model-time alias `T` / `t` into the same `Expression::Time`
+/// node a bare `TIME` produces, so a `[scaling]` expression spells the built-in
+/// the way `[odes]` does (issue #1028).
+///
+/// `[odes]` reserves `TIME`/`T`/`t` for the solver clock and rejects any state,
+/// individual parameter, or intermediate that collides with them. `[scaling]`
+/// parses with `fallback_covariate = true`, so `TIME` was already special-cased by
+/// `parse_atom` but a bare `T` landed as `Covariate("T")` — a required data column
+/// named `T` if the dataset happened to carry one, and otherwise (before the
+/// undefined-name guard) a silent zero. Only `Covariate` leaves are folded:
+/// a state or individual parameter genuinely named `T` resolves to `Variable("T")`
+/// during the parse and keeps winning, matching the usual name-resolution
+/// precedence (the ODE-model case can't arise — `[odes]` rejects that name).
+///
+/// Two further guards keep the fold from *taking* a name that means something
+/// else. A `[scaling]` `y` covariate has been a required data column since #540,
+/// so a dataset with a real column named `T` used to work and must keep working:
+///
+/// 1. a `T` / `t` listed in `declared_covariates` (the `[covariates]` block) is a
+///    data column by explicit declaration and is left as `Covariate` — the same
+///    precedence a bound state or individual parameter gets; and
+/// 2. when the fold does fire it pushes a `parse_warnings` note naming that escape
+///    hatch, so a model that meant the column — and did not declare it, which is
+///    only a warning elsewhere — is told rather than silently re-pointed at the
+///    clock. Spelling it `TIME` clears the warning.
+fn rewrite_scaling_time_alias(
+    expr: &mut Expression,
+    context: &str,
+    declared_covariates: &[String],
+    parse_warnings: &mut Vec<String>,
+) {
+    let mut folded: Option<String> = None;
+    visit_expr_nodes_mut(expr, &mut |e: &mut Expression| {
+        if let Expression::Covariate(name) = e {
+            if is_time_alias(name) && !declares_time_alias(declared_covariates) {
+                if folded.is_none() {
+                    folded = Some(name.clone());
+                }
+                *e = Expression::Time;
+            }
+        }
+    });
+    if let Some(name) = folded {
+        parse_warnings.push(format!(
+            "{context}: `{name}` resolved as the model-time built-in (the `[odes]` alias \
+             for `TIME`), not as a data column. Spell it `TIME` to silence this; if your \
+             dataset really has a column named `{name}`, declare it in `[covariates]` and \
+             it will be read as the column instead. See issue #1028."
+        ));
+    }
+}
+
+/// Run [`rewrite_scaling_time_alias`] on a *throwaway* parse of `src` purely to
+/// collect the warning it would emit, discarding the rewritten expression.
+///
+/// For `[adaptive_dosing] observe`, which is stored as a raw string and compiled at
+/// simulate time — where `parse_warnings` is long sealed and the adaptive result has
+/// no warnings channel — this is what keeps the fold from being silent on that path.
+/// The expression is re-parsed rather than duplicating the alias test, so the note
+/// can never disagree with the fold that actually happens (#1028). A parse failure is
+/// ignored: the real compile reports it, with its own context.
+#[allow(clippy::too_many_arguments)]
+fn warn_if_time_alias_folds(
+    src: &str,
+    context: &str,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    declared_covariates: &[String],
+    parse_warnings: &mut Vec<String>,
+) {
+    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
+    if let Ok(mut expr) = parse_scalar_expression(src, ctx) {
+        rewrite_scaling_time_alias(&mut expr, context, declared_covariates, parse_warnings);
+    }
+}
+
+/// Whether `expr` reads the model-time built-in, under either spelling: the
+/// `Expression::Time` node a bare `TIME` parses to, or the `T` / `t` alias
+/// [`rewrite_scaling_time_alias`] folds into it. Drives the `obs_scale`
+/// rejection (#1028) — see [`build_obs_scale_spec`].
+///
+/// `declared_covariates` gets the same precedence it gets in the fold: a `T`
+/// declared in `[covariates]` is a data column, not the clock, so it does not
+/// trip the rejection.
+fn expr_references_time_builtin(expr: &Expression, declared_covariates: &[String]) -> bool {
+    let mut found = false;
+    visit_expr_nodes(expr, &mut |e: &Expression| match e {
+        Expression::Time => found = true,
+        Expression::Covariate(n)
+            if is_time_alias(n) && !declares_time_alias(declared_covariates) =>
+        {
+            found = true
+        }
+        _ => {}
+    });
+    found
+}
+
+/// Whether `name` is the `[odes]` model-time alias, i.e. `T` under either case.
+/// The two spellings are one built-in, so every guard that keys on the alias must
+/// treat them as one name.
+fn is_time_alias(name: &str) -> bool {
+    name == "T" || name == "t"
+}
+
+/// Whether `[covariates]` declares the model-time alias, in *either* case.
+///
+/// Deliberately case-insensitive while ordinary covariate resolution is
+/// case-sensitive: since [`is_time_alias`] collapses `T` and `t` into one
+/// built-in, a case-exact check would let `[covariates] T` fail to protect a
+/// `y = ... t ...` reference (silently folding it to the clock even though the
+/// user took the documented escape hatch) and, in `obs_scale`, would raise the
+/// `TIME`-rejection error against a legitimately declared column. Matching the
+/// declaration the same way the reference is matched keeps the escape hatch
+/// working for both spellings (#1028).
+fn declares_time_alias(declared_covariates: &[String]) -> bool {
+    declared_covariates
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case("T"))
+}
+
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
 /// the uniform and per-CMT paths.
 #[allow(clippy::too_many_arguments)]
@@ -7324,6 +7526,8 @@ pub(crate) fn build_y_output_fn(
     kappa_names: &[String],
     readout_synth: &[ReadoutSynthParam],
     forbidden_state_names: &[String],
+    declared_covariates: &[String],
+    parse_warnings: &mut Vec<String>,
 ) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram, Vec<String>), String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
@@ -7335,6 +7539,13 @@ pub(crate) fn build_y_output_fn(
     }
     let ctx = ParseCtx::new(theta_names, eta_names, &defined);
     let mut expr = parse_scalar_expression(value, ctx).map_err(|e| format!("{context}: {e}"))?;
+
+    // `T` / `t` is the `[odes]` spelling of the model-time built-in; fold it into
+    // the `Expression::Time` node a bare `TIME` already parses to, so the two
+    // blocks agree on the name (#1028). Runs before the covariate scan below so
+    // the alias never registers as a required data column — unless `[covariates]`
+    // declares it, in which case it stays the data column it was declared to be.
+    rewrite_scaling_time_alias(&mut expr, context, declared_covariates, parse_warnings);
 
     // Analytic Form C (#650): reject a readout that references a peripheral (or a
     // depot/transit amount with no closed form) — the analytical solutions don't
@@ -7538,6 +7749,12 @@ pub(crate) fn build_y_output_fn(
 ///   `y[CMT=N] = <expr>` and uniform `y = <expr>` syntaxes both go here
 ///   (`OdeReadout::PerCmt` vs `OdeReadout::Single` respectively), and
 ///   replace the default `OdeReadout::ObsCmt(idx)` state-index readout.
+/// - The trailing `Vec<String>` is every covariate name referenced across the
+///   block — **both** the Form C `y` readouts and the Form B `obs_scale`
+///   expressions (#1028). The caller registers them via
+///   `register_referenced_covariates`, which is what makes an identifier the
+///   parse could not bind to a theta / eta / individual parameter / state a
+///   *required data column* rather than a silent `0.0`.
 ///
 /// `is_ode = true` enables Form C and lets expressions reference state names.
 /// `pk_indices` is parallel to `indiv_var_names`: `pk_indices[i]` is the
@@ -7551,11 +7768,19 @@ pub(crate) fn build_y_output_fn(
 /// - Mixing uniform (`obs_scale = K`) with per-CMT (`obs_scale[CMT=N] = K`)
 ///   within the same group → error.
 /// - Duplicate `[CMT=N]` keys → error.
+/// - `obs_scale` referencing the `TIME` built-in (or its `T` alias) → error: the
+///   divisor is subject-static, so `TIME` would always read the t=0 default
+///   (#1028). Form C `y = <expr>` is where a time-dependent readout belongs.
 /// - `obs_scale` referencing the same individual parameter bound to a built-in
 ///   `pk <model>(...)` block's `v`/`v1` role → **warning** (`parse_warnings`),
 ///   not an error: it's a supported feature, but also the signature of a
 ///   common mistake (a leftover `obs_scale = V` from an `ode(...)`
 ///   translation) — see [`build_obs_scale_spec`] (#712).
+///
+/// `declared_covariates` is the `[covariates]` block's name list (empty when the
+/// block is absent). It only affects name *precedence*: a `T` / `t` declared there
+/// is a data column and is read as one, instead of being folded into the
+/// model-time built-in (#1028).
 #[allow(clippy::too_many_arguments)]
 fn parse_scaling_block(
     lines: &[String],
@@ -7569,6 +7794,7 @@ fn parse_scaling_block(
     kappa_names: &[String],
     readout_synth: &[ReadoutSynthParam],
     volume_indiv_name: Option<&str>,
+    declared_covariates: &[String],
     parse_warnings: &mut Vec<String>,
 ) -> Result<
     (
@@ -7591,7 +7817,7 @@ fn parse_scaling_block(
     // per-CMT readouts carry their own program inside each `PerCmtReadout` (#439),
     // so the analytic-sensitivity provider can differentiate each endpoint.
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
-    let mut y_covariates: Vec<String> = Vec::new();
+    let mut scaling_covariates: Vec<String> = Vec::new();
 
     for line in lines {
         let trimmed = line.trim();
@@ -7606,15 +7832,24 @@ fn parse_scaling_block(
 
         match base {
             "obs_scale" => {
-                let spec = build_obs_scale_spec(
+                let (spec, cov_names) = build_obs_scale_spec(
                     value,
                     theta_names,
                     eta_names,
                     indiv_var_names,
                     pk_indices,
                     volume_indiv_name,
+                    declared_covariates,
                     parse_warnings,
                 )?;
+                // Form B `obs_scale` covariate leaves are required data columns too
+                // (#1028) — pooled into the same list the Form C `y` readout feeds,
+                // so both halves of `[scaling]` reach `register_referenced_covariates`.
+                for cov in cov_names {
+                    if !scaling_covariates.contains(&cov) {
+                        scaling_covariates.push(cov);
+                    }
+                }
                 match cmt_opt {
                     None => {
                         if obs_scale_uniform.is_some() {
@@ -7665,10 +7900,12 @@ fn parse_scaling_block(
                     kappa_names,
                     readout_synth,
                     &forbidden,
+                    declared_covariates,
+                    parse_warnings,
                 )?;
                 for cov in cov_names {
-                    if !y_covariates.contains(&cov) {
-                        y_covariates.push(cov);
+                    if !scaling_covariates.contains(&cov) {
+                        scaling_covariates.push(cov);
                     }
                 }
                 match cmt_opt {
@@ -7744,8 +7981,8 @@ fn parse_scaling_block(
         );
     }
 
-    y_covariates.sort();
-    Ok((scaling, readout, readout_program, y_covariates))
+    scaling_covariates.sort();
+    Ok((scaling, readout, readout_program, scaling_covariates))
 }
 
 // ── ode_template desugaring + the analytical+ODE-only-absorption error rule ──
@@ -10021,6 +10258,231 @@ struct ParsedKappas {
 
 // --- Block extraction ---
 
+/// Which header form a `[block]` accepts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlockForm {
+    /// `[name]` only.
+    Unnamed,
+    /// `[name]` or `[name INSTANCE]` — several instances may coexist.
+    Either,
+    /// `[name INSTANCE]` only.
+    Named,
+}
+
+/// Every `[block]` name the parser reads, with the header form it accepts and
+/// the cargo feature it needs (`None` = always compiled in).
+///
+/// This is the closed-world registry behind `E_UNKNOWN_BLOCK` (#1040). Blocks
+/// are consumed by *name lookup* — `blocks.get("fit_options")` and friends —
+/// never by an exhaustive match, so without this table a block the parser does
+/// not know is simply never read: a misspelled `[fit_option]` used to leave
+/// `ferx check` reporting `valid: true` while the fit silently ran with the
+/// default method and no covariance step. Keys inside a block are already
+/// closed-world (`[event_model]: unknown key ...`); this closes the same door
+/// on the block names themselves.
+///
+/// **Teaching the parser a new block means adding it here in the same PR** —
+/// otherwise the new block is rejected as unknown.
+///
+/// `covariate_nn` carries no feature here on purpose: it has its own, more
+/// specific `E_NN_FEATURE_DISABLED` error (which points at the design doc)
+/// raised further down in `parse_full_model`.
+const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
+    ("adaptive_dosing", BlockForm::Unnamed, None),
+    ("binary_model", BlockForm::Either, Some("survival")),
+    ("covariate_nn", BlockForm::Named, None),
+    ("covariates", BlockForm::Unnamed, None),
+    ("data", BlockForm::Unnamed, None),
+    ("data_selection", BlockForm::Unnamed, None),
+    ("derived", BlockForm::Unnamed, None),
+    ("diffusion", BlockForm::Unnamed, None),
+    ("error_model", BlockForm::Unnamed, None),
+    ("event_model", BlockForm::Either, Some("survival")),
+    ("fit_options", BlockForm::Unnamed, None),
+    ("individual_parameters", BlockForm::Unnamed, None),
+    ("initial_conditions", BlockForm::Unnamed, None),
+    ("markov_model", BlockForm::Either, Some("markov")),
+    ("mixture", BlockForm::Unnamed, None),
+    ("odes", BlockForm::Unnamed, None),
+    ("output", BlockForm::Unnamed, None),
+    ("parameters", BlockForm::Unnamed, None),
+    ("scaling", BlockForm::Unnamed, None),
+    ("simulation", BlockForm::Unnamed, None),
+    ("structural_model", BlockForm::Unnamed, None),
+];
+
+/// Blocks that *were* ferx syntax and are no longer read, with the remediation
+/// to print. Kept separate from [`BLOCK_REGISTRY`] because they are neither
+/// valid (they must not appear in the "valid blocks" enumeration) nor unknown
+/// (a bare "unknown block, did you mean …" is unhelpful for something that was
+/// once the documented spelling, and the nearest valid name is often far enough
+/// away that no did-you-mean fires at all).
+///
+/// `initial_values` is the one live case: initial estimates moved inline into
+/// `[parameters]`, the parser stopped reading the block, and — because unknown
+/// names were silently dropped — nothing ever said so. `ferx-r` still lists it
+/// in its section docs and three of its checked-in example models still carry
+/// one, so this fires for real files (#1040).
+const DEPRECATED_BLOCKS: &[(&str, &str)] = &[(
+    "initial_values",
+    "initial estimates are declared inline in `[parameters]` \
+     (`theta NAME(init, lower, upper)`, `omega NAME ~ variance`); \
+     the block has not been read for several releases — delete it",
+)];
+
+/// The name of every `[block]` **this build** of the parser will accept, in the
+/// order they appear in the error message (alphabetical).
+///
+/// Feature-gated blocks are filtered out when their feature is off: a default
+/// build cannot use `[event_model]`, so listing it as valid would advertise a
+/// name the same binary then rejects with `E_BLOCK_FEATURE_DISABLED`. The
+/// registry itself still *recognises* those names in every build — that is what
+/// makes the rejection a specific "build with `--features …`" error rather than
+/// a bare "unknown block".
+///
+/// Exposed so downstream consumers (`ferx-r`'s `ferx_model_validate()`,
+/// `ferxtranslate`) can source the block list from the engine instead of
+/// keeping their own copy — the duplicated R-side list had already drifted
+/// from this one (#1040). Because the result is build-dependent, a consumer
+/// must read it from the same binary it will parse with.
+pub fn known_block_names() -> Vec<&'static str> {
+    BLOCK_REGISTRY
+        .iter()
+        .filter(|(_, _, feature)| feature.is_none_or(block_feature_enabled))
+        .map(|(n, _, _)| *n)
+        .collect()
+}
+
+/// Whether the cargo feature a registry entry names is enabled in this build.
+fn block_feature_enabled(feature: &str) -> bool {
+    match feature {
+        "survival" => cfg!(feature = "survival"),
+        "markov" => cfg!(feature = "markov"),
+        "nn" => cfg!(feature = "nn"),
+        // An unrecognised feature name can only be a registry typo; treating it
+        // as enabled keeps a mistake here from rejecting a valid model.
+        _ => true,
+    }
+}
+
+/// Levenshtein distance, used only to offer a did-you-mean for a misspelled
+/// block name.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The registry name closest to `name`, when one is close enough to be worth
+/// suggesting: an edit distance of at most 2, or a plain prefix relationship
+/// (which catches `fit_option` → `fit_options` and `param` → `parameters`).
+pub(crate) fn nearest_block_name(name: &str) -> Option<&'static str> {
+    BLOCK_REGISTRY
+        .iter()
+        .map(|(n, _, _)| *n)
+        .filter(|n| n.starts_with(name) || name.starts_with(*n) || edit_distance(name, n) <= 2)
+        .min_by_key(|n| edit_distance(name, n))
+}
+
+/// Reject any `[block]` header the parser would otherwise drop on the floor.
+///
+/// `headers` is every header seen, in source order, as
+/// `(type, instance, 1-based line)`. Four silent-drop shapes are caught, in
+/// the order a user is most likely to hit them:
+///
+/// 1. a block that was ferx syntax and is no longer read
+///    (`E_DEPRECATED_BLOCK`),
+/// 2. an unrecognised block name (`E_UNKNOWN_BLOCK`),
+/// 3. a known block written in the wrong header form — an instance name on a
+///    block that takes none, or a missing one on `[covariate_nn NAME]`
+///    (`E_BLOCK_INSTANCE_NAME`),
+/// 4. a known block whose cargo feature this binary was not built with
+///    (`E_BLOCK_FEATURE_DISABLED`).
+///
+/// All findings of the first non-empty class are reported together, so an
+/// author fixing a batch of typos sees them in one pass.
+fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), String> {
+    let mut deprecated: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    let mut wrong_form: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
+    let mut seen: Vec<(&str, Option<&str>)> = Vec::new();
+
+    for (ty, instance, line) in headers {
+        // Report each distinct header once, however many times it is repeated.
+        // Keyed on the instance name too, so `[foo A]` and `[foo B]` are two
+        // findings rather than one entry that names only the first.
+        let key = (ty.as_str(), instance.as_deref());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        // Echo the header exactly as written, instance name included, so the
+        // text is greppable in the user's own file.
+        let header = match instance {
+            Some(inst) => format!("[{ty} {inst}]"),
+            None => format!("[{ty}]"),
+        };
+        if let Some((name, remedy)) = DEPRECATED_BLOCKS.iter().find(|(n, _)| *n == ty) {
+            deprecated.push(format!(
+                "`[{name}]` (line {line}) is no longer read: {remedy}"
+            ));
+            continue;
+        }
+        let Some((name, form, feature)) = BLOCK_REGISTRY.iter().find(|(n, _, _)| n == ty) else {
+            let hint = match nearest_block_name(ty) {
+                Some(near) => format!(" — did you mean `[{near}]`"),
+                None => String::new(),
+            };
+            unknown.push(format!("`{header}` (line {line}){hint}"));
+            continue;
+        };
+        match (form, instance) {
+            (BlockForm::Unnamed, Some(inst)) => wrong_form.push(format!(
+                "`[{name} {inst}]` (line {line}) does not take an instance name — write `[{name}]`"
+            )),
+            (BlockForm::Named, None) => wrong_form.push(format!(
+                "`[{name}]` (line {line}) requires an instance name — write `[{name} NAME]`"
+            )),
+            _ => {}
+        }
+        if let Some(feature) = feature {
+            if !block_feature_enabled(feature) {
+                disabled.push(format!(
+                    "`[{name}]` (line {line}) requires building ferx-core with `--features {feature}`"
+                ));
+            }
+        }
+    }
+
+    if !deprecated.is_empty() {
+        return Err(format!("Deprecated block {}.", deprecated.join("; ")));
+    }
+    if !unknown.is_empty() {
+        return Err(format!(
+            "Unknown block {}. Valid blocks: {}.",
+            unknown.join("; "),
+            known_block_names().join(", ")
+        ));
+    }
+    if !wrong_form.is_empty() {
+        return Err(format!("Block {}.", wrong_form.join("; ")));
+    }
+    if !disabled.is_empty() {
+        return Err(format!("Block {}.", disabled.join("; ")));
+    }
+    Ok(())
+}
+
 fn extract_model_name(content: &str) -> String {
     let re = Regex::new(r"(?m)^\s*model\s+(\w+)").unwrap();
     re.captures(content)
@@ -10064,6 +10526,10 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
         Named { ty: String, name: String },
     }
     let mut current: Option<BlockTarget> = None;
+    // Every header seen, in source order, as `(type, instance, 1-based line)`.
+    // Validated against `BLOCK_REGISTRY` once the whole file has been scanned
+    // (#1040) so a misspelled block name is an error rather than a silent drop.
+    let mut headers: Vec<(String, Option<String>, usize)> = Vec::new();
 
     for (idx, line) in content.lines().enumerate() {
         let without_comment = match line.find('#').into_iter().chain(line.find("//")).min() {
@@ -10077,6 +10543,11 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
 
         if let Some(caps) = block_re.captures(trimmed) {
             let ty = caps[1].to_lowercase();
+            headers.push((
+                ty.clone(),
+                caps.get(2).map(|m| m.as_str().to_string()),
+                idx + 1,
+            ));
             current = match caps.get(2) {
                 Some(m) => Some(BlockTarget::Named {
                     ty,
@@ -10113,6 +10584,8 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
             None => { /* lines before any block header are ignored */ }
         }
     }
+
+    check_block_names(&headers)?;
 
     Ok(out)
 }
@@ -12715,7 +13188,11 @@ pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-fn current_model_time() -> f64 {
+/// The model-time thread-local `Expression::Time` / `Op::PushTime` resolves
+/// against. `pub(crate)` so a hand-built `OdeReadout::Single` test closure can
+/// observe the same value a compiled readout would (the readout closure signature
+/// carries no `time` argument — the guard is the channel).
+pub(crate) fn current_model_time() -> f64 {
     MODEL_TIME.with(std::cell::Cell::get)
 }
 
@@ -12877,6 +13354,48 @@ fn visit_expr_nodes(expr: &Expression, f: &mut dyn FnMut(&Expression)) {
             visit_expr_nodes(e, f);
         }
         _ => {}
+    }
+}
+
+/// Mutable twin of [`visit_expr_nodes`] — same pre-order shape, but `f` may
+/// **replace** the node it is handed. Backs the in-place node rewrites
+/// (`rewrite_scaling_time_alias`) that run between parse and index resolution.
+/// Recursion happens after `f` returns, so a replacement node's children are
+/// visited too; a rewrite that could re-fire on its own output must therefore be
+/// idempotent (all current ones replace a leaf with a leaf).
+fn visit_expr_nodes_mut(expr: &mut Expression, f: &mut dyn FnMut(&mut Expression)) {
+    f(expr);
+    match expr {
+        Expression::BinOp(lhs, _, rhs) => {
+            visit_expr_nodes_mut(lhs, f);
+            visit_expr_nodes_mut(rhs, f);
+        }
+        Expression::UnaryFn(_, arg) => visit_expr_nodes_mut(arg, f),
+        Expression::Power(base, exp) => {
+            visit_expr_nodes_mut(base, f);
+            visit_expr_nodes_mut(exp, f);
+        }
+        Expression::Conditional(cond, t, e) => {
+            visit_condition_nodes_mut(cond, f);
+            visit_expr_nodes_mut(t, f);
+            visit_expr_nodes_mut(e, f);
+        }
+        _ => {}
+    }
+}
+
+/// Condition companion of [`visit_expr_nodes_mut`].
+fn visit_condition_nodes_mut(cond: &mut Condition, f: &mut dyn FnMut(&mut Expression)) {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            visit_expr_nodes_mut(l, f);
+            visit_expr_nodes_mut(r, f);
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            visit_condition_nodes_mut(l, f);
+            visit_condition_nodes_mut(r, f);
+        }
+        Condition::Not(c) => visit_condition_nodes_mut(c, f),
     }
 }
 
@@ -15724,6 +16243,23 @@ impl OdeOutputProgram {
     /// See [`OdeOutputProgram::dual_evaluable`].
     pub(crate) fn is_dual_evaluable(&self) -> bool {
         self.dual_evaluable
+    }
+
+    /// Whether the readout reads the model-time built-in (`Op::PushTime`, from a
+    /// `TIME` / `T` / `t` reference). Such a readout is **not** a pure function of
+    /// the compartment state: its value at a fixed state depends on which
+    /// observation is being read.
+    ///
+    /// That breaks any consumer that characterises the readout by probing it at a
+    /// synthetic state — the modified-release closed-form fast path
+    /// (`pk::modified_release::recover_disp_params_g`) probes `readout(0)`,
+    /// `readout(e_c)`, `readout(2·e_c)` to establish linearity in the central
+    /// amount, and an additive `TIME` term evaluates to its *ambient* thread-local
+    /// value there (`0.0` at the gate), so the probe would certify a linear readout
+    /// and the fast path would then silently drop the whole time term. Callers that
+    /// probe must decline on `true` (#1028).
+    pub(crate) fn reads_time_builtin(&self) -> bool {
+        self.bc.ops.iter().any(|op| matches!(op, Op::PushTime))
     }
 
     /// Number of compartment-state inputs in the readout's `vars[0..n_states]`
