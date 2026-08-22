@@ -3229,6 +3229,15 @@ impl AbsorptionOdeEquivalent {
         }
     }
 
+    /// The reconstructed `.ferx` source the twin is built from. Exposed so a test can
+    /// assert on what the reconstruction emitted — specifically that `[adaptive_dosing]`
+    /// is dropped (#993) — instead of inferring it from the twin parsing successfully,
+    /// which only holds while the block still carries something the ODE parse rejects.
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
     /// Build (once, thread-safely) and return the ODE equivalent sub-model. The source is
     /// reconstructed from already-validated model blocks, so parsing it is infallible in
     /// practice; a failure is an internal reconstruction bug and panics loudly rather than

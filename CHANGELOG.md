@@ -23,14 +23,16 @@ section of the SDLC for the versioning policy).
 - **The dose-attribute double-use error now covers analytical (`pk ...`) models (#1004).** #993
   rejected this on ODE models only, reasoning that an analytical model's explicit
   `pk(..., f=F)` mapping made a second use "stated rather than silent". It is not: nothing in the
-  model says the value is applied twice, and a `[scaling]`, `[initial_conditions]`, or
-  `[adaptive_dosing] observe` expression that reads a mapped `f=`/`lagtime=` parameter applied it
+  model says the value is applied twice, and a `[scaling]` or `[adaptive_dosing] observe`
+  expression that reads a mapped `f=`/`lagtime=` parameter applied it
   once at the dose and once where it was read — on the **default** engine, with no diagnostic.
   Measured at exactly `F` on the prediction. Now rejected at parse time with the same
   `E_DOSE_ATTR_DOUBLE_USE` code. The remediation differs from the ODE engine's: there the *name*
   routes the parameter, so renaming fixes it; here the **mapping** binds it, so the fix is to drop
   the `f=`/`lagtime=` argument (or the read), and the message says so. A parameter merely *named*
-  `F` that no `pk(...)` argument maps stays an ordinary parameter — unchanged. **Breaking** for a
+  `F` that no `pk(...)` argument maps stays an ordinary parameter — unchanged, as does an
+  `[initial_conditions]` read: an initial condition is not an absorbed dose, so the engine seeds
+  the amount with `F = 1` and no lag and `init(depot) = F * 500` applies `F` once. **Breaking** for a
   model that maps a dose attribute and also reads it, e.g. the apparent-volume idiom
   `pk(..., f=F)` + `obs_scale = V / F`; a model using `CL/F`, `V/F` apparent parameters *without*
   mapping `f=` is unaffected, which is the ordinary NONMEM convention. Note this is again

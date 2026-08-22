@@ -2737,8 +2737,9 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // first, and re-walks the entries because the parsed `ScalingSpec` keeps
         // compiled programs rather than the name references.
         //
-        // The read-set is collected on **both** engines, because the `D{n}`/`R{n}`
-        // recording below applies to both; only the rejection is ODE-scoped.
+        // The read-set is collected once and serves both engines: the rejection
+        // below splits on the engine (ODE via `ode_slot_map`, analytical via the
+        // `pk(...)` mapping — #1004), the `D{n}`/`R{n}` recording does not.
         let mut scaling_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
         for line in scaling_lines {
             let trimmed = line.trim();
@@ -2879,40 +2880,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.pk_indices,
             &model.kappa_names,
         )?;
-        // #1004: a dose attribute the `pk(...)` call maps (`f=`/`lagtime=`) that an
-        // init expression *also* reads. Exact analytical analogue of the `[odes]`
-        // `init(state) = <expr>` half of #993: without it the rule has a hole the
-        // size of its own remedy — a user told to drop `F` from `[scaling]` could
-        // move it into `init(central) = F * 100` from the same model. Runs after
-        // `parse_initial_conditions_block` so a malformed block reports its own
-        // syntax error first (this block is analytical-only; the ODE arm above
-        // already rejected `is_ode`). The `D{n}`/`R{n}` recording mirrors the
-        // `[scaling]` site: an init expression is a prediction path for the
-        // data-gated half too.
-        let mut init_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for line in ic_lines {
-            if let Some((_, expr)) = parse_init_line(line) {
-                init_reads.extend(collect_indiv_param_reads(
-                    &expr,
-                    &model.theta_names,
-                    &model.eta_names,
-                    &model.indiv_param_names,
-                    "[initial_conditions] init",
-                )?);
-            }
-        }
-        let analytical_slots =
-            analytical_dose_attr_slot_map(&pk_param_map, &model.indiv_param_names);
-        check_dose_attr_double_use(
-            &model.indiv_param_names,
-            &analytical_slots,
-            &init_reads,
-            usize::MAX,
-            "[initial_conditions]",
-            Some(&pk_param_map),
-        )?;
-        let init_indiv_names = model.indiv_param_names.clone();
-        record_coded_rate_reads(&mut model, &init_indiv_names, &ode_slot_map, &init_reads);
+        // Deliberately NOT a `check_dose_attr_double_use` site, unlike `[scaling]`
+        // and `[adaptive_dosing] observe` (#1004). An analytical init amount is not
+        // a dose: `pk::analytical_init_concentration_g` propagates it with `F = 1`
+        // and no lag ("an initial condition is not an absorbed dose, so
+        // bioavailability does not apply"), so `init(depot) = F * 500` — the
+        // bioavailable residue of a pre-study dose — applies `F` exactly once, to a
+        // term the engine never scales. `[scaling]` is a doubling because
+        // `obs_scale` multiplies *every* prediction including the F-scaled dose
+        // contribution; an init is one additive term beside it. For the same
+        // reason a `D{n}`/`R{n}` read here is not a prediction-path read and is
+        // not recorded for `check_modeled_dose_rates`.
         model.analytical_init = analytical_init;
         // Register init-expression covariates as required data columns, mirroring
         // the scaling (`scaling_covariates`) and error-selector blocks above. Without
@@ -8460,14 +8438,18 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // `pk one_cpt_transit`/`pk two_cpt_transit`/`pk one_cpt_ig`/`pk two_cpt_ig`, so it does
     // not recurse into this desugar.
     //
-    // `adaptive_dosing` is dropped rather than carried (#993). Two independent reasons,
-    // and the first is a crash: the twin *is* an ODE model, so a re-emitted
-    // `observe` that reads a dose attribute hits `check_dose_attr_double_use` — which
-    // the analytical primary is deliberately out of scope for — and the resulting parse
+    // `adaptive_dosing` is dropped rather than carried (#993). Two independent reasons.
+    // The first was a crash: the twin *is* an ODE model, so a re-emitted `observe` that
+    // reads a dose attribute hits `check_dose_attr_double_use`, and the resulting parse
     // error surfaces through `get_or_build`'s `.expect()` as a panic mid-fit, on the
     // plain `predict`/`fit` path that reroutes TV-covariate / `TIME` / IOV subjects here.
-    // Blocks that would otherwise reach a new ODE-only check (`odes`, `scaling`) decline
-    // the twin outright above; `adaptive_dosing` does not, so it has to be dropped here.
+    // Blocks that would otherwise reach an ODE-scoped check (`odes`, `scaling`) decline
+    // the twin outright above; `adaptive_dosing` does not,
+    // so it has to be dropped here. Since #1004 the analytical primary rejects that shape
+    // itself, so the twin can no longer be *reached* with it — but the drop is what keeps
+    // that true by construction, and the assertion in
+    // `adaptive_observe_does_not_reach_the_absorption_twin` pins it directly rather than
+    // relying on the primary's scope staying where it is.
     // Second, the twin is reached only through `CompiledModel::effective_for` on the
     // prediction path (`pk/mod.rs`), and nothing there reads a controller spec —
     // `simulate_adaptive_from_spec` takes the spec as an argument from the primary — so
@@ -8964,8 +8946,22 @@ fn ode_free_slot_count(names: &[String]) -> usize {
 ///
 /// `analytical_pk_map` is `None` for the ODE callers and `Some(pk_param_map)` for
 /// the analytical ones. It selects the remediation clause (rename vs drop the
-/// mapping) and supplies the role name **as the user spelled it**, so an `alag=`
-/// model is not told to look for a `lagtime=` argument it never wrote.
+/// mapping) and, via [`analytical_role_binding`], supplies the `role=value` pair
+/// **as the user spelled it**, so an `alag=` model is not told to look for a
+/// `lagtime=` argument it never wrote.
+///
+/// Scope gap on the analytical side: the caller iterates `indiv_param_names`,
+/// which does not carry a parameter assigned only inside an `if` body — while
+/// `build_pk_param_fn` resolves `pk(..., f=F)` against those nested names too, so
+/// such a parameter *is* applied at the dose and escapes this check. That model
+/// has a wider defect anyway (#1026: reading the name off the prediction path
+/// yields `NaN` with a clean parse); fixing the registration there closes this
+/// hole with it.
+///
+/// `[initial_conditions]` is deliberately **not** a call site. An analytical init
+/// amount is propagated by `pk::analytical_init_concentration_g` with `F = 1` and
+/// no lag, so reading a mapped dose attribute in an init expression applies it
+/// once, not twice — see the note at that block.
 fn check_dose_attr_double_use(
     indiv_param_names: &[String],
     indiv_param_slots: &[usize],
@@ -9000,29 +8996,30 @@ fn check_dose_attr_double_use(
         // mapping — not the name — is what has to go (#1004; renaming alone
         // changes nothing, the mapping follows the parameter).
         //
-        // The analytical clause quotes the role **as the user spelled it** —
-        // `alag=` is a legal alias for `lagtime=`, and naming an argument the model
-        // file does not contain sends the reader looking for the wrong text.
+        // The analytical clause quotes the mapping **as the user spelled it** —
+        // `alag=` is a legal alias for `lagtime=`, and the mapped value may differ
+        // in case from the declaration (`alag=TLAG` binding a declared `tlag`
+        // through the lowercase compat lookup). Naming an argument the model file
+        // does not contain sends the reader looking for the wrong text, so the
+        // role/value pair comes from the entry that actually did the binding.
         let (ordinary_remedy, issue) = match analytical_pk_map {
             Some(map) => {
-                let role = map
-                    .iter()
-                    .find(|(key, value)| {
-                        value.as_str() == name
-                            && PkParams::name_to_index(key)
-                                .is_some_and(|s| crate::types::RESERVED_PK_SLOTS.contains(&s))
-                    })
-                    .map(|(key, _)| key.clone())
+                let (role, bound) = analytical_role_binding(map, name, attr)
+                    .map(|(k, v)| (k.clone(), v.clone()))
                     // Unreachable: `analytical_dose_attr_slot_map` set this
-                    // parameter's slot from exactly such an entry. Name the
-                    // canonical role rather than panicking if that ever drifts.
-                    .unwrap_or_else(|| match attr {
-                        crate::types::DoseAttr::F => "f".to_string(),
-                        _ => "lagtime".to_string(),
+                    // parameter's slot from exactly such an entry, under the same
+                    // resolution. Name the canonical role rather than panicking if
+                    // that ever drifts.
+                    .unwrap_or_else(|| {
+                        let role = match attr {
+                            crate::types::DoseAttr::F => "f",
+                            _ => "lagtime",
+                        };
+                        (role.to_string(), name.to_string())
                     });
                 (
                     format!(
-                        "remove the `{role}={name}` mapping from the `pk(...)` call — the \
+                        "remove the `{role}={bound}` mapping from the `pk(...)` call — the \
                          mapping, not the name, is what makes `{name}` a dose attribute"
                     ),
                     "#1004",
@@ -9070,21 +9067,66 @@ fn analytical_dose_attr_slot_map(
     indiv_var_names: &[String],
 ) -> Vec<usize> {
     let mut slots = vec![usize::MAX; indiv_var_names.len()];
-    for (key, value) in pk_param_map {
+    // Iterate in sorted key order. `pk_param_map` is a `HashMap`, and a parameter
+    // bound to *both* roles (`pk(..., f=X, lagtime=X)`) is written twice — so with
+    // arbitrary iteration order the surviving slot, and therefore the diagnostic
+    // `check_dose_attr_double_use` emits, differed between runs of the identical
+    // model. Same reason `build_pk_param_fn` sorts its `pk_entries`.
+    let mut entries: Vec<(&String, &String)> = pk_param_map.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (key, value) in entries {
         let target = match PkParams::name_to_index(key) {
             Some(s @ (crate::types::PK_IDX_F | crate::types::PK_IDX_LAGTIME)) => s,
             _ => continue,
         };
+        // Exact first, then the lowercase compat form — `build_pk_param_fn`'s own
+        // order. The conversion is hoisted out of the `position` closure so it
+        // costs one allocation per mapping rather than one per candidate name.
         let idx = indiv_var_names.iter().position(|n| n == value).or_else(|| {
-            indiv_var_names
-                .iter()
-                .position(|n| *n == value.to_lowercase())
+            let lowered = value.to_lowercase();
+            indiv_var_names.iter().position(|n| *n == lowered)
         });
         if let Some(i) = idx {
             slots[i] = target;
         }
     }
     slots
+}
+
+/// The `pk(...)` entry that binds `name` to dose attribute `attr` on an analytical
+/// model, as `(role key, mapped value)` — both **as the user spelled them**, so the
+/// remediation clause in [`check_dose_attr_double_use`] quotes text that is
+/// actually in the model file (`alag=TLAG`, not the canonical `lagtime=tlag`).
+///
+/// Resolution mirrors [`analytical_dose_attr_slot_map`]'s, which is what assigned
+/// the slot in the first place: the role key must route to `attr`'s reserved slot,
+/// and the mapped value must match the declared parameter exactly or through the
+/// legacy lowercase compat lookup. Filtering on `attr` is what keeps the noun and
+/// the quoted role in agreement when one parameter fills both roles; sorting picks
+/// one deterministically in that same case.
+fn analytical_role_binding<'a>(
+    pk_param_map: &'a HashMap<String, String>,
+    name: &str,
+    attr: crate::types::DoseAttr,
+) -> Option<(&'a String, &'a String)> {
+    let target = match attr {
+        crate::types::DoseAttr::F => crate::types::PK_IDX_F,
+        _ => crate::types::PK_IDX_LAGTIME,
+    };
+    let mut hit: Option<(&String, &String)> = None;
+    for (key, value) in pk_param_map {
+        if PkParams::name_to_index(key) != Some(target) {
+            continue;
+        }
+        if value.as_str() != name && value.to_lowercase() != name {
+            continue;
+        }
+        match hit {
+            Some((k, _)) if k <= key => {}
+            _ => hit = Some((key, value)),
+        }
+    }
+    hit
 }
 
 /// The individual-parameter names an expression *source* references, upper-cased,

@@ -333,12 +333,15 @@ If you need an ordinary parameter, rename it: the name is what routes it.
 The **analytical** engine applies the same rule, with one difference: there the
 `pk(...)` mapping — not the name — is what binds a parameter to the dose
 ([#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004)). A model that maps
-`pk(..., f=F)` or `lagtime=TLAG` and *also* reads that parameter in `[scaling]`,
-`[initial_conditions]`, or `[adaptive_dosing] observe` is rejected with the same
-code. So the remedy differs: **drop the mapping**, not the name — renaming a
-mapped parameter changes nothing, because the mapping follows it. A parameter
-merely *named* `F` that no `pk(...)` argument maps is an ordinary parameter on
-this engine and stays silent.
+`pk(..., f=F)` or `lagtime=TLAG` and *also* reads that parameter in `[scaling]`
+or `[adaptive_dosing] observe` is rejected with the same code. So the remedy
+differs: **drop the mapping**, not the name — renaming a mapped parameter changes
+nothing, because the mapping follows it. A parameter merely *named* `F` that no
+`pk(...)` argument maps is an ordinary parameter on this engine and stays silent.
+
+`[initial_conditions]` is *not* one of those surfaces: an initial condition is not
+an absorbed dose, so the engine deposits the amount with `F = 1` and no lag, and
+`init(depot) = F * 500` applies `F` exactly once.
 
 This is a deliberate divergence from NONMEM, which computes the same doubled
 value without a diagnostic: `$PK` defining `F1` **and** `S2 = V/F1` (rather than

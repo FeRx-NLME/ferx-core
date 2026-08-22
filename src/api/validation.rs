@@ -2999,9 +2999,10 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     // drop-the-mapping clause — renaming is the wrong repair there, since the
     // `f=`/`lagtime=` mapping follows the parameter.
     //
-    // No `.with_block()`: the message already opens with `[odes]: ` / `[scaling]: `
-    // like every other block-scoped parse error, and the renderer prefixes the block
-    // it is given — setting both prints it twice.
+    // No `.with_block()`: the message already opens with the block it came from
+    // (`[odes]: ` / `[scaling]: ` / `[adaptive_dosing]: `) like every other
+    // block-scoped parse error, and the renderer prefixes the block it is given —
+    // setting both prints it twice.
     if err.contains("reserved dose-attribute name")
         || err.contains("mapping from the `pk(...)` call")
     {

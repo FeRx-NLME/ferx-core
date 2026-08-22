@@ -371,8 +371,10 @@ from it) is correct and stays silent.
 Analytical (`pk ...`) models are covered by the same rule
 ([#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004)), keyed off the
 `pk(..., f=F)` / `lagtime=…` mapping instead of the name — their prediction-path
-surfaces are `[scaling]`, `[initial_conditions]`, and `[adaptive_dosing]
-observe`. Because the mapping is the binding there, the remediation is to drop
+surfaces are `[scaling]` and `[adaptive_dosing] observe` (an `[initial_conditions]`
+amount is not a dose, so the engine seeds it with `F = 1` and no lag, and reading
+the attribute there applies it once). Because the mapping is the binding, the
+remediation is to drop
 the `f=`/`lagtime=` argument rather than rename the parameter; a parameter merely
 *named* `F` that nothing maps is an ordinary parameter on that engine. See
 [Individual Parameters](individual-parameters.qmd#pk-parameter-names).
