@@ -2116,7 +2116,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // both spell out what it does instead: "an outer loop minimising the AGQ objective while
     // fed the analytic *FOCE* gradient would converge, silently, to the wrong parameters" —
     // reporting AGQ OFVs at the FOCE optimum. Reject up front until the trust region routes
-    // the quadrature gradient (and gets a BHHH Hessian built from per-subject AGQ scores).
+    // the quadrature gradient (and gets a BHHH Hessian built from per-subject AGQ scores) — #1047.
     if (laplace_stage || focei_quadrature) && options.optimizer == Optimizer::TrustRegion {
         let label = if laplace_stage { "laplace" } else { "focei" };
         diags.push(

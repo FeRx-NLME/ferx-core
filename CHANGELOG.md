@@ -356,7 +356,7 @@ section of the SDLC for the versioning policy).
   FOCE/Laplace closed form while reporting quadrature OFVs: a fit that converged, smoothly, to
   the FOCE optimum with no warning. `ferx check` and `fit()` now both reject the combination and
   name the optimizers that do support it. Full quadrature support in the trust region needs a
-  BHHH Hessian built from per-subject quadrature scores and is tracked separately.
+  BHHH Hessian built from per-subject quadrature scores and is tracked in #1047.
 - **A negative Form C `[scaling]` prediction is no longer silently clamped to zero on ODE models
   (#1020).** The ODE predictor applied its negative-prediction guard to the *final* prediction
   vector — after the `y = <expr>` / `y[CMT=N] = <expr>` readout had been evaluated. That guard is a
