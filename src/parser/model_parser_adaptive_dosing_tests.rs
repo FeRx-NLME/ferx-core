@@ -4,6 +4,15 @@ fn lines(body: &[&str]) -> Vec<String> {
     body.iter().map(|s| s.to_string()).collect()
 }
 
+/// Block-parse with no `[covariates]` declarations, which is what every test here
+/// wants: these exercise the block's own grammar and validation, not the `T`/`t`
+/// name precedence the declarations feed (#1028 — that has its own tests against
+/// the whole model). Shadows the parser's two-argument function so the 37 call
+/// sites below stay on the shape they were written in.
+fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, String> {
+    super::parse_adaptive_dosing_block(lines, &[])
+}
+
 /// A minimal block that parses — the base every "one thing wrong" error test
 /// mutates. Continuous (percentage) titration, bare-endpoint observe.
 fn valid_min() -> Vec<&'static str> {

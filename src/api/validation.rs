@@ -67,11 +67,29 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
 /// surfaces the actionable message instead of "covariate not found in data". The
 /// `E_MISSING_COVARIATE` message text stays byte-for-byte identical to the
 /// historical `Err(String)` for the names that remain.
+///
+/// "Carries" means the *predictor* can resolve the name, which is a slightly wider
+/// test than membership in `Population::covariate_names`. A CSV-read population
+/// always lists every covariate column there, but an in-memory `Population` built
+/// programmatically may populate each `Subject::covariates` map and leave the name
+/// list empty — a construction the predictors have always resolved fine, since they
+/// read the per-subject map (`Subject::obs_cov`), not the list. So a name every
+/// subject's map carries counts as present. Without this, `predict()` gaining the
+/// check (#1028) would have started panicking on those callers even though nothing
+/// about their predictions was undefined.
 pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let carried = |name: &str| -> bool {
+        population.covariate_names.iter().any(|n| n == name)
+            || (!population.subjects.is_empty()
+                && population
+                    .subjects
+                    .iter()
+                    .all(|s| s.covariates.contains_key(name)))
+    };
     let missing: Vec<&str> = model
         .referenced_covariates
         .iter()
-        .filter(|name| !population.covariate_names.iter().any(|n| n == *name))
+        .filter(|name| !carried(name))
         .map(|s| s.as_str())
         .collect();
 
@@ -103,14 +121,44 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
     } else {
         population.covariate_names.join(", ")
     };
+    // `TAFD` / `TAD` / `MACHEPS` are solver-injected built-ins *inside `[odes]`* and
+    // ordinary covariates everywhere else — including `[scaling]`, which is
+    // deliberate (`docs/model-file/scaling.qmd`) so a dataset that really carries a
+    // `TAD` column can use it. The failure mode is a user who expected the `[odes]`
+    // built-in and gets the bare "covariate not found in data: TAD", which reads as
+    // a typo report rather than a scope explanation. Name the scope when one of them
+    // is among the missing (#1028). Appended only in that case, so the historical
+    // message text is byte-for-byte unchanged for every ordinary covariate.
+    const ODE_ONLY_BUILTINS: &[&str] = &["TAFD", "TAD", "MACHEPS"];
+    let builtin_shaped: Vec<&str> = plain
+        .iter()
+        .copied()
+        .filter(|n| ODE_ONLY_BUILTINS.contains(n))
+        .collect();
+    let builtin_hint = if builtin_shaped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Note: {} {} a solver-injected built-in only inside `[odes]`; anywhere else \
+             (including `[scaling]`) the name is an ordinary covariate and must be a data \
+             column. Compute it as an `[odes]` intermediate and read that state instead.",
+            builtin_shaped.join(", "),
+            if builtin_shaped.len() == 1 {
+                "is"
+            } else {
+                "are"
+            },
+        )
+    };
     diags.push(
         Diagnostic::error(
             "E_MISSING_COVARIATE",
             format!(
                 "Model references covariate(s) not found in data (case-sensitive): {}. \
-                 Available covariate columns: {}.",
+                 Available covariate columns: {}.{}",
                 plain.join(", "),
-                available
+                available,
+                builtin_hint,
             ),
         )
         .with_suggestion(format!("available covariate columns: {}", available)),
@@ -1117,6 +1165,25 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
              `check_model_data` before predicting on untrusted input.)"
         );
     }
+}
+
+/// Panic when the data does not carry every covariate the model references, for
+/// the `Vec`-returning [`predict()`](crate::predict) path (issue #1028).
+///
+/// `fit()` runs [`check_covariates`] through [`check_model_data`] and `simulate()`
+/// calls it directly, so both already refuse a model whose identifiers don't bind
+/// to a data column. `predict()` ran no data check at all, which is what let an
+/// undefined name in `[scaling]` reach the predictor: the parser classifies any
+/// identifier it cannot bind to a theta / eta / individual parameter / state as a
+/// covariate, and a covariate missing from the data resolves to the map's `0.0`
+/// default — so `y[CMT=1] = A * TOTALLY_UNDEFINED_NAME` returned an all-zero
+/// structural prediction with no diagnostic. This closes that gap so `predict()`
+/// fails as loudly as `fit()` does, on the same message.
+pub(crate) fn assert_covariates_present(model: &CompiledModel, population: &Population) {
+    panic_if_unsupported(
+        first_error(&check_covariates(model, population)).err(),
+        "a model referencing covariates the data does not carry",
+    );
 }
 
 /// Shared check→`panic!` wrapper for the non-`fit` entry points (`predict()`/
@@ -2934,7 +3001,102 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     if err.contains("reserved dose-attribute name") {
         return Diagnostic::error("E_DOSE_ATTR_DOUBLE_USE", err.to_string());
     }
+    // #1040: the block-header shapes the parser used to drop silently.
+    // `check_block_names` writes each offending header as ``[name] (line N)``,
+    // so the block / line the check report wants come straight out of the
+    // message — this path has no `ParsedModel` to read `block_lines` from,
+    // since a parse error is terminal.
+    if let Some(rest) = err.strip_prefix("Unknown block `[") {
+        let mut d = Diagnostic::error("E_UNKNOWN_BLOCK", String::new());
+        if let Some(near) =
+            block_type(rest).and_then(|b| crate::parser::model_parser::nearest_block_name(&b))
+        {
+            d = d.with_suggestion(format!("did you mean `[{near}]`?"));
+        }
+        return locate(d, err, rest);
+    }
+    if let Some(rest) = err.strip_prefix("Deprecated block `[") {
+        return locate(
+            Diagnostic::error("E_DEPRECATED_BLOCK", String::new()),
+            err,
+            rest,
+        );
+    }
+    if let Some(rest) = err.strip_prefix("Block `[") {
+        // Match each shape on its own sentinel rather than letting one be the
+        // `else` of the other: a future ``Block `[…]`` message that is neither
+        // must fall through to `E_PARSE`, not be mis-coded as the last branch.
+        let code = if err.contains("instance name") {
+            "E_BLOCK_INSTANCE_NAME"
+        } else if err.contains("requires building ferx-core with `--features") {
+            "E_BLOCK_FEATURE_DISABLED"
+        } else {
+            return Diagnostic::error("E_PARSE", err.to_string());
+        };
+        return locate(Diagnostic::error(code, String::new()), err, rest);
+    }
     Diagnostic::error("E_PARSE", err.to_string())
+}
+
+#[cfg(test)]
+#[path = "tests/block_name_diagnostic_tests.rs"]
+mod block_name_diagnostic_tests;
+
+/// Give a block-header diagnostic its message plus whatever location the
+/// message text carries.
+///
+/// `err` is the whole parser error; `rest` is its tail, starting just after the
+/// opening ``` `[ ```. The block type always transfers to `block`.
+///
+/// The line is only lifted into `line` when the message names exactly **one**
+/// header — the structured field points at a single place, so promoting the
+/// first of several would silently mislocate the rest. In that unambiguous case
+/// the ` (line N)` is also *removed* from the message, since the renderer
+/// already prints `block:line` ahead of it and repeating it reads as
+/// `fit_option:16: … (line 16)`. With several headers the message keeps every
+/// parenthetical (each finding needs its own) and no `line` is attached.
+fn locate(mut d: Diagnostic, err: &str, rest: &str) -> Diagnostic {
+    if let Some(b) = block_type(rest) {
+        d = d.with_block(b);
+    }
+    let mut lines = line_spans(err);
+    match (lines.next(), lines.next()) {
+        (Some((span, n)), None) => {
+            let mut message = String::with_capacity(err.len());
+            message.push_str(&err[..span.0]);
+            message.push_str(&err[span.1..]);
+            d.message = message;
+            d.with_line(n)
+        }
+        _ => {
+            d.message = err.to_string();
+            d
+        }
+    }
+}
+
+/// The block *type* out of the tail of a `check_block_names` message — `rest`
+/// starts just after the opening ``` `[ ```, e.g. ``covariate_nn X]` (line 7)
+/// requires …``. An instance name, when present, is dropped: `block` names the
+/// type, matching every other block-scoped diagnostic.
+fn block_type(rest: &str) -> Option<String> {
+    rest.find(']')
+        .and_then(|end| rest[..end].split_whitespace().next())
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+}
+
+/// Every ` (line N)` in `msg`, as `((start, end), N)` byte spans over `msg`.
+/// The leading space is part of the span so removing one leaves no double
+/// space behind.
+fn line_spans(msg: &str) -> impl Iterator<Item = ((usize, usize), usize)> + '_ {
+    msg.match_indices(" (line ").filter_map(move |(at, pat)| {
+        let digits_at = at + pat.len();
+        let digits = &msg[digits_at..];
+        let end = digits.find(')')?;
+        let n = digits[..end].parse::<usize>().ok()?;
+        Some(((at, digits_at + end + 1), n))
+    })
 }
 
 /// Validate a model file (and optionally a dataset) **without fitting**.
