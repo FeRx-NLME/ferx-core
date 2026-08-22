@@ -11173,6 +11173,49 @@ fn scaling_y_readout_t_alias_loses_to_a_declared_covariate() {
     }
 }
 
+/// The alias collapses `T` and `t` into one built-in, so the declaration that
+/// protects it has to be matched the same way. A case-exact guard let
+/// `[covariates] T` fail to protect a `y = ... t ...` reference — silently folding
+/// it to the clock even though the user took the documented escape hatch — and, in
+/// `obs_scale`, raised the `TIME`-rejection error against a legitimately declared
+/// column. Both spellings of the declaration must cover both spellings of the
+/// reference (#1042 review).
+#[test]
+fn scaling_time_alias_declaration_is_case_insensitive() {
+    for declared in ["T", "t"] {
+        for used in ["T", "t"] {
+            let src = ode_model_with_scaling(
+                "ode(states=[depot, central])",
+                Some(&format!("  y = central / V * {used}\n")),
+            ) + &format!("\n[covariates]\n  {declared} continuous\n");
+            let model = parse_model_string(&src)
+                .unwrap_or_else(|e| panic!("declared `{declared}`, used `{used}`: {e}"));
+            assert_eq!(
+                model.referenced_covariates,
+                vec![used.to_string()],
+                "declared `{declared}` must protect the `{used}` reference"
+            );
+            assert!(
+                !readout_reads_time(&model),
+                "declared `{declared}`, used `{used}`: must not fold to the clock"
+            );
+        }
+    }
+}
+
+/// The same case-insensitivity on the `obs_scale` side, where the mismatch was not
+/// a silent fold but a hard error thrown at a column the model legitimately
+/// declared.
+#[test]
+fn obs_scale_time_rejection_respects_a_case_mismatched_declaration() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  obs_scale = 1000 / t\n  y = central\n"),
+    ) + "\n[covariates]\n  T continuous\n";
+    let model = parse_model_string(&src).expect("a declared `T` column is not the TIME built-in");
+    assert_eq!(model.referenced_covariates, vec!["t".to_string()]);
+}
+
 /// …and when the fold *does* fire (no declaration), it says so. The undeclared
 /// case is the one the parser cannot disambiguate — a dataset column named `T` is
 /// only a warning elsewhere — so the note names both escapes: spell it `TIME`, or

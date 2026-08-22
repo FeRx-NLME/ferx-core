@@ -83,6 +83,13 @@ protocol-time-dependent target such as `observe = central / V - TARGET * TIME /
 (TIME + T50)` therefore titrates against the intended ramp
 ([#1028](https://github.com/FeRx-NLME/ferx-core/issues/1028)).
 
+The shared name scope includes the `T` precedence rule: a `T` (or `t`) declared in
+`[covariates]` is the **data column**, in `observe` exactly as in `[scaling]`, so
+one model can never read the column in one block and the clock in the other. When
+`T` does fold into the built-in, the warning is reported at parse time — `observe`
+itself is compiled at simulate time, where there is no warnings channel. See
+[Scaling](scaling.qmd#if-your-dataset-has-a-column-named-t).
+
 ¹ **The signal source is exactly one of `observe` (a latent expression, un-noised) or `with_assay_error = true` + `assay_cmt` (a noised model output).** Setting both, or neither, is a parse error. Titrating on a *measured* quantity uses the model's own output (so its value and σ can never disagree on scale); titrating on a *derived latent* quantity (effect-site, a ratio — anything with no error model) uses `observe`.
 
 ### Rules — `when signal <op> <value> : <action>`

@@ -58,6 +58,22 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **An adaptive-dosing run now reads a `TIME`-dependent `[scaling]` Form C readout on the same
+  clock as `fit()` / `predict()` (#1028 follow-up).** #1028 moved the readout's `TIME` to the raw
+  data-file clock (the `$ERROR` convention shared by sdtab, `predict()`/`simulate()` and `[derived]`
+  windows) on the static predictors, but the reactive driver and the frozen-schedule replay
+  verifier kept feeding it the integrator break the observation was keyed to. For a subject with
+  stacked reset occasions — whose data `TIME` restarts while the internal timeline stays monotonic —
+  those are different numbers, so the *same record* got one `TIME` under `simulate_adaptive` and
+  another under `fit()`, and the replay verifier's bit-equality against the static engine no longer
+  held. Both now use the raw clock. Also in the same area: a `T` / `t` declared in `[covariates]` is
+  now honoured **case-insensitively** (declaring `T` protects a `t` reference and vice versa —
+  previously the case-mismatched pair silently folded to the model clock in `y`, and raised the
+  time-in-`obs_scale` error against a legitimately declared column), and the declaration now reaches
+  `[adaptive_dosing] observe`, which compiles through the same readout compiler — so a declared `T`
+  can no longer be the data column in `[scaling]` and the clock in `observe` for one model. The
+  `T`-fold warning for `observe` is emitted at parse time, since the block is compiled at simulate
+  time where there is no warnings channel.
 - **`TIME` now works in a `[scaling]` Form C readout, and an undefined name in `[scaling]` is no
   longer a silent zero (#1028).** A `y = <expr>` / `y[CMT=N] = <expr>` readout referencing the
   `TIME` built-in parsed fine but was never bound to the observation — the integrator's model-time

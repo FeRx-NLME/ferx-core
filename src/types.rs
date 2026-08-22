@@ -3760,8 +3760,8 @@ impl CompiledModel {
     /// θ, observation covariates, and TIME — never on η), so the FOCE/FOCEI
     /// data term, Laplace curvature term, and inner EBE objective can all share
     /// one matrix and stay mutually consistent. The TIME fed to each row is the
-    /// raw data-file time (`obs_raw_times`, matching what NONMEM's `$ERROR`
-    /// sees), falling back to `obs_times` for in-memory subjects.
+    /// raw data-file time ([`Subject::readout_time`], matching what NONMEM's
+    /// `$ERROR` sees), falling back to `obs_times` for in-memory subjects.
     pub fn ruv_obs_mult(&self, subject: &Subject, theta: &[f64]) -> Option<Vec<Vec<f64>>> {
         let rm = self.ruv_magnitude.as_ref()?;
         if !rm.is_active() {
@@ -3770,12 +3770,7 @@ impl CompiledModel {
         let n = subject.observations.len();
         let mut out = Vec::with_capacity(n);
         for j in 0..n {
-            let time = subject
-                .obs_raw_times
-                .get(j)
-                .copied()
-                .unwrap_or_else(|| subject.obs_times.get(j).copied().unwrap_or(0.0));
-            out.push(rm.eval_obs(theta, subject.obs_cov(j), time));
+            out.push(rm.eval_obs(theta, subject.obs_cov(j), subject.readout_time(j)));
         }
         Some(out)
     }
@@ -3802,12 +3797,7 @@ impl CompiledModel {
         let n = subject.observations.len();
         let mut out = Vec::with_capacity(n);
         for j in 0..n {
-            let time = subject
-                .obs_raw_times
-                .get(j)
-                .copied()
-                .unwrap_or_else(|| subject.obs_times.get(j).copied().unwrap_or(0.0));
-            out.push(rm.eval_obs_theta_grad(theta, subject.obs_cov(j), time)?);
+            out.push(rm.eval_obs_theta_grad(theta, subject.obs_cov(j), subject.readout_time(j))?);
         }
         Some(out)
     }

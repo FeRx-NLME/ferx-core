@@ -2414,11 +2414,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .get("simulation")
         .map(|lines| parse_simulation_block(lines))
         .transpose()?;
+    // Peek the `[covariates]` declarations (parsed for real further down, at the
+    // block's own site) purely for name precedence: a declared `T` / `t` is a data
+    // column, not the `[odes]` model-time alias, in `[scaling]` and in
+    // `[adaptive_dosing] observe` alike (#1028). Peeked rather than hoisted so a
+    // malformed `[covariates]` block still reports its own error at its own site, in
+    // the existing order — hence the `.ok()`.
+    let declared_covariate_names: Vec<String> = blocks
+        .get("covariates")
+        .and_then(|lines| parse_covariates_block(lines).ok())
+        .map(|decls| decls.into_iter().map(|d| d.name).collect())
+        .unwrap_or_default();
     // Declarative reactive-dosing controller (#391 S2). Parsed and validated here;
     // compiled to a controller and run by the adaptive simulate path in a later slice.
     let adaptive_dosing = blocks
         .get("adaptive_dosing")
-        .map(|lines| parse_adaptive_dosing_block(lines))
+        .map(|lines| parse_adaptive_dosing_block(lines, &declared_covariate_names))
         .transpose()?;
     let mut fit_options = if let Some(lines) = blocks.get("fit_options") {
         parse_fit_options(lines)?
@@ -2532,6 +2543,20 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.indiv_param_names,
             "[adaptive_dosing] observe",
         )?;
+        // The `T` / `t` model-time fold warns wherever it fires — but `observe` is
+        // compiled at *simulate* time (`sim::adaptive_control::compile_observe`), long
+        // after `parse_warnings` is sealed, and the adaptive result has no warnings
+        // channel of its own. Emit the note here instead, from the same helper the
+        // compiler will run, so the fold is not silent on this one path (#1028).
+        warn_if_time_alias_folds(
+            observe,
+            "[adaptive_dosing] observe",
+            &model.theta_names,
+            &model.eta_names,
+            &model.indiv_param_names,
+            &declared_covariate_names,
+            &mut model.parse_warnings,
+        );
         if let Some(ode) = model.ode_spec.as_ref() {
             let n_states = ode.state_names.len();
             check_dose_attr_double_use(
@@ -2674,17 +2699,6 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 .cloned()
         };
         let mut scaling_parse_warnings: Vec<String> = Vec::new();
-        // Peek the `[covariates]` declarations (parsed for real further down, at the
-        // block's own site) purely for name precedence inside `[scaling]`: a declared
-        // `T` is a data column, not the model-time alias, and a declared `TAD` is a
-        // data column rather than the rejected `[odes]` built-in (#1028). Peeked
-        // rather than hoisted so a malformed `[covariates]` block still reports its
-        // own error at its own site, in the existing order — hence the `.ok()`.
-        let declared_covariates_for_scaling: Vec<String> = blocks
-            .get("covariates")
-            .and_then(|lines| parse_covariates_block(lines).ok())
-            .map(|decls| decls.into_iter().map(|d| d.name).collect())
-            .unwrap_or_default();
 
         let (scaling, output_fn, output_program, scaling_covariates) = parse_scaling_block(
             scaling_lines,
@@ -2698,7 +2712,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.kappa_names,
             &readout_synth_params,
             volume_indiv_name_for_scaling.as_deref(),
-            &declared_covariates_for_scaling,
+            &declared_covariate_names,
             &mut scaling_parse_warnings,
         )?;
         model.parse_warnings.extend(scaling_parse_warnings);
@@ -5666,7 +5680,10 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
 /// is the S2.2 step. The one ambiguity this parser *can* settle without the model
 /// — `with_assay_error` on an expression `observe` with no designated endpoint —
 /// is rejected here rather than left to guess a σ downstream.
-fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, String> {
+fn parse_adaptive_dosing_block(
+    lines: &[String],
+    declared_covariates: &[String],
+) -> Result<AdaptiveDosingSpec, String> {
     let mut observe: Option<String> = None;
     let mut with_assay_error = false;
     let mut assay_cmt: Option<usize> = None;
@@ -5831,6 +5848,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
     // controller with a contradiction the parser would have rejected here.
     let spec = AdaptiveDosingSpec {
         observe,
+        observe_declared_covariates: declared_covariates.to_vec(),
         with_assay_error,
         assay_cmt,
         at,
@@ -7397,7 +7415,7 @@ fn rewrite_scaling_time_alias(
     let mut folded: Option<String> = None;
     visit_expr_nodes_mut(expr, &mut |e: &mut Expression| {
         if let Expression::Covariate(name) = e {
-            if (name == "T" || name == "t") && !declared_covariates.iter().any(|d| d == name) {
+            if is_time_alias(name) && !declares_time_alias(declared_covariates) {
                 if folded.is_none() {
                     folded = Some(name.clone());
                 }
@@ -7415,6 +7433,31 @@ fn rewrite_scaling_time_alias(
     }
 }
 
+/// Run [`rewrite_scaling_time_alias`] on a *throwaway* parse of `src` purely to
+/// collect the warning it would emit, discarding the rewritten expression.
+///
+/// For `[adaptive_dosing] observe`, which is stored as a raw string and compiled at
+/// simulate time — where `parse_warnings` is long sealed and the adaptive result has
+/// no warnings channel — this is what keeps the fold from being silent on that path.
+/// The expression is re-parsed rather than duplicating the alias test, so the note
+/// can never disagree with the fold that actually happens (#1028). A parse failure is
+/// ignored: the real compile reports it, with its own context.
+#[allow(clippy::too_many_arguments)]
+fn warn_if_time_alias_folds(
+    src: &str,
+    context: &str,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    declared_covariates: &[String],
+    parse_warnings: &mut Vec<String>,
+) {
+    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
+    if let Ok(mut expr) = parse_scalar_expression(src, ctx) {
+        rewrite_scaling_time_alias(&mut expr, context, declared_covariates, parse_warnings);
+    }
+}
+
 /// Whether `expr` reads the model-time built-in, under either spelling: the
 /// `Expression::Time` node a bare `TIME` parses to, or the `T` / `t` alias
 /// [`rewrite_scaling_time_alias`] folds into it. Drives the `obs_scale`
@@ -7428,13 +7471,36 @@ fn expr_references_time_builtin(expr: &Expression, declared_covariates: &[String
     visit_expr_nodes(expr, &mut |e: &Expression| match e {
         Expression::Time => found = true,
         Expression::Covariate(n)
-            if (n == "T" || n == "t") && !declared_covariates.iter().any(|d| d == n) =>
+            if is_time_alias(n) && !declares_time_alias(declared_covariates) =>
         {
             found = true
         }
         _ => {}
     });
     found
+}
+
+/// Whether `name` is the `[odes]` model-time alias, i.e. `T` under either case.
+/// The two spellings are one built-in, so every guard that keys on the alias must
+/// treat them as one name.
+fn is_time_alias(name: &str) -> bool {
+    name == "T" || name == "t"
+}
+
+/// Whether `[covariates]` declares the model-time alias, in *either* case.
+///
+/// Deliberately case-insensitive while ordinary covariate resolution is
+/// case-sensitive: since [`is_time_alias`] collapses `T` and `t` into one
+/// built-in, a case-exact check would let `[covariates] T` fail to protect a
+/// `y = ... t ...` reference (silently folding it to the clock even though the
+/// user took the documented escape hatch) and, in `obs_scale`, would raise the
+/// `TIME`-rejection error against a legitimately declared column. Matching the
+/// declaration the same way the reference is matched keeps the escape hatch
+/// working for both spellings (#1028).
+fn declares_time_alias(declared_covariates: &[String]) -> bool {
+    declared_covariates
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case("T"))
 }
 
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
