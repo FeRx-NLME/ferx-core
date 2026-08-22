@@ -2191,7 +2191,64 @@ fn state_named_parameter_declines_the_absorption_twin_with_a_warning() {
             "a recognised closed form whose twin was declined must not be called unrecognised \
              ({label}), got: {rejection}"
         );
+
+        // The other two reroute-needing features the twin serves (#719) take their own message
+        // arms, so assert each carries the cause and the reason too — a declined twin loses SS
+        // and infusion exactly like it loses the TV-covariate reroute, and an author who hits
+        // one of those first must not be told the form is unrecognised either.
+        for (feature, marker, population) in [
+            (
+                "steady-state",
+                "steady-state (SS) doses",
+                ss_dose_population(),
+            ),
+            ("infusion", "infusion doses", infusion_population()),
+        ] {
+            let msg = crate::api::check_absorption_closed_form_support(&parsed.model, &population)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a declined-twin model ({label}) must reject a {feature} subject, not \
+                         silently serve it from the closed form"
+                    )
+                });
+            // Pin *which* arm fired: these populations are built by mutating the TV-covariate
+            // one, so without this the assertions below would pass just as happily on the
+            // TV-covariate message and prove nothing about the SS / infusion arms.
+            assert!(
+                msg.contains(marker),
+                "the {feature} subject ({label}) must hit the {feature} arm, got: {msg}"
+            );
+            assert!(
+                msg.contains(colliding) && !msg.contains("an unrecognised closed form"),
+                "the {feature} rejection ({label}) must name the decline cause and quote the \
+                 reason (naming `{colliding}`), got: {msg}"
+            );
+        }
     }
+}
+
+/// A one-subject population whose subject takes a **steady-state** dose, and one whose subject
+/// takes an **infusion** — the other two features that reroute to the ODE twin (#719) and are
+/// therefore rejected when there is no twin. Each hits its own arm of
+/// `check_absorption_closed_form_support`, so both are exercised alongside the TV-covariate one.
+fn ss_dose_population() -> crate::types::Population {
+    let mut pop = tv_cov_population();
+    let s = &mut pop.subjects[0];
+    s.id = "SS1".to_string();
+    s.obs_covariates = Vec::new(); // drop the TV covariate so the SS arm is what fires
+    s.doses = vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    pop
+}
+
+fn infusion_population() -> crate::types::Population {
+    let mut pop = tv_cov_population();
+    let s = &mut pop.subjects[0];
+    s.id = "INF1".to_string();
+    s.obs_covariates = Vec::new(); // drop the TV covariate so the infusion arm is what fires
+    s.doses = vec![crate::types::DoseEvent::new(
+        0.0, 100.0, 1, 50.0, false, 0.0,
+    )];
+    pop
 }
 
 /// A one-subject population whose subject carries a time-varying covariate row — the cheapest
