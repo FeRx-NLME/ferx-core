@@ -6,9 +6,11 @@ use argmin::solver::trustregion::{Steihaug, TrustRegion};
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
-use crate::estimation::gauss_newton::subject_nll_pop_grad;
+use crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
-use crate::estimation::outer_optimizer::{pop_nll_opts, OuterResult};
+use crate::estimation::outer_optimizer::{
+    ofv_is_valid, pop_nll_opts, resolve_outer_ftol, OuterResult,
+};
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params, PackedBounds,
 };
@@ -21,7 +23,13 @@ struct GradCache {
     x: Vec<f64>,
     etas: Vec<DVector<f64>>,
     h_mats: Vec<DMatrix<f64>>,
+    /// Raw per-subject score `gᵢ` — the BHHH Hessian's outer-product input.
     per_subj_grads: Vec<Vec<f64>>,
+    /// Per-subject FOCEI EBE-response correction `tᵢ` (`∂log|H̃|/∂η · dη̂/dθ`),
+    /// all-zero under FOCE / additive error. Kept alongside `gᵢ` rather than
+    /// folded into it: the gradient wants `gᵢ + tᵢ`, the BHHH Hessian must stay
+    /// on the raw score (see [`Gradient`] / [`Hessian`] below).
+    per_subj_corrections: Vec<Vec<f64>>,
 }
 
 struct FoceiProblem<'a> {
@@ -78,22 +86,41 @@ impl FoceiProblem<'_> {
         }
     }
 
-    /// Compute per-subject NLL gradients via `subject_nll_pop_grad`, caching the
-    /// result so that `hessian()` can reuse it without a second inner-loop solve.
+    /// Compute per-subject NLL gradients via `subject_nll_pop_grad_with_cache`,
+    /// caching the result so that `hessian()` can reuse it without a second
+    /// inner-loop solve.
+    ///
+    /// Returns `(etas, h_mats, gᵢ, tᵢ)`: the raw score and the FOCEI EBE-response
+    /// correction separately, because they have different consumers — see the
+    /// [`Gradient`] and [`Hessian`] impls.
     ///
     /// Three cache states (keyed by `x` equality and sentinel field):
     ///   Full hit:    `c.x == x` and `!c.per_subj_grads.is_empty()` → return everything cached.
     ///   Partial hit: `c.x == x` and `c.per_subj_grads.is_empty()`  → EBEs warm (from `cost()`),
     ///                                                                   run AD pass only.
     ///   Miss:        `c.x != x` or cache is `None`                 → full inner solve + AD.
-    fn compute_ad_grads(&self, x: &[f64]) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<f64>>) {
+    #[allow(clippy::type_complexity)]
+    fn compute_ad_grads(
+        &self,
+        x: &[f64],
+    ) -> (
+        Vec<DVector<f64>>,
+        Vec<DMatrix<f64>>,
+        Vec<Vec<f64>>,
+        Vec<Vec<f64>>,
+    ) {
         let maybe_warm: Option<(Vec<DVector<f64>>, Vec<DMatrix<f64>>)> = {
             let cache = self.grad_cache.lock().unwrap();
             if let Some(ref c) = *cache {
                 if c.x == x {
                     if !c.per_subj_grads.is_empty() {
                         // Full hit: EBEs and AD gradients both cached.
-                        return (c.etas.clone(), c.h_mats.clone(), c.per_subj_grads.clone());
+                        return (
+                            c.etas.clone(),
+                            c.h_mats.clone(),
+                            c.per_subj_grads.clone(),
+                            c.per_subj_corrections.clone(),
+                        );
                     }
                     // Partial hit: EBEs ready from cost(), AD not yet done.
                     Some((c.etas.clone(), c.h_mats.clone()))
@@ -108,11 +135,12 @@ impl FoceiProblem<'_> {
         // Use warm EBEs on partial hit; run inner solve on miss.
         let (etas, h_mats) = maybe_warm.unwrap_or_else(|| self.run_inner(x));
         let n_subj = self.population.subjects.len();
+        let n = x.len();
 
-        let per_subj: Vec<Vec<f64>> = (0..n_subj)
+        let per_subj: Vec<(Vec<f64>, Vec<f64>)> = (0..n_subj)
             .into_par_iter()
             .map(|i| {
-                subject_nll_pop_grad(
+                let (_, gi, cache) = subject_nll_pop_grad_with_cache(
                     x,
                     self.init_params,
                     self.model,
@@ -123,19 +151,26 @@ impl FoceiProblem<'_> {
                     &[], // IOV not yet supported in trust_region path
                     &self.bounds,
                     self.options,
-                )
-                .1
+                );
+                let ti = cache
+                    .as_ref()
+                    .map(|c| c.gn_theta_correction.clone())
+                    .unwrap_or_else(|| vec![0.0; n]);
+                (gi, ti)
             })
             .collect();
+
+        let (grads, corrections): (Vec<Vec<f64>>, Vec<Vec<f64>>) = per_subj.into_iter().unzip();
 
         *self.grad_cache.lock().unwrap() = Some(GradCache {
             x: x.to_vec(),
             etas: etas.clone(),
             h_mats: h_mats.clone(),
-            per_subj_grads: per_subj.clone(),
+            per_subj_grads: grads.clone(),
+            per_subj_corrections: corrections.clone(),
         });
 
-        (etas, h_mats, per_subj)
+        (etas, h_mats, grads, corrections)
     }
 }
 
@@ -157,6 +192,7 @@ impl CostFunction for FoceiProblem<'_> {
             etas,
             h_mats,
             per_subj_grads: vec![],
+            per_subj_corrections: vec![],
         });
         Ok(ofv)
     }
@@ -166,13 +202,22 @@ impl Gradient for FoceiProblem<'_> {
     type Param = Vec<f64>;
     type Gradient = Vec<f64>;
 
+    /// `grad(OFV) = 2 · Σᵢ (gᵢ + tᵢ)` — the score plus the FOCEI `log|H̃|`
+    /// EBE-response curvature.
+    ///
+    /// `tᵢ` is not optional polish: under `interaction` the fixed-η̂ analytic
+    /// gradient drops it (the #274/#289 Δ — the envelope theorem zeros the inner
+    /// objective but not `log|H̃|`), and a gradient optimizer descending on the
+    /// truncated score stalls above the minimum (warfarin FOCEI −276.6 instead of
+    /// −286.0, `gauss_newton::build_gn_system`). It is identically zero under
+    /// FOCE and for additive error, so those paths are unchanged bit-for-bit.
     fn gradient(&self, p: &Vec<f64>) -> Result<Vec<f64>, Error> {
-        let (_, _, per_subj) = self.compute_ad_grads(p);
+        let (_, _, per_subj, corrections) = self.compute_ad_grads(p);
         let n = p.len();
         let mut g = vec![0.0_f64; n];
-        for gi in &per_subj {
+        for (gi, ti) in per_subj.iter().zip(&corrections) {
             for k in 0..n {
-                g[k] += 2.0 * gi[k];
+                g[k] += 2.0 * (gi[k] + ti[k]);
             }
         }
         Ok(g)
@@ -184,10 +229,14 @@ impl Hessian for FoceiProblem<'_> {
     type Hessian = Vec<Vec<f64>>;
 
     fn hessian(&self, p: &Vec<f64>) -> Result<Vec<Vec<f64>>, Error> {
-        let (_, _, per_subj) = self.compute_ad_grads(p);
+        let (_, _, per_subj, _) = self.compute_ad_grads(p);
         let n = p.len();
         // BHHH approximation: H ≈ 4 Σ gᵢgᵢᵀ  (factor 4 because OFV = 2*NLL,
         // so grad(OFV) = 2*gᵢ and the outer product scales by 4).
+        //
+        // Raw score only — the FOCEI `tᵢ` correction the gradient carries is a
+        // *curvature* term, not part of the score, and folding it into the outer
+        // product corrupts the Hessian (same rule as `build_gn_system`).
         let mut h = vec![vec![0.0_f64; n]; n];
         for gi in &per_subj {
             for i in 0..n {
@@ -324,18 +373,24 @@ type TrState = IterState<Vec<f64>, Vec<f64>, (), Vec<Vec<f64>>, (), f64>;
 /// ordinary mid-descent behaviour. The count is set well above that transient and
 /// far below the thousands of frozen iterations a converged run spends waiting
 /// for `outer_maxiter`.
+///
+/// Because progress is an **or** (`Δf > ftol` *or* `‖Δx‖ > xtol`) and a rejected
+/// trust-region step moves neither the parameters nor the objective, 20
+/// consecutive no-progress iterations means 20 consecutive *rejections* — the
+/// radius has shrunk by ≈`0.25²⁰ ≈ 1e-12` from the last accepted step. That is
+/// what the count actually tests, and it is why it does not need re-tuning per
+/// model.
+///
+/// Reaching it costs at least `TRUST_REGION_NO_PROGRESS_ITERS + 1` outer
+/// iterations, so a fit given a smaller `maxiter` can never report converged.
+/// [`classify_termination`] says so explicitly rather than blaming the fit.
 const TRUST_REGION_NO_PROGRESS_ITERS: u32 = 20;
-
-/// Relative objective tolerance for the no-progress test, used when
-/// `[fit_options] outer_ftol` is unset. Matches the NLopt outer default
-/// (see `resolve_outer_ftol`).
-const TRUST_REGION_DEFAULT_FTOL: f64 = 1e-6;
 
 /// L2 norm of a packed vector (the outer gradient, a step, or the parameter
 /// vector itself); `f64::INFINITY` if any entry is non-finite, so a blown-up
 /// value can never read as small.
 fn l2_norm(v: &[f64]) -> f64 {
-    let norm = v.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
     if norm.is_finite() {
         norm
     } else {
@@ -397,16 +452,40 @@ struct TrustRegionWithStop {
 }
 
 impl TrustRegionWithStop {
-    fn new(inner: TrustRegion<Steihaug<Vec<f64>, f64>, f64>, options: &FitOptions) -> Self {
+    /// `model` only feeds [`resolve_outer_ftol`], which auto-selects `1e-8` for a
+    /// pure non-Gaussian (TTE / categorical) non-ODE objective and `1e-6`
+    /// otherwise. Hardcoding `1e-6` here would leave `trust_region` stopping 100×
+    /// looser than every other optimizer on exactly the near-flat frailty-ω²
+    /// ridge #469 tightened it for.
+    fn new(
+        inner: TrustRegion<Steihaug<Vec<f64>, f64>, f64>,
+        model: &CompiledModel,
+        options: &FitOptions,
+    ) -> Self {
         Self {
             inner,
-            ftol: options.outer_ftol.unwrap_or(TRUST_REGION_DEFAULT_FTOL),
+            ftol: resolve_outer_ftol(
+                model.has_non_gaussian(),
+                model.is_ode_based(),
+                options.outer_ftol,
+            ),
             xtol: options.outer_xtol,
             prev: None,
             stalled_iters: 0,
             ever_progressed: false,
             verbose: options.verbose,
         }
+    }
+
+    /// `true` once the run has stalled for a full window **without ever having
+    /// made progress** — a trust region that rejects from its very first step has
+    /// not converged, it failed to start. Distinct from the converged stop so the
+    /// fit can bail out here instead of paying out the whole `maxiter` budget on
+    /// a frozen state, and so the warning can name the real cause (the starting
+    /// values) rather than telling the user to raise a budget that is not the
+    /// problem.
+    fn stalled_without_ever_progressing(&self) -> bool {
+        !self.ever_progressed && self.stalled_iters >= TRUST_REGION_NO_PROGRESS_ITERS
     }
 
     /// Record one optimizer iteration; `true` once the run has settled — no
@@ -461,12 +540,21 @@ impl<'a> Solver<FoceiProblem<'a>, TrState> for TrustRegionWithStop {
             None => return TerminationStatus::NotTerminated,
         };
         if self.note_iteration(state.get_iter(), state.get_cost(), x) {
-            TerminationStatus::Terminated(TerminationReason::SolverConverged)
-        } else {
-            TerminationStatus::NotTerminated
+            return TerminationStatus::Terminated(TerminationReason::SolverConverged);
         }
+        if self.stalled_without_ever_progressing() {
+            return TerminationStatus::Terminated(TerminationReason::SolverExit(
+                TRUST_REGION_NO_INITIAL_PROGRESS.to_string(),
+            ));
+        }
+        TerminationStatus::NotTerminated
     }
 }
+
+/// `SolverExit` reason for a run that rejected every step from iteration 0.
+/// Matched by [`classify_termination`] so the warning names the starting values
+/// instead of the iteration budget.
+const TRUST_REGION_NO_INITIAL_PROGRESS: &str = "made no progress from the starting values";
 
 /// Map an argmin termination status onto `(converged, warning)`.
 ///
@@ -476,23 +564,54 @@ impl<'a> Solver<FoceiProblem<'a>, TrState> for TrustRegionWithStop {
 /// units short of the optimum was labelled `Converged: YES` and its standard
 /// errors were computed at a non-stationary point.
 ///
-/// Only a solver-side stop counts as convergence: `SolverConverged` (our
-/// stationary-gradient criterion) and `TargetCostReached` (a caller-set target
-/// cost — unreachable here, since we never set one, but honest if it ever is).
-/// Everything else — budget exhaustion, Ctrl-C, timeout, a solver bail-out — is
-/// reported as not converged with a warning naming the reason.
+/// Only a solver-side stop counts as convergence: `SolverConverged` (the
+/// no-progress criterion of [`TRUST_REGION_NO_PROGRESS_ITERS`] — *not* a
+/// gradient-stationarity test, see that constant for why) and `TargetCostReached`
+/// (a caller-set target cost — unreachable here, since we never set one, but
+/// honest if it ever is). Everything else — budget exhaustion, Ctrl-C, timeout, a
+/// solver bail-out — is reported as not converged with a warning naming the
+/// reason.
+///
+/// The `maxiter` message names the `[fit_options]` key (`maxiter`), not the
+/// internal `FitOptions` field, and calls out the case where the budget was too
+/// small for the stopping rule to fire *at all* rather than blaming the fit.
 fn classify_termination(status: &TerminationStatus, max_iters: u64) -> (bool, Option<String>) {
     match status {
         TerminationStatus::Terminated(TerminationReason::SolverConverged)
         | TerminationStatus::Terminated(TerminationReason::TargetCostReached) => (true, None),
-        TerminationStatus::Terminated(TerminationReason::MaxItersReached) => (
-            false,
-            Some(format!(
-                "Trust-region did not converge: reached outer_maxiter ({max_iters}). \
-                 The estimates and any standard errors are reported at a non-stationary \
-                 point; raise maxiter or improve the starting values."
-            )),
-        ),
+        TerminationStatus::Terminated(TerminationReason::MaxItersReached) => {
+            let min_for_convergence = u64::from(TRUST_REGION_NO_PROGRESS_ITERS) + 1;
+            let remedy = if max_iters < min_for_convergence {
+                format!(
+                    "settling cannot even be demonstrated below maxiter = {min_for_convergence} \
+                     (the stopping rule needs {TRUST_REGION_NO_PROGRESS_ITERS} consecutive \
+                     rejected steps), so raise maxiter above that before reading anything into \
+                     this verdict."
+                )
+            } else {
+                "raise maxiter or improve the starting values.".to_string()
+            };
+            (
+                false,
+                Some(format!(
+                    "Trust-region did not converge: reached the iteration budget \
+                     (maxiter = {max_iters}). The estimates and any standard errors are \
+                     reported at a non-stationary point; {remedy}"
+                )),
+            )
+        }
+        TerminationStatus::Terminated(TerminationReason::SolverExit(reason))
+            if reason == TRUST_REGION_NO_INITIAL_PROGRESS =>
+        {
+            (
+                false,
+                Some(format!(
+                    "Trust-region did not converge: {reason} — every step was rejected from the \
+                     first iteration, so the fit never left them. Check the starting values \
+                     (`inits_from_nca` helps) and that the model is identifiable on this data."
+                )),
+            )
+        }
         TerminationStatus::Terminated(reason) => (
             false,
             Some(format!("Trust-region did not converge: {reason}")),
@@ -551,6 +670,7 @@ pub fn optimize_trust_region(
             .expect("trust region radius must be positive")
             .with_max_radius(10.0)
             .expect("trust region max radius must be positive"),
+        model,
         options,
     );
 
@@ -559,29 +679,38 @@ pub fn optimize_trust_region(
         .configure(|state| state.param(x0.clone()).max_iters(max_iters))
         .run();
 
-    let (converged, mut best_x, final_gradient) = match result {
+    let (converged, best_x, n_iterations, final_gradient) = match result {
         Ok(res) => {
             let (converged, warning) =
                 classify_termination(res.state().get_termination_status(), max_iters);
+            let n_iterations = res.state().get_iter() as usize;
             if options.verbose {
                 eprintln!(
                     "Trust-region finished: {} iters, {}",
-                    res.state().get_iter(),
+                    n_iterations,
                     res.state().get_termination_status()
                 );
             }
-            let vec = res
+            let mut vec = res
                 .state()
                 .get_best_param()
                 .cloned()
                 .unwrap_or_else(|| x0.clone());
+            // Clamp *before* the gradient: the trust region is unconstrained and
+            // can walk a theta past its bound, and every downstream consumer
+            // (`unpack_params`, the covariance step, `packed_estimate`) sees the
+            // clamped vector. Taking the gradient at the raw point would report a
+            // ‖∂OFV/∂x‖ that belongs to a different parameter vector than the
+            // estimates it is printed next to.
+            clamp_to_bounds(&mut vec, &compute_bounds(init_params));
             // Gradient at the returned point, for `FitResult.final_gradient` and
             // so the non-convergence warning can quote how far from stationary
             // the fit stopped. Reuses the executor's problem, and with it the
-            // gradient cache: free when the last evaluated point is the one
-            // returned, and otherwise (the final trial step was rejected, so the
-            // cache holds that rejected point) one extra gradient evaluation per
-            // fit — not per iteration.
+            // gradient cache — but note that on the *converged* path the run
+            // stopped precisely because its last steps were rejected, so `cost()`
+            // has already overwritten the cache with the rejected trial point and
+            // this misses. Budget one extra gradient evaluation per fit; it is
+            // per-fit, not per-iteration.
             let OptimizationResult {
                 problem: mut prob, ..
             } = res;
@@ -592,18 +721,16 @@ pub fn optimize_trust_region(
                 }
                 warnings.push(w);
             }
-            (converged, vec, grad)
+            (converged, vec, n_iterations, grad)
         }
         Err(e) => {
             if options.verbose {
                 eprintln!("Trust-region stopped: {}", e);
             }
             warnings.push(format!("Trust-region did not converge: {}", e));
-            (false, x0.clone(), None)
+            (false, x0.clone(), 0, None)
         }
     };
-
-    clamp_to_bounds(&mut best_x, &compute_bounds(init_params));
 
     let final_params = unpack_params(&best_x, init_params);
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
@@ -634,13 +761,17 @@ pub fn optimize_trust_region(
         eprintln!("Final OFV = {:.6}", final_ofv);
     }
 
-    // A settled run whose objective is not finite has not converged to anything:
-    // the trial objective is clamped to a large sentinel when it blows up, so the
-    // no-progress rule can otherwise "settle" on that sentinel.
-    let converged = converged && final_ofv.is_finite();
+    // A settled run whose objective is not a real population OFV has not
+    // converged to anything: `ofv_fixed` clamps a blown-up objective to a ~1e20
+    // sentinel, and the no-progress rule can settle on that sentinel or on any
+    // other diverged value. `is_finite()` is *not* enough — the sentinel is
+    // finite — so this uses the same validity cutoff the multi-start ranking
+    // applies (`DIVERGENCE_OFV`).
+    let converged = converged && ofv_is_valid(final_ofv);
     if !converged && warnings.is_empty() {
         warnings.push(format!(
-            "Trust-region did not converge: final OFV is not finite ({final_ofv})"
+            "Trust-region did not converge: the final OFV ({final_ofv:.4e}) is not a valid \
+             population objective — the fit diverged."
         ));
     }
 
@@ -667,7 +798,11 @@ pub fn optimize_trust_region(
         params: final_params,
         ofv: final_ofv,
         converged,
-        n_iterations: 0,
+        // Outer trust-region iterations actually run. This is the number the
+        // convergence verdict is about — `io/output.rs` prints it right next to
+        // the "reached the iteration budget (maxiter = N)" warning, so a
+        // hardcoded 0 contradicted the message beside it.
+        n_iterations,
         eta_hats: final_ehs,
         h_matrices: final_hms,
         kappas: final_kappas,
@@ -950,7 +1085,11 @@ mod tests {
         );
         assert!(!conv, "budget exhaustion is not convergence");
         let warn = warn.expect("MaxItersReached must warn");
-        assert!(warn.contains("reached outer_maxiter (300)"), "{warn}");
+        // Names the `[fit_options]` key the user can actually set — `maxiter`,
+        // not the internal `outer_maxiter` field.
+        assert!(warn.contains("maxiter = 300"), "{warn}");
+        assert!(!warn.contains("outer_maxiter"), "{warn}");
+        assert!(warn.contains("raise maxiter"), "{warn}");
 
         for reason in [
             TerminationReason::Interrupt,
@@ -965,6 +1104,131 @@ mod tests {
         let (conv, warn) = classify_termination(&TerminationStatus::NotTerminated, 300);
         assert!(!conv);
         assert!(warn.is_some());
+    }
+
+    /// Reaching the no-progress stop costs at least
+    /// `TRUST_REGION_NO_PROGRESS_ITERS + 1` outer iterations, so a smaller budget
+    /// makes `Converged: NO` structural rather than a verdict on the fit. The
+    /// warning has to say so instead of telling the user to "improve the starting
+    /// values" for a run that was never allowed to demonstrate settling.
+    #[test]
+    fn classify_termination_flags_a_budget_too_small_to_ever_converge() {
+        let floor = u64::from(TRUST_REGION_NO_PROGRESS_ITERS) + 1;
+
+        let (_, warn) = classify_termination(
+            &TerminationStatus::Terminated(TerminationReason::MaxItersReached),
+            floor - 1,
+        );
+        let warn = warn.expect("MaxItersReached must warn");
+        assert!(
+            warn.contains(&format!(
+                "cannot even be demonstrated below maxiter = {floor}"
+            )),
+            "{warn}"
+        );
+        assert!(!warn.contains("improve the starting values"), "{warn}");
+
+        // At the floor and above it is an ordinary budget verdict again.
+        let (_, warn) = classify_termination(
+            &TerminationStatus::Terminated(TerminationReason::MaxItersReached),
+            floor,
+        );
+        let warn = warn.expect("MaxItersReached must warn");
+        assert!(warn.contains("improve the starting values"), "{warn}");
+        assert!(!warn.contains("cannot even be demonstrated"), "{warn}");
+    }
+
+    /// A run that rejected every step from iteration 0 gets its own reason, so
+    /// the warning points at the starting values rather than at a budget that was
+    /// never the constraint.
+    #[test]
+    fn classify_termination_names_the_starting_values_when_nothing_ever_moved() {
+        let (conv, warn) = classify_termination(
+            &TerminationStatus::Terminated(TerminationReason::SolverExit(
+                TRUST_REGION_NO_INITIAL_PROGRESS.to_string(),
+            )),
+            500,
+        );
+        assert!(!conv, "a run that never started has not converged");
+        let warn = warn.expect("the no-initial-progress exit must warn");
+        assert!(warn.contains(TRUST_REGION_NO_INITIAL_PROGRESS), "{warn}");
+        // Not just argmin's `Display` echo of the exit string — the arm has to
+        // add the remedy, which is what distinguishes it from the generic
+        // solver-bail-out branch.
+        assert!(warn.contains("`inits_from_nca` helps"), "{warn}");
+        assert!(warn.contains("every step was rejected"), "{warn}");
+        assert!(
+            !warn.contains("maxiter = 500"),
+            "the budget is not the cause here: {warn}"
+        );
+    }
+
+    /// Analytic-gradient ↔ central-FD parity for the vector the trust region
+    /// descends on.
+    ///
+    /// `Gradient::gradient` must equal `d/dx` of `CostFunction::cost` — the OFV
+    /// *after* the inner loop has re-solved the EBEs at `x`, i.e. the marginal.
+    /// Under `interaction` the fixed-η̂ analytic score `2·Σ gᵢ` alone does **not**:
+    /// it drops the `log|H̃|` EBE-response term `tᵢ` (#274/#289), and a gradient
+    /// optimizer descending on it stalls above the minimum. Dropping `tᵢ` here
+    /// fails this test by orders of magnitude on the σ and Ω coordinates.
+    ///
+    /// Each evaluation gets a fresh `FoceiProblem` so `cost` is a pure function of
+    /// `x` (no warm-started EBE carry-over between FD probes).
+    #[test]
+    fn gradient_matches_central_fd_of_the_marginal_cost() {
+        use crate::io::datareader::read_nonmem_csv;
+        use std::path::Path;
+
+        let model = warfarin_model();
+        let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data must load");
+
+        for interaction in [false, true] {
+            let options = FitOptions {
+                interaction,
+                // The FD baseline is only as good as the EBE fixpoint under it.
+                inner_tol: 1e-10,
+                inner_maxiter: 200,
+                verbose: false,
+                ..FitOptions::default()
+            };
+            let init = &model.default_params;
+            let bounds = compute_bounds(init);
+            let mut x = pack_params(init);
+            clamp_to_bounds(&mut x, &bounds);
+
+            let fresh = || FoceiProblem {
+                model: &model,
+                population: &population,
+                options: &options,
+                init_params: init,
+                bounds: compute_bounds(init),
+                cached_etas: std::sync::Mutex::new(vec![
+                    DVector::zeros(model.n_eta);
+                    population.subjects.len()
+                ]),
+                grad_cache: std::sync::Mutex::new(None),
+            };
+
+            let analytic = fresh().gradient(&x).expect("gradient must evaluate");
+
+            let h = 1e-5;
+            for k in 0..x.len() {
+                let mut up = x.clone();
+                up[k] += h;
+                let mut dn = x.clone();
+                dn[k] -= h;
+                let fd = (fresh().cost(&up).unwrap() - fresh().cost(&dn).unwrap()) / (2.0 * h);
+                let scale = fd.abs().max(analytic[k].abs()).max(1.0);
+                assert!(
+                    (analytic[k] - fd).abs() / scale < 5e-3,
+                    "interaction={interaction} coord {k}: analytic {} vs central FD {}",
+                    analytic[k],
+                    fd
+                );
+            }
+        }
     }
 
     /// The no-progress test that stands in for argmin's missing convergence
@@ -1022,9 +1286,7 @@ mod tests {
             "a run that exhausted outer_maxiter must not report converged"
         );
         assert!(
-            res.warnings
-                .iter()
-                .any(|w| w.contains("reached outer_maxiter (2)")),
+            res.warnings.iter().any(|w| w.contains("maxiter = 2")),
             "missing the budget-exhaustion warning: {:?}",
             res.warnings
         );
@@ -1034,16 +1296,122 @@ mod tests {
             res.final_gradient.is_some(),
             "trust_region must report final_gradient"
         );
+        // ...and the iteration count it stopped at, which was hardcoded to 0
+        // right next to the warning that names the budget.
+        assert_eq!(
+            res.n_iterations, 2,
+            "the reported iteration count must be the budget it exhausted"
+        );
+    }
+
+    fn warfarin_model() -> crate::types::CompiledModel {
+        crate::parser::model_parser::parse_model_file(std::path::Path::new(
+            "examples/warfarin.ferx",
+        ))
+        .expect("warfarin model must parse")
     }
 
     fn stall_tracker() -> TrustRegionWithStop {
         TrustRegionWithStop::new(
             TrustRegion::new(Steihaug::new()).with_radius(1.0).unwrap(),
+            &warfarin_model(),
             &FitOptions {
                 verbose: false,
                 ..FitOptions::default()
             },
         )
+    }
+
+    /// The no-progress test must run on the same objective tolerance every other
+    /// outer optimizer resolves, not a hardcoded `1e-6`: `resolve_outer_ftol`
+    /// tightens to `1e-8` for a pure non-Gaussian (TTE) non-ODE objective, and
+    /// that tightening is the #469 fix for the near-flat frailty-ω² ridge.
+    /// Hardcoding would have left `trust_region` stopping 100× looser than
+    /// `bobyqa` on exactly that model, and reporting `Converged: YES` for it.
+    #[test]
+    fn stall_tolerance_follows_resolve_outer_ftol() {
+        let tracker = |model: &crate::types::CompiledModel, override_ftol| {
+            TrustRegionWithStop::new(
+                TrustRegion::new(Steihaug::new()).with_radius(1.0).unwrap(),
+                model,
+                &FitOptions {
+                    outer_ftol: override_ftol,
+                    ..FitOptions::default()
+                },
+            )
+        };
+
+        let gaussian = warfarin_model();
+        assert!(!gaussian.has_non_gaussian());
+        assert_eq!(tracker(&gaussian, None).ftol, 1e-6);
+
+        // An explicit `[fit_options] outer_ftol` still wins.
+        assert_eq!(tracker(&gaussian, Some(1e-10)).ftol, 1e-10);
+
+        // The step limb is the user's `outer_xtol` verbatim.
+        assert_eq!(
+            tracker(&gaussian, None).xtol,
+            FitOptions::default().outer_xtol
+        );
+
+        // The branch that matters — a pure-TTE objective gets the #469 `1e-8` —
+        // needs a model only the `survival` build can parse.
+        #[cfg(feature = "survival")]
+        {
+            let tte = crate::parser::model_parser::parse_model_file(std::path::Path::new(
+                "examples/tte_weibull.ferx",
+            ))
+            .expect("tte_weibull model must parse");
+            assert!(tte.has_non_gaussian() && !tte.is_ode_based());
+            assert_eq!(
+                tracker(&tte, None).ftol,
+                1e-8,
+                "a pure-TTE fit must inherit the #469 tightening"
+            );
+            assert_eq!(tracker(&tte, Some(1e-5)).ftol, 1e-5);
+        }
+    }
+
+    /// A run that rejects every step from iteration 0 must bail out on its own
+    /// rather than paying out the whole `maxiter` budget on a frozen state. The
+    /// converged verdict stays false either way (see
+    /// `note_iteration_never_converges_without_progress_first`); this pins the
+    /// *early exit* that keeps it from costing 500 inner-loop solves.
+    #[test]
+    fn stalled_without_ever_progressing_bails_out_of_a_frozen_run() {
+        let mut tracker = stall_tracker();
+        let x = vec![1.0, 1.0];
+
+        for k in 0..TRUST_REGION_NO_PROGRESS_ITERS {
+            assert!(!tracker.note_iteration(k as u64, 42.0, x.clone()));
+            assert!(
+                !tracker.stalled_without_ever_progressing(),
+                "bailed out after only {k} frozen iterations"
+            );
+        }
+        // Call k = 0 only seeded `prev`, so the window closes one call later.
+        assert!(!tracker.note_iteration(
+            u64::from(TRUST_REGION_NO_PROGRESS_ITERS),
+            42.0,
+            x.clone()
+        ));
+        assert!(
+            tracker.stalled_without_ever_progressing(),
+            "a fully frozen run must bail out instead of burning the budget"
+        );
+
+        // A run that did move is never diverted onto this exit, however long it
+        // then sits still — that is the converged stop's business.
+        let mut moving = stall_tracker();
+        moving.note_iteration(0, 100.0, vec![1.0]);
+        moving.note_iteration(1, 90.0, vec![1.0]);
+        for k in 0..(TRUST_REGION_NO_PROGRESS_ITERS * 2) {
+            moving.note_iteration(2 + k as u64, 90.0, vec![1.0]);
+            assert!(
+                !moving.stalled_without_ever_progressing(),
+                "a run that progressed must not take the never-started exit"
+            );
+        }
     }
 
     /// The other half of #1000: with argmin's `TrustRegion` never terminating on

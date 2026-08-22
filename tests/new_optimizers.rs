@@ -451,13 +451,18 @@ fn trust_region_reports_converged_when_it_settles() {
         !result
             .warnings
             .iter()
-            .any(|w| w.contains("reached outer_maxiter")),
+            .any(|w| w.contains("iteration budget")),
         "a settled fit must not carry the budget-exhaustion warning: {:?}",
         result.warnings
     );
     // Anchor: the same fit under the default optimizer. `trust_region` may take a
     // slightly different path, but a run that reports converged must land at the
     // same optimum, not somewhere short of it.
+    //
+    // Deliberately **one-sided**: the failure this guards against is settling
+    // *above* the optimum. A `trust_region` run that reaches a lower OFV than
+    // BOBYQA is an improvement, not a regression, and must not turn the nightly
+    // job red — so only the shortfall is bounded.
     let mut ref_opts = base_options();
     ref_opts.method = EstimationMethod::Foce;
     ref_opts.optimizer = Optimizer::Auto;
@@ -465,7 +470,7 @@ fn trust_region_reports_converged_when_it_settles() {
     let reference = fit(&model, &population, &model.default_params, &ref_opts)
         .expect("reference fit must succeed");
     assert!(
-        (result.ofv - reference.ofv).abs() < 0.05,
+        result.ofv < reference.ofv + 0.05,
         "trust_region reported converged at OFV {} but the default optimizer reaches {}",
         result.ofv,
         reference.ofv

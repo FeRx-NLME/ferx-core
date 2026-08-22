@@ -330,7 +330,24 @@ section of the SDLC for the versioning policy).
   `outer_xtol` for 20 consecutive iterations — and a run that instead hits `maxiter` reports
   `Converged: NO` with a warning naming the budget and the gradient norm it stopped at. Fits that
   do settle now also stop as soon as they settle instead of grinding out the remaining budget (the
-  warfarin fit returns at iteration 59), and the trust-region path now reports `final_gradient`.
+  warfarin fit returns at iteration 59), and the trust-region path now reports `final_gradient` and
+  the number of outer iterations it actually ran (it reported `Iterations: 0` before). `outer_ftol`
+  and `outer_xtol`, previously `bobyqa`-only, now also govern `trust_region`; `outer_ftol` resolves
+  the same way for both, so a pure-TTE fit gets the #469 `1e-8` tightening rather than a looser
+  hardcoded value. Two verdicts are newly explicit: a `maxiter` below 21 cannot demonstrate settling
+  at all (the warning says so instead of blaming the fit), and a run that rejects every step from
+  the first iteration is reported against its *starting values* and bails out immediately rather
+  than spending the whole budget frozen. Note for multi-start users: `n_starts` prefers a converged
+  candidate over a non-converged one, and that key was inert while every `trust_region` run claimed
+  convergence — a settled start can now be selected over a better-OFV start that ran out of budget.
+- **`optimizer = trust_region` under `method = focei` no longer descends on a truncated gradient.**
+  The trust region used the fixed-η̂ score `2·Σ gᵢ`, which drops the `log|H̃|` EBE-response term
+  `tᵢ` (#274/#289) that the Gauss-Newton path already adds — the omission a gradient optimizer
+  stalls above the minimum on. It now uses the same `2·Σ (gᵢ + tᵢ)` marginal gradient, pinned
+  against central finite differences of the objective in a unit test. FOCE and additive-error fits
+  are unchanged bit-for-bit (`tᵢ` is identically zero there); FOCEI fits reach a lower OFV, and
+  `final_gradient` is now the marginal gradient rather than a quantity that stays large at the
+  optimum.
 - **A negative Form C `[scaling]` prediction is no longer silently clamped to zero on ODE models
   (#1020).** The ODE predictor applied its negative-prediction guard to the *final* prediction
   vector — after the `y = <expr>` / `y[CMT=N] = <expr>` readout had been evaluated. That guard is a

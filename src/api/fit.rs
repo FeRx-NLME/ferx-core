@@ -164,11 +164,9 @@ pub(crate) fn perturb_init(
 /// The validity cutoff sits well below the ~1e20 inner-objective sentinel but
 /// far above any legitimate population OFV, so a real fit never trips it; a NaN
 /// OFV is non-finite and therefore also invalid, so it can never block a finite
-/// valid candidate.
+/// valid candidate. See `estimation::outer_optimizer::ofv_is_valid`.
 pub(crate) fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: bool) -> bool {
-    /// OFVs at or above this are treated as diverged/invalid (see above).
-    const DIVERGENCE_OFV: f64 = 1e14;
-    let valid = |o: f64| o.is_finite() && o < DIVERGENCE_OFV;
+    let valid = crate::estimation::outer_optimizer::ofv_is_valid;
     match (valid(b_ofv), valid(c_ofv)) {
         (false, true) => true,
         (true, false) => false,
