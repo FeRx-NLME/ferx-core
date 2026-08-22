@@ -2104,6 +2104,42 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         }
     }
 
+    // ── Quadrature × trust_region: objective and gradient would disagree ──────────────────
+    // A quadrature stage minimises the AGQ marginal, and every optimizer reaches it through
+    // `pop_nll_opts`. Only the *gradient* differs: `optimize_nlopt` and `optimize_bfgs` both
+    // go through `population_gradient`, which branches on `agq_nodes()` and hands the job to
+    // `agq::agq_population_gradient`. The trust-region path has its own `Gradient` impl
+    // (`trust_region::FoceiProblem`) with no such branch — it returns the FOCE/Laplace
+    // closed form regardless.
+    //
+    // That mismatch does not fail loudly. `FitOptions::agq_nodes` and `population_gradient`
+    // both spell out what it does instead: "an outer loop minimising the AGQ objective while
+    // fed the analytic *FOCE* gradient would converge, silently, to the wrong parameters" —
+    // reporting AGQ OFVs at the FOCE optimum. Reject up front until the trust region routes
+    // the quadrature gradient (and gets a BHHH Hessian built from per-subject AGQ scores).
+    if (laplace_stage || focei_quadrature) && options.optimizer == Optimizer::TrustRegion {
+        let label = if laplace_stage { "laplace" } else { "focei" };
+        diags.push(
+            Diagnostic::error(
+                "E_OPTIMIZER_AGQ",
+                format!(
+                    "optimizer = trust_region does not support the quadrature objective \
+                     (method = {label}{}). Its gradient is the FOCE/Laplace closed form, so it \
+                     would descend on a different function than the one being scored and \
+                     converge silently to the FOCE optimum while reporting quadrature OFVs. \
+                     Use optimizer = bobyqa, slsqp, lbfgs, nlopt_lbfgs, mma, or bfgs, which \
+                     route the quadrature gradient.",
+                    if focei_quadrature && !laplace_stage {
+                        format!(" with n_agq = {}", options.n_agq)
+                    } else {
+                        String::new()
+                    }
+                ),
+            )
+            .with_block("fit_options"),
+        );
+    }
+
     // Explicit `gradient_method = ad`: the Enzyme autodiff path was retired in
     // favour of the hand-rolled `Dual2` analytic sensitivities. Reject it rather
     // than silently running a different method. `auto` (analytic where in scope,

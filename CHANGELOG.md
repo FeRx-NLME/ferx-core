@@ -348,6 +348,15 @@ section of the SDLC for the versioning policy).
   are unchanged bit-for-bit (`tᵢ` is identically zero there); FOCEI fits reach a lower OFV, and
   `final_gradient` is now the marginal gradient rather than a quantity that stays large at the
   optimum.
+- **`optimizer = trust_region` is now rejected on a quadrature stage (`E_OPTIMIZER_AGQ`) instead
+  of silently fitting the wrong objective.** `method = laplace` (any `n_agq`) and `method = focei`
+  with `n_agq > 1` minimise the adaptive-quadrature marginal, and every optimizer scores it — but
+  only the NLopt and BFGS paths route the matching gradient (`agq_population_gradient`). The
+  trust region has its own gradient with no quadrature branch, so it descended on the
+  FOCE/Laplace closed form while reporting quadrature OFVs: a fit that converged, smoothly, to
+  the FOCE optimum with no warning. `ferx check` and `fit()` now both reject the combination and
+  name the optimizers that do support it. Full quadrature support in the trust region needs a
+  BHHH Hessian built from per-subject quadrature scores and is tracked separately.
 - **A negative Form C `[scaling]` prediction is no longer silently clamped to zero on ODE models
   (#1020).** The ODE predictor applied its negative-prediction guard to the *final* prediction
   vector — after the `y = <expr>` / `y[CMT=N] = <expr>` readout had been evaluated. That guard is a
