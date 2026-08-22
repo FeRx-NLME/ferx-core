@@ -134,6 +134,156 @@ mu-centering that mitigates it — so the diagnostic is most warranted in exactl
 case. Prefer log-mu-referenced forms (`P = TV * exp(ETA)`) where the model allows.
 :::
 
+::: {.callout-important}
+## A theta with no ETA at all is worse than slow — it can drift
+
+The warning above covers a parameter whose eta ferx could not mu-reference. A
+**fixed-effect-only theta** — one that carries no eta anywhere in
+`[individual_parameters]` — is a distinct and more damaging case, and SAEM warns
+about it separately:
+
+```
+SAEM: estimated parameter(s) [TVFRD1] have NO associated ETA, so they are not
+mu-referenced and are moved only by the η-frozen numerical M-step. ...
+```
+
+Such a theta never receives the closed-form `log θ += γ·mean(η)` shift, which is
+an exact Robbins-Monro average. Its only channel is the numerical M-step, which
+re-maximises the conditional observation likelihood against a **single** MCMC η
+draw. Assigning that maximiser outright is `argmax` of one draw rather than the
+SA average of `E[argmax]`, so the estimate carries a Monte-Carlo bias that does
+not decay with iteration count, and it can settle a long way from the marginal
+optimum — dragging correlated typical values with it.
+
+Measured on a FREM `iiv_on_ruv` model (475 subjects, 12 etas) whose absorption
+fraction `TVFRD1` splits a zero-order duration and a first-order rate
+(`D1 = MAT*(1-TVFRD1)`, `KA = 1/(MAT*TVFRD1)`) with no eta of its own. The
+marginal −2logL optimum for `TVFRD1` on this dataset is ≈ 0.29:
+
+| Run | TVCL | TVV | TVMAT | TVFRD1 |
+|---|---|---|---|---|
+| NONMEM IMP (reference) | 7.060 | 133.8 | 2.680 | 0.394 |
+| ferx IMP | 7.068 | 135.5 | 2.751 | 0.311 |
+| ferx IMPMAP | 7.046 | 134.2 | 2.780 | 0.318 |
+| ferx SAEM, **before** the #1011 damping | 7.169 | 143.2 | 3.020 | **0.039** |
+| ferx SAEM, before, started *at* the IMPMAP solution | 7.046 | 136.4 | 3.191 | **0.065** |
+| **ferx SAEM, current** | 7.123 | 139.5 | 2.686 | **0.290** |
+| ferx SAEM, `FRD1 = TVFRD1*exp(ETA_FRD1)`, ω² = 0.01 | 7.181 | 142.5 | 2.646 | 0.313 |
+| ferx SAEM, `TVFRD1` held `FIX` at 0.394 | 7.025 | 131.9 | 2.770 | (fixed) |
+
+Restarting SAEM at the right answer did not rescue the old behaviour — the
+M-step walked the parameter back down — so this was never a starting-value
+problem.
+
+The remedy depends on what the parameter *is*. A typical value should be put in
+a mu-referenceable form (`P = TVP * exp(ETA_P)`, with a small — optionally `FIX`
+— omega; ferx applies the mu-referencing automatically). A parameter that has no
+eta to give — a covariate coefficient, an allometric exponent, a structural
+constant — should be held `FIX`, or the fit cross-checked against FOCEI/IMPMAP.
+
+The advisory deliberately stays quiet about two kinds of theta, because "has no
+ETA" would be false for them:
+
+- **Mixing coefficients** of a [mixture model](mixture.qmd). The numerical θ/σ
+  M-step never moves them — they do not enter the residual/eta likelihood, and
+  the mixing M-step overwrites them from the class responsibilities — and a
+  mixing expression is *forbidden* from depending on an eta in the first place.
+- **`MIXNUM`-switched class typical values**, and log-mu-referenced thetas
+  dropped to the identity scale by a negative lower bound. These carry an eta in
+  the model text and are on the numerical M-step for a reason SAEM already
+  states in its own warning; repeating "add an ETA" on top of that would be both
+  false and contradictory.
+
+### What SAEM does about it now
+
+The numerical θ/σ M-step result is blended in as a Robbins-Monro step
+`θ ← θ + γ_θ·(θ* − θ)` rather than assigned outright, with `γ_θ` capped at
+**0.03** during exploration and following the full decaying `γ = 1/(k−k1)` in
+convergence. This is the θ-side counterpart of the cap SAEM already applied to
+the Ω sufficient statistic, and it exists for the same reason: a single
+un-equilibrated MCMC draw must not be able to carry a parameter away.
+
+The cap is the `mstep_damping` fit option, and defaults to 0.03:
+
+```
+[fit_options]
+  method        = saem
+  mstep_damping = 0.01   # smaller damps harder; 1.0 turns the damping off
+```
+
+Values must lie in `(0, 1]`. Smaller damps harder — on the model below, 0.01
+moves `TVFRD1` to 0.355 and 0.003 to 0.357, against NONMEM's 0.394 — but tighter
+caps also slow legitimate exploration, and here they pull `TVV` off (129.9 at
+0.01 against NONMEM's 133.8). **`mstep_damping = 1.0` disables the damping
+entirely**, in both phases, restoring the pre-0.3.x behaviour exactly; that is
+the escape hatch if a model fitted better without it.
+
+`1.0` is therefore a *sentinel*, not a cap value, and the option is deliberately
+discontinuous there: `mstep_damping = 0.999` still buys the full convergence
+schedule `γ = 1/(k−k1)`, while `1.0` buys none of it. There is no setting that
+means "cap exploration a little and leave convergence alone" — the option only
+ever governs the exploration cap — and "off" has to restore the whole pre-damping
+trajectory to be a useful escape hatch. (Lifting only the exploration cap left
+the model above at `TVFRD1` 0.047 rather than its true undamped 0.039.)
+
+The damping is applied only to the channel the bias lives in: a fit is damped
+when NLopt is left estimating a theta that is **not mu-referenced**, which is
+exactly the situation the advisory above warns about. A theta that is `FIX`, that
+is pinned out by the mu-reference shift, or that is mu-referenceable at all (so
+the exact closed-form `log θ += γ·mean(η)` update is available to it) is left on
+the undamped update, and a fit whose every estimated theta is one of those is
+unaffected down to the last bit — and setting `mstep_damping` on such a model
+warns that it has no effect rather than accepting it silently.
+
+**Sigma is damped with the same `γ_θ`**, on the same gate, even though the gate
+is a statement about theta. That is not an oversight: the numerical M-step is a
+*single* NLopt problem over the concatenated `[θ; σ]` vector, so `θ*` and `σ*`
+are one joint maximiser of the same frozen-η likelihood. Blending theta at `γ_θ`
+while assigning sigma outright would take an inconsistent partial step — sigma
+would jump to the value that is optimal for the theta the M-step wanted, while
+theta is held near the theta it had, leaving sigma to absorb the very misfit the
+damping just stopped theta from fixing. So a model that trips the gate has its
+sigma damped too, including when the theta that trips it is a covariate
+coefficient or an allometric exponent rather than a typical value.
+
+One case is deliberately left out of scope: under `mu_referencing = false` every
+theta goes through the numerical M-step, but a theta written in a
+mu-referenceable form is not the fixed-effect-only channel the damping was
+calibrated against, so such a fit keeps the undamped update and `mstep_damping`
+reports that it had no effect (naming that reason).
+
+"Mu-referenced" here means ferx *detected* the pairing — the `TVX * exp(ETA_X)`
+and logit forms. A parameter that carries an eta in a form ferx cannot pair with
+a single theta (an additive `X = TVX + ETA_X`, or a covariate model whose typical
+value is not log-linear in one theta) counts as un-referenced and is damped,
+which is the intended side to err on: that theta has no closed-form shift either,
+so the numerical M-step really is its only mover.
+
+[Mixture models](mixture.qmd) are also excluded. A `MIXNUM`-switched typical
+value goes through the same numerical M-step, but it is solving a different
+problem — the class typical values must *separate* from a common start, and the
+class assignments only settle once they have. Damping that excursion stalls the
+separation, so mixtures keep the undamped update.
+
+Averaging the M-step *objective* over the last `K` η draws instead — the obvious
+alternative — is both weaker and far more expensive: it reaches `TVFRD1` 0.081 at
+K = 50 and 0.130 at K = 150 (15× the wall time), because consecutive SAEM draws
+are heavily autocorrelated. Damping the iterate accumulates over every iteration
+rather than a K-window, which is why it wins on both axes.
+
+Damping reduces the Monte-Carlo bias but does not remove it, so the advisory
+still fires and the two structural remedies remain the better answer:
+
+* **Attach an eta** — `P = TVP * exp(ETA_P)` with a small omega (optionally
+  `FIX`). ferx then mu-references it automatically and the exact closed-form
+  update takes over.
+* **Hold it `FIX`** at a value estimated by another method. Every theta then
+  lands within 3% of NONMEM, `TVV` included.
+
+Otherwise estimate the model with [FOCEI](foce.qmd) or
+[IMPMAP](impmap.qmd), which do not depend on this channel.
+:::
+
 The number of NLopt evaluations saved is stored in `FitResult::saem_mu_ref_m_step_evals_saved`, accumulated across SAEM iterations as `2 × mstep_maxiter × n_mu_ref_pairs` per outer step (one finite-difference probe pair per pinned mu-ref dimension, capped at `mstep_maxiter` NLopt gradient requests). The field is `None` when mu-referencing is off or method ≠ SAEM.
 
 When `n_leapfrog > 0`, `FitResult::saem_n_subjects_hmc` records how many subjects used HMC at least once during the E-step (the remainder used MH fallback). The field is `None` for MH-only runs. The fit YAML also emits `saem_n_subjects_hmc` and `saem_n_subjects_mh` when the field is `Some`.

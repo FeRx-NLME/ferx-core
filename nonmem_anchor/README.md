@@ -15,7 +15,12 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | **Steady-state absorption** | `SS=1` into `first_order(ka)` — [#719](https://github.com/FeRx-NLME/ferx-core/issues/719) gap 1 (`ADVAN2` exact analytic SS; `KA` slow so the absorption tail spans `II`) | `ss_first_order.ctl` | *(in `tests/ss_absorption_nonmem_anchor.rs`)* |
 | **Infusion into absorption** | `RATE>0` into `first_order(ka)` — [#719](https://github.com/FeRx-NLME/ferx-core/issues/719) gap 2 (`ADVAN2` native zero-order-into-depot = the kernel convolution `R_in_inf`) | `inf_first_order.ctl` | *(in `tests/infusion_absorption_nonmem_anchor.rs`)* |
 | **Dose compartment** | any `CMT` on the six analytical disposition models — [#375](https://github.com/FeRx-NLME/ferx-core/issues/375) (`ADVAN1/2/3/4/11/12`, `MAXEVAL=0`, `$TABLE FORMAT=,1PE17.10`) | `dose_cmt_*.ctl` (13) | *(in `tests/nonmem_dose_compartment_anchor.rs`)* |
+| **`TIME` in the structural readout** | `[scaling] y = <expr>` referencing the `TIME` built-in — [#1028](https://github.com/FeRx-NLME/ferx-core/issues/1028) (`ADVAN13 TOL=9`, `MAXEVAL=0`, all `$THETA` `FIX`; the ferx readout and NONMEM's `$ERROR IPRED` are the same per-record object) | `scaling_time_readout.ctl` | *(in `tests/scaling_time_readout_nonmem_anchor.rs`)* |
 | **Oral central infusion** | `RATE>0` into an oral model's central `CMT=2` (depot bypass) at `F=1` and `F2=0.6` — [#376](https://github.com/FeRx-NLME/ferx-core/issues/376) (the #350 event-driven fix, directly anchored; the dose_cmt anchors cover oral infusion into the *peripheral* only) | `oral_central_inf_advan{2,4}_f{1,06}.ctl` (4) | *(in `tests/oral_central_infusion_nonmem_anchor.rs`)* |
+
+The **`TIME`-readout** control runs on its own tiny `scaling_time_readout.csv`
+(one subject, 100 mg IV bolus, seven samples over 24 h) — see
+"`TIME` in the structural readout" below.
 
 The transit control runs on `transit_oral.csv`; the IG and Weibull controls run
 on `igd_oral.csv` (the same data re-keyed to a 1-compartment layout — every record
@@ -641,3 +646,53 @@ mv ss_slow_advan*.lst ss_slow_advan*.tab results/
 
 > **Run status — DONE (#908).** Both runs executed on NONMEM 7.6.0 via `nmfe76`;
 > `results/ss_slow_advan*.{lst,tab}` are the verbatim output of the committed `.ctl`.
+
+
+## `TIME` in the structural readout (#1028)
+
+ferx's `[scaling] y = <expr>` and NONMEM's `$ERROR IPRED = ...` are the same
+object — the structural prediction handed to the residual error model, evaluated
+once per observation record — and NONMEM has always had `TIME` in scope there. So
+a response-versus-time readout translates line for line, which makes this the
+right reference for the `TIME` built-in ferx restored in #1028.
+
+| File | What it is |
+|------|------------|
+| `scaling_time_readout.ctl` | **NONMEM control** — `ADVAN13 TOL=9`, 1-cpt IV, `$ERROR IPRED = A(1)/V + BETA*TIME/(TIME + T50)`. |
+| `scaling_time_readout.csv` | Dataset: one subject, 100 mg bolus into CMT 1, samples at 0.5–24 h. |
+| `results/scaling_time_readout.{lst,tab}` | The committed NONMEM outputs (NONMEM 7.6.0). |
+| `tests/scaling_time_readout_nonmem_anchor.rs` | The ferx twin + the comparison. |
+
+Every `$THETA` is `FIX` and `$OMEGA 0 FIX` with `MAXEVAL=0`, so this is a pure
+evaluation at known parameters (`CL = 5`, `V = 50`, `BETA = 3`, `T50 = 4`) — no
+optimiser on either side.
+
+### Run NONMEM
+
+```bash
+cd nonmem_anchor
+nmfe76 scaling_time_readout.ctl scaling_time_readout.lst
+```
+
+### Run ferx (cross-check)
+
+```bash
+cargo test --test scaling_time_readout_nonmem_anchor
+```
+
+### Expected
+
+| t (h) | NONMEM `IPRED` | `A(1)/V` alone | `BETA·t/(t+T50)` |
+|------:|---------------:|---------------:|-----------------:|
+| 0.5 | 2.2358 | 1.9025 | 0.3333 |
+| 1.0 | 2.4097 | 1.8097 | 0.6000 |
+| 2.0 | 2.6375 | 1.6375 | 1.0000 |
+| 4.0 | 2.8406 | 1.3406 | 1.5000 |
+| 8.0 | 2.8987 | 0.8987 | 2.0000 |
+| 12.0 | 2.8524 | 0.6024 | 2.2500 |
+| 24.0 | 2.7529 | 0.1814 | 2.5714 |
+
+ferx reproduces the `IPRED` column to <1e-4 relative (NONMEM's table carries five
+significant figures). The middle column is what a readout stuck at `TIME = 0`
+would return — 1.18x off at the first sample and 15x off by 24 h — so the anchor
+discriminates the bug by three orders of magnitude more than the tolerance.

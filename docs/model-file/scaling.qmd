@@ -70,6 +70,12 @@ The scale is evaluated **once per subject** with subject-level
 covariates (matching the no-TV path). Time-varying covariate support for
 expression scales is a Phase 1.5 follow-up.
 
+Because the divisor is subject-static, `obs_scale` **cannot reference the
+`TIME` built-in** (or its `T` alias): it is evaluated once, at `t = 0`, and the
+result divides every observation, so a `TIME` reference would always read `0`.
+The parser rejects it and points you at Form C, where the readout is evaluated
+per observation and `TIME` resolves to each row's own time.
+
 ## Form C — explicit output expression
 
 Use when the built-in concentration readout is not the observed quantity —
@@ -96,6 +102,148 @@ individual parameters (`CL`, `V`, `KA`), thetas (`TVCL`), etas
 at evaluation time — states from the ODE solver, individual parameters
 from the subject-static `pk_param_fn`, and thetas/etas/covariates from
 the values supplied by the caller.
+
+### Signed readouts (since #1020)
+
+A Form C readout is an arbitrary expression, so it may legitimately be
+**negative** — a change from baseline, a difference from a comparator, a
+z-score, or the `sqrt(N) * logit(p)` transform used in model-based
+meta-analysis of a bounded endpoint. Its negative part is preserved.
+
+```ferx
+[scaling]
+  y[CMT=1] = sqrt(N) * log(P / (1 - P))    # negative for every arm below 50%
+```
+
+The negative-prediction clamp that guards the ODE solver applies only to the
+**default readout** — the bare compartment state (`obs_cmt`, and the analytical
+PK concentration), where non-negativity is a physical property of the quantity
+and a negative value can only be integration overshoot. It is not applied to
+Form C.
+
+The same gate applies to the adaptive-dosing monitor path: a `Dv` monitor's
+assay floor (`max(0)` after the residual draw) fires only on the bare-state
+readout, so a Form C signal a controller thresholds is not silently floored at
+`0` over its whole negative region (#1039). See
+[Adaptive dosing](adaptive-dosing.qmd).
+
+Forms A and B (`obs_scale = <expr>` / `obs_scale[CMT=n] = <expr>`) keep the
+default bare-state readout — the divisor is applied *downstream* of it — so the
+clamp still guards the compartment state they read. Only Form C (`y = <expr>`)
+replaces the readout and so opts out of the clamp.
+
+Before #1020 the ODE path clamped the final prediction vector unconditionally,
+after the Form C expression had been evaluated, so every negative readout was
+silently returned as exactly `0`: no warning, no error, and a fit that converged
+to plausible-looking parameters with the residual σ inflated to absorb the
+mismatch. (The analytical Form C path — #650 — always left the readout
+unclamped; the two paths now agree.)
+
+`NaN` is still not clamped on either path: it propagates to a `NaN` objective
+so the optimizer rejects the step, which is what surfaces a bad scale or a
+missing per-CMT entry loudly (see [Runtime behaviour on bad
+scales](#runtime-behaviour-on-bad-scales)).
+
+This matches NONMEM, which applies no non-negativity guard to `$ERROR` output.
+Anchored on NONMEM 7.5.1 (`nonmem_anchor/signed_readout.ctl`): a one-compartment
+`$DES` model read out as a change from baseline, `IPRED = A(1)/V - BASE`, with
+`CL = 4`, `V = 12`, `BASE = 2` all `FIX` and `MAXEVAL=0`.
+
+| t (h) | NONMEM `IPRED` | ferx `y = central / V - BASE` |
+|---|---|---|
+| 0.25 | 5.6670 | 5.667037 |
+| 1 | 3.9711 | 3.971094 |
+| 4 | 0.19664 | 0.196643 |
+| 12 | −1.8474 | −1.847370 |
+| 24 | −1.9972 | −1.997204 |
+
+The two sub-baseline points come back negative on both engines; before #1020
+ferx returned exactly `0` for them. Every point agrees to within the reference
+table's own 5-significant-figure rounding. The ferx run pins `ode_reltol` /
+`ode_abstol` tight, because a readout written as a *difference* of two numbers of
+size ~2 amplifies any solver-level disagreement by the cancellation — worth doing
+in your own model too when the readout is a change from baseline. The test is
+`tests/signed_readout_nonmem_anchor.rs`.
+
+### `TIME` in a Form C readout
+
+A Form C readout is evaluated **per observation**, so it may reference the
+`TIME` built-in — spelled `TIME` or `T`, the same two spellings `[odes]`
+accepts — and it resolves to that observation's own time. This is what a
+response-versus-time readout needs, and it is the direct way to write one:
+
+```ferx
+[scaling]
+  y[CMT=1] = EMAX * TIME / (TIME + T50)
+```
+
+Until [#1028](https://github.com/FeRx-NLME/ferx-core/issues/1028), `TIME` parsed
+in `[scaling]` but was never bound to the observation, so it read `0` and
+collapsed the whole structural prediction with no diagnostic. Models that worked
+around this with a dummy integrating state —
+
+```ferx
+[structural_model]
+  ode(states=[clock])
+[odes]
+  d/dt(clock) = 1
+```
+
+— no longer need it, and are better off without: `clock` starts at the
+subject's **first record**, not at `t = 0`, so it silently disagrees with `TIME`
+on any dataset with no `TIME = 0` row.
+
+The value is the **raw data-file `TIME`**, the same clock sdtab/covtab `TIME`,
+`predict()` / `simulate()` `TIME`, `[derived]` integral windows, and a custom
+residual-error magnitude report. This matters only for datasets with stacked
+reset occasions whose `TIME` restarts: there the integrator runs on an internal
+monotonic timeline, and the readout — like NONMEM's `$ERROR`, whose `TIME` is
+also not `$DES`'s clock — stays on the user clock.
+
+#### If your dataset has a column named `T`
+
+`T` and `t` are the `[odes]` spellings of the model-time built-in, and
+`[scaling]` folds them the same way — so a `T` **column** would otherwise be
+silently replaced by the clock. Declaring it wins:
+
+```ferx
+[covariates]
+  T continuous
+[scaling]
+  y = central / V * T     # the column, not the clock
+```
+
+The declaration is matched **case-insensitively** against both spellings, so
+declaring `T` also protects a `t` reference and vice versa — the fold treats the
+two as one built-in, so the escape hatch has to as well. It covers the whole
+block: Form C `y`, and `obs_scale`, where an undeclared `T` is instead rejected
+as a time reference in a subject-static divisor.
+
+The declaration also reaches `[adaptive_dosing] observe`, which compiles through
+the same readout compiler — so a declared `T` is the data column there too,
+rather than the same model reading the column in `[scaling]` and the clock in
+`observe`.
+
+Whenever `T` / `t` *is* folded into the built-in, ferx emits a parse warning
+saying so and naming both escapes (spell it `TIME`, or declare the column).
+Writing `TIME` is unambiguous and never warns.
+
+`TAFD` and `TAD` are *not* built-ins here. They stay ordinary covariate
+references in `[scaling]`, so a `TAFD` / `TAD` **column** in the dataset
+resolves normally — unlike in `[odes]`, where the two names are reserved for
+the solver-injected anchors and a same-named data column is unreachable. If the
+column is absent, the resulting `E_MISSING_COVARIATE` names that scope split, so
+"I meant the `[odes]` built-in" is not mistaken for a typo.
+
+### Undefined names are data columns, not zeros
+
+Any identifier in a `[scaling]` expression that does not resolve to a state, an
+individual parameter, a theta, an eta, or the `TIME` built-in is treated as a
+**covariate**, and therefore as a required data column — in `obs_scale` (Form
+A/B) exactly as in `y` (Form C). A name the dataset does not carry is reported
+as `E_MISSING_COVARIATE` by `fit()`, `simulate()`, and `predict()` alike; it is
+never read as a silent `0.0`. So a typo in `[scaling]` fails loudly instead of
+quietly fitting a different structural model (#1028).
 
 ### Form C on analytical PK models (since #650)
 

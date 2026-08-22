@@ -14,7 +14,7 @@ mod validation;
 pub(crate) use validation::{
     apply_iov_occasion_rule, assert_absorption_closed_form_support,
     assert_absorption_dosing_supported, assert_absorption_flip_flop_no_twin,
-    assert_analytic_readout_support, assert_dose_compartments_supported,
+    assert_analytic_readout_support, assert_covariates_present, assert_dose_compartments_supported,
     assert_modeled_doses_supported, check_absorption_closed_form_support, check_absorption_dosing,
     check_absorption_flip_flop_no_twin, check_analytic_readout_support, check_covariates,
     check_dose_compartments, check_modeled_dose_rates,
@@ -164,6 +164,10 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/dose_compartment_tests.rs"]
 mod dose_compartment_tests;
+
+#[cfg(test)]
+#[path = "tests/scaling_undefined_tests.rs"]
+mod scaling_undefined_tests;
 
 #[cfg(test)]
 #[path = "tests/simulation_template_tests.rs"]

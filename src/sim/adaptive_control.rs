@@ -242,9 +242,15 @@ pub(crate) fn build_adaptive_controller(
 /// would predict — `observe = central / V` yields the concentration, not the raw
 /// amount. ODE-only (the adaptive engine runs on the ODE path); an unknown name
 /// or an IOV reference in `observe` is rejected by the shared compiler.
+/// `declared_covariates` is the model's `[covariates]` declarations, carried on the
+/// spec as [`AdaptiveDosingSpec::observe_declared_covariates`]: `observe` must apply
+/// the same `T` / `t` name precedence a `[scaling]` expression gets, or the same
+/// model reads a declared `T` as the data column in `[scaling]` and as the
+/// model-time built-in here (#1028).
 pub(crate) fn compile_observe(
     model: &CompiledModel,
     observe: &str,
+    declared_covariates: &[String],
 ) -> Result<(OdeOutputFn, Vec<String>), String> {
     let ode = model.ode_spec.as_ref().ok_or_else(|| {
         "[adaptive_dosing] requires an ODE model (the analytical engine is a follow-up)".to_string()
@@ -253,6 +259,14 @@ pub(crate) fn compile_observe(
     // caller validates them against the data so a misspelt name fails loudly
     // instead of silently reading 0.0 (the readout leaves an absent covariate at
     // 0.0, which would drive the controller off a wrong signal).
+    //
+    // The shared compiler's `T`-alias note is discarded *here* on purpose: this runs at
+    // simulate time, long after `model.parse_warnings` was sealed, and the adaptive
+    // result has no warnings channel. The parser emits the identical note for this same
+    // `observe` string at parse time, from the same helper
+    // (`warn_if_time_alias_folds`), so the fold is not silent — it is just reported
+    // earlier (#1028).
+    let mut observe_warnings: Vec<String> = Vec::new();
     let (out_fn, _program, cov_names) = crate::parser::model_parser::build_y_output_fn(
         observe,
         "[adaptive_dosing] observe",
@@ -267,6 +281,8 @@ pub(crate) fn compile_observe(
         &[],
         // ODE-only path: any integrated state is valid, no forbidden names (#650).
         &[],
+        declared_covariates,
+        &mut observe_warnings,
     )?;
     Ok((out_fn, cov_names))
 }
@@ -330,7 +346,7 @@ pub(crate) fn compile_adaptive(
             .observe
             .as_deref()
             .expect("validate() requires observe without with_assay_error");
-        let (out_fn, cov) = compile_observe(model, observe_src)?;
+        let (out_fn, cov) = compile_observe(model, observe_src, &spec.observe_declared_covariates)?;
         (ObserveMode::Ipred, Some(out_fn), cov, 1)
     };
     let monitors = vec![MonitorSpec::new(ADAPTIVE_SIGNAL, cmt, mode)];
@@ -359,6 +375,7 @@ mod tests {
     ) -> AdaptiveDosingSpec {
         AdaptiveDosingSpec {
             observe: Some("central".to_string()),
+            observe_declared_covariates: Vec::new(),
             with_assay_error: false,
             assay_cmt: None,
             at: vec![24.0, 48.0],
@@ -711,6 +728,7 @@ mod tests {
             // `observe` is the latent (Ipred) signal; under assay error there is no
             // expression — the signal is the named model output (`assay_cmt`).
             observe: (!with_assay_error).then(|| observe.to_string()),
+            observe_declared_covariates: Vec::new(),
             with_assay_error,
             assay_cmt,
             at: vec![24.0, 48.0],
@@ -728,7 +746,8 @@ mod tests {
     #[test]
     fn compile_observe_yields_concentration_not_amount() {
         let model = parse_full_model(ODE_MODEL).expect("ODE model parses").model;
-        let (observe, _cov) = compile_observe(&model, "central / V").expect("observe compiles");
+        let (observe, _cov) =
+            compile_observe(&model, "central / V", &[]).expect("observe compiles");
         let theta = model.default_params.theta.clone();
         let eta = vec![0.0; model.n_eta + model.n_kappa];
         let cov = HashMap::new();
@@ -744,7 +763,7 @@ mod tests {
     #[test]
     fn compile_observe_requires_ode_model() {
         let model = parse_full_model(ANALYTICAL_MODEL).unwrap().model;
-        let err = compile_observe(&model, "central / V")
+        let err = compile_observe(&model, "central / V", &[])
             .err()
             .expect("analytical model must error");
         assert!(err.contains("requires an ODE model"), "got: {err}");
