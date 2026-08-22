@@ -12388,7 +12388,16 @@ fn build_error_spec(
                     // `combined` model swaps which sigma is the proportional
                     // component — it makes the file honest about a model the
                     // user did not write, which is the #1001 failure mode again.
-                    Some(slot) => {
+                    //
+                    // `None` is folded in here rather than given its own arm.
+                    // The repeat guard above leaves every `named` distinct and
+                    // declared, so by argument `idx` at least `idx + 1` sigmas
+                    // exist and `get(idx)` is always `Some` — an arm no input can
+                    // reach is also an arm no test can cover, and it would sit in
+                    // the diff as permanently-missed lines. Binding the whole
+                    // `Option` keeps the impossible case a message rather than an
+                    // `unreachable!()` panic in the parser.
+                    slot => {
                         return Err(format!(
                             "[error_model] argument {} names sigma '{}', but a \
                              single-endpoint [error_model] has its sigmas consumed \
@@ -12402,22 +12411,7 @@ fn build_error_spec(
                              changes the model rather than fixing the spelling.",
                             idx + 1,
                             named,
-                            slot
-                        ));
-                    }
-                    // Unreachable: the repeat guard above leaves every `named`
-                    // distinct and declared, so by argument `idx` at least
-                    // `idx + 1` sigmas exist. Kept as an error rather than an
-                    // `unreachable!()` so a future relaxation of that guard
-                    // degrades to a message instead of a panic in the parser.
-                    None => {
-                        return Err(format!(
-                            "[error_model] argument {} names '{}', but [parameters] \
-                             declares only {} sigma(s). Declare one sigma per \
-                             argument.",
-                            idx + 1,
-                            named,
-                            sigma_names.len()
+                            slot.map(String::as_str).unwrap_or("<none>")
                         ));
                     }
                 }
