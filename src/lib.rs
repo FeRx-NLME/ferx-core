@@ -43,7 +43,9 @@ pub use estimation::run_sir::run_sir;
 pub use estimation::uncertainty_samples::UncertaintyMethod;
 pub use frem::{prepare_frem, FremDataInfo, FremFitInit, FremPrepareResult};
 pub use io::datareader::{read_nonmem_csv, read_nonmem_csv_with_covariates};
-pub use parser::model_parser::{parse_full_model_file, parse_model_file, parse_model_string};
+pub use parser::model_parser::{
+    known_block_names, parse_full_model_file, parse_model_file, parse_model_string,
+};
 pub use propensity_match::MatchMethod;
 // Adaptive (feedback) dosing vocabulary (#391). Re-exported at the crate root so
 // the public `simulate_adaptive` API — its controller, monitors, and the fields

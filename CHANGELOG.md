@@ -20,6 +20,23 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **An unrecognised `[block]` name is now an error (#1040).** Blocks were read by name lookup, so a
+  header the parser did not know was never read and never reported: a misspelled `[fit_option]` left
+  `ferx check` saying `valid: true` while the fit ran with the default method, the default iteration
+  cap and **no covariance step** — returning without standard errors and no indication why. The same
+  went for `[scalings]`, `[outputs]`, `[derived]`, `[covariates]` and friends. Block names are now
+  closed-world, like the keys inside a block already were: an unknown header is `E_UNKNOWN_BLOCK`,
+  listing every offender with its line, the full valid set, and a did-you-mean for a near match. Two
+  neighbouring silent drops go with it — an instance name where none is taken (`[fit_options DOSE]`)
+  or missing where one is required (`[covariate_nn]`) is `E_BLOCK_INSTANCE_NAME`, and a block whose
+  cargo feature this binary lacks (`[event_model]` without `--features survival`, `[markov_model]`
+  without `--features markov`) is `E_BLOCK_FEATURE_DISABLED` instead of being parsed away, and
+  `[initial_values]` — ferx's own former spelling for initial estimates, unread since they moved
+  inline into `[parameters]` — is `E_DEPRECATED_BLOCK`, naming the replacement rather than offering
+  a did-you-mean that does not exist. The recognised block names are exported as
+  `known_block_names()` so wrappers can read the list from the engine rather than keeping their own
+  copy; it reflects the features the binary was built with, so it never advertises a name the same
+  binary would refuse.
 - **A dose attribute that is also read by the model is now an error (#993).** `F`,
   `LAGTIME`/`ALAG` and the compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` are applied by the
   engine **at the dose event**. A model that declares one and *also* references it in `[odes]`
@@ -53,6 +70,67 @@ section of the SDLC for the versioning policy).
   column was that one. Every observation was then scored with the subject's first value of it —
   silently, with no diagnostic, and with the whole point of a time- or record-varying magnitude lost.
   Such covariates now register as referenced, so their per-observation snapshots survive.
+- **An adaptive-dosing run now reads a `TIME`-dependent `[scaling]` Form C readout on the same
+  clock as `fit()` / `predict()` (#1028 follow-up).** #1028 moved the readout's `TIME` to the raw
+  data-file clock (the `$ERROR` convention shared by sdtab, `predict()`/`simulate()` and `[derived]`
+  windows) on the static predictors, but the reactive driver and the frozen-schedule replay
+  verifier kept feeding it the integrator break the observation was keyed to. For a subject with
+  stacked reset occasions — whose data `TIME` restarts while the internal timeline stays monotonic —
+  those are different numbers, so the *same record* got one `TIME` under `simulate_adaptive` and
+  another under `fit()`, and the replay verifier's bit-equality against the static engine no longer
+  held. Both now use the raw clock. Also in the same area: a `T` / `t` declared in `[covariates]` is
+  now honoured **case-insensitively** (declaring `T` protects a `t` reference and vice versa —
+  previously the case-mismatched pair silently folded to the model clock in `y`, and raised the
+  time-in-`obs_scale` error against a legitimately declared column), and the declaration now reaches
+  `[adaptive_dosing] observe`, which compiles through the same readout compiler — so a declared `T`
+  can no longer be the data column in `[scaling]` and the clock in `observe` for one model. The
+  `T`-fold warning for `observe` is emitted at parse time, since the block is compiled at simulate
+  time where there is no warnings channel.
+- **`TIME` now works in a `[scaling]` Form C readout, and an undefined name in `[scaling]` is no
+  longer a silent zero (#1028).** A `y = <expr>` / `y[CMT=N] = <expr>` readout referencing the
+  `TIME` built-in parsed fine but was never bound to the observation — the integrator's model-time
+  guard is dropped before the readout runs — so `TIME` read `0` at every row and the whole
+  time-dependent term vanished. A response-versus-time readout such as
+  `y[CMT=1] = EMAX * TIME / (TIME + T50)` therefore fit, converged, and reported plausible
+  parameters for a structural model nobody wrote. `TIME` (and the `T` alias `[odes]` also accepts)
+  now resolves to each observation's own time on both the ODE and analytical Form C paths, on the
+  production predictor and the analytic sensitivity walks alike — and to each decision's time in an
+  `[adaptive_dosing] observe` expression, which compiles through the same readout compiler — so the
+  dummy `d/dt(clock) = 1`
+  workaround is no longer needed (and is better dropped: `clock` starts at the subject's first
+  record, not at `t = 0`). Separately, `obs_scale` expressions never registered their covariate
+  references as required data columns, and `predict()` ran no covariate check at all, so an
+  unresolvable identifier anywhere in `[scaling]` reached the predictor as the covariate map's
+  `0.0` default. Both halves of the block now register their references, and `predict()` reports
+  `E_MISSING_COVARIATE` for a missing column just as `fit()` and `simulate()` already did.
+  **Breaking** in two narrow places: `obs_scale = TIME` (or `= T`) is now a parse error naming Form
+  C as the place for a time-dependent readout — the divisor is subject-static, evaluated once at
+  `t = 0`, so it could only ever have read `0`; and a `[scaling]` expression referencing an
+  *undeclared* data column named `T` now reads the model-time built-in instead, matching `[odes]`,
+  where that name has always been reserved. Declaring `T` in `[covariates]` keeps it a data column,
+  and whenever the fold does happen ferx warns and names both escapes, so the substitution is never
+  silent. `TAFD` / `TAD` are unaffected and remain ordinary covariate references in `[scaling]`;
+  when such a column is missing, `E_MISSING_COVARIATE` now explains that the name is an `[odes]`-only
+  built-in rather than reading as a plain typo report. The readout's `TIME` is the raw data-file
+  clock — the same one sdtab, `predict()`/`simulate()` and `[derived]` windows report, and NONMEM's
+  `$ERROR` uses — which differs from the integrator timeline only for datasets with stacked reset
+  occasions. A modified-release model whose closed-form fast path applies now declines to the ODE
+  path when its readout reads `TIME`, instead of dropping the time term via a state-space linearity
+  probe. `predict()`'s new covariate check accepts a name every subject's covariate map carries even
+  when the population's `covariate_names` list is empty, so a programmatically built in-memory
+  `Population` keeps working.
+- **An adaptive-dosing `dv` monitor no longer floors a negative Form C `[scaling]` readout at zero
+  (#1039).** The assay floor on the `ObserveMode::Dv` path ("an assay cannot read below zero") was
+  written when every monitored readout was a compartment amount or concentration, and was applied
+  unconditionally after the residual draw. A Form C `y = <expr>` readout is an arbitrary
+  expression — a change from baseline, a difference from a comparator, a z-score, the
+  `sqrt(N) * logit(p)` transform — so the *same model* read correctly under `mode = ipred` and
+  came back as exactly `0` under `mode = dv` for every negative sample, silently: a controller
+  thresholding a change-from-baseline signal saw `0` over precisely the region it was written to
+  react to, and dosed accordingly. The floor is now gated on the same predicate as the prediction
+  path (#1020), so it applies only to the bare-state readout and to Forms A/B, which keep it. With
+  `sigma → 0` a `dv` monitor again reproduces the `ipred` monitor sample for sample, negative
+  samples included.
 - **SAEM no longer lets a fixed-effect-only theta drift away from the marginal optimum (#1011).** The
   numerical θ/σ M-step assigned NLopt's maximiser outright, re-maximising against a *single* MCMC η
   draw each iteration — `argmax` of one draw rather than the stochastic-approximation average of
