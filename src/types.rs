@@ -2024,6 +2024,17 @@ pub type RuvMagFn = Box<dyn Fn(&[f64], &HashMap<String, f64>, f64) -> f64 + Send
 #[non_exhaustive]
 pub struct RuvMagnitude {
     pub per_sigma: Vec<Option<RuvMagFn>>,
+    /// Whether any slot's magnitude expression references a `θ` (#484/#1029).
+    ///
+    /// A θ-free magnitude — every `weight = <covariate expr>` model, and the
+    /// TIME/covariate-only #484 forms — is a per-observation *constant* for a
+    /// fixed dataset, so an analytic θ gradient that chains only through the
+    /// prediction (`∂nll/∂f · ∂f/∂θ`) is still exact. A θ-*dependent* one adds a
+    /// direct `∂V/∂θ` channel that such a gradient omits, so the estimators
+    /// without one (the Gauss-Newton Laplace/Sheiner–Beal gradients) consult
+    /// this flag and route those subjects to their magnitude-aware
+    /// finite-difference fallback instead.
+    pub theta_dependent: bool,
     /// Parallel to `per_sigma`: the compiled `Dual1` θ-derivative program for the
     /// same non-bare slot (#576/#486), or `None` for a bare slot. Lets the
     /// analytic outer θ/σ gradient differentiate the magnitude directly — a new
@@ -3844,6 +3855,19 @@ impl CompiledModel {
     #[inline]
     pub fn has_custom_ruv_magnitude(&self) -> bool {
         self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
+    }
+
+    /// Whether an *active* custom residual magnitude depends on `θ`
+    /// (see [`RuvMagnitude::theta_dependent`]).
+    ///
+    /// `false` for the θ-free case — every `weight = <covariate expr>` model
+    /// (#1029) and the TIME/covariate-only #484 forms — where an analytic θ
+    /// gradient that chains through the prediction alone is still exact.
+    #[inline]
+    pub fn has_theta_dependent_ruv_magnitude(&self) -> bool {
+        self.ruv_magnitude
+            .as_ref()
+            .is_some_and(|m| m.is_active() && m.theta_dependent)
     }
 
     /// Multiplicative factor applied to the residual *variance* for a subject

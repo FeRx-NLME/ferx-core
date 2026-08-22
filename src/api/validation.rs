@@ -2101,30 +2101,6 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // Custom residual-error magnitude (#484) is wired through the FOCE/FOCEI
-    // objective (data term + Laplace curvature) only. SAEM's σ/θ M-step, the
-    // Gauss-Newton BHHH gradient, and the importance-sampling likelihood read
-    // the residual variance through paths that do not yet apply the
-    // per-observation magnitude, so reject them up front rather than silently
-    // fitting a mis-specified error model.
-    if model.has_custom_ruv_magnitude() {
-        for &m in &chain {
-            if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
-                diags.push(
-                    Diagnostic::error(
-                        "E_RUV_MAGNITUDE_METHOD_UNSUPPORTED",
-                        "a custom residual-error magnitude (an [error_model] sigma written as an \
-                         expression of TIME / covariates / thetas, or a `weight = …` modifier) is \
-                         currently supported for method = foce and method = focei only. SAEM, GN, \
-                         GN-hybrid, and importance-sampling paths do not yet apply the \
-                         per-observation magnitude.",
-                    )
-                    .with_block("error_model"),
-                );
-            }
-        }
-    }
-
     if !model.residual_correlations.is_empty() {
         for &m in &chain {
             if !matches!(

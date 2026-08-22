@@ -112,7 +112,20 @@ section of the SDLC for the versioning policy).
   scale, so its OFV differs from the hand-built one by the change-of-variable constant
   `Σ 2·ln(weight)` — data-only, identical across models on the same rows, and cancelling out of every
   ΔOFV, LRT and AIC comparison. Not yet supported with per-CMT error models, inside a
-  covariate-selected `if/else`, or for methods other than `foce`/`focei`.
+  covariate-selected `if/else`.
+- **Residual-error magnitudes now work under every estimator (#484 / #1029).** A `weight = …`
+  modifier — and any `[error_model]` sigma written as an expression of TIME / covariates / thetas —
+  used to be rejected up front for anything but `foce` and `focei`, because SAEM's M-step, the
+  Gauss-Newton BHHH gradients, the importance-sampling likelihood and proposal, and the IOV
+  individual likelihood (SAEM's E-step, the Bayes MH target) all read the residual variance through
+  call sites that never applied the per-observation multiplier. They all thread it now, so FOCE,
+  FOCEI, Laplace/AGQ, SAEM, IMP, IMPMAP, GN, GN-hybrid and Bayes score the same weighted likelihood
+  and `method =` chooses the algorithm rather than the model. Gradients keep up: SAEM's M-step
+  carries the magnitude's *direct* θ channel (a θ that appears only in the error model used to read
+  a gradient of exactly zero there), and the Gauss-Newton closed forms — which have no such term —
+  route a θ-dependent magnitude to their magnitude-aware finite-difference fallback. A weight built
+  from covariates and TIME alone, which is every #1029 model, has no direct-θ channel and keeps the
+  fast analytic path everywhere.
 - **SAEM now warns when an estimated theta carries no ETA at all.** A fixed-effect-only theta is not
   mu-referenced, so it never gets the γ-damped closed-form `log θ += γ·mean(η)` update and is moved
   only by the η-frozen numerical M-step — which re-maximises against a *single* MCMC η draw with no

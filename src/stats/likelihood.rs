@@ -2409,13 +2409,24 @@ pub fn individual_nll_iov(
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
     // IIV on residual error (#409): η_ruv is a BSV eta, indexed into `eta`.
     let ruv_scale = model.residual_var_scale(eta);
+    // #484/#1029: per-observation residual-magnitude multiplier, so the IOV
+    // individual NLL (SAEM's E-step, the Bayes MH target, the IOV IS weights)
+    // scores the same variance the non-IOV path and FOCE/FOCEI do.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
             Some(vv) => vv,
-            None => model.residual_variance_at(err_keys[j], f_pred, sigma_values) * ruv_scale,
+            None => {
+                model.residual_variance_at_scaled(
+                    err_keys[j],
+                    f_pred,
+                    sigma_values,
+                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                ) * ruv_scale
+            }
         };
         let cens = subject.cens.get(j).copied().unwrap_or(0);
         if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
@@ -2782,6 +2793,53 @@ mod tests {
         let base = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma);
         let iov = individual_nll_iov(&model, &subj, &theta, &eta, &[], &omega, None, &sigma);
         approx::assert_relative_eq!(base, iov, epsilon = 1e-10);
+    }
+
+    /// The IOV individual NLL — SAEM's E-step evaluator, the Bayes MH target,
+    /// and the IOV importance-sampling weight — must apply the per-observation
+    /// residual magnitude (#484/#1029) exactly as the non-IOV path does. With no
+    /// kappas the two are the same likelihood, so any divergence is the
+    /// magnitude going missing on one side. A weight that *varies within the
+    /// subject* is what makes this bite: a frozen or dropped multiplier still
+    /// matches on the first row.
+    #[test]
+    fn test_individual_nll_iov_applies_the_residual_magnitude() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(5.0)\n  theta TVV(50.0)\n  omega ETA_CL ~ 0.09\n  \
+             sigma PROP_ERR ~ 0.10 (sd)\n  sigma ADD_ERR ~ 0.50 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+             DV ~ combined(PROP_ERR * (1.0 + 0.5 * WPSE), ADD_ERR) weight = WPSE\n\
+             [covariates]\n  WPSE continuous\n",
+        )
+        .expect("weighted model parses");
+        assert!(model.has_custom_ruv_magnitude());
+
+        let mut subj = make_simple_subject();
+        let snap =
+            |w: f64| -> HashMap<String, f64> { [("WPSE".to_string(), w)].into_iter().collect() };
+        subj.covariates = snap(0.5);
+        subj.obs_covariates = (0..subj.observations.len())
+            .map(|j| snap(0.5 + 0.3 * j as f64))
+            .collect();
+
+        let theta = vec![5.0, 50.0];
+        let eta = vec![0.0];
+        let omega = make_omega(0.09);
+        let sigma = vec![0.10, 0.50];
+
+        let base = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma);
+        let iov = individual_nll_iov(&model, &subj, &theta, &eta, &[], &omega, None, &sigma);
+        approx::assert_relative_eq!(base, iov, epsilon = 1e-10);
+
+        // Guard against a vacuous pass: the magnitude must actually move the NLL.
+        let mut flat = subj.clone();
+        flat.obs_covariates = vec![snap(0.5); subj.observations.len()];
+        let flat_nll = individual_nll(&model, &flat, &theta, &eta, &omega, &sigma);
+        assert!(
+            (flat_nll - base).abs() > 1e-6,
+            "the per-observation weight must change the NLL, else this test proves nothing"
+        );
     }
 
     #[test]

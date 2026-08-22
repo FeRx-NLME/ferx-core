@@ -130,8 +130,11 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   the initial estimates is rejected (`E_RUV_MAGNITUDE_NONPOSITIVE`): the variance
   is proportional to its square, so a zero multiplier collapses that
   observation's variance onto the internal floor.
-- Supported for `method = foce` and `method = focei` only. SAEM, GN, GN-hybrid,
-  and importance-sampling are rejected up front.
+- **Supported by every estimator** (#1029). FOCE, FOCEI, Laplace/AGQ, SAEM, IMP,
+  IMPMAP, Gauss-Newton, GN-hybrid and Bayes all score the same magnitude-aware
+  likelihood, so switching method changes the algorithm, not the model. (Before
+  #1029 everything but FOCE/FOCEI was rejected up front, because those paths read
+  the residual variance through call sites that never applied the multiplier.)
 - **Analytic gradient (#576/#486).** The inner EBE η-gradient and the outer
   θ/σ population gradient are both analytic for a magnitude-active model under
   **FOCE and FOCEI** — the magnitude is η-independent, so the inner loop just
@@ -144,6 +147,15 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   combinations still fall back to finite differences (which remain
   magnitude-aware, so fits stay correct, just slower): `block_sigma` correlated
   residual error, `iiv_on_ruv`, an M3-BLOQ censored row, and more than 32 thetas.
+- **The direct-θ channel and the other estimators.** When the magnitude
+  expression names a θ, that θ moves the residual variance *directly* as well as
+  through the prediction. SAEM's M-step carries both (it differences the whole
+  observation likelihood for a magnitude-active model rather than chaining
+  `∂nll/∂f` alone). The **Gauss-Newton** closed forms have no direct-`∂R/∂θ`
+  term, so a θ-dependent magnitude routes those subjects to GN's
+  finite-difference fallback — correct, just slower. A magnitude built only from
+  covariates and `TIME` — including every `weight =` model — has no direct-θ
+  channel at all, and keeps the fast closed forms everywhere.
 
 ## Residual weighting (`weight = ...`)
 
@@ -254,10 +266,11 @@ a published figure.
   weight — the usual cause is an arm with no reported standard error — would
   collapse that row's variance onto the internal floor and let a single
   observation own the whole objective.
-- Like any magnitude, it is supported for `method = foce` and `method = focei`
-  only; SAEM, GN, GN-hybrid and importance sampling are rejected up front rather
-  than silently ignoring the weight. The inner η-gradient and outer θ/σ gradient
-  stay analytic.
+- **Every estimator applies the weight.** FOCE, FOCEI, Laplace/AGQ, SAEM, IMP,
+  IMPMAP, Gauss-Newton, GN-hybrid and Bayes score the same weighted likelihood,
+  so `method =` picks the algorithm, not the model. A weight is a per-observation
+  constant (covariates and `TIME` only), so the inner η-gradient and the outer
+  θ/σ gradient stay analytic throughout.
 
 ## Log-transform-both-sides (LTBS)
 

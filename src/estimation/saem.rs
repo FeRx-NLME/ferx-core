@@ -625,6 +625,10 @@ fn obs_nll_subject_into_iov(
     // IIV on residual error (#409): scale the PK residual variance by
     // exp(2·η_ruv); FREM rows keep their own variance.
     let ruv_scale = model.residual_var_scale(eta);
+    // #484/#1029: per-observation residual-magnitude multiplier (θ/covariate/TIME
+    // only, never η), so the M-step scores the same variance the E-step and every
+    // other estimator does.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
     let mut total_nll = 0.0_f64;
@@ -635,9 +639,13 @@ fn obs_nll_subject_into_iov(
         let f = preds[j].max(1e-12);
         let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
             Some(vv) => vv.max(1e-12),
-            None => {
-                (model.residual_variance_at(err_keys[j], f, sigma_values) * ruv_scale).max(1e-12)
-            }
+            None => (model.residual_variance_at_scaled(
+                err_keys[j],
+                f,
+                sigma_values,
+                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+            ) * ruv_scale)
+                .max(1e-12),
         };
         let cens = subject.cens.get(j).copied().unwrap_or(0);
         if m3 && cens != 0 {
@@ -756,6 +764,10 @@ fn obs_nll_subject_grad_iov(
     // `eta`.  See the non-IOV `obs_nll_subject_grad` for the score-consistency
     // argument behind scaling V, dV/df, and dV/dlogσ together.
     let ruv_scale = model.residual_var_scale(eta);
+    // #484/#1029: per-observation residual-magnitude multiplier. It rides the
+    // sigma loadings, so V, ∂V/∂f, and ∂V/∂log σ all take their `_scaled` forms
+    // together — the same score-consistency argument as `ruv_scale` below.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
 
@@ -769,22 +781,25 @@ fn obs_nll_subject_grad_iov(
     for j in 0..n_obs {
         let cmt = err_keys[j];
         let f = preds[j].max(1e-12);
+        let mult_j = ruv_mult.as_ref().map(|m| m[j].as_slice());
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
         let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
         obs_var_scale[j] = s;
         let v = match frem_vj {
             Some(vv) => vv.max(1e-12),
-            None => (model.residual_variance_at(cmt, f, sigma_values) * s).max(1e-12),
+            None => {
+                (model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s).max(1e-12)
+            }
         };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
         all_preds_base[j] = f;
         residuals[j] = resid;
         variances[j] = v;
-        let dv_df = if frem_vj.is_some() {
-            0.0
-        } else {
-            model.error_spec.dvar_df(cmt, f, sigma_values) * s
+        let dv_df = match (frem_vj, mult_j) {
+            (Some(_), _) => 0.0,
+            (None, Some(m)) => model.error_spec.dvar_df_scaled(cmt, f, sigma_values, m) * s,
+            (None, None) => model.error_spec.dvar_df(cmt, f, sigma_values) * s,
         };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
@@ -803,9 +818,33 @@ fn obs_nll_subject_grad_iov(
         let mut theta_p = theta.to_vec();
         theta_p[i] += delta;
         let preds_p = crate::pk::predict_iov(model, subject, &theta_p, eta, kappas);
+        // With a custom magnitude active, θ moves the residual variance through
+        // *two* channels — the prediction (`∂nll/∂f · ∂f/∂θ`) and, when the
+        // magnitude expression names a θ, the variance directly. The analytic
+        // chain below carries only the first, so difference the whole Gaussian
+        // NLL instead: the prediction solve this loop already pays for is the
+        // dominant cost, and re-evaluating the magnitude bytecode is negligible
+        // beside it. A magnitude-free model keeps the exact legacy chain, so no
+        // existing fit changes numerically (#484/#1029).
         let mut d_obs_nll = 0.0_f64;
-        for j in 0..n_obs {
-            d_obs_nll += d_nll_d_f[j] * (preds_p[j] - all_preds_base[j]) / delta;
+        if ruv_mult.is_some() {
+            let mult_p = model.ruv_obs_mult(subject, &theta_p);
+            let nll_p = crate::stats::residual_error::gaussian_obs_nll_scaled(
+                &model.error_spec,
+                &err_keys,
+                &subject.observations,
+                &preds_p,
+                sigma_values,
+                &model.residual_correlations,
+                ruv_scale,
+                frem_ov.as_deref(),
+                mult_p.as_deref(),
+            );
+            d_obs_nll = (nll_p - nll_base) / delta;
+        } else {
+            for j in 0..n_obs {
+                d_obs_nll += d_nll_d_f[j] * (preds_p[j] - all_preds_base[j]) / delta;
+            }
         }
         grad[i] = if theta_packs_log_mask[i] {
             theta[i] * d_obs_nll
@@ -827,11 +866,19 @@ fn obs_nll_subject_grad_iov(
                 let resid = residuals[j];
                 // d(v_j)/d(log sigma_k); zero unless sigma_k enters obs j's
                 // endpoint, so per-CMT each sigma picks up only its own
-                // endpoint's observations.
-                let ratio = model
-                    .error_spec
-                    .dvar_dlogsigma(err_keys[j], k, f, sigma_values)
-                    * obs_var_scale[j];
+                // endpoint's observations. The #484/#1029 magnitude rides slot
+                // k's loading, so it scales this derivative by m_k² — the same
+                // `_scaled` pairing V/∂V∂f already take above.
+                let ratio = match ruv_mult.as_ref().map(|m| m[j].as_slice()) {
+                    Some(m) => {
+                        model
+                            .error_spec
+                            .dvar_dlogsigma_scaled(err_keys[j], k, f, sigma_values, m)
+                    }
+                    None => model
+                        .error_spec
+                        .dvar_dlogsigma(err_keys[j], k, f, sigma_values),
+                } * obs_var_scale[j];
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
@@ -1236,6 +1283,10 @@ fn obs_nll_subject_grad(
     // a per-obs scale and apply it consistently to V, dV/df, and dV/dlogσ so the
     // analytical score stays exact.
     let ruv_scale = model.residual_var_scale(eta);
+    // #484/#1029: per-observation residual-magnitude multiplier, applied to V,
+    // dV/df, and dV/dlogσ together for the same score-consistency reason as
+    // `ruv_scale`.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
 
@@ -1248,22 +1299,25 @@ fn obs_nll_subject_grad(
     for j in 0..n_obs {
         let cmt = err_keys[j];
         let f = preds_base[j].max(1e-12);
+        let mult_j = ruv_mult.as_ref().map(|m| m[j].as_slice());
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
         let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
         obs_var_scale[j] = s;
         let v = match frem_vj {
             Some(vv) => vv.max(1e-12),
-            None => (model.residual_variance_at(cmt, f, sigma_values) * s).max(1e-12),
+            None => {
+                (model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s).max(1e-12)
+            }
         };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
         residuals[j] = resid;
         variances[j] = v;
         // d(obs_nll_j)/d(f_j) = -resid/V + 0.5 * (dV/df) * (1/V - resid²/V²)
-        let dv_df = if frem_vj.is_some() {
-            0.0
-        } else {
-            model.error_spec.dvar_df(cmt, f, sigma_values) * s
+        let dv_df = match (frem_vj, mult_j) {
+            (Some(_), _) => 0.0,
+            (None, Some(m)) => model.error_spec.dvar_df_scaled(cmt, f, sigma_values, m) * s,
+            (None, None) => model.error_spec.dvar_df(cmt, f, sigma_values) * s,
         };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
@@ -1284,11 +1338,33 @@ fn obs_nll_subject_grad(
         // Difference on raw predictions — do NOT clip before differencing.
         // Clipping both pp and pb at 1e-12 before subtracting would produce a
         // zero difference whenever pb < 1e-12, silently zeroing the gradient.
-        let d_obs_nll: f64 = d_nll_d_f
-            .iter()
-            .zip(preds_p.iter().zip(preds_base.iter()))
-            .map(|(&dl, (&pp, &pb))| dl * (pp - pb) / delta)
-            .sum();
+        //
+        // With a magnitude active, θ reaches the variance directly as well as
+        // through the prediction, and this chain carries only the second
+        // channel — so difference the whole Gaussian NLL instead (the IOV twin
+        // of this fork carries the same reasoning). Magnitude-free models keep
+        // the exact legacy chain and are numerically unchanged.
+        let d_obs_nll: f64 = if ruv_mult.is_some() {
+            let mult_p = model.ruv_obs_mult(subject, &theta_p);
+            let nll_p = crate::stats::residual_error::gaussian_obs_nll_scaled(
+                &model.error_spec,
+                &err_keys,
+                &subject.observations,
+                &preds_p,
+                sigma_values,
+                &model.residual_correlations,
+                ruv_scale,
+                frem_ov.as_deref(),
+                mult_p.as_deref(),
+            );
+            (nll_p - nll_base) / delta
+        } else {
+            d_nll_d_f
+                .iter()
+                .zip(preds_p.iter().zip(preds_base.iter()))
+                .map(|(&dl, (&pp, &pb))| dl * (pp - pb) / delta)
+                .sum()
+        };
         grad[i] = if theta_packs_log_mask[i] {
             theta[i] * d_obs_nll
         } else {
@@ -1311,11 +1387,18 @@ fn obs_nll_subject_grad(
                 let resid = residuals[j];
                 // ratio = d(V_j)/d(log sigma_k); zero unless sigma_k enters
                 // obs j's endpoint (so per-CMT each sigma sums only over its
-                // own endpoint's observations).
-                let ratio = model
-                    .error_spec
-                    .dvar_dlogsigma(err_keys[j], k, f, sigma_values)
-                    * obs_var_scale[j];
+                // own endpoint's observations). The #484/#1029 magnitude rides
+                // slot k's loading, scaling this derivative by m_k².
+                let ratio = match ruv_mult.as_ref().map(|m| m[j].as_slice()) {
+                    Some(m) => {
+                        model
+                            .error_spec
+                            .dvar_dlogsigma_scaled(err_keys[j], k, f, sigma_values, m)
+                    }
+                    None => model
+                        .error_spec
+                        .dvar_dlogsigma(err_keys[j], k, f, sigma_values),
+                } * obs_var_scale[j];
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
@@ -6555,5 +6638,175 @@ mod tests {
             "coordinate with block scale 0 must not move"
         );
         assert_ne!(eta[0], eta0[0], "unclamped coordinate should have moved");
+    }
+
+    // ── #484/#1029: the residual magnitude reaches the SAEM M-step ──────────
+    //
+    // `obs_nll_sum` routes through `likelihood::obs_nll_subject_into`, the same
+    // magnitude-aware data term FOCE/FOCEI score. So asserting the M-step's own
+    // `nll` against it *is* the cross-estimator likelihood-agreement check, and
+    // FD of it pins the θ/σ score terms — including the magnitude's direct-θ
+    // channel, which the prediction chain rule alone would drop.
+
+    /// Shared body: analytic M-step `(nll, grad)` for `model` vs `obs_nll_sum`
+    /// and its forward difference, in the same log-packed space SAEM optimises.
+    fn check_saem_mstep_matches_fd(model: &CompiledModel, theta: &[f64], sigma_values: &[f64]) {
+        use crate::types::{DoseEvent, Population};
+
+        let make_subj = |id: &str, wpse: f64, scale: f64| Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 4.0, 8.0],
+            observations: vec![8.0 * scale, 6.0 * scale, 4.0 * scale],
+            obs_cmts: vec![1; 3],
+            cens: vec![0; 3],
+            // WPSE varies within the subject: a per-record snapshot, so a
+            // magnitude frozen at the subject's first value would be caught.
+            covariates: [("WPSE".to_string(), wpse)].into_iter().collect(),
+            obs_covariates: vec![
+                [("WPSE".to_string(), wpse)].into_iter().collect(),
+                [("WPSE".to_string(), wpse * 1.5)].into_iter().collect(),
+                [("WPSE".to_string(), wpse * 2.0)].into_iter().collect(),
+            ],
+            ..Default::default()
+        };
+        let population = Population {
+            subjects: vec![make_subj("1", 0.5, 1.0), make_subj("2", 0.8, 1.1)],
+            covariate_names: vec!["WPSE".to_string()],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let etas: Vec<Vec<f64>> = vec![vec![0.0], vec![0.05]];
+        let n_theta = theta.len();
+        let n_sigma = sigma_values.len();
+        let n = n_theta + n_sigma;
+
+        let f0 = obs_nll_sum(model, &population, theta, sigma_values, &etas);
+        let h = 1e-6;
+        let mut ref_grad = vec![0.0f64; n];
+        for i in 0..n_theta {
+            let mut tp = theta.to_vec();
+            tp[i] += h;
+            ref_grad[i] =
+                theta[i] * (obs_nll_sum(model, &population, &tp, sigma_values, &etas) - f0) / h;
+        }
+        for k in 0..n_sigma {
+            let mut sp = sigma_values.to_vec();
+            sp[k] += h;
+            ref_grad[n_theta + k] =
+                sigma_values[k] * (obs_nll_sum(model, &population, theta, &sp, &etas) - f0) / h;
+        }
+
+        let mask = vec![true; n_theta];
+        let lo = vec![-1e30f64; n];
+        let hi = vec![1e30f64; n];
+        let mut total_nll = 0.0f64;
+        let mut total_grad = vec![0.0f64; n];
+        let mut scratch = EventPkParams::default();
+        for (i, subject) in population.subjects.iter().enumerate() {
+            let (nll_i, grad_i) = obs_nll_subject_grad(
+                model,
+                subject,
+                theta,
+                sigma_values,
+                &etas[i],
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
+                &mut scratch,
+            );
+            total_nll += nll_i;
+            for (g, gi) in total_grad.iter_mut().zip(grad_i.iter()) {
+                *g += gi;
+            }
+        }
+
+        assert!(
+            (total_nll - f0).abs() < 1e-8,
+            "M-step NLL disagrees with the shared magnitude-aware data term: \
+             {total_nll} vs {f0}"
+        );
+        for j in 0..n {
+            let rel = if ref_grad[j].abs() > 1e-8 {
+                (total_grad[j] - ref_grad[j]).abs() / ref_grad[j].abs()
+            } else {
+                (total_grad[j] - ref_grad[j]).abs()
+            };
+            assert!(
+                rel < 1e-3,
+                "weighted M-step grad[{j}]: analytic={:.6e}, fd={:.6e}, rel={:.2e}",
+                total_grad[j],
+                ref_grad[j],
+                rel
+            );
+        }
+    }
+
+    /// `weight = <covariate>` (#1029): θ-free, so the analytic prediction chain
+    /// rule stays exact once V / ∂V∂f / ∂V∂logσ take their `_scaled` forms.
+    #[test]
+    fn obs_nll_subject_grad_weighted_error_matches_fd() {
+        let model = crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.10 (sd)
+  sigma ADD_ERR  ~ 0.50 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR * (1.0 + 0.5 * WPSE), ADD_ERR) weight = WPSE
+[covariates]
+  WPSE continuous
+",
+        )
+        .expect("weighted model parses");
+        assert!(model.has_custom_ruv_magnitude());
+        assert!(
+            !model.has_theta_dependent_ruv_magnitude(),
+            "a covariate weight must not be flagged θ-dependent"
+        );
+        check_saem_mstep_matches_fd(&model, &[1.0, 10.0], &[0.10, 0.50]);
+    }
+
+    /// θ-*dependent* magnitude (#484): θ now moves the residual variance
+    /// directly as well as through the prediction. The M-step θ gradient must
+    /// carry both channels — the analytic `∂nll/∂f · ∂f/∂θ` chain alone fails
+    /// this test.
+    #[test]
+    fn obs_nll_subject_grad_theta_dependent_magnitude_matches_fd() {
+        let model = crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta RUV_W(0.30, 0.01, 5.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.10 (sd)
+  sigma ADD_ERR  ~ 0.50 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR * (1.0 + RUV_W * WPSE))
+[covariates]
+  WPSE continuous
+",
+        )
+        .expect("theta-dependent magnitude model parses");
+        assert!(model.has_theta_dependent_ruv_magnitude());
+        check_saem_mstep_matches_fd(&model, &[1.0, 10.0, 0.30], &[0.10, 0.50]);
     }
 }

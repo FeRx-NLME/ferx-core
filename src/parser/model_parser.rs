@@ -12359,6 +12359,7 @@ fn build_ruv_magnitude(
         Some(RuvMagnitude {
             per_sigma,
             per_sigma_deriv,
+            theta_dependent: !used_thetas.is_empty(),
         })
     } else {
         None
