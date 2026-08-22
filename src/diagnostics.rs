@@ -21,6 +21,10 @@
 //! |------|---------|
 //! | `E_PARSE`                 | the model file failed to parse |
 //! | `E_MISSING_BLOCK`         | a required `[block]` is absent |
+//! | `E_UNKNOWN_BLOCK`         | a `[block]` header is not a recognised block name |
+//! | `E_DEPRECATED_BLOCK`      | a `[block]` that was ferx syntax and is no longer read |
+//! | `E_BLOCK_INSTANCE_NAME`   | a `[block NAME]` instance name is present where none is taken, or missing where one is required |
+//! | `E_BLOCK_FEATURE_DISABLED`| a `[block]` needs a cargo feature this binary was not built with |
 //! | `E_NN_FEATURE_DISABLED`   | a `[covariate_nn]` block needs `--features nn` |
 //! | `E_MISSING_COVARIATE`     | the model references a covariate not present in the data |
 //! | `E_PER_CMT_SCALING`       | an observed compartment lacks a per-CMT scaling entry |

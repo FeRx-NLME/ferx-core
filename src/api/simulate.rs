@@ -288,6 +288,31 @@ pub(crate) fn validate_tte_simulatable(
     Ok(())
 }
 
+/// Reject a `params` value that cannot drive an IOV (`kappa`) simulation.
+///
+/// An IOV model draws one κ ~ N(0, Ω_IOV) per occasion, so `params.omega_iov` must
+/// be present whenever `model.n_kappa > 0`. The parser guarantees that for
+/// `CompiledModel::default_params`, but a caller that *rebuilds* `ModelParameters`
+/// from a fit — e.g. the R `ferx_simulate(..., fit = f)` bridge (#1019) — can drop
+/// the IOV block and reach the emitter with `None`. That is a caller bug rather than
+/// a user-fixable model error, but it must be reported, not panicked across an FFI
+/// boundary. Silently substituting the model's *initial* Ω_IOV is not an option: it
+/// would under- or over-disperse every simulated occasion with no diagnostic.
+pub(crate) fn validate_iov_simulatable(
+    model: &CompiledModel,
+    params: &ModelParameters,
+) -> Result<(), String> {
+    if model.n_kappa > 0 && params.omega_iov.is_none() {
+        return Err(format!(
+            "model declares {} kappa (IOV) but the supplied parameters carry no omega_iov; \
+             simulation draws one kappa vector per occasion from it. Rebuild the parameters \
+             with the fitted IOV covariance (see `fitted_params_from_result`) before simulating",
+            model.n_kappa
+        ));
+    }
+    Ok(())
+}
+
 /// Simulate observations under `opts`, returning only the observation rows.
 ///
 /// Thin wrapper over [`simulate_with_options_diag`] that discards the per-subject
@@ -343,6 +368,11 @@ pub fn simulate_with_options_diag(
     // not yet supported for an ODE hazard).
     #[cfg(feature = "survival")]
     validate_tte_simulatable(model, population, opts.horizon)?;
+
+    // An IOV model needs the fitted Ω_IOV in `params` (#1019). Report a missing one
+    // as a clean Err here; the Vec-returning entry points enforce the same contract
+    // as a panic at the chokepoint below, since they cannot signal.
+    validate_iov_simulatable(model, params)?;
 
     // Parity with `fit()`: a referenced covariate absent from the data would
     // silently read 0.0 (e.g. a `Selected` error model's `if (FREE==0)` selector
@@ -580,10 +610,10 @@ fn emit_subject_rows<R: rand::Rng>(
     // Non-IOV models keep the TV-covariate-aware fast-path dispatcher unchanged
     // and draw no extra randoms, so their output is byte-identical.
     let ipreds = if model.n_kappa > 0 {
-        let omega_iov = params
-            .omega_iov
-            .as_ref()
-            .expect("omega_iov is present whenever the model declares kappa (n_kappa > 0)");
+        let omega_iov = params.omega_iov.as_ref().expect(
+            "omega_iov is present whenever the model declares kappa (n_kappa > 0) — \
+                 guaranteed by `validate_iov_simulatable` at every simulate entry point (#1019)",
+        );
         // One κ vector per occasion group, in `iov_occasion_groups` order — the
         // exact order `predict_iov` indexes its `kappas` argument by. Empty when
         // the subject carries no occasion labels, in which case `predict_iov`
@@ -858,6 +888,14 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // enforce the identical contract as a panic rather than emitting wrong rows.
     #[cfg(feature = "survival")]
     if let Err(e) = validate_tte_simulatable(model, population, horizon) {
+        panic!("{e}");
+    }
+
+    // Same split for the IOV precondition (#1019): `simulate_with_options*` already
+    // returned a clean Err; the Vec-returning `simulate` / `simulate_with_seed` and the
+    // uncertainty path funnel through here, where the only way to enforce the contract
+    // is to fail loud rather than emit rows with no inter-occasion variability.
+    if let Err(e) = validate_iov_simulatable(model, params) {
         panic!("{e}");
     }
 

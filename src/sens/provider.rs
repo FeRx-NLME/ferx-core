@@ -683,9 +683,9 @@ fn apply_readout_jet<T: PkNum>(
         // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
         // thread-local; enter this observation's time to match production's
         // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
-        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(
-            subject.obs_times.get(obs_i).copied().unwrap_or(0.0),
-        );
+        // `readout_time`, like production — the raw data-file clock.
+        let _time_guard =
+            crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(obs_i));
         eval_readout_jet::<T>(
             prog,
             conc,
@@ -2108,7 +2108,7 @@ fn run_obs_iov<const M: usize>(
                 ro_obs.at(j),
                 slot_row,
                 subject.obs_cov(j),
-                subject.obs_times[j],
+                subject.readout_time(j),
                 &seed,
                 &mut ro_state,
                 &mut ro_vars,
@@ -2418,7 +2418,7 @@ fn run_obs_iov_eta<const N: usize>(
                 ro_obs.at(j),
                 slot_row,
                 subject.obs_cov(j),
-                subject.obs_times[j],
+                subject.readout_time(j),
                 &seed,
                 &mut ro_state,
                 &mut ro_vars,
@@ -3319,7 +3319,7 @@ fn run_obs_tvcov<const M: usize>(
             // thread-local; enter this observation's time to match production's
             // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
             let _time_guard =
-                crate::parser::model_parser::ModelTimeGuard::enter(subject.obs_times[j]);
+                crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(j));
             eval_readout_jet::<Dual2<M>>(
                 ro,
                 c_clamped,
@@ -3685,7 +3685,7 @@ fn run_obs_grad_tvcov<const N: usize>(
                 },
             });
             let _time_guard =
-                crate::parser::model_parser::ModelTimeGuard::enter(subject.obs_times[j]);
+                crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(j));
             eval_readout_jet::<Dual1<N>>(
                 ro,
                 c_clamped,

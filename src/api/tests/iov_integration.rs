@@ -1,5 +1,6 @@
 use super::fit;
 use super::simulate_with_seed;
+use super::{simulate_with_options, SimOutcome};
 use crate::types::*;
 
 use std::collections::HashMap;
@@ -1807,4 +1808,93 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
             "predictions must be finite"
         );
     }
+}
+
+// ── #1019: simulating an IOV model from caller-rebuilt parameters ────────
+//
+// The R bridge rebuilds `ModelParameters` from a fit object; before #1019 it
+// dropped `omega_iov`, and the per-occasion κ draw in `emit_subject_rows`
+// unwrapped that `None` — a panic across the FFI boundary that took the R
+// session's error handling with it. The contract is now enforced at every
+// simulate entry point: a clean `Err` where one can be returned, a loud panic
+// on the Vec-returning chokepoint.
+
+/// `params` with the IOV block stripped — exactly what a fit-rebuilt
+/// `ModelParameters` looked like before the fix.
+fn iov_params_without_omega_iov(model: &CompiledModel) -> ModelParameters {
+    let mut params = model.default_params.clone();
+    params.omega_iov = None;
+    params
+}
+
+#[test]
+fn test_simulate_with_options_errs_when_omega_iov_missing() {
+    let model = make_iov_model();
+    let population = make_iov_population();
+    let params = iov_params_without_omega_iov(&model);
+
+    let err = simulate_with_options(
+        &model,
+        &population,
+        &params,
+        2,
+        &crate::SimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        },
+    )
+    .expect_err("an IOV model with no omega_iov must not simulate");
+    assert!(
+        err.contains("omega_iov") && err.contains("kappa"),
+        "error must name the missing IOV covariance; got: {err}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "carry no omega_iov")]
+fn test_simulate_with_seed_panics_when_omega_iov_missing() {
+    let model = make_iov_model();
+    let population = make_iov_population();
+    let params = iov_params_without_omega_iov(&model);
+    // No Err channel on this entry point: fail loud rather than emit rows with
+    // zero inter-occasion variability.
+    let _ = simulate_with_seed(&model, &population, &params, 1, 1);
+}
+
+#[test]
+fn test_simulate_from_fitted_params_carries_omega_iov() {
+    let model = make_iov_model();
+    let population = make_iov_population();
+    let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+    let fit_result = fit(&model, &population, &model.default_params.clone(), &opts)
+        .expect("IOV fit must succeed");
+
+    // The supported way to rebuild parameters from a fit — the fix the R bridge
+    // mirrors. It must carry the IOV covariance through, and simulate cleanly.
+    let params =
+        crate::estimation::uncertainty_samples::fitted_params_from_result(&fit_result, &model);
+    assert!(
+        params.omega_iov.is_some(),
+        "fitted_params_from_result must thread omega_iov through for a kappa model"
+    );
+
+    let results = simulate_with_options(
+        &model,
+        &population,
+        &params,
+        2,
+        &crate::SimulateOptions {
+            seed: Some(7),
+            ..Default::default()
+        },
+    )
+    .expect("simulating from fitted params must succeed");
+    assert_eq!(
+        results.len(),
+        2 * population.subjects.len() * population.subjects[0].obs_times.len()
+    );
+    assert!(results.iter().all(|r| {
+        r.ipred.is_finite()
+            && matches!(&r.outcome, SimOutcome::Continuous { value } if value.is_finite())
+    }));
 }

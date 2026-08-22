@@ -219,6 +219,12 @@ When the dataset has occasion labels the sdtab CSV gains an `OCC` column (one ro
 
 > **Note**: `shrinkage_kappa` exists as a placeholder field on `FitResult` but is not yet computed — it is always returned as an empty `Vec`. Use `ebe_kappas` directly if you need a manual shrinkage diagnostic.
 
+## Simulation
+
+`simulate()` is occasion-aware for a `kappa` model: it draws one independent κ ~ N(0, Ω~IOV~) per occasion group, so a VPC from an IOV model carries the inter-occasion spread the fit estimated (drawing a single κ for the whole subject would silently under-disperse it).
+
+That draw needs Ω~IOV~ in the parameters you hand to `simulate()`. The model's own parameters (`model.default_params`) always carry it, but a caller that **rebuilds** parameters from a fit must thread the fitted IOV covariance through as well — `estimation::uncertainty_samples::fitted_params_from_result()` does this and is the supported way to go from a `FitResult` to a simulate-ready `ModelParameters`. Parameters with a missing `omega_iov` are rejected: `simulate_with_options()` / `simulate_with_options_diag()` return an `Err` naming the omission, and the `Vec`-returning `simulate()` / `simulate_with_seed()` panic with the same message rather than silently emitting occasion-free draws (issue #1019).
+
 ## Limitations
 
 - **Cross-occasion dose carryover.** Predictions are computed by `pk::predict_iov`, which builds per-event PK parameters carrying each event's occasion kappa and propagates the compartment amounts *continuously* across occasion boundaries (via the event-driven solver). A dose from an earlier occasion is therefore eliminated through a later occasion with the later occasion's clearance — matching NONMEM's integration model (this replaced the earlier "Option A" superposition, which used a single clearance for the whole dose history and biased no-washout designs; issue #104). On the warfarin IOV reference, ferx's population prediction now matches NONMEM's to 5 significant figures on every row. A ~17 OFV-unit gap versus NONMEM remains at matched parameters, but it is *not* a prediction difference — it is a cross-engine FOCEI marginal/EBE difference for this weakly-identified multi-random-effect model (and NONMEM's reference itself did not converge cleanly here). See `tests/warfarin_iov_nonmem.rs`.

@@ -505,6 +505,31 @@ fn classify_warning_dw_is_warning() {
 }
 
 #[test]
+fn classify_warning_sir_proposal_diagnostics_route_to_sir() {
+    // #1021: the proposal-conditioning notes are prefixed `SIR:` / `SIR fallback:`
+    // and match none of the older "sir failed" / "sir requested" phrasings. The
+    // shrinkage one also name-drops "the covariance step", so it must not be
+    // claimed by a covariance arm.
+    let w = classify_warning(
+        "SIR: proposal was shrunk in 3 direction(s) so draws stay inside the parameter \
+         bounds [TVKA -0.74 (sd 6.15e3 → 2.89e0)]. Those directions come from \
+         eigenvalue-floored (non-identified) curvature in the covariance step; the SIR \
+         CIs along them understate the true uncertainty.",
+    );
+    assert_eq!(w.category.as_str(), "sir", "message: {}", w.message);
+    assert_eq!(w.severity, WarningSeverity::Warning);
+
+    let w = classify_warning(
+        "SIR: proposal covariance is rank-deficient beyond the FIX-ed parameters: 1 \
+         direction(s) carry no uncertainty [TVCL +0.71, TVV -0.70].",
+    );
+    assert_eq!(w.category.as_str(), "sir", "message: {}", w.message);
+
+    let w = classify_warning("SIR fallback: proposal was shrunk in 1 direction(s).");
+    assert_eq!(w.category.as_str(), "sir", "message: {}", w.message);
+}
+
+#[test]
 fn classify_warning_mu_ref_is_info() {
     let w = classify_warning("mu-ref: CL, V");
     assert_eq!(w.severity, WarningSeverity::Info);
@@ -783,6 +808,31 @@ fn classify_warning_roundtrips_every_engine_message() {
             "SIR requested but not run: Bayesian estimation reports posterior \
              credible intervals instead of a Hessian-based covariance, which SIR \
              would have to draw from.",
+            Warning,
+            "sir",
+        ),
+        // #1021: proposal-conditioning diagnostics. The shrinkage message names
+        // "the covariance step", which earlier arms sniff for — it must still
+        // route to "sir".
+        (
+            "SIR: proposal was shrunk in 3 direction(s) so draws stay inside the \
+             parameter bounds [TVKA -0.74 (sd 6.15e3 → 2.89e0)]. Those directions \
+             come from eigenvalue-floored (non-identified) curvature in the \
+             covariance step; the SIR CIs along them understate the true uncertainty.",
+            Warning,
+            "sir",
+        ),
+        (
+            "SIR: proposal covariance is rank-deficient beyond the FIX-ed \
+             parameters: 1 direction(s) carry no uncertainty [TVCL +0.71, TVV -0.70]. \
+             SIR holds those parameter combinations at their ML values, so their CIs \
+             are not explored — they are not identified by the data.",
+            Warning,
+            "sir",
+        ),
+        (
+            "SIR fallback: proposal was shrunk in 1 direction(s) so draws stay inside \
+             the parameter bounds [ADD_ERR +0.99 (sd 4.36e3 → 2.17e0)].",
             Warning,
             "sir",
         ),

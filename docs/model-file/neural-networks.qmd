@@ -69,6 +69,16 @@ DOI [10.1002/psp4.12808](https://doi.org/10.1002/psp4.12808).
 
 ### `[dynamics_nn]` — Low-dimensional Neural ODEs
 
+::: {.callout-important}
+## Not accepted yet — design sketch only
+
+`[dynamics_nn]` is **Phase B** and the parser does not read it. Since block
+names became closed-world, a file containing one is rejected outright with
+`E_UNKNOWN_BLOCK` rather than parsed with the block ignored (see the
+[check report](../file-formats/check-report.qmd)). The syntax below shows the
+intended shape; it is not usable in this release.
+:::
+
 A small neural network appears on the **right-hand side of an ODE**,
 replacing mechanistic terms like Michaelis–Menten or linear elimination
 when the dynamics are unknown:
