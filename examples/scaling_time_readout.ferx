@@ -1,0 +1,71 @@
+# Form C readout that references the `TIME` built-in (issue #1028).
+#
+# The observed quantity is not the concentration alone: it is the concentration
+# plus a saturating response-versus-time term, `EMAX * TIME / (TIME + T50)` —
+# the shape a disease-progression / placebo-response / model-based meta-analysis
+# (MBMA) readout takes. `TIME` resolves to each observation's own time, exactly
+# as it does in `[odes]` and as NONMEM's `$ERROR` resolves it:
+#
+#   $ERROR
+#     IPRED = A(1)/V + BETA*TIME/(TIME + T50)
+#
+# and this file is the twin of `nonmem_anchor/scaling_time_readout.ctl`, which
+# anchors the readout against NONMEM 7.6.0 (see that directory's README).
+#
+# `T` is accepted as an alias for `TIME`, matching `[odes]`.
+#
+# Note `obs_scale` cannot reference `TIME`: it is a *subject-static* divisor,
+# evaluated once at t = 0 and applied to every observation, so a `TIME` in it
+# could only ever read 0. The parser rejects that and points here.
+#
+# Run:
+#   cargo run --release -- examples/scaling_time_readout.ferx --simulate
+#
+# Simulate-and-refit recovers both halves of the readout (30 subjects, seed 1):
+#
+#   param     estimate   truth
+#   TVCL      4.9139     5.0
+#   TVV      50.5053    50.0
+#   TVEMAX    2.9914     3.0     <- the TIME term's asymptote
+#   TVT50     4.0442     4.0     <- and its half-maximal time
+
+[parameters]
+  theta TVCL(5.0,  0.1,  100.0)
+  theta TVV(50.0,  1.0,  500.0)
+  theta TVEMAX(3.0, 0.0,  100.0)   # asymptote of the time response
+  theta TVT50(4.0, 0.01, 100.0)    # time to half-maximal response
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  EMAX = TVEMAX
+  T50  = TVT50
+
+[structural_model]
+  ode(states=[central])            # no obs_cmt — Form C below provides the readout
+
+[odes]
+  d/dt(central) = -(CL / V) * central
+
+[scaling]
+  y = central / V + EMAX * TIME / (TIME + T50)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 300
+  covariance = true
+
+[simulation]
+  n_subjects = 30
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 36.0, 48.0]
+  seed       = 1

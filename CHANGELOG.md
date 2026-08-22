@@ -37,6 +37,23 @@ section of the SDLC for the versioning policy).
   **stricter than NONMEM**: `$PK` defining `F1` **and** `S2 = V/F1` runs clean under `ADVAN2` and
   returns predictions scaled by exactly `F1` — anchored on NONMEM 7.6.0, two streams differing in
   one `$PK` line (`nonmem_anchor/analytical_dose_attr_double_use_{A,B}.ctl`).
+- **An unrecognised `[block]` name is now an error (#1040).** Blocks were read by name lookup, so a
+  header the parser did not know was never read and never reported: a misspelled `[fit_option]` left
+  `ferx check` saying `valid: true` while the fit ran with the default method, the default iteration
+  cap and **no covariance step** — returning without standard errors and no indication why. The same
+  went for `[scalings]`, `[outputs]`, `[derived]`, `[covariates]` and friends. Block names are now
+  closed-world, like the keys inside a block already were: an unknown header is `E_UNKNOWN_BLOCK`,
+  listing every offender with its line, the full valid set, and a did-you-mean for a near match. Two
+  neighbouring silent drops go with it — an instance name where none is taken (`[fit_options DOSE]`)
+  or missing where one is required (`[covariate_nn]`) is `E_BLOCK_INSTANCE_NAME`, and a block whose
+  cargo feature this binary lacks (`[event_model]` without `--features survival`, `[markov_model]`
+  without `--features markov`) is `E_BLOCK_FEATURE_DISABLED` instead of being parsed away, and
+  `[initial_values]` — ferx's own former spelling for initial estimates, unread since they moved
+  inline into `[parameters]` — is `E_DEPRECATED_BLOCK`, naming the replacement rather than offering
+  a did-you-mean that does not exist. The recognised block names are exported as
+  `known_block_names()` so wrappers can read the list from the engine rather than keeping their own
+  copy; it reflects the features the binary was built with, so it never advertises a name the same
+  binary would refuse.
 - **A dose attribute that is also read by the model is now an error (#993).** `F`,
   `LAGTIME`/`ALAG` and the compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` are applied by the
   engine **at the dose event**. A model that declares one and *also* references it in `[odes]`
@@ -48,7 +65,7 @@ section of the SDLC for the versioning policy).
   reservation but are consulted only for a coded `RATE=-2`/`-1` dose, so that collision is reported
   against the dataset (same code) and a model whose data never codes `RATE` is untouched. Reads from
   `[derived]`/`[output]` are post-solve reporting and remain silent. (Analytical models were left out
-  of this first pass and are covered by #1004 below.) **Breaking** for a model that folds `F` into the absorption flux
+  of this first pass; they are covered by #1004 above.) **Breaking** for a model that folds `F` into the absorption flux
   — the pre-dose-entry convention the ODE docs' migration note describes, which until now computed
   `F²` without complaint; the fix is to drop `F` from the right-hand side, or rename the parameter
   if it was never bioavailability. Note this makes ferx **stricter than NONMEM**, which allows a
@@ -57,7 +74,127 @@ section of the SDLC for the versioning policy).
   two `ADVAN13` streams differing in one `$DES` line give predictions differing by exactly `F1`,
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
+### Fixed
+- **An adaptive-dosing run now reads a `TIME`-dependent `[scaling]` Form C readout on the same
+  clock as `fit()` / `predict()` (#1028 follow-up).** #1028 moved the readout's `TIME` to the raw
+  data-file clock (the `$ERROR` convention shared by sdtab, `predict()`/`simulate()` and `[derived]`
+  windows) on the static predictors, but the reactive driver and the frozen-schedule replay
+  verifier kept feeding it the integrator break the observation was keyed to. For a subject with
+  stacked reset occasions — whose data `TIME` restarts while the internal timeline stays monotonic —
+  those are different numbers, so the *same record* got one `TIME` under `simulate_adaptive` and
+  another under `fit()`, and the replay verifier's bit-equality against the static engine no longer
+  held. Both now use the raw clock. Also in the same area: a `T` / `t` declared in `[covariates]` is
+  now honoured **case-insensitively** (declaring `T` protects a `t` reference and vice versa —
+  previously the case-mismatched pair silently folded to the model clock in `y`, and raised the
+  time-in-`obs_scale` error against a legitimately declared column), and the declaration now reaches
+  `[adaptive_dosing] observe`, which compiles through the same readout compiler — so a declared `T`
+  can no longer be the data column in `[scaling]` and the clock in `observe` for one model. The
+  `T`-fold warning for `observe` is emitted at parse time, since the block is compiled at simulate
+  time where there is no warnings channel.
+- **`TIME` now works in a `[scaling]` Form C readout, and an undefined name in `[scaling]` is no
+  longer a silent zero (#1028).** A `y = <expr>` / `y[CMT=N] = <expr>` readout referencing the
+  `TIME` built-in parsed fine but was never bound to the observation — the integrator's model-time
+  guard is dropped before the readout runs — so `TIME` read `0` at every row and the whole
+  time-dependent term vanished. A response-versus-time readout such as
+  `y[CMT=1] = EMAX * TIME / (TIME + T50)` therefore fit, converged, and reported plausible
+  parameters for a structural model nobody wrote. `TIME` (and the `T` alias `[odes]` also accepts)
+  now resolves to each observation's own time on both the ODE and analytical Form C paths, on the
+  production predictor and the analytic sensitivity walks alike — and to each decision's time in an
+  `[adaptive_dosing] observe` expression, which compiles through the same readout compiler — so the
+  dummy `d/dt(clock) = 1`
+  workaround is no longer needed (and is better dropped: `clock` starts at the subject's first
+  record, not at `t = 0`). Separately, `obs_scale` expressions never registered their covariate
+  references as required data columns, and `predict()` ran no covariate check at all, so an
+  unresolvable identifier anywhere in `[scaling]` reached the predictor as the covariate map's
+  `0.0` default. Both halves of the block now register their references, and `predict()` reports
+  `E_MISSING_COVARIATE` for a missing column just as `fit()` and `simulate()` already did.
+  **Breaking** in two narrow places: `obs_scale = TIME` (or `= T`) is now a parse error naming Form
+  C as the place for a time-dependent readout — the divisor is subject-static, evaluated once at
+  `t = 0`, so it could only ever have read `0`; and a `[scaling]` expression referencing an
+  *undeclared* data column named `T` now reads the model-time built-in instead, matching `[odes]`,
+  where that name has always been reserved. Declaring `T` in `[covariates]` keeps it a data column,
+  and whenever the fold does happen ferx warns and names both escapes, so the substitution is never
+  silent. `TAFD` / `TAD` are unaffected and remain ordinary covariate references in `[scaling]`;
+  when such a column is missing, `E_MISSING_COVARIATE` now explains that the name is an `[odes]`-only
+  built-in rather than reading as a plain typo report. The readout's `TIME` is the raw data-file
+  clock — the same one sdtab, `predict()`/`simulate()` and `[derived]` windows report, and NONMEM's
+  `$ERROR` uses — which differs from the integrator timeline only for datasets with stacked reset
+  occasions. A modified-release model whose closed-form fast path applies now declines to the ODE
+  path when its readout reads `TIME`, instead of dropping the time term via a state-space linearity
+  probe. `predict()`'s new covariate check accepts a name every subject's covariate map carries even
+  when the population's `covariate_names` list is empty, so a programmatically built in-memory
+  `Population` keeps working.
+- **An adaptive-dosing `dv` monitor no longer floors a negative Form C `[scaling]` readout at zero
+  (#1039).** The assay floor on the `ObserveMode::Dv` path ("an assay cannot read below zero") was
+  written when every monitored readout was a compartment amount or concentration, and was applied
+  unconditionally after the residual draw. A Form C `y = <expr>` readout is an arbitrary
+  expression — a change from baseline, a difference from a comparator, a z-score, the
+  `sqrt(N) * logit(p)` transform — so the *same model* read correctly under `mode = ipred` and
+  came back as exactly `0` under `mode = dv` for every negative sample, silently: a controller
+  thresholding a change-from-baseline signal saw `0` over precisely the region it was written to
+  react to, and dosed accordingly. The floor is now gated on the same predicate as the prediction
+  path (#1020), so it applies only to the bare-state readout and to Forms A/B, which keep it. With
+  `sigma → 0` a `dv` monitor again reproduces the `ipred` monitor sample for sample, negative
+  samples included.
+- **SAEM no longer lets a fixed-effect-only theta drift away from the marginal optimum (#1011).** The
+  numerical θ/σ M-step assigned NLopt's maximiser outright, re-maximising against a *single* MCMC η
+  draw each iteration — `argmax` of one draw rather than the stochastic-approximation average of
+  `E[argmax]`, a Monte-Carlo bias that does not decay with iteration count. A log-mu-referenced theta
+  was unaffected (its closed-form `log θ += γ·mean(η)` update is already an exact Robbins-Monro
+  average), and Ω was already protected by a per-iteration SA cap; the θ channel was the one left
+  exposed. The M-step result is now blended in as `θ ← θ + γ_θ·(θ* − θ)` with `γ_θ` capped at 0.03
+  during exploration and following the full decaying `γ = 1/(k−k1)` in convergence — the θ-side
+  counterpart of the existing Ω cap. On the FREM `iiv_on_ruv` model of #1011, whose absorption
+  fraction `TVFRD1` carries no ETA, SAEM moves from **0.039 to 0.290** against a marginal −2logL
+  optimum of ≈ 0.29 (NONMEM IMP 0.394, ferx IMP 0.311, IMPMAP 0.318); `TVMAT` 3.020 → 2.686 (NONMEM
+  2.680) and σ 0.213 → 0.170 (NONMEM 0.177). Damping applies **only when NLopt is left estimating a theta
+  that is not mu-referenced** — the shape the bias was measured on, and the same condition the
+  advisory below warns about. A theta that is `FIX`, that is pinned out by the mu-reference shift,
+  or that is mu-referenceable at all (so the exact closed-form `log θ += γ·mean(η)` update is
+  available to it) stays on the undamped update, and a fit whose every estimated theta is one of
+  those is bit-identical to before — `warfarin_saem`, all three of whose thetas are
+  log-mu-referenced, is unchanged. Mu-referencing here means the pairing ferx *detects*: a parameter
+  whose eta is attached in a form ferx cannot pair with a single theta (an additive
+  `X = TVX + ETA_X`, a covariate model that is not log-linear in one theta) counts as un-referenced
+  and is damped, which is the intended side to err on — that theta has no closed-form shift either. Mixture models are excluded: a `MIXNUM`-switched
+  typical value uses the same M-step but must *separate* from a common start before the class
+  assignments settle, and damping that excursion stalls it (a 0.03 cap left `TVCL1 = 1.145` against
+  NONMEM's 1.002 on `tests/nonmem/mixture_iv_saem`), so mixtures keep the undamped update. The bias
+  is reduced, not removed, so the #1011 advisory still fires — attaching an ETA or holding the
+  parameter `FIX` remains the better fix. The cap is exposed as the `mstep_damping` `[fit_options]`
+  key (default `0.03`, must be in `(0, 1]`); smaller damps harder, and **`mstep_damping = 1.0`
+  disables the damping entirely**, restoring the previous behaviour exactly if a model fitted better
+  without it. Setting it on a model it cannot affect warns rather than being silently ignored, and a value
+  outside `(0, 1]` reaching `run_saem` from a programmatic caller that bypassed the parser is
+  clamped with a warning rather than applied (a negative damping would step theta and sigma away
+  from the M-step optimum every iteration; `+∞`, which reads as "no damping", now clamps to the
+  `1.0` off value rather than to the tightest damping). `mstep_damping = 1.0` is a *sentinel*, not
+  a cap value — the option is discontinuous there, since `0.999` still buys the full convergence
+  schedule — and the no-effect warning now names which of the three reasons applies, including the
+  `mu_referencing = false` case it previously mis-described as "every theta is mu-referenced".
+  Sigma is blended with the same `γ_θ` on the same gate: theta and sigma come out of one joint
+  NLopt solve, so damping only theta would leave sigma absorbing the misfit the damping just
+  stopped theta from fixing.
+
 ### Added
+- **SAEM now warns when an estimated theta carries no ETA at all.** A fixed-effect-only theta is not
+  mu-referenced, so it never gets the γ-damped closed-form `log θ += γ·mean(η)` update and is moved
+  only by the η-frozen numerical M-step — which re-maximises against a *single* MCMC η draw with no
+  stochastic-approximation damping and can drift far from the marginal optimum, dragging correlated
+  typical values with it. SAEM previously said nothing (its existing advisory only covers a theta
+  whose ETA could not be mu-referenced); IMP/IMPMAP have warned about this since #406. On a FREM
+  `iiv_on_ruv` model whose absorption fraction `TVFRD1` has no ETA, SAEM drove it to **0.039** while
+  IMP (0.311), IMPMAP (0.318) and NONMEM IMP (0.394) agree, with `TVV` +6% and `TVMAT` +9% carried
+  along; restarting SAEM *at* the IMPMAP solution still walked it down to 0.065. Adding
+  `FRD1 = TVFRD1*exp(ETA_FRD1)` (ω² = 0.01) recovers 0.313, and holding `TVFRD1` `FIX` puts every
+  other theta within 3% of NONMEM. The advisory names the remedy that fits the parameter — put a
+  typical value in a mu-referenceable form, or hold a covariate coefficient / allometric exponent /
+  structural constant `FIX` and cross-check against FOCEI/IMPMAP — and stays quiet about thetas for
+  which "has no ETA" would be false: a mixture's mixing coefficients (never moved by the numerical
+  M-step, and forbidden from depending on an eta at all), and `MIXNUM`-switched class typical values
+  or identity-scale-dropped log-mu-references, which carry an eta and already get their own message.
+  See
+  [SAEM: non-mu-referenced parameters](https://ferx-nlme.github.io/ferx-core/estimation/saem.html).
 - **Class-aware mu-referencing for mixture models (#996).** A `MIXNUM`-switched typical value written
   as `CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)` is now recognised at parse
   time and resolved to one anchor theta per class (any number of classes; a trailing `else` covers
@@ -201,6 +338,41 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **A negative Form C `[scaling]` prediction is no longer silently clamped to zero on ODE models
+  (#1020).** The ODE predictor applied its negative-prediction guard to the *final* prediction
+  vector — after the `y = <expr>` / `y[CMT=N] = <expr>` readout had been evaluated. That guard is a
+  statement about a compartment amount (which cannot go below zero, so a negative value is solver
+  overshoot), but a Form C readout is an arbitrary user expression that is often legitimately
+  signed: a change from baseline, a difference from a comparator, a z-score, or the
+  `sqrt(N) * logit(p)` transform used in model-based meta-analysis of a bounded endpoint, which is
+  negative for every arm below 50%. Every such prediction came back as exactly `0`, with no warning
+  and nothing in the fit output to show it — the fit converged with the residual σ inflated to
+  absorb the mismatch and the between-subject variance collapsed. The clamp now applies only to the
+  default bare-state readout (`obs_cmt`, and the analytical PK concentration), matching the
+  analytical Form C path, which never clamped its readout. `NaN` is still never clamped on either
+  path, so a bad scale or a missing per-CMT entry keeps surfacing as a `NaN` objective. Applies to
+  every ODE driver (dense, dense-with-states, event-driven, adaptive-dosing replay) and to the
+  analytic `Dual2`/`Dual1` sensitivity walks, whose clamp is gated identically so the analytic
+  gradient still matches finite differences of the predictor.
+- **SIR no longer fails with "All SIR samples had invalid weights" on a rank-deficient covariance
+  (#1021).** A parameter direction the data do not identify comes back from the covariance step with
+  a variance around `1 / eigenvalue floor` — thousands of standard deviations in packed log-space —
+  so every proposal draw landed outside the parameter bounds and was rejected. Each proposal
+  direction is now capped so ±2 standard deviations stay inside the room between the estimate and
+  its nearer packed bound, near-null
+  directions (a likelihood ridge left over after `FIX`ed parameters are excluded) are floored rather
+  than fatal, and both cases are reported as `SIR:` warnings naming the parameters involved. When
+  every sample *is* still rejected, the error now reports the rejection tally, the coordinates whose
+  bounds were hit, and the proposal's rank deficiency instead of the bare message. This is the
+  common model-based meta-analysis case, where fixing the residual variance is the weighting scheme
+  and cannot be dropped.
+- **Simulating an IOV (`kappa`) model with parameters that carry no IOV covariance now reports an
+  error instead of panicking (#1019).** `simulate()` draws one κ per occasion from `omega_iov`; a
+  caller that rebuilds `ModelParameters` from a fit and drops that block (the R
+  `ferx_simulate(..., fit = f)` bridge did) hit an `expect()` deep in the row emitter, which crossed
+  the FFI boundary as a process panic. `simulate_with_options`/`_diag` now return a clean `Err`
+  naming the missing `omega_iov` and the fix; the `Vec`-returning `simulate`/`simulate_with_seed`
+  fail loud with the same message rather than emitting rows with no inter-occasion variability.
 - **Log-mu-referenced θ with a negative lower bound no longer takes the wrong closed-form update
   (#996).** Such a θ is packed on the identity scale, so the SAEM/IMP `log θ += mean(η)` shift was not
   its EM optimum — it applied `θ += mean(η)` where the closed form means `θ *= exp(mean(η))`. It is

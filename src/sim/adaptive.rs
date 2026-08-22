@@ -703,6 +703,19 @@ pub struct AdaptiveDosingSpec {
     /// (the signal is then the noised model output named by `assay_cmt`, not a
     /// re-typed expression). The `when` rules compare the keyword `signal` to it.
     pub observe: Option<String>,
+    /// Covariate names the model's `[covariates]` block declares, captured at parse
+    /// time (empty when the block is absent).
+    ///
+    /// `observe` is stored as a raw string and compiled only at simulate time, by
+    /// `sim::adaptive_control::compile_observe`, through the very same
+    /// `build_y_output_fn` a `[scaling]` Form C readout uses. That compiler needs the
+    /// declarations to apply the `T` / `t` name precedence — a declared `T` is a data
+    /// column, not the model-time built-in (#1028) — and they are not otherwise
+    /// reachable from a `CompiledModel` (`referenced_covariates` holds names the model
+    /// *reads*, which is a declared-and-unreferenced `T` short). Carried here so
+    /// `observe` and `[scaling]` resolve the name identically, rather than the same
+    /// model reading the column in one block and the clock in the other.
+    pub observe_declared_covariates: Vec<String>,
     /// Titrate on the assay-noised measurement of a model output (`true`) rather
     /// than a latent expression (`false`, the default). When set, the signal's
     /// value *and* its σ both come from the output named by `assay_cmt`, so they
@@ -1109,6 +1122,7 @@ mod tests {
     fn base_spec() -> AdaptiveDosingSpec {
         AdaptiveDosingSpec {
             observe: Some("central".to_string()),
+            observe_declared_covariates: Vec::new(),
             with_assay_error: false,
             assay_cmt: None,
             at: vec![24.0],

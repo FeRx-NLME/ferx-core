@@ -1052,6 +1052,29 @@ impl Subject {
         self.dose_covariates.get(k).unwrap_or(&self.covariates)
     }
 
+    /// The `TIME` a *record-level* expression sees at observation index `j`: the
+    /// raw data-file time ([`Subject::obs_raw_times`]), falling back to the
+    /// internal monotonic [`Subject::obs_times`] for in-memory subjects that
+    /// don't carry it.
+    ///
+    /// This is the user clock, and it is the convention every other per-record
+    /// object already uses — sdtab/covtab `TIME`, `predict()`/`simulate()` `TIME`,
+    /// `[derived]` integral windows, and the custom residual-magnitude model
+    /// ([`ModelParameters::ruv_obs_mult`], documented as "matching what NONMEM's
+    /// `$ERROR` sees"). A `[scaling]` Form C readout is the `$ERROR` twin — it is
+    /// anchored against NONMEM's `$ERROR` in
+    /// `tests/scaling_time_readout_nonmem_anchor.rs` — so it reads the same clock
+    /// (#1028). The two differ only for subjects with stacked reset occasions
+    /// whose data TIME restarts, where `obs_times` is the shifted integrator
+    /// timeline; the integrator itself keeps using `obs_times`, exactly as
+    /// NONMEM's `$DES` clock is not its `$ERROR` `TIME`.
+    pub fn readout_time(&self, j: usize) -> f64 {
+        self.obs_raw_times
+            .get(j)
+            .copied()
+            .unwrap_or_else(|| self.obs_times.get(j).copied().unwrap_or(0.0))
+    }
+
     /// Covariate snapshot at EVID=2 row index `m`. Same fallback as
     /// the others — for time-constant covariates this returns the
     /// subject-static map.
@@ -3737,8 +3760,8 @@ impl CompiledModel {
     /// θ, observation covariates, and TIME — never on η), so the FOCE/FOCEI
     /// data term, Laplace curvature term, and inner EBE objective can all share
     /// one matrix and stay mutually consistent. The TIME fed to each row is the
-    /// raw data-file time (`obs_raw_times`, matching what NONMEM's `$ERROR`
-    /// sees), falling back to `obs_times` for in-memory subjects.
+    /// raw data-file time ([`Subject::readout_time`], matching what NONMEM's
+    /// `$ERROR` sees), falling back to `obs_times` for in-memory subjects.
     pub fn ruv_obs_mult(&self, subject: &Subject, theta: &[f64]) -> Option<Vec<Vec<f64>>> {
         let rm = self.ruv_magnitude.as_ref()?;
         if !rm.is_active() {
@@ -3747,12 +3770,7 @@ impl CompiledModel {
         let n = subject.observations.len();
         let mut out = Vec::with_capacity(n);
         for j in 0..n {
-            let time = subject
-                .obs_raw_times
-                .get(j)
-                .copied()
-                .unwrap_or_else(|| subject.obs_times.get(j).copied().unwrap_or(0.0));
-            out.push(rm.eval_obs(theta, subject.obs_cov(j), time));
+            out.push(rm.eval_obs(theta, subject.obs_cov(j), subject.readout_time(j)));
         }
         Some(out)
     }
@@ -3779,12 +3797,7 @@ impl CompiledModel {
         let n = subject.observations.len();
         let mut out = Vec::with_capacity(n);
         for j in 0..n {
-            let time = subject
-                .obs_raw_times
-                .get(j)
-                .copied()
-                .unwrap_or_else(|| subject.obs_times.get(j).copied().unwrap_or(0.0));
-            out.push(rm.eval_obs_theta_grad(theta, subject.obs_cov(j), time)?);
+            out.push(rm.eval_obs_theta_grad(theta, subject.obs_cov(j), subject.readout_time(j))?);
         }
         Some(out)
     }
@@ -4606,7 +4619,16 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || lower.contains("censoring handling")
     {
         (WarningSeverity::Warning, WarningCode::BloqMethod)
-    } else if lower.contains("sir failed") || lower.contains("sir requested") {
+    } else if lower.contains("sir failed")
+        || lower.contains("sir requested")
+        || lower.starts_with("sir:")
+        || lower.starts_with("sir fallback:")
+    {
+        // The `sir:` / `sir fallback:` prefixes carry the proposal-conditioning
+        // diagnostics (#1021) — a rank-deficient or bound-shrunk proposal. They
+        // reach this arm because no earlier pattern matches them: the shrinkage
+        // message mentions "the covariance step" but not "not positive definite",
+        // so the compound covariance arm above does not claim it.
         (WarningSeverity::Warning, WarningCode::Sir)
     } else if lower.contains("ess = 0") || lower.contains("proposal collapse") {
         (WarningSeverity::Warning, WarningCode::ImportanceSampling)
@@ -5301,6 +5323,24 @@ pub struct FitOptions {
     /// the M-step is still tracking correlated samples.
     pub saem_n_mh_steps: usize,
     pub saem_adapt_interval: usize,
+    /// Exploration-phase cap on the stochastic-approximation step for the
+    /// **numerical θ/σ M-step** (issue #1011); `None` uses the
+    /// `MSTEP_SA_MAX_STEP` default of 0.03.
+    ///
+    /// The M-step result is blended in as `θ ← θ + γ_θ·(θ* − θ)` rather than
+    /// assigned, because assigning it outright is `argmax` of a *single* MCMC η
+    /// draw rather than the SA average of `E[argmax]` — a Monte-Carlo bias that
+    /// does not decay with iteration count for a θ with no ETA. This is the
+    /// θ-side counterpart of the Ω cap; in the convergence phase the cap lifts
+    /// and the full decaying `γ = 1/(k−k1)` applies either way.
+    ///
+    /// Smaller damps harder. **`1.0` disables the damping**, reproducing the
+    /// pre-#1011 assignment exactly. Must be in `(0, 1]`.
+    ///
+    /// Ignored when the numerical M-step has no θ to estimate (every θ
+    /// mu-referenced or `FIX`), and for mixture models — see
+    /// `estimation::saem::damps_numerical_mstep`.
+    pub saem_mstep_damping: Option<f64>,
     /// Number of initial exploration iterations during which the BSV/IOV Ω
     /// M-step is suppressed (Ω held at its initial value) while the MH chain
     /// warms up. Prevents the iteration-1 Ω collapse on sparse data, where a
@@ -5781,6 +5821,7 @@ impl Default for FitOptions {
             saem_n_convergence: 250,
             saem_n_mh_steps: 20,
             saem_adapt_interval: 50,
+            saem_mstep_damping: None,
             saem_omega_burnin: 20,
             saem_seed: None,
             saem_conddist: false,
@@ -6474,6 +6515,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "n_leapfrog",
             "saem_n_leapfrog",
             "adapt_interval",
+            "mstep_damping",
+            "saem_mstep_damping",
             "omega_burnin",
             "conddist",
             "saem_conddist",

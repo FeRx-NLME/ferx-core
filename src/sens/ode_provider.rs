@@ -1730,6 +1730,18 @@ fn resolve_obs_readout<T: crate::sens::num::PkNum>(
     // (#540); for static covariates this is the subject map. Threaded as constants
     // — a covariate carries no derivative in the individual-parameter dual basis.
     let obs_cov = subject.obs_cov(j);
+    // A `TIME`-referencing Form C readout resolves `Op::PushTime` from the model-time
+    // thread-local; enter this observation's time so the dual walk differentiates the
+    // same expression the f64 predictor evaluates (`OdeReadout::eval` enters the
+    // matching guard, #1028). `TIME` is η/θ-constant, so it lands as `k(t)` in the
+    // dual bytecode — the guard changes the *value* it folds in, not the derivative
+    // basis. Entered once here rather than per readout arm: it is a thread-local
+    // swap plus a restore on drop, and the `ObsCmt` arm (which reads a state slot
+    // and never evaluates a program) is the only one that cannot observe it.
+    // `readout_time` (the raw data-file clock, not the shifted integrator timeline)
+    // is the same convention the f64 predictor feeds `OdeReadout::eval`, so the two
+    // linearise the same expression under stacked resets too.
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(j));
     let raw = match &ode.readout {
         OdeReadout::ObsCmt(idx) => st.get(*idx).copied().unwrap_or(T::from_f64(0.0)),
         OdeReadout::Single(_) => ode
@@ -1750,7 +1762,12 @@ fn resolve_obs_readout<T: crate::sens::num::PkNum>(
     // `conc.max(0)` (predictions.rs) and the dual walks: a clamped value carries zero
     // derivatives. A NaN readout is `< 0.0` → false, so it passes through and
     // `apply_output_transform` preserves it as a tripwire (#449 review).
-    let raw = if raw.val() < 0.0 {
+    //
+    // Gated on `clamps_negative` exactly as the f64 predictor is: a Form C `[scaling]`
+    // readout is an arbitrary expression that may be legitimately negative, so it is
+    // left alone (#1020). Keeping the two gates identical is what keeps the analytic
+    // jet equal to FD of the f64 predictor.
+    let raw = if raw.val() < 0.0 && ode.readout.clamps_negative() {
         T::from_f64(0.0)
     } else {
         raw

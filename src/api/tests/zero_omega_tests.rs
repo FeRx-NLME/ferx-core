@@ -112,6 +112,48 @@ fn check_covariates_message_unchanged_when_nothing_is_eta_shaped() {
     );
 }
 
+/// `TAFD` / `TAD` / `MACHEPS` are solver-injected built-ins *inside `[odes]`* and
+/// ordinary covariates everywhere else — including `[scaling]`, deliberately, so a
+/// dataset carrying a real `TAD` column can use it. When such a column is absent
+/// the bare "covariate not found in data: TAD" reads as a typo report rather than
+/// a scope explanation, so the message names the scope (#1028).
+#[test]
+fn check_covariates_names_the_odes_scope_for_a_missing_builtin() {
+    let model = model_referencing(&["TAD"]);
+    let pop = population_with_covariates(&["AGE"]);
+    let diags = check_covariates(&model, &pop);
+
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0].code, "E_MISSING_COVARIATE");
+    assert!(
+        diags[0].message.contains("only inside `[odes]`"),
+        "the message must explain the scope, got: {}",
+        diags[0].message
+    );
+    assert!(
+        diags[0].message.starts_with(
+            "Model references covariate(s) not found in data (case-sensitive): TAD. \
+             Available covariate columns: AGE."
+        ),
+        "the historical text must still lead the message, got: {}",
+        diags[0].message
+    );
+}
+
+/// …and the hint is scoped to those names: an ordinary missing covariate keeps the
+/// byte-for-byte historical message (pinned separately above).
+#[test]
+fn check_covariates_hint_is_absent_for_an_ordinary_covariate() {
+    let model = model_referencing(&["WT"]);
+    let pop = population_with_covariates(&["AGE"]);
+    let diags = check_covariates(&model, &pop);
+    assert!(
+        !diags[0].message.contains("[odes]"),
+        "no `[odes]` hint for an ordinary name, got: {}",
+        diags[0].message
+    );
+}
+
 #[test]
 fn check_covariates_silent_when_an_eta_named_column_exists() {
     // A model may legitimately read a NONMEM-exported `ETA_CL` column as a

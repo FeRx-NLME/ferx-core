@@ -256,6 +256,19 @@ pub fn recover_disp_params_g<T: PkNum>(
 ) -> Option<DispParams<T>> {
     let prog = spec.rhs_program.as_ref()?;
     let ro = spec.readout_program.as_ref()?;
+    // A `TIME`-reading readout (`y = central/V + BETA*TIME/(TIME+T50)`, now that
+    // #1028 makes `TIME` resolve per observation) is not a function of the state
+    // alone, so the linearity probe below cannot characterise it: the probe
+    // evaluates the readout under whatever the *ambient* model-time thread-local
+    // holds — `0.0` at this gate — which makes an additive time term vanish, passes
+    // `y0 ≈ 0`, and would let `mr_observable_g`'s `m·amount` silently drop the term
+    // for every MR-scoped subject. It would also make scope membership depend on
+    // ambient thread-local state (a non-zero ambient time flips the same model from
+    // admitted to declined). Decline outright and take the ODE path, which enters
+    // the per-observation guard (#1028).
+    if ro.reads_time_builtin() {
+        return None;
+    }
     let n = spec.n_states;
     let mut vars: Vec<T> = Vec::new();
     let mut stack: Vec<T> = Vec::new();
@@ -554,6 +567,20 @@ pub(crate) fn mr_scope<'a>(
     // `TIME` *in the RHS* fails the time-invariance check). Decline it here so a
     // direct caller is safe, independent of the routing site's own guard.
     if crate::pk::model_uses_time_builtin(model) {
+        return None;
+    }
+    // …and the same for `TIME` in the Form C *readout*, which
+    // `model_uses_time_builtin` does not see (it inspects the individual-parameter
+    // program only). `mr_observable_g` reads the observable as `m·amount`, with `m`
+    // recovered by a state-space linearity probe that evaluates the readout at the
+    // ambient model time — so a time term would be silently dropped rather than
+    // rejected. Mirrors the same decline inside `recover_disp_params_g`, kept here
+    // too so scope membership never depends on the ambient thread-local (#1028).
+    if spec
+        .readout_program
+        .as_ref()
+        .is_some_and(|ro| ro.reads_time_builtin())
+    {
         return None;
     }
     if spec.init_fn.is_some() || !spec.dose_attr_map.is_empty() {
@@ -1578,6 +1605,64 @@ mod tests {
             mr_predictions(&model, &subject, &[5.0, 50.0, 1.5], &[0.0]).is_none(),
             "a TIME-dependent disposition must decline"
         );
+    }
+
+    #[test]
+    fn declines_time_dependent_readout() {
+        // #1028: the Form C readout resolves `TIME` per observation, so a readout with
+        // an additive time term is no longer a function of the state alone. The MR fast
+        // path reads the observable as `m·amount`, with `m` recovered by a linearity
+        // probe (`readout(0) ≈ 0`, `readout(2·e_c) ≈ 2·readout(e_c)`) evaluated under
+        // the *ambient* model-time thread-local — `0.0` here — so the time term
+        // evaluates to zero at the probe, `y0 == 0` passes, and the closed form would
+        // then silently serve predictions with the whole term missing. Decline instead.
+        let src = REDUCE_1CPT.replace("y = central / V", "y = central / V + 0.5 * TIME");
+        let model = parse(&src);
+        let subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 2.0, 4.0],
+        );
+        let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
+        let eta = [0.0, 0.0];
+
+        // Baseline: the same model *without* the time term is MR-admitted, so the
+        // decline below is attributable to the readout and nothing else.
+        assert!(
+            mr_scope(&parse(REDUCE_1CPT), &subject, &theta, &eta).is_some(),
+            "REDUCE_1CPT must be MR-admitted before the TIME term is added"
+        );
+        assert!(
+            mr_scope(&model, &subject, &theta, &eta).is_none(),
+            "a TIME-reading Form C readout must decline the closed-form MR scope"
+        );
+        assert!(
+            mr_predictions(&model, &subject, &theta, &eta).is_none(),
+            "…and the MR value path with it"
+        );
+        assert!(
+            mr_subject_sensitivities(&model, &subject, &theta, &eta).is_none(),
+            "…and the MR analytic-gradient path"
+        );
+
+        // The term is real on the path that now serves this model: the ODE readout
+        // (which enters the per-observation guard) differs from the time-free twin by
+        // exactly `0.5·t`. Had the fast path stayed in scope it would have returned the
+        // time-free values — which is the silent-wrong this decline prevents.
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let p = flat_params(&model, &theta, &eta);
+        let with_time = crate::ode::ode_predictions(spec, &p, &theta, &eta, &subject);
+        let base_model = parse(REDUCE_1CPT);
+        let base_spec = base_model.ode_spec.as_ref().expect("ode model");
+        let base_p = flat_params(&base_model, &theta, &eta);
+        let without_time = crate::ode::ode_predictions(base_spec, &base_p, &theta, &eta, &subject);
+        for (i, t) in subject.obs_times.iter().enumerate() {
+            let delta = with_time[i] - without_time[i];
+            assert!(
+                (delta - 0.5 * t).abs() < 1e-6,
+                "obs {i} t={t}: readout time term is {delta}, expected {}",
+                0.5 * t
+            );
+        }
     }
 
     #[test]
