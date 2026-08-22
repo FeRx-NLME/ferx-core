@@ -128,4 +128,6 @@ is flagged rather than left to the reader: `ferx check` emits
 ends `Converged: NO` there adds a post-fit warning saying the result may be badly
 wrong rather than merely imprecise — `Converged: NO` is the state that actually
 predicts the bad answer. `gn_hybrid` is exempt from both, since its FOCEI polish
-recovers the optimum.
+recovers the optimum — and so is a hand-written `methods = [gn, focei]`, which is
+the same polish spelled out. The rule is "`gn` is the last estimating stage": a
+GN result something else re-optimises is not the result you get.

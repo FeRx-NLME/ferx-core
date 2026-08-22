@@ -52,8 +52,9 @@ pub(crate) use postfit::{
     compute_eta_shrinkage, compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ,
     compute_param_corr, compute_subject_results, cov_diagnostics, eps_shrinkage_warning,
     eta_shrinkage_warning, extract_standard_errors, high_correlation_warning, inflated_rse_warning,
-    is_last_estimating_stage, probe_nlopt_algorithms, rebuild_warnings_structured,
-    resolve_covariance_status, resolve_sir_fallback, sir_unavailable_warning,
+    is_last_estimating_stage, keep_gn_zero_eta_warning, probe_nlopt_algorithms,
+    rebuild_warnings_structured, resolve_covariance_status, resolve_sir_fallback,
+    sir_unavailable_warning,
 };
 pub use predict::{predict, PredictionResult};
 #[cfg(feature = "survival")]

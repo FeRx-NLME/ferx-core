@@ -24,6 +24,23 @@ use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
+/// The #1006 post-fit warning carried by a **pure** Gauss-Newton run that ends
+/// unconverged on a fixed-effects-only model (`n_eta = 0`).
+///
+/// Named rather than inlined because the exemption has two halves. `gn_hybrid` is
+/// handled here (`options.method` is `FoceGnHybrid` during its GN phase), but a
+/// hand-written `methods = [gn, focei]` chain — the same polish, spelled out — is
+/// invisible from inside this function: `api::fit` rewrites `stage_opts.method` to
+/// the stage's method and blanks `stage_opts.methods`, so the chain is gone by the
+/// time `run_foce_gn` sees its options. `fit_inner` therefore drops this exact
+/// string from a GN stage that is not the last estimating stage; see
+/// `api::postfit::keep_gn_zero_eta_warning`.
+pub(crate) const GN_ZERO_ETA_NONCONVERGENCE_WARNING: &str =
+    "Gauss-Newton did not converge on a model with no random effects \
+     (n_eta = 0). BHHH curvature is unreliable far from the optimum in \
+     this regime, so the result may be badly wrong, not just imprecise. \
+     Use method = gn_hybrid or focei, or improve the sigma start.";
+
 /// Run FOCE estimation using a Gauss-Newton optimizer.
 ///
 /// Returns the same `OuterResult` as `optimize_population`.
@@ -372,16 +389,14 @@ pub fn run_foce_gn(
         // a poor start, so the BHHH step can collapse orders of magnitude above
         // the optimum (8940 OFV units off on the `one_cpt_iv_pooled` anchor).
         // `gn_hybrid` is exempt: its FOCEI polish re-optimises from here and
-        // recovers the optimum. `ferx check` flags the same combination up
-        // front as W_GN_NO_RANDOM_EFFECTS (`check_model_options`).
+        // recovers the optimum. A hand-written `methods = [gn, focei]` chain
+        // earns the same exemption, but this function cannot see it — `api::fit`
+        // blanks `stage_opts.methods` per stage — so that case is suppressed by
+        // name in `fit_inner` via [`GN_ZERO_ETA_NONCONVERGENCE_WARNING`].
+        // `ferx check` flags the same combination up front as
+        // W_GN_NO_RANDOM_EFFECTS (`check_model_options`).
         if model.n_eta == 0 && !matches!(options.method, EstimationMethod::FoceGnHybrid) {
-            warnings.push(
-                "Gauss-Newton did not converge on a model with no random effects \
-                 (n_eta = 0). BHHH curvature is unreliable far from the optimum in \
-                 this regime, so the result may be badly wrong, not just imprecise. \
-                 Use method = gn_hybrid or focei, or improve the sigma start."
-                    .to_string(),
-            );
+            warnings.push(GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string());
         }
     }
 
@@ -3620,15 +3635,17 @@ mod tests {
             .expect("one_cpt_iv data loads");
         let opts = FitOptions {
             method: EstimationMethod::FoceGn,
-            outer_maxiter: 2, // guarantees non-convergence from the example's poor 0.02 (sd) start
+            // Forces non-convergence structurally: the only normal convergence
+            // branch is `rel_change < 1e-6 && iter > 3`, so a 2-iteration budget
+            // cannot converge from any start. This pins the *gate* on the
+            // warning (n_eta = 0, not gn_hybrid, not converged), not the BHHH
+            // collapse itself — that is anchored in docs/estimation/gauss-newton.qmd.
+            outer_maxiter: 2,
             run_covariance_step: false,
             ..Default::default()
         };
         let res = run_foce_gn(&model, &pop, &model.default_params, &opts);
-        assert!(
-            !res.converged,
-            "2 GN iters must not converge from 0.02 (sd)"
-        );
+        assert!(!res.converged, "a 2-iteration GN budget cannot converge");
         assert!(
             res.warnings.iter().any(is_targeted),
             "targeted #1006 warning missing: {:?}",
