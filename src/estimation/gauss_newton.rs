@@ -27,6 +27,15 @@ use rayon::prelude::*;
 /// The #1006 post-fit warning carried by a **pure** Gauss-Newton run that ends
 /// unconverged on a fixed-effects-only model (`n_eta = 0`).
 ///
+/// States the *outcome* only. The remedy ("prefer `gn_hybrid` or `focei`, or improve
+/// the `sigma` start") belongs to `W_GN_NO_RANDOM_EFFECTS`, which `check_model_options`
+/// raises for the same configuration and `fit_inner` surfaces alongside this one —
+/// repeating it here made a single `gn` run at `n_eta = 0` give the same advice twice.
+/// Inside `fit()` the two always travel together: this warning needs `n_eta = 0` and a
+/// non-hybrid, non-polished `gn` stage, which is precisely when the check raises
+/// `W_GN_NO_RANDOM_EFFECTS`. A caller reaching `run_foce_gn` directly, bypassing
+/// `check_model_options`, sees the outcome without the remedy.
+///
 /// Named rather than inlined because the exemption has two halves. `gn_hybrid` is
 /// handled here (`options.method` is `FoceGnHybrid` during its GN phase), but a
 /// hand-written `methods = [gn, focei]` chain — the same polish, spelled out — is
@@ -38,8 +47,7 @@ use rayon::prelude::*;
 pub(crate) const GN_ZERO_ETA_NONCONVERGENCE_WARNING: &str =
     "Gauss-Newton did not converge on a model with no random effects \
      (n_eta = 0). BHHH curvature is unreliable far from the optimum in \
-     this regime, so the result may be badly wrong, not just imprecise. \
-     Use method = gn_hybrid or focei, or improve the sigma start.";
+     this regime, so the result may be badly wrong, not just imprecise.";
 
 /// Run FOCE estimation using a Gauss-Newton optimizer.
 ///

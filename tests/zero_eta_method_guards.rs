@@ -67,6 +67,46 @@ fn standalone_gn_at_zero_eta_surfaces_both_diagnostics_from_fit() {
 }
 
 #[test]
+fn the_gn_remedy_is_stated_exactly_once() {
+    // The check-time warning owns the remedy and the post-fit one owns the
+    // outcome. Before the split a single `gn` run said "use gn_hybrid or focei"
+    // twice. Pinned from both sides: the advice must appear (it is the useful
+    // half) and must appear once, so neither restoring it to the post-fit
+    // message nor dropping it from the check passes.
+    let (model, pop) = pooled();
+    let opts = budgeted(FitOptions {
+        method: EstimationMethod::FoceGn,
+        ..Default::default()
+    });
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("fit returns");
+    let with_remedy: Vec<&String> = res
+        .warnings
+        .iter()
+        .filter(|w| w.contains("gn_hybrid"))
+        .collect();
+    assert_eq!(
+        with_remedy.len(),
+        1,
+        "the gn remedy must be stated exactly once: {:?}",
+        res.warnings
+    );
+    assert!(
+        with_remedy[0].contains(START_SENSITIVE) && with_remedy[0].contains("sigma start"),
+        "the remedy belongs to W_GN_NO_RANDOM_EFFECTS, in full: {}",
+        with_remedy[0]
+    );
+    let post_fit = res
+        .warnings
+        .iter()
+        .find(|w| w.contains(BADLY_WRONG))
+        .expect("post-fit warning present");
+    assert!(
+        !post_fit.contains("gn_hybrid") && !post_fit.contains("sigma start"),
+        "the post-fit warning states the outcome only: {post_fit}"
+    );
+}
+
+#[test]
 fn a_gn_focei_chain_at_zero_eta_drops_the_badly_wrong_claim() {
     // `methods = [gn, focei]` is `gn_hybrid` spelled out: the FOCEI stage
     // re-optimises the GN result, so neither #1006 diagnostic applies. The GN

@@ -1964,7 +1964,8 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                  start-sensitive: without an inner EBE loop to absorb a poor start, \
                  the BHHH step can collapse far from the optimum and return a badly \
                  wrong result with no diagnostic beyond Converged: NO. Prefer \
-                 method = gn_hybrid or focei for a fixed-effects-only model.",
+                 method = gn_hybrid or focei for a fixed-effects-only model, or \
+                 improve the sigma start.",
             )
             .with_block("fit_options"),
         );
