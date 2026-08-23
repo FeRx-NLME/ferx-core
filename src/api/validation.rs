@@ -3152,16 +3152,23 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
         return Diagnostic::error("E_NN_FEATURE_DISABLED", err.to_string())
             .with_block("covariate_nn");
     }
-    // #993: a dose attribute applied by the engine *and* read on the prediction
-    // path. Worth its own code rather than a generic `E_PARSE` — the fix is
-    // mechanical (rename, or drop the read), so a consumer (`ferxtranslate`,
-    // `ferx-r`) can act on it rather than surfacing prose. The sentinel is the
-    // remediation clause `check_dose_attr_double_use` always emits.
+    // #993/#1004: a dose attribute applied by the engine *and* read on the
+    // prediction path. Worth its own code rather than a generic `E_PARSE` — the
+    // fix is mechanical (drop the read, rename, or drop the `pk(...)` mapping),
+    // so a consumer (`ferxtranslate`, `ferx-r`) can act on it rather than
+    // surfacing prose. Two sentinels, one per remediation clause
+    // `check_dose_attr_double_use` emits: the ODE wording ends in the
+    // reserved-name clause, the analytical wording (#1004) in the
+    // drop-the-mapping clause — renaming is the wrong repair there, since the
+    // `f=`/`lagtime=` mapping follows the parameter.
     //
-    // No `.with_block()`: the message already opens with `[odes]: ` / `[scaling]: `
-    // like every other block-scoped parse error, and the renderer prefixes the block
-    // it is given — setting both prints it twice.
-    if err.contains("reserved dose-attribute name") {
+    // No `.with_block()`: the message already opens with the block it came from
+    // (`[odes]: ` / `[scaling]: ` / `[adaptive_dosing]: `) like every other
+    // block-scoped parse error, and the renderer prefixes the block it is given —
+    // setting both prints it twice.
+    if err.contains("reserved dose-attribute name")
+        || err.contains("mapping from the `pk(...)` call")
+    {
         return Diagnostic::error("E_DOSE_ATTR_DOUBLE_USE", err.to_string());
     }
     // #1040: the block-header shapes the parser used to drop silently.

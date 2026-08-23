@@ -2357,9 +2357,13 @@ fn adaptive_observe_does_not_reach_the_absorption_twin() {
     // the plain predict path that reroutes TV-covariate / `TIME` / IOV subjects.
     //
     // The block is now dropped from the twin, so the model keeps a working fallback.
-    // Without that drop this test fails on the `is_some` below (and, before #1008,
-    // panicked instead): #1008's decline stops the crash but would still cost this
-    // model its twin.
+    //
+    // #1004 update: the primary no longer accepts a dose-attribute read in `observe`
+    // — that is now the analytical rejection, asserted below — so no *reachable*
+    // controller carries something the twin's own parse would reject. That makes
+    // "the twin exists, therefore the block was dropped" vacuous: with the drop
+    // removed this test still passed. The second half therefore asserts on the
+    // re-emitted source itself, which holds whatever the controller says.
     let src = "
 [parameters]
   theta TVCL(5.0, 0.0, 1e15)
@@ -2391,8 +2395,24 @@ fn adaptive_observe_does_not_reach_the_absorption_twin() {
 [error_model]
   DV ~ proportional(EPS1)
 ";
-    let parsed = parse_full_model(src)
-        .expect("the analytical primary is out of scope for the #993 rejection");
+    // Half one: the primary rejects it itself (#1004), rather than accepting it and
+    // handing the twin a source whose own parse fails — which since #1008 costs the
+    // model its fallback silently instead of panicking.
+    let err = expect_parse_err(src);
+    assert!(
+        err.contains("[adaptive_dosing]:") && err.contains("remove the `f=F` mapping"),
+        "the primary must reject the dose-attribute observe, got: {err}"
+    );
+
+    // Half two: the block-drop itself, asserted on the reconstructed source rather
+    // than inferred from the twin parsing. "The twin builds, therefore the block
+    // was dropped" only holds while the controller still carries something the ODE
+    // parse rejects — and after #1004 the primary rejects that shape first, so any
+    // controller reaching this point is one the twin's own parse would accept.
+    // Reading the emitted source keeps the guard honest whatever `observe` says.
+    let ok_src = src.replace("observe = central / (V * F)", "observe = central / V");
+    assert_ne!(ok_src, src, "the accepted variant must actually differ");
+    let parsed = parse_full_model(&ok_src).expect("a controller without a dose attribute parses");
     // The primary keeps its controller — only the twin drops it.
     assert!(
         parsed.adaptive_dosing.is_some(),
@@ -2403,9 +2423,16 @@ fn adaptive_observe_does_not_reach_the_absorption_twin() {
         .absorption_ode_equivalent
         .as_ref()
         .expect("a plain transit model carries an ODE twin");
-    // A twin that exists at all is the proof the block was dropped: had it been
-    // re-emitted, the twin is an ODE model, the check would have rejected `observe`,
-    // and the attach site would have declined the twin (panicked, before #1008).
+    // The drop, asserted where it happens. `AbsorptionOdeEquivalent` keeps only the
+    // built model since #1008, so the reconstruction is re-run here rather than read
+    // off the twin — same function, same blocks, and it fails if the block comes back.
+    let extracted = super::extract_blocks(&ok_src).expect("the model file extracts");
+    let twin_src = super::absorption_ode_equivalent_source(&extracted)
+        .expect("a plain transit model reconstructs a twin source");
+    assert!(
+        !twin_src.contains("[adaptive_dosing]"),
+        "the twin source must not re-emit the controller block, got:\n{twin_src}"
+    );
     let twin = eq.built();
     assert!(
         twin.ode_spec.is_some(),
@@ -2502,13 +2529,142 @@ fn dose_attr_read_only_for_reporting_is_accepted() {
     );
 }
 
+/// An analytical model whose `pk(...)` call carries the extra argument `mapping`
+/// (empty for none) and whose `[scaling]`/`[initial_conditions]`/
+/// `[adaptive_dosing]` block is `block`. `decl` is the individual-parameter line
+/// for the parameter under test.
+fn analytical_dose_attr_src(mapping: &str, decl: &str, block: &str) -> String {
+    let args = if mapping.is_empty() {
+        "cl=CL, v=V, ka=KA".to_string()
+    } else {
+        format!("cl=CL, v=V, ka=KA, {mapping}")
+    };
+    format!(
+        "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVKA(1.5, 0.0, 1e15)
+  theta TVF(0.5, 0.0, 1.0)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  {decl}
+
+[structural_model]
+  pk one_cpt_oral({args})
+
+{block}
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+    )
+}
+
 #[test]
-fn analytical_f_mapping_is_not_a_double_use() {
-    // Scope boundary. An analytical model binds F through an explicit
-    // `pk(..., f=F)` mapping, so a second use is *stated* rather than silent, and
-    // `ode_param_slots` — what makes a bare `F` a dose attribute — never runs. The
-    // check must not fire here, or every `f=F` model with a `[scaling]` block
-    // breaks.
+fn analytical_dose_attr_read_in_scaling_is_rejected() {
+    // #1004, the analytical half of #993. `pk(..., f=F)` applies `F` at the dose;
+    // an `obs_scale`/`y` that reads `F` applies it a second time — measured at
+    // exactly `F` on the prediction (`tests/dose_attr_double_use_nonmem_anchor.rs`,
+    // which also pins NONMEM's own ADVAN2 doing the same silently under
+    // `S2 = V/F1`). #1003 left this accepted, arguing the explicit mapping made it
+    // "stated rather than silent"; nothing in the model states the value is applied
+    // twice, which is exactly the silence #993 closed on the ODE engine.
+    //
+    // The readouts deliberately do NOT mention `V`: `obs_scale = V * F` (what this
+    // test pinned before) trips the pre-existing volume double-divide warning in
+    // `build_obs_scale_spec`, which masks how quiet the general case is.
+    for readout in [
+        "obs_scale = 50.0 * F",
+        "obs_scale = 1.0 / F",
+        "y = central * F",
+    ] {
+        let src = analytical_dose_attr_src("f=F", "F  = TVF", &format!("[scaling]\n  {readout}"));
+        let err = expect_parse_err(&src);
+        assert!(
+            err.contains("[scaling]:") && err.contains("remove the `f=F` mapping"),
+            "`{readout}` double-applies F and must be rejected, got: {err}"
+        );
+        // The remediation is engine-correct: renaming does nothing here, because
+        // the mapping follows the parameter.
+        assert!(
+            !err.contains("reserved dose-attribute name"),
+            "the analytical wording must not tell the user to rename: {err}"
+        );
+    }
+}
+
+#[test]
+fn analytical_lag_mapping_read_in_scaling_is_rejected() {
+    // The lag half, and both spellings of the mapping (`lagtime=` and the NONMEM
+    // alias `alag=`, which `PkParams::name_to_index` routes to the same slot). A
+    // readout that multiplies by the lag applies it once as a time shift at the
+    // dose and once as a number here.
+    for mapping in ["lagtime=TLAG", "alag=TLAG"] {
+        let src = analytical_dose_attr_src(
+            mapping,
+            "TLAG = TVLAG",
+            "[scaling]\n  obs_scale = 2.0 * TLAG",
+        );
+        let err = expect_parse_err(&src);
+        // The message must quote the role the model file actually uses: telling an
+        // `alag=` user to remove a `lagtime=` argument names text that is not there.
+        assert!(
+            err.contains("[scaling]:")
+                && err.contains("absorption lag")
+                && err.contains(&format!("remove the `{mapping}` mapping")),
+            "`{mapping}` + a TLAG readout must be rejected and quote its own spelling, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn analytical_dose_attr_read_in_initial_conditions_is_accepted() {
+    // Scope floor, and the one surface the #1004 rule must NOT claim. An analytical
+    // init amount is not a dose: `pk::analytical_init_concentration_g` propagates it
+    // with `F = 1` and no lag ("an initial condition is not an absorbed dose, so
+    // bioavailability does not apply"), so `init(depot) = F * 500` — the
+    // bioavailable residue of a pre-study 500 mg dose — applies `F` exactly once,
+    // to a term the engine never scales. That is a legitimate model.
+    //
+    // Contrast `[scaling]`, which IS a doubling: `obs_scale` multiplies every
+    // prediction, the F-scaled dose contribution included. An init sits beside that
+    // contribution, not on top of it.
+    for block in [
+        "[initial_conditions]\n  init(central) = F * 100.0",
+        "[initial_conditions]\n  init(depot) = F * 500.0",
+    ] {
+        let src = analytical_dose_attr_src("f=F", "F  = TVF", block);
+        assert!(
+            parse_full_model(&src).is_ok(),
+            "an init amount that reads a mapped `F` applies it once, not twice: {block}"
+        );
+    }
+    // Same for lag, whose init impulse is likewise deposited at t=0 unshifted.
+    let lag = analytical_dose_attr_src(
+        "lagtime=TLAG",
+        "TLAG = TVLAG",
+        "[initial_conditions]\n  init(central) = TLAG * 100.0",
+    );
+    assert!(
+        parse_full_model(&lag).is_ok(),
+        "the init impulse carries no lag either"
+    );
+}
+
+#[test]
+fn analytical_dose_attr_read_only_for_reporting_is_accepted() {
+    // The analytical counterpart of `dose_attr_read_only_for_reporting_is_accepted`
+    // (which pins the ODE engine). `[derived]`/`[output]` are post-solve reporting,
+    // not the prediction path, so tabulating a mapped `F` is correct and must stay
+    // silent on the default engine too — this is the scope floor `ferxtranslate`'s
+    // reporting columns sit on.
     let src = "
 [parameters]
   theta TVCL(5.0, 0.0, 1e15)
@@ -2525,15 +2681,219 @@ fn analytical_f_mapping_is_not_a_double_use() {
 [structural_model]
   pk one_cpt_iv(cl=CL, v=V, f=F)
 
-[scaling]
-  obs_scale = V * F
+[derived]
+  AUCF = F * 100.0 / CL
+
+[output]
+  F
 
 [error_model]
   DV ~ proportional(EPS1)
 ";
     assert!(
         parse_full_model(src).is_ok(),
-        "an analytical `f=F` mapping is out of scope for the #993 rejection"
+        "reading a mapped F only for reporting is not a double use"
+    );
+}
+
+#[test]
+fn analytical_dose_attr_remedy_quotes_the_mapping_as_written() {
+    // The remediation clause has to name text the model file actually contains.
+    // `analytical_dose_attr_slot_map` binds through `build_pk_param_fn`'s lowercase
+    // compat lookup as well as an exact match, so `alag=TLAG` legitimately binds a
+    // parameter declared `tlag` — and the message must say `alag=TLAG`, not the
+    // canonical `lagtime=` (an argument the file never wrote) nor `tlag` (the
+    // declaration's casing, which is not what the `pk(...)` call says).
+    let src = analytical_dose_attr_src(
+        "alag=TLAG",
+        "tlag = TVLAG",
+        "[scaling]\n  obs_scale = 2.0 * tlag",
+    );
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("remove the `alag=TLAG` mapping"),
+        "the message must quote the mapping as written, got: {err}"
+    );
+    assert!(
+        !err.contains("lagtime="),
+        "naming a `lagtime=` argument the file does not contain misdirects: {err}"
+    );
+}
+
+#[test]
+fn analytical_dose_attr_diagnostic_is_deterministic_across_parses() {
+    // `pk_param_map` is a `HashMap`, and one parameter can fill both dose-attribute
+    // roles. With arbitrary iteration order the surviving slot — and therefore the
+    // noun and the quoted role — differed between parses of the identical source,
+    // and the two halves disagreed with each other ("bioavailability … remove the
+    // `lagtime=X` mapping"). Sorted iteration in `analytical_dose_attr_slot_map`
+    // plus an `attr`-filtered role lookup makes both stable and mutually
+    // consistent. Several parses in one process, because `HashMap`'s ordering is
+    // per-instance.
+    let src = analytical_dose_attr_src(
+        "f=X, lagtime=X",
+        "X  = TVF",
+        "[scaling]\n  obs_scale = 2.0 * X",
+    );
+    let first = expect_parse_err(&src);
+    for _ in 0..16 {
+        assert_eq!(
+            expect_parse_err(&src),
+            first,
+            "the diagnostic must not depend on HashMap iteration order"
+        );
+    }
+    // And the noun must agree with the role the clause tells the user to remove.
+    assert!(
+        first.contains("absorption lag") && first.contains("remove the `lagtime=X` mapping"),
+        "noun and quoted role must describe the same slot, got: {first}"
+    );
+}
+
+#[test]
+fn analytical_lag_alias_spellings_each_name_their_own_mapping() {
+    // `lagtime=` and `alag=` are two spellings of the SAME slot, so a `pk(...)`
+    // call may legally carry both. Two cases, both of which the remediation clause
+    // has to get right on its own — the role lookup cannot just take the first map
+    // entry that routes to the lag slot.
+    //
+    // (a) Two different parameters on the one slot. Whichever is read, the message
+    //     must quote *that* parameter's own spelling.
+    let two = |readout: &str| {
+        format!(
+            "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVKA(1.5, 0.0, 1e15)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  TLAGA = TVLAG
+  TLAGB = TVLAG
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=TLAGA, alag=TLAGB)
+
+[scaling]
+  obs_scale = 2.0 * {readout}
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+        )
+    };
+    for (readout, want) in [
+        ("TLAGA", "remove the `lagtime=TLAGA` mapping"),
+        ("TLAGB", "remove the `alag=TLAGB` mapping"),
+    ] {
+        let err = expect_parse_err(&two(readout));
+        assert!(
+            err.contains(want),
+            "reading `{readout}` must quote its own mapping, got: {err}"
+        );
+    }
+
+    // (b) One parameter under both spellings. Both `analytical_dose_attr_slot_map`
+    //     and `build_pk_param_fn` iterate ascending and let the last write win, so
+    //     `lagtime=` is the mapping that actually reaches the slot — quoting
+    //     `alag=` would name one whose removal changes nothing.
+    let both = analytical_dose_attr_src(
+        "lagtime=X, alag=X",
+        "X = TVLAG",
+        "[scaling]\n  obs_scale = 2.0 * X",
+    );
+    let err = expect_parse_err(&both);
+    assert!(
+        err.contains("remove the `lagtime=X` mapping"),
+        "must quote the binding mapping, not the shadowed alias, got: {err}"
+    );
+}
+
+#[test]
+fn analytical_dose_attr_read_in_adaptive_observe_is_rejected() {
+    // The controller signal. A dose attribute read here biases every dose the
+    // controller then emits by exactly that attribute.
+    let src = analytical_dose_attr_src(
+        "f=F",
+        "F  = TVF",
+        "[adaptive_dosing]\n  observe = central / (50.0 * F)\n  at = [24, 48]\n  \
+         start_dose = 100\n  route = bolus(cmt = 1)\n  dose_bounds = [0, 400]\n  \
+         when signal < 10 : increase 25%",
+    );
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("[adaptive_dosing]:") && err.contains("remove the `f=F` mapping"),
+        "an observe signal that reads F double-applies it, got: {err}"
+    );
+}
+
+#[test]
+fn analytical_unmapped_f_named_parameter_is_not_a_double_use() {
+    // Scope floor for #1004. On the analytical engine the *name* is inert — only
+    // the `pk(...)` mapping binds a parameter to the dose route. A model with an
+    // ordinary parameter that happens to be called `F`, not mapped, is correct and
+    // must keep parsing (this is what ferxtranslate's nlmixr2 sources produce: a
+    // plain parameter whose name has dose-attribute shape).
+    let src = analytical_dose_attr_src("", "F  = TVF", "[scaling]\n  obs_scale = 50.0 * F");
+    assert!(
+        parse_full_model(&src).is_ok(),
+        "an unmapped `F` is an ordinary parameter on the analytical engine"
+    );
+
+    // And the mapped-but-unread case: `f=F` with a readout that does not mention
+    // `F` is the ordinary bioavailability model, which must stay silent.
+    let ok = analytical_dose_attr_src("f=F", "F  = TVF", "[scaling]\n  obs_scale = 50.0");
+    assert!(
+        parse_full_model(&ok).is_ok(),
+        "a mapped-but-unread F is the ordinary model"
+    );
+}
+
+#[test]
+fn analytical_dose_attr_mapped_to_another_parameter_only_rejects_that_one() {
+    // The mapping, not the name, is what the check follows: `f=FBIO` makes `FBIO`
+    // the dose attribute even though its name has no dose-attribute shape, while a
+    // separate parameter literally named `F` stays ordinary. Reading `F` is fine;
+    // reading `FBIO` is the double use.
+    let ok = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  F    = TVF
+  FBIO = TVF
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=FBIO)
+
+[scaling]
+  obs_scale = 50.0 * F
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    assert!(
+        parse_full_model(ok).is_ok(),
+        "the unmapped `F` is ordinary; only the mapped `FBIO` is the dose attribute"
+    );
+    let bad = ok.replace("obs_scale = 50.0 * F\n", "obs_scale = 50.0 * FBIO\n");
+    assert_ne!(bad, ok, "the bad variant must actually differ");
+    let err = expect_parse_err(&bad);
+    assert!(
+        err.contains("`FBIO`") && err.contains("remove the `f=FBIO` mapping"),
+        "reading the mapped `FBIO` is the double use, got: {err}"
     );
 }
 
