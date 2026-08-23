@@ -61,14 +61,16 @@ with the run, never with a fitted model's parameters.
 ## `observe` must not read a dose attribute
 
 `observe` is a prediction path, so the same rule applies as in `[odes]` and
-`[scaling]`: a parameter the engine already applies **at the dose event** —
-`F`, `LAGTIME`/`ALAG`, or an indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` — must not be
-read back here. Writing `observe = central / (V * F)` applies `F` once to the
-dose and once to the signal, so the value the `when` rules compare against is
-wrong by exactly `F` — and unlike a mis-scaled readout this biases the
+`[scaling]`: a parameter the engine already applies **at the dose event** — on an
+ODE model `F`, `LAGTIME`/`ALAG`, or an indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}`; on
+an analytical model whatever the `pk(..., f=…)` / `lagtime=…` mapping binds —
+must not be read back here. Writing `observe = central / (V * F)` applies `F`
+once to the dose and once to the signal, so the value the `when` rules compare
+against is wrong by exactly `F` — and unlike a mis-scaled readout this biases the
 **titration decision**, and every dose the controller goes on to emit. Such a
 model is rejected at parse time with `E_DOSE_ATTR_DOUBLE_USE`
-([#993](https://github.com/FeRx-NLME/ferx-core/issues/993)); see
+([#993](https://github.com/FeRx-NLME/ferx-core/issues/993),
+[#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004)); see
 [Reading a dose attribute is an error, not a warning](ode-models.qmd#reading-a-dose-attribute-is-an-error-not-a-warning).
 
 `D{n}`/`R{n}` are the exception, as everywhere: the engine only consults them for

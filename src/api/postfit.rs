@@ -347,6 +347,20 @@ pub(crate) fn is_last_estimating_stage(
     is_last || trailing_eval_only_imp
 }
 
+/// Whether a Gauss-Newton stage's warning survives into `FitResult.warnings`.
+///
+/// The #1006 post-fit warning says a fixed-effects-only GN result "may be badly
+/// wrong". That is only true if nothing re-optimises it. `run_foce_gn` exempts
+/// `gn_hybrid` itself, but it cannot exempt a hand-written `methods = [gn, focei]`
+/// chain — `fit_inner` blanks `stage_opts.methods` per stage, so the GN stage sees
+/// `method = gn` and no chain. This is the other half of that exemption, applied
+/// where the chain *is* visible: a GN stage followed by a further estimating stage
+/// drops the warning, a trailing one keeps it. Every other warning passes through.
+pub(crate) fn keep_gn_zero_eta_warning(warning: &str, is_last_estimating: bool) -> bool {
+    is_last_estimating
+        || warning != crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING
+}
+
 /// Resolve the reported [`CovarianceStatus`] from the three signals that
 /// determine it: whether the covariance step was requested, whether it produced
 /// a covariance matrix, and whether the SIR fallback (`covariance_fallback =

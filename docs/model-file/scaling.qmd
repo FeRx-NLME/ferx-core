@@ -29,6 +29,26 @@ not reject it, since `obs_scale` referencing an individual parameter is
 also a real, supported feature (see Form B) for an intentional additional
 transform on top of the built-in concentration output.
 
+::: {.callout-important}
+## Bioavailability and lag are an error here, not a warning
+
+The volume case above is a *warning* because a further division by `V` can be a
+deliberate transform. A **dose attribute** is not: if the `pk(...)` call maps
+`f=F` or `lagtime=TLAG`, the engine already applies that value at the dose, so an
+`obs_scale`/`y` that also reads it applies it twice — measured at exactly `F` on
+the prediction. There is no reading of that model under which the doubling is
+intended, so it is rejected with `E_DOSE_ATTR_DOUBLE_USE`
+([#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004)) rather than warned
+about. The fix is to drop the `f=`/`lagtime=` mapping if the parameter is an
+ordinary one — renaming does not help, because the mapping follows the
+parameter — or to drop the read if it really is the dose attribute.
+
+NONMEM computes the same doubled value silently: `$PK` with both `F1` and
+`S2 = V/F1` runs clean. That is the `CL/F`, `V/F` apparent-parameter convention
+being written *on top of* a separately-defined `F1`, which double-counts there
+too; ferx is deliberately stricter.
+:::
+
 Three forms are supported. Each is optional; omitting `[scaling]` keeps
 the historical "raw prediction equals DV" behaviour.
 
