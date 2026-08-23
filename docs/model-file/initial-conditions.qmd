@@ -34,7 +34,12 @@ Each line is `init(NAME) = <expr>`, where:
   thetas, etas, covariates, and individual parameters declared in
   `[individual_parameters]` — exactly the symbols a Form-B `[scaling]`
   expression sees. So `init(central) = CONC0 * V` reads the data column `CONC0`
-  and the per-subject `V`.
+  and the per-subject `V`. Unlike `[scaling]`, that includes a parameter the
+  `pk(...)` call maps as a dose attribute (`f=`, `lagtime=`/`alag=`): an initial
+  condition is **not** an absorbed dose, so the engine deposits the amount with
+  `F = 1` and no lag. `init(depot) = F * 500` — the bioavailable residue of a
+  pre-study 500 mg dose — therefore applies `F` exactly once and is accepted
+  ([#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004)).
 
 ::: {.callout-important}
 A covariate named in the init expression is a **required data column**, matched

@@ -372,3 +372,197 @@ fn check_model_options_allows_focei_without_random_effects() {
         );
     }
 }
+
+// --- imp / impmap / bayes guard (#1007) ---------------------------------------
+
+#[test]
+fn check_model_options_rejects_imp_impmap_bayes_without_random_effects() {
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    for (method, name) in [
+        (EstimationMethod::Imp, "imp"),
+        (EstimationMethod::Impmap, "impmap"),
+        (EstimationMethod::Bayes, "bayes"),
+    ] {
+        let diags = check_model_options(&model, &opts_with_methods(vec![method]));
+        let hit = diags
+            .iter()
+            .find(|d| d.code == "E_METHOD_NO_RANDOM_EFFECTS")
+            .unwrap_or_else(|| panic!("{name} at n_eta = 0 must be rejected: {diags:?}"));
+        assert_eq!(hit.severity, crate::diagnostics::Severity::Error);
+        assert!(
+            hit.message.contains(&format!("method = {name}")),
+            "message must name the offending method: {}",
+            hit.message
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == "E_SAEM_NO_RANDOM_EFFECTS"),
+            "{name} must not reuse the stable SAEM code"
+        );
+    }
+}
+
+#[test]
+fn check_model_options_rejects_imp_anywhere_in_a_chain() {
+    // `methods = [focei, imp]` previously ran the whole FOCEI stage before the
+    // IMP stage errored at run time (#1007); it must now fail up front.
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    let diags = check_model_options(
+        &model,
+        &opts_with_methods(vec![EstimationMethod::FoceI, EstimationMethod::Imp]),
+    );
+    assert!(diags.iter().any(|d| d.code == "E_METHOD_NO_RANDOM_EFFECTS"));
+}
+
+#[test]
+fn check_model_options_allows_imp_impmap_bayes_with_random_effects() {
+    let model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    assert!(model.n_eta > 0, "fixture must carry random effects");
+    for method in [
+        EstimationMethod::Imp,
+        EstimationMethod::Impmap,
+        EstimationMethod::Bayes,
+    ] {
+        let diags = check_model_options(&model, &opts_with_methods(vec![method]));
+        assert!(
+            !diags.iter().any(|d| d.code == "E_METHOD_NO_RANDOM_EFFECTS"),
+            "{method:?} at n_eta > 0 must not be rejected: {diags:?}"
+        );
+    }
+}
+
+// --- pure-GN warning (#1006) ---------------------------------------------------
+
+#[test]
+fn check_model_options_warns_gn_without_random_effects() {
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    let diags = check_model_options(&model, &opts_with_methods(vec![EstimationMethod::FoceGn]));
+    let hit = diags
+        .iter()
+        .find(|d| d.code == "W_GN_NO_RANDOM_EFFECTS")
+        .expect("gn at n_eta = 0 must warn");
+    // Warning, not error: `gn` does reach the optimum from a good start, so a
+    // clean `ferx check` run must stay `valid: true` for this model.
+    assert_eq!(hit.severity, crate::diagnostics::Severity::Warning);
+    assert!(hit.message.contains("gn_hybrid"));
+}
+
+#[test]
+fn check_model_options_does_not_warn_gn_hybrid_or_mixed_effects_gn() {
+    // gn_hybrid's FOCEI polish recovers the optimum, and gn with random effects
+    // has the inner EBE loop to absorb a poor start — neither may warn.
+    let mut pooled = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    pooled.n_eta = 0;
+    let diags = check_model_options(
+        &pooled,
+        &opts_with_methods(vec![EstimationMethod::FoceGnHybrid]),
+    );
+    assert!(
+        !diags.iter().any(|d| d.code == "W_GN_NO_RANDOM_EFFECTS"),
+        "gn_hybrid must not warn at n_eta = 0: {diags:?}"
+    );
+
+    let mixed = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    assert!(mixed.n_eta > 0);
+    let diags = check_model_options(&mixed, &opts_with_methods(vec![EstimationMethod::FoceGn]));
+    assert!(
+        !diags.iter().any(|d| d.code == "W_GN_NO_RANDOM_EFFECTS"),
+        "gn at n_eta > 0 must not warn: {diags:?}"
+    );
+}
+
+#[test]
+fn check_model_options_rejects_imp_via_the_singular_method_field() {
+    // Every other guard test drives `methods = [...]`; a user writing
+    // `method = imp` in `[fit_options]` reaches the same guard through
+    // `method_chain()`'s *empty*-`methods` branch, which must be covered too.
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    for (method, name) in [
+        (EstimationMethod::Imp, "imp"),
+        (EstimationMethod::Impmap, "impmap"),
+        (EstimationMethod::Bayes, "bayes"),
+    ] {
+        let opts = FitOptions {
+            method,
+            ..Default::default()
+        };
+        assert!(opts.methods.is_empty(), "must exercise the singular field");
+        let diags = check_model_options(&model, &opts);
+        let hit = diags
+            .iter()
+            .find(|d| d.code == "E_METHOD_NO_RANDOM_EFFECTS")
+            .unwrap_or_else(|| panic!("method = {name} must be rejected: {diags:?}"));
+        assert!(hit.message.contains(&format!("method = {name}")));
+    }
+}
+
+#[test]
+fn check_model_options_rejects_eval_only_imp_without_random_effects() {
+    // The deliberate behaviour change in #1007: an `imp_eval_only` chain at
+    // n_eta = 0 used to run, downgrade the IMP failure to a post-fit warning and
+    // still return a `FitResult`. Requesting an IMP objective with nothing to
+    // integrate over is a spec contradiction, so it is rejected before the fit.
+    // Pinned here so re-exempting the eval-only path cannot pass silently.
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Imp],
+        imp_eval_only: true,
+        ..Default::default()
+    };
+    let diags = check_model_options(&model, &opts);
+    assert!(
+        diags.iter().any(|d| d.code == "E_METHOD_NO_RANDOM_EFFECTS"),
+        "eval-only IMP at n_eta = 0 must be rejected up front: {diags:?}"
+    );
+}
+
+#[test]
+fn check_model_options_does_not_warn_gn_polished_by_a_later_stage() {
+    // `methods = [gn, focei]` is `gn_hybrid` spelled out — the FOCEI stage
+    // re-optimises the GN result, so the #1006 "may be badly wrong" advice does
+    // not apply. The exemption keys off *last estimating stage*, not off the
+    // `gn_hybrid` token, so both spellings behave the same.
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    let diags = check_model_options(
+        &model,
+        &opts_with_methods(vec![EstimationMethod::FoceGn, EstimationMethod::FoceI]),
+    );
+    assert!(
+        !diags.iter().any(|d| d.code == "W_GN_NO_RANDOM_EFFECTS"),
+        "a polished gn stage must not warn: {diags:?}"
+    );
+
+    // ...but a trailing `gn` still does, wherever it sits in the chain.
+    let diags = check_model_options(
+        &model,
+        &opts_with_methods(vec![EstimationMethod::FoceI, EstimationMethod::FoceGn]),
+    );
+    assert!(
+        diags.iter().any(|d| d.code == "W_GN_NO_RANDOM_EFFECTS"),
+        "a trailing gn stage must warn: {diags:?}"
+    );
+}
+
+#[test]
+fn check_model_options_warns_gn_followed_only_by_an_eval_only_imp() {
+    // An evaluation-only IMP stage is not an estimator — it does not re-optimise
+    // the GN result — so `gn` remains the last *estimating* stage and keeps its
+    // warning. (The chain is separately rejected for the IMP itself.)
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::FoceGn, EstimationMethod::Imp],
+        imp_eval_only: true,
+        ..Default::default()
+    };
+    let diags = check_model_options(&model, &opts);
+    assert!(
+        diags.iter().any(|d| d.code == "W_GN_NO_RANDOM_EFFECTS"),
+        "gn before an eval-only IMP is still the last estimating stage: {diags:?}"
+    );
+}

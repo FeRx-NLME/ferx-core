@@ -216,6 +216,52 @@ fn dose_attr_double_use_is_reported_as_its_own_code() {
 }
 
 #[test]
+fn analytical_dose_attr_double_use_is_reported_as_its_own_code() {
+    // #1004. The analytical message ends in a *different* remediation clause than
+    // the ODE one (drop the mapping, not rename), so it needs its own sentinel in
+    // `parse_error_to_diagnostic` — and therefore its own test, or the analytical
+    // half silently reports `E_PARSE` while the ODE half reports the real code.
+    let model = temp_model(
+        "analytical_dose_attr_double_use",
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+
+[scaling]
+  obs_scale = 1000.0 / F
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid);
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_DOSE_ATTR_DOUBLE_USE");
+    assert_eq!(d.block, None);
+    assert!(
+        d.message.starts_with("[scaling]:")
+            && d.message.contains("bioavailability")
+            && d.message.contains("remove the `f=F` mapping"),
+        "{}",
+        d.message
+    );
+    let _ = std::fs::remove_file(&model);
+}
+
+#[test]
 fn single_endpoint_sigma_order_mismatch_is_reported_as_its_own_code() {
     // #1001. `proportional(S_SMALL)` with `S_BIG` declared first used to validate
     // clean and then fit against `S_BIG`. Like #993 the code exists so a consumer

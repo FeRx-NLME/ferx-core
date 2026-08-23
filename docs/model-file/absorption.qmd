@@ -263,6 +263,34 @@ such a twin-less model is **rejected with a hard error** (`E_TRANSIT_FLIP_FLOP`)
 `fit`, `predict`, `simulate`, and `ferx check` — rewrite it as an explicit ODE
 `transit()` model, or adjust the MTT / CL starting estimates.
 
+::: {.callout-note}
+## When a model loses its ODE twin
+
+The twin is a real ODE model, built and validated when your model file is parsed. It is
+therefore subject to the checks that apply only to ODE models — which your analytic model
+itself is out of scope for. So a construct can be legal in the closed form and illegal in
+its twin. The likeliest one is an individual parameter named after one of the twin's own
+compartments: `CENTRAL = ...` (or `PERIPH` for a 2-compartment model) means nothing to the
+closed form, which has no compartment namespace, but collides with the twin's state names.
+
+Such a model still parses and still fits — it simply keeps no ODE fallback, and ferx says
+so with a `W_ABSORPTION_TWIN_DECLINED` warning quoting the reason. The consequence is that
+every feature reached through the twin becomes unavailable: SS and infusion doses, IOV,
+time-varying covariates, a `TIME`-dependent parameter, and the flip-flop reroute above are
+all rejected with an explicit error instead — and that error repeats the reason, so you do
+not have to go back to the parse warning to find out what broke. Renaming the offending
+parameter restores the twin.
+
+(A handful of shapes are recognised by name and declined **without** that warning — a user
+`[odes]` / `[scaling]` / `[initial_conditions]` block; a parameter whose name shadows a
+reserved `f` / `lagtime` slot it is not the mapping for, or collides with a slot already
+taken by a disposition role (`f=V1` alongside `v=V`); and a parameter that is both a dose
+attribute and a disposition parameter, as in `pk one_cpt_transit(..., v=F, f=F)`. Those are
+deliberate scope limits rather than build failures, so they are silent — but the model is
+just as twin-less, and the same SS / IOV / time-varying-covariate rejections apply, with no
+quoted reason since there is no build failure to quote.)
+:::
+
 [`examples/one_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_transit.ferx)
 is a complete self-contained analytic transit model:
 

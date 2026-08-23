@@ -5680,7 +5680,7 @@ fn transit_with_tvcov_routes_to_ode_equivalent() {
     assert!(
         std::ptr::eq(
             m.effective_for(&tv),
-            m.absorption_ode_equivalent.as_ref().unwrap().get_or_build()
+            m.absorption_ode_equivalent.as_ref().unwrap().built()
         ),
         "TV-cov transit subject must be served by the ODE equivalent"
     );

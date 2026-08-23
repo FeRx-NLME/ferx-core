@@ -37,6 +37,41 @@ section of the SDLC for the versioning policy).
   `block_sigma`, permuting its lower triangle to match); reordering the *arguments* instead also
   parses but swaps which sigma is the proportional component, which changes the model rather than the
   spelling.
+- **The dose-attribute double-use error now covers analytical (`pk ...`) models (#1004).** #993
+  rejected this on ODE models only, reasoning that an analytical model's explicit
+  `pk(..., f=F)` mapping made a second use "stated rather than silent". It is not: nothing in the
+  model says the value is applied twice, and a `[scaling]` or `[adaptive_dosing] observe`
+  expression that reads a mapped `f=`/`lagtime=` parameter applied it
+  once at the dose and once where it was read — on the **default** engine, with no diagnostic.
+  Measured at exactly `F` on the prediction. Now rejected at parse time with the same
+  `E_DOSE_ATTR_DOUBLE_USE` code. The remediation differs from the ODE engine's: there the *name*
+  routes the parameter, so renaming fixes it; here the **mapping** binds it, so the fix is to drop
+  the `f=`/`lagtime=` argument (or the read), and the message says so. A parameter merely *named*
+  `F` that no `pk(...)` argument maps stays an ordinary parameter — unchanged, as does an
+  `[initial_conditions]` read: an initial condition is not an absorbed dose, so the engine seeds
+  the amount with `F = 1` and no lag and `init(depot) = F * 500` applies `F` once. **Breaking** for a
+  model that maps a dose attribute and also reads it, e.g. the apparent-volume idiom
+  `pk(..., f=F)` + `obs_scale = V / F`; a model using `CL/F`, `V/F` apparent parameters *without*
+  mapping `f=` is unaffected, which is the ordinary NONMEM convention. Note this is again
+  **stricter than NONMEM**: `$PK` defining `F1` **and** `S2 = V/F1` runs clean under `ADVAN2` and
+  returns predictions scaled by exactly `F1` — anchored on NONMEM 7.6.0, two streams differing in
+  one `$PK` line (`nonmem_anchor/analytical_dose_attr_double_use_{A,B}.ctl`).
+- **`method = imp`, `impmap` and `bayes` are now rejected by `ferx check` on a model with no
+  random effects (#1007).** All three already refused `n_eta = 0` at run time, so a
+  `methods = [focei, imp]` chain ran its whole FOCEI stage before failing and `ferx check`
+  reported the model as valid. The new `E_METHOD_NO_RANDOM_EFFECTS` diagnostic fires up front,
+  anywhere in a method chain, matching the `saem` guard added in #1002. The run-time errors stay
+  as the backstop for direct `fit()` callers. One consequence to note when upgrading: a chain with
+  `imp_eval_only = true` on a fixed-effects-only model previously returned a fit result with the
+  IMP failure downgraded to a warning, and now returns this error instead.
+- **`method = gn` on a fixed-effects-only model now warns (#1006).** Pure Gauss-Newton is
+  start-sensitive at `n_eta = 0`: with no inner EBE loop to absorb a poor `sigma` start, the BHHH
+  step can collapse far from the optimum and return a badly wrong answer whose only signal was
+  `Converged: NO`. `ferx check` now emits `W_GN_NO_RANDOM_EFFECTS` pointing at `gn_hybrid` /
+  `focei`, and an unconverged pure-GN run at `n_eta = 0` adds a matching post-fit warning. A
+  warning rather than an error, since `gn` does reach the optimum from a good start. Both are
+  suppressed when a later stage re-optimises the GN result — `gn_hybrid`, and equally a
+  hand-written `methods = [gn, focei]`.
 - **An unrecognised `[block]` name is now an error (#1040).** Blocks were read by name lookup, so a
   header the parser did not know was never read and never reported: a misspelled `[fit_option]` left
   `ferx check` saying `valid: true` while the fit ran with the default method, the default iteration
@@ -64,8 +99,8 @@ section of the SDLC for the versioning policy).
   with `E_DOSE_ATTR_DOUBLE_USE`, naming both readings and the fix. `D{n}`/`R{n}` carry the same
   reservation but are consulted only for a coded `RATE=-2`/`-1` dose, so that collision is reported
   against the dataset (same code) and a model whose data never codes `RATE` is untouched. Reads from
-  `[derived]`/`[output]` are post-solve reporting and remain silent, as does an analytical model's
-  explicit `pk(..., f=F)` mapping. **Breaking** for a model that folds `F` into the absorption flux
+  `[derived]`/`[output]` are post-solve reporting and remain silent. (Analytical models were left out
+  of this first pass; they are covered by #1004 above.) **Breaking** for a model that folds `F` into the absorption flux
   — the pre-dose-entry convention the ODE docs' migration note describes, which until now computed
   `F²` without complaint; the fix is to drop `F` from the right-hand side, or rename the parameter
   if it was never bioavailability. Note this makes ferx **stricter than NONMEM**, which allows a
@@ -354,6 +389,23 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **A transit / inverse-Gaussian absorption model no longer panics mid-fit when its ODE fallback
+  cannot be built (#1008).** The analytic `one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` /
+  `two_cpt_ig` closed forms carry a synthesized ODE twin that serves the subjects the closed form
+  cannot (time-varying covariates, a `TIME`-dependent parameter, IOV, steady-state or infusion
+  doses, the flip-flop regime). The twin is an ODE model while the model you wrote is analytical,
+  so parse checks that apply only to ODE models run on the twin and not on your model — and a
+  model ferx accepted could produce a twin ferx rejected. That surfaced as an internal panic
+  during `fit()` / `predict()`, the first time a subject actually needed the fallback. The twin is
+  now built at parse time: if it cannot be built the model simply stays closed-form and a
+  `W_ABSORPTION_TWIN_DECLINED` warning (`absorption_twin_declined`) reports the reason, and any
+  subject that needs the fallback is rejected up front with an explicit message instead of
+  crashing. That rejection quotes the reason too — previously the twin-less messages described
+  only the *desugar's* scope limits ("an unrecognised closed form", "outside the automatic
+  ODE-equivalent rewrite"), which is the wrong cause for a twin that was built and rejected, and
+  the actionable reason never reached `fit()`'s `Err` or `predict()`'s panic. A live example: an
+  individual parameter named `CENTRAL` (or `PERIPH`), which collides with the twin's own state
+  names.
 - **A negative Form C `[scaling]` prediction is no longer silently clamped to zero on ODE models
   (#1020).** The ODE predictor applied its negative-prediction guard to the *final* prediction
   vector — after the `y = <expr>` / `y[CMT=N] = <expr>` readout had been evaluated. That guard is a

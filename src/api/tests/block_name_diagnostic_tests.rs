@@ -1,5 +1,5 @@
 //! `parse_error_to_diagnostic` mapping for the closed-world `[block]`-name
-//! errors (#1040) and the other prose sentinels the function carries.
+//! errors (#1040).
 //!
 //! A parse failure is terminal — `validate_model_file` returns before it has a
 //! `ParsedModel` to read `block_lines` from — so the block and line in the
@@ -146,6 +146,84 @@ fn unrelated_parse_error_stays_e_parse() {
     assert_eq!(d.code, "E_PARSE");
     assert!(d.block.is_none());
     assert!(d.line.is_none());
+}
+
+// ── parse-warning → check-report code (`parse_warning_to_code`) ─────────────
+
+/// #1008: a declined absorption ODE twin reaches the check report under its own
+/// code, not the generic `W_PARSE`.
+///
+/// Driven by the message the **parser actually produces** rather than a pasted
+/// copy: the mapping keys on the `W_ABSORPTION_TWIN_DECLINED` token the warning
+/// text carries, so a reworded warning that dropped the token would silently
+/// fall through to `W_PARSE` — and a hand-written string here would not notice.
+#[test]
+fn declined_absorption_twin_warning_maps_to_its_own_code() {
+    // A parameter named after the twin's own `central` state — the twin's parse
+    // rejects the collision, so the model keeps no ODE fallback.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta TVX(1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  CENTRAL = TVX
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let model = crate::parser::model_parser::parse_model_string(src).expect("the primary parses");
+    let warning = model
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("ODE equivalent could not be built"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the declined twin must warn; warnings: {:?}",
+                model.parse_warnings
+            )
+        });
+    assert_eq!(
+        super::parse_warning_to_code(warning),
+        "W_ABSORPTION_TWIN_DECLINED"
+    );
+}
+
+/// The pre-existing arms and the catch-all, so the chain's ordering is pinned
+/// rather than only its newest arm.
+#[test]
+fn parse_warning_codes_cover_their_arms_and_fall_through() {
+    use super::parse_warning_to_code;
+    assert_eq!(
+        parse_warning_to_code("`TVX` is declared in [parameters] but not referenced anywhere"),
+        "W_UNUSED_PARAM"
+    );
+    assert_eq!(
+        parse_warning_to_code(
+            "[derived] name `WT` shadows a covariate (W_DERIVED_COVARIATE_SHADOW)"
+        ),
+        "W_DERIVED_COVARIATE_SHADOW"
+    );
+    assert_eq!(
+        parse_warning_to_code("[derived] `AUC`: step= ignored (W_DERIVED_STEP_IGNORED)"),
+        "W_DERIVED_STEP_IGNORED"
+    );
+    assert_eq!(
+        parse_warning_to_code("some unrelated parse-time note"),
+        "W_PARSE"
+    );
 }
 
 // ── #1001: single-endpoint sigma order ──────────────────────────────────────

@@ -98,16 +98,20 @@ different case, not this one.)
 
 **Which estimators apply.** `foce`, `focei`, `laplace` and `gn_hybrid` all reduce
 correctly and agree to the last printed digit — all four land on OFV −269.6370 on
-the anchor below. `saem` is rejected outright; `imp`, `impmap` and `bayes` error
-when the fit reaches them. Each of the four integrates over the random effects,
-and with none declared there is nothing to integrate.
+the anchor below. `saem`, `imp`, `impmap` and `bayes` are all rejected by
+`ferx check` before the fit starts (`E_SAEM_NO_RANDOM_EFFECTS` /
+`E_METHOD_NO_RANDOM_EFFECTS`, #1002 / #1007). Each of the four integrates over the
+random effects, and with none declared there is nothing to integrate.
 
 **`gn` is not recommended at `n_eta = 0`.** Pure Gauss-Newton reduces correctly in
 principle, but its BHHH Hessian badly over-estimates curvature far from the
 optimum and there is no inner loop to keep it close. On this page's own example it
 stops at OFV 8670 with `Converged: NO` and 6900% RSEs — a result that is wrong
 rather than merely imprecise. Use `gn_hybrid`, whose FOCEI polish recovers it, or
-`focei`. See [Gauss-Newton — fixed-effects-only models](../estimation/gauss-newton.qmd#fixed-effects-only-models).
+`focei`. Since #1006 `ferx check` warns about the combination
+(`W_GN_NO_RANDOM_EFFECTS`), and a pure-GN run that ends unconverged at `n_eta = 0`
+adds a warning saying the result may be wrong rather than imprecise. See
+[Gauss-Newton — fixed-effects-only models](../estimation/gauss-newton.qmd#fixed-effects-only-models).
 
 **Starting values matter more.** Without random effects there is no inner loop to
 absorb a poor `sigma` start, so a start that a mixed-effects model shrugs off can
