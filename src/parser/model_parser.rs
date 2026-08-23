@@ -1221,15 +1221,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // assume constant parameters over each absorption window, so they cannot serve a subject
     // whose parameters switch mid-profile (a `TIME`-dependent parameter or time-varying
     // covariates). For a plain-form transit / IG model we reconstruct its exact ODE
-    // (`transit()` / `igd()`) equivalent *source* here and stash it on the model;
-    // `CompiledModel::effective_for` compiles it lazily and routes only the subjects that need
-    // it to this fallback, so a plain fit whose subjects never need it keeps its fast, exact
-    // closed form at zero extra cost. Non-absorption / out-of-scope forms yield `None`. (The
-    // equivalent is a normal ODE model with no `pk one_cpt_transit`/`pk one_cpt_ig`/…, so
-    // building it later does not re-enter this branch.)
-    let absorption_ode_equivalent: Option<crate::types::AbsorptionOdeEquivalent> =
-        absorption_ode_equivalent_source(&extracted)
-            .map(crate::types::AbsorptionOdeEquivalent::new);
+    // (`transit()` / `igd()`) equivalent *source* here; it is compiled at the attach site
+    // below (once the primary's own blocks have parsed, so a broken primary reports its own
+    // error first), and `CompiledModel::effective_for` routes only the subjects that need it
+    // to this fallback. Non-absorption / out-of-scope forms yield `None`. (The equivalent is
+    // a normal ODE model with no `pk one_cpt_transit`/`pk one_cpt_ig`/…, so compiling it does
+    // not re-enter this branch.)
+    let absorption_ode_equivalent_src: Option<String> =
+        absorption_ode_equivalent_source(&extracted);
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
     // this (large) function reads unchanged. Named blocks are pulled from
     // `extracted.named` directly where they're consumed below.
@@ -3067,9 +3066,37 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         used_thetas
     };
 
-    // Attach the `one_cpt_transit` ODE-equivalent sub-model built above (`None` for
-    // non-transit / out-of-scope forms). The runtime dispatch reads it off the model.
-    model.absorption_ode_equivalent = absorption_ode_equivalent;
+    // Compile and attach the ODE-equivalent sub-model whose source was reconstructed above
+    // (`None` for non-transit / out-of-scope forms). The runtime dispatch reads it off the
+    // model.
+    //
+    // The twin is built **here, at parse time**, and a build failure declines it rather than
+    // propagating (#1008). The twin is an ODE model while this primary is analytical, so every
+    // ODE-scoped parse check runs on the twin and not on the primary: a model this parser
+    // accepts can reconstruct into a twin the parser rejects. Building lazily and `.expect()`ing
+    // that parse turned each such case into an internal panic mid-fit, the first time a
+    // TV-covariate / `TIME` / IOV / SS / infusion subject rerouted — invisible to the model
+    // author and to the parse tests. Three point guards in `absorption_ode_equivalent_source`
+    // were added one-per-incident for exactly this (`f=V1` slot collision, `[adaptive_dosing]`
+    // re-emission, a dose-attribute param in a disposition role); this makes the class
+    // structurally unreachable, so a *new* ODE-only check cannot re-arm it.
+    //
+    // Declining is the standing policy of the desugar, and it is not silent-wrong: without a
+    // twin the model simply stays closed-form, and a subject that actually needs the fallback
+    // is rejected up front with an actionable message — `check_absorption_closed_form_support`
+    // (TV covariates / IOV / SS / infusion / resets) and `check_absorption_flip_flop_no_twin`,
+    // both of which already key on `absorption_ode_equivalent.is_none()` and both of which run
+    // on every entry point (`fit` as an `Err`, `predict`/`simulate` as their `assert_*`
+    // wrappers). The warning carries the twin parser's own message so the reason is visible
+    // without a debugger.
+    if let Some(src) = absorption_ode_equivalent_src {
+        match crate::types::AbsorptionOdeEquivalent::build(&src) {
+            Ok(eq) => model.absorption_ode_equivalent = Some(eq),
+            Err(e) => model
+                .parse_warnings
+                .push(crate::types::absorption_twin_declined_warning(&e)),
+        }
+    }
 
     // ── [event_model] / [event_model NAME] blocks ──────────────────────────────
     // Unnamed: `[event_model]` — one TTE endpoint.
@@ -8221,14 +8248,22 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // `cl/v1/q/v2/<abs>`, where `<abs>` is `n/mtt` (transit) or `mat/cv2` (IG). Any other
     // structural form stays closed-form.
     let structural = extracted.unnamed.get("structural_model")?;
-    let transit_one = Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
-    let transit_two = Regex::new(r"^pk\s+two_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
-    let ig_one = Regex::new(r"^pk\s+one_cpt_ig\s*\(([^)]*)\)\s*$").unwrap();
-    let ig_two = Regex::new(r"^pk\s+two_cpt_ig\s*\(([^)]*)\)\s*$").unwrap();
+    // `LazyLock` rather than per-call `Regex::new`: since #1008 the twin is compiled eagerly, so
+    // every transit/IG model reaches this function twice — once for itself, once from the twin's
+    // own parse, where all four patterns are compiled only to miss (the twin's structural model
+    // is `ode(...)`). Compiling them per call cost ~0.9 ms of the parse, measured on #1027.
+    static TRANSIT_ONE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap());
+    static TRANSIT_TWO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+two_cpt_transit\s*\(([^)]*)\)\s*$").unwrap());
+    static IG_ONE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+one_cpt_ig\s*\(([^)]*)\)\s*$").unwrap());
+    static IG_TWO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+two_cpt_ig\s*\(([^)]*)\)\s*$").unwrap());
     // (args, is_two_cpt, is_ig, pk_label)
     let (args_str, is_two_cpt, is_ig, pk_label) = if let Some(caps) = structural
         .iter()
-        .find_map(|l| transit_one.captures(l.trim()))
+        .find_map(|l| TRANSIT_ONE.captures(l.trim()))
     {
         (
             caps.get(1)?.as_str().to_string(),
@@ -8238,7 +8273,7 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
         )
     } else if let Some(caps) = structural
         .iter()
-        .find_map(|l| transit_two.captures(l.trim()))
+        .find_map(|l| TRANSIT_TWO.captures(l.trim()))
     {
         (
             caps.get(1)?.as_str().to_string(),
@@ -8246,14 +8281,14 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
             false,
             "pk two_cpt_transit",
         )
-    } else if let Some(caps) = structural.iter().find_map(|l| ig_one.captures(l.trim())) {
+    } else if let Some(caps) = structural.iter().find_map(|l| IG_ONE.captures(l.trim())) {
         (
             caps.get(1)?.as_str().to_string(),
             false,
             true,
             "pk one_cpt_ig",
         )
-    } else if let Some(caps) = structural.iter().find_map(|l| ig_two.captures(l.trim())) {
+    } else if let Some(caps) = structural.iter().find_map(|l| IG_TWO.captures(l.trim())) {
         (
             caps.get(1)?.as_str().to_string(),
             true,
@@ -8336,9 +8371,10 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // disposition role. `pk one_cpt_transit(cl=CL, v=F, n=N, mtt=MTT, f=F)` passes it — `F`
     // is the `f=` mapping — but the twin then emits `d/dt(central) = … − (CL/F) * central`
     // and `obs_scale = F`, reading a name `ode_param_slots` routes to the F slot. That is a
-    // dose-attribute double use, so the twin's own parse now rejects it and `get_or_build`
-    // turns the rejection into a panic. Decline instead, per this function's standing
-    // policy: keep the model closed-form rather than panicking at eval time.
+    // dose-attribute double use, so the twin's own parse rejects it. Decline here, per this
+    // function's standing policy: keep the model closed-form. (Since #1008 an unguarded case
+    // like this no longer panics — the attach site declines the twin and warns — but naming
+    // the case here keeps the *reason* for the decline specific instead of generic.)
     if disposition
         .iter()
         .filter_map(|role| roles.get(*role))
@@ -8370,8 +8406,8 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // *name* routes to an already-taken *disposition* slot (e.g. `f=V1`, where `V1` name-routes
     // to the V slot held by `v=V`) is not a reserved-name shadow, so it passes the guard above —
     // but the generated twin's `ode_param_slots` would reject it as two parameters mapping to one
-    // slot, which `AbsorptionOdeEquivalent::get_or_build` surfaces as a *panic*. The closed form
-    // binds F/lagtime by role, so the collision is harmless there. Dry-run the real slot
+    // slot (which, before #1008, `AbsorptionOdeEquivalent::get_or_build` surfaced as a *panic*).
+    // The closed form binds F/lagtime by role, so the collision is harmless there. Dry-run the real slot
     // assignment on the twin's projected parameter names. This list is a superset of the twin's
     // real (filtered) parameter set, so it catches every real collision — at worst it declines an
     // *unused* colliding name the real twin would not hit, which is harmless (the model stays
@@ -8398,14 +8434,16 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // `pk one_cpt_transit`/`pk two_cpt_transit`/`pk one_cpt_ig`/`pk two_cpt_ig`, so it does
     // not recurse into this desugar.
     //
-    // `adaptive_dosing` is dropped rather than carried (#993). Two independent reasons,
-    // and the first is a crash: the twin *is* an ODE model, so a re-emitted
-    // `observe` that reads a dose attribute hits `check_dose_attr_double_use` — which
-    // the analytical primary is deliberately out of scope for — and the resulting parse
-    // error surfaces through `get_or_build`'s `.expect()` as a panic mid-fit, on the
-    // plain `predict`/`fit` path that reroutes TV-covariate / `TIME` / IOV subjects here.
-    // Blocks that would otherwise reach a new ODE-only check (`odes`, `scaling`) decline
-    // the twin outright above; `adaptive_dosing` does not, so it has to be dropped here.
+    // `adaptive_dosing` is dropped rather than carried (#993). Two independent reasons.
+    // First, it would cost the model its twin for no gain: the twin *is* an ODE model, so a
+    // re-emitted `observe` that reads a dose attribute hits `check_dose_attr_double_use` —
+    // which the analytical primary is deliberately out of scope for — and the twin's parse
+    // fails. (Before #1008 that failure was a panic mid-fit, through `get_or_build`'s
+    // `.expect()`, on the plain `predict`/`fit` path that reroutes TV-covariate / `TIME` /
+    // IOV subjects here; it now declines the twin at parse time, which is survivable but
+    // still needlessly loses the fallback.) Blocks that would otherwise reach a new ODE-only
+    // check (`odes`, `scaling`) decline the twin outright above; `adaptive_dosing` does not,
+    // so it has to be dropped here.
     // Second, the twin is reached only through `CompiledModel::effective_for` on the
     // prediction path (`pk/mod.rs`), and nothing there reads a controller spec —
     // `simulate_adaptive_from_spec` takes the spec as an argument from the primary — so

@@ -337,6 +337,23 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **A transit / inverse-Gaussian absorption model no longer panics mid-fit when its ODE fallback
+  cannot be built (#1008).** The analytic `one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` /
+  `two_cpt_ig` closed forms carry a synthesized ODE twin that serves the subjects the closed form
+  cannot (time-varying covariates, a `TIME`-dependent parameter, IOV, steady-state or infusion
+  doses, the flip-flop regime). The twin is an ODE model while the model you wrote is analytical,
+  so parse checks that apply only to ODE models run on the twin and not on your model — and a
+  model ferx accepted could produce a twin ferx rejected. That surfaced as an internal panic
+  during `fit()` / `predict()`, the first time a subject actually needed the fallback. The twin is
+  now built at parse time: if it cannot be built the model simply stays closed-form and a
+  `W_ABSORPTION_TWIN_DECLINED` warning (`absorption_twin_declined`) reports the reason, and any
+  subject that needs the fallback is rejected up front with an explicit message instead of
+  crashing. That rejection quotes the reason too — previously the twin-less messages described
+  only the *desugar's* scope limits ("an unrecognised closed form", "outside the automatic
+  ODE-equivalent rewrite"), which is the wrong cause for a twin that was built and rejected, and
+  the actionable reason never reached `fit()`'s `Err` or `predict()`'s panic. A live example: an
+  individual parameter named `CENTRAL` (or `PERIPH`), which collides with the twin's own state
+  names.
 - **A negative Form C `[scaling]` prediction is no longer silently clamped to zero on ODE models
   (#1020).** The ODE predictor applied its negative-prediction guard to the *final* prediction
   vector — after the `y = <expr>` / `y[CMT=N] = <expr>` readout had been evaluated. That guard is a
