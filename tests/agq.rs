@@ -852,6 +852,97 @@ fn focei_quadrature_out_of_analytic_scope_is_rejected() {
     );
 }
 
+/// `optimizer = trust_region` must be rejected on a quadrature stage.
+///
+/// Every optimizer *scores* the quadrature marginal (`pop_nll_opts` dispatches on
+/// `agq_nodes()`), but only `optimize_nlopt` and `optimize_bfgs` route the matching
+/// gradient — both go through `population_gradient`, which hands AGQ to
+/// `agq::agq_population_gradient`. `trust_region` has its own `Gradient` impl with no such
+/// branch, so it would descend on the FOCE/Laplace closed form while reporting quadrature
+/// OFVs — the silent wrong answer `FitOptions::agq_nodes` and `population_gradient` both
+/// warn about in as many words. Rejecting at check time is the guard; #1034 review.
+#[test]
+fn trust_region_with_a_quadrature_stage_is_rejected() {
+    use ferx_core::api::check_model_options;
+    use ferx_core::Optimizer;
+
+    let model = parse_model_string(WARFARIN_SRC).expect("warfarin must parse");
+    let has_agq_guard = |opts: &FitOptions| {
+        check_model_options(&model, opts)
+            .iter()
+            .any(|d| d.code == "E_OPTIMIZER_AGQ")
+    };
+
+    // `laplace` is a quadrature stage at any node count, including the n_agq = 1 default.
+    for n_agq in [1, 3] {
+        let opts = FitOptions {
+            method: EstimationMethod::Laplace,
+            optimizer: Optimizer::TrustRegion,
+            n_agq,
+            ..FitOptions::default()
+        };
+        assert!(
+            has_agq_guard(&opts),
+            "laplace + trust_region must be rejected at n_agq = {n_agq}"
+        );
+    }
+
+    // `focei` is one only above n_agq = 1; plain FOCEI keeps working with trust_region.
+    let focei_quad = FitOptions {
+        method: EstimationMethod::FoceI,
+        optimizer: Optimizer::TrustRegion,
+        n_agq: 3,
+        ..FitOptions::default()
+    };
+    assert!(has_agq_guard(&focei_quad));
+    let plain_focei = FitOptions {
+        method: EstimationMethod::FoceI,
+        optimizer: Optimizer::TrustRegion,
+        n_agq: 1,
+        ..FitOptions::default()
+    };
+    assert!(
+        !has_agq_guard(&plain_focei),
+        "plain FOCEI (n_agq = 1) is not a quadrature stage and must stay allowed"
+    );
+
+    // The guard is about this optimizer, not about quadrature: the AGQ-aware optimizers
+    // must be untouched.
+    for optimizer in [
+        Optimizer::Bobyqa,
+        Optimizer::Slsqp,
+        Optimizer::NloptLbfgs,
+        Optimizer::Lbfgs,
+        Optimizer::Bfgs,
+        Optimizer::Mma,
+        Optimizer::Auto,
+    ] {
+        let opts = FitOptions {
+            method: EstimationMethod::Laplace,
+            optimizer,
+            n_agq: 3,
+            ..FitOptions::default()
+        };
+        assert!(
+            !has_agq_guard(&opts),
+            "{optimizer:?} routes the quadrature gradient and must not be rejected"
+        );
+    }
+
+    // A chained fit whose *later* stage is the quadrature one is caught too — the guard
+    // reads the chain, not just `method`.
+    let chained = FitOptions {
+        method: EstimationMethod::Foce,
+        methods: vec![EstimationMethod::Foce, EstimationMethod::Laplace],
+        optimizer: Optimizer::TrustRegion,
+        ..FitOptions::default()
+    };
+    assert!(
+        has_agq_guard(&chained),
+        "a laplace stage anywhere in the chain must be caught"
+    );
+}
+
 /// The runtime IOV grid cap fires for the FOCEI quadrature too, and names `focei` (not
 /// `laplace`) in the message (#251 review #4). `21^5` over the stacked (η, κ) dimension is
 /// far past `MAX_AGQ_GRID`.

@@ -356,6 +356,43 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **`optimizer = trust_region` no longer reports `Converged: YES` when it merely ran out of
+  iterations (#1000).** The underlying solver has no convergence criterion of its own, so
+  exhausting `maxiter` was its only way to stop — and every such run was labelled converged, with
+  standard errors computed at a non-stationary point (on the `one_cpt_iv_pooled` zero-Ω anchor,
+  8 000–11 000 OFV units short of the optimum). The trust region now stops when it can no longer
+  make progress — no objective improvement beyond `outer_ftol` and no parameter movement beyond
+  `outer_xtol` for 20 consecutive iterations — and a run that instead hits `maxiter` reports
+  `Converged: NO` with a warning naming the budget and the gradient norm it stopped at. Fits that
+  do settle now also stop as soon as they settle instead of grinding out the remaining budget (the
+  warfarin fit returns at iteration 59), and the trust-region path now reports `final_gradient` and
+  the number of outer iterations it actually ran (it reported `Iterations: 0` before). `outer_ftol`
+  and `outer_xtol`, previously `bobyqa`-only, now also govern `trust_region`; `outer_ftol` resolves
+  the same way for both, so a pure-TTE fit gets the #469 `1e-8` tightening rather than a looser
+  hardcoded value. Two verdicts are newly explicit: a `maxiter` below 21 cannot demonstrate settling
+  at all (the warning says so instead of blaming the fit), and a run that rejects every step from
+  the first iteration is reported against its *starting values* and bails out immediately rather
+  than spending the whole budget frozen. Note for multi-start users: `n_starts` prefers a converged
+  candidate over a non-converged one, and that key was inert while every `trust_region` run claimed
+  convergence — a settled start can now be selected over a better-OFV start that ran out of budget.
+- **`optimizer = trust_region` under `method = focei` no longer descends on a truncated gradient.**
+  The trust region used the fixed-η̂ score `2·Σ gᵢ`, which drops the `log|H̃|` EBE-response term
+  `tᵢ` (#274/#289) that the Gauss-Newton path already adds — the omission a gradient optimizer
+  stalls above the minimum on. It now uses the same `2·Σ (gᵢ + tᵢ)` marginal gradient, pinned
+  against central finite differences of the objective in a unit test. FOCE and additive-error fits
+  are unchanged bit-for-bit (`tᵢ` is identically zero there); on warfarin the FOCEI fit now
+  reaches OFV −286.0042, the same value `nlopt_lbfgs` converges to, instead of settling 4.1 units
+  above it at −281.88. `final_gradient` is now the marginal gradient rather than a quantity that
+  stays large at the optimum.
+- **`optimizer = trust_region` is now rejected on a quadrature stage (`E_OPTIMIZER_AGQ`) instead
+  of silently fitting the wrong objective.** `method = laplace` (any `n_agq`) and `method = focei`
+  with `n_agq > 1` minimise the adaptive-quadrature marginal, and every optimizer scores it — but
+  only the NLopt and BFGS paths route the matching gradient (`agq_population_gradient`). The
+  trust region has its own gradient with no quadrature branch, so it descended on the
+  FOCE/Laplace closed form while reporting quadrature OFVs: a fit that converged, smoothly, to
+  the FOCE optimum with no warning. `ferx check` and `fit()` now both reject the combination and
+  name the optimizers that do support it. Full quadrature support in the trust region needs a
+  BHHH Hessian built from per-subject quadrature scores and is tracked in #1047.
 - **A transit / inverse-Gaussian absorption model no longer panics mid-fit when its ODE fallback
   cannot be built (#1008).** The analytic `one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` /
   `two_cpt_ig` closed forms carry a synthesized ODE twin that serves the subjects the closed form

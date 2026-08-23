@@ -87,6 +87,32 @@ fn resolve_outer_ftol_auto_and_override() {
     assert_eq!(resolve_outer_ftol(false, false, Some(1e-10)), 1e-10);
 }
 
+/// `ofv_is_valid` separates a real population objective from the clamped
+/// divergence sentinel. The point of the helper is that `is_finite()` alone does
+/// **not**: the inner objective clamps a blown-up value to `1e20`, which is
+/// perfectly finite, so an optimizer that guards its convergence verdict with
+/// `is_finite()` will happily report `Converged: YES` on a diverged run.
+#[test]
+fn ofv_is_valid_rejects_the_clamped_sentinel_not_just_non_finite() {
+    // Real population OFVs, both signs, and the extremes of the valid range.
+    assert!(ofv_is_valid(-286.0));
+    assert!(ofv_is_valid(0.0));
+    assert!(ofv_is_valid(12_345.678));
+    assert!(ofv_is_valid(DIVERGENCE_OFV - 1.0));
+
+    // The sentinel is finite — this is the case `is_finite()` misses.
+    assert!(1e20_f64.is_finite());
+    assert!(!ofv_is_valid(1e20));
+    assert!(!ofv_is_valid(DIVERGENCE_OFV));
+
+    // ...and the ordinary non-finite cases are still rejected.
+    assert!(!ofv_is_valid(f64::NAN));
+    assert!(!ofv_is_valid(f64::INFINITY));
+    // A large *negative* OFV is legitimate (the cutoff is one-sided).
+    assert!(ofv_is_valid(-1e15));
+    assert!(!ofv_is_valid(f64::NEG_INFINITY));
+}
+
 /// Covariance progress reporter math (the pure pieces behind `cov_progress`).
 /// Stride caps output at ~20 lines but never zero; the print predicate fires
 /// every `step` items plus the final one; the ETA extrapolates wall-clock
