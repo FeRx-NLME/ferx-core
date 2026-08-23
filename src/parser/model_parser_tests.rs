@@ -211,7 +211,7 @@ fn transit_time_desugars_to_ode_equivalent() {
         .absorption_ode_equivalent
         .as_ref()
         .expect("transit + TIME must carry an ODE equivalent")
-        .get_or_build();
+        .built();
     let ode = eq
         .ode_spec
         .as_ref()
@@ -1980,9 +1980,16 @@ fn dose_attr_param_reused_as_a_disposition_role_declines_the_twin() {
     // mapping — so the #735 shadow guard allows it — *and* the `v=` role, so the
     // generated twin emits `d/dt(central) = … − (CL/F) * central` with
     // `obs_scale = F`, reading a name `ode_param_slots` routes to the F slot. The
-    // twin's own parse rejects that as a #993 double use and `get_or_build`
-    // `.expect()`s, so a model the analytical primary accepts crashed the moment a
-    // TV-covariate / `TIME` / IOV subject rerouted to the twin.
+    // twin's own parse rejects that as a #993 double use, which (before #1008 made
+    // the build a parse-time decline) `get_or_build` `.expect()`ed — so a model the
+    // analytical primary accepts crashed the moment a TV-covariate / `TIME` / IOV
+    // subject rerouted to the twin.
+    //
+    // The specific guard is kept even though #1008's attach-site decline would now
+    // catch this generically: it declines *before* reconstructing a twin known to be
+    // unusable, so the model needs no `W_ABSORPTION_TWIN_DECLINED` warning for a case
+    // the desugar can name exactly. (`state_named_parameter_declines_the_absorption_
+    // twin_with_a_warning` covers the generic backstop.)
     //
     // The model is pharmacological nonsense (bioavailability used as a volume), but
     // nonsense must not panic. Declining keeps it closed-form — exactly what it was
@@ -2014,6 +2021,325 @@ fn dose_attr_param_reused_as_a_disposition_role_declines_the_twin() {
         "a dose-attribute parameter reused as a disposition role must decline the twin, \
          not build one that panics"
     );
+    // The desugar names this case, so it declines *before* reconstructing a source —
+    // no generic build-failure warning is raised.
+    assert!(
+        !parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("W_ABSORPTION_TWIN_DECLINED")),
+        "a guard-recognised decline must not fall through to the generic build-failure \
+         warning; warnings: {:?}",
+        parsed.model.parse_warnings
+    );
+}
+
+/// #1008: the third live door into the `.expect()` panic the first two (#1003) armed —
+/// found by probing the class rather than the instances, and the reason the fix is
+/// structural instead of a fourth point guard.
+///
+/// The twin's ODE states are named `central` (and `periph` for 2-cpt). An individual
+/// parameter named `CENTRAL` is meaningless to the analytical primary — which has no state
+/// namespace at all — so nothing rejects it there; the twin then re-emits it into
+/// `[individual_parameters]` beside `states=[central]`, and the twin's own parse rejects the
+/// case-insensitive name collision. None of the three existing guards look at state names,
+/// so this reached `get_or_build` and panicked mid-fit.
+///
+/// Three shapes are covered: a stray parameter that merely *exists* (never referenced by the
+/// `pk()` mapping), one that fills a disposition role, and the 2-cpt `periph` analogue —
+/// whose colliding name set differs because the twin's state list is topology-dependent.
+#[test]
+fn state_named_parameter_declines_the_absorption_twin_with_a_warning() {
+    let stray = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta TVX(1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  CENTRAL = TVX
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    // `v=CENTRAL` — the parameter is load-bearing, so the twin's `d/dt(central)` RHS reads
+    // the very name it declares as a state.
+    let disposition_role = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  CENTRAL = TVV
+  N   = TVN
+  MTT = TVMTT
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=CENTRAL, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    // The 2-cpt twin declares a second state, `periph`, so its state namespace — and hence
+    // the set of parameter names that collide — depends on the topology. Cover both.
+    let two_cpt_periph = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV1(50.0, 0.0, 1e15)
+  theta TVQ(10.0, 0.0, 1e15)
+  theta TVV2(80.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V1  = TVV1
+  Q   = TVQ
+  PERIPH = TVV2
+  N   = TVN
+  MTT = TVMTT
+
+[structural_model]
+  pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=PERIPH, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    for (label, src, colliding) in [
+        ("stray", stray, "CENTRAL"),
+        ("disposition role", disposition_role, "CENTRAL"),
+        ("2-cpt periph", two_cpt_periph, "PERIPH"),
+    ] {
+        let parsed = parse_full_model(src)
+            .unwrap_or_else(|e| panic!("the analytical primary ({label}) must still parse: {e}"));
+        assert!(
+            parsed.model.absorption_ode_equivalent.is_none(),
+            "a parameter named after a twin state ({label}) must decline the twin, not build \
+             one that panics"
+        );
+        let warning = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .find(|w| w.contains("W_ABSORPTION_TWIN_DECLINED"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the decline ({label}) must be reported; warnings: {:?}",
+                    parsed.model.parse_warnings
+                )
+            });
+        // The twin parser's own message is carried through, so the reason is readable
+        // without a debugger — the specific complaint here is the state-name collision.
+        assert!(
+            warning.contains(colliding) && warning.contains("collides"),
+            "the warning must carry the twin parser's reason (naming `{colliding}`), \
+             got: {warning}"
+        );
+        // …and it must classify to its own code rather than the `general` bucket, so a
+        // consumer can branch on "this model kept no ODE fallback". Asserted here on the
+        // *produced* message, so the code cannot drift away from the text that carries it.
+        assert_eq!(
+            crate::types::classify_warning(warning).category.as_str(),
+            "absorption_twin_declined",
+            "the decline ({label}) must classify to its own warning code"
+        );
+
+        // The load-bearing half of the trade (#1027 review): declining is only safe because a
+        // subject that would have rerouted is *rejected*, not silently served by the closed
+        // form. Reach the guard directly rather than through `fit()` (Tier 1: no convergence
+        // loop) — this is the exact call `fit()` makes at its `check_absorption_closed_form_
+        // support` gate, and the same `Option<String>` `predict()`/`simulate()` panic on.
+        let rejection =
+            crate::api::check_absorption_closed_form_support(&parsed.model, &tv_cov_population())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a declined-twin model ({label}) must reject a TV-covariate subject, \
+                         not silently serve it from the closed form"
+                    )
+                });
+        // …and the rejection must name the real cause. Before #1027 it told the author their
+        // model was "an unrecognised closed form" and pointed at a rewrite they did not need,
+        // while the reason lived in a parse warning `fit()` never reaches on the `Err` path.
+        // Asserted on the *content* (the colliding name) rather than the wrapper wording, so a
+        // reworded clause does not silently pass a rejection that dropped the reason.
+        assert!(
+            rejection.contains(colliding),
+            "the rejection ({label}) must quote the twin's decline reason (naming \
+             `{colliding}`), got: {rejection}"
+        );
+        assert!(
+            !rejection.contains("an unrecognised closed form"),
+            "a recognised closed form whose twin was declined must not be called unrecognised \
+             ({label}), got: {rejection}"
+        );
+
+        // The other two reroute-needing features the twin serves (#719) take their own message
+        // arms, so assert each carries the cause and the reason too — a declined twin loses SS
+        // and infusion exactly like it loses the TV-covariate reroute, and an author who hits
+        // one of those first must not be told the form is unrecognised either.
+        for (feature, marker, population) in [
+            (
+                "steady-state",
+                "steady-state (SS) doses",
+                ss_dose_population(),
+            ),
+            ("infusion", "infusion doses", infusion_population()),
+        ] {
+            let msg = crate::api::check_absorption_closed_form_support(&parsed.model, &population)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a declined-twin model ({label}) must reject a {feature} subject, not \
+                         silently serve it from the closed form"
+                    )
+                });
+            // Pin *which* arm fired: these populations are built by mutating the TV-covariate
+            // one, so without this the assertions below would pass just as happily on the
+            // TV-covariate message and prove nothing about the SS / infusion arms.
+            assert!(
+                msg.contains(marker),
+                "the {feature} subject ({label}) must hit the {feature} arm, got: {msg}"
+            );
+            assert!(
+                msg.contains(colliding) && !msg.contains("an unrecognised closed form"),
+                "the {feature} rejection ({label}) must name the decline cause and quote the \
+                 reason (naming `{colliding}`), got: {msg}"
+            );
+        }
+    }
+}
+
+/// A one-subject population whose subject takes a **steady-state** dose, and one whose subject
+/// takes an **infusion** — the other two features that reroute to the ODE twin (#719) and are
+/// therefore rejected when there is no twin. Each hits its own arm of
+/// `check_absorption_closed_form_support`, so both are exercised alongside the TV-covariate one.
+fn ss_dose_population() -> crate::types::Population {
+    let mut pop = tv_cov_population();
+    let s = &mut pop.subjects[0];
+    s.id = "SS1".to_string();
+    s.obs_covariates = Vec::new(); // drop the TV covariate so the SS arm is what fires
+    s.doses = vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    pop
+}
+
+fn infusion_population() -> crate::types::Population {
+    let mut pop = tv_cov_population();
+    let s = &mut pop.subjects[0];
+    s.id = "INF1".to_string();
+    s.obs_covariates = Vec::new(); // drop the TV covariate so the infusion arm is what fires
+    s.doses = vec![crate::types::DoseEvent::new(
+        0.0, 100.0, 1, 50.0, false, 0.0,
+    )];
+    pop
+}
+
+/// A one-subject population whose subject carries a time-varying covariate row — the cheapest
+/// thing that makes `Subject::has_tv_covariates()` true, which is what routes a closed-form
+/// absorption subject to its twin (`CompiledModel::effective_for`) and, twin-less, is what
+/// `check_absorption_closed_form_support` rejects on.
+fn tv_cov_population() -> crate::types::Population {
+    crate::types::Population {
+        subjects: vec![crate::types::Subject {
+            id: "TV1".to_string(),
+            doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![10.0],
+            obs_cmts: vec![1],
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![std::collections::HashMap::from([("WT".to_string(), 80.0)])],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }],
+        covariate_names: vec!["WT".to_string()],
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    }
+}
+
+/// The positive control for the test above: an ordinary transit model — same shape, no
+/// state-named parameter — keeps its twin and is warned about nothing. Without this, the
+/// decline path could pass by declining *everything*.
+#[test]
+fn an_ordinary_transit_model_keeps_its_twin_and_warns_about_nothing() {
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta TVX(1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  CENTRAL_AMT = TVX
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let parsed = parse_full_model(src).expect("an ordinary transit model parses");
+    assert!(
+        parsed
+            .model
+            .absorption_ode_equivalent
+            .as_ref()
+            .is_some_and(|eq| eq.built().ode_spec.is_some()),
+        "an ordinary transit model must keep a working ODE twin; warnings: {:?}",
+        parsed.model.parse_warnings
+    );
+    assert!(
+        !parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("W_ABSORPTION_TWIN_DECLINED")),
+        "nothing to decline here; warnings: {:?}",
+        parsed.model.parse_warnings
+    );
+    // The negative control for the rejection assertion in the test above: a twin-carrying
+    // model must *accept* the very subject a declined one rejects — otherwise that assertion
+    // could pass by rejecting every transit model with a TV covariate.
+    assert_eq!(
+        crate::api::check_absorption_closed_form_support(&parsed.model, &tv_cov_population()),
+        None,
+        "a twin-carrying transit model must reroute a TV-covariate subject, not reject it"
+    );
 }
 
 #[test]
@@ -2026,21 +2352,18 @@ fn adaptive_observe_does_not_reach_the_absorption_twin() {
     // reach a new ODE-only check from there — their presence makes the twin decline
     // outright — but `[adaptive_dosing]` does not decline it. So an analytical model
     // that the parser deliberately accepts (the rejection is ODE-scoped, see #1004)
-    // produced a twin that the parser *rejects*, and `get_or_build` turns a parse
-    // error into a `.expect()` panic — mid-fit, on the plain predict path that
-    // reroutes TV-covariate / `TIME` / IOV subjects to the twin.
+    // produced a twin that the parser *rejects* — which, before #1008 made the build
+    // a parse-time decline, `get_or_build` turned into a `.expect()` panic mid-fit, on
+    // the plain predict path that reroutes TV-covariate / `TIME` / IOV subjects.
     //
-    // The block is now dropped from the twin. Without that, this test panics rather
-    // than failing.
+    // The block is now dropped from the twin, so the model keeps a working fallback.
     //
-    // #1004 update: the primary no longer accepts a dose-attribute read in
-    // `observe` — that is now the analytical rejection, asserted below — which
-    // makes the twin panic unreachable *by construction* for this shape. The
-    // block-drop still has to hold, so the second half of this test keeps a
-    // controller the primary accepts and proves the twin still builds. Both halves
-    // matter: the first pins that the primary rejects rather than deferring to a
-    // twin that would panic, the second that a legitimate controller still gets a
-    // twin.
+    // #1004 update: the primary no longer accepts a dose-attribute read in `observe`
+    // — that is now the analytical rejection, asserted below — so no *reachable*
+    // controller carries something the twin's own parse would reject. That makes
+    // "the twin exists, therefore the block was dropped" vacuous: with the drop
+    // removed this test still passed. The second half therefore asserts on the
+    // re-emitted source itself, which holds whatever the controller says.
     let src = "
 [parameters]
   theta TVCL(5.0, 0.0, 1e15)
@@ -2073,7 +2396,8 @@ fn adaptive_observe_does_not_reach_the_absorption_twin() {
   DV ~ proportional(EPS1)
 ";
     // Half one: the primary rejects it itself (#1004), rather than accepting it and
-    // handing the twin a source that only fails at `get_or_build` time.
+    // handing the twin a source whose own parse fails — which since #1008 costs the
+    // model its fallback silently instead of panicking.
     let err = expect_parse_err(src);
     assert!(
         err.contains("[adaptive_dosing]:") && err.contains("remove the `f=F` mapping"),
@@ -2099,12 +2423,17 @@ fn adaptive_observe_does_not_reach_the_absorption_twin() {
         .absorption_ode_equivalent
         .as_ref()
         .expect("a plain transit model carries an ODE twin");
+    // The drop, asserted where it happens. `AbsorptionOdeEquivalent` keeps only the
+    // built model since #1008, so the reconstruction is re-run here rather than read
+    // off the twin — same function, same blocks, and it fails if the block comes back.
+    let extracted = super::extract_blocks(&ok_src).expect("the model file extracts");
+    let twin_src = super::absorption_ode_equivalent_source(&extracted)
+        .expect("a plain transit model reconstructs a twin source");
     assert!(
-        !eq.source().contains("[adaptive_dosing]"),
-        "the twin source must not re-emit the controller block, got:\n{}",
-        eq.source()
+        !twin_src.contains("[adaptive_dosing]"),
+        "the twin source must not re-emit the controller block, got:\n{twin_src}"
     );
-    let twin = eq.get_or_build();
+    let twin = eq.built();
     assert!(
         twin.ode_spec.is_some(),
         "the twin must be a working ODE model"
@@ -2570,9 +2899,9 @@ fn analytical_dose_attr_mapped_to_another_parameter_only_rejects_that_one() {
 
 #[test]
 fn transit_twin_with_reserved_f_name_still_builds() {
-    // Regression guard on the absorption ODE twin. `AbsorptionOdeEquivalent::
-    // get_or_build` `.expect()`s its reconstructed source to re-parse, so any new
-    // parse error that the twin can trip turns into a panic at fit time. The twin
+    // Regression guard on the absorption ODE twin: any new parse error the twin can
+    // trip costs the model its fallback (and, before #1008, panicked at fit time), so
+    // the twin must keep re-parsing for the shapes the desugar accepts. The twin
     // re-emits `[individual_parameters]` verbatim and, for an `f=` role whose
     // parameter does not already self-route, appends an `f = <param>` alias — so
     // `f` appears as a declaration but never as a read. Cover both: a parameter
@@ -2606,10 +2935,23 @@ fn transit_twin_with_reserved_f_name_still_builds() {
         );
         let parsed = parse_full_model(&src)
             .unwrap_or_else(|e| panic!("transit model with {mapping} must parse: {e}"));
-        // Force the lazy twin build — this is the `.expect()` that would panic.
-        if let Some(eq) = parsed.model.absorption_ode_equivalent.as_ref() {
-            let _ = eq.get_or_build();
-        }
+        // The twin is built during that parse (#1008). Assert it is *present*: a twin
+        // whose source fails to parse is now declined rather than panicking, so
+        // "didn't panic" alone would pass vacuously for a broken reconstruction.
+        let eq = parsed
+            .model
+            .absorption_ode_equivalent
+            .as_ref()
+            .unwrap_or_else(|| {
+                panic!(
+                    "transit model with {mapping} must keep its ODE twin; warnings: {:?}",
+                    parsed.model.parse_warnings
+                )
+            });
+        assert!(
+            eq.built().ode_spec.is_some(),
+            "the twin for {mapping} must be a working ODE model"
+        );
     }
 }
 

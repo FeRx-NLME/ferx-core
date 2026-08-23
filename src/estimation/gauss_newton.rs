@@ -24,6 +24,31 @@ use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
+/// The #1006 post-fit warning carried by a **pure** Gauss-Newton run that ends
+/// unconverged on a fixed-effects-only model (`n_eta = 0`).
+///
+/// States the *outcome* only. The remedy ("prefer `gn_hybrid` or `focei`, or improve
+/// the `sigma` start") belongs to `W_GN_NO_RANDOM_EFFECTS`, which `check_model_options`
+/// raises for the same configuration and `fit_inner` surfaces alongside this one —
+/// repeating it here made a single `gn` run at `n_eta = 0` give the same advice twice.
+/// Inside `fit()` the two always travel together: this warning needs `n_eta = 0` and a
+/// non-hybrid, non-polished `gn` stage, which is precisely when the check raises
+/// `W_GN_NO_RANDOM_EFFECTS`. A caller reaching `run_foce_gn` directly, bypassing
+/// `check_model_options`, sees the outcome without the remedy.
+///
+/// Named rather than inlined because the exemption has two halves. `gn_hybrid` is
+/// handled here (`options.method` is `FoceGnHybrid` during its GN phase), but a
+/// hand-written `methods = [gn, focei]` chain — the same polish, spelled out — is
+/// invisible from inside this function: `api::fit` rewrites `stage_opts.method` to
+/// the stage's method and blanks `stage_opts.methods`, so the chain is gone by the
+/// time `run_foce_gn` sees its options. `fit_inner` therefore drops this exact
+/// string from a GN stage that is not the last estimating stage; see
+/// `api::postfit::keep_gn_zero_eta_warning`.
+pub(crate) const GN_ZERO_ETA_NONCONVERGENCE_WARNING: &str =
+    "Gauss-Newton did not converge on a model with no random effects \
+     (n_eta = 0). BHHH curvature is unreliable far from the optimum in \
+     this regime, so the result may be badly wrong, not just imprecise.";
+
 /// Run FOCE estimation using a Gauss-Newton optimizer.
 ///
 /// Returns the same `OuterResult` as `optimize_population`.
@@ -367,6 +392,20 @@ pub fn run_foce_gn(
 
     if !converged {
         warnings.push("Gauss-Newton: max iterations reached without convergence".to_string());
+        // #1006: at n_eta = 0 an unconverged pure-GN run is the state that
+        // predicts a badly wrong answer — there is no inner EBE loop to absorb
+        // a poor start, so the BHHH step can collapse orders of magnitude above
+        // the optimum (8940 OFV units off on the `one_cpt_iv_pooled` anchor).
+        // `gn_hybrid` is exempt: its FOCEI polish re-optimises from here and
+        // recovers the optimum. A hand-written `methods = [gn, focei]` chain
+        // earns the same exemption, but this function cannot see it — `api::fit`
+        // blanks `stage_opts.methods` per stage — so that case is suppressed by
+        // name in `fit_inner` via [`GN_ZERO_ETA_NONCONVERGENCE_WARNING`].
+        // `ferx check` flags the same combination up front as
+        // W_GN_NO_RANDOM_EFFECTS (`check_model_options`).
+        if model.n_eta == 0 && !matches!(options.method, EstimationMethod::FoceGnHybrid) {
+            warnings.push(GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string());
+        }
     }
 
     // Recompute gradient at the final accepted x so the stored value is always
@@ -3585,5 +3624,64 @@ mod tests {
         }
         assert!(checked, "expected at least one GN trace row");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// #1006: an unconverged pure-GN run on a fixed-effects-only model must
+    /// carry the targeted post-fit warning, while `gn_hybrid` (whose FOCEI
+    /// polish recovers the optimum) and a mixed-effects `gn` run must not.
+    #[test]
+    fn gn_unconverged_at_zero_eta_pushes_targeted_warning() {
+        use std::path::Path;
+        let is_targeted = |w: &String| w.contains("no random effects");
+
+        let model = crate::parser::model_parser::parse_model_file(Path::new(
+            "examples/one_cpt_iv_pooled.ferx",
+        ))
+        .expect("pooled model parses");
+        assert_eq!(model.n_eta, 0, "fixture must be fixed-effects-only");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None)
+            .expect("one_cpt_iv data loads");
+        let opts = FitOptions {
+            method: EstimationMethod::FoceGn,
+            // Forces non-convergence structurally: the only normal convergence
+            // branch is `rel_change < 1e-6 && iter > 3`, so a 2-iteration budget
+            // cannot converge from any start. This pins the *gate* on the
+            // warning (n_eta = 0, not gn_hybrid, not converged), not the BHHH
+            // collapse itself — that is anchored in docs/estimation/gauss-newton.qmd.
+            outer_maxiter: 2,
+            run_covariance_step: false,
+            ..Default::default()
+        };
+        let res = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(!res.converged, "a 2-iteration GN budget cannot converge");
+        assert!(
+            res.warnings.iter().any(is_targeted),
+            "targeted #1006 warning missing: {:?}",
+            res.warnings
+        );
+
+        // gn_hybrid control: identical unconverged GN phase, but the FOCEI
+        // polish makes the targeted warning inapplicable.
+        let hybrid_opts = FitOptions {
+            method: EstimationMethod::FoceGnHybrid,
+            ..opts.clone()
+        };
+        let res = run_foce_gn(&model, &pop, &model.default_params, &hybrid_opts);
+        assert!(
+            !res.warnings.iter().any(is_targeted),
+            "gn_hybrid must not carry the #1006 warning: {:?}",
+            res.warnings
+        );
+
+        // Mixed-effects control: same tiny budget, but the inner EBE loop makes
+        // the targeted warning inapplicable at n_eta > 0.
+        let mixed = make_model();
+        let mixed_pop = make_population();
+        let res = run_foce_gn(&mixed, &mixed_pop, &mixed.default_params, &opts);
+        assert!(
+            !res.warnings.iter().any(is_targeted),
+            "mixed-effects gn must not carry the #1006 warning: {:?}",
+            res.warnings
+        );
     }
 }

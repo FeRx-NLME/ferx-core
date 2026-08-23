@@ -1200,6 +1200,45 @@ fn panic_if_unsupported(result: Option<String>, what: &str) {
     }
 }
 
+/// The short parenthetical naming *why* a closed-form absorption model has no ODE twin, for the
+/// twin-less rejection messages below.
+///
+/// Two shapes reach those messages. The desugar can decline by name before reconstructing a
+/// source (a user `[odes]` / `[scaling]` / `[initial_conditions]` block, a reserved-slot shadow
+/// or collision, a dose-attribute parameter in a disposition role) — "an unrecognised closed
+/// form" describes that. Or the twin *was* reconstructed and its own parse rejected it (#1008),
+/// which the model records as a `W_ABSORPTION_TWIN_DECLINED` parse warning. Both land on
+/// `absorption_ode_equivalent.is_none()`, so without this the second case is told it is an
+/// unrecognised form and pointed at a rewrite it does not need.
+fn twin_less_cause(model: &CompiledModel) -> &'static str {
+    if crate::types::absorption_twin_decline_reason(model).is_some() {
+        "(its twin was built and declined, #1008)"
+    } else {
+        "(an unrecognised closed form)"
+    }
+}
+
+/// The clause appended to a twin-less rejection when the twin was declined at parse time
+/// (#1008), quoting the twin parser's own reason; empty otherwise. Pairs with
+/// [`twin_less_cause`], which names the cause — this one carries only the reason, so the two
+/// do not repeat each other.
+///
+/// This is the only place the reason reaches a user on the reject path. `fit()` copies
+/// `model.parse_warnings` into the result at `api::fit`, but every call site of
+/// [`check_absorption_closed_form_support`] / [`check_absorption_flip_flop_no_twin`] returns
+/// `Err` (or panics, on `predict`/`simulate`) *before* that — so the warning that names the
+/// colliding parameter is otherwise visible only through `ferx check`.
+fn twin_decline_clause(model: &CompiledModel) -> String {
+    match crate::types::absorption_twin_decline_reason(model) {
+        Some(reason) => format!(
+            " Note: this model is not outside the rewrite's scope — its twin was built and then \
+             rejected by its own parse: {reason} Fixing that restores the twin and this feature, \
+             and is usually easier than the rewrite suggested above."
+        ),
+        None => String::new(),
+    }
+}
+
 /// Features the analytic closed-form absorption models — transit (`one_cpt_transit`,
 /// `two_cpt_transit`, #386) and inverse-Gaussian (`one_cpt_ig`, `two_cpt_ig`, #790) —
 /// do not support: the exponential-tilting closed form is a constant-parameter
@@ -1225,47 +1264,56 @@ pub(crate) fn check_absorption_closed_form_support(
         return None;
     }
     let name = model.pk_model.canonical_name();
+    // Why this model has no twin, and (for a #1008 decline) the twin parser's own reason. Every
+    // message below is reached under `absorption_ode_equivalent.is_none()`, which covers both
+    // "the desugar declined by name" and "the twin was built and rejected" — see
+    // `twin_decline_clause`.
+    let no_twin_cause = twin_less_cause(model);
+    let decline = twin_decline_clause(model);
     // IOV (n_kappa > 0): the closed-form superposition cannot express cross-occasion dose
     // carryover (#104) — a dose whose drug persists into a later occasion must decay with that
     // occasion's disposition. The plain form carries an `absorption_ode_equivalent` (the
     // `transit()`/`igd()` forcing twin) that `effective_for` routes IOV subjects to (it
-    // integrates the carryover exactly, #663), so it is NOT rejected. Only a twin-less form (a
-    // user `[odes]`/`[scaling]`/`[initial_conditions]` block, or a role shadowing a reserved
-    // F/lagtime slot) is rejected here rather than mis-fit.
+    // integrates the carryover exactly, #663), so it is NOT rejected. Only a twin-less form is
+    // rejected here rather than mis-fit — either one the desugar declines by name (a user
+    // `[odes]`/`[scaling]`/`[initial_conditions]` block, a role shadowing a reserved F/lagtime
+    // slot) or one whose twin was built and rejected by its own parse (#1008); the cause set is
+    // open-ended, which is why `no_twin_cause`/`decline` name it instead of the message text.
     if model.n_kappa > 0 && model.absorption_ode_equivalent.is_none() {
         return Some(format!(
             "{name} does not support IOV (n_kappa > 0) in this form: the analytic absorption \
              closed form assumes constant disposition over each absorption window, and this \
-             form is outside the automatic ODE-equivalent rewrite. Write the model as an ODE \
-             transit()/igd() forcing in [odes] directly."
+             model has no ODE twin {no_twin_cause} to reroute to. Write the model as an ODE \
+             transit()/igd() forcing in [odes] directly.{decline}"
         ));
     }
     // A `TIME`-built-in structural parameter makes the disposition switch mid-profile — the
     // closed form assumes constant parameters over each absorption window, so it cannot serve
     // it. The plain form carries an `absorption_ode_equivalent` (built at parse time), which
-    // the runtime dispatch routes such subjects to, so it is NOT rejected. Only a form outside
-    // the desugar's scope (a `lagtime=`/`f=` mapping or a custom `[scaling]` — no equivalent)
-    // is rejected here rather than mis-predict.
+    // the runtime dispatch routes such subjects to, so it is NOT rejected. Only a twin-less form
+    // is rejected here rather than mis-predict — outside the desugar's scope (a custom
+    // `[scaling]`, a reserved-slot shadow), or declined because its twin failed to parse (#1008).
     if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
         && model.absorption_ode_equivalent.is_none()
     {
         return Some(format!(
             "{name} does not support a TIME-dependent structural parameter in this form: \
              the analytic absorption closed form assumes constant parameters over each \
-             absorption window, and this form is outside the automatic ODE-equivalent rewrite. \
-             Write the model as an ODE transit()/igd() forcing in [odes] directly."
+             absorption window, and this model has no ODE twin {no_twin_cause} to reroute to. \
+             Write the model as an ODE transit()/igd() forcing in [odes] directly.{decline}"
         ));
     }
     for subject in &population.subjects {
         // Time-varying covariates make the disposition switch mid-absorption, which the
         // closed form cannot serve. The plain form's `absorption_ode_equivalent` handles it
-        // (the runtime dispatch routes TV-cov subjects there), so reject only the
-        // out-of-scope forms that carry no equivalent.
+        // (the runtime dispatch routes TV-cov subjects there), so reject only the forms that
+        // carry no equivalent — out of the desugar's scope, or declined at parse time (#1008).
         if subject.has_tv_covariates() && model.absorption_ode_equivalent.is_none() {
             return Some(format!(
                 "{name} does not support within-subject time-varying covariates \
                  (subject {}): the analytic absorption closed form assumes constant parameters \
-                 over each absorption window. Use an ODE absorption model.",
+                 over each absorption window, and this model has no ODE twin {no_twin_cause} to \
+                 reroute to. Use an ODE absorption model.{decline}",
                 subject.id
             ));
         }
@@ -1335,12 +1383,14 @@ pub(crate) fn check_absorption_closed_form_support(
                         "{name} does not support steady-state (SS) doses in this form (subject \
                          {}): SS reroutes to the ODE absorption twin, but this model has no twin \
                          {}. Use a non-SS multiple-dose schedule, or write the model as an ODE \
-                         transit()/igd() forcing in [odes].",
+                         transit()/igd() forcing in [odes].{decline}",
                         subject.id,
                         if model.has_lagtime_on_cmt(dose.cmt_raw()) {
+                            // The lagtime case is a twin-*carrying* scope limit, so it names the
+                            // combination rather than the twin-less cause.
                             "for the SS + lagtime combination (a follow-up)"
                         } else {
-                            "(an unrecognised closed form)"
+                            no_twin_cause
                         }
                     ));
                 }
@@ -1354,8 +1404,8 @@ pub(crate) fn check_absorption_closed_form_support(
                     return Some(format!(
                         "{name} does not support infusion doses in this form (subject {}): an \
                          infusion reroutes to the ODE absorption twin, but this model has no twin \
-                         (an unrecognised closed form). Write the model as an ODE transit()/igd() \
-                         forcing in [odes] for a zero-order input into the kernel.",
+                         {no_twin_cause}. Write the model as an ODE transit()/igd() forcing in \
+                         [odes] for a zero-order input into the kernel.{decline}",
                         subject.id
                     ));
                 }
@@ -1789,6 +1839,16 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
         }
         _ => ("1/(2·MAT·CV²)", "igd()", "MAT / CV² / CL"),
     };
+    // The twin-less cause, and (for a #1008 decline) the twin parser's own reason — the
+    // desugar's by-name declines and a rejected twin build both land on `is_none()` here.
+    let cause = if crate::types::absorption_twin_decline_reason(model).is_some() {
+        "its twin was built and declined, #1008"
+    } else {
+        "a user `[odes]` / `[scaling]` / `[initial_conditions]` block, or a parameter whose name \
+         collides with a reserved `f`/`lagtime` slot, declines the desugar — a `lagtime=`/`f=` \
+         mapping alone now auto-routes, #735"
+    };
+    let decline = twin_decline_clause(model);
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     for subject in &population.subjects {
         if crate::pk::absorption_flip_flop_at(model, subject, theta, &zero_eta) {
@@ -1798,11 +1858,8 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
                  or (2-cpt) coincident disposition eigenvalues — so it returns an \
                  identically-zero concentration profile, which silently degenerates the objective \
                  (a proportional error model collapses `(σ·pred)²` to 0). This model has no ODE \
-                 twin to fall back on (a user `[odes]` / `[scaling]` / `[initial_conditions]` \
-                 block, or a parameter whose name collides with a reserved `f`/`lagtime` slot, \
-                 declines the desugar — a `lagtime=`/`f=` mapping alone now auto-routes, #735) — \
-                 rewrite it as an explicit ODE `{ode_fn}` model, or check the {params} starting \
-                 estimates.",
+                 twin to fall back on ({cause}) — rewrite it as an explicit ODE `{ode_fn}` model, \
+                 or check the {params} starting estimates.{decline}",
                 model.pk_model.canonical_name(),
                 subject.id
             ));
@@ -1865,24 +1922,107 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     let chain = options.method_chain();
     let mut diags = Vec::new();
 
-    // A fixed-effects-only model (`n_eta = 0`, #989) has no latent variable, so
-    // SAEM's E-step is empty: the stochastic approximation has nothing to average
-    // and the M-step is plain ML on θ/σ. It runs, reports `converged`, and lands
-    // slightly off the true optimum (−269.5986 vs −269.6370 on the `one_cpt_iv`
-    // zero-Ω anchor) purely because the SA gain sequence stops short. Reject it
-    // and point at the estimators that solve this exactly, matching what
-    // `imp` / `impmap` / `bayes` already do at run time — but check it *here* so
-    // `ferx check` catches it and a `methods = [saem, focei]` chain fails up
-    // front rather than mid-run.
-    if model.n_eta == 0 && chain.contains(&EstimationMethod::Saem) {
-        diags.push(
-            Diagnostic::error(
+    // A fixed-effects-only model (`n_eta = 0`, #989 / #1007) has no latent
+    // variable to integrate over, so every estimator whose objective *is* an
+    // integral over η degenerates there. SAEM's E-step is empty — it runs,
+    // reports `converged`, and lands slightly off the true optimum (−269.5986 vs
+    // −269.6370 on the `one_cpt_iv` zero-Ω anchor) purely because the SA gain
+    // sequence stops short; the other three collapse to the observation
+    // likelihood FOCE/FOCEI already minimise exactly. One table, so adding a
+    // method to the family cannot leave one of the two codes behind — `saem` keeps
+    // `E_SAEM_NO_RANDOM_EFFECTS` (documented as stable since #1002, and tooling
+    // may match on it) and the three #1007 additions share one new sibling code.
+    // The per-method sentence is the only text that differs; the surrounding
+    // message is byte-identical to the historical inline guards.
+    //
+    // Each of the three also refuses at run time — five sites, not the three the
+    // issue lists: `importance_sampling.rs` (both the estimating and the marginal
+    // entry points), `impmap.rs` (both the IMP and IMPMAP drivers) and
+    // `bayes.rs`. Those stay as the backstop for callers that bypass this check;
+    // rejecting here as well means `ferx check` catches it and a
+    // `methods = [focei, imp]` chain fails up front rather than after the FOCEI
+    // stage has run. Note this also fail-fasts an `imp_eval_only` chain whose IMP
+    // failure was previously downgraded to a warning after the fit: requesting an
+    // IMP objective at n_eta = 0 is a spec contradiction better surfaced before
+    // the fit runs.
+    if model.n_eta == 0 {
+        for (method, name, code, why) in [
+            (
+                EstimationMethod::Saem,
+                "saem",
                 "E_SAEM_NO_RANDOM_EFFECTS",
-                "method = saem requires at least one random effect (n_eta = 0). \
-                 SAEM is an EM over the random effects, so with none declared its \
+                "SAEM is an EM over the random effects, so with none declared its \
                  E-step is empty and it only approaches the objective that FOCE/FOCEI \
-                 minimise exactly. Use method = foce, focei, or laplace for a \
-                 fixed-effects-only (naive-pooled) model.",
+                 minimise exactly.",
+            ),
+            (
+                EstimationMethod::Imp,
+                "imp",
+                "E_METHOD_NO_RANDOM_EFFECTS",
+                "With no random effects the marginal likelihood is just the \
+                 observation likelihood, which FOCE/FOCEI minimise exactly.",
+            ),
+            (
+                EstimationMethod::Impmap,
+                "impmap",
+                "E_METHOD_NO_RANDOM_EFFECTS",
+                "With no random effects the marginal likelihood is just the \
+                 observation likelihood, which FOCE/FOCEI minimise exactly.",
+            ),
+            (
+                EstimationMethod::Bayes,
+                "bayes",
+                "E_METHOD_NO_RANDOM_EFFECTS",
+                "With no random effects the marginal likelihood is just the \
+                 observation likelihood, which FOCE/FOCEI minimise exactly.",
+            ),
+        ] {
+            if chain.contains(&method) {
+                diags.push(
+                    Diagnostic::error(
+                        code,
+                        format!(
+                            "method = {name} requires at least one random effect \
+                             (n_eta = 0). {why} Use method = foce, focei, or laplace \
+                             for a fixed-effects-only (naive-pooled) model."
+                        ),
+                    )
+                    .with_block("fit_options"),
+                );
+            }
+        }
+    }
+
+    // Pure Gauss-Newton at n_eta = 0 (#1006) is start-sensitive rather than
+    // invalid: with no inner EBE loop to absorb a poor `sigma` start, the BHHH
+    // outer-product Hessian over-estimates curvature far from the optimum and
+    // the LM-damped step can collapse — on the `one_cpt_iv_pooled` anchor it
+    // stops 8940 OFV units short, reporting nothing beyond `Converged: NO`.
+    // A warning, not an error, because `gn` does reach the optimum from a good
+    // start. Exempt whenever a later stage re-optimises the GN result: that is
+    // `gn_hybrid` (whose FOCEI polish is internal to `run_foce_gn`) but equally
+    // a hand-written `methods = [gn, focei]`, which is the same thing spelled
+    // out — hence `is_last_estimating_stage` on the GN stage rather than a bare
+    // `chain.contains`. An unconverged pure-GN run at n_eta = 0 additionally
+    // pushes a post-fit warning (`gauss_newton.rs`), under the same rule, since
+    // `Converged: NO` is the state that actually predicts the bad answer.
+    if model.n_eta == 0
+        && chain
+            .iter()
+            .rposition(|&m| m == EstimationMethod::FoceGn)
+            .is_some_and(|idx| {
+                crate::api::is_last_estimating_stage(&chain, idx, options.imp_eval_only)
+            })
+    {
+        diags.push(
+            Diagnostic::warning(
+                "W_GN_NO_RANDOM_EFFECTS",
+                "method = gn on a model with no random effects (n_eta = 0) is \
+                 start-sensitive: without an inner EBE loop to absorb a poor start, \
+                 the BHHH step can collapse far from the optimum and return a badly \
+                 wrong result with no diagnostic beyond Converged: NO. Prefer \
+                 method = gn_hybrid or focei for a fixed-effects-only model, or \
+                 improve the sigma start.",
             )
             .with_block("fit_options"),
         );
@@ -2971,6 +3111,29 @@ pub fn check_experimental_features(model: &CompiledModel) -> Vec<Diagnostic> {
     diags
 }
 
+/// Map a free-text parse **warning** to its check-report code.
+///
+/// Warning sibling of [`parse_error_to_diagnostic`], and split out of
+/// `validate_model_file`'s loop for the same reason: the mapping is a pure
+/// string→code function, so it is worth testing directly rather than only
+/// through a model file on disk. Each arm matches a sentinel the emitting site
+/// carries verbatim (the `W_…` token, or a pinned phrase), so a reworded warning
+/// falls through to the generic `W_PARSE` rather than silently mislabelling —
+/// which is why the codes are asserted at both ends.
+fn parse_warning_to_code(w: &str) -> &'static str {
+    if w.contains("declared in [parameters] but not referenced") {
+        "W_UNUSED_PARAM"
+    } else if w.contains("W_DERIVED_COVARIATE_SHADOW") {
+        "W_DERIVED_COVARIATE_SHADOW"
+    } else if w.contains("W_DERIVED_STEP_IGNORED") {
+        "W_DERIVED_STEP_IGNORED"
+    } else if w.contains("W_ABSORPTION_TWIN_DECLINED") {
+        "W_ABSORPTION_TWIN_DECLINED"
+    } else {
+        "W_PARSE"
+    }
+}
+
 /// Map a free-text parser error string to a single structured [`Diagnostic`].
 /// Recognises the `"Missing [X] block"` shape (→ `E_MISSING_BLOCK`, with the block
 /// name attached), the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`), and the
@@ -3160,16 +3323,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //     context in the message text; we use W_PARSE as the generic code here
     //     rather than a narrower code that would mislabel unrelated warnings.
     for w in &parsed.model.parse_warnings {
-        let code = if w.contains("declared in [parameters] but not referenced") {
-            "W_UNUSED_PARAM"
-        } else if w.contains("W_DERIVED_COVARIATE_SHADOW") {
-            "W_DERIVED_COVARIATE_SHADOW"
-        } else if w.contains("W_DERIVED_STEP_IGNORED") {
-            "W_DERIVED_STEP_IGNORED"
-        } else {
-            "W_PARSE"
-        };
-        diags.push(Diagnostic::warning(code, w.clone()));
+        diags.push(Diagnostic::warning(parse_warning_to_code(w), w.clone()));
     }
 
     // 2b. Model / estimation-option compatibility (data-independent): catches
