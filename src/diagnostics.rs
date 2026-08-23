@@ -33,6 +33,9 @@
 //! | `E_SDE_INCOMPATIBLE`      | an SDE (`[diffusion]`) model used with SAEM / GN |
 //! | `E_AD_RETIRED`            | `gradient_method = ad` requested; the Enzyme AD path was retired (use `auto` / `fd`) |
 //! | `E_IMP_CHAIN`             | `imp` mis-placed in a method chain (repeated / non-terminal) |
+//! | `E_SAEM_NO_RANDOM_EFFECTS`| `method = saem` anywhere in a chain on a model with `n_eta = 0` |
+//! | `E_METHOD_NO_RANDOM_EFFECTS` | `method = imp` / `impmap` / `bayes` anywhere in a chain on a model with `n_eta = 0` |
+//! | `W_GN_NO_RANDOM_EFFECTS`  | `method = gn` as the last estimating stage on a model with `n_eta = 0` (start-sensitive; prefer `gn_hybrid`) |
 //! | `E_OPTIMIZER_IOV`         | `optimizer = trust_region` used with an IOV model |
 //! | `W_STEADY_STATE_II`       | SS=1 dose with missing / non-positive II |
 //! | `W_STEADY_STATE_INFUSION` | SS=1 infusion with `T_inf > II` (overlapping pulses) |

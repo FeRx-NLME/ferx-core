@@ -1865,24 +1865,107 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     let chain = options.method_chain();
     let mut diags = Vec::new();
 
-    // A fixed-effects-only model (`n_eta = 0`, #989) has no latent variable, so
-    // SAEM's E-step is empty: the stochastic approximation has nothing to average
-    // and the M-step is plain ML on θ/σ. It runs, reports `converged`, and lands
-    // slightly off the true optimum (−269.5986 vs −269.6370 on the `one_cpt_iv`
-    // zero-Ω anchor) purely because the SA gain sequence stops short. Reject it
-    // and point at the estimators that solve this exactly, matching what
-    // `imp` / `impmap` / `bayes` already do at run time — but check it *here* so
-    // `ferx check` catches it and a `methods = [saem, focei]` chain fails up
-    // front rather than mid-run.
-    if model.n_eta == 0 && chain.contains(&EstimationMethod::Saem) {
-        diags.push(
-            Diagnostic::error(
+    // A fixed-effects-only model (`n_eta = 0`, #989 / #1007) has no latent
+    // variable to integrate over, so every estimator whose objective *is* an
+    // integral over η degenerates there. SAEM's E-step is empty — it runs,
+    // reports `converged`, and lands slightly off the true optimum (−269.5986 vs
+    // −269.6370 on the `one_cpt_iv` zero-Ω anchor) purely because the SA gain
+    // sequence stops short; the other three collapse to the observation
+    // likelihood FOCE/FOCEI already minimise exactly. One table, so adding a
+    // method to the family cannot leave one of the two codes behind — `saem` keeps
+    // `E_SAEM_NO_RANDOM_EFFECTS` (documented as stable since #1002, and tooling
+    // may match on it) and the three #1007 additions share one new sibling code.
+    // The per-method sentence is the only text that differs; the surrounding
+    // message is byte-identical to the historical inline guards.
+    //
+    // Each of the three also refuses at run time — five sites, not the three the
+    // issue lists: `importance_sampling.rs` (both the estimating and the marginal
+    // entry points), `impmap.rs` (both the IMP and IMPMAP drivers) and
+    // `bayes.rs`. Those stay as the backstop for callers that bypass this check;
+    // rejecting here as well means `ferx check` catches it and a
+    // `methods = [focei, imp]` chain fails up front rather than after the FOCEI
+    // stage has run. Note this also fail-fasts an `imp_eval_only` chain whose IMP
+    // failure was previously downgraded to a warning after the fit: requesting an
+    // IMP objective at n_eta = 0 is a spec contradiction better surfaced before
+    // the fit runs.
+    if model.n_eta == 0 {
+        for (method, name, code, why) in [
+            (
+                EstimationMethod::Saem,
+                "saem",
                 "E_SAEM_NO_RANDOM_EFFECTS",
-                "method = saem requires at least one random effect (n_eta = 0). \
-                 SAEM is an EM over the random effects, so with none declared its \
+                "SAEM is an EM over the random effects, so with none declared its \
                  E-step is empty and it only approaches the objective that FOCE/FOCEI \
-                 minimise exactly. Use method = foce, focei, or laplace for a \
-                 fixed-effects-only (naive-pooled) model.",
+                 minimise exactly.",
+            ),
+            (
+                EstimationMethod::Imp,
+                "imp",
+                "E_METHOD_NO_RANDOM_EFFECTS",
+                "With no random effects the marginal likelihood is just the \
+                 observation likelihood, which FOCE/FOCEI minimise exactly.",
+            ),
+            (
+                EstimationMethod::Impmap,
+                "impmap",
+                "E_METHOD_NO_RANDOM_EFFECTS",
+                "With no random effects the marginal likelihood is just the \
+                 observation likelihood, which FOCE/FOCEI minimise exactly.",
+            ),
+            (
+                EstimationMethod::Bayes,
+                "bayes",
+                "E_METHOD_NO_RANDOM_EFFECTS",
+                "With no random effects the marginal likelihood is just the \
+                 observation likelihood, which FOCE/FOCEI minimise exactly.",
+            ),
+        ] {
+            if chain.contains(&method) {
+                diags.push(
+                    Diagnostic::error(
+                        code,
+                        format!(
+                            "method = {name} requires at least one random effect \
+                             (n_eta = 0). {why} Use method = foce, focei, or laplace \
+                             for a fixed-effects-only (naive-pooled) model."
+                        ),
+                    )
+                    .with_block("fit_options"),
+                );
+            }
+        }
+    }
+
+    // Pure Gauss-Newton at n_eta = 0 (#1006) is start-sensitive rather than
+    // invalid: with no inner EBE loop to absorb a poor `sigma` start, the BHHH
+    // outer-product Hessian over-estimates curvature far from the optimum and
+    // the LM-damped step can collapse — on the `one_cpt_iv_pooled` anchor it
+    // stops 8940 OFV units short, reporting nothing beyond `Converged: NO`.
+    // A warning, not an error, because `gn` does reach the optimum from a good
+    // start. Exempt whenever a later stage re-optimises the GN result: that is
+    // `gn_hybrid` (whose FOCEI polish is internal to `run_foce_gn`) but equally
+    // a hand-written `methods = [gn, focei]`, which is the same thing spelled
+    // out — hence `is_last_estimating_stage` on the GN stage rather than a bare
+    // `chain.contains`. An unconverged pure-GN run at n_eta = 0 additionally
+    // pushes a post-fit warning (`gauss_newton.rs`), under the same rule, since
+    // `Converged: NO` is the state that actually predicts the bad answer.
+    if model.n_eta == 0
+        && chain
+            .iter()
+            .rposition(|&m| m == EstimationMethod::FoceGn)
+            .is_some_and(|idx| {
+                crate::api::is_last_estimating_stage(&chain, idx, options.imp_eval_only)
+            })
+    {
+        diags.push(
+            Diagnostic::warning(
+                "W_GN_NO_RANDOM_EFFECTS",
+                "method = gn on a model with no random effects (n_eta = 0) is \
+                 start-sensitive: without an inner EBE loop to absorb a poor start, \
+                 the BHHH step can collapse far from the optimum and return a badly \
+                 wrong result with no diagnostic beyond Converged: NO. Prefer \
+                 method = gn_hybrid or focei for a fixed-effects-only model, or \
+                 improve the sigma start.",
             )
             .with_block("fit_options"),
         );
