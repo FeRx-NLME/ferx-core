@@ -1372,6 +1372,98 @@ mod tests {
         }
     }
 
+    /// The three verdicts `Solver::terminate` can return, driven through the trait
+    /// method itself rather than through the tracker.
+    ///
+    /// The tracker tests below pin `note_iteration` and
+    /// `stalled_without_ever_progressing` in isolation; this pins the wiring —
+    /// that a settled run reports `SolverConverged`, a never-started one reports
+    /// the [`TRUST_REGION_NO_INITIAL_PROGRESS`] `SolverExit` (the branch that
+    /// lets the fit bail out instead of paying out `maxiter`), and everything
+    /// before either threshold reports `NotTerminated` so the executor keeps
+    /// going.
+    #[test]
+    fn terminate_maps_the_tracker_onto_argmin_statuses() {
+        let state_at = |iter: u64, cost: f64, x: Vec<f64>| -> TrState {
+            let mut st: TrState = IterState::new().param(x).cost(cost);
+            for _ in 0..iter {
+                st.increment_iter();
+            }
+            st
+        };
+        let terminated_as = |status: &TerminationStatus| -> Option<String> {
+            match status {
+                TerminationStatus::Terminated(r) => Some(format!("{r}")),
+                TerminationStatus::NotTerminated => None,
+            }
+        };
+
+        // Settled: descend once, then freeze for a full window.
+        let mut settled = stall_tracker();
+        let x = vec![0.5, -0.25];
+        assert!(matches!(
+            settled.terminate(&state_at(0, 100.0, x.clone())),
+            TerminationStatus::NotTerminated
+        ));
+        // Call k = 0 is the drop from 100 to 50 (progress, resetting the window);
+        // k = 1..N-1 are stalls, so the window closes on the call after the loop.
+        for k in 0..u64::from(TRUST_REGION_NO_PROGRESS_ITERS) {
+            assert!(
+                matches!(
+                    settled.terminate(&state_at(k + 1, 50.0, x.clone())),
+                    TerminationStatus::NotTerminated
+                ),
+                "terminated early at iteration {}",
+                k + 1
+            );
+        }
+        let status = settled.terminate(&state_at(99, 50.0, x.clone()));
+        assert!(
+            matches!(
+                status,
+                TerminationStatus::Terminated(TerminationReason::SolverConverged)
+            ),
+            "a settled run must report SolverConverged, got {status}"
+        );
+
+        // Never started: frozen from iteration 0, so the *other* exit fires and
+        // `classify_termination` turns it into the starting-values warning.
+        let mut frozen = stall_tracker();
+        let y = vec![1.0, 1.0];
+        // Call k = 0 only seeds `prev`, so the window closes one call later.
+        for k in 0..u64::from(TRUST_REGION_NO_PROGRESS_ITERS) {
+            assert!(
+                matches!(
+                    frozen.terminate(&state_at(k, 42.0, y.clone())),
+                    TerminationStatus::NotTerminated
+                ),
+                "bailed out after only {k} frozen iterations"
+            );
+        }
+        let status = frozen.terminate(&state_at(99, 42.0, y.clone()));
+        let reason = terminated_as(&status).expect("a fully frozen run must terminate");
+        assert!(
+            reason.contains(TRUST_REGION_NO_INITIAL_PROGRESS),
+            "expected the no-initial-progress exit, got {reason}"
+        );
+        // ...and never `SolverConverged`, which would recreate #1000.
+        assert!(!matches!(
+            status,
+            TerminationStatus::Terminated(TerminationReason::SolverConverged)
+        ));
+        let (converged, warn) = classify_termination(&status, 500);
+        assert!(!converged);
+        assert!(warn.expect("must warn").contains("starting values"));
+
+        // A state with no parameter vector cannot be judged; the executor keeps going.
+        let mut empty = stall_tracker();
+        let bare: TrState = IterState::new();
+        assert!(matches!(
+            empty.terminate(&bare),
+            TerminationStatus::NotTerminated
+        ));
+    }
+
     /// A run that rejects every step from iteration 0 must bail out on its own
     /// rather than paying out the whole `maxiter` budget on a frozen state. The
     /// converged verdict stays false either way (see
