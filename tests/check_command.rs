@@ -262,6 +262,60 @@ fn analytical_dose_attr_double_use_is_reported_as_its_own_code() {
 }
 
 #[test]
+fn single_endpoint_sigma_order_mismatch_is_reported_as_its_own_code() {
+    // #1001. `proportional(S_SMALL)` with `S_BIG` declared first used to validate
+    // clean and then fit against `S_BIG`. Like #993 the code exists so a consumer
+    // (`ferxtranslate`, ferx-r) can offer the mechanical fix — reorder one of the
+    // two lists — without matching prose, and like #993 the mapping itself keys off
+    // a prose substring, so it needs a test or a reworded message silently
+    // downgrades every case to `E_PARSE`.
+    let model = temp_model(
+        "sigma_order_mismatch",
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma S_BIG ~ 2.0 (sd)
+  sigma S_SMALL ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(S_SMALL)
+",
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid);
+    // Assert the count before indexing, so a regression that reports nothing fails
+    // with this line rather than an opaque index-out-of-bounds panic.
+    assert_eq!(
+        report.diagnostics.len(),
+        1,
+        "expected exactly one diagnostic, got: {:?}",
+        report.diagnostics
+    );
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_SIGMA_ORDER_MISMATCH");
+    // The message already opens with the block, so attaching one too would print it
+    // twice — the renderer prefixes whatever `block` it is given.
+    assert_eq!(d.block, None);
+    assert!(
+        d.message.starts_with("[error_model]")
+            && d.message.contains("S_SMALL")
+            && d.message.contains("S_BIG"),
+        "{}",
+        d.message
+    );
+    let _ = std::fs::remove_file(&model);
+}
+
+#[test]
 fn no_data_means_no_covariate_check() {
     // Same model, but without --data the covariate check does not run, so the
     // model is structurally valid.

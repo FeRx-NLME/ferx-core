@@ -225,3 +225,75 @@ fn parse_warning_codes_cover_their_arms_and_fall_through() {
         "W_PARSE"
     );
 }
+
+// ── #1001: single-endpoint sigma order ──────────────────────────────────────
+//
+// These two run the *parser* and feed it its own error string, rather than
+// asserting a hand-written literal: the mapping keys off a prose substring that
+// is split across a `\` line continuation at the emitting site in
+// `build_error_spec`, so a copy pasted here could agree with itself while
+// disagreeing with what the parser actually emits. Re-wrapping the message
+// breaks the mapping, and these are what fail.
+
+/// A mis-ordered single-endpoint `[error_model]` earns its own code, so a
+/// consumer can offer the (mechanical) reorder without matching prose.
+#[test]
+fn sigma_order_mismatch_maps_to_its_own_code() {
+    let parsed = crate::parser::model_parser::parse_full_model(
+        "
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma S_BIG ~ 2.0 (sd)
+  sigma S_SMALL ~ 0.05 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(S_SMALL)
+",
+    );
+    let err = match parsed {
+        Ok(_) => panic!("a mis-ordered single-endpoint [error_model] must be rejected"),
+        Err(e) => e,
+    };
+    let d = parse_error_to_diagnostic(&err);
+    assert_eq!(d.code, "E_SIGMA_ORDER_MISMATCH", "{err}");
+    // The message already opens with `[error_model] `, and the renderer prefixes
+    // whatever block it is given — setting both would print it twice.
+    assert!(d.block.is_none(), "{:?}", d.block);
+}
+
+/// A *repeated* argument is deliberately not the same code: no reordering can
+/// fix it, so it must not reach a consumer as the reorder-shaped
+/// `E_SIGMA_ORDER_MISMATCH`. Pins the split, which is the whole reason the two
+/// messages are worded differently.
+#[test]
+fn repeated_sigma_argument_is_not_coded_as_an_order_mismatch() {
+    let parsed = crate::parser::model_parser::parse_full_model(
+        "
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma S_A ~ 0.05 (sd)
+  sigma S_B ~ 1.0 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(S_A, S_A)
+",
+    );
+    let err = match parsed {
+        Ok(_) => panic!("a repeated sigma argument must be rejected"),
+        Err(e) => e,
+    };
+    let d = parse_error_to_diagnostic(&err);
+    assert_eq!(d.code, "E_PARSE", "{err}");
+}

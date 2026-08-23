@@ -49,8 +49,12 @@
   omega ETA_CL ~ 0.09              # IIV on CL (~30% CV)
   omega ETA_V  ~ 0.09              # IIV on V  (~30% CV)
 
-  sigma ADD_ERR  ~ 0.02 (sd)       # additive residual (defines PRED=0 in the dead time)
+  # A single-endpoint `combined` model consumes these two POSITIONALLY (#1001):
+  # slot 1 is the proportional coefficient, slot 2 the additive SD. Declaring
+  # ADD_ERR first therefore made 0.02 the proportional term and 0.10 the additive
+  # one — the inverse of every label in this file, and of the header above.
   sigma PROP_ERR ~ 0.10 (sd)       # proportional residual (~10% CV)
+  sigma ADD_ERR  ~ 0.02 (sd)       # additive residual (defines PRED=0 in the dead time)
 
 [individual_parameters]
   CL   = TVCL * exp(ETA_CL)
@@ -72,7 +76,7 @@
   y = central / V                  # observable = concentration (mg/L)
 
 [error_model]
-  DV ~ combined(ADD_ERR, PROP_ERR)
+  DV ~ combined(PROP_ERR, ADD_ERR)
 
 [fit_options]
   method     = focei

@@ -322,6 +322,8 @@ The interpretation of sigma's role in the residual-error model depends on the er
 | Proportional | Variance (or SD with `(sd)`) of the proportional coefficient |
 | Combined | First sigma = proportional coefficient, second = additive component |
 
+For a **single-endpoint** `[error_model]` ("first" and "second" above) these roles are read from the `[parameters]` **declaration order**, and the names written in the `[error_model]` arguments must match that order — a mismatch is rejected with `E_SIGMA_ORDER_MISMATCH`. Per-CMT and covariate-selected error models bind by name instead. See [Sigma order](error-model.qmd#sigma-order).
+
 > **Migration note** (pre-issue-#56 models): `sigma NAME ~ value` was previously interpreted as a standard deviation. The new default is **variance**, so a pre-#56 value `v` becomes either `v² (variance)` or `v (sd)`. The `examples/` directory uses the `(sd)` form to preserve the prior initial values verbatim.
 
 ## Complete Examples

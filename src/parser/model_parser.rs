@@ -12,6 +12,19 @@ use std::sync::LazyLock;
 static DIFFUSION_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?").unwrap());
 
+/// Identifier scanner for `[error_model]` argument text. Hoisted out of the
+/// functions that use it because compiling the regex costs far more than the
+/// scan it performs, and it runs on every parse: `arg_sigma_name` calls it once
+/// per argument (from both `build_error_spec` and `build_ruv_magnitude`) and
+/// `used_sigma_names` scans every argument of every `[error_model]` form. Every
+/// identifier scan over `[error_model]` text goes through this one static — add
+/// new callers here rather than compiling a second copy.
+static ARG_IDENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z_]\w*").unwrap());
+
+/// Whether an `[error_model]` argument is a bare identifier (so an unresolved one
+/// is a typo'd sigma name) rather than a #484 magnitude expression.
+static BARE_IDENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_]\w*$").unwrap());
+
 // ── Mu-referencing pattern detection ────────────────────────────────────────
 
 /// Anchor of a mu-referencing relationship — either a plain user-declared
@@ -2052,7 +2065,6 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // restriction.
     // Capture referenced sigma names before `parsed_error_model` is consumed.
     let used_sigmas_in_error = used_sigma_names(&parsed_error_model, &sigma_names);
-    validate_block_sigma_single_error_order(&parsed_error_model, &block_sigmas, &sigma_names)?;
     // Capture the single-endpoint arguments before `parsed_error_model` is
     // consumed, so the custom residual-magnitude programs (#484) can be built
     // after the [covariates] block is parsed (covariate names are needed to
@@ -11897,37 +11909,6 @@ fn build_residual_correlations(
     Ok(out)
 }
 
-fn validate_block_sigma_single_error_order(
-    parsed_error_model: &ParsedErrorModel,
-    block_sigmas: &[BlockSigmaSpec],
-    sigma_names: &[String],
-) -> Result<(), String> {
-    if block_sigmas.is_empty() {
-        return Ok(());
-    }
-    let ParsedErrorModel::Single(_, error_sigma_args) = parsed_error_model else {
-        return Ok(());
-    };
-    for (idx, arg) in error_sigma_args.iter().enumerate() {
-        let expected = arg_sigma_name(arg, sigma_names)?;
-        let expected = &expected;
-        if sigma_names.get(idx) != Some(expected) {
-            return Err(format!(
-                "block_sigma with a single-endpoint [error_model] requires the \
-                 error-model sigma order to match the leading sigma slots; expected \
-                 '{}' at position {}, got '{}'",
-                sigma_names
-                    .get(idx)
-                    .map(String::as_str)
-                    .unwrap_or("<missing>"),
-                idx + 1,
-                expected
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validate_residual_correlations(
     error_spec: &ErrorSpec,
     correlations: &[ResidualCorrelation],
@@ -12590,11 +12571,98 @@ fn build_error_spec(
     match parsed {
         ParsedErrorModel::Single(model, args) => {
             // Single-endpoint sigmas are consumed positionally from the global
-            // sigma vector. Each argument must scale exactly one declared sigma
-            // (a bare name or a magnitude expression, #484); `arg_sigma_name`
-            // both resolves that sigma and rejects an unknown/typo'd reference.
-            for arg in &args {
-                arg_sigma_name(arg, sigma_names)?;
+            // sigma vector: `ErrorSpec::Single` carries no indices, so every
+            // consumer (`sigma_loadings`, `residual_variance`, `sigma_types`,
+            // the #484 magnitude multipliers, …) reads the *leading* slots.
+            //
+            // Each argument must therefore scale exactly one declared sigma —
+            // `arg_sigma_name` resolves that sigma and rejects an unknown/typo'd
+            // reference — **and** must be the sigma that actually occupies its
+            // slot. Before #1001 the resolved name was discarded here, so
+            // `proportional(S_SMALL)` with `S_BIG` declared first validated,
+            // fitted against `S_BIG`, and reported nothing: the written name was
+            // checked for existence and then ignored. The per-CMT and
+            // covariate-selected arms below bind strictly by name, so without
+            // this the same file meant two different things depending on which
+            // `[error_model]` form it used.
+            //
+            // Rejecting rather than binding by name keeps one resolution rule
+            // for the whole positional path (including `block_sigma`, whose
+            // entries land in the same flat vector — this check generalises the
+            // block_sigma-only guard it replaces).
+            //
+            // Two distinct defects, kept apart because their remedies are:
+            // repeating a name is a *count* problem no permutation can fix,
+            // while a genuine order mismatch is fixed by reordering one list.
+            // `claimed` tracks the sigmas earlier arguments already took so the
+            // repeat is caught first — otherwise `combined(S_A, S_A)` with two
+            // sigmas declared falls into the order arm below and is told to
+            // reorder lists that cannot be reordered into agreement.
+            let mut claimed: Vec<String> = Vec::with_capacity(args.len());
+            for (idx, arg) in args.iter().enumerate() {
+                let named = arg_sigma_name(arg, sigma_names)?;
+                // Duplicate `sigma` declarations are rejected upstream, so no
+                // declaration order can put one name in two slots and no
+                // argument order can either — say what is actually wrong, and
+                // leave this on the generic `E_PARSE` rather than the
+                // reorder-shaped `E_SIGMA_ORDER_MISMATCH` a consumer would act
+                // on. Both reachable shapes (a second sigma declared or not)
+                // report the same defect with the same code; the counts are
+                // interpolated so the message stays honest if `args.len()` is
+                // ever not pinned to the model's `n_sigma()`.
+                if let Some(first) = claimed.iter().position(|c| *c == named) {
+                    return Err(format!(
+                        "[error_model] argument {} names sigma '{}', which argument \
+                         {} already claims; each argument of a single-endpoint \
+                         [error_model] must name a distinct declared sigma (this \
+                         model needs {}, [parameters] declares {}). Give argument \
+                         {} its own sigma.",
+                        idx + 1,
+                        named,
+                        first + 1,
+                        args.len(),
+                        sigma_names.len(),
+                        idx + 1
+                    ));
+                }
+                match sigma_names.get(idx) {
+                    Some(slot) if *slot == named => {}
+                    // Both remedies are spelled out because both have a silent
+                    // failure mode. `block_sigma` pushes its diagonals along the
+                    // written name order, so reordering the names without
+                    // permuting the lower triangle swaps the two variances and
+                    // parses clean. And reordering the *arguments* of a
+                    // `combined` model swaps which sigma is the proportional
+                    // component — it makes the file honest about a model the
+                    // user did not write, which is the #1001 failure mode again.
+                    //
+                    // `None` is folded in here rather than given its own arm.
+                    // The repeat guard above leaves every `named` distinct and
+                    // declared, so by argument `idx` at least `idx + 1` sigmas
+                    // exist and `get(idx)` is always `Some` — an arm no input can
+                    // reach is also an arm no test can cover, and it would sit in
+                    // the diff as permanently-missed lines. Binding the whole
+                    // `Option` keeps the impossible case a message rather than an
+                    // `unreachable!()` panic in the parser.
+                    slot => {
+                        return Err(format!(
+                            "[error_model] argument {} names sigma '{}', but a \
+                             single-endpoint [error_model] has its sigmas consumed \
+                             positionally from the [parameters] declaration order, \
+                             which supplies '{}' in that position. Reorder the sigma \
+                             declarations to match the [error_model] argument order \
+                             — if a block_sigma supplies them, permute its lower \
+                             triangle to match the new name order. Reordering the \
+                             arguments instead also parses, but for `combined` it \
+                             swaps which sigma is the proportional component, so it \
+                             changes the model rather than fixing the spelling.",
+                            idx + 1,
+                            named,
+                            slot.map(String::as_str).unwrap_or("<none>")
+                        ));
+                    }
+                }
+                claimed.push(named);
             }
             Ok((model, ErrorSpec::Single(model)))
         }
@@ -14239,10 +14307,9 @@ fn used_sigma_names(
 ) -> std::collections::HashSet<String> {
     let sigma_set: std::collections::HashSet<&str> =
         sigma_names.iter().map(|s| s.as_str()).collect();
-    let ident_re = Regex::new(r"[A-Za-z_]\w*").unwrap();
     let mut out = std::collections::HashSet::new();
     let scan = |arg: &str, out: &mut std::collections::HashSet<String>| {
-        for m in ident_re.find_iter(arg) {
+        for m in ARG_IDENT_RE.find_iter(arg) {
             if sigma_set.contains(m.as_str()) {
                 out.insert(m.as_str().to_string());
             }
@@ -14286,9 +14353,8 @@ fn used_sigma_names(
 fn arg_sigma_name(arg: &str, sigma_names: &[String]) -> Result<String, String> {
     let sigma_set: std::collections::HashSet<&str> =
         sigma_names.iter().map(|s| s.as_str()).collect();
-    let ident_re = Regex::new(r"[A-Za-z_]\w*").unwrap();
     let mut found: Vec<String> = Vec::new();
-    for m in ident_re.find_iter(arg) {
+    for m in ARG_IDENT_RE.find_iter(arg) {
         let id = m.as_str();
         if sigma_set.contains(id) && !found.iter().any(|f| f == id) {
             found.push(id.to_string());
@@ -14301,7 +14367,7 @@ fn arg_sigma_name(arg: &str, sigma_names: &[String]) -> Result<String, String> {
             // the historical "unknown sigma" wording. A non-trivial expression
             // that names no sigma is the #484-specific error.
             let trimmed = arg.trim();
-            if Regex::new(r"^[A-Za-z_]\w*$").unwrap().is_match(trimmed) {
+            if BARE_IDENT_RE.is_match(trimmed) {
                 Err(format!(
                     "[error_model] references unknown sigma '{}' \
                      (declare it in [parameters])",

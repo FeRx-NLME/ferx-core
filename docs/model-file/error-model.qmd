@@ -52,7 +52,7 @@ $$
 \text{Var}(DV) = (\sigma_1 \cdot f)^2 + \sigma_2^2
 $$
 
-Use when both proportional and additive error sources are present. Requires two sigma parameters defined in `[parameters]`.
+Use when both proportional and additive error sources are present. Requires two sigma parameters defined in `[parameters]`. The first argument is the **proportional** sigma and the second the **additive** one — see [Sigma order](#sigma-order) below, which also explains why the argument order and the declaration order must agree.
 
 ::: {.callout-warning}
 ## Choose the additive initial estimate on the scale of your data
@@ -78,6 +78,71 @@ concentrations reach the hundreds/thousands of ng/mL. Seeding the additive
 matching Pumas). Re-seeding the additive SD to a data-scaled value (tens of
 ng/mL) reaches the correct basin.
 :::
+
+## Sigma order {#sigma-order}
+
+A single-endpoint `[error_model]` — one `DV ~ ...` line with no `CMT=` prefix and no `if/else` selector — consumes its sigmas **positionally**, from the order they are declared in `[parameters]`. The names written in the arguments are checked against the declared order and must match it:
+
+```
+[parameters]
+  sigma PROP_ERR ~ 0.04 (sd)     # slot 1 -> the proportional component
+  sigma ADD_ERR  ~ 0.1  (sd)     # slot 2 -> the additive component
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+```
+
+Writing the arguments in any other order is an error (`E_SIGMA_ORDER_MISMATCH`):
+
+```
+[parameters]
+  sigma ADD_ERR  ~ 0.1  (sd)
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)   # rejected: slot 1 holds ADD_ERR
+```
+
+**Fix it by reordering the `sigma` declarations**, so that the declared order matches what the arguments say:
+
+```
+[parameters]
+  sigma PROP_ERR ~ 0.04 (sd)
+  sigma ADD_ERR  ~ 0.1  (sd)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)   # accepted, and means what it reads as
+```
+
+::: {.callout-warning}
+## Reordering the *arguments* is not the same fix
+
+`combined(ADD_ERR, PROP_ERR)` also makes the two lists agree, and also parses — but it makes `ADD_ERR` the **proportional** coefficient and `PROP_ERR` the additive term. That is a different model, not a different spelling of the same one. It is honest (the file now says what it does), but it is almost certainly not what you meant, and the objective moves by the full 40×-sigma gap. Reorder the declarations.
+
+If the sigmas come from a `block_sigma`, reordering the names is **not enough on its own**: the lower triangle is positional too, so it must be permuted to match the new name order. Rewriting
+
+```
+block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]
+```
+
+as `block_sigma (ADD_ERR, PROP_ERR) = [0.04, 0.10, 1.00]` parses cleanly and silently swaps the two variances; the matching rewrite is `[1.00, 0.10, 0.04]`.
+:::
+
+::: {.callout-important}
+## Why this is an error rather than a re-binding
+
+Before [#1001](https://github.com/FeRx-NLME/ferx-core/issues/1001) the names were checked for existence and then discarded, so the second example above **fitted silently against `ADD_ERR`** as its proportional component. The model validated, the fit converged, and the reported standard errors and diagnostics were all internally consistent — there was nothing to notice. Two sigmas 40× apart shifted the objective by more than 100 units on a 24-observation dataset with no diagnostic at any level.
+
+The per-CMT and covariate-selected forms below bind strictly **by name**, so the same file meant two different things depending on which `[error_model]` form it used.
+
+Rejecting keeps one resolution rule for the whole positional path. It is a breaking change only for models that were already getting a different fit from the one they appeared to describe.
+:::
+
+A sigma declared *after* the ones the error model names is untouched by this rule — it simply occupies a later slot that the error model never loads. This is the shape used by, for example, FREM models, where a trailing sigma is consumed by machinery other than `[error_model]` (`[fit_options] frem_sigma`, which binds by name and does not care which slot it lands in).
+
+Such a sigma still earns the generic "declared in `[parameters]` but not referenced in `[error_model]`" warning. For a sigma that really is unused, that warning is right. For one consumed by another block — `frem_sigma` is the case in the tree today — the warning's "it will not affect predictions" clause is wrong, and it can be ignored.
+
+Per-CMT (`CMT=N:`) and covariate-selected (`if/else`) error models resolve each endpoint's sigmas **by name**, so declaration order does not constrain them. Note the corollary: the same two sigma declarations and the same `combined(...)` arguments are rejected as a single-endpoint model and accepted with a `CMT=` prefix or inside a selector, because those forms carry resolved indices and the single-endpoint form does not. Prefer fixing the declaration order over reaching for a per-CMT prefix to silence the error — the prefix changes how observations are dispatched, not just how the sigmas are bound.
 
 ## Time-varying / covariate-dependent magnitude
 

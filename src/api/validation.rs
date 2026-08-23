@@ -3172,8 +3172,11 @@ fn parse_warning_to_code(w: &str) -> &'static str {
 
 /// Map a free-text parser error string to a single structured [`Diagnostic`].
 /// Recognises the `"Missing [X] block"` shape (→ `E_MISSING_BLOCK`, with the block
-/// name attached), the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`), and the
-/// dose-attribute double use (→ `E_DOSE_ATTR_DOUBLE_USE`, #993); everything else is
+/// name attached), the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`), the
+/// dose-attribute double use (→ `E_DOSE_ATTR_DOUBLE_USE`, #993), the
+/// single-endpoint sigma order mismatch (→ `E_SIGMA_ORDER_MISMATCH`, #1001), and
+/// the block-header shapes (→ `E_UNKNOWN_BLOCK` / `E_DEPRECATED_BLOCK` /
+/// `E_BLOCK_INSTANCE_NAME` / `E_BLOCK_FEATURE_DISABLED`, #1040); everything else is
 /// a generic `E_PARSE`. Each shape is matched on a sentinel the emitting site is
 /// pinned to by a test, so a reworded message cannot silently fall through to the
 /// catch-all.
@@ -3206,6 +3209,24 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
         || err.contains("mapping from the `pk(...)` call")
     {
         return Diagnostic::error("E_DOSE_ATTR_DOUBLE_USE", err.to_string());
+    }
+    // #1001: a single-endpoint `[error_model]` naming its sigmas in an order other
+    // than the `[parameters]` declaration order — which used to fit silently against
+    // the leading slots instead. Its own code for the same reason as #993: the remedy
+    // is mechanical (reorder one list), so a consumer can offer it rather than
+    // reprinting prose. The sentinel is the rule clause the emitting arm in
+    // `build_error_spec` always carries.
+    //
+    // Matched on a substring rather than a prefix, so it must not overlap the
+    // block-header shapes below: this message opens with `[error_model] argument
+    // …`, which none of their `strip_prefix` sentinels match, and none of their
+    // messages carries this clause. The two families are independent, so their
+    // relative order here is not load-bearing.
+    //
+    // No `.with_block()`: the message already opens with `[error_model] `, and the
+    // renderer prefixes whatever block it is given — setting both prints it twice.
+    if err.contains("consumed positionally") {
+        return Diagnostic::error("E_SIGMA_ORDER_MISMATCH", err.to_string());
     }
     // #1040: the block-header shapes the parser used to drop silently.
     // `check_block_names` writes each offending header as ``[name] (line N)``,
