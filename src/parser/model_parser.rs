@@ -9121,8 +9121,13 @@ fn analytical_role_binding<'a>(
         if value.as_str() != name && value.to_lowercase() != name {
             continue;
         }
+        // Keep the LARGEST role key, matching which mapping actually binds: both
+        // `analytical_dose_attr_slot_map` and `build_pk_param_fn` iterate the map
+        // in ascending key order and let the last write win, so with `lagtime=X`
+        // and `alag=X` both present it is `lagtime=` that reaches the slot. Quoting
+        // the other one would name a mapping whose removal changes nothing.
         match hit {
-            Some((k, _)) if k <= key => {}
+            Some((k, _)) if k >= key => {}
             _ => hit = Some((key, value)),
         }
     }

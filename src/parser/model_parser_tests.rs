@@ -2422,6 +2422,71 @@ fn analytical_dose_attr_diagnostic_is_deterministic_across_parses() {
 }
 
 #[test]
+fn analytical_lag_alias_spellings_each_name_their_own_mapping() {
+    // `lagtime=` and `alag=` are two spellings of the SAME slot, so a `pk(...)`
+    // call may legally carry both. Two cases, both of which the remediation clause
+    // has to get right on its own — the role lookup cannot just take the first map
+    // entry that routes to the lag slot.
+    //
+    // (a) Two different parameters on the one slot. Whichever is read, the message
+    //     must quote *that* parameter's own spelling.
+    let two = |readout: &str| {
+        format!(
+            "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVKA(1.5, 0.0, 1e15)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  TLAGA = TVLAG
+  TLAGB = TVLAG
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=TLAGA, alag=TLAGB)
+
+[scaling]
+  obs_scale = 2.0 * {readout}
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+        )
+    };
+    for (readout, want) in [
+        ("TLAGA", "remove the `lagtime=TLAGA` mapping"),
+        ("TLAGB", "remove the `alag=TLAGB` mapping"),
+    ] {
+        let err = expect_parse_err(&two(readout));
+        assert!(
+            err.contains(want),
+            "reading `{readout}` must quote its own mapping, got: {err}"
+        );
+    }
+
+    // (b) One parameter under both spellings. Both `analytical_dose_attr_slot_map`
+    //     and `build_pk_param_fn` iterate ascending and let the last write win, so
+    //     `lagtime=` is the mapping that actually reaches the slot — quoting
+    //     `alag=` would name one whose removal changes nothing.
+    let both = analytical_dose_attr_src(
+        "lagtime=X, alag=X",
+        "X = TVLAG",
+        "[scaling]\n  obs_scale = 2.0 * X",
+    );
+    let err = expect_parse_err(&both);
+    assert!(
+        err.contains("remove the `lagtime=X` mapping"),
+        "must quote the binding mapping, not the shadowed alias, got: {err}"
+    );
+}
+
+#[test]
 fn analytical_dose_attr_read_in_adaptive_observe_is_rejected() {
     // The controller signal. A dose attribute read here biases every dose the
     // controller then emits by exactly that attribute.
