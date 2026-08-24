@@ -11,9 +11,9 @@
 //!
 //! - SAEM's M-step, where η is a draw from the E-step ([`crate::estimation::saem`]);
 //! - variational inference, where η is a reparameterized draw from `q_φ`
-//!   ([`crate::estimation::vi`]).
+//!   (the next consumer; not yet in the tree).
 //!
-//! Extracted verbatim from `saem.rs` so both callers share one copy; SAEM's
+//! Extracted verbatim from `saem.rs` so the next consumer shares one copy; SAEM's
 //! behaviour is unchanged.
 //!
 //! Both entry points return `(nll, grad)` so the caller gets the objective for
