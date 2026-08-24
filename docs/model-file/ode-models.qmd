@@ -348,11 +348,40 @@ remove it from [odes]; if it is meant to be an ordinary parameter, rename it —
 ```
 
 The rule follows the **expressions compiled against your individual parameters**,
-not the block headings: every read inside `[odes]` counts, including an
-`init(state) = …` seed, and so does the `[adaptive_dosing] observe` signal. That
-last one matters most — `observe` is what the `when` rules compare against, so a
-double-applied `F` there biases the titration decision itself and every dose the
-controller goes on to emit, not just a reported number.
+not the block headings: every read in the `[odes]` **RHS** counts, and so does the
+`[adaptive_dosing] observe` signal. That last one matters most — `observe` is what
+the `when` rules compare against, so a double-applied `F` there biases the
+titration decision itself and every dose the controller goes on to emit, not just
+a reported number.
+
+::: {.callout-note}
+## An `init(state) = …` seed is *not* a double use
+
+An initial condition is not an absorbed dose. The engine seeds the state with the
+raw expression value and applies dose attributes only at dose events, so
+
+```text
+[odes]
+  init(central) = F * 100.0
+  d/dt(central) = -(CL/V) * central
+```
+
+applies `F` **once**, to a quantity nothing else scales — the bioavailable residue
+of a pre-study 100 mg dose. This is accepted
+([#1046](https://github.com/FeRx-NLME/ferx-core/issues/1046)); it was rejected
+before, which made a correct model unwritable and advised the one repair that is
+always wrong for it — renaming the parameter whose meaning *is* bioavailability.
+
+The RHS is genuinely different: `d/dt(central) = … F …` folds `F` into the flux,
+so every gram that ever entered the compartment is multiplied by it a second time.
+That stays rejected.
+
+NONMEM agrees. `A_0(1) = F1*100` with `F1 = 0.5` seeds 50, not 25, and
+`A_0(1) = ALAG1*100` is deposited unshifted — each run byte-identical to the twin
+seeding from an ordinary parameter of the same value
+(`nonmem_anchor/odes_init_dose_attr_{f,lag}_{A,B}.ctl`). The analytical
+`[initial_conditions]` block carries the same carve-out.
+:::
 
 The same rule covers `LAGTIME`/`ALAG` and the compartment-indexed `F{n}` /
 `ALAG{n}` / `LAGTIME{n}` below. These apply to **every** dose, so the collision

@@ -139,6 +139,106 @@ fn analytical_central_init_matches_ode_init() {
     }
 }
 
+/// Both engines' initial-condition blocks accept a read of a **dose attribute**, and
+/// they must agree on what it means.
+///
+/// The two carve-outs shipped separately — analytical `[initial_conditions]` in
+/// #1004/#1035, ODE `[odes] init(...)` in #1046 — each argued from its own engine's
+/// source that an initial condition is not an absorbed dose, so `F` applies to it
+/// exactly once and the seed is not a double use. Nothing tied the two arguments
+/// together. This does: one model, `f=F` on the analytical side and the same `F`
+/// routed to the engine's dose slot by name on the ODE side, seeding an identical
+/// baseline while `F` also scales the oral dose.
+///
+/// If either engine ever started applying `F` to its seed, this diverges — the
+/// analytical `add_analytical_init` impulse is F-bypassed (`analytical_init_concentration`
+/// propagates with `F = 1`) and `OdeSpec::initial_state` writes the raw value, so
+/// today they coincide. NONMEM agrees with both
+/// (`nonmem_anchor/odes_init_dose_attr_f_{A,B}.ctl`, #1046).
+#[test]
+fn analytical_and_ode_init_agree_when_the_seed_reads_bioavailability() {
+    const F_THETAS: &str = r"
+[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVF(0.5, 0.0, 1.0)
+
+  omega ETA_CL ~ 0.09
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = TVF
+";
+    let an = parse_full_model(&format!(
+        "{F_THETAS}
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+
+[initial_conditions]
+  init(central) = F * 30 * V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+    ))
+    .expect("analytical model with an F-reading init parses (#1004/#1035)")
+    .model;
+
+    let ode = parse_full_model(&format!(
+        "{F_THETAS}
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  init(central) = F * 30 * V
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - CL / V * central
+
+[scaling]
+  obs_scale = V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+    ))
+    .expect("ODE model with an F-reading init parses (#1046)")
+    .model;
+
+    let pop = population();
+    let pa = predict(&an, &pop, &an.default_params);
+    let po = predict(&ode, &pop, &ode.default_params);
+    assert_eq!(pa.len(), po.len());
+    assert!(!pa.is_empty());
+
+    // The seed carries `F` exactly once: baseline concentration at t=0 is
+    // `F * 30 * V / V = 0.5 * 30 = 15`. A seed that also went through the dose's
+    // bioavailability would read 7.5 here, and one that ignored `F` would read 30 —
+    // so this single value separates all three readings.
+    assert!(
+        (pa[0].pred - 15.0).abs() < 1e-6,
+        "analytical baseline at t=0 should be F*30 = 15, got {}",
+        pa[0].pred
+    );
+
+    for (x, y) in pa.iter().zip(po.iter()) {
+        let tol = ATOL + RTOL * x.pred.abs();
+        assert!(
+            (x.pred - y.pred).abs() <= tol,
+            "t={:.3}: analytical PRED {:.6} vs ODE PRED {:.6} (|diff| {:.2e} > tol {:.2e})",
+            x.time,
+            x.pred,
+            y.pred,
+            (x.pred - y.pred).abs(),
+            tol
+        );
+    }
+}
+
 /// `predict_iov` is the prediction path the importance-sampling (IMP) estimator
 /// and the IOV likelihood use — even for non-IOV models. It must carry the
 /// initial-compartment amount too, otherwise IMP mispredicts baseline subjects

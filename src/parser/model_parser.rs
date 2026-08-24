@@ -10013,11 +10013,28 @@ fn build_ode_spec(
     // `ode_template`-generated equations plus the injected joint-PK-TTE
     // `d/dt(__chz_n)` hazard lines are all in `stmts_owned` by now.
     //
-    // `init(state) = <expr>` directives are pulled out of the block *before*
-    // `stmts_owned` is parsed, so they must be walked separately or the rule has a
-    // hole exactly the size of its own remedy: a user told to drop `F` from the RHS
-    // could move it into `init(central) = F * AMT` and get the same silent double
-    // application from the same block.
+    // `init(state) = <expr>` reads are deliberately NOT folded in (#1046), mirroring
+    // the analytical `[initial_conditions]` carve-out (#1004/#1035). An initial
+    // condition is not a dose: `OdeSpec::initial_state` seeds the state vector with
+    // the raw expression value, and `F` / lag are resolved through `DoseAttrMap` at
+    // dose events only — a path the seed never takes. So `init(central) = F * 100`
+    // (the bioavailable residue of a pre-study dose) applies `F` exactly once, to a
+    // quantity the engine never scales, and rejecting it would make a correct model
+    // unwritable while advising the wrong repair — renaming the very parameter whose
+    // meaning *is* bioavailability. The RHS is a genuine doubling by contrast:
+    // `d/dt(central) = … F …` folds `F` into the flux, so every gram that ever
+    // entered the compartment is multiplied by it a second time (the `F²` defect
+    // #993 exists for), which is why the RHS walk below stays.
+    //
+    // Anchored on NONMEM 7.6.0 (`nonmem_anchor/odes_init_dose_attr_{f,lag}_{A,B}.ctl`):
+    // `A_0(1) = F1*100` with `F1 = 0.5` seeds 50, not 25, and `A_0(1) = ALAG1*100`
+    // seeds at t=0 unshifted — each table byte-identical to its twin seeding from an
+    // ordinary parameter of the same value, so the reference engine likewise treats a
+    // dose-attribute name as an ordinary value in an initial condition.
+    //
+    // For the same reason a `D{n}`/`R{n}` read in an init is not a prediction-path
+    // read: the marking loop below is driven by this same `rhs_reads` set, so leaving
+    // init out keeps it from recording one.
     let mut rhs_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut collect_reads = |e: &Expression| {
         if let Expression::Variable(name) = e {
@@ -10025,9 +10042,6 @@ fn build_ode_spec(
         }
     };
     visit_stmt_nodes(&stmts_owned, &mut collect_reads);
-    for (_, init_expr) in &init_specs {
-        visit_expr_nodes(init_expr, &mut collect_reads);
-    }
     check_dose_attr_double_use(
         &indiv_names_owned,
         &indiv_slots_owned,
