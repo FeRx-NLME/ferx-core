@@ -154,6 +154,21 @@ fits a diagonal covariance: `O(d)` parameters per subject rather than `O(d²)`, 
 preferable once `n_eta` is large — at the cost of a looser bound whenever the true posterior
 is correlated, which for CL/V it almost always is.
 
+How much looser is not a matter of taste: for a Gaussian posterior with precision `H = Σ⁻¹`, the
+best diagonal `q` matches the diagonal of the **precision** (`Sₖₖ = 1/Hₖₖ`, which is smaller than
+`Σₖₖ`), and the bound it pays is
+
+$$
+-2\cdot\mathrm{ELBO}_{\text{mean field}} - (-2 \log p(y)) = -\log(1 - r^2)
+$$
+
+with `r` the posterior *precision* correlation, for two random effects; in general the cost is
+`log(det Σ · Πₖ Hₖₖ)`, which is zero exactly when the posterior is uncorrelated. On warfarin with
+`block_omega (ETA_CL, ETA_V)` the
+two families converge to the same parameter vector (max drift 0.89%) and `mean_field`'s bound is
+**7.70 units** looser. So `mean_field` is a scaling decision, and on a strongly correlated
+posterior it costs real tightness — check `elbo_tightness_ratio` after switching.
+
 ### The KL half: `vi_kl`
 
 By default the `KL(q ‖ N(0, Ω))` term is taken in closed form, so only the data term is
@@ -298,7 +313,9 @@ omega ETA_KA ~ 0.30
 — the `ETA_KA`/`ETA_CL` and `ETA_KA`/`ETA_V` covariances are not parameters, and VI leaves them
 at exactly zero rather than letting them pick up sampling correlation. Both `vi_omega_update`
 routes preserve this: the closed-form maximizer masks `Ω` directly, and the Adam route simply
-gets no gradient at those coordinates. A `FIX`ed random effect likewise keeps its whole declared
+gets no gradient at those coordinates. Cross-checked externally — nlmixr2 7.0's `est = "emvi"`
+holds the same two slots at exactly zero on the same declaration, under both variational
+families, while estimating the declared block. A `FIX`ed random effect likewise keeps its whole declared
 row and column of `Ω`, not just its own variance.
 
 ## Standard errors
@@ -315,6 +332,11 @@ this small is measurable rather than lucky: the Laplace covariance matches NUTS 
 same fits, so the true per-subject posterior *is* Gaussian here, and a Gaussian `q` has nothing to
 get wrong. Both limits of this model are Gaussian — data-rich by asymptotics, data-poor because
 the `N(0, Ω)` prior dominates.
+
+The **correlations** hold up as well as the variances, which matters because they are what
+`full_rank` exists for: against the same NUTS reference the variational correlations land within
+**0.008** — and they are not small correlations being reproduced, `(V, KA)` sits at `+0.67`. So
+`eta_covs` is validated as a covariance, not as a set of variances.
 
 The **20–25%** figure in the literature comes from deep compartment models, where a
 neural-network structural model gives the per-subject posterior a geometry a 1-cpt model cannot
@@ -553,25 +575,73 @@ covered here.
 
 ## Comparison with NONMEM
 
-*Still to be added: the NONMEM FOCEI column, as a slow-tests-gated convergence test.* What is
-measured so far, on warfarin (10 subjects, 110 observations, 1-cpt oral, lognormal `η` on
-CL/V/KA, proportional error):
+On warfarin (10 subjects, 110 observations, 1-cpt oral, lognormal `η` on CL/V/KA, proportional
+error), all four estimators fit the same file from the same initial estimates:
 
-| | TVCL | TVV | TVKA | σ | OFV |
-|---|---|---|---|---|---|
-| ferx AGQ (`n_agq = 9`) | 0.132687 | 7.7375 | 0.8109 | 0.010565 | −285.977 |
-| ferx FOCEI | 0.132695 | 7.7377 | 0.8108 | 0.010565 | −286.004 |
-| nlmixr2 FOCEI | 0.132738 | 7.7385 | 0.8285 | 0.010574 | −285.947 |
-| ferx VI (`vi_mc_samples = 128`) | — | — | — | 0.011234 | −285.425 |
+| | TVCL | TVV | TVKA | ω²(CL) | ω²(V) | ω²(KA) | σ | OFV |
+|---|---|---|---|---|---|---|---|---|
+| **NONMEM FOCEI** (`METHOD=COND INTERACTION`) | 0.132695 | 7.73771 | 0.81080 | 0.028588 | 0.009592 | 0.335880 | 0.010565 | **−286.004219** |
+| ferx FOCEI | 0.132695 | 7.73771 | 0.81080 | 0.028590 | 0.009592 | 0.335871 | 0.010565 | **−286.004220** |
+| ferx AGQ (`n_agq = 9`) | 0.132687 | 7.73746 | 0.81090 | 0.028592 | 0.009592 | 0.336036 | 0.010565 | −285.977 |
+| ferx VI (`vi_mc_samples = 128`) | 0.132693 | 7.73775 | 0.81092 | 0.028592 | 0.009587 | 0.335997 | 0.011175 | −285.519 |
+| nlmixr2 FOCEI | 0.132738 | 7.73851 | 0.82849 | 0.030642 | 0.010205 | 0.342155 | 0.010574 | −285.947 |
 
-The FOCEI columns also pin the objective *convention*: ferx omits `½·n_obs·log 2π` and nlmixr2
+**ferx FOCEI reproduces NONMEM's FOCEI to six decimal places on the OFV** and to 5–6 significant
+figures on every parameter. That is what makes the row above it worth reading: the predictor, the
+dose bookkeeping, the residual model and the objective's additive constants are pinned against
+NONMEM, so where VI differs, the difference is the estimator rather than the plumbing.
+
+VI lands on the same solution — `θ` within 0.015%, `Ω` within 0.05%, and its Laplace objective
+0.49 units off. The one parameter that misses is `σ`, at **+5.8%**: that is VI's Monte-Carlo
+floor, and it falls as `vi_mc_samples` rises — 8 → 32 → 128 walks it 0.013763 → 0.011646 →
+0.011234 on the same model started closer in. VI's OFV here is the Laplace objective at the VI
+estimate (`vi_final_ofv = laplace`), so it is comparable with the rest of the column;
+`−2·ELBO` never is.
+
+::: {.callout-warning}
+## From a distant start, VI may need more than the default 25 000 iterations
+
+This table starts VI where NONMEM's control stream starts (`TVCL 0.2, TVV 10, TVKA 1.5,
+σ 0.02`), and from there it takes **~34 250 iterations** to settle. At the default
+`vi_iters = 25000` it stops on the ceiling with `TVCL` 4.9% high, reporting
+`converged: false` and `elbo_tightness_ratio: 2.7` — correctly, and those two fields are the
+thing to check. If a VI fit reports non-convergence with an `elbo_tightness_ratio` far from 1,
+raise `vi_iters` before concluding anything about the model. Starting closer (the same model
+from `0.13 / 8 / 1.0`) needs ~17 500.
+:::
+
+The FOCEI rows also pin the objective *convention*: ferx omits `½·n_obs·log 2π` and nlmixr2
 has an `adjObf` flag defaulting to `TRUE`, and the measured offset between them is zero — a
-mismatch would have shown as `110 · log 2π ≈ 202`. VI's OFV here is the Laplace objective at the
-VI estimate (`vi_final_ofv = laplace`), so it is directly comparable with the rest of the column.
+mismatch would have shown as `110 · log 2π ≈ 202`.
 
 The harness that produces these numbers, including a cross-implementation comparison against
 nlmixr2 7.0's `est = "emvi"` — the only other variational-inference implementation in a
-pharmacometrics package — lives in `tools/vi-emvi-comparison/`.
+pharmacometrics package — lives in `tools/vi-emvi-comparison/`. Against `emvi` on this model, ferx
+agrees to 0.01–0.05% on `θ` and 0.2–0.6% on `Ω`; per-subject, both implementations recover the
+exact posterior's *correlations* (from a per-subject NUTS reference), ferx to ≤0.008 and `emvi` to
+≤0.20. The reproducible tests are `tests/warfarin_vi_nonmem.rs` (this table) and
+`tests/vi.rs::vi_recovers_the_agq_solution_on_warfarin`.
+
+::: {.callout-note collapse="true"}
+## Comparing ferx's `−2·ELBO` with nlmixr2's `viElbo`
+
+The two are not on the same scale, and the difference is a constant rather than a mystery.
+nlmixr2's `emvi` reports the ELBO on the **log** scale and drops two per-subject constants that a
+fully-normalized ELBO carries — the `η`-prior normalizer `−(d/2)·log 2π` and the Gaussian entropy
+constant `+(d/2)(1 + log 2π)` — which net to `+d/2` each. Both tools drop the observation constant
+`½·n_obs·log 2π` (the NONMEM convention). So
+
+```
+ferx_ELBO = viElbo + N·d/2,     and ferx reports −2·ELBO
+```
+
+which on warfarin (`N = 10`, `d = 3`) is `+15`. Read `emvi`'s value off a **tail mean** of its
+trace, not the last iterate: one iterate of a stochastic optimizer carries the noise of its final
+step (per-iterate `sd ≈ 1.7` here), enough to put the converted number below the marginal it is
+supposed to bound. Converted properly, ferx's bound is the tighter of the two by 1–3 units on
+this model — though the two fits sit at slightly different parameter vectors, and an ELBO only
+bounds `−2 log L` at the vector where it was evaluated.
+:::
 
 ## References
 

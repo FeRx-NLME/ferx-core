@@ -289,18 +289,34 @@ Persistent state lives **outside** the repo at `~/.local/share/ferx-vi-validatio
 tree, and `results/` is regenerable. Deleting that directory undoes the whole install; the system
 R library is never touched.
 
-### 4.7 Open items — resolved on the first run
+### 4.7 Open items — all resolved (the last two on 2026-08-24, from nlmixr2est's source)
 
 - ~~The step size under `adaptEta = FALSE`.~~ **`etaScale`, which defaulted to `0.1`.** It is the
   ADVI step-size constant, not a reparameterization — see §4.5.
 - ~~The per-subject layout of `mu` and `Lpack`.~~ **`mu` is `N × n_eta` (10 × 3), `Lpack` /
   `scale` is `N × n_eta(n_eta+1)/2` (10 × 6), raw lower-triangular, subject order matching the
   data.** `Lpack` and `scale` are the same object under `fullRank`.
-- **Still open: row- vs column-major packing of `Lpack`.** Row-major reproduces plausible
-  variances and column-major does not, so row-major is very likely right — but it is not yet
-  *proven*, and it gates the off-diagonal half of Tier 2. See §4.11.
-- **Still open:** whether `emvi`'s ELBO uses the sampled-KL form or the analytic split. Converged
-  results should agree either way; it only matters for localizing a disagreement.
+- ~~Row- vs column-major packing of `Lpack`.~~ **Row-major — read from the source (2026-08-24),
+  not inferred.** nlmixr2est 7.0.2 `src/inner.cpp` draws `η = μ + L·ε` indexing
+  `Lpack(s, i*(i+1)/2 + j)` for `j ≤ i` (`:15107`) and unpacks the reported covariance the same
+  way, `for r, for c ≤ r: L(r,c) = Lpack(i, r*(r+1)/2 + c)` (`:15293`): row `i` starts at offset
+  `i(i+1)/2`, column `j` within it. The earlier plausibility argument was right, and
+  `tier2-offdiag.R` now confirms it against a third quantity — the Anchor C NUTS posterior —
+  where row-major reproduces the reference correlations to 0.20 worst-case and column-major
+  misses by up to **1.39**, which is outside the range a correlation can be wrong by at all.
+  This unblocks the off-diagonal half of Tier 2; see §4.14a.
+- ~~Whether `emvi`'s ELBO uses the sampled-KL form or the analytic split, and what scale it is
+  on.~~ **Sampled, on the log scale, with two per-subject constants dropped — also read from the
+  source.** `adviElboGradCoreFR` (`:15059`) reports
+  `Σᵢ[−likInner0(ηᵢ) + Σₖ log|L_kk,i|] − ½·N·log|Ω|`, averaged over `nMc` draws (`:15239`).
+  `likInner0` (`:1738`) is the negative log joint on the 1× scale with no `2π` constants, so
+  relative to a fully-normalized ELBO this drops the `η`-prior normalizer `−(d/2)·log 2π` and the
+  Gaussian entropy constant `+(d/2)(1 + log 2π)`, netting `+d/2` per subject:
+
+      ferx_ELBO = emvi_ELBO + N·d/2        (+15 on warfarin, N = 10, d = 3)
+
+  and ferx reports `−2·ELBO`. Both sides drop the observation constant `½·n_obs·log 2π`, which
+  §4.4 *measured* rather than assumed. This is the Tier-3 blocker; see §4.14a.
 
 ### 4.8 What this anchor cannot establish
 
@@ -652,9 +668,8 @@ Both implementations now track the exact reference to within ~13 %, and ferx's r
 posterior width scales with `σ²`. The across-subject spread is comparable too: ferx 2.4× / 1.7× /
 5.0× against `emvi` 2.9× / 2.3× / 5.9×, where §4.11 reported 2.0× against 23.8×.
 
-**Still not compared:** the off-diagonals, pending §4.7's row- vs column-major question. Row-major
-remains the better fit — column-major drives the `S₂₂` median to 0.457 with a low of 0.06×, which
-is not a plausible posterior — but that is evidence, not proof, and `S₁₁` is invariant either way.
+**The off-diagonals** were left out here pending §4.7's row- vs column-major question. That is now
+closed — row-major, from nlmixr2est's source — and the comparison is in §4.14a.
 
 **What this leaves as the honest Anchor B result.** Tier 1 parity on population parameters, now
 anchored on AGQ rather than on mutual agreement; Tier 2a parity on per-subject means; Tier 2b
@@ -662,6 +677,58 @@ agreement to ~13 % against ground truth, with each tool's residual explained by 
 claim §4.8 makes still stands and matters more than before: this is co-validation, and the value
 of the exercise turned out to be less that the two tools agreed than that a third quantity showed
 where they both did not.
+
+### 4.14a Tier 2b off-diagonals and Tier 3, both unblocked (2026-08-24)
+
+§4.7's last two open items were the two things §4.14 could not report. Both are now settled from
+nlmixr2est's own source, which turns each from an inference into a reading.
+
+**Tier 2b, the off-diagonals.** With the packing proven row-major, the whole per-subject
+covariance is comparable — and it is read against Anchor C's NUTS posterior, not against the
+other tool. `Rscript tools/vi-emvi-comparison/tier2-offdiag.R`, median and worst case over the
+10 subjects:
+
+| correlation | `(CL,V)` | `(CL,KA)` | `(V,KA)` |
+|---|---|---|---|
+| NUTS (reference) | 0.316 | 0.189 | 0.672 |
+| ferx VI | 0.319 | 0.194 | 0.670 |
+| `emvi` | 0.432 | 0.185 | 0.667 |
+| worst \|ferx − NUTS\| | 0.004 | 0.006 | 0.008 |
+| worst \|`emvi` − NUTS\| | 0.200 | 0.200 | 0.097 |
+
+Both implementations recover the correlation structure — including the substantial `+0.67` on
+`(V, KA)`, the regime a `mean_field` `q` could not represent at all. ferx tracks the exact
+posterior to **≤0.008**; `emvi` to **≤0.20**, with the caveat that matters: Anchor C fixes every
+population parameter at the AGQ estimate and `emvi`'s `q` comes from its own fit, whose `σ` is
+~8% away, so part of that spread is the parameter difference rather than the `q`. The
+column-major reading, for contrast, misses by up to **1.39** — impossible for a correlation, and
+that is what makes the packing verdict a measurement rather than a plausibility argument.
+
+**Tier 3, the ELBO.** The conversion of §4.7 makes the two bounds comparable for the first time.
+In ferx's convention (`−2·ELBO`; lower is tighter), reading `emvi`'s bound off the mean of its
+last 50 iterates (per-iterate `sd` ≈ 1.71–1.75 in ELBO units, so `SE ≈ 0.25`, i.e. `±0.50` after
+the `−2` scaling — the harness itself prints the tail-5 mean, which is the same number to a
+quarter-unit but with 3× the standard error):
+
+| arm | ferx `−2·ELBO` | `emvi`, converted | difference |
+|---|---|---|---|
+| diagonal `Ω` | −285.242 | −282.786 | `emvi` looser by **2.46 ± 0.50** |
+| mixed `Ω`, `full_rank` | −285.576 | −282.875 | `emvi` looser by **2.70 ± 0.50** |
+| mixed `Ω`, `mean_field` | −277.873 | −276.823 | `emvi` looser by **1.05 ± 0.48** |
+
+The diagonal row needed one harness re-run to be readable (2026-08-24). The first pass stored only
+that arm's **last iterate** — `128.347`, which at `sd` 1.71 sits ~1σ above the local mean and
+converts to `−286.693`, i.e. 0.72 *below* AGQ's `−2 log L = −285.977`, which a bound cannot do.
+Read off the tail mean instead (`126.393`) it lands at `−282.786`, comfortably above the marginal
+and in line with the mixed arms. That was the same last-iterate trap §4.11a fell into, in the
+opposite direction, and nothing about `emvi` changed: the re-run reproduced every arm's estimates
+to the digit — it is seeded — and only added the trace the harness now keeps (`elbo_summary` on
+the diagonal arm too).
+
+So the Tier-3 result, on all three arms: **the two ELBOs agree on scale once the `N·d/2` constant
+is applied, and ferx's bound is the tighter of the two by 1–3 units.** What this does *not* settle
+is why — the arms sit at different parameter vectors (§4.13), and a bound is a bound at the vector
+where it was evaluated. Tier 3 is now comparable; it is not yet attributable.
 
 ## 5. Anchor C — per-subject NUTS  *(the only route to L3)*
 
@@ -771,9 +838,12 @@ variance claim and needed none of it.
 
 ## 6. Anchor D — FOCEI / SAEM / NONMEM / nlmixr2 `focei`  *(plumbing and placement)*
 
+**Status:** **done** (2026-08-24). Results in [§6.1](#61-results-2026-08-24); the CLAUDE.md
+"compare with NONMEM" obligation for `method = vi` is discharged, and
+`docs/estimation/vi.qmd` carries the filled table instead of the placeholder.
+
 **Establishes:** L4, plus the shared predictor / dose-bookkeeping / residual-model plumbing. This
-is `VI_PLAN.md` §6 test 12, and it is the CLAUDE.md "compare with NONMEM" deliverable —
-`docs/estimation/vi.qmd` still carries the placeholder.
+is `VI_PLAN.md` §6 test 12.
 
 Be clear about what it buys. These estimators target the same parameters by different
 approximations, so every disagreement has an escape hatch, and the `elbo_oracle.rs` argument for
@@ -790,6 +860,49 @@ results are *inference* claims about the method, not implementation claims. They
 over many seeds with known truth — the shape of `tests/vi_dcm_omega_recovery.rs` — and no second
 tool settles them. As `vi.qmd` says of the Janssen table: one fold, one replicate, one seed cannot
 distinguish that from sampling noise.
+
+### 6.1 Results (2026-08-24)
+
+**No NONMEM run was needed.** `tests/nonmem/warfarin_imp.ctl` chains
+`$EST METHOD=COND INTERACTION` → `$EST METHOD=IMP`, and its **first** step is FOCEI on exactly the
+Anchor B model — `ADVAN2 TRANS2`, lognormal `η` on CL/V/KA, proportional error, and the same
+initial estimates as `examples/warfarin.ferx`. So the licensed run already committed for the IMP
+anchor carries the FOCEI column too: `TABLE NO. 1` of `warfarin_imp.ext`. NONMEM is not installed
+on this machine and did not have to be. (`tests/warfarin_imp_nonmem.rs` asserts `TABLE NO. 2`;
+the new `tests/warfarin_vi_nonmem.rs` asserts `TABLE NO. 1`.)
+
+| | TVCL | TVV | TVKA | ω²CL | ω²V | ω²KA | σ (SD) | OFV |
+|---|---|---|---|---|---|---|---|---|
+| **NONMEM FOCEI** | 0.132695 | 7.73771 | 0.810796 | 0.0285884 | 0.00959179 | 0.335880 | 0.0105651 | **−286.004219** |
+| ferx FOCEI | 0.132695 | 7.73771 | 0.810796 | 0.028590 | 0.009592 | 0.335871 | 0.010565 | **−286.004220** |
+| ferx AGQ (`n_agq = 9`) | 0.132687 | 7.73746 | 0.810900 | 0.028592 | 0.009592 | 0.336036 | 0.010565 | −285.977 |
+| ferx VI | 0.132693 | 7.73775 | 0.810916 | 0.028592 | 0.009587 | 0.335997 | 0.011175 | −285.519 |
+| nlmixr2 FOCEI | 0.132738 | 7.73851 | 0.828490 | 0.030642 | 0.010205 | 0.342155 | 0.010574 | −285.947 |
+
+**ferx FOCEI reproduces NONMEM's FOCEI to six decimal places on the OFV** (−286.004220 against
+−286.004219) and to 5–6 significant figures on every parameter. That is the whole value of this
+anchor for VI: it pins the shared plumbing — predictor, dose bookkeeping, residual model, and the
+objective's additive constants — so a VI disagreement cannot be attributed to any of them. Note
+what it does *not* say: FOCEI is the same approximation in both engines, so this is an
+implementation check, not a statement about the estimator.
+
+VI lands on the same basin from NONMEM's own starting values: `θ` within **0.015%**, `Ω` within
+**0.05%**, and its Laplace objective 0.49 units off. `σ` is again the one parameter that misses,
+by **+5.8%** — the Monte-Carlo floor of §4.11a, unchanged by the external comparison.
+
+**One finding that only this anchor could produce: `vi_iters = 25000` is not enough from a
+distant start.** From NONMEM's initial estimates (`0.2 / 10 / 1.5`, `σ` 0.02) VI needs
+**~34 250 iterations** to settle. At the default it stops on the ceiling with `−2·ELBO ≈ −240`
+and `TVCL` **4.9%** high — a fit that reports failure honestly, but a fit no assertion should be
+read against. Given the room it converges by its own criterion and lands where the table says.
+The `tests/vi.rs` fixture starts at `0.13 / 8 / 1.0` and needs ~17 500, which is why every
+previous run of this model missed the ceiling. Documented, default unchanged; it belongs with the
+draw-count finding of §4.11a as a "VI's stopping behaviour depends on where you start it" pair.
+
+**Test.** `tests/warfarin_vi_nonmem.rs`, three `slow-tests`-gated cases (FOCEI, AGQ, VI). FOCEI
+and AGQ carry **0.1%** and **0.5%** parameter bands; VI carries 1% on `θ`/`Ω`, 15% on `σ` and 3
+OFV units, and additionally asserts `−2·ELBO ≥` NONMEM's OFV — the bound property against an
+external reference.
 
 ## 7. Anchor E — Janssen et al.'s Julia implementation  *(narrow; lowest priority)*
 
@@ -820,13 +933,14 @@ citation.
 | `−2·ELBO` is an upper bound on `−2 log L` | oracle (zero gap) + theory | **A** |
 | `elbo_tightness_ratio ≈ 1` ideal; gap `≈ ½ tr(H·S)` | heuristic, calibrated on two runs | **A** |
 | Closed-form `Ω*` is the exact ELBO maximizer | FD check (§6.4) | **A**, **B** (same M-step) |
-| `block_omega` structural zeros preserved, both routes | internal + **ferx arms confirmed** (§4.13) | **B** (`emvi` only) |
-| `mean_field` bound looser than `full_rank` when correlated | **measured: 7.70 units at a common parameter vector, drift 0.89 %** (§4.13) | closed on the ferx side; `emvi`'s arms still drift 5.7 % |
+| `block_omega` structural zeros preserved, both routes | internal + **ferx arms confirmed** (§4.13) + `emvi` both families | **B** — closed |
+| `mean_field` bound looser than `full_rank` when correlated | **closed**: both families' ELBO at *one* parameter vector, against the closed form `−log(1 − r²)` on the posterior precision correlation — `elbo_agq_bound.rs::the_mean_field_bound_is_looser_than_full_rank_at_one_parameter_vector` | **A** (the unit test), corroborated by **B** |
 | VI understates posterior variance by ~20–25% | ~~Janssen's authority~~ **measured ≤4% here, and 0.2% on the anchoring dataset** (§5.1) | closed for this model family; the DCM regime is untested |
 | `Ω_iov` ~24% low | one simulated recovery | **C** + replicates |
-| `Ω` collapse driven by capacity vs distinct covariate patterns | `vi_dcm_omega_recovery.rs` | **D** + replicates |
+| `Ω` collapse driven by capacity vs distinct covariate patterns | `vi_dcm_omega_recovery.rs` | **D** + replicates (D done; the replicates are not) |
 | Path derivative lowers gradient variance vs standard | cited (Roeder 2017) | needs `vi_estimator` first |
-| `θ/Ω/σ` land in the right place on warfarin | **AGQ + both FOCEI + `emvi`** (§4.14) | closed |
+| `θ/Ω/σ` land in the right place on warfarin | **AGQ + both FOCEI + `emvi` + NONMEM FOCEI** (§4.14, §6.1) | closed |
+| the per-subject `q` recovers the posterior *correlations*, not just variances | **measured against NUTS: ferx ≤0.008, `emvi` ≤0.20** (§4.14a, §5.1) | **C**, cross-checked by **B** |
 | VI's OFV sits ~10 units below FOCEI's | ~~two implementations agreeing~~ **retracted** (§4.11a) | n/a — it was two defects |
 | Janssen fold-1 reproduction | one out-of-tree run | **E** |
 
@@ -840,6 +954,8 @@ Checked 2026-08-19 on this machine.
 | R 4.5 + `rxode2`, `numDeriv`, `reticulate` | present | B, D |
 | `nlmixr2est` | **7.0.2 installed** (2026-08-19) at `~/.local/share/ferx-vi-validation/Rlib`, with rxode2 5.1.6 and RcppParallel 6.2.0 — prebuilt arm64 binaries, no compilation. The system library's 4.1.1 is untouched. Re-provision with `tools/vi-emvi-comparison/run.sh` | **B** (done) |
 | numpyro / jax | **numpyro 0.21.0 + jax 0.10.2 installed** (2026-08-20) in an isolated venv at `$FERX_VI_STATE/pyenv`, built from `/opt/anaconda3/bin/python3.11` (the system `python3` is 3.14 with no `numpy` and no jax wheels). Re-provision with `tools/vi-nuts-anchor/run.sh` | **C** (done) |
+| NONMEM | **absent, and not needed** — Anchor D reads the FOCEI step of the already-committed `tests/nonmem/warfarin_imp.ext` (§6.1) | D (done) |
+| nlmixr2est **source** (CRAN tarball, read-only) | fetched 2026-08-24 to settle §4.7's `Lpack` and ELBO conventions; not installed, not committed | B (done) |
 | cmdstan / cmdstanr / rstan | absent | C (fallback) |
 | Julia | absent | E |
 
@@ -869,20 +985,37 @@ new Python stack (roughly an afternoon).
 
 1. ~~**Anchor A**~~ — **done**, see §3, including both follow-ups (2-D `η` fixture,
    `agq_eval_only`).
-2. **Anchor D**, filling the `vi.qmd` NONMEM placeholder — the standing CLAUDE.md obligation.
-3. ~~**Anchor B** on warfarin~~ — **done and then corrected**: §4.11 (first run), §4.11a (what it
-   got wrong and why), §4.14 (both sides converged), §4.13 (mixed-`Ω` arms). Remaining:
-   - settle nlmixr2's Cholesky packing to finish the Tier-2 off-diagonals (§4.7);
-   - reconcile the two ELBO scales for Tier 3 (§4.7);
-   - re-run the mixed-`Ω` arms of §4.13 under the corrected settings, so their absolute numbers
-     match §4.14 (claim (a)'s verdict does not depend on it);
+2. ~~**Anchor D**, filling the `vi.qmd` NONMEM placeholder~~ — **done**, §6.1. No NONMEM run was
+   needed: the FOCEI step of the committed `warfarin_imp` reference *is* the column. ferx FOCEI
+   matches it to six decimals on the OFV; VI lands on the same basin from NONMEM's own initial
+   estimates. Test: `tests/warfarin_vi_nonmem.rs`. One finding came out of it — `vi_iters = 25000`
+   stops short from a distant start (~34 250 needed), documented, default unchanged.
+3. ~~**Anchor B** on warfarin~~ — **done, corrected, and now complete**: §4.11 (first run), §4.11a
+   (what it got wrong and why), §4.14 (both sides converged), §4.13 (mixed-`Ω` arms), §4.14a
+   (off-diagonals and Tier 3). All four follow-ups are closed:
+   - ~~settle nlmixr2's Cholesky packing to finish the Tier-2 off-diagonals~~ — **row-major**, read
+     from nlmixr2est's source and confirmed against the NUTS arbiter (§4.7, §4.14a);
+   - ~~reconcile the two ELBO scales for Tier 3~~ — **`ferx_ELBO = emvi_ELBO + N·d/2`**, derived
+     from the source, and now comparable on **all three** arms: the diagonal one took one harness
+     re-run (2026-08-24) to store a tail mean rather than a last iterate, which moved it from an
+     apparent bound violation to `−282.786` (§4.7, §4.14a);
+   - ~~re-run the mixed-`Ω` arms of §4.13 under the corrected settings~~ — **already done**: the
+     saved `emvi-results.rds` has every block arm at `iters = 20000`, which is what §4.13's
+     re-run box reports. This checklist line was stale, not outstanding;
    - ~~test the Polyak-vs-last-iterate explanation for the `S₁₁` spread~~ — **dropped**: the
      spread was under-convergence and the explanation was directionally impossible (§4.11a).
 
-   Claim (b) still needs a Tier-1 fixed-parameter test rather than more harness runs (§4.13).
-   Three code findings came out of this anchor and are **not** validation items: the FOCEI
+   ~~Claim (b) still needs a Tier-1 fixed-parameter test rather than more harness runs (§4.13).~~
+   **Landed**: `elbo_agq_bound.rs::the_mean_field_bound_is_looser_than_full_rank_at_one_parameter_vector`
+   evaluates both families at one parameter vector and one posterior mode by deterministic
+   quadrature, and checks the gap against the closed form `−log(1 − r²)` on the posterior
+   *precision* correlation — 4–8% agreement, where substituting the covariance diagonal for the
+   precision diagonal (the natural wrong `q`) reads 17.1%.
+   Four code findings came out of these two anchors and are **not** validation items: the FOCEI
    structural-zero asymmetry (§4.13, **unfixed**); the VI draw-count default, where
-   `vi_mc_samples = 8` stops short on warfarin (§4.11a, **documented, default unchanged**); and
+   `vi_mc_samples = 8` stops short on warfarin (§4.11a, **documented, default unchanged**); the
+   `vi_iters = 25000` ceiling, which stops short from a distant start (§6.1, **documented,
+   default unchanged**); and
    VI reporting `converged: true` after 500 iterations with `elbo_tightness_ratio: 78` when all
    population parameters are FIXed (**fixed**: the parameter-stability criterion was comparing a
    constant vector against itself and overriding the objective test; the same run now goes 6250
