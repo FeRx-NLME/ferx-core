@@ -282,6 +282,9 @@ pub(crate) fn compile_observe(
         // ODE-only path: any integrated state is valid, no forbidden names (#650).
         &[],
         declared_covariates,
+        // `[scaling]` named intermediates (#1030) are local to that block; the
+        // `observe` expression is its own one-line readout with nothing to inline.
+        &[],
         &mut observe_warnings,
     )?;
     Ok((out_fn, cov_names))

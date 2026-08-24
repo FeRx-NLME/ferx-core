@@ -110,6 +110,10 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **A `[derived]` row aggregate followed by more expression is now an error instead of silently
+  dropping the rest (#1030 review).** `CMAX = max(IPRED) * 2` parsed as the aggregate and discarded
+  the `* 2`, reporting the unscaled maximum. There is no aggregate form that continues into a larger
+  expression, so it now says so rather than returning a wrong number.
 - **A zero, negative, or non-finite residual-error magnitude is now rejected (#484 / #1029).** The
   magnitude multiplies a sigma loading, so a zero one — an MBMA arm with no reported standard error,
   say — collapses that observation's variance onto the internal `1e-12` floor and lets a single row
@@ -240,6 +244,28 @@ section of the SDLC for the versioning policy).
   stopped theta from fixing.
 
 ### Added
+- **`[scaling]` accepts named intermediates, expressions can be split across lines, and `min`/`max`
+  take two arguments (#1030).** Three restrictions that individually looked defensible combined to
+  make a standard bounded-endpoint readout unmaintainable: a model-based meta-analysis logit-Emax
+  readout with the published `[0.01, 0.99]` clamp came out as one ~200-character line with the same
+  sub-expression written four times, because there was nowhere to name it. Now: (1) any `[scaling]`
+  line whose key is not `obs_scale` / `y` declares a **named intermediate** usable by the entries
+  below it, following the same define-above-use-below rule as `[individual_parameters]` —
+  intermediates are inlined, so covariates reached only through one are still required data columns
+  and the dose-attribute double-use rejection still sees them; (2) a long expression may be
+  **continued across lines** by starting the continued line with an operator or ending the previous
+  one with it, in `[individual_parameters]`, `[odes]`, `[scaling]`, `[derived]`, and
+  `[initial_conditions]`; (3) **`min(a, b)`
+  and `max(a, b)`** are available everywhere the DSL parses expressions, desugaring to the inline
+  conditional so they differentiate and compile exactly like the hand-written `if (a >= b) a else b`
+  — each argument appears twice in the desugared tree, so clamp a named intermediate rather than a
+  long expression. In `[derived]`, where `min`/`max` also name the row aggregate, the two are told
+  apart by the second argument: a comparison is a row filter, anything else is the numeric clamp.
+  The three-line readout now reads the way the published Mlxtran does. Two smaller diagnostics come
+  with it: `max(a, b)` used to report `Missing closing parenthesis for function max`, which sent the
+  reader after a bracket bug that did not exist — arity errors now say so — and a `[scaling]` key
+  that is neither `obs_scale`/`y` nor read by any entry is rejected, so a misspelt `obs_scal = V`
+  still fails loudly instead of silently disabling scaling.
 - **First-class residual weighting: `weight = <expr>` on the error model (#1029).** Meta-analysis
   rows are trial-arm summaries that differ in precision, and inverse-variance weighting is what makes
   an MBMA an MBMA. Until now it had to be hand-built in three places that must agree — divide `DV` in
