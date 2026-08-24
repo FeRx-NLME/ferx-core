@@ -14,10 +14,26 @@
 //! ```
 //!
 //! and the probe calls a segment stiff when `λ_max ≥` [`STIFF_RE_LAMBDA_THRESHOLD`] — i.e.
-//! when `τ_fast` is below [`STIFF_TAU_FAST`] in the model's own time unit. Measured across the
-//! ferx-testdata ODE library (15 models × 5 solvers, #978): the three genuinely stiff models
-//! read `λ_max` 90–132 while the twelve non-stiff ones read `≤ 12.4`, a 7× gap with no
-//! overlap.
+//! when `τ_fast` is below [`STIFF_TAU_FAST`] in the model's own time unit.
+//!
+//! Measured per segment across the ferx-testdata ODE library (#978):
+//!
+//! | model family | `λ_max` across segments | verdict |
+//! |---|---|---|
+//! | cyclophosphamide | 20 – 234 | stiff everywhere |
+//! | TMDD SAD (`cr`, `crib`, `ib`) | 1.7 – 126 | **straddles the threshold within one model** |
+//! | TMDD SAD (`qss`, `mm`, `linear`) | 1.8 – 2.1 | non-stiff |
+//! | busulfan, pembrolizumab | 0.1 – 4.6 | non-stiff |
+//!
+//! Note the TMDD row, because it is the one that decides the shape of this module. The issue
+//! that proposed the probe measured those models at their *declared initial condition* only and
+//! read them as uniformly non-stiff (`≤ 12.4`), which suggested a comfortable 7× gap between
+//! the stiff and non-stiff families and a threshold with nothing near it. Per segment there is
+//! no such gap: the same model reads 3.7 on its low-dose subjects and 126 on its high-dose ones.
+//! Stiffness here is a property of *where the model is*, not of the model, and a single
+//! per-model verdict cannot be right for both ends of a dose range. Hence a per-segment probe —
+//! and hence the guard in `integrate_resolved_g`, which stops being a formality once a real
+//! model is expected to cross the threshold in normal operation.
 //!
 //! **The threshold is dimensional.** `λ_max` is a rate, so a model written in days reads 24×
 //! smaller than the same model written in hours. It is calibrated for the PK convention the
@@ -60,10 +76,16 @@ use crate::sens::num::PkNum;
 
 /// `|Re λ|max` at or above which [`resolve_method`] calls a segment stiff.
 ///
-/// Calibrated on the ferx-testdata ODE library (see the module docs): stiff models read
-/// 90–132, non-stiff ones `≤ 12.4`. `30` sits in the empty middle of that gap, far enough
-/// above the non-stiff ceiling that ordinary absorption/elimination rates never reach it and
-/// far enough below the stiff floor that a genuinely stability-limited system is not missed.
+/// Calibrated on the ferx-testdata ODE library (see the module docs). It sits well above the
+/// rates ordinary absorption/elimination produce — the non-stiff models there top out at 4.6,
+/// and even the fast TMDD parameterizations sit at 1.8–2.1 — and well below the 20–234 the
+/// stiff cyclophosphamide models read at every segment.
+///
+/// It is *not* a gap with nothing in it. The TMDD `cr`/`crib`/`ib` models sweep 3.7 to 126
+/// across their own segments, so they cross it within a single fit, on the high-dose subjects.
+/// That is the intended behaviour rather than a miscalibration — those segments really are
+/// stiff, and fitting one of them under `auto` is 160× faster than under the explicit default —
+/// but it does mean escalation is a routine event on real models, not a rare one.
 pub const STIFF_RE_LAMBDA_THRESHOLD: f64 = 30.0;
 
 /// The same threshold expressed as a timescale: a segment is stiff when its fastest mode
