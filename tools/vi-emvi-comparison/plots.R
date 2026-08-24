@@ -307,17 +307,20 @@ if (!file.exists(anchor_c)) {
       subtitle = sprintf(paste0(
         "Zero is the exact posterior mean, from NUTS at a fixed population estimate (Anchor C). ",
         "Both tools sit on it:\nferx within %.1e and emvi within %.1e, against an η range of ",
-        "%.2f–%.2f across subjects. So the means are\nnot where the two implementations differ — ",
-        "the variances are (figures 3–4), and σ is (figure 1)."),
+        "%.2f–%.2f across subjects — so the means are not\nwhere any disagreement between these ",
+        "implementations lives. For that, see the variances (figures 3–4)\nand the population ",
+        "parameters (figure 1)."),
         max(abs(dq$d[dq$tool == "ferx"])), max(abs(dq$d[dq$tool == "nlmixr2"])),
         min(apply(ac$nuts_mean, 2, function(z) diff(range(z)))),
         max(apply(ac$nuts_mean, 2, function(z) diff(range(z))))),
       x = "subject", y = "mean − NUTS mean  (×10⁻³)",
-      caption = paste0(
+      caption = sprintf(paste0(
         "absolute, not relative: several subjects have a near-zero mean, where a percentage ",
-        "misreports a 10⁻³ gap\nemvi's q comes from its own fit (σ ~2% from AGQ's) while NUTS ",
-        "and ferx's q both sit at the AGQ estimate,\nso part of the orange spread is that, not ",
-        "the inference · ferx VI with the population parameters FIXed lands within 9.5e-05")
+        "misreports a 10⁻³ gap\nemvi's q comes from its own fit (σ %+.1f%% from AGQ's) and ferx's ",
+        "from its own (σ %+.1f%%), while the NUTS reference sits at the AGQ\nestimate — so part of ",
+        "each spread is that parameter difference rather than the inference"),
+        100 * (utils::tail(nm_vec(e$emvi), 1) / pull_pop(agq)[["sigma"]] - 1),
+        100 * (pull_pop(f_vi)[["sigma"]] / pull_pop(agq)[["sigma"]] - 1))
     ) + theme_ferx()
 
   ggsave(file.path(figs, "eta-means-vs-nuts.png"), p2, width = 8.4, height = 4.0, dpi = 200)
@@ -331,6 +334,28 @@ lv <- q |> select(id, eta, ferx = var_ferx, nlmixr2 = var_emvi) |>
   pivot_longer(c(ferx, nlmixr2), names_to = "tool", values_to = "var")
 ref <- tibble(id = rep(seq_len(nrow(Href)), 3), eta = factor(rep(ETA, each = nrow(Href)), ETA),
               var = as.vector(Href))
+# Medians and ranges against the reference, for the subtitles below. These used to be typed in,
+# and they were the ~1% arm's numbers: on the 10% arm they asserted a 12% variance excess and a
+# sigma 6.3% high where the truth is ~1.00 and +0.18%. Anything a subtitle claims is computed.
+refm <- tibble(id = rep(seq_len(nrow(Href)), 3), eta = factor(rep(ETA, each = nrow(Href)), ETA),
+               ref = as.vector(Href))
+# `refrat`, not `rat`: figure 4 below binds `rat` to its own long-format frame, and these
+# subtitles are evaluated after that point -- so a shared name silently emptied the ranges and
+# printed "Inf--Infx" rather than failing.
+refrat <- q |> left_join(refm, by = c("id", "eta")) |>
+  transmute(id, eta, ferx = var_ferx / ref, nlmixr2 = var_emvi / ref)
+refrat_med <- refrat |> group_by(eta) |>
+  summarise(f = median(ferx), e = median(nlmixr2), .groups = "drop")
+med_str <- function(col) paste(sprintf("%.2f", refrat_med[[col]]), collapse = " / ")
+rng_str <- function(col) {
+  v <- refrat[[col]]
+  stopifnot("range asked for a column refrat does not carry" = length(v) > 0 && all(is.finite(v)))
+  sprintf("%.2f–%.2f×", min(v), max(v))
+}
+# ferx's own sigma against AGQ's: posterior width scales with sigma^2, so this is what a uniform
+# variance offset SHOULD equal if sigma is the whole of it. Stating both lets the reader check.
+sig_ratio <- pull_pop(f_vi)[["sigma"]] / pull_pop(agq)[["sigma"]]
+
 spread <- q |> group_by(eta) |>
   summarise(f = max(var_ferx) / min(var_ferx), e = max(var_emvi) / min(var_emvi), .groups = "drop") |>
   mutate(lab = sprintf("across-subject spread   ferx %.1f×    emvi %.1f×", f, e))
@@ -346,11 +371,12 @@ p3 <- ggplot(lv, aes(factor(id), var)) +
   scale_y_log10(labels = label_scientific(digits = 2), expand = expansion(c(0.06, 0.22))) +
   labs(
     title = "Tier 2b — per-subject posterior variances, against a near-exact reference",
-    subtitle = paste0(
+    subtitle = sprintf(paste0(
       "Diagonal of each subject's variational covariance, log scale, with AGQ's Laplace ",
-      "posterior H⁻¹ as the\nreference. Both implementations track it: medians 1.12 / 1.13 / 1.13 ",
-      "(ferx) and 1.05 / 0.97 / 1.18 (emvi).\nferx's uniform ~12% excess is its σ still sitting ",
-      "6.3% high — posterior width scales with σ²."),
+      "posterior H⁻¹ as the\nreference. Median ratio to it: %s (ferx), %s (emvi). ferx's σ is ",
+      "%+.1f%% of AGQ's, and posterior width\nscales with σ², so a uniform offset of %.2f× is ",
+      "what σ alone would account for."),
+      med_str("f"), med_str("e"), 100 * (sig_ratio - 1), sig_ratio^2),
     x = "subject", y = "posterior variance (log scale)",
     caption = paste0(
       "diagonal only · the off-diagonals are compared separately, against NUTS rather than AGQ: ",
@@ -379,11 +405,12 @@ p4 <- ggplot(rat, aes(factor(id), r, fill = tool)) +
   scale_y_log10(breaks = c(0.5, 0.75, 1, 1.5, 2), labels = c("0.5×", "0.75×", "1×", "1.5×", "2×")) +
   labs(
     title = "Tier 2b, as a ratio — how far off each tool is, per subject",
-    subtitle = paste0(
-      "Each tool's posterior variance divided by the AGQ reference. On the line means correct. ",
-      "The two miss it\ndifferently: ferx is a tight band ~12% high (a uniform σ² effect), emvi is ",
-      "centred on it but scatters\n(0.65–1.51× against ferx's 1.11–1.45×). The earlier reading — a ",
-      "24× spread and a 30% systematic\ndeficit — was an under-converged run on both sides."),
+    subtitle = sprintf(paste0(
+      "Each tool's posterior variance divided by the AGQ reference. On the line means correct.\n",
+      "ferx spans %s (median %s), emvi %s (median %s).\nA tight band away from 1 is a scale ",
+      "error — σ, since width scales with σ². A wide band centred on 1 is\nnoise in the reported ",
+      "q, not bias."),
+      rng_str("ferx"), med_str("f"), rng_str("nlmixr2"), med_str("e")),
     x = "subject", y = "variance ÷ AGQ reference",
     caption = "log scale · a point below the line means the tool reports the tighter posterior"
   ) + theme_ferx()

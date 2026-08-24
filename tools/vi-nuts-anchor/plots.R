@@ -75,8 +75,39 @@ load_run <- function(file, label) {
   )
 }
 
-full <- load_run(file.path(res, "anchor-c.json"), "warfarin")
-sparse <- load_run(file.path(res, "anchor-c-sparse.json"), "2 obs/subject")
+# The regime strip labels the ARM, and its default is derived rather than hardcoded: the 1% arm
+# lives in `results`, the realistic one in `results-10pct`. FERX_ARM_LABEL overrides.
+arm_label <- Sys.getenv("FERX_ARM_LABEL", unset = {
+  b <- basename(res)
+  if (b == "results") "warfarin (~1% residual)" else sub("^results-", "", b)
+})
+full <- load_run(file.path(res, "anchor-c.json"), arm_label)
+# The thinned variant is optional: it exists for the ~1% arm, where the posterior is Gaussian in
+# both the data-rich and data-poor limits and sparsity was the only lever available. An arm
+# without it simply gets one regime.
+sparse_file <- file.path(res, "anchor-c-sparse.json")
+sparse <- if (file.exists(sparse_file)) {
+  load_run(sparse_file, "2 obs/subject")
+} else {
+  message("no anchor-c-sparse.json in ", res, " -- drawing the single regime")
+  list(ratios = NULL)
+}
+
+# Everything the subtitles claim is computed. They used to be typed in, and they carried the ~1%
+# arm's findings: "variances agree to 0.2%", "the true posterior IS Gaussian", "the published
+# 20-25% understatement does not appear". On the 10% arm all three are false -- VI understates
+# 3-4%, Laplace/NUTS is 0.966 rather than 1.000, so the posterior is NOT Gaussian to 0.1%, and an
+# understatement does appear. A figure that narrates the wrong dataset is worse than a bare one.
+med_of <- function(q) {
+  full$ratios |> filter(quantity == q) |> group_by(eta) |>
+    summarise(m = median(ratio), .groups = "drop")
+}
+fmt_med <- function(q) paste(sprintf("%.3f", med_of(q)$m), collapse = " / ")
+worst_under <- function(q) 100 * (1 - min(med_of(q)$m))
+gaussian_gap <- worst_under("Laplace ÷ NUTS")   # how far the true posterior is from Gaussian
+vi_gap <- worst_under("VI ÷ NUTS")              # how far q is from the truth
+nuts_mean <- fromJSON(file.path(res, "anchor-c.json"), simplifyVector = TRUE)$nuts_mean
+mean_err <- max(abs(full$vi_mean - nuts_mean))
 
 # ---- 1. the overlay ---------------------------------------------------------------------
 # Four subjects rather than ten: the point is that the curves sit on the histograms, and ten
@@ -105,13 +136,16 @@ p1 <- ggplot(dr, aes(draw)) +
   facet_wrap(~panel, scales = "free", ncol = 3) +
   labs(
     title = "Anchor C — the variational posterior is the posterior",
-    subtitle = paste0(
+    subtitle = sprintf(paste0(
       "Grey: the NUTS marginal for one subject's η, from 4 chains × 20 000 draws with 0 ",
       "divergences. Blue: the\nvariational Gaussian ferx reports, at the same fixed (θ, Ω, σ). ",
-      "Four subjects spanning the range of posterior\nwidths. Variances agree to 0.2%, means to ",
-      "2×10⁻⁵."),
+      "Four subjects spanning the range of posterior\nwidths. Median variance ratio %s; means ",
+      "agree to %.1e."),
+      fmt_med("VI ÷ NUTS"), mean_err),
     x = "η", y = "density",
-    caption = "warfarin, population parameters FIXed at the AGQ estimate so the comparison is about q alone · −2·ELBO −285.924 against −2 log L −285.977"
+    caption = sprintf(paste0(
+      "population parameters FIXed at the AGQ estimate, so the comparison is about q alone · ",
+      "results read from %s"), res)
   ) +
   theme_ferx() +
   theme(
@@ -123,7 +157,7 @@ ggsave(file.path(figs, "posterior-overlay.png"), p1, width = 8.4, height = 6.4, 
 # ---- 2. the published claim, measured ---------------------------------------------------
 vr <- bind_rows(full$ratios, sparse$ratios) |>
   filter(quantity == "VI ÷ NUTS") |>
-  mutate(regime = factor(regime, c("warfarin", "2 obs/subject")))
+  mutate(regime = factor(regime, unique(regime)))
 med <- vr |> group_by(regime, eta) |> summarise(m = median(ratio), .groups = "drop")
 p2 <- ggplot(vr, aes(factor(id), ratio)) +
   geom_hline(yintercept = 1, colour = REF, linewidth = 0.4) +
@@ -133,13 +167,16 @@ p2 <- ggplot(vr, aes(factor(id), ratio)) +
   facet_grid(regime ~ eta) +
   scale_y_continuous(labels = label_number(accuracy = 0.01)) +
   labs(
-    title = "The published 20–25% understatement does not appear on this model",
-    subtitle = paste0(
+    title = sprintf(
+      "The understatement, measured: %.1f%% here against the published 20–25%%",
+      vi_gap),
+    subtitle = sprintf(paste0(
       "Variational variance ÷ the exact posterior's, per subject. On the line means no ",
-      "understatement. Warfarin\nshows none (medians 1.00); thinning to two observations a ",
-      "subject brings out 4% on η V and η KA. Neither\nis 20–25% — that figure is from deep ",
-      "compartment models, whose posterior geometry a 1-cpt model\ncannot produce. See the next ",
-      "figure for why."),
+      "understatement.\nMedian ratio %s, i.e. up to %.1f%% understated. The published 20–25%% is ",
+      "from deep compartment models,\nwhose posterior geometry a 1-cpt model cannot produce — so ",
+      "read this as the effect's size in THIS regime,\nnot as a refutation. The next figure ",
+      "separates the family from the optimizer."),
+      fmt_med("VI ÷ NUTS"), vi_gap),
     x = "subject", y = "VI variance ÷ NUTS variance",
     caption = "diagonals only · the off-diagonals are compared in the overlay, where a wrong correlation shows as a tilted density rather than a number"
   ) + theme_ferx()
@@ -155,21 +192,26 @@ ord <- c("VI ÷ NUTS", "Laplace ÷ NUTS", "VI ÷ Laplace")
 # colour mean two things to anyone reading them together. Faceting keeps a single blue series.
 wr <- bind_rows(full$ratios, sparse$ratios) |>
   mutate(quantity = factor(quantity, ord),
-         regime = factor(regime, c("warfarin", "2 obs/subject")))
+         regime = factor(regime, unique(regime)))
 p3 <- ggplot(wr, aes(eta, ratio)) +
   geom_hline(yintercept = 1, colour = REF, linewidth = 0.4) +
   geom_point(position = position_jitter(width = 0.18, height = 0, seed = 1),
              colour = FERX, size = 1.9, stroke = 0) +
   facet_grid(regime ~ quantity) +
   labs(
-    title = "Why the understatement is small here: the true posterior is already Gaussian",
-    subtitle = paste0(
-      "Middle panel is the key. The Laplace covariance matches NUTS to 0.1% in both regimes, so ",
-      "the exact\nper-subject posterior *is* Gaussian and a Gaussian q has nothing to get wrong. ",
-      "A small left panel is\ntherefore a statement about the dataset, not a compliment to the ",
-      "estimator. Right panel: q found\nthat Gaussian.\n\nBoth limits of this model are Gaussian ",
-      "— data-rich by asymptotics, data-poor because the N(0, Ω) prior\ndominates — so testing ",
-      "the 20–25% claim needs a fixture chosen for posterior geometry, not sparsity."),
+    title = "Where the understatement comes from: the family, or the optimizer",
+    subtitle = sprintf(paste0(
+      "Middle panel is the key: Laplace ÷ NUTS is %s, so the exact posterior departs from ",
+      "Gaussian by %.1f%%.\nRight panel, VI ÷ Laplace at %s, says q found the best Gaussian ",
+      "available. Left panel is the two composed\n(%.1f%% total). %s"),
+      fmt_med("Laplace ÷ NUTS"), gaussian_gap, fmt_med("VI ÷ Laplace"), vi_gap,
+      if (gaussian_gap < 0.5) paste0(
+        "With the posterior Gaussian to under half a percent there is nothing here for a ",
+        "Gaussian q to get wrong, so the left panel is a statement about the dataset rather ",
+        "than a compliment to the estimator."
+      ) else sprintf(paste0(
+        "The family accounts for it: Laplace alone misses by %.1f%% against q's %.1f%%, so the ",
+        "optimizer contributes nothing measurable."), gaussian_gap, vi_gap)),
     x = NULL, y = "ratio"
   ) +
   theme_ferx() + theme(panel.grid.major.x = element_blank())
