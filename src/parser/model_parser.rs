@@ -246,6 +246,29 @@ fn analytic_readout_state_names(pk_model: PkModel) -> (Vec<String>, Vec<String>)
     (allowed, forbidden)
 }
 
+/// Compartment names rejected in a compartment-free (`$PRED`-equivalent) readout
+/// (#811). The model has no amounts at all, so the whole canonical vocabulary is
+/// forbidden — including `central`, which every other readout scope allows.
+///
+/// Rejecting them by name (rather than letting them fall through to an undefined
+/// identifier, or worse a silent covariate lookup) is what turns "I forgot the
+/// `pk` line" into a diagnostic that says so.
+fn algebraic_forbidden_state_names() -> Vec<String> {
+    [
+        "central",
+        "depot",
+        "peripheral",
+        "periph",
+        "peripheral1",
+        "periph1",
+        "peripheral2",
+        "periph2",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
 /// All variable names assigned anywhere in the statement tree, in
 /// first-occurrence order, deduplicated. Used by `[individual_parameters]`
 /// to enumerate "tv" parameters for the AD path and to populate the per-var
@@ -1230,6 +1253,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // the rest of this function — including ODE detection below — sees a normal
     // ODE model with no special-casing.
     apply_ode_template(&mut extracted)?;
+    // Compartment-free (`$PRED`-equivalent) structural model (#811): if
+    // [structural_model] declares its prediction directly instead of a `pk`/`ode`
+    // disposition, move the equation lines into [scaling] and leave a marker, so
+    // the ordinary Form C readout pipeline takes over from here. Runs after the
+    // `ode_template` rewrite (which this must never see) and before anything else
+    // reads the blocks. Also the single point where every [structural_model] line
+    // is classified, so an unrecognized one errors instead of being dropped.
+    apply_algebraic_structural(&mut extracted)?;
     // Prepare the absorption ODE-equivalent (#486; IG #790): the transit / IG closed forms
     // assume constant parameters over each absorption window, so they cannot serve a subject
     // whose parameters switch mid-profile (a `TIME`-dependent parameter or time-varying
@@ -1500,6 +1531,21 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .iter()
         .any(|l| l.starts_with("ode(") || l.starts_with("ode "));
 
+    // Compartment-free (`$PRED`-equivalent) model (#811). `apply_algebraic_structural`
+    // has already moved the equations into the `scaling` block and left the marker,
+    // so from here this is an "analytical" model (`ode_spec == None`) whose readout
+    // happens to reference no compartment amount.
+    let is_algebraic = is_algebraic_structural(struct_lines);
+    // A compartment-free model has no closed form consuming PK slots, so — unlike an
+    // analytical `pk ...` model, whose readout parameters must fit the small spare
+    // region `allocate_readout_extra_slots` owns (at most `0..=PK_IDX_MTT` minus the
+    // structural slots) — it lays its individual parameters out the way an ODE model
+    // does: every parameter gets a slot from the full `MAX_PK_PARAMS` layout via
+    // `ode_param_slots`. That is what lets an MBMA-style model carry dozens of
+    // fixed effects (#811); `build_pk_param_fn` then takes its ODE branch for both,
+    // keyed on the empty `pk_param_map`.
+    let uses_ode_param_layout = is_ode || is_algebraic;
+
     // #486 — desugar a bare θ/η in a Form-C `y = expr` readout into a synthetic
     // individual parameter (`__ferx_ro_th{i} = THETA(i)` / `…eta{k} = ETA(k)`). The
     // readout (rewritten in `parse_scaling_block` below) then references that
@@ -1516,7 +1562,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // `pk_model` nor `pk_param_map` exists yet at this point — so the analytical append is
     // deferred to that allocator (still before `build_pk_param_fn`, the real constraint).
     let mut readout_synth_params: Vec<ReadoutSynthParam> = match blocks.get("scaling") {
-        Some(lines) => collect_readout_theta_eta_synth(lines, &theta_names, &eta_names)?,
+        Some(lines) => collect_readout_theta_eta_synth(lines, &theta_names, &eta_names)
+            .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
         None => Vec::new(),
     };
     // #486 — the `__ferx_ro_` (Form-C readout) and `__ferx_pktime_` (direct `pk(...=TIME)`
@@ -1551,7 +1598,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // the synthetics would overflow, keep the readout on the FD fallback (its prior
     // behaviour) instead of erroring, and note it.
     let mut readout_fd_fallback_note: Option<String> = None;
-    if is_ode {
+    if uses_ode_param_layout {
         if !readout_synth_params.is_empty() {
             let free = ode_free_slot_count(&indiv_var_names);
             if readout_synth_params.len() > free {
@@ -1590,7 +1637,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // reserving PK_IDX_F / PK_IDX_LAGTIME). The RHS evaluator, the parameter
     // writer (`build_pk_param_fn`), and `pk_indices` all share this map.
     // Empty for analytical models, which route through `pk_param_map` instead.
-    let ode_slot_map: Vec<usize> = if is_ode {
+    let ode_slot_map: Vec<usize> = if uses_ode_param_layout {
         ode_param_slots(&indiv_var_names)?
     } else {
         Vec::new()
@@ -1700,7 +1747,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
         // TTE-only models have no [structural_model] block — supply a no-op placeholder.
         // The PK model is never invoked for pure-TTE subjects (no Gaussian observations).
-        let (pk_model, pk_param_map) = if struct_lines.is_empty() {
+        // A compartment-free model (#811) takes the same placeholder for the same
+        // reason: its prediction comes from the readout alone, and no closed form is
+        // ever evaluated (`CompiledModel::is_algebraic` gates every dispatch that
+        // would otherwise read `pk_model`).
+        let (pk_model, pk_param_map) = if struct_lines.is_empty() || is_algebraic {
             (PkModel::OneCptIv, HashMap::new())
         } else {
             parse_structural_model(struct_lines)?
@@ -1910,9 +1961,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &structural_vars,
         &analytical_modeled_slots,
         pk_model,
-        is_ode,
+        // A compartment-free model lays its parameters out like an ODE model
+        // (every one gets a slot from the full layout upstream), so this
+        // allocator — which exists to squeeze readout parameters into an
+        // analytical model's few spare slots — has nothing to do for it (#811).
+        uses_ode_param_layout,
         &readout_synth_params,
-    )?;
+    )
+    .map_err(|e| retarget_scaling_diag(is_algebraic, e))?;
     let readout_extra_slots = readout_alloc.slots;
     // #486: the analytical half of the direct-θ/η readout desugaring. The ODE path appended
     // its synthetics far upstream (its slot map was already known there); the analytical path
@@ -2732,14 +2788,20 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &pk_indices_for_scaling,
             &state_names_for_scaling,
             is_ode_model,
+            is_algebraic,
             model.pk_model,
             &model.kappa_names,
             &readout_synth_params,
             volume_indiv_name_for_scaling.as_deref(),
             &declared_covariate_names,
             &mut scaling_parse_warnings,
-        )?;
-        model.parse_warnings.extend(scaling_parse_warnings);
+        )
+        .map_err(|e| retarget_scaling_diag(is_algebraic, e))?;
+        model.parse_warnings.extend(
+            scaling_parse_warnings
+                .into_iter()
+                .map(|w| retarget_scaling_diag(is_algebraic, w)),
+        );
 
         // #993, the `[scaling]` half of the dose-attribute double-use rejection
         // (`[odes]`'s lives in `build_ode_spec`). A readout that divides by `F` gets
@@ -2752,32 +2814,44 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // The read-set is collected once and serves both engines: the rejection
         // below splits on the engine (ODE via `ode_slot_map`, analytical via the
         // `pk(...)` mapping — #1004), the `D{n}`/`R{n}` recording does not.
-        let mut scaling_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Named intermediates are inlined first (#1030), so a readout that reaches
-        // `F` through one is caught by the double-use rejection exactly as if it had
-        // been written inline. Scanning the intermediate lines directly instead would
-        // over-report — an intermediate no entry uses is rejected upstream, but one
-        // used by `y` only would still be charged against `obs_scale`.
-        let scaling_intermediates_for_reads = scaling_intermediates(scaling_lines)?;
-        for line in scaling_lines {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+        //
+        // A compartment-free model (#811) has no doses at all, so there is no dose
+        // attribute to apply twice and no coded `RATE` to record: the whole pass is
+        // inapplicable, and running it would misfire — its ODE-side arm routes by
+        // *name*, and a compartment-free model uses the ODE slot layout, so an
+        // ordinary parameter called `F` would be read as bioavailability.
+        let scaling_reads: std::collections::HashSet<String> = if is_algebraic {
+            std::collections::HashSet::new()
+        } else {
+            let mut scaling_reads: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            // Named intermediates are inlined first (#1030), so a readout that reaches
+            // `F` through one is caught by the double-use rejection exactly as if it had
+            // been written inline. Scanning the intermediate lines directly instead would
+            // over-report — an intermediate no entry uses is rejected upstream, but one
+            // used by `y` only would still be charged against `obs_scale`.
+            let scaling_intermediates_for_reads = scaling_intermediates(scaling_lines)?;
+            for line in scaling_lines {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let (key, value) = split_scaling_entry(trimmed)?;
+                let (base, _cmt) = parse_scaling_key(key)?;
+                if base != "y" && base != "obs_scale" {
+                    continue;
+                }
+                scaling_reads.extend(collect_indiv_param_reads(
+                    value,
+                    &theta_names_for_scaling,
+                    &eta_names_for_scaling,
+                    &indiv_var_names_for_scaling,
+                    &scaling_intermediates_for_reads,
+                    &format!("[scaling] {base}"),
+                )?);
             }
-            let (key, value) = split_scaling_entry(trimmed)?;
-            let (base, _cmt) = parse_scaling_key(key)?;
-            if base != "y" && base != "obs_scale" {
-                continue;
-            }
-            scaling_reads.extend(collect_indiv_param_reads(
-                value,
-                &theta_names_for_scaling,
-                &eta_names_for_scaling,
-                &indiv_var_names_for_scaling,
-                &scaling_intermediates_for_reads,
-                &format!("[scaling] {base}"),
-            )?);
-        }
+            scaling_reads
+        };
 
         // Both engines. The ODE side (#993) keys off `ode_slot_map` — name-based
         // routing is what makes a bare `F` a dose attribute there. The analytical
@@ -2787,7 +2861,9 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // twice, which is the same silence #993 closed — measured at exactly `F`
         // on the prediction on both ferx and NONMEM's analytical ADVAN2 routine
         // (`S2 = V/F1` with `F1` defined; see the anchor test).
-        if is_ode_model {
+        if is_algebraic {
+            // No doses: nothing to double-apply (see the note on `scaling_reads`).
+        } else if is_ode_model {
             check_dose_attr_double_use(
                 &indiv_var_names_for_scaling,
                 &ode_slot_map,
@@ -2813,12 +2889,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // data-aware check (#993 — see `mark_prediction_path_read`). The ODE RHS half
         // is recorded in `build_ode_spec`; this adds the readout half, which is the
         // *only* prediction path an analytical model has.
-        record_coded_rate_reads(
-            &mut model,
-            &indiv_var_names_for_scaling,
-            &ode_slot_map,
-            &scaling_reads,
-        );
+        if !is_algebraic {
+            record_coded_rate_reads(
+                &mut model,
+                &indiv_var_names_for_scaling,
+                &ode_slot_map,
+                &scaling_reads,
+            );
+        }
 
         // AD compatibility check (Phase 2.5):
         //
@@ -2838,16 +2916,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 // Form C sensitivity program (issue #367); `None` for per-CMT.
                 ode_spec.readout_program = output_program;
             } else {
-                let (state_names, _forbidden) = analytic_readout_state_names(model.pk_model);
+                // A compartment-free model (#811) reconstructs no amounts, so its
+                // `state[]` layout is EMPTY — the marker `CompiledModel::is_algebraic`
+                // reads to tell the two apart, since both have `ode_spec == None`.
+                let state_names = if is_algebraic {
+                    Vec::new()
+                } else {
+                    analytic_readout_state_names(model.pk_model).0
+                };
                 // Warn (not silent) when the readout can't ride the analytic Dual2
                 // provider — it stays correct via FD of the readout-aware predictor,
                 // but the user loses the analytic-gradient speedup (#650). The
                 // dual-evaluable case (indiv-params/covariates only) is served
                 // analytically by the static superposition path.
-                let has_depot_slot = matches!(
-                    model.pk_model,
-                    PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
-                );
+                let has_depot_slot = !is_algebraic
+                    && matches!(
+                        model.pk_model,
+                        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+                    );
                 let dual_ok = model.analytical_init.is_empty()
                     && matches!(
                         (&new_readout, &output_program),
@@ -2855,15 +2941,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                             if p.is_dual_evaluable() && !(has_depot_slot && p.references_state(0))
                     );
                 if !dual_ok {
-                    model.parse_warnings.push(
-                        "[scaling] y: this analytic Form C readout (a per-CMT readout, a \
+                    // Same condition, two homes for the readout: `[scaling]` on a
+                    // compartment model, `[structural_model]` on a compartment-free
+                    // one (#811), where the equation is the model.
+                    let block = if is_algebraic {
+                        "[structural_model]"
+                    } else {
+                        "[scaling]"
+                    };
+                    model.parse_warnings.push(format!(
+                        "{block} y: this readout (a per-CMT readout, a \
                          direct THETA/ETA reference, a neural-network output, or a model with \
                          [initial_conditions]) falls back to finite-difference gradients. The \
                          prediction is exact; only the analytic-gradient speedup is lost. Use \
                          individual-parameter / covariate references in the readout to keep it \
                          analytic. See issue #650."
-                            .to_string(),
-                    );
+                    ));
                 }
                 model.analytic_readout = Some(crate::types::AnalyticReadout {
                     readout: new_readout,
@@ -7677,13 +7770,26 @@ pub(crate) fn build_y_output_fn(
     // callers (any state name is integrated), so this is a no-op there. Point the
     // user at an ODE model, mirroring `[initial_conditions]`'s scope.
     if let Some(name) = expr_references_any(&expr, forbidden_state_names) {
-        return Err(format!(
-            "{context}: compartment `{name}` is not available in an analytic Form C \
-             readout — the closed forms don't expose a peripheral (or transit/IV depot) \
-             amount with cross-compartment sensitivity. Reference the central compartment \
-             amount (`central`, plus the oral `depot` for first-order oral models), or use \
-             an ODE model with `ode(states=[...])` in [odes]. See issue #650."
-        ));
+        // A compartment-free model (#811) has an EMPTY allowed set, so *every*
+        // compartment name is forbidden — for a different reason than a
+        // peripheral is on a closed form, and with different advice.
+        return Err(if state_names.is_empty() {
+            format!(
+                "{context}: `{name}` is a compartment amount, but this model declares \
+                 no compartments — it computes its prediction directly. Declare a \
+                 compartment model (`pk NAME(...)` or `ode(states=[...])`) if the \
+                 prediction depends on one, or define `{name}` in \
+                 [individual_parameters]. See issue #811."
+            )
+        } else {
+            format!(
+                "{context}: compartment `{name}` is not available in an analytic Form C \
+                 readout — the closed forms don't expose a peripheral (or transit/IV depot) \
+                 amount with cross-compartment sensitivity. Reference the central compartment \
+                 amount (`central`, plus the oral `depot` for first-order oral models), or use \
+                 an ODE model with `ode(states=[...])` in [odes]. See issue #650."
+            )
+        });
     }
     // #486: rewrite the bare θ/η references the parser desugared into synthetic
     // individual parameters (`__ferx_ro_*`, already appended to `indiv_var_names`)
@@ -7914,6 +8020,10 @@ fn parse_scaling_block(
     pk_indices: &[usize],
     state_names: &[String],
     is_ode: bool,
+    // Compartment-free (`$PRED`-equivalent) model (#811): the readout references no
+    // compartment amount, so it is compiled against an EMPTY state list. Mutually
+    // exclusive with `is_ode` — a compartment-free model has no `ode_spec`.
+    is_algebraic: bool,
     pk_model: PkModel,
     kappa_names: &[String],
     readout_synth: &[ReadoutSynthParam],
@@ -8051,6 +8161,12 @@ fn parse_scaling_block(
                 // oral `depot`) and forbid peripheral / no-closed-form amounts.
                 let (y_state_names, forbidden): (Vec<String>, Vec<String>) = if is_ode {
                     (state_names.to_vec(), Vec::new())
+                } else if is_algebraic {
+                    // Compartment-free (#811): no amounts exist, so the allowed set is
+                    // empty and every compartment-ish name is rejected with a pointer
+                    // at the compartment forms rather than falling through to a
+                    // silent covariate lookup / undefined-identifier error.
+                    (Vec::new(), algebraic_forbidden_state_names())
                 } else {
                     analytic_readout_state_names(pk_model)
                 };
@@ -11014,6 +11130,13 @@ const CONTINUATION_BLOCKS: &[&str] = &[
     "odes",
     "scaling",
     "derived",
+    // A compartment-free `[structural_model]` (#811) holds the same `NAME = <expr>`
+    // entries `[scaling]` does — including the long bounded-endpoint readouts
+    // continuation lines exist for. Folding here (rather than after the #811
+    // desugaring moves them) keeps one definition of "a line" for every block.
+    // The disposition forms are single-line directives, none of which can begin
+    // with an operator, so this is inert for them.
+    "structural_model",
     // `init(NAME) = <expr>` — line-oriented like `[scaling]`, and every line must
     // start with `init(`, so a line opening with an operator is unreachable here too.
     "initial_conditions",
@@ -12196,9 +12319,279 @@ fn parse_role_pairs(params_str: &str, ctx: &str) -> Result<HashMap<String, Strin
     Ok(map)
 }
 
+// ── [structural_model] line classification + the compartment-free form (#811) ──
+
+/// Canonical marker line [`apply_algebraic_structural`] leaves in
+/// `[structural_model]` once it has moved a compartment-free model's equation
+/// lines into the `[scaling]` block.
+///
+/// Carries the reserved `__ferx_` prefix, and a user line that spelled it would
+/// be rejected by [`classify_structural_line`] (it is neither a disposition
+/// directive nor an assignment) before the desugaring ever runs — so the marker
+/// cannot be forged from a model file.
+const ALGEBRAIC_MARKER: &str = "__ferx_algebraic()";
+
+/// One `[structural_model]` line, classified. The block accepts exactly these
+/// four forms; anything else is a parse error (#811).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StructuralLineKind {
+    /// `pk NAME(role=VAR, …)` — analytical closed form.
+    Pk,
+    /// `ode(states=[…])` / `ode(obs_cmt=…, states=[…])` — hand-written ODE system.
+    Ode,
+    /// `ode_template NAME(…)` — rewritten to `ode(...)` by [`apply_ode_template`]
+    /// before this classifier ever sees a block, so it is unreachable in practice;
+    /// kept as a form so the "expected one of" diagnostic can name it.
+    OdeTemplate,
+    /// `NAME = <expr>` / `y[CMT=N] = <expr>` — a compartment-free readout entry or
+    /// one of its named intermediates.
+    Assignment,
+}
+
+/// Which kind of structural model a `[structural_model]` block declares (#811).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StructuralBlockKind {
+    /// A compartment system: `pk ...`, `ode(...)`, or `ode_template ...`.
+    Disposition,
+    /// Compartment-free (`$PRED`-equivalent): assignment lines only, culminating
+    /// in a `y = <expr>` readout.
+    Algebraic,
+}
+
+/// Classify one (trimmed, comment-stripped) `[structural_model]` line.
+///
+/// Every line in the block is classified, and an unrecognized one is an error.
+/// Before #811 the block was scanned for the *first* `pk ...(...)` match with an
+/// unanchored regex and every other line was silently discarded, so `zpk
+/// one_cpt_iv(cl=CL, v=V)` parsed as `one_cpt_iv` and a stray or mistyped line
+/// vanished without a word — the same silent-wrong-model class as #261 / #1028 /
+/// #1040.
+fn classify_structural_line(line: &str) -> Result<StructuralLineKind, String> {
+    if starts_with_keyword(line, 0, "pk") {
+        return Ok(StructuralLineKind::Pk);
+    }
+    // Checked before `ode`: `starts_with_keyword` requires a non-identifier
+    // terminator, so `ode_template …` does not match the `ode` keyword anyway,
+    // but ordering it first keeps that independent of the helper's contract.
+    if starts_with_keyword(line, 0, "ode_template") {
+        return Ok(StructuralLineKind::OdeTemplate);
+    }
+    if starts_with_keyword(line, 0, "ode") {
+        return Ok(StructuralLineKind::Ode);
+    }
+    // The compartment-free form: `NAME = <expr>`, optionally subscripted
+    // `y[CMT=N] = <expr>`. The key must be a bare identifier — `parse_scaling_key`
+    // accepts any text before `[`, so without this check a mistyped disposition
+    // (`zpk one_cpt_iv(cl=CL, v=V)`) would classify as an assignment whose "name"
+    // is `zpk one_cpt_iv(cl`.
+    if let Ok((key, _value)) = split_scaling_entry(line) {
+        if let Ok((base, _cmt)) = parse_scaling_key(key) {
+            if is_plain_identifier(base) {
+                return Ok(StructuralLineKind::Assignment);
+            }
+        }
+    }
+    Err(format!(
+        "[structural_model]: unrecognized line `{line}`. Expected one of: \
+         `pk NAME(role=VAR, ...)` (analytical closed form), `ode(states=[...])` \
+         (ODE system), `ode_template NAME(...)`, or — for a compartment-free \
+         ($PRED-equivalent) model — an assignment `y = <expr>`, optionally \
+         preceded by named intermediates."
+    ))
+}
+
+/// Classify a whole `[structural_model]` block, rejecting mixed and duplicate
+/// declarations (#811).
+fn classify_structural_block(lines: &[String]) -> Result<StructuralBlockKind, String> {
+    let mut disposition: Option<(StructuralLineKind, String)> = None;
+    let mut assignment: Option<String> = None;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match classify_structural_line(line)? {
+            StructuralLineKind::Assignment => {
+                if assignment.is_none() {
+                    assignment = Some(line.to_string());
+                }
+            }
+            kind => {
+                // A second disposition line used to be silently ignored (the `pk`
+                // scan returned on the first match).
+                if let Some((_, first)) = &disposition {
+                    return Err(format!(
+                        "[structural_model]: more than one structural model declared \
+                         (`{first}` and `{line}`); declare exactly one."
+                    ));
+                }
+                disposition = Some((kind, line.to_string()));
+            }
+        }
+    }
+    match (disposition, assignment) {
+        (Some(_), Some(assign)) => Err(format!(
+            "[structural_model]: cannot mix a compartment model with the \
+             compartment-free assignment form (at `{assign}`). A readout on top of a \
+             compartment model belongs in `[scaling]` as `y = <expr>`; a \
+             compartment-free ($PRED-equivalent) model declares no `pk`/`ode` line \
+             at all."
+        )),
+        (Some(_), None) => Ok(StructuralBlockKind::Disposition),
+        (None, Some(_)) => Ok(StructuralBlockKind::Algebraic),
+        (None, None) => Err("[structural_model] is empty. Declare a compartment model \
+             (`pk NAME(...)` or `ode(states=[...])`), or a compartment-free \
+             ($PRED-equivalent) model as `y = <expr>`."
+            .to_string()),
+    }
+}
+
+/// Desugar a compartment-free (`$PRED`-equivalent) `[structural_model]` into the
+/// existing Form C readout pipeline (#811).
+///
+/// A `[structural_model]` block with no `pk` / `ode` / `ode_template` line and at
+/// least one `NAME = <expr>` line declares its prediction directly, with no
+/// compartments underneath. Rather than compile a third kind of readout, the
+/// equation lines are **moved into the `[scaling]` block** and the structural
+/// block is replaced by [`ALGEBRAIC_MARKER`] — after which the ordinary Form C
+/// path (`parse_scaling_block`, its named intermediates, the θ/η desugaring, the
+/// covariate registration and the `OdeOutputProgram` sensitivity program) takes
+/// over with no special-casing, exactly as [`apply_ode_template`] does for
+/// `ode_template`.
+///
+/// Runs after [`apply_ode_template`], so an `ode_template` line has already been
+/// rewritten to `ode(...)` and is never seen here. A no-op for every compartment
+/// model.
+fn apply_algebraic_structural(extracted: &mut ExtractedBlocks) -> Result<(), String> {
+    let Some(struct_lines) = extracted.unnamed.get("structural_model") else {
+        // TTE-only / endpoint-only models legitimately have no block at all; the
+        // "missing block" diagnostic belongs to `parse_full_model`, which knows
+        // whether an endpoint block makes the omission valid.
+        return Ok(());
+    };
+    if classify_structural_block(struct_lines)? != StructuralBlockKind::Algebraic {
+        return Ok(());
+    }
+
+    // A compartment-free model's `[structural_model]` *is* its readout, so a
+    // `[scaling]` block alongside it would either declare a second `y` or divide
+    // the readout's own output by `obs_scale` — the double-apply #650 already
+    // rejects for an analytical Form C readout. Reject the whole combination
+    // rather than a key at a time: with no compartments there is nothing left for
+    // `[scaling]` to mean.
+    if extracted.unnamed.contains_key("scaling") {
+        return Err(
+            "[scaling] cannot be combined with a compartment-free ($PRED-equivalent) \
+             [structural_model] — that block already declares the prediction. Fold \
+             the scaling into the `y = <expr>` equation (e.g. `y = ... / 1000`)."
+                .to_string(),
+        );
+    }
+
+    // Blocks that only mean something with compartments underneath. Rejected here,
+    // by name, rather than left to be silently ignored downstream (`[odes]` is only
+    // read when `[structural_model]` declares `ode(...)`, so an algebraic model
+    // carrying one would drop it without a word).
+    for (block, why) in [
+        (
+            "odes",
+            "declares derivatives of compartment states, and this model has none",
+        ),
+        (
+            "initial_conditions",
+            "seeds compartment amounts, and this model has none",
+        ),
+        (
+            "diffusion",
+            "adds SDE diffusion to compartment states, and this model has none",
+        ),
+    ] {
+        if extracted.unnamed.contains_key(block) {
+            return Err(format!(
+                "[{block}] cannot be combined with a compartment-free \
+                 ($PRED-equivalent) [structural_model]: it {why}. Declare an ODE \
+                 disposition (`ode(states=[...])`) if the model needs compartments."
+            ));
+        }
+    }
+
+    // The block must actually produce a prediction, and `obs_scale` — the divisive
+    // Form A/B key — has nothing to divide here. Checked up front so the user sees
+    // the real problem instead of the Form C pipeline's downstream wording ("a
+    // binding no entry reads" for a block of intermediates with no `y`).
+    let mut has_y = false;
+    for line in struct_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, _value) = split_scaling_entry(trimmed)?;
+        let (base, _cmt) = parse_scaling_key(key)?;
+        match base {
+            "y" => has_y = true,
+            "obs_scale" => {
+                return Err(
+                    "[structural_model]: `obs_scale` has no meaning in a compartment-free \
+                     ($PRED-equivalent) model — there is no built-in prediction to divide. \
+                     Fold the conversion into the equation (e.g. `y = ... / 1000`)."
+                        .to_string(),
+                )
+            }
+            _ => {}
+        }
+    }
+    if !has_y {
+        return Err(
+            "[structural_model]: a compartment-free ($PRED-equivalent) model must end in \
+             a `y = <expr>` entry — that is the prediction. Lines above it are named \
+             intermediates it can reference."
+                .to_string(),
+        );
+    }
+
+    let equations = extracted
+        .unnamed
+        .remove("structural_model")
+        .expect("guarded by the `get` above");
+    extracted.unnamed.insert(
+        "structural_model".to_string(),
+        vec![ALGEBRAIC_MARKER.to_string()],
+    );
+    extracted.unnamed.insert("scaling".to_string(), equations);
+    Ok(())
+}
+
+/// Whether `[structural_model]` carries the compartment-free marker this parse
+/// left behind (#811). The block is `[ALGEBRAIC_MARKER]` exactly, so an
+/// `is_ode`-style `starts_with` scan is enough.
+fn is_algebraic_structural(struct_lines: &[String]) -> bool {
+    struct_lines.iter().any(|l| l == ALGEBRAIC_MARKER)
+}
+
+/// Retarget a `[scaling]`-worded diagnostic at `[structural_model]` (#811).
+///
+/// A compartment-free model's equations are written in `[structural_model]` but
+/// parsed by the `[scaling]` Form C pipeline after [`apply_algebraic_structural`]
+/// moves them, so every message that pipeline emits names a block the user never
+/// wrote. Rewriting the prefix at the few call sites that feed it those lines
+/// keeps one copy of ~40 diagnostics instead of threading a block label through
+/// all of them. A no-op for a real `[scaling]` block.
+fn retarget_scaling_diag(is_algebraic: bool, msg: String) -> String {
+    if is_algebraic {
+        msg.replace("[scaling]", "[structural_model]")
+    } else {
+        msg
+    }
+}
+
 fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, String>), String> {
     // pk model_name(param=VAR, param=VAR, ...)
-    let pk_re = Regex::new(r"pk\s+(\w+)\(([^)]+)\)").unwrap();
+    //
+    // Anchored at the start of the (already trimmed) line: an unanchored match
+    // read `zpk one_cpt_iv(cl=CL, v=V)` as a valid `one_cpt_iv` declaration
+    // (#811). `classify_structural_line` rejects such a line before this runs;
+    // the anchor keeps the two from drifting.
+    let pk_re = Regex::new(r"^pk\s+(\w+)\(([^)]+)\)\s*$").unwrap();
 
     for line in lines {
         if let Some(caps) = pk_re.captures(line) {
@@ -14672,10 +15065,15 @@ fn allocate_readout_extra_slots(
     structural_vars: &std::collections::HashSet<String>,
     modeled_slots: &[(String, usize)],
     pk_model: PkModel,
-    is_ode: bool,
+    // Whether the model already gave every individual parameter a slot from the
+    // full `MAX_PK_PARAMS` layout via `ode_param_slots` — true for ODE models and
+    // for compartment-free ones (#811). This allocator exists only to squeeze a
+    // readout's parameters into an analytical model's few spare slots, so for
+    // those there is nothing to do.
+    uses_ode_param_layout: bool,
     synth_params: &[ReadoutSynthParam],
 ) -> Result<ReadoutExtraSlots, String> {
-    if is_ode {
+    if uses_ode_param_layout {
         return Ok(ReadoutExtraSlots::default());
     }
     let Some(lines) = scaling_lines else {

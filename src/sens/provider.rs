@@ -514,6 +514,14 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
 /// [`tvcov_analytical_supported`] — everything except the `TIME`-routing clause, so the
 /// two can compose without recursion (#637 review #1).
 fn analytical_supported_core(model: &CompiledModel) -> bool {
+    // A compartment-free model (#811) carries a *placeholder* `pk_model` that the
+    // `matches!` below would happily admit — and then every walk here would
+    // evaluate a closed form the model does not have, against doses it does not
+    // carry. Decline before the match so the placeholder can never be dispatched
+    // on; such a model is served by `sens::algebraic`, which needs no closed form.
+    if model.is_algebraic() {
+        return false;
+    }
     matches!(
         model.pk_model,
         PkModel::OneCptIv

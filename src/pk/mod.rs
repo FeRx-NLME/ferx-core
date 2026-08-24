@@ -252,12 +252,12 @@ pub fn apply_analytic_readout(
         return;
     };
     let n_states = ar.state_names.len();
-    if n_states == 0 {
-        return;
-    }
     // Canonical order is `["central"]` (IV) or `["depot", "central"]` (oral), so
     // the central amount lands in the last slot and the depot (if any) in slot 0.
-    let central_slot = n_states - 1;
+    // A compartment-free model (#811) has NO amounts at all: `state[]` is empty,
+    // there is no central concentration to convert, and the readout is evaluated
+    // on `θ`/`η`/individual parameters/covariates/`TIME` alone.
+    let central_slot = n_states.checked_sub(1);
     let need_depot = n_states > 1 && ar.state_names[0] == "depot";
 
     // Re-evaluate the readout's individual parameters per observation whenever a
@@ -300,8 +300,11 @@ pub fn apply_analytic_readout(
             &static_pk
         };
         // Central AMOUNT = concentration × V (concentration already carries the
-        // init impulse and per-event/SS dynamics).
-        state[central_slot] = *pred * pk_i.v();
+        // init impulse and per-event/SS dynamics). No-op for a compartment-free
+        // model, whose `state[]` is empty (#811).
+        if let Some(c) = central_slot {
+            state[c] = *pred * pk_i.v();
+        }
         if let Some(d) = &depot_amts {
             state[0] = d.get(i).copied().unwrap_or(0.0);
         }
@@ -973,7 +976,13 @@ pub fn predict_iov(
         })
         .collect();
 
-    let mut preds = if let Some(ref ode) = model.ode_spec {
+    let mut preds = if model.is_algebraic() {
+        // Compartment-free model (#811): nothing to integrate or superpose. The
+        // κ-dependence, if any, lives entirely in the individual parameters the
+        // readout reads, so it enters at the per-occasion readout pass at the
+        // bottom of this function rather than through a concentration.
+        vec![0.0; subject.obs_times.len()]
+    } else if let Some(ref ode) = model.ode_spec {
         crate::ode::ode_predictions_event_driven(
             ode,
             subject,
@@ -1094,7 +1103,33 @@ pub fn predict_iov(
     // (the readout is BSV-only — a κ reference is rejected at parse). The central
     // concentration already carries the per-occasion dynamics; the readout maps
     // it (amount = conc × V) into the observed output. No-op unless set.
-    apply_analytic_readout(model, subject, theta, eta_bsv, &mut preds);
+    //
+    // A compartment-free model (#811) has no concentration to carry that
+    // per-occasion dynamic, so the BSV-only convention would drop κ from the
+    // prediction entirely. Its readout is instead evaluated **per occasion**, with
+    // that occasion's `[η_bsv, κ]`, exactly as the `[scaling]` pass above does —
+    // the individual parameters the readout reads are the only place κ can enter.
+    if model.is_algebraic() && !subject.occasions.is_empty() {
+        // Guarded on `subject.occasions` (not `occ_groups`) for the same reason the
+        // scaling pass is: `iov_occasion_groups` appends dose-only occasions that
+        // own no observation, so a non-empty `occ_groups` does not imply every
+        // observation is labelled. Unlabelled subjects fall through to the shared
+        // κ = 0 call below.
+        let raw = preds.clone();
+        for (occ_id, obs_indices) in &occ_groups {
+            if obs_indices.is_empty() {
+                continue;
+            }
+            let combined = combined_for(*occ_id);
+            let mut occ_preds = raw.clone();
+            apply_analytic_readout(model, subject, theta, &combined, &mut occ_preds);
+            for &j in obs_indices {
+                preds[j] = occ_preds[j];
+            }
+        }
+    } else {
+        apply_analytic_readout(model, subject, theta, eta_bsv, &mut preds);
+    }
     // LTBS log-wrap. The IOV dispatch above is total (ODE or event-driven), so
     // this is the single log-wrap point for the IOV path — predictions are
     // logged exactly once.
@@ -2204,7 +2239,14 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     let has_tv = subject.has_tv_covariates();
     let uses_time = model_uses_time_builtin(model);
 
-    let mut preds = if let Some(ref ode) = model.ode_spec {
+    let mut preds = if model.is_algebraic() {
+        // Compartment-free model (#811): there is no state to integrate and no
+        // closed form to evaluate — the `[structural_model]` readout *is* the
+        // prediction. These zeros are never read: `apply_analytic_readout` builds
+        // an empty `state[]` for such a model (no `central = conc × V` step) and
+        // overwrites every entry with the readout's value.
+        vec![0.0; subject.obs_times.len()]
+    } else if let Some(ref ode) = model.ode_spec {
         // ODE path. Resets (EVID=3/4) need the state-propagating event-driven
         // walker too, even without time-varying covariates — the plain
         // `ode_predictions` loop has no reset event.

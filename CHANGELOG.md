@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **Every line in `[structural_model]` is now checked (#811).** The block was scanned for the first
+  `pk NAME(...)` match with an unanchored pattern and every other line was discarded, so
+  `zpk one_cpt_iv(cl=CL, v=V)` parsed as a valid one-compartment IV model and a mistyped or stray
+  line vanished without a word. Each line must now be one of the four accepted forms —
+  `pk NAME(...)`, `ode(states=[...])`, `ode_template NAME(...)`, or an equation line — and anything
+  else, a second disposition line, or a mix of a compartment model with equation lines is a parse
+  error naming the offending line. A model file that relied on the old leniency was already being
+  read as something other than what it said.
 - **A single-endpoint `[error_model]` must now name its sigmas in declaration order (#1001).**
   A one-line `DV ~ ...` error model consumes its sigmas **positionally** from the `[parameters]`
   declaration order. The names written in the arguments were checked for existence and then
@@ -244,6 +252,17 @@ section of the SDLC for the versioning policy).
   stopped theta from fixing.
 
 ### Added
+- **`[structural_model]` accepts a compartment-free model — the `$PRED` equivalent (#811).** A
+  block with no `pk ...` / `ode(...)` line and at least one `NAME = <expr>` line declares its
+  prediction directly, with no compartments underneath: write named intermediates above a final
+  `y = <expr>`, exactly as in `[scaling]`, and reference thetas, etas, individual parameters,
+  `TIME`, and any data column. This is the shape of every model-based meta-analysis structural
+  model (a dose-response or time-course regression, not a PK system), which until now had to be
+  written as a dummy compartment driven by `d/dt(clock) = 1` with the real equation hidden in a
+  `[scaling]` readout. Such a model carries no doses and lays its individual parameters out like an
+  ODE model, so it is not limited to the handful of spare parameter slots an analytical readout
+  draws from. Blocks that presuppose compartments (`[odes]`, `[initial_conditions]`,
+  `[diffusion]`, `[scaling]`) are rejected by name rather than silently ignored.
 - **`[scaling]` accepts named intermediates, expressions can be split across lines, and `min`/`max`
   take two arguments (#1030).** Three restrictions that individually looked defensible combined to
   make a standard bounded-endpoint readout unmaintainable: a model-based meta-analysis logit-Emax
