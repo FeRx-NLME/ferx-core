@@ -338,6 +338,13 @@ The **correlations** hold up as well as the variances, which matters because the
 **0.008** — and they are not small correlations being reproduced, `(V, KA)` sits at `+0.67`. So
 `eta_covs` is validated as a covariance, not as a set of variances.
 
+Both numbers above are from a dataset with a ~1% residual error. At a realistic **10%** residual
+the same comparison gives a variational variance of **0.96–0.98×** the exact posterior's — a 3–4%
+understatement — and the decomposition attributes it: the *Laplace* covariance understates by the
+same 3–4%, and VI reproduces Laplace to 0.4%. So what is being measured there is the Gaussian
+family meeting a mildly non-Gaussian posterior, which is the effect the literature describes,
+rather than anything about the optimizer.
+
 The **20–25%** figure in the literature comes from deep compartment models, where a
 neural-network structural model gives the per-subject posterior a geometry a 1-cpt model cannot
 produce. Treat it as the number for that regime, not a general one, and expect something closer to
@@ -592,11 +599,10 @@ dose bookkeeping, the residual model and the objective's additive constants are 
 NONMEM, so where VI differs, the difference is the estimator rather than the plumbing.
 
 VI lands on the same solution — `θ` within 0.015%, `Ω` within 0.05%, and its Laplace objective
-0.49 units off. The one parameter that misses is `σ`, at **+5.8%**: that is VI's Monte-Carlo
-floor, and it falls as `vi_mc_samples` rises — 8 → 32 → 128 walks it 0.013763 → 0.011646 →
-0.011234 on the same model started closer in. VI's OFV here is the Laplace objective at the VI
-estimate (`vi_final_ofv = laplace`), so it is comparable with the rest of the column;
-`−2·ELBO` never is.
+0.49 units off. The one parameter that misses is `σ`, at **+5.8%**, and the next section explains
+why: this dataset carries a ~1% proportional residual, which is the one regime where VI's `σ`
+stalls. VI's OFV here is the Laplace objective at the VI estimate (`vi_final_ofv = laplace`), so
+it is comparable with the rest of the column; `−2·ELBO` never is.
 
 ::: {.callout-warning}
 ## From a distant start, VI may need more than the default 25 000 iterations
@@ -641,6 +647,48 @@ step (per-iterate `sd ≈ 1.7` here), enough to put the converted number below t
 supposed to bound. Converted properly, ferx's bound is the tighter of the two by 1–3 units on
 this model — though the two fits sit at slightly different parameter vectors, and an ELBO only
 bounds `−2 log L` at the vector where it was evaluated.
+:::
+
+## Residual error and VI's `σ`
+
+The warfarin file above carries a **~1% proportional residual**, which is not a realistic PK error
+and is the only regime in which VI's `σ` misses. Same model, same design, changing only the
+residual:
+
+| residual | AGQ `σ` (reference) | VI `σ` | VI − AGQ | VI iterations |
+|---|---|---|---|---|
+| 1% | 0.010565 | 0.011149 | **+5.5%** | 10 875 |
+| 3% | 0.031290 | 0.031555 | +0.85% | 5 000 |
+| 10% | 0.104005 | 0.104046 | **+0.04%** | 2 125 |
+| 25% | 0.258353 | 0.258362 | +0.003% | 1 750 |
+
+At any realistic residual, VI reproduces the quadrature reference on every population parameter,
+and it gets there in a fifth of the iterations. Two practical consequences:
+
+- **`vi_mc_samples` is not the lever.** Going 128 → 512 draws at a 1% residual moves `σ` by 0.8%.
+  Raising the draw count *does* fix the default `vi_mc_samples = 8`, which is 30% high, but not
+  the residual beyond that.
+- **The tell is `q`'s contraction.** VI initialises `q` at the prior `Ω`. At a 1% residual the
+  per-subject posterior variance is ~1400× smaller than the prior, and `σ` — coupled to `q`'s
+  width, since posterior width scales with `σ²` — settles before `q` finishes contracting. At 10%
+  the contraction is ~14× and the problem disappears. If you are fitting data with a residual
+  error under ~3%, check `σ` against a `method = laplace` fit before trusting it.
+
+::: {.callout-note collapse="true"}
+## Why this is not the ELBO preferring a larger `σ`
+
+Worth ruling out, since a Gaussian `q` of positive width does pay for that width partly by
+inflating residual variance. Fixing `θ` and `Ω` at the AGQ estimate and profiling:
+
+| `σ` (FIXed) | `−2·ELBO` |
+|---|---|
+| 0.010565 (AGQ) | **−285.924** |
+| 0.011149 (VI's) | −285.477 |
+
+Lower is tighter, so VI's own objective is 0.45 units *better* at the value it failed to reach —
+there is no optimum offset. And started at that optimum with `σ` free, it walks *up* to 0.010832
+and reports `converged: true` at a worse bound than where it began. A convergence failure of the
+`σ` coordinate, not a property of the variational objective.
 :::
 
 ## References

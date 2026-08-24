@@ -368,8 +368,17 @@ than a defect in either." Both halves were defects.
   the correct value. The cause is the convergence rule meeting its own noise floor: it stops once
   the ELBO's drift is indistinguishable from Monte-Carlo noise, and at 8 draws that happens while
   real drift remains, leaving `σ` — the slowest coordinate — furthest from its optimum. Raising
-  the draw count resolves it (`128` → **0.55 OFV**, not 11.3); starting from a fitted FOCEI point
-  does not.
+  the draw count resolves *most* of it (`128` → **0.55 OFV**, not 11.3); starting from a fitted
+  FOCEI point does not.
+
+  > **Corrected again (§4.15, 2026-08-24).** The Monte-Carlo floor explains the 8-draw default's
+  > 30%, and **not** the ~5% that survives at 128 draws: 4× more draws buys 0.8%, the ELBO is
+  > 0.45 units *better* at AGQ's `σ` than at VI's, and starting `σ` at that optimum it walks up
+  > 2.5% and certifies convergence there. It is a convergence failure of the `σ` coordinate, and
+  > it is confined to residual errors `≲ 3%` — at 10% the miss is +0.04%. So this bullet's
+  > mechanism is right for its own measurement and wrong as the general explanation, which is
+  > the third time in this document that a plausible mechanism fitted the observation without
+  > being the mechanism.
 
   > **Attribution corrected the same day.** This was first written up as a `σ`-specific
   > step-size pathology, and a closed-form `σ` M-step was implemented as the fix
@@ -736,6 +745,125 @@ is applied, and ferx's bound is the tighter of the two by 1–3 units.** What th
 is why — the arms sit at different parameter vectors (§4.13), and a bound is a bound at the vector
 where it was evaluated. Tier 3 is now comparable; it is not yet attributable.
 
+### 4.15 The residual-error arm — what the 1% dataset was hiding (2026-08-24)
+
+**`data/warfarin.csv` carries a ~1% proportional residual, and that is where every σ conclusion
+in this document came from.** It is not a realistic PK error, and it turns out to be the one
+regime in which ferx's VI misses σ at all. Same design, same `θ`/`Ω`, one variable changed:
+
+| residual | AGQ `σ` | VI `σ` | VI − AGQ | VI iterations |
+|---|---|---|---|---|
+| 1% (`data/warfarin.csv`) | 0.010565 | 0.011149 | **+5.5%** | 10 875 |
+| 1% (simulated) | 0.010434 | 0.011025 | **+5.7%** | 7 625 |
+| 3% | 0.031290 | 0.031555 | +0.85% | 5 000 |
+| 10% | 0.104005 | 0.104046 | **+0.04%** | 2 125 |
+| 25% | 0.258353 | 0.258362 | +0.003% | 1 750 |
+
+Monotone in `σ`, reproduced on simulated data at 1% (so it is the residual magnitude, not that
+file), and the iteration count tracks it.
+
+**§4.11a's attribution is wrong.** It blamed the Monte-Carlo floor of the convergence rule, and
+that survives only for the 8-draw default (+30%). The residual ~5% is not the draw count and not
+a property of the ELBO's optimum:
+
+- `vi_mc_samples` 128 → 256 → 512 moves `σ` 0.011234 → 0.011183 → 0.011149. Four times the draws
+  buys 0.8%.
+- **The ELBO prefers AGQ's `σ`.** With `θ`/`Ω` FIXed at the AGQ estimate, `σ = 0.010565` gives
+  `−2·ELBO = −285.924` against `−285.477` at `σ = 0.011149`. VI's own objective is 0.45 units
+  better at the value it failed to reach.
+- **Started at that optimum it walks away.** `σ` free at 0.010565, everything else FIXed: it ends
+  at 0.010832 (+2.5%) reporting `converged: true`, at `−2·ELBO = −285.779` — worse than where it
+  started.
+
+So the σ error is a **convergence failure of the `σ` coordinate**, confined to `σ ≲ 3%`.
+
+**Mechanism — measured, with the last step still a hypothesis.** `q` initialises at the prior. At
+1% the per-subject posterior variance is ~2e−5 against a prior `Ω` of 0.029, so `q` must contract
+by a factor of ~1400; at 10% it is ~14. The closed-form `σ` M-step reads `E_q[(y−f)²]`, which an
+over-wide `q` inflates, and posterior width scales with `σ²`, so the two prop each other up. The
+objective-drift test then cannot distinguish "settled" from "still on the way back". The
+contraction ratio and the regime boundary are measured; the self-reinforcing pair is inference
+from them. **Candidate fix: initialise `S` at the Laplace posterior rather than at `Ω`.** Not
+attempted here — it is an estimator change with its own test and changelog obligations.
+
+#### 4.15a The 10% arm, run end to end
+
+`tools/vi-emvi-comparison/make-wide-residual-data.sh` builds the dataset (deterministic, seed 1,
+simulated from the 1% file's own converged estimates with `σ = 0.10`);
+`q_at_agq_10pct.ferx` carries its AGQ estimate for Anchor C; `FERX_DATA` / `FERX_VI_OUT` /
+`FERX_Q_MODEL` select the arm in both drivers. **No NONMEM column** — that licensed run is on the
+1% file — and none is needed: NONMEM's role was corroborating AGQ, which is dataset-independent
+and already done once (§6.1).
+
+**Tier 1 — everything is inside 0.10 SE of AGQ.** Deviations in percent and in units of ferx's
+own FOCEI standard error:
+
+| vs AGQ | TVKA | ω²KA | σ | worst, in SE |
+|---|---|---|---|---|
+| ferx FOCEI | −0.93% | −1.95% | +0.07% | 0.10 SE |
+| nlmixr2 FOCEI | −0.79% | −1.99% | +0.09% | 0.10 SE |
+| ferx VI | +0.01% | −0.54% | **+0.18%** | 0.02 SE |
+| nlmixr2 `emvi` | +0.00% | −1.19% | +0.48% | 0.06 SE |
+
+Read the percent column alone and VI looks better than FOCEI; read the SE column and **no
+estimator is distinguishable from the reference on this data**. The `−2%` on `ω²KA` that both
+FOCEI implementations share — first-order bias, and it is theirs, not either codebase's — is
+0.04 SE, because `ω²KA` carries a 57% CV on 10 subjects. σ's +5.5% at 1% remains the only
+deviation anywhere in Anchor B that a standard error calls real.
+
+**Tier 2a.** Per-subject means against NUTS: max `|diff|` `1.5e−4` / `1.3e−4` / `3.5e−4`.
+
+**Tier 2b — the tier that only this arm can reach.** The 1% posterior is Gaussian to 0.1%, so
+there was nothing for a Gaussian `q` to understate (§5.1). At 10% there is:
+
+| median over subjects | `η` CL | `η` V | `η` KA |
+|---|---|---|---|
+| VI / NUTS | 0.973 | 0.983 | 0.959 |
+| Laplace / NUTS | 0.966 | 1.000 | 0.956 |
+| VI / Laplace | **1.004** | 0.985 | **1.001** |
+
+VI understates posterior variance by **3–4%**, Laplace understates by the same, and VI reproduces
+Laplace to 0.4%. That is the **variational family** meeting a mildly non-Gaussian posterior, not
+the optimizer — the decomposition §5.1 built and could not exercise. It is also the first
+measurement of the `vi.qmd` understatement claim in a regime where the claim has room to apply:
+3–4% here, against the 20–25% Janssen reports for deep compartment models.
+
+Off-diagonals (`tier2-offdiag.R`): NUTS correlations 0.353 / 0.207 / 0.630, ferx within **0.022**,
+`emvi` within **0.066**.
+
+**Tier 3.** `emvi`'s converted `−2·ELBO` is 74.411 against ferx VI's 74.131, both above AGQ's
+73.575 — the bound holds and ferx's is tighter by 0.28. This is also an independent check on the
+`+N·d/2` conversion of §4.7: on this arm the raw `viElbo` is *negative* (−52.2) because the
+objective is positive, and only the +15 offset puts it in the narrow band where it is a valid
+bound at all (0 would give 104.4; −15 would give 44.4, below the marginal).
+
+**Claim (b)** stays confounded on the `emvi` side here: its two family arms drift 0.87% on the
+fixed effects and 6.63% on the `Ω` diagonal. The Tier-1 unit test (§4.13) is what closed it.
+
+#### 4.15b Three harness defects this arm exposed
+
+All the same shape — a value pinned where the caller believed it configurable. None of them
+would have failed loudly.
+
+1. **Both `run.sh` drivers hardcoded the results directory** and then exported over the caller's
+   `FERX_VI_OUT`, so running a second arm overwrote the first arm's fits. It did: the 1% arm's
+   eight ferx fits and its `emvi-results.rds` were lost and had to be regenerated (they reproduce
+   their recorded values exactly; the diagonal ELBO trace of §4.14a is the one artifact that
+   would need another nlmixr2 run to restore).
+2. **`anchor_c.py` hardcoded `θ`/`Ω`/`σ`** at the 1% AGQ estimate, so the 10% NUTS reference
+   conditioned on `σ = 0.0106` while ferx's `q` sat at 0.104. The variance ratio came back at
+   **~80×**, which is `(0.104/0.0106)²` and nothing whatever about inference. The tell is that
+   the `Laplace / NUTS` row stays at 1.00 — both halves of it use the same constants — so only
+   the VI row moves. Now read from the q file that pins ferx's side.
+3. **NUTS reported zero divergences while one subject's chains had `r̂ = 24` and `n_eff = 2`**,
+   and the comparison wrote that reference out. Divergences are not the diagnostic that catches
+   this. Now gated on `r̂ < 1.01` and `n_eff > 1000`, with warmup at 4000 and acceptance 0.95,
+   which fixes the subject (max `r̂` 1.0002, min `n_eff` 61 168).
+
+The first two are the §4.11a lesson in a new costume: a reference that is quietly wrong reads as a
+spectacular defect in whatever is measured against it, and an 80× ratio is far more likely to be a
+broken arbiter than a broken estimator.
+
 ## 5. Anchor C — per-subject NUTS  *(the only route to L3)*
 
 **Establishes:** L3, which nothing else on this list reaches. Fix `(θ̂, Ω̂, σ̂)` as data, run NUTS
@@ -941,7 +1069,8 @@ citation.
 | Closed-form `Ω*` is the exact ELBO maximizer | FD check (§6.4) | **A**, **B** (same M-step) |
 | `block_omega` structural zeros preserved, both routes | internal + **ferx arms confirmed** (§4.13) + `emvi` both families | **B** — closed |
 | `mean_field` bound looser than `full_rank` when correlated | **closed**: both families' ELBO at *one* parameter vector, against the closed form `−log(1 − r²)` on the posterior precision correlation — `elbo_agq_bound.rs::the_mean_field_bound_is_looser_than_full_rank_at_one_parameter_vector` | **A** (the unit test), corroborated by **B** |
-| VI understates posterior variance by ~20–25% | ~~Janssen's authority~~ **measured ≤4% here, and 0.2% on the anchoring dataset** (§5.1) | closed for this model family; the DCM regime is untested |
+| VI understates posterior variance by ~20–25% | ~~Janssen's authority~~ **measured: 0.2% at a 1% residual, 3–4% at a realistic 10% one, and attributable to the Gaussian family (Laplace understates identically)** (§5.1, §4.15a) | closed for this model family; the DCM regime is untested |
+| VI's `σ` sits ~6% above the reference | ~~the Monte-Carlo floor~~ **retracted: a `σ`-coordinate convergence failure, confined to residuals ≲3%** (§4.15) | closed — and the fix (initialise `S` at the Laplace posterior) is not attempted |
 | `Ω_iov` ~24% low | one simulated recovery | **C** + replicates |
 | `Ω` collapse driven by capacity vs distinct covariate patterns | `vi_dcm_omega_recovery.rs` | **D** + replicates (D done; the replicates are not) |
 | Path derivative lowers gradient variance vs standard | cited (Roeder 2017) | needs `vi_estimator` first |
@@ -959,6 +1088,7 @@ Checked 2026-08-19 on this machine.
 | ferx AGQ (`method = laplace`, `n_agq`) | present | **A**, and the Tier 1/2 arbiter (§4.11a) |
 | R 4.5 + `rxode2`, `numDeriv`, `reticulate` | present | B, D |
 | `nlmixr2est` | **7.0.2 installed** (2026-08-19) at `~/.local/share/ferx-vi-validation/Rlib`, with rxode2 5.1.6 and RcppParallel 6.2.0 — prebuilt arm64 binaries, no compilation. The system library's 4.1.1 is untouched. Re-provision with `tools/vi-emvi-comparison/run.sh` | **B** (done) |
+| `warfarin_10pct.csv` (the realistic-residual arm) | generated on demand by `tools/vi-emvi-comparison/make-wide-residual-data.sh` into `$FERX_VI_STATE`; deterministic, so it is not committed | B, C (§4.15a) |
 | numpyro / jax | **numpyro 0.21.0 + jax 0.10.2 installed** (2026-08-20) in an isolated venv at `$FERX_VI_STATE/pyenv`, built from `/opt/anaconda3/bin/python3.11` (the system `python3` is 3.14 with no `numpy` and no jax wheels). Re-provision with `tools/vi-nuts-anchor/run.sh` | **C** (done) |
 | NONMEM | **absent, and not needed** — Anchor D reads the FOCEI step of the already-committed `tests/nonmem/warfarin_imp.ext` (§6.1) | D (done) |
 | nlmixr2est **source** (CRAN tarball, read-only) | fetched 2026-08-24 to settle §4.7's `Lpack` and ELBO conventions; not installed, not committed | B (done) |
@@ -1017,11 +1147,15 @@ new Python stack (roughly an afternoon).
    quadrature, and checks the gap against the closed form `−log(1 − r²)` on the posterior
    *precision* correlation — 4–8% agreement, where substituting the covariance diagonal for the
    precision diagonal (the natural wrong `q`) reads 17.1%.
-   Four code findings came out of these two anchors and are **not** validation items: the FOCEI
+   Six code findings came out of these anchors and are **not** validation items: the FOCEI
    structural-zero asymmetry (§4.13, **unfixed**); the VI draw-count default, where
    `vi_mc_samples = 8` stops short on warfarin (§4.11a, **documented, default unchanged**); the
    `vi_iters = 25000` ceiling, which stops short from a distant start (§6.1, **documented,
-   default unchanged**); and
+   default unchanged**); the **`σ`-coordinate convergence failure at residuals ≲3%** (§4.15,
+   **unfixed**; candidate fix is to initialise `S` at the Laplace posterior rather than the
+   prior); the **three harness defects of §4.15b** (all **fixed**: `FERX_VI_OUT` honoured in both
+   drivers, `anchor_c.py` reading its parameter vector from the q file, and a `r̂`/`n_eff` gate on
+   the NUTS reference); and
    VI reporting `converged: true` after 500 iterations with `elbo_tightness_ratio: 78` when all
    population parameters are FIXed (**fixed**: the parameter-stability criterion was comparing a
    constant vector against itself and overriding the objective test; the same run now goes 6250
@@ -1029,10 +1163,12 @@ new Python stack (roughly an afternoon).
    pinned by `tests/vi.rs::vi_recovers_the_agq_solution_on_warfarin`, which asserts both `σ`
    routes reach the AGQ solution.
 4. **`vi_estimator`**, which unblocks `VI_PLAN.md` §6 test 8 and the Anchor C gradient comparison.
-5. ~~**Anchor C**~~ — **done**, §5.1. L3 established: the variational posterior matches NUTS to
-   0.2% in variance. The understatement claim turned out to be out of scope for this model family
-   (its posterior is Gaussian to 0.1%), so what remains is a fixture chosen for posterior
-   *geometry* rather than sparsity, plus the `Ω_iov` recovery on the IOV fixture.
+5. ~~**Anchor C**~~ — **done**, §5.1, and **extended** in §4.15a. L3 established: the variational
+   posterior matches NUTS to 0.2% in variance at a 1% residual. The understatement claim was out
+   of scope there (that posterior is Gaussian to 0.1%) — the realistic 10% arm reaches it and
+   measures **3–4%**, attributable to the Gaussian family since Laplace understates identically.
+   What remains is a fixture chosen for posterior *geometry* rather than residual magnitude (a
+   saturating structural model, or Janssen's DCM), plus the `Ω_iov` recovery on the IOV fixture.
 6. **Anchor E**, only if the published-figure artifact is wanted in-tree.
 
 ## 11. References
