@@ -923,6 +923,9 @@ fn scaling_supported(model: &CompiledModel) -> bool {
 pub fn sens_supported(model: &CompiledModel) -> bool {
     analytical_supported(model)
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model))
+        // Compartment-free models (#811) are served by neither: they have no closed
+        // form and no ODE spec, only a readout over the individual-parameter jet.
+        || crate::sens::algebraic::supported(model)
 }
 
 /// Whether the exact analytic **outer** (population) FOCE/FOCEI gradient is
@@ -3872,6 +3875,15 @@ fn subject_eta_grad_impl(
     // takes the ODE-provider branch below (that branch ignores the analytical
     // `cached_schedule`, so a stale one is harmless). Unchanged for every other model (#486).
     let model = crate::pk::effective_model_for_eval(model, subject, theta, eta);
+    // Compartment-free models (#811), before the ODE/analytical split for the same
+    // reason as in `subject_sensitivities_impl` — and so the inner and outer take
+    // the same route, which is the property `subject_eta_grad_tvcov_with_schedule`
+    // exists to protect. Time-varying covariates are ordinary here (a per-row study
+    // or arm covariate), so this must come before the event-walk test below, which
+    // would otherwise claim such a subject for a walk it cannot run.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_eta_grad(model, subject, theta, eta);
+    }
     // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
     // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
     // scope the outer provider uses, so inner and outer stay on the same route.
@@ -5142,6 +5154,13 @@ fn subject_sensitivities_impl(
     // routes to its exact ODE `transit()` equivalent, which then takes the ODE-provider
     // branch below; every other model is unchanged (#486).
     let model = crate::pk::effective_model_for_eval(model, subject, theta, eta);
+    // Compartment-free models (#811) first: they have `ode_spec == None` and a
+    // placeholder `pk_model`, so both branches below would misread them — the ODE
+    // test as "analytical", then `analytical_supported` (which declines them
+    // explicitly) as "out of scope", losing an analytic gradient that exists.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_sensitivities(model, subject, theta, eta);
+    }
     // ODE models route to the ODE sensitivity provider (issue #367, Option A;
     // armed in #410) when in its supported scope; out-of-scope ODE subjects return
     // `None` and fall back to the prior path (gradient-free outer, FD inner). The

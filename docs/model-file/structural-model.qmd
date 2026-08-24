@@ -145,3 +145,129 @@ function on an analytical `pk` model is an error.
 
 See [ODE Models](ode-models.qmd) for full ODE syntax and
 [Scaling](scaling.qmd) for the `[scaling]` block.
+
+## Compartment-Free Models (the `$PRED` equivalent)
+
+Not every structural model is a compartment system. A dose-response curve, a
+response time-course, or a published meta-regression equation is just an
+equation: given the parameters and the row's data, compute the prediction. That
+is what NONMEM's `$PRED` block does, and ferx writes it the same way — as the
+equation itself, with no `pk` or `ode` line:
+
+```
+[structural_model]
+  EFF = EMAX * TIME / (ET50 + TIME)
+  y   = E0 - EFF
+```
+
+A `[structural_model]` block with **no `pk` / `ode` / `ode_template` line** and at
+least one `NAME = <expr>` line is a compartment-free model. There is no keyword to
+remember: the equation is the declaration.
+
+The grammar is the same one `[scaling]` uses for its Form C readout, so
+everything that works there works here:
+
+- **`y = <expr>`** is the prediction. Required — a block of intermediates with no
+  `y` is a model that predicts nothing, and is rejected.
+- **Named intermediates.** Any line whose key is not `y` declares a local binding
+  the lines below it can use, following the same define-above-use-below rule as
+  `[individual_parameters]`. This is what keeps a long bounded-endpoint equation
+  readable instead of repeating a sub-expression four times.
+- **Continuation lines.** Start a continued line with an operator, or end the
+  previous line with one.
+- **`y[CMT=N] = <expr>`** gives a per-compartment-code readout for a multi-endpoint
+  dataset, exactly as in `[scaling]`.
+
+Inside the equation you may reference individual parameters, thetas, etas, the
+`TIME` built-in, `if`/`else`, and **any data column**. A name the model does not
+define is a covariate: that is how a model reaches the per-row data it regresses
+on (dose, arm size, a study-level flag), and the column then becomes required.
+
+### What a compartment-free model does not have
+
+There are no compartments, so there is nothing to dose and nothing to integrate.
+The dataset needs no `AMT` column and normally has no dose records at all. The
+following are rejected by name rather than silently ignored:
+
+| | Why |
+|---|---|
+| `[odes]` | declares derivatives of compartment states |
+| `[initial_conditions]` | seeds compartment amounts |
+| `[diffusion]` | adds SDE diffusion to compartment states |
+| `[scaling]` | this block already declares the prediction — fold any conversion into `y` |
+| `obs_scale = ...` | there is no built-in prediction to divide |
+| `central` / `depot` / `peripheral` in the equation | no compartment exists to read |
+
+`[error_model]`, `[fit_options]`, `[covariates]`, `[derived]` and `[output]` all
+work unchanged.
+
+### Worked example
+
+An Emax time-course with between-subject variability on the baseline — the shape
+of a model-based meta-analysis structural model:
+
+```
+[parameters]
+  theta TVE0(10.0, 0.1, 100.0)
+  theta TVEMAX(6.0, 0.1, 100.0)
+  theta TVET50(2.0, 0.01, 100.0)
+
+  omega ETA_E0 ~ 0.09
+
+  sigma ADD ~ 0.5 (sd)
+
+[individual_parameters]
+  E0   = TVE0 * exp(ETA_E0)
+  EMAX = TVEMAX
+  ET50 = TVET50
+
+[structural_model]
+  EFF = EMAX * TIME / (ET50 + TIME)
+  y   = E0 - EFF
+
+[error_model]
+  DV ~ additive(ADD)
+```
+
+The equivalent NONMEM control is a direct translation:
+
+```
+$PRED
+E0   = THETA(1)*EXP(ETA(1))
+EMAX = THETA(2)
+ET50 = THETA(3)
+Y    = E0 - EMAX*TIME/(ET50 + TIME) + EPS(1)
+```
+
+Fitted to the same 30-subject dataset from the same starting estimates, the two
+agree to ~1e-4 relative on every estimate and to 5 decimal places on the
+objective (`nonmem_anchor/algebraic_emax.*`, exercised by
+`tests/algebraic_pred_nonmem_anchor.rs`):
+
+| | ferx | NONMEM 7.5.1 |
+|---|---|---|
+| OFV | 62.5385 | 62.5384884 |
+| TVE0 | 10.203867 | 10.2040 |
+| TVEMAX | 5.917646 | 5.91754 |
+| TVET50 | 2.099437 | 2.09949 |
+| ω²(E0) | 0.092357 | 0.0924622 |
+| σ (SD) | 0.480452 | 0.480452 |
+| SE(TVE0) | 0.572367 | 0.572542 |
+
+SEs are compared against `$COVARIANCE MATRIX=R`, which is what ferx's covariance
+step computes (a pure `R⁻¹`); NONMEM's default sandwich is a different estimator
+and would not be comparable.
+
+### Gradients
+
+Compartment-free models take the **analytic** `Dual2` gradient on both loops:
+with no state to integrate, the sensitivity is the chain rule
+`∂y/∂θ = (∂y/∂p)·(∂p/∂θ)` over the individual-parameter program, evaluated once
+per observation. Two cases currently fall back to finite differences — correct,
+just slower, and reported honestly as FD rather than claimed as analytic:
+
+- inter-occasion variability (a `kappa` in the model), and
+- more than 24 estimated `(θ, η)` in total.
+
+See [Scaling](scaling.qmd) for the Form C readout on top of a *compartment*
+model, which shares this grammar.

@@ -997,7 +997,19 @@ fn fit_inner(
     accumulated_warnings.extend(pre_run_warnings);
     // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING) accumulated
     // by read_nonmem_csv into population.warnings.
-    accumulated_warnings.extend(population.warnings.iter().cloned());
+    //
+    // `W_NO_DOSES` is dropped for a compartment-free model (#811): the reader is
+    // model-blind, so it flags a dose-free dataset as a probable missing `AMT`
+    // column, but such a model has nothing to dose — a dose-free dataset is its
+    // normal shape, and the warning would fire on every MBMA fit. Every other
+    // reader warning is kept.
+    accumulated_warnings.extend(
+        population
+            .warnings
+            .iter()
+            .filter(|w| !(model.is_algebraic() && w.starts_with("W_NO_DOSES")))
+            .cloned(),
+    );
 
     // Inner-gradient FD-fallback notice for the gradient-driven methods: if some
     // (but not all) subjects fall outside the analytic provider's scope, surface

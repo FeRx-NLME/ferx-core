@@ -4007,6 +4007,14 @@ impl CompiledModel {
             self.ode_spec.is_none(),
             "analytical_compartment_names called on an ODE model — use ode_spec.state_names instead"
         );
+        // A compartment-free model (#811) has no compartments to name. Its
+        // `pk_model` is a placeholder, so the match below would advertise
+        // `["central"]` — and `[derived]` would then resolve a bare `central` to a
+        // compartment reference that reads NaN forever, instead of reporting it as
+        // the undefined name it is.
+        if self.is_algebraic() {
+            return &[];
+        }
         use std::sync::OnceLock;
         // Exhaustive `match` on `pk_model` so adding an 11th `PkModel` variant is a
         // COMPILE error here (a missing arm), not a runtime index-out-of-bounds on a

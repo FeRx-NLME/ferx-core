@@ -1865,7 +1865,14 @@ pub fn compute_predictions_with_states(
         // TV covariates); states via predict_all_states (superposition only — valid
         // for the no-reset, no-TV case).
         let ipred = compute_predictions_with_tv(model, subject, theta, eta);
-        let states = if !model.analytical_init.is_empty() {
+        let states = if model.is_algebraic() {
+            // A compartment-free model (#811) has no compartments to report. Its
+            // `pk_model` is a placeholder, so the superposition below would happily
+            // reconstruct one-compartment IV amounts — all zero, since there are no
+            // doses — and present them as this model's state. Outer-empty → NaN
+            // compartments, the same convention the reset / TV / IOV cases use.
+            vec![]
+        } else if !model.analytical_init.is_empty() {
             // [initial_conditions] baseline (#521): ipred is init-aware (the
             // closed-form baseline is layered onto the central readout), but the
             // superposition state reconstruction does not yet seed the baseline

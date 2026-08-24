@@ -1,0 +1,42 @@
+# Compartment-free structural model — the `$PRED` equivalent (issue #811).
+#
+# An Emax response time-course with between-subject variability on the baseline.
+# There are no compartments, no doses and nothing to integrate: the equation IS
+# the model. This is the shape of a model-based meta-analysis structural model,
+# and of any dose-response or response-versus-time regression.
+#
+# Run:
+#   cargo run --release --bin ferx -- examples/emax_timecourse.ferx \
+#       --data data/emax_timecourse.csv
+#
+# The dataset carries no AMT column — a compartment-free model has nothing to
+# dose. See docs/model-file/structural-model.qmd, and
+# nonmem_anchor/algebraic_emax.ctl for the NONMEM `$PRED` twin this is anchored
+# against.
+
+[parameters]
+  theta TVE0(8.0,   0.1,  100.0)    # baseline response
+  theta TVEMAX(4.0, 0.1,  100.0)    # maximum drop from baseline
+  theta TVET50(1.0, 0.01, 100.0)    # time to half-maximal effect
+
+  omega ETA_E0 ~ 0.04               # between-subject variability on the baseline
+
+  sigma ADD ~ 1.0 (variance)        # additive residual error
+
+[individual_parameters]
+  E0   = TVE0 * exp(ETA_E0)
+  EMAX = TVEMAX
+  ET50 = TVET50
+
+[structural_model]
+  # No `pk ...` and no `ode(...)` line: this block declares the prediction
+  # directly. `EFF` is a named intermediate; `y` is the prediction.
+  EFF = EMAX * TIME / (ET50 + TIME)
+  y   = E0 - EFF
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method     = foce
+  covariance = true
