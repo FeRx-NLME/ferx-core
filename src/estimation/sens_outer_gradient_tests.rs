@@ -5258,6 +5258,43 @@ fn magnitude_theta_family_outer_gradient_matches_fd() {
     check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
 }
 
+/// Inverse-variance weighting (#1029) rides the same magnitude channel: the
+/// modifier desugars to a covariate multiplier on the *additive* slot only, so
+/// the σ gradient must stay exact for both slots — the weighted additive one and
+/// the untouched proportional one. The weight is θ-free, so this also pins the
+/// direct-θ channel's zero rows (a `Some(mult)` slot whose `∂mult/∂θ` is 0).
+const WARFARIN_RUV_WEIGHT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+  sigma ADD_ERR ~ 0.09
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR) weight = 1.0 / sqrt(NARM)
+[covariates]
+  NARM continuous
+"#;
+
+#[test]
+fn weight_modifier_outer_gradient_matches_fd() {
+    let model = parse_model_string(WARFARIN_RUV_WEIGHT).expect("parse");
+    let theta = vec![0.22, 11.0, 1.4];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+    let mut subject = subject_with_obs(&model, &theta, &times);
+    subject.covariates = HashMap::from([("NARM".to_string(), 9.0)]);
+    check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
+}
+
 /// Custom / time-varying residual-magnitude combined with **`iiv_on_ruv`**
 /// (Tier-1 follow-up to #644/#659): the residual-eta `c̃`-column `d/R` is a
 /// function of θ through the magnitude, so `theta_block` adds its `m_vec[rr]` row

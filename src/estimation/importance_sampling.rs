@@ -25,7 +25,6 @@
 
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
 use crate::stats::likelihood::{iov_occasion_groups, m3_logcdf, obs_nll_subject_into};
-use crate::stats::residual_error::compute_r_diag;
 use crate::stats::special::ln_gamma;
 use crate::stats::util::{
     ess_from_weights, log_sum_exp2 as logsumexp2,
@@ -1682,12 +1681,15 @@ fn compute_joint_posterior_hessian(
     let kappa_slices: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
     let ipreds = predict_iov(model, subject, theta, eta_hat.as_slice(), &kappa_slices);
 
-    // Compute residual variance with FREM overrides
-    let mut r_diag = compute_r_diag(
+    // Compute residual variance with FREM overrides. #484/#1029: the magnitude
+    // multiplier rides the sigma loadings, so the proposal precision reflects
+    // the same `R` the importance weights are computed against.
+    let mut r_diag = crate::stats::residual_error::compute_r_diag_maybe_scaled(
         &model.error_spec,
         &ipreds,
         model.error_spec.obs_keys(subject).as_ref(),
         sigma,
+        model.ruv_obs_mult(subject, theta).as_deref(),
     );
     // IIV on residual error (#409): scale PK residual variance by exp(2·η̂_ruv).
     let ruv_scale = model.residual_var_scale(eta_hat.as_slice());
@@ -1847,6 +1849,10 @@ fn subject_is_estimate_joint(
     // outer `Vec` plus its per-occasion κ vectors (a hot-loop allocator cost
     // at K in the thousands).
     let mut kappas_sampled: Vec<Vec<f64>> = (0..n_occ).map(|_| vec![0.0_f64; n_iov]).collect();
+    // #484/#1029: per-observation residual-magnitude multiplier. η-independent
+    // (θ / covariates / TIME only), so it is hoisted out of the draw loop and
+    // shared by every importance sample.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
 
     for _ in 0..k_samples {
         // Draw from joint proposal
@@ -1878,7 +1884,13 @@ fn subject_is_estimate_joint(
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
             let f = f.max(1e-12);
-            let v = (model.residual_variance_at(err_keys[j], f, sigma) * ruv_scale).max(1e-12);
+            let v = (model.residual_variance_at_scaled(
+                err_keys[j],
+                f,
+                sigma,
+                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+            ) * ruv_scale)
+                .max(1e-12);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if m3 && cens != 0 {
                 obs_nll += -m3_logcdf(y, f, v.sqrt(), cens);
@@ -2193,8 +2205,12 @@ pub(crate) fn compute_posterior_hessian(
     // lowers ESS). block_sigma is rejected with FREM and iiv_on_ruv, so no R
     // overrides or residual-eta curvature apply. A non-PD R falls through to the
     // diagonal approximation below.
+    // #484/#1029: the per-observation magnitude multiplier rides the sigma
+    // loadings, so the proposal precision is built from the same `R` the
+    // importance weights score against.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
     if !model.residual_correlations.is_empty() {
-        let r = crate::stats::residual_error::compute_r_matrix_with_correlations(
+        let r = crate::stats::residual_error::r_matrix_maybe_scaled(
             &model.error_spec,
             &ipreds,
             // #669: selector-resolved endpoint keys (matches the diagonal
@@ -2202,23 +2218,22 @@ pub(crate) fn compute_posterior_hessian(
             // endpoints by branch, so `obs_cmts` would build the proposal
             // precision from the wrong branch's sigma.
             model.error_spec.obs_keys(subject).as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            &subject.obs_l2,
+            subject,
             sigma,
             &model.residual_correlations,
+            ruv_mult.as_deref(),
         );
         if let Some(chol) = r.cholesky() {
             let r_inv = chol.inverse();
             return omega_inv + jacobian.transpose() * &r_inv * jacobian;
         }
     }
-    let mut r_diag = compute_r_diag(
+    let mut r_diag = crate::stats::residual_error::compute_r_diag_maybe_scaled(
         &model.error_spec,
         &ipreds,
         model.error_spec.obs_keys(subject).as_ref(),
         sigma,
+        ruv_mult.as_deref(),
     );
     // IIV on residual error (#409): scale the PK residual variance at the mode by
     // exp(2·η̂_ruv) so the Laplace proposal precision reflects the per-subject
@@ -3223,6 +3238,92 @@ mod tests {
         assert!(
             err.contains("log-determinant is not finite") && err.contains("class 2"),
             "got: {err}"
+        );
+    }
+
+    /// #484/#1029: the importance-sampling proposal precision
+    /// `H_post = Ω⁻¹ + Jᵀ R⁻¹ J` must be built from the *magnitude-scaled* `R`,
+    /// so the Student-t proposal has the shape of the posterior the weights are
+    /// actually scored against. Compared here to `Ω⁻¹ + Jᵀ R⁻¹ J` assembled by
+    /// hand from `variance_at_scaled`; a magnitude dropped here would reproduce
+    /// the unscaled reference instead, which the second assertion rules out.
+    #[test]
+    fn posterior_hessian_uses_the_magnitude_scaled_residual_variance() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{DoseEvent, Subject};
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(1.0)\n  theta TVV(10.0)\n  omega ETA_CL ~ 0.04\n  \
+             sigma PROP_ERR ~ 0.10 (sd)\n  sigma ADD_ERR ~ 0.50 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+             DV ~ combined(PROP_ERR, ADD_ERR) weight = WPSE\n[covariates]\n  WPSE continuous\n",
+        )
+        .expect("weighted model parses");
+
+        let snap =
+            |w: f64| -> HashMap<String, f64> { [("WPSE".to_string(), w)].into_iter().collect() };
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 4.0, 8.0],
+            observations: vec![8.0, 6.0, 4.0],
+            obs_cmts: vec![1; 3],
+            cens: vec![0; 3],
+            covariates: snap(0.5),
+            obs_covariates: vec![snap(0.5), snap(1.0), snap(2.0)],
+            ..Default::default()
+        };
+
+        let theta = [1.0_f64, 10.0];
+        let sigma = [0.10_f64, 0.50];
+        let eta_hat = DVector::from_vec(vec![0.0]);
+        let jacobian = DMatrix::from_column_slice(3, 1, &[-0.4, -0.3, -0.15]);
+        let omega_inv = DMatrix::from_element(1, 1, 1.0 / 0.04);
+
+        let mut scratch = EventPkParams::default();
+        let got = compute_posterior_hessian(
+            &model,
+            &subject,
+            &theta,
+            &eta_hat,
+            &sigma,
+            &jacobian,
+            &omega_inv,
+            1,
+            &mut scratch,
+        );
+
+        let ipreds = compute_predictions_with_tv_into(
+            &model,
+            &subject,
+            &theta,
+            eta_hat.as_slice(),
+            &mut scratch,
+        );
+        let mult = model
+            .ruv_obs_mult(&subject, &theta)
+            .expect("magnitude active");
+        let reference = |scaled: bool| -> f64 {
+            let mut acc = 1.0 / 0.04;
+            for j in 0..3 {
+                let r = if scaled {
+                    model
+                        .error_spec
+                        .variance_at_scaled(1, ipreds[j], &sigma, &[], &mult[j])
+                } else {
+                    model.error_spec.variance_at(1, ipreds[j], &sigma)
+                };
+                acc += jacobian[(j, 0)] * jacobian[(j, 0)] / r;
+            }
+            acc
+        };
+
+        approx::assert_relative_eq!(got[(0, 0)], reference(true), epsilon = 1e-10);
+        assert!(
+            (reference(true) - reference(false)).abs() > 1e-6,
+            "the weight must move the proposal precision, else this test proves nothing"
         );
     }
 }

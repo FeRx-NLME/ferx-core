@@ -16485,3 +16485,312 @@ fn unknown_gradient_value_does_not_advertise_the_retired_ad_route() {
         "`gradient = ad` must still parse so the engine can emit its own retirement error"
     );
 }
+
+// ── Residual weighting: `weight = <expr>` (issue #1029) ──────────────────────
+//
+// The modifier desugars into a #484 per-observation residual magnitude on the
+// *additive* sigma slot: weighting is defined as "divide DV and the prediction
+// by the weight", so the additive loading picks up a factor `W` and the
+// proportional loading is untouched (a common scale factor cancels out of a
+// constant-CV error).
+
+/// Study-as-subject MBMA model: one trial-level mean per row, weighted by its
+/// reported standard error. `error_block` overrides just the `[error_model]`
+/// body so negative tests can vary one line.
+fn weighted_model_str(sigma_block: &str, error_block: &str) -> String {
+    format!(
+        r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+{}
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+{}
+
+[covariates]
+  WPSE continuous
+  NARM continuous
+",
+        sigma_block, error_block
+    )
+}
+
+/// Single sigma, so `additive(ADD_ERR)` lands on slot 0. A single-endpoint
+/// `[error_model]` consumes its sigmas positionally from the `[parameters]`
+/// declaration order (#1001), so the fixture has to declare exactly the sigmas
+/// the error block names, in the order it names them.
+const W_SIGMA_ADD: &str = "  sigma ADD_ERR ~ 1.0 (variance) FIX\n";
+/// Proportional first, additive second — `combined`'s argument order.
+const W_SIGMA_COMBINED: &str = "  sigma PROP_ERR ~ 0.04\n  sigma ADD_ERR ~ 1.0 (variance) FIX\n";
+/// Proportional only, for the `weight =`-on-proportional rejection.
+const W_SIGMA_PROP: &str = "  sigma PROP_ERR ~ 0.04\n";
+
+/// The additive-slot fixture, the shape most of these tests want.
+fn weighted_add_model_str(error_block: &str) -> String {
+    weighted_model_str(W_SIGMA_ADD, error_block)
+}
+
+#[test]
+fn test_weight_modifier_scales_the_additive_slot() {
+    let model = parse_model_string(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = WPSE",
+    ))
+    .unwrap();
+    let rm = model
+        .ruv_magnitude
+        .as_ref()
+        .expect("`weight =` compiles to a residual magnitude");
+    assert!(rm.is_active());
+    assert_eq!(rm.per_sigma.len(), 1);
+    assert!(
+        rm.per_sigma[0].is_some(),
+        "additive slot carries the weight"
+    );
+
+    let theta = vec![0.2, 10.0];
+    let cov: std::collections::HashMap<String, f64> =
+        [("WPSE".to_string(), 2.5)].into_iter().collect();
+    let m = rm.eval_obs(&theta, &cov, 0.0);
+    assert!((m[0] - 2.5).abs() < 1e-12, "got {m:?}");
+}
+
+#[test]
+fn test_weight_modifier_on_combined_leaves_the_proportional_slot_bare() {
+    // `W * (f/W) = f`: a common scale factor cancels out of the proportional
+    // (constant-CV) loading, so only the additive slot may be weighted.
+    let model = parse_model_string(&weighted_model_str(
+        W_SIGMA_COMBINED,
+        "  DV ~ combined(PROP_ERR, ADD_ERR) weight = WPSE",
+    ))
+    .unwrap();
+    let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+    assert_eq!(rm.per_sigma.len(), 2);
+    assert!(rm.per_sigma[0].is_none(), "proportional slot stays bare");
+    assert!(
+        rm.per_sigma[1].is_some(),
+        "additive slot carries the weight"
+    );
+
+    let theta = vec![0.2, 10.0];
+    let cov: std::collections::HashMap<String, f64> =
+        [("WPSE".to_string(), 4.0)].into_iter().collect();
+    let m = rm.eval_obs(&theta, &cov, 0.0);
+    assert!((m[0] - 1.0).abs() < 1e-12, "got {m:?}");
+    assert!((m[1] - 4.0).abs() < 1e-12, "got {m:?}");
+}
+
+#[test]
+fn test_weight_modifier_accepts_an_expression_with_its_own_parens() {
+    // The weighted-logit MBMA transform: `weight = 1/sqrt(N)`. The peel must not
+    // stop at the expression's own closing paren.
+    let model = parse_model_string(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = 1.0 / sqrt(NARM)",
+    ))
+    .unwrap();
+    let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+    let theta = vec![0.2, 10.0];
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 16.0)].into_iter().collect();
+    let m = rm.eval_obs(&theta, &cov, 0.0);
+    assert!((m[0] - 0.25).abs() < 1e-12, "got {m:?}");
+}
+
+#[test]
+fn test_weight_modifier_composes_with_a_custom_magnitude() {
+    // `weight =` multiplies whatever magnitude expression the slot already
+    // carries (#484) rather than replacing it.
+    let model = parse_model_string(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR * 3.0) weight = WPSE",
+    ))
+    .unwrap();
+    let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+    let theta = vec![0.2, 10.0];
+    let cov: std::collections::HashMap<String, f64> =
+        [("WPSE".to_string(), 2.0)].into_iter().collect();
+    let m = rm.eval_obs(&theta, &cov, 0.0);
+    assert!((m[0] - 6.0).abs() < 1e-12, "got {m:?}");
+}
+
+#[test]
+fn test_weight_modifier_rejected_on_proportional_error() {
+    let err = expect_parse_err(&weighted_model_str(
+        W_SIGMA_PROP,
+        "  DV ~ proportional(PROP_ERR) weight = WPSE",
+    ));
+    assert!(
+        err.contains("no effect on a purely proportional"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_weight_modifier_rejected_with_per_cmt_error_models() {
+    let err = expect_parse_err(&pkpd_model_str(
+        "  CMT=1: DV ~ proportional(PROP_ERR_PK)\n  CMT=2: DV ~ additive(ADD_ERR_PD) weight = WT",
+    ));
+    assert!(err.contains("not supported with per-CMT"), "got: {err}");
+}
+
+#[test]
+fn test_weight_modifier_rejected_inside_a_covariate_selected_block() {
+    let err = expect_parse_err(&weighted_add_model_str(
+        "  if (WPSE > 1.0) { DV ~ additive(ADD_ERR) weight = WPSE }\n  else { DV ~ additive(ADD_ERR) }",
+    ));
+    assert!(
+        err.contains("not supported inside a covariate-selected"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_weight_modifier_rejects_an_undeclared_covariate() {
+    // Inherits #484's guard: an undeclared name would silently evaluate to 0
+    // and collapse every observation's weight to zero.
+    let err = expect_parse_err(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = NOTACOV",
+    ));
+    assert!(err.contains("undeclared covariate"), "got: {err}");
+}
+
+#[test]
+fn test_weight_modifier_rejects_an_empty_right_hand_side() {
+    let err = expect_parse_err(&weighted_add_model_str("  DV ~ additive(ADD_ERR) weight ="));
+    assert!(
+        err.contains("no expression on its right-hand side"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_weight_modifier_rejects_eta_dependence() {
+    // A weight is a property of the datum, never of the individual.
+    let err = expect_parse_err(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = exp(ETA_CL)",
+    ));
+    assert!(!err.is_empty(), "an eta-dependent weight must not parse");
+}
+
+#[test]
+fn test_split_weight_modifier_ignores_a_weight_inside_the_sigma_parens() {
+    // A covariate literally named `WEIGHT` inside a magnitude expression is at
+    // paren depth 1 and must not be mistaken for the modifier.
+    let (stmt, w) = super::split_weight_modifier("DV ~ additive(ADD * WEIGHT)").unwrap();
+    assert_eq!(stmt, "DV ~ additive(ADD * WEIGHT)");
+    assert!(w.is_none());
+}
+
+#[test]
+fn test_split_weight_modifier_ignores_a_comparison() {
+    let (stmt, w) = super::split_weight_modifier("DV ~ additive(ADD) weight == 2").unwrap();
+    assert_eq!(stmt, "DV ~ additive(ADD) weight == 2");
+    assert!(w.is_none());
+}
+
+#[test]
+fn test_split_weight_modifier_ignores_a_longer_identifier() {
+    let (stmt, w) = super::split_weight_modifier("DV ~ additive(ADD) weighted = 2").unwrap();
+    assert_eq!(stmt, "DV ~ additive(ADD) weighted = 2");
+    assert!(w.is_none());
+}
+
+#[test]
+fn test_split_weight_modifier_requires_a_statement_before_it() {
+    let err = super::split_weight_modifier("weight = WPSE").unwrap_err();
+    assert!(
+        err.contains("must follow a `DV ~ TYPE(...)` statement"),
+        "got: {err}"
+    );
+}
+
+/// A covariate that appears *only* in a `weight =` / magnitude expression is
+/// still model-referenced. Without it in `referenced_covariates`,
+/// `Population::prune_irrelevant_tv_covariates` drops the per-observation
+/// snapshots for a subject whose only time-varying covariate is that one, and
+/// every row is silently scored with the subject's *first* weight — the whole
+/// point of the feature, lost with no diagnostic (#484 / #1029).
+#[test]
+fn test_weight_covariate_is_registered_as_model_referenced() {
+    let model = parse_model_string(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = WPSE",
+    ))
+    .unwrap();
+    assert!(
+        model.referenced_covariates.contains(&"WPSE".to_string()),
+        "got: {:?}",
+        model.referenced_covariates
+    );
+}
+
+#[test]
+fn test_weight_covariate_survives_tv_snapshot_pruning() {
+    use crate::types::{Population, Subject};
+
+    let model = parse_model_string(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = WPSE",
+    ))
+    .unwrap();
+
+    // One subject whose only time-varying column is the weight.
+    let snap = |w: f64| -> std::collections::HashMap<String, f64> {
+        [("WPSE".to_string(), w)].into_iter().collect()
+    };
+    let subject = Subject {
+        id: "1".to_string(),
+        obs_times: vec![1.0, 2.0],
+        observations: vec![9.0, 6.0],
+        obs_cmts: vec![1, 1],
+        cens: vec![0, 0],
+        covariates: snap(0.5),
+        obs_covariates: vec![snap(0.5), snap(1.5)],
+        ..Default::default()
+    };
+    let mut pop = Population {
+        subjects: vec![subject],
+        covariate_names: vec!["WPSE".to_string()],
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+
+    let pruned = pop.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+    assert_eq!(pruned, 0, "the weight covariate is model-referenced");
+    assert_eq!(pop.subjects[0].obs_cov(1).get("WPSE"), Some(&1.5));
+}
+
+/// `weight =` desugars into the sigma argument (`ADD_ERR` becomes
+/// `(ADD_ERR) * (WPSE)`), and #1001's positional sigma-order check reads the
+/// sigma name back *out* of that rewritten argument. The two must not blind each
+/// other: an order mismatch under a weighted model still has to be reported as
+/// an order mismatch, naming the sigma the user wrote, rather than degrading
+/// into "references multiple sigmas" — or, worse, passing.
+#[test]
+fn test_weight_modifier_still_reports_a_sigma_order_mismatch() {
+    let err = expect_parse_err(&weighted_model_str(
+        "  sigma PROP_ERR ~ 0.04\n  sigma ADD_ERR ~ 1.0 (variance) FIX\n",
+        "  DV ~ additive(ADD_ERR) weight = WPSE",
+    ));
+    assert!(
+        err.contains("consumed positionally") && err.contains("ADD_ERR"),
+        "got: {err}"
+    );
+}
+
+/// The weight expression itself must not name a sigma — that would make the
+/// desugared argument reference two, which no positional slot can express.
+#[test]
+fn test_weight_modifier_rejects_a_sigma_in_the_weight_expression() {
+    let err = expect_parse_err(&weighted_model_str(
+        "  sigma ADD_ERR ~ 1.0 (variance) FIX\n  sigma PROP_ERR ~ 0.04\n",
+        "  DV ~ additive(ADD_ERR) weight = PROP_ERR",
+    ));
+    assert!(err.contains("multiple sigmas"), "got: {err}");
+}
