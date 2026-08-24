@@ -134,8 +134,17 @@ diag_or <- function(om) if (is.matrix(om)) diag(om) else om
 # already committed. Same model, same data, same initial estimates. It is in this figure to
 # CORROBORATE the reference rather than to compete with it: AGQ integrates the marginal and
 # NONMEM approximates it, and if the two disagreed the reference would be the thing in doubt.
+# Only the ~1% arm has a NONMEM column -- that licensed run was made on data/warfarin.csv, and
+# the 10% arm (VI_VALIDATION.md 4.15) has no equivalent. The column is dropped rather than
+# carried over: NONMEM's estimates for a DIFFERENT dataset next to this arm's would be a
+# straightforward lie, and the figure would not look wrong.
 NM_FOCEI <- c(1.32695e-01, 7.73771e+00, 8.10796e-01, 2.85884e-02, 9.59179e-03, 3.35880e-01,
               sqrt(1.11621e-04))
+data_file <- Sys.getenv("FERX_DATA", "data/warfarin.csv")
+has_nonmem <- basename(data_file) == "warfarin.csv"
+if (!has_nonmem) {
+  message("no NONMEM column for ", basename(data_file), " -- AGQ is the reference either way")
+}
 
 agq_pop <- pull_pop(agq)
 
@@ -158,13 +167,13 @@ column <- function(label, tool, family, value) tibble(
   se_units = (value - agq_pop) / focei_se
 )
 dev <- bind_rows(
-  column("NONMEM FOCEI", "NONMEM", "FOCEI", NM_FOCEI),
+  if (has_nonmem) column("NONMEM FOCEI", "NONMEM", "FOCEI", NM_FOCEI),
   column("ferx FOCEI", "ferx", "FOCEI", pull_pop(f_focei)),
   column("nlmixr2 FOCEI", "nlmixr2", "FOCEI", nm_vec(e$focei)),
   column("ferx VI", "ferx", "VI", pull_pop(f_vi)),
   column("nlmixr2 emvi", "nlmixr2", "VI", nm_vec(e$emvi))
-) |> mutate(estimator = factor(estimator, c("NONMEM FOCEI", "ferx FOCEI", "nlmixr2 FOCEI",
-                                            "ferx VI", "nlmixr2 emvi")))
+) |> mutate(estimator = factor(estimator, intersect(
+  c("NONMEM FOCEI", "ferx FOCEI", "nlmixr2 FOCEI", "ferx VI", "nlmixr2 emvi"), estimator)))
 
 # ---- 1. population parameters, against the AGQ reference --------------------------------
 # One row per parameter, one point per estimator, zero = the reference. This replaced a
@@ -185,6 +194,15 @@ DODGE <- position_dodge(width = 0.78)
 # `band` shades the "on the reference" region; `lab_at` is where point labels start, and they
 # are not the same number on the SE panel: nothing there exceeds 1 SE, so labelling at the band
 # would label nothing and the one deviation worth naming would go unnamed.
+# Named by the data, for the subtitle: which cell is furthest out in each view. They are
+# usually DIFFERENT cells -- that disagreement is the reason the figure has two panels.
+worst_of <- function(col) {
+  r <- dev[which.max(abs(dev[[col]])), ]
+  list(label = paste(r$estimator, r$parameter), pct = r$pct, se_units = r$se_units)
+}
+worst_pct <- worst_of("pct")
+worst_se <- worst_of("se_units")
+
 panel <- function(xvar, band, xlab, fmt, labels, lab_at = band) {
   lab <- dev |> filter(abs(.data[[xvar]]) > lab_at)
   ggplot(dev, aes(.data[[xvar]], parameter, group = estimator)) +
@@ -213,23 +231,29 @@ p1 <- panel("pct", NEAR, "deviation from AGQ", "%+.1f%%",
   patchwork::plot_layout(ncol = 2, guides = "collect") +
   patchwork::plot_annotation(
     title = "Tier 1 — every estimator against the AGQ reference, two ways",
+    # Every number AND every name in this subtitle is computed. It used to assert which columns
+    # were the outliers, which was true of the ~1% arm and false of the 10% one: there the two
+    # FOCEI implementations share a -2% miss on omega^2KA -- first-order bias, visible once the
+    # residual is realistic -- and VI's sigma, the whole story at 1%, is down to +0.2%. A figure
+    # that narrates one dataset's findings over another's is worse than one that narrates none.
     subtitle = sprintf(paste0(
       "Left: relative deviation, the cross-implementation view. Right: the same deviations ",
-      "divided by ferx's FOCEI\nstandard error — the inferential view, and it reverses the ",
-      "ranking. nlmixr2's FOCEI Ω is the visual outlier on the\nleft (%+.1f%%) and only %.2f SE ",
-      "on the right, because ω² carries a %.0f%% SE on 10 subjects; ferx VI's σ is\n%+.1f%% but ",
-      "%.2f SE, the largest real deviation in the tier. NONMEM's FOCEI lands on the reference in ",
-      "both."),
-      max(dev$pct[dev$estimator == "nlmixr2 FOCEI"]),
-      max(abs(dev$se_units[dev$estimator == "nlmixr2 FOCEI"])),
-      100 * focei_se[["ETA_CL"]] / agq_pop[["ETA_CL"]],
-      dev$pct[dev$estimator == "ferx VI" & dev$parameter == "σ"],
-      dev$se_units[dev$estimator == "ferx VI" & dev$parameter == "σ"]),
+      "divided by ferx's FOCEI\nstandard error — the inferential view, and the two disagree ",
+      "about what matters. Largest relative miss: %s\n(%+.1f%%, but %+.2f SE). Largest ",
+      "inferential miss: %s (%+.2f SE, %+.1f%%). %s"),
+      worst_pct$label, worst_pct$pct, worst_pct$se_units,
+      worst_se$label, worst_se$se_units, worst_se$pct,
+      if (has_nonmem) sprintf(
+        paste0("NONMEM's FOCEI lands on the reference (worst %.2f%%), so it is corroborated ",
+               "rather than assumed."),
+        max(abs(dev$pct[dev$estimator == "NONMEM FOCEI"]))
+      ) else "No NONMEM column on this arm; AGQ stands on its own quadrature."),
     caption = paste0(
       "warfarin, 10 subjects, 110 observations · 1-cpt oral, lognormal η on CL/V/KA, ",
       "proportional error · shaded bands: ±1% and ±1 SE\nSEs are ferx's FOCEI covariance step ",
-      "(they scale the deviations; they are not error bars on these points) · NONMEM column: ",
-      "tests/nonmem/warfarin_imp.ext TABLE NO. 1"),
+      "(they scale the deviations; they are not error bars on these points)",
+      if (has_nonmem) " · NONMEM column: tests/nonmem/warfarin_imp.ext TABLE NO. 1" else
+        sprintf(" · data: %s", basename(data_file))),
     theme = theme_ferx()
   )
 

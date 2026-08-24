@@ -15,7 +15,10 @@ cd "$REPO"
 # tree, and the run outputs are regenerable.
 STATE="${FERX_VI_STATE:-$HOME/.local/share/ferx-vi-validation}"
 RLIB="$STATE/Rlib"
-RESULTS="$STATE/results"
+# FERX_VI_OUT is honoured HERE, not just exported below: it was hardcoded to $STATE/results and
+# then exported over the caller's value, so `FERX_VI_OUT=... run.sh` silently wrote the second
+# arm's fits on top of the first one's. Exactly the failure the FERX_DATA note below warns about.
+RESULTS="${FERX_VI_OUT:-$STATE/results}"
 mkdir -p "$RLIB" "$RESULTS"
 
 # ---- The linker workaround ---------------------------------------------------------------
@@ -43,6 +46,22 @@ fi
 export FERX_RLIB="$RLIB"
 export FERX_VI_OUT="$RESULTS"
 
+# FERX_DATA points both sides at the same file. It exists because the comparison now has two
+# arms: data/warfarin.csv (~1% proportional residual -- the arm with a NONMEM column, and the
+# regime where VI's sigma misses by 5.5%) and warfarin_10pct.csv (10%, realistic, where VI lands
+# on AGQ to 0.04%). See VI_VALIDATION.md 4.15 and make-wide-residual-data.sh.
+#
+#   FERX_DATA=$FERX_VI_STATE/warfarin_10pct.csv FERX_VI_OUT=$FERX_VI_STATE/results-10pct \
+#     tools/vi-emvi-comparison/run.sh
+#
+# Point FERX_VI_OUT somewhere separate when switching arms, or the second run overwrites the
+# first arm's fits and the figures silently mix two datasets.
+DATA="${FERX_DATA:-$REPO/data/warfarin.csv}"
+[ -f "$DATA" ] || { echo "data file not found: $DATA" >&2; exit 1; }
+export FERX_DATA="$DATA"
+echo "data: $DATA"
+echo "results: $RESULTS"
+
 # ---- nlmixr2 side ------------------------------------------------------------------------
 echo "=== nlmixr2: FOCEI + emvi ==="
 Rscript tools/vi-emvi-comparison/emvi-compare.R
@@ -63,7 +82,7 @@ fi
 for m in $MODELS; do
   echo "--- $m ---"
   ( cd "$RESULTS" && "$REPO/target/ci-fast/ferx" \
-      "$REPO/tools/vi-emvi-comparison/$m.ferx" --data "$REPO/data/warfarin.csv" \
+      "$REPO/tools/vi-emvi-comparison/$m.ferx" --data "$DATA" \
       | tail -n 20 )
 done
 

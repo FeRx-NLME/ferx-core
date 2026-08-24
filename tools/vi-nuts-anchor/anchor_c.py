@@ -31,13 +31,50 @@ from numpyro.infer import MCMC, NUTS
 
 numpyro.set_host_device_count(4)
 
-# The AGQ (n_agq = 9) estimate. It reproduces both ferx's and nlmixr2's FOCEI sigma to six
-# decimals, which is what qualifies it as the common parameter vector: the comparison below is
-# only about q, so both sides must sit at the same theta/Omega/sigma.
+# The AGQ (n_agq = 9) estimate, and both sides of the comparison MUST sit on it: the comparison
+# is only about q, so a parameter difference between the NUTS model and ferx's q contaminates it
+# entirely. These are defaults for data/warfarin.csv (the ~1% arm) and are OVERWRITTEN from the
+# q file in main() -- see load_params().
+#
+# They used to be constants, and that silently broke the 10% arm (VI_VALIDATION.md 4.15): NUTS
+# conditioned on sigma = 0.010565 while ferx's q sat at 0.104, and the variance ratio came back
+# at ~80x, which is (0.104/0.0106)^2 rather than anything about the inference. A ratio that large
+# is the signature to look for -- the Laplace/NUTS row stays at 1.00 because both halves of it
+# use the same constants, so only the VI row moves.
 THETA = np.array([0.132687, 7.737464, 0.810901])  # TVCL, TVV, TVKA
 OMEGA = np.array([0.028592, 0.009592, 0.336036])  # diag, in variance units
 SIGMA = 0.010565  # proportional, SD scale
 ETA_NAMES = ["eta_CL", "eta_V", "eta_KA"]
+
+
+def load_params(q_file):
+    """(theta, omega_diag, sigma_sd) from the FIXed q model's own fit YAML.
+
+    The q file is a ferx fit of a model whose population parameters are all FIXed at the AGQ
+    estimate, so its reported values ARE the parameter vector the comparison must condition on.
+    Reading them beats restating them here: a second copy is a second thing to forget when the
+    arm changes.
+
+    Parsed by hand rather than with PyYAML, matching ferx_posterior() below -- the venv carries
+    jax and numpyro and nothing else, and one regex is cheaper than a dependency.
+    """
+    txt = open(q_file, errors="replace").read()
+
+    def section(name, key):
+        block = txt[txt.index(f"\n{name}:") :]
+        end = re.search(r"\n\S", block[1:])
+        block = block[: end.start() + 1] if end else block
+        return [float(m) for m in re.findall(rf"{key}:\s*([-\d.eE+]+)", block)]
+
+    theta = np.array(section("theta", "estimate"))
+    omega = np.array(section("omega", "variance"))
+    sigma = section("sigma", "estimate")
+    if len(theta) != 3 or len(omega) != 3 or not sigma:
+        sys.exit(
+            f"{q_file}: expected 3 thetas, 3 omega variances and a sigma; "
+            f"got {len(theta)}, {len(omega)}, {len(sigma)}"
+        )
+    return theta, omega, sigma[0]
 
 
 def read_warfarin(path):
@@ -183,10 +220,44 @@ def main():
     print(f"data file: {data}")
     print(f"data: {len(ids)} subjects, {int(mask.sum())} observations")
 
-    kernel = NUTS(model, target_accept_prob=0.9)
-    mcmc = MCMC(kernel, num_warmup=2000, num_samples=20000, num_chains=4, progress_bar=False)
+    # Condition NUTS on the SAME vector ferx's q was fitted at, read from the q file itself.
+    global THETA, OMEGA, SIGMA
+    THETA, OMEGA, SIGMA = load_params(q_file)
+    print(f"conditioning on theta {THETA}, omega {OMEGA}, sigma {SIGMA:.6f}")
+    print(f"  (from {q_file})")
+
+    # 4000 warmup and 0.95 acceptance, not the 2000/0.9 this started with: on the 10% arm one
+    # subject's chains failed to mix at the looser settings (r_hat 24, n_eff 2) while the run
+    # still reported ZERO divergences and the comparison happily wrote its output. Divergences
+    # are not the diagnostic that catches this; r_hat is, and it is now gated below.
+    kernel = NUTS(model, target_accept_prob=0.95)
+    mcmc = MCMC(kernel, num_warmup=4000, num_samples=20000, num_chains=4, progress_bar=False)
     mcmc.run(jax.random.PRNGKey(0), jnp.array(t), jnp.array(y), jnp.array(mask), jnp.array(dose))
     mcmc.print_summary(exclude_deterministic=True)
+
+    # The gate. A reference posterior is only a reference if its chains agree: an unmixed subject
+    # produces a variance inflated by orders of magnitude, which then reads as the variational
+    # posterior "understating" by the same factor. Fail loudly instead -- a wrong reference is
+    # worse than no reference, and this exact failure produced a 0.002 variance ratio that looked
+    # like a spectacular VI defect.
+    diag = numpyro.diagnostics.summary(mcmc.get_samples(group_by_chain=True))["eta"]
+    r_hat, n_eff = np.array(diag["r_hat"]), np.array(diag["n_eff"])
+    bad = [
+        (ids[i], k, float(r_hat[i, k]), float(n_eff[i, k]))
+        for i in range(r_hat.shape[0])
+        for k in range(r_hat.shape[1])
+        if not (r_hat[i, k] < 1.01 and n_eff[i, k] > 1000)
+    ]
+    if bad:
+        print("\nNUTS did not converge for:")
+        for sid, k, rh, ne in bad:
+            print(f"  subject {sid}, {ETA_NAMES[k]}: r_hat {rh:.2f}, n_eff {ne:.0f}")
+        sys.exit(
+            "refusing to write a reference from unmixed chains. Raise num_warmup, or init at "
+            "the Laplace mode; do NOT read the variance ratios above."
+        )
+    print(f"\nchains agree: max r_hat {r_hat.max():.4f}, min n_eff {n_eff.min():.0f}")
+
     draws = np.array(mcmc.get_samples()["eta"])  # [draws, n_subj, 3]
 
     nuts_mean = draws.mean(axis=0)
