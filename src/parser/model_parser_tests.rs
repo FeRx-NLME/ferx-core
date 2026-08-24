@@ -1773,40 +1773,184 @@ fn dose_attr_read_in_odes_rhs_is_matched_case_insensitively() {
     );
 }
 
-#[test]
-fn dose_attr_read_in_odes_init_is_rejected() {
-    // `init(state) = <expr>` lives in `[odes]` but is split out of the block before
-    // the derivative statements are parsed, so it needs its own walk. Without one
-    // the rule has a hole the exact size of its own remedy: a user told to drop `F`
-    // from the RHS can move it into the initial condition and get the same silent
-    // double application from the same block.
-    let src = "
+/// Build a 1-compartment ODE model that declares dose attribute `name` and reads it
+/// in an `init(...)` seed — never in the RHS. Companion to [`dose_attr_rhs_model`],
+/// which is the rejected shape; this is the accepted one (#1046).
+fn dose_attr_init_model(name: &str) -> String {
+    format!(
+        "
 [parameters]
   theta TVCL(5.0, 0.0, 1e15)
   theta TVV(50.0, 0.0, 1e15)
-  theta TVF(0.5, 0.0, 1.0)
+  theta TVA(0.5, 0.0, 1.0)
   omega ETA_CL ~ 0.09
   sigma EPS1 ~ 0.1 (sd)
 
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
   V  = TVV
-  F  = TVF
+  {name} = TVA
 
 [structural_model]
   ode(obs_cmt=central, states=[central])
 
 [odes]
-  init(central) = F * 100.0
+  init(central) = {name} * 100.0
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+    )
+}
+
+#[test]
+fn dose_attr_read_in_odes_init_is_accepted() {
+    // The scope floor of the #993 rule, and the one surface it must NOT claim
+    // (#1046). An `init(...)` seed is not a dose: `OdeSpec::initial_state` writes the
+    // raw expression value into the state vector, and `F`/lag are resolved through
+    // `DoseAttrMap` at dose events only — a path the seed never takes. So
+    // `init(central) = F * 100` (the bioavailable residue of a pre-study 100 mg dose)
+    // applies `F` exactly once, to a quantity the engine never scales.
+    //
+    // Anchored on NONMEM 7.6.0, which agrees: `A_0(1) = F1*100` with `F1 = 0.5` seeds
+    // 50, not 25, and its table is byte-identical to the twin seeding from an ordinary
+    // parameter of the same value (`nonmem_anchor/odes_init_dose_attr_f_{A,B}.ctl`;
+    // same for lag). Rejecting this made a correct model unwritable and advised the
+    // wrong repair — renaming the parameter whose meaning *is* bioavailability.
+    //
+    // Contrast the RHS, which IS a doubling and stays rejected:
+    // `dose_attr_read_in_odes_rhs_is_rejected`.
+    for name in ["F", "LAGTIME", "ALAG", "F1", "ALAG1", "LAGTIME1"] {
+        let src = dose_attr_init_model(name);
+        if let Err(e) = parse_full_model(&src) {
+            panic!("`init(central) = {name} * 100` applies `{name}` once: {e}");
+        }
+    }
+}
+
+#[test]
+fn an_init_read_counts_as_a_use_for_the_never_used_census() {
+    // Companion to the acceptance test above, and deliberately *not* folded into it:
+    // asserting "no never-used warning" for `F`/`LAGTIME`/`F1`/… cannot fail, because
+    // the census exempts every dose-attribute name before it looks at block text
+    // (`RESERVED_PK_SLOTS` for the bare names, `DoseAttr::from_indexed_name` for the
+    // indexed ones). Measured: with the `init(...)` line deleted entirely, all six
+    // still produce zero "never used" warnings.
+    //
+    // So the census claim has to be made with a name the exemption does not cover. An
+    // ordinary parameter read *only* from the init is that name — and it is the shape
+    // that would regress if the seed ever stopped being counted as a use.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVA(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  FSEED = TVA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  init(central) = FSEED * 100.0
   d/dt(central) = -(CL/V) * central
 
 [error_model]
   DV ~ proportional(EPS1)
 ";
-    let err = expect_parse_err(src);
+    let never_used = |s: &str| -> Vec<String> {
+        parse_full_model(s)
+            .expect("parses")
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("never used"))
+            .cloned()
+            .collect()
+    };
+    assert!(
+        never_used(src).is_empty(),
+        "`FSEED` is read by the init seed, so it is used: {:?}",
+        never_used(src)
+    );
+    // Non-vacuity: delete the init line and the very same parameter *is* reported —
+    // so the assertion above is a statement about the init read, not about the census
+    // being silent in general.
+    let without = src.replace("  init(central) = FSEED * 100.0\n", "");
+    assert_ne!(without, src, "the init line must actually be removed");
+    assert!(
+        never_used(&without).iter().any(|w| w.contains("`FSEED`")),
+        "with the init read gone `FSEED` must be reported unused: {:?}",
+        never_used(&without)
+    );
+}
+
+#[test]
+fn coded_rate_param_read_in_odes_init_is_not_recorded() {
+    // The `D{n}`/`R{n}` half of #1046, and the reason the fix had to drop the init
+    // walk from `rhs_reads` rather than skip the check: that same set drives
+    // `mark_prediction_path_read`, whose marks `check_modeled_dose_rates` turns into
+    // a data-gated error once a `RATE=-2` dose lands on the compartment. An init
+    // amount consults no dose attribute at all — modeled duration included — so a
+    // `D1` read there must record nothing, or a correct model would be rejected as
+    // soon as its dataset happened to carry a coded RATE.
+    use crate::types::DoseAttr;
+    let parsed = parse_full_model(&dose_attr_init_model("D1")).expect("`D1` in an init parses");
+    assert_eq!(
+        parsed
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Duration, 1),
+        None,
+        "an init-only `D1` read is not a prediction-path read"
+    );
+
+    // Control: the same parameter read in the RHS *is* recorded, so the assertion
+    // above cannot pass for a map that simply never marks anything.
+    let rhs = dose_attr_init_model("D1").replace(
+        "d/dt(central) = -(CL/V) * central",
+        "d/dt(central) = -(CL/V) * D1 * central",
+    );
+    assert_eq!(
+        parse_full_model(&rhs)
+            .expect("`D1` in the RHS parses — it is data-gated, not rejected")
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Duration, 1),
+        Some("D1"),
+        "a `D1` read by the [odes] RHS must still be recorded for the data check"
+    );
+}
+
+#[test]
+fn dose_attr_read_in_both_odes_init_and_rhs_is_still_rejected() {
+    // Overshoot guard for #1046. Accepting the init read must not disarm the RHS
+    // walk: a model that seeds from `F` *and* folds `F` into the flux still applies
+    // it twice on the dose-driven term, which is exactly the #993 defect. Pins that
+    // the fix dropped the init walk only.
+    let src = dose_attr_init_model("F").replace(
+        "d/dt(central) = -(CL/V) * central",
+        "d/dt(central) = -(CL/V) * F * central",
+    );
+    let err = expect_parse_err(&src);
     assert!(
         err.contains("[odes]:") && err.contains("reserved dose-attribute name"),
-        "an `init(...)` read of `F` is the same double use: {err}"
+        "the RHS read is still a double use even when an init also reads it: {err}"
+    );
+    // And the message must say *which* read to remove. This is the exact model where
+    // the un-narrowed wording misled: "remove it from [odes]" invites deleting the
+    // `init(...)` line, which is legal (#1046) and does not clear the error. The
+    // sibling data-gated half already says "[odes] RHS or [scaling]"
+    // (`api/validation.rs`), so the two halves of `E_DOSE_ATTR_DOUBLE_USE` agree.
+    assert!(
+        err.contains("read in the [odes] RHS") && err.contains("remove it from the [odes] RHS"),
+        "the remedy must name the RHS, not the whole block: {err}"
     );
 }
 
@@ -2598,6 +2742,25 @@ fn analytical_dose_attr_read_in_scaling_is_rejected() {
             "the analytical wording must not tell the user to rename: {err}"
         );
     }
+}
+
+#[test]
+fn analytical_dose_attr_read_through_scaling_intermediate_is_rejected() {
+    // #1030 must not open a hole in #1004: naming the doubled read does not make it
+    // stop happening, so a readout that reaches `F` only through a named
+    // intermediate is rejected exactly as the inline spelling is. This is the
+    // read-scan half of the inlining contract — the scan runs on the expanded AST,
+    // not on the raw line.
+    let src = analytical_dose_attr_src(
+        "f=F",
+        "F  = TVF",
+        "[scaling]\n  SCALE = 50.0 * F\n  obs_scale = SCALE",
+    );
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("[scaling]:") && err.contains("remove the `f=F` mapping"),
+        "a dose attribute reached through an intermediate must still be rejected, got: {err}"
+    );
 }
 
 #[test]
@@ -11363,12 +11526,579 @@ fn test_parse_scaling_y_and_obs_scale_mix_rejected_on_analytical() {
 
 #[test]
 fn test_parse_scaling_unknown_key_errors() {
+    // Since #1030 any key other than `obs_scale`/`y` is a *named intermediate*, so
+    // the old blanket "unknown key" rejection is gone. The protection it provided —
+    // catching a misspelt `obs_scale`, which would otherwise silently disable
+    // scaling — is re-established from the other side: an intermediate no entry
+    // reads is rejected, and the error names both readings.
     let src = analytical_model_with_scaling(Some("  foo = 1000\n"));
-    let err = parse_model_string(&src).expect_err("unknown scaling key must be rejected");
+    let err = parse_model_string(&src).expect_err("an unread scaling key must be rejected");
+    assert!(
+        err.contains("foo") && err.contains("never used") && err.contains("misspelled"),
+        "expected unused-intermediate error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_scaling_unknown_key_with_cmt_subscript_errors() {
+    // `[CMT=N]` belongs to `obs_scale`/`y` only — an intermediate takes no
+    // subscript, so this stays an unknown-key error rather than becoming a
+    // legal-but-unread binding (#1030).
+    let src = analytical_model_with_scaling(Some("  foo[CMT=1] = 1000\n"));
+    let err = parse_model_string(&src).expect_err("subscripted unknown key must be rejected");
     assert!(
         err.contains("unknown key") && err.contains("foo"),
         "expected unknown-key error, got: {}",
         err
+    );
+}
+
+// ── [scaling] named intermediates (#1030) ───────────────────────────────────
+
+/// The headline case: a readout written with named intermediates must compile to
+/// the *same* function as the hand-expanded one-liner it replaces. That is the
+/// whole contract — intermediates are inlined into the AST, so nothing downstream
+/// can tell the two apart.
+#[test]
+fn test_scaling_intermediates_match_hand_expanded_readout() {
+    let with_names = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some(
+            "  ACR20    = central / V\n\
+             \x20 ACR20SAT = max(ACR20, 0.01)\n\
+             \x20 y        = log(ACR20SAT / (1 - ACR20SAT))\n",
+        ),
+    );
+    // What the block had to say before #1030: the same sub-expression four times,
+    // guarded with the inline conditional that `max` desugars to.
+    let hand = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some(
+            "  y = log((if (central / V > 0.01) central / V else 0.01) \
+             / (1 - (if (central / V > 0.01) central / V else 0.01)))\n",
+        ),
+    );
+
+    let readout = |src: &str| -> crate::ode::OdeOutputFn {
+        let model = parse_model_string(src).expect("model parses");
+        let ode = model.ode_spec.expect("ODE spec present");
+        match ode.readout {
+            crate::ode::OdeReadout::Single(f) => f,
+            _ => panic!("Form C must set OdeReadout::Single"),
+        }
+    };
+    let f_named = readout(&with_names);
+    let f_hand = readout(&hand);
+
+    let cov = HashMap::new();
+    let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
+    pk[0] = 1.0; // CL
+    pk[1] = 50.0; // V
+    pk[2] = 1.0; // KA
+                 // Above the clamp, below it, and far above — `max` uses `>=` where the hand
+                 // form uses `>`, so the two agree everywhere except exactly at the bound.
+    for central in [0.0, 0.05, 20.0, 100.0] {
+        let state = vec![0.0, central];
+        let a = f_named(&state, &pk, &[], &[], &cov);
+        let b = f_hand(&state, &pk, &[], &[], &cov);
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "named-intermediate readout must equal the hand-expanded one at \
+             central={central} (named={a}, hand={b})"
+        );
+    }
+}
+
+/// `min(a, b)` / `max(a, b)` compose into the published `[0.01, 0.99]` clamp, and
+/// the clamp actually bites on both sides.
+#[test]
+fn test_scaling_intermediates_two_sided_clamp() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some(
+            "  RAW = central / V\n\
+             \x20 SAT = min(max(RAW, 0.01), 0.99)\n\
+             \x20 y   = SAT\n",
+        ),
+    );
+    let model = parse_model_string(&src).expect("model parses");
+    let ode = model.ode_spec.expect("ODE spec present");
+    let f = match ode.readout {
+        crate::ode::OdeReadout::Single(f) => f,
+        _ => panic!("Form C must set OdeReadout::Single"),
+    };
+    let cov = HashMap::new();
+    let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
+    pk[1] = 100.0; // V — so y = central / 100
+    for (central, want) in [(0.0, 0.01), (5.0, 0.05), (500.0, 0.99)] {
+        let y = f(&vec![0.0, central], &pk, &[], &[], &cov);
+        assert!(
+            (y - want).abs() < 1e-12,
+            "central={central} → expected {want}, got {y}"
+        );
+    }
+}
+
+/// A covariate reachable only through an intermediate is still a required data
+/// column — intermediates participate in the #1028 "defined" set, as the issue
+/// asked, because they are inlined before the covariate scan runs.
+#[test]
+fn test_scaling_intermediate_covariate_is_registered() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  W = sqrt(NARM)\n  y = central / V * W\n"),
+    );
+    let model = parse_model_string(&src).expect("model parses");
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "NARM"),
+        "a covariate reached through an intermediate must be a required column, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// Intermediates work on the `obs_scale` (Form B) half of the block too.
+#[test]
+fn test_scaling_intermediate_in_obs_scale() {
+    let src = analytical_model_with_scaling(Some("  K = MW * 1000\n  obs_scale = K\n"));
+    let model = parse_model_string(&src).expect("model parses");
+    assert!(
+        matches!(
+            model.scaling,
+            crate::types::ScalingSpec::ExpressionScale { .. }
+        ),
+        "obs_scale built from an intermediate must be a Form B expression scale"
+    );
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "MW"),
+        "obs_scale covariate reached through an intermediate must be registered, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// Order is the same rule `[individual_parameters]` already enforces: define
+/// above, use below. That makes a reference cycle unrepresentable rather than a
+/// recursion guard to get right.
+#[test]
+fn test_scaling_intermediate_forward_reference_rejected() {
+    let src = analytical_model_with_scaling(Some("  A = B * 2\n  B = 3\n  y = A\n"));
+    let err = parse_model_string(&src).expect_err("forward reference must be rejected");
+    assert!(
+        err.contains("declared on or below"),
+        "expected forward-reference error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_scaling_intermediate_self_reference_rejected() {
+    let src = analytical_model_with_scaling(Some("  A = A + 1\n  y = A\n"));
+    let err = parse_model_string(&src).expect_err("self reference must be rejected");
+    assert!(
+        err.contains("declared on or below"),
+        "expected self-reference error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_scaling_intermediate_duplicate_rejected() {
+    let src = analytical_model_with_scaling(Some("  A = 2\n  A = 3\n  y = A\n"));
+    let err = parse_model_string(&src).expect_err("duplicate intermediate must be rejected");
+    assert!(
+        err.contains("duplicate named intermediate"),
+        "expected duplicate error, got: {}",
+        err
+    );
+}
+
+/// A binding named after something already in scope would never be read — the
+/// expression parser binds θ / η / individual parameters / states first — so it is
+/// rejected rather than left silently dead.
+#[test]
+fn test_scaling_intermediate_shadowing_rejected() {
+    for (name, what) in [
+        ("V", "an individual parameter"),
+        ("TVCL", "a theta"),
+        ("ETA_CL", "an eta"),
+    ] {
+        let src = analytical_model_with_scaling(Some(&format!("  {name} = 2\n  y = {name}\n")));
+        let err = parse_model_string(&src)
+            .expect_err("a name already in scope must be rejected as an intermediate");
+        assert!(
+            err.contains(what) && err.contains(name),
+            "expected shadowing error naming {what}, got: {}",
+            err
+        );
+    }
+}
+
+/// The three pre-scans that run *before* `parse_scaling_block` — the #486 direct-θ/η
+/// desugaring and the #650 readout slot allocator — must see through intermediates
+/// too, or a readout that was analytic when written inline would silently drop to
+/// finite-difference sensitivities once it was named.
+#[test]
+fn test_scaling_intermediate_keeps_the_analytic_readout_path() {
+    let model_src = |scaling: &str| {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  theta TVBMAX(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  BMAX = TVBMAX
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[scaling]
+{scaling}
+"#
+        )
+    };
+    // A non-structural individual parameter (`BMAX`) reached only through an
+    // intermediate still earns a differentiable PK slot; and a bare theta inside an
+    // intermediate is still desugared into a synthetic readout parameter.
+    for scaling in [
+        "  C   = central / V\n  SIG = BMAX * C\n  y   = SIG\n",
+        "  G = TVCL * 2\n  y = central / V + G\n",
+    ] {
+        let model = parse_model_string(&model_src(scaling)).expect("model parses");
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("finite-difference")),
+            "readout `{scaling}` must stay on the analytic path, warnings: {:?}",
+            model.parse_warnings
+        );
+    }
+}
+
+/// `obs_scale` is a subject-static divisor, so a `TIME` reference in it is
+/// rejected (#1028). Routing that reference through an intermediate must not
+/// launder it — the inlining happens before the check.
+#[test]
+fn test_scaling_intermediate_cannot_smuggle_time_into_obs_scale() {
+    let src = analytical_model_with_scaling(Some("  K = 1 + TIME\n  obs_scale = K\n"));
+    let err = parse_model_string(&src).expect_err("TIME in obs_scale must be rejected");
+    assert!(
+        err.contains("subject-static divisor"),
+        "expected the obs_scale TIME rejection, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_scaling_intermediate_reserved_name_rejected() {
+    let src = analytical_model_with_scaling(Some("  TIME = 2\n  y = TIME\n"));
+    let err = parse_model_string(&src).expect_err("`TIME` must be rejected as an intermediate");
+    assert!(
+        err.contains("model-time built-in"),
+        "expected reserved-name error, got: {}",
+        err
+    );
+}
+
+/// `TAD` / `TAFD` / `MACHEPS` are supplied by the evaluator, so a binding under one
+/// of those names is either dead or a silent override. Rejected like `TIME`.
+#[test]
+fn test_scaling_intermediate_eval_builtin_name_rejected() {
+    for name in ["TAD", "TAFD", "MACHEPS"] {
+        let src =
+            analytical_model_with_scaling(Some(&format!("  {name} = 2\n  obs_scale = {name}\n")));
+        let err = parse_model_string(&src)
+            .expect_err("an eval-time built-in must be rejected as an intermediate");
+        assert!(
+            err.contains("eval-time built-in") && err.contains(name),
+            "expected built-in shadowing error for {name}, got: {}",
+            err
+        );
+    }
+}
+
+/// A declared covariate clashes the *other* way round from a θ/η/state: an
+/// unresolved `[scaling]` identifier parses as `Covariate(name)`, which the
+/// substituter does rewrite — so an intermediate named after a data column would
+/// silently shadow it and drop it from the required-column set. Rejected too.
+#[test]
+fn test_scaling_intermediate_covariate_shadowing_rejected() {
+    let src = "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[covariates]
+  WT continuous
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[scaling]
+  WT = 70
+  obs_scale = WT
+";
+    let err = parse_model_string(src)
+        .expect_err("an intermediate named after a declared covariate must be rejected");
+    assert!(
+        err.contains("a declared covariate") && err.contains("WT"),
+        "expected covariate shadowing error, got: {}",
+        err
+    );
+}
+
+/// Define-above-use-below is enforced on both sides: an *entry* may not read an
+/// intermediate declared below it either, even though the substitution itself is
+/// order-independent.
+#[test]
+fn test_scaling_entry_forward_reference_rejected() {
+    let src = analytical_model_with_scaling(Some("  obs_scale = FOO * 2\n  FOO = 3\n"));
+    let err = parse_model_string(&src)
+        .expect_err("an entry reading an intermediate declared below it must be rejected");
+    assert!(
+        err.contains("declared on or below this line") && err.contains("FOO"),
+        "expected entry forward-reference error, got: {}",
+        err
+    );
+}
+
+/// The dead-binding guard scans tokens while the substitution walks the AST, so the
+/// two must agree on what counts as a *read*. An identifier followed by `(` parses
+/// as a function call, never a `Variable`/`Covariate` leaf — so the intermediate is
+/// not inlined, and must be reported rather than silently vanishing.
+#[test]
+fn test_scaling_intermediate_in_unreachable_position_is_reported() {
+    let src = analytical_model_with_scaling(Some("  FOO = 2\n  obs_scale = FOO(V)\n"));
+    let err = parse_model_string(&src)
+        .expect_err("an intermediate the substituter cannot reach must be reported unused");
+    assert!(
+        err.contains("is never used") && err.contains("FOO"),
+        "expected unused-intermediate error, got: {}",
+        err
+    );
+}
+
+// ── Two-argument min / max (#1030) ──────────────────────────────────────────
+
+#[test]
+fn test_min_max_two_args_in_individual_parameters() {
+    let content = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = max(TVCL * WT / 70, 1.0)
+  V  = min(TVV, 20.0)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let parsed = parse_full_model(content).unwrap();
+    let theta = vec![2.0, 10.0];
+    let eta = vec![0.0];
+    let mut covs = HashMap::new();
+
+    covs.insert("WT".to_string(), 70.0);
+    let p = (parsed.model.pk_param_fn)(&theta, &eta, &covs, 0.0);
+    assert!(
+        (p.values[0] - 2.0).abs() < 1e-12,
+        "WT=70 → CL = max(2, 1) = 2"
+    );
+    assert!((p.values[1] - 10.0).abs() < 1e-12, "V = min(10, 20) = 10");
+
+    // Below the floor: the clamp bites.
+    covs.insert("WT".to_string(), 7.0);
+    let p = (parsed.model.pk_param_fn)(&theta, &eta, &covs, 0.0);
+    assert!(
+        (p.values[0] - 1.0).abs() < 1e-12,
+        "WT=7 → CL = max(0.2, 1) = 1, got {}",
+        p.values[0]
+    );
+}
+
+/// The arity diagnostic the issue called out: a one-argument `max` used to be
+/// silently the identity, and a stray comma in a one-argument function reported a
+/// missing `)`, sending the reader after a bracket bug that does not exist.
+#[test]
+fn test_min_max_arity_diagnostics() {
+    let one_arg = analytical_model_with_scaling(Some("  y = max(central)\n"));
+    let err = parse_model_string(&one_arg).expect_err("one-argument max must be rejected");
+    assert!(
+        err.contains("two arguments") && err.contains("max(a, b)"),
+        "expected an arity error, got: {}",
+        err
+    );
+
+    let extra_arg = analytical_model_with_scaling(Some("  y = exp(central, 2)\n"));
+    let err = parse_model_string(&extra_arg).expect_err("two-argument exp must be rejected");
+    assert!(
+        err.contains("takes 1 argument") && err.contains("min(a, b)"),
+        "expected an arity error naming the two-argument functions, got: {}",
+        err
+    );
+}
+
+// ── Operator continuation lines (#1030) ─────────────────────────────────────
+
+#[test]
+fn test_join_continuation_lines() {
+    let join = |lines: &[&str]| -> Vec<String> {
+        super::join_continuation_lines(&lines.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    };
+    // Leading operator continues the previous line...
+    assert_eq!(
+        join(&["A = B", "+ C", "- D", "E = F"]),
+        vec!["A = B + C - D".to_string(), "E = F".to_string()]
+    );
+    // ...as does a trailing one.
+    assert_eq!(
+        join(&["A = B +", "C", "E = F"]),
+        vec!["A = B + C".to_string(), "E = F".to_string()]
+    );
+    // A trailing `=` continues too, so `LEMAX =` on its own line works.
+    assert_eq!(join(&["A =", "B * 2"]), vec!["A = B * 2".to_string()]);
+    // A leading operator on the very first line has nothing to join to; leave it
+    // for the statement parser to reject with its own message.
+    assert_eq!(join(&["+ C"]), vec!["+ C".to_string()]);
+    // Ordinary lines are untouched.
+    assert_eq!(
+        join(&["A = B", "C = D"]),
+        vec!["A = B".to_string(), "C = D".to_string()]
+    );
+}
+
+/// The additive-on-logit covariate model from the issue: one covariate per line,
+/// which used to fail with ``Expected an assignment, … got Plus``.
+#[test]
+fn test_individual_parameters_operator_continuation_lines() {
+    let content = r#"
+[parameters]
+  theta LEMAX0(0.5, -5.0, 5.0)
+  theta OR_ABATA(1.5, 0.1, 10.0)
+  theta OR_ADALI(2.0, 0.1, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_EMAX ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = LEMAX0
+       + log(OR_ABATA) * ABATA
+       + log(OR_ADALI) * ADALI
+       + ETA_EMAX
+  V  = TVV *
+       2.0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let parsed = parse_full_model(content).expect("continuation lines parse");
+    let theta = vec![0.5, 1.5, 2.0, 10.0];
+    let eta = vec![0.25];
+    let mut covs = HashMap::new();
+    covs.insert("ABATA".to_string(), 1.0);
+    covs.insert("ADALI".to_string(), 0.0);
+    let p = (parsed.model.pk_param_fn)(&theta, &eta, &covs, 0.0);
+    let want = 0.5 + 1.5f64.ln() + 0.25;
+    assert!(
+        (p.values[0] - want).abs() < 1e-12,
+        "expected {want}, got {}",
+        p.values[0]
+    );
+    assert!((p.values[1] - 20.0).abs() < 1e-12, "trailing `*` continues");
+}
+
+/// `[scaling]` is scanned line by line rather than through the token stream, so
+/// its continuation support is worth pinning separately.
+#[test]
+fn test_scaling_continuation_lines() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = central / V\n      * 2.0\n"),
+    );
+    let model = parse_model_string(&src).expect("continuation line parses in [scaling]");
+    let ode = model.ode_spec.expect("ODE spec present");
+    let f = match ode.readout {
+        crate::ode::OdeReadout::Single(f) => f,
+        _ => panic!("Form C must set OdeReadout::Single"),
+    };
+    let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
+    pk[1] = 50.0;
+    let y = f(&vec![0.0, 100.0], &pk, &[], &[], &HashMap::new());
+    assert!((y - 4.0).abs() < 1e-12, "expected 100/50*2 = 4, got {y}");
+}
+
+/// `[initial_conditions]` is line-oriented too (`init(NAME) = <expr>`, one per
+/// line), so its continuation support is pinned on its own path — and the joined
+/// expression must actually reach the init amount, not just parse.
+#[test]
+fn test_initial_conditions_continuation_lines() {
+    let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[initial_conditions]
+  init(central) = CONC0 * V
+                  + 5.0
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+    let model = parse_model_string(content).expect("continuation line parses in the init block");
+    assert_eq!(model.analytical_init.len(), 1, "init block parsed");
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "CONC0"),
+        "the continued line's covariate must still be a required column, got: {:?}",
+        model.referenced_covariates
+    );
+    // CONC0 = 2, V = 10 → 2*10 + 5 = 25. The `+ 5.0` line has to be part of the
+    // expression, not silently dropped.
+    let mut covs = HashMap::new();
+    covs.insert("CONC0".to_string(), 2.0);
+    let theta = vec![1.0, 10.0];
+    let eta = vec![0.0];
+    let pk = (model.pk_param_fn)(&theta, &eta, &covs, 0.0);
+    let amount = (model.analytical_init[0].amount_fn)(&theta, &eta, &covs, &pk);
+    assert!(
+        (amount - 25.0).abs() < 1e-12,
+        "expected 2*10 + 5 = 25, got {amount}"
     );
 }
 
@@ -14183,6 +14913,72 @@ fn parse_derived_per_row() {
     } else {
         panic!("expected PerRow");
     }
+}
+
+/// `min`/`max` at a `[derived]` statement's top level used to be read *only* as the
+/// row aggregate, so the two-argument numeric form (#1030) meant one thing nested
+/// (`1 * max(CL, 2)`) and failed outright unnested. A second argument with no
+/// comparison operator cannot be a row filter, so both spellings now agree.
+#[test]
+fn parse_derived_two_arg_max_at_statement_top_level() {
+    let (theta, eta, indiv_params, covariates, prev_derived) = make_derived_ctx_simple();
+    let eval_one = |derived: &str| {
+        let src = minimal_model_with_derived(derived);
+        let parsed = parse_full_model(&src).expect("two-arg max at top level parses");
+        let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind else {
+            panic!("expected PerRow, got the row aggregate");
+        };
+        let ctx = DerivedContext {
+            theta: &theta,
+            eta: &eta,
+            indiv_params: &indiv_params,
+            covariates: &covariates,
+            ipred: 0.0,
+            pred: 0.0,
+            dv: 0.0,
+            time: 1.0,
+            tafd: 1.0,
+            tad: 1.0,
+            prev_derived: &prev_derived,
+            compartments: &[],
+            compartment_names: &[],
+        };
+        eval(&ctx)
+    };
+    // CL = 1: the floor bites at top level exactly as it does nested.
+    assert_eq!(eval_one("X = max(CL, 2.0)"), 2.0);
+    assert_eq!(eval_one("X = 1 * max(CL, 2.0)"), 2.0);
+    assert_eq!(eval_one("X = min(CL, 2.0)"), 1.0);
+    // Still an expression, not a call: trailing operators are honoured.
+    assert_eq!(eval_one("X = max(CL, 2.0) * 3"), 6.0);
+}
+
+/// A second argument that *is* a comparison keeps meaning the row filter.
+#[test]
+fn parse_derived_aggregate_filter_still_parses() {
+    let src = minimal_model_with_derived("CMAX = max(IPRED, TIME > 0)");
+    let parsed = parse_full_model(&src).expect("aggregate with a row filter parses");
+    assert!(matches!(
+        parsed.model.derived_exprs[0].kind,
+        DerivedKind::Aggregate { .. }
+    ));
+}
+
+/// Trailing tokens after a row aggregate's `)` used to be dropped in silence, so
+/// `max(IPRED) * 2` computed `max(IPRED)`. No aggregate form continues into a
+/// larger expression, so it is now an error rather than a wrong number.
+#[test]
+fn parse_derived_aggregate_rejects_trailing_tokens() {
+    let src = minimal_model_with_derived("CMAX = max(IPRED) * 2");
+    let err = match parse_full_model(&src) {
+        Ok(_) => panic!("trailing tokens after an aggregate must error"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("unexpected token(s) after"),
+        "expected the trailing-token error, got: {}",
+        err
+    );
 }
 
 #[test]
