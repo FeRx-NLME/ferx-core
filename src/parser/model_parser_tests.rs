@@ -10048,7 +10048,9 @@ fn test_init_time_builtin_rejected() {
             .err()
             .unwrap_or_else(|| panic!("`init(response) = {rhs}` must be rejected"));
         assert!(
-            err.contains("init(response)") && err.contains("`TIME` built-in"),
+            err.contains("init(response)")
+                && err.contains("time built-in(s): TIME")
+                && err.contains("evaluated at the time origin"),
             "error should name init(response) and the TIME built-in, got: {err}"
         );
         assert!(
@@ -10059,20 +10061,56 @@ fn test_init_time_builtin_rejected() {
 }
 
 #[test]
-fn test_init_time_alias_and_siblings_still_rejected() {
-    // The other reserved clocks are ordinary identifiers in an init RHS, so they
-    // fall out of the undefined-name check — that behaviour predates #994 and
-    // must not regress when the `TIME` node guard is added in front of it.
-    for rhs in INIT_REJECTED_BUILTINS.iter().filter(|n| **n != "TIME") {
-        let src = turnover_ode_model(&format!("  init(response) = {rhs}"));
-        let err = parse_full_model(&src)
-            .err()
-            .unwrap_or_else(|| panic!("`init(response) = {rhs}` must be rejected"));
-        assert!(
-            err.contains("init(response)"),
-            "error should name init(response), got: {err}"
-        );
+fn test_init_time_clocks_rejected_in_every_casing() {
+    // Every clock, every spelling, one diagnostic (#994). Before this, the four
+    // names split three ways on representation alone: `TIME`/`time` were
+    // accepted (an `Expression::Time` node the undefined-name walker cannot
+    // see), `Time` was reported as a plain undefined name, and `T`/`TAFD`/`TAD`
+    // were reported as undefined names. The casing asymmetry was the tell that
+    // none of it was a scope decision.
+    //
+    // The assertion is on the *clock* diagnostic specifically, not merely on
+    // "some error": the node guard feeds the same message as the undefined-name
+    // split, so a regression that reported one as the other would otherwise
+    // pass unnoticed.
+    for base in ODE_INIT_REJECTED_BUILTINS {
+        for rhs in [
+            base.to_string(),
+            base.to_lowercase(),
+            // `Tafd` / `Time` / `T` — mixed case, the spelling that used to be
+            // handled differently from the other two.
+            base[..1].to_string() + &base[1..].to_lowercase(),
+        ] {
+            let src = turnover_ode_model(&format!("  init(response) = {rhs}"));
+            let err = parse_full_model(&src)
+                .err()
+                .unwrap_or_else(|| panic!("`init(response) = {rhs}` must be rejected"));
+            assert!(
+                err.contains("init(response)") && err.contains("time built-in(s)"),
+                "`{rhs}` should get the clock diagnostic, not a bare undefined-name \
+                 error, got: {err}"
+            );
+        }
     }
+}
+
+#[test]
+fn test_init_reports_clock_and_undefined_name_together() {
+    // One parse, both problems (#994 review): an init RHS can carry a clock and
+    // an undefined name at once, and reporting them one per parse costs the user
+    // two round-trips for a single line.
+    let src = turnover_ode_model("  init(response) = TIME + BASE");
+    let err = parse_full_model(&src)
+        .err()
+        .expect("`init(response) = TIME + BASE` must be rejected");
+    assert!(
+        err.contains("time built-in(s): TIME"),
+        "error should name the clock, got: {err}"
+    );
+    assert!(
+        err.contains("undefined name(s): BASE"),
+        "error should name the undefined BASE in the same message, got: {err}"
+    );
 }
 
 #[test]
@@ -10085,13 +10123,13 @@ fn test_init_undefined_name_message_lists_the_real_scope() {
     let err = parse_full_model(&src)
         .err()
         .expect("undefined name must be rejected");
-    for builtin in INIT_SCOPE_BUILTINS {
+    for builtin in ODE_INIT_SCOPE_BUILTINS {
         assert!(
             err.contains(builtin),
             "message should list the accepted built-in {builtin}, got: {err}"
         );
     }
-    for rejected in INIT_REJECTED_BUILTINS {
+    for rejected in ODE_INIT_REJECTED_BUILTINS {
         assert!(
             err.contains(rejected),
             "message should list the out-of-scope built-in {rejected}, got: {err}"
@@ -10159,6 +10197,34 @@ fn test_analytical_init_time_builtin_rejected() {
         assert!(
             err.contains("#994"),
             "error should cite the issue, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_analytical_init_clock_names_are_ordinary_covariates() {
+    // The `[odes]`-only built-ins are ordinary covariates everywhere else — the
+    // same deliberate rule `[scaling]` follows so a dataset that really carries a
+    // `TAD` column can use it (#1028, `ODE_ONLY_BUILTINS` in `api::validation`).
+    // `[initial_conditions]` is "everywhere else", so only `TIME` is rejected
+    // there; `T`/`TAFD`/`TAD`/`MACHEPS` parse as covariate leaves and become
+    // required data columns. Pinned because `ODE_INIT_REJECTED_BUILTINS` is
+    // public and a consumer mirroring it on an analytical model would otherwise
+    // reject a legal reference (#994 review).
+    for name in ["T", "TAFD", "TAD", "MACHEPS"] {
+        let src = analytical_oral_with_init(&format!(
+            "
+[initial_conditions]
+  init(central) = {name} * 10
+"
+        ));
+        let model = parse_model_string(&src)
+            .unwrap_or_else(|e| panic!("`init(central) = {name} * 10` must parse: {e}"));
+        assert_eq!(model.analytical_init.len(), 1);
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == name),
+            "`{name}` must be registered as a required data column, got: {:?}",
+            model.referenced_covariates
         );
     }
 }

@@ -93,13 +93,15 @@ above — numerically equivalent, and still allocation-free.
 - **Central or depot only.** A peripheral-compartment initial amount needs the
   cross-compartment impulse response, which the analytical closed forms do not
   expose. Use an ODE model for that.
-- **No time built-ins (`TIME`, `T`, `TAFD`, `TAD`) in the init expression.** The
-  baseline amount is evaluated once per subject at the time origin, so every
-  clock would read exactly `0` and the reference could only flatten the
-  expression. The parser rejects them; see
+- **No `TIME` in the init expression.** The baseline amount is evaluated once
+  per subject at the time origin, so `TIME` would read exactly `0` and the
+  reference could only flatten the expression — `init(central) = TIME + 50` was
+  bit-identical to `init(central) = 50`. The parser rejects it (issue #994).
+  Note that `T` / `TAFD` / `TAD` / `MACHEPS` are **not** built-ins on this
+  surface: outside `[odes]` they are ordinary covariates, so they are accepted
+  here and become required data columns, exactly as in `[scaling]`. See
   [What an `init(...)` expression may reference](ode-models.qmd#init-scope) for
-  the full scope rule, which is shared with the ODE-path `init(...)` directive
-  (issue #994).
+  the two surfaces side by side.
 - **No `KAPPA_*` (IOV) in the init expression.** The baseline amount is a single
   t = 0 quantity evaluated with the between-subject η only, so a per-occasion
   kappa reference would silently see `kappa = 0`. The parser rejects it (the same

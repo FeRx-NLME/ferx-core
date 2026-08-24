@@ -20,12 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
-- **The `init(...)` scope rule is now published by the engine (#994).** `INIT_SCOPE_BUILTINS` and
-  `INIT_REJECTED_BUILTINS` name the built-ins an init expression may and may not reference, so a
-  code generator can source the rule from the same binary it will parse with instead of mirroring it
-  by guesswork — the arrangement `known_block_names()` (#1040) already provides for block names. The
-  `[odes] init(...)` diagnostic is rendered from the same lists, so message and guard cannot drift.
-  The full rule is documented under
+- **The `init(...)` scope rule is now published by the engine (#994).** `ODE_INIT_SCOPE_BUILTINS` and
+  `ODE_INIT_REJECTED_BUILTINS` name the built-ins an `[odes] init(...)` expression may and may not
+  reference, so a code generator can source the rule from the same binary it will parse with instead
+  of mirroring it by guesswork — the arrangement `known_block_names()` (#1040) already provides for
+  block names. The `[odes] init(...)` diagnostics are rendered from the same lists, so message and
+  guard cannot drift. They are named for the `[odes]` surface because the two surfaces genuinely
+  differ: outside `[odes]`, `MACHEPS` / `TAFD` / `TAD` are ordinary covariates rather than
+  solver-injected built-ins (the same deliberate rule `[scaling]` follows), so only `TIME` is
+  rejected in `[initial_conditions]`. Both surfaces are documented side by side under
   [ODE models → What an `init(...)` expression may reference](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#init-scope).
 
 ### Changed
@@ -131,6 +134,12 @@ section of the SDLC for the versioning policy).
   `MIXNUM`, the other built-in the check cannot see, stays in scope: it resolves to the subject's
   mixture class, so a class-switched baseline does real work — it is now named in the diagnostic,
   which previously listed neither.
+- **Every spelling of every clock in an `[odes] init(...)` now gets the same explanation (#994).**
+  `TIME`, `time`, `Time`, `T`, `TAFD` and `TAD` used to split three ways on representation alone —
+  accepted, reported as a plain undefined name, or reported as an undefined name — so the message a
+  user got depended on the casing they happened to type. All of them now report why a clock cannot
+  appear in an initial condition. An expression carrying both a clock and an undefined name reports
+  both problems from one parse instead of one per parse.
 - **A zero, negative, or non-finite residual-error magnitude is now rejected (#484 / #1029).** The
   magnitude multiplies a sigma loading, so a zero one — an MBMA arm with no reported standard error,
   say — collapses that observation's variance onto the internal `1e-12` floor and lets a single row
