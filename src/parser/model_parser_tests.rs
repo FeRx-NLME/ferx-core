@@ -17061,6 +17061,172 @@ fn test_unweighted_kappa_is_not_restricted_to_individual_parameters() {
     .expect("an unweighted kappa is unaffected by the #1031 guard");
 }
 
+/// A weighted kappa that no individual parameter references scales nothing —
+/// but the fit still reports `→ SD = γ/√N`, and a covariate named *only* by the
+/// weight never reaches `referenced_covariates`, so the datareader skips the
+/// column and the data check then blames a present column for reading 0.
+#[test]
+fn test_weighted_kappa_must_be_referenced_in_individual_parameters() {
+    let model_str = weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM\n  kappa KAPPA_V ~ 0.04 weight = NARM",
+        "",
+    );
+    let err = expect_parse_err(&model_str);
+    assert!(
+        err.contains("`KAPPA_V`") && err.contains("never referenced in [individual_parameters]"),
+        "got: {err}"
+    );
+}
+
+/// The same guard must not fire on a kappa that *is* referenced, including one
+/// reached only from inside a conditional branch.
+#[test]
+fn test_weighted_kappa_referenced_in_a_branch_is_not_inert() {
+    let model_str = r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.09 weight = NARM
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  if (NARM > 1) {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    parse_model_string(model_str).expect("a kappa referenced inside a branch is not inert");
+}
+
+/// An *estimated* theta in the weight moves the divisor during the outer
+/// optimisation, so the up-front `E_KAPPA_WEIGHT_NONPOSITIVE` check — evaluated
+/// at the initial θ — certifies nothing: a weight that starts positive and
+/// crosses zero mid-fit divides an individual parameter by zero silently.
+#[test]
+fn test_weighted_kappa_rejects_an_estimated_theta_in_the_weight() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = TVCL * NARM",
+        "",
+    ));
+    assert!(
+        err.contains("references estimated theta(s) `TVCL`"),
+        "got: {err}"
+    );
+}
+
+/// A FIXed theta is a known constant, so it is as safe as a covariate column
+/// and stays allowed.
+#[test]
+fn test_weighted_kappa_allows_a_fixed_theta_in_the_weight() {
+    let model_str = weighted_kappa_model_str(
+        "  theta NSCALE(2.0) FIX\n  kappa KAPPA_CL ~ 0.09 weight = NSCALE * NARM",
+        "",
+    );
+    let model = parse_model_string(&model_str).expect("a FIXed theta in the weight is allowed");
+    let w = model.kappa_weights[0].as_ref().expect("weight recorded");
+    // 2.0 (NSCALE, FIXed) × 100 (NARM) = 200.
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 100.0)].into_iter().collect();
+    assert_eq!(
+        (w.eval)(&model.default_params.theta, &cov, 0.0),
+        200.0,
+        "the fixed theta enters the weight"
+    );
+}
+
+/// The "outside `[individual_parameters]`" error names the block the author
+/// wrote (`event_model armA`), not the bare instance label (`armA`), which on
+/// its own reads as a block name that does not exist. Every *named* block type
+/// is feature-gated, so this is the survival build's case.
+#[cfg(feature = "survival")]
+#[test]
+fn test_weighted_kappa_outside_error_names_the_block_type() {
+    let model_str = r"
+[parameters]
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  omega ETA ~ 0.09
+  kappa KAPPA_CL ~ 0.09 weight = NARM
+
+[event_model armA]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(KAPPA_CL)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    let err = expect_parse_err(model_str);
+    assert!(
+        err.contains("[event_model armA] references `KAPPA_CL`"),
+        "got: {err}"
+    );
+}
+
+/// Mu-reference detection runs on the *rewritten* statements, so the declared
+/// `weight = W` form and the hand-written `K / sqrt(W)` agree on their mu-refs
+/// exactly as they agree on the objective. Detecting on a pre-rewrite snapshot
+/// registered a kappa mu-ref the rewritten model does not satisfy — which
+/// `method = bayes` then rejects while accepting the hand-written twin.
+#[test]
+fn test_weighted_kappa_mu_refs_match_the_hand_written_form() {
+    let declared = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let hand_written = parse_model_string(
+        &weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")
+            .replace("ETA_CL + KAPPA_CL", "ETA_CL + KAPPA_CL / sqrt(NARM)"),
+    )
+    .unwrap();
+    assert_eq!(
+        declared.kappa_mu_refs.contains_key("KAPPA_CL"),
+        hand_written.kappa_mu_refs.contains_key("KAPPA_CL"),
+        "declared and hand-written forms must agree on kappa mu-refs"
+    );
+    assert!(
+        !declared.kappa_mu_refs.contains_key("KAPPA_CL"),
+        "a weighted kappa is not a bare Eta after the rewrite, so it is not a mu-ref"
+    );
+}
+
+/// The order-dependent case the pre-rewrite snapshot got backwards: in
+/// `TVCL * exp(KAPPA_CL) * exp(ETA_CL)` the left-to-right `or_else` returns the
+/// *kappa* index on the snapshot, losing the BSV eta's mu-ref that survives the
+/// rewrite — and with it SAEM/IMP's closed-form θ step.
+#[test]
+fn test_weighted_kappa_left_of_the_bsv_eta_keeps_the_bsv_mu_reference() {
+    let model_str = weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", "").replace(
+        "CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+        "CL = TVCL * exp(KAPPA_CL) * exp(ETA_CL)",
+    );
+    let model = parse_model_string(&model_str).unwrap();
+    let mu = model
+        .mu_refs
+        .get("ETA_CL")
+        .expect("BSV mu-ref survives a kappa written to its left");
+    assert_eq!(mu.theta_name, "TVCL");
+    assert!(mu.log_transformed);
+}
+
 #[test]
 fn test_split_weight_modifier_peels_a_kappa_declaration() {
     let (stmt, w) = super::split_weight_modifier(

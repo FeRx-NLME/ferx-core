@@ -17,7 +17,7 @@ pub(crate) use validation::{
     assert_analytic_readout_support, assert_covariates_present, assert_dose_compartments_supported,
     assert_modeled_doses_supported, check_absorption_closed_form_support, check_absorption_dosing,
     check_absorption_flip_flop_no_twin, check_analytic_readout_support, check_covariates,
-    check_dose_compartments, check_modeled_dose_rates,
+    check_dose_compartments, check_kappa_weights, check_modeled_dose_rates,
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{

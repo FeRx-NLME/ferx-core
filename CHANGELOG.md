@@ -254,11 +254,14 @@ section of the SDLC for the versioning policy).
   are unchanged, and the reported Ω_IOV stays the **unweighted** γ² a published analysis quotes.
   The fit printout adds the number a reader actually needs next to it — the effective SD at the
   median arm, `γ/√N` — and `FitResult` carries `kappa_weights` / `kappa_weight_typical`. The weight
-  may reference covariates, thetas and `TIME` but not a random effect; a weighted kappa may be
-  referenced only in `[individual_parameters]` (elsewhere it would read as the unweighted κ);
-  `block_kappa` cannot carry one. A weight that is zero, negative or non-finite at any record — a
-  blank arm-size cell — is rejected up front with `E_KAPPA_WEIGHT_NONPOSITIVE` instead of dividing
-  an individual parameter by zero mid-fit, and one that moves *within* an occasion warns.
+  may reference covariates, `FIX`ed thetas and `TIME` but neither a random effect nor an estimated
+  theta (both would make the divisor move underneath the up-front positivity check); a weighted
+  kappa may be referenced only in `[individual_parameters]`, and must be referenced somewhere in it
+  (elsewhere it would read as the unweighted κ, and nowhere would report a scaling that was never
+  applied); `block_kappa` cannot carry one. A weight that is zero, negative or non-finite at any
+  record — a blank arm-size cell — is rejected up front by both `fit()` and `simulate()` with
+  `E_KAPPA_WEIGHT_NONPOSITIVE` instead of dividing an individual parameter by zero mid-run, and one
+  that moves *within* an occasion warns.
 - **First-class residual weighting: `weight = <expr>` on the error model (#1029).** Meta-analysis
   rows are trial-arm summaries that differ in precision, and inverse-variance weighting is what makes
   an MBMA an MBMA. Until now it had to be hand-built in three places that must agree — divide `DV` in

@@ -1535,8 +1535,41 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 return Err(format!(
                     "[parameters] kappa `{name}` weight `{src}` references a random effect. \
                      A weight is the *known* precision of an occasion (an arm's sample size), \
-                     so it may depend only on covariates, thetas and TIME — a random effect \
-                     there would make the variance of κ a function of κ itself."
+                     so it may depend only on covariates, fixed thetas and TIME — a random \
+                     effect there would make the variance of κ a function of κ itself."
+                ));
+            }
+            // Same argument one step further out: an *estimated* theta makes the
+            // weight move during the outer optimisation, so the up-front
+            // positivity check (`E_KAPPA_WEIGHT_NONPOSITIVE`, evaluated at the
+            // initial θ) certifies nothing — a weight that is positive at the
+            // start and crosses zero mid-fit divides an individual parameter by
+            // zero with no diagnostic. A FIXed theta is a known constant, so it
+            // is as safe as a covariate column and stays allowed.
+            let mut estimated: Vec<&str> = Vec::new();
+            visit_expr_nodes(&expr, &mut |e: &Expression| {
+                if let Expression::Theta(ti) = e {
+                    if thetas.get(*ti).is_some_and(|t| !t.fixed) {
+                        let tn = thetas[*ti].name.as_str();
+                        if !estimated.contains(&tn) {
+                            estimated.push(tn);
+                        }
+                    }
+                }
+            });
+            if !estimated.is_empty() {
+                return Err(format!(
+                    "[parameters] kappa `{name}` weight `{src}` references estimated theta(s) {}. \
+                     A weight is the *known* precision of an occasion, so it may depend only on \
+                     covariates, FIXed thetas and TIME: an estimated theta moves the weight during \
+                     the fit, so the up-front check that it stays strictly positive cannot certify \
+                     it, and a weight that crosses zero divides an individual parameter by zero. \
+                     Declare the constant `FIX`, or move it into a covariate column.",
+                    estimated
+                        .iter()
+                        .map(|n| format!("`{n}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 ));
             }
             out.push(Some(expr));
@@ -1559,10 +1592,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .enumerate()
             .filter_map(|(k, w)| w.as_ref().and_then(|_| kappa_names.get(k)))
             .collect();
-        let named_blocks = extracted.named.values().flat_map(|m| m.iter());
+        // `extracted.named` is keyed block-type → instance-name, so the inner
+        // key alone would print `[armA]` — the instance, not the block. Label
+        // each with the pair the author actually wrote (`event_model armA`).
+        let named_blocks = extracted
+            .named
+            .iter()
+            .flat_map(|(ty, m)| m.keys().map(move |inst| (format!("{ty} {inst}"), &m[inst])));
         for (block, lines) in blocks
             .iter()
             .filter(|(b, _)| b.as_str() != "parameters" && b.as_str() != "individual_parameters")
+            .map(|(b, l)| (b.clone(), l))
             .chain(named_blocks)
         {
             let mut refs: HashSet<String> = HashSet::new();
@@ -1581,19 +1621,44 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             }
         }
     }
-    // Snapshot for mu-reference detection, taken *before* the rewrite and only
-    // when there is a rewrite to do (so an unweighted model detects on the
-    // statements it always did, byte for byte). Detection pattern-matches on
-    // `exp(Eta(a) + Eta(b))` shapes; wrapping a kappa in a division can mask a
-    // *BSV* eta's mu-reference that sits in the same expression, which would
-    // silently cost SAEM/IMP its closed-form θ step.
-    let mu_ref_stmts: Option<Vec<Statement>> = if weighted_kappa_slots.is_empty() {
-        None
-    } else {
-        let snapshot = indiv_stmts.clone();
-        rewrite_weighted_kappas(&mut indiv_stmts, &weighted_kappa_slots);
-        Some(snapshot)
-    };
+    if !weighted_kappa_slots.is_empty() {
+        // Mu-reference detection (further down) runs on the *rewritten*
+        // statements, deliberately: the declared form and the hand-written
+        // `K / sqrt(W)` must be the same model everywhere, mu-refs included.
+        // Detecting on a pre-rewrite snapshot would register a kappa mu-ref the
+        // rewritten model does not satisfy (which `method = bayes` then
+        // rejects) and, in `THETA * exp(KAPPA) * exp(ETA)`, would return the
+        // kappa's index and *lose* the BSV eta's mu-ref that survives the
+        // rewrite — costing SAEM/IMP the closed-form θ step it is meant to
+        // protect. `exp(ETA + KAPPA/sqrt(W))` still resolves to `ETA` via the
+        // `(a, b) => a.or(b)` arm, which already tolerates a non-bare operand.
+        let rewritten = rewrite_weighted_kappas(&mut indiv_stmts, &weighted_kappa_slots);
+        // A weight that scales nothing is not a no-op: `print_results` would
+        // still report `→ SD = γ/√N` for a scaling that was never applied, and
+        // a covariate named only by the weight expression never reaches
+        // `referenced_covariates`, so the datareader skips the column and the
+        // data check then blames a *present* column for evaluating to 0.
+        let mut inert: Vec<&str> = weighted_kappa_slots
+            .keys()
+            .filter(|slot| !rewritten.contains(slot))
+            .filter_map(|slot| kappa_names.get(slot - n_eta).map(String::as_str))
+            .collect();
+        if !inert.is_empty() {
+            inert.sort_unstable();
+            return Err(format!(
+                "[parameters] kappa(s) {} are declared with `weight = ...` but never referenced \
+                 in [individual_parameters]. The weight is applied where the kappa is *used* \
+                 (`K` → `K / sqrt(W)`), so an unreferenced one scales nothing while the fit still \
+                 reports the weighted SD. Reference the kappa in [individual_parameters], or drop \
+                 the `weight = ...` modifier.",
+                inert
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+    }
 
     // Detect ODE vs analytical model
     let is_ode = struct_lines
@@ -2316,13 +2381,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .chain(kappa_names.iter())
         .cloned()
         .collect();
-    // On a weighted-kappa model (#1031) detection runs on the pre-rewrite
-    // snapshot: `K / sqrt(W)` is not a bare `Eta` node, and the mu-reference
-    // matcher would stop recognising the mu-referenced *BSV* eta sharing that
-    // `exp(...)` — costing SAEM/IMP their closed-form θ step over a change that
-    // is only about κ's scale.
+    // Detection runs on the statements as they will actually be evaluated —
+    // including the weighted-kappa rewrite (#1031), which is the point: the
+    // declared `weight = W` form and the hand-written `K / sqrt(W)` must agree
+    // on their mu-refs exactly as they agree on the objective. See the rewrite
+    // site above.
     let all_mu_refs = detect_mu_refs(
-        mu_ref_stmts.as_deref().unwrap_or(&indiv_stmts),
+        &indiv_stmts,
         &theta_names,
         &all_eta_names,
         &nn_specs_for_ctx,
@@ -14059,10 +14124,23 @@ fn visit_stmt_nodes(stmts: &[Statement], f: &mut dyn FnMut(&Expression)) {
 /// a replacement node, so replacing `Eta(k)` with an expression that still
 /// contains `Eta(k)` would re-fire forever. This walk descends only into the
 /// nodes it did not create.
-fn rewrite_weighted_kappas(stmts: &mut [Statement], weights: &HashMap<usize, Expression>) {
-    fn walk_expr(expr: &mut Expression, weights: &HashMap<usize, Expression>) {
+///
+/// Returns the set of slots that were actually rewritten — i.e. the weighted
+/// kappas the block really references. A weighted kappa missing from that set
+/// carries a weight that does nothing, which the caller rejects rather than
+/// letting the fit report a scaling it never applied.
+fn rewrite_weighted_kappas(
+    stmts: &mut [Statement],
+    weights: &HashMap<usize, Expression>,
+) -> HashSet<usize> {
+    fn walk_expr(
+        expr: &mut Expression,
+        weights: &HashMap<usize, Expression>,
+        hit: &mut HashSet<usize>,
+    ) {
         if let Expression::Eta(i) = expr {
             if let Some(w) = weights.get(i) {
+                hit.insert(*i);
                 *expr = Expression::BinOp(
                     Box::new(Expression::Eta(*i)),
                     BinOp::Div,
@@ -14073,41 +14151,46 @@ fn rewrite_weighted_kappas(stmts: &mut [Statement], weights: &HashMap<usize, Exp
         }
         match expr {
             Expression::BinOp(l, _, r) => {
-                walk_expr(l, weights);
-                walk_expr(r, weights);
+                walk_expr(l, weights, hit);
+                walk_expr(r, weights, hit);
             }
-            Expression::UnaryFn(_, a) => walk_expr(a, weights),
+            Expression::UnaryFn(_, a) => walk_expr(a, weights, hit),
             Expression::Power(b, e) => {
-                walk_expr(b, weights);
-                walk_expr(e, weights);
+                walk_expr(b, weights, hit);
+                walk_expr(e, weights, hit);
             }
             Expression::Conditional(c, t, e) => {
-                walk_cond(c, weights);
-                walk_expr(t, weights);
-                walk_expr(e, weights);
+                walk_cond(c, weights, hit);
+                walk_expr(t, weights, hit);
+                walk_expr(e, weights, hit);
             }
             _ => {}
         }
     }
-    fn walk_cond(cond: &mut Condition, weights: &HashMap<usize, Expression>) {
+    fn walk_cond(
+        cond: &mut Condition,
+        weights: &HashMap<usize, Expression>,
+        hit: &mut HashSet<usize>,
+    ) {
         match cond {
             Condition::Compare(l, _, r) => {
-                walk_expr(l, weights);
-                walk_expr(r, weights);
+                walk_expr(l, weights, hit);
+                walk_expr(r, weights, hit);
             }
             Condition::And(l, r) | Condition::Or(l, r) => {
-                walk_cond(l, weights);
-                walk_cond(r, weights);
+                walk_cond(l, weights, hit);
+                walk_cond(r, weights, hit);
             }
-            Condition::Not(c) => walk_cond(c, weights),
+            Condition::Not(c) => walk_cond(c, weights, hit),
         }
     }
+    let mut hit: HashSet<usize> = HashSet::new();
     for s in stmts {
         match s {
             Statement::Assign(_, e)
             | Statement::AssignIdx(_, e)
             | Statement::DiffEq(_, e)
-            | Statement::DiffEqIdx(_, e) => walk_expr(e, weights),
+            | Statement::DiffEqIdx(_, e) => walk_expr(e, weights, &mut hit),
             // Bytecode forms only exist after `resolve_variable_indices`, which
             // runs long after this rewrite.
             Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {}
@@ -14116,15 +14199,16 @@ fn rewrite_weighted_kappas(stmts: &mut [Statement], weights: &HashMap<usize, Exp
                 else_body,
             } => {
                 for (cond, body) in branches {
-                    walk_cond(cond, weights);
-                    rewrite_weighted_kappas(body, weights);
+                    walk_cond(cond, weights, &mut hit);
+                    hit.extend(rewrite_weighted_kappas(body, weights));
                 }
                 if let Some(eb) = else_body {
-                    rewrite_weighted_kappas(eb, weights);
+                    hit.extend(rewrite_weighted_kappas(eb, weights));
                 }
             }
         }
     }
+    hit
 }
 
 /// Accumulate every covariate name referenced in an expression.

@@ -182,3 +182,43 @@ fn an_unweighted_kappa_is_not_checked() {
         .iter()
         .all(|d| d.code != "E_KAPPA_WEIGHT_NONPOSITIVE"));
 }
+
+/// `simulate()` runs its own (shorter) validation list, so the weight check has
+/// to be wired there too: a blank arm-size cell in a simulation dataset — the
+/// exact MBMA case the error exists for — otherwise divides an individual
+/// parameter by zero and lands as NaN/Inf DV instead of an up-front error.
+#[test]
+fn a_zero_arm_size_is_rejected_on_the_simulate_path() {
+    let model = weighted_kappa_model();
+    let pop = population_with_arm_sizes(&[(1, 200.0), (2, 0.0)]);
+    let err = crate::api::simulate_with_options(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        &crate::api::SimulateOptions::default(),
+    )
+    .expect_err("simulate must reject a non-positive kappa weight");
+    assert!(
+        err.contains("kappa `KAPPA_CL` weight `NARM` evaluates to 0"),
+        "got: {err}"
+    );
+}
+
+/// The same path must stay open for a dataset whose arm sizes are all positive.
+#[test]
+fn positive_arm_sizes_pass_on_the_simulate_path() {
+    let model = weighted_kappa_model();
+    let pop = population_with_arm_sizes(&[(1, 200.0), (2, 150.0)]);
+    let out = crate::api::simulate_with_options(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        &crate::api::SimulateOptions::default(),
+    );
+    assert!(
+        !matches!(&out, Err(e) if e.contains("weight `NARM`")),
+        "a positive weight must not be rejected: {out:?}"
+    );
+}

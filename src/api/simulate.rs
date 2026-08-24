@@ -380,6 +380,13 @@ pub fn simulate_with_options_diag(
     // with no diagnostic). Reject it here the same way `fit()` does (#658).
     first_error(&check_covariates(model, population))?;
 
+    // Same parity for a sample-size-weighted kappa (#1031): the weight is applied
+    // as `κ/√W`, so a blank or zero arm-size cell — the exact MBMA case the check
+    // exists for — divides an individual parameter by zero and yields NaN/Inf DV
+    // instead of an up-front error. Only the fatal half; the within-occasion
+    // variation warning belongs to `fit()`'s warning list.
+    first_error(&check_kappa_weights(model, population))?;
+
     // Validate the TTE horizon on the library path too — the `.ferx` parser
     // already rejects a non-finite / non-positive horizon, but a direct caller of
     // this API must get the same guard: a NaN window makes every `t_event < window`
@@ -1007,8 +1014,10 @@ pub fn simulate_with_uncertainty(
 
     // Parity with `fit()`: reject a referenced covariate absent from the data
     // rather than silently reading it as 0.0 (a `Selected` error-model selector
-    // would otherwise route every row to branch 0). See #658.
+    // would otherwise route every row to branch 0). See #658 — and, for a
+    // weighted kappa, a non-positive weight before it divides by zero (#1031).
     first_error(&check_covariates(model, population))?;
+    first_error(&check_kappa_weights(model, population))?;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),

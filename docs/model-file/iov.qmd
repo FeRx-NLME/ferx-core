@@ -139,19 +139,23 @@ $\gamma/\sqrt{200} \approx 0.14$ is the between-arm SD a reader is looking for.
 
 ### Rules and diagnostics
 
-- The weight may reference **covariates, thetas and `TIME`** — not random
-  effects. A weight is the known precision of an occasion; a random effect there
-  would make the variance of κ a function of κ.
+- The weight may reference **covariates, `FIX`ed thetas and `TIME`** — not
+  random effects, and not estimated thetas. A weight is the *known* precision of
+  an occasion: a random effect there would make the variance of κ a function of
+  κ, and an estimated theta would move the weight during the fit, so the
+  positivity check below (evaluated at the initial θ) could not certify it.
 - A weighted kappa may be referenced **only in `[individual_parameters]`**.
-  Elsewhere it would read as the unweighted κ, so the parser rejects it.
+  Elsewhere it would read as the unweighted κ, so the parser rejects it — and it
+  must be referenced *somewhere* in that block, since a weight that scales
+  nothing would still be reported as if it had been applied.
 - `block_kappa` cannot carry a weight: the divisor would have to apply to the
   block's covariances too for the matrix to stay a valid one. Declare a weighted
   kappa as a diagonal `kappa`.
 - A weight that is zero, negative or non-finite at any record is a fit-time
   error (`E_KAPPA_WEIGHT_NONPOSITIVE`) — the usual cause is a blank arm-size
-  cell. A weight that changes *within* an occasion warns
-  (`W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION`): κ is drawn once per occasion, so
-  `Ω_IOV/W` is ambiguous when `W` moves underneath it.
+  cell. `simulate()` enforces the same check. A weight that changes *within* an
+  occasion warns (`W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION`): κ is drawn once per
+  occasion, so `Ω_IOV/W` is ambiguous when `W` moves underneath it.
 
 ### Validation against NONMEM
 

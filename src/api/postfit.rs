@@ -769,12 +769,6 @@ pub(crate) fn compute_subject_results(
         .collect()
 }
 
-/// Kappa shrinkage pooled across all subject-occasion pairs.
-///
-/// `1 - sqrt(mean(κ̂²)) / sqrt(omega_iov_kk)` for each kappa k, where the mean
-/// runs over every (subject, occasion) pair.  Returns NaN for a given kappa when
-/// the corresponding diagonal of `omega_iov` is non-positive or when fewer than
-/// two (subject, occasion) observations are available.
 /// Per-kappa weight of the *median* subject-occasion in this dataset (#1031),
 /// parallel to `CompiledModel::kappa_names`; `None` for an unweighted kappa.
 ///
@@ -819,6 +813,12 @@ pub(crate) fn kappa_weight_typicals(
         .collect()
 }
 
+/// Kappa shrinkage pooled across all subject-occasion pairs.
+///
+/// `1 - sqrt(mean(κ̂²)) / sqrt(omega_iov_kk)` for each kappa k, where the mean
+/// runs over every (subject, occasion) pair.  Returns NaN for a given kappa when
+/// the corresponding diagonal of `omega_iov` is non-positive or when fewer than
+/// two (subject, occasion) observations are available.
 pub(crate) fn compute_kappa_shrinkage(
     kappas_per_subject: &[Vec<DVector<f64>>],
     omega_iov: &DMatrix<f64>,
