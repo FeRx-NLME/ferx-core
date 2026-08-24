@@ -138,9 +138,24 @@ NM_FOCEI <- c(1.32695e-01, 7.73771e+00, 8.10796e-01, 2.85884e-02, 9.59179e-03, 3
               sqrt(1.11621e-04))
 
 agq_pop <- pull_pop(agq)
+
+# Percent is the natural axis for a cross-implementation check, and on its own it MISLEADS here:
+# on 10 subjects Omega carries an SE of 45% of its own estimate while sigma's is 7.9%, so
+# nlmixr2's +7.2% on omega^2CL is 0.16 SE -- indistinguishable from the reference -- while ferx
+# VI's +6.3% on sigma is 0.80 SE, the largest deviation in the tier. Read percent alone and the
+# ranking inverts. Both panels, therefore, from ferx's own FOCEI covariance step.
+pull_se <- function(y) c(
+  vapply(y$theta, function(t) t$se, numeric(1)),
+  vapply(y$omega, function(o) o$se, numeric(1)),
+  sigma = y$sigma[[1]]$se
+)
+focei_se <- pull_se(f_focei)
+stopifnot("the FOCEI reference fit must carry standard errors" = all(is.finite(focei_se)))
+
 column <- function(label, tool, family, value) tibble(
   estimator = label, tool = tool, family = family, parameter = factor(PAR, levels = rev(PAR)),
-  pct = 100 * (value - agq_pop) / abs(agq_pop)
+  pct = 100 * (value - agq_pop) / abs(agq_pop),
+  se_units = (value - agq_pop) / focei_se
 )
 dev <- bind_rows(
   column("NONMEM FOCEI", "NONMEM", "FOCEI", NM_FOCEI),
@@ -167,49 +182,58 @@ lab1 <- dev |> filter(abs(pct) > NEAR)
 # own row-slot, in a fixed order, so a reader can follow one estimator across parameters.
 DODGE <- position_dodge(width = 0.78)
 
-p1 <- ggplot(dev, aes(pct, parameter, group = estimator)) +
-  annotate("rect", xmin = -NEAR, xmax = NEAR, ymin = -Inf, ymax = Inf, fill = RULE, alpha = 0.45) +
-  geom_vline(xintercept = 0, colour = REF, linewidth = 0.5) +
-  geom_point(aes(fill = tool, shape = family), size = 2.6, colour = "white", stroke = 0.6,
-             position = DODGE) +
-  geom_text(data = lab1, aes(label = sprintf("%+.1f%%", pct)), hjust = -0.3, size = 2.6,
-            colour = INK2, position = DODGE) +
-  scale_fill_manual(values = c(ferx = COL[["ferx"]], nlmixr2 = COL[["nlmixr2"]], NONMEM = INK)) +
-  scale_shape_manual(values = c(FOCEI = 24, VI = 21)) +
-  guides(
-    fill = guide_legend(order = 1, override.aes = list(shape = 21, size = 3)),
-    shape = guide_legend(order = 2, override.aes = list(fill = INK3, size = 3))
-  ) +
-  scale_x_continuous(breaks = seq(-2, 8, 2), labels = label_percent(scale = 1, accuracy = 1),
-                     expand = expansion(c(0.06, 0.16))) +
-  labs(
-    title = "Tier 1 — every estimator against the AGQ reference",
-    # Computed rather than written in: this subtitle went stale once already when the runs
-    # behind it were corrected, and a figure that misreports its own numbers is worse than one
-    # carrying no numbers at all.
+# `band` shades the "on the reference" region; `lab_at` is where point labels start, and they
+# are not the same number on the SE panel: nothing there exceeds 1 SE, so labelling at the band
+# would label nothing and the one deviation worth naming would go unnamed.
+panel <- function(xvar, band, xlab, fmt, labels, lab_at = band) {
+  lab <- dev |> filter(abs(.data[[xvar]]) > lab_at)
+  ggplot(dev, aes(.data[[xvar]], parameter, group = estimator)) +
+    annotate("rect", xmin = -band, xmax = band, ymin = -Inf, ymax = Inf, fill = RULE, alpha = 0.45) +
+    geom_vline(xintercept = 0, colour = REF, linewidth = 0.5) +
+    geom_point(aes(fill = tool, shape = family), size = 2.6, colour = "white", stroke = 0.6,
+               position = DODGE) +
+    geom_text(data = lab, aes(label = sprintf(fmt, .data[[xvar]])), hjust = -0.3, size = 2.6,
+              colour = INK2, position = DODGE) +
+    scale_fill_manual(values = c(ferx = COL[["ferx"]], nlmixr2 = COL[["nlmixr2"]], NONMEM = INK)) +
+    scale_shape_manual(values = c(FOCEI = 24, VI = 21)) +
+    guides(
+      fill = guide_legend(order = 1, override.aes = list(shape = 21, size = 3)),
+      shape = guide_legend(order = 2, override.aes = list(fill = INK3, size = 3))
+    ) +
+    scale_x_continuous(labels = labels, expand = expansion(c(0.06, 0.16))) +
+    labs(x = xlab, y = NULL) +
+    theme_ferx() +
+    theme(panel.grid.major.y = element_line(colour = RULE, linewidth = 0.3))
+}
+
+p1 <- panel("pct", NEAR, "deviation from AGQ", "%+.1f%%",
+            label_percent(scale = 1, accuracy = 1)) +
+  panel("se_units", 1, "deviation ÷ FOCEI standard error", "%+.2f SE",
+        label_number(accuracy = 0.5, suffix = " SE"), lab_at = 0.5) +
+  patchwork::plot_layout(ncol = 2, guides = "collect") +
+  patchwork::plot_annotation(
+    title = "Tier 1 — every estimator against the AGQ reference, two ways",
     subtitle = sprintf(paste0(
-      "Signed deviation from ferx AGQ (n_agq = 9), which integrates the marginal instead of ",
-      "approximating it.\nShaded band is ±%.0f%%. NONMEM's FOCEI lands on the reference (worst ",
-      "%.2f%%), so the reference is corroborated,\nnot assumed — and ferx FOCEI reproduces NONMEM ",
-      "to %.0e on the OFV. The outliers are nlmixr2's FOCEI Ω\n(up to %+.1f%%) and both VI ",
-      "implementations' σ, which miss in OPPOSITE directions (%+.1f%% / %+.1f%%)."),
-      NEAR,
-      max(abs(dev$pct[dev$estimator == "NONMEM FOCEI"])),
-      1e-6,
+      "Left: relative deviation, the cross-implementation view. Right: the same deviations ",
+      "divided by ferx's FOCEI\nstandard error — the inferential view, and it reverses the ",
+      "ranking. nlmixr2's FOCEI Ω is the visual outlier on the\nleft (%+.1f%%) and only %.2f SE ",
+      "on the right, because ω² carries a %.0f%% SE on 10 subjects; ferx VI's σ is\n%+.1f%% but ",
+      "%.2f SE, the largest real deviation in the tier. NONMEM's FOCEI lands on the reference in ",
+      "both."),
       max(dev$pct[dev$estimator == "nlmixr2 FOCEI"]),
+      max(abs(dev$se_units[dev$estimator == "nlmixr2 FOCEI"])),
+      100 * focei_se[["ETA_CL"]] / agq_pop[["ETA_CL"]],
       dev$pct[dev$estimator == "ferx VI" & dev$parameter == "σ"],
-      dev$pct[dev$estimator == "nlmixr2 emvi" & dev$parameter == "σ"]),
-    x = "deviation from AGQ", y = NULL,
+      dev$se_units[dev$estimator == "ferx VI" & dev$parameter == "σ"]),
     caption = paste0(
       "warfarin, 10 subjects, 110 observations · 1-cpt oral, lognormal η on CL/V/KA, ",
-      "proportional error\nNONMEM column: tests/nonmem/warfarin_imp.ext TABLE NO. 1 · ",
-      "σ is compared as an SD, so NONMEM's $SIGMA variance is square-rooted first")
-  ) +
-  theme_ferx() +
-  theme(panel.grid.major.y = element_line(colour = RULE, linewidth = 0.3),
-        panel.grid.major.x = element_line(colour = RULE, linewidth = 0.3))
+      "proportional error · shaded bands: ±1% and ±1 SE\nSEs are ferx's FOCEI covariance step ",
+      "(they scale the deviations; they are not error bars on these points) · NONMEM column: ",
+      "tests/nonmem/warfarin_imp.ext TABLE NO. 1"),
+    theme = theme_ferx()
+  )
 
-ggsave(file.path(figs, "population-vs-agq.png"), p1, width = 8.2, height = 5.2, dpi = 200)
+ggsave(file.path(figs, "population-vs-agq.png"), p1, width = 11.4, height = 5.2, dpi = 200)
 
 # ---- per-subject q ----------------------------------------------------------------------
 ETA <- c("η CL", "η V", "η KA")
