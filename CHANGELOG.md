@@ -240,6 +240,25 @@ section of the SDLC for the versioning policy).
   stopped theta from fixing.
 
 ### Added
+- **Sample-size-weighted IOV: `weight = <expr>` on a `kappa` declaration (#1031).** The arm-level
+  random effect of every longitudinal MBMA — between-treatment-arm variability — is distributed
+  `κ_ik ~ N(0, γ²/N_ik)`: a 400-subject arm's mean wanders a quarter as far as a 25-subject arm's.
+  ferx could express that only by hand, inside a structural equation
+  (`... + ETA_EMAX + KAPPA_EMAX / sqrt(NARM)`), which put a variance-structure decision where
+  `/ NARM` instead of `/ sqrt(NARM)` produces a plausible wrong answer rather than an error, and
+  where nothing marks the term as weighted. Declare it where the rest of the variance structure is
+  declared instead: `kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM`, and write the structural expression
+  as `... + ETA_EMAX + KAPPA_EMAX`. The engine applies the scaling by rewriting the kappa as
+  `KAPPA / sqrt(W)`, which is exactly the hand-written form — so the objective, the analytic
+  sensitivities, the EBEs and every estimator that supports IOV (FOCE, FOCEI, Laplace/AGQ, SAEM)
+  are unchanged, and the reported Ω_IOV stays the **unweighted** γ² a published analysis quotes.
+  The fit printout adds the number a reader actually needs next to it — the effective SD at the
+  median arm, `γ/√N` — and `FitResult` carries `kappa_weights` / `kappa_weight_typical`. The weight
+  may reference covariates, thetas and `TIME` but not a random effect; a weighted kappa may be
+  referenced only in `[individual_parameters]` (elsewhere it would read as the unweighted κ);
+  `block_kappa` cannot carry one. A weight that is zero, negative or non-finite at any record — a
+  blank arm-size cell — is rejected up front with `E_KAPPA_WEIGHT_NONPOSITIVE` instead of dividing
+  an individual parameter by zero mid-fit, and one that moves *within* an occasion warns.
 - **First-class residual weighting: `weight = <expr>` on the error model (#1029).** Meta-analysis
   rows are trial-arm summaries that differ in precision, and inverse-variance weighting is what makes
   an MBMA an MBMA. Until now it had to be hand-built in three places that must agree — divide `DV` in

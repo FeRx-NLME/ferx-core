@@ -10643,3 +10643,104 @@ fn tte_only_subject_declines_the_event_walk_gradient() {
         "the #905 gate must keep a no-Gaussian-obs subject off the event-driven gradient walk"
     );
 }
+
+/// Sample-size-weighted IOV (#1031): `weight = NARM` desugars every reference to
+/// `KAPPA_CL` into `KAPPA_CL / sqrt(NARM)`, so the analytic `∂f/∂κ` must pick up
+/// the same `1/√W` factor — and, because the weight is an ordinary covariate
+/// read per record, a different factor per occasion.
+const WARFARIN_IOV_WEIGHTED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.25 weight = NARM
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[covariates]
+  NARM continuous
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+/// [`iov_subject`] with a per-record arm size — two occasions of different size,
+/// so a scaling that were applied uniformly (or not at all) shows up.
+fn weighted_iov_subject() -> Subject {
+    let mut s = iov_subject();
+    let narm = |n: f64| -> HashMap<String, f64> { [("NARM".to_string(), n)].into_iter().collect() };
+    s.covariates = narm(64.0);
+    s.obs_covariates = s
+        .occasions
+        .iter()
+        .map(|&occ| narm(if occ == 1 { 64.0 } else { 16.0 }))
+        .collect();
+    s.dose_covariates = s
+        .dose_occasions
+        .iter()
+        .map(|&occ| narm(if occ == 1 { 64.0 } else { 16.0 }))
+        .collect();
+    s
+}
+
+/// Weighted-kappa IOV: provider == FD of `predict_iov` over `[η_bsv, κ_g0, κ_g1]`.
+/// A wrong `1/√W` in the κ column is invisible to the value check and shows up
+/// only here — there is no second copy of the formula to disagree with it.
+#[test]
+fn weighted_iov_provider_matches_fd_of_predict_iov() {
+    let model = parse_model_string(WARFARIN_IOV_WEIGHTED).expect("parse weighted IOV");
+    assert!(model.has_weighted_kappa());
+    assert!(
+        iov_analytical_supported(&model),
+        "a weighted kappa must stay on the analytic IOV walk"
+    );
+    check_iov_provider_vs_fd(
+        &model,
+        &weighted_iov_subject(),
+        &[0.2, 10.0, 1.5],
+        &[0.12, -0.08, 0.20, 0.40, -0.80],
+    );
+}
+
+/// The weighted model's `∂f/∂κ` is exactly the unweighted model's, divided by
+/// `√W` for that occasion — the reparameterisation stated as a derivative.
+#[test]
+fn weighted_iov_kappa_gradient_is_the_unweighted_one_scaled() {
+    let weighted = parse_model_string(WARFARIN_IOV_WEIGHTED).expect("parse weighted IOV");
+    let plain = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+    let subject = weighted_iov_subject();
+    let theta = [0.2, 10.0, 1.5];
+    // κ_g0 sits at arm size 64 (÷8), κ_g1 at 16 (÷4).
+    let stacked_w = [0.12, -0.08, 0.20, 0.40, -0.80];
+    let stacked_p = [0.12, -0.08, 0.20, 0.40 / 8.0, -0.80 / 4.0];
+    let sw = subject_sensitivities_iov(&weighted, &subject, &theta, &stacked_w).expect("supported");
+    let sp = subject_sensitivities_iov(&plain, &subject, &theta, &stacked_p).expect("supported");
+    let n_st = stacked_w.len();
+    for (j, (ow, op)) in sw.obs.iter().zip(sp.obs.iter()).enumerate() {
+        approx::assert_relative_eq!(ow.f, op.f, max_relative = 1e-10);
+        // κ columns: g0 → /8, g1 → /4. BSV columns are untouched.
+        for k in 0..n_st {
+            let scale = match k {
+                3 => 1.0 / 8.0,
+                4 => 1.0 / 4.0,
+                _ => 1.0,
+            };
+            approx::assert_relative_eq!(
+                ow.df_deta[k],
+                op.df_deta[k] * scale,
+                max_relative = 1e-9,
+                epsilon = 1e-12
+            );
+        }
+        assert!(ow.f.is_finite(), "obs {j} must be finite");
+    }
+}

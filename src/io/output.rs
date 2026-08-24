@@ -324,6 +324,25 @@ pub fn print_results(result: &FitResult) {
             } else {
                 eprintln!("  {:<20} = {:.6}  SE = {}", label, var, se_str);
             }
+            // Sample-size-weighted IOV (#1031): the estimate above is the
+            // *unweighted* γ² — the quantity a published MBMA reports — so
+            // print the effective SD at the median arm alongside it. A raw
+            // γ of 2.0 on a logit scale reads as alarming until it is divided.
+            if let Some(Some(w)) = result.kappa_weights.get(i) {
+                match result.kappa_weight_typical.get(i).copied().flatten() {
+                    Some(n) if n > 0.0 && var >= 0.0 => eprintln!(
+                        "  {:<20}   weight = {}  →  SD = {:.4} at {} = {:.4} (κ ~ N(0, {}/{}))",
+                        "",
+                        w,
+                        var.sqrt() / n.sqrt(),
+                        w,
+                        n,
+                        name,
+                        w
+                    ),
+                    _ => eprintln!("  {:<20}   weight = {} (κ ~ N(0, {}/{}))", "", w, name, w),
+                }
+            }
         }
         // Off-diagonal covariances/correlations (block_kappa)
         let has_offdiag = (0..n_kappa).any(|i| (0..i).any(|j| iov[(i, j)].abs() > 1e-15));
@@ -2300,6 +2319,8 @@ mod tests {
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),
             kappa_init_as_sd: Vec::new(),
+            kappa_weights: Vec::new(),
+            kappa_weight_typical: Vec::new(),
             se_kappa: None,
             shrinkage_kappa: Vec::new(),
             shrinkage_kappa_by_occ: Vec::new(),
@@ -2874,6 +2895,8 @@ mod tests {
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),
             kappa_init_as_sd: Vec::new(),
+            kappa_weights: Vec::new(),
+            kappa_weight_typical: Vec::new(),
             se_kappa: None,
             shrinkage_kappa: Vec::new(),
             shrinkage_kappa_by_occ: Vec::new(),
@@ -3669,6 +3692,25 @@ mod tests {
                 .contains("npde_seed"),
             "npde_seed line should be absent when NPDE did not run"
         );
+    }
+
+    /// A weighted kappa (#1031) prints the weight and, when the dataset gave
+    /// one, the effective SD at the median arm — the number that makes a raw
+    /// γ readable. Both arms (typical known / unknown) are exercised.
+    #[test]
+    fn print_results_reports_a_weighted_kappa() {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.omega_iov = Some(DMatrix::from_element(1, 1, 4.0));
+        r.kappa_names = vec!["KAPPA_EMAX".to_string()];
+        r.kappa_fixed = vec![false];
+        r.kappa_init_as_sd = vec![true];
+        r.kappa_weights = vec![Some("NARM".to_string())];
+        r.kappa_weight_typical = vec![Some(400.0)];
+        print_results(&r);
+        // No typical arm size (an empty or all-non-finite weight column):
+        // the weight still prints, without the derived SD.
+        r.kappa_weight_typical = vec![None];
+        print_results(&r);
     }
 
     #[test]

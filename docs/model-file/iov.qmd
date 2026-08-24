@@ -78,6 +78,121 @@ kappa KAPPA_KA ~ 0.10
 
 A name may not appear in both a `kappa` and a `block_kappa` line.
 
+## Sample-size-weighted IOV (`weight = ...`)
+
+> **Maturity: experimental** ([#1031](https://github.com/FeRx-NLME/ferx-core/issues/1031)).
+
+The arm-level random effect of a longitudinal model-based meta-analysis — the
+**between-treatment-arm variability (BTAV)** — is not drawn from one variance.
+It scales with the number of subjects behind the arm:
+
+$$
+\kappa_{ik} \sim \mathcal{N}\!\left(0, \frac{\gamma^2}{N_{ik}}\right)
+$$
+
+A 400-subject arm's mean wanders a quarter as far as a 25-subject arm's. Declare
+that where the rest of the variance structure is declared:
+
+```
+[parameters]
+  kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM
+
+[individual_parameters]
+  LEMAX = LEMAX0 + log(OR_ABATA) * ABATA + ETA_EMAX + KAPPA_EMAX
+
+[covariates]
+  NARM continuous     # number of subjects in this arm
+```
+
+`weight = W` means `κ ~ N(0, Ω_IOV / W)`. The engine applies the scaling by
+rewriting every reference to the kappa as `KAPPA / sqrt(W)` — precisely the
+hand-written form the modifier replaces — so the objective, the analytic
+sensitivities, the EBEs and every estimator see a model they already support.
+
+### Why declare it rather than write it
+
+`KAPPA_EMAX / sqrt(NARM)` in the middle of a structural equation works, but it
+puts a **variance-structure decision inside a structural expression**:
+
+- `/ NARM` instead of `/ sqrt(NARM)` produces a plausible wrong answer rather
+  than an error;
+- nothing in the model summary marks `KAPPA_EMAX` as weighted — it reports as an
+  ordinary IOV term;
+- the term can only be scaled where it is *used*, so the same divisor has to be
+  repeated in every expression the kappa enters.
+
+### What is reported
+
+The estimate stays the **unweighted** $\gamma^2$ — the quantity a published MBMA
+reports — and the fit prints the effective SD at the median arm alongside it:
+
+```
+--- KAPPA (IOV) Estimates ---
+  KAPPA_EMAX           = 4.145382  SE = 0.412000
+                         weight = NARM  →  SD = 0.1440 at NARM = 200.0000 (κ ~ N(0, KAPPA_EMAX/NARM))
+```
+
+A raw $\gamma$ of 2.0 on a logit scale reads as alarming until it is divided;
+$\gamma/\sqrt{200} \approx 0.14$ is the between-arm SD a reader is looking for.
+`FitResult` carries both as `kappa_weights` (the source text) and
+`kappa_weight_typical` (the median arm size).
+
+### Rules and diagnostics
+
+- The weight may reference **covariates, thetas and `TIME`** — not random
+  effects. A weight is the known precision of an occasion; a random effect there
+  would make the variance of κ a function of κ.
+- A weighted kappa may be referenced **only in `[individual_parameters]`**.
+  Elsewhere it would read as the unweighted κ, so the parser rejects it.
+- `block_kappa` cannot carry a weight: the divisor would have to apply to the
+  block's covariances too for the matrix to stay a valid one. Declare a weighted
+  kappa as a diagonal `kappa`.
+- A weight that is zero, negative or non-finite at any record is a fit-time
+  error (`E_KAPPA_WEIGHT_NONPOSITIVE`) — the usual cause is a blank arm-size
+  cell. A weight that changes *within* an occasion warns
+  (`W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION`): κ is drawn once per occasion, so
+  `Ω_IOV/W` is ambiguous when `W` moves underneath it.
+
+### Validation against NONMEM
+
+NONMEM has no `weight =` on an `$OMEGA`, so its equivalent model writes the
+scaling into `$PK` by hand — which is exactly what the declaration desugars
+into. Both engines were run on the warfarin IOV dataset with an arm-size column
+(`NARM` = 400 on occasion 1, 25 on occasion 2), 1-cpt oral, FOCE, same starting
+values (`tests/nonmem/kappa_weight_iov.{ctl,lst,ext}`):
+
+| Quantity | NONMEM 7.6.0 | ferx |
+|---|---|---|
+| OFV (without constant) | 207.455 | 205.683 |
+| TVCL | 0.31727 | 0.32464 |
+| TVV | 8.4018 | 8.4445 |
+| TVKA | 2.6180 | 2.4467 |
+| ω²(CL) | 0.59721 | 0.61281 |
+| ω²(KA) | 1.0571 | 0.89725 |
+| γ² (Ω_IOV) | 2.0013 | 1.8402 |
+| σ² (proportional) | 0.037588 | 0.040884 |
+
+ferx reaches a lower objective from the same start on a surface where κ is
+weakly identified (it enters divided by √400 and √25). The residual difference
+is the pre-existing cross-engine FOCE/IOV gap, not the weighting — evaluated at
+*identical fixed* parameters it is **smaller** with the weight than without:
+
+| Parameters | Model | NONMEM | ferx | Δ |
+|---|---|---|---|---|
+| inits, γ² = 0.01 | weighted `κ/√NARM` | 466.779 | 466.720 | 0.06 |
+| inits, γ² = 0.01 | plain `κ` | 332.265 | 331.620 | 0.65 |
+| NM MLE, γ² = 2.00 | weighted `κ/√NARM` | 207.455 | 205.943 | 1.51 |
+| NM MLE, γ² = 2.00 | plain `κ` | 238.889 | 238.524 | 0.37 |
+
+The declaration itself is exact: `weight = NARM` and the hand-written
+`KAPPA_CL / sqrt(NARM)` score **bit-identically** in ferx under FOCE, FOCEI,
+Laplace and SAEM (`tests/weighted_kappa_iov.rs`), and the analytic `∂f/∂κ`
+matches finite differences of the production predictor to tolerance.
+
+This is the random-effect sibling of the residual
+[`weight = ...`](error-model.qmd#residual-weighting-weight-...) modifier, and the
+two share syntax and validation.
+
 ## Model File Setup
 
 ```
