@@ -302,19 +302,27 @@ step counts, which a fit does not currently print — they are what a diagnostic
   right that the system is stiff but the method it picked could not integrate it — try naming
   `rodas5p` or `rosenbrock23` explicitly.
 
-Measured on the ferx-testdata ODE library (one prediction pass, default tolerances):
+Measured on the ferx-testdata ODE library at default tolerances. `λ_max` is the range across
+every integration segment of every subject; the wall-clock columns are FOCEI fits:
 
-| model | `λ_max` range across segments | what `auto` starts | vs `rk45` |
-|---|---|---|---|
-| cyclophosphamide (`run2_final`) | 35 – 234 | `rodas4` | **6.2 ms → 1.0 ms**, predictions agree to 8 digits |
-| cyclophosphamide (`run1_initial`) | 20 – 176 | `rodas4` | **4.4 ms → 1.0 ms** |
-| TMDD SAD (`cr`, `crib`, `ib`) | 1.7 – 126 | mixed, per segment | within run-to-run noise; predictions agree to 7 digits |
-| busulfan, pembrolizumab | 0.1 – 4.6 | `rk45` (no escalation) | unchanged |
+| model | `λ_max` across segments | what `auto` starts | `rk45` | `auto` |
+|---|---|---|---|---|
+| cyclophosphamide `run2_final` | 35 – 234 | `rodas4` | 827 s for **one** capped iteration, OFV 3243.83, not converged | **0.7 s to convergence**, OFV 3241.708 |
+| TMDD SAD `cr`, 4-iteration budget | 3.7 – 126 | mixed, per segment | 372.4 s, OFV 5018.5 | **2.3 s**, OFV 4888.4 |
+| TMDD SAD `crib`, 4-iteration budget | 3.7 – 126 | mixed, per segment | 33.1 s, OFV 4885.0 | **2.2 s**, OFV 4893.0 |
+| busulfan, pembrolizumab | 0.1 – 4.6 | `rk45` (no escalation) | — | unchanged |
 
-The cyclophosphamide models are the clear win: they are stiff at every segment and an explicit
-method is stability-limited throughout. The TMDD models are the interesting case — they are
-stiff on the high-dose segments and not on the low-dose ones, which is exactly the situation a
-single per-model choice cannot serve and a per-segment probe can.
+Read the wall-clock column first and the OFV column second. On the two TMDD rows the solvers sit
+at different points on the optimizer's path after the same number of iterations, so the OFV
+difference there mixes accuracy with how far each got — `crib` lands slightly higher and `cr` 130
+units lower, and neither is a claim about accuracy. The cyclophosphamide row is the like-for-like
+one: `auto` reaches OFV 3241.708 against NONMEM FOCEI's 3241.721 on the same model and data, a
+difference of 0.013, while `rk45` spends 827 seconds without finishing a single iteration.
+
+The cyclophosphamide model is the clear win: it is stiff at every segment, so an explicit method
+is stability-limited throughout. The TMDD models are the more interesting case — stiff on the
+high-dose segments and not on the low-dose ones, which is exactly the situation a single
+per-model choice cannot serve and a per-segment probe can.
 
 `auto` is not the default. The explicit default is right for the overwhelming majority of PK
 models, `auto` adds a Jacobian build and an eigensolve to every segment (~1–5 µs, roughly one

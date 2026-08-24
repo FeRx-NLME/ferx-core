@@ -31,9 +31,10 @@ section of the SDLC for the versioning policy).
   trajectory, or that clamps at the minimum step (the freeze-pad failure that produces finite,
   silently wrong output), is discarded and re-solved explicitly, so the worst case is the explicit
   answer at twice the cost rather than a corrupted objective; the guard applies to `auto` only, and a
-  named `ode_method` is honoured exactly as before. Measured 6× faster than `rk45` on the stiff
-  cyclophosphamide models with predictions agreeing to 8 digits, and unchanged where nothing is
-  stiff. Two new counters on the solver-statistics struct record what it did — segments escalated, escalations rejected — for diagnostic callers and the test suite (a fit does not print solver statistics today). The
+  named `ode_method` is honoured exactly as before. Measured on ferx-testdata: the stiff cyclophosphamide model
+  converges in 0.7 s at OFV 3241.708 (NONMEM FOCEI: 3241.721) where `rk45` spends 827 s
+  without finishing one optimizer iteration, and a TMDD fit runs 372.4 s → 2.3 s at a
+  fixed iteration budget; nothing changes where nothing is stiff. Two new counters on the solver-statistics struct record what it did — segments escalated, escalations rejected — for diagnostic callers and the test suite (a fit does not print solver statistics today). The
   threshold is a rate and therefore carries the model's time unit (calibrated on the hour-based PK
   convention), so name a method explicitly on an unusual time scale. See
   [ODE models → Letting ferx pick the stepper](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#letting-ferx-pick-the-stepper-ode_method-auto).
