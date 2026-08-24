@@ -7439,3 +7439,87 @@ fn ode_provider_signed_form_c_readout_not_clamped_and_matches_production() {
     check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
     check_inner_outer_eta_parity(&model, &subj, &theta, &eta);
 }
+
+/// A fast-binding (TMDD-shaped) system under `ode_method = auto`. The probe reads the
+/// post-dose Jacobian as stiff and starts Rodas4, so this is the analytic-sensitivity path
+/// running on a *different stepper* than the one every other ODE parity test exercises.
+const THREE_STATE_BINDING_AUTO: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVVC(3.0, 0.1, 100.0)
+  theta TVKON(60.0, 1e-3, 1e4)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  VC = TVVC
+  KON = TVKON
+  KOFF = 20.0
+  KINT = 0.5
+  R0 = 10.0
+[structural_model]
+  ode(obs_cmt=central, states=[central, target, complex])
+[odes]
+  init(target) = R0
+  d/dt(central) = -(CL/VC) * central - KON * central * target + KOFF * complex
+  d/dt(target)  = -KON * central * target + KOFF * complex - 0.05 * target + 0.5
+  d/dt(complex) =  KON * central * target - KOFF * complex - KINT * complex
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_method = auto
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// CLAUDE.md's `Dual2`-vs-FD rule, applied to the stepper `ode_method = auto` switches into
+/// (#978).
+///
+/// `auto` is resolved inside the drivers, so the `T = Dual2` sensitivity solve and the
+/// `T = f64` prediction each probe their own segment and each pick a method. Nothing outside
+/// the driver coordinates them: the guarantee that they agree rests entirely on the probe
+/// reading `.val()` only, and a break in it would show up here — and *only* here — as an
+/// analytic gradient differentiating a trajectory the predictor never produced. That failure
+/// compiles, runs, and returns a plausible number, which is why it needs a parity test rather
+/// than an inspection.
+#[test]
+fn ode_provider_matches_fd_under_the_auto_stiff_switch() {
+    let model = parse_model_string(THREE_STATE_BINDING_AUTO).expect("parse");
+    assert_eq!(
+        model.ode_spec.as_ref().unwrap().solver_opts.method,
+        crate::ode::OdeMethod::Auto,
+        "the fit option must reach the solver, or this test pins the default stepper"
+    );
+    assert!(
+        ode_analytical_supported(&model),
+        "must be served analytically, not silently dropped to FD"
+    );
+
+    let theta = vec![0.2, 3.0, 60.0];
+    let eta = vec![0.15];
+    // Sampled across the fast binding phase and out into the slow terminal one.
+    let subject = bolus_subject(&[0.02, 0.1, 0.5, 1.0, 4.0, 12.0, 24.0]);
+
+    // Non-vacuity: the probe must actually have escalated on this fixture. Without this the
+    // parity checks below would pass by exercising plain RK45 and pin nothing about `auto`.
+    let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
+    let (_preds, stats) = crate::ode::ode_predictions_with_solver_stats(
+        model.ode_spec.as_ref().unwrap(),
+        &pk.values,
+        &theta,
+        &eta,
+        &subject,
+    );
+    assert!(
+        stats.auto_stiff_segments > 0,
+        "fixture must read stiff, got {stats:?}"
+    );
+    assert_eq!(
+        stats.auto_stiff_rejected, 0,
+        "and the escalation must hold up, got {stats:?}"
+    );
+
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}

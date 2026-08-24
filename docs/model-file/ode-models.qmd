@@ -228,6 +228,7 @@ Set `ode_method` in `[fit_options]` to pick a different stepper:
 | `rosenbrock23` (aliases `ros23`, `ode23s`) | 2(3) | 3 | yes | crude tolerances, rough right-hand sides |
 | `rodas4` | 4(3) | 6 | yes | the stiff workhorse at typical tolerances (1e-6 – 1e-9) |
 | `rodas5p` | 5(4) | 8 | yes | stiff systems at tight tolerances (`ode_reltol` ≤ 1e-9) |
+| `auto` | — | — | decides | letting ferx pick between the two families per integration — see [below](#letting-ferx-pick-the-stepper-ode_method-auto) |
 
 Note the two different axes. The Rosenbrock methods buy **stability**; `vern7` buys **order**.
 Which one helps depends on what is capping your step size, and picking the wrong one costs
@@ -244,6 +245,80 @@ A stiff step is more expensive than an explicit one — it builds a finite-diffe
 (`n + 1` extra right-hand-side evaluations) and factorizes an `n × n` matrix once per step —
 so on a non-stiff one- to three-compartment model RK45 remains faster. Switch only when
 stiffness, not accuracy, is what is capping the step size.
+
+#### Letting ferx pick the stepper (`ode_method = auto`)
+
+`auto` decides for you, from the model rather than from the data:
+
+```
+[fit_options]
+  ode_method = auto
+```
+
+Before each integration, ferx builds the Jacobian `J = ∂f/∂u` of your `[odes]` right-hand
+side at the state that integration is about to start from, and reads its eigenvalues. The
+discriminator is the fastest mode,
+
+$$\lambda_{\max} = \max_i |\operatorname{Re} \lambda_i(J)|, \qquad \tau_{\text{fast}} = 1/\lambda_{\max},$$
+
+and a system whose fastest mode decays faster than `1/30` of a time unit
+(`λ_max ≥ 30`) starts on a stiff method — `rodas4`, or `rodas5p` when `ode_reltol ≤ 1e-8`.
+Everything else stays on the explicit default. Naming any other `ode_method` still forces that
+method exactly; `auto` is the only value that decides anything.
+
+Three properties are worth knowing before you rely on it.
+
+**It probes per integration segment, not once per model.** ferx splits a subject's timeline at
+every dose, and the probe runs at the start of each of those segments. That is deliberate:
+in a binding model the fast eigenvalue is carried by a term like `KON · central`, which is
+identically **zero before any drug is present**. A model whose stiffness comes from binding is
+at its least stiff at the declared initial condition, so a single probe there would read it as
+non-stiff and never escalate. Probing per segment sees the post-dose Jacobian, where the
+stiffness actually lives. It also re-decides as the optimizer moves θ, so a fit that walks into
+a stiff region of parameter space switches with it.
+
+**A escalation that fails is caught and undone.** Every stiff method in ferx has been measured
+diverging on *some* model where the explicit family stayed clean, and those failures differ
+between methods — so `auto` treats a bad escalation as an expected outcome, not an impossible
+one. If the stiff solve comes back non-finite, **or** clamps at the minimum step (the
+freeze-pad failure described above — finite output, silently wrong), the result is discarded
+and the segment is re-solved explicitly. That bounds the worst case to "the explicit answer,
+at twice the cost" rather than a corrupted objective function. The guard applies only to
+`auto`: a named method is always honoured as asked.
+
+**The threshold is a rate, so it carries your model's time unit.** `λ_max ≥ 30` is calibrated
+for the hour-based convention typical of PK models (and the one the default tolerances assume).
+The same model written in days reads 24× smaller and may not trigger. On an unusual time scale,
+set `ode_method` explicitly instead.
+
+Two counters report what `auto` did, alongside the step counts:
+
+- **auto-stiff segments** — integrations that started on a stiff method because the probe
+  escalated. Always `0` under a named method, so any non-zero value is `auto` at work.
+- **auto-stiff rejections** — escalations whose result was thrown away and re-solved
+  explicitly. A subset of the above, and normally `0`. A non-zero count means the probe was
+  right that the system is stiff but the method it picked could not integrate it — try naming
+  `rodas5p` or `rosenbrock23` explicitly.
+
+Measured on the ferx-testdata ODE library (one prediction pass, default tolerances):
+
+| model | `λ_max` range across segments | what `auto` starts | vs `rk45` |
+|---|---|---|---|
+| cyclophosphamide (`run2_final`) | 35 – 234 | `rodas4` | **6.2 ms → 1.0 ms**, predictions agree to 8 digits |
+| cyclophosphamide (`run1_initial`) | 20 – 176 | `rodas4` | **4.4 ms → 1.0 ms** |
+| TMDD SAD (`cr`, `crib`, `ib`) | 1.7 – 126 | mixed, per segment | within run-to-run noise; predictions agree to 7 digits |
+| busulfan, pembrolizumab | 0.1 – 4.6 | `rk45` (no escalation) | unchanged |
+
+The cyclophosphamide models are the clear win: they are stiff at every segment and an explicit
+method is stability-limited throughout. The TMDD models are the interesting case — they are
+stiff on the high-dose segments and not on the low-dose ones, which is exactly the situation a
+single per-model choice cannot serve and a per-segment probe can.
+
+`auto` is not the default. The explicit default is right for the overwhelming majority of PK
+models, `auto` adds a Jacobian build and an eigensolve to every segment (~1–5 µs, roughly one
+solver step), and a fixed method is the more predictable thing to have in a control stream you
+intend to publish. Reach for it when you do not know whether a model is stiff, or — as in the
+TMDD case — when the answer differs between subjects.
 
 #### Which regime am I in?
 

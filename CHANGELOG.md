@@ -20,6 +20,23 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ode_method = auto` picks the ODE stepper for you (#978).** An a-priori stiffness probe builds
+  the Jacobian `J = ∂f/∂u` of the `[odes]` right-hand side at the state each integration segment
+  starts from and reads its fastest mode, `max |Re λ(J)|`; a system above `30` per time unit starts
+  on a stiff Rosenbrock method (`rodas4`, or `rodas5p` at `ode_reltol ≤ 1e-8`), everything else stays
+  on the explicit default. Probing **per segment** rather than once per model is what makes it work
+  on binding/TMDD models, whose fast eigenvalue is carried by a term like `KON · central` and so is
+  identically zero at the declared initial condition — the one state at which such a model looks
+  non-stiff — and it re-decides as the optimizer moves θ. An escalation that returns a non-finite
+  trajectory, or that clamps at the minimum step (the freeze-pad failure that produces finite,
+  silently wrong output), is discarded and re-solved explicitly, so the worst case is the explicit
+  answer at twice the cost rather than a corrupted objective; the guard applies to `auto` only, and a
+  named `ode_method` is honoured exactly as before. Measured 6× faster than `rk45` on the stiff
+  cyclophosphamide models with predictions agreeing to 8 digits, and unchanged where nothing is
+  stiff. Two new solver counters report what it did (segments escalated, escalations rejected). The
+  threshold is a rate and therefore carries the model's time unit (calibrated on the hour-based PK
+  convention), so name a method explicitly on an unusual time scale. See
+  [ODE models → Letting ferx pick the stepper](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#letting-ferx-pick-the-stepper-ode_method-auto).
 - **The `init(...)` scope rule is now published by the engine (#994).** `ODE_INIT_SCOPE_BUILTINS` and
   `ODE_INIT_REJECTED_BUILTINS` name the built-ins an `[odes] init(...)` expression may and may not
   reference, so a code generator can source the rule from the same binary it will parse with instead

@@ -133,6 +133,16 @@ pub enum OdeMethod {
     /// (`ode_reltol ≤ 1e-8`); at loose ones RK45's cheaper steps win. See
     /// [`crate::ode::explicit_rk`].
     Vern7,
+    /// Pick the stepper from the system itself: an a-priori Jacobian eigenvalue probe reads
+    /// `|Re λ|max` at each integration's own initial state and starts a stiff method only
+    /// where the system is genuinely stability-limited, keeping the explicit default
+    /// everywhere else. See [`crate::ode::stiffness`] for what is measured, where, and why an
+    /// unclassifiable system stays explicit.
+    ///
+    /// This is a *starting* decision per integrated segment, not a mid-step switch: the
+    /// method is still fixed for the duration of one segment, so every guarantee the other
+    /// variants carry (dense output, event root-finding, `Dual2` sensitivities) is unchanged.
+    Auto,
 }
 
 impl OdeMethod {
@@ -145,6 +155,7 @@ impl OdeMethod {
             "rodas4" => Some(OdeMethod::Rodas4),
             "rodas5p" | "rodas5" => Some(OdeMethod::Rodas5P),
             "vern7" | "verner7" => Some(OdeMethod::Vern7),
+            "auto" => Some(OdeMethod::Auto),
             _ => None,
         }
     }
@@ -157,6 +168,7 @@ impl OdeMethod {
             OdeMethod::Rodas4 => "rodas4",
             OdeMethod::Rodas5P => "rodas5p",
             OdeMethod::Vern7 => "vern7",
+            OdeMethod::Auto => "auto",
         }
     }
 }
@@ -233,6 +245,22 @@ pub struct OdeSolverStats {
     ///   no `u_new` existed to force-accept and the driver had to stop. The remaining
     ///   `saveat` points are then freeze-padded with the last state — finite, but wrong.
     pub min_step_clamped_steps: usize,
+    /// Integrations that [`OdeMethod::Auto`] started on a stiff method because the a-priori
+    /// probe read `|Re λ|max ≥` [`crate::ode::stiffness::STIFF_RE_LAMBDA_THRESHOLD`].
+    ///
+    /// Zero under every explicitly-named `ode_method`, so a non-zero value says exactly one
+    /// thing: `auto` was asked, and it escalated this many segments.
+    pub auto_stiff_segments: usize,
+    /// Escalated integrations whose stiff solve was thrown away — it came back non-finite, or
+    /// it clamped at `min_dt` and freeze-padded — and were re-solved with the explicit default,
+    /// whose result is what the caller receives.
+    ///
+    /// A subset of [`auto_stiff_segments`](Self::auto_stiff_segments). The stiff attempt's
+    /// steps stay counted in the other fields — they were really taken — so a fit that reads
+    /// slow *and* shows a non-zero count here is paying for both solves. Non-zero means the
+    /// probe was right that the system is stiff and wrong that this stiff method could
+    /// integrate it; naming `rodas5p` (or `rosenbrock23`) explicitly is the next thing to try.
+    pub auto_stiff_rejected: usize,
 }
 
 impl OdeSolverStats {
@@ -251,6 +279,27 @@ impl OdeSolverStats {
         } else {
             self.rejected_steps += 1;
         }
+    }
+
+    /// Accumulate another integration's counters into these, for a caller that splits one
+    /// logical solve across more than one driver call (the `auto` finite-guard's escalated
+    /// attempt and its explicit re-solve).
+    #[inline]
+    pub(crate) fn merge(&mut self, other: &OdeSolverStats) {
+        let OdeSolverStats {
+            attempted_steps,
+            accepted_steps,
+            rejected_steps,
+            min_step_clamped_steps,
+            auto_stiff_segments,
+            auto_stiff_rejected,
+        } = *other;
+        self.attempted_steps += attempted_steps;
+        self.accepted_steps += accepted_steps;
+        self.rejected_steps += rejected_steps;
+        self.min_step_clamped_steps += min_step_clamped_steps;
+        self.auto_stiff_segments += auto_stiff_segments;
+        self.auto_stiff_rejected += auto_stiff_rejected;
     }
 
     /// Record an attempt that produced no usable step at `min_dt` (a singular Rosenbrock
@@ -343,6 +392,12 @@ pub(crate) fn make_stepper<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn Ste
         stiff @ (OdeMethod::Rosenbrock23 | OdeMethod::Rodas4 | OdeMethod::Rodas5P) => {
             Box::new(super::rosenbrock::RosStepper::new(n, stiff))
         }
+        // `Auto` names a *decision*, not a stepper: every driver resolves it through
+        // `stiffness::resolve_method` before it gets here, so this arm is only reachable
+        // from a caller that built a stepper straight from the options. Falling through to
+        // the explicit default keeps such a caller integrating (correctly, if slowly on a
+        // stiff system) rather than panicking inside a fit's worker thread.
+        OdeMethod::Auto => Box::new(Rk45Stepper::new(n)),
     }
 }
 
@@ -727,18 +782,8 @@ pub(crate) fn solve_ode_dense(
     opts: &OdeSolverOptions,
     stats: Option<&mut OdeSolverStats>,
 ) -> (Vec<SolPoint>, Vec<SolPoint>) {
-    let mut stepper = make_stepper::<f64>(u0.len(), opts.method);
-    let (hard, soft) = integrate_dense_g(
-        stepper.as_mut(),
-        rhs,
-        u0,
-        t_span,
-        params,
-        saveat,
-        interp_at,
-        opts,
-        stats,
-    );
+    let (hard, soft) =
+        integrate_resolved_g(rhs, u0, t_span, params, saveat, interp_at, opts, stats);
     let to_points = |v: Vec<SolPointG<f64>>| -> Vec<SolPoint> {
         v.into_iter().map(|p| SolPoint { t: p.t, u: p.u }).collect()
     };
@@ -791,6 +836,61 @@ pub fn solve_ode_until_threshold(
     monitor: usize,
     threshold: f64,
 ) -> ThresholdCrossing {
+    // Both early exits below return without stepping, so probe after them rather than before.
+    if u[monitor] >= threshold || (t_span.1 - t_span.0).abs() < 1e-15 {
+        return until_threshold_with(
+            rhs,
+            u,
+            t_span,
+            params,
+            opts,
+            monitor,
+            threshold,
+            OdeMethod::default(),
+        );
+    }
+    let method = super::stiffness::resolve_method(rhs, u, params, t_span.0, opts);
+    if method == OdeMethod::default() || opts.method != OdeMethod::Auto {
+        return until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method);
+    }
+    // Escalated by the probe — the same guard `integrate_resolved_g` applies, in the shape
+    // this driver reports failure in. A stiff method that cannot form a step, or that
+    // drives the monitored accumulator non-finite or backwards, comes back as `Failed`; the
+    // segment is then re-run explicitly from the *entry* state, since `u` is unspecified after
+    // a failure. A censored draw laundered out of a diverged stiff solve would be the worst
+    // possible outcome here, so the retry is not optional.
+    let u_entry = u.to_vec();
+    match until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method) {
+        ThresholdCrossing::Failed(_) => {
+            u.copy_from_slice(&u_entry);
+            until_threshold_with(
+                rhs,
+                u,
+                t_span,
+                params,
+                opts,
+                monitor,
+                threshold,
+                OdeMethod::default(),
+            )
+        }
+        ok => ok,
+    }
+}
+
+/// [`solve_ode_until_threshold`] with the stepper already chosen — the body both the probed
+/// and the re-solved pass run through.
+#[allow(clippy::too_many_arguments)]
+fn until_threshold_with(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u: &mut [f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    opts: &OdeSolverOptions,
+    monitor: usize,
+    threshold: f64,
+    method: OdeMethod,
+) -> ThresholdCrossing {
     let (t0, tf) = t_span;
 
     // Already at/above threshold at the span start (e.g. threshold ≈ 0 from u≈1, or a non-zero
@@ -803,7 +903,7 @@ pub fn solve_ode_until_threshold(
         return ThresholdCrossing::ReachedEnd;
     }
 
-    let mut stepper = make_stepper::<f64>(u.len(), opts.method);
+    let mut stepper = make_stepper::<f64>(u.len(), method);
     // This driver localizes the crossing inside a step, so it always interpolates.
     stepper.set_dense_required(true);
     let err_exp = stepper.err_exp();
@@ -944,18 +1044,106 @@ pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
     opts: &OdeSolverOptions,
     stats: Option<&mut OdeSolverStats>,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
-    let mut stepper = make_stepper::<T>(u0.len(), opts.method);
-    integrate_dense_g(
-        stepper.as_mut(),
-        rhs,
-        u0,
-        t_span,
-        params,
-        saveat,
-        interp_at,
-        opts,
-        stats,
-    )
+    integrate_resolved_g(rhs, u0, t_span, params, saveat, interp_at, opts, stats)
+}
+
+/// [`integrate_dense_g`] with the method resolved first, and the guard that makes
+/// [`OdeMethod::Auto`] safe to escalate: the one place `auto` turns into a stepper.
+///
+/// Every implicit stepper in the library was measured diverging on *some* model where the
+/// explicit family stayed clean (#978), and those failures are disjoint across methods — so a
+/// failed escalation is a known, recoverable outcome rather than an impossible one. When one
+/// happens the segment is re-solved with the explicit default and *that* result is what the
+/// caller gets, which bounds `auto`'s worst case to "the explicit answer, twice the cost"
+/// instead of a corrupted objective.
+///
+/// The guard is scoped to escalations. A named `ode_method` is honoured exactly as before,
+/// failed result included: a user who asked for `rodas4` gets `rodas4`, and a fixed method that
+/// silently re-solved as something else would be the worse surprise.
+///
+/// Generic over `T`, so the `f64` prediction and the `Dual2` sensitivity solve share one copy
+/// of both the resolution and the guard. Both read `.val()` only and see the same values, so
+/// they make the same decision on the same segment and the gradient keeps differentiating the
+/// trajectory the predictor reports.
+#[allow(clippy::too_many_arguments)]
+fn integrate_resolved_g<T: PkNum>(
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u0: &[T],
+    t_span: (f64, f64),
+    params: &[T],
+    saveat: &[f64],
+    interp_at: &[f64],
+    opts: &OdeSolverOptions,
+    mut stats: Option<&mut OdeSolverStats>,
+) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
+    // A zero-length span returns `u0` at every requested time without stepping, so there is
+    // no stepper to choose and no reason to pay for a Jacobian. Dosing timelines produce these
+    // wherever two events share a time.
+    let method = if (t_span.1 - t_span.0).abs() < 1e-15 {
+        OdeMethod::default()
+    } else {
+        super::stiffness::resolve_method(rhs, u0, params, t_span.0, opts)
+    };
+    let run = |method: OdeMethod, stats: Option<&mut OdeSolverStats>| {
+        let mut stepper = make_stepper::<T>(u0.len(), method);
+        integrate_dense_g(
+            stepper.as_mut(),
+            rhs,
+            u0,
+            t_span,
+            params,
+            saveat,
+            interp_at,
+            opts,
+            stats,
+        )
+    };
+
+    // Not an escalation — a named method, or `auto` reading the system as non-stiff. Nothing
+    // to guard, and the caller's counters are written directly by the one and only solve.
+    if opts.method != OdeMethod::Auto || method == OdeMethod::default() {
+        return run(method, stats);
+    }
+
+    // An escalation is scored on its own counters so the guard can read what *this* attempt
+    // did, rather than a total the caller has been accumulating across segments.
+    let mut attempt = OdeSolverStats {
+        auto_stiff_segments: 1,
+        ..Default::default()
+    };
+    let out = run(method, Some(&mut attempt));
+
+    // Two ways an escalation goes wrong, and the second is the one that bites. A non-finite
+    // trajectory is loud. A stiff method that clamps at `min_dt` is not: the driver stops and
+    // freeze-pads the remaining saves with the last state, so the result comes back finite,
+    // plausible, and wrong (#959) — measured at 4.8e282 on a system whose true solution had
+    // already blown up. Both are the same failure to the caller, so both discard the result.
+    //
+    // A clamp means the *stiff* method could not form a step, which is the one thing it was
+    // escalated to do; it is not the ordinary cost of a hard segment. So this trigger fires
+    // where the escalation genuinely failed, not merely where it worked hard.
+    let stalled = attempt.min_step_clamped_steps > 0;
+    let usable = !stalled && finite_g(&out.0) && finite_g(&out.1);
+    if !usable {
+        attempt.auto_stiff_rejected = 1;
+    }
+    // The stiff attempt's steps stay counted either way — they were taken, and they cost what
+    // they cost. A fit that reads slow *and* shows a rejection is paying for both solves.
+    if let Some(s) = stats.as_deref_mut() {
+        s.merge(&attempt);
+    }
+    if usable {
+        return out;
+    }
+    run(OdeMethod::default(), stats)
+}
+
+/// Whether every saved state is finite, reading values only (`T = Dual2` decides identically
+/// to `T = f64`, which is what keeps the two paths on the same stepper).
+fn finite_g<T: PkNum>(points: &[SolPointG<T>]) -> bool {
+    points
+        .iter()
+        .all(|p| p.u.iter().all(|v| v.val().is_finite()))
 }
 
 #[cfg(test)]
