@@ -400,8 +400,14 @@ settled it was a third quantity neither codebase computes: the Laplace posterior
 evaluate. Measured against it, ferx's variational `S` was **1.75×** too wide, uniformly across
 all three `η` — the signature of a scalar `σ` error, since posterior width scales with `σ²` and
 `1.339² = 1.79`. That is the diagnosis the cross-tool ratio could not deliver. The reference is
-now `agq_ref.ferx` in the harness, and figures 3–4 are read against it rather than against
-either tool.
+now `agq_ref.ferx` in the harness, and **every** figure is read against a reference neither
+implementation computes — AGQ for the population parameters and the per-subject variances, NUTS
+for the per-subject means. Figures 1–2 were the last to get that treatment (2026-08-24): they
+plotted ferx *against* nlmixr2, which measures mutual agreement and cannot orient it, and the
+agreement flattered the wrong thing, since nlmixr2's FOCEI is the loosest of the five columns
+(`Ω` 6–7% off AGQ). Redrawn against AGQ they say something different and true: four of the five
+estimator columns sit inside ±1% on every parameter, and the outliers are nlmixr2's FOCEI `Ω` and
+the two VI implementations' `σ`, missing in *opposite* directions.
 
 **Standing lesson for this document.** Co-validation localizes a disagreement; it cannot orient
 one. Every tier that compares two approximations to each other needs a third quantity with a

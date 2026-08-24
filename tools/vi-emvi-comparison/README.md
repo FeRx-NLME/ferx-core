@@ -56,7 +56,7 @@ minutes.
 |---|---|
 | `run.sh` | driver — installs, sets the linker workaround, runs both sides |
 | `emvi-compare.R` | nlmixr2 side, both models: FOCEI (convention anchor), `emvi`, `emvi` with `returnVi`, then the three mixed-Ω fits |
-| `plots.R` | the four figures, drawn from both sides' saved output — run after `run.sh`, fits nothing; `FERX_VI_FIGS` sets where they land |
+| `plots.R` | the four figures, drawn from both sides' saved output — run after `run.sh`, fits nothing; `FERX_VI_FIGS` sets where they land. Every one reads against a reference neither tool computes: AGQ for the population parameters (`population-vs-agq.png`) and the per-subject variances (`eta-variance{,-ratio}.png`), NUTS for the per-subject means (`eta-means-vs-nuts.png`) |
 | `tier2-offdiag.R` | Tier 2b — the per-subject **covariance**, ferx and `emvi` both read against the Anchor C NUTS reference; also confirms the `Lpack` convention against that arbiter. Needs `tools/vi-nuts-anchor/run.sh` to have produced `anchor-c.json` |
 | `warfarin_cmp.ferx` | ferx FOCEI, diagonal Ω |
 | `vi_adam.ferx` | ferx VI, `vi_omega_update = adam` |
