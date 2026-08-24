@@ -1773,40 +1773,184 @@ fn dose_attr_read_in_odes_rhs_is_matched_case_insensitively() {
     );
 }
 
-#[test]
-fn dose_attr_read_in_odes_init_is_rejected() {
-    // `init(state) = <expr>` lives in `[odes]` but is split out of the block before
-    // the derivative statements are parsed, so it needs its own walk. Without one
-    // the rule has a hole the exact size of its own remedy: a user told to drop `F`
-    // from the RHS can move it into the initial condition and get the same silent
-    // double application from the same block.
-    let src = "
+/// Build a 1-compartment ODE model that declares dose attribute `name` and reads it
+/// in an `init(...)` seed — never in the RHS. Companion to [`dose_attr_rhs_model`],
+/// which is the rejected shape; this is the accepted one (#1046).
+fn dose_attr_init_model(name: &str) -> String {
+    format!(
+        "
 [parameters]
   theta TVCL(5.0, 0.0, 1e15)
   theta TVV(50.0, 0.0, 1e15)
-  theta TVF(0.5, 0.0, 1.0)
+  theta TVA(0.5, 0.0, 1.0)
   omega ETA_CL ~ 0.09
   sigma EPS1 ~ 0.1 (sd)
 
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
   V  = TVV
-  F  = TVF
+  {name} = TVA
 
 [structural_model]
   ode(obs_cmt=central, states=[central])
 
 [odes]
-  init(central) = F * 100.0
+  init(central) = {name} * 100.0
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+    )
+}
+
+#[test]
+fn dose_attr_read_in_odes_init_is_accepted() {
+    // The scope floor of the #993 rule, and the one surface it must NOT claim
+    // (#1046). An `init(...)` seed is not a dose: `OdeSpec::initial_state` writes the
+    // raw expression value into the state vector, and `F`/lag are resolved through
+    // `DoseAttrMap` at dose events only — a path the seed never takes. So
+    // `init(central) = F * 100` (the bioavailable residue of a pre-study 100 mg dose)
+    // applies `F` exactly once, to a quantity the engine never scales.
+    //
+    // Anchored on NONMEM 7.6.0, which agrees: `A_0(1) = F1*100` with `F1 = 0.5` seeds
+    // 50, not 25, and its table is byte-identical to the twin seeding from an ordinary
+    // parameter of the same value (`nonmem_anchor/odes_init_dose_attr_f_{A,B}.ctl`;
+    // same for lag). Rejecting this made a correct model unwritable and advised the
+    // wrong repair — renaming the parameter whose meaning *is* bioavailability.
+    //
+    // Contrast the RHS, which IS a doubling and stays rejected:
+    // `dose_attr_read_in_odes_rhs_is_rejected`.
+    for name in ["F", "LAGTIME", "ALAG", "F1", "ALAG1", "LAGTIME1"] {
+        let src = dose_attr_init_model(name);
+        if let Err(e) = parse_full_model(&src) {
+            panic!("`init(central) = {name} * 100` applies `{name}` once: {e}");
+        }
+    }
+}
+
+#[test]
+fn an_init_read_counts_as_a_use_for_the_never_used_census() {
+    // Companion to the acceptance test above, and deliberately *not* folded into it:
+    // asserting "no never-used warning" for `F`/`LAGTIME`/`F1`/… cannot fail, because
+    // the census exempts every dose-attribute name before it looks at block text
+    // (`RESERVED_PK_SLOTS` for the bare names, `DoseAttr::from_indexed_name` for the
+    // indexed ones). Measured: with the `init(...)` line deleted entirely, all six
+    // still produce zero "never used" warnings.
+    //
+    // So the census claim has to be made with a name the exemption does not cover. An
+    // ordinary parameter read *only* from the init is that name — and it is the shape
+    // that would regress if the seed ever stopped being counted as a use.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVA(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  FSEED = TVA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  init(central) = FSEED * 100.0
   d/dt(central) = -(CL/V) * central
 
 [error_model]
   DV ~ proportional(EPS1)
 ";
-    let err = expect_parse_err(src);
+    let never_used = |s: &str| -> Vec<String> {
+        parse_full_model(s)
+            .expect("parses")
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("never used"))
+            .cloned()
+            .collect()
+    };
+    assert!(
+        never_used(src).is_empty(),
+        "`FSEED` is read by the init seed, so it is used: {:?}",
+        never_used(src)
+    );
+    // Non-vacuity: delete the init line and the very same parameter *is* reported —
+    // so the assertion above is a statement about the init read, not about the census
+    // being silent in general.
+    let without = src.replace("  init(central) = FSEED * 100.0\n", "");
+    assert_ne!(without, src, "the init line must actually be removed");
+    assert!(
+        never_used(&without).iter().any(|w| w.contains("`FSEED`")),
+        "with the init read gone `FSEED` must be reported unused: {:?}",
+        never_used(&without)
+    );
+}
+
+#[test]
+fn coded_rate_param_read_in_odes_init_is_not_recorded() {
+    // The `D{n}`/`R{n}` half of #1046, and the reason the fix had to drop the init
+    // walk from `rhs_reads` rather than skip the check: that same set drives
+    // `mark_prediction_path_read`, whose marks `check_modeled_dose_rates` turns into
+    // a data-gated error once a `RATE=-2` dose lands on the compartment. An init
+    // amount consults no dose attribute at all — modeled duration included — so a
+    // `D1` read there must record nothing, or a correct model would be rejected as
+    // soon as its dataset happened to carry a coded RATE.
+    use crate::types::DoseAttr;
+    let parsed = parse_full_model(&dose_attr_init_model("D1")).expect("`D1` in an init parses");
+    assert_eq!(
+        parsed
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Duration, 1),
+        None,
+        "an init-only `D1` read is not a prediction-path read"
+    );
+
+    // Control: the same parameter read in the RHS *is* recorded, so the assertion
+    // above cannot pass for a map that simply never marks anything.
+    let rhs = dose_attr_init_model("D1").replace(
+        "d/dt(central) = -(CL/V) * central",
+        "d/dt(central) = -(CL/V) * D1 * central",
+    );
+    assert_eq!(
+        parse_full_model(&rhs)
+            .expect("`D1` in the RHS parses — it is data-gated, not rejected")
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Duration, 1),
+        Some("D1"),
+        "a `D1` read by the [odes] RHS must still be recorded for the data check"
+    );
+}
+
+#[test]
+fn dose_attr_read_in_both_odes_init_and_rhs_is_still_rejected() {
+    // Overshoot guard for #1046. Accepting the init read must not disarm the RHS
+    // walk: a model that seeds from `F` *and* folds `F` into the flux still applies
+    // it twice on the dose-driven term, which is exactly the #993 defect. Pins that
+    // the fix dropped the init walk only.
+    let src = dose_attr_init_model("F").replace(
+        "d/dt(central) = -(CL/V) * central",
+        "d/dt(central) = -(CL/V) * F * central",
+    );
+    let err = expect_parse_err(&src);
     assert!(
         err.contains("[odes]:") && err.contains("reserved dose-attribute name"),
-        "an `init(...)` read of `F` is the same double use: {err}"
+        "the RHS read is still a double use even when an init also reads it: {err}"
+    );
+    // And the message must say *which* read to remove. This is the exact model where
+    // the un-narrowed wording misled: "remove it from [odes]" invites deleting the
+    // `init(...)` line, which is legal (#1046) and does not clear the error. The
+    // sibling data-gated half already says "[odes] RHS or [scaling]"
+    // (`api/validation.rs`), so the two halves of `E_DOSE_ATTR_DOUBLE_USE` agree.
+    assert!(
+        err.contains("read in the [odes] RHS") && err.contains("remove it from the [odes] RHS"),
+        "the remedy must name the RHS, not the whole block: {err}"
     );
 }
 

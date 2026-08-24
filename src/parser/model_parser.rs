@@ -2577,6 +2577,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &observe_reads,
                 n_states,
                 "[adaptive_dosing]",
+                "[adaptive_dosing]",
                 None,
             )?;
         } else {
@@ -2587,6 +2588,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &analytical_slots,
                 &observe_reads,
                 usize::MAX,
+                "[adaptive_dosing]",
                 "[adaptive_dosing]",
                 Some(&pk_param_map),
             )?;
@@ -2794,6 +2796,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &scaling_reads,
                 state_names_for_scaling.len(),
                 "[scaling]",
+                "[scaling]",
                 None,
             )?;
         } else {
@@ -2804,6 +2807,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &analytical_slots,
                 &scaling_reads,
                 usize::MAX,
+                "[scaling]",
                 "[scaling]",
                 Some(&pk_param_map),
             )?;
@@ -9108,12 +9112,20 @@ fn ode_free_slot_count(names: &[String]) -> usize {
 /// amount is propagated by `pk::analytical_init_concentration_g` with `F = 1` and
 /// no lag, so reading a mapped dose attribute in an init expression applies it
 /// once, not twice — see the note at that block.
+/// `read_site` names the surface the `reads` set was actually collected from, for the
+/// "read in …" and "remove it from …" clauses. It is usually the same as `block`, but
+/// not always: since #1046 only the **RHS** of `[odes]` is a prediction-path read —
+/// an `init(...)` seed is not — so telling an `[odes]` user to "remove it from
+/// `[odes]`" would send them to delete a read that is legal and whose removal does not
+/// clear the error. `block` stays the `"{block}:"` prefix every block-scoped parse
+/// error carries (and that `parse_error_to_diagnostic` / the tests key on).
 fn check_dose_attr_double_use(
     indiv_param_names: &[String],
     indiv_param_slots: &[usize],
     reads: &std::collections::HashSet<String>,
     n_states: usize,
     block: &str,
+    read_site: &str,
     analytical_pk_map: Option<&HashMap<String, String>>,
 ) -> Result<(), String> {
     for (i, name) in indiv_param_names.iter().enumerate() {
@@ -9178,9 +9190,9 @@ fn check_dose_attr_double_use(
         };
         return Err(format!(
             "{block}: `{name}` is this model's {noun}{scope} — the engine already \
-             {applied} — but it is also read in {block}, so the value is applied \
+             {applied} — but it is also read in {read_site}, so the value is applied \
              twice: once at the dose, once where you read it ({issue}). If `{name}` is \
-             meant to be {noun}, remove it from {block}; if it is meant to be an \
+             meant to be {noun}, remove it from {read_site}; if it is meant to be an \
              ordinary parameter, {ordinary_remedy}.",
             noun = attr.noun(),
             applied = attr.applied_as(),
@@ -10113,11 +10125,28 @@ fn build_ode_spec(
     // `ode_template`-generated equations plus the injected joint-PK-TTE
     // `d/dt(__chz_n)` hazard lines are all in `stmts_owned` by now.
     //
-    // `init(state) = <expr>` directives are pulled out of the block *before*
-    // `stmts_owned` is parsed, so they must be walked separately or the rule has a
-    // hole exactly the size of its own remedy: a user told to drop `F` from the RHS
-    // could move it into `init(central) = F * AMT` and get the same silent double
-    // application from the same block.
+    // `init(state) = <expr>` reads are deliberately NOT folded in (#1046), mirroring
+    // the analytical `[initial_conditions]` carve-out (#1004/#1035). An initial
+    // condition is not a dose: `OdeSpec::initial_state` seeds the state vector with
+    // the raw expression value, and `F` / lag are resolved through `DoseAttrMap` at
+    // dose events only — a path the seed never takes. So `init(central) = F * 100`
+    // (the bioavailable residue of a pre-study dose) applies `F` exactly once, to a
+    // quantity the engine never scales, and rejecting it would make a correct model
+    // unwritable while advising the wrong repair — renaming the very parameter whose
+    // meaning *is* bioavailability. The RHS is a genuine doubling by contrast:
+    // `d/dt(central) = … F …` folds `F` into the flux, so every gram that ever
+    // entered the compartment is multiplied by it a second time (the `F²` defect
+    // #993 exists for), which is why the RHS walk below stays.
+    //
+    // Anchored on NONMEM 7.6.0 (`nonmem_anchor/odes_init_dose_attr_{f,lag}_{A,B}.ctl`):
+    // `A_0(1) = F1*100` with `F1 = 0.5` seeds 50, not 25, and `A_0(1) = ALAG1*100`
+    // seeds at t=0 unshifted — each table byte-identical to its twin seeding from an
+    // ordinary parameter of the same value, so the reference engine likewise treats a
+    // dose-attribute name as an ordinary value in an initial condition.
+    //
+    // For the same reason a `D{n}`/`R{n}` read in an init is not a prediction-path
+    // read: the marking loop below is driven by this same `rhs_reads` set, so leaving
+    // init out keeps it from recording one.
     let mut rhs_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut collect_reads = |e: &Expression| {
         if let Expression::Variable(name) = e {
@@ -10125,15 +10154,13 @@ fn build_ode_spec(
         }
     };
     visit_stmt_nodes(&stmts_owned, &mut collect_reads);
-    for (_, init_expr) in &init_specs {
-        visit_expr_nodes(init_expr, &mut collect_reads);
-    }
     check_dose_attr_double_use(
         &indiv_names_owned,
         &indiv_slots_owned,
         &rhs_reads,
         n_states,
         "[odes]",
+        "the [odes] RHS",
         None,
     )?;
 
