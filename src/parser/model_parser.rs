@@ -12,6 +12,19 @@ use std::sync::LazyLock;
 static DIFFUSION_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?").unwrap());
 
+/// Identifier scanner for `[error_model]` argument text. Hoisted out of the
+/// functions that use it because compiling the regex costs far more than the
+/// scan it performs, and it runs on every parse: `arg_sigma_name` calls it once
+/// per argument (from both `build_error_spec` and `build_ruv_magnitude`) and
+/// `used_sigma_names` scans every argument of every `[error_model]` form. Every
+/// identifier scan over `[error_model]` text goes through this one static — add
+/// new callers here rather than compiling a second copy.
+static ARG_IDENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z_]\w*").unwrap());
+
+/// Whether an `[error_model]` argument is a bare identifier (so an unresolved one
+/// is a typo'd sigma name) rather than a #484 magnitude expression.
+static BARE_IDENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_]\w*$").unwrap());
+
 // ── Mu-referencing pattern detection ────────────────────────────────────────
 
 /// Anchor of a mu-referencing relationship — either a plain user-declared
@@ -1221,15 +1234,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // assume constant parameters over each absorption window, so they cannot serve a subject
     // whose parameters switch mid-profile (a `TIME`-dependent parameter or time-varying
     // covariates). For a plain-form transit / IG model we reconstruct its exact ODE
-    // (`transit()` / `igd()`) equivalent *source* here and stash it on the model;
-    // `CompiledModel::effective_for` compiles it lazily and routes only the subjects that need
-    // it to this fallback, so a plain fit whose subjects never need it keeps its fast, exact
-    // closed form at zero extra cost. Non-absorption / out-of-scope forms yield `None`. (The
-    // equivalent is a normal ODE model with no `pk one_cpt_transit`/`pk one_cpt_ig`/…, so
-    // building it later does not re-enter this branch.)
-    let absorption_ode_equivalent: Option<crate::types::AbsorptionOdeEquivalent> =
-        absorption_ode_equivalent_source(&extracted)
-            .map(crate::types::AbsorptionOdeEquivalent::new);
+    // (`transit()` / `igd()`) equivalent *source* here; it is compiled at the attach site
+    // below (once the primary's own blocks have parsed, so a broken primary reports its own
+    // error first), and `CompiledModel::effective_for` routes only the subjects that need it
+    // to this fallback. Non-absorption / out-of-scope forms yield `None`. (The equivalent is
+    // a normal ODE model with no `pk one_cpt_transit`/`pk one_cpt_ig`/…, so compiling it does
+    // not re-enter this branch.)
+    let absorption_ode_equivalent_src: Option<String> =
+        absorption_ode_equivalent_source(&extracted);
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
     // this (large) function reads unchanged. Named blocks are pulled from
     // `extracted.named` directly where they're consumed below.
@@ -2053,7 +2065,6 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // restriction.
     // Capture referenced sigma names before `parsed_error_model` is consumed.
     let used_sigmas_in_error = used_sigma_names(&parsed_error_model, &sigma_names);
-    validate_block_sigma_single_error_order(&parsed_error_model, &block_sigmas, &sigma_names)?;
     // Capture the single-endpoint arguments before `parsed_error_model` is
     // consumed, so the custom residual-magnitude programs (#484) can be built
     // after the [covariates] block is parsed (covariate names are needed to
@@ -2414,11 +2425,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .get("simulation")
         .map(|lines| parse_simulation_block(lines))
         .transpose()?;
+    // Peek the `[covariates]` declarations (parsed for real further down, at the
+    // block's own site) purely for name precedence: a declared `T` / `t` is a data
+    // column, not the `[odes]` model-time alias, in `[scaling]` and in
+    // `[adaptive_dosing] observe` alike (#1028). Peeked rather than hoisted so a
+    // malformed `[covariates]` block still reports its own error at its own site, in
+    // the existing order — hence the `.ok()`.
+    let declared_covariate_names: Vec<String> = blocks
+        .get("covariates")
+        .and_then(|lines| parse_covariates_block(lines).ok())
+        .map(|decls| decls.into_iter().map(|d| d.name).collect())
+        .unwrap_or_default();
     // Declarative reactive-dosing controller (#391 S2). Parsed and validated here;
     // compiled to a controller and run by the adaptive simulate path in a later slice.
     let adaptive_dosing = blocks
         .get("adaptive_dosing")
-        .map(|lines| parse_adaptive_dosing_block(lines))
+        .map(|lines| parse_adaptive_dosing_block(lines, &declared_covariate_names))
         .transpose()?;
     let mut fit_options = if let Some(lines) = blocks.get("fit_options") {
         parse_fit_options(lines)?
@@ -2520,10 +2542,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // `when` rules cannot reach a parameter (they compare the `signal` keyword to an
     // `f64` literal), so `observe` is the whole surface.
     //
-    // Same split as `[scaling]`: rejection is ODE-scoped — an analytical model binds
-    // F/lagtime through an explicit `pk(..., f=F)` mapping, and `ode_slot_map`, what
-    // makes a *bare* `F` a dose attribute, is empty there — while the `D{n}`/`R{n}`
-    // recording runs on both engines.
+    // Same split as `[scaling]`: the rejection runs on both engines — the ODE
+    // side over `ode_slot_map` (#993), the analytical side over the explicit
+    // `pk(..., f=F)`/`lagtime=` mapping (#1004) — as does the `D{n}`/`R{n}`
+    // recording.
     if let Some(observe) = adaptive_dosing.as_ref().and_then(|s| s.observe.as_deref()) {
         let observe_reads = collect_indiv_param_reads(
             observe,
@@ -2532,6 +2554,20 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.indiv_param_names,
             "[adaptive_dosing] observe",
         )?;
+        // The `T` / `t` model-time fold warns wherever it fires — but `observe` is
+        // compiled at *simulate* time (`sim::adaptive_control::compile_observe`), long
+        // after `parse_warnings` is sealed, and the adaptive result has no warnings
+        // channel of its own. Emit the note here instead, from the same helper the
+        // compiler will run, so the fold is not silent on this one path (#1028).
+        warn_if_time_alias_folds(
+            observe,
+            "[adaptive_dosing] observe",
+            &model.theta_names,
+            &model.eta_names,
+            &model.indiv_param_names,
+            &declared_covariate_names,
+            &mut model.parse_warnings,
+        );
         if let Some(ode) = model.ode_spec.as_ref() {
             let n_states = ode.state_names.len();
             check_dose_attr_double_use(
@@ -2540,6 +2576,18 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &observe_reads,
                 n_states,
                 "[adaptive_dosing]",
+                None,
+            )?;
+        } else {
+            let analytical_slots =
+                analytical_dose_attr_slot_map(&pk_param_map, &model.indiv_param_names);
+            check_dose_attr_double_use(
+                &model.indiv_param_names,
+                &analytical_slots,
+                &observe_reads,
+                usize::MAX,
+                "[adaptive_dosing]",
+                Some(&pk_param_map),
             )?;
         }
         // Cloned because `record_coded_rate_reads` needs `&mut model` for the map
@@ -2687,6 +2735,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.kappa_names,
             &readout_synth_params,
             volume_indiv_name_for_scaling.as_deref(),
+            &declared_covariate_names,
             &mut scaling_parse_warnings,
         )?;
         model.parse_warnings.extend(scaling_parse_warnings);
@@ -2699,8 +2748,9 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // first, and re-walks the entries because the parsed `ScalingSpec` keeps
         // compiled programs rather than the name references.
         //
-        // The read-set is collected on **both** engines, because the `D{n}`/`R{n}`
-        // recording below applies to both; only the rejection is ODE-scoped.
+        // The read-set is collected once and serves both engines: the rejection
+        // below splits on the engine (ODE via `ode_slot_map`, analytical via the
+        // `pk(...)` mapping — #1004), the `D{n}`/`R{n}` recording does not.
         let mut scaling_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
         for line in scaling_lines {
             let trimmed = line.trim();
@@ -2721,10 +2771,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             )?);
         }
 
-        // Rejection is ODE-only: an analytical model binds F/lagtime through an
-        // explicit `pk(..., f=F)` mapping, so a double use there is stated rather
-        // than silent, and `ode_slot_map` — what makes a *bare* `F` a dose attribute
-        // — is empty for that engine anyway.
+        // Both engines. The ODE side (#993) keys off `ode_slot_map` — name-based
+        // routing is what makes a bare `F` a dose attribute there. The analytical
+        // side (#1004) keys off the explicit `pk(..., f=F)`/`lagtime=` mapping:
+        // #1003's scope note argued that mapping made a second use "stated rather
+        // than silent", but nothing in the model states the value is applied
+        // twice, which is the same silence #993 closed — measured at exactly `F`
+        // on the prediction on both ferx and NONMEM's analytical ADVAN2 routine
+        // (`S2 = V/F1` with `F1` defined; see the anchor test).
         if is_ode_model {
             check_dose_attr_double_use(
                 &indiv_var_names_for_scaling,
@@ -2732,6 +2786,18 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &scaling_reads,
                 state_names_for_scaling.len(),
                 "[scaling]",
+                None,
+            )?;
+        } else {
+            let analytical_slots =
+                analytical_dose_attr_slot_map(&pk_param_map, &indiv_var_names_for_scaling);
+            check_dose_attr_double_use(
+                &indiv_var_names_for_scaling,
+                &analytical_slots,
+                &scaling_reads,
+                usize::MAX,
+                "[scaling]",
+                Some(&pk_param_map),
             )?;
         }
 
@@ -2825,6 +2891,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.pk_indices,
             &model.kappa_names,
         )?;
+        // Deliberately NOT a `check_dose_attr_double_use` site, unlike `[scaling]`
+        // and `[adaptive_dosing] observe` (#1004). An analytical init amount is not
+        // a dose: `pk::analytical_init_concentration_g` propagates it with `F = 1`
+        // and no lag ("an initial condition is not an absorbed dose, so
+        // bioavailability does not apply"), so `init(depot) = F * 500` — the
+        // bioavailable residue of a pre-study dose — applies `F` exactly once, to a
+        // term the engine never scales. `[scaling]` is a doubling because
+        // `obs_scale` multiplies *every* prediction including the F-scaled dose
+        // contribution; an init is one additive term beside it. For the same
+        // reason a `D{n}`/`R{n}` read here is not a prediction-path read and is
+        // not recorded for `check_modeled_dose_rates`.
         model.analytical_init = analytical_init;
         // Register init-expression covariates as required data columns, mirroring
         // the scaling (`scaling_covariates`) and error-selector blocks above. Without
@@ -3048,9 +3125,37 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         used_thetas
     };
 
-    // Attach the `one_cpt_transit` ODE-equivalent sub-model built above (`None` for
-    // non-transit / out-of-scope forms). The runtime dispatch reads it off the model.
-    model.absorption_ode_equivalent = absorption_ode_equivalent;
+    // Compile and attach the ODE-equivalent sub-model whose source was reconstructed above
+    // (`None` for non-transit / out-of-scope forms). The runtime dispatch reads it off the
+    // model.
+    //
+    // The twin is built **here, at parse time**, and a build failure declines it rather than
+    // propagating (#1008). The twin is an ODE model while this primary is analytical, so every
+    // ODE-scoped parse check runs on the twin and not on the primary: a model this parser
+    // accepts can reconstruct into a twin the parser rejects. Building lazily and `.expect()`ing
+    // that parse turned each such case into an internal panic mid-fit, the first time a
+    // TV-covariate / `TIME` / IOV / SS / infusion subject rerouted — invisible to the model
+    // author and to the parse tests. Three point guards in `absorption_ode_equivalent_source`
+    // were added one-per-incident for exactly this (`f=V1` slot collision, `[adaptive_dosing]`
+    // re-emission, a dose-attribute param in a disposition role); this makes the class
+    // structurally unreachable, so a *new* ODE-only check cannot re-arm it.
+    //
+    // Declining is the standing policy of the desugar, and it is not silent-wrong: without a
+    // twin the model simply stays closed-form, and a subject that actually needs the fallback
+    // is rejected up front with an actionable message — `check_absorption_closed_form_support`
+    // (TV covariates / IOV / SS / infusion / resets) and `check_absorption_flip_flop_no_twin`,
+    // both of which already key on `absorption_ode_equivalent.is_none()` and both of which run
+    // on every entry point (`fit` as an `Err`, `predict`/`simulate` as their `assert_*`
+    // wrappers). The warning carries the twin parser's own message so the reason is visible
+    // without a debugger.
+    if let Some(src) = absorption_ode_equivalent_src {
+        match crate::types::AbsorptionOdeEquivalent::build(&src) {
+            Ok(eq) => model.absorption_ode_equivalent = Some(eq),
+            Err(e) => model
+                .parse_warnings
+                .push(crate::types::absorption_twin_declined_warning(&e)),
+        }
+    }
 
     // ── [event_model] / [event_model NAME] blocks ──────────────────────────────
     // Unnamed: `[event_model]` — one TTE endpoint.
@@ -5661,7 +5766,10 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
 /// is the S2.2 step. The one ambiguity this parser *can* settle without the model
 /// — `with_assay_error` on an expression `observe` with no designated endpoint —
 /// is rejected here rather than left to guess a σ downstream.
-fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, String> {
+fn parse_adaptive_dosing_block(
+    lines: &[String],
+    declared_covariates: &[String],
+) -> Result<AdaptiveDosingSpec, String> {
     let mut observe: Option<String> = None;
     let mut with_assay_error = false;
     let mut assay_cmt: Option<usize> = None;
@@ -5826,6 +5934,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
     // controller with a contradiction the parser would have rejected here.
     let spec = AdaptiveDosingSpec {
         observe,
+        observe_declared_covariates: declared_covariates.to_vec(),
         with_assay_error,
         assay_cmt,
         at,
@@ -6999,8 +7108,9 @@ fn build_obs_scale_spec(
     indiv_var_names: &[String],
     pk_indices: &[usize],
     volume_indiv_name: Option<&str>,
+    declared_covariates: &[String],
     parse_warnings: &mut Vec<String>,
-) -> Result<ScalingSpec, String> {
+) -> Result<(ScalingSpec, Vec<String>), String> {
     // Try scalar first (Form A). Otherwise parse as expression (Form B).
     if let Ok(k) = value.parse::<f64>() {
         // Divisor — strictly positive. A negative scale would flip every
@@ -7011,11 +7121,30 @@ fn build_obs_scale_spec(
                 value
             ));
         }
-        return Ok(ScalingSpec::ScalarScale(k));
+        return Ok((ScalingSpec::ScalarScale(k), Vec::new()));
     }
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
     let expr =
         parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] obs_scale: {}", e))?;
+    // `obs_scale` is a **subject-static** divisor: `apply_scaling` evaluates it once
+    // per subject against the baseline covariate map and a `t = 0` `pk_param_fn`
+    // snapshot, then divides the whole prediction vector by the result. A `TIME`
+    // reference in it would therefore read whatever the model-time thread-local
+    // happened to hold — in practice the `0.0` default — and silently scale every
+    // observation by the t=0 value. Reject it rather than serve that (#1028); a
+    // genuinely time-dependent readout is Form C's job, where `TIME` resolves per
+    // observation.
+    if expr_references_time_builtin(&expr, declared_covariates) {
+        return Err(format!(
+            "[scaling] obs_scale: `{}` references the `TIME` built-in (or its `T` alias), \
+             but `obs_scale` is a subject-static divisor — it is evaluated once per \
+             subject at t = 0 and applied to every observation, so `TIME` would always \
+             read 0. Write the time-dependent readout as Form C instead \
+             (`y = <expr>`, or `y[CMT=N] = <expr>`), where `TIME` resolves to each \
+             observation's own time. See issue #1028.",
+            value.trim()
+        ));
+    }
     if let Some(vname) = volume_indiv_name {
         let mut references_volume = false;
         visit_expr_nodes(&expr, &mut |e| {
@@ -7039,6 +7168,19 @@ fn build_obs_scale_spec(
             ));
         }
     }
+    // Covariate leaves — every identifier the parse could not bind to a theta, an
+    // eta, or an individual parameter. The `scale_fn` below reads them straight out
+    // of the per-subject covariate map, so they are required data columns and must
+    // be registered as such (issue #1028). Before this they were silently dropped:
+    // a typo'd name (or a real covariate the data didn't carry) resolved to the
+    // map's `0.0` default, and the divisive scale then turned every prediction into
+    // `x / 0` → the `apply_scaling` NaN/zero path, with no diagnostic. The `y`
+    // (Form C) half of `[scaling]` has registered its covariates since #540; this
+    // closes the `obs_scale` half. Returned unsorted — `register_referenced_covariates`
+    // pools and re-sorts.
+    let mut cov_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_covariates(&expr, &mut cov_set);
+    let covariates_ref: Vec<String> = cov_set.into_iter().collect();
     // Pre-resolve indiv param name → PK slot so the closure can look up
     // `pk.values[slot]` for each `Expression::Variable(name)`. Mirrors
     // the analytical Form B path from Phase 1.5.
@@ -7074,7 +7216,10 @@ fn build_obs_scale_spec(
             eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
         },
     );
-    Ok(ScalingSpec::ExpressionScale { scale_fn, deriv })
+    Ok((
+        ScalingSpec::ExpressionScale { scale_fn, deriv },
+        covariates_ref,
+    ))
 }
 
 /// Resolve a `[initial_conditions] init(NAME)` compartment name to a 1-based
@@ -7322,6 +7467,128 @@ fn parse_initial_conditions_block(
     Ok((out, init_covariates))
 }
 
+/// Fold the `[odes]` model-time alias `T` / `t` into the same `Expression::Time`
+/// node a bare `TIME` produces, so a `[scaling]` expression spells the built-in
+/// the way `[odes]` does (issue #1028).
+///
+/// `[odes]` reserves `TIME`/`T`/`t` for the solver clock and rejects any state,
+/// individual parameter, or intermediate that collides with them. `[scaling]`
+/// parses with `fallback_covariate = true`, so `TIME` was already special-cased by
+/// `parse_atom` but a bare `T` landed as `Covariate("T")` — a required data column
+/// named `T` if the dataset happened to carry one, and otherwise (before the
+/// undefined-name guard) a silent zero. Only `Covariate` leaves are folded:
+/// a state or individual parameter genuinely named `T` resolves to `Variable("T")`
+/// during the parse and keeps winning, matching the usual name-resolution
+/// precedence (the ODE-model case can't arise — `[odes]` rejects that name).
+///
+/// Two further guards keep the fold from *taking* a name that means something
+/// else. A `[scaling]` `y` covariate has been a required data column since #540,
+/// so a dataset with a real column named `T` used to work and must keep working:
+///
+/// 1. a `T` / `t` listed in `declared_covariates` (the `[covariates]` block) is a
+///    data column by explicit declaration and is left as `Covariate` — the same
+///    precedence a bound state or individual parameter gets; and
+/// 2. when the fold does fire it pushes a `parse_warnings` note naming that escape
+///    hatch, so a model that meant the column — and did not declare it, which is
+///    only a warning elsewhere — is told rather than silently re-pointed at the
+///    clock. Spelling it `TIME` clears the warning.
+fn rewrite_scaling_time_alias(
+    expr: &mut Expression,
+    context: &str,
+    declared_covariates: &[String],
+    parse_warnings: &mut Vec<String>,
+) {
+    let mut folded: Option<String> = None;
+    visit_expr_nodes_mut(expr, &mut |e: &mut Expression| {
+        if let Expression::Covariate(name) = e {
+            if is_time_alias(name) && !declares_time_alias(declared_covariates) {
+                if folded.is_none() {
+                    folded = Some(name.clone());
+                }
+                *e = Expression::Time;
+            }
+        }
+    });
+    if let Some(name) = folded {
+        parse_warnings.push(format!(
+            "{context}: `{name}` resolved as the model-time built-in (the `[odes]` alias \
+             for `TIME`), not as a data column. Spell it `TIME` to silence this; if your \
+             dataset really has a column named `{name}`, declare it in `[covariates]` and \
+             it will be read as the column instead. See issue #1028."
+        ));
+    }
+}
+
+/// Run [`rewrite_scaling_time_alias`] on a *throwaway* parse of `src` purely to
+/// collect the warning it would emit, discarding the rewritten expression.
+///
+/// For `[adaptive_dosing] observe`, which is stored as a raw string and compiled at
+/// simulate time — where `parse_warnings` is long sealed and the adaptive result has
+/// no warnings channel — this is what keeps the fold from being silent on that path.
+/// The expression is re-parsed rather than duplicating the alias test, so the note
+/// can never disagree with the fold that actually happens (#1028). A parse failure is
+/// ignored: the real compile reports it, with its own context.
+#[allow(clippy::too_many_arguments)]
+fn warn_if_time_alias_folds(
+    src: &str,
+    context: &str,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    declared_covariates: &[String],
+    parse_warnings: &mut Vec<String>,
+) {
+    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
+    if let Ok(mut expr) = parse_scalar_expression(src, ctx) {
+        rewrite_scaling_time_alias(&mut expr, context, declared_covariates, parse_warnings);
+    }
+}
+
+/// Whether `expr` reads the model-time built-in, under either spelling: the
+/// `Expression::Time` node a bare `TIME` parses to, or the `T` / `t` alias
+/// [`rewrite_scaling_time_alias`] folds into it. Drives the `obs_scale`
+/// rejection (#1028) — see [`build_obs_scale_spec`].
+///
+/// `declared_covariates` gets the same precedence it gets in the fold: a `T`
+/// declared in `[covariates]` is a data column, not the clock, so it does not
+/// trip the rejection.
+fn expr_references_time_builtin(expr: &Expression, declared_covariates: &[String]) -> bool {
+    let mut found = false;
+    visit_expr_nodes(expr, &mut |e: &Expression| match e {
+        Expression::Time => found = true,
+        Expression::Covariate(n)
+            if is_time_alias(n) && !declares_time_alias(declared_covariates) =>
+        {
+            found = true
+        }
+        _ => {}
+    });
+    found
+}
+
+/// Whether `name` is the `[odes]` model-time alias, i.e. `T` under either case.
+/// The two spellings are one built-in, so every guard that keys on the alias must
+/// treat them as one name.
+fn is_time_alias(name: &str) -> bool {
+    name == "T" || name == "t"
+}
+
+/// Whether `[covariates]` declares the model-time alias, in *either* case.
+///
+/// Deliberately case-insensitive while ordinary covariate resolution is
+/// case-sensitive: since [`is_time_alias`] collapses `T` and `t` into one
+/// built-in, a case-exact check would let `[covariates] T` fail to protect a
+/// `y = ... t ...` reference (silently folding it to the clock even though the
+/// user took the documented escape hatch) and, in `obs_scale`, would raise the
+/// `TIME`-rejection error against a legitimately declared column. Matching the
+/// declaration the same way the reference is matched keeps the escape hatch
+/// working for both spellings (#1028).
+fn declares_time_alias(declared_covariates: &[String]) -> bool {
+    declared_covariates
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case("T"))
+}
+
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
 /// the uniform and per-CMT paths.
 #[allow(clippy::too_many_arguments)]
@@ -7336,6 +7603,8 @@ pub(crate) fn build_y_output_fn(
     kappa_names: &[String],
     readout_synth: &[ReadoutSynthParam],
     forbidden_state_names: &[String],
+    declared_covariates: &[String],
+    parse_warnings: &mut Vec<String>,
 ) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram, Vec<String>), String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
@@ -7347,6 +7616,13 @@ pub(crate) fn build_y_output_fn(
     }
     let ctx = ParseCtx::new(theta_names, eta_names, &defined);
     let mut expr = parse_scalar_expression(value, ctx).map_err(|e| format!("{context}: {e}"))?;
+
+    // `T` / `t` is the `[odes]` spelling of the model-time built-in; fold it into
+    // the `Expression::Time` node a bare `TIME` already parses to, so the two
+    // blocks agree on the name (#1028). Runs before the covariate scan below so
+    // the alias never registers as a required data column — unless `[covariates]`
+    // declares it, in which case it stays the data column it was declared to be.
+    rewrite_scaling_time_alias(&mut expr, context, declared_covariates, parse_warnings);
 
     // Analytic Form C (#650): reject a readout that references a peripheral (or a
     // depot/transit amount with no closed form) — the analytical solutions don't
@@ -7550,6 +7826,12 @@ pub(crate) fn build_y_output_fn(
 ///   `y[CMT=N] = <expr>` and uniform `y = <expr>` syntaxes both go here
 ///   (`OdeReadout::PerCmt` vs `OdeReadout::Single` respectively), and
 ///   replace the default `OdeReadout::ObsCmt(idx)` state-index readout.
+/// - The trailing `Vec<String>` is every covariate name referenced across the
+///   block — **both** the Form C `y` readouts and the Form B `obs_scale`
+///   expressions (#1028). The caller registers them via
+///   `register_referenced_covariates`, which is what makes an identifier the
+///   parse could not bind to a theta / eta / individual parameter / state a
+///   *required data column* rather than a silent `0.0`.
 ///
 /// `is_ode = true` enables Form C and lets expressions reference state names.
 /// `pk_indices` is parallel to `indiv_var_names`: `pk_indices[i]` is the
@@ -7563,11 +7845,19 @@ pub(crate) fn build_y_output_fn(
 /// - Mixing uniform (`obs_scale = K`) with per-CMT (`obs_scale[CMT=N] = K`)
 ///   within the same group → error.
 /// - Duplicate `[CMT=N]` keys → error.
+/// - `obs_scale` referencing the `TIME` built-in (or its `T` alias) → error: the
+///   divisor is subject-static, so `TIME` would always read the t=0 default
+///   (#1028). Form C `y = <expr>` is where a time-dependent readout belongs.
 /// - `obs_scale` referencing the same individual parameter bound to a built-in
 ///   `pk <model>(...)` block's `v`/`v1` role → **warning** (`parse_warnings`),
 ///   not an error: it's a supported feature, but also the signature of a
 ///   common mistake (a leftover `obs_scale = V` from an `ode(...)`
 ///   translation) — see [`build_obs_scale_spec`] (#712).
+///
+/// `declared_covariates` is the `[covariates]` block's name list (empty when the
+/// block is absent). It only affects name *precedence*: a `T` / `t` declared there
+/// is a data column and is read as one, instead of being folded into the
+/// model-time built-in (#1028).
 #[allow(clippy::too_many_arguments)]
 fn parse_scaling_block(
     lines: &[String],
@@ -7581,6 +7871,7 @@ fn parse_scaling_block(
     kappa_names: &[String],
     readout_synth: &[ReadoutSynthParam],
     volume_indiv_name: Option<&str>,
+    declared_covariates: &[String],
     parse_warnings: &mut Vec<String>,
 ) -> Result<
     (
@@ -7603,7 +7894,7 @@ fn parse_scaling_block(
     // per-CMT readouts carry their own program inside each `PerCmtReadout` (#439),
     // so the analytic-sensitivity provider can differentiate each endpoint.
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
-    let mut y_covariates: Vec<String> = Vec::new();
+    let mut scaling_covariates: Vec<String> = Vec::new();
 
     for line in lines {
         let trimmed = line.trim();
@@ -7618,15 +7909,24 @@ fn parse_scaling_block(
 
         match base {
             "obs_scale" => {
-                let spec = build_obs_scale_spec(
+                let (spec, cov_names) = build_obs_scale_spec(
                     value,
                     theta_names,
                     eta_names,
                     indiv_var_names,
                     pk_indices,
                     volume_indiv_name,
+                    declared_covariates,
                     parse_warnings,
                 )?;
+                // Form B `obs_scale` covariate leaves are required data columns too
+                // (#1028) — pooled into the same list the Form C `y` readout feeds,
+                // so both halves of `[scaling]` reach `register_referenced_covariates`.
+                for cov in cov_names {
+                    if !scaling_covariates.contains(&cov) {
+                        scaling_covariates.push(cov);
+                    }
+                }
                 match cmt_opt {
                     None => {
                         if obs_scale_uniform.is_some() {
@@ -7677,10 +7977,12 @@ fn parse_scaling_block(
                     kappa_names,
                     readout_synth,
                     &forbidden,
+                    declared_covariates,
+                    parse_warnings,
                 )?;
                 for cov in cov_names {
-                    if !y_covariates.contains(&cov) {
-                        y_covariates.push(cov);
+                    if !scaling_covariates.contains(&cov) {
+                        scaling_covariates.push(cov);
                     }
                 }
                 match cmt_opt {
@@ -7756,8 +8058,8 @@ fn parse_scaling_block(
         );
     }
 
-    y_covariates.sort();
-    Ok((scaling, readout, readout_program, y_covariates))
+    scaling_covariates.sort();
+    Ok((scaling, readout, readout_program, scaling_covariates))
 }
 
 // ── ode_template desugaring + the analytical+ODE-only-absorption error rule ──
@@ -8005,14 +8307,22 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // `cl/v1/q/v2/<abs>`, where `<abs>` is `n/mtt` (transit) or `mat/cv2` (IG). Any other
     // structural form stays closed-form.
     let structural = extracted.unnamed.get("structural_model")?;
-    let transit_one = Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
-    let transit_two = Regex::new(r"^pk\s+two_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
-    let ig_one = Regex::new(r"^pk\s+one_cpt_ig\s*\(([^)]*)\)\s*$").unwrap();
-    let ig_two = Regex::new(r"^pk\s+two_cpt_ig\s*\(([^)]*)\)\s*$").unwrap();
+    // `LazyLock` rather than per-call `Regex::new`: since #1008 the twin is compiled eagerly, so
+    // every transit/IG model reaches this function twice — once for itself, once from the twin's
+    // own parse, where all four patterns are compiled only to miss (the twin's structural model
+    // is `ode(...)`). Compiling them per call cost ~0.9 ms of the parse, measured on #1027.
+    static TRANSIT_ONE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap());
+    static TRANSIT_TWO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+two_cpt_transit\s*\(([^)]*)\)\s*$").unwrap());
+    static IG_ONE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+one_cpt_ig\s*\(([^)]*)\)\s*$").unwrap());
+    static IG_TWO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^pk\s+two_cpt_ig\s*\(([^)]*)\)\s*$").unwrap());
     // (args, is_two_cpt, is_ig, pk_label)
     let (args_str, is_two_cpt, is_ig, pk_label) = if let Some(caps) = structural
         .iter()
-        .find_map(|l| transit_one.captures(l.trim()))
+        .find_map(|l| TRANSIT_ONE.captures(l.trim()))
     {
         (
             caps.get(1)?.as_str().to_string(),
@@ -8022,7 +8332,7 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
         )
     } else if let Some(caps) = structural
         .iter()
-        .find_map(|l| transit_two.captures(l.trim()))
+        .find_map(|l| TRANSIT_TWO.captures(l.trim()))
     {
         (
             caps.get(1)?.as_str().to_string(),
@@ -8030,14 +8340,14 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
             false,
             "pk two_cpt_transit",
         )
-    } else if let Some(caps) = structural.iter().find_map(|l| ig_one.captures(l.trim())) {
+    } else if let Some(caps) = structural.iter().find_map(|l| IG_ONE.captures(l.trim())) {
         (
             caps.get(1)?.as_str().to_string(),
             false,
             true,
             "pk one_cpt_ig",
         )
-    } else if let Some(caps) = structural.iter().find_map(|l| ig_two.captures(l.trim())) {
+    } else if let Some(caps) = structural.iter().find_map(|l| IG_TWO.captures(l.trim())) {
         (
             caps.get(1)?.as_str().to_string(),
             true,
@@ -8120,9 +8430,10 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // disposition role. `pk one_cpt_transit(cl=CL, v=F, n=N, mtt=MTT, f=F)` passes it — `F`
     // is the `f=` mapping — but the twin then emits `d/dt(central) = … − (CL/F) * central`
     // and `obs_scale = F`, reading a name `ode_param_slots` routes to the F slot. That is a
-    // dose-attribute double use, so the twin's own parse now rejects it and `get_or_build`
-    // turns the rejection into a panic. Decline instead, per this function's standing
-    // policy: keep the model closed-form rather than panicking at eval time.
+    // dose-attribute double use, so the twin's own parse rejects it. Decline here, per this
+    // function's standing policy: keep the model closed-form. (Since #1008 an unguarded case
+    // like this no longer panics — the attach site declines the twin and warns — but naming
+    // the case here keeps the *reason* for the decline specific instead of generic.)
     if disposition
         .iter()
         .filter_map(|role| roles.get(*role))
@@ -8154,8 +8465,8 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // *name* routes to an already-taken *disposition* slot (e.g. `f=V1`, where `V1` name-routes
     // to the V slot held by `v=V`) is not a reserved-name shadow, so it passes the guard above —
     // but the generated twin's `ode_param_slots` would reject it as two parameters mapping to one
-    // slot, which `AbsorptionOdeEquivalent::get_or_build` surfaces as a *panic*. The closed form
-    // binds F/lagtime by role, so the collision is harmless there. Dry-run the real slot
+    // slot (which, before #1008, `AbsorptionOdeEquivalent::get_or_build` surfaced as a *panic*).
+    // The closed form binds F/lagtime by role, so the collision is harmless there. Dry-run the real slot
     // assignment on the twin's projected parameter names. This list is a superset of the twin's
     // real (filtered) parameter set, so it catches every real collision — at worst it declines an
     // *unused* colliding name the real twin would not hit, which is harmless (the model stays
@@ -8182,14 +8493,19 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
     // `pk one_cpt_transit`/`pk two_cpt_transit`/`pk one_cpt_ig`/`pk two_cpt_ig`, so it does
     // not recurse into this desugar.
     //
-    // `adaptive_dosing` is dropped rather than carried (#993). Two independent reasons,
-    // and the first is a crash: the twin *is* an ODE model, so a re-emitted
-    // `observe` that reads a dose attribute hits `check_dose_attr_double_use` — which
-    // the analytical primary is deliberately out of scope for — and the resulting parse
-    // error surfaces through `get_or_build`'s `.expect()` as a panic mid-fit, on the
-    // plain `predict`/`fit` path that reroutes TV-covariate / `TIME` / IOV subjects here.
-    // Blocks that would otherwise reach a new ODE-only check (`odes`, `scaling`) decline
-    // the twin outright above; `adaptive_dosing` does not, so it has to be dropped here.
+    // `adaptive_dosing` is dropped rather than carried (#993). Two independent reasons.
+    // First, it would cost the model its twin for no gain: the twin *is* an ODE model, so a
+    // re-emitted `observe` that reads a dose attribute hits `check_dose_attr_double_use` and
+    // the twin's parse fails. (Before #1008 that failure was a panic mid-fit, through
+    // `get_or_build`'s `.expect()`, on the plain `predict`/`fit` path that reroutes
+    // TV-covariate / `TIME` / IOV subjects here; it now declines the twin at parse time,
+    // which is survivable but still needlessly loses the fallback.) Blocks that would
+    // otherwise reach an ODE-scoped check (`odes`, `scaling`) decline the twin outright
+    // above; `adaptive_dosing` does not, so it has to be dropped here. Since #1004 the
+    // analytical primary rejects that shape itself, so the twin can no longer be *reached*
+    // with it — which is why `adaptive_observe_does_not_reach_the_absorption_twin` asserts
+    // on the re-emitted source directly. "The twin still builds" no longer implies the drop
+    // once no reachable controller carries something the twin's parse would reject.
     // Second, the twin is reached only through `CompiledModel::effective_for` on the
     // prediction path (`pk/mod.rs`), and nothing there reads a controller spec —
     // `simulate_adaptive_from_spec` takes the spec as an argument from the primary — so
@@ -8670,12 +8986,45 @@ fn ode_free_slot_count(names: &[String]) -> usize {
 /// below reports it precisely ("the model has only N compartment(s)"); telling such
 /// a user to rename `F5` would send them after the wrong thing, so out-of-range
 /// indices are left for that check.
+///
+/// Runs on **both engines** (#993 shipped the ODE half; #1004 the analytical).
+/// `indiv_param_slots` is what differs: the ODE caller passes `ode_slot_map`
+/// (name-based routing is what makes a bare `F` a dose attribute there), the
+/// analytical caller passes [`analytical_dose_attr_slot_map`] (the explicit
+/// `pk(..., f=F)` / `lagtime=` mapping is what binds it there — measured on
+/// NONMEM's own analytical routine, ADVAN2 with `F1` defined and `S2 = V/F1`:
+/// predictions shift by exactly `F1` with no diagnostic, see
+/// `tests/dose_attr_double_use_nonmem_anchor.rs`). An analytical caller passes
+/// `usize::MAX` for `n_states`: a compartment-indexed `EveryDose` attribute
+/// cannot reach this check there — an *unmapped* `F{n}`/`ALAG{n}` is already a
+/// parse error ("nothing binds it to the dose route"), and a mapped one resolves
+/// through the bare-slot arm of `DoseAttrConsumption::of`, whose `cmt` is `None`.
+///
+/// `analytical_pk_map` is `None` for the ODE callers and `Some(pk_param_map)` for
+/// the analytical ones. It selects the remediation clause (rename vs drop the
+/// mapping) and, via [`analytical_role_binding`], supplies the `role=value` pair
+/// **as the user spelled it**, so an `alag=` model is not told to look for a
+/// `lagtime=` argument it never wrote.
+///
+/// Scope gap on the analytical side: the caller iterates `indiv_param_names`,
+/// which does not carry a parameter assigned only inside an `if` body — while
+/// `build_pk_param_fn` resolves `pk(..., f=F)` against those nested names too, so
+/// such a parameter *is* applied at the dose and escapes this check. That model
+/// has a wider defect anyway (#1026: reading the name off the prediction path
+/// yields `NaN` with a clean parse); fixing the registration there closes this
+/// hole with it.
+///
+/// `[initial_conditions]` is deliberately **not** a call site. An analytical init
+/// amount is propagated by `pk::analytical_init_concentration_g` with `F = 1` and
+/// no lag, so reading a mapped dose attribute in an init expression applies it
+/// once, not twice — see the note at that block.
 fn check_dose_attr_double_use(
     indiv_param_names: &[String],
     indiv_param_slots: &[usize],
     reads: &std::collections::HashSet<String>,
     n_states: usize,
     block: &str,
+    analytical_pk_map: Option<&HashMap<String, String>>,
 ) -> Result<(), String> {
     for (i, name) in indiv_param_names.iter().enumerate() {
         let slot = indiv_param_slots.get(i).copied();
@@ -8695,18 +9044,150 @@ fn check_dose_attr_double_use(
             Some(c) => format!(" for doses into compartment {c}"),
             None => String::new(),
         };
+        // The remedy for "it is meant to be an ordinary parameter" differs by
+        // engine. On an ODE model the *name* is what routes a bare `F`/`LAGTIME`
+        // (or an indexed `F{n}`/`ALAG{n}`) onto the dose, so renaming un-routes
+        // it. On an analytical model the name is inert; the explicit
+        // `pk(..., f=NAME)` / `lagtime=NAME` mapping is what binds it, so the
+        // mapping — not the name — is what has to go (#1004; renaming alone
+        // changes nothing, the mapping follows the parameter).
+        //
+        // The analytical clause quotes the mapping **as the user spelled it** —
+        // `alag=` is a legal alias for `lagtime=`, and the mapped value may differ
+        // in case from the declaration (`alag=TLAG` binding a declared `tlag`
+        // through the lowercase compat lookup). Naming an argument the model file
+        // does not contain sends the reader looking for the wrong text, so the
+        // role/value pair comes from the entry that actually did the binding.
+        let (ordinary_remedy, issue) = match analytical_pk_map {
+            Some(map) => {
+                let (role, bound) = analytical_role_binding(map, name, attr)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    // Unreachable: `analytical_dose_attr_slot_map` set this
+                    // parameter's slot from exactly such an entry, under the same
+                    // resolution. Name the canonical role rather than panicking if
+                    // that ever drifts.
+                    .unwrap_or_else(|| {
+                        let role = match attr {
+                            crate::types::DoseAttr::F => "f",
+                            _ => "lagtime",
+                        };
+                        (role.to_string(), name.to_string())
+                    });
+                (
+                    format!(
+                        "remove the `{role}={bound}` mapping from the `pk(...)` call — the \
+                         mapping, not the name, is what makes `{name}` a dose attribute"
+                    ),
+                    "#1004",
+                )
+            }
+            None => (
+                format!("rename it — `{name}` is a reserved dose-attribute name"),
+                "#993",
+            ),
+        };
         return Err(format!(
             "{block}: `{name}` is this model's {noun}{scope} — the engine already \
              {applied} — but it is also read in {block}, so the value is applied \
-             twice: once at the dose, once where you read it (#993). If `{name}` is \
+             twice: once at the dose, once where you read it ({issue}). If `{name}` is \
              meant to be {noun}, remove it from {block}; if it is meant to be an \
-             ordinary parameter, rename it — `{name}` is a reserved dose-attribute \
-             name.",
+             ordinary parameter, {ordinary_remedy}.",
             noun = attr.noun(),
             applied = attr.applied_as(),
         ));
     }
     Ok(())
+}
+
+/// The `indiv_param_slots` argument of [`check_dose_attr_double_use`] for an
+/// **analytical** model (#1004): a vector parallel to `indiv_var_names` carrying
+/// [`crate::types::PK_IDX_F`] / [`crate::types::PK_IDX_LAGTIME`] for the
+/// parameter(s) the `pk(...)` call maps onto the dose route via `f=` /
+/// `lagtime=`/`alag=`, and a `usize::MAX` sentinel everywhere else.
+///
+/// The sentinel makes `DoseAttrConsumption::of` fall through its bare-slot arm
+/// to name-based recognition, exactly as the ODE caller's unrelated slots do —
+/// so an analytical `D{n}`/`R{n}` still classifies as `CodedRateOnly` (skipped
+/// here, judged with the data in `check_modeled_dose_rates`) and everything else
+/// stays an ordinary parameter.
+///
+/// Binding resolution mirrors `build_pk_param_fn`'s, which is what actually
+/// wires the value: the mapped name matches a declared parameter exactly, or by
+/// its lowercase form (the legacy `vars.get(to_lowercase())` compat lookup). A
+/// value that resolves to neither is a numeric literal, `TIME` (desugared to a
+/// synthetic parameter upstream), or an undefined name that
+/// `build_pk_param_fn` rejects with its own error — none of which can collide
+/// with a read.
+fn analytical_dose_attr_slot_map(
+    pk_param_map: &HashMap<String, String>,
+    indiv_var_names: &[String],
+) -> Vec<usize> {
+    let mut slots = vec![usize::MAX; indiv_var_names.len()];
+    // Iterate in sorted key order. `pk_param_map` is a `HashMap`, and a parameter
+    // bound to *both* roles (`pk(..., f=X, lagtime=X)`) is written twice — so with
+    // arbitrary iteration order the surviving slot, and therefore the diagnostic
+    // `check_dose_attr_double_use` emits, differed between runs of the identical
+    // model. Same reason `build_pk_param_fn` sorts its `pk_entries`.
+    let mut entries: Vec<(&String, &String)> = pk_param_map.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (key, value) in entries {
+        let target = match PkParams::name_to_index(key) {
+            Some(s @ (crate::types::PK_IDX_F | crate::types::PK_IDX_LAGTIME)) => s,
+            _ => continue,
+        };
+        // Exact first, then the lowercase compat form — `build_pk_param_fn`'s own
+        // order. The conversion is hoisted out of the `position` closure so it
+        // costs one allocation per mapping rather than one per candidate name.
+        let idx = indiv_var_names.iter().position(|n| n == value).or_else(|| {
+            let lowered = value.to_lowercase();
+            indiv_var_names.iter().position(|n| *n == lowered)
+        });
+        if let Some(i) = idx {
+            slots[i] = target;
+        }
+    }
+    slots
+}
+
+/// The `pk(...)` entry that binds `name` to dose attribute `attr` on an analytical
+/// model, as `(role key, mapped value)` — both **as the user spelled them**, so the
+/// remediation clause in [`check_dose_attr_double_use`] quotes text that is
+/// actually in the model file (`alag=TLAG`, not the canonical `lagtime=tlag`).
+///
+/// Resolution mirrors [`analytical_dose_attr_slot_map`]'s, which is what assigned
+/// the slot in the first place: the role key must route to `attr`'s reserved slot,
+/// and the mapped value must match the declared parameter exactly or through the
+/// legacy lowercase compat lookup. Filtering on `attr` is what keeps the noun and
+/// the quoted role in agreement when one parameter fills both roles; sorting picks
+/// one deterministically in that same case.
+fn analytical_role_binding<'a>(
+    pk_param_map: &'a HashMap<String, String>,
+    name: &str,
+    attr: crate::types::DoseAttr,
+) -> Option<(&'a String, &'a String)> {
+    let target = match attr {
+        crate::types::DoseAttr::F => crate::types::PK_IDX_F,
+        _ => crate::types::PK_IDX_LAGTIME,
+    };
+    let mut hit: Option<(&String, &String)> = None;
+    for (key, value) in pk_param_map {
+        if PkParams::name_to_index(key) != Some(target) {
+            continue;
+        }
+        if value.as_str() != name && value.to_lowercase() != name {
+            continue;
+        }
+        // Keep the LARGEST role key, matching which mapping actually binds: both
+        // `analytical_dose_attr_slot_map` and `build_pk_param_fn` iterate the map
+        // in ascending key order and let the last write win, so with `lagtime=X`
+        // and `alag=X` both present it is `lagtime=` that reaches the slot. Quoting
+        // the other one would name a mapping whose removal changes nothing.
+        match hit {
+            Some((k, _)) if k >= key => {}
+            _ => hit = Some((key, value)),
+        }
+    }
+    hit
 }
 
 /// The individual-parameter names an expression *source* references, upper-cased,
@@ -9560,6 +10041,7 @@ fn build_ode_spec(
         &rhs_reads,
         n_states,
         "[odes]",
+        None,
     )?;
 
     // Reject name collisions (case-insensitive) across the three name spaces.
@@ -10033,6 +10515,231 @@ struct ParsedKappas {
 
 // --- Block extraction ---
 
+/// Which header form a `[block]` accepts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlockForm {
+    /// `[name]` only.
+    Unnamed,
+    /// `[name]` or `[name INSTANCE]` — several instances may coexist.
+    Either,
+    /// `[name INSTANCE]` only.
+    Named,
+}
+
+/// Every `[block]` name the parser reads, with the header form it accepts and
+/// the cargo feature it needs (`None` = always compiled in).
+///
+/// This is the closed-world registry behind `E_UNKNOWN_BLOCK` (#1040). Blocks
+/// are consumed by *name lookup* — `blocks.get("fit_options")` and friends —
+/// never by an exhaustive match, so without this table a block the parser does
+/// not know is simply never read: a misspelled `[fit_option]` used to leave
+/// `ferx check` reporting `valid: true` while the fit silently ran with the
+/// default method and no covariance step. Keys inside a block are already
+/// closed-world (`[event_model]: unknown key ...`); this closes the same door
+/// on the block names themselves.
+///
+/// **Teaching the parser a new block means adding it here in the same PR** —
+/// otherwise the new block is rejected as unknown.
+///
+/// `covariate_nn` carries no feature here on purpose: it has its own, more
+/// specific `E_NN_FEATURE_DISABLED` error (which points at the design doc)
+/// raised further down in `parse_full_model`.
+const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
+    ("adaptive_dosing", BlockForm::Unnamed, None),
+    ("binary_model", BlockForm::Either, Some("survival")),
+    ("covariate_nn", BlockForm::Named, None),
+    ("covariates", BlockForm::Unnamed, None),
+    ("data", BlockForm::Unnamed, None),
+    ("data_selection", BlockForm::Unnamed, None),
+    ("derived", BlockForm::Unnamed, None),
+    ("diffusion", BlockForm::Unnamed, None),
+    ("error_model", BlockForm::Unnamed, None),
+    ("event_model", BlockForm::Either, Some("survival")),
+    ("fit_options", BlockForm::Unnamed, None),
+    ("individual_parameters", BlockForm::Unnamed, None),
+    ("initial_conditions", BlockForm::Unnamed, None),
+    ("markov_model", BlockForm::Either, Some("markov")),
+    ("mixture", BlockForm::Unnamed, None),
+    ("odes", BlockForm::Unnamed, None),
+    ("output", BlockForm::Unnamed, None),
+    ("parameters", BlockForm::Unnamed, None),
+    ("scaling", BlockForm::Unnamed, None),
+    ("simulation", BlockForm::Unnamed, None),
+    ("structural_model", BlockForm::Unnamed, None),
+];
+
+/// Blocks that *were* ferx syntax and are no longer read, with the remediation
+/// to print. Kept separate from [`BLOCK_REGISTRY`] because they are neither
+/// valid (they must not appear in the "valid blocks" enumeration) nor unknown
+/// (a bare "unknown block, did you mean …" is unhelpful for something that was
+/// once the documented spelling, and the nearest valid name is often far enough
+/// away that no did-you-mean fires at all).
+///
+/// `initial_values` is the one live case: initial estimates moved inline into
+/// `[parameters]`, the parser stopped reading the block, and — because unknown
+/// names were silently dropped — nothing ever said so. `ferx-r` still lists it
+/// in its section docs and three of its checked-in example models still carry
+/// one, so this fires for real files (#1040).
+const DEPRECATED_BLOCKS: &[(&str, &str)] = &[(
+    "initial_values",
+    "initial estimates are declared inline in `[parameters]` \
+     (`theta NAME(init, lower, upper)`, `omega NAME ~ variance`); \
+     the block has not been read for several releases — delete it",
+)];
+
+/// The name of every `[block]` **this build** of the parser will accept, in the
+/// order they appear in the error message (alphabetical).
+///
+/// Feature-gated blocks are filtered out when their feature is off: a default
+/// build cannot use `[event_model]`, so listing it as valid would advertise a
+/// name the same binary then rejects with `E_BLOCK_FEATURE_DISABLED`. The
+/// registry itself still *recognises* those names in every build — that is what
+/// makes the rejection a specific "build with `--features …`" error rather than
+/// a bare "unknown block".
+///
+/// Exposed so downstream consumers (`ferx-r`'s `ferx_model_validate()`,
+/// `ferxtranslate`) can source the block list from the engine instead of
+/// keeping their own copy — the duplicated R-side list had already drifted
+/// from this one (#1040). Because the result is build-dependent, a consumer
+/// must read it from the same binary it will parse with.
+pub fn known_block_names() -> Vec<&'static str> {
+    BLOCK_REGISTRY
+        .iter()
+        .filter(|(_, _, feature)| feature.is_none_or(block_feature_enabled))
+        .map(|(n, _, _)| *n)
+        .collect()
+}
+
+/// Whether the cargo feature a registry entry names is enabled in this build.
+fn block_feature_enabled(feature: &str) -> bool {
+    match feature {
+        "survival" => cfg!(feature = "survival"),
+        "markov" => cfg!(feature = "markov"),
+        "nn" => cfg!(feature = "nn"),
+        // An unrecognised feature name can only be a registry typo; treating it
+        // as enabled keeps a mistake here from rejecting a valid model.
+        _ => true,
+    }
+}
+
+/// Levenshtein distance, used only to offer a did-you-mean for a misspelled
+/// block name.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The registry name closest to `name`, when one is close enough to be worth
+/// suggesting: an edit distance of at most 2, or a plain prefix relationship
+/// (which catches `fit_option` → `fit_options` and `param` → `parameters`).
+pub(crate) fn nearest_block_name(name: &str) -> Option<&'static str> {
+    BLOCK_REGISTRY
+        .iter()
+        .map(|(n, _, _)| *n)
+        .filter(|n| n.starts_with(name) || name.starts_with(*n) || edit_distance(name, n) <= 2)
+        .min_by_key(|n| edit_distance(name, n))
+}
+
+/// Reject any `[block]` header the parser would otherwise drop on the floor.
+///
+/// `headers` is every header seen, in source order, as
+/// `(type, instance, 1-based line)`. Four silent-drop shapes are caught, in
+/// the order a user is most likely to hit them:
+///
+/// 1. a block that was ferx syntax and is no longer read
+///    (`E_DEPRECATED_BLOCK`),
+/// 2. an unrecognised block name (`E_UNKNOWN_BLOCK`),
+/// 3. a known block written in the wrong header form — an instance name on a
+///    block that takes none, or a missing one on `[covariate_nn NAME]`
+///    (`E_BLOCK_INSTANCE_NAME`),
+/// 4. a known block whose cargo feature this binary was not built with
+///    (`E_BLOCK_FEATURE_DISABLED`).
+///
+/// All findings of the first non-empty class are reported together, so an
+/// author fixing a batch of typos sees them in one pass.
+fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), String> {
+    let mut deprecated: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    let mut wrong_form: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
+    let mut seen: Vec<(&str, Option<&str>)> = Vec::new();
+
+    for (ty, instance, line) in headers {
+        // Report each distinct header once, however many times it is repeated.
+        // Keyed on the instance name too, so `[foo A]` and `[foo B]` are two
+        // findings rather than one entry that names only the first.
+        let key = (ty.as_str(), instance.as_deref());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        // Echo the header exactly as written, instance name included, so the
+        // text is greppable in the user's own file.
+        let header = match instance {
+            Some(inst) => format!("[{ty} {inst}]"),
+            None => format!("[{ty}]"),
+        };
+        if let Some((name, remedy)) = DEPRECATED_BLOCKS.iter().find(|(n, _)| *n == ty) {
+            deprecated.push(format!(
+                "`[{name}]` (line {line}) is no longer read: {remedy}"
+            ));
+            continue;
+        }
+        let Some((name, form, feature)) = BLOCK_REGISTRY.iter().find(|(n, _, _)| n == ty) else {
+            let hint = match nearest_block_name(ty) {
+                Some(near) => format!(" — did you mean `[{near}]`"),
+                None => String::new(),
+            };
+            unknown.push(format!("`{header}` (line {line}){hint}"));
+            continue;
+        };
+        match (form, instance) {
+            (BlockForm::Unnamed, Some(inst)) => wrong_form.push(format!(
+                "`[{name} {inst}]` (line {line}) does not take an instance name — write `[{name}]`"
+            )),
+            (BlockForm::Named, None) => wrong_form.push(format!(
+                "`[{name}]` (line {line}) requires an instance name — write `[{name} NAME]`"
+            )),
+            _ => {}
+        }
+        if let Some(feature) = feature {
+            if !block_feature_enabled(feature) {
+                disabled.push(format!(
+                    "`[{name}]` (line {line}) requires building ferx-core with `--features {feature}`"
+                ));
+            }
+        }
+    }
+
+    if !deprecated.is_empty() {
+        return Err(format!("Deprecated block {}.", deprecated.join("; ")));
+    }
+    if !unknown.is_empty() {
+        return Err(format!(
+            "Unknown block {}. Valid blocks: {}.",
+            unknown.join("; "),
+            known_block_names().join(", ")
+        ));
+    }
+    if !wrong_form.is_empty() {
+        return Err(format!("Block {}.", wrong_form.join("; ")));
+    }
+    if !disabled.is_empty() {
+        return Err(format!("Block {}.", disabled.join("; ")));
+    }
+    Ok(())
+}
+
 fn extract_model_name(content: &str) -> String {
     let re = Regex::new(r"(?m)^\s*model\s+(\w+)").unwrap();
     re.captures(content)
@@ -10076,6 +10783,10 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
         Named { ty: String, name: String },
     }
     let mut current: Option<BlockTarget> = None;
+    // Every header seen, in source order, as `(type, instance, 1-based line)`.
+    // Validated against `BLOCK_REGISTRY` once the whole file has been scanned
+    // (#1040) so a misspelled block name is an error rather than a silent drop.
+    let mut headers: Vec<(String, Option<String>, usize)> = Vec::new();
 
     for (idx, line) in content.lines().enumerate() {
         let without_comment = match line.find('#').into_iter().chain(line.find("//")).min() {
@@ -10089,6 +10800,11 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
 
         if let Some(caps) = block_re.captures(trimmed) {
             let ty = caps[1].to_lowercase();
+            headers.push((
+                ty.clone(),
+                caps.get(2).map(|m| m.as_str().to_string()),
+                idx + 1,
+            ));
             current = match caps.get(2) {
                 Some(m) => Some(BlockTarget::Named {
                     ty,
@@ -10125,6 +10841,8 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
             None => { /* lines before any block header are ignored */ }
         }
     }
+
+    check_block_names(&headers)?;
 
     Ok(out)
 }
@@ -11198,37 +11916,6 @@ fn build_residual_correlations(
     Ok(out)
 }
 
-fn validate_block_sigma_single_error_order(
-    parsed_error_model: &ParsedErrorModel,
-    block_sigmas: &[BlockSigmaSpec],
-    sigma_names: &[String],
-) -> Result<(), String> {
-    if block_sigmas.is_empty() {
-        return Ok(());
-    }
-    let ParsedErrorModel::Single(_, error_sigma_args) = parsed_error_model else {
-        return Ok(());
-    };
-    for (idx, arg) in error_sigma_args.iter().enumerate() {
-        let expected = arg_sigma_name(arg, sigma_names)?;
-        let expected = &expected;
-        if sigma_names.get(idx) != Some(expected) {
-            return Err(format!(
-                "block_sigma with a single-endpoint [error_model] requires the \
-                 error-model sigma order to match the leading sigma slots; expected \
-                 '{}' at position {}, got '{}'",
-                sigma_names
-                    .get(idx)
-                    .map(String::as_str)
-                    .unwrap_or("<missing>"),
-                idx + 1,
-                expected
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validate_residual_correlations(
     error_spec: &ErrorSpec,
     correlations: &[ResidualCorrelation],
@@ -12018,11 +12705,98 @@ fn build_error_spec(
     match parsed {
         ParsedErrorModel::Single(model, args) => {
             // Single-endpoint sigmas are consumed positionally from the global
-            // sigma vector. Each argument must scale exactly one declared sigma
-            // (a bare name or a magnitude expression, #484); `arg_sigma_name`
-            // both resolves that sigma and rejects an unknown/typo'd reference.
-            for arg in &args {
-                arg_sigma_name(arg, sigma_names)?;
+            // sigma vector: `ErrorSpec::Single` carries no indices, so every
+            // consumer (`sigma_loadings`, `residual_variance`, `sigma_types`,
+            // the #484 magnitude multipliers, …) reads the *leading* slots.
+            //
+            // Each argument must therefore scale exactly one declared sigma —
+            // `arg_sigma_name` resolves that sigma and rejects an unknown/typo'd
+            // reference — **and** must be the sigma that actually occupies its
+            // slot. Before #1001 the resolved name was discarded here, so
+            // `proportional(S_SMALL)` with `S_BIG` declared first validated,
+            // fitted against `S_BIG`, and reported nothing: the written name was
+            // checked for existence and then ignored. The per-CMT and
+            // covariate-selected arms below bind strictly by name, so without
+            // this the same file meant two different things depending on which
+            // `[error_model]` form it used.
+            //
+            // Rejecting rather than binding by name keeps one resolution rule
+            // for the whole positional path (including `block_sigma`, whose
+            // entries land in the same flat vector — this check generalises the
+            // block_sigma-only guard it replaces).
+            //
+            // Two distinct defects, kept apart because their remedies are:
+            // repeating a name is a *count* problem no permutation can fix,
+            // while a genuine order mismatch is fixed by reordering one list.
+            // `claimed` tracks the sigmas earlier arguments already took so the
+            // repeat is caught first — otherwise `combined(S_A, S_A)` with two
+            // sigmas declared falls into the order arm below and is told to
+            // reorder lists that cannot be reordered into agreement.
+            let mut claimed: Vec<String> = Vec::with_capacity(args.len());
+            for (idx, arg) in args.iter().enumerate() {
+                let named = arg_sigma_name(arg, sigma_names)?;
+                // Duplicate `sigma` declarations are rejected upstream, so no
+                // declaration order can put one name in two slots and no
+                // argument order can either — say what is actually wrong, and
+                // leave this on the generic `E_PARSE` rather than the
+                // reorder-shaped `E_SIGMA_ORDER_MISMATCH` a consumer would act
+                // on. Both reachable shapes (a second sigma declared or not)
+                // report the same defect with the same code; the counts are
+                // interpolated so the message stays honest if `args.len()` is
+                // ever not pinned to the model's `n_sigma()`.
+                if let Some(first) = claimed.iter().position(|c| *c == named) {
+                    return Err(format!(
+                        "[error_model] argument {} names sigma '{}', which argument \
+                         {} already claims; each argument of a single-endpoint \
+                         [error_model] must name a distinct declared sigma (this \
+                         model needs {}, [parameters] declares {}). Give argument \
+                         {} its own sigma.",
+                        idx + 1,
+                        named,
+                        first + 1,
+                        args.len(),
+                        sigma_names.len(),
+                        idx + 1
+                    ));
+                }
+                match sigma_names.get(idx) {
+                    Some(slot) if *slot == named => {}
+                    // Both remedies are spelled out because both have a silent
+                    // failure mode. `block_sigma` pushes its diagonals along the
+                    // written name order, so reordering the names without
+                    // permuting the lower triangle swaps the two variances and
+                    // parses clean. And reordering the *arguments* of a
+                    // `combined` model swaps which sigma is the proportional
+                    // component — it makes the file honest about a model the
+                    // user did not write, which is the #1001 failure mode again.
+                    //
+                    // `None` is folded in here rather than given its own arm.
+                    // The repeat guard above leaves every `named` distinct and
+                    // declared, so by argument `idx` at least `idx + 1` sigmas
+                    // exist and `get(idx)` is always `Some` — an arm no input can
+                    // reach is also an arm no test can cover, and it would sit in
+                    // the diff as permanently-missed lines. Binding the whole
+                    // `Option` keeps the impossible case a message rather than an
+                    // `unreachable!()` panic in the parser.
+                    slot => {
+                        return Err(format!(
+                            "[error_model] argument {} names sigma '{}', but a \
+                             single-endpoint [error_model] has its sigmas consumed \
+                             positionally from the [parameters] declaration order, \
+                             which supplies '{}' in that position. Reorder the sigma \
+                             declarations to match the [error_model] argument order \
+                             — if a block_sigma supplies them, permute its lower \
+                             triangle to match the new name order. Reordering the \
+                             arguments instead also parses, but for `combined` it \
+                             swaps which sigma is the proportional component, so it \
+                             changes the model rather than fixing the spelling.",
+                            idx + 1,
+                            named,
+                            slot.map(String::as_str).unwrap_or("<none>")
+                        ));
+                    }
+                }
+                claimed.push(named);
             }
             Ok((model, ErrorSpec::Single(model)))
         }
@@ -12839,7 +13613,11 @@ pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-fn current_model_time() -> f64 {
+/// The model-time thread-local `Expression::Time` / `Op::PushTime` resolves
+/// against. `pub(crate)` so a hand-built `OdeReadout::Single` test closure can
+/// observe the same value a compiled readout would (the readout closure signature
+/// carries no `time` argument — the guard is the channel).
+pub(crate) fn current_model_time() -> f64 {
     MODEL_TIME.with(std::cell::Cell::get)
 }
 
@@ -13001,6 +13779,48 @@ fn visit_expr_nodes(expr: &Expression, f: &mut dyn FnMut(&Expression)) {
             visit_expr_nodes(e, f);
         }
         _ => {}
+    }
+}
+
+/// Mutable twin of [`visit_expr_nodes`] — same pre-order shape, but `f` may
+/// **replace** the node it is handed. Backs the in-place node rewrites
+/// (`rewrite_scaling_time_alias`) that run between parse and index resolution.
+/// Recursion happens after `f` returns, so a replacement node's children are
+/// visited too; a rewrite that could re-fire on its own output must therefore be
+/// idempotent (all current ones replace a leaf with a leaf).
+fn visit_expr_nodes_mut(expr: &mut Expression, f: &mut dyn FnMut(&mut Expression)) {
+    f(expr);
+    match expr {
+        Expression::BinOp(lhs, _, rhs) => {
+            visit_expr_nodes_mut(lhs, f);
+            visit_expr_nodes_mut(rhs, f);
+        }
+        Expression::UnaryFn(_, arg) => visit_expr_nodes_mut(arg, f),
+        Expression::Power(base, exp) => {
+            visit_expr_nodes_mut(base, f);
+            visit_expr_nodes_mut(exp, f);
+        }
+        Expression::Conditional(cond, t, e) => {
+            visit_condition_nodes_mut(cond, f);
+            visit_expr_nodes_mut(t, f);
+            visit_expr_nodes_mut(e, f);
+        }
+        _ => {}
+    }
+}
+
+/// Condition companion of [`visit_expr_nodes_mut`].
+fn visit_condition_nodes_mut(cond: &mut Condition, f: &mut dyn FnMut(&mut Expression)) {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            visit_expr_nodes_mut(l, f);
+            visit_expr_nodes_mut(r, f);
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            visit_condition_nodes_mut(l, f);
+            visit_condition_nodes_mut(r, f);
+        }
+        Condition::Not(c) => visit_condition_nodes_mut(c, f),
     }
 }
 
@@ -13633,10 +14453,9 @@ fn used_sigma_names(
 ) -> std::collections::HashSet<String> {
     let sigma_set: std::collections::HashSet<&str> =
         sigma_names.iter().map(|s| s.as_str()).collect();
-    let ident_re = Regex::new(r"[A-Za-z_]\w*").unwrap();
     let mut out = std::collections::HashSet::new();
     let scan = |arg: &str, out: &mut std::collections::HashSet<String>| {
-        for m in ident_re.find_iter(arg) {
+        for m in ARG_IDENT_RE.find_iter(arg) {
             if sigma_set.contains(m.as_str()) {
                 out.insert(m.as_str().to_string());
             }
@@ -13680,9 +14499,8 @@ fn used_sigma_names(
 fn arg_sigma_name(arg: &str, sigma_names: &[String]) -> Result<String, String> {
     let sigma_set: std::collections::HashSet<&str> =
         sigma_names.iter().map(|s| s.as_str()).collect();
-    let ident_re = Regex::new(r"[A-Za-z_]\w*").unwrap();
     let mut found: Vec<String> = Vec::new();
-    for m in ident_re.find_iter(arg) {
+    for m in ARG_IDENT_RE.find_iter(arg) {
         let id = m.as_str();
         if sigma_set.contains(id) && !found.iter().any(|f| f == id) {
             found.push(id.to_string());
@@ -13695,7 +14513,7 @@ fn arg_sigma_name(arg: &str, sigma_names: &[String]) -> Result<String, String> {
             // the historical "unknown sigma" wording. A non-trivial expression
             // that names no sigma is the #484-specific error.
             let trimmed = arg.trim();
-            if Regex::new(r"^[A-Za-z_]\w*$").unwrap().is_match(trimmed) {
+            if BARE_IDENT_RE.is_match(trimmed) {
                 Err(format!(
                     "[error_model] references unknown sigma '{}' \
                      (declare it in [parameters])",
@@ -15849,6 +16667,23 @@ impl OdeOutputProgram {
     /// See [`OdeOutputProgram::dual_evaluable`].
     pub(crate) fn is_dual_evaluable(&self) -> bool {
         self.dual_evaluable
+    }
+
+    /// Whether the readout reads the model-time built-in (`Op::PushTime`, from a
+    /// `TIME` / `T` / `t` reference). Such a readout is **not** a pure function of
+    /// the compartment state: its value at a fixed state depends on which
+    /// observation is being read.
+    ///
+    /// That breaks any consumer that characterises the readout by probing it at a
+    /// synthetic state — the modified-release closed-form fast path
+    /// (`pk::modified_release::recover_disp_params_g`) probes `readout(0)`,
+    /// `readout(e_c)`, `readout(2·e_c)` to establish linearity in the central
+    /// amount, and an additive `TIME` term evaluates to its *ambient* thread-local
+    /// value there (`0.0` at the gate), so the probe would certify a linear readout
+    /// and the fast path would then silently drop the whole time term. Callers that
+    /// probe must decline on `true` (#1028).
+    pub(crate) fn reads_time_builtin(&self) -> bool {
+        self.bc.ops.iter().any(|op| matches!(op, Op::PushTime))
     }
 
     /// Number of compartment-state inputs in the readout's `vars[0..n_states]`

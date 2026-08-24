@@ -368,6 +368,17 @@ Reads that are *not* on the prediction path are fine: `[derived]` and `[output]`
 are post-solve reporting, so tabulating your own `F` (or an exposure computed
 from it) is correct and stays silent.
 
+Analytical (`pk ...`) models are covered by the same rule
+([#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004)), keyed off the
+`pk(..., f=F)` / `lagtime=…` mapping instead of the name — their prediction-path
+surfaces are `[scaling]` and `[adaptive_dosing] observe` (an `[initial_conditions]`
+amount is not a dose, so the engine seeds it with `F = 1` and no lag, and reading
+the attribute there applies it once). Because the mapping is the binding, the
+remediation is to drop
+the `f=`/`lagtime=` argument rather than rename the parameter; a parameter merely
+*named* `F` that nothing maps is an ordinary parameter on that engine. See
+[Individual Parameters](individual-parameters.qmd#pk-parameter-names).
+
 See `examples/bioavailability_ode.ferx` for a complete worked model.
 
 ### Compartment-indexed bioavailability and lag (`Fn` / `ALAGn`)

@@ -117,13 +117,13 @@ pub(crate) fn absorption_flip_flop_at(
 /// sensitivity dispatchers route through here, and within an iteration they evaluate at
 /// the same `(theta, eta)`, so they agree on the decision.
 ///
-/// A flip-flop absorption model with no ODE twin (one with a user `[odes]` / `[scaling]` /
-/// `[initial_conditions]` block, or a parameter name that shadows / collides with a reserved
-/// F/lagtime slot, which the desugar declines — a `lagtime=`/`f=` mapping alone now auto-routes,
-/// #735) has nothing to reroute to, and is rejected up front at η = 0 typical
-/// values by [`crate::api::check_absorption_flip_flop_no_twin`] (`fit()` → `Err`,
-/// `predict()`/`simulate()` panic) rather than silently returning the closed form's
-/// `0`. (This function still returns the closed form for it — the guard runs first.)
+/// A flip-flop absorption model with no ODE twin has nothing to reroute to, and is rejected
+/// up front at η = 0 typical values by [`crate::api::check_absorption_flip_flop_no_twin`]
+/// (`fit()` → `Err`, `predict()`/`simulate()` panic) rather than silently returning the closed
+/// form's `0`. (This function still returns the closed form for it — the guard runs first.)
+/// See [`crate::types::CompiledModel::absorption_ode_equivalent`] for what "no twin" covers:
+/// the desugar's by-name declines *and* a twin that was reconstructed and rejected by its own
+/// parse (#1008). Do not re-derive a closed list of causes here — the set is open-ended.
 pub(crate) fn effective_model_for_eval<'a>(
     model: &'a CompiledModel,
     subject: &Subject,
@@ -131,9 +131,9 @@ pub(crate) fn effective_model_for_eval<'a>(
     eta: &[f64],
 ) -> &'a CompiledModel {
     let structural = model.effective_for(subject);
-    // No twin to route to (a non-absorption model, or a transit/IG whose desugar declined —
-    // a user `[odes]`/`[scaling]`/`[initial_conditions]` block or a reserved-slot shadow/
-    // collision): nothing parameter-dependent to decide.
+    // No twin to route to (a non-absorption model, or a transit/IG that has none — declined by
+    // the desugar, or built and rejected by its own parse, #1008): nothing parameter-dependent
+    // to decide.
     let Some(twin) = &model.absorption_ode_equivalent else {
         return structural;
     };
@@ -144,7 +144,7 @@ pub(crate) fn effective_model_for_eval<'a>(
     if structural.ode_spec.is_some() || !absorption_flip_flop_at(model, subject, theta, eta) {
         return structural;
     }
-    twin.get_or_build()
+    twin.built()
 }
 
 /// Divide each prediction in-place by the scale derived from
@@ -308,15 +308,17 @@ pub fn apply_analytic_readout(
         let cov = subject.obs_cov(i);
         let obs_cmt = subject.obs_cmts.get(i).copied().unwrap_or(0);
         // A readout referencing the `TIME` builtin resolves `Op::PushTime` from the
-        // model-time thread-local; set it to this observation's time so the readout
-        // evaluates `TIME` at the observation (the analytic providers set the matching
-        // guard around their readout eval, keeping FD parity). A no-op for a readout
-        // that does not reference `TIME`.
-        let t = subject.obs_times.get(i).copied().unwrap_or(0.0);
-        *pred = crate::parser::model_parser::with_model_time(t, || {
-            ar.readout
-                .eval(&state, &pk_i.values, theta, eta, cov, obs_cmt)
-        });
+        // model-time thread-local; `OdeReadout::eval` enters this observation's time
+        // as the guard (#1028), so the readout evaluates `TIME` at the observation
+        // here exactly as it does on the ODE predictor path. A no-op for a readout
+        // that does not reference `TIME`; the analytic providers set the matching
+        // guard around their own readout eval, keeping FD parity. `readout_time` is
+        // the raw data-file clock — the `$ERROR` convention, which differs from the
+        // integrator timeline only under stacked reset occasions.
+        let t = subject.readout_time(i);
+        *pred = ar
+            .readout
+            .eval(&state, &pk_i.values, theta, eta, cov, obs_cmt, t);
     }
 }
 

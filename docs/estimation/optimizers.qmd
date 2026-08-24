@@ -63,7 +63,75 @@ aliases for `nlopt_lbfgs`. The built-in implementation is slated for removal.
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `trust_region` | Newton trust-region with Steihaug CG | Uses the analytic outer gradient and a BHHH approximate Hessian `H ≈ 4 Σ gᵢgᵢᵀ` (always positive semi-definite). The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)`; pin it with `steihaug_max_iters`. Best combined with `inits_from_nca` since it benefits from good starting values. |
+| `trust_region` | Newton trust-region with Steihaug CG | Uses the analytic outer gradient and a BHHH approximate Hessian `H ≈ 4 Σ gᵢgᵢᵀ` (always positive semi-definite). The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)`; pin it with `steihaug_max_iters`. Best combined with `inits_from_nca` since it benefits from good starting values. Stops when it can no longer make progress — see [convergence reporting](#trust-region-convergence-reporting). |
+
+### Trust-region convergence reporting {#trust-region-convergence-reporting}
+
+`trust_region` stops once it has gone 20 consecutive iterations without
+measurable progress — no objective improvement beyond `outer_ftol` and no
+parameter movement beyond `outer_xtol` (default `1e-4`, relative). `outer_ftol`
+is resolved exactly as it is for `bobyqa`: `1e-8` for a pure non-Gaussian
+(TTE / categorical) non-ODE objective and `1e-6` otherwise, with an explicit
+`[fit_options] outer_ftol` always winning. A run that instead exhausts `maxiter`
+is reported as **`Converged: NO`**, with a warning naming the budget it ran out
+of and the gradient norm it stopped at.
+
+Because progress is an *or* — the objective improved **or** the parameters moved
+— and a rejected trust-region step moves neither, 20 no-progress iterations means
+20 consecutive *rejections*: the radius has shrunk by roughly `0.25²⁰ ≈ 1e-12`
+from the last accepted step. That is the real content of the count, and it is why
+it does not need tuning per model.
+
+Two consequences worth knowing:
+
+- Demonstrating settling costs at least 21 outer iterations, so a fit run with
+  `maxiter` below that can never report `Converged: YES` however good it is. The
+  warning says so explicitly rather than blaming the fit.
+- A run that rejects *every* step from the first iteration has not converged, it
+  failed to start. That is reported as its own non-convergence reason — pointing
+  at the starting values, not the budget — and the fit bails out there instead of
+  spending the rest of `maxiter` on a frozen state.
+
+Before [#1000](https://github.com/FeRx-NLME/ferx-core/issues/1000) every
+`trust_region` run reported `Converged: YES`, including one that had simply run
+out of iterations: the underlying solver has no convergence criterion of its own,
+so hitting `maxiter` was its only way to stop. On `examples/one_cpt_iv_pooled.ferx`
+with `data/one_cpt_iv.csv`:
+
+| `maxiter` | OFV | reported (before) | reported (now) |
+|---|---|---|---|
+| 5 | 11325.8283 | `Converged: YES` | `Converged: NO` (budget below the 21-iteration floor) |
+| 300 | 8504.4349 | `Converged: YES` | `Converged: NO` |
+| 2000 | −269.6370 | `Converged: YES` | `Converged: YES` (at iteration 1920) |
+
+The true optimum is −269.6370 (NONMEM `$OMEGA 0 FIX` anchors it at −269.63700440),
+so the first two rows were 8 000–11 000 OFV units off and reported as converged,
+with standard errors computed at a non-stationary point.
+
+The stopping rule is deliberately **not** a gradient test. The outer gradient is
+evaluated at EBEs held fixed within the iteration, which makes its norm an
+unreliable stationarity measure on an ODE model: on `one_cpt_iv_ode` the norm at
+the optimum the default optimizer reaches (OFV −387.0737) is 43.2, while a
+*worse* point 0.73 OFV units away carries 4.0 — not monotone in solution quality,
+so no threshold separates the two. Objective and step size are the noise-robust
+measures, and they are what `bobyqa` already stops on.
+
+Stopping early also saves work: the warfarin fit settles at iteration 59 and now
+returns there rather than grinding out the remaining budget.
+
+Note that "converged" still means *this optimizer stopped making progress*, not
+that the point is a verified global optimum — a `trust_region` fit can settle
+slightly above the optimum other optimizers reach
+([#864](https://github.com/FeRx-NLME/ferx-core/issues/864)). Compare against a
+second optimizer when the OFV matters.
+
+One more thing changes for multi-start users: `n_starts` ranks candidates by
+validity, then by *converged*, then by OFV. Every `trust_region` start used to
+report `Converged: YES`, so that middle key was inert and selection came down to
+OFV. Now that budget exhaustion reports honestly, a start that settled can be
+preferred over one that was still descending when it ran out of iterations, even
+if the latter reached a lower OFV. Give `trust_region` multi-starts a `maxiter`
+generous enough that the good start is allowed to settle.
 
 ---
 

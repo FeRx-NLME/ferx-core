@@ -56,6 +56,62 @@ fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
     }
 }
 
+/// A Form C readout that returns nothing but the model-time thread-local, so a
+/// prediction vector *is* the sequence of `TIME` values the readout saw (#1028).
+fn time_readout_ode_spec() -> OdeSpec {
+    OdeSpec {
+        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+            dy[0] = 0.0;
+        }),
+        n_states: 1,
+        state_names: vec!["central".into()],
+        readout: OdeReadout::Single(Box::new(|_state, _pk, _theta, _eta, _cov| {
+            crate::parser::model_parser::current_model_time()
+        })),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+        init_fn: None,
+    }
+}
+
+/// The Form C readout's `TIME` is the **raw data-file clock** (`obs_raw_times`),
+/// not the shifted internal timeline `obs_times` carries for subjects with stacked
+/// reset occasions (#1028). That is the convention every other per-record object
+/// already uses — sdtab/covtab `TIME`, `predict()`/`simulate()` `TIME`, `[derived]`
+/// integral windows, and the custom residual-magnitude model
+/// (`ModelParameters::ruv_obs_mult`, documented as matching what NONMEM's `$ERROR`
+/// sees) — and a Form C readout is the `$ERROR` twin. Before this, a reset-stacked
+/// dataset got the integrator clock in the readout and the data clock in the
+/// residual-magnitude model, for the same record.
+#[test]
+fn form_c_readout_time_is_the_raw_data_clock() {
+    // Two occasions of 0 h / 1 h, stacked onto a monotonic 0/1/2/3 integrator grid.
+    let mut subj = make_subject(Vec::new(), vec![0.0, 1.0, 2.0, 3.0]);
+    subj.obs_raw_times = vec![0.0, 1.0, 0.0, 1.0];
+
+    let ode = time_readout_ode_spec();
+    let pk = pk_one(5.0, 1.0);
+    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+    assert_eq!(
+        preds, subj.obs_raw_times,
+        "the readout must see the raw data-file TIME, got {preds:?}"
+    );
+
+    // Fallback: an in-memory subject with no `obs_raw_times` keeps reading
+    // `obs_times`, so nothing changes for the (overwhelmingly common) no-reset case.
+    let plain = make_subject(Vec::new(), vec![0.0, 1.0, 2.0, 3.0]);
+    let preds_plain = ode_predictions(&ode, &pk.values, &[], &[], &plain);
+    assert_eq!(
+        preds_plain, plain.obs_times,
+        "with no raw times the readout falls back to obs_times, got {preds_plain:?}"
+    );
+}
+
 /// 1-cpt IV bolus + a cumulative-hazard accumulator: state 0 = central
 /// (`dC/dt = -ke·C`, `ke = CL/V`), state 1 = CHZ (`dCHZ/dt = 0.1·C`). With a
 /// bolus `amt` at t=0 this has the closed form `C(t) = amt·e^{-ke t}`,
@@ -751,6 +807,129 @@ fn adaptive_state_independent_controller_matches_static_ode() {
         assert_eq!(run.ledger[i].decision_idx, i);
         assert_eq!(run.ledger[i].dose_idx, i);
     }
+}
+
+#[test]
+fn adaptive_form_c_readout_time_matches_the_static_engine() {
+    // Degenerate oracle for the readout clock (#1028). The adaptive driver used to
+    // feed the readout `t_start` — the integrator break the observation was keyed to,
+    // off `shadow.obs_times` — while the static predictor reads the raw data clock.
+    // For a subject with stacked reset occasions the two are *different numbers*, so
+    // a `TIME`-reading Form C readout returned one answer under `simulate_adaptive`
+    // and another under `predict()`/`fit()` for the same record.
+    //
+    // The readout here returns nothing but the model-time thread-local, so each
+    // prediction *is* the `TIME` the readout saw. A fixed-dose controller keeps the
+    // dynamics identical to the static twin, isolating the clock.
+    let ode = time_readout_ode_spec();
+    let pk = pk_one(1.0, 10.0);
+    let decisions = [0.0, 24.0];
+    let obs = vec![6.0, 30.0, 54.0, 78.0];
+    // Two occasions whose data TIME restarts: the internal grid stays monotonic
+    // while the user clock repeats 6/30.
+    let raw = vec![6.0, 30.0, 6.0, 30.0];
+
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+    let mut base = make_subject(vec![], obs.clone());
+    base.obs_raw_times = raw.clone();
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base,
+        &decisions,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs");
+
+    assert_eq!(
+        run.predictions, raw,
+        "the adaptive readout must see the raw data-file TIME, got {:?}",
+        run.predictions
+    );
+
+    // …and agree with the static engine on the realized doses, record for record.
+    let static_doses: Vec<DoseEvent> = decisions
+        .iter()
+        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    let mut static_subject = make_subject(static_doses, obs);
+    static_subject.obs_raw_times = raw;
+    let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+    assert_eq!(
+        run.predictions, static_preds,
+        "adaptive and static readouts must be on the same clock"
+    );
+}
+
+#[test]
+fn adaptive_tv_frozen_replay_readout_time_matches_the_driver() {
+    // The same clock split in `adaptive_frozen_replay_tv` (#1028) — the replay
+    // verifier, whose entire job is to prove bit-equality with the static engine, so
+    // it is the one path that must not be on the other convention. Same TIME-returning
+    // readout; the replay must reproduce the driver's `TIME` values exactly.
+    let ode = time_readout_ode_spec();
+    let v = 10.0;
+    let obs_times = [0.0, 24.0, 48.0, 72.0];
+    let raw = vec![0.0, 24.0, 0.0, 24.0];
+    let cls = [1.0, 0.7, 0.5, 0.3];
+    let obs_pk: Vec<PkParams> = cls.iter().map(|&cl| pk_one(cl, v)).collect();
+    let event_pk = crate::pk::EventPkParams {
+        dose: Vec::new(),
+        obs: obs_pk.clone(),
+        pk_only: Vec::new(),
+    };
+    let decisions = [0.0, 24.0, 48.0];
+    let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+        actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+        rule: None,
+    };
+    let mut base = make_subject(vec![], obs_times.to_vec());
+    base.obs_raw_times = raw.clone();
+    let run = ode_predictions_adaptive_impl(
+        &ode,
+        &obs_pk[0].values,
+        Some(&event_pk),
+        None,
+        None,
+        &[],
+        &[],
+        &base,
+        &decisions,
+        &[],
+        &mut decide,
+        100,
+        None,
+    )
+    .expect("driver runs");
+    assert_eq!(run.predictions, raw, "driver reads the raw data clock");
+
+    let mut static_subject = base.clone();
+    static_subject.doses = run
+        .ledger
+        .iter()
+        .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+        .collect();
+    let dose_f: Vec<f64> = run.ledger.iter().map(|e| e.f_applied).collect();
+    let replay = adaptive_frozen_replay_tv(
+        &ode,
+        &event_pk,
+        None,
+        None,
+        &[],
+        &[],
+        &static_subject,
+        &dose_f,
+        &decisions,
+    );
+    assert_eq!(
+        replay, run.predictions,
+        "the frozen replay must be on the driver's clock, bit for bit"
+    );
 }
 
 #[test]
@@ -2124,9 +2303,11 @@ fn adaptive_dv_noised_and_deterministic() {
 
 #[test]
 fn adaptive_dv_clamps_negative_at_zero() {
-    // Edge (b): the noised value cannot read below zero. At t=0 the pre-dose
-    // trough is 0, so a negative assay draw with a large sigma would push it
-    // negative; assert it clamps to exactly 0.
+    // Edge (b): on a *bare-state* readout (`OdeReadout::ObsCmt`, a compartment
+    // amount / concentration) the noised value cannot read below zero. At t=0 the
+    // pre-dose trough is 0, so a negative assay draw with a large sigma would push
+    // it negative; assert it clamps to exactly 0. Form C readouts are exempt —
+    // see `adaptive_dv_form_c_monitor_keeps_negative_sample` (#1039).
     let ode = one_cpt_ode_spec();
     let pk = pk_one(1.0, 10.0);
     let neg_seed = (0u64..)
@@ -2155,6 +2336,113 @@ fn adaptive_dv_clamps_negative_at_zero() {
     assert_eq!(
         run.decisions[0].observed_signals[0].value, 0.0,
         "a negative assay reading must clamp at 0"
+    );
+}
+
+/// A Form C `[scaling]` monitor read in `dv` mode must keep its negative
+/// samples (#1039). The assay floor is a statement about a compartment amount,
+/// not about an arbitrary user expression — a change-from-baseline signal that
+/// a controller thresholds is legitimately negative, and flooring it at 0 made
+/// the controller blind over exactly the region it reacts to.
+#[test]
+fn adaptive_dv_form_c_monitor_keeps_negative_sample() {
+    // `clock - 5`: latent = -5 at t=0. sd = 0.1, so no draw of a standard normal
+    // this test could see reaches 0 — the sample must stay negative *and* noised.
+    let ode = signed_readout_clock_spec(OdeReadout::Single(Box::new(
+        |s: &[f64], _pk: &[f64], _t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| s[0] - 5.0,
+    )));
+    let pk = pk_one(1.0, 1.0);
+    let small_var = |_cmt: usize, _ipred: f64| Some(0.01);
+    let assay = AssayNoise {
+        resid_var: &small_var,
+        base_seed: 4242,
+    };
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+    let base = make_subject(
+        vec![DoseEvent::new(0.0, 0.0, 1, 0.0, false, 0.0)],
+        vec![1.0],
+    );
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base,
+        &[0.0],
+        &dv_monitor(),
+        &mut controller,
+        100,
+        Some(&assay),
+    )
+    .expect("dv run");
+    let value = run.decisions[0].observed_signals[0].value;
+    assert!(
+        value < 0.0,
+        "a Form C dv monitor must keep its negative sample, got {value}"
+    );
+    assert!(
+        (value + 5.0).abs() > 1e-12,
+        "expected the assay to perturb the latent value, got {value}"
+    );
+    assert!(
+        (value + 5.0).abs() < 1.0,
+        "expected a sd=0.1 perturbation around -5, got {value}"
+    );
+}
+
+/// Degenerate oracle for #1039 (epic #391 validation rule — no NONMEM anchor):
+/// with `sigma -> 0` a `dv` monitor on a Form C model must equal the `ipred`
+/// monitor on the same model, decision for decision, *including* the negative
+/// samples. That equality is exactly what the ungated assay clamp broke.
+#[test]
+fn adaptive_dv_zero_variance_equals_ipred_on_signed_form_c() {
+    let ode = signed_readout_clock_spec(OdeReadout::Single(Box::new(
+        |s: &[f64], _pk: &[f64], _t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| s[0] - 5.0,
+    )));
+    let pk = pk_one(1.0, 1.0);
+    // Straddle the sign change at t=5: two negative samples, then two positive.
+    let decisions = [0.0, 2.0, 6.0, 10.0];
+    let base = make_subject(
+        vec![DoseEvent::new(0.0, 0.0, 1, 0.0, false, 0.0)],
+        vec![1.0],
+    );
+    let hold = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+
+    let sample = |monitors: &[MonitorSpec], assay: Option<&AssayNoise>| -> Vec<f64> {
+        let mut ctrl = hold;
+        ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            monitors,
+            &mut ctrl,
+            100,
+            assay,
+        )
+        .expect("adaptive run")
+        .decisions
+        .iter()
+        .map(|d| d.observed_signals[0].value)
+        .collect()
+    };
+
+    let ipred = sample(&[MonitorSpec::new("A", 1, ObserveMode::Ipred)], None);
+    let zero_var = |_cmt: usize, _ipred: f64| Some(0.0);
+    let assay = AssayNoise {
+        resid_var: &zero_var,
+        base_seed: 7,
+    };
+    let dv = sample(&dv_monitor(), Some(&assay));
+
+    for (got, want) in ipred.iter().zip([-5.0, -3.0, 1.0, 5.0]) {
+        assert_relative_eq!(*got, want, epsilon = 1e-9);
+    }
+    assert_eq!(
+        dv, ipred,
+        "a zero-variance dv monitor must reproduce the ipred monitor sample for sample"
     );
 }
 

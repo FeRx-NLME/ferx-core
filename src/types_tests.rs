@@ -478,6 +478,72 @@ fn classify_warning_flat_parameter_is_warning() {
     assert_eq!(w.source_method.as_deref(), Some("parameters"));
 }
 
+/// #1008: a declined absorption ODE twin gets its own code rather than the `general`
+/// fallback, so a consumer (the R wrapper, an agent) can branch on "this model kept no
+/// ODE fallback" instead of matching prose. Built through the real emitter rather than a
+/// pasted copy, so a reworded message cannot drift away from the token it is keyed on.
+#[test]
+fn classify_warning_absorption_twin_declined_is_warning() {
+    let w = classify_warning(&super::absorption_twin_declined_warning(
+        "[odes]: name `CENTRAL` collides with a previously-declared state (case-insensitive); \
+         state, individual-parameter, and ODE-block intermediate names must all be distinct.",
+    ));
+    assert_eq!(w.severity, WarningSeverity::Warning);
+    assert_eq!(w.category.as_str(), "absorption_twin_declined");
+}
+
+/// The decline arm sits ahead of *every* prose arm because the message carries the twin
+/// parser's own error text verbatim (#1027 review). A twin error that happens to contain a
+/// substring a later arm matches — here `"ill-conditioned"`, which would otherwise classify
+/// `Critical` / `condition_number` — must still read as a twin decline.
+#[test]
+fn classify_warning_twin_decline_beats_prose_arms_in_the_reason() {
+    for reason in [
+        "[odes]: the Jacobian is ill-conditioned at the initial state",
+        "the fit did not converge in the re-emitted [fit_options]",
+        "covariance failed to parse",
+        "condition number check rejected the block",
+    ] {
+        let w = classify_warning(&super::absorption_twin_declined_warning(reason));
+        assert_eq!(
+            w.category.as_str(),
+            "absorption_twin_declined",
+            "a twin decline whose reason says {reason:?} must not be claimed by a prose arm"
+        );
+        assert_eq!(w.severity, WarningSeverity::Warning);
+    }
+}
+
+/// The reason round-trips out of the warning verbatim, so the up-front rejection messages
+/// in `api::validation` can quote it (#1027 review). Also pins the terminator normalisation:
+/// a reason with no sentence-ending punctuation gets one, so it cannot run into the fixed
+/// text around it.
+#[test]
+fn absorption_twin_decline_reason_round_trips() {
+    let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+    assert_eq!(
+        super::absorption_twin_decline_reason(&model),
+        None,
+        "a model with no decline warning has no reason"
+    );
+    model
+        .parse_warnings
+        .push(super::absorption_twin_declined_warning(
+            "two parameters map to the V slot",
+        ));
+    assert_eq!(
+        super::absorption_twin_decline_reason(&model),
+        Some("two parameters map to the V slot."),
+        "the reason comes back verbatim, with a terminator added"
+    );
+    // An already-terminated reason is not double-punctuated.
+    let terminated = super::absorption_twin_declined_warning("names must all be distinct.");
+    assert!(
+        terminated.ends_with("names must all be distinct."),
+        "got: {terminated}"
+    );
+}
+
 #[test]
 fn classify_warning_dw_is_warning() {
     let w = classify_warning("Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).");
@@ -2269,15 +2335,15 @@ fn call_time_ode_tolerances_reach_the_absorption_twin() {
     // rather than be silently dropped at the twin source's parse default.
     use crate::parser::model_parser::parse_model_string;
 
-    // Lazy branch: sync BEFORE the twin is built, so the override is applied at build time.
-    let mut lazy = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
+    // The override must reach the twin (built at parse time since #1008).
+    let mut model = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
     assert!(
-        lazy.absorption_ode_equivalent.is_some(),
+        model.absorption_ode_equivalent.is_some(),
         "one_cpt_transit carries an ODE twin"
     );
-    assert!(lazy.n_kappa > 0, "model has IOV");
+    assert!(model.n_kappa > 0, "model has IOV");
     assert!(
-        lazy.ode_spec.is_none(),
+        model.ode_spec.is_none(),
         "the closed-form transit primary is analytic"
     );
 
@@ -2285,11 +2351,11 @@ fn call_time_ode_tolerances_reach_the_absorption_twin() {
     opts.ode_reltol = 1e-10;
     opts.ode_abstol = 1e-11;
     opts.ode_max_steps = 77_777;
-    lazy.sync_ode_solver_opts(&opts);
+    model.sync_ode_solver_opts(&opts);
 
     // IOV ⇒ every subject reroutes to the twin; its OdeSpec must carry the *call-time*
     // tolerances, not the source's 1e-8 / 5000.
-    let twin = lazy.effective_for(&bare_subject("1"));
+    let twin = model.effective_for(&bare_subject("1"));
     let so = twin
         .ode_spec
         .as_ref()
@@ -2316,35 +2382,22 @@ fn call_time_ode_tolerances_reach_the_absorption_twin() {
         "un-synced twin keeps its source max_steps"
     );
 
-    // Already-built branch: build the twin first, THEN sync — the override must still land
-    // on the cached model (a second fit reusing the model with new tolerances).
-    let mut prebuilt = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
-    let built_reltol = prebuilt
-        .effective_for(&bare_subject("3"))
-        .ode_spec
-        .as_ref()
-        .unwrap()
-        .solver_opts
-        .reltol;
-    assert_eq!(
-        built_reltol, 1e-8,
-        "twin builds at source tol before any sync"
-    );
+    // Re-sync: a second fit reusing the same owned model with *different* tolerances must
+    // overwrite the first sync's stamp, not keep it. (Before #1008 this block tested a
+    // sync-before-build vs sync-after-build ordering; the twin is now always built by the
+    // time anyone can sync, so the only distinction left worth pinning is second-sync-wins.)
     let mut tight = FitOptions::default();
     tight.ode_reltol = 1e-12;
     tight.ode_abstol = 1e-13;
     tight.ode_max_steps = 4242;
-    prebuilt.sync_ode_solver_opts(&tight);
-    let rso = prebuilt
-        .effective_for(&bare_subject("4"))
+    model.sync_ode_solver_opts(&tight);
+    let rso = model
+        .effective_for(&bare_subject("3"))
         .ode_spec
         .as_ref()
         .unwrap()
         .solver_opts;
-    assert_eq!(
-        rso.reltol, 1e-12,
-        "sync after build updates the already-built twin"
-    );
+    assert_eq!(rso.reltol, 1e-12, "a second sync overwrites the first");
     assert_eq!(rso.abstol, 1e-13);
     assert_eq!(rso.max_steps, 4242);
 }

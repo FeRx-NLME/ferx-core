@@ -1210,7 +1210,30 @@ fn resolve_scaling(ps: ParameterScaling, opt: Optimizer) -> ParameterScaling {
 /// is unreachable, so BOBYQA would grind toward its maxeval budget instead of converging
 /// (≈3× the evaluations on an ODE fit). A non-Gaussian endpoint carried on an ODE
 /// disposition (`is_ode` true) therefore keeps `1e-6`.
-fn resolve_outer_ftol(is_non_gaussian: bool, is_ode: bool, override_ftol: Option<f64>) -> f64 {
+/// OFVs at or above this are treated as diverged/invalid.
+///
+/// The inner objective clamps a blown-up value to a `~1e20` sentinel, which is
+/// *finite* — so `is_finite()` alone does not separate a diverged run from a real
+/// one. This cutoff sits well below the sentinel and far above any legitimate
+/// population OFV, so a real fit never trips it.
+pub(crate) const DIVERGENCE_OFV: f64 = 1e14;
+
+/// Whether an OFV is a real population objective rather than a diverged run's
+/// clamped sentinel or a `NaN`.
+///
+/// Two callers, one rule: the multi-start ranking (`api::fit::multistart_prefers`,
+/// which must never return a divergence as "best") and an outer optimizer's
+/// convergence verdict (which must never report `Converged: YES` at a point the
+/// inner objective clamped).
+pub(crate) fn ofv_is_valid(ofv: f64) -> bool {
+    ofv.is_finite() && ofv < DIVERGENCE_OFV
+}
+
+pub(crate) fn resolve_outer_ftol(
+    is_non_gaussian: bool,
+    is_ode: bool,
+    override_ftol: Option<f64>,
+) -> f64 {
     override_ftol.unwrap_or(if is_non_gaussian && !is_ode {
         1e-8
     } else {

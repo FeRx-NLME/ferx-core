@@ -56,6 +56,11 @@ pub fn predict(
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
+    // Every identifier the parser could not bind resolves as a covariate, and a
+    // covariate absent from the data reads as 0.0 — so an undefined name anywhere in
+    // the model (notably `[scaling]`, #1028) silently collapsed the prediction. `fit()`
+    // and `simulate()` already refuse this; match them here.
+    assert_covariates_present(model, population);
     // …and that every dose names a compartment the analytical engine can route
     // it into, so an unroutable infusion errors here with subject/time context
     // instead of panicking deep inside the event-driven walk (#375).

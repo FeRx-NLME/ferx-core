@@ -683,9 +683,9 @@ fn apply_readout_jet<T: PkNum>(
         // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
         // thread-local; enter this observation's time to match production's
         // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
-        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(
-            subject.obs_times.get(obs_i).copied().unwrap_or(0.0),
-        );
+        // `readout_time`, like production — the raw data-file clock.
+        let _time_guard =
+            crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(obs_i));
         eval_readout_jet::<T>(
             prog,
             conc,
@@ -1435,12 +1435,10 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
 pub fn iov_sens_supported(model: &CompiledModel) -> bool {
     // A closed-form transit/IG IOV model is served by its ODE twin (issue #719, routed
     // per-subject by `CompiledModel::effective_for`), so its analytic-IOV outer-gradient scope
-    // is the twin's ODE-IOV scope. (`get_or_build` is cached; the twin is built for the fit
-    // anyway.)
+    // is the twin's ODE-IOV scope. (The twin is built at parse time, #1008.)
     if model.n_kappa > 0 {
         if let Some(eq) = &model.absorption_ode_equivalent {
-            return ODE_SENS_ENABLED
-                && crate::sens::ode_provider::ode_iov_supported(eq.get_or_build());
+            return ODE_SENS_ENABLED && crate::sens::ode_provider::ode_iov_supported(eq.built());
         }
     }
     iov_analytical_supported(model)
@@ -2110,7 +2108,7 @@ fn run_obs_iov<const M: usize>(
                 ro_obs.at(j),
                 slot_row,
                 subject.obs_cov(j),
-                subject.obs_times[j],
+                subject.readout_time(j),
                 &seed,
                 &mut ro_state,
                 &mut ro_vars,
@@ -2420,7 +2418,7 @@ fn run_obs_iov_eta<const N: usize>(
                 ro_obs.at(j),
                 slot_row,
                 subject.obs_cov(j),
-                subject.obs_times[j],
+                subject.readout_time(j),
                 &seed,
                 &mut ro_state,
                 &mut ro_vars,
@@ -3321,7 +3319,7 @@ fn run_obs_tvcov<const M: usize>(
             // thread-local; enter this observation's time to match production's
             // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
             let _time_guard =
-                crate::parser::model_parser::ModelTimeGuard::enter(subject.obs_times[j]);
+                crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(j));
             eval_readout_jet::<Dual2<M>>(
                 ro,
                 c_clamped,
@@ -3687,7 +3685,7 @@ fn run_obs_grad_tvcov<const N: usize>(
                 },
             });
             let _time_guard =
-                crate::parser::model_parser::ModelTimeGuard::enter(subject.obs_times[j]);
+                crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(j));
             eval_readout_jet::<Dual1<N>>(
                 ro,
                 c_clamped,

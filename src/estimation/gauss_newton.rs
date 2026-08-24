@@ -23,6 +23,31 @@ use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
+/// The #1006 post-fit warning carried by a **pure** Gauss-Newton run that ends
+/// unconverged on a fixed-effects-only model (`n_eta = 0`).
+///
+/// States the *outcome* only. The remedy ("prefer `gn_hybrid` or `focei`, or improve
+/// the `sigma` start") belongs to `W_GN_NO_RANDOM_EFFECTS`, which `check_model_options`
+/// raises for the same configuration and `fit_inner` surfaces alongside this one —
+/// repeating it here made a single `gn` run at `n_eta = 0` give the same advice twice.
+/// Inside `fit()` the two always travel together: this warning needs `n_eta = 0` and a
+/// non-hybrid, non-polished `gn` stage, which is precisely when the check raises
+/// `W_GN_NO_RANDOM_EFFECTS`. A caller reaching `run_foce_gn` directly, bypassing
+/// `check_model_options`, sees the outcome without the remedy.
+///
+/// Named rather than inlined because the exemption has two halves. `gn_hybrid` is
+/// handled here (`options.method` is `FoceGnHybrid` during its GN phase), but a
+/// hand-written `methods = [gn, focei]` chain — the same polish, spelled out — is
+/// invisible from inside this function: `api::fit` rewrites `stage_opts.method` to
+/// the stage's method and blanks `stage_opts.methods`, so the chain is gone by the
+/// time `run_foce_gn` sees its options. `fit_inner` therefore drops this exact
+/// string from a GN stage that is not the last estimating stage; see
+/// `api::postfit::keep_gn_zero_eta_warning`.
+pub(crate) const GN_ZERO_ETA_NONCONVERGENCE_WARNING: &str =
+    "Gauss-Newton did not converge on a model with no random effects \
+     (n_eta = 0). BHHH curvature is unreliable far from the optimum in \
+     this regime, so the result may be badly wrong, not just imprecise.";
+
 /// Run FOCE estimation using a Gauss-Newton optimizer.
 ///
 /// Returns the same `OuterResult` as `optimize_population`.
@@ -366,6 +391,20 @@ pub fn run_foce_gn(
 
     if !converged {
         warnings.push("Gauss-Newton: max iterations reached without convergence".to_string());
+        // #1006: at n_eta = 0 an unconverged pure-GN run is the state that
+        // predicts a badly wrong answer — there is no inner EBE loop to absorb
+        // a poor start, so the BHHH step can collapse orders of magnitude above
+        // the optimum (8940 OFV units off on the `one_cpt_iv_pooled` anchor).
+        // `gn_hybrid` is exempt: its FOCEI polish re-optimises from here and
+        // recovers the optimum. A hand-written `methods = [gn, focei]` chain
+        // earns the same exemption, but this function cannot see it — `api::fit`
+        // blanks `stage_opts.methods` per stage — so that case is suppressed by
+        // name in `fit_inner` via [`GN_ZERO_ETA_NONCONVERGENCE_WARNING`].
+        // `ferx check` flags the same combination up front as
+        // W_GN_NO_RANDOM_EFFECTS (`check_model_options`).
+        if model.n_eta == 0 && !matches!(options.method, EstimationMethod::FoceGnHybrid) {
+            warnings.push(GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string());
+        }
     }
 
     // Recompute gradient at the final accepted x so the stored value is always
@@ -695,9 +734,24 @@ fn dr_diag_d_log_sigma(
                         // d(sigma_prop^2 * f^2)/d(log sigma_prop) = 2 * sigma_prop^2 * f^2
                         let sp2 = sigma_values[0] * sigma_values[0];
                         2.0 * sp2 * f_j * f_j * mk2
-                    } else {
-                        // sigma_k == 1: d(sigma_add^2)/d(log sigma_add) = 2 * sigma_add^2
+                    } else if sigma_k == 1 {
+                        // d(sigma_add^2)/d(log sigma_add) = 2 * sigma_add^2
                         2.0 * sigma_values[1] * sigma_values[1] * mk2
+                    } else {
+                        // `ks` runs over the *whole* flat sigma vector (`for ks in
+                        // 0..n_sigma`, where `n_sigma = template.sigma.values.len()`),
+                        // not over the error model's own count. A sigma declared past
+                        // the ones a single-endpoint `[error_model]` loads — legal, and
+                        // documented as inert since #1001 — does not enter R, so ∂R/∂log
+                        // σ_k is identically zero for it. Without this arm the `else`
+                        // above answered for every `sigma_k >= 1` and handed the
+                        // trailing sigma the *additive* sigma's derivative, putting a
+                        // spurious row/column into the FOCE score (`subject_nll_pop_grad`)
+                        // and hence into the `s`/`rsr` cross-product in
+                        // `covariance.rs` — wrong sandwich SEs for every parameter, with
+                        // no diagnostic. The `Additive`/`Proportional` arms above always
+                        // guarded this; `Combined` did not.
+                        0.0
                     }
                 }
             }
@@ -2120,6 +2174,41 @@ mod tests {
             input_columns: vec![],
             exclusions: None,
             warnings: vec![],
+        }
+    }
+
+    /// A sigma declared past the ones the `[error_model]` names is inert — #1001
+    /// documents it that way and accepts the spelling (FREM's trailing `EPSCOV`
+    /// is the shipped example). `dr_diag_d_log_sigma`'s `Combined` arm used a
+    /// bare `else` for `sigma_k != 0`, so the trailing sigma was handed the
+    /// *additive* sigma's derivative instead of zero, and `subject_nll_pop_grad`
+    /// (also the `s`/`rsr` score cross-product in `covariance.rs`) carried a
+    /// spurious row for a parameter that does not enter `R`.
+    ///
+    /// Mutation check: reverting the `else if sigma_k == 1` to a bare `else`
+    /// makes `combined_ignores_sigmas_past_its_own_slots` fail on the
+    /// `sigma_k = 2` row with `2·0.1² = 0.02`.
+    #[test]
+    fn combined_ignores_sigmas_past_its_own_slots() {
+        let r_diag = [0.25_f64, 1.0];
+        let pred = [2.0_f64, 4.0];
+        let sigmas = [0.2_f64, 0.1, 1.0]; // prop, add, trailing/unreferenced
+
+        // Slot 0 and slot 1 keep their derivatives.
+        let d0 = dr_diag_d_log_sigma(ErrorModel::Combined, &r_diag, &pred, &sigmas, 0, None);
+        assert!((d0[0] - 2.0 * 0.04 * 4.0).abs() < 1e-12, "{d0:?}");
+        let d1 = dr_diag_d_log_sigma(ErrorModel::Combined, &r_diag, &pred, &sigmas, 1, None);
+        assert!(d1.iter().all(|v| (v - 2.0 * 0.01).abs() < 1e-12), "{d1:?}");
+
+        // Slot 2 is not loaded by a `combined` error model, so ∂R/∂log σ₂ ≡ 0.
+        let d2 = dr_diag_d_log_sigma(ErrorModel::Combined, &r_diag, &pred, &sigmas, 2, None);
+        assert!(d2.iter().all(|v| *v == 0.0), "{d2:?}");
+
+        // The other two error models always guarded this; pin that they still do,
+        // so the three arms cannot drift apart again.
+        for em in [ErrorModel::Additive, ErrorModel::Proportional] {
+            let d = dr_diag_d_log_sigma(em, &r_diag, &pred, &sigmas, 1, None);
+            assert!(d.iter().all(|v| *v == 0.0), "{em:?}: {d:?}");
         }
     }
 
@@ -3811,5 +3900,64 @@ mod tests {
         assert!(model.has_theta_dependent_ruv_magnitude());
         check_gn_grad_matches_fd(&model, true);
         check_gn_grad_matches_fd(&model, false);
+    }
+
+    /// #1006: an unconverged pure-GN run on a fixed-effects-only model must
+    /// carry the targeted post-fit warning, while `gn_hybrid` (whose FOCEI
+    /// polish recovers the optimum) and a mixed-effects `gn` run must not.
+    #[test]
+    fn gn_unconverged_at_zero_eta_pushes_targeted_warning() {
+        use std::path::Path;
+        let is_targeted = |w: &String| w.contains("no random effects");
+
+        let model = crate::parser::model_parser::parse_model_file(Path::new(
+            "examples/one_cpt_iv_pooled.ferx",
+        ))
+        .expect("pooled model parses");
+        assert_eq!(model.n_eta, 0, "fixture must be fixed-effects-only");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None)
+            .expect("one_cpt_iv data loads");
+        let opts = FitOptions {
+            method: EstimationMethod::FoceGn,
+            // Forces non-convergence structurally: the only normal convergence
+            // branch is `rel_change < 1e-6 && iter > 3`, so a 2-iteration budget
+            // cannot converge from any start. This pins the *gate* on the
+            // warning (n_eta = 0, not gn_hybrid, not converged), not the BHHH
+            // collapse itself — that is anchored in docs/estimation/gauss-newton.qmd.
+            outer_maxiter: 2,
+            run_covariance_step: false,
+            ..Default::default()
+        };
+        let res = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(!res.converged, "a 2-iteration GN budget cannot converge");
+        assert!(
+            res.warnings.iter().any(is_targeted),
+            "targeted #1006 warning missing: {:?}",
+            res.warnings
+        );
+
+        // gn_hybrid control: identical unconverged GN phase, but the FOCEI
+        // polish makes the targeted warning inapplicable.
+        let hybrid_opts = FitOptions {
+            method: EstimationMethod::FoceGnHybrid,
+            ..opts.clone()
+        };
+        let res = run_foce_gn(&model, &pop, &model.default_params, &hybrid_opts);
+        assert!(
+            !res.warnings.iter().any(is_targeted),
+            "gn_hybrid must not carry the #1006 warning: {:?}",
+            res.warnings
+        );
+
+        // Mixed-effects control: same tiny budget, but the inner EBE loop makes
+        // the targeted warning inapplicable at n_eta > 0.
+        let mixed = make_model();
+        let mixed_pop = make_population();
+        let res = run_foce_gn(&mixed, &mixed_pop, &mixed.default_params, &opts);
+        assert!(
+            !res.warnings.iter().any(is_targeted),
+            "mixed-effects gn must not carry the #1006 warning: {:?}",
+            res.warnings
+        );
     }
 }

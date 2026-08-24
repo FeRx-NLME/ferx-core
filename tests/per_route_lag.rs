@@ -639,6 +639,44 @@ fn shipped_per_route_lag_example_parses() {
     parse_full_model(&src).expect("per_route_lag_absorption.ferx parses");
 }
 
+/// Regression (#1001 review): the example declared `sigma ADD_ERR` before
+/// `sigma PROP_ERR` and wrote `combined(ADD_ERR, PROP_ERR)`. A single-endpoint
+/// `combined` model consumes those *positionally* — slot 1 is the proportional
+/// coefficient, slot 2 the additive SD — so the file simulated and fitted with a
+/// 2% proportional term and a 0.10 mg/L additive floor, the inverse of its own
+/// header, its inline comments, and the `--simulate` parameters it advertises.
+///
+/// Parsing alone cannot catch this: *both* lists were transposed, so the #1001
+/// order check is satisfied either way. Pin the roles, not just the spelling.
+#[test]
+fn shipped_per_route_lag_example_binds_its_residual_components_by_role() {
+    let src = std::fs::read_to_string("examples/per_route_lag_absorption.ferx")
+        .expect("read per_route_lag_absorption.ferx");
+    let parsed = parse_full_model(&src).expect("per_route_lag_absorption.ferx parses");
+    assert!(
+        matches!(
+            parsed.model.error_model,
+            ferx_core::types::ErrorModel::Combined
+        ),
+        "expected a combined error model, got {:?}",
+        parsed.model.error_model
+    );
+    // Slot order is the binding. `sigma_loadings` reads slot 0 scaled by the
+    // prediction (proportional) and slot 1 unscaled (additive).
+    assert_eq!(
+        parsed.model.default_params.sigma.names,
+        vec!["PROP_ERR".to_string(), "ADD_ERR".to_string()],
+        "the proportional sigma must occupy the first slot"
+    );
+    // …and the values must be the ones the header advertises for those roles.
+    assert!(
+        (parsed.model.default_params.sigma.values[0] - 0.10).abs() < 1e-12
+            && (parsed.model.default_params.sigma.values[1] - 0.02).abs() < 1e-12,
+        "expected proportional 0.10 / additive 0.02, got {:?}",
+        parsed.model.default_params.sigma.values
+    );
+}
+
 // ── `lag=` is universal: transit() and igd() carry it too ─────────────────────
 //
 // The `lag=` argument is captured kind-agnostically by the parser and applied at a

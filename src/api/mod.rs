@@ -14,7 +14,7 @@ mod validation;
 pub(crate) use validation::{
     apply_iov_occasion_rule, assert_absorption_closed_form_support,
     assert_absorption_dosing_supported, assert_absorption_flip_flop_no_twin,
-    assert_analytic_readout_support, assert_dose_compartments_supported,
+    assert_analytic_readout_support, assert_covariates_present, assert_dose_compartments_supported,
     assert_modeled_doses_supported, check_absorption_closed_form_support, check_absorption_dosing,
     check_absorption_flip_flop_no_twin, check_analytic_readout_support, check_covariates,
     check_dose_compartments, check_modeled_dose_rates,
@@ -52,8 +52,9 @@ pub(crate) use postfit::{
     compute_eta_shrinkage, compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ,
     compute_param_corr, compute_subject_results, cov_diagnostics, eps_shrinkage_warning,
     eta_shrinkage_warning, extract_standard_errors, high_correlation_warning, inflated_rse_warning,
-    is_last_estimating_stage, probe_nlopt_algorithms, rebuild_warnings_structured,
-    resolve_covariance_status, resolve_sir_fallback, sir_unavailable_warning,
+    is_last_estimating_stage, keep_gn_zero_eta_warning, probe_nlopt_algorithms,
+    rebuild_warnings_structured, resolve_covariance_status, resolve_sir_fallback,
+    sir_unavailable_warning,
 };
 pub use predict::{predict, PredictionResult};
 #[cfg(feature = "survival")]
@@ -164,6 +165,10 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/dose_compartment_tests.rs"]
 mod dose_compartment_tests;
+
+#[cfg(test)]
+#[path = "tests/scaling_undefined_tests.rs"]
+mod scaling_undefined_tests;
 
 #[cfg(test)]
 #[path = "tests/simulation_template_tests.rs"]

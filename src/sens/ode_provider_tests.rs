@@ -382,6 +382,102 @@ fn ode_provider_form_c_per_obs_covariate_matches_production() {
     check_vs_production(&model, &subj, &theta, &eta);
 }
 
+// 2-cpt ODE whose Form C readout references the `TIME` built-in directly
+// (`y = central/V1 + BETA*TIME`, the response-versus-time shape from #1028). `TIME`
+// compiles to `Op::PushTime`, which resolves from the model-time thread-local — the
+// integrator's own guard is dropped before the readout runs, so without an explicit
+// per-observation guard at the readout seam every `TIME` read the `0.0` default and
+// the whole time-dependent term vanished silently. `BETA = TVBETA` is a
+// non-structural readout parameter, so `∂y/∂TVBETA = TIME` — a direct probe that the
+// observation's own time (not a stale 0) reaches the readout. Mirrors the analytic
+// Form C twin (`iov_form_c_time_readout_evaluated_at_obs_time`, provider_tests.rs).
+const TWOCPT_ODE_READOUT_TIME: &str = r#"
+[parameters]
+  theta TVCL(4.0,   0.1, 100.0)
+  theta TVV1(12.0,  1.0, 500.0)
+  theta TVQ(2.0,    0.01, 100.0)
+  theta TVV2(25.0,  1.0, 500.0)
+  theta TVBETA(0.05, -10.0, 10.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V1   = TVV1 * exp(ETA_V1)
+  Q    = TVQ
+  V2   = TVV2
+  BETA = TVBETA
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1 + BETA * TIME
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+/// #1028: a `TIME`-referencing ODE Form C readout must evaluate `TIME` at each
+/// observation. `∂y/∂TVBETA` equals that observation's time — it would be 0 at every
+/// row if the readout read a stale model-time of 0 — and `check_vs_production` ties
+/// the analytic dual walk to FD of the production predictor, so both sides are pinned
+/// to the same (guarded) expression.
+#[test]
+fn ode_provider_form_c_time_readout_evaluated_at_obs_time() {
+    let model = parse_model_string(TWOCPT_ODE_READOUT_TIME).expect("parse");
+    assert!(
+        ode_analytical_supported(&model),
+        "TIME-referencing Form C readout should stay analytic (#1028)"
+    );
+    let times = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0];
+    let subject = bolus_subject(&times);
+    let theta = vec![4.0, 12.0, 2.0, 25.0, 0.05];
+    let eta = vec![0.12, -0.08];
+
+    check_vs_production(&model, &subject, &theta, &eta);
+
+    let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+    for (j, obs) in sens.obs.iter().enumerate() {
+        // ∂(central/V1 + TVBETA·TIME)/∂TVBETA = TIME at observation j.
+        approx::assert_relative_eq!(
+            obs.df_dtheta[4],
+            times[j],
+            max_relative = 1e-6,
+            epsilon = 1e-9
+        );
+    }
+}
+
+/// #1028 production half: the f64 ODE predictor must read `TIME` at each observation
+/// too — the sensitivity parity above would still pass if *both* sides read a stale
+/// 0. Differencing the same model at `TVBETA = 0.05` and `TVBETA = 0` isolates the
+/// readout's time term from the disposition, which is identical in the two runs, so
+/// the gap must be exactly `BETA · t`.
+#[test]
+fn ode_form_c_time_readout_prediction_uses_obs_time() {
+    let model = parse_model_string(TWOCPT_ODE_READOUT_TIME).expect("parse");
+    let times = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0];
+    let subject = bolus_subject(&times);
+    let eta = vec![0.0, 0.0];
+    let beta = 0.05;
+    let with_beta =
+        compute_predictions_with_tv(&model, &subject, &[4.0, 12.0, 2.0, 25.0, beta], &eta);
+    let no_beta = compute_predictions_with_tv(&model, &subject, &[4.0, 12.0, 2.0, 25.0, 0.0], &eta);
+    for (j, t) in times.iter().enumerate() {
+        approx::assert_relative_eq!(
+            with_beta[j] - no_beta[j],
+            beta * t,
+            max_relative = 1e-8,
+            epsilon = 1e-12
+        );
+    }
+}
+
 /// Shared check: provider `f`/`∂f/∂η`/`∂f/∂θ` vs production predictor + FD.
 fn check_vs_production(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
     let sens = ode_subject_sensitivities(model, subject, theta, eta).expect("supported");

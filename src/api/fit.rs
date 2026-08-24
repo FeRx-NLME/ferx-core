@@ -164,11 +164,9 @@ pub(crate) fn perturb_init(
 /// The validity cutoff sits well below the ~1e20 inner-objective sentinel but
 /// far above any legitimate population OFV, so a real fit never trips it; a NaN
 /// OFV is non-finite and therefore also invalid, so it can never block a finite
-/// valid candidate.
+/// valid candidate. See `estimation::outer_optimizer::ofv_is_valid`.
 pub(crate) fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: bool) -> bool {
-    /// OFVs at or above this are treated as diverged/invalid (see above).
-    const DIVERGENCE_OFV: f64 = 1e14;
-    let valid = |o: f64| o.is_finite() && o < DIVERGENCE_OFV;
+    let valid = crate::estimation::outer_optimizer::ofv_is_valid;
     match (valid(b_ofv), valid(c_ofv)) {
         (false, true) => true,
         (true, false) => false,
@@ -945,7 +943,8 @@ fn fit_inner(
     // parser rejects Form C `y[CMT=N]` readouts on SDE models — so an SDE model
     // is always single-endpoint here, which the EKF residual-variance
     // assumption in stats/likelihood.rs relies on.)
-    first_error(&check_model_options(model, options))?;
+    let option_diags = check_model_options(model, options);
+    first_error(&option_diags)?;
 
     // Pre-compute n_params (uses init_params, available before chain runs).
     let fixed_mask = crate::estimation::parameterization::packed_fixed_mask(init_params);
@@ -1034,6 +1033,13 @@ fn fit_inner(
     // copy) and `init_params`, matching the historical inline checks.
     for d in check_model_data_warnings(model, population, init_params) {
         accumulated_warnings.push(d.message);
+    }
+    // Warning-severity *option* diagnostics (e.g. W_GN_NO_RANDOM_EFFECTS, #1006).
+    // `first_error` above consumes only errors, so without this a warning added to
+    // `check_model_options` is reported by `ferx check` and silently dropped by
+    // `fit()` — the same treatment `check_model_data_warnings` gets, one line up.
+    for d in option_diags.iter().filter(|d| !d.is_error()) {
+        accumulated_warnings.push(d.message.clone());
     }
     // Experimental-feature notices (data-independent; see check_experimental_features).
     for d in check_experimental_features(model) {
@@ -1459,7 +1465,11 @@ fn fit_inner(
 
         stage_params = stage_result.params.clone();
         total_iterations += stage_result.n_iterations;
-        for w in &stage_result.warnings {
+        for w in stage_result
+            .warnings
+            .iter()
+            .filter(|w| keep_gn_zero_eta_warning(w, is_last_estimating))
+        {
             accumulated_warnings.push(if n_stages > 1 {
                 format!("[{}] {}", method.label(), w)
             } else {

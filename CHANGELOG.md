@@ -20,6 +20,75 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **A single-endpoint `[error_model]` must now name its sigmas in declaration order (#1001).**
+  A one-line `DV ~ ...` error model consumes its sigmas **positionally** from the `[parameters]`
+  declaration order. The names written in the arguments were checked for existence and then
+  discarded, so `DV ~ proportional(S_SMALL)` bound `S_BIG` whenever `S_BIG` happened to be declared
+  first — and `combined(A, B)` ignored a transposition of its two arguments entirely. The fit
+  converged and every reported SE and diagnostic was internally consistent, so there was nothing to
+  notice; on a 24-observation dataset two sigmas 40× apart moved the objective by 110.7 units
+  (confirmed on both engines against NONMEM 7.6.0, `nonmem_anchor/sigma_order_{small,big}.ctl`).
+  Mismatches are now rejected at parse time with `E_SIGMA_ORDER_MISMATCH`, naming the argument, the
+  sigma that actually occupies the slot, and the fix. This generalises a check that previously fired
+  only when `block_sigma` was present. Per-CMT and covariate-selected error models bind by name and
+  are unaffected, as is a trailing sigma consumed elsewhere (e.g. FREM's `frem_sigma`). **Breaking**
+  for any model that named its sigmas out of order — such a model was already getting a different fit
+  from the one it appeared to describe. Fix it by reordering the `sigma` **declarations** (and, for a
+  `block_sigma`, permuting its lower triangle to match); reordering the *arguments* instead also
+  parses but swaps which sigma is the proportional component, which changes the model rather than the
+  spelling.
+- **The dose-attribute double-use error now covers analytical (`pk ...`) models (#1004).** #993
+  rejected this on ODE models only, reasoning that an analytical model's explicit
+  `pk(..., f=F)` mapping made a second use "stated rather than silent". It is not: nothing in the
+  model says the value is applied twice, and a `[scaling]` or `[adaptive_dosing] observe`
+  expression that reads a mapped `f=`/`lagtime=` parameter applied it
+  once at the dose and once where it was read — on the **default** engine, with no diagnostic.
+  Measured at exactly `F` on the prediction. Now rejected at parse time with the same
+  `E_DOSE_ATTR_DOUBLE_USE` code. The remediation differs from the ODE engine's: there the *name*
+  routes the parameter, so renaming fixes it; here the **mapping** binds it, so the fix is to drop
+  the `f=`/`lagtime=` argument (or the read), and the message says so. A parameter merely *named*
+  `F` that no `pk(...)` argument maps stays an ordinary parameter — unchanged, as does an
+  `[initial_conditions]` read: an initial condition is not an absorbed dose, so the engine seeds
+  the amount with `F = 1` and no lag and `init(depot) = F * 500` applies `F` once. **Breaking** for a
+  model that maps a dose attribute and also reads it, e.g. the apparent-volume idiom
+  `pk(..., f=F)` + `obs_scale = V / F`; a model using `CL/F`, `V/F` apparent parameters *without*
+  mapping `f=` is unaffected, which is the ordinary NONMEM convention. Note this is again
+  **stricter than NONMEM**: `$PK` defining `F1` **and** `S2 = V/F1` runs clean under `ADVAN2` and
+  returns predictions scaled by exactly `F1` — anchored on NONMEM 7.6.0, two streams differing in
+  one `$PK` line (`nonmem_anchor/analytical_dose_attr_double_use_{A,B}.ctl`).
+- **`method = imp`, `impmap` and `bayes` are now rejected by `ferx check` on a model with no
+  random effects (#1007).** All three already refused `n_eta = 0` at run time, so a
+  `methods = [focei, imp]` chain ran its whole FOCEI stage before failing and `ferx check`
+  reported the model as valid. The new `E_METHOD_NO_RANDOM_EFFECTS` diagnostic fires up front,
+  anywhere in a method chain, matching the `saem` guard added in #1002. The run-time errors stay
+  as the backstop for direct `fit()` callers. One consequence to note when upgrading: a chain with
+  `imp_eval_only = true` on a fixed-effects-only model previously returned a fit result with the
+  IMP failure downgraded to a warning, and now returns this error instead.
+- **`method = gn` on a fixed-effects-only model now warns (#1006).** Pure Gauss-Newton is
+  start-sensitive at `n_eta = 0`: with no inner EBE loop to absorb a poor `sigma` start, the BHHH
+  step can collapse far from the optimum and return a badly wrong answer whose only signal was
+  `Converged: NO`. `ferx check` now emits `W_GN_NO_RANDOM_EFFECTS` pointing at `gn_hybrid` /
+  `focei`, and an unconverged pure-GN run at `n_eta = 0` adds a matching post-fit warning. A
+  warning rather than an error, since `gn` does reach the optimum from a good start. Both are
+  suppressed when a later stage re-optimises the GN result — `gn_hybrid`, and equally a
+  hand-written `methods = [gn, focei]`.
+- **An unrecognised `[block]` name is now an error (#1040).** Blocks were read by name lookup, so a
+  header the parser did not know was never read and never reported: a misspelled `[fit_option]` left
+  `ferx check` saying `valid: true` while the fit ran with the default method, the default iteration
+  cap and **no covariance step** — returning without standard errors and no indication why. The same
+  went for `[scalings]`, `[outputs]`, `[derived]`, `[covariates]` and friends. Block names are now
+  closed-world, like the keys inside a block already were: an unknown header is `E_UNKNOWN_BLOCK`,
+  listing every offender with its line, the full valid set, and a did-you-mean for a near match. Two
+  neighbouring silent drops go with it — an instance name where none is taken (`[fit_options DOSE]`)
+  or missing where one is required (`[covariate_nn]`) is `E_BLOCK_INSTANCE_NAME`, and a block whose
+  cargo feature this binary lacks (`[event_model]` without `--features survival`, `[markov_model]`
+  without `--features markov`) is `E_BLOCK_FEATURE_DISABLED` instead of being parsed away, and
+  `[initial_values]` — ferx's own former spelling for initial estimates, unread since they moved
+  inline into `[parameters]` — is `E_DEPRECATED_BLOCK`, naming the replacement rather than offering
+  a did-you-mean that does not exist. The recognised block names are exported as
+  `known_block_names()` so wrappers can read the list from the engine rather than keeping their own
+  copy; it reflects the features the binary was built with, so it never advertises a name the same
+  binary would refuse.
 - **A dose attribute that is also read by the model is now an error (#993).** `F`,
   `LAGTIME`/`ALAG` and the compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` are applied by the
   engine **at the dose event**. A model that declares one and *also* references it in `[odes]`
@@ -30,8 +99,8 @@ section of the SDLC for the versioning policy).
   with `E_DOSE_ATTR_DOUBLE_USE`, naming both readings and the fix. `D{n}`/`R{n}` carry the same
   reservation but are consulted only for a coded `RATE=-2`/`-1` dose, so that collision is reported
   against the dataset (same code) and a model whose data never codes `RATE` is untouched. Reads from
-  `[derived]`/`[output]` are post-solve reporting and remain silent, as does an analytical model's
-  explicit `pk(..., f=F)` mapping. **Breaking** for a model that folds `F` into the absorption flux
+  `[derived]`/`[output]` are post-solve reporting and remain silent. (Analytical models were left out
+  of this first pass; they are covered by #1004 above.) **Breaking** for a model that folds `F` into the absorption flux
   — the pre-dose-entry convention the ODE docs' migration note describes, which until now computed
   `F²` without complaint; the fix is to drop `F` from the right-hand side, or rename the parameter
   if it was never bioavailability. Note this makes ferx **stricter than NONMEM**, which allows a
@@ -53,6 +122,83 @@ section of the SDLC for the versioning policy).
   column was that one. Every observation was then scored with the subject's first value of it —
   silently, with no diagnostic, and with the whole point of a time- or record-varying magnitude lost.
   Such covariates now register as referenced, so their per-observation snapshots survive.
+- **A sigma declared past the ones a `combined` `[error_model]` names no longer perturbs the FOCE
+  score or the `s` / `rsr` standard errors (#1001 review).** `dr_diag_d_log_sigma`'s `Combined` arm
+  answered every `sigma_k >= 1` with the *additive* sigma's derivative, where its `additive` and
+  `proportional` siblings correctly returned zero. Since the loop runs over the whole flat sigma
+  vector, a third, unreferenced sigma — legal, and documented as inert — picked up a non-zero
+  `∂R/∂log σ` it has no business having, putting a spurious row and column into
+  `subject_nll_pop_grad` and hence into the score cross-product behind `covariance = s` / `rsr`.
+  Affected `method = foce` / `gn` / `gn_hybrid` fits of a `combined` error model with an extra
+  declared sigma; the reported standard errors were wrong for *every* parameter, silently.
+- **`examples/per_route_lag_absorption.ferx` had its two residual components the wrong way round
+  (#1001 review).** The file declared `sigma ADD_ERR` before `sigma PROP_ERR` and wrote
+  `combined(ADD_ERR, PROP_ERR)`; a single-endpoint `combined` model consumes those positionally, so
+  0.02 was the *proportional* coefficient and 0.10 the *additive* SD — the inverse of the file's own
+  header, both inline comments, and the `--simulate` parameters it advertises. Both lists were
+  transposed together, so the new #1001 check could not see it. Declarations and arguments are now
+  in role order. Users who copied this example's error model should swap it back the same way.
+- **An adaptive-dosing run now reads a `TIME`-dependent `[scaling]` Form C readout on the same
+  clock as `fit()` / `predict()` (#1028 follow-up).** #1028 moved the readout's `TIME` to the raw
+  data-file clock (the `$ERROR` convention shared by sdtab, `predict()`/`simulate()` and `[derived]`
+  windows) on the static predictors, but the reactive driver and the frozen-schedule replay
+  verifier kept feeding it the integrator break the observation was keyed to. For a subject with
+  stacked reset occasions — whose data `TIME` restarts while the internal timeline stays monotonic —
+  those are different numbers, so the *same record* got one `TIME` under `simulate_adaptive` and
+  another under `fit()`, and the replay verifier's bit-equality against the static engine no longer
+  held. Both now use the raw clock. Also in the same area: a `T` / `t` declared in `[covariates]` is
+  now honoured **case-insensitively** (declaring `T` protects a `t` reference and vice versa —
+  previously the case-mismatched pair silently folded to the model clock in `y`, and raised the
+  time-in-`obs_scale` error against a legitimately declared column), and the declaration now reaches
+  `[adaptive_dosing] observe`, which compiles through the same readout compiler — so a declared `T`
+  can no longer be the data column in `[scaling]` and the clock in `observe` for one model. The
+  `T`-fold warning for `observe` is emitted at parse time, since the block is compiled at simulate
+  time where there is no warnings channel.
+- **`TIME` now works in a `[scaling]` Form C readout, and an undefined name in `[scaling]` is no
+  longer a silent zero (#1028).** A `y = <expr>` / `y[CMT=N] = <expr>` readout referencing the
+  `TIME` built-in parsed fine but was never bound to the observation — the integrator's model-time
+  guard is dropped before the readout runs — so `TIME` read `0` at every row and the whole
+  time-dependent term vanished. A response-versus-time readout such as
+  `y[CMT=1] = EMAX * TIME / (TIME + T50)` therefore fit, converged, and reported plausible
+  parameters for a structural model nobody wrote. `TIME` (and the `T` alias `[odes]` also accepts)
+  now resolves to each observation's own time on both the ODE and analytical Form C paths, on the
+  production predictor and the analytic sensitivity walks alike — and to each decision's time in an
+  `[adaptive_dosing] observe` expression, which compiles through the same readout compiler — so the
+  dummy `d/dt(clock) = 1`
+  workaround is no longer needed (and is better dropped: `clock` starts at the subject's first
+  record, not at `t = 0`). Separately, `obs_scale` expressions never registered their covariate
+  references as required data columns, and `predict()` ran no covariate check at all, so an
+  unresolvable identifier anywhere in `[scaling]` reached the predictor as the covariate map's
+  `0.0` default. Both halves of the block now register their references, and `predict()` reports
+  `E_MISSING_COVARIATE` for a missing column just as `fit()` and `simulate()` already did.
+  **Breaking** in two narrow places: `obs_scale = TIME` (or `= T`) is now a parse error naming Form
+  C as the place for a time-dependent readout — the divisor is subject-static, evaluated once at
+  `t = 0`, so it could only ever have read `0`; and a `[scaling]` expression referencing an
+  *undeclared* data column named `T` now reads the model-time built-in instead, matching `[odes]`,
+  where that name has always been reserved. Declaring `T` in `[covariates]` keeps it a data column,
+  and whenever the fold does happen ferx warns and names both escapes, so the substitution is never
+  silent. `TAFD` / `TAD` are unaffected and remain ordinary covariate references in `[scaling]`;
+  when such a column is missing, `E_MISSING_COVARIATE` now explains that the name is an `[odes]`-only
+  built-in rather than reading as a plain typo report. The readout's `TIME` is the raw data-file
+  clock — the same one sdtab, `predict()`/`simulate()` and `[derived]` windows report, and NONMEM's
+  `$ERROR` uses — which differs from the integrator timeline only for datasets with stacked reset
+  occasions. A modified-release model whose closed-form fast path applies now declines to the ODE
+  path when its readout reads `TIME`, instead of dropping the time term via a state-space linearity
+  probe. `predict()`'s new covariate check accepts a name every subject's covariate map carries even
+  when the population's `covariate_names` list is empty, so a programmatically built in-memory
+  `Population` keeps working.
+- **An adaptive-dosing `dv` monitor no longer floors a negative Form C `[scaling]` readout at zero
+  (#1039).** The assay floor on the `ObserveMode::Dv` path ("an assay cannot read below zero") was
+  written when every monitored readout was a compartment amount or concentration, and was applied
+  unconditionally after the residual draw. A Form C `y = <expr>` readout is an arbitrary
+  expression — a change from baseline, a difference from a comparator, a z-score, the
+  `sqrt(N) * logit(p)` transform — so the *same model* read correctly under `mode = ipred` and
+  came back as exactly `0` under `mode = dv` for every negative sample, silently: a controller
+  thresholding a change-from-baseline signal saw `0` over precisely the region it was written to
+  react to, and dosed accordingly. The floor is now gated on the same predicate as the prediction
+  path (#1020), so it applies only to the bare-state readout and to Forms A/B, which keep it. With
+  `sigma → 0` a `dv` monitor again reproduces the `ipred` monitor sample for sample, negative
+  samples included.
 - **SAEM no longer lets a fixed-effect-only theta drift away from the marginal optimum (#1011).** The
   numerical θ/σ M-step assigned NLopt's maximiser outright, re-maximising against a *single* MCMC η
   draw each iteration — `argmax` of one draw rather than the stochastic-approximation average of
@@ -287,6 +433,60 @@ section of the SDLC for the versioning policy).
   unchanged (#971).
 
 ### Fixed
+- **`optimizer = trust_region` no longer reports `Converged: YES` when it merely ran out of
+  iterations (#1000).** The underlying solver has no convergence criterion of its own, so
+  exhausting `maxiter` was its only way to stop — and every such run was labelled converged, with
+  standard errors computed at a non-stationary point (on the `one_cpt_iv_pooled` zero-Ω anchor,
+  8 000–11 000 OFV units short of the optimum). The trust region now stops when it can no longer
+  make progress — no objective improvement beyond `outer_ftol` and no parameter movement beyond
+  `outer_xtol` for 20 consecutive iterations — and a run that instead hits `maxiter` reports
+  `Converged: NO` with a warning naming the budget and the gradient norm it stopped at. Fits that
+  do settle now also stop as soon as they settle instead of grinding out the remaining budget (the
+  warfarin fit returns at iteration 59), and the trust-region path now reports `final_gradient` and
+  the number of outer iterations it actually ran (it reported `Iterations: 0` before). `outer_ftol`
+  and `outer_xtol`, previously `bobyqa`-only, now also govern `trust_region`; `outer_ftol` resolves
+  the same way for both, so a pure-TTE fit gets the #469 `1e-8` tightening rather than a looser
+  hardcoded value. Two verdicts are newly explicit: a `maxiter` below 21 cannot demonstrate settling
+  at all (the warning says so instead of blaming the fit), and a run that rejects every step from
+  the first iteration is reported against its *starting values* and bails out immediately rather
+  than spending the whole budget frozen. Note for multi-start users: `n_starts` prefers a converged
+  candidate over a non-converged one, and that key was inert while every `trust_region` run claimed
+  convergence — a settled start can now be selected over a better-OFV start that ran out of budget.
+- **`optimizer = trust_region` under `method = focei` no longer descends on a truncated gradient.**
+  The trust region used the fixed-η̂ score `2·Σ gᵢ`, which drops the `log|H̃|` EBE-response term
+  `tᵢ` (#274/#289) that the Gauss-Newton path already adds — the omission a gradient optimizer
+  stalls above the minimum on. It now uses the same `2·Σ (gᵢ + tᵢ)` marginal gradient, pinned
+  against central finite differences of the objective in a unit test. FOCE and additive-error fits
+  are unchanged bit-for-bit (`tᵢ` is identically zero there); on warfarin the FOCEI fit now
+  reaches OFV −286.0042, the same value `nlopt_lbfgs` converges to, instead of settling 4.1 units
+  above it at −281.88. `final_gradient` is now the marginal gradient rather than a quantity that
+  stays large at the optimum.
+- **`optimizer = trust_region` is now rejected on a quadrature stage (`E_OPTIMIZER_AGQ`) instead
+  of silently fitting the wrong objective.** `method = laplace` (any `n_agq`) and `method = focei`
+  with `n_agq > 1` minimise the adaptive-quadrature marginal, and every optimizer scores it — but
+  only the NLopt and BFGS paths route the matching gradient (`agq_population_gradient`). The
+  trust region has its own gradient with no quadrature branch, so it descended on the
+  FOCE/Laplace closed form while reporting quadrature OFVs: a fit that converged, smoothly, to
+  the FOCE optimum with no warning. `ferx check` and `fit()` now both reject the combination and
+  name the optimizers that do support it. Full quadrature support in the trust region needs a
+  BHHH Hessian built from per-subject quadrature scores and is tracked in #1047.
+- **A transit / inverse-Gaussian absorption model no longer panics mid-fit when its ODE fallback
+  cannot be built (#1008).** The analytic `one_cpt_transit` / `two_cpt_transit` / `one_cpt_ig` /
+  `two_cpt_ig` closed forms carry a synthesized ODE twin that serves the subjects the closed form
+  cannot (time-varying covariates, a `TIME`-dependent parameter, IOV, steady-state or infusion
+  doses, the flip-flop regime). The twin is an ODE model while the model you wrote is analytical,
+  so parse checks that apply only to ODE models run on the twin and not on your model — and a
+  model ferx accepted could produce a twin ferx rejected. That surfaced as an internal panic
+  during `fit()` / `predict()`, the first time a subject actually needed the fallback. The twin is
+  now built at parse time: if it cannot be built the model simply stays closed-form and a
+  `W_ABSORPTION_TWIN_DECLINED` warning (`absorption_twin_declined`) reports the reason, and any
+  subject that needs the fallback is rejected up front with an explicit message instead of
+  crashing. That rejection quotes the reason too — previously the twin-less messages described
+  only the *desugar's* scope limits ("an unrecognised closed form", "outside the automatic
+  ODE-equivalent rewrite"), which is the wrong cause for a twin that was built and rejected, and
+  the actionable reason never reached `fit()`'s `Err` or `predict()`'s panic. A live example: an
+  individual parameter named `CENTRAL` (or `PERIPH`), which collides with the twin's own state
+  names.
 - **A negative Form C `[scaling]` prediction is no longer silently clamped to zero on ODE models
   (#1020).** The ODE predictor applied its negative-prediction guard to the *final* prediction
   vector — after the `y = <expr>` / `y[CMT=N] = <expr>` readout had been evaluated. That guard is a

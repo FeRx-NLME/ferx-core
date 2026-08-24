@@ -80,6 +80,79 @@ fn missing_block_is_reported_as_e_missing_block() {
     let _ = std::fs::remove_file(&model);
 }
 
+/// #1040: a misspelled optional block used to leave `ferx check` reporting
+/// `valid: true` while the fit silently ran with the default method and no
+/// covariance step. It is now an error, located at the offending header.
+#[test]
+fn unknown_block_is_reported_as_e_unknown_block() {
+    let model = temp_model(
+        "unknown_block",
+        &format!("{COV_MODEL}\n[fit_option]\n  method = focei\n  covariance = true\n"),
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid, "unknown block must invalidate the report");
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_UNKNOWN_BLOCK");
+    assert_eq!(d.block.as_deref(), Some("fit_option"));
+    assert_eq!(d.line, Some(17));
+    assert_eq!(
+        d.suggestion.as_deref(),
+        Some("did you mean `[fit_options]`?")
+    );
+    assert!(
+        d.message.contains("Valid blocks: "),
+        "message must enumerate the valid set: {}",
+        d.message
+    );
+    let _ = std::fs::remove_file(&model);
+}
+
+/// `[initial_values]` was ferx's own spelling for initial estimates before they
+/// moved inline into `[parameters]`. The parser stopped reading it and — because
+/// unknown names were dropped in silence — never said so. It gets its own code
+/// and a remediation rather than a bare "unknown block", since no valid name is
+/// close enough for a did-you-mean.
+#[test]
+fn deprecated_block_is_reported_as_e_deprecated_block() {
+    let model = temp_model(
+        "deprecated_block",
+        &format!("{COV_MODEL}\n[initial_values]\n  theta = [0.2, 10.0]\n"),
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(
+        !report.valid,
+        "a deprecated block must invalidate the report"
+    );
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_DEPRECATED_BLOCK");
+    assert_eq!(d.block.as_deref(), Some("initial_values"));
+    assert_eq!(d.line, Some(17));
+    assert!(
+        d.message.contains("`[parameters]`") && d.message.contains("delete it"),
+        "message must name the replacement: {}",
+        d.message
+    );
+    assert!(d.suggestion.is_none());
+    let _ = std::fs::remove_file(&model);
+}
+
+/// The same rejection reaches `fit()` through `first_error`, byte-identical —
+/// there is no separate path for the batch and the fail-fast callers.
+#[test]
+fn unknown_block_also_fails_the_parser_directly() {
+    let model = temp_model(
+        "unknown_block_parse",
+        &format!("{COV_MODEL}\n[scalings]\n  V = 1.0\n"),
+    );
+    let err = match parse_full_model_file(Path::new(model.to_str().unwrap())) {
+        Err(e) => e,
+        Ok(_) => panic!("unknown block must fail the parse"),
+    };
+    assert!(err.starts_with("Unknown block `[scalings]`"), "{err}");
+    assert!(err.contains("did you mean `[scaling]`"), "{err}");
+    let _ = std::fs::remove_file(&model);
+}
+
 #[test]
 fn missing_covariate_is_reported_with_data() {
     // bioavailability.csv carries no covariate columns, but the model references WGT.
@@ -136,6 +209,106 @@ fn dose_attr_double_use_is_reported_as_its_own_code() {
     assert_eq!(d.block, None);
     assert!(
         d.message.starts_with("[odes]:") && d.message.contains("bioavailability"),
+        "{}",
+        d.message
+    );
+    let _ = std::fs::remove_file(&model);
+}
+
+#[test]
+fn analytical_dose_attr_double_use_is_reported_as_its_own_code() {
+    // #1004. The analytical message ends in a *different* remediation clause than
+    // the ODE one (drop the mapping, not rename), so it needs its own sentinel in
+    // `parse_error_to_diagnostic` — and therefore its own test, or the analytical
+    // half silently reports `E_PARSE` while the ODE half reports the real code.
+    let model = temp_model(
+        "analytical_dose_attr_double_use",
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+
+[scaling]
+  obs_scale = 1000.0 / F
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid);
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_DOSE_ATTR_DOUBLE_USE");
+    assert_eq!(d.block, None);
+    assert!(
+        d.message.starts_with("[scaling]:")
+            && d.message.contains("bioavailability")
+            && d.message.contains("remove the `f=F` mapping"),
+        "{}",
+        d.message
+    );
+    let _ = std::fs::remove_file(&model);
+}
+
+#[test]
+fn single_endpoint_sigma_order_mismatch_is_reported_as_its_own_code() {
+    // #1001. `proportional(S_SMALL)` with `S_BIG` declared first used to validate
+    // clean and then fit against `S_BIG`. Like #993 the code exists so a consumer
+    // (`ferxtranslate`, ferx-r) can offer the mechanical fix — reorder one of the
+    // two lists — without matching prose, and like #993 the mapping itself keys off
+    // a prose substring, so it needs a test or a reworded message silently
+    // downgrades every case to `E_PARSE`.
+    let model = temp_model(
+        "sigma_order_mismatch",
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma S_BIG ~ 2.0 (sd)
+  sigma S_SMALL ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(S_SMALL)
+",
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid);
+    // Assert the count before indexing, so a regression that reports nothing fails
+    // with this line rather than an opaque index-out-of-bounds panic.
+    assert_eq!(
+        report.diagnostics.len(),
+        1,
+        "expected exactly one diagnostic, got: {:?}",
+        report.diagnostics
+    );
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_SIGMA_ORDER_MISMATCH");
+    // The message already opens with the block, so attaching one too would print it
+    // twice — the renderer prefixes whatever `block` it is given.
+    assert_eq!(d.block, None);
+    assert!(
+        d.message.starts_with("[error_model]")
+            && d.message.contains("S_SMALL")
+            && d.message.contains("S_BIG"),
         "{}",
         d.message
     );

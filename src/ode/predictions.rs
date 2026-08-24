@@ -1511,13 +1511,26 @@ pub struct PerCmtReadout {
 
 impl OdeReadout {
     /// Evaluate the readout at one observation given the compartment `state`
-    /// vector, the flat PK-parameter slice, θ/η, the covariate snapshot, and the
-    /// observation's 1-based CMT. Shared by the ODE predictor ([`read_observable`])
-    /// and the analytic Form C path (`pk::apply_analytic_readout`, #650) so the
-    /// two dispatch/NaN-guard conventions cannot drift. A `PerCmt` map miss (or an
-    /// out-of-range `ObsCmt`) yields `NaN` — the loud guard that propagates to a
-    /// NaN OFV rather than silently mis-reading, since parser + fit-time validation
+    /// vector, the flat PK-parameter slice, θ/η, the covariate snapshot, the
+    /// observation's 1-based CMT, and the observation `time`. Shared by the ODE
+    /// predictor ([`read_observable`]) and the analytic Form C path
+    /// (`pk::apply_analytic_readout`, #650) so the two dispatch/NaN-guard
+    /// conventions cannot drift. A `PerCmt` map miss (or an out-of-range
+    /// `ObsCmt`) yields `NaN` — the loud guard that propagates to a NaN OFV
+    /// rather than silently mis-reading, since parser + fit-time validation
     /// already guarantee every observed CMT has an entry.
+    ///
+    /// `time` seeds the model-time thread-local for the duration of the Form C
+    /// arms, so a `[scaling] y = <expr>` readout that references the `TIME` / `T`
+    /// built-in resolves `Op::PushTime` to *this* observation's time (#1028).
+    /// Without the guard the readout ran outside any [`ModelTimeGuard`] — the
+    /// integrator's guard is dropped before the readout — so `TIME` silently read
+    /// the `0.0` default and collapsed the whole structural prediction. The
+    /// `ObsCmt` arm reads a state slot directly and skips the guard entirely, so
+    /// the overwhelmingly common built-in readout pays nothing. The analytic and
+    /// dual-walk readout sites (`sens::provider::apply_readout_jet`,
+    /// `sens::ode_provider::resolve_obs_readout`) enter the matching guard, so
+    /// FD and analytic sensitivities linearise the same expression.
     #[inline]
     pub(crate) fn eval(
         &self,
@@ -1527,12 +1540,19 @@ impl OdeReadout {
         eta: &[f64],
         covariates: &HashMap<String, f64>,
         obs_cmt: usize,
+        time: f64,
     ) -> f64 {
         match self {
             OdeReadout::ObsCmt(idx) => state[*idx],
-            OdeReadout::Single(out_fn) => out_fn(state, pk_params_flat, theta, eta, covariates),
+            OdeReadout::Single(out_fn) => {
+                let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(time);
+                out_fn(state, pk_params_flat, theta, eta, covariates)
+            }
             OdeReadout::PerCmt(map) => match map.get(&obs_cmt) {
-                Some(r) => (r.out_fn)(state, pk_params_flat, theta, eta, covariates),
+                Some(r) => {
+                    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(time);
+                    (r.out_fn)(state, pk_params_flat, theta, eta, covariates)
+                }
                 None => f64::NAN,
             },
         }
@@ -1542,7 +1562,9 @@ impl OdeReadout {
 /// Read the observable value at observation `obs_idx`.
 ///
 /// `subject.obs_cmts[obs_idx]` selects the per-CMT readout when
-/// `OdeReadout::PerCmt` is in use; the simpler variants ignore it.
+/// `OdeReadout::PerCmt` is in use; the simpler variants ignore it. `time` is the
+/// observation time a `TIME`-referencing Form C readout resolves against (#1028)
+/// — see [`OdeReadout::eval`].
 #[inline]
 fn read_observable(
     ode: &OdeSpec,
@@ -1552,9 +1574,10 @@ fn read_observable(
     eta: &[f64],
     covariates: &HashMap<String, f64>,
     obs_cmt: usize,
+    time: f64,
 ) -> f64 {
     ode.readout
-        .eval(u, pk_params_flat, theta, eta, covariates, obs_cmt)
+        .eval(u, pk_params_flat, theta, eta, covariates, obs_cmt, time)
 }
 
 /// Record `read_observable` into `predictions[obs_idx]` for every observation
@@ -1577,8 +1600,12 @@ fn record_observations(
 ) {
     for &obs_idx in obs_idxs {
         let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+        // The readout's `TIME` is the *user* clock (`readout_time`), not the shifted
+        // integrator timeline — the `$ERROR` convention the rest of the per-record
+        // objects use. The two differ only under stacked reset occasions (#1028).
+        let t_obs = subject.readout_time(obs_idx);
         predictions[obs_idx] =
-            read_observable(ode, u, pk, theta, eta, subject.obs_cov(obs_idx), cmt);
+            read_observable(ode, u, pk, theta, eta, subject.obs_cov(obs_idx), cmt, t_obs);
         if let Some(states) = states.as_deref_mut() {
             states[obs_idx] = u.to_vec();
         }
@@ -3360,7 +3387,16 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     // compiled `observe` expression for the latent value; absent
                     // one (the programmatic path), read the model's cmt readout.
                     let latent = match am.observe {
-                        Some(f) => f(&u, pk_readout, theta, readout_eta, decision_cov),
+                        // `[adaptive_dosing] observe` compiles through the same
+                        // `build_y_output_fn` as a `[scaling]` Form C readout, so it can
+                        // reference the `TIME` / `T` built-in — enter this decision's time
+                        // so it resolves there rather than to the thread-local default
+                        // (#1028). The `None` arm's `read_observable` guards itself.
+                        Some(f) => {
+                            let _time_guard =
+                                crate::parser::model_parser::ModelTimeGuard::enter(t_start);
+                            f(&u, pk_readout, theta, readout_eta, decision_cov)
+                        }
                         None => read_observable(
                             ode,
                             &u,
@@ -3369,6 +3405,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             readout_eta,
                             decision_cov,
                             m.cmt,
+                            t_start,
                         ),
                     };
                     // Resolve the monitored signal on its own mode: Ipred is the
@@ -3409,9 +3446,23 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             // finiteness guard. Value-pathology (a NaN/∞ in `sigma`, a
                             // diverged IPRED) is whole-sim garbage-in, out of scope here.
                             let eps = assay_standard_normal(a.base_seed, decision_index, &m.name);
+                            let noised = latent + var.sqrt() * eps;
                             // Edge (b): an assay cannot read below zero; clamp the
                             // noised value at 0 (BLQ-blinding is deferred to Part F).
-                            (latent + var.sqrt() * eps).max(0.0)
+                            // Gated on the same predicate as the prediction path
+                            // (#1039): "cannot read below zero" is a statement about a
+                            // compartment amount / concentration, not about a Form C
+                            // `[scaling]` readout, which is an arbitrary expression
+                            // (change from baseline, z-score, `sqrt(N)*logit(p)`) and is
+                            // legitimately signed. Without the gate the *same* model
+                            // read `mode = ipred` correctly and `mode = dv` floored at 0,
+                            // so a controller thresholding a signed signal silently saw
+                            // `0` over the whole negative region.
+                            if ode.readout.clamps_negative() {
+                                noised.max(0.0)
+                            } else {
+                                noised
+                            }
                         }
                     };
                     signals.insert(m.name.clone(), value);
@@ -3638,6 +3689,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     obs_eta,
                     shadow.obs_cov(obs_idx),
                     cmt,
+                    // The readout's `TIME` is the user clock, not `t_start` — the
+                    // integrator break this observation was keyed to. `obs_map` keys off
+                    // `shadow.obs_times`, so `t_start` is the shifted monotonic timeline
+                    // (and, thanks to the reader's pre-dose trough nudge, 1 ULP off the
+                    // data value even with no resets). Using it here would give
+                    // `simulate_adaptive` a different `TIME` than `predict()`/`fit()` for
+                    // the same record, and break the frozen-schedule replay oracle's
+                    // bit-equality against the static engine (#1028).
+                    shadow.readout_time(obs_idx),
                 );
             }
         }
@@ -4082,6 +4142,11 @@ fn adaptive_frozen_replay_tv(
                     obs_eta,
                     subject.obs_cov(obs_idx),
                     cmt,
+                    // User clock, not the integrator break — see the matching note in
+                    // `ode_predictions_adaptive_impl`. This is the replay verifier, so it
+                    // is the one path that *must* agree with the static engine bit for
+                    // bit (#1028).
+                    subject.readout_time(obs_idx),
                 );
             }
         }
@@ -4279,10 +4344,23 @@ pub(crate) fn adaptive_window_signal_aucs(
                 .enumerate()
                 .map(|(i, u)| {
                     let s = match observe {
-                        Some(f) => f(u, pk_params_flat, theta, eta, cov),
-                        None => {
-                            read_observable(ode, u, pk_params_flat, theta, eta, cov, monitor_cmt)
+                        // Same `TIME` guard as the decision-time monitor read above
+                        // (#1028), at this grid point's own time.
+                        Some(f) => {
+                            let _time_guard =
+                                crate::parser::model_parser::ModelTimeGuard::enter(grid[i]);
+                            f(u, pk_params_flat, theta, eta, cov)
                         }
+                        None => read_observable(
+                            ode,
+                            u,
+                            pk_params_flat,
+                            theta,
+                            eta,
+                            cov,
+                            monitor_cmt,
+                            grid[i],
+                        ),
                     };
                     (grid[i], s)
                 })
@@ -4634,6 +4712,8 @@ pub fn ode_predictions_event_driven(
                     eta,
                     subject.obs_cov(idx),
                     cmt,
+                    // User-clock `TIME` for the readout — see `record_observations`.
+                    subject.readout_time(idx),
                 );
                 // Clamp negative readouts (ODE solver overshoot guard);
                 // let NaN through so a missing `OdeReadout::PerCmt` entry

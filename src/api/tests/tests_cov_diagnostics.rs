@@ -191,3 +191,31 @@ fn cov_stage_three_method_chain_estimating_imp() {
     assert!(!is_last_estimating_stage(&chain, 1, false));
     assert!(is_last_estimating_stage(&chain, 2, false));
 }
+
+// ── keep_gn_zero_eta_warning: the chain half of the #1006 exemption ──
+
+#[test]
+fn gn_zero_eta_warning_dropped_when_a_later_stage_re_optimises() {
+    // `methods = [gn, focei]`: `run_foce_gn` sees `method = gn` and no chain
+    // (fit_inner blanks `stage_opts.methods`), so it pushes the #1006 warning
+    // unconditionally. The FOCEI stage that follows recovers the optimum, so the
+    // "result may be badly wrong" claim is false and must not reach FitResult.
+    let w = crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING;
+    assert!(!keep_gn_zero_eta_warning(w, false));
+    assert!(keep_gn_zero_eta_warning(w, true));
+}
+
+#[test]
+fn gn_zero_eta_filter_passes_every_other_warning_through() {
+    // Only the one #1006 string is chain-conditional; a non-terminal stage's
+    // other warnings (including GN's own generic non-convergence note) still
+    // reach the user.
+    for w in [
+        "Gauss-Newton: max iterations reached without convergence",
+        "Gauss-Newton: trust radius collapsed",
+        "Covariance step failed — SEs not available",
+    ] {
+        assert!(keep_gn_zero_eta_warning(w, false), "wrongly dropped: {w}");
+        assert!(keep_gn_zero_eta_warning(w, true), "wrongly dropped: {w}");
+    }
+}
