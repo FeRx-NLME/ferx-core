@@ -11630,6 +11630,53 @@ fn test_scaling_continuation_lines() {
     assert!((y - 4.0).abs() < 1e-12, "expected 100/50*2 = 4, got {y}");
 }
 
+/// `[initial_conditions]` is line-oriented too (`init(NAME) = <expr>`, one per
+/// line), so its continuation support is pinned on its own path — and the joined
+/// expression must actually reach the init amount, not just parse.
+#[test]
+fn test_initial_conditions_continuation_lines() {
+    let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[initial_conditions]
+  init(central) = CONC0 * V
+                  + 5.0
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+    let model = parse_model_string(content).expect("continuation line parses in the init block");
+    assert_eq!(model.analytical_init.len(), 1, "init block parsed");
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "CONC0"),
+        "the continued line's covariate must still be a required column, got: {:?}",
+        model.referenced_covariates
+    );
+    // CONC0 = 2, V = 10 → 2*10 + 5 = 25. The `+ 5.0` line has to be part of the
+    // expression, not silently dropped.
+    let mut covs = HashMap::new();
+    covs.insert("CONC0".to_string(), 2.0);
+    let theta = vec![1.0, 10.0];
+    let eta = vec![0.0];
+    let pk = (model.pk_param_fn)(&theta, &eta, &covs, 0.0);
+    let amount = (model.analytical_init[0].amount_fn)(&theta, &eta, &covs, &pk);
+    assert!(
+        (amount - 25.0).abs() < 1e-12,
+        "expected 2*10 + 5 = 25, got {amount}"
+    );
+}
+
 #[test]
 fn test_parse_scaling_y_form_c_on_ode() {
     // ODE form C: ode(states=...) without obs_cmt, and `y = central / V`

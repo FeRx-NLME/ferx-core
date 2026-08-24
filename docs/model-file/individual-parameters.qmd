@@ -79,8 +79,9 @@ This is the natural layout for an additive-on-logit covariate model — one
 covariate per line — which previously had to be collapsed onto a single line
 ([#1030](https://github.com/FeRx-NLME/ferx-core/issues/1030)). A trailing `=`
 continues too, so `LEMAX =` on its own line followed by an indented expression is
-accepted. The same applies in `[odes]`, `[scaling]`, and `[derived]`; newlines
-*inside* `(...)` or `[...]` have always been ignored and still are.
+accepted. The same applies in `[odes]`, `[scaling]`, `[derived]`, and
+`[initial_conditions]`; newlines *inside* `(...)` or `[...]` have always been
+ignored and still are.
 
 ## Conditional Logic (`if` / `else`)
 

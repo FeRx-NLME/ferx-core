@@ -238,7 +238,8 @@ section of the SDLC for the versioning policy).
   intermediates are inlined, so covariates reached only through one are still required data columns
   and the dose-attribute double-use rejection still sees them; (2) a long expression may be
   **continued across lines** by starting the continued line with an operator or ending the previous
-  one with it, in `[individual_parameters]`, `[odes]`, `[scaling]`, and `[derived]`; (3) **`min(a, b)`
+  one with it, in `[individual_parameters]`, `[odes]`, `[scaling]`, `[derived]`, and
+  `[initial_conditions]`; (3) **`min(a, b)`
   and `max(a, b)`** are available everywhere the DSL parses expressions, desugaring to the inline
   conditional so they differentiate and compile exactly like the hand-written `if (a >= b) a else b`.
   The three-line readout now reads the way the published Mlxtran does. Two smaller diagnostics come

@@ -10959,7 +10959,19 @@ fn join_bracketed_lines(lines: &[String]) -> Vec<String> {
 /// Block types whose lines are expression statements, and therefore accept
 /// operator continuation lines (#1030). Everything else (`[parameters]`,
 /// `[fit_options]`, …) keeps its strict one-declaration-per-line grammar.
-const CONTINUATION_BLOCKS: &[&str] = &["individual_parameters", "odes", "scaling", "derived"];
+///
+/// The entry criterion is that a *statement* in the block can never begin with a
+/// binary operator — see [`join_continuation_lines`] for why that is what makes
+/// joining a strict widening rather than a reinterpretation.
+const CONTINUATION_BLOCKS: &[&str] = &[
+    "individual_parameters",
+    "odes",
+    "scaling",
+    "derived",
+    // `init(NAME) = <expr>` — line-oriented like `[scaling]`, and every line must
+    // start with `init(`, so a line opening with an operator is unreachable here too.
+    "initial_conditions",
+];
 
 /// Leading characters that mark a line as the continuation of the previous one.
 /// Every statement in a continuation block starts with an identifier, `d/dt(`,
