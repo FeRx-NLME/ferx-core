@@ -203,6 +203,7 @@ fn build_warfarin_model() -> CompiledModel {
         omega_init_as_sd: vec![false; 3],
         sigma_init_as_sd: vec![false; 1],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         tv_fn: None,
         pk_indices: vec![PK_IDX_CL, PK_IDX_V, PK_IDX_KA],
 
@@ -336,6 +337,7 @@ fn generate_two_cpt_iv() {
         omega_init_as_sd: vec![false; 4],
         sigma_init_as_sd: vec![false; 1],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         tv_fn: None,
         pk_indices: vec![PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2],
 
@@ -466,6 +468,7 @@ fn generate_two_cpt_oral_cov() {
         omega_init_as_sd: vec![false; 5],
         sigma_init_as_sd: vec![false; 1],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         tv_fn: None,
         pk_indices: vec![PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_KA],
 
@@ -669,6 +672,7 @@ fn generate_mm_oral() {
         omega_init_as_sd: vec![false; 2],
         sigma_init_as_sd: vec![false; 1],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         tv_fn: None,
         pk_indices: vec![0, 2],
 

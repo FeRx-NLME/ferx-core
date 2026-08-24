@@ -68,6 +68,7 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: vec![false],
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: Some(Box::new(|_t, _c| vec![])),

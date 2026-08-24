@@ -48,6 +48,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         // Analytical models populate tv_fn; ODE models leave it None.
@@ -161,6 +162,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         omega_init_as_sd: Vec::new(),
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,

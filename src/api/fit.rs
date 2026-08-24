@@ -2096,6 +2096,18 @@ fn fit_inner(
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
         kappa_init_as_sd: model.kappa_init_as_sd.clone(),
+        // Left empty unless a kappa actually carries a weight, so an ordinary
+        // IOV fit's YAML/fitrx output is byte-identical to before #1031.
+        kappa_weights: if model.has_weighted_kappa() {
+            model
+                .kappa_weights
+                .iter()
+                .map(|w| w.as_ref().map(|w| w.expr.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        kappa_weight_typical: kappa_weight_typicals(model, population, &result.params.theta),
         se_kappa,
         shrinkage_kappa,
         shrinkage_kappa_by_occ,

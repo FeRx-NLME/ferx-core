@@ -1495,6 +1495,171 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         ));
     }
 
+    // ── Sample-size-weighted IOV (#1031) ────────────────────────────────────
+    // `kappa K ~ γ² weight = W` declares `κ_ik ~ N(0, Ω_IOV / W_ik)` — the
+    // between-treatment-arm variability of a longitudinal MBMA, whose arm-level
+    // effect scales with the number of subjects behind the arm.
+    //
+    // The engine applies it by *reparameterisation*, not by scaling the prior:
+    // every reference to a weighted kappa in `[individual_parameters]` is
+    // rewritten `K` → `K / sqrt(W)`. With `κ ~ N(0, γ²)` the rewritten effect
+    // `κ/√W` is distributed exactly `N(0, γ²/W)`, so the two formulations are
+    // the same likelihood — and the rewritten model is precisely the
+    // hand-written form this modifier replaces, which every estimator, analytic
+    // sensitivity, and diagnostic already supports. Two things fall out of that
+    // choice for free: the estimated Ω_IOV stays the *unweighted* γ² a published
+    // analysis reports, and the κ̂ EBEs (and their shrinkage, which compares
+    // Var(κ̂) against Ω_IOV) stay on Ω_IOV's own scale.
+    //
+    // The rewrite runs here — before the covariate collection, the pk/tv
+    // closures, and the ODE/scaling compilers all consume `indiv_stmts` — so a
+    // covariate named only by a weight expression is registered like any other
+    // (the #484/#1029 time-varying-snapshot trap) with no extra plumbing.
+    let kappa_weight_exprs: Vec<Option<Expression>> = {
+        let mut out: Vec<Option<Expression>> = Vec::with_capacity(kappa_names.len());
+        for (k, src) in kappa_info.weights.iter().enumerate() {
+            let Some(src) = src else {
+                out.push(None);
+                continue;
+            };
+            let name = kappa_names.get(k).map(String::as_str).unwrap_or("<kappa>");
+            // No `defined_vars`: a weight is evaluated at the point of *use*, so
+            // letting it name an `[individual_parameters]` local would make its
+            // value depend on statement order (and read 0.0 when the local is
+            // assigned later). Unknown identifiers are covariates, checked
+            // against the data by `check_covariates` like every other.
+            let ctx = ParseCtx::new(&theta_names, &eta_names, &[]).with_nn_specs(&nn_specs_for_ctx);
+            let expr = parse_scalar_expression(src, ctx)
+                .map_err(|e| format!("[parameters] kappa `{name}` weight `{src}`: {e}"))?;
+            if expr_uses_eta(&expr) {
+                return Err(format!(
+                    "[parameters] kappa `{name}` weight `{src}` references a random effect. \
+                     A weight is the *known* precision of an occasion (an arm's sample size), \
+                     so it may depend only on covariates, fixed thetas and TIME — a random \
+                     effect there would make the variance of κ a function of κ itself."
+                ));
+            }
+            // Same argument one step further out: an *estimated* theta makes the
+            // weight move during the outer optimisation, so the up-front
+            // positivity check (`E_KAPPA_WEIGHT_NONPOSITIVE`, evaluated at the
+            // initial θ) certifies nothing — a weight that is positive at the
+            // start and crosses zero mid-fit divides an individual parameter by
+            // zero with no diagnostic. A FIXed theta is a known constant, so it
+            // is as safe as a covariate column and stays allowed.
+            let mut estimated: Vec<&str> = Vec::new();
+            visit_expr_nodes(&expr, &mut |e: &Expression| {
+                if let Expression::Theta(ti) = e {
+                    if thetas.get(*ti).is_some_and(|t| !t.fixed) {
+                        let tn = thetas[*ti].name.as_str();
+                        if !estimated.contains(&tn) {
+                            estimated.push(tn);
+                        }
+                    }
+                }
+            });
+            if !estimated.is_empty() {
+                return Err(format!(
+                    "[parameters] kappa `{name}` weight `{src}` references estimated theta(s) {}. \
+                     A weight is the *known* precision of an occasion, so it may depend only on \
+                     covariates, FIXed thetas and TIME: an estimated theta moves the weight during \
+                     the fit, so the up-front check that it stays strictly positive cannot certify \
+                     it, and a weight that crosses zero divides an individual parameter by zero. \
+                     Declare the constant `FIX`, or move it into a covariate column.",
+                    estimated
+                        .iter()
+                        .map(|n| format!("`{n}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+            }
+            out.push(Some(expr));
+        }
+        out
+    };
+    let weighted_kappa_slots: HashMap<usize, Expression> = kappa_weight_exprs
+        .iter()
+        .enumerate()
+        .filter_map(|(k, w)| w.as_ref().map(|w| (n_eta + k, w.clone())))
+        .collect();
+    if !weighted_kappa_slots.is_empty() {
+        // A weighted kappa outside `[individual_parameters]` would read as the
+        // *unweighted* κ — a plausible wrong answer rather than an error, which
+        // is the exact failure this feature exists to remove. Every block that
+        // can see a kappa name at all is scanned textually (the compiled forms
+        // differ per block; the name does not).
+        let weighted_names: Vec<&String> = kappa_weight_exprs
+            .iter()
+            .enumerate()
+            .filter_map(|(k, w)| w.as_ref().and_then(|_| kappa_names.get(k)))
+            .collect();
+        // `extracted.named` is keyed block-type → instance-name, so the inner
+        // key alone would print `[armA]` — the instance, not the block. Label
+        // each with the pair the author actually wrote (`event_model armA`).
+        let named_blocks = extracted
+            .named
+            .iter()
+            .flat_map(|(ty, m)| m.keys().map(move |inst| (format!("{ty} {inst}"), &m[inst])));
+        for (block, lines) in blocks
+            .iter()
+            .filter(|(b, _)| b.as_str() != "parameters" && b.as_str() != "individual_parameters")
+            .map(|(b, l)| (b.clone(), l))
+            .chain(named_blocks)
+        {
+            let mut refs: HashSet<String> = HashSet::new();
+            collect_referenced_identifiers(lines, &mut refs);
+            for name in &weighted_names {
+                if refs.contains(&name.to_ascii_uppercase()) {
+                    return Err(format!(
+                        "[{block}] references `{name}`, a kappa declared with `weight = ...`. \
+                         A weighted kappa is scaled where it is used, and only \
+                         `[individual_parameters]` applies that scaling — a reference here \
+                         would silently use the unweighted κ. Move the term into \
+                         `[individual_parameters]` (assign it to an individual parameter and \
+                         reference that name instead)."
+                    ));
+                }
+            }
+        }
+    }
+    if !weighted_kappa_slots.is_empty() {
+        // Mu-reference detection (further down) runs on the *rewritten*
+        // statements, deliberately: the declared form and the hand-written
+        // `K / sqrt(W)` must be the same model everywhere, mu-refs included.
+        // Detecting on a pre-rewrite snapshot would register a kappa mu-ref the
+        // rewritten model does not satisfy (which `method = bayes` then
+        // rejects) and, in `THETA * exp(KAPPA) * exp(ETA)`, would return the
+        // kappa's index and *lose* the BSV eta's mu-ref that survives the
+        // rewrite — costing SAEM/IMP the closed-form θ step it is meant to
+        // protect. `exp(ETA + KAPPA/sqrt(W))` still resolves to `ETA` via the
+        // `(a, b) => a.or(b)` arm, which already tolerates a non-bare operand.
+        let rewritten = rewrite_weighted_kappas(&mut indiv_stmts, &weighted_kappa_slots);
+        // A weight that scales nothing is not a no-op: `print_results` would
+        // still report `→ SD = γ/√N` for a scaling that was never applied, and
+        // a covariate named only by the weight expression never reaches
+        // `referenced_covariates`, so the datareader skips the column and the
+        // data check then blames a *present* column for evaluating to 0.
+        let mut inert: Vec<&str> = weighted_kappa_slots
+            .keys()
+            .filter(|slot| !rewritten.contains(slot))
+            .filter_map(|slot| kappa_names.get(slot - n_eta).map(String::as_str))
+            .collect();
+        if !inert.is_empty() {
+            inert.sort_unstable();
+            return Err(format!(
+                "[parameters] kappa(s) {} are declared with `weight = ...` but never referenced \
+                 in [individual_parameters]. The weight is applied where the kappa is *used* \
+                 (`K` → `K / sqrt(W)`), so an unreferenced one scales nothing while the fit still \
+                 reports the weighted SD. Reference the kappa in [individual_parameters], or drop \
+                 the `weight = ...` modifier.",
+                inert
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+    }
+
     // Detect ODE vs analytical model
     let is_ode = struct_lines
         .iter()
@@ -2216,6 +2381,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .chain(kappa_names.iter())
         .cloned()
         .collect();
+    // Detection runs on the statements as they will actually be evaluated —
+    // including the weighted-kappa rewrite (#1031), which is the point: the
+    // declared `weight = W` form and the hand-written `K / sqrt(W)` must agree
+    // on their mu-refs exactly as they agree on the objective. See the rewrite
+    // site above.
     let all_mu_refs = detect_mu_refs(
         &indiv_stmts,
         &theta_names,
@@ -2356,6 +2526,25 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .transpose()?;
     default_params.mixture = mixture_params;
 
+    // Per-kappa weight, carried for *reporting* and validation only (#1031) —
+    // the scaling itself was desugared into `indiv_stmts` above. The evaluator
+    // lets `fit()` report the effective SD (`γ/√W`) at a typical arm size, and
+    // lets the up-front data check reject a weight that is zero, negative or
+    // non-finite before it divides an individual parameter.
+    let kappa_weights: Vec<Option<crate::types::KappaWeight>> = kappa_weight_exprs
+        .into_iter()
+        .zip(kappa_info.weights.iter())
+        .map(|(expr, src)| {
+            let expr = expr?;
+            let src = src.clone().unwrap_or_default();
+            let eval: crate::types::KappaWeightFn = Box::new(move |theta, cov, time| {
+                let vars: HashMap<String, f64> = HashMap::new();
+                with_model_time(time, || eval_expression(&expr, theta, &[], cov, &vars, &[]))
+            });
+            Some(crate::types::KappaWeight { expr: src, eval })
+        })
+        .collect();
+
     let model = CompiledModel {
         name,
         pk_model,
@@ -2376,6 +2565,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         omega_init_as_sd,
         sigma_init_as_sd,
         kappa_init_as_sd,
+        kappa_weights,
         tv_fn,
         #[cfg(feature = "nn")]
         covariate_nns,
@@ -10711,6 +10901,10 @@ struct ParsedKappas {
     block: Vec<BlockKappaSpec>,
     /// All kappa names in declaration order (diagonal then block, interleaved).
     names_ordered: Vec<String>,
+    /// Parallel to `names_ordered`: the `weight = <expr>` source text (#1031),
+    /// or `None` for an unweighted kappa. Always `None` for a `block_kappa`
+    /// member, which the parser rejects a weight on.
+    weights: Vec<Option<String>>,
 }
 
 // --- Block extraction ---
@@ -11674,6 +11868,7 @@ fn parse_parameters(
     let mut kappas: Vec<KappaSpec> = Vec::new();
     let mut block_kappas: Vec<BlockKappaSpec> = Vec::new();
     let mut kappa_names_ordered: Vec<String> = Vec::new();
+    let mut kappa_weights_ordered: Vec<Option<String>> = Vec::new();
 
     // theta NAME(init)  |  theta NAME(init, FIX)
     // theta NAME(init, lower, upper)  |  theta NAME(init, lower, upper, FIX)
@@ -11761,6 +11956,17 @@ fn parse_parameters(
     // Rejoin multi-line `block_*` declarations before matching.
     let lines = join_bracketed_lines(lines);
     for line in &lines {
+        // #1031: a `kappa` declaration may carry a trailing `weight = <expr>`
+        // (sample-size-weighted IOV). It is peeled off before the declaration
+        // regexes run because every one of them is unanchored — the modifier
+        // would otherwise sit past the end of a successful match and be
+        // silently dropped, which is the specific failure mode this feature
+        // exists to remove. A weight left on any other declaration is rejected
+        // below rather than ignored, for the same reason.
+        let (line, weight_expr) =
+            split_weight_modifier(line, "parameters", "a `kappa NAME ~ VALUE` declaration")?;
+        let line = &line;
+        let mut weight_consumed = false;
         if let Some(caps) = theta_re.captures(line) {
             let name = caps[1].to_string();
             let init: f64 = caps[2]
@@ -11885,6 +12091,7 @@ fn parse_parameters(
             }
             for name in &names {
                 kappa_names_ordered.push(name.clone());
+                kappa_weights_ordered.push(None);
             }
             let fixed = caps.get(3).is_some();
             block_kappas.push(BlockKappaSpec {
@@ -11969,12 +12176,34 @@ fn parse_parameters(
             let variance = if init_as_sd { raw * raw } else { raw };
             let fixed = caps.get(3).is_some() || caps.get(5).is_some();
             kappa_names_ordered.push(name.clone());
+            kappa_weights_ordered.push(weight_expr.clone());
+            weight_consumed = true;
             kappas.push(KappaSpec {
                 name,
                 variance,
                 fixed,
                 init_as_sd,
             });
+        }
+        if let Some(w) = &weight_expr {
+            if !weight_consumed {
+                return Err(format!(
+                    "[parameters] `weight = {w}` is only supported on a `kappa NAME ~ VALUE` \
+                     declaration (it declares κ ~ N(0, Ω_IOV / W), the sample-size-weighted \
+                     IOV of an MBMA arm effect). It has no meaning on `{}`.{} For a weighted \
+                     residual error write the modifier on the `[error_model]` statement \
+                     instead.",
+                    line.trim(),
+                    if block_kappa_re.is_match(line) {
+                        " A `block_kappa` cannot carry one: the weight scales a single \
+                         kappa's variance, and a block's off-diagonal covariances would \
+                         need the same divisor to stay a valid covariance matrix — declare \
+                         the weighted kappa as a diagonal `kappa` instead."
+                    } else {
+                        ""
+                    }
+                ));
+            }
         }
     }
 
@@ -12003,6 +12232,7 @@ fn parse_parameters(
             diagonal: kappas,
             block: block_kappas,
             names_ordered: kappa_names_ordered,
+            weights: kappa_weights_ordered,
         },
     ))
 }
@@ -12434,12 +12664,14 @@ fn split_top_level_args(s: &str) -> Vec<String> {
     out
 }
 
-/// Peel an optional trailing `weight = <expr>` modifier off an `[error_model]`
-/// statement (#1029):
+/// Peel an optional trailing `weight = <expr>` modifier off a statement that
+/// accepts one — an `[error_model]` residual (#1029) or a `[parameters]` kappa
+/// declaration (#1031):
 ///
 /// ```text
 /// DV ~ additive(ADD_ERR) weight = WPSE
 /// DV ~ combined(PROP_ERR, ADD_ERR) weight = 1 / sqrt(NARM)
+/// kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM
 /// ```
 ///
 /// The `weight` keyword is recognised only at bracket depth 0 and only when
@@ -12447,8 +12679,14 @@ fn split_top_level_args(s: &str) -> Vec<String> {
 /// survives intact and a covariate named `weight` *inside* a magnitude
 /// expression (#484) is not mistaken for the modifier. Returns
 /// `(statement_without_modifier, Some(weight_expr))`, or `(statement, None)`
-/// when no modifier is present.
-fn split_weight_modifier(body: &str) -> Result<(String, Option<String>), String> {
+/// when no modifier is present. `block` and `stmt_desc` name the block and the
+/// statement form the modifier attaches to, so each caller's diagnostics read
+/// as its own.
+fn split_weight_modifier(
+    body: &str,
+    block: &str,
+    stmt_desc: &str,
+) -> Result<(String, Option<String>), String> {
     const KW: &[u8] = b"weight";
     let bytes = body.as_bytes();
     let mut depth: i32 = 0;
@@ -12494,14 +12732,14 @@ fn split_weight_modifier(body: &str) -> Result<(String, Option<String>), String>
     let expr = body[eq + 1..].trim();
     if expr.is_empty() {
         return Err(format!(
-            "[error_model] `weight =` has no expression on its right-hand side: `{}`",
+            "[{block}] `weight =` has no expression on its right-hand side: `{}`",
             body.trim()
         ));
     }
     let stmt = body[..i].trim();
     if stmt.is_empty() {
         return Err(format!(
-            "[error_model] `weight = {}` must follow a `DV ~ TYPE(...)` statement on the same line",
+            "[{block}] `weight = {}` must follow {stmt_desc} on the same line",
             expr
         ));
     }
@@ -12564,7 +12802,10 @@ fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), St
     let body = body.trim();
     // #1029: `weight = …` would otherwise be swallowed by the statement regex's
     // failure path and silently ignored inside a branch.
-    if split_weight_modifier(body)?.1.is_some() {
+    if split_weight_modifier(body, "error_model", "a `DV ~ TYPE(...)` statement")?
+        .1
+        .is_some()
+    {
         return Err(
             "[error_model] `weight = …` is not supported inside a covariate-selected if/else \
              block"
@@ -12822,7 +13063,8 @@ fn parse_error_model(
         // Inverse-variance weighting (#1029): `… weight = <expr>` is peeled off
         // before the statement regexes run — its trailing `= expr` would defeat
         // their `$` anchor and the whole line would be silently ignored.
-        let (body, weight_expr) = split_weight_modifier(&body)?;
+        let (body, weight_expr) =
+            split_weight_modifier(&body, "error_model", "a `DV ~ TYPE(...)` statement")?;
 
         // A `log(DV)` LHS (case 2) is detected first since the plain regex's
         // `\w+` LHS can't match the parenthesised form.
@@ -14152,6 +14394,108 @@ fn visit_stmt_nodes(stmts: &[Statement], f: &mut dyn FnMut(&Expression)) {
             }
         }
     }
+}
+
+/// Rewrite every reference to a sample-size-weighted IOV kappa (#1031) into its
+/// scaled form: `Eta(k)` → `Eta(k) / sqrt(W_k)`, where `weights` maps the
+/// kappa's slot in the *extended* eta vector (`n_eta + kappa_idx`) to its
+/// compiled weight expression.
+///
+/// This is the whole of "the engine applies the scaling": with `κ ~ N(0, γ²)`
+/// the rewritten effect is distributed `N(0, γ²/W)`, so the declaration
+/// `kappa K ~ γ² weight = W` and the hand-written `K / sqrt(W)` are the same
+/// model — and every estimator, sensitivity and diagnostic downstream sees a
+/// shape it already supports.
+///
+/// Not written on top of [`visit_expr_nodes_mut`]: that walker recurses *into*
+/// a replacement node, so replacing `Eta(k)` with an expression that still
+/// contains `Eta(k)` would re-fire forever. This walk descends only into the
+/// nodes it did not create.
+///
+/// Returns the set of slots that were actually rewritten — i.e. the weighted
+/// kappas the block really references. A weighted kappa missing from that set
+/// carries a weight that does nothing, which the caller rejects rather than
+/// letting the fit report a scaling it never applied.
+fn rewrite_weighted_kappas(
+    stmts: &mut [Statement],
+    weights: &HashMap<usize, Expression>,
+) -> HashSet<usize> {
+    fn walk_expr(
+        expr: &mut Expression,
+        weights: &HashMap<usize, Expression>,
+        hit: &mut HashSet<usize>,
+    ) {
+        if let Expression::Eta(i) = expr {
+            if let Some(w) = weights.get(i) {
+                hit.insert(*i);
+                *expr = Expression::BinOp(
+                    Box::new(Expression::Eta(*i)),
+                    BinOp::Div,
+                    Box::new(Expression::UnaryFn("sqrt".to_string(), Box::new(w.clone()))),
+                );
+            }
+            return;
+        }
+        match expr {
+            Expression::BinOp(l, _, r) => {
+                walk_expr(l, weights, hit);
+                walk_expr(r, weights, hit);
+            }
+            Expression::UnaryFn(_, a) => walk_expr(a, weights, hit),
+            Expression::Power(b, e) => {
+                walk_expr(b, weights, hit);
+                walk_expr(e, weights, hit);
+            }
+            Expression::Conditional(c, t, e) => {
+                walk_cond(c, weights, hit);
+                walk_expr(t, weights, hit);
+                walk_expr(e, weights, hit);
+            }
+            _ => {}
+        }
+    }
+    fn walk_cond(
+        cond: &mut Condition,
+        weights: &HashMap<usize, Expression>,
+        hit: &mut HashSet<usize>,
+    ) {
+        match cond {
+            Condition::Compare(l, _, r) => {
+                walk_expr(l, weights, hit);
+                walk_expr(r, weights, hit);
+            }
+            Condition::And(l, r) | Condition::Or(l, r) => {
+                walk_cond(l, weights, hit);
+                walk_cond(r, weights, hit);
+            }
+            Condition::Not(c) => walk_cond(c, weights, hit),
+        }
+    }
+    let mut hit: HashSet<usize> = HashSet::new();
+    for s in stmts {
+        match s {
+            Statement::Assign(_, e)
+            | Statement::AssignIdx(_, e)
+            | Statement::DiffEq(_, e)
+            | Statement::DiffEqIdx(_, e) => walk_expr(e, weights, &mut hit),
+            // Bytecode forms only exist after `resolve_variable_indices`, which
+            // runs long after this rewrite.
+            Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {}
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (cond, body) in branches {
+                    walk_cond(cond, weights, &mut hit);
+                    hit.extend(rewrite_weighted_kappas(body, weights));
+                }
+                if let Some(eb) = else_body {
+                    hit.extend(rewrite_weighted_kappas(eb, weights));
+                }
+            }
+        }
+    }
+    hit
 }
 
 /// Accumulate every covariate name referenced in an expression.

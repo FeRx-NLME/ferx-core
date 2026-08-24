@@ -281,6 +281,28 @@ section of the SDLC for the versioning policy).
   stopped theta from fixing.
 
 ### Added
+- **Sample-size-weighted IOV: `weight = <expr>` on a `kappa` declaration (#1031).** The arm-level
+  random effect of every longitudinal MBMA — between-treatment-arm variability — is distributed
+  `κ_ik ~ N(0, γ²/N_ik)`: a 400-subject arm's mean wanders a quarter as far as a 25-subject arm's.
+  ferx could express that only by hand, inside a structural equation
+  (`... + ETA_EMAX + KAPPA_EMAX / sqrt(NARM)`), which put a variance-structure decision where
+  `/ NARM` instead of `/ sqrt(NARM)` produces a plausible wrong answer rather than an error, and
+  where nothing marks the term as weighted. Declare it where the rest of the variance structure is
+  declared instead: `kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM`, and write the structural expression
+  as `... + ETA_EMAX + KAPPA_EMAX`. The engine applies the scaling by rewriting the kappa as
+  `KAPPA / sqrt(W)`, which is exactly the hand-written form — so the objective, the analytic
+  sensitivities, the EBEs and every estimator that supports IOV (FOCE, FOCEI, Laplace/AGQ, SAEM)
+  are unchanged, and the reported Ω_IOV stays the **unweighted** γ² a published analysis quotes.
+  The fit printout adds the number a reader actually needs next to it — the effective SD at the
+  median arm, `γ/√N` — and `FitResult` carries `kappa_weights` / `kappa_weight_typical`. The weight
+  may reference covariates, `FIX`ed thetas and `TIME` but neither a random effect nor an estimated
+  theta (both would make the divisor move underneath the up-front positivity check); a weighted
+  kappa may be referenced only in `[individual_parameters]`, and must be referenced somewhere in it
+  (elsewhere it would read as the unweighted κ, and nowhere would report a scaling that was never
+  applied); `block_kappa` cannot carry one. A weight that is zero, negative or non-finite at any
+  record — a blank arm-size cell — is rejected up front by both `fit()` and `simulate()` with
+  `E_KAPPA_WEIGHT_NONPOSITIVE` instead of dividing an individual parameter by zero mid-run, and one
+  that moves *within* an occasion warns.
 - **`[scaling]` accepts named intermediates, expressions can be split across lines, and `min`/`max`
   take two arguments (#1030).** Three restrictions that individually looked defensible combined to
   make a standard bounded-endpoint readout unmaintainable: a model-based meta-analysis logit-Emax

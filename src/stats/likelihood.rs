@@ -2530,6 +2530,7 @@ mod tests {
             omega_init_as_sd: vec![false],
             sigma_init_as_sd: vec![false],
             kappa_init_as_sd: Vec::new(),
+            kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
             tv_fn: None,
             pk_indices: vec![0, 1],

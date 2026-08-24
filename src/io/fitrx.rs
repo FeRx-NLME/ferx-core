@@ -265,6 +265,13 @@ struct IovWire {
     /// .fitrx files from before issue #5.
     #[serde(default)]
     kappa_init_as_sd: Vec<bool>,
+    /// Per-kappa `weight = <expr>` source text and the median arm weight it
+    /// evaluated to (#1031). Both empty for a model with no weighted kappa, and
+    /// defaulted so a bundle written before #1031 still reads.
+    #[serde(default)]
+    kappa_weights: Vec<Option<String>>,
+    #[serde(default)]
+    kappa_weight_typical: Vec<Option<f64>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -623,6 +630,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             omega_iov: MatrixWire::from(m),
             omega_iov_param_corr: r.omega_iov_param_corr.as_ref().map(MatrixWire::from),
             kappa_init_as_sd: r.kappa_init_as_sd.clone(),
+            kappa_weights: r.kappa_weights.clone(),
+            kappa_weight_typical: r.kappa_weight_typical.clone(),
         }),
         eta_param_info: r
             .eta_param_info
@@ -1678,6 +1687,8 @@ fn wire_to_fit_result(
         kappa_names,
         kappa_fixed,
         kappa_init_as_sd,
+        kappa_weights,
+        kappa_weight_typical,
         se_kappa,
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
@@ -1699,6 +1710,8 @@ fn wire_to_fit_result(
                 iov.kappa_names,
                 iov.kappa_fixed,
                 init_as_sd,
+                iov.kappa_weights,
+                iov.kappa_weight_typical,
                 iov.se_kappa,
                 iov.shrinkage_kappa,
                 iov.shrinkage_kappa_by_occ,
@@ -1709,6 +1722,8 @@ fn wire_to_fit_result(
         }
         None => (
             None,
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1800,6 +1815,8 @@ fn wire_to_fit_result(
         kappa_names,
         kappa_fixed,
         kappa_init_as_sd,
+        kappa_weights,
+        kappa_weight_typical,
         se_kappa,
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
@@ -2041,6 +2058,8 @@ mod tests {
             kappa_names: vec![],
             kappa_fixed: vec![],
             kappa_init_as_sd: vec![],
+            kappa_weights: Vec::new(),
+            kappa_weight_typical: Vec::new(),
             se_kappa: None,
             shrinkage_kappa: vec![],
             shrinkage_kappa_by_occ: vec![],
@@ -2490,6 +2509,27 @@ mod tests {
         assert_eq!(loaded.fit.ebe_kappas[0].len(), 2);
         assert!((loaded.fit.ebe_kappas[0][0][0] - 0.01).abs() < 1e-9);
         assert_eq!(loaded.fit.ebe_kappas[1].len(), 1);
+    }
+
+    /// A weighted kappa (#1031) carries its declaration and the arm size it was
+    /// read against into the bundle, so a reloaded fit still reports the
+    /// effective SD rather than a bare gamma^2.
+    #[test]
+    fn roundtrip_with_a_weighted_kappa() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weighted_kappa.fitrx");
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_row_slice(1, 1, &[4.0]));
+        r.kappa_names = vec!["KAPPA_EMAX".into()];
+        r.kappa_fixed = vec![false];
+        r.shrinkage_kappa = vec![0.1];
+        r.kappa_weights = vec![Some("NARM".into())];
+        r.kappa_weight_typical = vec![Some(200.0)];
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.kappa_weights, vec![Some("NARM".to_string())]);
+        assert_eq!(loaded.fit.kappa_weight_typical, vec![Some(200.0)]);
     }
 
     #[test]

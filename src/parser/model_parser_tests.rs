@@ -17672,28 +17672,48 @@ fn test_weight_modifier_rejects_eta_dependence() {
 fn test_split_weight_modifier_ignores_a_weight_inside_the_sigma_parens() {
     // A covariate literally named `WEIGHT` inside a magnitude expression is at
     // paren depth 1 and must not be mistaken for the modifier.
-    let (stmt, w) = super::split_weight_modifier("DV ~ additive(ADD * WEIGHT)").unwrap();
+    let (stmt, w) = super::split_weight_modifier(
+        "DV ~ additive(ADD * WEIGHT)",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap();
     assert_eq!(stmt, "DV ~ additive(ADD * WEIGHT)");
     assert!(w.is_none());
 }
 
 #[test]
 fn test_split_weight_modifier_ignores_a_comparison() {
-    let (stmt, w) = super::split_weight_modifier("DV ~ additive(ADD) weight == 2").unwrap();
+    let (stmt, w) = super::split_weight_modifier(
+        "DV ~ additive(ADD) weight == 2",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap();
     assert_eq!(stmt, "DV ~ additive(ADD) weight == 2");
     assert!(w.is_none());
 }
 
 #[test]
 fn test_split_weight_modifier_ignores_a_longer_identifier() {
-    let (stmt, w) = super::split_weight_modifier("DV ~ additive(ADD) weighted = 2").unwrap();
+    let (stmt, w) = super::split_weight_modifier(
+        "DV ~ additive(ADD) weighted = 2",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap();
     assert_eq!(stmt, "DV ~ additive(ADD) weighted = 2");
     assert!(w.is_none());
 }
 
 #[test]
 fn test_split_weight_modifier_requires_a_statement_before_it() {
-    let err = super::split_weight_modifier("weight = WPSE").unwrap_err();
+    let err = super::split_weight_modifier(
+        "weight = WPSE",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap_err();
     assert!(
         err.contains("must follow a `DV ~ TYPE(...)` statement"),
         "got: {err}"
@@ -17783,4 +17803,428 @@ fn test_weight_modifier_rejects_a_sigma_in_the_weight_expression() {
         "  DV ~ additive(ADD_ERR) weight = PROP_ERR",
     ));
     assert!(err.contains("multiple sigmas"), "got: {err}");
+}
+
+// ── #1031: sample-size-weighted IOV (`kappa K ~ γ² weight = W`) ─────────────
+//
+// `κ_ik ~ N(0, Ω_IOV / W_ik)` — the between-treatment-arm variability of a
+// longitudinal MBMA, whose arm-level effect scales with the number of subjects
+// behind the arm. The engine applies it by rewriting every reference to the
+// kappa as `K / sqrt(W)`, which is the same distribution and the same model the
+// modifier replaces.
+
+/// One arm-level random effect on CL, weighted by the arm size `NARM`.
+/// `kappa_line` and `extra_block` are varied by the negative tests.
+fn weighted_kappa_model_str(kappa_line: &str, extra_block: &str) -> String {
+    format!(
+        r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+{kappa_line}
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[covariates]
+  NARM continuous
+{extra_block}
+[fit_options]
+  iov_column = OCC
+"
+    )
+}
+
+/// The individual parameter a weighted kappa feeds must come out identical to
+/// the hand-written `KAPPA / sqrt(NARM)` form — that equivalence is the whole
+/// implementation, and it is what lets every estimator downstream stay unaware
+/// of the feature.
+#[test]
+fn test_weighted_kappa_divides_the_kappa_by_sqrt_of_the_weight() {
+    let weighted = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let plain =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")).unwrap();
+    let theta = weighted.default_params.theta.clone();
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 4.0)].into_iter().collect();
+    // Extended η = [ETA_CL, KAPPA_CL]. κ = 0.8 at NARM = 4 must act as κ = 0.4.
+    let got = (weighted.pk_param_fn)(&theta, &[0.1, 0.8], &cov, 0.0);
+    let want = (plain.pk_param_fn)(&theta, &[0.1, 0.4], &cov, 0.0);
+    approx::assert_relative_eq!(got.values[0], want.values[0], max_relative = 1e-12);
+    // ... and it is genuinely scaled, not passed through.
+    let unscaled = (plain.pk_param_fn)(&theta, &[0.1, 0.8], &cov, 0.0);
+    assert!(
+        (got.values[0] - unscaled.values[0]).abs() > 1e-6,
+        "weight had no effect: {got:?} vs {unscaled:?}"
+    );
+}
+
+/// The weight is per *record*, so a covariate that differs between occasions
+/// scales each occasion by its own arm size.
+#[test]
+fn test_weighted_kappa_reads_the_weight_at_the_record() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let theta = model.default_params.theta.clone();
+    let big: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 100.0)].into_iter().collect();
+    let small: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 1.0)].into_iter().collect();
+    let cl_big = (model.pk_param_fn)(&theta, &[0.0, 1.0], &big, 0.0).values[0];
+    let cl_small = (model.pk_param_fn)(&theta, &[0.0, 1.0], &small, 0.0).values[0];
+    let tvcl = theta[0];
+    approx::assert_relative_eq!(cl_big, tvcl * (1.0f64 / 10.0).exp(), max_relative = 1e-12);
+    approx::assert_relative_eq!(cl_small, tvcl * 1.0f64.exp(), max_relative = 1e-12);
+}
+
+/// Ω_IOV keeps its declared (unweighted) scale — the γ² a published MBMA
+/// reports. Only the *effect* is divided.
+#[test]
+fn test_weighted_kappa_leaves_omega_iov_on_the_unweighted_scale() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 2.0 (sd) weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let iov = model
+        .default_params
+        .omega_iov
+        .as_ref()
+        .expect("IOV present");
+    approx::assert_relative_eq!(iov.matrix[(0, 0)], 4.0, max_relative = 1e-12);
+}
+
+/// The model carries the weight for reporting: the source text plus an
+/// evaluator, so a fit can print the effective SD `γ/√W` at a typical arm size.
+#[test]
+fn test_weighted_kappa_is_reported_on_the_compiled_model() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    assert!(model.has_weighted_kappa());
+    let w = model.kappa_weights[0].as_ref().expect("weight recorded");
+    assert_eq!(w.expr, "NARM");
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 200.0)].into_iter().collect();
+    approx::assert_relative_eq!(
+        (w.eval)(&model.default_params.theta, &cov, 0.0),
+        200.0,
+        max_relative = 1e-12
+    );
+}
+
+/// An unweighted IOV model must not start carrying weight metadata — the
+/// `kappa_weights` slots exist but stay empty.
+#[test]
+fn test_unweighted_kappa_carries_no_weight() {
+    let model =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")).unwrap();
+    assert!(!model.has_weighted_kappa());
+    assert!(model.kappa_weights.iter().all(|w| w.is_none()));
+}
+
+/// A covariate named only by a weight expression is still model-referenced:
+/// without it in `referenced_covariates` the per-observation snapshots are
+/// pruned and every occasion silently reads the subject's first arm size
+/// (the #484 / #1029 trap).
+#[test]
+fn test_weighted_kappa_registers_its_covariate() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    assert!(
+        model.referenced_covariates.contains(&"NARM".to_string()),
+        "got: {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// Weighting a kappa must not cost the *BSV* eta sharing its `exp(...)` its
+/// mu-reference — that would silently drop SAEM/IMP to the general θ step.
+#[test]
+fn test_weighted_kappa_preserves_the_bsv_mu_reference() {
+    let weighted = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let plain =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")).unwrap();
+    let plain_ref = plain.mu_refs.get("ETA_CL").expect("baseline mu-ref");
+    let weighted_ref = weighted
+        .mu_refs
+        .get("ETA_CL")
+        .expect("BSV mu-ref survives the kappa rewrite");
+    assert_eq!(weighted_ref.theta_name, plain_ref.theta_name);
+    assert_eq!(weighted_ref.log_transformed, plain_ref.log_transformed);
+}
+
+#[test]
+fn test_weighted_kappa_rejects_a_random_effect_in_the_weight() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = exp(ETA_CL)",
+        "",
+    ));
+    assert!(err.contains("references a random effect"), "got: {err}");
+}
+
+#[test]
+fn test_weighted_kappa_rejects_an_empty_right_hand_side() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight =",
+        "",
+    ));
+    assert!(
+        err.contains("no expression on its right-hand side"),
+        "got: {err}"
+    );
+}
+
+/// A weight on anything but a `kappa` is rejected rather than ignored: the
+/// unanchored declaration regexes would otherwise drop it silently, which is
+/// the failure mode the feature exists to remove.
+#[test]
+fn test_weight_modifier_rejected_on_a_non_kappa_declaration() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09\n  omega ETA_V ~ 0.04 weight = NARM",
+        "",
+    ));
+    assert!(
+        err.contains("only supported on a `kappa NAME ~ VALUE` declaration"),
+        "got: {err}"
+    );
+}
+
+/// A `block_kappa` cannot carry a weight: the divisor would have to apply to
+/// the block's covariances too for the matrix to stay a valid one.
+#[test]
+fn test_weight_modifier_rejected_on_block_kappa() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.01, 0.04] weight = NARM",
+        "",
+    ));
+    assert!(err.contains("`block_kappa` cannot carry one"), "got: {err}");
+}
+
+/// Only `[individual_parameters]` applies the scaling, so a weighted kappa
+/// named anywhere else would read as the *unweighted* κ — a plausible wrong
+/// answer. Reject it instead.
+#[test]
+fn test_weighted_kappa_rejected_outside_individual_parameters() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n",
+    ));
+    assert!(
+        err.contains("references `KAPPA_CL`, a kappa declared with `weight = ...`"),
+        "got: {err}"
+    );
+}
+
+/// The unweighted kappa keeps its freedom to appear elsewhere.
+#[test]
+fn test_unweighted_kappa_is_not_restricted_to_individual_parameters() {
+    parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09",
+        "\n[derived]\n  KOUT = KAPPA_CL\n",
+    ))
+    .expect("an unweighted kappa is unaffected by the #1031 guard");
+}
+
+/// A weighted kappa that no individual parameter references scales nothing —
+/// but the fit still reports `→ SD = γ/√N`, and a covariate named *only* by the
+/// weight never reaches `referenced_covariates`, so the datareader skips the
+/// column and the data check then blames a present column for reading 0.
+#[test]
+fn test_weighted_kappa_must_be_referenced_in_individual_parameters() {
+    let model_str = weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM\n  kappa KAPPA_V ~ 0.04 weight = NARM",
+        "",
+    );
+    let err = expect_parse_err(&model_str);
+    assert!(
+        err.contains("`KAPPA_V`") && err.contains("never referenced in [individual_parameters]"),
+        "got: {err}"
+    );
+}
+
+/// The same guard must not fire on a kappa that *is* referenced, including one
+/// reached only from inside a conditional branch.
+#[test]
+fn test_weighted_kappa_referenced_in_a_branch_is_not_inert() {
+    let model_str = r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.09 weight = NARM
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  if (NARM > 1) {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    parse_model_string(model_str).expect("a kappa referenced inside a branch is not inert");
+}
+
+/// An *estimated* theta in the weight moves the divisor during the outer
+/// optimisation, so the up-front `E_KAPPA_WEIGHT_NONPOSITIVE` check — evaluated
+/// at the initial θ — certifies nothing: a weight that starts positive and
+/// crosses zero mid-fit divides an individual parameter by zero silently.
+#[test]
+fn test_weighted_kappa_rejects_an_estimated_theta_in_the_weight() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = TVCL * NARM",
+        "",
+    ));
+    assert!(
+        err.contains("references estimated theta(s) `TVCL`"),
+        "got: {err}"
+    );
+}
+
+/// A FIXed theta is a known constant, so it is as safe as a covariate column
+/// and stays allowed.
+#[test]
+fn test_weighted_kappa_allows_a_fixed_theta_in_the_weight() {
+    let model_str = weighted_kappa_model_str(
+        "  theta NSCALE(2.0) FIX\n  kappa KAPPA_CL ~ 0.09 weight = NSCALE * NARM",
+        "",
+    );
+    let model = parse_model_string(&model_str).expect("a FIXed theta in the weight is allowed");
+    let w = model.kappa_weights[0].as_ref().expect("weight recorded");
+    // 2.0 (NSCALE, FIXed) × 100 (NARM) = 200.
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 100.0)].into_iter().collect();
+    assert_eq!(
+        (w.eval)(&model.default_params.theta, &cov, 0.0),
+        200.0,
+        "the fixed theta enters the weight"
+    );
+}
+
+/// The "outside `[individual_parameters]`" error names the block the author
+/// wrote (`event_model armA`), not the bare instance label (`armA`), which on
+/// its own reads as a block name that does not exist. Every *named* block type
+/// is feature-gated, so this is the survival build's case.
+#[cfg(feature = "survival")]
+#[test]
+fn test_weighted_kappa_outside_error_names_the_block_type() {
+    let model_str = r"
+[parameters]
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  omega ETA ~ 0.09
+  kappa KAPPA_CL ~ 0.09 weight = NARM
+
+[event_model armA]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(KAPPA_CL)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    let err = expect_parse_err(model_str);
+    assert!(
+        err.contains("[event_model armA] references `KAPPA_CL`"),
+        "got: {err}"
+    );
+}
+
+/// Mu-reference detection runs on the *rewritten* statements, so the declared
+/// `weight = W` form and the hand-written `K / sqrt(W)` agree on their mu-refs
+/// exactly as they agree on the objective. Detecting on a pre-rewrite snapshot
+/// registered a kappa mu-ref the rewritten model does not satisfy — which
+/// `method = bayes` then rejects while accepting the hand-written twin.
+#[test]
+fn test_weighted_kappa_mu_refs_match_the_hand_written_form() {
+    let declared = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let hand_written = parse_model_string(
+        &weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")
+            .replace("ETA_CL + KAPPA_CL", "ETA_CL + KAPPA_CL / sqrt(NARM)"),
+    )
+    .unwrap();
+    assert_eq!(
+        declared.kappa_mu_refs.contains_key("KAPPA_CL"),
+        hand_written.kappa_mu_refs.contains_key("KAPPA_CL"),
+        "declared and hand-written forms must agree on kappa mu-refs"
+    );
+    assert!(
+        !declared.kappa_mu_refs.contains_key("KAPPA_CL"),
+        "a weighted kappa is not a bare Eta after the rewrite, so it is not a mu-ref"
+    );
+}
+
+/// The order-dependent case the pre-rewrite snapshot got backwards: in
+/// `TVCL * exp(KAPPA_CL) * exp(ETA_CL)` the left-to-right `or_else` returns the
+/// *kappa* index on the snapshot, losing the BSV eta's mu-ref that survives the
+/// rewrite — and with it SAEM/IMP's closed-form θ step.
+#[test]
+fn test_weighted_kappa_left_of_the_bsv_eta_keeps_the_bsv_mu_reference() {
+    let model_str = weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", "").replace(
+        "CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+        "CL = TVCL * exp(KAPPA_CL) * exp(ETA_CL)",
+    );
+    let model = parse_model_string(&model_str).unwrap();
+    let mu = model
+        .mu_refs
+        .get("ETA_CL")
+        .expect("BSV mu-ref survives a kappa written to its left");
+    assert_eq!(mu.theta_name, "TVCL");
+    assert!(mu.log_transformed);
+}
+
+#[test]
+fn test_split_weight_modifier_peels_a_kappa_declaration() {
+    let (stmt, w) = super::split_weight_modifier(
+        "kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM",
+        "parameters",
+        "a `kappa NAME ~ VALUE` declaration",
+    )
+    .unwrap();
+    assert_eq!(stmt, "kappa KAPPA_EMAX ~ 2.0 (sd)");
+    assert_eq!(w.as_deref(), Some("NARM"));
 }
