@@ -1165,3 +1165,161 @@ fn production_kl_matches_the_textbook_kl() {
         );
     }
 }
+
+/// **Claim (b): a `mean_field` `q` gives a looser bound than `full_rank` — measured at
+/// *one* parameter vector, with a closed form to check the size against.**
+///
+/// `docs/estimation/vi.qmd` tells users a diagonal `q` costs "a looser bound whenever the
+/// true posterior is correlated". `VI_VALIDATION.md` §4.13 could only get a *direction* for
+/// that from the `emvi` harness, and explains why: each family arm runs its own M-step, so
+/// the two ELBOs are evaluated at different `(θ, Ω, σ)` — and an ELBO bounds `−2 log L` at
+/// the parameter vector where it was evaluated, so a gap between two different vectors
+/// attributes nothing. On the `emvi` side the arms still drift 5.7% apart.
+///
+/// This test is the route §4.13 names. Both families are evaluated at the **same** fixed
+/// parameter vector and the **same** posterior mode, by the deterministic quadrature in
+/// this module, so nothing is left for a parameter difference or Monte-Carlo noise to
+/// explain.
+///
+/// # Which `q` represents each family
+///
+/// For a Gaussian posterior `N(m, Σ)` with precision `H = Σ⁻¹`:
+///
+/// * the best **full-rank** `q` is the posterior itself, `S = Σ`, giving a zero gap;
+/// * the best **mean-field** `q` matches the diagonal of the **precision**, not of the
+///   covariance: `Sₖₖ = 1/Hₖₖ`. This is the textbook result behind the whole
+///   variance-understatement story — `1/Hₖₖ ≤ Σₖₖ`, with equality only when the posterior
+///   is uncorrelated.
+///
+/// Substituting the second into `2·KL(q ‖ p)` makes the trace term collapse to `d`
+/// exactly, so in 2-D the bound gap has the closed form
+///
+/// ```text
+///   −2·ELBO_meanfield − (−2 log p(y)) = −log(1 − r²),    r = H₁₂ / √(H₁₁H₂₂)
+/// ```
+///
+/// the **precision** correlation. That is what makes this a measurement rather than a
+/// direction: the test asserts not just that `mean_field` is looser but that it is looser
+/// by the predicted amount.
+///
+/// # Why the inequality is safe despite `S = Σ` being only approximately optimal
+///
+/// The posterior here is not exactly Gaussian, so the Laplace `q` is not exactly the
+/// full-rank optimum. It does not need to be. The mean-field family is *contained* in the
+/// full-rank family, so
+///
+/// ```text
+///   best mean-field  ≥  this particular full-rank q  ≥  best full-rank
+/// ```
+///
+/// and showing the mean-field optimum is looser than one specific full-rank `q` settles the
+/// claim in the direction that matters. The mean-field side *is* asserted to be its own
+/// family's optimum, by perturbation: scaling any single variance up or down worsens the
+/// bound.
+///
+/// One-`η` fixtures are skipped — with `d = 1` the two families are the same family, and
+/// `−log(1 − r²)` is zero, so there is nothing to measure.
+#[test]
+fn the_mean_field_bound_is_looser_than_full_rank_at_one_parameter_vector() {
+    for fx in fixtures() {
+        let params = fx.model.default_params.clone();
+        let d = params.omega.dim();
+        if d < 2 {
+            continue;
+        }
+
+        for i in 0..fx.pop.subjects.len() {
+            let subject = &fx.pop.subjects[i];
+            let marginal = agq_neg_two_log_marginal(&fx.model, &fx.pop, i, &params, fx.agq_nodes);
+            let (mode, lap_cov) = laplace_posterior(&fx.model, subject, &params);
+            let precision = lap_cov
+                .clone()
+                .try_inverse()
+                .expect("the Laplace covariance is invertible");
+
+            // The mean-field optimum: S_kk = 1/H_kk.
+            let mf_cov = DMatrix::from_diagonal(&DVector::from_iterator(
+                d,
+                (0..d).map(|k| 1.0 / precision[(k, k)]),
+            ));
+
+            let full_rank_bound =
+                neg_two_elbo_quad(&fx.model, subject, &params, &mode, &lap_cov, fx.quad_nodes);
+            let mean_field_bound =
+                neg_two_elbo_quad(&fx.model, subject, &params, &mode, &mf_cov, fx.quad_nodes);
+
+            // `-log(1 - r^2)` on the precision correlation, for d = 2.
+            let r = precision[(0, 1)] / (precision[(0, 0)] * precision[(1, 1)]).sqrt();
+            let predicted_gap = -(1.0 - r * r).ln();
+
+            assert!(
+                mean_field_bound > full_rank_bound,
+                "[{}] subject {}: mean_field -2*ELBO = {mean_field_bound:.6} is not looser \
+                 than full_rank's {full_rank_bound:.6}. The posterior's precision \
+                 correlation is {r:.4}, so a diagonal q must pay for it.",
+                fx.label,
+                subject.id
+            );
+
+            // Both are still bounds — a looser bound is still a bound.
+            for (label, value) in [
+                ("full_rank", full_rank_bound),
+                ("mean_field", mean_field_bound),
+            ] {
+                assert!(
+                    value >= marginal - 1e-7,
+                    "[{}] subject {} {label}: -2*ELBO = {value:.10} fell BELOW \
+                     -2 log p(y) = {marginal:.10}",
+                    fx.label,
+                    subject.id
+                );
+            }
+
+            // The measured gap against its closed form. The closed form assumes an exactly
+            // Gaussian posterior; this one is not, so 12% of slack covers that plus the
+            // quadrature's own error. It is a threshold in an empty gap, not a guess:
+            // measured error is 4-8% across the three subjects, and substituting the
+            // *covariance* diagonal for the precision diagonal -- the natural wrong q, and
+            // the one the variance-understatement story is about -- reads 17.1%.
+            let measured_gap = mean_field_bound - full_rank_bound;
+            let gap_err = (measured_gap - predicted_gap).abs() / predicted_gap.abs().max(1e-12);
+            assert!(
+                gap_err < 0.12,
+                "[{}] subject {}: the family cost measured {measured_gap:.6} against the \
+                 closed form -log(1 - r^2) = {predicted_gap:.6} (r = {r:.4}, {:.1}% off). \
+                 A disagreement here means the mean-field optimum is not where the theory \
+                 puts it, or the KL is wrong for a diagonal S.",
+                fx.label,
+                subject.id,
+                gap_err * 100.0
+            );
+
+            // The mean-field q really is its family's optimum: any single-coordinate rescale
+            // makes the bound worse. This is what licenses reading `measured_gap` as the cost
+            // of the *family* rather than of one arbitrary diagonal q.
+            for k in 0..d {
+                for scale in [0.75_f64, 1.33] {
+                    let mut perturbed = mf_cov.clone();
+                    perturbed[(k, k)] *= scale;
+                    let worse = neg_two_elbo_quad(
+                        &fx.model,
+                        subject,
+                        &params,
+                        &mode,
+                        &perturbed,
+                        fx.quad_nodes,
+                    );
+                    assert!(
+                        worse > mean_field_bound,
+                        "[{}] subject {}: scaling S[{k},{k}] by {scale} IMPROVED the \
+                         mean-field bound ({worse:.6} against {mean_field_bound:.6}), so \
+                         1/H_kk is not the diagonal optimum and the comparison above is \
+                         against the wrong q.",
+                        fx.label,
+                        subject.id
+                    );
+                }
+            }
+        }
+    }
+}
